@@ -1233,23 +1233,23 @@ pub(crate) trait ErasedReplicatedTextExecutable {
     fn reset_cache_distributed(&mut self) -> Result<(), Error>;
     fn load_prompt_cache(
         &mut self,
-        directory: &Path,
+        store: &dyn eredu_core::cache::PromptCacheStore,
         expected: &PromptCacheDescriptor,
         prefix_token_ids: &[u32],
     ) -> Result<PromptCacheManifest, Error>;
     fn load_prompt_cache_for_input(
         &mut self,
-        directory: &Path,
+        store: &dyn eredu_core::cache::PromptCacheStore,
         expected: &PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         input_identity: eredu_runtime::PreparedInputCacheIdentity,
     ) -> Result<PromptCacheManifest, Error> {
         let _ = input_identity;
-        self.load_prompt_cache(directory, expected, prefix_token_ids)
+        self.load_prompt_cache(store, expected, prefix_token_ids)
     }
     fn save_prompt_cache(
         &mut self,
-        destination: &Path,
+        store: &dyn eredu_core::cache::PromptCacheStore,
         descriptor: PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         options: &PromptCacheOptions,

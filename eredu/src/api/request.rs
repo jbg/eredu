@@ -193,6 +193,9 @@ impl<B: eredu_core::TextGenerationBackend, F> GenerationRequest<'_, B, F> {
 /// failures have distinct variants.
 #[derive(Debug, thiserror::Error)]
 pub enum PreparedChatError {
+    /// Prompt-cache format, storage or resource failure.
+    #[error(transparent)]
+    PromptCache(#[from] eredu_core::cache::PromptCacheStoreError),
     /// Exact input accounting or capability observation failed.
     #[error(transparent)]
     Capability(#[from] eredu_core::CapabilityError),

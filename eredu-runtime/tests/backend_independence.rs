@@ -3577,7 +3577,7 @@ where
 
     fn load_prompt_cache(
         &mut self,
-        _: &std::path::Path,
+        _: &dyn eredu_core::cache::PromptCacheStore,
         _: &eredu_core::cache::PromptCacheDescriptor,
         _: &eredu_core::cache::PromptCacheModelIdentity,
         _: &[u32],
@@ -3593,7 +3593,7 @@ where
     fn save_prompt_cache(
         &mut self,
         state: &mut Self::State,
-        _: &std::path::Path,
+        _: &dyn eredu_core::cache::PromptCacheStore,
         descriptor: eredu_core::cache::PromptCacheDescriptor,
         prefix: &[u32],
         _: &eredu_core::cache::PromptCacheOptions,
@@ -4722,7 +4722,7 @@ fn prediction_target_capture_uses_one_authoritative_transaction_and_publication(
     .unwrap();
     session
         .save_prompt_cache(
-            std::path::Path::new("unused"),
+            &eredu_runtime::MemoryPromptCacheStore::new(0),
             descriptor.clone(),
             &[1, 2],
             &eredu_core::cache::PromptCacheOptions::default(),
@@ -4738,7 +4738,12 @@ fn prediction_target_capture_uses_one_authoritative_transaction_and_publication(
     );
     assert_eq!(session.report().unwrap().state_report(), &[11]);
     session
-        .load_prompt_cache(std::path::Path::new("unused"), &descriptor, &[1, 2], &())
+        .load_prompt_cache(
+            &eredu_runtime::MemoryPromptCacheStore::new(0),
+            &descriptor,
+            &[1, 2],
+            &(),
+        )
         .unwrap();
     assert_eq!(session.report().unwrap().state_report(), &[1]);
     let restored_lane = session.prepare_prediction_target_state(&()).unwrap();
@@ -5644,7 +5649,7 @@ fn run_partitioned_agreement_rank_with_observer(
         .unwrap();
         session
             .save_prompt_cache(
-                std::path::Path::new("unused"),
+                &eredu_runtime::MemoryPromptCacheStore::new(0),
                 descriptor.clone(),
                 &[3],
                 &eredu_core::cache::PromptCacheOptions::default(),
@@ -5652,7 +5657,12 @@ fn run_partitioned_agreement_rank_with_observer(
             )
             .unwrap();
         session
-            .load_prompt_cache(std::path::Path::new("unused"), &descriptor, &[3], &())
+            .load_prompt_cache(
+                &eredu_runtime::MemoryPromptCacheStore::new(0),
+                &descriptor,
+                &[3],
+                &(),
+            )
             .unwrap();
         session.report().unwrap().distributed_commit()
     } else {
@@ -6045,7 +6055,7 @@ fn distributed_prompt_cache_save_is_reversible_and_fences_one_rank_failures() {
         true,
     );
     peer.save_prompt_cache(
-        std::path::Path::new("unused"),
+        &eredu_runtime::MemoryPromptCacheStore::new(0),
         descriptor.clone(),
         &[1],
         &eredu_core::cache::PromptCacheOptions::default(),
@@ -6077,7 +6087,7 @@ fn distributed_prompt_cache_save_is_reversible_and_fences_one_rank_failures() {
         );
     replacement
         .save_prompt_cache(
-            std::path::Path::new("unused"),
+            &eredu_runtime::MemoryPromptCacheStore::new(0),
             descriptor.clone(),
             &[1],
             &replacement_options,
@@ -6111,7 +6121,7 @@ fn distributed_prompt_cache_save_is_reversible_and_fences_one_rank_failures() {
     );
     successful
         .save_prompt_cache(
-            std::path::Path::new("unused"),
+            &eredu_runtime::MemoryPromptCacheStore::new(0),
             descriptor.clone(),
             &[1],
             &eredu_core::cache::PromptCacheOptions::default(),
@@ -6173,7 +6183,7 @@ fn distributed_prompt_cache_load_is_provisional_until_every_rank_succeeds() {
         true,
     );
     peer.save_prompt_cache(
-        std::path::Path::new("unused"),
+        &eredu_runtime::MemoryPromptCacheStore::new(0),
         descriptor.clone(),
         &[3],
         &eredu_core::cache::PromptCacheOptions::default(),
@@ -6199,7 +6209,7 @@ fn distributed_prompt_cache_load_is_provisional_until_every_rank_succeeds() {
     );
     successful
         .save_prompt_cache(
-            std::path::Path::new("unused"),
+            &eredu_runtime::MemoryPromptCacheStore::new(0),
             descriptor.clone(),
             &[3],
             &eredu_core::cache::PromptCacheOptions::default(),
@@ -8625,7 +8635,7 @@ fn production_composite_input_reuses_the_shared_session_lifecycle() {
         let before_identity_mismatch = session.report().unwrap().state_report().clone();
         let mismatch = session
             .save_prompt_cache_for_input(
-                std::path::Path::new("unused"),
+                &eredu_runtime::MemoryPromptCacheStore::new(0),
                 descriptor.clone(),
                 &[7],
                 &eredu_core::cache::PromptCacheOptions::default(),
@@ -8643,7 +8653,7 @@ fn production_composite_input_reuses_the_shared_session_lifecycle() {
 
         session
             .save_prompt_cache_for_input(
-                std::path::Path::new("unused"),
+                &eredu_runtime::MemoryPromptCacheStore::new(0),
                 descriptor.clone(),
                 &[7],
                 &eredu_core::cache::PromptCacheOptions::default(),
@@ -8655,7 +8665,7 @@ fn production_composite_input_reuses_the_shared_session_lifecycle() {
         assert_eq!(session.report().unwrap().state_report(), &[0, 0, 0, 0]);
         session
             .load_prompt_cache_for_input(
-                std::path::Path::new("unused"),
+                &eredu_runtime::MemoryPromptCacheStore::new(0),
                 &descriptor,
                 &[7],
                 input_identity.clone(),
@@ -10240,3 +10250,227 @@ mod prefill_agreement_tests;
 
 #[path = "backend_independence/component_adapter.rs"]
 mod component_adapter;
+
+#[test]
+fn portable_prompt_cache_drives_native_transfers_publication_and_restore() {
+    use eredu_core::{cache::*, BackendFailure};
+    use eredu_runtime::{
+        publish_prompt_cache, DirectoryPromptCacheStore, MemoryPromptCacheStore,
+        PromptCacheBlockRestore, PromptCacheExport, PromptCacheExportBlock,
+        PromptCacheExportInventory, PromptCachePayload, PromptCacheRestore,
+        PromptCacheTensorLayout,
+    };
+    struct Bytes(Vec<Vec<u8>>);
+    impl PromptCachePayload for Bytes {
+        fn bytes(&self) -> Result<Vec<&[u8]>, BackendFailure> {
+            Ok(self.0.iter().map(Vec::as_slice).collect())
+        }
+    }
+    struct Source {
+        inventory: PromptCacheExportInventory,
+        copies: Cell<usize>,
+        fail: Cell<bool>,
+    }
+    impl PromptCacheExport for Source {
+        type Payload = Bytes;
+        fn inventory(&self) -> &PromptCacheExportInventory {
+            &self.inventory
+        }
+        fn transfer_block(&self, _: usize) -> Result<Bytes, BackendFailure> {
+            self.copies.set(self.copies.get() + 1);
+            if self.fail.get() {
+                return Err(BackendFailure::from_error(std::io::Error::other(
+                    "native transfer failed",
+                )));
+            }
+            Ok(Bytes(vec![
+                1f32.to_le_bytes().repeat(2),
+                (-2f32).to_le_bytes().repeat(2),
+            ]))
+        }
+        fn transfer_state(&self, _: usize) -> Result<Bytes, BackendFailure> {
+            unreachable!()
+        }
+    }
+    #[derive(Default)]
+    struct Target {
+        bytes: Vec<Vec<u8>>,
+        retained: usize,
+        transferred: usize,
+    }
+    impl Target {
+        fn read(
+            &mut self,
+            block: &PromptCacheBlock,
+            source: &eredu_runtime::RetainedCacheShard,
+        ) -> Result<(), BackendFailure> {
+            let mut first = vec![0; 8];
+            let mut second = vec![0; 8];
+            source
+                .read_into(
+                    &mut [
+                        (&block.first_array, &mut first),
+                        (&block.second_array, &mut second),
+                    ],
+                    Some(&block.payload_sha256),
+                )
+                .map_err(BackendFailure::from_error)?;
+            self.bytes.extend([first, second]);
+            Ok(())
+        }
+    }
+    impl PromptCacheBlockRestore for Target {
+        fn retain_block(
+            &mut self,
+            block: &PromptCacheBlock,
+            source: Arc<eredu_runtime::RetainedCacheShard>,
+            _: std::path::PathBuf,
+        ) -> Result<(), BackendFailure> {
+            self.retained += 1;
+            self.read(block, &source)
+        }
+        fn transfer_block(
+            &mut self,
+            block: &PromptCacheBlock,
+            source: &eredu_runtime::RetainedCacheShard,
+        ) -> Result<(), BackendFailure> {
+            self.transferred += 1;
+            self.read(block, source)
+        }
+    }
+    let model = PromptCacheModelIdentity::new(
+        "fixture",
+        "fixture",
+        "state-layout",
+        1,
+        0,
+        1,
+        0,
+        PromptCacheTopology::default(),
+        LayerSchedule::new(
+            1,
+            vec![LayerCachePolicy::key_value(AttentionPolicy::Full, 1, 1).unwrap()],
+        )
+        .unwrap(),
+        vec![0],
+        vec![PromptCacheStateSegment::new("state", 0..1).unwrap()],
+    )
+    .unwrap();
+    let descriptor =
+        PromptCacheDescriptor::from_model_identity(model.clone(), "checkpoint", "input", 1)
+            .unwrap();
+    let source = Source {
+        inventory: PromptCacheExportInventory {
+            block_size_tokens: 2,
+            blocks: vec![PromptCacheExportBlock {
+                id: CacheBlockId {
+                    session_id: 1,
+                    global_layer: 0,
+                    representation: CacheRepresentation::KeyValue,
+                    start: 0,
+                    end: 2,
+                    rank: None,
+                },
+                tensors: std::array::from_fn(|_| {
+                    PromptCacheTensorLayout::new(vec![1, 1, 2, 1], "Float32".into()).unwrap()
+                }),
+            }],
+            states: vec![],
+            unsealed_streams: vec![],
+            transfer_bytes: 16,
+        },
+        copies: Cell::new(0),
+        fail: Cell::new(false),
+    };
+    let options = PromptCacheOptions::new(None, true).unwrap();
+    assert!(publish_prompt_cache(
+        &source,
+        &MemoryPromptCacheStore::new(1),
+        descriptor.clone(),
+        &[7, 8],
+        &options
+    )
+    .is_err());
+    assert_eq!(
+        source.copies.get(),
+        0,
+        "budget rejection precedes native copying"
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let stores: Vec<Box<dyn PromptCacheStore>> = vec![
+        Box::new(MemoryPromptCacheStore::new(1 << 20)),
+        Box::new(DirectoryPromptCacheStore::new(
+            directory.path().join("cache"),
+            1 << 20,
+        )),
+    ];
+    for store in stores {
+        let manifest =
+            publish_prompt_cache(&source, &*store, descriptor.clone(), &[7, 8], &options).unwrap();
+        source.fail.set(true);
+        assert!(
+            publish_prompt_cache(&source, &*store, descriptor.clone(), &[7, 8], &options).is_err()
+        );
+        source.fail.set(false);
+        let read = store.open().unwrap().unwrap();
+        assert_eq!(
+            read.manifest(),
+            &manifest,
+            "failed transfer leaves publication intact"
+        );
+        assert!(PromptCacheRestore::new(&*read, &descriptor, &model, &[8, 7], 2).is_err());
+        let restore = PromptCacheRestore::new(&*read, &descriptor, &model, &[7, 8], 2).unwrap();
+        let mut target = Target::default();
+        restore.restore_blocks(&mut target).unwrap();
+        assert_eq!(
+            target.bytes,
+            vec![
+                1f32.to_le_bytes().repeat(2),
+                (-2f32).to_le_bytes().repeat(2)
+            ]
+        );
+        assert_eq!(
+            (target.retained, target.transferred),
+            if store.directory().is_some() {
+                (1, 0)
+            } else {
+                (0, 1)
+            }
+        );
+        store.clear().unwrap();
+        let mut pinned = Target::default();
+        restore.restore_blocks(&mut pinned).unwrap();
+        assert_eq!(
+            pinned.bytes, target.bytes,
+            "admitted generation survives eviction"
+        );
+    }
+    // The same portable publisher participates in the all-rank reversible protocol.
+    let destination = directory.path().join("distributed");
+    let active = DirectoryPromptCacheStore::new(&destination, 1 << 20);
+    let stage = || {
+        eredu_runtime::PreparedPromptCachePublication::stage(
+            &destination,
+            descriptor.topology(),
+            &options,
+            |store, options| {
+                publish_prompt_cache(&source, store, descriptor.clone(), &[7, 8], options)
+                    .map_err(BackendFailure::from_error)
+            },
+        )
+        .unwrap()
+    };
+    let mut transaction = stage();
+    assert!(active.open().unwrap().is_none());
+    transaction.publish().unwrap();
+    assert_eq!(
+        active.open().unwrap().unwrap().manifest(),
+        transaction.manifest()
+    );
+    transaction.rollback();
+    assert!(active.open().unwrap().is_none());
+    let mut transaction = stage();
+    transaction.publish().unwrap();
+    transaction.commit();
+    assert!(active.open().unwrap().is_some());
+}

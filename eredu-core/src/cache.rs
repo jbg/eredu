@@ -5,6 +5,10 @@
 
 mod policy;
 mod prompt;
+mod store;
+pub use store::{
+    PromptCacheRead, PromptCacheReader, PromptCacheStore, PromptCacheStoreError, PromptCacheWrite,
+};
 
 pub use policy::{
     AppendStreamPolicy, CacheBlockId, CachePolicyError, CacheRankIdentity, CacheRepresentation,

@@ -1472,11 +1472,11 @@ where
 
     fn load_prompt_cache(
         &mut self,
-        directory: &Path,
+        store: &dyn eredu_core::cache::PromptCacheStore,
         expected: &PromptCacheDescriptor,
         prefix_token_ids: &[u32],
     ) -> Result<PromptCacheManifest, Error> {
-        let _ = (directory, expected, prefix_token_ids);
+        let _ = (store, expected, prefix_token_ids);
         Err(Error::ArchitectureModel(
             "composite prompt-cache loading requires the prepared-input identity".into(),
         ))
@@ -1484,14 +1484,14 @@ where
 
     fn load_prompt_cache_for_input(
         &mut self,
-        directory: &Path,
+        store: &dyn eredu_core::cache::PromptCacheStore,
         expected: &PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         input_identity: eredu_runtime::PreparedInputCacheIdentity,
     ) -> Result<PromptCacheManifest, Error> {
         self.session
             .load_prompt_cache_for_input(
-                directory,
+                store,
                 expected,
                 prefix_token_ids,
                 input_identity,
@@ -1502,7 +1502,7 @@ where
 
     fn save_prompt_cache(
         &mut self,
-        destination: &Path,
+        store: &dyn eredu_core::cache::PromptCacheStore,
         descriptor: PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         options: &PromptCacheOptions,
@@ -1518,7 +1518,7 @@ where
             })?;
         self.session
             .save_prompt_cache_for_input(
-                destination,
+                store,
                 descriptor,
                 prefix_token_ids,
                 options,

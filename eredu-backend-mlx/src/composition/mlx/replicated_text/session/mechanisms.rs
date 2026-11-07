@@ -87,11 +87,6 @@ pub(in crate::composition::mlx::replicated_text) struct PreparedExactBindings {
     local_parameters: Option<std::collections::BTreeSet<String>>,
 }
 
-pub(in crate::composition::mlx::replicated_text) struct MlxPromptCacheSaveTransaction {
-    publication: eredu_runtime::ReversiblePromptCachePublication,
-    manifest: PromptCacheManifest,
-}
-
 impl<A, S> MlxReplicatedTextMechanisms<A, S>
 where
     S: MlxStateMechanisms,
@@ -644,35 +639,39 @@ where
 
     fn load_prompt_cache(
         &mut self,
-        directory: &Path,
+        store: &dyn eredu_core::cache::PromptCacheStore,
         expected: &PromptCacheDescriptor,
         identity: &PromptCacheModelIdentity,
         prefix_token_ids: &[u32],
         selected: &SelectedStateRealization,
         context: &Stream,
     ) -> Result<(S, PromptCacheManifest), Error> {
-        let directory = eredu_runtime::prompt_cache_rank_path(directory, expected.topology());
-        S::load_prompt_cache(
-            selected,
-            &directory,
-            expected,
-            identity,
-            prefix_token_ids,
-            context,
-        )
+        eredu_runtime::with_rank_prompt_cache_store(store, expected.topology(), |store| {
+            S::load_prompt_cache(
+                selected,
+                store,
+                expected,
+                identity,
+                prefix_token_ids,
+                context,
+            )
+        })
     }
 
     fn save_prompt_cache(
         &mut self,
         state: &mut S,
-        destination: &Path,
+        store: &dyn eredu_core::cache::PromptCacheStore,
         descriptor: PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         options: &PromptCacheOptions,
         _context: &Stream,
     ) -> Result<PromptCacheManifest, Error> {
-        let destination = eredu_runtime::prompt_cache_rank_path(destination, descriptor.topology());
-        S::save_prompt_cache(state, &destination, descriptor, prefix_token_ids, options)
+        eredu_runtime::with_rank_prompt_cache_store(
+            store,
+            &descriptor.topology().clone(),
+            |store| S::save_prompt_cache(state, store, descriptor, prefix_token_ids, options),
+        )
     }
 
     fn state_report(&self, state: &S) -> Result<Self::StateReport, Error> {
@@ -793,7 +792,7 @@ where
     A::Error: std::fmt::Display,
     A::Unit: 'static,
 {
-    type PromptCacheSaveTransaction = MlxPromptCacheSaveTransaction;
+    type PromptCacheSaveTransaction = eredu_runtime::PreparedPromptCachePublication;
 
     fn prepare_prompt_cache_save(
         &mut self,
@@ -804,32 +803,22 @@ where
         options: &PromptCacheOptions,
         _context: &Stream,
     ) -> Result<Self::PromptCacheSaveTransaction, Error> {
-        let destination = eredu_runtime::prompt_cache_rank_path(destination, descriptor.topology());
-        let publication = eredu_runtime::ReversiblePromptCachePublication::begin(
-            &destination,
-            options.replace_existing(),
+        eredu_runtime::PreparedPromptCachePublication::stage(
+            destination,
+            &descriptor.topology().clone(),
+            options,
+            |store, options| {
+                S::save_prompt_cache(state, store, descriptor, prefix_token_ids, options)
+                    .map_err(eredu_core::BackendFailure::from_error)
+            },
         )
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-        let staging_options =
-            PromptCacheOptions::new(options.application_namespace().map(str::to_owned), false)
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        let manifest = S::save_prompt_cache(
-            state,
-            publication.staging_destination(),
-            descriptor,
-            prefix_token_ids,
-            &staging_options,
-        )?;
-        Ok(MlxPromptCacheSaveTransaction {
-            publication,
-            manifest,
-        })
+        .map_err(|e| Error::Other(Box::new(e)))
     }
 
     fn prepared_prompt_cache_manifest(
         transaction: &Self::PromptCacheSaveTransaction,
     ) -> &PromptCacheManifest {
-        &transaction.manifest
+        transaction.manifest()
     }
 
     fn publish_prompt_cache_save(
@@ -837,21 +826,15 @@ where
         transaction: &mut Self::PromptCacheSaveTransaction,
     ) -> Result<(), Error> {
         transaction
-            .publication
             .publish()
-            .map_err(|error| Error::Parallel(error.to_string()))
+            .map_err(|error| Error::Other(Box::new(error)))
     }
 
     fn commit_prompt_cache_save(&mut self, transaction: Self::PromptCacheSaveTransaction) {
-        transaction.publication.commit().unwrap_or_else(|error| {
-            panic!("committed prompt-cache publication cleanup failed: {error}")
-        });
+        transaction.commit();
     }
 
     fn rollback_prompt_cache_save(&mut self, transaction: Self::PromptCacheSaveTransaction) {
-        transaction
-            .publication
-            .rollback()
-            .unwrap_or_else(|error| panic!("prompt-cache publication rollback failed: {error}"));
+        transaction.rollback();
     }
 }

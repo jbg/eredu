@@ -7,10 +7,9 @@ use std::sync::Mutex;
 /// The open handle survives path replacement and unlinking. Callers provide the
 /// already admitted destination buffers; reads hash those exact bytes before
 /// publishing them. No payload-sized intermediate allocation is made here.
-#[derive(Debug)]
 pub struct RetainedCacheShard {
     path: PathBuf,
-    file: Mutex<File>,
+    file: Mutex<Box<dyn eredu_core::cache::PromptCacheReader>>,
     metadata: safetensors::tensor::Metadata,
     data_start: u64,
 }
@@ -159,10 +158,65 @@ impl RetainedCacheShard {
         }
         Ok(Self {
             path: path.to_path_buf(),
-            file: Mutex::new(file),
+            file: Mutex::new(Box::new(file)),
             metadata,
             data_start,
         })
+    }
+
+    /// Admits the same bounded shard format from any immutable store reader.
+    pub fn from_reader(
+        name: &Path,
+        mut reader: Box<dyn eredu_core::cache::PromptCacheReader>,
+        payload_bytes: u64,
+    ) -> Result<Self, PromptCachePersistenceError> {
+        let (metadata, length, data_start) = read_shard_metadata_from_file(name, &mut *reader)?;
+        validate_file_boundary(name, &metadata, length, data_start)?;
+        if metadata.data_len() as u64 != payload_bytes {
+            return Err(malformed(
+                name,
+                "payload length differs from admitted cache shard",
+            ));
+        }
+        Ok(Self {
+            path: name.to_path_buf(),
+            file: Mutex::new(reader),
+            metadata,
+            data_start,
+        })
+    }
+
+    /// Validates block declarations against the exact reader retained for payload reads.
+    pub fn from_block_reader(
+        name: &Path,
+        reader: Box<dyn eredu_core::cache::PromptCacheReader>,
+        block: &PromptCacheBlock,
+    ) -> Result<Self, PromptCachePersistenceError> {
+        let source = Self::from_reader(name, reader, block.logical_bytes)?;
+        validate_block_metadata(
+            name,
+            block,
+            &source.metadata,
+            source.data_start + source.metadata.data_len() as u64,
+            source.data_start,
+        )?;
+        Ok(source)
+    }
+    /// Validates fixed-state declarations against the reader used for payload reads.
+    pub fn from_state_reader(
+        name: &Path,
+        reader: Box<dyn eredu_core::cache::PromptCacheReader>,
+        state: &PromptCacheStateTensor,
+    ) -> Result<Self, PromptCachePersistenceError> {
+        let source = Self::from_reader(name, reader, state.logical_bytes)?;
+        validate_state_metadata(
+            name,
+            state,
+            &source.metadata,
+            source.data_start + source.metadata.data_len() as u64,
+            source.data_start,
+        )?;
+        Ok(source)
     }
 
     /// Retains a prompt shard and validates its metadata against the manifest on
@@ -248,5 +302,14 @@ impl RetainedCacheShard {
             }
         }
         Ok(())
+    }
+}
+
+impl std::fmt::Debug for RetainedCacheShard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RetainedCacheShard")
+            .field("name", &self.path)
+            .field("metadata", &self.metadata)
+            .finish_non_exhaustive()
     }
 }

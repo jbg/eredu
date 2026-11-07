@@ -436,7 +436,7 @@ fn exercise_backend_cache_lifecycle(device: Device, expected_storage: HostTransf
     let cache_path = destination.path().join("backend-cache");
     manager
         .save_prompt_cache(
-            &cache_path,
+            &eredu_runtime::DirectoryPromptCacheStore::new(&cache_path, u64::MAX),
             prompt_descriptor(),
             &[7],
             &[],
@@ -444,12 +444,11 @@ fn exercise_backend_cache_lifecycle(device: Device, expected_storage: HostTransf
         )
         .unwrap();
     let (restored, manifest) = open_prompt_cache(
-        &cache_path,
+        &*crate::tests::support::read_prompt_cache(&cache_path),
         &prompt_descriptor(),
         &prompt_model_identity(),
         &[7],
-        options(),
-    )
+        options(), &stream)
     .unwrap();
     assert_eq!(
         manifest.application_namespace.as_deref(),

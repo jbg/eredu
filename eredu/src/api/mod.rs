@@ -50,6 +50,12 @@ mod forecast;
 pub use forecast::*;
 mod draft;
 mod loaded;
+mod prompt_cache;
+pub use eredu_core::cache::{
+    PromptCacheRead, PromptCacheStore, PromptCacheStoreError, PromptCacheWrite,
+};
+pub use eredu_runtime::{DirectoryPromptCacheStore, MemoryPromptCacheStore};
+pub use prompt_cache::PromptCacheStats;
 mod observed;
 mod parameters;
 pub use control::{

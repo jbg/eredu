@@ -21,6 +21,8 @@ use std::{
 pub struct GenerationStats {
     /// Present when a retained speculative executor ran, including an early cancellation.
     pub drafting: Option<SpeculativeStats>,
+    /// Present for bounded plain-text prefix reuse.
+    pub prompt_cache: Option<super::PromptCacheStats>,
 }
 
 /// A target-only source, requiring no speculative backend implementation.
@@ -235,6 +237,7 @@ fn speculative_output(
 ) -> GenerationOutput<GenerationStats> {
     output.map_stats(|stats| GenerationStats {
         drafting: Some(stats),
+        prompt_cache: None,
     })
 }
 

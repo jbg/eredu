@@ -2017,6 +2017,65 @@ pub trait TextGenerationBackend: BackendProvider {
         Ok(false)
     }
 
+    /// Completes the remaining prepared prompt without sampling. On success
+    /// the exact input identity is committed and the input is consumed. Returns
+    /// false without execution when the backend has no such boundary.
+    fn complete_text_prefill(
+        _runtime: &mut ModelRuntime<Self>,
+        _prompt: Self::Prompt,
+        _state: &mut Self::TextGenerationState,
+    ) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
+
+    /// Model-derived prompt-cache identity for the selected execution state.
+    fn prompt_cache_model_identity(
+        _runtime: &ModelRuntime<Self>,
+    ) -> Result<crate::cache::PromptCacheModelIdentity, BackendFailure> {
+        Err(BackendFailure::from_error(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "prompt-cache storage is unavailable",
+        )))
+    }
+    /// Content identity for the exact backend-prepared plain-text prefix.
+    fn prompt_cache_prefix_fingerprint(
+        _runtime: &ModelRuntime<Self>,
+        prefix: &[u32],
+    ) -> Result<String, BackendFailure> {
+        Ok(crate::cache::prompt_cache_token_fingerprint(prefix))
+    }
+    /// Native isolated-state byte bound, before portable encoding/publication costs.
+    fn estimate_prompt_cache_state(
+        _runtime: &ModelRuntime<Self>,
+    ) -> Result<Option<u64>, BackendFailure> {
+        Ok(None)
+    }
+    /// Saves through the backend's ordinary prompt-cache export path.
+    fn save_prompt_cache(
+        _runtime: &mut ModelRuntime<Self>,
+        _store: &dyn crate::cache::PromptCacheStore,
+        _descriptor: crate::cache::PromptCacheDescriptor,
+        _prefix: &[u32],
+        _options: &crate::cache::PromptCacheOptions,
+    ) -> Result<crate::cache::PromptCacheManifest, BackendFailure> {
+        Err(BackendFailure::from_error(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "prompt-cache export is unavailable",
+        )))
+    }
+    /// Loads through the backend's ordinary prompt-cache import path.
+    fn load_prompt_cache(
+        _runtime: &mut ModelRuntime<Self>,
+        _store: &dyn crate::cache::PromptCacheStore,
+        _descriptor: &crate::cache::PromptCacheDescriptor,
+        _prefix: &[u32],
+    ) -> Result<crate::cache::PromptCacheManifest, BackendFailure> {
+        Err(BackendFailure::from_error(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "prompt-cache import is unavailable",
+        )))
+    }
+
     /// Trained canvas extent of the selected iterative realization, without execution.
     fn refinement_canvas_length(_runtime: &ModelRuntime<Self>) -> Option<std::num::NonZeroU32> {
         None

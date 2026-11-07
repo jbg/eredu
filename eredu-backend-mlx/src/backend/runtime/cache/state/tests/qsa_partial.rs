@@ -109,16 +109,28 @@ fn exercise(stream: &Stream) {
     let destination = directory.path().join("qsa-partial");
     state
         .save_prompt_cache(
-            &destination,
+            &eredu_runtime::DirectoryPromptCacheStore::new(&destination, u64::MAX),
             descriptor.clone(),
             &[7, 8],
             &PromptCacheOptions::default(),
         )
         .unwrap();
-    let (manager, manifest) =
-        open_prompt_cache(&destination, &descriptor, &identity, &[7, 8], options).unwrap();
+    let (manager, manifest) = open_prompt_cache(
+        &*crate::tests::support::read_prompt_cache(&destination),
+        &descriptor,
+        &identity,
+        &[7, 8],
+        options,
+        &stream,
+    )
+    .unwrap();
     assert_eq!(manifest.state_tensors.len(), 4);
-    let arrays = load_prompt_cache_state_tensors(&destination, &manifest, stream).unwrap();
+    let arrays = load_prompt_cache_state_tensors(
+        &*crate::tests::support::read_prompt_cache(&destination),
+        &manifest,
+        stream,
+    )
+    .unwrap();
     let mut restored = MlxHybridState::paged(layout, manager, None, &[]).unwrap();
     restored
         .restore_prompt_cache_state(arrays, 2, &[0])

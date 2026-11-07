@@ -33,6 +33,9 @@ pub struct Profile {
     pub prefill_chunk_tokens: u64,
     pub placement: Placement,
     pub allocator_cache_bytes: u64,
+    /// Execution-state paging is independent of reusable-cache storage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paged_state: Option<eredu_core::PagedStatePlan>,
 }
 
 impl Profile {
@@ -52,7 +55,43 @@ impl Profile {
                 "separate memory needs a device identity".into(),
             ));
         }
+        if let Some(state) = &self.paged_state {
+            self.inspection_options()?;
+            if state.block_size_tokens > i32::MAX as u32 {
+                return Err(CatalogueError::Invalid("state block exceeds i32".into()));
+            }
+        }
         Ok(())
+    }
+
+    /// Uses the same selected execution-state policy when building cold forecasts.
+    pub fn inspection_options(
+        &self,
+    ) -> Result<eredu::api::MetadataInspectionOptions, CatalogueError> {
+        let options = eredu::api::MetadataInspectionOptions::new(
+            BackendId::new(&self.backend).map_err(|e| CatalogueError::Invalid(e.to_string()))?,
+        );
+        if let Some(state) = &self.paged_state {
+            let block = i32::try_from(state.block_size_tokens)
+                .map_err(|e| CatalogueError::Invalid(e.to_string()))?;
+            let paged = eredu_runtime::PagedCacheOptions::new(
+                block,
+                state.device_bytes,
+                state.host_bytes,
+                1,
+            )
+            .map_err(|e| CatalogueError::Invalid(e.to_string()))?
+            .with_full_attention(true)
+            .with_persistence_retention(true);
+            let request = options
+                .load_request()
+                .clone()
+                .with_state_residency(eredu_runtime::CacheResidencyPolicy::Paged(paged))
+                .with_prompt_cache_persistence(true);
+            Ok(options.with_load_request(request))
+        } else {
+            Ok(options)
+        }
     }
 
     pub fn memory_options(&self) -> Result<GenerationMemoryOptions, CatalogueError> {

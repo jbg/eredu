@@ -17,7 +17,6 @@ use safemlx::{
     ops::indexing::{NewAxis, TryIndexOp},
     Array, Dtype, Stream,
 };
-use std::path::Path;
 
 use crate::{
     backend::error::Error,

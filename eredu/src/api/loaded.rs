@@ -203,6 +203,9 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
     where
         F: FnMut(SemanticEvent),
     {
+        if self.prompt_cache_store.is_some() {
+            return self.generate_with_store(request, started);
+        }
         let mode = request.output_mode;
         self.generate_prepared(request, None, started, mode, None)
     }
@@ -412,6 +415,11 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
         F: FnMut(SemanticEvent),
         V: eredu_core::SpeculativeGenerationVisitor,
     {
+        if self.prompt_cache_store.is_some() {
+            return Err(PreparedChatError::Backend(eredu_core::BackendFailure::from_error(
+                std::io::Error::new(std::io::ErrorKind::Unsupported,
+                    "automatic prompt-cache publication is not admitted by speculative execution; remove the store first"))));
+        }
         let scheduler = source_request_scheduler(&request);
         let SourceRequest {
             drafting,

@@ -1061,6 +1061,7 @@ dependencies = [
  "eredu",
  "eredu-architectures",
  "eredu-core",
+ "eredu-runtime",
  "futures",
  "regex",
  "reqwest",

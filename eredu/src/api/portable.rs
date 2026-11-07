@@ -382,6 +382,7 @@ pub struct LoadedTextModelConfig {
 /// Backend-specific state remains owned by [`ModelRuntime`].
 pub struct LoadedModel<B: TextGenerationBackend> {
     pub(crate) session_identity: String,
+    pub(crate) prompt_cache_store: Option<(String, Box<dyn eredu_core::cache::PromptCacheStore>)>,
     pub(crate) runtime: ModelRuntime<B>,
     pub(crate) tokenizer: ChatTokenizer,
     pub(crate) tokenizer_fingerprint: [u8; 32],
@@ -439,6 +440,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
             std::sync::Arc::new(super::tokenizer::tokenizer_token_filter(&tokenizer));
         Self {
             session_identity: super::observed::new_identity("session"),
+            prompt_cache_store: None,
             runtime,
             tokenizer,
             tokenizer_fingerprint,

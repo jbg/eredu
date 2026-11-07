@@ -918,30 +918,24 @@ where
 
     fn load_prompt_cache(
         &mut self,
-        directory: &Path,
+        store: &dyn eredu_core::cache::PromptCacheStore,
         expected: &PromptCacheDescriptor,
         prefix_token_ids: &[u32],
     ) -> Result<PromptCacheManifest, Error> {
         self.session
-            .load_prompt_cache(directory, expected, prefix_token_ids, &self.stream)
+            .load_prompt_cache(store, expected, prefix_token_ids, &self.stream)
             .map_err(|error| Error::Other(Box::new(error)))
     }
 
     fn save_prompt_cache(
         &mut self,
-        destination: &Path,
+        store: &dyn eredu_core::cache::PromptCacheStore,
         descriptor: PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         options: &PromptCacheOptions,
     ) -> Result<PromptCacheManifest, Error> {
         self.session
-            .save_prompt_cache(
-                destination,
-                descriptor,
-                prefix_token_ids,
-                options,
-                &self.stream,
-            )
+            .save_prompt_cache(store, descriptor, prefix_token_ids, options, &self.stream)
             .map_err(|error| Error::Other(Box::new(error)))
     }
 

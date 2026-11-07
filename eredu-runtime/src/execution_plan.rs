@@ -174,6 +174,18 @@ impl NormalizedLoadRequest {
             .with_prompt_cache_persistence(plan.prompt_cache_persistence())
             .with_drafting_plan(plan.drafting())?
             .with_media_companions(plan.media_companions().clone());
+        if let Some(state) = plan.paged_state() {
+            let options = crate::PagedCacheOptions::new(
+                state.block_size_tokens as i32,
+                state.device_bytes,
+                state.host_bytes,
+                1,
+            )
+            .map_err(|_| ExecutionPlanLoadError::Unsupported("paged-state limits"))?
+            .with_full_attention(true)
+            .with_persistence_retention(plan.prompt_cache_persistence());
+            request = request.with_state_residency(crate::CacheResidencyPolicy::Paged(options));
+        }
         if let Some(source) = plan.draft_adapter() {
             request = request.with_draft_adapter(source.clone());
         }

@@ -149,7 +149,7 @@ pub(crate) fn bf16_row_projection(
     bf16_projection(
         input,
         weight,
-        groups,
+        groups.map(ProjectionGroups::Unchecked),
         false,
         BatchedDotReduction::Native,
         None,
@@ -279,10 +279,24 @@ fn ordered_bf16_affine(
     Ok(Some(Array::from_slice(&output, &shape)))
 }
 
+// Host-generated batch indices are bounded by construction. Preserve device
+// validation for arbitrary routed rows without synchronizing every attention tile.
+enum ProjectionGroups<'a> {
+    Unchecked(&'a Array),
+    ContiguousBatches(&'a Array),
+}
+impl ProjectionGroups<'_> {
+    fn values(&self) -> &Array {
+        match self {
+            Self::Unchecked(ids) | Self::ContiguousBatches(ids) => ids,
+        }
+    }
+}
+
 fn bf16_projection(
     input: &Array,
     weight: &Array,
-    groups: Option<&Array>,
+    groups: Option<ProjectionGroups<'_>>,
     columns: bool,
     reduction: BatchedDotReduction,
     bias: Option<&Array>,
@@ -317,7 +331,8 @@ fn bf16_projection(
         if weight.dim(-1) != width || weight.ndim() != if groups.is_some() { 3 } else { 2 } {
             return Err(Exception::custom("invalid row projection geometry"));
         }
-        if let Some(ids) = groups {
+        if let Some(group) = &groups {
+            let ids = group.values();
             if ids.ndim() != 1
                 || ids.dim(0) != rows
                 || !matches!(
@@ -327,17 +342,20 @@ fn bf16_projection(
             {
                 return Err(Exception::custom("invalid row projection group indices"));
             }
-            let valid = ids
-                .ge(Array::from_int(0), stream)?
-                .logical_and(ids.lt(Array::from_int(weight.dim(0)), stream)?, stream)?;
-            if !valid.all(None, stream)?.try_item::<bool>(stream)? {
-                return Err(Exception::custom(
-                    "row projection group index is outside the bank",
-                ));
+            if matches!(group, ProjectionGroups::Unchecked(_)) {
+                let valid = ids
+                    .ge(Array::from_int(0), stream)?
+                    .logical_and(ids.lt(Array::from_int(weight.dim(0)), stream)?, stream)?;
+                if !valid.all(None, stream)?.try_item::<bool>(stream)? {
+                    return Err(Exception::custom(
+                        "row projection group index is outside the bank",
+                    ));
+                }
             }
         }
         let ids = groups
-            .cloned()
+            .as_ref()
+            .map(|group| group.values().clone())
             .unwrap_or_else(|| Array::from_slice(&[0i32], &[1]));
         let ids = ids.as_dtype(Dtype::Int32, stream)?;
         let bias_values = bias
@@ -353,7 +371,10 @@ fn bf16_projection(
             )
             .with_template_arg_int("OUTPUTS", outputs)
             .with_template_arg_int("GROUPED", i32::from(groups.is_some()))
-            .with_grid([32, outputs, rows])
+            // Schedule adjacent input rows against the same weight row. This
+            // reuses weights across prefill rows without changing any dot's
+            // accumulation order or output layout.
+            .with_grid([32, rows, outputs])
             .with_thread_group([32, 1, 1])
             .with_output_arg([rows, outputs], Dtype::Bfloat16);
         let mut output = KERNEL.with(|cell| -> Result<Vec<Array>, Exception> {
@@ -362,8 +383,8 @@ fn bf16_projection(
                     "bf16_row_projection", ["input", "weight", "groups", "bias"], ["output"],
                     concat!(
                         "uint lane = thread_position_in_grid.x;",
-                        "uint col = thread_position_in_grid.y;",
-                        "uint row = thread_position_in_grid.z;",
+                        "uint col = thread_position_in_grid.z;",
+                        "uint row = thread_position_in_grid.y;",
                         "uint group = GROUPED ? uint(groups[row]) : 0;",
                         "size_t base = (size_t(group) * OUTPUTS + col) * WIDTH;",
                         "float sum = 0.0f;",
@@ -474,6 +495,8 @@ impl PreparedBf16BatchedProduct {
             .checked_mul(heads)
             .ok_or_else(|| Exception::custom("matrix batch count overflow"))?;
         let input = lhs.reshape(&[-1, self.width], stream)?;
+        // query_banks = batch * heads and repeats = heads / key-value heads;
+        // every generated bank is in 0..batch*key-value-heads (weights.dim(0)).
         let ids = (0..query_banks)
             .flat_map(|head| std::iter::repeat_n(head / repeats, rows as usize))
             .collect::<Vec<_>>();
@@ -481,7 +504,7 @@ impl PreparedBf16BatchedProduct {
         bf16_projection(
             &input,
             &self.weights,
-            Some(&groups),
+            Some(ProjectionGroups::ContiguousBatches(&groups)),
             self.columns,
             self.reduction,
             None,

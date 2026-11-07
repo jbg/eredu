@@ -290,7 +290,7 @@ fn fixed_only_hybrid_prompt_cache_round_trips_without_attention() {
     let tokens = [1_u32, 2, 3];
     let manifest = state
         .save_prompt_cache(
-            &destination,
+            &eredu_runtime::DirectoryPromptCacheStore::new(&destination, u64::MAX),
             descriptor.clone(),
             &tokens,
             &PromptCacheOptions::default(),
@@ -299,11 +299,23 @@ fn fixed_only_hybrid_prompt_cache_round_trips_without_attention() {
     assert!(manifest.blocks.is_empty());
     assert_eq!(manifest.state_tensors.len(), 1);
 
-    let (restored_manager, manifest) =
-        open_prompt_cache(&destination, &descriptor, &identity, &tokens, paging).unwrap();
+    let (restored_manager, manifest) = open_prompt_cache(
+        &*crate::tests::support::read_prompt_cache(&destination),
+        &descriptor,
+        &identity,
+        &tokens,
+        paging,
+        &crate::tests::support::cache_cpu_stream(),
+    )
+    .unwrap();
     let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = context.stream();
-    let tensors = load_prompt_cache_state_tensors(&destination, &manifest, stream).unwrap();
+    let tensors = load_prompt_cache_state_tensors(
+        &*crate::tests::support::read_prompt_cache(&destination),
+        &manifest,
+        stream,
+    )
+    .unwrap();
     let mut restored =
         MlxHybridState::from_selected(&selected, Some(restored_manager), None).unwrap();
     restored

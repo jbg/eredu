@@ -1525,7 +1525,7 @@ impl MlxHybridState {
     /// Finalizes paged attention and persists every declared fixed component.
     pub fn save_prompt_cache(
         &mut self,
-        destination: impl AsRef<Path>,
+        store: &dyn eredu_core::cache::PromptCacheStore,
         descriptor: PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         options: &PromptCacheOptions,
@@ -1591,13 +1591,7 @@ impl MlxHybridState {
             .collect::<Vec<_>>();
         manager
             .ok_or_else(|| Exception::custom("cannot persist hybrid state without attention"))?
-            .save_prompt_cache(
-                destination,
-                descriptor,
-                prefix_token_ids,
-                &state_arrays,
-                options,
-            )
+            .save_prompt_cache(store, descriptor, prefix_token_ids, &state_arrays, options)
             .map_err(|error| Exception::custom(error.to_string()))
     }
 }

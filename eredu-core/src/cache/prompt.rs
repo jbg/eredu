@@ -725,6 +725,7 @@ pub struct PromptCacheOptions {
     application_namespace: Option<String>,
     /// Allows atomically replacing an existing destination.
     replace_existing: bool,
+    capture_limit: Option<u64>,
 }
 
 impl PromptCacheOptions {
@@ -744,7 +745,18 @@ impl PromptCacheOptions {
         Ok(Self {
             application_namespace,
             replace_existing,
+            capture_limit: None,
         })
+    }
+
+    /// Bounds each rank's export, including staging, before copying state.
+    pub fn with_capture_limit(mut self, bytes: u64) -> Self {
+        self.capture_limit = Some(self.capture_limit.map_or(bytes, |limit| limit.min(bytes)));
+        self
+    }
+    /// Optional per-rank export allowance carried through coordinated publication.
+    pub fn capture_limit(&self) -> Option<u64> {
+        self.capture_limit
     }
 
     /// Returns the optional application grouping label.

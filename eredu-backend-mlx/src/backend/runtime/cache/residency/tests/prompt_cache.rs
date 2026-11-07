@@ -44,7 +44,7 @@ fn prompt_cache_save_selects_only_descriptor_owned_layers() {
 
     let manifest = manager
         .save_prompt_cache(
-            destination.path().join("target-only"),
+            &eredu_runtime::DirectoryPromptCacheStore::new(destination.path().join("target-only"),u64::MAX),
             descriptor,
             &[7],
             &[],
@@ -265,12 +265,11 @@ fn imported_prompt_shards_retain_handles_without_payload_buffers() {
     write_prompt_fixture(directory.path(), "retained");
     let options = PagedCacheOptions::new(1, 64, 64, 1).unwrap();
     let (manager, _) = open_prompt_cache(
-        directory.path(),
+        &*crate::tests::support::read_prompt_cache(directory.path()),
         &prompt_descriptor(),
         &prompt_model_identity(),
         &[7],
-        options,
-    )
+        options, &crate::tests::support::cache_cpu_stream())
     .unwrap();
     let state = manager.lock().unwrap();
     assert_eq!(state.telemetry.report.imported_retained_shards, 1);
@@ -393,14 +392,9 @@ fn prompt_load_rejects_model_incompatible_key_value_dimensions() {
     )
     .unwrap();
 
-    let error = open_prompt_cache(
-        directory.path(),
-        &prompt_descriptor(),
-        &prompt_model_identity(),
-        &[7],
-        PagedCacheOptions::new(1, 64, 64, 1).unwrap(),
-    )
-    .unwrap_err();
+    let error = eredu_core::cache::PromptCacheStore::open(
+        &eredu_runtime::DirectoryPromptCacheStore::new(directory.path(),u64::MAX))
+        .err().expect("malformed cache must fail before native restoration");
     assert!(error.to_string().contains("does not match its policy"));
 }
 
@@ -430,13 +424,8 @@ fn prompt_load_rejects_model_incompatible_layer_representation() {
     )
     .unwrap();
 
-    let error = open_prompt_cache(
-        directory.path(),
-        &prompt_descriptor(),
-        &prompt_model_identity(),
-        &[7],
-        PagedCacheOptions::new(1, 64, 64, 1).unwrap(),
-    )
-    .unwrap_err();
+    let error = eredu_core::cache::PromptCacheStore::open(
+        &eredu_runtime::DirectoryPromptCacheStore::new(directory.path(),u64::MAX))
+        .err().expect("malformed cache must fail before native restoration");
     assert!(error.to_string().contains("does not match its policy"));
 }

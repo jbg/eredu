@@ -914,6 +914,9 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         let preparation_started = Instant::now();
         use eredu_core::run_preparation::TextPreparationStage as Stage;
         let host = (|| {
+            if self.prompt_cache_store.is_some() {
+                return Err(CaptureError::Unsupported("automatic prompt-cache store publication is outside controlled snapshot and observation budgets; remove the configured store before starting a controlled run".into()).into());
+            }
             if prepared.session_identity != self.session_identity {
                 return Err(CaptureError::Invalid(
                     "prepared request belongs to another loaded session".into(),

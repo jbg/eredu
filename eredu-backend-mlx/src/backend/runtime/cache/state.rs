@@ -3,7 +3,6 @@
 use std::{
     collections::BTreeMap,
     ops::{Deref, DerefMut, Range},
-    path::Path,
 };
 
 use eredu_core::cache::{
