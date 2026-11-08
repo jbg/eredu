@@ -13651,6 +13651,25 @@ Families validate the exact added state geometry and the transport that requires
 it. Gemma shared-KV partitions use this projection for their declared receiver
 caches, without reconstructing the component or its parameter topology.
 
+### Cache transfer stream lifetime
+
+MLX retains native streams for the process lifetime. The backend retains one
+cache promotion stream and one cache demotion stream per physical device, plus
+one CPU prompt-cache persistence stream. Attention scans, concurrent requests,
+cache manager resets and model reloads reuse these lanes. Registry lookup and
+fallible creation are serialized; work submission and completion waits do not
+hold the registry lock. Creation failures propagate through cache errors and do
+not install an entry. Existing lanes are never replaced after execution errors.
+
+Shared streams provide ordered asynchronous submission, not shared storage.
+Each promotion retains its own completion events and inserts the consumer's
+stream dependency before exposing the block. Demotion workers retain their
+existing completion tickets. Array ownership, transfer reservations, two-block
+prefetch limits and aggregate cache admission remain in the cache lifecycle;
+reusing a stream neither establishes completion nor releases a reservation.
+Promotion and demotion use separate lanes so cache-budget backpressure can wait
+for demotion without coupling it to the promotion queue.
+
 ### Prompt-cache stores and independent requests
 
 Prompt-cache import/export consumes the neutral `PromptCacheStore` contract.

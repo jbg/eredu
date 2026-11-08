@@ -439,7 +439,10 @@ impl CacheResidencyManager {
             },
             records,
             states: state_arrays,
-            stream: Stream::new_with_device(&Device::new(DeviceType::Cpu, 0)),
+            stream: cache_transfer_stream(
+                CacheTransferDevice::CPU,
+                CacheTransferRole::Persistence,
+            )?,
         };
         let manifest = eredu_runtime::publish_prompt_cache(
             &source,

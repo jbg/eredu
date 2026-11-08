@@ -17,14 +17,13 @@ impl CacheBlockPrefetch {
         ids: Vec<CacheBlockId>,
         execution_stream: &Stream,
     ) -> Result<Self, CacheResidencyError> {
-        let device = execution_stream
-            .get_device()
-            .map_err(|source| transfer_error("inspect cache execution stream", source))?;
+        let device = CacheTransferDevice::from_stream(execution_stream)?;
+        let transfer_stream = cache_transfer_stream(device, CacheTransferRole::Promotion)?;
         Ok(Self {
             manager,
             ids: ids.into(),
             pending: VecDeque::with_capacity(PAGED_CACHE_PREFETCH_BLOCKS),
-            transfer_stream: Stream::new_with_device(&device),
+            transfer_stream,
             execution_stream: execution_stream.clone(),
         })
     }
@@ -160,7 +159,7 @@ impl CacheResidencyManager {
         Ok(lease)
     }
 
-    /// Creates a fixed two-block promotion window on a dedicated stream for
+    /// Creates a fixed two-block promotion window on a shared transfer stream for
     /// the execution stream's device.
     pub fn prefetch_blocks(
         &self,
