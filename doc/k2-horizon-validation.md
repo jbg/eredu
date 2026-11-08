@@ -127,6 +127,40 @@ same script for dense and MoVA. Natural-text and tool cases retain exact prompt
 bytes, token IDs, reference settings and per-step metrics in the released-results
 manifest; its commands identify the retained validation binaries and their hashes.
 
+## Paged-cache transfer acceptance
+
+The dense SafeTensors release at revision
+`c4f92a0d66e2ec6685ed9fff4f6c33e2a217f23b` passes the existing full-model
+acceptance criteria on Metal with one-token cache blocks, a 512 KiB device-cache
+budget and a 64 MiB host-cache budget. FP32 prefill `[1, 3, 2]` and four cached
+teacher-forced steps `[4]`, `[5]`, `[6]`, `[7]` have maximum relative L2
+`0.00213944286827178`, minimum cosine `0.9999988542368837`, top-ten overlap ten
+and matching final-row argmax at every step. These FP32 measurements are separate
+from the BF16 results above.
+
+The checkpoint payload SHA-256 matches the pinned publisher manifest. The CPU
+eager reference uses Python 3.12.13, PyTorch 2.15.0 and Transformers 5.22.2 on
+macOS 27.0.1 arm64. The pinned publisher modeling source SHA-256 is
+`5bb3ae46a8a64387f34042b63027a2fc9fffc6912178f29d7952ea1cdb1c65fb`.
+The reference tensor SHA-256 is
+`0abd1e93422b60c1fd8d8f1c87c5b904b9342991c894c79a9c83c25fca6848ef`.
+Payloads, reference tensors and detailed output remain outside the repository.
+
+With `$K2` pointing to an external directory containing that pinned release:
+
+```sh
+python eredu-backend-mlx/validation/k2_horizon_reference.py \
+  "$K2/artifact" "$K2/transfer-reference.safetensors" --dtype float32
+EREDU_VALIDATION_DEVICE=gpu EREDU_VALIDATION_PAGED_CACHE=1 \
+  cargo run -p eredu-backend-mlx --features metal --example k2_checkpoint_parity -- \
+  "$K2/artifact" "$K2/transfer-reference.safetensors" float32
+```
+
+The shared native cache lifecycle case separately covers repeated scans, resets,
+manager reloads, dropped prefetch windows, event ordering and aggregate budget
+release. This acceptance does not establish paired-request phone replay or native
+multi-GPU/CUDA behavior.
+
 ## Tokenizer, templates and IFM protocol
 
 All 64 exact rendered-prompt and token-ID cases pass for the four released

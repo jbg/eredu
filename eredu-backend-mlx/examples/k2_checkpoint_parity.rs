@@ -263,9 +263,38 @@ fn main() -> anyhow::Result<()> {
             Ok::<_, eredu_nn::Error>(block)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mut caches = (0..blocks.len())
-        .map(|_| MlxKeyValueLayerState::Device(Default::default()))
-        .collect::<Vec<_>>();
+    // Reuse the complete-model acceptance route for bounded attention scans.
+    let pager = std::env::var_os("EREDU_VALIDATION_PAGED_CACHE")
+        .map(|_| {
+            eredu_backend_mlx::backend::runtime::cache::residency::CacheResidencyManager::new(
+                eredu_runtime::PagedCacheOptions::new(1, 512 * 1024, 64 * 1024 * 1024, 1)?
+                    .with_full_attention(true),
+            )
+        })
+        .transpose()?;
+    let mut caches = if let Some(manager) = pager {
+        use eredu_backend_mlx::backend::runtime::cache::state::MlxKeyValueState;
+        use eredu_core::{cache::LayerCachePolicy, AttentionPolicy, LayerSchedule};
+        use eredu_runtime::{LayerRuntimeState, StateLayout};
+        let policy = LayerCachePolicy::key_value(
+            AttentionPolicy::Full,
+            args.num_key_value_heads,
+            args.head_dim,
+        )?;
+        let layout = StateLayout::new(LayerSchedule::new(
+            blocks.len(),
+            vec![policy; blocks.len()],
+        )?)?;
+        let mut state =
+            MlxKeyValueState::paged_with_global_layer_start(layout, manager, None, layer_start)?;
+        (0..blocks.len())
+            .map(|layer| state.layer(layer).cloned())
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        (0..blocks.len())
+            .map(|_| MlxKeyValueLayerState::Device(Default::default()))
+            .collect::<Vec<_>>()
+    };
     let inputs = reference["input_ids"]
         .evaluated()?
         .as_slice::<i32>()

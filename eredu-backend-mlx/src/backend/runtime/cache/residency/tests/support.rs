@@ -393,6 +393,68 @@ fn exercise_backend_cache_lifecycle(device: Device, expected_storage: HostTransf
             .with_pool(pool.clone())
             .unwrap()
     };
+    // A scan, request reset and model reload must all reuse the same queues.
+    // Exercise real demotion/promotion and abandon a prefetched window before
+    // resetting: completion ownership and pool accounting still apply.
+    let key = super::super::CacheTransferDevice::from_stream(&stream).unwrap();
+    let mut indices = None;
+    for _ in 0..64 {
+        let manager = CacheResidencyManager::new(options()).unwrap();
+        manager.bind_transfer_device(&stream).unwrap();
+        for _ in 0..2 {
+            let id = manager
+                .seal_block(0, 0, 1, None, backend_key_value_block(&stream), false)
+                .unwrap();
+            let next = manager
+                .seal_block(0, 1, 2, None, backend_key_value_block(&stream), false)
+                .unwrap();
+            let demotion = manager.begin_device_demotion(&id).unwrap();
+            manager.finish_device_demotion(&demotion).unwrap();
+            let mut window = manager.prefetch_blocks(vec![id, next], &consumer).unwrap();
+            let current = window.stream_indices().unwrap().1;
+            assert_ne!(current, consumer.get_index().unwrap());
+            if let Some(previous) = indices {
+                assert_eq!(current, previous);
+            }
+            indices = Some(current);
+            let lease = window.next_block().unwrap().unwrap();
+            assert_eq!(window.pending_len(), 1);
+            let consumed = lease.arrays().arrays()[0].square(&consumer).unwrap();
+            let completion = async_eval_with_event([&consumed]).unwrap();
+            drop((lease, window));
+            manager.clear().unwrap();
+            completion.synchronize().unwrap();
+            assert_eq!(
+                consumed.evaluated().unwrap().try_as_slice::<f32>().unwrap(),
+                &[1.0]
+            );
+            let pool_report = pool.report().unwrap();
+            assert_eq!(pool_report.current_device_bytes, 0);
+            assert_eq!(pool_report.current_host_bytes, 0);
+            assert_eq!(pool_report.current_transfer_in_flight_bytes, 0);
+        }
+    }
+    // Workers and persistence use the same process scope as attention scans.
+    for role in [
+        super::super::CacheTransferRole::Demotion,
+        super::super::CacheTransferRole::Persistence,
+    ] {
+        let device = if role == super::super::CacheTransferRole::Persistence {
+            super::super::CacheTransferDevice::CPU
+        } else {
+            key
+        };
+        let first = super::super::cache_transfer_stream(device, role).unwrap();
+        let second = super::super::cache_transfer_stream(device, role).unwrap();
+        assert_eq!(first.get_index().unwrap(), second.get_index().unwrap());
+        assert_eq!(
+            super::super::CacheTransferDevice::from_stream(&first).unwrap(),
+            device,
+        );
+        if device == key {
+            assert_ne!(first.get_index().unwrap(), indices.unwrap());
+        }
+    }
     let manager = CacheResidencyManager::new(options()).unwrap();
     manager.bind_transfer_device(&stream).unwrap();
     let id = manager
@@ -448,7 +510,9 @@ fn exercise_backend_cache_lifecycle(device: Device, expected_storage: HostTransf
         &prompt_descriptor(),
         &prompt_model_identity(),
         &[7],
-        options(), &stream)
+        options(),
+        &stream,
+    )
     .unwrap();
     assert_eq!(
         manifest.application_namespace.as_deref(),
