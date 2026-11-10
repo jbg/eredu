@@ -20,13 +20,14 @@ use eredu_backend_mlx::{
         },
         ExecutionContext,
     },
+    native::MlxAudioModel,
     MlxTensor,
 };
 use eredu_checkpoint::{
     recipe::{DerivedWeightRecipe, RecipeDtype},
     store::TensorSelection,
 };
-use eredu_media::audio::AudioWaveform;
+use eredu_media::audio::{AudioWaveform, LogMelFeatures};
 use eredu_nn::{Index, Parameterized, Tensor};
 use eredu_runtime::ResidentRuntime;
 use safemlx::{Array, Device, DeviceType};
@@ -46,6 +47,9 @@ struct Args {
     output: PathBuf,
     #[arg(long, default_value = "cpu", value_parser = ["cpu", "gpu"])]
     device: String,
+    /// Compare the released LiveASR block protocol.
+    #[arg(long)]
+    live_asr: bool,
 }
 
 fn sha256(path: &Path) -> Result<String, Box<dyn Error>> {
@@ -94,16 +98,18 @@ fn bind<M: Parameterized<MlxTensor>>(
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
+    let reference_name = if args.live_asr {
+        "live-reference.json"
+    } else {
+        "reference.json"
+    };
     let metadata: Value =
-        serde_json::from_slice(&std::fs::read(args.reference.join("reference.json"))?)?;
+        serde_json::from_slice(&std::fs::read(args.reference.join(reference_name))?)?;
     let model_hash = sha256(&args.checkpoint.join("model.safetensors"))?;
     let codec_hash = sha256(&args.checkpoint.join("audio_tokenizer/model.safetensors"))?;
     if metadata["model_sha256"] != model_hash || metadata["codec_sha256"] != codec_hash {
         return Err("native weights differ from the reference artifacts".into());
     }
-    let tolerance = metadata["maximum_absolute_tolerance"]
-        .as_f64()
-        .ok_or("missing tolerance")?;
     let model = PreparedAudio::open(&args.checkpoint, 2)?;
     let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let device = if args.device == "gpu" {
@@ -112,6 +118,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         DeviceType::Cpu
     };
     let native = ExecutionContext::new(Device::new(device, 0));
+    if args.live_asr {
+        return compare_live_asr(&args, &metadata, model, native);
+    }
+    let tolerance = metadata["maximum_absolute_tolerance"]
+        .as_f64()
+        .ok_or("missing tolerance")?;
     let ctx = native.stream();
     let reference =
         Array::load_safetensors(args.reference.join("reference.safetensors"), cpu.stream())?;
@@ -299,5 +311,69 @@ fn main() -> Result<(), Box<dyn Error>> {
             "passed": true,
         }))?,
     )?;
+    Ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct LiveBlock {
+    frames: usize,
+    #[serde(rename = "final")]
+    final_chunk: bool,
+    restart: bool,
+    audio_tokens: usize,
+    closed: bool,
+    tokens: Vec<i32>,
+}
+
+fn compare_live_asr(
+    args: &Args,
+    metadata: &Value,
+    model: PreparedAudio,
+    native: ExecutionContext,
+) -> Result<(), Box<dyn Error>> {
+    let bytes = std::fs::read(args.reference.join("live-pcm.f32"))?;
+    if bytes.len() % 4 != 0 {
+        return Err("invalid LiveASR PCM payload".into());
+    }
+    let pcm: Vec<_> = bytes
+        .chunks_exact(4)
+        .map(|value| f32::from_le_bytes(value.try_into().expect("four bytes")))
+        .collect();
+    let features = model
+        .processor
+        .transform()?
+        .extract(AudioWaveform::new(&pcm, 16_000)?)?;
+    let mut session = MlxAudioModel::load(model, native)?.prepare_live_transcription()?;
+    let blocks: Vec<LiveBlock> = serde_json::from_value(metadata["blocks"].clone())?;
+    let mut cursor = 0;
+    let mut token_count = 0;
+    for (index, block) in blocks.iter().enumerate() {
+        let end = cursor + block.frames;
+        let result = session.advance(
+            &LogMelFeatures {
+                values: features.values[cursor * features.mel_bins..end * features.mel_bins]
+                    .to_vec(),
+                mask: features.mask[cursor..end].to_vec(),
+                frames: block.frames,
+                mel_bins: features.mel_bins,
+            },
+            block.final_chunk,
+            block.restart,
+        )?;
+        assert_eq!(result.audio_tokens, block.audio_tokens, "block {index}");
+        assert_eq!(result.closed, block.closed, "block {index}");
+        assert_eq!(result.tokens, block.tokens, "block {index}");
+        token_count += result.tokens.len();
+        cursor = end;
+    }
+    assert_eq!(cursor, features.frames);
+    let report = json!({
+        "device": args.device,
+        "wav_sha256": metadata["wav_sha256"],
+        "matched_blocks": blocks.len(),
+        "matched_tokens": token_count,
+    });
+    std::fs::write(&args.output, serde_json::to_vec_pretty(&report)?)?;
+    println!("{report}");
     Ok(())
 }

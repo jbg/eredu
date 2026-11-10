@@ -498,13 +498,17 @@ pub struct EncoderState<S, T: Tensor> {
 }
 
 impl<S, T: Tensor> EncoderState<S, T> {
-    #[cfg(feature = "audio")]
     pub(super) fn try_branch<E>(&self, branch: impl FnOnce(&S) -> Result<S, E>) -> Result<Self, E> {
         Ok(Self {
             backbone: branch(&self.backbone)?,
             features: self.features.clone(),
             ..*self
         })
+    }
+
+    pub(super) fn projected_positions(&self, frames: i32, final_chunk: bool) -> Option<usize> {
+        let total = self.frames.checked_add(frames)?;
+        usize::try_from(frame_tokens(total, final_chunk) - self.tokens).ok()
     }
     /// Returns the LFM2 layer-state realization.
     pub fn backbone(&self) -> &S {

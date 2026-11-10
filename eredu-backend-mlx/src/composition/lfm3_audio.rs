@@ -17,7 +17,8 @@ use crate::backend::{
 use crate::{MlxTensor, Stream};
 use eredu_architectures::lfm3::audio::{
     AudioAdvance, AudioPhase, AudioRequest, AudioSession, AudioSessionError, AudioSnapshot,
-    AudioSnapshotError, BindingSource, PreparedAudio, PreparedResidentAudio, ResidentAudio,
+    AudioSnapshotError, AudioTranscription, AudioTranscriptionBlock, AudioTranscriptionError,
+    BindingSource, LogMelFeatures, PreparedAudio, PreparedResidentAudio, ResidentAudio,
     ResidentAudioBinding, ResidentAudioError,
 };
 #[cfg(feature = "audio")]
@@ -141,6 +142,15 @@ impl MlxAudioModel {
         Ok(MlxAudioSession(self.0.start(request, random)?))
     }
 
+    /// Prepares the checkpoint's live English transcription session.
+    pub fn prepare_live_transcription(
+        self,
+    ) -> Result<MlxAudioTranscription, AudioTranscriptionError> {
+        self.0
+            .prepare_live_transcription()
+            .map(MlxAudioTranscription)
+    }
+
     /// Prepares one streamed mono PCM utterance between the supplied token spans.
     #[cfg(feature = "audio")]
     pub fn prepare_ingress(
@@ -182,6 +192,32 @@ impl MlxAudioIngress {
 
     /// Drops the incomplete prompt without starting a response.
     pub fn cancel(self) {
+        self.0.cancel();
+    }
+}
+
+/// Controlled live transcription over one resident Audio graph.
+pub struct MlxAudioTranscription(AudioTranscription<MlxNeuralBackend, Binding>);
+
+impl MlxAudioTranscription {
+    /// Maximum mel frames in one block, derived from the checkpoint cadence.
+    pub fn frames_per_block(&self) -> usize {
+        self.0.frames_per_block()
+    }
+
+    /// Processes one mel block and publishes its transcript after completion.
+    pub fn advance(
+        &mut self,
+        features: &LogMelFeatures,
+        final_chunk: bool,
+        restart: bool,
+    ) -> Result<AudioTranscriptionBlock, AudioTranscriptionError> {
+        let _scope = Recovery::begin(Vec::<safemlx::Array>::new()).map_err(failure)?;
+        self.0.advance(features, final_chunk, restart)
+    }
+
+    /// Stops between settled blocks.
+    pub fn cancel(&mut self) {
         self.0.cancel();
     }
 }

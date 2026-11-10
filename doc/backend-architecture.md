@@ -16551,6 +16551,12 @@ The input progress and candidate caches commit together after completion.
 Finalization passes the existing language state into the ordinary response
 driver. MLX supplies tensor binding and recovery scopes for these advances.
 
+The LiveASR owner reuses the streamed encoder, projector and prompt traversal.
+The architecture owns the retained-tokenizer prompt, block cadence, greedy
+text filters and closing rules. Restarting the language context preserves
+the encoder continuation. The encoder and language candidates settle before
+a transcript block is returned.
+
 `eredu-codec::liquid` owns LiquidCodec configuration, complete neural encoder and
 decoder equations, reflective analysis, scalar-product alphabet ordering and
 polar synthesis. It consumes neutral neural/storage/runtime contracts without

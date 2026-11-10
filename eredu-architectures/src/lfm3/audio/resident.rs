@@ -2,13 +2,15 @@
 
 #[cfg(feature = "audio")]
 mod ingress;
+mod transcription;
 #[cfg(feature = "audio")]
 pub use ingress::{AudioIngress, AudioIngressError, AudioIngressProgress, AudioIngressRequest};
+pub use transcription::{AudioTranscription, AudioTranscriptionBlock, AudioTranscriptionError};
 
 use super::{
     AudioExecutionKernel, AudioMode, AudioPrompt, AudioSampling, AudioSchedulePolicy, AudioSession,
     AudioSessionError, AudioTokens, BindingSource, DepthDeclaration, DepthDecoder, DepthFrame,
-    Encoder, Feedback, PreparedAudio, Projector,
+    Encoder, EncoderState, Feedback, PreparedAudio, Projector,
 };
 use crate::lfm3::{CompleteLfm3Kernel, LayeredModel};
 use eredu_codec::liquid::{DecoderState, NeuralCodec};
@@ -475,6 +477,40 @@ where
         .map_err(failure)
     }
 
+    fn language_logits(&mut self, hidden: &B::Tensor) -> Result<B::Tensor, BackendFailure> {
+        self.language
+            .architecture_mut()
+            .kernel_mut()
+            .static_modules_mut()
+            .project_normalized(hidden, self.binding.context())
+            .map_err(failure)
+    }
+
+    fn project_stream_chunk(
+        &mut self,
+        features: &LogMelFeatures,
+        state: &mut EncoderState<H::State, B::Tensor>,
+        final_chunk: bool,
+    ) -> Result<Option<B::Tensor>, BackendFailure> {
+        let context = self.binding.context();
+        let frames = i32::try_from(features.frames).map_err(failure)?;
+        let features = B::Tensor::from_f32_slice(&features.values, &[1, frames, 128], context)
+            .and_then(|value| value.transpose_axes(&[0, 2, 1], context))
+            .map_err(failure)?;
+        let encoded = self
+            .encoder
+            .advance(&features, state, final_chunk, context)
+            .map_err(failure)?;
+        if encoded.dim(1) == 0 {
+            return Ok(None);
+        }
+        self.projector
+            .forward(&encoded, context)
+            .and_then(|value| value.squeeze_axes(&[0], context))
+            .map(Some)
+            .map_err(failure)
+    }
+
     fn append(
         &mut self,
         state: &mut ResidentAudioState<B, H>,
@@ -504,12 +540,7 @@ where
         &self.artifact.depth
     }
     fn text_logits(&mut self, state: &Self::State) -> Result<B::Tensor, BackendFailure> {
-        self.language
-            .architecture_mut()
-            .kernel_mut()
-            .static_modules_mut()
-            .project_normalized(&state.hidden, self.binding.context())
-            .map_err(failure)
+        self.language_logits(&state.hidden)
     }
     fn depth_logits(
         &mut self,

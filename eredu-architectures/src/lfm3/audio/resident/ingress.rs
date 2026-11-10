@@ -1,7 +1,7 @@
 //! Streaming input for one utterance in a resident Audio prompt.
 
 use super::*;
-use crate::lfm3::audio::{encoder::STRIDE, AudioSchedule, EncoderState};
+use crate::lfm3::audio::{encoder::STRIDE, AudioSchedule};
 use eredu_media::{audio::power_mel::PowerMelStream, MediaError};
 
 /// Text spans surrounding a single live utterance in checkpoint template order.
@@ -204,29 +204,11 @@ where
             self.progress.samples += samples.len();
             return Ok(());
         }
-        let context = self.model.binding.context();
-        let frames = i32::try_from(features.frames).map_err(failure)?;
-        let features = B::Tensor::from_f32_slice(&features.values, &[1, frames, 128], context)
-            .and_then(|value| value.transpose_axes(&[0, 2, 1], context))
-            .map_err(failure)?;
         let mut encoder = self.encoder.try_branch(H::branch_state)?;
-        let encoded = self
+        let projected = self
             .model
-            .encoder
-            .advance(&features, &mut encoder, final_chunk, context)
-            .map_err(failure)?;
-        let count = encoded.dim(1) as usize;
-        let projected = if count == 0 {
-            None
-        } else {
-            Some(
-                self.model
-                    .projector
-                    .forward(&encoded, context)
-                    .and_then(|value| value.squeeze_axes(&[0], context))
-                    .map_err(failure)?,
-            )
-        };
+            .project_stream_chunk(&features, &mut encoder, final_chunk)?;
+        let count = projected.as_ref().map_or(0, |rows| rows.dim(0) as usize);
         let mut tokens = Vec::new();
         if count != 0 && self.progress.audio_tokens == 0 {
             tokens.extend_from_slice(&self.prefix);

@@ -310,8 +310,15 @@ and model frontiers unchanged. `finish` flushes the remaining input, appends
 the suffix and enters the ordinary response session. Cancelling ingress drops
 the incomplete prompt. Snapshots and forks are available after finish.
 
-Ingress prepares a prompt for turn-based generation. Continuous transcription
-while PCM is arriving, snapshots during ingress, capture, and bounded or
+For continuous English transcription, `MlxAudioModel::prepare_live_transcription`
+opens the publisher's LiveASR protocol. The caller supplies unpadded mel blocks
+from the checkpoint processor, normally 96 frames. Each advance publishes a
+complete greedy text block, including its projected audio-position count and
+whether it reached a closing token. A restart resets the language context and
+keeps the encoder following the stream. Cancellation and finalization close
+the session at a block boundary.
+
+Snapshots and forks during ingress or LiveASR, capture, and bounded or
 distributed speech sessions have no selected implementation.
 
 LiquidCodec's standalone `Tokenizer` implements finite audio-tokenizer calls and
