@@ -52,6 +52,8 @@ pub mod ear_encoder_preparation;
 /// Shared bounded streaming convolutions and finite-stream lifecycle.
 pub mod streaming;
 
+/// LiquidCodec spectral and finite-scalar quantization components.
+pub mod liquid;
 /// Periodic-Hann STFT, inverse STFT and overlap-add mechanisms.
 pub mod spectral;
 

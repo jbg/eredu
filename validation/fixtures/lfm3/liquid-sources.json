@@ -1,0 +1,16 @@
+{
+  "repository": "LiquidAI/LFM3-Audio-2B",
+  "revision": "2d6c1f99c129b3ef07a8d168bc0ff08e2bdb93f1",
+  "weight_file": "audio_tokenizer/model.safetensors",
+  "weights_sha256": "45984a872fdcf0b94cd0ec68822bbf26f0c6fcb580cfaba0f7fa3ee60355137f",
+  "source_sha256": {
+    "configuration_lfm3.py": "176cced35657aedfea7d7002221360582d1c05fcaca882c21508bc3a73b282e5",
+    "modeling_lfm3.py": "e8cd5254ea99ce6bd731b57b10908c2e8b5010ce8315341f895a38484885eeab",
+    "lfm3_conv.py": "80d4a985382a22774212759248a6b4c737bfbf9c2a47b3dd7f797dda748e4bb4",
+    "configuration_liquid_codec.py": "ad89deb17164b8ae9a59d9c86545fd01ad281786c8702850aff9042e5f94a463",
+    "modeling_liquid_codec.py": "5ca87e1b6e0549b40dc90fad5ee9d55620e9defb78c67e19c5937208c8e14f74",
+    "audio_tokenizer/config.json": "13ac10473c6cf45618a3e9603f529c889683c9e28fa77e0d4f0ca6e686d0cbf4"
+  },
+  "scope": "Spectral analysis, learned FSQ projections and overlap-add streaming components; no complete neural codec or audio task support claim.",
+  "maximum_absolute_tolerance": 0.0005
+}

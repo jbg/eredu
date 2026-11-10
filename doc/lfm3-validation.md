@@ -13,9 +13,9 @@ Ordinary and controlled text generation use the shared drivers. The existing tag
 tool dialect consumes the released template's function/parameter tags; the LFM2
 Python-call dialect does not describe this template.
 
-This is a text implementation with independent vision components, not complete
-LFM3-family integration. Public vision/video generation, audio, LiquidCodec, omni
-and d1 decision execution are not implemented. Published
+This is a text implementation with independent vision and codec components, not
+complete LFM3-family integration. Public vision/video generation, complete neural
+LiquidCodec execution, audio, omni and d1 decision execution are not implemented. Published
 NVFP4 GGUF encoding is not admitted by the current generic GGUF reader. No support
 for these paths is inferred from the shared text backbone or source inventory.
 
@@ -163,3 +163,8 @@ These components have no public VL task admission, conditional text composition,
 GGUF admission, selected memory/residency reports, TP/PP construction or controlled
 media-session integration. No corresponding support is advertised by their
 existence or by encoder/projector comparison.
+
+LiquidCodec component scope, passing scalar/synthesis comparisons and the failing
+spectral-analysis comparison are documented in
+[LiquidCodec validation](liquid-codec-validation.md). Component results do not
+establish complete codec or speech-model acceptance.
