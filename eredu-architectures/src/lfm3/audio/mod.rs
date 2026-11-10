@@ -1,11 +1,15 @@
 //! LFM3 speech-input processor and encoder declarations.
 
+mod artifact;
 mod depth;
+pub use artifact::{ArtifactError, AudioTokens, BindingSource, PreparedAudio, TextAssets};
 mod encoder;
+mod prompt;
 pub use depth::{
     CompletedSpeechFrame, DepthDeclaration, DepthDecoder, DepthFrame, DepthUnit, Feedback,
 };
 pub use encoder::{Declaration, Downsampler, Encoder, EncoderState, Projector, Unit};
+pub use prompt::AudioPrompt;
 
 use eredu_nn::Error;
 use serde_json::{json, Value};

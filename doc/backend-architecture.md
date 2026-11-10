@@ -16492,6 +16492,22 @@ from the checkpoint schedule. Completion distinguishes valid codec codes from
 speech EOS. The request owner supplies sampling, random state and execution
 completion. The standalone components do not select a realtime execution graph.
 
+`lfm3::audio::PreparedAudio` admits the complete floating SafeTensors model and
+its LiquidCodec companion. The language, encoder, and depth scopes share one
+retained model source with separate read authority. The codec owns a separate
+retained source. Admission projects the released language, encoder, depth and
+feedback aliases into their canonical destinations before materialization.
+The tokenizer, chat template, generation defaults and processor policy are
+retained alongside the component declarations.
+
+`AudioPrompt` pairs token IDs with exact speech input and output row counts.
+The shared language traversal replaces the placeholder spans at the execution
+group's embedding boundary, preserving the causal cache positions. The readout
+returns normalized language states for depth scoring or the existing tied text
+head. The same traversal hook can be used with resident or caller-configured
+layerwise language execution. Public speech task selection and controlled
+session orchestration are separate integration work.
+
 `eredu-codec::liquid` owns LiquidCodec configuration, complete neural encoder and
 decoder equations, reflective analysis, scalar-product alphabet ordering and
 polar synthesis. It consumes neutral neural/storage/runtime contracts without

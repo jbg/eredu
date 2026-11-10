@@ -435,7 +435,10 @@ where
             };
         Ok(LayeredForwardState {
             hidden,
-            context: ForwardContext { mask },
+            context: ForwardContext {
+                mask,
+                normalized_audio_output: false,
+            },
         })
     }
 
@@ -650,9 +653,16 @@ where
         &mut self,
         hidden: &B::Tensor,
         _state: &mut S,
-        _forward: &Self::ForwardContext,
+        forward: &Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
+        if forward.normalized_audio_output {
+            return self.static_modules.decoder_resources_mut().normalize(
+                hidden,
+                context,
+                &mut ComponentInstrumentation::disabled(),
+            );
+        }
         self.finish_local(hidden, None, context)
     }
     fn projects_final_text_position() -> bool {
@@ -665,7 +675,7 @@ where
         forward: &Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        if G::FINAL_TEXT_POSITION {
+        if G::FINAL_TEXT_POSITION && !forward.normalized_audio_output {
             self.finish_local(
                 &crate::decoder::final_hidden_position(hidden, context)?,
                 None,
@@ -679,7 +689,7 @@ where
         &mut self,
         hidden: &B::Tensor,
         _state: &mut S,
-        _forward: &Self::ForwardContext,
+        forward: &Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
         observer: &mut O,
     ) -> Result<B::Tensor, Self::Error>
@@ -687,12 +697,16 @@ where
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
-        self.finish_local_instrumented(
-            hidden,
-            None,
-            context,
-            &mut ComponentInstrumentation::new("readout", &mut observer),
-        )
+        let mut instrumentation = ComponentInstrumentation::new("readout", &mut observer);
+        if forward.normalized_audio_output {
+            self.static_modules.decoder_resources_mut().normalize(
+                hidden,
+                context,
+                &mut instrumentation,
+            )
+        } else {
+            self.finish_local_instrumented(hidden, None, context, &mut instrumentation)
+        }
     }
 }
 

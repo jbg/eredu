@@ -1,0 +1,128 @@
+{
+  "schema_version": 1,
+  "repository": "LiquidAI/LFM3-Audio-2B",
+  "revision": "2d6c1f99c129b3ef07a8d168bc0ff08e2bdb93f1",
+  "scope": "Resident mixed prefill, eight cached steps and one sampled speech frame with PCM and cached feedback.",
+  "model_sha256": "9abe5e402f163296e0988f94ad67f65dab61c723e260fea9374109b3775e28f7",
+  "codec_sha256": "45984a872fdcf0b94cd0ec68822bbf26f0c6fcb580cfaba0f7fa3ee60355137f",
+  "storage_dtype": "BF16 with F32 codec window",
+  "execution_dtype": "F32",
+  "reference": {
+    "torch": "2.15.0",
+    "transformers": "5.22.2",
+    "safetensors": "0.8.0",
+    "huggingface_hub": "2.4.0",
+    "attention": "eager"
+  },
+  "native_runtime": {
+    "mlx_version": "0.32.3",
+    "mlx_revision": "64ea011cb65f14d9ce2737e60db9a4ae91ed7441"
+  },
+  "maximum_absolute_tolerance": 0.0005,
+  "case": {
+    "input_samples": 2151,
+    "sample_rate": 16000,
+    "prompt": [
+      124894,
+      5,
+      125031,
+      125031,
+      13,
+      125032,
+      21,
+      34
+    ],
+    "cached_inputs": [
+      55,
+      125032,
+      89,
+      144,
+      233,
+      125032,
+      377,
+      610
+    ],
+    "speech_reveal_order": [
+      7,
+      1,
+      10,
+      0,
+      5,
+      3,
+      2,
+      6,
+      8,
+      11,
+      4,
+      9
+    ],
+    "speech_code_selection": "greedy over the codec vocabulary",
+    "pcm_samples": 1920,
+    "pcm_reference_peak": 1.2716528772216407e-06
+  },
+  "native": [
+    {
+      "device": "cpu",
+      "maximum_absolute_errors": {
+        "features": 4.76837158203125e-07,
+        "prefill_hidden": 0.000141143798828125,
+        "prefill_logits": 0.00011491775512695312,
+        "cached_hidden": 0.0001068115234375,
+        "cached_logits": 2.6941299438476562e-05,
+        "depth": 2.288818359375e-05,
+        "speech_pcm": 2.7853275241795927e-12,
+        "feedback_hidden": 4.76837158203125e-06,
+        "feedback_logits": 4.0531158447265625e-06
+      },
+      "greedy_rows_matched": 17,
+      "speech_code_ids": [
+        1639,
+        1339,
+        1002,
+        559,
+        40,
+        1776,
+        128,
+        281,
+        1806,
+        620,
+        280,
+        331
+      ],
+      "passed": true
+    },
+    {
+      "device": "gpu",
+      "maximum_absolute_errors": {
+        "features": 4.76837158203125e-07,
+        "prefill_hidden": 0.000308990478515625,
+        "prefill_logits": 0.00023984909057617188,
+        "cached_hidden": 0.00022125244140625,
+        "cached_logits": 5.0067901611328125e-05,
+        "depth": 2.574920654296875e-05,
+        "speech_pcm": 4.405364961712621e-12,
+        "feedback_hidden": 1.1444091796875e-05,
+        "feedback_logits": 6.16908073425293e-06
+      },
+      "greedy_rows_matched": 17,
+      "speech_code_ids": [
+        1639,
+        1339,
+        1002,
+        559,
+        40,
+        1776,
+        128,
+        281,
+        1806,
+        620,
+        280,
+        331
+      ],
+      "passed": true,
+      "environment": {
+        "MLX_ENABLE_TF32": "0"
+      }
+    }
+  ]
+}
