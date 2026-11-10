@@ -3,7 +3,7 @@
 use super::{slaney_mel_filters, AudioWaveform, LogMelFeatures};
 use crate::MediaError;
 use rustfft::{num_complex::Complex32, Fft, FftPlanner};
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 /// Host processing geometry for uncentered Slaney power-mel features.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -25,17 +25,18 @@ pub struct PowerMelConfig {
 }
 
 /// Reusable immutable host transform.
+#[derive(Clone)]
 pub struct PowerMel {
     config: PowerMelConfig,
-    window: Vec<f32>,
-    filters: Vec<f32>,
+    window: Arc<[f32]>,
+    filters: Arc<[f32]>,
     fft: Arc<dyn Fft<f32>>,
 }
 
 /// Mono stream continuation with fewer than one window of retained samples.
 #[derive(Debug, Clone)]
 pub struct PowerMelStream<'a> {
-    transform: &'a PowerMel,
+    transform: Cow<'a, PowerMel>,
     carry: Vec<f32>,
     emitted: bool,
     finished: bool,
@@ -86,7 +87,7 @@ impl PowerMel {
         Ok(Self {
             config,
             window,
-            filters,
+            filters: filters.into(),
             fft,
         })
     }
@@ -100,11 +101,29 @@ impl PowerMel {
     /// Starts an independent input stream.
     pub fn stream(&self) -> PowerMelStream<'_> {
         PowerMelStream {
-            transform: self,
+            transform: Cow::Borrowed(self),
             carry: Vec::new(),
             emitted: false,
             finished: false,
         }
+    }
+
+    /// Starts an owned stream whose branches share the immutable transform.
+    pub fn into_stream(self) -> PowerMelStream<'static> {
+        PowerMelStream {
+            transform: Cow::Owned(self),
+            carry: Vec::new(),
+            emitted: false,
+            finished: false,
+        }
+    }
+
+    /// Maximum samples that finalize within a nonzero frame budget.
+    pub fn max_samples_for_frames(&self, frames: usize) -> Option<usize> {
+        frames
+            .checked_sub(1)?
+            .checked_mul(self.config.hop_length)?
+            .checked_add(self.config.fft_length)
     }
 }
 
@@ -151,14 +170,15 @@ impl PowerMelStream<'_> {
             MediaError::invalid(format!("power-mel allocation failed: {error}"))
         })?;
         if frames > 0 {
-            let transform = self.transform;
+            let transform = self.transform.as_ref();
             let mut spectrum = vec![Complex32::default(); config.fft_length];
             let mut scratch = vec![Complex32::default(); transform.fft.get_inplace_scratch_len()];
             let bins = config.fft_length / 2 + 1;
             let mut power = vec![0.0; bins];
             for frame in 0..frames {
                 let start = frame * config.hop_length;
-                for (tap, (value, window)) in spectrum.iter_mut().zip(&transform.window).enumerate()
+                for (tap, (value, window)) in
+                    spectrum.iter_mut().zip(transform.window.iter()).enumerate()
                 {
                     let index = start + tap;
                     let sample = if index < self.carry.len() {

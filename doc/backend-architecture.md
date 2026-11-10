@@ -16541,6 +16541,16 @@ state growth is checked by the shared realtime driver before publication and
 charged to the lineage's high-water reservation. The MLX recovery scope
 retains that reservation through any unresolved work from the advance.
 
+The Audio ingress owner accepts one streamed utterance between two token
+spans. The portable power-mel stream shares its immutable FFT plan and
+retains only the window overlap. The architecture branches the causal encoder
+and language cache, projects newly complete audio rows, and appends them
+through the shared language prompt traversal. It reserves context for the
+final input window, suffix, and response budget before accepting samples.
+The input progress and candidate caches commit together after completion.
+Finalization passes the existing language state into the ordinary response
+driver. MLX supplies tensor binding and recovery scopes for these advances.
+
 `eredu-codec::liquid` owns LiquidCodec configuration, complete neural encoder and
 decoder equations, reflective analysis, scalar-product alphabet ordering and
 polar synthesis. It consumes neutral neural/storage/runtime contracts without
