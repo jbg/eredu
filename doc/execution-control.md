@@ -268,6 +268,13 @@ Its selected embedded prediction path remains separately scheduled. Their plain-
 distributed execution. LFM2 retains convolution history, attention caches and absolute
 positions across passes; convolution-only schedules use the same driver.
 
+The experimental LFM3 text adapter uses this same chunked-prefill and controlled
+generation driver. Its state retains convolution carry, full KV history, sliding
+KV history and absolute positions independently. The compact shared CPU and Metal
+conformance case covers bounded residency and controlled/uninterrupted agreement;
+[released-checkpoint evidence](lfm3-validation.md) records numerical coverage and
+the family tasks without an implementation.
+
 Composite adapters with retained prefill requests support prepared media and absolute
 capture spans through the shared cursor described under [Flash-Next](#flash-next).
 Adapters without that cursor retain a complete pass for structured input. Nonempty

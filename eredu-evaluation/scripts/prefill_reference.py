@@ -19,6 +19,7 @@ def main():
     parser.add_argument('--f32-checkpoint', type=Path, required=True)
     parser.add_argument('--tokens', default='1,3,2,5,8,13,21,34,55')
     parser.add_argument('--decode', default='5,8,13')
+    parser.add_argument('--trust-remote-code', action='store_true')
     args = parser.parse_args()
     provenance = json.loads(args.provenance.read_text())
     source = Path(provenance['path'])
@@ -40,11 +41,12 @@ def main():
         with (checkpoint / name).open('rb') as stream:
             derived[name] = hashlib.file_digest(stream, 'sha256').hexdigest()
     for sidecar in source.iterdir():
-        if sidecar.suffix in ('.json', '.jinja'):
+        if sidecar.suffix in ('.json', '.jinja') or (args.trust_remote_code and sidecar.suffix == '.py'):
             shutil.copyfile(sidecar, checkpoint / sidecar.name)
     torch.set_num_threads(4)
     model = AutoModelForCausalLM.from_pretrained(checkpoint, local_files_only=True,
-                                                dtype=torch.float32, attn_implementation='eager').eval()
+                                                dtype=torch.float32, attn_implementation='eager',
+                                                trust_remote_code=args.trust_remote_code).eval()
     prompt = [int(value) for value in args.tokens.split(',')]
     decode = [int(value) for value in args.decode.split(',')]
     logits = []

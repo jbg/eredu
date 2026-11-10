@@ -173,6 +173,8 @@ pub mod k2_horizon;
 pub mod kimi_linear;
 /// LFM2 and LFM2-MoE hybrid decoder architecture.
 pub mod lfm2;
+/// LFM3 tri-hybrid text and multimodal family declarations.
+pub mod lfm3;
 pub mod nemotron_h;
 /// Shared text and Pixtral geometry for Nemotron-Labs-Diffusion.
 pub mod nemotron_labs_diffusion;

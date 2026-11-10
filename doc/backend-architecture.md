@@ -16411,6 +16411,22 @@ Nemotron's dimension-based block constructors and configuration-to-state builder
 unit construction consumes prepared typed scopes.
 
 
+LFM3's text `Declaration` owns its three-way convolution/global/sliding layer schedule,
+scalar head gates, sandwich normalizations, parameter identities, mixed mutable state,
+and TP/PP geometry. SafeTensors and GGUF preparation retain this declaration through
+replicated and partitioned construction. Independently leased decoder layers use the
+shared parameter providers, completion handling and controlled generation drivers.
+The GGUF positional companion is a bounded F32 table validated during admission;
+its normalized policy is retained separately from learned execution parameters.
+
+The general neural rotary contract distinguishes zero-tail frequency progression from
+prefix-only rotation and distinguishes FP32 tables/products from input-rounded tables.
+MLX realizes these contracts without a family branch. Shared decoder attention can
+broadcast one sigmoid gate per query head before the output projection. Architecture
+discovery retains the gate's head-row mapping and post-write normalization separately.
+These contracts support the LFM3 text route; they do not declare vision, speech, codec,
+omni or decision execution. Numerical coverage is in [LFM3 validation](lfm3-validation.md).
+
 LFM2's `Declaration` pairs existing typed static, attention/convolution, normalization,
 dense and routed feed-forward scopes with component ownership and state. Its parameter
 projection borrows those scopes. Format projection clones parameter identities and

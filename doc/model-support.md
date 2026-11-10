@@ -75,6 +75,7 @@ projector.
 | K2 Horizon | text | yes | `k2-horizon` | dense, MoE and MoVA; independently addressable value/feed-forward experts, grouped RMSNorm, YaRN, IFM reasoning/tools and external drafting; [validation](k2-horizon-validation.md) |
 | Kimi Linear | text | yes | `kimi-linear` | KDA/MLA hybrid layers, dense and routed/shared experts |
 | LFM2 / LFM2.5 | text | yes | `lfm2`, `lfm2moe` | causal-convolution/attention hybrid, dense and MoE |
+| LFM3 text/base | text | `lfm3` | `lfm3` | experimental text route: gated global/sliding attention, width-seven convolutions and sandwich norms; [validation and family coverage](lfm3-validation.md) |
 | Nemotron-H | text | yes | `nemotron_h`, `nemotron_h_moe` | Mamba, attention, dense MLP, and MoE layers |
 | Inkling | text, image, audio | yes | `inkling` + projector | multimodal hMLP ingress and dense/MoE text execution |
 | Muse-Glimmer | text, image, video | yes | `muse-glimmer`; optional image-only projector | vision tower, mixed attention, ATEM/DFlash paths |

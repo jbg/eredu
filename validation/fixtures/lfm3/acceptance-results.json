@@ -1,0 +1,268 @@
+{
+  "schema_version": 1,
+  "backend": "mlx",
+  "device": "cpu",
+  "dtype": "float32",
+  "maximum_absolute_tolerance": 0.0005,
+  "cases": [
+    {
+      "id": "short",
+      "maximum_absolute_error_by_row": [
+        6.318092346191406e-05,
+        4.9591064453125e-05,
+        5.53131103515625e-05,
+        3.6716461181640625e-05,
+        3.62396240234375e-05,
+        3.933906555175781e-05,
+        2.288818359375e-05,
+        4.279613494873047e-05,
+        4.6253204345703125e-05
+      ],
+      "argmax_ids": [
+        34,
+        13,
+        13,
+        21,
+        34,
+        55,
+        8,
+        13,
+        13
+      ],
+      "argmax_matches_reference": true
+    },
+    {
+      "id": "window",
+      "maximum_absolute_error_by_row": [
+        0.0001544952392578125,
+        7.05718994140625e-05,
+        6.628036499023438e-05,
+        5.352497100830078e-05,
+        5.030632019042969e-05,
+        5.316734313964844e-05,
+        4.9233436584472656e-05,
+        7.140636444091797e-05,
+        3.9696693420410156e-05
+      ],
+      "argmax_ids": [
+        39,
+        14,
+        64019,
+        729,
+        729,
+        742,
+        34,
+        13,
+        2
+      ],
+      "argmax_matches_reference": true
+    },
+    {
+      "id": "greedy",
+      "maximum_absolute_error_by_row": [
+        6.318092346191406e-05,
+        5.5909156799316406e-05,
+        5.245208740234375e-05,
+        2.9087066650390625e-05,
+        3.3736228942871094e-05,
+        3.4689903259277344e-05,
+        3.075599670410156e-05,
+        3.49879264831543e-05,
+        2.7418136596679688e-05
+      ],
+      "argmax_ids": [
+        34,
+        55,
+        34,
+        55,
+        34,
+        55,
+        34,
+        55,
+        34
+      ],
+      "argmax_matches_reference": true
+    }
+  ],
+  "metal_float32": {
+    "device": "gpu",
+    "environment": {
+      "MLX_ENABLE_TF32": "0"
+    },
+    "maximum_absolute_tolerance": 0.0005,
+    "cases": [
+      {
+        "id": "greedy",
+        "maximum_absolute_error_by_row": [
+          6.67572021484375e-05,
+          6.0558319091796875e-05,
+          4.4345855712890625e-05,
+          3.719329833984375e-05,
+          3.62396240234375e-05,
+          3.62396240234375e-05,
+          3.790855407714844e-05,
+          4.482269287109375e-05,
+          3.8623809814453125e-05
+        ],
+        "argmax_ids": [
+          34,
+          55,
+          34,
+          55,
+          34,
+          55,
+          34,
+          55,
+          34
+        ],
+        "argmax_matches_reference": true
+      },
+      {
+        "id": "window",
+        "maximum_absolute_error_by_row": [
+          0.00011399388313293457,
+          6.937980651855469e-05,
+          7.343292236328125e-05,
+          7.82012939453125e-05,
+          7.581710815429688e-05,
+          8.976459503173828e-05,
+          6.771087646484375e-05,
+          5.933642387390137e-05,
+          3.3855438232421875e-05
+        ],
+        "argmax_ids": [
+          39,
+          14,
+          64019,
+          729,
+          729,
+          742,
+          34,
+          13,
+          2
+        ],
+        "argmax_matches_reference": true
+      }
+    ]
+  },
+  "metal_gguf": {
+    "artifact": "LiquidAI/LFM3-1.7B-GGUF/LFM3-1.7B-Q4_K_M.gguf",
+    "artifact_revision": "cd0c74c575b5c416f3011b5b4c298077f26ca8c2",
+    "sha256": "3793e1e6e2266919d6e015287221b41100175a98eddaba92e111aed3b05c93c4",
+    "reference": {
+      "repository": "ggml-org/llama.cpp",
+      "revision": "cd959bae99ff4bed22bef2604f45241c09bbb8c8",
+      "version": "0.9.0 build 12110",
+      "device": "gpu",
+      "flash_attention": false,
+      "kv_dtype": "float32"
+    },
+    "environment": {
+      "MLX_ENABLE_TF32": "0"
+    },
+    "tolerance": {
+      "maximum_relative_l2": 0.02,
+      "minimum_cosine": 0.999,
+      "minimum_top5_overlap": 4,
+      "unambiguous_argmax_match": true,
+      "argmax_margin_min": 0.0
+    },
+    "cases": [
+      {
+        "id": "short",
+        "maximum_absolute_error_by_row": [
+          0.24158096313476562,
+          0.2003798484802246,
+          0.19682344794273376,
+          0.11892879009246826,
+          0.11957025527954102,
+          0.1390063762664795,
+          0.09601068496704102,
+          0.17055124044418335,
+          0.15938636660575867
+        ],
+        "relative_l2_by_row": [
+          0.018828527664815842,
+          0.017329056353624642,
+          0.01551366423955763,
+          0.010743562206314516,
+          0.011410134330832938,
+          0.012404151402052224,
+          0.00964911291221134,
+          0.014057754437374231,
+          0.012139593808241424
+        ],
+        "cosine_by_row": [
+          0.9998310075221244,
+          0.9998499043747764,
+          0.9998801571849069,
+          0.9999423707784523,
+          0.9999361426335815,
+          0.9999230809964065,
+          0.9999541877309028,
+          0.999901269540722,
+          0.9999263130231119
+        ],
+        "argmax_ids": [
+          34,
+          13,
+          13,
+          21,
+          34,
+          55,
+          8,
+          13,
+          13
+        ],
+        "argmax_matches_reference": true,
+        "top5_overlap_by_row": [
+          5,
+          5,
+          4,
+          5,
+          5,
+          5,
+          5,
+          5,
+          5
+        ],
+        "shared_parity_passed": true
+      }
+    ]
+  },
+  "precision_observations": {
+    "metal_default_tf32_float32": {
+      "prefill_maximum_absolute_error": 0.0214691162,
+      "decode_maximum_absolute_error": 0.0238952637,
+      "passes_float32_tolerance": false
+    },
+    "llama_cpp_cpu_q4_k_m": {
+      "activation_dot_type": "Q8_K",
+      "maximum_absolute_error_range": [
+        0.54,
+        0.94
+      ],
+      "relative_l2_range": [
+        0.052,
+        0.088
+      ],
+      "argmax_matches_reference": true,
+      "passes_shared_logit_tolerance": false
+    }
+  },
+  "shared_conformance": {
+    "target": "eredu-backend-mlx/tests/chunked_prefill.rs",
+    "cases": {
+      "cpu_chunked_prefill_matches_full_observed_logits_and_controlled_generation": "passed",
+      "metal_chunked_prefill_matches_full_observed_logits_and_controlled_generation": "passed"
+    },
+    "scope": [
+      "resident",
+      "host-layerwise",
+      "disk-streamed",
+      "affine-quantized-loading",
+      "chunked-prefill",
+      "controlled-uninterrupted-generation"
+    ]
+  }
+}

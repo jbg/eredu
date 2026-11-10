@@ -865,8 +865,245 @@ pub(super) fn lfm2_unit(
         }
     }
 }
+pub(super) fn lfm3_unit(
+    g: &mut Builder,
+    declaration: &crate::lfm3::Declaration,
+    layer: usize,
+    path: &str,
+    mixer_node: &str,
+    ffn_node: &str,
+) {
+    use crate::lfm3::declarations::{FeedForwardParameters as F, MixerParameters as M};
+    let scope = &declaration.blocks[layer];
+    let width = declaration.statics.embedding_spec().dimensions as usize;
+    let read = |projection: &eredu_nn::LinearSpec, prefix: &str, role, rows, head_normalization| {
+        ComponentRead {
+            head_normalization,
+            ..declared_component_read(projection, format!("parameters:{prefix}"), role, rows)
+        }
+    };
+    let attention = matches!(scope.mixer, M::Attention(..));
+    if let M::Attention(spec, _) = &scope.mixer {
+        let prefix = format!("{path}.self_attn");
+        let [query, key, value, write] = spec.projection.projections();
+        let normalizations = [&spec.query_norm, &spec.key_norm];
+        let dim = spec.projection.geometry.key_dimensions() as usize;
+        let heads = spec.projection.geometry.query_heads() as usize;
+        let kv = spec.projection.geometry.key_value_heads() as usize;
+        let head_rows = |sharing| ComponentRowMapping::HeadRows {
+            offset: 0,
+            component_head_width: dim,
+            read_head_width: dim,
+            component_heads_per_read_head: sharing,
+            read_head_stride: None,
+        };
+        let head_norm = |heads, index: usize| {
+            Some(ComponentHeadNormalization {
+                output_scale: ComponentScalar::new(1.0),
+                heads,
+                head_width: dim,
+                independent_gains: false,
+                normalization: declared_normalization(normalizations[index]),
+            })
+        };
+        let write_weight = write.weight.id.as_str().to_owned();
+        g.descriptor.components.push(ComponentGroup {
+            routed_reads: Vec::new(),
+            id: format!("{mixer_node}.channels"),
+            node_id: mixer_node.into(),
+            layer_index: layer,
+            count: write.input as usize,
+            activation: format!("{path}.attention.channels"),
+            effective_activation: format!("{path}.attention.channels.effective"),
+            write_input: Some(format!("{path}.attention.write_input")),
+            write_output: Some(format!("{path}.attention.write")),
+            output: Some(format!("{path}.attention.output")),
+            write_partition: ComponentWritePartition::Complete,
+            input: format!("{path}.attention.input"),
+            reads: vec![
+                read(
+                    query,
+                    &prefix,
+                    ComponentReadRole::Query,
+                    head_rows(1),
+                    head_norm(heads, 0),
+                ),
+                read(
+                    key,
+                    &prefix,
+                    ComponentReadRole::Key,
+                    head_rows(heads / kv),
+                    head_norm(kv, 1),
+                ),
+                read(
+                    value,
+                    &prefix,
+                    ComponentReadRole::Value,
+                    ComponentRowMapping::GroupedQuery {
+                        offset: 0,
+                        head_width: dim,
+                        queries_per_kv: heads / kv,
+                    },
+                    None,
+                ),
+                read(
+                    &spec.gate,
+                    &prefix,
+                    ComponentReadRole::OutputGate,
+                    ComponentRowMapping::GroupedQuery {
+                        offset: 0,
+                        head_width: 1,
+                        queries_per_kv: dim,
+                    },
+                    None,
+                ),
+            ],
+            write_weight: write_weight.clone(),
+            write_input_projection: None,
+            shared_write_weight: write_weight,
+            write_parameter_group: format!("parameters:{prefix}"),
+            write_bias: None,
+            activation_equation: ComponentActivation::Attention {
+                attended_head_normalization: None,
+                query_heads: heads,
+                key_value_heads: kv,
+                head_width: dim,
+                output_gate: Some(ComponentNonlinearity::Sigmoid),
+            },
+            input_normalization: declared_normalization(&scope.operator_norm),
+            output_gate: None,
+            output_normalization: scope
+                .post_operator_norm
+                .as_ref()
+                .map(declared_normalization),
+            residual_scale: ComponentScalar::new(1.0),
+        });
+        let mut shape = axes(heads * dim);
+        shape[2].name = "component".into();
+        g.component_observation(
+            mixer_node,
+            format!("{path}.attention.channels"),
+            "Aggregated attention channels consumed by the output projection",
+            shape,
+        );
+    }
+    {
+        let F::Dense(spec) = &scope.feed_forward;
+        let prefix = format!("{path}.feed_forward");
+        let gate = &spec.gate;
+        let up = &spec.up;
+        let write = &spec.down;
+        let write_weight = write.weight.id.as_str().to_owned();
+        let count = write.input as usize;
+        g.descriptor.components.push(ComponentGroup {
+            routed_reads: Vec::new(),
+            id: format!("{ffn_node}.units"),
+            node_id: ffn_node.into(),
+            layer_index: layer,
+            count,
+            activation: format!("{path}.feed_forward.units"),
+            effective_activation: format!("{path}.feed_forward.units.effective"),
+            write_input: Some(format!("{path}.feed_forward.write_input")),
+            write_output: Some(format!("{path}.feed_forward.write")),
+            output: Some(format!("{path}.feed_forward.output")),
+            write_partition: ComponentWritePartition::Complete,
+            input: format!("{path}.feed_forward.input"),
+            reads: vec![
+                read(
+                    gate,
+                    &prefix,
+                    ComponentReadRole::Gate,
+                    ComponentRowMapping::Direct { offset: 0 },
+                    None,
+                ),
+                read(
+                    up,
+                    &prefix,
+                    ComponentReadRole::Value,
+                    ComponentRowMapping::Direct { offset: 0 },
+                    None,
+                ),
+            ],
+            write_weight: write_weight.clone(),
+            write_input_projection: None,
+            shared_write_weight: declared_shared_weight(&write.weight).into(),
+            write_parameter_group: format!("parameters:{prefix}"),
+            write_bias: write.bias.as_ref().map(|bias| bias.id.to_string()),
+            activation_equation: declared_gated_product(spec.policy)
+                .expect("admitted LFM3 gated product policy"),
+            input_normalization: declared_normalization(&scope.feed_forward_norm),
+            output_gate: None,
+            output_normalization: scope.post_ffn_norm.as_ref().map(declared_normalization),
+            residual_scale: ComponentScalar::new(1.0),
+        });
+        let mut shape = axes(count);
+        shape[2].name = "component".into();
+        g.component_observation(
+            ffn_node,
+            format!("{path}.feed_forward.units"),
+            "Gated feed-forward units consumed by the down projection",
+            shape,
+        );
+    }
+    for (node, boundary) in [
+        (mixer_node, if attention { "attention" } else { "mixer" }),
+        (ffn_node, "feed_forward"),
+    ] {
+        for (suffix, meaning) in [
+            ("input", "Normalized operator input"),
+            ("write", "Operator write before residual addition"),
+            ("output", "Operator contribution before residual addition"),
+            ("residual", "Residual after operator addition"),
+        ] {
+            g.component_observation(
+                node,
+                format!("{path}.{boundary}.{suffix}"),
+                meaning,
+                axes(width),
+            );
+        }
+    }
+}
 
 pub(super) fn lfm2_readout(g: &mut Builder, declaration: &crate::lfm2::Declaration) {
+    let statics = &declaration.statics;
+    let embedding = statics.embedding_spec();
+    readout_observations(
+        g,
+        embedding.dimensions as usize,
+        embedding.vocabulary as usize,
+    );
+    g.descriptor.component_readout = Some(ComponentReadout {
+        token_embedding_normalization: None,
+        embedding_normalization: None,
+        embedding: "readout.embedding".into(),
+        embedding_weight: embedding.weight.id.as_str().into(),
+        embedding_scale: ComponentScalar::new(1.0),
+        tied_embeddings: statics.head_spec().is_none(),
+        equation: ComponentReadoutEquation {
+            residual_cycles: vec![],
+            block_transforms: vec![],
+            score_writes: vec![],
+            stream_residual: None,
+            residual: "readout.residual".into(),
+            normalized: "readout.normalized".into(),
+            projection_input: Some("readout.projection_input".into()),
+            linear_scores: "readout.linear".into(),
+            logits: MODEL_LOGITS_OBSERVATION_PATH.into(),
+            normalization: declared_normalization(statics.normalization_spec()),
+            weight: statics
+                .head_spec()
+                .map(|p| p.weight.id.as_str())
+                .unwrap_or(embedding.weight.id.as_str())
+                .into(),
+            bias: None,
+            output_transform: ComponentOutputTransform::Identity,
+            block_normalizations: vec![],
+            other_writes: vec![],
+        },
+    });
+}
+pub(super) fn lfm3_readout(g: &mut Builder, declaration: &crate::lfm3::Declaration) {
     let statics = &declaration.statics;
     let embedding = statics.embedding_spec();
     readout_observations(
@@ -917,6 +1154,35 @@ pub(super) fn lfm2_other_writes(g: &mut Builder, declaration: &crate::lfm2::Decl
             (matches!(scope.mixer, M::Convolution(_)), "mixer"),
             (matches!(scope.feed_forward, F::Routed(_)), "feed_forward"),
         ] {
+            if present {
+                let output_suffix = if boundary == "feed_forward" {
+                    "contribution"
+                } else {
+                    "output"
+                };
+                readout.other_writes.push(ComponentResidualWrite {
+                    input: Some(format!("model.layers.{layer}.{boundary}.input")),
+                    layer_index: layer,
+                    node_id: format!("decoder.layers.{layer}.{boundary}"),
+                    output: format!("model.layers.{layer}.{boundary}.{output_suffix}"),
+                    effective_output: format!(
+                        "model.layers.{layer}.{boundary}.{output_suffix}.effective"
+                    ),
+                    residual_scale: ComponentScalar::new(1.0),
+                });
+            }
+        }
+    }
+}
+pub(super) fn lfm3_other_writes(g: &mut Builder, declaration: &crate::lfm3::Declaration) {
+    use crate::lfm3::declarations::MixerParameters as M;
+    let readout = g
+        .descriptor
+        .component_readout
+        .as_mut()
+        .expect("LFM3 readout");
+    for (layer, scope) in declaration.blocks.iter().enumerate() {
+        for (present, boundary) in [(matches!(scope.mixer, M::Convolution(_)), "mixer")] {
             if present {
                 let output_suffix = if boundary == "feed_forward" {
                     "contribution"

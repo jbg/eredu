@@ -1510,6 +1510,9 @@ pub struct Attention<B: NeuralBackend> {
     /// Activation applied to either separately projected or fused-query gates.
     #[parameter(skip)]
     pub output_gate_activation: OutputGateActivation,
+    /// Broadcast one output-gate scalar over each query head.
+    #[parameter(skip)]
+    pub output_gate_per_head: bool,
     /// Normalize complete Q/K projections using per-head scale vectors.
     #[parameter(skip)]
     pub query_key_norm_per_head_weights: bool,
@@ -1643,6 +1646,27 @@ impl OutputGateActivation {
 }
 
 impl<B: NeuralBackend> Attention<B> {
+    fn gate_attended(
+        &self,
+        attended: B::Tensor,
+        gate: Option<B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        let Some(gate) = gate else {
+            return Ok(attended);
+        };
+        let gate = self.output_gate_activation.apply::<B>(gate, context)?;
+        if self.output_gate_per_head {
+            let shape = attended.shape();
+            attended
+                .reshape(&[shape[0], shape[1], self.query_heads, -1], context)?
+                .multiply(&gate.expand_dims(-1, context)?, context)?
+                .reshape(&shape, context)
+        } else {
+            attended.multiply(&gate, context)
+        }
+    }
+
     /// Assembles grouped-query attention from architecture-named operators.
     #[allow(clippy::too_many_arguments)]
     pub fn from_parts(
@@ -1735,6 +1759,7 @@ impl<B: NeuralBackend> Attention<B> {
             query_position_scaling: None,
             output_gate: None,
             output_gate_activation: OutputGateActivation::Sigmoid,
+            output_gate_per_head: false,
             query_key_norm_per_head_weights: false,
             rotary_pair_dimensions: 0,
             query_heads,
@@ -1830,6 +1855,7 @@ impl<B: NeuralBackend> Attention<B> {
                 .gate
                 .as_ref()
                 .map_or(OutputGateActivation::Sigmoid, |(_, activation)| *activation),
+            output_gate_per_head: false,
             query_key_norm_per_head_weights: config.query_key_norm_per_head_weights(),
             rotary_pair_dimensions: config.rotary_pair_dimensions(),
             query_heads,
@@ -2082,13 +2108,7 @@ impl<B: NeuralBackend> Attention<B> {
             let attended = attended
                 .transpose_axes(&[0, 2, 1, 3], context)?
                 .reshape(&[batch, sequence, -1], context)?;
-            return match output_gate {
-                Some(gate) => attended.multiply(
-                    &self.output_gate_activation.apply::<B>(gate, context)?,
-                    context,
-                ),
-                None => Ok(attended),
-            };
+            return self.gate_attended(attended, output_gate, context);
         }
         if let Some(window) = self.sliding_window.filter(|_| {
             allow_sliding_prefill
@@ -2110,13 +2130,7 @@ impl<B: NeuralBackend> Attention<B> {
                 offset,
                 context,
             )?;
-            return match output_gate {
-                Some(gate) => attended.multiply(
-                    &self.output_gate_activation.apply::<B>(gate, context)?,
-                    context,
-                ),
-                None => Ok(attended),
-            };
+            return self.gate_attended(attended, output_gate, context);
         }
         let request = AttentionRequest {
             arithmetic: self.arithmetic,
@@ -2136,13 +2150,7 @@ impl<B: NeuralBackend> Attention<B> {
         let attended = attended
             .transpose_axes(&[0, 2, 1, 3], context)?
             .reshape(&[batch, sequence, -1], context)?;
-        match output_gate {
-            Some(gate) => attended.multiply(
-                &self.output_gate_activation.apply::<B>(gate, context)?,
-                context,
-            ),
-            None => Ok(attended),
-        }
+        self.gate_attended(attended, output_gate, context)
     }
 
     /// Executes grouped-query attention and its output projection.

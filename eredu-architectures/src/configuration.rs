@@ -262,6 +262,8 @@ pub enum ModelKind {
     MuseSpark,
     /// Liquid AI LFM2/LFM2.5 dense or MoE architecture.
     Lfm2,
+    /// Liquid AI LFM3 tri-hybrid architecture.
+    Lfm3,
     /// Nemotron-H hybrid architecture.
     NemotronH,
     /// Nemotron-Labs-Diffusion shared text backbone and optional Pixtral context.
@@ -307,7 +309,7 @@ impl<'de> Deserialize<'de> for ModelKind {
 
 impl ModelKind {
     /// Every architecture family implemented by this crate.
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 26] = [
         Self::DeepSeekV3,
         Self::DeepSeekV4,
         Self::DiffusionGemma,
@@ -322,6 +324,7 @@ impl ModelKind {
         Self::MuseGlimmer,
         Self::MuseSpark,
         Self::Lfm2,
+        Self::Lfm3,
         Self::NemotronH,
         Self::NemotronLabsDiffusion,
         Self::Moshi,
@@ -352,6 +355,7 @@ impl ModelKind {
             Self::MuseGlimmer => "muse_glimmer",
             Self::MuseSpark => "muse_spark",
             Self::Lfm2 => "lfm2",
+            Self::Lfm3 => "lfm3",
             Self::NemotronH => "nemotron_h",
             Self::NemotronLabsDiffusion => "nemotron_labs_diffusion",
             Self::Moshi => "moshi",
@@ -380,6 +384,7 @@ impl ModelKind {
             Self::Nanbeige => &["Nanbeige"],
             Self::MuseGlimmer | Self::MuseSpark => &["meta-models"],
             Self::Lfm2 => &["LiquidAI"],
+            Self::Lfm3 => &["LiquidAI"],
             Self::NemotronH | Self::NemotronLabsDiffusion | Self::VoiceChat => &["nvidia"],
             Self::Moshi => &["kyutai", "nvidia"],
             Self::Qwen2
@@ -432,6 +437,7 @@ impl ModelKind {
             "muse_glimmer" | "muse_glimmer_text" => Ok(Self::MuseGlimmer),
             "muse_spark" | "muse_spark_text" => Ok(Self::MuseSpark),
             "lfm2" | "lfm2_moe" => Ok(Self::Lfm2),
+            "lfm3" => Ok(Self::Lfm3),
             "nemotron_h" => Ok(Self::NemotronH),
             "nemotron_labs_diffusion" | "nemotron_labs_diffusion_vlm" => {
                 Ok(Self::NemotronLabsDiffusion)
@@ -488,6 +494,8 @@ pub enum GgufArchitecture {
     MuseSpark,
     /// `lfm2`.
     Lfm2,
+    /// Liquid AI LFM3 tri-hybrid architecture.
+    Lfm3,
     /// `lfm2moe`.
     Lfm2Moe,
     /// `nemotron_h`.
@@ -537,6 +545,7 @@ impl GgufArchitecture {
             "muse-glimmer" => Ok(Self::MuseGlimmer),
             "muse-spark" => Ok(Self::MuseSpark),
             "lfm2" => Ok(Self::Lfm2),
+            "lfm3" => Ok(Self::Lfm3),
             "lfm2moe" => Ok(Self::Lfm2Moe),
             "nemotron_h" => Ok(Self::NemotronH),
             "nemotron_h_moe" => Ok(Self::NemotronHMoe),
@@ -572,6 +581,7 @@ impl GgufArchitecture {
             Self::MuseGlimmer => ModelKind::MuseGlimmer,
             Self::MuseSpark => ModelKind::MuseSpark,
             Self::Lfm2 | Self::Lfm2Moe => ModelKind::Lfm2,
+            Self::Lfm3 => ModelKind::Lfm3,
             Self::NemotronH | Self::NemotronHMoe => ModelKind::NemotronH,
             Self::VoiceChat => ModelKind::VoiceChat,
             Self::Qwen2 => ModelKind::Qwen2,
@@ -604,6 +614,7 @@ impl GgufArchitecture {
             Self::MuseGlimmer => "muse-glimmer",
             Self::MuseSpark => "muse-spark",
             Self::Lfm2 => "lfm2",
+            Self::Lfm3 => "lfm3",
             Self::Lfm2Moe => "lfm2moe",
             Self::NemotronH => "nemotron_h",
             Self::NemotronHMoe => "nemotron_h_moe",
@@ -635,6 +646,7 @@ fn resolve_gguf_configuration(
             GgufModelConfig::NemotronLabsDiffusion(admitted.clone()),
             admitted.checkpoint().clone(),
             admitted.mapping().to_vec(),
+            None,
             None,
             None,
             None,
@@ -849,6 +861,8 @@ pub enum SafetensorsModelConfig {
     Muse(crate::muse::DecoderConfig),
     /// LFM2 family geometry.
     Lfm2(crate::lfm2::ModelArgs),
+    /// LFM3 text/base decoder configuration.
+    Lfm3(crate::lfm3::ModelArgs),
     /// Nemotron-H family geometry.
     NemotronH(crate::nemotron_h::ModelArgs),
     /// Moshi-family realtime geometry.
@@ -879,6 +893,7 @@ pub struct SafetensorsArchitecturePlan {
     moshi_parameters: Option<crate::moshi::MoshiParameterContract>,
     qwen4_exp_target: Option<std::sync::Arc<crate::qwen4_exp::prepared::SafetensorsTargetPlan>>,
     pub(crate) lfm2: Option<std::sync::Arc<crate::lfm2::Declaration>>,
+    pub(crate) lfm3: Option<std::sync::Arc<crate::lfm3::Declaration>>,
     pub(crate) kimi: Option<std::sync::Arc<crate::kimi_linear::Declaration>>,
     pub(crate) nemotron: Option<std::sync::Arc<crate::nemotron_h::Declaration>>,
     pub(crate) dense: Option<std::sync::Arc<crate::decoder::DecoderDeclaration>>,
@@ -911,6 +926,8 @@ pub enum GgufModelConfig {
     KimiLinear(crate::kimi_linear::ModelArgs),
     /// LFM2 family geometry.
     Lfm2(crate::lfm2::ModelArgs),
+    /// LFM3 text/base decoder configuration.
+    Lfm3(crate::lfm3::ModelArgs),
     /// Llama-compatible family geometry.
     Llama(crate::llama::ModelArgs),
     /// Gemma 2 geometry and equations.
@@ -951,6 +968,7 @@ impl SafetensorsModelConfig {
             | Self::VoiceChat(_) => false,
             Self::Muse(args) => args.num_experts > 0,
             Self::Lfm2(args) => args.num_experts > 0,
+            Self::Lfm3(_) => false,
             Self::NemotronH(args) => args.n_routed_experts > 0,
             Self::Qwen(args) => args.num_experts > 0,
             Self::QwenHybrid(args) => args.text.num_experts > 0,
@@ -974,6 +992,7 @@ impl GgufModelConfig {
             Self::K2Horizon(args) => args.is_moe(),
             Self::KimiLinear(args) => args.num_experts > 0,
             Self::Lfm2(args) => args.num_experts > 0,
+            Self::Lfm3(_) => false,
             Self::Gemma2(_) | Self::Llama(_) | Self::Nanbeige(_) | Self::VoiceChat(_) => false,
             Self::Muse(args) => args.num_experts > 0,
             Self::NemotronH(args) => args.n_routed_experts > 0,
@@ -992,6 +1011,7 @@ pub struct GgufArchitecturePlan {
     checkpoint: GgufCheckpointPlan,
     tensor_mapping: Vec<eredu_gguf::TranslatedTensorLayout>,
     pub(crate) lfm2: Option<std::sync::Arc<crate::lfm2::Declaration>>,
+    pub(crate) lfm3: Option<std::sync::Arc<crate::lfm3::Declaration>>,
     pub(crate) kimi: Option<std::sync::Arc<crate::kimi_linear::Declaration>>,
     pub(crate) nemotron: Option<std::sync::Arc<crate::nemotron_h::Declaration>>,
     pub(crate) dense: Option<std::sync::Arc<crate::decoder::DecoderDeclaration>>,
@@ -1039,6 +1059,7 @@ impl GgufArchitecturePlan {
         checkpoint: GgufCheckpointPlan,
         tensor_mapping: Vec<eredu_gguf::TranslatedTensorLayout>,
         lfm2: Option<std::sync::Arc<crate::lfm2::Declaration>>,
+        lfm3: Option<std::sync::Arc<crate::lfm3::Declaration>>,
         kimi: Option<std::sync::Arc<crate::kimi_linear::Declaration>>,
         nemotron: Option<std::sync::Arc<crate::nemotron_h::Declaration>>,
         dense: Option<std::sync::Arc<crate::decoder::DecoderDeclaration>>,
@@ -1052,6 +1073,7 @@ impl GgufArchitecturePlan {
             checkpoint,
             tensor_mapping,
             lfm2,
+            lfm3,
             kimi,
             nemotron,
             dense,
@@ -1319,6 +1341,7 @@ impl SafetensorsArchitecturePlan {
                     moshi_parameters: None,
                     qwen4_exp_target: None,
                     lfm2: None,
+                    lfm3: None,
                     kimi: None,
                     nemotron: nemotron.clone(),
                     dense: None,
@@ -1348,6 +1371,7 @@ impl SafetensorsArchitecturePlan {
                 moshi_parameters: None,
                 qwen4_exp_target: None,
                 lfm2: None,
+                lfm3: None,
                 kimi: None,
                 nemotron,
                 dense: None,
@@ -1847,6 +1871,9 @@ fn resolve_safetensors_architecture(
         ModelKind::Lfm2 => crate::lfm2::model_args_from_config_value(json)
             .map(SafetensorsModelConfig::Lfm2)
             .map_err(|error| invalid_configuration(kind, error)),
+        ModelKind::Lfm3 => crate::lfm3::model_args_from_config_value(json)
+            .map(SafetensorsModelConfig::Lfm3)
+            .map_err(|error| invalid_configuration(kind, error)),
         ModelKind::NemotronH => crate::nemotron_h::model_args_from_config_value(json)
             .map(SafetensorsModelConfig::NemotronH)
             .map_err(|error| invalid_configuration(kind, error)),
@@ -1890,6 +1917,13 @@ fn resolve_safetensors_architecture(
             crate::moshi::parameter_contract(config)
                 .map_err(|error| invalid_configuration(kind, error))?,
         ),
+        _ => None,
+    };
+    let lfm3 = match &model {
+        SafetensorsModelConfig::Lfm3(args) => Some(std::sync::Arc::new(
+            crate::lfm3::Declaration::new(args.clone())
+                .map_err(|e| invalid_configuration(kind, e))?,
+        )),
         _ => None,
     };
     let lfm2 = match &model {
@@ -2018,6 +2052,10 @@ fn resolve_safetensors_architecture(
             crate::lfm2::safetensors_plan(lfm2.as_deref().expect("declared LFM2 family"), true)
                 .map_err(|error| invalid_configuration(kind, error))?
         }
+        SafetensorsModelConfig::Lfm3(_) => {
+            crate::lfm3::safetensors_plan(lfm3.as_deref().expect("declared LFM3 family"), true)
+                .map_err(|error| invalid_configuration(kind, error))?
+        }
         SafetensorsModelConfig::NemotronH(_) => nemotron
             .as_ref()
             .expect("declared Nemotron family")
@@ -2062,6 +2100,7 @@ fn resolve_safetensors_architecture(
         moshi_recipes: None,
         moshi_parameters,
         lfm2,
+        lfm3,
         kimi,
         nemotron,
         dense,

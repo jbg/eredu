@@ -44,6 +44,33 @@ fn fixture(sliding: bool) -> tempfile::TempDir {
     write_fixture(config, shapes)
 }
 
+fn lfm3_fixture() -> tempfile::TempDir {
+    use eredu_nn::DeclareLogicalParameters;
+    let config = serde_json::json!({
+        "model_type": "lfm3", "architectures": ["Lfm3ForCausalLM"],
+        "hidden_size": 32, "intermediate_size": 64, "num_hidden_layers": 3,
+        "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 8,
+        "vocab_size": 64, "max_position_embeddings": 128,
+        "norm_eps": 0.00001, "tie_word_embeddings": true,
+        "conv_L_cache": 7, "conv_bias": false, "use_sandwich_norm": true,
+        "sliding_window": 4,
+        "layer_types": ["conv", "sliding_attention", "full_attention"],
+        "rope_parameters": {
+            "full_attention": {"rope_type": "default", "rope_theta": 1000000.0, "partial_rotary_factor": 0.5},
+            "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0}
+        }
+    });
+    let args = eredu_architectures::lfm3::model_args_from_config_value(&config).unwrap();
+    let declaration = eredu_architectures::lfm3::Declaration::new(args).unwrap();
+    let shapes = declaration
+        .logical_parameters()
+        .unwrap()
+        .into_iter()
+        .map(|parameter| (parameter.parameter.id.to_string(), parameter.shape))
+        .collect();
+    write_fixture(config, shapes)
+}
+
 fn write_fixture(
     config: serde_json::Value,
     shapes: Vec<(String, Vec<usize>)>,
@@ -316,7 +343,11 @@ fn run_cases(device: DeviceType, families: Vec<(&str, tempfile::TempDir)>) {
 fn run(device: DeviceType) {
     run_cases(
         device,
-        vec![("llama", fixture(false)), ("mistral", fixture(true))],
+        vec![
+            ("llama", fixture(false)),
+            ("mistral", fixture(true)),
+            ("lfm3", lfm3_fixture()),
+        ],
     );
 }
 

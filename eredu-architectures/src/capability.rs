@@ -16,7 +16,7 @@ use eredu_core::{
 use eredu_runtime::StateLayout as RuntimeStateLayout;
 
 use crate::{
-    gemma4, gpt_oss, kimi_linear, lfm2,
+    gemma4, gpt_oss, kimi_linear, lfm2, lfm3,
     llama::ModelArgs as LlamaModelArgs,
     nemotron_h,
     qwen::{
@@ -682,6 +682,61 @@ fn lfm2_spec(declaration: &lfm2::Declaration) -> Result<Spec, CapabilityError> {
         )?,
     ))
 }
+fn lfm3_spec(declaration: &lfm3::Declaration) -> Result<Spec, CapabilityError> {
+    let args = declaration.args();
+    let context = plain_context(args.max_position_embeddings)?;
+    let attention = declaration
+        .blocks
+        .iter()
+        .filter(|policy| {
+            matches!(
+                policy.mixer,
+                lfm3::declarations::MixerParameters::Attention(
+                    _,
+                    eredu_core::AttentionPolicy::Full
+                )
+            )
+        })
+        .count() as u64;
+    let conv = declaration
+        .blocks
+        .iter()
+        .filter(|policy| {
+            matches!(
+                policy.mixer,
+                lfm3::declarations::MixerParameters::Convolution(_)
+            )
+        })
+        .count() as u64;
+    let mut windows = BTreeMap::<u64, u64>::new();
+    for policy in args.layer_schedule.iter() {
+        if let lfm3::OperatorPolicy::SelfAttention(eredu_core::AttentionPolicy::Sliding {
+            window,
+        }) = policy.operator
+        {
+            *windows.entry(u64::from(window.get())).or_default() += 1;
+        }
+    }
+    Ok((
+        context.0,
+        context.1,
+        CacheStateStrategy::HybridRecurrent {
+            full_attention_layers: attention,
+            sliding_attention: windows
+                .into_iter()
+                .map(|(window, layers)| SlidingWindowLayerCount { window, layers })
+                .collect(),
+            recurrent_layers: conv,
+        },
+        text_modalities(),
+        state_memory_layout_from_layout(
+            declaration.definition().state_layout().clone(),
+            declaration.statics.embedding_spec().dimensions,
+            256,
+            EstimationCompleteness::Complete,
+        )?,
+    ))
+}
 
 fn nemotron_spec(declaration: &nemotron_h::Declaration) -> Result<Spec, CapabilityError> {
     let context = plain_context(declaration.args().max_position_embeddings)?;
@@ -1319,6 +1374,13 @@ pub fn lfm2(declaration: &crate::lfm2::Declaration) -> Result<CapabilityEstimate
     Ok(finish(
         declaration.args().model_type.clone(),
         lfm2_spec(declaration)?,
+    ))
+}
+/// Derives LFM3 capabilities from retained layer and mixed-state declarations.
+pub fn lfm3(declaration: &crate::lfm3::Declaration) -> Result<CapabilityEstimate, CapabilityError> {
+    Ok(finish(
+        declaration.args().model_type.clone(),
+        lfm3_spec(declaration)?,
     ))
 }
 

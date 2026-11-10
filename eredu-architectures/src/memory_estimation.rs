@@ -225,6 +225,15 @@ pub fn generation_memory_geometry(
                 })?
                 .as_ref(),
         )?,
+        (Some(SafetensorsModelConfig::Lfm3(args)), None)
+        | (None, Some(GgufModelConfig::Lfm3(args))) => crate::capability::lfm3(
+            plan.lfm3_declaration(args)
+                .map_err(|detail| CapabilityError::InvalidConfiguration {
+                    field: "lfm3_declaration",
+                    detail,
+                })?
+                .as_ref(),
+        )?,
         (Some(SafetensorsModelConfig::NemotronH(args)), None)
         | (None, Some(GgufModelConfig::NemotronH(args))) => crate::capability::nemotron_h(
             plan.nemotron_declaration(args)

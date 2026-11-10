@@ -1567,6 +1567,12 @@ impl NormalizationConstructionSpec {
 pub enum RotaryAlgorithm {
     /// Unscaled rotary embeddings.
     Default,
+    /// Keep full-head frequency spacing and set the remaining inverse
+    /// frequencies to zero. Split-half pairing still spans the complete head.
+    ZeroTail {
+        /// Fraction of frequency pairs with nonzero inverse frequency.
+        rotary_fraction: f32,
+    },
     /// Uniform position interpolation by an extension factor.
     Linear {
         /// Context extension factor.
@@ -1614,6 +1620,9 @@ impl RotaryAlgorithm {
         let positive = |value: f32| value.is_finite() && value > 0.0;
         let valid = match self {
             Self::Default => true,
+            Self::ZeroTail { rotary_fraction } => {
+                positive(rotary_fraction) && rotary_fraction <= 1.0
+            }
             Self::Linear { factor } => positive(factor),
             Self::Llama3 {
                 factor,
@@ -1662,6 +1671,9 @@ impl RotaryAlgorithm {
 pub enum RotaryArithmetic {
     /// Backend-native fused rotary application.
     Native,
+    /// Keep trigonometric tables, products and sums in FP32 and cast only
+    /// the completed rotated value to the input dtype.
+    Float32Products,
     /// Compute trigonometric values and amplitude in FP32, cast to the input
     /// dtype, and round each product before adding the rotated components.
     InputProducts,
