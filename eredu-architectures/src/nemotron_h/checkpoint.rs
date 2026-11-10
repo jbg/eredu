@@ -183,9 +183,10 @@ pub fn unit_recipes(
         .block(identity)
         .ok_or("unresolved Nemotron invocation scope")?;
     let normalized = normalized_checkpoint_keys(store, args)?;
+    let unit_prefix = format!("{root}.");
     let mut recipes = normalized
         .iter()
-        .filter(|(runtime, raw)| runtime.starts_with(&root) && *runtime != *raw)
+        .filter(|(runtime, raw)| runtime.starts_with(&unit_prefix) && *runtime != *raw)
         .map(|(runtime, raw)| {
             (
                 runtime.clone(),
