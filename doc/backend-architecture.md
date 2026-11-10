@@ -16505,8 +16505,17 @@ The shared language traversal replaces the placeholder spans at the execution
 group's embedding boundary, preserving the causal cache positions. The readout
 returns normalized language states for depth scoring or the existing tied text
 head. The same traversal hook can be used with resident or caller-configured
-layerwise language execution. Public speech task selection and controlled
-session orchestration are separate integration work.
+layerwise language execution.
+
+The resident Audio driver composes the admitted language, speech input, depth,
+feedback and codec modules. The architecture owns checkpoint sampling
+defaults, interleaved cadence, end markers and the three-pass refinement
+schedule. It delegates categorical operations to the shared sampler and uses
+`RealtimeGenerationState` to publish model state, the schedule, sampler histories
+and random state after exact completion. Codec continuation branches its
+caller-owned neural state and shares immutable overlap roots. MLX supplies
+resident parameter bindings, device state, sampling primitives and completion.
+The architecture selects F32 widening recipes before native binding.
 
 `eredu-codec::liquid` owns LiquidCodec configuration, complete neural encoder and
 decoder equations, reflective analysis, scalar-product alphabet ordering and

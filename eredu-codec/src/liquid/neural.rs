@@ -670,6 +670,17 @@ pub struct DecoderState<S, T: Tensor> {
     batch: i32,
 }
 impl<S, T: Tensor> DecoderState<S, T> {
+    /// Branches the caller-owned neural continuation and shares immutable overlap roots.
+    /// The supplied operation must isolate every mutable neural cache component.
+    pub fn try_branch<E>(&self, branch: impl FnOnce(&S) -> Result<S, E>) -> Result<Self, E> {
+        Ok(Self {
+            neural: branch(&self.neural)?,
+            overlap: self.overlap.clone(),
+            config: self.config.clone(),
+            batch: self.batch,
+        })
+    }
+
     /// Current spectral finite-stream lifecycle.
     pub fn phase(&self) -> StreamPhase {
         self.overlap.phase()

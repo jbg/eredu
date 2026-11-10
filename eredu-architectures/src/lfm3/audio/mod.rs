@@ -5,11 +5,23 @@ mod depth;
 pub use artifact::{ArtifactError, AudioTokens, BindingSource, PreparedAudio, TextAssets};
 mod encoder;
 mod prompt;
+mod realtime;
+mod resident;
+mod schedule;
 pub use depth::{
     CompletedSpeechFrame, DepthDeclaration, DepthDecoder, DepthFrame, DepthUnit, Feedback,
 };
 pub use encoder::{Declaration, Downsampler, Encoder, EncoderState, Projector, Unit};
 pub use prompt::AudioPrompt;
+pub use realtime::{
+    AudioAdvance, AudioExecutionKernel, AudioSampling, AudioSession, AudioSessionError,
+};
+pub use resident::{
+    AudioRequest, ResidentAudio, ResidentAudioBinding, ResidentAudioError, ResidentAudioState,
+};
+pub use schedule::{
+    AudioMode, AudioPhase, AudioSchedule, AudioScheduleError, AudioSchedulePolicy, DepthProgress,
+};
 
 use eredu_nn::Error;
 use serde_json::{json, Value};

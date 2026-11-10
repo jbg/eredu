@@ -86,6 +86,6 @@ prepared codec selection, GGUF admission, host-layerwise/disk-streamed adapters,
 TP/PP construction, selected memory reports and controlled-session/capture
 integration are not implemented. The independent units and caller-owned state
 are building blocks for these paths; they do not establish support for them.
-LFM3 Audio has standalone speech input, depth scoring and feedback components.
-Public audio and omni orchestration still need to connect them to the codec.
-Standalone codec acceptance does not establish audio language-model acceptance.
+The resident LFM3 Audio session connects depth scoring and feedback to codec
+continuation through the shared realtime transaction. Its conditional reference
+coverage is recorded separately in [LFM3 Audio validation](lfm3-validation.md#mixed-speech-input-and-feedback).
