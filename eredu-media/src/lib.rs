@@ -6,6 +6,7 @@
 pub mod audio;
 mod error;
 pub mod image;
+pub mod patches;
 pub mod video;
 
 pub use error::MediaError;

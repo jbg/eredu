@@ -1,0 +1,310 @@
+{
+  "repository": "LiquidAI/LFM3-VL-2B",
+  "revision": "23387beda43c60310348e83e25f78f33c3140d3a",
+  "source_sha256": "a9bb8b1c159c9d6c3007bc1c7ad8018b599f759d97da2701714e37426283e131",
+  "derived_sha256": "c3b082e92461caa62c4a65cbdbf8ba27362ff8d58b2c966ee098f3723528bdfe",
+  "torch": "2.15.0",
+  "transformers": "5.22.2",
+  "attention": "eager",
+  "dtype": "float32",
+  "resizing": false,
+  "cases": [
+    {
+      "id": "image",
+      "grid": [
+        [
+          1,
+          4,
+          6
+        ]
+      ],
+      "frames": [
+        [
+          1,
+          64,
+          96
+        ]
+      ]
+    },
+    {
+      "id": "video_odd",
+      "grid": [
+        [
+          2,
+          4,
+          6
+        ]
+      ],
+      "frames": [
+        [
+          3,
+          64,
+          96
+        ]
+      ]
+    },
+    {
+      "id": "mixed_images",
+      "grid": [
+        [
+          1,
+          4,
+          4
+        ],
+        [
+          1,
+          6,
+          4
+        ]
+      ],
+      "frames": [
+        [
+          1,
+          64,
+          64
+        ],
+        [
+          1,
+          96,
+          64
+        ]
+      ]
+    }
+  ],
+  "maximum_absolute_tolerance": 0.0005,
+  "schema_version": 1,
+  "scope": "Released encoder/projector components and merge-major host patch packing; no end-to-end conditional-generation support claim.",
+  "backend": "mlx",
+  "native": [
+    {
+      "device": "cpu",
+      "dtype": "float32",
+      "revision": "23387beda43c60310348e83e25f78f33c3140d3a",
+      "derived_sha256": "c3b082e92461caa62c4a65cbdbf8ba27362ff8d58b2c966ee098f3723528bdfe",
+      "maximum_absolute_tolerance": 0.0005,
+      "cases": [
+        {
+          "id": "image",
+          "packing": {
+            "shape": [
+              24,
+              1536
+            ],
+            "maximum_absolute_error": 0.0,
+            "relative_l2": 0.0,
+            "finite": true,
+            "passed": true
+          },
+          "encoder": {
+            "shape": [
+              24,
+              1024
+            ],
+            "maximum_absolute_error": 6.771087646484375e-05,
+            "relative_l2": 2.2443119090459966e-06,
+            "finite": true,
+            "passed": true
+          },
+          "projector": {
+            "shape": [
+              6,
+              2048
+            ],
+            "maximum_absolute_error": 5.513429641723633e-07,
+            "relative_l2": 3.040210971850769e-06,
+            "finite": true,
+            "passed": true
+          }
+        },
+        {
+          "id": "video_odd",
+          "packing": {
+            "shape": [
+              48,
+              1536
+            ],
+            "maximum_absolute_error": 0.0,
+            "relative_l2": 0.0,
+            "finite": true,
+            "passed": true
+          },
+          "encoder": {
+            "shape": [
+              48,
+              1024
+            ],
+            "maximum_absolute_error": 6.771087646484375e-05,
+            "relative_l2": 2.244311909045982e-06,
+            "finite": true,
+            "passed": true
+          },
+          "projector": {
+            "shape": [
+              12,
+              2048
+            ],
+            "maximum_absolute_error": 5.513429641723633e-07,
+            "relative_l2": 3.040210971850754e-06,
+            "finite": true,
+            "passed": true
+          }
+        },
+        {
+          "id": "mixed_images",
+          "packing": {
+            "shape": [
+              40,
+              1536
+            ],
+            "maximum_absolute_error": 0.0,
+            "relative_l2": 0.0,
+            "finite": true,
+            "passed": true
+          },
+          "encoder": {
+            "shape": [
+              40,
+              1024
+            ],
+            "maximum_absolute_error": 8.7738037109375e-05,
+            "relative_l2": 2.2726619866851834e-06,
+            "finite": true,
+            "passed": true
+          },
+          "projector": {
+            "shape": [
+              10,
+              2048
+            ],
+            "maximum_absolute_error": 6.705522537231445e-07,
+            "relative_l2": 3.2023948264080222e-06,
+            "finite": true,
+            "passed": true
+          }
+        }
+      ],
+      "passed": true
+    },
+    {
+      "device": "gpu",
+      "dtype": "float32",
+      "revision": "23387beda43c60310348e83e25f78f33c3140d3a",
+      "derived_sha256": "c3b082e92461caa62c4a65cbdbf8ba27362ff8d58b2c966ee098f3723528bdfe",
+      "maximum_absolute_tolerance": 0.0005,
+      "cases": [
+        {
+          "id": "image",
+          "packing": {
+            "shape": [
+              24,
+              1536
+            ],
+            "maximum_absolute_error": 0.0,
+            "relative_l2": 0.0,
+            "finite": true,
+            "passed": true
+          },
+          "encoder": {
+            "shape": [
+              24,
+              1024
+            ],
+            "maximum_absolute_error": 0.00013017654418945312,
+            "relative_l2": 3.5549434573866617e-06,
+            "finite": true,
+            "passed": true
+          },
+          "projector": {
+            "shape": [
+              6,
+              2048
+            ],
+            "maximum_absolute_error": 7.115304470062256e-07,
+            "relative_l2": 3.6804268751307164e-06,
+            "finite": true,
+            "passed": true
+          }
+        },
+        {
+          "id": "video_odd",
+          "packing": {
+            "shape": [
+              48,
+              1536
+            ],
+            "maximum_absolute_error": 0.0,
+            "relative_l2": 0.0,
+            "finite": true,
+            "passed": true
+          },
+          "encoder": {
+            "shape": [
+              48,
+              1024
+            ],
+            "maximum_absolute_error": 0.0001239776611328125,
+            "relative_l2": 3.87839663488065e-06,
+            "finite": true,
+            "passed": true
+          },
+          "projector": {
+            "shape": [
+              12,
+              2048
+            ],
+            "maximum_absolute_error": 1.259148120880127e-06,
+            "relative_l2": 4.562560500414899e-06,
+            "finite": true,
+            "passed": true
+          }
+        },
+        {
+          "id": "mixed_images",
+          "packing": {
+            "shape": [
+              40,
+              1536
+            ],
+            "maximum_absolute_error": 0.0,
+            "relative_l2": 0.0,
+            "finite": true,
+            "passed": true
+          },
+          "encoder": {
+            "shape": [
+              40,
+              1024
+            ],
+            "maximum_absolute_error": 7.43865966796875e-05,
+            "relative_l2": 2.2515657231472038e-06,
+            "finite": true,
+            "passed": true
+          },
+          "projector": {
+            "shape": [
+              10,
+              2048
+            ],
+            "maximum_absolute_error": 9.834766387939453e-07,
+            "relative_l2": 4.415832069544458e-06,
+            "finite": true,
+            "passed": true
+          }
+        }
+      ],
+      "passed": true,
+      "environment": {
+        "MLX_ENABLE_TF32": "0"
+      }
+    }
+  ],
+  "precision_note": "Exact F32 widening of released BF16 component weights; native BF16 is a separate measurement.",
+  "package_versions": {
+    "torch": "2.15.0",
+    "transformers": "5.22.2",
+    "torchvision": "0.29.2",
+    "pillow": "13.0.0",
+    "safetensors": "0.8.0",
+    "huggingface_hub": "2.4.0"
+  }
+}

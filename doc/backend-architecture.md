@@ -16427,6 +16427,18 @@ discovery retains the gate's head-row mapping and post-write normalization separ
 These contracts support the LFM3 text route; they do not declare vision, speech, codec,
 omni or decision execution. Numerical coverage is in [LFM3 validation](lfm3-validation.md).
 
+`lfm3::vision` declares independent patchifier, encoder-block and projector units.
+Its portable components own gated spatial-convolution equations, frame-local
+bidirectional GQA, axial positions, pre-normalization residual blocks and spatial
+merging. The declarations retain exact SafeTensors identities and geometry. The
+neural mechanisms remain ordinary linear, RMSNorm, LayerNorm, convolution,
+attention and multi-axis rotary contracts; MLX contains no LFM3 vision equation.
+`eredu-media::patches` packs normalized host frames in merge-major order, repeats
+a still image across temporal slots, and pads an incomplete final temporal group
+with the last actual frame. It performs no family selection or device allocation.
+These independently constructible components do not register conditional-generation
+support, selected residency/distribution capabilities or controlled media sessions.
+
 LFM2's `Declaration` pairs existing typed static, attention/convolution, normalization,
 dense and routed feed-forward scopes with component ownership and state. Its parameter
 projection borrows those scopes. Format projection clones parameter identities and
