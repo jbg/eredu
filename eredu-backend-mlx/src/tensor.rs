@@ -773,6 +773,27 @@ impl Tensor for MlxTensor {
         ))
     }
 
+    fn host_rfft(
+        &self,
+        length: i32,
+        axis: i32,
+        context: &Self::Context,
+    ) -> Result<(Self, Self), Error> {
+        if backend(backend(context.get_device())?.get_type())? == safemlx::DeviceType::Cpu {
+            return self.rfft(length, axis, context);
+        }
+        let host = backend(Stream::try_new_with_device(&safemlx::Device::new(
+            safemlx::DeviceType::Cpu,
+            0,
+        )))?;
+        let input = tensor(self.0.copy(&host))?;
+        let (real, imaginary) = input.rfft(length, axis, &host)?;
+        Ok((
+            tensor(real.0.copy(context))?,
+            tensor(imaginary.0.copy(context))?,
+        ))
+    }
+
     fn irfft(
         real: &Self,
         imaginary: &Self,

@@ -275,6 +275,15 @@ conformance case covers bounded residency and controlled/uninterrupted agreement
 [released-checkpoint evidence](lfm3-validation.md) records numerical coverage and
 the family tasks without an implementation.
 
+LiquidCodec's standalone `Tokenizer` implements finite audio-tokenizer calls and
+explicit decode-stream advancement over shared neural/spectral equations. Its
+caller-owned decoder state retains KV/convolution state and overlap-add roots.
+It does not implement public controlled preparation, cancellation, transactional
+commitment, capture or snapshot orchestration. Those are integration gaps, not
+codec architecture limitations; standalone stream advancement does not advertise
+controlled realtime support. Native completion and rollback remain the execution
+owner's responsibility.
+
 Composite adapters with retained prefill requests support prepared media and absolute
 capture spans through the shared cursor described under [Flash-Next](#flash-next).
 Adapters without that cursor retain a complete pass for structured input. Nonempty

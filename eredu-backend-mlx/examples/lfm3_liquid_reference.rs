@@ -1,4 +1,4 @@
-//! Released LiquidCodec spectral/FSQ component acceptance; not full codec support.
+//! Pinned LiquidCodec component and complete neural execution comparisons.
 use clap::Parser;
 use eredu_backend_mlx::{
     backend::{
@@ -16,8 +16,11 @@ use eredu_checkpoint::{
     validation::resolve_safetensors_plan,
 };
 use eredu_codec::{
-    liquid::{Analysis, Config, Quantizer, QuantizerSpec, Synthesis},
+    liquid::{
+        Analysis, Config, Declaration, NeuralCodec, Quantizer, QuantizerSpec, Synthesis, Tokenizer,
+    },
     spectral::OverlapAddStream,
+    AudioTokenizer,
 };
 use eredu_nn::{Index, Tensor};
 use safemlx::{Array, Device, DeviceType};
@@ -30,10 +33,19 @@ use std::{
     path::{Path, PathBuf},
 };
 type Backend = MlxNeuralBackend;
+use eredu_backend_mlx::backend::runtime::cache::state::MlxHybridState;
+struct StateFactory;
+impl eredu_runtime::ArchitectureStateFactory<Backend> for StateFactory {
+    type State = MlxHybridState;
+    type Error = safemlx::error::Exception;
+    fn realize(&mut self, layout: &eredu_runtime::StateLayout) -> Result<Self::State, Self::Error> {
+        MlxHybridState::device(layout.clone(), &[])
+    }
+}
 
 #[derive(Parser)]
 struct Args {
-    /// F32 learned scalar-projection checkpoint produced by the reference runner.
+    /// F32 checkpoint produced by the reference runner (complete for --neural).
     checkpoint: PathBuf,
     /// Directory containing reference.json and reference.safetensors.
     reference: PathBuf,
@@ -41,6 +53,9 @@ struct Args {
     output: PathBuf,
     #[arg(long,default_value="cpu",value_parser=["cpu","gpu"])]
     device: String,
+    /// Compare complete native neural encode/decode and cached streaming.
+    #[arg(long)]
+    neural: bool,
 }
 
 fn sha256(path: &Path) -> Result<String, Box<dyn Error>> {
@@ -82,14 +97,25 @@ fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
     let config = Config::from_json(&std::fs::read(args.checkpoint.join("config.json"))?)?;
     let spec = QuantizerSpec::new(&config, "quantizer")?;
+    let declaration = Declaration::new(config.clone())?;
     let metadata: Value =
         serde_json::from_slice(&std::fs::read(args.reference.join("reference.json"))?)?;
-    if metadata["derived_sha256"] != sha256(&args.checkpoint.join("model.safetensors"))? {
-        return Err("native scalar projection weights differ from the reference artifact".into());
+    let digest_key = if args.neural {
+        "neural_sha256"
+    } else {
+        "derived_sha256"
+    };
+    if metadata[digest_key] != sha256(&args.checkpoint.join("model.safetensors"))? {
+        return Err("native codec weights differ from the reference artifact".into());
     }
     let catalog = SafetensorsMetadataCatalog::discover(&args.checkpoint)?;
-    let resolution = resolve_safetensors_plan(&catalog, &spec.safetensors_plan()?)
-        .map_err(|e| format!("scalar projection admission: {e:?}"))?;
+    let plan = if args.neural {
+        declaration.safetensors_plan()?
+    } else {
+        spec.safetensors_plan()?
+    };
+    let resolution =
+        resolve_safetensors_plan(&catalog, &plan).map_err(|e| format!("codec admission: {e:?}"))?;
     let source = open_prepared_safetensors_source(
         catalog.admitted_shards(),
         catalog.tensors().clone(),
@@ -116,6 +142,19 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
     let arrays = materialize_module_bindings(source.as_ref(), &bindings, io.stream(), stream)?;
     populate_module_from_arrays_excluding(&mut quantizer, &arrays, |_| false)?;
+    let mut neural = if args.neural {
+        let mut model = NeuralCodec::<Backend>::new(&declaration, stream)?;
+        let bindings = build_neutral_module_bindings_with_recipes(
+            &model,
+            source.as_ref(),
+            &mut BTreeMap::new(),
+        )?;
+        let arrays = materialize_module_bindings(source.as_ref(), &bindings, io.stream(), stream)?;
+        populate_module_from_arrays_excluding(&mut model, &arrays, |_| false)?;
+        Some(Tokenizer::new(model, StateFactory))
+    } else {
+        None
+    };
     let analysis = Analysis::<MlxTensor>::new(&config, stream)?;
     let synthesis = Synthesis::<Backend>::new(&config, stream)?;
     let atol = metadata["maximum_absolute_tolerance"]
@@ -163,8 +202,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                     stream,
                 )
             };
-            let raw = synthesis.overlap_add(&slice(&log)?, &slice(&angle)?, stream)?;
-            chunks.push(state.push(Some(raw), false, stream)?);
+            let raw = if count == 0 {
+                None
+            } else {
+                Some(synthesis.overlap_add(&slice(&log)?, &slice(&angle)?, stream)?)
+            };
+            chunks.push(state.push(raw, false, stream)?);
             start += count;
         }
         chunks.push(state.push(None, true, stream)?);
@@ -175,9 +218,59 @@ fn main() -> Result<(), Box<dyn Error>> {
             &reference[&format!("{name}.streamed_pcm")],
             atol,
         )?;
+        let complete = if let Some(model) = neural.as_mut() {
+            let mut encoder =
+                MlxHybridState::device(declaration.encoder_state_layout().clone(), &[])?;
+            let latents =
+                model
+                    .model_mut()
+                    .encode_latents(&tensor("pcm")?, &mut encoder, stream)?;
+            let encoder_scores = compare(&latents, &reference[&format!("{name}.latents")], atol)?;
+            let encoded = AudioTokenizer::encode(model, &tensor("pcm")?, stream)?;
+            let reference_codes = reference[&format!("{name}.codes")]
+                .evaluated()?
+                .try_to_vec::<i32>()?;
+            let encoded = encoded.to_i32_vec(stream)?;
+            let native = AudioTokenizer::decode(model, &tensor("codes")?, stream)?;
+            let finite = compare(&native, &reference[&format!("{name}.full_pcm")], atol)?;
+            model.start_decode_stream(1)?;
+            let codes = tensor("codes")?;
+            let mut start = 0;
+            let mut chunks = Vec::new();
+            for count in case["code_chunks"]
+                .as_array()
+                .ok_or("missing code chunk lengths")?
+            {
+                let count = count.as_i64().ok_or("invalid code chunk length")? as i32;
+                let chunk = codes.index(
+                    &[Index::Full, Index::Full, Index::Range(start, start + count)],
+                    stream,
+                )?;
+                chunks.push(model.decode_chunk(Some(&chunk), false, stream)?);
+                start += count;
+            }
+            chunks.push(model.decode_chunk(None, true, stream)?);
+            let sample_counts = chunks.iter().map(|t| t.dim(2)).collect::<Vec<_>>();
+            let streamed = compare(
+                &MlxTensor::concatenate(&chunks, 2, stream)?,
+                &reference[&format!("{name}.streamed_pcm")],
+                atol,
+            )?;
+            let matches = encoded == reference_codes;
+            let passed = encoder_scores["passed"] == true
+                && matches
+                && finite["passed"] == true
+                && streamed["passed"] == true
+                && json!(sample_counts) == case["streamed_samples"];
+            json!({"encoder_latents":encoder_scores,"code_ids_match":matches,
+                "code_ids_mismatched":encoded.iter().zip(&reference_codes).filter(|(a,b)|a!=b).count(),
+                "finite_pcm":finite,"streamed_pcm":streamed,"streamed_samples":sample_counts,"passed":passed})
+        } else {
+            Value::Null
+        };
         results.push(json!({"id":name,"features":features,"codes_match":codes_match,"decoded":decoded,
             "raw_audio":raw_audio,"raw_envelope":raw_envelope,"full_pcm":pcm,"streamed_pcm":streamed,
-            "streamed_samples":lengths,"streamed_sample_counts_match":lengths_match}));
+            "streamed_samples":lengths,"streamed_sample_counts_match":lengths_match,"neural":complete}));
     }
     let passed = results.iter().all(|r| {
         r["codes_match"] == true
@@ -193,15 +286,21 @@ fn main() -> Result<(), Box<dyn Error>> {
             .iter()
             .all(|k| r[k]["passed"] == true)
     });
+    let neural_passed = if args.neural {
+        Some(results.iter().all(|r| r["neural"]["passed"] == true))
+    } else {
+        None
+    };
     std::fs::write(
         &args.output,
         serde_json::to_vec_pretty(&json!({"device":args.device,"dtype":"float32",
         "revision":metadata["revision"],"derived_sha256":metadata["derived_sha256"],
-        "maximum_absolute_tolerance":atol,"cases":results,"passed":passed}))?,
+        "neural_sha256":metadata.get("neural_sha256"),"neural_passed":neural_passed,"neural_api":args.neural.then_some("AudioTokenizer"),
+        "maximum_absolute_tolerance":atol,"cases":results,"passed":passed&&neural_passed.unwrap_or(true)}))?,
     )?;
     println!("output={} passed={passed}", args.output.display());
-    if !passed {
-        return Err("LiquidCodec component parity failed".into());
+    if !passed || neural_passed == Some(false) {
+        return Err("LiquidCodec reference parity failed".into());
     }
     Ok(())
 }

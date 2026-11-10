@@ -16459,27 +16459,38 @@ with the last actual frame. It performs no family selection or device allocation
 These independently constructible components do not register conditional-generation
 support, selected residency/distribution capabilities or controlled media sessions.
 
-`eredu-codec::liquid` owns LiquidCodec component configuration, reflective analysis,
-scalar-product alphabet ordering, learned scalar projections and polar synthesis.
-It depends on neutral neural/storage/runtime contracts and does not import the
-language-model architecture crate. Its scalar projections have exact SafeTensors
-geometry and canonical/legacy aliases. Fixed scalar lookup tables are immutable
-constants exposed separately from learned parameters and mutable streaming carry.
+`eredu-codec::liquid` owns LiquidCodec configuration, complete neural encoder and
+decoder equations, reflective analysis, scalar-product alphabet ordering and
+polar synthesis. It consumes neutral neural/storage/runtime contracts without
+importing the language-model architecture crate. Its declaration owns strict
+SafeTensors geometry and aliases, independent parameter-unit identities and
+separate encoder/decoder convolution and KV state layouts. Independently
+constructible backbone blocks and resident composition share equations.
+`Tokenizer` supplies the shared `AudioTokenizer` interface over a bound codec
+and caller-supplied neutral state factory; it does not discover artifacts or
+select application tasks, devices, residency or distribution.
 
-The shared spectral mechanism selects zero or reflective analysis endpoints and
-exposes unnormalized inverse-FFT sample/envelope sums. Its streaming continuation
-retains only `FFT-hop` samples of each sum and the unconsumed initial trim; final
-flush consumes the tail and closes the stream. Ordinary finite reconstruction
-uses the same overlap-add arithmetic. Native spectral transforms remain backend
-mechanisms. General neural finite-value admission, `log1p` and checked ties-to-even
-I32 rounding are portable contracts; MLX implements them without codec-family
-dispatch. Deferred value assertions belong to the existing submission validation
-batch and must fail before completed results are published. Invalid rounded values
-are sanitized before native integer conversion while validation is pending.
+The shared spectral mechanism selects endpoint, window-arithmetic and FFT
+execution policies and exposes unnormalized inverse-FFT sample/envelope sums.
+Streaming continuation retains only `FFT-hop` samples of each sum and the
+unconsumed initial trim; final flush consumes the tail and closes the stream.
+Finite reconstruction shares this arithmetic. LiquidCodec's analysis selects
+portable F32 polynomial Hann coefficients and host-F32 FFT. The neutral
+`Tensor::host_rfft` mechanism includes transfer and completion ownership; MLX
+realizes it with a CPU stream and retained copy dependencies on native graphs.
+Synthesis binds the source window and uses native inverse FFT. Backend code
+contains no codec equation or policy dispatch.
 
-These codec components do not register a complete neural codec, speech-generation
-task or controlled realtime session. Current evidence and the unresolved analysis
-phase comparison are recorded in [LiquidCodec validation](liquid-codec-validation.md).
+General finite-value admission, `log1p` and checked ties-to-even I32 rounding are
+portable tensor contracts. Deferred value assertions join the existing submission
+validation batch and fail before completed results are published. Invalid rounded
+values are sanitized before integer conversion while validation is pending.
+Codec continuation retains neural state and independent overlap-add roots;
+transactional publication, native completion and snapshot isolation belong to
+the execution owner. These codec surfaces do not register prepared speech tasks,
+selected bounded/distributed capabilities or controlled realtime sessions.
+Current full resident reference evidence and integration limits are recorded in
+[LiquidCodec validation](liquid-codec-validation.md).
 
 LFM2's `Declaration` pairs existing typed static, attention/convolution, normalization,
 dense and routed feed-forward scopes with component ownership and state. Its parameter

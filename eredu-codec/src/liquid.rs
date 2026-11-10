@@ -1,8 +1,10 @@
-//! Portable LiquidCodec spectral and learned finite-scalar quantization units.
-//! Neural encoder/decoder composition is separate from these components.
+//! Portable LiquidCodec declarations, neural execution, quantization and streaming.
 
 use crate::{
-    spectral::{AnalysisEndpoints, OverlapAddOutput, PeriodicHannIstft, PeriodicHannStft},
+    spectral::{
+        AnalysisEndpoints, AnalysisExecution, OverlapAddOutput, PeriodicHannIstft,
+        PeriodicHannStft, WindowArithmetic,
+    },
     Error,
 };
 use eredu_nn::{
@@ -10,6 +12,9 @@ use eredu_nn::{
     NeuralBackend, PadMode, ParameterSpec, Parameterized, Tensor, TensorElementType,
 };
 use serde::Deserialize;
+
+mod neural;
+pub use neural::{BackboneBlock, Declaration, DecoderState, NeuralCodec, Tokenizer, Unit};
 
 /// Released codec component geometry, independent of language-model architectures.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -161,20 +166,25 @@ pub struct Analysis<T: Tensor> {
 impl<T: Tensor> Analysis<T> {
     /// Optional tensor mechanisms needed by reflective codec analysis.
     pub const fn required_capabilities() -> eredu_nn::NeuralOperatorCapabilities {
-        PeriodicHannStft::<T>::required_capabilities()
-            .union(eredu_nn::NeuralOperatorCapabilities::REQUIRE_FINITE)
-            .union(eredu_nn::NeuralOperatorCapabilities::SQRT)
-            .union(eredu_nn::NeuralOperatorCapabilities::LOG1P)
+        PeriodicHannStft::<T>::required_capabilities_for(
+            WindowArithmetic::Float32Polynomial,
+            AnalysisExecution::HostFloat32,
+        )
+        .union(eredu_nn::NeuralOperatorCapabilities::REQUIRE_FINITE)
+        .union(eredu_nn::NeuralOperatorCapabilities::SQRT)
+        .union(eredu_nn::NeuralOperatorCapabilities::LOG1P)
     }
     /// Constructs analysis constants without opening a checkpoint.
     pub fn new(config: &Config, context: &T::Context) -> Result<Self, Error> {
         config.validate()?;
         Ok(Self {
             config: config.clone(),
-            stft: PeriodicHannStft::with_endpoints(
+            stft: PeriodicHannStft::with_policy(
                 config.stft_n_fft,
                 config.stft_hop_length,
                 AnalysisEndpoints::Reflect,
+                WindowArithmetic::Float32Polynomial,
+                AnalysisExecution::HostFloat32,
                 context,
             )?,
         })
@@ -507,6 +517,14 @@ pub struct Synthesis<B: NeuralBackend> {
     istft: PeriodicHannIstft<B::Tensor>,
 }
 impl<B: NeuralBackend> Synthesis<B> {
+    /// Binds the retained checkpoint synthesis window without regenerating it.
+    pub fn set_window(
+        &mut self,
+        window: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<(), Error> {
+        self.istft.set_window(window, context)
+    }
     /// Constructs parameter-free periodic-Hann synthesis constants.
     pub fn new(config: &Config, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
         config.validate()?;
