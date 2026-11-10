@@ -901,6 +901,10 @@ score workspace, preserving the ordinary softmax and value-product reductions.
 Larger key rows retain the two-scan bounded mechanism. Explicit rotary input
 products retain inverse frequencies directly so positions multiply the same
 rounded coefficients instead of dividing by reconstructed denominators.
+Nontraditional piecewise wavelength-scaled RoPE and native YaRN return the input
+dtype after their FP32 rotary calculation and preserve unrotated trailing
+features. YaRN applies its amplitude only to rotated features before the final
+output cast.
 The CPU realization uses complete FP32 matrix accumulations, cascade row sums
 and a fixed softmax reduction with a pinned exponential polynomial. These are
 generic native numerical operations, independent of checkpoint and family policy.
@@ -925,6 +929,8 @@ retention keep their ordinary ownership and completion contracts.
 The shared FP32 sigmoid/SiLU kernel reshapes scalar inputs to a one-element
 array for Metal argument binding, while retaining the original output shape.
 Scalar, singleton and vector calls use the same exponential rounding policy.
+ELU evaluates BF16/F16 inputs in FP32 and casts the completed activation back to
+the input dtype. Its negative branch uses `expm1` to preserve values near zero.
 Single-row F32 activations with materialized row-major F16/BF16 dense weights
 use a mixed-dtype Metal GEMV for linear and tied-embedding output projections.
 It converts weights in registers and preserves the pinned MLX F32 GEMV's lane,
