@@ -16459,6 +16459,24 @@ with the last actual frame. It performs no family selection or device allocation
 These independently constructible components do not register conditional-generation
 support, selected residency/distribution capabilities or controlled media sessions.
 
+`lfm3::audio` owns the released speech input processor policy, the convolutional
+downsampler, the causal encoder and its language-width projector. The encoder
+reuses dense LFM2 parameter declarations and execution in a separate checkpoint
+namespace, with sliding KV state at each attention layer. SafeTensors admission
+matches both canonical and released tensor names. The downsampler, encoder
+blocks, final RMS normalization and projector have independent parameter scopes.
+Finite clips and feature streams share the same downsampling and backbone
+equations. A feature stream retains up to fifteen mel frames for the next
+downsampling stride, plus the caller-owned backbone state.
+
+`eredu-media::audio::power_mel` owns host FFT, Slaney filter construction,
+normalization and PCM overlap for uncentered windows. Finite processing and
+stream finalization use the same right-padding rule. The optional audio feature
+enables host FFT processing while the declaration and neural components remain
+portable. Host preprocessing takes mono PCM at the admitted rate. These
+components supply encoder embeddings and do not register a public speech task
+or select bounded, distributed or controlled execution.
+
 `eredu-codec::liquid` owns LiquidCodec configuration, complete neural encoder and
 decoder equations, reflective analysis, scalar-product alphabet ordering and
 polar synthesis. It consumes neutral neural/storage/runtime contracts without
