@@ -3,10 +3,13 @@
 import argparse
 import hashlib
 import json
+import wave
 from pathlib import Path
 
+import numpy as np
 import torch
 from safetensors.torch import save_file
+from transformers import AutoTokenizer
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
 
@@ -15,10 +18,55 @@ def digest(path):
         return hashlib.file_digest(source, 'sha256').hexdigest()
 
 
+def live_asr(model, extractor, root, wav_path, out, provenance):
+    with wave.open(str(wav_path), 'rb') as wav:
+        if (wav.getnchannels(), wav.getsampwidth(), wav.getframerate()) != (1, 2, 16000):
+            raise ValueError('LiveASR fixture requires mono 16-kHz signed 16-bit WAV')
+        pcm = np.frombuffer(wav.readframes(wav.getnframes()), dtype='<i2').astype('<f4') / 32768
+    tokenizer = AutoTokenizer.from_pretrained(root, local_files_only=True, trust_remote_code=True)
+    prompt = tokenizer(
+        '<|startoftext|><|im_start|>system\nPerform live ASR.<|im_end|>\n<|im_start|>assistant\n',
+        add_special_tokens=False, return_tensors='pt',
+    ).input_ids
+    suppress = tokenizer.convert_tokens_to_ids(['<|mixed_end|>', '<|endoftext|>'])
+    stop = tokenizer.convert_tokens_to_ids(['<|endoftext|>', '<|im_start|>'])
+    cadence = 8 * model.config.interleaved_n_audio
+    blocks = []
+    state = None
+    features = extractor(pcm, sampling_rate=16000, return_tensors='pt').input_features
+    split = [7] + list(range(cadence, features.shape[-1], cadence))
+    if len(split) < 3:
+        raise ValueError('LiveASR fixture must contain more than two full audio blocks')
+    start = 0
+    for index, end in enumerate([*split, features.shape[-1]]):
+        final = end == features.shape[-1]
+        restart = index == 2
+        result = model.transcribe_live(
+            features[..., start:end], state, input_ids=prompt if state is None or restart else None,
+            is_final=final, max_new_tokens=96 if final else 48,
+            suppress_token_ids=suppress, stop_token_ids=stop,
+        )
+        state = result.state
+        blocks.append({
+            'frames': end - start, 'final': final, 'restart': restart,
+            'audio_tokens': result.num_audio_tokens, 'closed': result.closed,
+            'tokens': result.sequences[0].tolist(),
+        })
+        start = end
+    pcm.tofile(out / 'live-pcm.f32')
+    (out / 'live-reference.json').write_text(json.dumps({
+        **provenance,
+        'wav_sha256': digest(wav_path), 'blocks': blocks,
+    }, indent=2) + '\n')
+    print(tokenizer.decode([token for block in blocks for token in block['tokens']],
+                           skip_special_tokens=True), flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('checkpoint', type=Path)
     parser.add_argument('output', type=Path)
+    parser.add_argument('--live-asr-wav', type=Path, help='compare the publisher LiveASR protocol')
     args = parser.parse_args()
     root = args.checkpoint.resolve()
     out = args.output.resolve()
@@ -46,6 +94,11 @@ def main():
         root, local_files_only=True, dtype=torch.float32, attn_implementation='eager'
     ).eval()
     extractor = cls('feature_extraction_lfm3_audio', 'Lfm3AudioFeatureExtractor').from_pretrained(root / 'preprocessor_config.json')
+    if args.live_asr_wav:
+        live_asr(model, extractor, root, args.live_asr_wav, out, {
+            'model_sha256': model_hash, 'codec_sha256': codec_hash,
+        })
+        return
     cfg = model.config
     codec_cls = cls('modeling_liquid_codec', 'LiquidCodecModel')
     codec = codec_cls.from_pretrained(root / 'audio_tokenizer', local_files_only=True,

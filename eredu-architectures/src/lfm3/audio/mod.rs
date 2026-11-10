@@ -20,13 +20,15 @@ pub use realtime::{
 #[cfg(feature = "audio")]
 pub use resident::{AudioIngress, AudioIngressError, AudioIngressProgress, AudioIngressRequest};
 pub use resident::{
-    AudioRequest, AudioResidentParameterBytes, PreparedResidentAudio, ResidentAudio,
-    ResidentAudioBinding, ResidentAudioError, ResidentAudioState,
+    AudioRequest, AudioResidentParameterBytes, AudioTranscription, AudioTranscriptionBlock,
+    AudioTranscriptionError, PreparedResidentAudio, ResidentAudio, ResidentAudioBinding,
+    ResidentAudioError, ResidentAudioState,
 };
 pub use schedule::{
     AudioMode, AudioPhase, AudioSchedule, AudioScheduleError, AudioSchedulePolicy, DepthProgress,
 };
 
+pub use eredu_media::audio::LogMelFeatures;
 use eredu_nn::Error;
 use serde_json::{json, Value};
 
