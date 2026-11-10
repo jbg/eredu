@@ -196,16 +196,21 @@ pub fn unit_recipes(
         .collect::<BTreeMap<_, _>>();
     if let super::declarations::TargetOperatorParameters::Mamba(spec) = &scope.operator {
         let a_log = format!("{root}.mamba.A_log");
-        if let Some(raw) = normalized.get(&a_log) {
-            recipes.insert(
-                a_log,
-                DerivedWeightRecipe::NegLog {
-                    input: Box::new(DerivedWeightRecipe::source(
-                        raw.clone(),
-                        TensorSelection::Full,
-                    )),
-                },
-            );
+        // SafeTensors stores A_log directly; GGUF stores the transition -exp(A_log).
+        if store.source_backend().map_err(|error| error.to_string())?
+            == eredu_checkpoint::store::WeightStoreBackend::Gguf
+        {
+            if let Some(raw) = normalized.get(&a_log) {
+                recipes.insert(
+                    a_log,
+                    DerivedWeightRecipe::NegLog {
+                        input: Box::new(DerivedWeightRecipe::source(
+                            raw.clone(),
+                            TensorSelection::Full,
+                        )),
+                    },
+                );
+            }
         }
         let conv = format!("{root}.mamba.conv1d.weight");
         if let Some(raw) = normalized.get(&conv) {

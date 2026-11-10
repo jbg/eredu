@@ -717,7 +717,9 @@ The mixer projects one state policy for construction and retained partition
 validation, including convolution history when the kernel exceeds one and an F32
 recurrent matrix with its exact residency class. SafeTensors aliases, packed/split expert layouts, quantization
 companions, GGUF singleton-axis removal and negative-log transition conversion
-remain explicit storage extensions. Target routing matrices retain floating
+remain explicit storage extensions. SafeTensors stores Mamba `A_log` directly;
+only GGUF transitions stored as `-exp(A_log)` require `log(-x)` conversion.
+Target routing matrices retain floating
 storage under family-wide quantization; prediction router encodings follow their
 separate admitted format policy. Component discovery projects attention,
 dense/shared expert, readout and prediction parameter identities from these
