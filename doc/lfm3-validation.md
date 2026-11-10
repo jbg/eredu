@@ -257,8 +257,10 @@ processor transforms mono 16-kHz PCM to the input features.
 The session emits text token IDs, completed codebook frames with 24-kHz
 mono PCM, and speech EOS. Both `advance` and `events` use the same controlled
 driver. Idle snapshots and restore use explicit copy limits and preserve
-unfinished refinement and codec carry. Live ingress, live forks, distributed
-execution, and bounded residency remain unimplemented for Audio.
+unfinished refinement and codec carry. Live forks resume the settled state
+on the same resident graph, with independent restore origins and a shared
+copy budget. Live ingress, distributed execution and bounded residency remain
+unimplemented for Audio.
 
 A CPU loader check uses the pinned Audio checkpoint with the weight file and
 asset directory supplied separately. The selected language, encoder, depth
@@ -286,3 +288,13 @@ samples exactly within each device, including the final flush. A third
 snapshot is rejected at the two-snapshot limit without charging a copy.
 Dropping both handles releases all snapshot retention while preserving
 cumulative copy usage. Explicit cancellation rejects restore.
+
+The fork check uses the same fixture and forks after the first depth pass.
+Interleaved parent and child advances reproduce all three codebook frames
+and all 5,760 PCM samples exactly within each device on CPU and precise
+Metal. After the first speech commit, child retention grows from 8,914,005
+to 9,505,358 logical bytes. The branch count limit and cross-origin restore
+reject before charging. A CPU run capped at the initial retention rejects
+the child's first speech commit on both attempts, leaves its slot count at
+zero, and lets the source publish that frame. Dropping the child releases
+its retention and keeps cumulative copying charged.

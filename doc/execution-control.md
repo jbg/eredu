@@ -292,10 +292,18 @@ finishes. A snapshot retains the language and codec state, unfinished
 refinement, sampler histories and RNG. Restore only accepts snapshots from the
 same session and preserves cumulative copy charges. A caller that restores
 can receive the same token or PCM samples again and owns delivery of those
-events. Cancellation is terminal.
+events. Cancellation is terminal for the cancelled session.
 
-Live forks, capture, live PCM ingress, and bounded or distributed speech
-sessions have no selected implementation.
+A live fork continues from the current settled boundary. The child has its
+own restore origin, slot cursor and output events. Source and child share
+the resident graph and its synchronous advancement lane. They also share
+the original branch, snapshot and cumulative copy limits. Each child must
+admit retained state growth before publishing a step. A refused step leaves
+its generation state and output frontier unchanged. Restoring a child does
+not refund the child's high-water retention or the lineage's copy usage.
+
+Capture, live PCM ingress, and bounded or distributed speech sessions have
+no selected implementation.
 
 LiquidCodec's standalone `Tokenizer` implements finite audio-tokenizer calls and
 explicit decode-stream advancement over shared neural/spectral equations. Its

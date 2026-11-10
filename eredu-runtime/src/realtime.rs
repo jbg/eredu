@@ -175,6 +175,9 @@ pub enum RealtimeFrameExecutionError {
     /// Exact completion or atomic state publication failed.
     #[error("realtime frame publication failed")]
     Publication(#[source] RealtimeGenerationTransactionError),
+    /// The candidate's retained state exceeds the fork's shared budget.
+    #[error("realtime frame retention failed")]
+    Retention(#[source] BackendFailure),
 }
 
 /// Failure to attach exact backend completion evidence to a branch.
@@ -343,6 +346,26 @@ where
         T: RealtimeFrameTransition<M::Branch, Q, P, S, R, C>,
         T::Error: std::error::Error + Send + Sync + 'static,
     {
+        self.execute_frame_transition_checked(frame, transition, |_| Ok(()))
+    }
+
+    /// Checks candidate retention before publishing. Rejected candidates retire
+    /// through the same discard path as other unpublished work.
+    pub fn execute_frame_transition_checked<T>(
+        &mut self,
+        frame: &T::Input,
+        transition: &mut T,
+        check_retention: impl FnOnce(
+            &RealtimeGenerationBranch<M::Branch, Q, P, S, R, C>,
+        ) -> Result<(), BackendFailure>,
+    ) -> Result<T::Output, RealtimeFrameExecutionError>
+    where
+        P: Clone,
+        S: Clone,
+        R: Clone,
+        T: RealtimeFrameTransition<M::Branch, Q, P, S, R, C>,
+        T::Error: std::error::Error + Send + Sync + 'static,
+    {
         let mut branch = SemanticStateTransaction::branch(self)
             .map_err(RealtimeFrameExecutionError::Publication)?;
         let (output, completion) = match transition.execute(frame, &mut branch) {
@@ -361,6 +384,11 @@ where
                 return Err(RealtimeFrameExecutionError::Publication(discard));
             }
             return Err(RealtimeFrameExecutionError::CompletionAttachment(error));
+        }
+        if let Err(error) = check_retention(&branch) {
+            <Self as SemanticStateTransaction>::discard_branch(branch)
+                .map_err(RealtimeFrameExecutionError::Publication)?;
+            return Err(RealtimeFrameExecutionError::Retention(error));
         }
         SemanticStateTransaction::commit_branch(self, branch)
             .map_err(RealtimeFrameExecutionError::Publication)?;
@@ -1644,6 +1672,17 @@ mod tests {
         let mut controlled = clock_state();
         let mut direct_outputs = Vec::new();
         let mut controlled_outputs = Vec::new();
+        let refusal = eredu_core::execution_control::ExecutionControlError::Limit("retained bytes");
+        assert!(matches!(
+            direct.execute_frame_transition_checked(
+                &ClockInput::Audio,
+                &mut ClockTransition,
+                |_| { Err(BackendFailure::from_error(refusal)) }
+            ),
+            Err(RealtimeFrameExecutionError::Retention(_))
+        ));
+        assert_eq!(direct.model_state().discards.get(), 1);
+        assert_eq!(direct.revision(), 0);
         for input in [
             ClockInput::Audio,
             ClockInput::Tool,

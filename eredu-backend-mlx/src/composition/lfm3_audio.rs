@@ -11,6 +11,7 @@ use crate::backend::{
         },
         generation::MlxSamplingBackend,
     },
+    submission_recovery::{Recovery, Retention, Status},
     ExecutionContext,
 };
 use crate::{MlxTensor, Stream};
@@ -24,11 +25,19 @@ use eredu_core::{
     BackendFailure,
 };
 use eredu_nn::Parameterized;
-use eredu_runtime::{RuntimeLayerState, StateLayout};
+use eredu_runtime::{execution_control::SnapshotRetainedGrowth, RuntimeLayerState, StateLayout};
 
 struct Binding {
     execution: Stream,
     weights: Stream,
+}
+
+struct RetainedBranch {
+    _growth: SnapshotRetainedGrowth,
+}
+
+impl Retention for RetainedBranch {
+    fn observe(&self, _: Status) {}
 }
 
 fn failure(error: impl std::error::Error + Send + Sync + 'static) -> BackendFailure {
@@ -75,6 +84,14 @@ impl ResidentAudioBinding<MlxNeuralBackend> for Binding {
             .iter()
             .flat_map(RuntimeLayerState::retained_values)
             .collect()
+    }
+
+    fn with_fork_retention<T>(
+        retention: SnapshotRetainedGrowth,
+        operation: impl FnOnce() -> T,
+    ) -> Result<T, BackendFailure> {
+        let _scope = Recovery::begin(RetainedBranch { _growth: retention }).map_err(failure)?;
+        Ok(operation())
     }
 }
 
@@ -146,6 +163,11 @@ impl MlxAudioSession {
     /// Restores a boundary saved by this session.
     pub fn restore(&mut self, saved: &MlxAudioSnapshot) -> Result<(), AudioSnapshotError> {
         self.0.restore(&saved.0)
+    }
+
+    /// Forks the current settled continuation on the same resident graph.
+    pub fn fork(&self) -> Result<Self, AudioSnapshotError> {
+        self.0.fork().map(Self)
     }
 
     /// Executes a single text decision or depth pass.
