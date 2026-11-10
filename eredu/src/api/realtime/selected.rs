@@ -6,6 +6,9 @@ use crate::runtime::voicechat::{
     VoiceChatLoadingError, VoiceChatStartError,
 };
 use eredu_architectures::{
+    lfm3::audio::{
+        AudioResidentParameterBytes, PreparedAudio, PreparedResidentAudio, ResidentAudioError,
+    },
     moshi::{MoshiPreparationPlan, MoshiRealtimeExecution},
     realtime::{PreparedRealtimeArtifact, RealtimeArtifactVisitor},
     voicechat::{
@@ -17,8 +20,8 @@ use eredu_architectures::{
 };
 use eredu_backend_mlx::{
     native::{
-        state_capabilities, ExecutionContext, MlxPreparedRealtimeExecution, MlxRealtimeExecution,
-        MlxRealtimeExecutionContext,
+        state_capabilities, ExecutionContext, MlxAudioModel, MlxPreparedRealtimeExecution,
+        MlxRealtimeExecution, MlxRealtimeExecutionContext,
     },
     MlxLoadRequest,
 };
@@ -55,6 +58,9 @@ pub enum RealtimeLoadError {
     /// Speech session binding failed.
     #[error(transparent)]
     SpeechStart(#[from] VoiceChatStartError),
+    /// LFM3 Audio cold selection or resident binding failed.
+    #[error(transparent)]
+    Lfm3Audio(#[from] ResidentAudioError),
     /// Native failure with its original error retained as source.
     #[error("realtime backend failed: {0}")]
     Backend(#[source] BackendFailure),
@@ -77,6 +83,7 @@ struct SpeechSelection<'a> {
 enum Selection<'a> {
     Categorical(MlxPreparedRealtimeExecution),
     Speech(Box<SpeechSelection<'a>>),
+    Lfm3Audio(Box<PreparedResidentAudio>),
 }
 
 /// Complete cold selection. Loading accepts no replacement policy or source.
@@ -95,6 +102,8 @@ pub enum LoadedMlxRealtime {
     },
     /// PCM speech uses the shared controlled/iterator conversation session.
     Speech(MlxVoiceChatSession),
+    /// Resident LFM3 Audio awaiting a prepared prompt and seed.
+    Lfm3Audio(Box<MlxAudioModel>),
 }
 
 /// Selects from a discovered artifact without creating a native device or tensor.
@@ -115,7 +124,7 @@ impl<'a, 'o> RealtimeArtifactVisitor<'a> for Select<'o> {
         let RealtimeLoadOptions::Categorical(request) = self.options else {
             return Err(RealtimeLoadError::Protocol {
                 required: "categorical",
-                requested: "PCM",
+                requested: self.options.protocol(),
             });
         };
         let selected = MlxRealtimeExecutionContext::select_realtime_execution(
@@ -128,14 +137,27 @@ impl<'a, 'o> RealtimeArtifactVisitor<'a> for Select<'o> {
             selection: Selection::Categorical(selected),
         })
     }
+    fn lfm3_audio(self, artifact: &'a PreparedAudio) -> Result<Self::Output, Self::Error> {
+        if !matches!(self.options, RealtimeLoadOptions::Lfm3Audio) {
+            return Err(RealtimeLoadError::Protocol {
+                required: "prepared Audio prompt",
+                requested: self.options.protocol(),
+            });
+        }
+        let selected = PreparedResidentAudio::select(artifact.clone())?;
+        Ok(PreparedMlxRealtime {
+            selection: Selection::Lfm3Audio(Box::new(selected)),
+        })
+    }
+
     fn voicechat(
         self,
         artifacts: &'a RetainedVoiceChatArtifacts,
     ) -> Result<Self::Output, Self::Error> {
         let RealtimeLoadOptions::Speech(options) = self.options else {
             return Err(RealtimeLoadError::Protocol {
-                required: "PCM",
-                requested: "categorical",
+                required: "PCM conversation",
+                requested: self.options.protocol(),
             });
         };
         let prepared = PreparedVoiceChatSession::from_retained(artifacts, &options.conversation)?
@@ -199,9 +221,17 @@ impl PreparedMlxRealtime<'_> {
     pub fn speech_residency_report(&self) -> Option<VoiceChatResidencyReport> {
         match &self.selection {
             Selection::Speech(s) => Some(s.report),
-            Selection::Categorical(_) => None,
+            Selection::Categorical(_) | Selection::Lfm3Audio(_) => None,
         }
     }
+    /// Selected logical F32 parameter bytes for the resident Audio protocol.
+    pub fn audio_parameter_bytes(&self) -> Option<AudioResidentParameterBytes> {
+        match &self.selection {
+            Selection::Lfm3Audio(audio) => Some(audio.parameter_bytes()),
+            Selection::Categorical(_) | Selection::Speech(_) => None,
+        }
+    }
+
     /// Materializes the retained selection through the existing submission owners.
     /// Sources and host policy cannot change between selection and this binding.
     pub fn load(
@@ -218,6 +248,9 @@ impl PreparedMlxRealtime<'_> {
                     .map_err(backend)?;
                 Ok(LoadedMlxRealtime::Categorical { context, model })
             }
+            Selection::Lfm3Audio(audio) => Ok(LoadedMlxRealtime::Lfm3Audio(Box::new(
+                MlxAudioModel::load_prepared(*audio, weights, execution)?,
+            ))),
             Selection::Speech(s) => Ok(LoadedMlxRealtime::Speech(start_mlx_voicechat(
                 s.prepared,
                 &s.parameters,

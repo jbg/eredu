@@ -264,6 +264,8 @@ pub enum ModelKind {
     Lfm2,
     /// Liquid AI LFM3 tri-hybrid architecture.
     Lfm3,
+    /// Liquid AI LFM3 Audio speech and text realtime architecture.
+    Lfm3Audio,
     /// Nemotron-H hybrid architecture.
     NemotronH,
     /// Nemotron-Labs-Diffusion shared text backbone and optional Pixtral context.
@@ -309,7 +311,7 @@ impl<'de> Deserialize<'de> for ModelKind {
 
 impl ModelKind {
     /// Every architecture family implemented by this crate.
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 27] = [
         Self::DeepSeekV3,
         Self::DeepSeekV4,
         Self::DiffusionGemma,
@@ -325,6 +327,7 @@ impl ModelKind {
         Self::MuseSpark,
         Self::Lfm2,
         Self::Lfm3,
+        Self::Lfm3Audio,
         Self::NemotronH,
         Self::NemotronLabsDiffusion,
         Self::Moshi,
@@ -356,6 +359,7 @@ impl ModelKind {
             Self::MuseSpark => "muse_spark",
             Self::Lfm2 => "lfm2",
             Self::Lfm3 => "lfm3",
+            Self::Lfm3Audio => "lfm3_audio",
             Self::NemotronH => "nemotron_h",
             Self::NemotronLabsDiffusion => "nemotron_labs_diffusion",
             Self::Moshi => "moshi",
@@ -384,7 +388,7 @@ impl ModelKind {
             Self::Nanbeige => &["Nanbeige"],
             Self::MuseGlimmer | Self::MuseSpark => &["meta-models"],
             Self::Lfm2 => &["LiquidAI"],
-            Self::Lfm3 => &["LiquidAI"],
+            Self::Lfm3 | Self::Lfm3Audio => &["LiquidAI"],
             Self::NemotronH | Self::NemotronLabsDiffusion | Self::VoiceChat => &["nvidia"],
             Self::Moshi => &["kyutai", "nvidia"],
             Self::Qwen2
@@ -400,7 +404,7 @@ impl ModelKind {
     /// Neutral loader protocol required by this family.
     pub const fn loading_protocol(self) -> LoadingProtocol {
         match self {
-            Self::Moshi | Self::VoiceChat => LoadingProtocol::Realtime,
+            Self::Moshi | Self::VoiceChat | Self::Lfm3Audio => LoadingProtocol::Realtime,
             _ => LoadingProtocol::Model,
         }
     }
@@ -438,6 +442,7 @@ impl ModelKind {
             "muse_spark" | "muse_spark_text" => Ok(Self::MuseSpark),
             "lfm2" | "lfm2_moe" => Ok(Self::Lfm2),
             "lfm3" => Ok(Self::Lfm3),
+            "lfm3_audio" => Ok(Self::Lfm3Audio),
             "nemotron_h" => Ok(Self::NemotronH),
             "nemotron_labs_diffusion" | "nemotron_labs_diffusion_vlm" => {
                 Ok(Self::NemotronLabsDiffusion)
@@ -1871,6 +1876,9 @@ fn resolve_safetensors_architecture(
         ModelKind::Lfm2 => crate::lfm2::model_args_from_config_value(json)
             .map(SafetensorsModelConfig::Lfm2)
             .map_err(|error| invalid_configuration(kind, error)),
+        ModelKind::Lfm3Audio => Err(ArtifactError::UnsupportedLoadingProtocol(
+            LoadingProtocol::Realtime,
+        )),
         ModelKind::Lfm3 => crate::lfm3::model_args_from_config_value(json)
             .map(SafetensorsModelConfig::Lfm3)
             .map_err(|error| invalid_configuration(kind, error)),

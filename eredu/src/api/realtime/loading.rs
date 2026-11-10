@@ -32,4 +32,17 @@ pub enum RealtimeLoadOptions {
     Categorical(NormalizedLoadRequest),
     /// PCM input with speech, transcription, text and conversational tool events.
     Speech(SpeechSessionOptions),
+    /// Batch-one prepared prompts with text and streaming speech output.
+    Lfm3Audio,
+}
+
+#[cfg(feature = "mlx")]
+impl RealtimeLoadOptions {
+    pub(super) fn protocol(&self) -> &'static str {
+        match self {
+            Self::Categorical(_) => "categorical",
+            Self::Speech(_) => "PCM conversation",
+            Self::Lfm3Audio => "prepared Audio prompt",
+        }
+    }
 }

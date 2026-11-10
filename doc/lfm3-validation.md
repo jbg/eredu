@@ -243,17 +243,29 @@ distributed audio execution remain outside this path.
 
 ## Resident Audio sessions
 
-`eredu::api::realtime::PreparedAudio` admits a local SafeTensors directory.
-`MlxAudioModel::load` binds it to an explicit execution context, and `start`
-accepts a batch-one `AudioRequest` and sampling seed. The request supplies
+`eredu::api::realtime::prepare_realtime_model` discovers `lfm3_audio` from
+the model assets and admits the specified SafeTensors file or directory.
+`prepare_mlx_realtime` with `RealtimeLoadOptions::Lfm3Audio` selects the
+resident model and reports the logical F32 parameter bytes by component.
+The report excludes session state and temporary allocations. Load consumes
+the selection with explicit weight and execution contexts. The bound model's
+`start` accepts a batch-one `AudioRequest` and sampling seed. The request supplies
 token IDs with expanded speech placeholders, finite mel features in prompt
 order, optional replayed speech codes, a mode, and a slot budget. The retained
 processor transforms mono 16-kHz PCM to the input features.
 
 The session emits text token IDs, completed codebook frames with 24-kHz
 mono PCM, and speech EOS. Both `advance` and `events` use the same controlled
-driver. The explicit resident entry point does not select live ingress,
-public snapshots or forks, distributed execution, or bounded residency.
+driver. Live ingress, public snapshots and forks, distributed execution,
+and bounded residency remain unimplemented for Audio.
+
+A CPU loader check uses the pinned Audio checkpoint with the weight file and
+asset directory supplied separately. The selected language, encoder, depth
+and codec bindings total 6,915,206,144, 461,112,576, 533,873,408 and
+294,236,360 bytes respectively. After the configuration, processor,
+generation defaults and tokenizer paths are removed from the temporary
+asset directory, the selected model loads and commits token 13 for prompt
+IDs `[124894,5,13,21,34]` with seed 41 and a one-slot text budget.
 
 The released-checkpoint session check uses seed 41, a three-slot speech
 budget, and prompt IDs `[124894,5,125031,125031,13,21,34]` before marker

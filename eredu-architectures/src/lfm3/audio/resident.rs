@@ -77,12 +77,66 @@ pub enum ResidentAudioError {
     /// Prompt features or token budget disagree with the admitted geometry.
     #[error("invalid LFM3 Audio prompt geometry or context budget")]
     Prompt,
+    /// Retained checkpoint metadata could not describe the selected graph.
+    #[error(transparent)]
+    Artifact(#[from] super::ArtifactError),
     /// The shared realtime driver could not start.
     #[error(transparent)]
     Session(#[from] AudioSessionError),
     /// A native mechanism or neural operation failed.
     #[error(transparent)]
     Backend(#[from] BackendFailure),
+}
+
+/// Logical F32 parameter bytes for the resident Audio graph.
+/// Cache state, native temporary arrays, and allocator overhead are separate.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct AudioResidentParameterBytes {
+    /// Language weights, with the tied vocabulary table counted once.
+    pub language: u64,
+    /// Speech input encoder and projector weights.
+    pub encoder: u64,
+    /// Depth, tied codebook heads and feedback weights.
+    pub depth: u64,
+    /// LiquidCodec weights and retained synthesis window.
+    pub codec: u64,
+}
+
+/// Cold selection for the fixed resident F32 Audio profile.
+pub struct PreparedResidentAudio {
+    artifact: PreparedAudio,
+    sampling: AudioSampling,
+    report: AudioResidentParameterBytes,
+}
+
+impl PreparedResidentAudio {
+    /// Retains exact binding recipes and checkpoint sampling settings.
+    pub fn select(mut artifact: PreparedAudio) -> Result<Self, ResidentAudioError> {
+        let sampling = AudioSampling::from_artifact(&artifact)?;
+        let (language_weights, language) = artifact.language_weights.widened_f32()?;
+        let (encoder_weights, encoder) = artifact.encoder_weights.widened_f32()?;
+        let (depth_weights, depth) = artifact.depth_weights.widened_f32()?;
+        let (codec_weights, codec) = artifact.codec_weights.widened_f32()?;
+        artifact.language_weights = language_weights;
+        artifact.encoder_weights = encoder_weights;
+        artifact.depth_weights = depth_weights;
+        artifact.codec_weights = codec_weights;
+        Ok(Self {
+            artifact,
+            sampling,
+            report: AudioResidentParameterBytes {
+                language,
+                encoder,
+                depth,
+                codec,
+            },
+        })
+    }
+
+    /// Reports the selected logical F32 parameter bytes before device allocation.
+    pub fn parameter_bytes(&self) -> AudioResidentParameterBytes {
+        self.report
+    }
 }
 
 /// Materialized resident graph with exact source binding and separate language,
@@ -100,6 +154,7 @@ where
     codec: NeuralCodec<B>,
     binding: H,
     artifact: PreparedAudio,
+    sampling: AudioSampling,
 }
 
 /// State retained on one sequential resident speech branch.
@@ -153,10 +208,17 @@ where
 {
     /// Constructs and binds the selected resident modules from retained sources.
     pub fn new(artifact: PreparedAudio, binding: H) -> Result<Self, ResidentAudioError> {
-        let language_weights = artifact.language_weights.widened_f32();
-        let encoder_weights = artifact.encoder_weights.widened_f32();
-        let depth_weights = artifact.depth_weights.widened_f32();
-        let codec_weights = artifact.codec_weights.widened_f32();
+        Self::from_prepared(PreparedResidentAudio::select(artifact)?, binding)
+    }
+
+    /// Binds the exact cold selection without recomputing precision or sampling policy.
+    pub fn from_prepared(
+        prepared: PreparedResidentAudio,
+        binding: H,
+    ) -> Result<Self, ResidentAudioError> {
+        let PreparedResidentAudio {
+            artifact, sampling, ..
+        } = prepared;
         let ctx = binding.context();
         let architecture = CompleteLfm3Kernel::<B>::from_selected_declaration(
             artifact.language.clone(),
@@ -171,21 +233,21 @@ where
                 .architecture_mut()
                 .kernel_mut()
                 .static_modules_mut(),
-            &language_weights,
+            &artifact.language_weights,
         )?;
         for block in language.units_mut().iter_mut().flatten() {
-            binding.bind(block, &language_weights)?;
+            binding.bind(block, &artifact.language_weights)?;
         }
         let mut encoder = Encoder::new(&artifact.encoder, ctx).map_err(failure)?;
         let mut projector = Projector::new(&artifact.encoder, ctx).map_err(failure)?;
-        binding.bind(&mut encoder, &encoder_weights)?;
-        binding.bind(&mut projector, &encoder_weights)?;
+        binding.bind(&mut encoder, &artifact.encoder_weights)?;
+        binding.bind(&mut projector, &artifact.encoder_weights)?;
         let mut depth = DepthDecoder::new(&artifact.depth, ctx).map_err(failure)?;
         let mut feedback = Feedback::new(&artifact.depth, ctx).map_err(failure)?;
-        binding.bind(&mut depth, &depth_weights)?;
-        binding.bind(&mut feedback, &depth_weights)?;
+        binding.bind(&mut depth, &artifact.depth_weights)?;
+        binding.bind(&mut feedback, &artifact.depth_weights)?;
         let mut codec = NeuralCodec::new(&artifact.codec, ctx).map_err(failure)?;
-        binding.bind(&mut codec, &codec_weights)?;
+        binding.bind(&mut codec, &artifact.codec_weights)?;
         Ok(Self {
             language,
             encoder,
@@ -195,6 +257,7 @@ where
             codec,
             binding,
             artifact,
+            sampling,
         })
     }
 
@@ -207,7 +270,7 @@ where
         let policy =
             AudioSchedulePolicy::from_artifact(&self.artifact, request.mode, request.max_slots)
                 .map_err(AudioSessionError::from)?;
-        let sampling = AudioSampling::from_artifact(&self.artifact)?;
+        let sampling = self.sampling.clone();
         let mut tokens = request.tokens.to_vec();
         let original_last = *tokens.last().ok_or(ResidentAudioError::Prompt)?;
         if let Some(marker) = policy.prompt_marker(original_last) {

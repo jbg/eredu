@@ -16500,6 +16500,14 @@ feedback aliases into their canonical destinations before materialization.
 The tokenizer, chat template, generation defaults and processor policy are
 retained alongside the component declarations.
 
+The shared realtime loader dispatches `lfm3_audio` to this preparation. It
+retains the selected SafeTensors payload independently of the model asset
+directory. `PreparedResidentAudio` selects F32 binding recipes and validates
+the sampling defaults without creating native tensors. Its parameter report
+counts the selected language, encoder, depth and codec bindings. MLX consumes
+this selection with the supplied weight and execution contexts. Callers
+prepare each prompt separately from model loading.
+
 `AudioPrompt` pairs token IDs with exact speech input and output row counts.
 The shared language traversal replaces the placeholder spans at the execution
 group's embedding boundary, preserving the causal cache positions. The readout

@@ -103,9 +103,21 @@ pub struct BindingSource {
 
 impl BindingSource {
     /// Projects the resident F32 execution profile before native materialization.
-    pub(super) fn widened_f32(&self) -> Self {
+    pub(super) fn widened_f32(&self) -> Result<(Self, u64), ArtifactError> {
         let mut recipes = self.recipes.clone();
+        let mut bytes = 0u64;
         for key in self.source.source_keys() {
+            let metadata = self.source.source_metadata(&key).map_err(checkpoint)?;
+            let size = metadata
+                .logical_shape
+                .iter()
+                .try_fold(4u64, |size, &dimension| {
+                    size.checked_mul(u64::try_from(dimension).ok()?)
+                })
+                .ok_or_else(|| checkpoint("resident Audio parameter size overflowed"))?;
+            bytes = bytes
+                .checked_add(size)
+                .ok_or_else(|| checkpoint("resident Audio parameter size overflowed"))?;
             recipes
                 .entry(key.clone())
                 .or_insert_with(|| DerivedWeightRecipe::source(key, TensorSelection::Full));
@@ -116,10 +128,13 @@ impl BindingSource {
                 dtype: RecipeDtype::F32,
             };
         }
-        Self {
-            source: self.source.clone(),
-            recipes,
-        }
+        Ok((
+            Self {
+                source: self.source.clone(),
+                recipes,
+            },
+            bytes,
+        ))
     }
 
     /// Exact retained source for this scope, without checkpoint rediscovery.
@@ -244,6 +259,17 @@ impl PreparedAudio {
     /// Admits the model and bundled audio_tokenizer without materializing tensor payloads.
     pub fn open(root: &Path, max_cached_shards: usize) -> Result<Self, ArtifactError> {
         let config: Value = serde_json::from_slice(&read(root, "config.json")?)?;
+        Self::open_source(root, root, &config, max_cached_shards)
+    }
+
+    /// Admits an exact model payload with separately resolved Audio assets.
+    /// The companion codec lives under `audio_tokenizer` in the asset root.
+    pub(crate) fn open_source(
+        model: &Path,
+        root: &Path,
+        config: &Value,
+        max_cached_shards: usize,
+    ) -> Result<Self, ArtifactError> {
         let cadence = |key: &str, default: usize| match config.get(key) {
             None => Ok(default),
             Some(value) => value
@@ -254,8 +280,8 @@ impl PreparedAudio {
         };
         let interleaved_text_slots = cadence("interleaved_n_text", 6)?;
         let interleaved_speech_slots = cadence("interleaved_n_audio", 12)?;
-        let encoder = super::Declaration::from_config(&config)?;
-        let depth = DepthDeclaration::from_config(&config)?;
+        let encoder = super::Declaration::from_config(config)?;
+        let depth = DepthDeclaration::from_config(config)?;
         let mut text = config.get("lfm").unwrap_or(&config["text_config"]).clone();
         if let Some(tied) = config.get("tie_word_embeddings") {
             text.as_object_mut()
@@ -268,7 +294,7 @@ impl PreparedAudio {
                 "the dense LFM3 Audio contract requires floating source weights",
             ));
         }
-        let tokens = AudioTokens::from_config(&config, language.vocab_size)?;
+        let tokens = AudioTokens::from_config(config, language.vocab_size)?;
         let language = Arc::new(crate::lfm3::Declaration::new(language)?);
         let processor = ProcessorConfig::from_feature_extractor(&serde_json::from_slice(&read(
             root,
@@ -314,7 +340,7 @@ impl PreparedAudio {
         let model_plan =
             SafetensorsCheckpointPlan::new("LFM3 Audio SafeTensors", tensors, groups, policy)
                 .map_err(checkpoint)?;
-        let catalog = discover(root)?;
+        let catalog = discover(model)?;
         let combined = resolve(&catalog, &model_plan)?;
         let language_resolution = resolve(&catalog, &language_plan)?;
         let encoder_resolution = resolve(&catalog, &input_plan)?;
