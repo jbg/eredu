@@ -3,6 +3,25 @@
 use crate::Error;
 use eredu_nn::{Index, NeuralOperatorCapabilities, PadMode, Tensor, TensorElementType};
 
+mod window;
+
+/// Periodic Hann coefficient arithmetic, independent of endpoint padding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowArithmetic {
+    /// Backend F32 sine/cosine construction.
+    Native,
+    /// Fixed host F32 range reduction and fused cosine polynomial.
+    Float32Polynomial,
+}
+/// Explicit mechanism for the forward spectral transform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnalysisExecution {
+    /// Use the supplied execution context's native F32 FFT.
+    Native,
+    /// Use host F32 FFT arithmetic, including required device transfers.
+    HostFloat32,
+}
+
 /// Explicit finite-analysis endpoint extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnalysisEndpoints {
@@ -21,6 +40,7 @@ pub struct PeriodicHannStft<T: Tensor> {
     hop_length: i32,
     window: T,
     endpoints: AnalysisEndpoints,
+    execution: AnalysisExecution,
 }
 impl<T: Tensor> PeriodicHannStft<T> {
     /// Constructs a periodic Hann window; no waveform or transform state is retained.
@@ -34,23 +54,63 @@ impl<T: Tensor> PeriodicHannStft<T> {
         endpoints: AnalysisEndpoints,
         context: &T::Context,
     ) -> Result<Self, Error> {
+        Self::with_policy(
+            fft_size,
+            hop_length,
+            endpoints,
+            WindowArithmetic::Native,
+            AnalysisExecution::Native,
+            context,
+        )
+    }
+    /// Constructs explicit window and transform arithmetic without selecting a family.
+    pub fn with_policy(
+        fft_size: i32,
+        hop_length: i32,
+        endpoints: AnalysisEndpoints,
+        window: WindowArithmetic,
+        execution: AnalysisExecution,
+        context: &T::Context,
+    ) -> Result<Self, Error> {
         if fft_size < 2 || hop_length <= 0 || hop_length > fft_size {
             return Err(invalid("forward STFT requires FFT>=2 and 0<hop<=FFT"));
         }
         Ok(Self {
             fft_size,
             hop_length,
-            window: periodic_hann::<T>(fft_size, context)?.reshape(&[1, 1, fft_size], context)?,
+            window: match window {
+                WindowArithmetic::Native => periodic_hann::<T>(fft_size, context)?,
+                WindowArithmetic::Float32Polynomial => {
+                    T::from_f32_slice(&window::hann(fft_size), &[fft_size], context)?
+                }
+            }
+            .reshape(&[1, 1, fft_size], context)?,
             endpoints,
+            execution,
         })
     }
     /// Optional numerical capabilities required before native construction.
     pub const fn required_capabilities() -> NeuralOperatorCapabilities {
-        NeuralOperatorCapabilities::RFFT
-            .union(NeuralOperatorCapabilities::SIN_COS)
+        Self::required_capabilities_for(WindowArithmetic::Native, AnalysisExecution::Native)
+    }
+    /// Exact optional mechanisms for one retained arithmetic choice.
+    pub const fn required_capabilities_for(
+        window: WindowArithmetic,
+        execution: AnalysisExecution,
+    ) -> NeuralOperatorCapabilities {
+        let fft = match execution {
+            AnalysisExecution::Native => NeuralOperatorCapabilities::RFFT,
+            AnalysisExecution::HostFloat32 => NeuralOperatorCapabilities::HOST_RFFT,
+        };
+        let required = fft
             .union(NeuralOperatorCapabilities::CAST_FLOAT)
-            .union(NeuralOperatorCapabilities::FULL_F32)
-            .union(NeuralOperatorCapabilities::FROM_I32_SLICE)
+            .union(NeuralOperatorCapabilities::FROM_I32_SLICE);
+        match window {
+            WindowArithmetic::Native => required
+                .union(NeuralOperatorCapabilities::SIN_COS)
+                .union(NeuralOperatorCapabilities::FULL_F32),
+            WindowArithmetic::Float32Polynomial => required,
+        }
     }
     /// Number of complete analysis windows after the explicit endpoint padding.
     pub fn output_frames(&self, samples: i32) -> Result<i32, Error> {
@@ -122,7 +182,10 @@ impl<T: Tensor> PeriodicHannStft<T> {
             .take_axis(&T::from_i32_slice(&indices, &[count], context)?, 1, context)?
             .reshape(&[pcm.dim(0), frames, self.fft_size], context)?
             .multiply(&self.window, context)?;
-        let (real, imaginary) = framed.rfft(self.fft_size, 2, context)?;
+        let (real, imaginary) = match self.execution {
+            AnalysisExecution::Native => framed.rfft(self.fft_size, 2, context)?,
+            AnalysisExecution::HostFloat32 => framed.host_rfft(self.fft_size, 2, context)?,
+        };
         Ok((
             real.transpose_axes(&[0, 2, 1], context)?,
             imaginary.transpose_axes(&[0, 2, 1], context)?,
@@ -281,6 +344,21 @@ pub struct PeriodicHannIstft<T: Tensor> {
     fold_kernel: T,
 }
 impl<T: Tensor> PeriodicHannIstft<T> {
+    /// Replaces the synthesis coefficients with an explicit retained F32 window.
+    /// The caller's window must satisfy nonzero overlap after endpoint trimming.
+    /// The view shares its source; the fixed overlap routing kernel is reused.
+    pub fn set_window(&mut self, window: &T, context: &T::Context) -> Result<(), Error> {
+        if window.shape() != [self.fft_size]
+            || window.element_type() != Some(TensorElementType::F32)
+        {
+            return Err(invalid(
+                "synthesis window must be F32 with one coefficient per FFT tap",
+            ));
+        }
+        window.require_finite(context)?;
+        self.window = window.reshape(&[1, self.fft_size, 1], context)?;
+        Ok(())
+    }
     /// Constructs the periodic window and fixed overlap-add routing kernel.
     /// Trims `(fft_size-hop_length)/2` samples from each reconstructed endpoint.
     pub fn new(fft_size: i32, hop_length: i32, context: &T::Context) -> Result<Self, Error> {

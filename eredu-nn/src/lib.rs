@@ -4479,8 +4479,10 @@ impl NeuralOperatorCapabilities {
     pub const ROUND_TO_I32: Self = Self(1 << 55);
     /// Elementwise natural logarithm of one plus a floating value.
     pub const LOG1P: Self = Self(1 << 56);
+    /// Forward F32 real FFT using the backend's host execution mechanism.
+    pub const HOST_RFFT: Self = Self(1 << 57);
     /// Every currently declared optional operation.
-    pub const ALL: Self = Self((1 << 57) - 1);
+    pub const ALL: Self = Self((1 << 58) - 1);
 
     /// Returns the union of two capability sets.
     pub const fn union(self, other: Self) -> Self {
@@ -4498,6 +4500,7 @@ impl NeuralOperatorCapabilities {
             (NeuralOperatorCapabilities::REQUIRE_FINITE, "require_finite"),
             (NeuralOperatorCapabilities::ROUND_TO_I32, "round_to_i32"),
             (NeuralOperatorCapabilities::LOG1P, "log1p"),
+            (NeuralOperatorCapabilities::HOST_RFFT, "host_rfft"),
             (
                 NeuralOperatorCapabilities::CASCADED_LAYER_NORM,
                 "cascaded_layer_norm",
@@ -5974,6 +5977,22 @@ pub trait Tensor: Clone + Debug + Sized + 'static {
         let _ = (length, axis, context);
         Err(Error::backend(
             "forward real FFT is not implemented by this tensor backend",
+        ))
+    }
+    /// The same unnormalized one-sided F32 real FFT, explicitly executed using
+    /// host F32 arithmetic. Inputs and Cartesian outputs may cross devices;
+    /// backends retain transfers and host work through native completion.
+    /// This is a distinct mechanism, not a claim that accelerator FFT rounding
+    /// matches the host implementation.
+    fn host_rfft(
+        &self,
+        length: i32,
+        axis: i32,
+        context: &Self::Context,
+    ) -> Result<(Self, Self), Error> {
+        let _ = (length, axis, context);
+        Err(Error::backend(
+            "host F32 real FFT is not implemented by this tensor backend",
         ))
     }
     /// Inverse real FFT of a one-sided Hermitian spectrum represented by

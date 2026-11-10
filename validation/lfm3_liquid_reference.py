@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Pinned LiquidCodec component reference using the released neural codec weights.
-
-Full publisher encode/decode produces trained latents and spectral predictions.
-Native comparison currently covers spectral analysis, scalar projection/codes and
-spectral streaming only; it does not establish native full-codec parity.
-"""
+"""Pinned complete LiquidCodec reference and separately measured component inputs."""
 import argparse
 import hashlib
 import importlib.metadata
@@ -55,17 +50,24 @@ def main():
         weights = {name: checkpoint.get_tensor(name).float().contiguous() for name in checkpoint.keys()}
     codec.load_state_dict(weights, strict=True)
     save_file({name: value for name, value in weights.items() if name.startswith('quantizer.')}, derived / 'model.safetensors')
+    neural = output / 'f32-neural'
+    neural.mkdir(exist_ok=True)
+    shutil.copyfile(source / 'audio_tokenizer/config.json', neural / 'config.json')
+    save_file(weights, neural / 'model.safetensors')
     del weights
     tensors = {}
     cases = []
     with torch.inference_mode():
-        for name, samples in [('short', 2305), ('window', 1920 * 9 + 117)]:
+        for name, samples in [('silence', 1), ('short', 2305), ('window', 1920 * 9 + 117)]:
             time = torch.arange(samples, dtype=torch.float32) / 24000.0
             pcm = 0.2 * torch.sin(2 * torch.pi * 173.0 * time) + 0.07 * torch.cos(2 * torch.pi * 1093.0 * time)
+            if name == 'silence':
+                pcm.zero_()
             pcm = pcm.unsqueeze(0)
             padded = torch.nn.functional.pad(pcm, (0, -samples % config.frame_size))
             features = codec.stft(padded)
-            latents = codec.to_quantizer(codec.encoder(codec.frontend(features).mT)).mT
+            frontend = codec.frontend(features)
+            latents = codec.to_quantizer(codec.encoder(frontend.mT)).mT
             codes = codec.quantizer.encode(latents)
             decoded = codec.quantizer.decode(codes)
             embeddings = codec.from_quantizer(decoded.mT)
@@ -84,7 +86,7 @@ def main():
                                               finalize=False).audio_values)
                 start += count
             streamed.append(codec.decode(codes[..., :0], streaming_cache=cache, finalize=True).audio_values)
-            tensors.update({f'{name}.pcm': pcm.unsqueeze(1), f'{name}.features': features,
+            tensors.update({f'{name}.pcm': pcm.unsqueeze(1), f'{name}.features': features, f'{name}.frontend': frontend,
                             f'{name}.latents': latents, f'{name}.codes': codes.to(torch.int32),
                             f'{name}.decoded': decoded, f'{name}.log_magnitude': log_magnitude,
                             f'{name}.angle': angle, f'{name}.raw_audio': raw.unsqueeze(-1),
@@ -98,6 +100,7 @@ def main():
     save_file({name: value.contiguous() for name, value in tensors.items()}, output / 'reference.safetensors')
     report = {'repository': manifest['repository'], 'revision': manifest['revision'],
               'source_sha256': manifest['weights_sha256'], 'derived_sha256': digest(derived / 'model.safetensors'),
+              'neural_sha256': digest(neural / 'model.safetensors'),
               'dtype': 'float32', 'attention': 'eager', 'maximum_absolute_tolerance': manifest['maximum_absolute_tolerance'],
               'cases': cases, 'package_versions': {name: importlib.metadata.version(name)
                   for name in ('torch', 'transformers', 'safetensors', 'huggingface_hub')}}

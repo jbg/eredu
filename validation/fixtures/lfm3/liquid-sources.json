@@ -11,6 +11,6 @@
     "modeling_liquid_codec.py": "5ca87e1b6e0549b40dc90fad5ee9d55620e9defb78c67e19c5937208c8e14f74",
     "audio_tokenizer/config.json": "13ac10473c6cf45618a3e9603f529c889683c9e28fa77e0d4f0ca6e686d0cbf4"
   },
-  "scope": "Spectral analysis, learned FSQ projections and overlap-add streaming components; no complete neural codec or audio task support claim.",
+  "scope": "Resident neural codec, shared AudioTokenizer encode/decode and explicit streaming continuation; no bounded/distributed codec or audio language-model task support claim.",
   "maximum_absolute_tolerance": 0.0005
 }
