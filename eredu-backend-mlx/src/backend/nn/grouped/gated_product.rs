@@ -406,40 +406,11 @@ impl PackedGatedProductGroups {
             }
             None => gate_up,
         };
-        let mut gate = gate_up.try_index_device((.., ..self.intermediate_dim), stream)?;
-        let mut up = gate_up.try_index_device((.., self.intermediate_dim..), stream)?;
-        if let Some(bound) = self.policy.gate_upper_bound() {
-            gate = safemlx::ops::clip(gate, ((), bound), stream)?;
-        }
-        if let Some(bound) = self.policy.up_absolute_bound() {
-            up = safemlx::ops::clip(up, (-bound, bound), stream)?;
-        }
-        if self.policy.up_offset() != 0.0 {
-            up = up.add(Array::from_f32(self.policy.up_offset()), stream)?;
-        }
-        let gate = match self.policy.activation() {
-            GatedProductActivation::Silu if self.policy.sigmoid_multiplier() == 1.0 => {
-                silu(gate, stream)?
-            }
-            GatedProductActivation::Silu => gate.multiply(
-                sigmoid(
-                    gate.multiply(Array::from_f32(self.policy.sigmoid_multiplier()), stream)?,
-                    stream,
-                )?,
-                stream,
-            )?,
-            GatedProductActivation::Gelu => super::super::layers::gelu(gate, stream)?,
-            GatedProductActivation::GeluApproximate => {
-                super::super::layers::gelu_approximate(gate, stream)?
-            }
-            _ => {
-                return Err(Exception::custom(
-                    "unsupported grouped gated-product activation",
-                ))
-            }
-        };
+        let gate = gate_up.try_index_device((.., ..self.intermediate_dim), stream)?;
+        let up = gate_up.try_index_device((.., self.intermediate_dim..), stream)?;
+        let activated = super::super::layers::gated_product(gate, up, self.policy, stream)?;
         let activated = observe_units(
-            gate.multiply(up, stream)?,
+            activated,
             &plan,
             top_k_weights,
             token_offset,

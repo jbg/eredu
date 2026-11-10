@@ -128,7 +128,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedPlusSha
         )
     }
 
-    /// Executes routed/shared TP work with one reduction and literal post-bias.
+    /// Reduces routed/shared TP branches across their distinct precision boundaries.
     pub fn forward_tensor_parallel_with_provider<P, F>(
         &mut self,
         input: &B::Tensor,
@@ -167,39 +167,38 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedPlusSha
             context,
             &mut crate::decoder::ComponentInstrumentation::disabled(),
         )?;
-        Self::combine_tensor_parallel(routed, shared, context, &mut reduce)
+        Self::combine_tensor_parallel(routed, shared, input, context, &mut reduce)
     }
 
-    // Keep the ordinary fused reduction and literal post-reduction bias identical
-    // for observed and unobserved execution.
+    // Routing may accumulate in F32, but the completed routed contribution
+    // rounds to the input dtype before the independently reduced shared branch.
     fn combine_tensor_parallel<F>(
         routed: eredu_runtime::RoutedExpertTensorParallelOutput<B::Tensor>,
         shared: B::Tensor,
+        input: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
         reduce: &mut F,
     ) -> Result<B::Tensor, Error>
     where
         F: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
     {
-        match routed {
-            eredu_runtime::RoutedExpertTensorParallelOutput::Complete(routed) => {
-                routed.add(&reduce(shared, context)?, context)
-            }
+        let routed = match routed {
+            eredu_runtime::RoutedExpertTensorParallelOutput::Complete(routed) => routed,
             eredu_runtime::RoutedExpertTensorParallelOutput::Partial(routed) => {
                 let (reducible, post_reduce) = routed.into_parts();
-                let reduced = reduce(reducible.add(&shared, context)?, context)?;
+                let reduced = reduce(reducible, context)?;
                 match post_reduce {
-                    Some(bias) => reduced.add(&bias, context),
-                    None => Ok(reduced),
+                    Some(bias) => reduced.add(&bias, context)?,
+                    None => reduced,
                 }
             }
-        }
+        };
+        let routed = restore_routed_precision(routed, input, context)?;
+        routed.add(&reduce(shared, context)?, context)
     }
 
-    /// Observes actual routed units and shared scalar/write terms before the
-    /// ordinary fused TP reduction. Shared write/output callbacks are additive
-    /// terms, as declared by the architecture placement. The combined output is
-    /// complete. No separately reduced routed/shared diagnostic tensor is made.
+    /// Observes actual routed units and shared scalar/write terms before their
+    /// branch reductions. The combined output includes the routed precision cast.
     #[allow(clippy::too_many_arguments)]
     pub fn forward_tensor_parallel_with_provider_observed<P, O, F>(
         &mut self,
@@ -233,8 +232,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedPlusSha
     }
 
     /// Observes the ordinary resident-bank TP equation without requiring the
-    /// separate provider TP mechanism. The ordinary local expert output joins
-    /// the shared term before the same single reduction used by that path.
+    /// separate provider TP mechanism. Routed and shared branches reduce before
+    /// the input-precision routed contribution joins the shared term.
     pub(crate) fn forward_tensor_parallel_resident_observed<O, F>(
         &mut self,
         path: &str,
@@ -332,7 +331,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedPlusSha
             let shared = instrumentation.apply("write", shared)?;
             instrumentation.apply("output", shared)?
         };
-        let combined = Self::combine_tensor_parallel(routed, shared, context, &mut reduce)?;
+        let combined = Self::combine_tensor_parallel(routed, shared, input, context, &mut reduce)?;
         observe_and_intervene(observer, &format!("{path}.output"), &combined)
     }
 
@@ -384,6 +383,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedPlusSha
             },
         )
         .map_err(eredu_runtime::ObservedExpertProviderError::into_neural_error)?;
+        let routed = restore_routed_precision(routed, input, context)?;
         let shared = {
             let path = format!("{path}.shared");
             let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
@@ -424,5 +424,20 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedPlusSha
         let units = B::gated_product(gate, up, self.shared_policy, context)?;
         let units = instrumentation.apply("units", units)?;
         instrumentation.project::<B>("write_input", &mut self.shared_down, &units, None, context)
+    }
+}
+
+fn restore_routed_precision<T: Tensor>(
+    routed: T,
+    input: &T,
+    context: &T::Context,
+) -> Result<T, Error> {
+    let element = input
+        .element_type()
+        .ok_or_else(|| Error::backend("unknown DeepSeek routed input precision"))?;
+    if routed.element_type() == Some(element) {
+        Ok(routed)
+    } else {
+        routed.cast_float(element, context)
     }
 }

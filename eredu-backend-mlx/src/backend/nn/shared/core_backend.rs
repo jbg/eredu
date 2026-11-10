@@ -657,46 +657,13 @@ impl NeuralBackend for MlxNeuralBackend {
         policy: GatedProductPolicy,
         context: &Stream,
     ) -> Result<MlxTensor, ComputeError> {
-        let mut gate = gate.into_array();
-        let mut up = up.into_array();
         policy.validate()?;
-        if let Some(bound) = policy.gate_upper_bound() {
-            gate = compute(safemlx::ops::minimum(gate, Array::from_f32(bound), context))?;
-        }
-        if let Some(bound) = policy.up_absolute_bound() {
-            up = compute(safemlx::ops::clip(up, (-bound, bound), context))?;
-        }
-        if policy.up_offset() != 0.0 {
-            up = compute(up.add(Array::from_f32(policy.up_offset()), context))?;
-        }
-        let gate = match policy.activation() {
-            eredu_nn::GatedProductActivation::Silu if policy.sigmoid_multiplier() == 1.0 => {
-                compute(common::layers::silu(gate, context))?
-            }
-            eredu_nn::GatedProductActivation::Silu => {
-                let scaled =
-                    compute(gate.multiply(Array::from_f32(policy.sigmoid_multiplier()), context))?;
-                let probability = compute(sigmoid(scaled, context))?;
-                compute(gate.multiply(probability, context))?
-            }
-            eredu_nn::GatedProductActivation::Gelu => {
-                compute(super::super::layers::gelu(gate, context))?
-            }
-            eredu_nn::GatedProductActivation::GeluApproximate => {
-                if let Some(output) = compute(super::super::gated_arithmetic::gelu_product(
-                    &gate, &up, context,
-                ))? {
-                    return Ok(MlxTensor::from_array(output));
-                }
-                compute(nn::gelu_approximate(gate, context))?
-            }
-            _ => {
-                return Err(ComputeError::backend(
-                    "unsupported grouped gated-product activation",
-                ));
-            }
-        };
-        compute_tensor(gate.multiply(up, context))
+        compute_tensor(common::layers::gated_product(
+            gate.into_array(),
+            up.into_array(),
+            policy,
+            context,
+        ))
     }
 
     fn attention(

@@ -1,7 +1,7 @@
 //! Group selection and packed grouped-projection implementations.
 
 use eredu_checkpoint::WeightQuantization;
-use eredu_nn::{GatedProductActivation, GatedProductPolicy, TensorParallelGroupedOutput};
+use eredu_nn::{GatedProductPolicy, TensorParallelGroupedOutput};
 
 use eredu_backend_mlx_macros::PhysicalParameters;
 use safemlx::{
@@ -9,8 +9,8 @@ use safemlx::{
     ops::{
         arange, argpartition_axis, concatenate_axis, gather_qmm_with_mode,
         indexing::{scatter_single, take_along_axis, topk_axis, NewAxis, TryIndexOp},
-        matmul, quantized_matmul_with_mode, quantized_packed_dimension, r#where, sigmoid,
-        softmax_axis, sum_axis, zeros_dtype, QuantizationMode,
+        matmul, quantized_matmul_with_mode, quantized_packed_dimension, r#where, softmax_axis,
+        sum_axis, zeros_dtype, QuantizationMode,
     },
     Array, Dtype, Stream,
 };
@@ -24,7 +24,7 @@ use super::grouping::{
     gather_grouped_rows, gather_selection_values, grouped_matmul, topk_group_plan,
     GroupedSelectionPlan,
 };
-use super::layers::{relu2, silu};
+use super::layers::relu2;
 
 /// Applies one affine- or MXFP4-packed group projection to group-major rows.
 ///

@@ -56,7 +56,55 @@ pub fn sigmoid(input: Array, stream: &Stream) -> Result<Array, Exception> {
 
 /// Applies the squared rectified-linear activation.
 pub fn relu2(x: Array, stream: &Stream) -> Result<Array, Exception> {
-    maximum(&x, Array::from_f32(0.0), stream)?.square(stream)
+    let zero = Array::from_f32(0.0).as_dtype(x.dtype(), stream)?;
+    maximum(&x, zero, stream)?.square(stream)
+}
+
+/// Applies a gated equation with scalar operations rounded to each branch dtype.
+pub(crate) fn gated_product(
+    mut gate: Array,
+    mut up: Array,
+    policy: eredu_nn::GatedProductPolicy,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    use eredu_nn::GatedProductActivation;
+    policy
+        .validate()
+        .map_err(|error| Exception::custom(error.to_string()))?;
+    let gate_dtype = gate.dtype();
+    let up_dtype = up.dtype();
+    // Scalars keep their full precision during the operation; the result rounds
+    // at the same boundary as tensor/scalar arithmetic in the reference.
+    if let Some(bound) = policy.gate_upper_bound() {
+        gate = safemlx::ops::minimum(gate, Array::from_f32(bound), stream)?
+            .as_dtype(gate_dtype, stream)?;
+    }
+    if let Some(bound) = policy.up_absolute_bound() {
+        up = safemlx::ops::clip(up, (-bound, bound), stream)?.as_dtype(up_dtype, stream)?;
+    }
+    if policy.up_offset() != 0.0 {
+        up = up
+            .add(Array::from_f32(policy.up_offset()), stream)?
+            .as_dtype(up_dtype, stream)?;
+    }
+    let gate = match policy.activation() {
+        GatedProductActivation::Silu if policy.sigmoid_multiplier() == 1.0 => silu(gate, stream)?,
+        GatedProductActivation::Silu => {
+            let scaled = gate
+                .multiply(Array::from_f32(policy.sigmoid_multiplier()), stream)?
+                .as_dtype(gate_dtype, stream)?;
+            gate.multiply(safemlx::ops::sigmoid(scaled, stream)?, stream)?
+        }
+        GatedProductActivation::Gelu => gelu(gate, stream)?,
+        GatedProductActivation::GeluApproximate => {
+            if let Some(output) = super::gated_arithmetic::gelu_product(&gate, &up, stream)? {
+                return Ok(output);
+            }
+            gelu_approximate(gate, stream)?
+        }
+        _ => return Err(Exception::custom("unsupported gated-product activation")),
+    };
+    gate.multiply(up, stream)
 }
 
 /// Applies the exponential linear unit.
