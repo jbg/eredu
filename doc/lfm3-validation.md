@@ -13,8 +13,9 @@ Ordinary and controlled text generation use the shared drivers. The existing tag
 tool dialect consumes the released template's function/parameter tags; the LFM2
 Python-call dialect does not describe this template.
 
-This is a text implementation, not complete LFM3-family integration. Vision/video,
-audio, LiquidCodec, omni and d1 decision execution are not implemented. Published
+This is a text implementation with independent vision components, not complete
+LFM3-family integration. Public vision/video generation, audio, LiquidCodec, omni
+and d1 decision execution are not implemented. Published
 NVFP4 GGUF encoding is not admitted by the current generic GGUF reader. No support
 for these paths is inferred from the shared text backbone or source inventory.
 
@@ -118,3 +119,47 @@ EREDU_TOOL_CHECKPOINT=/private/tmp/lfm3-f32 cargo test -p eredu --no-default-fea
 
 The portable tokenizer/template case uses scripted backend outputs. It verifies
 native tool grammar activation and decoded semantic events, not model tool quality.
+
+## Independent vision components
+
+`lfm3::vision` contains the released encoder's linear patchifier, gated spatial
+depthwise-convolution blocks, frame-local bidirectional GQA blocks with axial RoPE,
+and LayerNorm/spatial-merge/GELU projector. Each encoder layer and the input/output
+units is constructible independently. The host patch-packing utility accepts
+already normalized frames; it duplicates still images across temporal slots and
+repeats the last frame when a video ends with an incomplete temporal patch.
+
+`validation/fixtures/lfm3/vision-sources.json` pins the VL instruction checkpoint,
+its complete weight hash and the publisher source-file hashes. The reference
+entry point executes the pinned publisher encoder, projector and image/video
+patchifiers on an exact F32 widening of the released component weights. Its cases
+are a rectangular image, an odd-length three-frame clip, and two differently
+shaped images. Inputs are already sized; resizing and frame sampling are outside
+this comparison. It does not establish end-to-end conditional-generation parity.
+
+The compact measured results in
+`validation/fixtures/lfm3/vision-component-results.json` record exact host packing
+agreement for all three cases. CPU encoder maximum absolute error is
+`8.7738037109375e-5`; precise Metal encoder maximum is `1.3017654418945312e-4`.
+Projector maxima are `6.705522537231445e-7` on CPU and
+`1.259148120880127e-6` on Metal. Every encoder/projector comparison meets the preset
+`5e-4` maximum absolute tolerance. These measurements use F32 widening; they do
+not establish native BF16 component parity.
+
+```sh
+python -c 'from huggingface_hub import snapshot_download; snapshot_download("LiquidAI/LFM3-VL-2B", revision="23387beda43c60310348e83e25f78f33c3140d3a", local_dir="/private/tmp/lfm3-vl-source", allow_patterns=["*.py", "*.json", "*.jinja", "*.safetensors"])'
+HF_HOME=/private/tmp/lfm3-hf HF_MODULES_CACHE=/private/tmp/lfm3-hf/modules python validation/lfm3_vision_reference.py /private/tmp/lfm3-vl-source /private/tmp/lfm3-vl-reference
+cargo run -p eredu-backend-mlx --no-default-features --example lfm3_vision_reference -- /private/tmp/lfm3-vl-reference/f32-component /private/tmp/lfm3-vl-reference /private/tmp/lfm3-vl-reference/cpu-results.json --device cpu
+MLX_ENABLE_TF32=0 cargo run -p eredu-backend-mlx --features metal --example lfm3_vision_reference -- /private/tmp/lfm3-vl-reference/f32-component /private/tmp/lfm3-vl-reference /private/tmp/lfm3-vl-reference/metal-results.json --device gpu
+```
+
+The reference runner needs PyTorch, Transformers, SafeTensors, torchvision and
+Pillow, and verifies the immutable weights and source hashes before executing
+publisher Python code. The native runner validates source geometry and checks the
+derived F32 weight hash before comparing values. Payloads and detailed outputs
+remain outside the checkout.
+
+These components have no public VL task admission, conditional text composition,
+GGUF admission, selected memory/residency reports, TP/PP construction or controlled
+media-session integration. No corresponding support is advertised by their
+existence or by encoder/projector comparison.

@@ -15,6 +15,8 @@ pub mod feed_forward;
 pub mod parallel;
 /// Shared complete and selected execution over exact TP/PP resource geometry.
 pub mod partitioned;
+/// Independently constructible hybrid vision encoder and spatial projector.
+pub mod vision;
 
 pub use block::{Block, BlockGeometry, TokenMixer};
 pub use checkpoint::{
