@@ -5,20 +5,22 @@ use super::{
     PreparedAudio,
 };
 use eredu_core::{
-    execution_control::{SnapshotEstimate, SnapshotLimits, SnapshotUsage},
+    execution_control::{SnapshotEstimate, SnapshotLimits, SnapshotResourceKind, SnapshotUsage},
     scheduler::SemanticStateTransaction,
     BackendFailure, Completion, TokenFilter,
 };
 use eredu_nn::{Index, Tensor, TensorElementType};
 use eredu_runtime::{
     execution_control::{
-        snapshot_value_estimate, IsolatedStateCopy, IsolatedStateError, IsolatedStateSnapshot,
-        SnapshotBudget, SnapshotReservation, SnapshotValue,
+        snapshot_value_estimate, ForkStateEstimate, IsolatedStateCopy, IsolatedStateError,
+        IsolatedStateFork, IsolatedStateSnapshot, SnapshotBudget, SnapshotReservation,
+        SnapshotRetainedGrowth, SnapshotValue,
     },
     DenseSamplingBackend, GenerationSampler, RealtimeFrameExecutionError, RealtimeFrameTransition,
     RealtimeGenerationBranch, RealtimeGenerationContract, RealtimeGenerationState,
     RealtimeGenerationTransactionError, Sampler, SamplingBackend,
 };
+use std::{cell::RefCell, rc::Rc};
 
 /// Public output of one completed Audio advancement.
 #[derive(Debug, Clone, PartialEq)]
@@ -60,9 +62,15 @@ pub enum AudioSessionError {
     /// A shared transition did not commit.
     #[error(transparent)]
     Transition(#[from] RealtimeFrameExecutionError),
+    /// Another branch is already advancing on the shared graph.
+    #[error("the shared LFM3 Audio graph is busy")]
+    Busy,
+    /// Native retention could not be established before advancement.
+    #[error(transparent)]
+    Backend(#[from] BackendFailure),
 }
 
-/// Portable failure when capturing or restoring a resident Audio session.
+/// Portable failure when capturing, restoring or forking a resident Audio session.
 #[derive(Debug, thiserror::Error)]
 pub enum AudioSnapshotError {
     /// The session has no snapshot budget.
@@ -263,6 +271,13 @@ pub trait AudioExecutionKernel {
         &mut self,
         state: &<Self::State as SemanticStateTransaction>::Branch,
     ) -> Result<Self::Completion, BackendFailure>;
+
+    /// Holds the branch's reservation through all native work in an advance.
+    /// Unresolved work must retain it even when the operation fails or unwinds.
+    fn with_fork_retention<T>(
+        retention: SnapshotRetainedGrowth,
+        operation: impl FnOnce() -> T,
+    ) -> Result<T, BackendFailure>;
 }
 
 type Random<K> = <<K as AudioExecutionKernel>::SamplerBackend as SamplingBackend>::RandomState;
@@ -286,10 +301,16 @@ type Generation<K> = RealtimeGenerationState<
 
 /// One controlled synchronous session using the shared atomic generation owner.
 pub struct AudioSession<K: AudioExecutionKernel> {
-    transition: Transition<K>,
+    transition: Rc<RefCell<Transition<K>>>,
     generation: Generation<K>,
     cancelled: bool,
     snapshot_budget: Option<SnapshotBudget>,
+    fork: Option<ForkRetention<K>>,
+}
+
+struct ForkRetention<K: AudioExecutionKernel> {
+    growth: SnapshotRetainedGrowth,
+    estimate: fn(&Branch<K>) -> Result<u64, BackendFailure>,
 }
 
 /// Reusable idle Audio state, including unfinished refinement and codec carry.
@@ -346,6 +367,52 @@ where
 
 impl<K: AudioExecutionKernel> AudioSession<K>
 where
+    K::State: IsolatedStateFork + ForkStateEstimate,
+    Random<K>: Clone + SnapshotValue,
+{
+    /// Copies the current settled continuation without replaying prefill.
+    /// The child shares the resident graph and copy budget, and advances independently.
+    pub fn fork(&self) -> Result<Self, AudioSnapshotError> {
+        self.check_snapshot_boundary()?;
+        let budget = self
+            .snapshot_budget
+            .as_ref()
+            .ok_or(AudioSnapshotError::NotConfigured)?;
+        let state_estimate = self
+            .generation
+            .estimate_isolated_copy()
+            .map_err(|error| IsolatedStateError::Backend(failure(error)))?;
+        // The child owns an origin and heap-backed reservation/high-water counters.
+        let estimate = snapshot_value_estimate::<Self>([
+            Ok(state_estimate),
+            Ok(SnapshotEstimate {
+                retained_bytes: 256,
+                copy_bytes: 256,
+            }),
+        ])
+        .map_err(IsolatedStateError::Backend)?;
+        let retention = budget
+            .reserve(SnapshotResourceKind::Branch, Some(estimate))
+            .map_err(IsolatedStateError::Admission)?;
+        let generation = self
+            .generation
+            .fork_isolated(&retention)
+            .map_err(|error| IsolatedStateError::Backend(failure(error)))?;
+        Ok(Self {
+            transition: self.transition.clone(),
+            generation,
+            cancelled: false,
+            snapshot_budget: Some(budget.clone()),
+            fork: Some(ForkRetention {
+                growth: SnapshotRetainedGrowth::new(&retention, state_estimate.retained_bytes),
+                estimate: Generation::<K>::estimate_fork_branch,
+            }),
+        })
+    }
+}
+
+impl<K: AudioExecutionKernel> AudioSession<K>
+where
     Random<K>: Clone,
 {
     /// Adopts prefetched language state and the exact initialized speech schedule.
@@ -369,10 +436,11 @@ where
             Some(random),
         )?;
         Ok(Self {
-            transition: Transition(kernel),
+            transition: Rc::new(RefCell::new(Transition(kernel))),
             generation,
             cancelled: false,
             snapshot_budget: None,
+            fork: None,
         })
     }
 
@@ -381,9 +449,23 @@ where
         if self.cancelled || self.phase() == AudioPhase::Finished {
             return Ok(AudioAdvance::Finished);
         }
-        self.generation
-            .execute_frame_transition(&(), &mut self.transition)
-            .map_err(Into::into)
+        let mut transition = self
+            .transition
+            .try_borrow_mut()
+            .map_err(|_| AudioSessionError::Busy)?;
+        let result = if let Some(fork) = &self.fork {
+            K::with_fork_retention(fork.growth.clone(), || {
+                self.generation
+                    .execute_frame_transition_checked(&(), &mut *transition, |branch| {
+                        let bytes = (fork.estimate)(branch)?;
+                        fork.growth.admit(bytes).map_err(failure)
+                    })
+            })?
+        } else {
+            self.generation
+                .execute_frame_transition(&(), &mut *transition)
+        };
+        result.map_err(Into::into)
     }
 
     /// Current phase, including cancellation.

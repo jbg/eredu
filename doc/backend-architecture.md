@@ -16534,6 +16534,13 @@ device-cache roots with independently owned cache metadata. Retention accounts
 for the roots even when their payloads are shared. The originating session's
 budget owns snapshot retention and cumulative copy work across restores.
 
+A resident Audio fork shares the bound graph with its source and copies the
+realtime continuation through `IsolatedStateFork`. Each session has a fresh
+restore origin. The graph accepts one synchronous advance at a time. Child
+state growth is checked by the shared realtime driver before publication and
+charged to the lineage's high-water reservation. The MLX recovery scope
+retains that reservation through any unresolved work from the advance.
+
 `eredu-codec::liquid` owns LiquidCodec configuration, complete neural encoder and
 decoder equations, reflective analysis, scalar-product alphabet ordering and
 polar synthesis. It consumes neutral neural/storage/runtime contracts without

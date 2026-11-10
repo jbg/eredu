@@ -17,7 +17,8 @@ use eredu_nn::{
 };
 use eredu_runtime::{
     execution_control::{
-        snapshot_value_estimate, IsolatedStateCopy, SnapshotReservation, SnapshotValue,
+        snapshot_value_estimate, ForkStateEstimate, IsolatedStateCopy, IsolatedStateFork,
+        SnapshotReservation, SnapshotRetainedGrowth, SnapshotValue,
     },
     DenseSamplingBackend, LayerRuntimeState, ResidentRuntime, RuntimeStateComponents,
     SamplingBackend, StateLayout, SubmissionBackend,
@@ -60,6 +61,12 @@ where
     fn branch_state(state: &Self::State) -> Result<Self::State, BackendFailure>;
     /// Collects state roots that must complete before canonical publication.
     fn retained_values(state: &Self::State) -> Vec<&B::Tensor>;
+
+    /// Holds retained branch accounting while native work can outlive an advance.
+    fn with_fork_retention<T>(
+        retention: SnapshotRetainedGrowth,
+        operation: impl FnOnce() -> T,
+    ) -> Result<T, BackendFailure>;
 }
 
 /// Host input for one batch-one Audio session. Token IDs already contain the
@@ -173,6 +180,7 @@ where
     hidden: B::Tensor,
     codec: Option<DecoderState<H::State, B::Tensor>>,
     origin: Arc<()>,
+    fork_retention: Option<SnapshotReservation>,
     binding: PhantomData<H>,
 }
 
@@ -194,6 +202,7 @@ where
                 .map(|state| state.try_branch(H::branch_state))
                 .transpose()?,
             origin: self.origin.clone(),
+            fork_retention: self.fork_retention.clone(),
             binding: PhantomData,
         })
     }
@@ -225,6 +234,7 @@ where
             hidden: self.hidden.copy_snapshot_value(retention)?,
             codec: self.codec.copy_snapshot_value(retention)?,
             origin: self.origin.clone(),
+            fork_retention: None,
             binding: PhantomData,
         })
     }
@@ -236,10 +246,34 @@ where
         Ok(())
     }
 
-    fn restore_isolated(&mut self, saved: Self) -> Result<(), BackendFailure> {
+    fn restore_isolated(&mut self, mut saved: Self) -> Result<(), BackendFailure> {
         self.validate_isolated_restore(&saved)?;
+        saved.fork_retention = self.fork_retention.take();
         *self = saved;
         Ok(())
+    }
+}
+
+impl<B, H> IsolatedStateFork for ResidentAudioState<B, H>
+where
+    B: GroupedNeuralBackend + DistributedNeuralBackend<Tensor: SnapshotValue>,
+    H: ResidentAudioBinding<B, State: SnapshotValue>,
+{
+    fn fork_isolated(&self, retention: &SnapshotReservation) -> Result<Self, BackendFailure> {
+        let mut child = self.copy_isolated(retention)?;
+        child.origin = Arc::new(());
+        child.fork_retention = Some(retention.clone());
+        Ok(child)
+    }
+}
+
+impl<B, H> ForkStateEstimate for ResidentAudioState<B, H>
+where
+    B: GroupedNeuralBackend + DistributedNeuralBackend<Tensor: SnapshotValue>,
+    H: ResidentAudioBinding<B, State: SnapshotValue>,
+{
+    fn estimate_fork_branch(branch: &Self) -> Result<u64, BackendFailure> {
+        Ok(branch.estimate_isolated_copy()?.retained_bytes)
     }
 }
 
@@ -400,6 +434,7 @@ where
             hidden,
             codec: None,
             origin: Arc::new(()),
+            fork_retention: None,
             binding: PhantomData,
         };
         self.complete(&state)?;
@@ -540,5 +575,12 @@ where
         let completion = B::submit(self.binding.context(), roots).map_err(failure)?;
         completion.wait().map_err(failure)?;
         Ok(completion)
+    }
+
+    fn with_fork_retention<T>(
+        retention: SnapshotRetainedGrowth,
+        operation: impl FnOnce() -> T,
+    ) -> Result<T, BackendFailure> {
+        H::with_fork_retention(retention, operation)
     }
 }
