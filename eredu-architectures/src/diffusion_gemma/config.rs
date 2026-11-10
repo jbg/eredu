@@ -3,7 +3,7 @@ use std::num::NonZeroU32;
 use eredu_core::InputModalities;
 use serde::Deserialize;
 
-use crate::gemma4::{ModelArgs, VisionConfig};
+use crate::gemma4::{ModelArgs, VisionConfig, VisionOwner, VisionPolicy};
 
 /// Context-encoder visibility selected independently from bidirectional refinement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,7 +16,7 @@ pub enum EncoderAttention {
 
 /// Exact DiffusionGemma family geometry. Text parameters serve both invocations.
 #[derive(Debug, Clone)]
-pub struct FamilyConfig {
+pub struct FamilyPolicy {
     /// Normalized shared text-block geometry, retaining diffusion identity.
     pub text: ModelArgs,
     /// Positive trained canvas length.
@@ -27,6 +27,26 @@ pub struct FamilyConfig {
     pub vision: Option<VisionConfig>,
     /// Image placeholder token, present exactly when a vision tower is enabled.
     pub image_token_id: Option<u32>,
+}
+
+/// Immutable source policy and retained vocabulary, feedback, encoder-scale and media scopes.
+#[derive(Debug, Clone)]
+pub struct FamilyConfig {
+    policy: FamilyPolicy,
+    conditioning: std::sync::Arc<super::conditioning::Declaration>,
+    encoder_scales: std::sync::Arc<Vec<crate::gemma4::text::specs::ResidualScaleSpec>>,
+    routed: std::sync::Arc<Vec<Option<crate::gemma4::text::routed::Declaration>>>,
+    attention: std::sync::Arc<Vec<crate::gemma4::text::specs::AttentionSpec>>,
+    dense: std::sync::Arc<Vec<crate::gemma4::text::specs::DenseSpec>>,
+    blocks: std::sync::Arc<Vec<crate::gemma4::text::specs::BlockSpec>>,
+    pinned: std::sync::Arc<crate::gemma4::text::pinned::Declaration>,
+    projectors: std::sync::Arc<Vec<crate::gemma4::media::ProjectionSpec>>,
+}
+impl std::ops::Deref for FamilyConfig {
+    type Target = FamilyPolicy;
+    fn deref(&self) -> &FamilyPolicy {
+        &self.policy
+    }
 }
 
 /// Invalid family identity, parameter geometry, or modality policy.
@@ -52,7 +72,7 @@ struct Source {
     text_config: serde_json::Value,
     canvas_length: u32,
     #[serde(default)]
-    vision_config: Option<VisionConfig>,
+    vision_config: Option<VisionPolicy>,
     #[serde(default)]
     image_token_id: Option<u32>,
     #[serde(default = "default_true")]
@@ -64,21 +84,352 @@ fn default_true() -> bool {
 }
 
 impl FamilyConfig {
+    /// Validates normalized family geometry and prepares independently owned static scopes once.
+    pub fn new(policy: FamilyPolicy) -> Result<Self, ConfigError> {
+        if policy.vision.is_some() != policy.image_token_id.is_some()
+            || policy
+                .image_token_id
+                .is_some_and(|id| id >= policy.text.vocab_size as u32)
+            || policy.canvas_length.get() > policy.text.max_position_embeddings as u32
+        {
+            return Err(ConfigError::Invalid(
+                "incompatible diffusion canvas or image geometry".into(),
+            ));
+        }
+        validate_projector_formats(&policy)?;
+        let projectors = policy
+            .vision
+            .iter()
+            .map(|vision| {
+                crate::gemma4::media::ProjectionSpec::diffusion_vision(&policy.text, vision)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+        let blocks = (0..policy.text.num_hidden_layers())
+            .map(|layer| {
+                crate::gemma4::text::specs::BlockSpec::at(
+                    &policy.text,
+                    layer,
+                    "model.decoder.layers",
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+        let dense = (0..policy.text.num_hidden_layers())
+            .map(|layer| {
+                crate::gemma4::text::specs::DenseSpec::at(
+                    &policy.text,
+                    layer,
+                    "model.decoder.layers",
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+        crate::gemma4::text::specs::DenseSpec::validate_scopes(&policy.text, &dense)
+            .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+        let attention = (0..policy.text.num_hidden_layers())
+            .map(|layer| {
+                crate::gemma4::text::specs::AttentionSpec::at(
+                    &policy.text,
+                    layer,
+                    "model.decoder.layers",
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+        crate::gemma4::text::specs::AttentionSpec::validate_scopes(&policy.text, &attention)
+            .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+        let routed = (0..policy.text.num_hidden_layers())
+            .map(|layer| {
+                (policy.text.layer_policy(layer).is_some_and(|p| {
+                    p.feed_forward == crate::gemma4::FeedForwardPolicy::DenseWithSparseMoe
+                }))
+                .then(|| {
+                    crate::gemma4::text::routed::Declaration::at(
+                        &policy.text,
+                        layer,
+                        "model.decoder.layers",
+                    )
+                })
+                .transpose()
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+        crate::gemma4::text::routed::Declaration::validate_scopes(&policy.text, &routed)
+            .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+        let pinned = crate::gemma4::text::pinned::Declaration::diffusion(&policy.text)
+            .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+        let conditioning = super::conditioning::Declaration::new(&policy.text)
+            .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+        let encoder_scales = (0..policy.text.num_hidden_layers())
+            .map(|layer| {
+                crate::gemma4::text::specs::ResidualScaleSpec::new(format!(
+                    "model.encoder.language_model.layers.{layer}.layer_scalar"
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+        validate_encoder_formats(&policy)?;
+        validate_static_topology(
+            &policy,
+            &pinned,
+            &conditioning,
+            &encoder_scales,
+            &projectors,
+            &blocks,
+            &dense,
+            &attention,
+            &routed,
+        )?;
+        Ok(Self {
+            policy,
+            conditioning: conditioning.into(),
+            encoder_scales: encoder_scales.into(),
+            routed: routed.into(),
+            attention: attention.into(),
+            dense: dense.into(),
+            blocks: blocks.into(),
+            pinned: pinned.into(),
+            projectors: projectors.into(),
+        })
+    }
+    /// Retained routed selector, expert bank and branch gains for one sparse invocation.
+    pub fn routed(
+        &self,
+        layer: usize,
+    ) -> Result<Option<&crate::gemma4::text::routed::Declaration>, eredu_nn::Error> {
+        self.routed
+            .get(layer)
+            .map(|s| s.as_ref())
+            .ok_or_else(|| eredu_nn::Error::backend("routed layer outside declared stack"))
+    }
+    pub(crate) fn routed_scopes(&self) -> &[Option<crate::gemma4::text::routed::Declaration>] {
+        &self.routed
+    }
+    pub(crate) fn routed_layers(
+        &self,
+    ) -> impl Iterator<Item = (usize, &crate::gemma4::text::routed::Declaration)> {
+        self.routed
+            .iter()
+            .enumerate()
+            .filter_map(|(layer, scope)| scope.as_ref().map(|scope| (layer, scope)))
+    }
+    /// Retained affine/head-gain owners and separate attention invocation/state semantics.
+    pub fn attention(
+        &self,
+        layer: usize,
+    ) -> Result<&crate::gemma4::text::specs::AttentionSpec, eredu_nn::Error> {
+        self.attention
+            .get(layer)
+            .ok_or_else(|| eredu_nn::Error::backend("attention outside the declared Gemma stack"))
+    }
+    pub(crate) fn attention_scopes(&self) -> &[crate::gemma4::text::specs::AttentionSpec] {
+        &self.attention
+    }
+    /// Retained dense gate, value and contraction parameters and their exact GELU equation.
+    pub fn dense(
+        &self,
+        layer: usize,
+    ) -> Result<&crate::gemma4::text::specs::DenseSpec, eredu_nn::Error> {
+        self.dense
+            .get(layer)
+            .ok_or_else(|| eredu_nn::Error::backend("dense layer outside the declared Gemma stack"))
+    }
+    pub(crate) fn dense_scopes(&self) -> &[crate::gemma4::text::specs::DenseSpec] {
+        &self.dense
+    }
+    /// Retained block gain, residual-scale and optional layer-input owners.
+    pub fn block(
+        &self,
+        layer: usize,
+    ) -> Result<&crate::gemma4::text::specs::BlockSpec, eredu_nn::Error> {
+        self.blocks
+            .get(layer)
+            .ok_or_else(|| eredu_nn::Error::backend("block outside the declared Gemma stack"))
+    }
+    pub(crate) fn blocks(&self) -> &[crate::gemma4::text::specs::BlockSpec] {
+        &self.blocks
+    }
+    /// Decoder-only feedback parameters, independent of shared-stack invocation state.
+    pub fn conditioning(&self) -> &super::conditioning::Declaration {
+        &self.conditioning
+    }
+    /// One independently owned encoder residual scale for this logical layer.
+    pub fn encoder_scalar(
+        &self,
+        layer: usize,
+    ) -> Result<&crate::gemma4::text::specs::ResidualScaleSpec, eredu_nn::Error> {
+        self.encoder_scales.get(layer).ok_or_else(|| {
+            eredu_nn::Error::backend("encoder scale outside the declared diffusion stack")
+        })
+    }
+    /// Retained shared vocabulary/readout owners, distinct from invocation state.
+    pub fn pinned(&self) -> &crate::gemma4::text::pinned::Declaration {
+        &self.pinned
+    }
+    /// Normalized geometry and execution policy, separate from retained edge ownership.
+    pub fn policy(&self) -> &FamilyPolicy {
+        &self.policy
+    }
+    /// Declared media-to-text parameter edges consumed by source schemas.
+    pub fn projectors(&self) -> &[crate::gemma4::media::ProjectionSpec] {
+        &self.projectors
+    }
+    /// Optional independently owned image-to-text projection.
+    pub fn vision_projector(&self) -> Option<&crate::gemma4::media::ProjectionSpec> {
+        self.projectors.first()
+    }
+
     /// Applies exact selected matrix encodings to shared text and image modules.
     pub fn with_checkpoint_formats(
         &self,
         formats: std::collections::HashMap<String, eredu_checkpoint::WeightQuantization>,
-    ) -> Self {
-        let mut config = self.clone();
-        config.text.weight_quantization = None;
-        config.text.quantized_weights = None;
-        config.text.quantized_weight_configs = Some(formats.clone());
-        if let Some(vision) = &mut config.vision {
-            vision.weight_quantization = None;
-            vision.quantized_weights = None;
-            vision.quantized_weight_configs = Some(formats);
+    ) -> Result<Self, ConfigError> {
+        let mut policy = self.policy.clone();
+        policy.text.weight_quantization = None;
+        policy.text.quantized_weights = None;
+        policy.text.quantized_weight_configs = Some(formats.clone());
+        if let Some(vision) = &mut policy.vision {
+            let formats = formats
+                .into_iter()
+                .filter(|(name, _)| name.starts_with("model.encoder.vision_tower."))
+                .collect::<std::collections::HashMap<_, _>>();
+            *vision = vision.with_formats(None, None, (!formats.is_empty()).then_some(formats))?;
         }
-        config
+        self.project_storage(policy)
+    }
+    /// Selects text execution formats while retaining independently admitted tower scopes.
+    pub(crate) fn with_text_formats(
+        &self,
+        formats: std::collections::HashMap<String, eredu_checkpoint::WeightQuantization>,
+    ) -> Result<Self, ConfigError> {
+        let mut policy = self.policy.clone();
+        policy.text.weight_quantization = None;
+        policy.text.quantized_weights = None;
+        policy.text.quantized_weight_configs = (!formats.is_empty()).then_some(formats);
+        self.project_storage(policy)
+    }
+    fn project_storage(&self, policy: FamilyPolicy) -> Result<Self, ConfigError> {
+        validate_projector_formats(&policy)?;
+        let name = crate::gemma4::media::ProjectionSpec::DIFFUSION_VISION_WEIGHT;
+        let encoding = policy.text.linear_format_for(name);
+        let mut changed = false;
+        let projectors = self
+            .projectors
+            .iter()
+            .map(|source| {
+                let projected = source
+                    .with_format(encoding)
+                    .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+                changed |= source.projection.format != projected.projection.format;
+                Ok(projected)
+            })
+            .collect::<Result<Vec<_>, ConfigError>>()?;
+        let blocks = self
+            .blocks
+            .iter()
+            .map(|spec| spec.project_formats(&policy.text))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+        let dense = self
+            .dense
+            .iter()
+            .map(|spec| spec.project_formats(&policy.text))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+        crate::gemma4::text::specs::DenseSpec::validate_scopes(&policy.text, &dense)
+            .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+        let attention = self
+            .attention
+            .iter()
+            .map(|spec| spec.project_formats(&policy.text))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+        crate::gemma4::text::specs::AttentionSpec::validate_scopes(&policy.text, &attention)
+            .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+        let routed = self
+            .routed
+            .iter()
+            .map(|scope| {
+                scope
+                    .as_ref()
+                    .map(|scope| scope.project_formats(&policy.text))
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+        crate::gemma4::text::routed::Declaration::validate_scopes(&policy.text, &routed)
+            .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+        let pinned = self
+            .pinned
+            .project_formats(&policy.text)
+            .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+        validate_encoder_formats(&policy)?;
+        let conditioning = self
+            .conditioning
+            .project_formats(&policy.text)
+            .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+        validate_static_topology(
+            &policy,
+            &pinned,
+            &conditioning,
+            &self.encoder_scales,
+            &projectors,
+            &blocks,
+            &dense,
+            &attention,
+            &routed,
+        )?;
+        Ok(Self {
+            policy,
+            conditioning: conditioning.into(),
+            encoder_scales: self.encoder_scales.clone(),
+            routed: if self.routed.iter().zip(&routed).all(|(s, t)| match (s, t) {
+                (None, None) => true,
+                (Some(s), Some(t)) => s.same_formats(t),
+                _ => false,
+            }) {
+                self.routed.clone()
+            } else {
+                routed.into()
+            },
+            attention: if self
+                .attention
+                .iter()
+                .zip(&attention)
+                .all(|(s, t)| s.same_formats(t))
+            {
+                self.attention.clone()
+            } else {
+                attention.into()
+            },
+            dense: if self
+                .dense
+                .iter()
+                .zip(&dense)
+                .all(|(source, target)| source.same_formats(target))
+            {
+                self.dense.clone()
+            } else {
+                dense.into()
+            },
+            blocks: if self
+                .blocks
+                .iter()
+                .zip(&blocks)
+                .all(|(source, target)| source.same_formats(target))
+            {
+                self.blocks.clone()
+            } else {
+                blocks.into()
+            },
+            pinned: pinned.into(),
+            projectors: if changed {
+                projectors.into()
+            } else {
+                self.projectors.clone()
+            },
+        })
     }
 
     /// Whether any shared layer invokes an independently addressed expert bank.
@@ -107,7 +458,7 @@ impl FamilyConfig {
             _ => {
                 return Err(ConfigError::Invalid(
                     "DiffusionGemma requires GELU-tanh gated feed-forward equations".into(),
-                ))
+                ));
             }
         }
         let encoder_attention = match object
@@ -119,7 +470,7 @@ impl FamilyConfig {
             _ => {
                 return Err(ConfigError::Invalid(
                     "unknown DiffusionGemma encoder visibility".into(),
-                ))
+                ));
             }
         };
         object.insert(
@@ -151,11 +502,14 @@ impl FamilyConfig {
             vision.input_score_arithmetic = true;
             vision.validate()?;
         }
-        Ok(Self {
+        Self::new(FamilyPolicy {
             text,
             canvas_length,
             encoder_attention,
-            vision: source.vision_config,
+            vision: source
+                .vision_config
+                .map(|policy| VisionConfig::new(policy, VisionOwner::DiffusionGemma))
+                .transpose()?,
             image_token_id: source.image_token_id,
         })
     }
@@ -238,7 +592,7 @@ impl FamilyConfig {
         }
         text.model_type = "diffusion_gemma_text".into();
         text.apply_diffusion_equations();
-        Ok(Self {
+        Self::new(FamilyPolicy {
             text,
             canvas_length: canvas,
             encoder_attention: EncoderAttention::CausalWithVisionSpans,
@@ -255,7 +609,15 @@ impl FamilyConfig {
                 ("text", self.text.architecture_fingerprint()),
                 ("canvas_length", self.canvas_length.to_string()),
                 ("encoder_attention", format!("{:?}", self.encoder_attention)),
-                ("vision", format!("{:?}", self.vision)),
+                (
+                    "vision",
+                    format!(
+                        "{:?}",
+                        self.vision
+                            .as_ref()
+                            .map(|vision| (vision.owner(), vision.policy()))
+                    ),
+                ),
                 ("image_token", format!("{:?}", self.image_token_id)),
             ],
         )
@@ -270,4 +632,89 @@ impl FamilyConfig {
             video: self.vision.is_some(),
         }
     }
+}
+
+fn validate_projector_formats(policy: &FamilyPolicy) -> Result<(), ConfigError> {
+    for name in policy
+        .text
+        .quantized_weight_configs
+        .iter()
+        .flat_map(|f| f.keys())
+        .chain(policy.text.quantized_weights.iter().flatten())
+    {
+        let projector = name.starts_with("model.encoder.embed_vision.");
+        if (projector && name != crate::gemma4::media::ProjectionSpec::DIFFUSION_VISION_WEIGHT)
+            || (policy.vision.is_none()
+                && (projector || name.starts_with("model.encoder.vision_tower.")))
+        {
+            return Err(ConfigError::Invalid(format!(
+                "diffusion media format references undeclared projection {name}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_encoder_formats(policy: &FamilyPolicy) -> Result<(), ConfigError> {
+    for name in policy
+        .text
+        .quantized_weight_configs
+        .iter()
+        .flat_map(|f| f.keys())
+        .chain(policy.text.quantized_weights.iter().flatten())
+    {
+        if name.starts_with("model.encoder.language_model.layers.") {
+            return Err(ConfigError::Invalid(format!(
+                "encoder scale has no matrix format extension: {name}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_static_topology(
+    policy: &FamilyPolicy,
+    pinned: &crate::gemma4::text::pinned::Declaration,
+    conditioning: &super::conditioning::Declaration,
+    scales: &[crate::gemma4::text::specs::ResidualScaleSpec],
+    projectors: &[crate::gemma4::media::ProjectionSpec],
+    blocks: &[crate::gemma4::text::specs::BlockSpec],
+    dense: &[crate::gemma4::text::specs::DenseSpec],
+    attention: &[crate::gemma4::text::specs::AttentionSpec],
+    routed: &[Option<crate::gemma4::text::routed::Declaration>],
+) -> Result<(), ConfigError> {
+    use eredu_nn::DeclareLogicalParameters;
+    let declarations = || -> Result<_, eredu_nn::Error> {
+        let mut parameters = pinned.logical_parameters()?;
+        parameters.extend(conditioning.logical_parameters()?);
+        parameters.extend(scales.logical_parameters()?);
+        parameters.extend(projectors.logical_parameters()?);
+        parameters.extend(blocks.logical_parameters()?);
+        parameters.extend(dense.logical_parameters()?);
+        parameters.extend(attention.logical_parameters()?);
+        for scope in routed.iter().flatten() {
+            parameters.extend(scope.logical_parameters()?);
+        }
+        if let Some(vision) = &policy.vision {
+            parameters.extend(vision.logical_parameters()?);
+        }
+        Ok(parameters)
+    };
+    let parameters = declarations().map_err(|e| ConfigError::Invalid(e.to_string()))?;
+    let references = crate::gemma4::text::specs::format_references(
+        policy.text.weight_quantization,
+        policy.text.quantized_weights.as_ref(),
+        policy.text.quantized_weight_configs.as_ref(),
+    )
+    .chain(policy.vision.iter().flat_map(|config| {
+        crate::gemma4::text::specs::format_references(
+            config.weight_quantization,
+            config.quantized_weights.as_ref(),
+            config.quantized_weight_configs.as_ref(),
+        )
+    }));
+    crate::gemma4::text::specs::validate_format_references(&parameters, routed, references)
+        .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+    eredu_nn::validate_logical_parameter_topology(&parameters)
+        .map_err(|e| ConfigError::Invalid(e.to_string()))
 }

@@ -40,7 +40,7 @@ impl PreparedRnntPredictorPipelineBindings {
             component: "RNNT predictor",
             reason,
         };
-        validate_rnnt_predictor_partition(bindings.definition(), bindings.dimensions(), &partition)
+        validate_rnnt_predictor_partition(bindings.declaration(), &partition)
             .map_err(ComponentPipelinePreparationError::Component)?;
         if cuts.dimensions() != bindings.dimensions()
             || activation_dtype != PipelineActivationDtype::Float32

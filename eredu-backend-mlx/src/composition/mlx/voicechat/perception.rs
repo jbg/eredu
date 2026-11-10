@@ -185,15 +185,14 @@ fn materialize(
     detached_preparation(
         Vec::<Array>::new(),
         || {
-            let precision = prepared.precision();
-            let (dimensions, definition, layout, source, units) = prepared.into_parts();
-            let kernel = match parallel {
-                Some((local, _)) => {
-                    PerceptionKernel::<MlxNeuralBackend>::new_parallel(dimensions, local)
+            let (declaration, selected, layout, source, units) = prepared.into_parts();
+            let definition = declaration.definition().clone();
+            let kernel = match selected.as_ref() {
+                Some(local) => {
+                    PerceptionKernel::<MlxNeuralBackend>::new_parallel(declaration, local)
                 }
-                None => PerceptionKernel::<MlxNeuralBackend>::new(dimensions),
+                None => PerceptionKernel::<MlxNeuralBackend>::new(declaration),
             }
-            .and_then(|architecture| architecture.with_precision(precision))
             .map_err(BackendFailure::from_error)?;
             let mut architecture = eredu_runtime::ComponentAdapter::new(definition, kernel)
                 .map_err(|error| BackendFailure::from_error(PerceptionError::from(error)))?;

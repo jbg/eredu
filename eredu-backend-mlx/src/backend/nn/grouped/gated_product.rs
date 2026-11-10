@@ -428,6 +428,7 @@ impl PackedGatedProductGroups {
                 )?,
                 stream,
             )?,
+            GatedProductActivation::Gelu => super::super::layers::gelu(gate, stream)?,
             GatedProductActivation::GeluApproximate => {
                 super::super::layers::gelu_approximate(gate, stream)?
             }

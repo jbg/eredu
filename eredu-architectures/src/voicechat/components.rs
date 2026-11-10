@@ -158,12 +158,13 @@ impl<'a> PreparedVoiceChatConstruction<'a> {
         }
         let backbone = PreparedBackboneParameters::from_retained(artifacts)
             .map_err(BackboneConstructionError::from)?;
+        let speech = PreparedSpeechProviders::from_retained(artifacts)?;
         let neural_state_geometry =
-            NeuralStateGeometry::new(backbone.args(), &artifacts.plan().config().tts.backbone)?;
+            NeuralStateGeometry::new(backbone.declaration(), speech.transformer_declaration())?;
         Ok(Self {
             artifacts,
             backbone,
-            speech: PreparedSpeechProviders::from_retained(artifacts)?,
+            speech,
             host: PreparedHostConditioning::from_retained(artifacts)?,
             silence: PreparedSilenceConditioning::from_retained(artifacts)?,
             neural_state_geometry,

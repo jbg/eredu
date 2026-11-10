@@ -13,8 +13,7 @@ use crate::decoder::{
 use eredu_checkpoint::{LinearFormat, WeightQuantization};
 use eredu_core::{AttentionPolicy, LayerSchedule};
 use eredu_nn::{
-    AttentionCache, AttentionRequest, Error, GatedProductPolicy, NeuralBackend,
-    NormalizationConstructionSpec, NormalizationScale, ParameterSpec, RotaryAlgorithm,
+    AttentionCache, AttentionRequest, Error, GatedProductPolicy, NeuralBackend, RotaryAlgorithm,
     RotaryArithmetic, RotarySpec, Tensor, TensorElementType,
 };
 use std::collections::BTreeMap;
@@ -109,43 +108,38 @@ impl TransformerConfig {
         self.formats = formats;
         self
     }
+    /// Resolves storage extensions against one exact retained stack before allocation.
+    pub(crate) fn validate_formats(
+        &self,
+        declaration: &impl eredu_nn::DeclareLogicalParameters,
+    ) -> Result<(), Error> {
+        let parameters = declaration.logical_parameters()?;
+        let slots = parameters
+            .into_iter()
+            .map(|p| (p.parameter.id.as_str(), p))
+            .collect::<BTreeMap<_, _>>();
+        for (name, format) in &self.formats {
+            format.validate().map_err(Error::backend_source)?;
+            let slot = slots.get(name.as_str()).ok_or_else(|| {
+                Error::backend(format!(
+                    "speech transformer format references undeclared slot {name}"
+                ))
+            })?;
+            if *format != LinearFormat::Dense
+                && (slot.role != eredu_nn::LogicalParameterRole::LinearWeight
+                    || slot.shape.len() != 2
+                    || slot.linear_format.is_none())
+            {
+                return Err(Error::backend(format!(
+                    "speech transformer encoding requires a declared affine slot: {name}"
+                )));
+            }
+        }
+        Ok(())
+    }
     /// Exact admitted dimensions and positional capacity.
     pub fn geometry(&self) -> &GemmaConfig {
         &self.geometry
-    }
-    /// Builds one independently materializable shared decoder block.
-    pub fn build_block<B: NeuralBackend>(
-        &self,
-        layer: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<TransformerBlock<B>, Error> {
-        if layer >= self.geometry.num_hidden_layers {
-            return Err(Error::backend("TTS layer is outside its stack"));
-        }
-        TransformerBlock::new(self, layer, context)
-    }
-    /// Builds the separately materializable final hidden-state normalization.
-    pub fn build_final_norm<B: NeuralBackend>(
-        &self,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Normalization, Error> {
-        B::normalization(
-            NormalizationConstructionSpec {
-                reduction: eredu_nn::NormalizationReduction::Native,
-                groups: Some(1),
-                dimensions: self.hidden_size(),
-                epsilon: self.rms_norm_epsilon(),
-                scale: NormalizationScale::LearnedOffset {
-                    weight: ParameterSpec::trainable(format!(
-                        "{}.norm.weight",
-                        self.parameter_root()
-                    ))
-                    .map_err(Error::backend)?,
-                    offset: 1.0,
-                },
-            },
-            context,
-        )
     }
 }
 impl Config for TransformerConfig {
@@ -353,12 +347,13 @@ impl<B: NeuralBackend> eredu_nn::Parameterized<B::Tensor> for TtsTransformer<B> 
 impl<B: NeuralBackend> TtsTransformer<B> {
     /// Constructs unloaded units without source access.
     pub fn new(
-        config: TransformerConfig,
+        declaration: super::tts_transformer_specs::TransformerDeclaration,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, super::tts_transformer_layered::TransformerError> {
         Ok(Self {
             runtime: eredu_runtime::ResidentRuntime::new(
-                super::tts_transformer_layered::TransformerKernel::new(config)?.into_component()?,
+                super::tts_transformer_layered::TransformerKernel::new(declaration)?
+                    .into_component()?,
                 context,
             )
             .map_err(eredu_runtime::ResidentUnitsError::into_architecture)?,
@@ -366,7 +361,7 @@ impl<B: NeuralBackend> TtsTransformer<B> {
     }
     /// Adopts independently materialized blocks and normalization without replacements.
     pub(super) fn from_parts(
-        config: TransformerConfig,
+        declaration: super::tts_transformer_specs::TransformerDeclaration,
         blocks: Vec<TransformerBlock<B>>,
         norm: B::Normalization,
     ) -> Result<Self, super::tts_transformer_layered::TransformerError> {
@@ -377,7 +372,7 @@ impl<B: NeuralBackend> TtsTransformer<B> {
         ];
         Ok(Self {
             runtime: eredu_runtime::ResidentRuntime::from_units(
-                TransformerKernel::new(config)?.into_component()?,
+                TransformerKernel::new(declaration)?.into_component()?,
                 units,
             )
             .map_err(eredu_runtime::ResidentUnitsError::into_architecture)?,
@@ -396,8 +391,10 @@ impl<B: NeuralBackend> TtsTransformer<B> {
     ) -> Result<B::Tensor, super::tts_transformer_layered::TransformerError> {
         use super::tts_transformer_layered::{TransformerInput, TransformerRuntimeState};
         let mut empty = [];
-        let mut state =
-            TransformerRuntimeState::<B, NoTransformerCache<B>>::new(self.config(), &mut empty)?;
+        let mut state = TransformerRuntimeState::<B, NoTransformerCache<B>>::for_architecture(
+            self.runtime.architecture().kernel(),
+            &mut empty,
+        )?;
         self.runtime.forward_with_state(
             TransformerInput {
                 embedded,
@@ -441,7 +438,10 @@ impl<B: NeuralBackend, C: AttentionCache<B::Tensor> + eredu_runtime::RuntimeLaye
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, super::tts_transformer_layered::TransformerError> {
         use super::tts_transformer_layered::{TransformerInput, TransformerRuntimeState};
-        let mut state = TransformerRuntimeState::<B, C>::new(self.config(), caches)?;
+        let mut state = TransformerRuntimeState::<B, C>::for_architecture(
+            self.runtime.architecture().kernel(),
+            caches,
+        )?;
         self.runtime.forward_with_state(
             TransformerInput {
                 embedded,

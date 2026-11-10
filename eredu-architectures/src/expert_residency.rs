@@ -1029,7 +1029,7 @@ where
         _ => {
             return Err(RoutedMechanismExecutionError::InvalidPlan(
                 "unknown expert route combination".into(),
-            ))
+            ));
         }
     };
 
@@ -1946,7 +1946,9 @@ pub enum ExpertResidencyCatalogError {
         binding: String,
     },
     /// A packed companion collides with its projection or another declared binding.
-    #[error("expert residency binding {binding:?} quantization companion {companion:?} collides with an existing binding")]
+    #[error(
+        "expert residency binding {binding:?} quantization companion {companion:?} collides with an existing binding"
+    )]
     QuantizationCompanionCollision {
         /// Quantizable projection binding.
         binding: String,
@@ -2030,7 +2032,10 @@ where
             eredu_checkpoint::expert::gated_product_materialization_recipes(catalog, &recipes)?;
         let selected_outputs = [&recipes.target_gate_up, &recipes.target_down]
             .into_iter()
-            .flat_map(|target| ["", "_scales", "_biases"].map(|suffix| format!("{target}{suffix}")))
+            .flat_map(|target| {
+                ["", "_scales", "_biases", "_global_scale"]
+                    .map(|suffix| format!("{target}{suffix}"))
+            })
             .filter_map(|target| outputs.get(&target).cloned().map(|recipe| (target, recipe)))
             .collect();
         let members = eredu_runtime::ParameterBankRecipes::new(catalog, selected_outputs, experts)
@@ -2044,10 +2049,10 @@ where
                 ("gate_up_proj", &recipes.target_gate_up),
                 ("down_proj", &recipes.target_down),
             ] {
-                let has_companions = ["_scales", "_biases"]
+                let has_companions = ["_scales", "_biases", "_global_scale"]
                     .iter()
                     .any(|suffix| outputs.contains_key(&format!("{target}{suffix}")));
-                for suffix in ["", "_scales", "_biases"] {
+                for suffix in ["", "_scales", "_biases", "_global_scale"] {
                     let name = format!("{target}{suffix}");
                     let Some(recipe) = selected.get(&name) else {
                         continue;

@@ -19,28 +19,52 @@ where
 {
     type FeedForward = RoutedMlp<B>;
 
-    fn build_feed_forward(
-        args: &ModelArgs,
-        layer: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self::FeedForward, Error> {
-        RoutedMlp::new(args, layer, context)
-    }
-
-    fn build_partitioned_feed_forward(
-        global: &ModelArgs,
+    type Parameters = eredu_nn::RoutedGatedProductSpec;
+    fn prepare_parameters(
+        _global: &ModelArgs,
         local: &ModelArgs,
+        _layer: usize,
+        dense: Option<&eredu_nn::GatedProductSpec>,
+        retained: Option<&Self::Parameters>,
+    ) -> Result<Self::Parameters, Error> {
+        if dense.is_some() {
+            return Err(Error::backend(
+                "GPT-OSS cannot consume dense feed-forward slots",
+            ));
+        }
+        super::moe::local_spec(
+            local,
+            retained.ok_or_else(|| {
+                Error::backend("GPT-OSS requires retained projection declarations")
+            })?,
+        )
+    }
+    fn parameter_description(
+        config: &ModelArgs,
+        common: &crate::decoder::DecoderDeclaration,
+        projections: Option<&crate::decoder::ProjectionDeclarations<Self::Parameters>>,
+    ) -> Result<eredu_runtime::ArchitectureParameterDescription, Error> {
+        let projections = projections
+            .ok_or_else(|| Error::backend("GPT-OSS requires retained projection declarations"))?;
+        let declaration = super::Declaration::from_scopes(
+            config.clone(),
+            std::sync::Arc::new(common.clone()),
+            projections.clone(),
+        )?;
+        super::parallel::parameter_description(
+            &declaration,
+            crate::decoder::ParameterEncoding::Stored,
+        )
+        .map_err(Error::backend_source)
+    }
+    fn build_feed_forward(
+        _global: &ModelArgs,
+        _local: &ModelArgs,
         layer: usize,
+        parameters: &Self::Parameters,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::FeedForward, Error> {
-        RoutedMlp::new_partitioned(global, local, layer, context)
-    }
-
-    fn parameter_description(
-        args: &ModelArgs,
-    ) -> Result<eredu_runtime::ArchitectureParameterDescription, eredu_runtime::ParallelPlanError>
-    {
-        super::parallel::parameter_description(args)
+        RoutedMlp::from_spec(layer, parameters.clone(), context)
     }
 }
 
@@ -50,7 +74,13 @@ pub fn new_block<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>(
     layer: usize,
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<TransformerBlock<B>, Error> {
-    TransformerBlock::from_factory::<_, GptOssBlockFactory>(args, args, layer, context)
+    TransformerBlock::from_factory::<_, GptOssBlockFactory>(
+        args,
+        args,
+        layer,
+        &crate::decoder::topology::BlockParameters::with_feed_forward(args, layer, None)?,
+        context,
+    )
 }
 
 /// Executes a block with runtime-owned expert residency.

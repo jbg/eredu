@@ -635,6 +635,13 @@ fn resolve_gguf_configuration(
             GgufModelConfig::NemotronLabsDiffusion(admitted.clone()),
             admitted.checkpoint().clone(),
             admitted.mapping().to_vec(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         );
         (architecture, plan)
     } else {
@@ -852,9 +859,9 @@ pub enum SafetensorsModelConfig {
     Qwen(crate::qwen::ModelArgs),
     /// Qwen hybrid-family geometry.
     QwenHybrid(crate::qwen::hybrid::ParsedHybridConfig),
-    /// Flash-Next configuration and exact SafeTensors encoding policy.
+    /// Retained Flash-Next parameter ownership and exact SafeTensors encoding policy.
     Qwen4Exp(
-        crate::qwen4_exp::config::Config,
+        std::sync::Arc<crate::qwen4_exp::Declaration>,
         crate::qwen4_exp::checkpoint::schema::SafetensorsEncoding,
     ),
     /// Qwen3-VL family geometry.
@@ -869,7 +876,16 @@ pub struct SafetensorsArchitecturePlan {
     checkpoint: SafetensorsCheckpointPlan,
     checkpoint_resolution: Option<ResolvedCheckpointPlan>,
     moshi_recipes: Option<AtomicRecipeSet>,
+    moshi_parameters: Option<crate::moshi::MoshiParameterContract>,
     qwen4_exp_target: Option<std::sync::Arc<crate::qwen4_exp::prepared::SafetensorsTargetPlan>>,
+    pub(crate) lfm2: Option<std::sync::Arc<crate::lfm2::Declaration>>,
+    pub(crate) kimi: Option<std::sync::Arc<crate::kimi_linear::Declaration>>,
+    pub(crate) nemotron: Option<std::sync::Arc<crate::nemotron_h::Declaration>>,
+    pub(crate) dense: Option<std::sync::Arc<crate::decoder::DecoderDeclaration>>,
+    pub(crate) gpt_oss: Option<std::sync::Arc<crate::gpt_oss::Declaration>>,
+    pub(crate) qwen: Option<std::sync::Arc<crate::qwen::Declaration>>,
+    pub(crate) k2: Option<std::sync::Arc<crate::k2_horizon::Declaration>>,
+    pub(crate) vl: Option<std::sync::Arc<crate::qwen::vl::Declaration>>,
 }
 
 /// Typed, normalized family configuration retained from GGUF admission.
@@ -975,6 +991,13 @@ pub struct GgufArchitecturePlan {
     model: GgufModelConfig,
     checkpoint: GgufCheckpointPlan,
     tensor_mapping: Vec<eredu_gguf::TranslatedTensorLayout>,
+    pub(crate) lfm2: Option<std::sync::Arc<crate::lfm2::Declaration>>,
+    pub(crate) kimi: Option<std::sync::Arc<crate::kimi_linear::Declaration>>,
+    pub(crate) nemotron: Option<std::sync::Arc<crate::nemotron_h::Declaration>>,
+    pub(crate) dense: Option<std::sync::Arc<crate::decoder::DecoderDeclaration>>,
+    pub(crate) gpt_oss: Option<std::sync::Arc<crate::gpt_oss::Declaration>>,
+    pub(crate) qwen: Option<std::sync::Arc<crate::qwen::Declaration>>,
+    pub(crate) k2: Option<std::sync::Arc<crate::k2_horizon::Declaration>>,
 }
 
 impl GgufArchitecturePlan {
@@ -987,16 +1010,16 @@ impl GgufArchitecturePlan {
 
     pub(crate) fn with_draft_adapter(
         mut self,
-        adapter: crate::nemotron_labs_diffusion::adapter::DraftAdapterConfig,
+        adapter: std::sync::Arc<crate::nemotron_labs_diffusion::adapter::DraftAdapterDeclaration>,
     ) -> Result<Self, String> {
         match &mut self.model {
             GgufModelConfig::NemotronLabsDiffusion(plan) => {
-                *plan = plan.clone().with_draft_adapter(adapter)
+                *plan = plan.clone().with_draft_adapter(adapter)?
             }
             _ => {
                 return Err(
                     "draft-only low-rank parameters require a shared-backbone family".into(),
-                )
+                );
             }
         }
         Ok(self)
@@ -1015,12 +1038,26 @@ impl GgufArchitecturePlan {
         model: GgufModelConfig,
         checkpoint: GgufCheckpointPlan,
         tensor_mapping: Vec<eredu_gguf::TranslatedTensorLayout>,
+        lfm2: Option<std::sync::Arc<crate::lfm2::Declaration>>,
+        kimi: Option<std::sync::Arc<crate::kimi_linear::Declaration>>,
+        nemotron: Option<std::sync::Arc<crate::nemotron_h::Declaration>>,
+        dense: Option<std::sync::Arc<crate::decoder::DecoderDeclaration>>,
+        gpt_oss: Option<std::sync::Arc<crate::gpt_oss::Declaration>>,
+        qwen: Option<std::sync::Arc<crate::qwen::Declaration>>,
+        k2: Option<std::sync::Arc<crate::k2_horizon::Declaration>>,
     ) -> Self {
         Self {
             architecture,
             model,
             checkpoint,
             tensor_mapping,
+            lfm2,
+            kimi,
+            nemotron,
+            dense,
+            gpt_oss,
+            qwen,
+            k2,
         }
     }
 
@@ -1072,16 +1109,16 @@ impl SafetensorsArchitecturePlan {
 
     pub(crate) fn with_draft_adapter(
         mut self,
-        adapter: crate::nemotron_labs_diffusion::adapter::DraftAdapterConfig,
+        adapter: std::sync::Arc<crate::nemotron_labs_diffusion::adapter::DraftAdapterDeclaration>,
     ) -> Result<Self, String> {
         match &mut self.model {
             SafetensorsModelConfig::NemotronLabsDiffusion(plan) => {
-                *plan = plan.clone().with_draft_adapter(adapter)
+                *plan = plan.clone().with_draft_parameters(adapter)?
             }
             _ => {
                 return Err(
                     "draft-only low-rank parameters require a shared-backbone family".into(),
-                )
+                );
             }
         }
         Ok(self)
@@ -1185,8 +1222,7 @@ impl SafetensorsArchitecturePlan {
                         "Inkling prediction depth exceeds usize".into(),
                     )
                 })?;
-                let mut target = args.clone();
-                target.mtp_config = None;
+                let target = args.without_prediction();
                 (
                     SafetensorsModelConfig::Inkling(target),
                     PredictionExtensionPlan::new(
@@ -1203,7 +1239,7 @@ impl SafetensorsArchitecturePlan {
                     )
                 })?;
                 let mut target = args.clone();
-                target.text.mtp_num_hidden_layers = 0;
+                target.text = target.text.without_prediction();
                 (
                     SafetensorsModelConfig::QwenHybrid(target),
                     PredictionExtensionPlan::new(
@@ -1232,6 +1268,20 @@ impl SafetensorsArchitecturePlan {
             }
             _ => return Ok(None),
         };
+        let nemotron = match &model {
+            SafetensorsModelConfig::NemotronH(_) => Some(std::sync::Arc::new(
+                self.nemotron
+                    .as_ref()
+                    .ok_or_else(|| {
+                        ArtifactError::InvalidArchitecturePlan(
+                            "missing admitted Nemotron scope".into(),
+                        )
+                    })?
+                    .prediction_target()
+                    .map_err(|e| ArtifactError::InvalidArchitecturePlan(e.to_string()))?,
+            )),
+            _ => None,
+        };
         let checkpoint = match &model {
             SafetensorsModelConfig::DeepSeekV3(args) => {
                 crate::deepseek::v3_safetensors_plan(args, true)
@@ -1249,7 +1299,10 @@ impl SafetensorsArchitecturePlan {
                 debug_assert_eq!(args.text.mtp_num_hidden_layers, 0);
                 Ok(checkpoint)
             }
-            SafetensorsModelConfig::NemotronH(args) => crate::nemotron_h::safetensors_plan(args),
+            SafetensorsModelConfig::NemotronH(_) => nemotron
+                .as_ref()
+                .expect("declared Nemotron target")
+                .safetensors_plan(),
             _ => unreachable!("prediction projection admits only typed extension families"),
         }
         .map_err(ArtifactError::InvalidArchitecturePlan)?;
@@ -1263,7 +1316,16 @@ impl SafetensorsArchitecturePlan {
                     checkpoint: checkpoint.clone(),
                     checkpoint_resolution: None,
                     moshi_recipes: None,
+                    moshi_parameters: None,
                     qwen4_exp_target: None,
+                    lfm2: None,
+                    kimi: None,
+                    nemotron: nemotron.clone(),
+                    dense: None,
+                    gpt_oss: None,
+                    qwen: None,
+                    k2: None,
+                    vl: None,
                 };
                 let extension_sources = extension.source_keys(&target)?;
                 let target_sources = resolution
@@ -1283,7 +1345,16 @@ impl SafetensorsArchitecturePlan {
                 checkpoint,
                 checkpoint_resolution,
                 moshi_recipes: None,
+                moshi_parameters: None,
                 qwen4_exp_target: None,
+                lfm2: None,
+                kimi: None,
+                nemotron,
+                dense: None,
+                gpt_oss: None,
+                qwen: None,
+                k2: None,
+                vl: None,
             },
             extension,
         )))
@@ -1333,14 +1404,20 @@ impl SafetensorsArchitecturePlan {
             resolve_safetensors_plan(&catalog, &self.checkpoint)
                 .map_err(invalid_checkpoint_validation)?,
         );
-        if let SafetensorsModelConfig::Moshi(config) = &self.model {
-            self.moshi_recipes = Some(crate::moshi::canonical_recipes(config, &catalog).map_err(
-                |error| {
+        if let SafetensorsModelConfig::Moshi(_) = &self.model {
+            self.moshi_recipes = Some(
+                crate::moshi::canonical_recipes(
+                    self.moshi_parameters
+                        .as_ref()
+                        .expect("retained Moshi contract"),
+                    &catalog,
+                )
+                .map_err(|error| {
                     ArtifactError::InvalidArchitecturePlan(format!(
                         "invalid Moshi checkpoint recipes: {error}"
                     ))
-                },
-            )?);
+                })?,
+            );
         }
         Ok(())
     }
@@ -1361,13 +1438,29 @@ pub enum PredictionExtensionKind {
     NemotronHMtp,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) enum PredictionScopes {
+    Component(std::sync::Arc<eredu_runtime::ComponentDefinition>),
+    Nemotron(std::sync::Arc<crate::nemotron_h::Declaration>),
+}
+impl PredictionScopes {
+    pub(crate) fn definition(&self) -> &std::sync::Arc<eredu_runtime::ComponentDefinition> {
+        match self {
+            Self::Component(definition) => definition,
+            Self::Nemotron(declaration) => declaration.definition(),
+        }
+    }
+}
+
 /// Exact prediction extension separated from an ordinary target architecture.
 #[derive(Debug, Clone)]
 pub struct PredictionExtensionPlan {
     kind: PredictionExtensionKind,
     depth: usize,
     complete_architecture: SafetensorsArchitecturePlan,
-    definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
+    scopes: PredictionScopes,
+    parameter_residencies:
+        std::sync::Arc<std::collections::BTreeMap<String, eredu_runtime::AuxiliaryModuleResidency>>,
 }
 
 impl PredictionExtensionPlan {
@@ -1381,39 +1474,64 @@ impl PredictionExtensionPlan {
                 "prediction extension depth must be positive".into(),
             ));
         }
-        let definition = match (kind, complete_architecture.model()) {
-            (PredictionExtensionKind::DeepSeekV3Mtp, SafetensorsModelConfig::DeepSeekV3(args)) => {
-                crate::deepseek::v3::component_definition(args, None)
-            }
-            (
-                PredictionExtensionKind::DeepSeekV4Embedded,
-                SafetensorsModelConfig::DeepSeekV4(args),
-            ) => crate::deepseek::v4::component_definition(args, None),
-            (PredictionExtensionKind::InklingMtp, SafetensorsModelConfig::Inkling(args)) => {
-                crate::inkling::model::component_definition(args, None)
-            }
-            (PredictionExtensionKind::QwenHybridMtp, SafetensorsModelConfig::QwenHybrid(args)) => {
-                if args.vision.is_some() {
-                    crate::qwen::hybrid::conditional_component_definition(args, None)
-                } else {
-                    crate::qwen::hybrid::component_definition(&args.text, None)
+        let scopes =
+            if let (PredictionExtensionKind::NemotronHMtp, SafetensorsModelConfig::NemotronH(_)) =
+                (kind, complete_architecture.model())
+            {
+                PredictionScopes::Nemotron(complete_architecture.nemotron.clone().ok_or_else(
+                    || {
+                        ArtifactError::InvalidArchitecturePlan(
+                            "missing admitted Nemotron prediction scope".into(),
+                        )
+                    },
+                )?)
+            } else {
+                let definition = match (kind, complete_architecture.model()) {
+                    (
+                        PredictionExtensionKind::DeepSeekV3Mtp,
+                        SafetensorsModelConfig::DeepSeekV3(args),
+                    ) => crate::deepseek::v3::component_definition(args, None),
+                    (
+                        PredictionExtensionKind::DeepSeekV4Embedded,
+                        SafetensorsModelConfig::DeepSeekV4(args),
+                    ) => crate::deepseek::v4::component_definition(args, None),
+                    (
+                        PredictionExtensionKind::InklingMtp,
+                        SafetensorsModelConfig::Inkling(args),
+                    ) => crate::inkling::model::component_definition(args, None),
+                    (
+                        PredictionExtensionKind::QwenHybridMtp,
+                        SafetensorsModelConfig::QwenHybrid(args),
+                    ) => {
+                        if args.vision.is_some() {
+                            crate::qwen::hybrid::conditional_component_definition(args, None)
+                        } else {
+                            crate::qwen::hybrid::component_definition(&args.text, None)
+                        }
+                    }
+                    _ => {
+                        return Err(ArtifactError::InvalidArchitecturePlan(
+                            "prediction kind differs from complete architecture".into(),
+                        ));
+                    }
                 }
-            }
-            (PredictionExtensionKind::NemotronHMtp, SafetensorsModelConfig::NemotronH(args)) => {
-                crate::nemotron_h::component_definition(args, None)
-            }
-            _ => {
-                return Err(ArtifactError::InvalidArchitecturePlan(
-                    "prediction kind differs from complete architecture".into(),
-                ))
-            }
-        }
-        .map_err(|error| ArtifactError::InvalidArchitecturePlan(error.to_string()))?;
+                .map_err(|error| ArtifactError::InvalidArchitecturePlan(error.to_string()))?;
+                PredictionScopes::Component(std::sync::Arc::new(definition))
+            };
+        let definition = scopes.definition();
+        let parameter_residencies = std::sync::Arc::new(
+            crate::prediction_extension::residency::parameter_residencies(
+                &complete_architecture,
+                depth,
+                &definition,
+            )?,
+        );
         Ok(Self {
             kind,
             depth,
             complete_architecture,
-            definition: std::sync::Arc::new(definition),
+            scopes,
+            parameter_residencies,
         })
     }
 
@@ -1439,7 +1557,24 @@ impl PredictionExtensionPlan {
 
     /// Validated complete execution declaration retained before target projection.
     pub fn definition(&self) -> &std::sync::Arc<eredu_runtime::ComponentDefinition> {
-        &self.definition
+        self.scopes.definition()
+    }
+
+    pub(crate) fn nemotron_declaration(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::nemotron_h::Declaration>> {
+        match &self.scopes {
+            PredictionScopes::Nemotron(declaration) => Some(declaration),
+            _ => None,
+        }
+    }
+
+    /// Exact physical prediction-module owners projected before backend construction.
+    /// Shared target parameters retain their target owner and are absent here.
+    pub fn parameter_residencies(
+        &self,
+    ) -> &std::collections::BTreeMap<String, eredu_runtime::AuxiliaryModuleResidency> {
+        self.parameter_residencies.as_ref()
     }
 
     /// Returns whether two opaque values came from the same admitted extension contract.
@@ -1450,7 +1585,8 @@ impl PredictionExtensionPlan {
     pub fn same_admission(&self, other: &Self) -> bool {
         self.kind == other.kind
             && self.depth == other.depth
-            && self.definition == other.definition
+            && self.definition() == other.definition()
+            && self.parameter_residencies == other.parameter_residencies
             && self.complete_architecture.model_kind() == other.complete_architecture.model_kind()
             && self.complete_architecture.checkpoint() == other.complete_architecture.checkpoint()
             && self.complete_architecture.checkpoint_resolution()
@@ -1729,6 +1865,11 @@ fn resolve_safetensors_architecture(
         ModelKind::Qwen4Exp => crate::qwen4_exp::config::Config::from_json(json)
             .map_err(|error| invalid_configuration(kind, error))
             .and_then(|config| {
+                crate::qwen4_exp::Declaration::new(config)
+                    .map(std::sync::Arc::new)
+                    .map_err(|error| invalid_configuration(kind, error))
+            })
+            .and_then(|config| {
                 crate::qwen4_exp::checkpoint::schema::SafetensorsEncoding::from_json(json)
                     .map(|encoding| SafetensorsModelConfig::Qwen4Exp(config, encoding))
                     .map_err(|error| invalid_configuration(kind, error))
@@ -1744,6 +1885,89 @@ fn resolve_safetensors_architecture(
                 .map_err(|error| invalid_configuration(kind, error))
         }
     }?;
+    let moshi_parameters = match &model {
+        SafetensorsModelConfig::Moshi(config) => Some(
+            crate::moshi::parameter_contract(config)
+                .map_err(|error| invalid_configuration(kind, error))?,
+        ),
+        _ => None,
+    };
+    let lfm2 = match &model {
+        SafetensorsModelConfig::Lfm2(args) => Some(std::sync::Arc::new(
+            crate::lfm2::Declaration::new(args.clone())
+                .map_err(|error| invalid_configuration(kind, error))?,
+        )),
+        _ => None,
+    };
+    let kimi = match &model {
+        SafetensorsModelConfig::KimiLinear(args) => Some(std::sync::Arc::new(
+            crate::kimi_linear::Declaration::new(args.clone())
+                .map_err(|e| invalid_configuration(kind, e))?,
+        )),
+        _ => None,
+    };
+    let nemotron = match &model {
+        SafetensorsModelConfig::NemotronH(args) => Some(std::sync::Arc::new(
+            crate::nemotron_h::Declaration::new(args.clone())
+                .map_err(|e| invalid_configuration(kind, e))?,
+        )),
+        _ => None,
+    };
+    let vl = match &model {
+        SafetensorsModelConfig::QwenVl(args) => {
+            Some(crate::qwen::vl::Declaration::new(args.clone()))
+        }
+        _ => None,
+    }
+    .transpose()
+    .map_err(|e| invalid_configuration(kind, e))?
+    .map(std::sync::Arc::new);
+    let qwen = match &model {
+        SafetensorsModelConfig::Qwen(args) => Some(crate::qwen::Declaration::new(args.clone())),
+        _ => None,
+    }
+    .transpose()
+    .map_err(|error| invalid_configuration(kind, error))?
+    .map(std::sync::Arc::new);
+    let k2 = match &model {
+        SafetensorsModelConfig::K2Horizon(args) => {
+            Some(crate::k2_horizon::Declaration::new(args.clone()))
+        }
+        _ => None,
+    }
+    .transpose()
+    .map_err(|e| invalid_configuration(kind, e))?
+    .map(std::sync::Arc::new);
+    let dense = match &model {
+        SafetensorsModelConfig::Llama(args) => Some(crate::decoder::DecoderDeclaration::new(args)),
+        SafetensorsModelConfig::Gemma2(args) => Some(crate::decoder::DecoderDeclaration::new(args)),
+        SafetensorsModelConfig::Nanbeige(args) => {
+            Some(crate::decoder::DecoderDeclaration::new(args))
+        }
+        _ => None,
+    }
+    .transpose()
+    .map_err(|error| invalid_configuration(kind, error))?
+    .map(std::sync::Arc::new)
+    .or_else(|| {
+        qwen.as_ref()
+            .filter(|d| !d.args().is_moe())
+            .map(|d| d.common().clone())
+    })
+    .or_else(|| {
+        k2.as_ref()
+            .filter(|d| !d.args().is_moe())
+            .map(|d| d.common().clone())
+    });
+    let gpt_oss = match &model {
+        SafetensorsModelConfig::GptOss(args) => {
+            Some(crate::gpt_oss::Declaration::new(args.clone()))
+        }
+        _ => None,
+    }
+    .transpose()
+    .map_err(|error| invalid_configuration(kind, error))?
+    .map(std::sync::Arc::new);
     let checkpoint = match &model {
         SafetensorsModelConfig::NemotronLabsDiffusion(args) => {
             crate::nemotron_labs_diffusion::safetensors_plan(args)
@@ -1765,34 +1989,56 @@ fn resolve_safetensors_architecture(
         }
         SafetensorsModelConfig::Gemma4(args) => crate::gemma4::safetensors_plan(args)
             .map_err(|error| invalid_configuration(kind, error))?,
-        SafetensorsModelConfig::GptOss(args) => crate::gpt_oss::safetensors_plan(args)
-            .map_err(|error| invalid_configuration(kind, error))?,
+        SafetensorsModelConfig::GptOss(_) => {
+            crate::gpt_oss::safetensors_plan(gpt_oss.as_deref().expect("admitted GPT-OSS scopes"))
+                .map_err(|error| invalid_configuration(kind, error))?
+        }
         SafetensorsModelConfig::Inkling(args) => crate::inkling::safetensors_plan(args)
             .map_err(|error| invalid_configuration(kind, error))?,
-        SafetensorsModelConfig::KimiLinear(args) => crate::kimi_linear::safetensors_plan(args)
-            .map_err(|error| invalid_configuration(kind, error))?,
-        SafetensorsModelConfig::Gemma2(args) => crate::gemma2::safetensors_plan(args)
-            .map_err(|error| invalid_configuration(kind, error))?,
-        SafetensorsModelConfig::Llama(args) => crate::llama::safetensors_plan(args)
-            .map_err(|error| invalid_configuration(kind, error))?,
-        SafetensorsModelConfig::Nanbeige(args) => crate::nanbeige::safetensors_plan(args)
-            .map_err(|error| invalid_configuration(kind, error))?,
+        SafetensorsModelConfig::KimiLinear(_) => {
+            crate::kimi_linear::safetensors_plan(kimi.as_deref().expect("declared Kimi family"))
+                .map_err(|error| invalid_configuration(kind, error))?
+        }
+        SafetensorsModelConfig::Gemma2(args) => {
+            crate::gemma2::safetensors_plan(args, dense.as_deref().expect("admitted Gemma2 scopes"))
+                .map_err(|error| invalid_configuration(kind, error))?
+        }
+        SafetensorsModelConfig::Llama(args) => {
+            crate::llama::safetensors_plan(args, dense.as_deref().expect("admitted Llama scopes"))
+                .map_err(|error| invalid_configuration(kind, error))?
+        }
+        SafetensorsModelConfig::Nanbeige(args) => crate::nanbeige::safetensors_plan(
+            args,
+            dense.as_deref().expect("admitted Nanbeige scopes"),
+        )
+        .map_err(|error| invalid_configuration(kind, error))?,
         SafetensorsModelConfig::Muse(args) => crate::muse::safetensors_plan(args)
             .map_err(|error| invalid_configuration(kind, error))?,
-        SafetensorsModelConfig::Lfm2(args) => crate::lfm2::safetensors_plan(args, true)
-            .map_err(|error| invalid_configuration(kind, error))?,
-        SafetensorsModelConfig::NemotronH(args) => crate::nemotron_h::safetensors_plan(args)
+        SafetensorsModelConfig::Lfm2(_) => {
+            crate::lfm2::safetensors_plan(lfm2.as_deref().expect("declared LFM2 family"), true)
+                .map_err(|error| invalid_configuration(kind, error))?
+        }
+        SafetensorsModelConfig::NemotronH(_) => nemotron
+            .as_ref()
+            .expect("declared Nemotron family")
+            .safetensors_plan()
             .map_err(|error| invalid_configuration(kind, error))?,
         SafetensorsModelConfig::VoiceChat(args) => {
             crate::voicechat::checkpoint::safetensors_plan(args, &args.linear_formats)
                 .map_err(|error| invalid_configuration(kind, error))?
         }
-        SafetensorsModelConfig::Moshi(args) => crate::moshi::safetensors_plan(args)
-            .map_err(|error| invalid_configuration(kind, error))?,
-        SafetensorsModelConfig::K2Horizon(args) => crate::k2_horizon::safetensors_plan(args)
-            .map_err(|error| invalid_configuration(kind, error))?,
-        SafetensorsModelConfig::Qwen(args) => crate::qwen::safetensors_plan(args)
-            .map_err(|error| invalid_configuration(kind, error))?,
+        SafetensorsModelConfig::Moshi(_) => crate::moshi::safetensors_plan(
+            moshi_parameters.as_ref().expect("declared Moshi contract"),
+        )
+        .map_err(|error| invalid_configuration(kind, error))?,
+        SafetensorsModelConfig::K2Horizon(_) => {
+            crate::k2_horizon::safetensors_plan(k2.as_deref().expect("admitted K2 scopes"))
+                .map_err(|error| invalid_configuration(kind, error))?
+        }
+        SafetensorsModelConfig::Qwen(_) => {
+            crate::qwen::safetensors_plan(qwen.as_deref().expect("admitted Qwen declaration"), true)
+                .map_err(|error| invalid_configuration(kind, error))?
+        }
         SafetensorsModelConfig::QwenHybrid(args) => {
             crate::qwen::hybrid::composite_safetensors_plan(args)
                 .map_err(|error| invalid_configuration(kind, error))?
@@ -1804,7 +2050,7 @@ fn resolve_safetensors_architecture(
                     "nested text configuration does not match dense/MoE family dispatch",
                 ));
             }
-            crate::qwen::vl::safetensors_plan(args)
+            crate::qwen::vl::safetensors_plan(vl.as_deref().expect("admitted VL text scopes"))
                 .map_err(|error| invalid_configuration(kind, error))?
         }
     };
@@ -1814,6 +2060,15 @@ fn resolve_safetensors_architecture(
         checkpoint,
         checkpoint_resolution: None,
         moshi_recipes: None,
+        moshi_parameters,
+        lfm2,
+        kimi,
+        nemotron,
+        dense,
+        gpt_oss,
+        qwen,
+        k2,
+        vl,
         qwen4_exp_target: None,
     })
 }

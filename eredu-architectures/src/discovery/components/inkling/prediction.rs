@@ -2,38 +2,48 @@
 use super::*;
 
 pub(in crate::discovery) fn declare(g: &mut Builder, args: &crate::inkling::ModelArgs) {
-    let Some(config) = args
-        .mtp_config
-        .as_ref()
-        .filter(|config| config.num_nextn_predict_layers > 0)
-    else {
+    if args.prediction().depths.is_empty() {
         return;
-    };
+    }
     let backbone = &args.text_config;
-    let width = backbone.hidden_size as usize;
     let vocabulary = backbone.unpadded_vocab_size.unwrap_or(backbone.vocab_size) as usize;
-    let norm = |gain: &str| ComponentNormalization {
-        kind: ComponentNormalizationKind::Rms,
-        epsilon: ComponentScalar::new(backbone.rms_norm_eps),
-        gain: Some(gain.into()),
-        gain_offset: ComponentScalar::new(0.0),
-        bias: None,
-        groups: 1,
-    };
-    for depth in 0..config.num_nextn_predict_layers as usize {
-        let attention = if config.local_layer_ids.contains(&depth) {
-            backbone
-                .layer_schedule
-                .iter()
-                .find_map(|policy| policy.attention.window())
-                .map(|window| AttentionPolicy::Sliding { window })
-                .expect("admitted local MTP policy")
-        } else {
-            AttentionPolicy::Full
+    let prediction = args.prediction();
+    let source_norm_spec = &args.pinned().embedding_norm;
+    let statics = &args.pinned().ordinary;
+    let embedding_weight = statics.embedding_spec().weight.id.to_string();
+    let readout_weight = statics.output_projection_spec().weight.id.to_string();
+    let source_gain = super::super::declared_normalization(&source_norm_spec)
+        .gain
+        .expect("declared embedding normalization");
+    let chain_prefix = prediction.chain_norm.as_ref().map(|spec| {
+        super::super::declared_normalization(spec)
+            .gain
+            .expect("declared chain normalization")
+            .trim_end_matches(".weight")
+            .to_owned()
+    });
+    for (depth, parameters) in prediction.depths.iter().enumerate() {
+        let width = parameters.fusion.input_projection.output as usize;
+        let hidden_width = parameters.fusion.hidden_norm.dimensions as usize;
+        let hidden_gain = super::super::declared_normalization(&parameters.fusion.hidden_norm)
+            .gain
+            .expect("declared hidden normalization");
+        let embedding_gain =
+            super::super::declared_normalization(&parameters.fusion.embedding_norm)
+                .gain
+                .expect("declared prediction embedding normalization");
+        let fusion_prefix = parameters
+            .fusion
+            .input_projection
+            .weight
+            .id
+            .as_str()
+            .trim_end_matches(".weight");
+        let attention = parameters.common.attention.policy;
+        let policy = crate::inkling::LayerPolicy {
+            attention,
+            feed_forward: crate::inkling::FeedForwardPolicy::Dense,
         };
-        let text = crate::inkling::mtp_text_args(backbone, config, attention)
-            .expect("admitted MTP geometry");
-        let policy = *text.layer_schedule.get(0).expect("one MTP decoder");
         let layer = backbone.num_hidden_layers as usize + depth;
         let root = format!("prediction.layers.{depth}");
         let path = format!("model.mtp.layers.{depth}");
@@ -59,32 +69,32 @@ pub(in crate::discovery) fn declare(g: &mut Builder, args: &crate::inkling::Mode
             (
                 &embedding,
                 ArchitectureNodeKind::Embedding,
-                "model.embed_tokens".to_owned(),
+                embedding_weight.trim_end_matches(".weight").to_owned(),
             ),
             (
                 &source_norm,
                 ArchitectureNodeKind::Normalization,
-                "model.embed_norm".to_owned(),
+                source_gain.trim_end_matches(".weight").to_owned(),
             ),
             (
                 &embedding_norm,
                 ArchitectureNodeKind::Normalization,
-                format!("{path}.embed_norm"),
+                embedding_gain.trim_end_matches(".weight").to_owned(),
             ),
             (
                 &hidden_first,
                 ArchitectureNodeKind::Normalization,
-                format!("{path}.hidden_norm"),
+                hidden_gain.trim_end_matches(".weight").to_owned(),
             ),
             (
                 &hidden_norm,
                 ArchitectureNodeKind::Normalization,
-                format!("{path}.hidden_norm"),
+                hidden_gain.trim_end_matches(".weight").to_owned(),
             ),
             (
                 &fusion,
                 ArchitectureNodeKind::Projector,
-                format!("{path}.input_proj"),
+                fusion_prefix.to_owned(),
             ),
             (
                 &block,
@@ -94,7 +104,7 @@ pub(in crate::discovery) fn declare(g: &mut Builder, args: &crate::inkling::Mode
             (
                 &head,
                 ArchitectureNodeKind::OutputHead,
-                "lm_head".to_owned(),
+                readout_weight.trim_end_matches(".weight").to_owned(),
             ),
         ] {
             g.node(node, kind, Some(&root), Some(&prefix), Some(width));
@@ -103,9 +113,7 @@ pub(in crate::discovery) fn declare(g: &mut Builder, args: &crate::inkling::Mode
             &head_norm,
             ArchitectureNodeKind::Normalization,
             Some(&root),
-            config
-                .chain_hidden_post_norm
-                .then_some("model.mtp.chain_norm"),
+            chain_prefix.as_deref(),
             Some(width),
         );
         g.get_mut(&block).layer_index = Some(layer);
@@ -161,18 +169,33 @@ pub(in crate::discovery) fn declare(g: &mut Builder, args: &crate::inkling::Mode
             None,
             Some(width),
         );
-        let local = attention.window().is_some();
+        let declared = &parameters.common.attention;
         let mut attrs = super::super::super::attention(
-            text.query_heads(local),
-            text.key_value_heads(local),
-            text.attention_head_dim(local),
+            declared.projection.geometry.query_heads(),
+            declared.projection.geometry.key_value_heads(),
+            declared.projection.geometry.key_dimensions(),
             attention,
         );
         attrs.positional_encoding = Some(PositionalEncoding::Relative);
         g.get_mut(&attention_node).attention = Some(attrs);
         let start = g.descriptor.components.len();
-        decoder_scalars(g, &text, policy, layer, &block, &block_path);
-        decoder_transforms(g, &text, policy, &block, &block_path);
+        decoder_scalars(
+            g,
+            policy,
+            layer,
+            &block,
+            &block_path,
+            &parameters.common,
+            Some(&parameters.dense),
+        );
+        decoder_transforms(
+            g,
+            policy,
+            &block,
+            &block_path,
+            &parameters.common,
+            Some(&parameters.dense),
+        );
         let components = g.descriptor.components.split_off(start);
         for (node, suffix, meaning) in [
             (
@@ -246,7 +269,9 @@ pub(in crate::discovery) fn declare(g: &mut Builder, args: &crate::inkling::Mode
                 output: format!("{hooks}.hidden.first_normalized"),
                 effective_output: Some(format!("{hooks}.hidden.first_normalized.effective")),
                 equation: ComponentTensorTransformEquation::Normalization {
-                    normalization: norm(&format!("{path}.hidden_norm.weight")),
+                    normalization: super::super::declared_normalization(
+                        &parameters.fusion.hidden_norm,
+                    ),
                 },
             });
         g.descriptor
@@ -261,7 +286,7 @@ pub(in crate::discovery) fn declare(g: &mut Builder, args: &crate::inkling::Mode
                     scale: ComponentScalar::new(1.0 / backbone.logits_mup_width_multiplier),
                 },
             });
-        let fusion_weight = format!("{path}.input_proj.weight");
+        let fusion_weight = parameters.fusion.input_projection.weight.id.to_string();
         g.descriptor.component_scopes.push(ComponentExecutionScope {
             id: format!("prediction.{depth}"),
             node_id: root,
@@ -281,27 +306,41 @@ pub(in crate::discovery) fn declare(g: &mut Builder, args: &crate::inkling::Mode
                         source: ComponentFusionSource::Observation {
                             path: format!("{hooks}.hidden.first_normalized.effective"),
                         },
-                        normalization: norm(&format!("{path}.hidden_norm.weight")),
+                        normalization: super::super::declared_normalization(
+                            &parameters.fusion.hidden_norm,
+                        ),
                         output: format!("{hooks}.hidden.normalized.effective"),
-                        columns: 0..width,
+                        columns: 0..hidden_width,
                     },
                     ComponentFusionInput {
                         source: ComponentFusionSource::TokenEmbedding {
-                            weight: "model.embed_tokens.weight".into(),
-                            shared_weight: "model.embed_tokens.weight".into(),
-                            parameter_group: "parameters:model.embed_tokens".into(),
+                            weight: embedding_weight.clone(),
+                            shared_weight: embedding_weight.clone(),
+                            parameter_group: format!(
+                                "parameters:{}",
+                                embedding_weight.trim_end_matches(".weight")
+                            ),
                             scale: ComponentScalar::new(1.0),
-                            normalization: Some(norm("model.embed_norm.weight")),
+                            normalization: Some(super::super::declared_normalization(
+                                &source_norm_spec,
+                            )),
                         },
-                        normalization: norm(&format!("{path}.embed_norm.weight")),
+                        normalization: super::super::declared_normalization(
+                            &parameters.fusion.embedding_norm,
+                        ),
                         output: format!("{hooks}.embedding.normalized.effective"),
-                        columns: width..width * 2,
+                        columns: hidden_width..parameters.fusion.input_projection.input as usize,
                     },
                 ],
                 weight: fusion_weight.clone(),
                 shared_weight: fusion_weight,
-                parameter_group: format!("parameters:{path}.input_proj"),
-                bias: None,
+                parameter_group: format!("parameters:{fusion_prefix}"),
+                bias: parameters
+                    .fusion
+                    .input_projection
+                    .bias
+                    .as_ref()
+                    .map(|bias| bias.id.to_string()),
                 projection_input: format!("{hooks}.fusion.input"),
                 output: format!("{hooks}.fusion.output"),
                 effective_output: format!("{hooks}.fusion.output.effective"),
@@ -316,8 +355,8 @@ pub(in crate::discovery) fn declare(g: &mut Builder, args: &crate::inkling::Mode
                 projection_input: Some(format!("{hooks}.readout.projection_input")),
                 linear_scores: format!("{hooks}.readout.linear"),
                 logits: format!("{hooks}.readout.linear.effective"),
-                normalization: if config.chain_hidden_post_norm {
-                    norm("model.mtp.chain_norm.weight")
+                normalization: if let Some(norm) = &prediction.chain_norm {
+                    super::super::declared_normalization(norm)
                 } else {
                     ComponentNormalization {
                         kind: ComponentNormalizationKind::Identity,
@@ -328,7 +367,7 @@ pub(in crate::discovery) fn declare(g: &mut Builder, args: &crate::inkling::Mode
                         groups: 1,
                     }
                 },
-                weight: "lm_head.weight".into(),
+                weight: readout_weight.clone(),
                 bias: None,
                 output_transform: ComponentOutputTransform::Identity,
                 block_normalizations: Vec::new(),

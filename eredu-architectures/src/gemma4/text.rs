@@ -5,10 +5,9 @@ use std::collections::HashMap;
 use eredu_core::AttentionPolicy;
 use eredu_nn::{
     AttentionCache, AttentionRequest, AttentionStateSource, AttentionValueSource, Error,
-    GatedProductGroupLayout, GroupSelectionOperator, GroupedGatedProductSpec, GroupedNeuralBackend,
-    LinearOperator, LinearSpec, NeuralBackend, NormalizationOperator, Parameter, ParameterSpec,
-    Parameterized, RotaryOperator, RotaryPosition, RotarySpec, RotarySubspace,
-    SelectorInputTransformSpec, Tensor, TopKGroupSelectionSpec, TopKGroupSelectorSpec,
+    GroupSelectionOperator, GroupedGatedProductSpec, GroupedNeuralBackend, LinearOperator,
+    NeuralBackend, NormalizationOperator, Parameter, Parameterized, RotaryOperator, RotaryPosition,
+    RotarySubspace, Tensor,
 };
 use eredu_runtime::{
     ExpertPass, ParameterProvider, ResidentExpertProvider, RoutedExpertRequest,
@@ -16,9 +15,14 @@ use eredu_runtime::{
 };
 
 use crate::decoder::ComponentInstrumentation;
-use crate::linear_format::standard_expert_projection;
+/// Shared static vocabulary and per-layer input resource declarations.
+pub mod pinned;
+/// Shared sparse-branch declarations for construction and cold consumers.
+pub mod routed;
+/// Ordinary projection declarations shared by construction and cold consumers.
+pub mod specs;
 
-use super::{FeedForwardPolicy, LayerPolicy, ModelArgs};
+use super::ModelArgs;
 
 /// Shared normalized key/value states keyed by exact attention policy.
 pub type SharedAttentionStates<T> = HashMap<AttentionPolicy, (T, T)>;
@@ -70,122 +74,42 @@ pub struct Attention<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     pub rotary: B::Rotary,
 }
 
-/// Exact ordinary projection declaration shared by construction and cold topology.
-pub(crate) fn linear_spec(
-    args: &ModelArgs,
-    weight_name: &str,
-    input: i32,
-    output: i32,
-    bias: bool,
-) -> Result<LinearSpec, Error> {
-    Ok(LinearSpec {
-        input,
-        output,
-        weight: ParameterSpec::trainable(weight_name).map_err(Error::backend)?,
-        bias: bias
-            .then(|| {
-                ParameterSpec::trainable(format!(
-                    "{}.bias",
-                    weight_name.trim_end_matches(".weight")
-                ))
-            })
-            .transpose()
-            .map_err(Error::backend)?,
-        format: crate::linear_format::standard_linear_format(
-            weight_name,
-            args.linear_format_for(weight_name),
-        )?,
-    })
-}
-
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> {
-    /// Builds one unloaded attention unit from normalized layer policy.
+    /// Builds one unloaded attention unit from its immutable family declaration.
     pub fn new(
-        args: &ModelArgs,
+        config: &super::FamilyConfig,
         layer: usize,
-        policy: LayerPolicy,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        Self::new_at(args, layer, policy, "model.language_model.layers", context)
+        Self::from_spec(
+            config.attention(layer)?.clone(),
+            config.text.attention_arithmetic,
+            context,
+        )
     }
 
-    /// Builds one attention unit under an explicit architecture-owned layer root.
-    pub fn new_at(
-        args: &ModelArgs,
-        layer: usize,
-        policy: LayerPolicy,
-        layer_root: &str,
+    fn from_spec(
+        spec: specs::AttentionSpec,
+        arithmetic: eredu_nn::AttentionArithmetic,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let prefix = format!("{layer_root}.{layer}.self_attn");
-        let head_dim = policy.head_dim.get() as i32;
-        let kv_heads = policy.num_key_value_heads.get() as i32;
-        let linear = |field: &str, input: i32, output: i32| {
-            let weight_name = format!("{prefix}.{field}.weight");
-            B::linear(
-                linear_spec(args, &weight_name, input, output, args.attention_bias)?,
-                context,
-            )
-        };
-        let owns_state = policy.key_value.owns_state();
-        let partial_dimensions =
-            partial_rotary_dimensions(head_dim, args.rope_scaling_for(policy.attention));
         Ok(Self {
-            query_heads: args.num_attention_heads,
-            key_value_heads: kv_heads,
-            rotary_dimensions: partial_dimensions,
-            policy: policy.attention,
-            state_source: policy.key_value,
-            arithmetic: args.attention_arithmetic,
-            query: linear(
-                "q_proj",
-                args.hidden_size,
-                args.num_attention_heads * head_dim,
-            )?,
-            key: owns_state
-                .then(|| linear("k_proj", args.hidden_size, kv_heads * head_dim))
+            query_heads: spec.geometry.query_heads(),
+            key_value_heads: spec.geometry.key_value_heads(),
+            rotary_dimensions: spec.rotary.dimensions,
+            policy: spec.policy.attention,
+            state_source: spec.policy.key_value,
+            arithmetic,
+            query: B::linear(spec.query, context)?,
+            key: spec.key.map(|s| B::linear(s, context)).transpose()?,
+            value: spec.value.map(|s| B::linear(s, context)).transpose()?,
+            output: B::linear(spec.output, context)?,
+            query_norm: B::normalization(spec.query_norm, context)?,
+            key_norm: spec
+                .key_norm
+                .map(|s| B::normalization(s, context))
                 .transpose()?,
-            value: (policy.key_value.value() == Some(AttentionValueSource::Projected))
-                .then(|| linear("v_proj", args.hidden_size, kv_heads * head_dim))
-                .transpose()?,
-            output: linear(
-                "o_proj",
-                args.num_attention_heads * head_dim,
-                args.hidden_size,
-            )?,
-            query_norm: B::normalization(
-                args.normalization(
-                    head_dim,
-                    ParameterSpec::trainable(format!("{prefix}.q_norm.weight"))
-                        .map_err(Error::backend)?,
-                ),
-                context,
-            )?,
-            key_norm: owns_state
-                .then(|| {
-                    B::normalization(
-                        args.normalization(
-                            head_dim,
-                            ParameterSpec::trainable(format!("{prefix}.k_norm.weight"))
-                                .map_err(Error::backend)?,
-                        ),
-                        context,
-                    )
-                })
-                .transpose()?,
-            rotary: B::rotary(
-                RotarySpec {
-                    arithmetic: args.rotary_arithmetic,
-                    dimensions: partial_dimensions,
-                    base: args.rope_theta_for(policy.attention),
-                    traditional: false,
-                    algorithm: crate::rotary::normalize_algorithm(
-                        args.rope_scaling_for(policy.attention),
-                    )
-                    .expect("validated Gemma 4 RoPE algorithm"),
-                },
-                context,
-            )?,
+            rotary: B::rotary(spec.rotary, context)?,
         })
     }
 
@@ -394,7 +318,7 @@ fn partial_rotary_dimensions(
 #[parameterized(tensor = "B::Tensor")]
 pub struct DenseMlp<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     #[parameter(skip)]
-    approximate_gelu: bool,
+    policy: eredu_nn::GatedProductPolicy,
     /// GELU gate projection.
     pub gate: B::Linear,
     /// Multiplicative up projection.
@@ -404,26 +328,15 @@ pub struct DenseMlp<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
 }
 
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DenseMlp<B> {
-    fn new(
-        args: &ModelArgs,
-        layer: usize,
-        intermediate: i32,
-        layer_root: &str,
+    fn from_spec(
+        spec: specs::DenseSpec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let prefix = format!("{layer_root}.{layer}.mlp");
-        let linear = |field: &str, input, output| {
-            let weight_name = format!("{prefix}.{field}.weight");
-            B::linear(
-                linear_spec(args, &weight_name, input, output, false)?,
-                context,
-            )
-        };
         Ok(Self {
-            approximate_gelu: args.approximate_gelu,
-            gate: linear("gate_proj", args.hidden_size, intermediate)?,
-            up: linear("up_proj", args.hidden_size, intermediate)?,
-            down: linear("down_proj", intermediate, args.hidden_size)?,
+            policy: spec.product.policy,
+            gate: B::linear(spec.product.gate, context)?,
+            up: B::linear(spec.product.up, context)?,
+            down: B::linear(spec.product.down, context)?,
         })
     }
 
@@ -435,7 +348,8 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DenseMlp<B> {
         instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error> {
         let gate = self.gate.forward(input, context)?;
-        let gate = if self.approximate_gelu {
+        let gate = if self.policy.activation() == eredu_nn::GatedProductActivation::GeluApproximate
+        {
             B::gelu_approximate(gate, context)?
         } else {
             B::Tensor::gelu(&gate, context)?
@@ -509,116 +423,113 @@ pub struct BlockInput<'a, T, C> {
 }
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DenseBlock<B> {
-    /// Builds one unloaded dense block.
+    /// Builds one unloaded block from the family-owned gain and layer-input scope.
     pub fn new(
-        args: &ModelArgs,
+        config: &super::FamilyConfig,
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        Self::new_at(args, layer, "model.language_model.layers", context)
+        Self::from_scopes(
+            &config.text,
+            layer,
+            config.block(layer)?,
+            config.dense(layer)?,
+            config.attention(layer)?,
+            config.routed(layer)?,
+            None,
+            context,
+        )
     }
 
-    /// Builds one ordinary block under an explicit released layer root.
-    pub fn new_at(
+    pub(crate) fn from_scopes(
         args: &ModelArgs,
         layer: usize,
-        layer_root: &str,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        Self::new_at_with_routed_spec(args, layer, layer_root, None, context)
-    }
-
-    pub(crate) fn new_at_with_routed_spec(
-        args: &ModelArgs,
-        layer: usize,
-        layer_root: &str,
+        block: &specs::BlockSpec,
+        dense: &specs::DenseSpec,
+        attention: &specs::AttentionSpec,
+        routed: Option<&super::text::routed::Declaration>,
         routed_spec: Option<GroupedGatedProductSpec>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let policy = args
+        let block = block
+            .clone()
+            .with_input_width(args.hidden_size_per_layer_input)?;
+        let width = args
             .layer_policy(layer)
-            .ok_or_else(|| Error::backend(format!("missing Gemma 4 layer policy {layer}")))?;
-        let prefix = format!("{layer_root}.{layer}");
-        let norm = |field: &str, dimensions| {
-            B::normalization(
-                args.normalization(
-                    dimensions,
-                    ParameterSpec::trainable(format!("{prefix}.{field}.weight"))
-                        .map_err(Error::backend)?,
-                ),
-                context,
-            )
+            .ok_or_else(|| Error::backend("dense layer outside local schedule"))?
+            .intermediate_size
+            .get() as i32;
+        let dense = dense.clone().with_intermediate(width)?;
+        let attention = attention.for_invocation(args, layer)?;
+        let routed = match routed {
+            Some(source) => Some(source.for_invocation(args, layer, routed_spec)?),
+            None if routed_spec.is_none() => None,
+            None => return Err(Error::backend("selected bank has no routed source owner")),
         };
-        let media_linear = |field: &str, input, output| {
-            let weight_name = format!("{prefix}.{field}.weight");
-            B::linear(
-                LinearSpec {
-                    input,
-                    output,
-                    weight: ParameterSpec::trainable(&weight_name).map_err(Error::backend)?,
-                    bias: None,
-                    format: crate::linear_format::standard_linear_format(
-                        &weight_name,
-                        args.linear_format_for(&weight_name),
-                    )?,
-                },
-                context,
-            )
-        };
-        let media_width = args.hidden_size_per_layer_input;
-        let sparse = policy.feed_forward == FeedForwardPolicy::DenseWithSparseMoe;
-        let (router, experts) = if sparse {
-            let selector = selector_spec(args, layer, layer_root)?;
-            let router = B::top_k_group_selector(selector, context)?;
-            let spec = match routed_spec {
-                Some(spec) => spec,
-                None => expert_bank_spec_at(args, &format!("{prefix}.experts.switch_glu"))?,
+        let spec =
+            specs::DecoderBlockSpec::from_scopes(args, layer, block, dense, attention, routed)?;
+        Self::from_spec(layer, spec, context)
+    }
+
+    pub(crate) fn from_spec(
+        layer: usize,
+        spec: specs::DecoderBlockSpec,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let specs::DecoderBlockSpec {
+            attention,
+            attention_arithmetic,
+            dense,
+            block,
+            routed,
+        } = spec;
+        let (per_layer_gate, per_layer_projection, per_layer_norm) =
+            if let Some(spec) = block.per_layer {
+                (
+                    Some(B::linear(spec.gate, context)?),
+                    Some(B::linear(spec.projection, context)?),
+                    Some(B::normalization(spec.norm, context)?),
+                )
+            } else {
+                (None, None, None)
             };
-            let experts = B::grouped_gated_product(spec, context)?;
-            (Some(router), Some(experts))
+        let (router, experts, sparse_norms) = if let Some(declaration) = routed {
+            (
+                Some(B::top_k_group_selector(
+                    declaration.routed.selector,
+                    context,
+                )?),
+                Some(B::grouped_gated_product(
+                    declaration.routed.experts,
+                    context,
+                )?),
+                declaration
+                    .norms
+                    .map(|spec| B::normalization(spec, context))
+                    .into_iter()
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
         } else {
-            (None, None)
+            (None, None, Vec::new())
         };
+        let mut sparse_norms = sparse_norms.into_iter();
         Ok(Self {
             layer,
-            attention: Attention::new_at(args, layer, policy, layer_root, context)?,
-            mlp: DenseMlp::new(
-                args,
-                layer,
-                policy.intermediate_size.get() as i32,
-                layer_root,
-                context,
-            )?,
+            attention: Attention::from_spec(attention, attention_arithmetic, context)?,
+            mlp: DenseMlp::from_spec(dense, context)?,
             router,
             experts,
-            input_norm: norm("input_layernorm", args.hidden_size)?,
-            post_attention_norm: norm("post_attention_layernorm", args.hidden_size)?,
-            pre_feed_forward_norm: norm("pre_feedforward_layernorm", args.hidden_size)?,
-            post_feed_forward_norm: norm("post_feedforward_layernorm", args.hidden_size)?,
-            post_feed_forward_norm_1: sparse
-                .then(|| norm("post_feedforward_layernorm_1", args.hidden_size))
-                .transpose()?,
-            pre_feed_forward_norm_2: sparse
-                .then(|| norm("pre_feedforward_layernorm_2", args.hidden_size))
-                .transpose()?,
-            post_feed_forward_norm_2: sparse
-                .then(|| norm("post_feedforward_layernorm_2", args.hidden_size))
-                .transpose()?,
-            per_layer_gate: (media_width > 0)
-                .then(|| media_linear("per_layer_input_gate", args.hidden_size, media_width))
-                .transpose()?,
-            per_layer_projection: (media_width > 0)
-                .then(|| media_linear("per_layer_projection", media_width, args.hidden_size))
-                .transpose()?,
-            per_layer_norm: (media_width > 0)
-                .then(|| norm("post_per_layer_input_norm", args.hidden_size))
-                .transpose()?,
-            layer_scalar: Parameter::unloaded(
-                ParameterSpec::trainable(format!("{prefix}.layer_scalar"))
-                    .map_err(Error::backend)?,
-                &[1],
-                context,
-            )?,
+            input_norm: B::normalization(block.input, context)?,
+            post_attention_norm: B::normalization(block.post_attention, context)?,
+            pre_feed_forward_norm: B::normalization(block.pre_feed_forward, context)?,
+            post_feed_forward_norm: B::normalization(block.post_feed_forward, context)?,
+            post_feed_forward_norm_1: sparse_norms.next(),
+            pre_feed_forward_norm_2: sparse_norms.next(),
+            post_feed_forward_norm_2: sparse_norms.next(),
+            per_layer_gate,
+            per_layer_projection,
+            per_layer_norm,
+            layer_scalar: block.residual_scale.unloaded(context)?,
         })
     }
 
@@ -1045,93 +956,4 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DenseBlock<B>
         };
         instrumentation.apply("residual.scaled", hidden)
     }
-}
-
-/// Returns the architecture-owned routed expert specification for one sparse layer.
-pub fn expert_bank_spec(args: &ModelArgs, layer: usize) -> Result<GroupedGatedProductSpec, Error> {
-    expert_bank_spec_at(
-        args,
-        &format!("model.language_model.layers.{layer}.experts.switch_glu"),
-    )
-}
-
-/// Returns the same architecture-owned bank at placement-resolved geometry.
-pub(crate) fn localized_expert_bank_spec(
-    args: &ModelArgs,
-    layer: usize,
-    expert_count: i32,
-    intermediate_dimensions: i32,
-) -> Result<GroupedGatedProductSpec, Error> {
-    expert_bank_spec(args, layer)?.with_group_geometry(expert_count, intermediate_dimensions)
-}
-
-pub(crate) fn expert_bank_spec_at(
-    args: &ModelArgs,
-    experts_prefix: &str,
-) -> Result<GroupedGatedProductSpec, Error> {
-    let expert_count = args
-        .num_experts
-        .ok_or_else(|| Error::backend("Gemma 4 sparse layer has no expert count"))?;
-    let expert_width = args
-        .moe_intermediate_size
-        .ok_or_else(|| Error::backend("Gemma 4 sparse layer has no expert width"))?;
-    let gate_up_name = format!("{experts_prefix}.gate_up_proj");
-    let down_name = format!("{experts_prefix}.down_proj");
-    GroupedGatedProductSpec::new(
-        expert_count,
-        args.hidden_size,
-        expert_width,
-        args.hidden_size,
-        eredu_nn::GatedProductPolicy::ordinary_gelu_approximate(),
-        GatedProductGroupLayout::Packed {
-            gate_up: standard_expert_projection(
-                &gate_up_name,
-                None,
-                args.linear_format_for(&gate_up_name),
-            )?,
-            down: standard_expert_projection(&down_name, None, args.linear_format_for(&down_name))?,
-        },
-    )
-    .map(|spec| spec.with_reduction(args.expert_reduction))
-}
-
-/// Exact routing declaration consumed by ordinary sparse blocks.
-pub(crate) fn selector_spec(
-    args: &ModelArgs,
-    layer: usize,
-    layer_root: &str,
-) -> Result<TopKGroupSelectorSpec, Error> {
-    let expert_count = args
-        .num_experts
-        .ok_or_else(|| Error::backend("sparse layer has no expert count"))?;
-    let top_k = args
-        .top_k_experts
-        .ok_or_else(|| Error::backend("sparse layer has no selection width"))?;
-    let router_prefix = format!("{layer_root}.{layer}.router");
-    let router_weight = format!("{router_prefix}.proj.weight");
-    let selector = TopKGroupSelectorSpec::new(
-        args.hidden_size,
-        ParameterSpec::trainable(&router_weight).map_err(Error::backend)?,
-        crate::linear_format::standard_linear_format(
-            &router_weight,
-            args.linear_format_for(&router_weight),
-        )?,
-        TopKGroupSelectionSpec::new(
-            expert_count,
-            top_k,
-            args.routing_scoring,
-            args.normalize_selected_routes,
-        )?,
-    )?
-    .with_arithmetic(args.routing_arithmetic)
-    .with_input_transform(SelectorInputTransformSpec::new(
-        args.rms_norm_eps,
-        ParameterSpec::trainable(format!("{router_prefix}.scale")).map_err(Error::backend)?,
-        true,
-    )?)
-    .with_coefficient_scale(
-        ParameterSpec::trainable(format!("{router_prefix}.per_expert_scale"))
-            .map_err(Error::backend)?,
-    );
-    Ok(selector)
 }

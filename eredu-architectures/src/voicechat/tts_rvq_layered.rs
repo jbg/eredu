@@ -4,6 +4,7 @@ use super::{
     tts_mog::{f32_shape, TtsError},
     tts_mog_layered::MogExecution,
     tts_rvq::{RefinementPolicy, RefinementState, RvqBank, RvqDimensions, RvqProjection},
+    tts_rvq_specs::{Declaration, RvqDeclaration},
 };
 use eredu_core::BackendFailure;
 use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Parameterized, Tensor, TensorElementType};
@@ -14,8 +15,8 @@ use eredu_runtime::{
     ComponentKernel, ComponentUnit, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress,
     ExecutionUnitLayout, LayeredForwardState, LayeredInvocation, LayeredTraversalHook,
     LayerwisePolicy, LayerwiseRuntime, LocalModelLayout, MemberSharding, OwnedParameterGroupSpec,
-    ParallelComponentKernel, ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec,
-    ParameterRole, StatelessComponentState, SubmissionBackend,
+    ParallelComponentKernel, ParameterGroupOwner, ParameterRole, StatelessComponentState,
+    SubmissionBackend,
 };
 use std::marker::PhantomData;
 
@@ -45,14 +46,14 @@ impl RvqLocalDimensions {
     }
 }
 
-/// Checks exact physical tensor placement and coherent bank/projection partitions.
-pub fn rvq_local_dimensions(
-    dimensions: RvqDimensions,
+pub(crate) fn declared_local_dimensions(
+    declaration: &Declaration,
     layout: &LocalModelLayout,
 ) -> Result<RvqLocalDimensions, TtsError> {
-    let description = rvq_parameter_description(dimensions)?;
+    let dimensions = declaration.bank.dimensions;
+    let description = declared_parameters(declaration)?;
     let range = layout
-        .tensor("tts_model.tts_model.rvq_embs")
+        .tensor(declaration.bank.table.id.as_str())
         .ok_or(TtsError::Configuration("RVQ layout omits codebook bank"))?
         .expanded_logical_range(dimensions.latent as usize)?;
     eredu_runtime::validate_parameter_layout(
@@ -464,26 +465,31 @@ impl<T> RvqForward<T> {
 /// Architecture-owned bank/projection graph with operation-specific unit activity.
 pub struct RvqKernel<B: NeuralBackend> {
     dimensions: RvqDimensions,
+    declaration: Declaration,
+    definition: ComponentDefinition,
     parallel: Option<(RvqLocalDimensions, LocalModelLayout)>,
     backend: PhantomData<fn() -> B>,
 }
 impl<B: NeuralBackend> RvqKernel<B> {
-    /// Validates dimensions without constructing any native parameter.
-    pub fn new(dimensions: RvqDimensions) -> Result<Self, TtsError> {
-        dimensions.validate()?;
+    /// Retains validated parameter ownership without constructing any native parameter.
+    pub fn new(declaration: RvqDeclaration) -> Result<Self, TtsError> {
+        let dimensions = declaration.dimensions();
+        let (declaration, definition) = declaration.into_parts();
         Ok(Self {
             dimensions,
+            declaration,
+            definition,
             parallel: None,
             backend: PhantomData,
         })
     }
     /// Selects exact rank-local bank and projection geometry without native allocation.
     pub fn new_parallel(
-        dimensions: RvqDimensions,
+        declaration: RvqDeclaration,
         layout: &LocalModelLayout,
     ) -> Result<Self, TtsError> {
-        let local = rvq_local_dimensions(dimensions, layout)?;
-        let mut architecture = Self::new(dimensions)?;
+        let mut architecture = Self::new(declaration)?;
+        let local = declared_local_dimensions(&architecture.declaration, layout)?;
         architecture.parallel = Some((local, layout.clone()));
         Ok(architecture)
     }
@@ -551,10 +557,7 @@ impl<B: NeuralBackend> RvqKernel<B> {
     }
     /// Combines validated semantic declarations with these typed equations.
     pub fn into_component(self) -> Result<ComponentAdapter<ComponentDefinition, Self>, TtsError> {
-        Ok(ComponentAdapter::new(
-            rvq_component_definition(self.dimensions)?,
-            self,
-        )?)
+        Ok(ComponentAdapter::new(self.definition.clone(), self)?)
     }
     /// Constructs only the requested unloaded unit.
     pub fn build_unit(
@@ -567,11 +570,16 @@ impl<B: NeuralBackend> RvqKernel<B> {
             return Err(TtsError::Configuration("unknown RVQ execution unit"));
         }
         Ok(if group == 0 {
-            RvqUnit::Bank(RvqBank::new_local(self.dimensions, self.local(), context)?)
+            RvqUnit::Bank(RvqBank::new(
+                self.declaration.bank.clone().local(self.local())?,
+                context,
+            )?)
         } else {
-            RvqUnit::Projection(RvqProjection::new_local(
-                self.dimensions,
-                self.local().latent,
+            RvqUnit::Projection(RvqProjection::new(
+                self.declaration
+                    .projection
+                    .clone()
+                    .local(self.local().latent)?,
                 context,
             )?)
         })
@@ -587,9 +595,10 @@ fn rvq_graph() -> Result<ExecutionGraph, TtsError> {
     )?)
 }
 
-/// Validated bank/projection invocations, transport and stateless resource geometry.
-pub fn rvq_component_definition(d: RvqDimensions) -> Result<ComponentDefinition, TtsError> {
-    let parameters = rvq_parameter_description(d)?;
+pub(crate) fn declared_component_definition(
+    declaration: &Declaration,
+) -> Result<ComponentDefinition, TtsError> {
+    let parameters = declared_parameters(declaration)?;
     let transport = ArchitectureGroupTransport {
         placement: ArchitectureGroupPlacement::Pipeline,
         kind: ArchitectureGroupKind::Projector,
@@ -620,32 +629,24 @@ pub fn rvq_component_definition(d: RvqDimensions) -> Result<ComponentDefinition,
     )?)
 }
 
-/// Cold canonical table/projection dimensions and independent storage ownership.
-pub fn rvq_parameter_description(
-    d: RvqDimensions,
+pub(super) fn declared_parameters(
+    declaration: &Declaration,
 ) -> Result<ArchitectureParameterDescription, TtsError> {
-    d.validate()?;
     let graph = rvq_graph()?;
     let layout = ExecutionUnitLayout::new(&graph, [1, 1])?;
-    let bank = ParameterGroupSpec::partitioned(
+    let bank = eredu_runtime::logical_parameter_group(
         BANK,
         ParameterRole::Channels,
-        d.latent as usize,
-        [ParameterMemberSpec::new(
-            "tts_model.tts_model.rvq_embs",
-            vec![31, d.cardinality as usize, d.latent as usize],
-            MemberSharding::Partitioned { axis: 2 },
-        )],
+        Some(declaration.bank.dimensions.latent as usize),
+        &declaration.bank,
+        |_| MemberSharding::Partitioned { axis: 2 },
     )?;
-    let projection = ParameterGroupSpec::partitioned(
+    let projection = eredu_runtime::logical_parameter_group(
         PROJECTION,
         ParameterRole::RowProjection,
-        d.latent as usize,
-        [ParameterMemberSpec::new(
-            "tts_model.tts_model.embed_code.weight",
-            vec![d.hidden as usize, d.latent as usize],
-            MemberSharding::Partitioned { axis: 1 },
-        )],
+        Some(declaration.projection.embedding.input as usize),
+        &declaration.projection,
+        |_| MemberSharding::Partitioned { axis: 1 },
     )?;
     let owned = vec![
         OwnedParameterGroupSpec::new(
@@ -806,10 +807,10 @@ impl<B: DistributedNeuralBackend> RvqKernel<B> {
         let (_, selected) = self.parallel.as_ref().ok_or(TtsError::Configuration(
             "parallel RVQ requires rank-local construction",
         ))?;
-        let description = rvq_parameter_description(self.dimensions)?;
+        let description = self.definition.parameters();
         eredu_runtime::validate_tensor_parallel_layout(
             "voicechat.tts.rvq",
-            &description,
+            description,
             selected,
             B::parallel_size(parallel),
             B::parallel_rank(parallel),

@@ -1,15 +1,16 @@
 //! DSpark's causal proposal decoder with independently encoded committed context.
 
 use eredu_nn::{
-    AttentionCache, AttentionRequest, EmbeddingLookupPolicy, EmbeddingOperator, EmbeddingSpec,
-    Error, GroupedNeuralBackend, LinearOperator, LinearSpec, NeuralBackend, Parameter,
-    ParameterSpec, Parameterized, Tensor, TensorElementType,
+    AttentionCache, AttentionRequest, DeclareLogicalParameters, EmbeddingLookupPolicy,
+    EmbeddingOperator, Error, GroupedNeuralBackend, LinearOperator, LogicalParameterDeclaration,
+    NeuralBackend, Parameter, Parameterized, Tensor, TensorElementType,
 };
 
-use super::super::DecoderConfig;
+use super::super::DecoderPolicy;
 use super::{DFlashContext, DFlashLayerContext};
 
 mod parallel;
+mod specs;
 
 /// Causal dense assistant body with independently acquired context/block/norm units.
 #[derive(Debug, Clone, Parameterized)]
@@ -21,8 +22,8 @@ pub struct DsparkDecoder<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBa
 }
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DsparkDecoder<B> {
     /// Constructs a causal body from normalized geometry, without checkpoint admission.
-    pub fn from_decoder_config(
-        args: DecoderConfig,
+    pub fn from_decoder_policy(
+        args: DecoderPolicy,
         captures: usize,
         block_size: usize,
         context: &<B::Tensor as Tensor>::Context,
@@ -140,8 +141,18 @@ pub struct DsparkConditional<T> {
 #[derive(Debug, Clone)]
 pub struct DsparkHeadDefinition {
     geometry: DsparkHeadGeometry,
-    formats: std::collections::HashMap<String, eredu_checkpoint::WeightQuantization>,
+    units: [specs::HeadUnitConstruction; 5],
     layout: eredu_runtime::ExecutionUnitLayout,
+}
+
+impl DeclareLogicalParameters for DsparkHeadDefinition {
+    fn logical_parameters(&self) -> Result<Vec<LogicalParameterDeclaration<'_>>, Error> {
+        let mut parameters = Vec::new();
+        for unit in &self.units {
+            parameters.extend(unit.module.logical_parameters()?);
+        }
+        Ok(parameters)
+    }
 }
 
 /// One vocabulary, transition, confidence or exact mapping parameter unit.
@@ -160,6 +171,27 @@ enum DsparkHeadModule<B: NeuralBackend> {
 }
 
 impl DsparkHeadDefinition {
+    pub(super) fn project_formats(
+        &self,
+        format: &impl Fn(&str) -> eredu_checkpoint::LinearFormat,
+    ) -> Result<Self, Error> {
+        let mut projected = self.clone();
+        for unit in &mut projected.units {
+            match &mut unit.module {
+                specs::HeadConstruction::Embedding(spec) => {
+                    super::body::project_embedding_encoding(spec, format)?
+                }
+                specs::HeadConstruction::Projection(spec)
+                | specs::HeadConstruction::Confidence(spec) => {
+                    super::body::project_linear_encoding(spec, format)?
+                }
+                specs::HeadConstruction::Mapping { .. } => {}
+            }
+        }
+        eredu_nn::validate_logical_parameter_topology(&projected.logical_parameters()?)
+            .map_err(Error::backend_source)?;
+        Ok(projected)
+    }
     /// Validates geometry without creating native parameters or allocating a tensor.
     pub fn new(
         geometry: DsparkHeadGeometry,
@@ -177,21 +209,34 @@ impl DsparkHeadDefinition {
         {
             return Err(Error::backend("invalid DSpark head geometry"));
         }
-        let graph = eredu_runtime::ExecutionGraph::chain([
-            "assistant.vocabulary",
-            "assistant.predecessor_table",
-            "assistant.successor_table",
-            "assistant.confidence",
-            "assistant.token_mapping",
-        ])
-        .map_err(Error::backend)?;
-        let layout =
-            eredu_runtime::ExecutionUnitLayout::new(&graph, [1; 5]).map_err(Error::backend)?;
-        Ok(Self {
+        let units = specs::units(geometry, &formats)?;
+        let graph = eredu_runtime::ExecutionGraph::chain(units.iter().map(|unit| unit.group))
+            .map_err(Error::backend)?;
+        let layout = eredu_runtime::ExecutionUnitLayout::new(&graph, units.iter().map(|_| 1))
+            .map_err(Error::backend)?;
+        let definition = Self {
             geometry,
-            formats,
+            units,
             layout,
-        })
+        };
+        eredu_nn::validate_logical_parameter_topology(&definition.logical_parameters()?)
+            .map_err(Error::backend_source)?;
+        Ok(definition)
+    }
+    pub(super) fn append_parameters(
+        &self,
+        declaration: &mut crate::external_assistant::AssistantParameterDeclarations,
+    ) -> Result<(), Error> {
+        for unit in &self.units {
+            declaration.append(
+                eredu_runtime::ReplicatedTextParameterOwner::ExecutionUnit {
+                    group: unit.group.into(),
+                    unit: 0,
+                },
+                &unit.module,
+            )?;
+        }
+        Ok(())
     }
     /// Cold head geometry without parameter construction.
     pub const fn geometry(&self) -> DsparkHeadGeometry {
@@ -211,82 +256,35 @@ impl DsparkHeadDefinition {
         ordinal: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<DsparkHeadUnit<B>, Error> {
-        let g = self.geometry;
-        let formats = &self.formats;
-        let format = |name: &str| {
-            crate::linear_format::standard_linear_format(
-                name,
-                formats
-                    .get(name)
-                    .copied()
-                    .map(Into::into)
-                    .unwrap_or(eredu_checkpoint::LinearFormat::Dense),
-            )
-        };
-        let projection = |name: &str, input, output, bias, compute| {
-            B::linear(
-                LinearSpec {
-                    input,
-                    output,
-                    weight: ParameterSpec::trainable(name).map_err(Error::backend)?,
-                    bias,
-                    format: format(name)?.with_compute_element(compute)?,
-                },
-                context,
-            )
-        };
-        let module = match ordinal {
-            0 => DsparkHeadModule::Projection(projection(
-                "lm_head.weight",
-                g.hidden,
-                g.vocabulary,
-                None,
-                None,
-            )?),
-            1 => DsparkHeadModule::Embedding(B::embedding(
-                EmbeddingSpec {
-                    vocabulary: g.vocabulary,
-                    dimensions: g.rank,
-                    weight: ParameterSpec::trainable("markov_head.markov_w1.weight")
-                        .map_err(Error::backend)?,
-                    format: format("markov_head.markov_w1.weight")?,
-                },
-                context,
-            )?),
-            2 => DsparkHeadModule::Projection(projection(
-                "markov_head.markov_w2.weight",
-                g.rank,
-                g.vocabulary,
-                None,
-                None,
-            )?),
-            3 => DsparkHeadModule::Confidence(projection(
-                "confidence_head.proj.weight",
-                g.hidden + g.rank,
-                1,
-                Some(
-                    ParameterSpec::trainable("confidence_head.proj.bias")
-                        .map_err(Error::backend)?,
-                ),
-                Some(TensorElementType::F32),
-            )?),
-            4 => {
+        let unit = self
+            .units
+            .get(ordinal)
+            .ok_or_else(|| Error::backend("invalid DSpark head unit ordinal"))?;
+        let module = match &unit.module {
+            specs::HeadConstruction::Projection(spec) => {
+                DsparkHeadModule::Projection(B::linear(spec.clone(), context)?)
+            }
+            specs::HeadConstruction::Embedding(spec) => {
+                DsparkHeadModule::Embedding(B::embedding(spec.clone(), context)?)
+            }
+            specs::HeadConstruction::Confidence(spec) => {
+                DsparkHeadModule::Confidence(B::linear(spec.clone(), context)?)
+            }
+            specs::HeadConstruction::Mapping { parameter, shape } => {
                 B::require_operator_capabilities(
                     "DSpark checkpoint mapping",
                     eredu_nn::NeuralOperatorCapabilities::UNLOADED_I64,
                 )?;
-                let mut mapping = ParameterSpec::trainable("d2t").map_err(Error::backend)?;
-                mapping.trainable = false;
                 DsparkHeadModule::Mapping(Parameter::unloaded_i64(
-                    mapping,
-                    &[g.vocabulary],
+                    parameter.clone(),
+                    shape,
                     context,
                 )?)
             }
-            _ => return Err(Error::backend("invalid DSpark head unit ordinal")),
         };
         Ok(DsparkHeadUnit { module })
     }
+
     /// Constructs resident heads through the same individual unit constructors.
     pub fn build_units<B: NeuralBackend>(
         &self,

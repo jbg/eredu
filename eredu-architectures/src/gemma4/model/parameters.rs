@@ -1,9 +1,8 @@
 //! Source-free Gemma invocation, storage, state and transport declarations.
 use crate::gemma4::{
     audio_layer_parameter_groups, audio_static_parameter_groups, layer_parameter_groups,
-    modality_projection_parameter_groups, state_layout, vision_layer_parameter_groups,
-    vision_static_parameter_groups, FamilyConfig, LocalGeometry, AUDIO_EXECUTION_GROUP,
-    TEXT_EXECUTION_GROUP, VISION_EXECUTION_GROUP,
+    state_layout, vision_layer_parameter_groups, vision_static_parameter_groups, FamilyConfig,
+    LocalGeometry, AUDIO_EXECUTION_GROUP, TEXT_EXECUTION_GROUP, VISION_EXECUTION_GROUP,
 };
 use eredu_nn::Error;
 use eredu_runtime::{
@@ -11,12 +10,12 @@ use eredu_runtime::{
     OwnedParameterGroupSpec, ParallelPlanError, ParameterGroupOwner,
 };
 fn text_static_parameter_ownership(
-    args: &crate::gemma4::ModelArgs,
+    args: &FamilyConfig,
 ) -> Result<Vec<OwnedParameterGroupSpec>, ParallelPlanError> {
     Ok(crate::gemma4::parallel::pinned_parameter_groups(args)?
         .into_iter()
         .map(|(role, group)| {
-            let owner = if role == "embedding" && args.tie_word_embeddings {
+            let owner = if role == "embedding" && args.text.tie_word_embeddings {
                 ParameterGroupOwner::static_any_of(["embedding", "output"])
             } else {
                 ParameterGroupOwner::static_role(role)
@@ -48,7 +47,7 @@ fn declare_parameters(args: &FamilyConfig) -> Result<ArchitectureParameterDescri
         args.text.num_hidden_layers(),
     ];
     let layout = ExecutionUnitLayout::new(&graph, counts).map_err(Error::backend)?;
-    let mut owned = text_static_parameter_ownership(&args.text).map_err(Error::backend)?;
+    let mut owned = text_static_parameter_ownership(args).map_err(Error::backend)?;
     {
         let mut add_static = |role: &'static str, groups: Vec<_>| {
             owned.extend(groups.into_iter().map(|group| {
@@ -61,20 +60,10 @@ fn declare_parameters(args: &FamilyConfig) -> Result<ArchitectureParameterDescri
                 vision_static_parameter_groups(vision).map_err(Error::backend)?,
             );
         }
-        if let Some(config) = &args.vision {
+        if let Some(spec) = args.projector(super::super::media::ProjectionKind::Vision) {
             add_static(
                 "vision_projection",
-                modality_projection_parameter_groups(
-                    "model.vision_projector",
-                    "embed_vision",
-                    config.hidden_size,
-                    args.text.hidden_size,
-                    config.linear_format_for(
-                        "model.embed_vision.embedding_projection.weight",
-                        config.hidden_size,
-                    ),
-                )
-                .map_err(Error::backend)?,
+                vec![spec.parameter_group("model.vision_projector")?],
             );
         }
         if let Some(audio) = &args.audio {
@@ -83,20 +72,10 @@ fn declare_parameters(args: &FamilyConfig) -> Result<ArchitectureParameterDescri
                 audio_static_parameter_groups(audio).map_err(Error::backend)?,
             );
         }
-        if let Some(config) = &args.audio {
+        if let Some(spec) = args.projector(super::super::media::ProjectionKind::Audio) {
             add_static(
                 "audio_projection",
-                modality_projection_parameter_groups(
-                    "model.audio_projector",
-                    "embed_audio",
-                    config.output_proj_dims,
-                    args.text.hidden_size,
-                    config.linear_format_for(
-                        "model.embed_audio.embedding_projection.weight",
-                        config.output_proj_dims,
-                    ),
-                )
-                .map_err(Error::backend)?,
+                vec![spec.parameter_group("model.audio_projector")?],
             );
         }
     }
@@ -115,7 +94,7 @@ fn declare_parameters(args: &FamilyConfig) -> Result<ArchitectureParameterDescri
                     args.audio.as_ref().expect("audio group configured"),
                     index,
                 ),
-                _ => layer_parameter_groups(&args.text, index),
+                _ => layer_parameter_groups(args, index),
             }
             .map_err(Error::backend)?;
             owned.extend(groups.into_iter().map(|group| {
@@ -179,7 +158,7 @@ fn component_state(
             geometry.validate_for(args).map_err(Error::backend_source)?;
             Ok(geometry.state_layout().clone())
         }
-        None => state_layout(&args.text).map_err(Error::backend_source),
+        None => state_layout(args).map_err(Error::backend_source),
     }
 }
 

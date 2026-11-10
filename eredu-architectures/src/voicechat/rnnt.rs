@@ -11,8 +11,8 @@ use eredu_runtime::execution_control::{
 };
 
 use eredu_nn::{
-    recurrent::{Lstm, LstmLayerSpec, LstmLayerState, LstmState},
-    LinearSpec, NeuralBackend, ParameterSpec, Parameterized, Tensor,
+    recurrent::{Lstm, LstmLayerState, LstmState},
+    NeuralBackend, Parameterized, Tensor,
 };
 
 use super::config::RnntConfig;
@@ -460,36 +460,15 @@ impl<B: NeuralBackend> Parameterized<B::Tensor> for Rnnt<B> {
     }
 }
 
-pub(super) fn parameter(id: String, group: &str) -> ParameterSpec {
-    let mut spec = ParameterSpec::trainable(id).expect("fixed RNNT parameter identity");
-    spec.group = Some(group.into());
-    spec
-}
-pub(super) fn affine(
-    input: i32,
-    output: i32,
-    weight: String,
-    bias: String,
-    group: &str,
-) -> LinearSpec {
-    LinearSpec {
-        input,
-        output,
-        weight: parameter(weight, group),
-        bias: Some(parameter(bias, group)),
-        format: eredu_nn::LinearFormatSpec::unscaled(eredu_checkpoint::LinearFormat::Dense)
-            .expect("dense RNNT layout"),
-    }
-}
 impl<B: NeuralBackend> Rnnt<B> {
     /// Declares resident resources through the same typed kernel as bounded execution.
     pub fn new(
-        dimensions: RnntDimensions,
+        declaration: super::rnnt_specs::RnntDeclaration,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, RnntError> {
         Ok(Self {
             runtime: eredu_runtime::ResidentRuntime::new(
-                super::rnnt_layered::RnntKernel::new(dimensions)?.into_component()?,
+                super::rnnt_layered::RnntKernel::new(declaration)?.into_component()?,
                 context,
             )
             .map_err(eredu_runtime::ResidentUnitsError::into_architecture)?,
@@ -826,21 +805,25 @@ pub trait RnntExecution<B: NeuralBackend> {
 // arithmetic type; generic linear promotion must not choose this policy.
 pub(super) fn encoder_projection_input<B: NeuralBackend>(
     projection: &B::Linear,
+    weight: &eredu_nn::ParameterId,
     encoder: &B::Tensor,
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<B::Tensor, RnntError> {
-    struct Dtype(Option<eredu_nn::TensorElementType>);
-    impl<'a, T: Tensor> eredu_nn::ParameterVisitor<'a, T> for Dtype {
+    struct Dtype<'p>(
+        &'p eredu_nn::ParameterId,
+        Option<eredu_nn::TensorElementType>,
+    );
+    impl<'a, T: Tensor> eredu_nn::ParameterVisitor<'a, T> for Dtype<'_> {
         fn visit(&mut self, metadata: eredu_nn::ParameterMetadata, tensor: &'a T) {
-            if metadata.id.as_str() == "stt_model.rnnt_joint.enc.weight" {
-                self.0 = tensor.element_type();
+            if &metadata.id == self.0 {
+                self.1 = tensor.element_type();
             }
         }
     }
-    let mut dtype = Dtype(None);
+    let mut dtype = Dtype(weight, None);
     projection.visit_parameters(&mut dtype);
     let dtype = dtype
-        .0
+        .1
         .filter(|d| {
             matches!(
                 d,
@@ -860,43 +843,6 @@ pub(super) fn encoder_projection_input<B: NeuralBackend>(
     }
 }
 
-fn predictor_layer_spec(
-    dimensions: RnntDimensions,
-    index: usize,
-) -> Result<LstmLayerSpec, RnntError> {
-    dimensions.validate()?;
-    if index >= dimensions.predictor_layers {
-        return Err(RnntError::InvalidConfiguration(
-            "RNNT predictor layer exceeds global geometry",
-        ));
-    }
-    let prefix = "stt_model.rnnt_decoder.prediction.dec_rnn.lstm";
-    let group = format!("voicechat.rnnt.predictor.{index}");
-    let matrix = |name: &str| {
-        affine(
-            dimensions.predictor_width,
-            dimensions.predictor_width * 4,
-            format!("{prefix}.weight_{name}_l{index}"),
-            format!("{prefix}.bias_{name}_l{index}"),
-            &group,
-        )
-    };
-    Ok(LstmLayerSpec {
-        input: matrix("ih"),
-        recurrent: matrix("hh"),
-    })
-}
-/// Constructs one canonical predictor layer for ordinary, leased or pipeline execution.
-pub fn build_predictor_layer<B: NeuralBackend>(
-    dimensions: RnntDimensions,
-    index: usize,
-    context: &<B::Tensor as Tensor>::Context,
-) -> Result<Lstm<B>, RnntError> {
-    Ok(Lstm::new(
-        vec![predictor_layer_spec(dimensions, index)?],
-        context,
-    )?)
-}
 /// Executes exactly one recurrent layer with immutable preceding carry.
 /// Initialization always derives from the original prediction input's precision,
 /// even when earlier layers promote their output to another arithmetic type.

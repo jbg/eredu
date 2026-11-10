@@ -161,10 +161,11 @@ impl RnntPredictorPipelineCuts {
 }
 /// Validates exact parameters, state slice and input/output stage ownership.
 pub fn validate_rnnt_predictor_partition<G>(
-    definition: &ComponentDefinition,
-    dimensions: RnntDimensions,
+    declaration: &super::rnnt_specs::RnntPredictorDeclaration,
     partition: &ArchitecturePartition<G, RnntPredictorBoundarySchema>,
 ) -> Result<Range<usize>, RnntError> {
+    let dimensions = declaration.dimensions();
+    let definition = declaration.definition();
     let description = definition.parameters();
     if partition.graph() != description.graph()
         || partition.unit_layout() != description.unit_layout()

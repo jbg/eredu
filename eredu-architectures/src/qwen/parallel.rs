@@ -1,29 +1,24 @@
 //! Semantic tensor-parallel placement for Qwen decoder blocks.
 
-use eredu_nn::{GroupedNeuralBackend, NeuralBackend};
-use eredu_runtime::{
-    aligned_partition_units, module_parameter_group, partitioned_module_parameter_group,
-    MemberSharding, ParallelPlanError, ParameterGroupSpec, ParameterRole,
-};
+use eredu_runtime::ParallelPlanError;
 
-use crate::decoder::{block_common_parallel_parameter_groups, dense_mlp_parallel_parameter_group};
-
-use super::{FeedForward, ModelArgs, RoutedTransformerBlock, TransformerBlock};
+use super::ModelArgs;
 
 /// Complete parameter topology derived from neutral router and expert specifications.
 pub fn parameter_description(
-    args: &ModelArgs,
+    declaration: &super::Declaration,
+    encoding: crate::decoder::ParameterEncoding,
 ) -> Result<eredu_runtime::ArchitectureParameterDescription, ParallelPlanError> {
+    let args = declaration.args();
     if !args.is_moe() {
-        return crate::decoder::dense_parameter_description(args);
+        return declaration.common().parameter_description(args, encoding);
     }
-    crate::decoder::routed_parameter_description(args, |layer| {
+    crate::decoder::routed_parameter_description(args, encoding, declaration.common(), |layer| {
         let root = format!("{}.layers.{layer}.mlp", args.parameter_root);
         Ok(crate::decoder::RoutedBlockParameters {
             selector_name: format!("{root}.gate"),
             bank_name: format!("{root}.experts.intermediate"),
-            selector: super::moe::selector_spec(args, layer)?,
-            bank: super::moe::expert_bank_spec(args, layer)?,
+            parameters: declaration.routed(layer)?.clone(),
         })
     })
 }
@@ -31,6 +26,7 @@ pub fn parameter_description(
 /// Derives rank-local Qwen construction geometry from a semantic placement plan.
 pub fn local_block_args(
     args: &ModelArgs,
+    bank: Option<&eredu_nn::GroupedGatedProductSpec>,
     layer: usize,
     layout: &eredu_runtime::LocalModelLayout,
 ) -> Result<ModelArgs, ParallelPlanError> {
@@ -69,7 +65,19 @@ pub fn local_block_args(
     local.num_attention_heads = query_width / args.head_dim;
     local.num_key_value_heads = key_width / args.head_dim;
     if args.is_moe() {
-        let gate_up = tensor("mlp.experts.gate_up_proj")?;
+        let bank = bank
+            .ok_or_else(|| ParallelPlanError::InvalidGroup("missing declared Qwen bank".into()))?;
+        let declared = bank
+            .packed_parameters()
+            .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+        let gate_up = layout
+            .tensor(declared.gate_up().parameter.id.as_str())
+            .ok_or_else(|| {
+                ParallelPlanError::InvalidTensor(format!(
+                    "missing local layout for {}",
+                    declared.gate_up().parameter.id
+                ))
+            })?;
         let fused_width = *gate_up.local_shape().get(1).ok_or_else(|| {
             ParallelPlanError::InvalidTensor(
                 "local Qwen expert gate/up tensor has rank below 2".into(),
@@ -103,65 +111,61 @@ pub fn local_block_args(
     Ok(local)
 }
 
-/// Returns the rank-local key/value head count for every Qwen decoder layer.
-pub fn local_key_value_heads(
-    args: &ModelArgs,
-    layout: &eredu_runtime::LocalModelLayout,
-) -> Result<Vec<i32>, ParallelPlanError> {
-    (0..args.num_hidden_layers as usize)
-        .map(|layer| Ok(local_block_args(args, layer, layout)?.num_key_value_heads))
-        .collect()
-}
-
 /// Complete rank-local geometry for the canonical neutral Qwen text model.
 pub type LocalGeometry = crate::decoder::LocalGeometry<ModelArgs>;
 
 /// Derives Qwen unit, vocabulary, and state geometry from one typed plan.
 pub fn local_geometry(
-    args: &ModelArgs,
+    declaration: &super::Declaration,
     layout: &eredu_runtime::LocalModelLayout,
 ) -> Result<LocalGeometry, ParallelPlanError> {
-    crate::decoder::local_geometry(args, layout, local_block_args)
+    crate::decoder::local_geometry(
+        declaration.args(),
+        declaration.common(),
+        layout,
+        |args, layer, layout| {
+            let bank = if args.is_moe() {
+                Some(
+                    declaration
+                        .expert_bank(layer)
+                        .map_err(|e| ParallelPlanError::InvalidGroup(e.to_string()))?,
+                )
+            } else {
+                None
+            };
+            local_block_args(args, bank, layer, layout)
+        },
+    )
 }
 
 /// Derives exact PP×TP×EP-local geometry from the selected routed realization.
 pub fn partition_local_routed_geometry(
-    args: &ModelArgs,
+    declaration: &super::Declaration,
     layout: &eredu_runtime::LocalModelLayout,
     owned_units: std::ops::Range<usize>,
     topology: eredu_core::ParallelRankTopology,
     realization: &crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
 ) -> Result<crate::decoder::PartitionLocalGeometry<ModelArgs>, ParallelPlanError> {
+    let args = declaration.args();
     if !args.is_moe() {
         return Err(ParallelPlanError::InvalidGroup(
             "partition-local routed Qwen geometry requires Qwen3-MoE".into(),
         ));
     }
-    validate_routed_realization(args, topology, realization)?;
+    validate_routed_realization(declaration, layout, topology, realization)?;
     crate::decoder::partition_local_geometry_with(
         args,
-        parameter_description(args)?.invocations(),
+        declaration.common(),
+        parameter_description(declaration, crate::decoder::ParameterEncoding::Stored)?
+            .invocations(),
         layout,
         owned_units,
         |args, layer, layout| {
-            let mut local = local_block_args(args, layer, layout)
-                .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
-            let spec = realization
-                .unit_spec(crate::decoder::TEXT_DECODER_EXECUTION_GROUP, layer)
-                .ok_or_else(|| {
-                    eredu_nn::Error::backend(format!(
-                        "selected routed Qwen realization omits unit {layer}"
-                    ))
-                })?;
+            let mut local =
+                local_block_args(args, Some(declaration.expert_bank(layer)?), layer, layout)
+                    .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
             let local_experts = i32::try_from(realization.local_global_group_indices().len())
                 .map_err(eredu_nn::Error::backend)?;
-            if spec.group_count() != local_experts
-                || spec.intermediate_dimensions() != local.moe_intermediate_size
-            {
-                return Err(eredu_nn::Error::backend(format!(
-                    "selected routed Qwen unit {layer} bank geometry drifted"
-                )));
-            }
             local.num_experts = local_experts;
             Ok(local)
         },
@@ -169,12 +173,20 @@ pub fn partition_local_routed_geometry(
 }
 
 fn validate_routed_realization(
-    args: &ModelArgs,
+    declaration: &super::Declaration,
+    layout: &eredu_runtime::LocalModelLayout,
     topology: eredu_core::ParallelRankTopology,
     realization: &crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
 ) -> Result<(), ParallelPlanError> {
-    let global_experts = usize::try_from(args.num_experts)
-        .map_err(|_| ParallelPlanError::InvalidGroup("Qwen expert count exceeds usize".into()))?;
+    let args = declaration.args();
+    let banks = declaration
+        .expert_banks()
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+    let global_experts = banks
+        .values()
+        .next()
+        .ok_or_else(|| ParallelPlanError::InvalidGroup("routed Qwen has no declared banks".into()))?
+        .group_count() as usize;
     let expected_local = eredu_core::balanced_contiguous_range(
         global_experts,
         topology.expert_parallel_size(),
@@ -192,107 +204,34 @@ fn validate_routed_realization(
             "selected routed Qwen expert ownership differs from the Cartesian rank".into(),
         ));
     }
-    let layers = usize::try_from(args.num_hidden_layers)
-        .map_err(|_| ParallelPlanError::InvalidGroup("Qwen layer count exceeds usize".into()))?;
-    if realization.unit_specs().len() != layers
-        || (0..layers).any(|layer| {
-            realization
-                .unit_spec(crate::decoder::TEXT_DECODER_EXECUTION_GROUP, layer)
-                .is_none()
-        })
-    {
+    if realization.unit_specs().len() != banks.len() {
         return Err(ParallelPlanError::InvalidGroup(
             "selected routed Qwen realization unit schedule drifted".into(),
         ));
     }
-    Ok(())
-}
-
-/// Declares every rank-local placement group for one dense Qwen block.
-pub fn layer_parallel_parameter_groups<B: NeuralBackend>(
-    block: &TransformerBlock<B>,
-    args: &ModelArgs,
-    layer: usize,
-) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    let mut groups = block_common_parallel_parameter_groups(block, args, layer)?;
-    groups.push(dense_mlp_parallel_parameter_group(
-        &block.body.mlp,
-        args,
-        layer,
-    )?);
-    Ok(groups)
-}
-
-/// Declares every rank-local placement group for a dynamically dense-or-routed Qwen block.
-pub fn routed_layer_parallel_parameter_groups<
-    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
->(
-    block: &RoutedTransformerBlock<B>,
-    args: &ModelArgs,
-    layer: usize,
-) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    let mut groups = block_common_parallel_parameter_groups(block, args, layer)?;
-    match &block.body.mlp {
-        FeedForward::Dense(mlp) => {
-            groups.push(dense_mlp_parallel_parameter_group(mlp, args, layer)?);
-        }
-        FeedForward::Routed(moe) => {
-            let prefix = format!("{}.layers.{layer}.mlp", args.parameter_root);
-            groups.push(module_parameter_group::<B::Tensor, _>(
-                format!("{prefix}.gate"),
-                ParameterRole::Replicated,
-                &moe.router,
-                |_, _| Ok(MemberSharding::Replicated),
-            )?);
-            let intermediate = usize::try_from(args.moe_intermediate_size).map_err(|_| {
-                ParallelPlanError::InvalidGroup("Qwen expert width exceeds usize".into())
-            })?;
-            let alignment = args
-                .weight_quantization_for(&format!("{prefix}.experts.down_proj"))
-                .map_or(Ok(1), |quantization| {
-                    usize::try_from(quantization.group_size()).map_err(|_| {
-                        ParallelPlanError::InvalidGroup(
-                            "Qwen expert quantization group exceeds usize".into(),
-                        )
-                    })
-                })?;
-            let units =
-                aligned_partition_units(&format!("{prefix}.experts"), intermediate, 1, alignment)?;
-            let segments = vec![0..intermediate, intermediate..2 * intermediate];
-            groups.push(partitioned_module_parameter_group::<B::Tensor, _>(
-                format!("{prefix}.experts.intermediate"),
-                ParameterRole::ExpertIntermediate,
-                units,
-                &moe.experts,
-                |metadata, shape| {
-                    let name = metadata.id.as_str();
-                    if name.contains("gate_up_proj") {
-                        if shape.len() < 3 {
-                            return Err(ParallelPlanError::InvalidTensor(format!(
-                                "packed Qwen gate/up expert parameter {name} has rank {}",
-                                shape.len()
-                            )));
-                        }
-                        Ok(MemberSharding::PartitionedSegments {
-                            axis: 1,
-                            segments: segments.clone(),
-                        })
-                    } else if name.contains("down_proj") {
-                        if shape.len() < 3 {
-                            return Err(ParallelPlanError::InvalidTensor(format!(
-                                "packed Qwen down expert parameter {name} has rank {}",
-                                shape.len()
-                            )));
-                        }
-                        Ok(MemberSharding::Partitioned { axis: 2 })
-                    } else {
-                        Err(ParallelPlanError::InvalidTensor(format!(
-                            "unexpected Qwen expert-bank parameter {name}"
-                        )))
-                    }
-                },
-            )?);
+    let local_count = i32::try_from(expected_local.len())
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+    for (layer, bank) in banks {
+        let local = local_block_args(
+            args,
+            Some(
+                declaration
+                    .expert_bank(layer)
+                    .map_err(|e| ParallelPlanError::InvalidGroup(e.to_string()))?,
+            ),
+            layer,
+            layout,
+        )?;
+        let expected = bank
+            .with_group_geometry(local_count, local.moe_intermediate_size)
+            .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+        if realization.unit_spec(crate::decoder::TEXT_DECODER_EXECUTION_GROUP, layer)
+            != Some(&expected)
+        {
+            return Err(ParallelPlanError::InvalidGroup(format!(
+                "selected routed Qwen bank declaration drifted at unit {layer}"
+            )));
         }
     }
-    Ok(groups)
+    Ok(())
 }

@@ -3,6 +3,8 @@
 pub mod boundary;
 mod checkpoint;
 pub mod composite;
+/// Shared construction, ownership and placement declarations for decoder feedback.
+pub mod conditioning;
 mod config;
 pub mod model;
 pub mod parallel;
@@ -21,9 +23,9 @@ pub enum TextInvocationPhase {
 
 pub use checkpoint::{
     canonical_safetensors_target, expert_recipes, expert_residency_catalog, gguf_plan,
-    safetensors_plan, translate_gguf_weight_name, unit_recipes,
+    safetensors_plan, unit_recipes, GgufNames,
 };
-pub use config::{ConfigError, EncoderAttention, FamilyConfig};
+pub use config::{ConfigError, EncoderAttention, FamilyConfig, FamilyPolicy};
 
 /// Declares one authoritative context history per shared text layer. Refinement
 /// invocations borrow these histories and own no second key/value state.
@@ -34,13 +36,12 @@ pub fn state_layout(
         .text
         .layer_schedule
         .iter()
-        .map(|policy| {
-            eredu_core::cache::LayerCachePolicy::key_value(
-                policy.attention,
-                policy.num_key_value_heads.get() as i32,
-                policy.head_dim.get() as i32,
-            )
-            .map_err(|error| eredu_runtime::StateError::InvalidResidency(error.to_string()))
+        .enumerate()
+        .map(|(layer, _)| {
+            config
+                .attention(layer)
+                .and_then(|spec| spec.state_policy(None, Vec::new()))
+                .map_err(|error| eredu_runtime::StateError::InvalidResidency(error.to_string()))
         })
         .collect::<Result<Vec<_>, _>>()?;
     eredu_runtime::StateLayout::new(

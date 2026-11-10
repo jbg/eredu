@@ -285,37 +285,36 @@ where
             record_gguf_media(&mut report, &inspection, media);
             record_media_companions(&mut report, &inspection);
             record_discovery(&mut report, descriptor, Some(&preparation), mechanisms);
-            let memory_materialization_workspace =
-                if let Some(rank) = report.resources.selected_rank.value() {
-                    rank.materialization_workspace.clone()
-                } else if preparation.execution().parallel_topology().is_some() {
-                    eredu_core::Observed::unavailable(
-                        "rank-local conversion workspace is not projected for this architecture",
-                    )
+            let memory_materialization_workspace = if let Some(rank) =
+                report.resources.selected_rank.value()
+            {
+                rank.materialization_workspace.clone()
+            } else if preparation.execution().parallel_topology().is_some() {
+                eredu_core::Observed::unavailable(
+                    "rank-local conversion workspace is not projected for this architecture",
+                )
+            } else {
+                let workspace = if let Some(target) = preparation.qwen4_construction() {
+                    target.parameter_materialization_workspace(mechanisms)
                 } else {
-                    let workspace = if let Some(target) = preparation.qwen4_construction() {
-                        target.parameter_materialization_workspace(mechanisms)
-                    } else {
-                        crate::replicated_text::artifact::catalog(&inspection)
-                            .map_err(|error| error.to_string())
-                            .and_then(|source| {
-                                preparation.execution().parameter_materialization_workspace(
-                                    source.as_ref(),
-                                    None,
-                                    mechanisms,
-                                )
-                            })
-                    };
-                    match workspace {
-                        Ok(value) => eredu_core::Observed::Available {
-                            value,
-                            kind: eredu_core::ObservationKind::Conservative,
-                            source: "selected checkpoint recipes and backend materialization facts"
-                                .into(),
-                        },
-                        Err(reason) => eredu_core::Observed::unavailable(reason),
-                    }
+                    crate::replicated_text::artifact::catalog(&inspection)
+                        .map_err(|error| error.to_string())
+                        .and_then(|source| {
+                            preparation
+                                .execution()
+                                .parameter_materialization_workspace(source.as_ref(), mechanisms)
+                        })
                 };
+                match workspace {
+                    Ok(value) => eredu_core::Observed::Available {
+                        value,
+                        kind: eredu_core::ObservationKind::Conservative,
+                        source: "selected checkpoint recipes and backend materialization facts"
+                            .into(),
+                    },
+                    Err(reason) => eredu_core::Observed::unavailable(reason),
+                }
+            };
             ModelInspectionOutcome {
                 report,
                 selected: Some(SelectedModelInspection {
@@ -383,7 +382,6 @@ fn record_rank_resources(
     selected: &crate::SelectedExecution,
     mechanisms: &impl PreparationMechanismProvider,
 ) {
-    use crate::configuration::{GgufModelConfig, SafetensorsModelConfig};
     let plan = inspection.architecture_plan();
     if !matches!(
         plan.model_kind(),
@@ -395,124 +393,14 @@ fn record_rank_resources(
         return;
     }
     let project = || -> Result<eredu_core::SelectedRankResourceProfile, String> {
-        let nemotron = plan
-            .gguf_media_projector()
-            .and_then(|projector| match projector.model() {
-                crate::gguf_companion::GgufMediaProjectorConfig::NemotronLabsDiffusion {
-                    config,
-                    ..
-                } => Some(config),
-                _ => None,
-            })
-            .or_else(|| {
-                match (
-                    plan.safetensors_architecture().map(|p| p.model()),
-                    plan.gguf_plan().map(|p| p.model()),
-                ) {
-                    (Some(SafetensorsModelConfig::NemotronLabsDiffusion(config)), None) => {
-                        Some(config)
-                    }
-                    (None, Some(GgufModelConfig::NemotronLabsDiffusion(plan))) => {
-                        Some(plan.text_config())
-                    }
-                    _ => None,
-                }
-            });
-        let muse = match crate::replicated_text::composite_config(plan)
-            .map_err(|error| error.to_string())?
-        {
-            Some(crate::replicated_text::CompositeConfig::Muse(config)) => Some(config),
-            _ => None,
+        let resources = match selected.partition_parameter_resources()? {
+            Some((resources, _)) => resources,
+            None => selected.parameter_resources().map_err(|e| e.to_string())?,
         };
-        let (parameters, layers, kv_width) = if let Some(config) = muse {
-            let config = crate::muse::with_checkpoint_formats(
-                config,
-                selected.text_realization().quantized_formats(),
-            )?;
-            let parameters = crate::muse::component_definition(&config, None)
-                .map_err(|error| error.to_string())?
-                .parameters()
-                .clone();
-            (
-                parameters,
-                config.num_hidden_layers as usize,
-                (config.num_key_value_heads * config.head_dim) as usize,
-            )
-        } else if let Some(config) = nemotron {
-            use crate::decoder::Config;
-            let config = config
-                .with_checkpoint_formats(selected.text_realization().quantized_formats())
-                .map_err(|e| e.to_string())?;
-            let parameters = if config.vision.is_some() {
-                crate::nemotron_labs_diffusion::parallel::composite_parameter_description(&config)
-            } else {
-                crate::nemotron_labs_diffusion::parallel::parameter_description(&config)
-            }
-            .map_err(|e| e.to_string())?;
-            (
-                parameters,
-                config.num_hidden_layers() as usize,
-                (config.num_key_value_heads() * config.head_dim()) as usize,
-            )
-        } else {
-            let args = match (
-                plan.safetensors_architecture().map(|p| p.model()),
-                plan.gguf_plan().map(|p| p.model()),
-            ) {
-                (Some(SafetensorsModelConfig::K2Horizon(args)), None)
-                | (None, Some(GgufModelConfig::K2Horizon(args))) => args,
-                _ => return Err("rank resource projection is unavailable for this family".into()),
-            };
-            let args = crate::replicated_text::selected_k2_horizon_args(
-                args,
-                selected.text_realization(),
-            )?;
-            (
-                crate::k2_horizon::parameter_description(&args).map_err(|e| e.to_string())?,
-                args.num_hidden_layers as usize,
-                (args.num_key_value_heads * args.head_dim) as usize,
-            )
-        };
-        let (resources, layout) = match selected.partition_parameter_resources(&parameters)? {
-            Some((resources, layout)) => (resources, Some(layout)),
-            None => (
-                selected.parameter_resources().map_err(|e| e.to_string())?,
-                None,
-            ),
-        };
-        let scalar_bytes = selected
-            .text_realization()
-            .state()
-            .floating_dtype()
-            .ok_or_else(|| "selected KV dtype is missing".to_owned())?
-            .bytes();
-        let mut cache_bytes_per_position = 0u64;
-        for layer in 0..layers {
-            if selected.partition_groups().is_some_and(|groups| {
-                !groups.iter().any(|group| {
-                    group.group().as_str() == crate::decoder::TEXT_DECODER_EXECUTION_GROUP
-                        && group.units().contains(&layer)
-                })
-            }) {
-                continue;
-            }
-            let width = if let Some(layout) = &layout {
-                layout
-                    .tensor(&format!("model.layers.{layer}.self_attn.k_proj.weight"))
-                    .ok_or_else(|| "local key projection is missing".to_owned())?
-                    .local_shape()[0]
-            } else {
-                kv_width
-            };
-            cache_bytes_per_position += 2 * width as u64 * u64::from(scalar_bytes.get());
-        }
+        let cache_bytes_per_position = selected.rank_attention_cache_bytes_per_position()?;
         let source =
             crate::replicated_text::artifact::catalog(inspection).map_err(|e| e.to_string())?;
-        let workspace = selected.parameter_materialization_workspace(
-            source.as_ref(),
-            layout.as_ref(),
-            mechanisms,
-        );
+        let workspace = selected.parameter_materialization_workspace(source.as_ref(), mechanisms);
         Ok(eredu_core::SelectedRankResourceProfile {
             topology: selected.parallel_topology(),
             materialized_parameter_bytes: resources.parameter_bytes,

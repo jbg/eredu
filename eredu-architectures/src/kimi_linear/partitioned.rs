@@ -32,6 +32,7 @@ where
         + BlockwiseAttentionBackend,
 {
     args: ModelArgs,
+    declaration: std::sync::Arc<super::Declaration>,
     static_modules: M,
     geometry: G,
     backend: std::marker::PhantomData<fn() -> B>,
@@ -47,7 +48,7 @@ pub trait KimiGeometry: 'static {
     /// Complete embedding and optional independent output vocabulary ownership.
     fn vocabulary_ranges(
         &self,
-        args: &ModelArgs,
+        declaration: &super::Declaration,
     ) -> (
         eredu_nn::VocabularyParallelRange,
         Option<eredu_nn::VocabularyParallelRange>,
@@ -55,7 +56,11 @@ pub trait KimiGeometry: 'static {
     /// Architecture-global units physically owned by the kernel.
     fn owned_units(&self) -> std::ops::Range<usize>;
     /// Admitted geometry for one global invocation.
-    fn block(&self, args: &ModelArgs, index: usize) -> Result<super::BlockGeometry, Error>;
+    fn block(
+        &self,
+        declaration: &super::Declaration,
+        index: usize,
+    ) -> Result<super::BlockGeometry, Error>;
     /// Selected routed bank geometry, when ownership specializes the bank.
     fn routed_spec(&self, _index: usize) -> Option<eredu_nn::GroupedGatedProductSpec> {
         None
@@ -63,7 +68,7 @@ pub trait KimiGeometry: 'static {
     /// Ordinary execution retains global-state admission on a TP construction.
     fn ordinary_state_layout<'a>(
         &'a self,
-        _args: &ModelArgs,
+        _declaration: &'a super::Declaration,
     ) -> Result<std::borrow::Cow<'a, StateLayout>, Error> {
         Ok(std::borrow::Cow::Borrowed(self.complete_state_layout()))
     }
@@ -95,7 +100,7 @@ impl KimiGeometry for CompleteKimiGeometry {
     }
     fn vocabulary_ranges(
         &self,
-        args: &ModelArgs,
+        declaration: &super::Declaration,
     ) -> (
         eredu_nn::VocabularyParallelRange,
         Option<eredu_nn::VocabularyParallelRange>,
@@ -107,31 +112,42 @@ impl KimiGeometry for CompleteKimiGeometry {
             );
         }
         let full = eredu_nn::VocabularyParallelRange {
-            global_vocabulary: args.vocab_size as usize,
-            local: 0..args.vocab_size as usize,
+            global_vocabulary: declaration.statics.embedding_spec().vocabulary as usize,
+            local: 0..declaration.statics.embedding_spec().vocabulary as usize,
         };
-        (full.clone(), (!args.tie_word_embeddings).then_some(full))
+        (
+            full.clone(),
+            declaration.statics.head_spec().is_some().then_some(full),
+        )
     }
     fn owned_units(&self) -> std::ops::Range<usize> {
         0..self.units
     }
-    fn block(&self, args: &ModelArgs, index: usize) -> Result<super::BlockGeometry, Error> {
+    fn block(
+        &self,
+        declaration: &super::Declaration,
+        index: usize,
+    ) -> Result<super::BlockGeometry, Error> {
         self.state_index(index)?;
         match &self.parallel {
             Some(geometry) => geometry.block(index).copied().ok_or_else(|| {
                 Error::backend(format!("missing rank-local Kimi block geometry {index}"))
             }),
-            None => Ok(super::BlockGeometry::replicated(args)),
+            None => declaration
+                .blocks
+                .get(index)
+                .map(|scope| scope.geometry(declaration.args()))
+                .ok_or_else(|| Error::backend("retained Kimi scope omits block")),
         }
     }
     fn ordinary_state_layout<'a>(
         &'a self,
-        args: &ModelArgs,
+        declaration: &'a super::Declaration,
     ) -> Result<std::borrow::Cow<'a, StateLayout>, Error> {
         match self.parallel {
-            Some(_) => super::state_layout(args)
-                .map(std::borrow::Cow::Owned)
-                .map_err(Error::backend),
+            Some(_) => Ok(std::borrow::Cow::Borrowed(
+                declaration.definition().state_layout(),
+            )),
             None => Ok(std::borrow::Cow::Borrowed(&self.state)),
         }
     }
@@ -148,7 +164,7 @@ impl KimiGeometry for PartitionLocalGeometry {
     }
     fn vocabulary_ranges(
         &self,
-        _args: &ModelArgs,
+        _declaration: &super::Declaration,
     ) -> (
         eredu_nn::VocabularyParallelRange,
         Option<eredu_nn::VocabularyParallelRange>,
@@ -158,7 +174,11 @@ impl KimiGeometry for PartitionLocalGeometry {
     fn owned_units(&self) -> std::ops::Range<usize> {
         self.owned_units()
     }
-    fn block(&self, _args: &ModelArgs, index: usize) -> Result<super::BlockGeometry, Error> {
+    fn block(
+        &self,
+        _declaration: &super::Declaration,
+        index: usize,
+    ) -> Result<super::BlockGeometry, Error> {
         self.block(index).copied().ok_or_else(|| {
             Error::backend(format!(
                 "Kimi unit {index} is outside owned range {:?}",
@@ -221,37 +241,24 @@ fn validate_identity(definition: &eredu_runtime::ComponentDefinition) -> Result<
     }
     Ok(())
 }
-/// Projects admitted formats while preserving logical consumers and observation seams.
-pub fn project_parameters(
-    args: &ModelArgs,
-    definition: &std::sync::Arc<eredu_runtime::ComponentDefinition>,
-) -> Result<std::sync::Arc<eredu_runtime::ComponentDefinition>, Error> {
-    validate_identity(definition)?;
-    let parameters = super::parameter_description(args).map_err(Error::backend)?;
-    definition
-        .project_parameters(parameters)
-        .map_err(Error::from)
-}
 fn select_definition(
-    args: &ModelArgs,
+    declaration: &super::Declaration,
     definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
     geometry: &impl KimiGeometry,
 ) -> Result<std::sync::Arc<eredu_runtime::ComponentDefinition>, Error> {
     validate_identity(&definition)?;
-    definition.validate_parameter_topology(
-        &super::parameter_description(args).map_err(Error::backend)?,
-    )?;
+    definition.validate_parameter_topology(declaration.definition().parameters())?;
     let state = geometry.complete_state_layout();
-    let global = super::state_layout(args).map_err(Error::backend)?;
-    if definition.state_layout() != &global && definition.state_layout() != state {
+    let global = declaration.definition().state_layout();
+    if definition.state_layout() != global && definition.state_layout() != state {
         return Err(invalid(
             &definition,
             "Kimi Linear retained state differs from global or selected geometry",
         ));
     }
     if let Some((_, layout)) = definition.parameters().partition_layout() {
-        let retained = super::local_geometry(args, layout).map_err(Error::backend_source)?;
-        let (embedding, output) = geometry.vocabulary_ranges(args);
+        let retained = super::local_geometry(declaration, layout).map_err(Error::backend_source)?;
+        let (embedding, output) = geometry.vocabulary_ranges(declaration);
         if retained.state_layout() != state
             || retained.embedding_range() != &embedding
             || retained.output_range() != output.as_ref()
@@ -262,7 +269,7 @@ fn select_definition(
             ));
         }
         for index in geometry.owned_units() {
-            if retained.block(index) != Some(&geometry.block(args, index)?) {
+            if retained.block(index) != Some(&geometry.block(declaration, index)?) {
                 return Err(invalid(
                     &definition,
                     format!("Kimi Linear retained block {index} placement differs from selected geometry"),
@@ -289,11 +296,12 @@ where
 {
     /// Constructs only statics and blocks selected by an exact dense Kimi partition.
     pub fn from_partition<A>(
-        args: ModelArgs,
+        declaration: std::sync::Arc<super::Declaration>,
         definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         partition: &eredu_runtime::ArchitecturePartition<PartitionLocalGeometry, A>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<PartitionedLayeredModel<B>, Error> {
+        let args = declaration.args().clone();
         crate::operator_requirements::require::<B>(
             "Kimi Linear",
             crate::operator_requirements::KIMI_LINEAR,
@@ -307,7 +315,7 @@ where
 
         partition
             .local_geometry()
-            .validate_for(&args)
+            .validate_for(&declaration)
             .map_err(Error::backend)?;
         let [group] = partition.groups() else {
             return Err(Error::backend(
@@ -323,21 +331,33 @@ where
             ));
         }
         let geometry = partition.local_geometry().clone();
-        let definition = select_definition(&args, definition, &geometry)?;
+        let definition = select_definition(&declaration, definition, &geometry)?;
         let selection = definition.select_partition(partition)?;
-        let static_modules = PartitionStaticModules::from_selected_spec(
-            super::static_spec(&args),
-            Some((
-                geometry.embedding_range().clone(),
-                geometry.output_range().cloned(),
-            )),
-            |role| {
-                selection.owns_storage(&eredu_runtime::ParameterStorageId::StaticRole(role.into()))
-            },
+        let owns = |role: &str| {
+            selection.owns_storage(&eredu_runtime::ParameterStorageId::StaticRole(role.into()))
+        };
+        let vocabulary = |role, range| {
+            if owns(role) {
+                eredu_runtime::VocabularyModulePlacement::VocabularyParallel(range)
+            } else {
+                eredu_runtime::VocabularyModulePlacement::Omitted
+            }
+        };
+        let static_modules = PartitionStaticModules::from_construction(
+            declaration.statics.clone(),
+            vocabulary("embedding", geometry.embedding_range().clone()),
+            geometry
+                .output_range()
+                .cloned()
+                .map_or(eredu_runtime::VocabularyModulePlacement::Omitted, |range| {
+                    vocabulary("output", range)
+                }),
+            owns("norm"),
             context,
         )?;
         let kernel = Self {
             args,
+            declaration,
             static_modules,
             geometry,
             backend: std::marker::PhantomData,
@@ -383,13 +403,15 @@ where
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<super::Block<B>, Error> {
-        super::Block::new_with_geometry_and_routed_spec(
-            &self.args,
-            index,
-            self.geometry.block(&self.args, index)?,
-            self.geometry.routed_spec(index),
-            context,
-        )
+        let geometry = self.geometry.block(&self.declaration, index)?;
+        let parameters = self
+            .declaration
+            .blocks
+            .get(index)
+            .cloned()
+            .ok_or_else(|| Error::backend("retained Kimi declaration omits unit"))?
+            .local(geometry, self.geometry.routed_spec(index))?;
+        super::Block::from_parameters(index, parameters, context)
     }
 
     fn begin_hidden<S>(
@@ -569,7 +591,7 @@ where
         state: &mut S,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        let expected = self.geometry.ordinary_state_layout(&self.args)?;
+        let expected = self.geometry.ordinary_state_layout(&self.declaration)?;
         let hidden = self
             .static_modules
             .decoder_resources_mut()
@@ -812,7 +834,9 @@ where
         address: eredu_runtime::ExecutionUnitAddress,
     ) -> Result<Option<eredu_runtime::RoutedObservationPoints>, Self::Error> {
         let path = format!("model.layers.{}", address.index());
-        Ok(self.args.routed_observation_points(&path, address.index()))
+        Ok(self
+            .declaration
+            .routed_observation_points(&path, address.index()))
     }
     fn routed_unit_observations(&self) -> bool {
         true
@@ -866,7 +890,7 @@ where
     {
         let index = address.index();
         let path = format!("model.layers.{}", address.index());
-        let points = self.args.routed_observation_points(&path, index);
+        let points = self.declaration.routed_observation_points(&path, index);
         let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
         unit.forward_partition_instrumented_with_feed_forward(
             hidden,
@@ -957,7 +981,7 @@ where
         let index = address.index();
         let path = format!("model.layers.{}", address.index());
         let ordinal = self.local_state_ordinal(index)?;
-        let points = self.args.routed_observation_points(&path, index);
+        let points = self.declaration.routed_observation_points(&path, index);
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
         unit.forward_partition_instrumented_with_feed_forward(
             hidden,
@@ -1330,59 +1354,55 @@ where
         + eredu_nn::DistributedNeuralBackend
         + BlockwiseAttentionBackend,
 {
-    /// Materializes complete resources from the cold retained declaration.
-    pub fn from_definition(
-        args: ModelArgs,
-        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<super::LayeredModel<B>, Error> {
-        Self::materialize(args, definition, None, context)
-    }
-    /// Materializes the same equations with admitted tensor-local geometry.
-    pub fn from_parallel_definition(
-        args: ModelArgs,
-        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
-        geometry: super::LocalGeometry,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<super::LayeredModel<B>, Error> {
-        Self::materialize(args, definition, Some(geometry), context)
-    }
-    fn materialize(
-        args: ModelArgs,
+    /// Materializes retained scopes at complete or admitted tensor-local geometry.
+    pub fn from_selected_declaration(
+        declaration: std::sync::Arc<super::Declaration>,
         definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         local: Option<super::LocalGeometry>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<super::LayeredModel<B>, Error> {
+        let args = declaration.args().clone();
         crate::operator_requirements::require::<B>(
             "Kimi Linear",
             crate::operator_requirements::KIMI_LINEAR,
         )?;
         args.validate().map_err(Error::backend)?;
         if let Some(local) = &local {
-            local.validate_for(&args).map_err(Error::backend)?;
+            local.validate_for(&declaration).map_err(Error::backend)?;
         }
         let geometry = CompleteKimiGeometry {
             state: match &local {
                 Some(local) => local.state_layout().clone(),
-                None => super::state_layout(&args).map_err(Error::backend)?,
+                None => declaration.definition().state_layout().clone(),
             },
             parallel: local.map(std::sync::Arc::new),
             units: args.num_hidden_layers as usize,
         };
-        let definition = select_definition(&args, definition, &geometry)?;
+        let definition = select_definition(&declaration, definition, &geometry)?;
+        let statics = &declaration.statics;
+        let boundary =
+            crate::decoder::NormalizedBoundary::new(statics.normalization_spec().clone(), context)?;
         let static_modules = match &geometry.parallel {
-            Some(local) => StaticModules::from_parallel_spec(
-                super::static_spec(&args),
+            Some(local) => StaticModules::from_parallel_boundary(
+                statics.embedding_spec().clone(),
+                statics.head_spec().cloned(),
+                boundary,
                 local.embedding_range().clone(),
                 local.output_range().cloned(),
                 context,
             )?,
-            None => StaticModules::from_spec(super::static_spec(&args), context)?,
+            None => StaticModules::from_boundary(
+                statics.embedding_spec().clone(),
+                statics.head_spec().cloned(),
+                boundary,
+                context,
+            )?,
         };
         eredu_runtime::ComponentAdapter::with_pinned_resources::<B>(
             definition,
             Self {
                 args,
+                declaration,
                 static_modules,
                 geometry,
                 backend: std::marker::PhantomData,
@@ -1400,6 +1420,6 @@ where
     }
     /// Returns the ordinary global-state declaration for low-level execution.
     pub fn state_layout(&self) -> Result<StateLayout, Error> {
-        super::state_layout(&self.args).map_err(Error::backend)
+        Ok(self.declaration.definition().state_layout().clone())
     }
 }

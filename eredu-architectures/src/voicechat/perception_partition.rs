@@ -142,31 +142,36 @@ fn ownership<G>(
 
 /// Validates selected units, state, physical placement and transport without native resources.
 pub fn validate_perception_partition<G>(
-    definition: &ComponentDefinition,
-    dimensions: PerceptionDimensions,
+    declaration: &PerceptionDeclaration,
     layout: Option<&LocalModelLayout>,
     partition: &ArchitecturePartition<G, PerceptionBoundarySchema>,
 ) -> Result<(), PerceptionError> {
     if let Some(layout) = layout {
-        perception_local_dimensions(dimensions, layout)?;
+        declaration.local_dimensions(layout)?;
     }
-    ownership(definition, dimensions, partition).map(|_| ())
+    ownership(
+        declaration.definition(),
+        declaration.dimensions(),
+        partition,
+    )
+    .map(|_| ())
 }
 
 impl<B: NeuralBackend> PerceptionKernel<B> {
     /// Constructs only the parameters and cache owners selected for one stage.
     pub fn new_partition<G>(
-        definition: ComponentDefinition,
-        dimensions: PerceptionDimensions,
+        declaration: PerceptionDeclaration,
         layout: Option<&LocalModelLayout>,
         partition: &ArchitecturePartition<G, PerceptionBoundarySchema>,
     ) -> Result<
         eredu_runtime::ComponentAdapter<eredu_runtime::ComponentDefinition, Self>,
         PerceptionError,
     > {
+        let dimensions = declaration.dimensions();
+        let definition = declaration.definition().clone();
         let mut architecture = match layout {
-            Some(layout) => Self::new_parallel(dimensions, layout)?,
-            None => Self::new(dimensions)?,
+            Some(layout) => Self::new_parallel(declaration, layout)?,
+            None => Self::new(declaration)?,
         };
         architecture.partition = Some(ownership(&definition, dimensions, partition)?);
         Ok(ComponentAdapter::new(definition, architecture)?.select_partition(partition)?)

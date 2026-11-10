@@ -1,12 +1,13 @@
 //! Strict hybrid text and conditional-generation configuration.
 
+use super::HybridConfig;
 use std::collections::{BTreeMap, HashMap};
 
 use crate::rotary::RopeValue;
 use eredu_checkpoint::{BlockFp8Format, BlockFp8ScaleEncoding, LinearFormat, WeightQuantization};
 use eredu_core::{
     attention::{AttentionPolicy, LayerSchedule},
-    cache::{derive_prompt_cache_architecture_fingerprint, LayerCachePolicy},
+    cache::derive_prompt_cache_architecture_fingerprint,
 };
 use eredu_gguf::MetadataValue;
 use eredu_runtime::{StateLayout, StateSegmentLifetime, StateSegmentSpec};
@@ -98,9 +99,10 @@ impl HybridVariant {
     }
 }
 
-/// Normalized Qwen3-Next/Qwen3.5 text configuration.
-#[derive(Debug, Clone)]
-pub struct HybridConfig {
+/// Normalized scalar invocation and format policy for Qwen3-Next/Qwen3.5.
+/// `HybridConfig` retains the corresponding validated parameter scopes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HybridPolicy {
     /// Validated variant policy.
     pub variant: HybridVariant,
     /// Effective text model type.
@@ -165,24 +167,28 @@ pub struct HybridConfig {
     pub linear_formats: HashMap<String, LinearFormat>,
 }
 
-/// Rank-local mutable-state geometry for one scheduled hybrid layer.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum HybridStateGeometry {
-    /// Ordinary append-only key/value state.
-    FullAttention {
-        /// Rank-local key/value heads.
-        key_value_heads: i32,
-    },
-    /// Fixed convolution history plus FP32 recurrent matrix.
-    LinearAttention {
-        /// Rank-local key heads.
-        key_heads: i32,
-        /// Rank-local value heads.
-        value_heads: i32,
-    },
-}
+impl HybridPolicy {
+    pub(crate) fn attention_head_geometry(
+        &self,
+    ) -> Result<eredu_nn::AttentionHeadGeometry, eredu_nn::Error> {
+        eredu_nn::AttentionHeadGeometry::new(
+            self.num_attention_heads,
+            self.num_key_value_heads,
+            self.head_dim,
+            self.head_dim,
+        )
+    }
+    pub(crate) fn recurrent_head_geometry(
+        &self,
+    ) -> Result<eredu_nn::GatedDeltaHeadGeometry, eredu_nn::Error> {
+        eredu_nn::GatedDeltaHeadGeometry::new(
+            self.linear_num_key_heads,
+            self.linear_num_value_heads,
+            self.linear_key_head_dim,
+            self.linear_value_head_dim,
+        )
+    }
 
-impl HybridConfig {
     /// Whether this policy selects routed plus shared experts.
     pub const fn is_moe(&self) -> bool {
         self.num_experts > 0
@@ -303,32 +309,15 @@ impl HybridConfig {
                 "hybrid decoder does not admit sliding self-attention",
             ));
         }
-        if self.linear_num_value_heads % self.linear_num_key_heads != 0 {
-            return Err(invalid(
-                "linear value-head count must be divisible by key-head count",
-            ));
-        }
-        if self.num_attention_heads % self.num_key_value_heads != 0 {
-            return Err(invalid(
-                "attention query-head count must be divisible by key/value heads",
-            ));
-        }
-        self.num_attention_heads
-            .checked_mul(self.head_dim)
-            .and_then(|width| width.checked_mul(2))
-            .ok_or_else(|| invalid("full-attention projection width overflowed"))?;
-        let key_width = self
-            .linear_num_key_heads
-            .checked_mul(self.linear_key_head_dim)
-            .ok_or_else(|| invalid("linear key width overflowed"))?;
-        let value_width = self
-            .linear_num_value_heads
-            .checked_mul(self.linear_value_head_dim)
-            .ok_or_else(|| invalid("linear value width overflowed"))?;
-        key_width
-            .checked_mul(2)
-            .and_then(|width| width.checked_add(value_width))
-            .ok_or_else(|| invalid("linear fused projection width overflowed"))?;
+        let attention_heads = self
+            .attention_head_geometry()
+            .map_err(|error| invalid(error.to_string()))?;
+        super::block::AttentionParameters::QUERY_LAYOUT
+            .projected_width(attention_heads)
+            .map_err(|error| invalid(error.to_string()))?;
+        self.recurrent_head_geometry()
+            .and_then(|geometry| geometry.qkv_width())
+            .map_err(|error| invalid(error.to_string()))?;
         if self.hidden_act != "silu" {
             return Err(invalid(format!(
                 "unsupported hybrid activation {:?}",
@@ -484,8 +473,8 @@ impl HybridConfigSource {
         self,
         variant: HybridVariant,
         layer_schedule: LayerSchedule<HybridLayerPolicy>,
-    ) -> HybridConfig {
-        HybridConfig {
+    ) -> HybridPolicy {
+        HybridPolicy {
             variant,
             model_type: variant.model_type().into(),
             vocab_size: self.vocab_size,
@@ -549,8 +538,8 @@ pub struct ParsedHybridConfig {
     pub image_token_id: Option<i32>,
     /// Video placeholder token for conditional-generation configs.
     pub video_token_id: Option<i32>,
-    /// Optional shared vision encoder policy.
-    pub vision: Option<VisionConfig>,
+    /// Optional retained shared vision construction scopes and invocation policy.
+    pub vision: Option<std::sync::Arc<crate::qwen::vision::Declaration>>,
 }
 
 /// Parses a shared projector GGUF with Qwen3.5 window-scheduled semantics.
@@ -705,10 +694,16 @@ pub fn model_args_from_config_value(
         (None, _, _) => {}
     }
     Ok(ParsedHybridConfig {
-        text,
+        text: HybridConfig::new(text).map_err(|e| invalid(e.to_string()))?,
         image_token_id: top.image_token_id,
         video_token_id: top.video_token_id,
-        vision,
+        vision: vision
+            .map(|config| {
+                crate::qwen::vision::Declaration::new(config, "model.visual")
+                    .map(std::sync::Arc::new)
+            })
+            .transpose()
+            .map_err(|e| invalid(e.to_string()))?,
     })
 }
 
@@ -803,7 +798,7 @@ pub fn model_args_from_gguf_catalog(
         .iter()
         .any(|suffix| arrays.contains(&format!("blk.{layer}.{suffix}")))
     });
-    let text = HybridConfig {
+    let text = HybridPolicy {
         variant,
         model_type: variant.model_type().into(),
         vocab_size,
@@ -858,7 +853,7 @@ pub fn model_args_from_gguf_catalog(
     };
     text.validate()?;
     Ok(ParsedHybridConfig {
-        text,
+        text: HybridConfig::new(text).map_err(|e| invalid(e.to_string()))?,
         image_token_id: None,
         video_token_id: None,
         vision: None,
@@ -883,7 +878,10 @@ pub fn with_gguf_vision_projector(
             vision.out_hidden_size, parsed.text.hidden_size
         )));
     }
-    parsed.vision = Some(vision);
+    parsed.vision = Some(std::sync::Arc::new(
+        crate::qwen::vision::Declaration::new(vision, "model.visual")
+            .map_err(|e| invalid(e.to_string()))?,
+    ));
     Ok(parsed)
 }
 
@@ -980,31 +978,20 @@ fn gguf_optional_f32(
 
 /// Grouped physical widths of Q, K, V, gate and beta/decay projections.
 pub fn fused_projection_widths(
-    config: &HybridConfig,
+    config: &HybridPolicy,
 ) -> Result<([i32; 4], i32), HybridConfigError> {
-    if config.linear_num_key_heads <= 0
-        || config.linear_num_value_heads <= 0
-        || config.linear_value_head_dim <= 0
-        || config.linear_num_value_heads % config.linear_num_key_heads != 0
-    {
-        return Err(invalid("invalid grouped fused projection dimensions"));
-    }
-    let value_dim = config
-        .linear_num_value_heads
-        .checked_mul(config.linear_value_head_dim)
-        .ok_or_else(|| invalid("fused projection dimension overflow"))?;
-    if value_dim % config.linear_num_key_heads != 0 {
-        return Err(invalid("invalid grouped fused projection dimensions"));
-    }
-    let value_per_key = value_dim / config.linear_num_key_heads;
+    let geometry = config
+        .recurrent_head_geometry()
+        .map_err(|e| invalid(e.to_string()))?;
+    let value_per_key = geometry.value_width() / geometry.key_heads();
     Ok((
         [
-            config.linear_key_head_dim,
-            config.linear_key_head_dim,
+            geometry.key_dimensions(),
+            geometry.key_dimensions(),
             value_per_key,
             value_per_key,
         ],
-        config.linear_num_value_heads / config.linear_num_key_heads,
+        geometry.value_heads() / geometry.key_heads(),
     ))
 }
 
@@ -1024,7 +1011,7 @@ pub fn fp8_block_row_widths(widths: &[i32]) -> Result<Vec<i32>, HybridConfigErro
 }
 
 /// Stable prompt-cache identity for global hybrid architecture semantics.
-pub fn prompt_cache_architecture_fingerprint(config: &HybridConfig) -> String {
+pub fn prompt_cache_architecture_fingerprint(config: &HybridPolicy) -> String {
     let fp8 = config.fp8.as_ref().map_or_else(
         || "none".into(),
         |fp8| {
@@ -1092,7 +1079,7 @@ pub fn conditional_prompt_cache_architecture_fingerprint(config: &ParsedHybridCo
                 config
                     .vision
                     .as_ref()
-                    .map(crate::qwen::vision::prompt_cache_architecture_fingerprint)
+                    .map(|v| crate::qwen::vision::prompt_cache_architecture_fingerprint(v.config()))
                     .unwrap_or_else(|| "none".into()),
             ),
             ("image_token", format!("{:?}", config.image_token_id)),
@@ -1103,83 +1090,66 @@ pub fn conditional_prompt_cache_architecture_fingerprint(config: &ParsedHybridCo
 
 /// Declares global mutable state for the exact ordered hybrid schedule.
 pub fn state_layout(config: &HybridConfig) -> Result<StateLayout, HybridConfigError> {
-    let geometry = config
-        .layer_schedule
-        .iter()
-        .map(|policy| match policy {
-            HybridLayerPolicy::SelfAttention(_) => HybridStateGeometry::FullAttention {
-                key_value_heads: config.num_key_value_heads,
-            },
-            HybridLayerPolicy::LinearAttention => HybridStateGeometry::LinearAttention {
-                key_heads: config.linear_num_key_heads,
-                value_heads: config.linear_num_value_heads,
-            },
-        })
-        .collect::<Vec<_>>();
-    state_layout_with_geometry(config, &geometry)
+    let predictions = usize::try_from(config.mtp_num_hidden_layers)
+        .map_err(|_| invalid("mtp_num_hidden_layers must be non-negative"))?;
+    state_layout_with_block_configs(
+        config,
+        std::iter::repeat_n(config, config.layer_schedule.len()),
+        std::iter::repeat_n(config, predictions),
+    )
 }
 
-/// Declares rank-local mutable state while retaining global schedule identity.
-pub fn state_layout_with_geometry(
+/// Projects state from selected target and prediction construction configurations.
+/// Borrowed configurations preserve bounded metadata use for global declarations.
+pub fn state_layout_with_block_configs<'a>(
     config: &HybridConfig,
-    geometry: &[HybridStateGeometry],
+    target: impl IntoIterator<Item = &'a HybridConfig>,
+    prediction: impl IntoIterator<Item = &'a HybridConfig>,
 ) -> Result<StateLayout, HybridConfigError> {
     let target_layers = config.layer_schedule.len();
     let mtp_layers = usize::try_from(config.mtp_num_hidden_layers)
         .map_err(|_| invalid("mtp_num_hidden_layers must be non-negative"))?;
-    if geometry.len() != target_layers && geometry.len() != target_layers + mtp_layers {
-        return Err(invalid(format!(
-            "hybrid state geometry has {} layers, expected {} target or {} total units",
-            geometry.len(),
-            target_layers,
-            target_layers + mtp_layers,
-        )));
+    let target = target.into_iter().collect::<Vec<_>>();
+    let prediction = prediction.into_iter().collect::<Vec<_>>();
+    if target.len() != target_layers || prediction.len() != mtp_layers {
+        return Err(invalid(format!("hybrid construction geometry has {}/{} target/prediction blocks, expected {target_layers}/{mtp_layers}", target.len(), prediction.len())));
     }
     let mut policies = config
         .layer_schedule
         .iter()
         .copied()
-        .zip(geometry.iter().copied())
+        .zip(target)
         .enumerate()
-        .map(|(layer, (policy, geometry))| match (policy, geometry) {
-            (
-                HybridLayerPolicy::SelfAttention(attention),
-                HybridStateGeometry::FullAttention { key_value_heads },
-            ) => LayerCachePolicy::key_value(attention, key_value_heads, config.head_dim)
-                .map_err(|error| invalid(error.to_string())),
-            (
-                HybridLayerPolicy::LinearAttention,
-                HybridStateGeometry::LinearAttention {
-                    key_heads,
-                    value_heads,
-                },
-            ) => crate::gated_delta::GatedDeltaStateGeometry {
-                key_heads,
-                value_heads,
-                key_dim: config.linear_key_head_dim,
-                value_dim: config.linear_value_head_dim,
-                kernel: config.linear_conv_kernel_dim,
-                dilation: 1,
+        .map(|(layer, (policy, local))| {
+            let scope =
+                super::BlockParameters::target(local, layer).map_err(|e| invalid(e.to_string()))?;
+            match (&scope.mixer, policy) {
+                (
+                    super::specs::MixerParameters::Attention(parameters),
+                    HybridLayerPolicy::SelfAttention(attention),
+                ) => parameters.state_policy(attention),
+                (
+                    super::specs::MixerParameters::Recurrent(spec),
+                    HybridLayerPolicy::LinearAttention,
+                ) => spec.state_policy(),
+                _ => Err(eredu_nn::Error::backend(
+                    "state invocation differs from declared mixer",
+                )),
             }
-            .state_policy()
-            .map_err(|error| invalid(error.to_string())),
-            (policy, geometry) => Err(invalid(format!(
-                "hybrid state geometry {geometry:?} does not match layer {layer} policy {policy:?}"
-            ))),
+            .map_err(|error| invalid(error.to_string()))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    for depth in 0..mtp_layers {
-        let key_value_heads = match geometry.get(target_layers + depth).copied() {
-            Some(HybridStateGeometry::FullAttention { key_value_heads }) => key_value_heads,
-            Some(other) => {
-                return Err(invalid(format!(
-                    "hybrid MTP geometry {other:?} is not full attention"
-                )))
-            }
-            None => config.num_key_value_heads,
-        };
+    for (depth, local) in prediction.into_iter().enumerate() {
         policies.push(
-            LayerCachePolicy::key_value(AttentionPolicy::Full, key_value_heads, config.head_dim)
+            super::BlockParameters::prediction(local, depth)
+                .and_then(|scope| match scope.mixer {
+                    super::specs::MixerParameters::Attention(parameters) => {
+                        parameters.state_policy(AttentionPolicy::Full)
+                    }
+                    _ => Err(eredu_nn::Error::backend(
+                        "prediction state requires declared attention",
+                    )),
+                })
                 .map_err(|error| invalid(error.to_string()))?,
         );
     }

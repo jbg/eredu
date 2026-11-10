@@ -1220,7 +1220,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> GemmaKernel<B
             crate::operator_requirements::GEMMA4,
         )?;
         let definition = parameters::select_definition(&args, definition, None)?;
-        let text = model_text::StaticTextModules::new(&args.text, context)?;
+        let text = model_text::StaticTextModules::new(&args, context)?;
         Self::with_text(args, definition, text, None, context)
     }
 
@@ -1236,7 +1236,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> GemmaKernel<B
             crate::operator_requirements::GEMMA4,
         )?;
         let definition = parameters::select_definition(&args, definition, Some(&geometry))?;
-        let text = model_text::StaticTextModules::new_parallel(&args.text, &geometry, context)?;
+        let text = model_text::StaticTextModules::new_parallel(&args, &geometry, context)?;
         Self::with_text(args, definition, text, Some(geometry), context)
     }
 
@@ -1253,21 +1253,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> GemmaKernel<B
             .map(|config| VisionStatic::new(config.clone(), context))
             .transpose()?;
         let vision_projection = args
-            .vision
-            .as_ref()
-            .map(|config| {
-                ModalityProjector::new_with_format(
-                    &args.text,
-                    "embed_vision",
-                    config.hidden_size,
-                    config.rms_norm_eps,
-                    config.linear_format_for(
-                        "model.embed_vision.embedding_projection.weight",
-                        config.hidden_size,
-                    ),
-                    context,
-                )
-            })
+            .projector(super::media::ProjectionKind::Vision)
+            .map(|spec| ModalityProjector::new(spec.clone(), context))
             .transpose()?;
         let audio = args
             .audio
@@ -1275,21 +1262,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> GemmaKernel<B
             .map(|config| AudioStatic::new(config.clone(), context))
             .transpose()?;
         let audio_projection = args
-            .audio
-            .as_ref()
-            .map(|config| {
-                ModalityProjector::new_with_format(
-                    &args.text,
-                    "embed_audio",
-                    config.output_proj_dims,
-                    config.rms_norm_eps,
-                    config.linear_format_for(
-                        "model.embed_audio.embedding_projection.weight",
-                        config.output_proj_dims,
-                    ),
-                    context,
-                )
-            })
+            .projector(super::media::ProjectionKind::Audio)
+            .map(|spec| ModalityProjector::new(spec.clone(), context))
             .transpose()?;
         Ok(Self {
             args,
@@ -2412,12 +2386,7 @@ fn slice_component<T: Tensor>(
 // Text-only pinned modules are isolated so the composite static tree can add
 // media without changing their stable parameter identities.
 pub(crate) mod model_text {
-    use eredu_nn::{
-        EmbeddingSpec, Error, GroupedNeuralBackend, LinearSpec, NormalizationConstructionSpec,
-        ParameterSpec, Parameterized, Tensor,
-    };
-
-    use super::super::ModelArgs;
+    use eredu_nn::{Error, GroupedNeuralBackend, Parameterized, Tensor};
 
     /// Pinned Gemma text modules.
     #[derive(Debug, Clone, Parameterized)]
@@ -2449,33 +2418,29 @@ pub(crate) mod model_text {
                 .ok_or_else(|| Error::backend("Gemma does not own readout normalization"))
         }
         pub(super) fn new(
-            args: &ModelArgs,
+            family: &super::super::FamilyConfig,
             context: &<B::Tensor as Tensor>::Context,
         ) -> Result<Self, Error> {
-            Self::materialize(args, None, context)
+            Self::materialize(family, None, context)
         }
 
         pub(super) fn new_parallel(
-            args: &ModelArgs,
+            family: &super::super::FamilyConfig,
             geometry: &super::super::LocalGeometry,
             context: &<B::Tensor as Tensor>::Context,
         ) -> Result<Self, Error> {
-            Self::materialize(args, Some(geometry), context)
+            Self::materialize(family, Some(geometry), context)
         }
 
         fn materialize(
-            args: &ModelArgs,
+            family: &super::super::FamilyConfig,
             geometry: Option<&super::super::LocalGeometry>,
             context: &<B::Tensor as Tensor>::Context,
         ) -> Result<Self, Error> {
             use crate::decoder::PartitionStaticModules;
             use eredu_runtime::VocabularyModulePlacement;
-            let per_layer_width = args.hidden_size_per_layer_input;
-            let combined_width = per_layer_width
-                .checked_mul(args.num_hidden_layers() as i32)
-                .ok_or_else(|| Error::backend("Gemma 4 per-layer width overflowed"))?;
-            let per_layer_embedding = "model.language_model.embed_tokens_per_layer.weight";
-            let per_layer_projection = "model.language_model.per_layer_model_projection.weight";
+            let args = &family.text;
+            let declaration = family.pinned().clone();
             let embedding = geometry.map_or(VocabularyModulePlacement::Local, |geometry| {
                 VocabularyModulePlacement::VocabularyParallel(geometry.embedding_range().clone())
             });
@@ -2491,66 +2456,27 @@ pub(crate) mod model_text {
                 VocabularyModulePlacement::Local
             };
             let ordinary = PartitionStaticModules::<B>::from_construction(
-                super::super::static_construction_specs(args)?,
+                declaration.ordinary,
                 embedding,
                 head,
                 true,
                 context,
             )?;
+            let (per_layer_embeddings, per_layer_projection, per_layer_norm) =
+                if let Some(spec) = declaration.per_layer {
+                    (
+                        Some(B::embedding(spec.embedding, context)?),
+                        Some(B::linear(spec.projection, context)?),
+                        Some(B::normalization(spec.norm, context)?),
+                    )
+                } else {
+                    (None, None, None)
+                };
             Ok(Self {
                 embeddings: ordinary.embeddings,
-                per_layer_embeddings: (per_layer_width > 0)
-                    .then(|| {
-                        B::embedding(
-                            EmbeddingSpec {
-                                vocabulary: args
-                                    .vocab_size_per_layer_input
-                                    .unwrap_or(args.vocab_size),
-                                dimensions: combined_width,
-                                weight: ParameterSpec::trainable(per_layer_embedding)
-                                    .map_err(Error::backend)?,
-                                format: crate::linear_format::standard_linear_format(
-                                    per_layer_embedding,
-                                    args.linear_format_for(per_layer_embedding),
-                                )?,
-                            },
-                            context,
-                        )
-                    })
-                    .transpose()?,
-                per_layer_projection: (per_layer_width > 0)
-                    .then(|| {
-                        B::linear(
-                            LinearSpec {
-                                input: args.hidden_size,
-                                output: combined_width,
-                                weight: ParameterSpec::trainable(per_layer_projection)
-                                    .map_err(Error::backend)?,
-                                bias: None,
-                                format: crate::linear_format::standard_linear_format(
-                                    per_layer_projection,
-                                    args.linear_format_for(per_layer_projection),
-                                )?,
-                            },
-                            context,
-                        )
-                    })
-                    .transpose()?,
-                per_layer_norm: (per_layer_width > 0)
-                    .then(|| {
-                        B::normalization(
-                            NormalizationConstructionSpec::learned(
-                                per_layer_width,
-                                args.rms_norm_eps,
-                                ParameterSpec::trainable(
-                                    "model.language_model.per_layer_projection_norm.weight",
-                                )
-                                .map_err(Error::backend)?,
-                            ),
-                            context,
-                        )
-                    })
-                    .transpose()?,
+                per_layer_embeddings,
+                per_layer_projection,
+                per_layer_norm,
                 norm: ordinary.norm,
                 head: ordinary.lm_head,
             })
@@ -2702,10 +2628,13 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ComponentKern
                     .as_ref()
                     .and_then(|plan| plan.unit_spec(TEXT_EXECUTION_GROUP, index))
                     .cloned();
-                Ok(Unit::Text(DenseBlock::new_at_with_routed_spec(
+                Ok(Unit::Text(DenseBlock::from_scopes(
                     args,
                     index,
-                    "model.language_model.layers",
+                    self.args.block(index)?,
+                    self.args.dense(index)?,
+                    self.args.attention(index)?,
+                    self.args.routed(index)?,
                     routed_spec,
                     context,
                 )?))

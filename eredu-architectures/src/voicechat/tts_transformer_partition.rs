@@ -169,7 +169,7 @@ impl<B: NeuralBackend> TransformerKernel<B> {
         }
         self.partition
             .as_ref()
-            .map_or(Some(&self.state_layout), |selected| {
+            .map_or(Some(self.definition.state_layout()), |selected| {
                 selected.local_state.as_ref()
             })
     }
@@ -177,16 +177,16 @@ impl<B: NeuralBackend> TransformerKernel<B> {
     /// Constructs only units authorized by an exact canonical architecture partition.
     /// `layout` is present when these units also have tensor-parallel projections.
     pub fn from_partition<G>(
-        definition: ComponentDefinition,
-        config: TransformerConfig,
+        declaration: TransformerDeclaration,
         layout: Option<&LocalModelLayout>,
         partition: &ArchitecturePartition<G, TransformerBoundarySchema>,
     ) -> Result<ComponentAdapter<ComponentDefinition, Self>, TransformerError> {
+        let definition = declaration.definition().clone();
         let mut model = match layout {
-            Some(layout) => Self::new_parallel(config, layout)?,
-            None => Self::new(config)?,
+            Some(layout) => Self::new_parallel(declaration, layout)?,
+            None => Self::new(declaration)?,
         };
-        if definition.state_layout() != &model.state_layout {
+        if definition.state_layout() != model.definition.state_layout() {
             return Err(TransformerError::Configuration(
                 "TTS definition cache geometry differs from selected execution",
             ));
@@ -382,7 +382,7 @@ impl<'a, B: NeuralBackend, C: RuntimeLayerState<B>, D: DerefMut<Target = [C]>>
             layout: selected
                 .local_state
                 .clone()
-                .unwrap_or_else(|| architecture.state_layout.clone()),
+                .unwrap_or_else(|| architecture.definition.state_layout().clone()),
             position: caches.first().map_or(0, |cache| cache.offset()),
             identity: architecture.config.architecture_fingerprint(),
             caches,

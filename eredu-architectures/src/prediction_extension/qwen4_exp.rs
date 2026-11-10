@@ -520,7 +520,14 @@ where
         residency: eredu_runtime::LayerWeightResidency,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, eredu_core::artifact::ArtifactError> {
-        let parameters = std::sync::Arc::new(prediction_parameters::<B>(&spec, context)?);
+        let source_parameters = source_spec
+            .parameter_description()
+            .map_err(|error| invalid(error.to_string()))?;
+        let mut bindings = PredictionBindingIndex::for_qwen4(&source_parameters, tasks)?;
+        let parameters = std::sync::Arc::new(
+            spec.parameter_description()
+                .map_err(|error| invalid(error.to_string()))?,
+        );
         let global_spec = std::sync::Arc::new(spec.clone());
         let (layout, source_layout) = match partitions {
             Some((source_partition, partition)) => {
@@ -531,7 +538,10 @@ where
                         "prediction source and executable tensor coordinates differ",
                     ));
                 }
-                let local = prediction_parameters::<B>(partition.local_spec(), context)?;
+                let local = partition
+                    .local_spec()
+                    .parameter_description()
+                    .map_err(|error| invalid(error.to_string()))?;
                 let layout = partition
                     .local_layout(&parameters, &local)
                     .map_err(|error| invalid(error.to_string()))?;
@@ -540,11 +550,11 @@ where
                     || {
                         source_partition
                             .local_layout(
-                                &prediction_parameters::<B>(source_spec, context)?,
-                                &prediction_parameters::<B>(
-                                    source_partition.local_spec(),
-                                    context,
-                                )?,
+                                &source_parameters,
+                                &source_partition
+                                    .local_spec()
+                                    .parameter_description()
+                                    .map_err(|error| invalid(error.to_string()))?,
                             )
                             .map_err(|error| invalid(error.to_string()))
                     },
@@ -564,11 +574,11 @@ where
         }
         B::require_operator_capabilities("qwen4_exp prediction", spec.required_operators())
             .map_err(|e| invalid(e.to_string()))?;
-        let shared = PreparedPredictionUnit::new_shared(
+        let shared = PreparedPredictionUnit::new(
             mtp::PredictionShared::<B>::new(source_spec, context)
                 .map_err(|e| invalid(e.to_string()))?,
             mtp::PredictionShared::<B>::new(&spec, context).map_err(|e| invalid(e.to_string()))?,
-            tasks,
+            bindings.take(None)?,
         )?
         .with_source_layout(source_layout.clone())
         .with_residency(residency);
@@ -590,11 +600,14 @@ where
                     None => mtp::PredictionUnit::<B>::new(local.clone(), context),
                 }
                 .map_err(|error| invalid(error.to_string()))?;
-                Ok(PreparedPredictionUnit::new(source, local, tasks)?
-                    .with_source_layout(source_layout.clone())
-                    .with_residency(residency))
+                Ok(
+                    PreparedPredictionUnit::new(source, local, bindings.take(Some(depth))?)?
+                        .with_source_layout(source_layout.clone())
+                        .with_residency(residency),
+                )
             })
             .collect::<Result<_, eredu_core::artifact::ArtifactError>>()?;
+        bindings.finish()?;
         Ok(Self {
             source,
             global_spec,
@@ -723,57 +736,6 @@ where
     }
 }
 
-/// Describes the same physical prediction owners used by materialization. The
-/// retained partition validates every parameter and encoding companion against
-/// this independently constructed local description.
-fn prediction_parameters<B>(
-    spec: &mtp::PredictionSpec,
-    context: &<B::Tensor as Tensor>::Context,
-) -> Result<eredu_runtime::ArchitectureParameterDescription, eredu_core::artifact::ArtifactError>
-where
-    B: GroupedNeuralBackend + DistributedNeuralBackend,
-{
-    use eredu_runtime::{
-        module_parameter_group, ArchitectureParameterDescription, ExecutionGraph,
-        ExecutionGroupSpec, ExecutionUnitLayout, MemberSharding, OwnedParameterGroupSpec,
-        ParameterGroupOwner, ParameterRole,
-    };
-    let graph = ExecutionGraph::new(vec![ExecutionGroupSpec::root("prediction")], "prediction")
-        .map_err(|error| invalid(error.to_string()))?;
-    let layout = ExecutionUnitLayout::new(&graph, [spec.units.len()])
-        .map_err(|error| invalid(error.to_string()))?;
-    let shared = mtp::PredictionShared::<B>::new(spec, context)
-        .map_err(|error| invalid(error.to_string()))?;
-    let shared = module_parameter_group(
-        "prediction.shared",
-        ParameterRole::Replicated,
-        &shared,
-        |_, _| Ok(MemberSharding::Replicated),
-    )
-    .map_err(|error| invalid(error.to_string()))?;
-    let mut owned = vec![OwnedParameterGroupSpec::new(
-        ParameterGroupOwner::static_role("prediction_shared"),
-        shared,
-    )];
-    for (depth, unit) in spec.units.iter().enumerate() {
-        let module = mtp::PredictionUnit::<B>::new(unit.clone(), context)
-            .map_err(|error| invalid(error.to_string()))?;
-        let group = module_parameter_group(
-            format!("mtp.layers.{depth}"),
-            ParameterRole::Replicated,
-            &module,
-            |_, _| Ok(MemberSharding::Replicated),
-        )
-        .map_err(|error| invalid(error.to_string()))?;
-        owned.push(OwnedParameterGroupSpec::new(
-            ParameterGroupOwner::execution_unit(layout.group_id(0).unwrap().clone(), depth),
-            group,
-        ));
-    }
-    ArchitectureParameterDescription::from_owned(&graph, &layout, owned)
-        .map_err(|error| invalid(error.to_string()))
-}
-
 /// Authors the capture and cache contract from the retained selected prediction.
 pub(crate) fn speculative_contract(
     spec: &crate::qwen4_exp::mtp::PredictionSpec,
@@ -805,7 +767,7 @@ pub(crate) fn speculative_contract(
             "prediction capture bounds exceed admitted invocation limits",
         ));
     }
-    let geometry = spec.fusion.geometry;
+    let geometry = spec.shared.fusion.geometry;
     let depth = NonZeroUsize::new(spec.units.len())
         .ok_or_else(|| invalid("prediction depth must be positive"))?;
     let state = spec.state_layout().map_err(|e| invalid(e.to_string()))?;

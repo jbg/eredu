@@ -2,25 +2,23 @@
 
 use std::{collections::BTreeMap, ops::Range};
 
-use crate::decoder::{self, Config as _};
+use crate::decoder;
 use eredu_checkpoint::LinearFormat;
 use eredu_core::{checkpoint::TensorDtype, CollectiveGroupId, ParallelRankTopology};
-use eredu_nn::NeuralBackend;
+use eredu_nn::{DeclareLogicalParameters, NeuralBackend};
 use eredu_runtime::{
-    aligned_partition_units, module_parameter_group, ArchitectureParameterDescription,
-    ArchitecturePartition, CommunicationCompletionPolicy, CommunicationGroupRequirements,
-    CommunicationManifest, CommunicationOperation, CommunicationOperationRequirement,
-    CommunicationTensorLimits, ExecutionGraph, ExecutionUnitLayout, LayerRuntimeState,
-    LayeredPartitionDriver, LocalModelLayout, MemberSharding, NoAuxiliaryBoundarySchema,
-    OwnedParameterGroupSpec, ParallelPlanError, ParameterGroupOwner, ParameterGroupSpec,
-    ParameterMemberSpec, ParameterRole, PartitionOwnership, PartitionedExecutionPlan,
-    PipelineActivationDtype, PipelineWireContract, StateLayout, StateSegmentLifetime,
-    StateSegmentSpec, TopologyCommunicationPlan,
+    aligned_partition_units, ArchitectureParameterDescription, ArchitecturePartition,
+    CommunicationCompletionPolicy, CommunicationGroupRequirements, CommunicationManifest,
+    CommunicationOperation, CommunicationOperationRequirement, CommunicationTensorLimits,
+    ExecutionGraph, ExecutionUnitLayout, LayerRuntimeState, LayeredPartitionDriver,
+    LocalModelLayout, MemberSharding, NoAuxiliaryBoundarySchema, OwnedParameterGroupSpec,
+    ParallelPlanError, ParameterGroupOwner, ParameterGroupSpec, ParameterRole, PartitionOwnership,
+    PartitionedExecutionPlan, PipelineActivationDtype, PipelineWireContract, StateLayout,
+    StateSegmentLifetime, StateSegmentSpec, TopologyCommunicationPlan,
 };
 
 use super::{
-    MoshiConfig, MoshiKernel, MoshiTransformerConfig, StaticModules, Unit, DEPTH_STATE_SEGMENT,
-    TEMPORAL_STATE_SEGMENT,
+    MoshiConfig, MoshiTransformerConfig, Unit, DEPTH_STATE_SEGMENT, TEMPORAL_STATE_SEGMENT,
 };
 
 /// Exact collective cardinality for one tensor-parallel realtime traversal.
@@ -88,11 +86,36 @@ impl MoshiMatrixContract {
 /// Complete Moshi parameter topology plus exact primary-matrix formats.
 #[derive(Debug, Clone)]
 pub struct MoshiParameterContract {
+    config: MoshiConfig,
     definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
     matrices: BTreeMap<String, MoshiMatrixContract>,
 }
 
 impl MoshiParameterContract {
+    pub(super) fn declarations(&self) -> &std::sync::Arc<super::declarations::Declarations> {
+        self.config.declarations()
+    }
+    /// Normalized configuration paired with these exact parameter scopes.
+    pub fn configuration(&self) -> &MoshiConfig {
+        &self.config
+    }
+    pub(super) fn retained_definition(&self) -> std::sync::Arc<eredu_runtime::ComponentDefinition> {
+        self.definition.clone()
+    }
+    pub(super) fn with_quantization(
+        &self,
+        quantization: Option<eredu_checkpoint::WeightQuantization>,
+    ) -> Result<Self, ParallelPlanError> {
+        if quantization == self.config.native_quantization() {
+            return Ok(self.clone());
+        }
+        let config = self
+            .config
+            .with_native_quantization(quantization)
+            .map_err(|e| ParallelPlanError::InvalidGroup(e.to_string()))?;
+        parameter_contract(&config)
+    }
+
     /// Complete neutral ownership and sharding description.
     pub fn description(&self) -> &ArchitectureParameterDescription {
         self.definition.parameters()
@@ -426,6 +449,7 @@ pub fn parameter_description(
 pub fn parameter_contract(
     config: &MoshiConfig,
 ) -> Result<MoshiParameterContract, ParallelPlanError> {
+    let declarations = config.declarations();
     let dimension = |label: &str, value: i32| {
         usize::try_from(value)
             .map_err(|_| ParallelPlanError::InvalidTensor(format!("Moshi {label} exceeds usize")))
@@ -449,310 +473,204 @@ pub fn parameter_contract(
         .clone();
     let mut owned = Vec::new();
 
-    let mut add_static = |owner: &str,
-                          logical: String,
-                          role: ParameterRole,
-                          target: String,
-                          shape: Vec<usize>,
-                          sharding: MemberSharding|
-     -> Result<(), ParallelPlanError> {
+    for table in &declarations.statics.embeddings {
+        let spec = &table.embedding;
         owned.push(OwnedParameterGroupSpec::new(
-            ParameterGroupOwner::static_role(owner),
-            ParameterGroupSpec::new(
-                logical,
-                role,
-                [ParameterMemberSpec::new(target, shape, sharding)],
+            ParameterGroupOwner::static_role("embedding"),
+            declared_group(
+                spec.weight.id.as_str().trim_end_matches(".weight"),
+                ParameterRole::Vocabulary,
+                spec,
+                MemberSharding::Balanced { axis: 0 },
             )?,
         ));
-        Ok(())
-    };
-    let construction = super::model::StaticConstruction::new(config)
-        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    for spec in &construction.embeddings {
-        let embedding = &spec.embedding;
-        let target = embedding.weight.id.as_str();
-        add_static(
-            "embedding",
-            target.trim_end_matches(".weight").into(),
-            ParameterRole::Vocabulary,
-            target.into(),
-            vec![
-                dimension("embedding vocabulary", embedding.vocabulary)?,
-                dimension("embedding width", embedding.dimensions)?,
-            ],
-            MemberSharding::Balanced { axis: 0 },
-        )?;
     }
-    let normalization_weight = match &construction.output_norm.scale {
-        eredu_nn::NormalizationScale::Learned(weight)
-        | eredu_nn::NormalizationScale::LearnedOffset { weight, .. } => weight,
-        eredu_nn::NormalizationScale::Unit => {
-            return Err(ParallelPlanError::InvalidGroup(
-                "Moshi output normalization requires a learned scale".into(),
-            ));
-        }
-    };
-    add_static(
-        "norm",
-        "out_norm".into(),
-        ParameterRole::Replicated,
-        normalization_weight.id.as_str().into(),
-        vec![dimension(
-            "normalization width",
-            construction.output_norm.dimensions,
-        )?],
-        MemberSharding::Replicated,
-    )?;
-    let output = &construction.text_output;
-    add_static(
-        "output",
-        "text_linear".into(),
-        ParameterRole::Vocabulary,
-        output.weight.id.as_str().into(),
-        vec![
-            dimension("output vocabulary", output.output)?,
-            dimension("output width", output.input)?,
-        ],
-        MemberSharding::Balanced { axis: 0 },
-    )?;
-
-    for layer in 0..temporal_layers {
-        for group in symbolic_block_parameter_groups(config.temporal(), layer)? {
+    owned.push(OwnedParameterGroupSpec::new(
+        ParameterGroupOwner::static_role("norm"),
+        declared_group(
+            "out_norm",
+            ParameterRole::Replicated,
+            &declarations.statics.output_norm,
+            MemberSharding::Replicated,
+        )?,
+    ));
+    owned.push(OwnedParameterGroupSpec::new(
+        ParameterGroupOwner::static_role("output"),
+        declared_group(
+            "text_linear",
+            ParameterRole::Vocabulary,
+            &declarations.statics.text_output,
+            MemberSharding::Balanced { axis: 0 },
+        )?,
+    ));
+    for (layer, spec) in declarations.temporal.iter().enumerate() {
+        for group in declared_block_groups(spec)? {
             owned.push(OwnedParameterGroupSpec::new(
                 ParameterGroupOwner::execution_unit(temporal_group.clone(), layer),
                 group,
             ));
         }
     }
-    for slice in 0..depth_slices {
-        let construction = super::depth::DepthConstruction::new(config, slice)
-            .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-        let transformer = construction.transformer;
-        let embedding = construction.embedding;
-        let input = construction.input;
-        let output = construction.output;
+    for (slice, spec) in declarations.depth.iter().enumerate() {
         let owner = ParameterGroupOwner::execution_unit(depth_group.clone(), slice);
-        let declarations = [
-            (
-                &embedding.weight,
+        let edge = &spec.edge;
+        let mut groups = vec![
+            declared_group(
+                edge.embedding
+                    .weight
+                    .id
+                    .as_str()
+                    .trim_end_matches(".weight"),
                 ParameterRole::Vocabulary,
-                [embedding.vocabulary, embedding.dimensions],
+                &edge.embedding,
                 MemberSharding::Balanced { axis: 0 },
-            ),
-            (
-                &input.weight,
+            )?,
+            declared_group(
+                edge.input.weight.id.as_str().trim_end_matches(".weight"),
                 ParameterRole::Replicated,
-                [input.output, input.input],
+                &edge.input,
                 MemberSharding::Replicated,
-            ),
-            (
-                &output.weight,
+            )?,
+            declared_group(
+                edge.output.weight.id.as_str().trim_end_matches(".weight"),
                 ParameterRole::Vocabulary,
-                [output.output, output.input],
+                &edge.output,
                 MemberSharding::Balanced { axis: 0 },
-            ),
+            )?,
         ];
-        let mut groups = Vec::new();
-        for (weight, role, shape, sharding) in declarations {
-            let target = weight.id.as_str();
-            groups.push(ParameterGroupSpec::new(
-                target.trim_end_matches(".weight"),
-                role,
-                [ParameterMemberSpec::new(
-                    target,
-                    shape
-                        .into_iter()
-                        .map(|value| dimension("depth matrix dimension", value))
-                        .collect::<Result<Vec<_>, _>>()?,
-                    sharding,
-                )],
-            )?);
+        for block in &spec.blocks {
+            groups.extend(declared_block_groups(block)?);
         }
-        for layer in 0..dimension("depth layer count", transformer.num_hidden_layers())? {
-            groups.extend(symbolic_block_parameter_groups(&transformer, layer)?);
-        }
-        for group in groups {
-            owned.push(OwnedParameterGroupSpec::new(owner.clone(), group));
-        }
+        owned.extend(
+            groups
+                .into_iter()
+                .map(|group| OwnedParameterGroupSpec::new(owner.clone(), group)),
+        );
     }
 
-    let mut expanded = Vec::with_capacity(owned.len());
-    let mut matrices = BTreeMap::new();
-    for tagged in owned {
-        let owner = tagged.owner().clone();
-        let group = tagged.into_group();
-        let mut declared = BTreeMap::new();
-        for member in group
-            .members()
-            .iter()
-            .filter(|member| member.global_shape().len() >= 2)
-        {
-            let format = config
-                .temporal()
-                .weight_quantization(member.target())
-                .into();
-            let declaration =
-                crate::linear_format::standard_parallel_linear_format(member, format)?;
-            let scale = declaration
-                .as_ref()
-                .and_then(|format| format.scale())
-                .map(|parameter| parameter.id.as_str().to_owned());
-            let affine_bias = declaration
-                .as_ref()
-                .and_then(|format| format.affine_bias())
-                .map(|parameter| parameter.id.as_str().to_owned());
-            declared.insert(
-                member.target().to_owned(),
-                (
-                    member.global_shape().to_vec(),
-                    format,
-                    (format != LinearFormat::Dense).then_some(member.global_shape().len() - 1),
-                    scale,
-                    affine_bias,
-                ),
-            );
-        }
-        let group = eredu_runtime::expand_linear_format_parameter_group(group, |member| {
-            crate::linear_format::standard_parallel_linear_format(
-                member,
-                config
-                    .temporal()
-                    .weight_quantization(member.target())
-                    .into(),
-            )
-        })?;
-        for (target, (logical_shape, format, packed_axis, scale, affine_bias)) in declared {
-            let primary = group
-                .members()
-                .iter()
-                .find(|member| member.target() == target)
-                .expect("linear-format expansion retains the primary target");
-            let contract = MoshiMatrixContract {
-                target: target.clone(),
-                logical_shape,
-                physical_shape: primary.global_shape().to_vec(),
-                format,
-                packed_axis,
-                scale,
-                affine_bias,
-            };
-            if matrices.insert(target.clone(), contract).is_some() {
-                return Err(ParallelPlanError::InvalidTensor(format!(
-                    "Moshi parameter contract repeats matrix {target:?}"
-                )));
-            }
-        }
-        expanded.push(OwnedParameterGroupSpec::new(owner, group));
-    }
-    let description = ArchitectureParameterDescription::from_owned(&graph, &layout, expanded)
+    let description = ArchitectureParameterDescription::from_owned(&graph, &layout, owned)
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+    let physical = description
+        .groups()
+        .iter()
+        .flat_map(|owned| owned.group().members())
+        .map(|member| (member.target(), member))
+        .collect::<BTreeMap<_, _>>();
+    let mut matrices = BTreeMap::new();
+    for declaration in declarations.logical_parameters().map_err(nn_invalid)? {
+        let Some(format) = declaration.linear_format else {
+            continue;
+        };
+        let target = declaration.parameter.id.as_str();
+        let primary = physical.get(target).ok_or_else(|| {
+            ParallelPlanError::InvalidTensor(format!(
+                "Moshi matrix {target:?} has no physical parameter placement"
+            ))
+        })?;
+        let contract = MoshiMatrixContract {
+            target: target.to_owned(),
+            packed_axis: (format.encoding() != LinearFormat::Dense)
+                .then_some(declaration.shape.len() - 1),
+            logical_shape: declaration.shape,
+            physical_shape: primary.global_shape().to_vec(),
+            format: format.encoding(),
+            scale: format
+                .scale()
+                .map(|parameter| parameter.id.as_str().to_owned()),
+            affine_bias: format
+                .affine_bias()
+                .map(|parameter| parameter.id.as_str().to_owned()),
+        };
+        if matrices.insert(target.to_owned(), contract).is_some() {
+            return Err(ParallelPlanError::InvalidTensor(format!(
+                "Moshi parameter contract repeats matrix {target:?}"
+            )));
+        }
+    }
     let definition = std::sync::Arc::new(
         super::model::definition_with_parameters(config, description)
             .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?,
     );
     Ok(MoshiParameterContract {
+        config: config.clone(),
         definition,
         matrices,
     })
 }
-
-fn symbolic_block_parameter_groups(
-    config: &MoshiTransformerConfig,
-    layer: usize,
+fn nn_invalid(error: eredu_nn::Error) -> ParallelPlanError {
+    ParallelPlanError::InvalidGroup(error.to_string())
+}
+fn declared_group(
+    name: impl Into<String>,
+    role: ParameterRole,
+    spec: &impl eredu_nn::DeclareLogicalParameters,
+    sharding: MemberSharding,
+) -> Result<ParameterGroupSpec, ParallelPlanError> {
+    eredu_runtime::logical_parameter_group(name, role, None, spec, |_| sharding.clone())
+}
+fn declared_block_groups(
+    spec: &super::declarations::BlockConstruction,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    let dimension = |label: &str, value: i32| {
-        usize::try_from(value)
-            .map_err(|_| ParallelPlanError::InvalidTensor(format!("Moshi {label} exceeds usize")))
-    };
-    let hidden = dimension("transformer hidden width", config.hidden_size())?;
-    let heads = dimension("attention head count", config.num_attention_heads())?;
-    let head = dimension("attention head width", config.head_dim())?;
-    let gated = dimension("gated hidden width", config.gated_hidden_size())?;
-    let root = format!("{}.layers.{layer}", config.parameter_root());
-    let quantization_alignment = config
-        .weight_quantization(&format!("{root}.self_attn.out_proj.weight"))
-        .map_or(Ok(1), |quantization| {
-            usize::try_from(quantization.group_size()).map_err(|_| {
-                ParallelPlanError::InvalidGroup("Moshi quantization group exceeds usize".into())
-            })
-        })?;
+    let root = &spec.root;
+    let alignment =
+        crate::linear_format::input_partition_alignment(spec.attention.output.format.encoding())
+            as usize;
     let attention_units = aligned_partition_units(
         &format!("{root}.self_attn"),
-        heads,
-        head,
-        quantization_alignment,
+        spec.attention.geometry.query_heads() as usize,
+        spec.attention.geometry.key_dimensions() as usize,
+        alignment,
     )?;
-    let gating_units =
-        aligned_partition_units(&format!("{root}.gating"), gated, 1, quantization_alignment)?;
-    let q_end = hidden;
-    let k_end = q_end.checked_add(hidden).ok_or_else(|| {
-        ParallelPlanError::InvalidTensor("Moshi fused attention width overflowed".into())
-    })?;
-    let v_end = k_end.checked_add(hidden).ok_or_else(|| {
-        ParallelPlanError::InvalidTensor("Moshi fused attention width overflowed".into())
-    })?;
-    let gate_end = gated;
-    let up_end = gated.checked_mul(2).ok_or_else(|| {
-        ParallelPlanError::InvalidTensor("Moshi fused gating width overflowed".into())
-    })?;
+    let gating_units = aligned_partition_units(
+        &format!("{root}.gating"),
+        spec.gating.down.input as usize,
+        1,
+        alignment,
+    )?;
     Ok(vec![
-        ParameterGroupSpec::partitioned(
+        eredu_runtime::logical_parameter_group(
             format!("{root}.self_attn.projections"),
             ParameterRole::AttentionHeads,
-            attention_units,
-            [
-                ParameterMemberSpec::new(
-                    format!("{root}.self_attn.in_proj.weight"),
-                    vec![v_end, hidden],
+            Some(attention_units),
+            &spec.attention,
+            |parameter| {
+                if parameter.parameter.id == spec.fused_attention().weight.id {
                     MemberSharding::PartitionedSegments {
                         axis: 0,
-                        segments: vec![0..q_end, q_end..k_end, k_end..v_end],
-                    },
-                ),
-                ParameterMemberSpec::new(
-                    format!("{root}.self_attn.out_proj.weight"),
-                    vec![hidden, hidden],
-                    MemberSharding::Partitioned { axis: 1 },
-                ),
-            ],
+                        segments: spec.qkv_segments(),
+                    }
+                } else {
+                    MemberSharding::Partitioned { axis: 1 }
+                }
+            },
         )?,
-        ParameterGroupSpec::new(
+        declared_group(
             format!("{root}.norm1"),
             ParameterRole::Replicated,
-            [ParameterMemberSpec::new(
-                format!("{root}.norm1.weight"),
-                vec![hidden],
-                MemberSharding::Replicated,
-            )],
+            &spec.norms[0],
+            MemberSharding::Replicated,
         )?,
-        ParameterGroupSpec::new(
+        declared_group(
             format!("{root}.norm2"),
             ParameterRole::Replicated,
-            [ParameterMemberSpec::new(
-                format!("{root}.norm2.weight"),
-                vec![hidden],
-                MemberSharding::Replicated,
-            )],
+            &spec.norms[1],
+            MemberSharding::Replicated,
         )?,
-        ParameterGroupSpec::partitioned(
+        eredu_runtime::logical_parameter_group(
             format!("{root}.gating.projections"),
             ParameterRole::FeedForwardIntermediate,
-            gating_units,
-            [
-                ParameterMemberSpec::new(
-                    format!("{root}.gating.linear_in.weight"),
-                    vec![up_end, hidden],
+            Some(gating_units),
+            &spec.gating,
+            |parameter| {
+                if parameter.parameter.id == spec.gating.gate_up.weight.id {
                     MemberSharding::PartitionedSegments {
                         axis: 0,
-                        segments: vec![0..gate_end, gate_end..up_end],
-                    },
-                ),
-                ParameterMemberSpec::new(
-                    format!("{root}.gating.linear_out.weight"),
-                    vec![hidden, gated],
-                    MemberSharding::Partitioned { axis: 1 },
-                ),
-            ],
+                        segments: spec.gated_segments(),
+                    }
+                } else {
+                    MemberSharding::Partitioned { axis: 1 }
+                }
+            },
         )?,
     ])
 }
@@ -845,6 +763,7 @@ impl LocalTransformerGeometry {
 /// Complete rank-local construction and state geometry for one Moshi rank.
 #[derive(Debug, Clone)]
 pub struct LocalGeometry {
+    source_declarations: std::sync::Arc<super::declarations::Declarations>,
     temporal: Vec<LocalTransformerGeometry>,
     depth: Vec<Vec<LocalTransformerGeometry>>,
     vocabulary_ranges: BTreeMap<String, Range<usize>>,
@@ -895,7 +814,7 @@ impl LocalGeometry {
             ));
         }
 
-        let expected_vocabularies = vocabulary_global_rows(config)?;
+        let expected_vocabularies = vocabulary_global_rows(&self.source_declarations)?;
         if self.vocabulary_ranges.len() != expected_vocabularies.len() {
             return Err(ParallelPlanError::InvalidTensor(
                 "rank-local Moshi vocabulary ownership is incomplete".into(),
@@ -914,27 +833,16 @@ impl LocalGeometry {
             }
         }
 
-        let temporal_heads = self
-            .temporal
-            .iter()
-            .map(LocalTransformerGeometry::attention_heads)
-            .collect::<Vec<_>>();
-        let depth_heads = self.depth.first().ok_or_else(|| {
+        let depth = self.depth.first().ok_or_else(|| {
             ParallelPlanError::InvalidGroup("rank-local Moshi geometry has no depth slices".into())
         })?;
-        if self.depth.iter().any(|slice| slice != depth_heads) {
+        if self.depth.iter().any(|slice| slice != depth) {
             return Err(ParallelPlanError::InvalidGroup(
                 "rank-local Moshi depth slices have inconsistent geometry".into(),
             ));
         }
-        let expected_state = local_state_layout(
-            config,
-            &temporal_heads,
-            &depth_heads
-                .iter()
-                .map(LocalTransformerGeometry::attention_heads)
-                .collect::<Vec<_>>(),
-        )?;
+        let expected_state =
+            local_state_layout(config, &self.temporal, depth, &self.source_declarations)?;
         if expected_state != self.state_layout {
             return Err(ParallelPlanError::InvalidGroup(
                 "rank-local Moshi state layout drifted from transformer geometry".into(),
@@ -971,19 +879,32 @@ impl LocalGeometry {
     /// types and shared decoder block implementation.
     pub fn build_unit<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
         &self,
-        config: &MoshiConfig,
+        parameters: &MoshiParameterContract,
         group: usize,
         index: usize,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<Unit<B>, eredu_nn::Error> {
+        let config = parameters.configuration();
         match group {
             0 => {
                 let local = self
                     .temporal_config(config.temporal(), index)
                     .map_err(eredu_nn::Error::backend)?;
-                super::block::build(&local, index, context).map(Unit::Temporal)
+                super::block::build(
+                    &local,
+                    index,
+                    parameters
+                        .declarations()
+                        .temporal
+                        .get(index)
+                        .ok_or_else(|| {
+                            eredu_nn::Error::backend("missing temporal parameter owner")
+                        })?,
+                    context,
+                )
+                .map(Unit::Temporal)
             }
-            1 => super::DepthSlice::new_parallel(config, index, self, context).map(Unit::Depth),
+            1 => super::DepthSlice::new_parallel(parameters, index, self, context).map(Unit::Depth),
             _ => Err(eredu_nn::Error::backend(format!(
                 "Moshi execution group {group} is outside 0..2"
             ))),
@@ -1036,129 +957,6 @@ where
     )
 }
 
-/// Declares pinned embedding, normalization, and text-output parameter groups.
-pub fn static_parameter_groups<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
-    modules: &StaticModules<B>,
-) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    let mut groups = Vec::with_capacity(modules.embeddings.tables.len() + 2);
-    for (index, table) in modules.embeddings.tables.iter().enumerate() {
-        let name = if index == 0 {
-            "text_emb".to_string()
-        } else {
-            format!("audio_embs.{}", index - 1)
-        };
-        groups.push(module_parameter_group::<B::Tensor, _>(
-            name,
-            ParameterRole::Vocabulary,
-            &table.embedding,
-            |_, shape| {
-                if shape.is_empty() {
-                    Err(ParallelPlanError::InvalidTensor(
-                        "Moshi embedding parameter is scalar".into(),
-                    ))
-                } else {
-                    Ok(MemberSharding::Balanced { axis: 0 })
-                }
-            },
-        )?);
-    }
-    groups.push(module_parameter_group::<B::Tensor, _>(
-        "out_norm",
-        ParameterRole::Replicated,
-        &modules.output_norm,
-        |_, _| Ok(MemberSharding::Replicated),
-    )?);
-    groups.push(module_parameter_group::<B::Tensor, _>(
-        "text_linear",
-        ParameterRole::Vocabulary,
-        &modules.text_output,
-        |_, shape| {
-            if shape.is_empty() {
-                Err(ParallelPlanError::InvalidTensor(
-                    "Moshi text output parameter is scalar".into(),
-                ))
-            } else {
-                Ok(MemberSharding::Balanced { axis: 0 })
-            }
-        },
-    )?);
-    Ok(groups)
-}
-
-/// Declares all semantic parameter groups for one temporal block or depth slice.
-pub fn unit_parameter_groups<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
-    unit: &Unit<B>,
-    config: &MoshiConfig,
-    group: usize,
-    index: usize,
-) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    match (group, unit) {
-        (0, Unit::Temporal(block)) => {
-            decoder::layer_parallel_parameter_groups(block, config.temporal(), index)
-        }
-        (1, Unit::Depth(slice)) => {
-            let prefix = format!("depformer.slices.{index}");
-            let mut groups = vec![
-                module_parameter_group::<B::Tensor, _>(
-                    format!("{prefix}.emb"),
-                    ParameterRole::Vocabulary,
-                    &slice.embedding,
-                    |_, shape| {
-                        (!shape.is_empty())
-                            .then_some(MemberSharding::Balanced { axis: 0 })
-                            .ok_or_else(|| {
-                                ParallelPlanError::InvalidTensor(format!(
-                                    "Moshi depth embedding {prefix}.emb is scalar"
-                                ))
-                            })
-                    },
-                )?,
-                module_parameter_group::<B::Tensor, _>(
-                    format!("{prefix}.linear_in"),
-                    ParameterRole::Replicated,
-                    &slice.input,
-                    |_, _| Ok(MemberSharding::Replicated),
-                )?,
-                module_parameter_group::<B::Tensor, _>(
-                    format!("{prefix}.linear_out"),
-                    ParameterRole::Vocabulary,
-                    &slice.output,
-                    |_, shape| {
-                        (!shape.is_empty())
-                            .then_some(MemberSharding::Balanced { axis: 0 })
-                            .ok_or_else(|| {
-                                ParallelPlanError::InvalidTensor(format!(
-                                    "Moshi depth output {prefix}.linear_out is scalar"
-                                ))
-                            })
-                    },
-                )?,
-            ];
-            let transformer = config
-                .depth_transformer(index)
-                .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-            for (layer, block) in slice.blocks.iter().enumerate() {
-                groups.extend(decoder::layer_parallel_parameter_groups(
-                    block,
-                    &transformer,
-                    layer,
-                )?);
-            }
-            Ok(groups)
-        }
-        _ => Err(ParallelPlanError::InvalidGroup(format!(
-            "Moshi unit does not match group {group} index {index}"
-        ))),
-    }
-}
-
-impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> MoshiKernel<B> {
-    /// Declares pinned parameter groups for semantic tensor-parallel planning.
-    pub fn static_parameter_groups(&self) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-        static_parameter_groups(self.static_modules())
-    }
-}
-
 /// Derives and validates all rank-local Moshi widths from a resolved placement.
 ///
 /// `contract` supplies canonical vocabulary groups and exact physical companions.
@@ -1170,13 +968,18 @@ pub fn local_geometry<'a>(
     layout: &eredu_runtime::LocalModelLayout,
     aliases: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) -> Result<LocalGeometry, ParallelPlanError> {
+    if config.architecture_fingerprint() != contract.configuration().architecture_fingerprint() {
+        return Err(ParallelPlanError::InvalidGroup(
+            "Moshi placement configuration differs from retained declarations".into(),
+        ));
+    }
     validate_alias_layouts(layout, aliases)?;
 
     let temporal_layers = usize::try_from(config.temporal().num_hidden_layers()).map_err(|_| {
         ParallelPlanError::InvalidGroup("Moshi temporal layer count exceeds usize".into())
     })?;
     let temporal = (0..temporal_layers)
-        .map(|layer| local_block_geometry(config.temporal(), layer, layout))
+        .map(|layer| local_block_geometry(config.temporal(), layer, layout, contract))
         .collect::<Result<Vec<_>, _>>()?;
 
     let depth = (0..config.frame_schedule().depth_audio_codebooks())
@@ -1185,7 +988,7 @@ pub fn local_geometry<'a>(
                 .depth_transformer(slice)
                 .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
             (0..transformer.num_hidden_layers() as usize)
-                .map(|layer| local_block_geometry(&transformer, layer, layout))
+                .map(|layer| local_block_geometry(&transformer, layer, layout, contract))
                 .collect::<Result<Vec<_>, _>>()
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -1213,18 +1016,14 @@ pub fn local_geometry<'a>(
         vocabulary_ranges.insert(matrix.target().to_owned(), range);
     }
 
-    let temporal_heads = temporal
-        .iter()
-        .map(LocalTransformerGeometry::attention_heads)
-        .collect::<Vec<_>>();
-    let depth_heads = depth
+    let depth_geometry = depth
         .first()
         .ok_or_else(|| ParallelPlanError::InvalidGroup("Moshi has no depth slices".into()))?;
     if depth.iter().any(|slice| {
         slice
             .iter()
             .map(LocalTransformerGeometry::attention_heads)
-            .ne(depth_heads
+            .ne(depth_geometry
                 .iter()
                 .map(LocalTransformerGeometry::attention_heads))
     }) {
@@ -1232,17 +1031,12 @@ pub fn local_geometry<'a>(
             "Moshi depth slices resolved different rank-local cache geometry".into(),
         ));
     }
-    let state_layout = local_state_layout(
-        config,
-        &temporal_heads,
-        &depth_heads
-            .iter()
-            .map(LocalTransformerGeometry::attention_heads)
-            .collect::<Vec<_>>(),
-    )?;
+    let state_layout =
+        local_state_layout(config, &temporal, depth_geometry, contract.declarations())?;
     let geometry = LocalGeometry {
         temporal,
         depth,
+        source_declarations: contract.declarations().clone(),
         vocabulary_ranges,
         state_layout,
         architecture_fingerprint: config.architecture_fingerprint().to_owned(),
@@ -1252,10 +1046,9 @@ pub fn local_geometry<'a>(
 }
 
 fn vocabulary_global_rows(
-    config: &MoshiConfig,
+    declarations: &super::declarations::Declarations,
 ) -> Result<BTreeMap<String, usize>, ParallelPlanError> {
-    let construction = super::model::StaticConstruction::new(config)
-        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+    let construction = &declarations.statics;
     let mut rows = BTreeMap::new();
     let mut add = |weight: &eredu_nn::ParameterSpec, vocabulary| -> Result<(), ParallelPlanError> {
         let vocabulary = usize::try_from(vocabulary).map_err(|_| {
@@ -1271,9 +1064,8 @@ fn vocabulary_global_rows(
         &construction.text_output.weight,
         construction.text_output.output,
     )?;
-    for slice in 0..config.frame_schedule().depth_audio_codebooks() {
-        let construction = super::depth::DepthConstruction::new(config, slice)
-            .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+    for slice in &declarations.depth {
+        let construction = &slice.edge;
         add(
             &construction.embedding.weight,
             construction.embedding.vocabulary,
@@ -1287,6 +1079,7 @@ fn local_block_geometry(
     config: &MoshiTransformerConfig,
     layer: usize,
     layout: &eredu_runtime::LocalModelLayout,
+    contract: &MoshiParameterContract,
 ) -> Result<LocalTransformerGeometry, ParallelPlanError> {
     if layer >= config.num_hidden_layers() as usize {
         return Err(ParallelPlanError::InvalidGroup(format!(
@@ -1294,16 +1087,74 @@ fn local_block_geometry(
             config.num_hidden_layers()
         )));
     }
-    let root = format!("{}.layers.{layer}", config.parameter_root());
-    let attention = required_parameter(layout, &format!("{root}.self_attn.in_proj"))?;
-    let attention_width = local_axis(attention, 0, "fused QKV width")?;
+    let root = format!(
+        "{}.layers.{layer}",
+        crate::decoder::Config::parameter_root(config)
+    );
+    let spec = contract
+        .declarations()
+        .temporal
+        .iter()
+        .chain(
+            contract
+                .declarations()
+                .depth
+                .iter()
+                .flat_map(|slice| slice.blocks.iter()),
+        )
+        .find(|spec| spec.root == root)
+        .ok_or_else(|| {
+            ParallelPlanError::InvalidGroup(format!("Moshi parameter owner {root} is missing"))
+        })?;
+    let root = &spec.root;
+    let logical_axis = |projection: &eredu_nn::LinearSpec,
+                        tensor: &eredu_runtime::LocalTensorLayout,
+                        axis: usize,
+                        label|
+     -> Result<usize, ParallelPlanError> {
+        let target = projection.weight.id.as_str();
+        let matrix = contract.matrices().get(target).ok_or_else(|| {
+            ParallelPlanError::InvalidTensor(format!("Moshi matrix contract is missing {target}"))
+        })?;
+        if matrix.logical_shape() != [projection.output as usize, projection.input as usize] {
+            return Err(ParallelPlanError::InvalidTensor(format!(
+                "Moshi matrix {target} declaration differs from retained geometry"
+            )));
+        }
+        let physical = matrix
+            .physical_shape()
+            .get(axis)
+            .copied()
+            .filter(|&n| n > 0)
+            .ok_or_else(|| {
+                ParallelPlanError::InvalidTensor(format!(
+                    "Moshi matrix {target} has no physical axis {axis}"
+                ))
+            })?;
+        let logical = matrix.logical_shape()[axis];
+        let scaled = local_axis(tensor, axis, label)?
+            .checked_mul(logical)
+            .ok_or_else(|| {
+                ParallelPlanError::InvalidTensor(format!(
+                    "Moshi matrix {target} logical width overflowed"
+                ))
+            })?;
+        if !scaled.is_multiple_of(physical) {
+            return Err(ParallelPlanError::InvalidTensor(format!(
+                "Moshi matrix {target} local storage splits a logical element"
+            )));
+        }
+        Ok(scaled / physical)
+    };
+    let attention = required_tensor(layout, spec.fused_attention().weight.id.as_str())?;
+    let attention_width = logical_axis(spec.fused_attention(), attention, 0, "fused QKV width")?;
     if !attention_width.is_multiple_of(3) {
         return Err(ParallelPlanError::InvalidTensor(format!(
             "Moshi {root} local fused QKV width {attention_width} is not divisible by three"
         )));
     }
     let query_width = attention_width / 3;
-    let head = usize::try_from(config.head_dim()).map_err(|_| {
+    let head = usize::try_from(spec.attention.geometry.key_dimensions()).map_err(|_| {
         ParallelPlanError::InvalidGroup("Moshi head dimension exceeds usize".into())
     })?;
     if query_width == 0 || !query_width.is_multiple_of(head) {
@@ -1311,23 +1162,29 @@ fn local_block_geometry(
             "Moshi {root} local query width {query_width} splits head dimension {head}"
         )));
     }
-    let output = required_parameter(layout, &format!("{root}.self_attn.out_proj"))?;
-    if local_axis(output, 1, "attention output input width")? != query_width {
+    let output = required_tensor(layout, spec.attention.output.weight.id.as_str())?;
+    if logical_axis(
+        &spec.attention.output,
+        output,
+        1,
+        "attention output input width",
+    )? != query_width
+    {
         return Err(ParallelPlanError::InvalidTensor(format!(
             "Moshi {root} attention row projection does not consume its local head partition"
         )));
     }
 
-    let gating = required_parameter(layout, &format!("{root}.gating.linear_in"))?;
-    let fused_gating = local_axis(gating, 0, "fused gating width")?;
+    let gating = required_tensor(layout, spec.gating.gate_up.weight.id.as_str())?;
+    let fused_gating = logical_axis(&spec.gating.gate_up, gating, 0, "fused gating width")?;
     if !fused_gating.is_multiple_of(2) {
         return Err(ParallelPlanError::InvalidTensor(format!(
             "Moshi {root} local fused gating width {fused_gating} is not even"
         )));
     }
     let gated_hidden_size = fused_gating / 2;
-    let down = required_parameter(layout, &format!("{root}.gating.linear_out"))?;
-    if local_axis(down, 1, "gating output input width")? != gated_hidden_size {
+    let down = required_tensor(layout, spec.gating.down.weight.id.as_str())?;
+    if logical_axis(&spec.gating.down, down, 1, "gating output input width")? != gated_hidden_size {
         return Err(ParallelPlanError::InvalidTensor(format!(
             "Moshi {root} gating row projection does not consume its local fused partition"
         )));
@@ -1344,21 +1201,6 @@ fn local_block_geometry(
         })?,
     })
 }
-
-fn required_parameter<'a>(
-    layout: &'a eredu_runtime::LocalModelLayout,
-    parameter: &str,
-) -> Result<&'a eredu_runtime::LocalTensorLayout, ParallelPlanError> {
-    layout
-        .tensor(&format!("{parameter}.weight"))
-        .or_else(|| layout.tensor(parameter))
-        .ok_or_else(|| {
-            ParallelPlanError::InvalidTensor(format!(
-                "missing rank-local Moshi layout for {parameter}"
-            ))
-        })
-}
-
 fn required_tensor<'a>(
     layout: &'a eredu_runtime::LocalModelLayout,
     target: &str,
@@ -1420,17 +1262,42 @@ fn validate_alias_layouts<'a>(
 
 fn local_state_layout(
     config: &MoshiConfig,
-    temporal_heads: &[i32],
-    depth_heads: &[i32],
+    temporal_geometry: &[LocalTransformerGeometry],
+    depth_geometry: &[LocalTransformerGeometry],
+    declarations: &super::declarations::Declarations,
 ) -> Result<StateLayout, ParallelPlanError> {
-    let temporal = decoder::cache_layout_with_key_value_heads(
+    let geometry = |source: &[super::declarations::BlockConstruction],
+                    blocks: &[LocalTransformerGeometry]| {
+        if source.len() != blocks.len() {
+            return Err(ParallelPlanError::InvalidGroup(
+                "Moshi local block count differs from declared owners".into(),
+            ));
+        }
+        source
+            .iter()
+            .zip(blocks)
+            .map(|(spec, block)| {
+                spec.localized(block.attention_heads, block.gated_hidden_size)
+                    .map(|local| local.attention.geometry)
+                    .map_err(nn_invalid)
+            })
+            .collect::<Result<Vec<_>, _>>()
+    };
+    let temporal = decoder::cache_layout_with_attention_geometry(
         config.temporal(),
-        temporal_heads.iter().copied(),
+        geometry(&declarations.temporal, temporal_geometry)?,
     )
     .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    let depth = decoder::cache_layout_with_key_value_heads(
+    let depth = decoder::cache_layout_with_attention_geometry(
         config.depth_template(),
-        depth_heads.iter().copied(),
+        geometry(
+            &declarations
+                .depth
+                .first()
+                .ok_or_else(|| ParallelPlanError::InvalidGroup("Moshi has no depth owners".into()))?
+                .blocks,
+            depth_geometry,
+        )?,
     )
     .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
     let temporal_count = temporal.len();

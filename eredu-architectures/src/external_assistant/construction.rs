@@ -93,8 +93,9 @@ impl<A: ExternalAssistantArchitecture> NormalizedExternalAssistant<A> {
         selected: SelectedExternalAssistant<A>,
         target: Option<&ExternalAssistantTargetProfile>,
     ) -> Result<Self, String> {
-        let source_module_config = A::module_config(&selected.source_config, target)?;
-        let module_config = A::module_config(&selected.config, target)?;
+        let source_module_config =
+            A::module_config(&selected.source_config, &selected.source_definition, target)?;
+        let module_config = A::module_config(&selected.config, &selected.definition, target)?;
         Ok(Self {
             selected,
             source_module_config,
@@ -244,7 +245,7 @@ impl CompatibleExternalAssistantPreparation {
             None => {
                 return Err(invalid_assistant(
                     "assistant target invocation admission requires selected source placement",
-                ))
+                ));
             }
         };
         if retained_rank != rank {
@@ -347,7 +348,7 @@ impl CompatibleExternalAssistantPreparation {
             _ => {
                 return Err(invalid_assistant(
                     "Muse invocation has a different capture contract",
-                ))
+                ));
             }
         };
         let placement = super::capture_placement::PreparedTargetCapturePlacement::prepare(

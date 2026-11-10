@@ -7,6 +7,7 @@ pub(super) fn gguf_composite(
     g: &mut Builder,
     config: &crate::gguf_companion::GgufMediaProjectorConfig,
     primary: &GgufModelConfig,
+    text_declaration: Option<&crate::qwen::Declaration>,
 ) {
     use crate::gguf_companion::GgufMediaProjectorConfig as C;
     match config {
@@ -15,7 +16,11 @@ pub(super) fn gguf_composite(
         }
         C::Qwen4Exp(_) | C::Qwen4ExpPending { .. } => {
             if let GgufModelConfig::Qwen4Exp(target) = primary {
-                qwen4_exp(g, target.text_plan().config());
+                qwen4_exp(
+                    g,
+                    target.text_plan().config(),
+                    target.text_plan().parameter_declaration(),
+                );
                 media(g, "vision");
             }
         }
@@ -24,11 +29,19 @@ pub(super) fn gguf_composite(
         C::Muse(c) => muse(g, c),
         C::Qwen35(c) | C::Qwen35Pending(c) => qwen_hybrid(g, c),
         C::Qwen3Vl(c) => {
-            qwen_with_deepstack(g, &c.text, c.vision.deepstack_layers().len());
+            qwen_with_deepstack(
+                g,
+                text_declaration.expect("admitted VL text scopes"),
+                c.vision.deepstack_layers().len(),
+            );
             media(g, "vision");
         }
         C::Qwen3VlPending(c) => {
-            qwen_with_deepstack(g, &c.text, c.vision.deepstack_layers().len());
+            qwen_with_deepstack(
+                g,
+                text_declaration.expect("admitted VL text scopes"),
+                c.vision.deepstack_layers().len(),
+            );
             media(g, "vision");
         }
     }
@@ -80,8 +93,40 @@ fn prepared_vision_addition(
     addition
 }
 
-pub(super) fn dense<C: Config>(g: &mut Builder, c: &C, moe_policy: Option<MoeAttributes>) {
-    dense_with_deepstack(g, c, moe_policy, 0);
+fn declared_static_input(
+    g: &mut Builder,
+    statics: &crate::decoder::StaticModuleConstruction,
+) -> String {
+    let embedding = statics.embedding_spec();
+    g.start(
+        super::components::declared_weight_prefix(&embedding.weight),
+        embedding.dimensions as usize,
+    )
+}
+
+fn declared_static_output(
+    g: &mut Builder,
+    previous: &str,
+    statics: &crate::decoder::StaticModuleConstruction,
+) {
+    let output = statics.output_projection_spec();
+    g.output(
+        previous,
+        super::components::declared_normalization_prefix(statics.normalization_spec())
+            .expect("declared final normalization weight"),
+        super::components::declared_weight_prefix(&output.weight),
+        output.input as usize,
+        output.output as usize,
+    );
+}
+
+pub(super) fn dense<C: Config>(
+    g: &mut Builder,
+    c: &C,
+    moe_policy: Option<MoeAttributes>,
+    declaration: &crate::decoder::DecoderDeclaration,
+) {
+    dense_with_deepstack(g, c, moe_policy, 0, declaration);
 }
 
 fn dense_with_deepstack<C: Config>(
@@ -89,14 +134,17 @@ fn dense_with_deepstack<C: Config>(
     c: &C,
     moe_policy: Option<MoeAttributes>,
     deepstack_count: usize,
+    declaration: &crate::decoder::DecoderDeclaration,
 ) {
     let root = c.parameter_root();
-    let width = c.hidden_size() as usize;
-    let embedding = format!("{root}.embed_tokens");
-    let mut previous = g.start(&embedding, width);
+    declaration.validate_for(c).expect("admitted dense policy");
+    let statics = declaration.static_construction();
+    let width = statics.embedding_spec().dimensions as usize;
+    let mut previous = declared_static_input(g, &statics);
     let fields = c.block_parameter_fields();
     let mut other_writes = Vec::new();
     for (i, policy) in c.attention_schedule().iter().enumerate() {
+        let scope = declaration.block_parameters(i);
         let path = format!("{root}.layers.{i}");
         let block = g.block(&previous, i, &path, width);
         let (op, join) = g.sublayer(
@@ -109,9 +157,9 @@ fn dense_with_deepstack<C: Config>(
             ArchitectureNodeKind::Attention,
         );
         let mut a = attention(
-            c.num_attention_heads(),
-            c.num_key_value_heads(),
-            c.head_dim(),
+            scope.attention.geometry.query_heads(),
+            scope.attention.geometry.key_value_heads(),
+            scope.attention.geometry.key_dimensions(),
             *policy,
         );
         a.positional_encoding = Some(if c.rotary_enabled() {
@@ -119,16 +167,19 @@ fn dense_with_deepstack<C: Config>(
         } else {
             PositionalEncoding::None
         });
-        a.sink_logits = c
-            .learned_attention_sinks()
-            .then(|| format!("{path}.{}.{}", fields.attention, fields.attention_sinks));
+        a.sink_logits = scope.sinks.as_ref().map(|sink| sink.weight.id.to_string());
         g.get_mut(&op).attention = Some(a);
         post_sublayer_norm(
             g,
             &block,
             &op,
             &join,
-            c.attention_output_normalization(i),
+            scope
+                .normalizations
+                .attention_output
+                .as_ref()
+                .and_then(super::components::declared_normalization_prefix)
+                .map(|prefix| format!("{prefix}.weight")),
             width,
         );
         let (ff, output) = g.sublayer(
@@ -145,7 +196,12 @@ fn dense_with_deepstack<C: Config>(
             &block,
             &ff,
             &output,
-            c.feed_forward_output_normalization(i),
+            scope
+                .normalizations
+                .feed_forward_output
+                .as_ref()
+                .and_then(super::components::declared_normalization_prefix)
+                .map(|prefix| format!("{prefix}.weight")),
             width,
         );
         let point = c.routed_observation_points(&path, i);
@@ -163,7 +219,7 @@ fn dense_with_deepstack<C: Config>(
             );
         }
         {
-            super::components::decoder_unit(g, c, i, &path, &op, &ff, dense_ffn);
+            super::components::decoder_unit(g, c, i, &path, &op, &ff, dense_ffn, scope);
             for (node, suffix, meaning, extent, axis) in [
                 (
                     &op,
@@ -176,7 +232,7 @@ fn dense_with_deepstack<C: Config>(
                     &op,
                     "attention.channels",
                     "Aggregated attention channels after gating, before output projection",
-                    (c.num_attention_heads() * c.head_dim()) as usize,
+                    scope.attention.geometry.attended_width() as usize,
                     "component",
                 ),
                 (
@@ -211,7 +267,10 @@ fn dense_with_deepstack<C: Config>(
                     &ff,
                     "feed_forward.units",
                     "Feed-forward unit values after activation/gating, before down projection",
-                    c.intermediate_size() as usize,
+                    scope
+                        .feed_forward
+                        .as_ref()
+                        .map_or(0, |spec| spec.down().input as usize),
                     "component",
                 ),
                 (
@@ -259,7 +318,12 @@ fn dense_with_deepstack<C: Config>(
             });
         }
         previous = output;
-        if let Some(name) = c.block_output_normalization(i) {
+        let terminal = scope
+            .terminal
+            .as_ref()
+            .and_then(super::components::declared_normalization_prefix)
+            .map(str::to_owned);
+        if let Some(name) = terminal {
             let id = format!("{block}.output_norm");
             g.node(
                 &id,
@@ -284,18 +348,8 @@ fn dense_with_deepstack<C: Config>(
             previous = addition;
         }
     }
-    g.output(
-        &previous,
-        &format!("{root}.norm"),
-        if c.tie_word_embeddings() {
-            &embedding
-        } else {
-            "lm_head"
-        },
-        width,
-        c.vocabulary_size() as usize,
-    );
-    super::components::readout(g, c);
+    declared_static_output(g, &previous, &statics);
+    super::components::readout(g, c, declaration);
     g.descriptor
         .component_readout
         .as_mut()
@@ -303,31 +357,50 @@ fn dense_with_deepstack<C: Config>(
         .other_writes = other_writes;
 }
 
-pub(super) fn nanbeige(g: &mut Builder, c: &crate::nanbeige::ModelArgs) {
-    dense(g, c, None);
-    g.repeated_decoder(c.parameter_root(), c.physical_layer_count(), c.num_loops());
+pub(super) fn nanbeige(
+    g: &mut Builder,
+    c: &crate::nanbeige::ModelArgs,
+    declaration: &crate::decoder::DecoderDeclaration,
+) {
+    dense(g, c, None, declaration);
+    use eredu_nn::DeclareLogicalParameters;
+    let parameters = declaration
+        .logical_parameters()
+        .expect("admitted repeated parameter slots");
+    g.repeated_decoder(c.physical_layer_count(), c.num_loops());
+    g.declared_parameter_sharing(&parameters)
+        .expect("admitted repeated parameter sharing");
 }
 
-pub(super) fn qwen(g: &mut Builder, c: &crate::qwen::ModelArgs) {
-    qwen_with_deepstack(g, c, 0);
+pub(super) fn qwen(g: &mut Builder, declaration: &crate::qwen::Declaration) {
+    qwen_with_deepstack(g, declaration, 0);
 }
-
-fn qwen_with_deepstack(g: &mut Builder, c: &crate::qwen::ModelArgs, deepstack_count: usize) {
+fn qwen_with_deepstack(
+    g: &mut Builder,
+    declaration: &crate::qwen::Declaration,
+    deepstack_count: usize,
+) {
+    let c = declaration.args();
     dense_with_deepstack(
         g,
         c,
         (c.num_experts > 0).then(|| {
+            let spec = declaration
+                .routed(0)
+                .expect("admitted Qwen routed declaration");
+            let selection = spec.selector.selection();
             moe(
-                c.num_experts,
-                c.num_experts_per_tok,
+                selection.group_count(),
+                selection.top_k(),
                 0,
-                c.norm_topk_prob,
+                selection.normalize_selected(),
                 RoutingScoreTransform::Softmax,
             )
         }),
         deepstack_count,
+        declaration.common(),
     );
-    routed_units::decoder(g, c, |layer| crate::qwen::expert_bank_spec(c, layer));
+    routed_units::decoder(g, c, |layer| declaration.expert_bank(layer).cloned());
     if let Ok(spec) = c.routing_spec() {
         for layer in 0..c.num_hidden_layers as usize {
             let unit = format!("{}.layers.{layer}", c.parameter_root);
@@ -347,26 +420,34 @@ fn qwen_with_deepstack(g: &mut Builder, c: &crate::qwen::ModelArgs, deepstack_co
     }
 }
 
-pub(super) fn gpt_oss(g: &mut Builder, c: &crate::gpt_oss::ModelArgs) {
+pub(super) fn gpt_oss(g: &mut Builder, declaration: &crate::gpt_oss::Declaration) {
+    let c = declaration.args();
+    let spec = declaration
+        .projections()
+        .parameters(0)
+        .expect("admitted GPT-OSS routed declaration");
+    let selection = spec.selector.selection();
     dense(
         g,
         c,
         Some(moe(
-            c.num_local_experts,
-            c.num_experts_per_tok,
+            selection.group_count(),
+            selection.top_k(),
             0,
-            false,
+            selection.normalize_selected(),
             RoutingScoreTransform::SelectedSoftmax,
         )),
+        declaration.common(),
     );
-    routed_units::decoder(g, c, |layer| crate::gpt_oss::expert_bank_spec(c, layer));
+    routed_units::decoder(g, c, |layer| declaration.expert_bank(layer).cloned());
 }
 
 pub(super) fn qwen_hybrid(g: &mut Builder, parsed: &crate::qwen::hybrid::ParsedHybridConfig) {
     use crate::qwen::hybrid::HybridLayerPolicy;
     let c = &parsed.text;
-    let width = c.hidden_size as usize;
-    let mut previous = g.start("model.embed_tokens", width);
+    let statics = c.statics();
+    let width = statics.embedding_spec().dimensions as usize;
+    let mut previous = declared_static_input(g, &statics);
     for (i, policy) in c.layer_schedule.iter().enumerate() {
         let path = format!("model.layers.{i}");
         let block = g.block(&previous, i, &path, width);
@@ -405,10 +486,17 @@ pub(super) fn qwen_hybrid(g: &mut Builder, parsed: &crate::qwen::hybrid::ParsedH
                 });
             }
             HybridLayerPolicy::SelfAttention(policy) => {
+                let scope = crate::qwen::hybrid::BlockParameters::target(c, i)
+                    .expect("admitted Qwen hybrid block declaration");
+                let crate::qwen::hybrid::MixerParameters::Attention(parameters) = &scope.mixer
+                else {
+                    unreachable!()
+                };
+                let geometry = parameters.projection.geometry;
                 g.get_mut(&op).attention = Some(attention(
-                    c.num_attention_heads,
-                    c.num_key_value_heads,
-                    c.head_dim,
+                    geometry.query_heads(),
+                    geometry.key_value_heads(),
+                    geometry.key_dimensions(),
                     *policy,
                 ))
             }
@@ -460,17 +548,7 @@ pub(super) fn qwen_hybrid(g: &mut Builder, parsed: &crate::qwen::hybrid::ParsedH
             previous = output;
         }
     }
-    g.output(
-        &previous,
-        "model.norm",
-        if c.tie_word_embeddings {
-            "model.embed_tokens"
-        } else {
-            "lm_head"
-        },
-        width,
-        c.vocab_size as usize,
-    );
+    declared_static_output(g, &previous, &statics);
     super::components::qwen_hybrid::readout(g, c);
     if let Some(vision) = &parsed.vision {
         let readout = g
@@ -676,17 +754,18 @@ fn merge_capture(g: &mut Builder, assembly: &str) {
     }
 }
 
-pub(super) fn remaining_safetensors(g: &mut Builder, c: &SafetensorsModelConfig) {
+pub(super) fn remaining_safetensors(
+    g: &mut Builder,
+    c: &SafetensorsModelConfig,
+    plan: &crate::processor_plan::ArtifactArchitecturePlan,
+) {
     match c {
         SafetensorsModelConfig::NemotronLabsDiffusion(c) => {
             super::nemotron_labs_diffusion::describe(g, c)
         }
-        SafetensorsModelConfig::Qwen4Exp(c, _) => qwen4_exp(g, c),
-        SafetensorsModelConfig::K2Horizon(c) => k2_horizon(g, c),
-        SafetensorsModelConfig::Nanbeige(c) => nanbeige(g, c),
-        SafetensorsModelConfig::Lfm2(c) => lfm2(g, c),
-        SafetensorsModelConfig::KimiLinear(c) => kimi(g, c),
-        SafetensorsModelConfig::NemotronH(c) => nemotron(g, c),
+        SafetensorsModelConfig::Qwen4Exp(c, _) => {
+            qwen4_exp(g, c.configuration(), c.target_parameters())
+        }
         SafetensorsModelConfig::DeepSeekV3(c) => deepseek_v3(g, c),
         SafetensorsModelConfig::DeepSeekV4(c) => deepseek_v4(g, c),
         SafetensorsModelConfig::DiffusionGemma(c) => diffusion_gemma(g, c),
@@ -694,12 +773,23 @@ pub(super) fn remaining_safetensors(g: &mut Builder, c: &SafetensorsModelConfig)
         SafetensorsModelConfig::Muse(c) => muse(g, c),
         SafetensorsModelConfig::Inkling(c) => inkling(g, c),
         SafetensorsModelConfig::QwenVl(c) => {
-            qwen_with_deepstack(g, &c.text, c.vision.deepstack_layers().len());
+            qwen_with_deepstack(
+                g,
+                plan.vl_declaration(c)
+                    .expect("admitted VL scopes")
+                    .text_declaration(),
+                c.vision.deepstack_layers().len(),
+            );
             media(g, "vision");
         }
         SafetensorsModelConfig::Moshi(c) => moshi(g, c),
         SafetensorsModelConfig::VoiceChat(c) => super::voicechat::describe(g, c),
-        SafetensorsModelConfig::Gemma2(_)
+        SafetensorsModelConfig::K2Horizon(_)
+        | SafetensorsModelConfig::Nanbeige(_)
+        | SafetensorsModelConfig::KimiLinear(_)
+        | SafetensorsModelConfig::Lfm2(_)
+        | SafetensorsModelConfig::NemotronH(_)
+        | SafetensorsModelConfig::Gemma2(_)
         | SafetensorsModelConfig::Llama(_)
         | SafetensorsModelConfig::Qwen(_)
         | SafetensorsModelConfig::GptOss(_)
@@ -712,11 +802,11 @@ pub(super) fn remaining_gguf(g: &mut Builder, c: &GgufModelConfig) {
         GgufModelConfig::NemotronLabsDiffusion(plan) => {
             super::nemotron_labs_diffusion::describe(g, plan.text_config())
         }
-        GgufModelConfig::Qwen4Exp(plan) => qwen4_exp(g, plan.text_plan().config()),
-        GgufModelConfig::K2Horizon(c) => k2_horizon(g, c),
-        GgufModelConfig::Lfm2(c) => lfm2(g, c),
-        GgufModelConfig::KimiLinear(c) => kimi(g, c),
-        GgufModelConfig::NemotronH(c) => nemotron(g, c),
+        GgufModelConfig::Qwen4Exp(plan) => qwen4_exp(
+            g,
+            plan.text_plan().config(),
+            plan.text_plan().parameter_declaration(),
+        ),
         GgufModelConfig::VoiceChat(c) => super::voicechat::describe(g, c),
         GgufModelConfig::DeepSeekV3(c) => deepseek_v3(g, c),
         GgufModelConfig::DeepSeekV4(c) => deepseek_v4(g, c),
@@ -724,7 +814,11 @@ pub(super) fn remaining_gguf(g: &mut Builder, c: &GgufModelConfig) {
         GgufModelConfig::Gemma4(c) => gemma(g, c),
         GgufModelConfig::Muse(c) => muse(g, c),
         GgufModelConfig::Inkling(c) => inkling(g, c),
-        GgufModelConfig::Gemma2(_)
+        GgufModelConfig::K2Horizon(_)
+        | GgufModelConfig::KimiLinear(_)
+        | GgufModelConfig::Lfm2(_)
+        | GgufModelConfig::NemotronH(_)
+        | GgufModelConfig::Gemma2(_)
         | GgufModelConfig::Llama(_)
         | GgufModelConfig::Nanbeige(_)
         | GgufModelConfig::Qwen(_)
@@ -733,14 +827,15 @@ pub(super) fn remaining_gguf(g: &mut Builder, c: &GgufModelConfig) {
     }
 }
 
-fn lfm2(g: &mut Builder, c: &crate::lfm2::ModelArgs) {
-    use crate::lfm2::{FeedForwardPolicy, OperatorPolicy};
-    let width = c.hidden_size as usize;
-    let mut previous = g.start("model.embed_tokens", width);
-    for (i, policy) in c.layer_schedule.iter().enumerate() {
+pub(super) fn lfm2(g: &mut Builder, declaration: &crate::lfm2::Declaration) {
+    use crate::lfm2::declarations::{FeedForwardParameters as F, MixerParameters as M};
+    let statics = &declaration.statics;
+    let width = statics.embedding_spec().dimensions as usize;
+    let mut previous = declared_static_input(g, statics);
+    for (i, scope) in declaration.blocks.iter().enumerate() {
         let path = format!("model.layers.{i}");
         let block = g.block(&previous, i, &path, width);
-        let conv = matches!(policy.operator, OperatorPolicy::CausalConvolution);
+        let conv = matches!(scope.mixer, M::Convolution(_));
         let (op, join) = g.sublayer(
             &block,
             &block,
@@ -754,20 +849,20 @@ fn lfm2(g: &mut Builder, c: &crate::lfm2::ModelArgs) {
                 ArchitectureNodeKind::Attention
             },
         );
-        match policy.operator {
-            OperatorPolicy::CausalConvolution => {
+        match &scope.mixer {
+            M::Convolution(spec) => {
                 g.get_mut(&op).mixer = Some(MixerAttributes {
                     mechanism: MixerMechanism::ShortConvolution,
                     recurrent: true,
-                    convolution_width: Some(c.conv_l_cache as usize),
+                    convolution_width: Some(spec.convolution.kernel_size as usize),
                 })
             }
-            OperatorPolicy::SelfAttention(p) => {
+            M::Attention(spec, p) => {
                 g.get_mut(&op).attention = Some(attention(
-                    c.num_attention_heads,
-                    c.num_key_value_heads,
-                    c.hidden_size / c.num_attention_heads,
-                    p,
+                    spec.projection.geometry.query_heads(),
+                    spec.projection.geometry.key_value_heads(),
+                    spec.projection.geometry.key_dimensions(),
+                    *p,
                 ))
             }
         }
@@ -780,16 +875,19 @@ fn lfm2(g: &mut Builder, c: &crate::lfm2::ModelArgs) {
             width,
             ArchitectureNodeKind::FeedForward,
         );
-        if policy.feed_forward == FeedForwardPolicy::SparseMoe {
-            let point = c.routed_observation_points(&path, i).expect("sparse layer");
+        if let F::Routed(spec) = &scope.feed_forward {
+            let selection = spec.selector.selection();
+            let point = declaration
+                .routed_observation_points(&path, i)
+                .expect("sparse layer");
             g.moe(
                 &ff,
                 &format!("{path}.feed_forward"),
                 moe(
-                    c.num_experts,
-                    c.num_experts_per_tok,
+                    selection.group_count(),
+                    selection.top_k(),
                     0,
-                    c.norm_topk_prob,
+                    selection.normalize_selected(),
                     RoutingScoreTransform::Sigmoid,
                 ),
                 Some(
@@ -810,42 +908,31 @@ fn lfm2(g: &mut Builder, c: &crate::lfm2::ModelArgs) {
                         .unwrap()
                         .path(),
                     input: Some(format!("{path}.feed_forward.input")),
-                    normalization: Some(routed_units::rms(
-                        format!("{path}.ffn_norm.weight"),
-                        c.norm_eps,
-                        0.0,
+                    normalization: Some(super::components::declared_normalization(
+                        &scope.feed_forward_norm,
                     )),
                     residual_scale: Some(ComponentScalar::new(1.0)),
                 },
-                crate::lfm2::moe::expert_bank_spec(c, i),
+                Ok(spec.experts.clone()),
             );
         }
-        super::components::lfm2_unit(g, c, i, &path, &op, &ff);
+        super::components::lfm2_unit(g, declaration, i, &path, &op, &ff);
         previous = output;
     }
-    g.output(
-        &previous,
-        "model.embedding_norm",
-        if c.tie_word_embeddings {
-            "model.embed_tokens"
-        } else {
-            "lm_head"
-        },
-        width,
-        c.vocab_size as usize,
-    );
-    super::components::lfm2_readout(g, c);
-    super::components::lfm2_other_writes(g, c);
+    declared_static_output(g, &previous, statics);
+    super::components::lfm2_readout(g, declaration);
+    super::components::lfm2_other_writes(g, declaration);
 }
 
-fn kimi(g: &mut Builder, c: &crate::kimi_linear::ModelArgs) {
-    use crate::kimi_linear::{AttentionKind, FeedForwardPolicy};
-    let width = c.hidden_size as usize;
-    let mut previous = g.start("model.embed_tokens", width);
-    for (i, policy) in c.layer_schedule.iter().enumerate() {
+pub(super) fn kimi(g: &mut Builder, declaration: &crate::kimi_linear::Declaration) {
+    use crate::kimi_linear::declarations::{FeedForwardParameters as F, MixerParameters as M};
+    let statics = &declaration.statics;
+    let width = statics.embedding_spec().dimensions as usize;
+    let mut previous = declared_static_input(g, statics);
+    for (i, scope) in declaration.blocks.iter().enumerate() {
         let path = format!("model.layers.{i}");
         let block = g.block(&previous, i, &path, width);
-        let kda = policy.attention == AttentionKind::Kda;
+        let kda = matches!(scope.mixer, M::Kda(_));
         let (op, join) = g.sublayer(
             &block,
             &block,
@@ -859,6 +946,20 @@ fn kimi(g: &mut Builder, c: &crate::kimi_linear::ModelArgs) {
                 ArchitectureNodeKind::Attention
             },
         );
+        let (heads, key_dim, value_dim, kernel) = match &scope.mixer {
+            M::Kda(spec) => (
+                spec.geometry.value_heads() as usize,
+                spec.geometry.key_dimensions() as usize,
+                spec.geometry.value_dimensions() as usize,
+                Some(spec.convolutions[0].kernel_size as usize),
+            ),
+            M::Mla(spec) => (
+                spec.geometry.heads() as usize,
+                spec.geometry.query_head_dimensions() as usize,
+                spec.geometry.value_dimensions() as usize,
+                None,
+            ),
+        };
         g.get_mut(&op).attention = Some(AttentionAttributes {
             mechanism: Some(if kda {
                 AttentionMechanism::Linear
@@ -867,21 +968,9 @@ fn kimi(g: &mut Builder, c: &crate::kimi_linear::ModelArgs) {
             }),
             recurrent: Some(kda),
             causal: Some(true),
-            query_heads: Some(if kda {
-                c.kda_config.num_heads
-            } else {
-                c.num_attention_heads
-            } as usize),
-            key_head_dimension: Some(if kda {
-                c.kda_config.head_dim
-            } else {
-                c.qk_nope_head_dim + c.qk_rope_head_dim
-            } as usize),
-            value_head_dimension: Some(if kda {
-                c.kda_config.head_dim
-            } else {
-                c.v_head_dim
-            } as usize),
+            query_heads: Some(heads),
+            key_head_dimension: Some(key_dim),
+            value_head_dimension: Some(value_dim),
             positional_encoding: Some(PositionalEncoding::None),
             receptive_field: (!kda).then_some(ReceptiveField::Full),
             ..Default::default()
@@ -890,7 +979,7 @@ fn kimi(g: &mut Builder, c: &crate::kimi_linear::ModelArgs) {
             g.get_mut(&op).mixer = Some(MixerAttributes {
                 mechanism: MixerMechanism::GatedDelta,
                 recurrent: true,
-                convolution_width: Some(c.kda_config.short_conv_kernel_size as usize),
+                convolution_width: kernel,
             });
         }
         let (ff, output) = g.sublayer(
@@ -902,16 +991,19 @@ fn kimi(g: &mut Builder, c: &crate::kimi_linear::ModelArgs) {
             width,
             ArchitectureNodeKind::FeedForward,
         );
-        if policy.feed_forward == FeedForwardPolicy::SparseMoe {
-            let point = c.routed_observation_points(&path, i).expect("sparse layer");
+        if let F::Sparse(parameters) = &scope.feed_forward {
+            let selection = parameters.routed.selector.selection();
+            let point = declaration
+                .routed_observation_points(&path, i)
+                .expect("sparse layer");
             let mut attrs = moe(
-                c.num_experts,
-                c.num_experts_per_token,
-                c.num_shared_experts,
-                c.moe_renormalize,
+                selection.group_count(),
+                selection.top_k(),
+                1,
+                selection.normalize_selected(),
                 RoutingScoreTransform::Sigmoid,
             );
-            attrs.shared_expert_width = Some(c.moe_intermediate_size as usize);
+            attrs.shared_expert_width = Some(parameters.shared.gate.output as usize);
             g.moe(
                 &ff,
                 &format!("{path}.mlp"),
@@ -934,40 +1026,30 @@ fn kimi(g: &mut Builder, c: &crate::kimi_linear::ModelArgs) {
                         .unwrap()
                         .path(),
                     input: Some(format!("{path}.feed_forward.input")),
-                    normalization: Some(routed_units::rms(
-                        format!("{path}.post_attention_layernorm.weight"),
-                        c.rms_norm_eps,
-                        0.0,
+                    normalization: Some(super::components::declared_normalization(
+                        &scope.post_attention_norm,
                     )),
                     residual_scale: Some(ComponentScalar::new(1.0)),
                 },
-                crate::kimi_linear::moe::expert_bank_spec(c, i),
+                Ok(parameters.routed.experts.clone()),
             );
         }
-        super::components::kimi_linear::unit(g, c, i, &path, &op, &ff);
+        super::components::kimi_linear::unit(g, declaration, i, &path, &op, &ff);
         previous = output;
     }
-    g.output(
-        &previous,
-        "model.norm",
-        if c.tie_word_embeddings {
-            "model.embed_tokens"
-        } else {
-            "lm_head"
-        },
-        width,
-        c.vocab_size as usize,
-    );
-    super::components::kimi_linear::readout(g, c);
-    if c.num_nextn_predict_layers > 0 {
+    declared_static_output(g, &previous, statics);
+    super::components::kimi_linear::readout(g, declaration);
+    if declaration.args().num_nextn_predict_layers > 0 {
         prediction(g, &previous);
     }
 }
 
-fn nemotron(g: &mut Builder, c: &crate::nemotron_h::ModelArgs) {
-    use crate::nemotron_h::LayerPolicy;
-    let width = c.hidden_size as usize;
-    let mut previous = g.start("model.embeddings", width);
+pub(super) fn nemotron(g: &mut Builder, declaration: &crate::nemotron_h::Declaration) {
+    use crate::nemotron_h::{declarations::TargetOperatorParameters as P, LayerPolicy};
+    let c = declaration.args();
+    let statics = &declaration.statics;
+    let width = statics.embedding_spec().dimensions as usize;
+    let mut previous = declared_static_input(g, &statics);
     for (i, policy) in c.layer_schedule.iter().enumerate() {
         let path = format!("model.layers.{i}");
         let block = g.block(&previous, i, &path, width);
@@ -986,32 +1068,33 @@ fn nemotron(g: &mut Builder, c: &crate::nemotron_h::ModelArgs) {
             width,
             kind,
         );
-        match policy {
-            LayerPolicy::Mamba => {
+        let scope = &declaration.blocks[i];
+        match (&scope.operator, policy) {
+            (P::Mamba(spec), LayerPolicy::Mamba) => {
                 g.get_mut(&op).mixer = Some(MixerAttributes {
                     mechanism: MixerMechanism::SelectiveStateSpace,
                     recurrent: true,
-                    convolution_width: Some(c.conv_kernel as usize),
+                    convolution_width: Some(spec.convolution.kernel_size as usize),
                 });
                 super::components::nemotron_other_unit(g, width, &path, &op, "mixer");
             }
-            LayerPolicy::SelfAttention(p) => {
-                let mut attributes =
-                    attention(c.num_attention_heads, c.num_key_value_heads, c.head_dim, *p);
+            (P::Attention(parameters), LayerPolicy::SelfAttention(p)) => {
+                let geometry = parameters.projection.geometry;
+                let mut attributes = attention(
+                    geometry.query_heads(),
+                    geometry.key_value_heads(),
+                    geometry.key_dimensions(),
+                    *p,
+                );
                 attributes.positional_encoding = Some(PositionalEncoding::None);
                 g.get_mut(&op).attention = Some(attributes);
-                super::components::nemotron_unit(g, c, i, &path, &op, true);
+                super::components::nemotron_unit(g, scope, i, &path, &op);
             }
-            LayerPolicy::SparseMoe => {
+            (P::Sparse(spec), LayerPolicy::SparseMoe) => {
                 super::components::nemotron_other_unit(g, width, &path, &op, "feed_forward");
-                let mut attrs = moe(
-                    c.n_routed_experts,
-                    c.num_experts_per_tok,
-                    c.n_shared_experts,
-                    c.norm_topk_prob,
-                    RoutingScoreTransform::Sigmoid,
-                );
-                attrs.shared_expert_width = Some(c.moe_shared_expert_intermediate_size as usize);
+                let mut attrs = declared_routing(spec.selector.selection(), c.n_shared_experts)
+                    .expect("admitted Nemotron routing equation");
+                attrs.shared_expert_width = Some(spec.shared.network.up.output as usize);
                 g.moe(
                     &op,
                     &format!("{path}.moe"),
@@ -1019,7 +1102,15 @@ fn nemotron(g: &mut Builder, c: &crate::nemotron_h::ModelArgs) {
                     Some(&format!("{path}.routing")),
                     width,
                 );
-                super::components::nemotron::shared_units(g, c, i, &path, &op);
+                super::components::nemotron::shared_units(
+                    g,
+                    spec,
+                    &scope.norm,
+                    i,
+                    &path,
+                    &op,
+                    &format!("{path}.moe"),
+                );
                 routed_units::relu2(
                     g,
                     RoutedUnitSite {
@@ -1027,52 +1118,36 @@ fn nemotron(g: &mut Builder, c: &crate::nemotron_h::ModelArgs) {
                         layer: i,
                         routing: &format!("{path}.routing"),
                         input: Some(format!("{path}.feed_forward.input")),
-                        normalization: Some(routed_units::rms(
-                            format!("{path}.norm.weight"),
-                            c.layer_norm_epsilon,
-                            0.0,
-                        )),
+                        normalization: Some(super::components::declared_normalization(&scope.norm)),
                         residual_scale: Some(ComponentScalar::new(1.0)),
                     },
-                    crate::nemotron_h::expert_bank_spec(c, i),
+                    Ok(spec.experts.clone()),
                 );
             }
-            LayerPolicy::DenseMlp => super::components::nemotron_unit(g, c, i, &path, &op, false),
+            (P::Dense(_), LayerPolicy::DenseMlp) => {
+                super::components::nemotron_unit(g, scope, i, &path, &op)
+            }
+            _ => unreachable!("validated Nemotron invocation and scope agree"),
         }
         previous = output;
     }
-    g.output(
-        &previous,
-        "model.norm_f",
-        if c.tie_word_embeddings {
-            "model.embeddings"
-        } else {
-            "lm_head"
-        },
-        width,
-        c.vocab_size as usize,
-    );
-    super::components::nemotron_readout(g, c);
+    declared_static_output(g, &previous, &statics);
+    super::components::nemotron_readout(g, declaration);
     if c.num_nextn_predict_layers > 0 {
-        super::components::nemotron::prediction::declare(g, c, &previous);
+        super::components::nemotron::prediction::declare(g, declaration, &previous);
     }
 }
 
 fn deepseek_v3(g: &mut Builder, c: &crate::deepseek::V3Args) {
-    let width = c.hidden_size as usize;
-    let mut previous = g.start("model.embed_tokens", width);
+    let statics = &c.parameters().statics;
+    let width = statics.embedding_spec().dimensions as usize;
+    let mut previous = declared_static_input(g, &statics);
     for i in 0..c.layer_schedule.len() {
         let path = format!("model.layers.{i}");
         let block = g.block(&previous, i, &path, width);
         previous = deepseek_v3_unit(g, c, i, &path, &block);
     }
-    g.output(
-        &previous,
-        "model.norm",
-        "lm_head",
-        width,
-        c.vocab_size as usize,
-    );
+    declared_static_output(g, &previous, &statics);
     super::components::deepseek_v3::readout(g, c);
     if c.num_nextn_predict_layers > 0 {
         super::components::deepseek_v3::prediction_scopes(g, c, &previous);
@@ -1096,13 +1171,15 @@ pub(super) fn deepseek_v3_unit(
         width,
         ArchitectureNodeKind::Attention,
     );
+    let spec = crate::deepseek::v3_specs::attention_spec(c, &format!("{path}.self_attn"))
+        .expect("admitted V3 MLA declaration");
     g.get_mut(&op).attention = Some(AttentionAttributes {
         mechanism: Some(AttentionMechanism::Latent),
         recurrent: Some(false),
         causal: Some(true),
-        query_heads: Some(c.num_attention_heads as usize),
-        key_head_dimension: Some((c.qk_nope_head_dim + c.qk_rope_head_dim) as usize),
-        value_head_dimension: Some(c.v_head_dim as usize),
+        query_heads: Some(spec.geometry.heads() as usize),
+        key_head_dimension: Some(spec.geometry.query_head_dimensions() as usize),
+        value_head_dimension: Some(spec.geometry.value_dimensions() as usize),
         receptive_field: Some(ReceptiveField::Full),
         positional_encoding: Some(PositionalEncoding::Rotary),
         ..Default::default()
@@ -1154,8 +1231,9 @@ pub(super) fn deepseek_v3_unit(
 }
 
 fn deepseek_v4(g: &mut Builder, c: &crate::deepseek::V4Args) {
-    let width = c.hidden_size as usize;
-    let mut previous = g.start("embed", width);
+    let statics = &c.parameters().statics;
+    let width = statics.embedding_spec().dimensions as usize;
+    let mut previous = declared_static_input(g, &statics);
     for (i, policy) in c
         .attention_schedule
         .iter()
@@ -1163,6 +1241,9 @@ fn deepseek_v4(g: &mut Builder, c: &crate::deepseek::V4Args) {
         .enumerate()
     {
         let path = format!("layers.{i}");
+        let attention_spec =
+            crate::deepseek::v4_specs::attention_spec(c, i, &format!("{path}.attn"))
+                .expect("validated V4 attention declaration");
         let block = g.block(&previous, i, &path, width);
         let mut streams = axes(width);
         streams.insert(
@@ -1199,10 +1280,10 @@ fn deepseek_v4(g: &mut Builder, c: &crate::deepseek::V4Args) {
             mechanism: Some(AttentionMechanism::CompressedSparse),
             causal: Some(true),
             recurrent: Some(false),
-            query_heads: Some(c.num_attention_heads as usize),
-            key_value_heads: Some(c.num_key_value_heads as usize),
-            key_head_dimension: Some(c.head_dim as usize),
-            value_head_dimension: Some(c.head_dim as usize),
+            query_heads: Some(attention_spec.geometry.query_heads() as usize),
+            key_value_heads: Some(attention_spec.geometry.key_value_heads() as usize),
+            key_head_dimension: Some(attention_spec.geometry.key_dimensions() as usize),
+            value_head_dimension: Some(attention_spec.geometry.value_dimensions() as usize),
             // Compressed layers combine local and pooled history. A sliding-only
             // field would misrepresent that second branch.
             receptive_field: matches!(policy, crate::deepseek::V4AttentionPolicy::Local).then_some(
@@ -1221,14 +1302,22 @@ fn deepseek_v4(g: &mut Builder, c: &crate::deepseek::V4Args) {
             Some(&format!("{path}.ffn")),
             Some(width),
         );
+        let routed_spec = crate::deepseek::v4_specs::moe_spec(c, i, &format!("{path}.ffn"), None)
+            .expect("validated V4 routed declaration");
+        let selector = &routed_spec.routed.parameters.selector;
         g.moe(
             &ff,
             &format!("{path}.ffn"),
             moe(
-                c.n_routed_experts,
-                c.num_experts_per_tok,
-                c.n_shared_experts,
-                c.norm_topk_prob,
+                selector.selection().group_count(),
+                selector.selection().top_k(),
+                routed_spec.routed.shared.gate.output
+                    / routed_spec
+                        .routed
+                        .parameters
+                        .experts
+                        .intermediate_dimensions(),
+                selector.selection().normalize_selected(),
                 RoutingScoreTransform::SqrtSoftplus,
             ),
             Some(&format!("{path}.feed_forward")),
@@ -1241,14 +1330,13 @@ fn deepseek_v4(g: &mut Builder, c: &crate::deepseek::V4Args) {
                 layer: i,
                 routing: &format!("{path}.feed_forward"),
                 input: Some(format!("{path}.feed_forward.input")),
-                normalization: Some(routed_units::rms(
-                    format!("{path}.ffn_norm.weight"),
-                    c.rms_norm_eps,
-                    0.0,
+                normalization: Some(super::components::declared_normalization(
+                    &crate::deepseek::v4_specs::block_normalizations(c, &path)
+                        .expect("validated V4 block normalization")[1],
                 )),
                 residual_scale: None,
             },
-            crate::deepseek::v4::expert_bank_spec(c, i),
+            Ok(routed_spec.routed.parameters.experts),
         );
         super::components::deepseek_v4::unit(g, c, i, &path, &path, &op, &ff);
         g.get_mut(&block).completeness = DescriptionCompleteness::Partial(vec![
@@ -1257,7 +1345,7 @@ fn deepseek_v4(g: &mut Builder, c: &crate::deepseek::V4Args) {
         ]);
         previous = block;
     }
-    g.output(&previous, "norm", "head", width, c.vocab_size as usize);
+    declared_static_output(g, &previous, &statics);
     super::components::deepseek_v4::readout(g, c);
     g.partial(
         "V4 compressed-history provenance and hash selection policy remain partially described",
@@ -1277,10 +1365,11 @@ fn components(
     g: &mut Builder,
     graph: eredu_runtime::ComponentGraph,
     root: &str,
-    width: usize,
-    vocab: usize,
+    statics: &crate::decoder::StaticModuleConstruction,
 ) {
     use eredu_runtime::ComponentKind as K;
+    let width = statics.embedding_spec().dimensions as usize;
+    let vocab = statics.output_projection_spec().output as usize;
     for component in graph.units() {
         let kind = match component.kind {
             K::StaticText => ArchitectureNodeKind::Embedding,
@@ -1402,12 +1491,15 @@ fn contained_ff(g: &mut Builder, layer: usize, attrs: Option<MoeAttributes>) {
 
 fn diffusion_gemma(g: &mut Builder, c: &crate::diffusion_gemma::FamilyConfig) {
     let text = &c.text;
-    let width = text.hidden_size as usize;
+    let declaration = c.pinned();
+    let width = declaration.embedding().dimensions as usize;
     g.node(
         "text.embedding",
         ArchitectureNodeKind::Embedding,
         None,
-        Some("model.decoder.embed_tokens"),
+        Some(super::components::declared_weight_prefix(
+            &declaration.embedding().weight,
+        )),
         Some(width),
     );
     g.node(
@@ -1426,16 +1518,21 @@ fn diffusion_gemma(g: &mut Builder, c: &crate::diffusion_gemma::FamilyConfig) {
         None,
         Some(width),
     );
+    let conditioning = c.conditioning();
     g.node(
         "refinement",
         ArchitectureNodeKind::DecoderBlock,
         None,
-        Some("model.decoder.self_conditioning"),
-        Some(width),
+        Some(crate::diffusion_gemma::conditioning::Declaration::ROOT),
+        Some(conditioning.product.gate.input as usize),
     );
     g.edge("context", "text.embedding", ArchitectureEdgeKind::Data);
     g.edge("refinement", "text.embedding", ArchitectureEdgeKind::Data);
     for (i, policy) in text.layer_schedule.iter().enumerate() {
+        let declaration = c
+            .attention(i)
+            .expect("admitted shared attention declaration");
+        let geometry = declaration.geometry;
         let block = format!("decoder.{i}");
         g.node(
             &block,
@@ -1451,9 +1548,9 @@ fn diffusion_gemma(g: &mut Builder, c: &crate::diffusion_gemma::FamilyConfig) {
             g,
             i,
             attention(
-                text.num_attention_heads,
-                policy.num_key_value_heads.get() as i32,
-                policy.head_dim.get() as i32,
+                geometry.query_heads(),
+                geometry.key_value_heads(),
+                geometry.key_dimensions(),
                 policy.attention,
             ),
         );
@@ -1462,15 +1559,12 @@ fn diffusion_gemma(g: &mut Builder, c: &crate::diffusion_gemma::FamilyConfig) {
             g,
             i,
             sparse.then(|| {
-                let mut routing = moe(
-                    text.num_experts.expect("validated experts"),
-                    text.top_k_experts.expect("validated top k"),
-                    0,
-                    false,
-                    RoutingScoreTransform::SelectedSoftmax,
-                );
-                routing.normalization = Some(RoutingNormalization::None);
-                routing
+                let declaration = c
+                    .routed(i)
+                    .expect("admitted shared layer")
+                    .expect("declared routed source");
+                declared_routing(declaration.routed.selector.selection(), 0)
+                    .expect("admitted routed scoring equation")
             }),
         );
         if sparse {
@@ -1482,10 +1576,23 @@ fn diffusion_gemma(g: &mut Builder, c: &crate::diffusion_gemma::FamilyConfig) {
                 None,
             );
         }
-        super::components::gemma4::unit_at(g, text, i, "model.decoder");
+        super::components::gemma4::unit_at(
+            g,
+            text,
+            i,
+            "model.decoder",
+            c.block(i).expect("admitted shared block"),
+            c.dense(i).expect("admitted shared dense branch"),
+            c.attention_scopes(),
+            c.routed(i).expect("admitted routed scope"),
+        );
         g.attach_parameters(
             &block,
-            &format!("model.encoder.language_model.layers.{i}.layer_scalar"),
+            c.encoder_scalar(i)
+                .expect("validated encoding scale")
+                .weight
+                .id
+                .as_str(),
         );
         previous = block;
     }
@@ -1497,25 +1604,17 @@ fn diffusion_gemma(g: &mut Builder, c: &crate::diffusion_gemma::FamilyConfig) {
         index: 1,
         executions: group.passes[0].executions.clone(),
     });
-    g.output(
-        &previous,
-        "model.decoder.norm",
-        if text.tie_word_embeddings {
-            "model.decoder.embed_tokens"
-        } else {
-            "lm_head"
-        },
-        width,
-        text.vocab_size as usize,
-    );
-    super::components::gemma4::readout_at(g, text, "model.decoder");
-    if c.vision.is_some() {
+    declared_static_output(g, &previous, &declaration.ordinary);
+    super::components::gemma4::readout(g, text, declaration);
+    if let Some(spec) = c.vision_projector() {
         media(g, "vision");
+        super::components::gemma4::modality_projector(g, "vision.projector", spec);
     }
 }
 
 fn gemma(g: &mut Builder, c: &crate::gemma4::FamilyConfig) {
     let text = &c.text;
+    let declaration = c.pinned();
     let graph = crate::gemma4::component_graph(
         text,
         crate::gemma4::ComponentOptions {
@@ -1525,21 +1624,23 @@ fn gemma(g: &mut Builder, c: &crate::gemma4::FamilyConfig) {
         },
     )
     .expect("admitted component geometry");
-    components(
-        g,
-        graph,
-        "model.language_model",
-        text.hidden_size as usize,
-        text.vocab_size as usize,
-    );
+    components(g, graph, "model.language_model", &declaration.ordinary);
+    if let Some(spec) = c.projector(crate::gemma4::media::ProjectionKind::Vision) {
+        super::components::gemma4::modality_projector(g, "vision.projector", spec);
+    }
+    if let Some(spec) = c.projector(crate::gemma4::media::ProjectionKind::Audio) {
+        super::components::gemma4::modality_projector(g, "audio.projector", spec);
+    }
     for (i, policy) in text.layer_schedule.iter().enumerate() {
+        let declaration = c.attention(i).expect("admitted attention declaration");
+        let geometry = declaration.geometry;
         contained_attention(
             g,
             i,
             attention(
-                text.num_attention_heads,
-                policy.num_key_value_heads.get() as i32,
-                policy.head_dim.get() as i32,
+                geometry.query_heads(),
+                geometry.key_value_heads(),
+                geometry.key_dimensions(),
                 policy.attention,
             ),
         );
@@ -1548,16 +1649,12 @@ fn gemma(g: &mut Builder, c: &crate::gemma4::FamilyConfig) {
             g,
             i,
             sparse.then(|| {
-                let mut attrs = moe(
-                    text.num_experts.expect("sparse experts"),
-                    text.top_k_experts.expect("sparse top k"),
-                    0,
-                    false,
-                    RoutingScoreTransform::Softmax,
-                );
-                attrs.score_transform = Some(RoutingScoreTransform::SelectedSoftmax);
-                attrs.normalization = Some(RoutingNormalization::None);
-                attrs
+                let declaration = c
+                    .routed(i)
+                    .expect("admitted layer")
+                    .expect("declared routed source");
+                declared_routing(declaration.routed.selector.selection(), 0)
+                    .expect("admitted routed scoring equation")
             }),
         );
         if sparse {
@@ -1570,24 +1667,94 @@ fn gemma(g: &mut Builder, c: &crate::gemma4::FamilyConfig) {
                 None,
             );
         }
-        super::components::gemma4::unit(g, text, i);
+        super::components::gemma4::unit(
+            g,
+            text,
+            i,
+            c.block(i).expect("admitted block"),
+            c.dense(i).expect("admitted dense branch"),
+            c.attention_scopes(),
+            c.routed(i).expect("admitted routed scope"),
+        );
     }
-    super::components::gemma4::readout(g, text);
+    super::components::gemma4::readout(g, text, declaration);
 }
 
 fn muse(g: &mut Builder, c: &crate::muse::DecoderConfig) {
+    let statics = c.pinned();
     components(
         g,
         crate::muse::component_graph(c).expect("admitted component geometry"),
         "model",
-        c.hidden_size as usize,
-        c.vocab_size as usize,
+        statics,
     );
+    if let Some(vision) = &c.vision_config {
+        use eredu_nn::DeclareLogicalParameters;
+        let declarations = vision.declaration();
+        let projector_parameters = declarations
+            .statics
+            .adapter
+            .logical_parameters()
+            .expect("validated Muse adapter slots")
+            .into_iter()
+            .chain(
+                declarations
+                    .statics
+                    .projection
+                    .logical_parameters()
+                    .expect("validated Muse projection slots"),
+            )
+            .map(|parameter| parameter.parameter.id.as_str().to_owned())
+            .collect::<std::collections::BTreeSet<_>>();
+        for parameter in declarations
+            .logical_parameters()
+            .expect("validated Muse vision slots")
+        {
+            let name = parameter.parameter.id.as_str();
+            let node = if projector_parameters.contains(name) {
+                "vision.projector"
+            } else {
+                "vision"
+            };
+            let prefix = name
+                .strip_suffix(".weight")
+                .or_else(|| name.strip_suffix(".bias"))
+                .unwrap_or(name);
+            g.attach_parameters(node, prefix);
+        }
+    }
+    if let Some(audio) = &c.audio_config {
+        use eredu_nn::DeclareLogicalParameters;
+        let declarations = audio.declaration();
+        for (kind, spec) in &declarations.units {
+            let node = if *kind == crate::muse::audio::AudioUnitKind::Projection {
+                "audio.projector"
+            } else {
+                "audio"
+            };
+            for parameter in spec
+                .logical_parameters()
+                .expect("validated Muse audio slots")
+            {
+                let name = parameter.parameter.id.as_str();
+                let prefix = name
+                    .strip_suffix(".weight")
+                    .or_else(|| name.strip_suffix(".bias"))
+                    .unwrap_or(name);
+                g.attach_parameters(node, prefix);
+            }
+        }
+    }
     for (i, policy) in c.attention_schedule.iter().enumerate() {
+        let parameters = &c
+            .attention(i)
+            .expect("admitted Muse attention declaration")
+            .parameters;
+        let geometry = parameters.projection.geometry;
         let mut attrs = attention(
-            c.num_attention_heads,
-            c.num_key_value_heads,
-            c.head_dim,
+            geometry.query_heads(),
+            geometry.key_value_heads(),
+            geometry.key_dimensions(),
             *policy,
         );
         attrs.positional_encoding = Some(if c.layer_uses_rope[i] {
@@ -1596,28 +1763,19 @@ fn muse(g: &mut Builder, c: &crate::muse::DecoderConfig) {
             PositionalEncoding::None
         });
         contained_attention(g, i, attrs);
+        let selection = c
+            .routed(i)
+            .map(|declaration| declaration.selector().selection());
         contained_ff(
             g,
             i,
-            (c.num_experts > 0).then(|| {
-                moe(
-                    c.num_experts,
-                    c.num_experts_per_tok,
-                    0,
-                    c.norm_topk_prob,
-                    match c.routed_feed_forward {
-                        crate::muse::RoutedFeedForwardEquation::DirectSoftmax => {
-                            RoutingScoreTransform::Softmax
-                        }
-                        crate::muse::RoutedFeedForwardEquation::CompressedSigmoid { .. } => {
-                            RoutingScoreTransform::Sigmoid
-                        }
-                    },
-                )
-            }),
+            selection
+                .as_ref()
+                .ok()
+                .and_then(|selection| declared_routing(*selection, 0)),
         );
         if c.is_moe() {
-            match crate::muse::text::routing_selection_spec(c) {
+            match selection {
                 Ok(spec) => g.routing_control(
                     &format!("decoder.{i}.feed_forward"),
                     &format!("model.layers.{i}.routing"),
@@ -1632,38 +1790,28 @@ fn muse(g: &mut Builder, c: &crate::muse::DecoderConfig) {
         }
         super::components::muse::unit(g, c, i);
     }
-    super::components::muse::readout(g, c);
+    super::components::muse::readout(g, c, statics);
 }
 
 fn inkling(g: &mut Builder, c: &crate::inkling::ModelArgs) {
     let text = &c.text_config;
+    let statics = &c.pinned().ordinary;
     components(
         g,
         crate::inkling::component_graph(c).expect("admitted component geometry"),
         "model",
-        text.hidden_size as usize,
-        text.vocab_size as usize,
+        &statics,
     );
+    super::components::inkling::media(g, c);
     for (i, policy) in text.layer_schedule.iter().enumerate() {
-        let sliding = matches!(policy.attention, AttentionPolicy::Sliding { .. });
+        let common = c.common(i).expect("admitted Inkling common declaration");
+        let parameters = &common.attention;
+        let dense = (policy.feed_forward == crate::inkling::FeedForwardPolicy::Dense)
+            .then(|| c.dense(i).expect("admitted Inkling dense declaration"));
         let mut attrs = attention(
-            if sliding {
-                text.swa_num_attention_heads
-                    .unwrap_or(text.num_attention_heads)
-            } else {
-                text.num_attention_heads
-            },
-            if sliding {
-                text.swa_num_key_value_heads
-                    .unwrap_or(text.num_key_value_heads)
-            } else {
-                text.num_key_value_heads
-            },
-            if sliding {
-                text.swa_head_dim.unwrap_or(text.head_dim)
-            } else {
-                text.head_dim
-            },
+            parameters.projection.geometry.query_heads(),
+            parameters.projection.geometry.key_value_heads(),
+            parameters.projection.geometry.key_dimensions(),
             policy.attention,
         );
         attrs.positional_encoding = Some(PositionalEncoding::Relative);
@@ -1672,10 +1820,12 @@ fn inkling(g: &mut Builder, c: &crate::inkling::ModelArgs) {
             g,
             i,
             (policy.feed_forward == crate::inkling::FeedForwardPolicy::SparseMoe).then(|| {
+                let parameters = c.sparse(i).expect("admitted Inkling routing declaration");
+                let selection = parameters.router.selection();
                 let mut attrs = moe(
-                    text.n_routed_experts,
-                    text.num_experts_per_tok,
-                    text.n_shared_experts,
+                    selection.selectable_groups(),
+                    selection.top_k(),
+                    selection.always_on_groups(),
                     text.norm_after_topk,
                     RoutingScoreTransform::Softmax,
                 );
@@ -1687,11 +1837,12 @@ fn inkling(g: &mut Builder, c: &crate::inkling::ModelArgs) {
         );
         super::components::inkling::decoder_scalars(
             g,
-            text,
             *policy,
             i,
             &format!("decoder.{i}"),
             &format!("model.layers.{i}"),
+            &common,
+            dense,
         );
         super::components::inkling::decoder_routed(
             g,
@@ -1702,13 +1853,14 @@ fn inkling(g: &mut Builder, c: &crate::inkling::ModelArgs) {
         );
         super::components::inkling::decoder_transforms(
             g,
-            text,
             *policy,
             &format!("decoder.{i}"),
             &format!("model.layers.{i}"),
+            &common,
+            dense,
         );
     }
-    super::components::inkling::target_readout(g, text);
+    super::components::inkling::target_readout(g, c);
     super::components::inkling::prediction(g, c);
 }
 
@@ -1728,6 +1880,36 @@ fn moshi(g: &mut Builder, c: &crate::moshi::MoshiConfig) {
         Some(c.depth_template().parameter_root()),
         None,
     );
+    let declarations = c.declarations();
+    for (node, parameters) in [
+        (
+            "temporal",
+            declarations
+                .temporal_parameters()
+                .expect("validated Moshi temporal declarations"),
+        ),
+        (
+            "depth",
+            declarations
+                .depth_parameters()
+                .expect("validated Moshi depth declarations"),
+        ),
+    ] {
+        for parameter in parameters {
+            let prefix = parameter.parameter.id.as_str().trim_end_matches(".weight");
+            g.attach_parameters(node, prefix);
+            if let Some(owner) = &parameter.parameter.alias_of {
+                let shared_with = g.parameter_group(owner.as_str().trim_end_matches(".weight"));
+                let id = format!("parameters:{prefix}");
+                g.descriptor
+                    .parameter_groups
+                    .iter_mut()
+                    .find(|group| group.id == id)
+                    .expect("declared Moshi parameter group")
+                    .shared_with = Some(shared_with);
+            }
+        }
+    }
     g.edge("temporal", "depth", ArchitectureEdgeKind::Data);
     g.get_mut("realtime").completeness = DescriptionCompleteness::Partial(vec!["Temporal/depth frame schedule, codebook branches, and per-frame observations require the separate realtime protocol".into()]);
     g.partial(
@@ -1764,83 +1946,129 @@ fn post_sublayer_norm(
     }
 }
 
-fn k2_horizon(g: &mut Builder, c: &crate::k2_horizon::ModelArgs) {
-    dense(g, c, None);
-    let score = if c.router_score_func == "sigmoid" {
-        RoutingScoreTransform::Sigmoid
-    } else {
-        RoutingScoreTransform::Softmax
-    };
+pub(super) fn k2_horizon(g: &mut Builder, source: &crate::k2_horizon::Declaration) {
+    let c = source.args();
+    let common = source
+        .common_projection()
+        .expect("admitted K2 common projection");
+    dense(g, c, None, &common);
+
     for layer in 0..c.num_hidden_layers as usize {
         let path = format!("model.layers.{layer}");
         let Some(points) = c.routed_observation_points(&path, layer) else {
             continue;
         };
-        for (bank, node, count, topk, shared, normalized) in [
+        let declaration = source
+            .block(layer)
+            .expect("validated K2 routed declaration");
+        for (bank, node, shared) in [
             (
                 crate::k2_horizon::ExpertBank::FeedForward,
                 format!("decoder.layers.{layer}.feed_forward"),
-                c.num_experts,
-                c.num_experts_per_tok,
                 c.num_shared_experts,
-                c.norm_topk_prob,
             ),
             (
                 crate::k2_horizon::ExpertBank::AttentionValue,
                 format!("decoder.layers.{layer}.attention.values"),
-                c.mova_num_experts,
-                c.mova_num_experts_per_tok,
                 0,
-                c.mova_num_experts_per_tok > 1,
             ),
         ] {
             let Some(point) = points.bank(bank.id()) else {
                 continue;
             };
+            let selector = match bank {
+                crate::k2_horizon::ExpertBank::FeedForward => {
+                    &declaration
+                        .routed
+                        .as_ref()
+                        .expect("declared feed-forward bank")
+                        .parameters
+                        .selector
+                }
+                crate::k2_horizon::ExpertBank::AttentionValue => {
+                    &declaration
+                        .values
+                        .as_ref()
+                        .expect("declared value bank")
+                        .router
+                }
+            };
+            let selection = selector.selection();
             let width = if bank == crate::k2_horizon::ExpertBank::AttentionValue {
+                let value = &declaration
+                    .values
+                    .as_ref()
+                    .expect("declared value bank")
+                    .experts;
                 let attention = format!("decoder.layers.{layer}.attention");
                 g.node(
                     &node,
                     ArchitectureNodeKind::MixtureOfExperts,
                     Some(&attention),
                     Some(&format!("{path}.self_attn.v_experts")),
-                    Some((c.num_key_value_heads * c.head_dim) as usize),
+                    Some(value.output_dimensions() as usize),
                 );
-                (c.num_key_value_heads * c.head_dim) as usize
+                value.output_dimensions() as usize
             } else {
-                c.hidden_size as usize
+                selector.input_dimensions() as usize
             };
-            let mut attributes = moe(count, topk, shared, normalized, score);
-            attributes.shared_expert_width =
-                (shared > 0).then_some((shared * c.moe_intermediate_size) as usize);
+            let mut attributes =
+                declared_routing(selection, shared).expect("validated K2 routing equation");
+            attributes.shared_expert_width = if shared > 0 {
+                declaration
+                    .routed
+                    .as_ref()
+                    .and_then(|routed| routed.shared.as_ref())
+                    .map(|spec| spec.gate.output as usize)
+            } else {
+                None
+            };
             g.moe(&node, point.path(), attributes, Some(point.path()), width);
-            if let Ok(spec) = c.routing_spec(bank) {
-                g.routing_control(&node, point.path(), spec, shared as u32, false);
-            }
+            g.routing_control(&node, point.path(), selection, shared as u32, false);
         }
     }
     routed_units::decoder(g, c, |layer| {
-        crate::k2_horizon::feed_forward_expert_spec(c, layer)
+        source.block(layer).and_then(|block| {
+            block
+                .routed
+                .map(|routed| routed.parameters.experts)
+                .ok_or_else(|| eredu_nn::Error::backend("K2 layer has no feed-forward bank"))
+        })
     });
-    super::components::k2_horizon::complete(g, c);
+    super::components::k2_horizon::complete(g, source);
 }
 
 // Configuration-only projection: bounds and native state mechanisms belong to
 // retained selection. Do not manufacture a TargetSpec with arbitrary limits here.
-fn qwen4_exp(g: &mut Builder, c: &crate::qwen4_exp::config::Config) {
-    use crate::qwen4_exp::config::LayerKind;
+fn qwen4_exp(
+    g: &mut Builder,
+    c: &crate::qwen4_exp::config::Config,
+    declaration: &crate::qwen4_exp::target::declarations::TargetParameters,
+) {
+    use crate::qwen4_exp::{config::LayerKind, target::declarations::MixerParameters};
     use ArchitectureEdgeKind as E;
     use ArchitectureNodeKind as K;
-    let hidden = c.hidden_size as usize;
+    let statics = &declaration.static_parameters;
+    let output = statics.output_projection();
+    let hidden = statics.embedding.dimensions as usize;
     let mut residual_axes = axes(hidden);
     residual_axes.insert(
         2,
         TensorAxis {
             name: "stream".into(),
-            dimension: SymbolicDimension::Known(c.residual.streams as usize),
+            dimension: SymbolicDimension::Known(statics.readout.geometry.streams() as usize),
         },
     );
-    let embedding = g.start("model.embed_tokens", hidden);
+    let embedding = g.start(
+        statics
+            .embedding
+            .weight
+            .id
+            .as_str()
+            .strip_suffix(".weight")
+            .expect("declared vocabulary weight"),
+        hidden,
+    );
     g.node("tokens", K::Processor, None, None, None);
     g.get_mut("tokens").label = "Original token IDs retained through media replacement".into();
     g.edge("tokens", &embedding, E::Data);
@@ -1850,20 +2078,34 @@ fn qwen4_exp(g: &mut Builder, c: &crate::qwen4_exp::config::Config) {
     g.edge(&embedding, "residual.expansion", E::Data);
     let mut previous = "residual.expansion".to_owned();
     for (layer, kind) in c.layers.iter().enumerate() {
+        let (mixer, feed_forward) = declaration
+            .decoder(layer)
+            .expect("declared Qwen4 invocation");
         let path = format!("model.layers.{layer}");
         if c.ngram.layers.contains(&layer) {
+            let lexical = declaration
+                .units
+                .iter()
+                .find_map(|unit| match unit {
+                    crate::qwen4_exp::target::declarations::UnitParameters::Lexical {
+                        layer: owner,
+                        parameters,
+                    } if *owner == layer => Some(parameters),
+                    _ => None,
+                })
+                .expect("declared Qwen4 lexical invocation");
             let id = format!("decoder.layers.{layer}.lexical");
             g.node(&id, K::Mixer, None, Some(&format!("{path}.ple")), None);
             g.get_mut(&id).label = format!(
                 "Gated n-gram injection; convolution dilation {}",
-                c.ngram.order
+                lexical.convolution.dilation
             );
             g.get_mut(&id).layer_index = Some(layer);
             g.get_mut(&id).output_axes = Some(residual_axes.clone());
             g.get_mut(&id).mixer = Some(MixerAttributes {
                 mechanism: MixerMechanism::ShortConvolution,
                 recurrent: true,
-                convolution_width: Some(c.ngram.kernel as usize),
+                convolution_width: Some(lexical.convolution.kernel_size as usize),
             });
             let table = format!("{id}.table");
             g.node(
@@ -1871,7 +2113,7 @@ fn qwen4_exp(g: &mut Builder, c: &crate::qwen4_exp::config::Config) {
                 K::Embedding,
                 Some(&id),
                 Some(&format!("{path}.ple.ple_embedding.ngram_embedding")),
-                Some(c.ngram.embedding_dim as usize),
+                Some(lexical.key.input as usize),
             );
             g.get_mut(&table).label = "Logical row-addressable n-gram table".into();
             g.edge("tokens", &table, E::Data);
@@ -1947,45 +2189,54 @@ fn qwen4_exp(g: &mut Builder, c: &crate::qwen4_exp::config::Config) {
             g.edge(&input, &residual, E::Residual);
             g.edge(&op, &residual, E::Data);
             if suffix == "feed_forward" {
+                let parameters = &feed_forward.feed_forward.parameters;
+                let selection = parameters.routed.selector.selection();
                 g.moe(
                     &op,
                     &op_path,
                     moe(
-                        c.experts.count,
-                        c.experts.selected,
+                        parameters.routed.experts.group_count(),
+                        selection.top_k(),
                         1,
-                        c.experts.renormalize,
+                        selection.normalize_selected(),
                         RoutingScoreTransform::Softmax,
                     ),
                     None,
                     hidden,
                 );
             } else if recurrent {
+                let MixerParameters::Recurrent(spec) = mixer else {
+                    unreachable!("declared recurrent invocation")
+                };
                 g.get_mut(&op).label =
                     "Gated delta recurrent mixer with sigmoid output gate".into();
                 g.get_mut(&op).mixer = Some(MixerAttributes {
                     mechanism: MixerMechanism::GatedDelta,
                     recurrent: true,
-                    convolution_width: Some(c.recurrent.kernel as usize),
+                    convolution_width: Some(spec.mixer.convolution.kernel_size as usize),
                 });
                 qwen4_state(g, &op, "Recurrent matrix and causal convolution history");
             } else {
+                let MixerParameters::Indexed { parameters, .. } = mixer else {
+                    unreachable!("declared indexed invocation")
+                };
+                let geometry = parameters.projection.geometry;
                 g.get_mut(&op).label = format!(
                     "QSA-selected original K/V; block ratio {}, selection budget {}",
                     c.attention.ratio, c.attention.budget
                 );
                 g.get_mut(&op).attention = Some(AttentionAttributes {
-                    head_sharing: Some(if c.attention.heads == c.attention.kv_heads {
+                    head_sharing: Some(if geometry.query_heads() == geometry.key_value_heads() {
                         HeadSharing::MultiHead
-                    } else if c.attention.kv_heads == 1 {
+                    } else if geometry.key_value_heads() == 1 {
                         HeadSharing::MultiQuery
                     } else {
                         HeadSharing::GroupedQuery
                     }),
-                    query_heads: Some(c.attention.heads as usize),
-                    key_value_heads: Some(c.attention.kv_heads as usize),
-                    key_head_dimension: Some(c.attention.head_dim as usize),
-                    value_head_dimension: Some(c.attention.head_dim as usize),
+                    query_heads: Some(geometry.query_heads() as usize),
+                    key_value_heads: Some(geometry.key_value_heads() as usize),
+                    key_head_dimension: Some(geometry.key_dimensions() as usize),
+                    value_head_dimension: Some(geometry.value_dimensions() as usize),
                     mechanism: Some(AttentionMechanism::Softmax),
                     causal: Some(true),
                     recurrent: Some(false),
@@ -2006,7 +2257,15 @@ fn qwen4_exp(g: &mut Builder, c: &crate::qwen4_exp::config::Config) {
         "output.collapse",
         K::Projector,
         None,
-        Some("model.hyper_connection_mixer"),
+        Some(
+            statics
+                .readout
+                .down
+                .weight
+                .group
+                .as_deref()
+                .expect("declared residual owner"),
+        ),
         Some(hidden),
     );
     g.get_mut("output.collapse").label =
@@ -2016,15 +2275,18 @@ fn qwen4_exp(g: &mut Builder, c: &crate::qwen4_exp::config::Config) {
         "output",
         K::OutputHead,
         None,
-        Some(if c.tied_embeddings {
-            "model.embed_tokens"
-        } else {
-            "lm_head"
-        }),
-        Some(c.vocabulary as usize),
+        Some(
+            output
+                .weight
+                .id
+                .as_str()
+                .strip_suffix(".weight")
+                .expect("declared vocabulary weight"),
+        ),
+        Some(output.output as usize),
     );
     g.edge("output.collapse", "output", E::Data);
-    let mut logits = axes(c.vocabulary as usize);
+    let mut logits = axes(output.output as usize);
     logits[2].name = "vocabulary".into();
     g.get_mut("output").output_axes = Some(logits.clone());
     g.observation(

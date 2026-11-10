@@ -1,5 +1,10 @@
 //! Prepared neutral construction for embedded prediction extensions.
 
+mod selection;
+pub use selection::SelectedPredictionParameters;
+
+mod bindings;
+use bindings::{PredictionBindingIndex, PreparedPredictionBindings};
 mod qwen4_exp;
 mod routed_preparation;
 pub(crate) use qwen4_exp::speculative_contract as qwen4_speculative_contract;
@@ -666,86 +671,20 @@ impl<M> PreparedPredictionUnit<M> {
     fn new<T: 'static>(
         source: M,
         local: M,
-        tasks: &[ReplicatedTextMaterializationTask],
+        bindings: PreparedPredictionBindings,
     ) -> Result<Self, eredu_core::artifact::ArtifactError>
     where
         M: Parameterized<T>,
     {
-        Self::new_with_role(source, local, tasks, PredictionModuleRole::Unit)
-    }
-
-    fn new_shared<T: 'static>(
-        source: M,
-        local: M,
-        tasks: &[ReplicatedTextMaterializationTask],
-    ) -> Result<Self, eredu_core::artifact::ArtifactError>
-    where
-        M: Parameterized<T>,
-    {
-        Self::new_with_role(source, local, tasks, PredictionModuleRole::Shared)
-    }
-
-    fn new_with_role<T: 'static>(
-        source: M,
-        local: M,
-        tasks: &[ReplicatedTextMaterializationTask],
-        role: PredictionModuleRole,
-    ) -> Result<Self, eredu_core::artifact::ArtifactError>
-    where
-        M: Parameterized<T>,
-    {
-        let names = eredu_nn::validate_parameter_topology(&source)
-            .map_err(|error| invalid(error.to_string()))?
-            .into_iter()
-            .map(|metadata| metadata.id.as_str().to_owned())
-            .collect::<std::collections::BTreeSet<_>>();
-        let all_task_names = tasks
-            .iter()
-            .map(ReplicatedTextMaterializationTask::name)
-            .collect::<Vec<_>>();
-        let tasks = tasks
-            .iter()
-            .filter(|task| names.contains(task.name()))
-            .cloned()
-            .collect::<Vec<_>>();
-        if let Some(owner) = tasks.iter().find_map(|task| task.auxiliary_residency()) {
-            if owner.shared() != (role == PredictionModuleRole::Shared)
-                || tasks
-                    .iter()
-                    .any(|task| task.auxiliary_residency() != Some(owner))
-            {
-                return Err(invalid("cold prediction residency grouping differs from the constructed physical module"));
-            }
-        }
-        let selected_names = tasks
-            .iter()
-            .flat_map(|task| {
-                std::iter::once(task.name()).chain(
-                    task.output_companions()
-                        .iter()
-                        .map(ReplicatedTextOutputCompanion::name),
-                )
-            })
-            .collect::<std::collections::BTreeSet<_>>();
-        let missing = names
-            .iter()
-            .filter(|name| !selected_names.contains(name.as_str()))
-            .collect::<Vec<_>>();
-        if !missing.is_empty() {
-            return Err(invalid(format!(
-                "prediction module parameters have no exact pre-resource materialization tasks: {missing:?}; local={:?}; all={all_task_names:?}",
-                tasks.iter().map(ReplicatedTextMaterializationTask::name).collect::<Vec<_>>()
-            )));
-        }
         let local_parameters = eredu_nn::validate_parameter_topology(&local)
             .map_err(|error| invalid(error.to_string()))?;
         Ok(Self {
             source,
             local,
-            tasks,
+            tasks: bindings.tasks,
             source_layout: None,
             residency: eredu_runtime::LayerWeightResidency::FullyResident,
-            role,
+            role: bindings.role,
             local_parameters,
         })
     }
@@ -3982,7 +3921,11 @@ pub fn prediction_extension_capability(
         SafetensorsModelConfig::DeepSeekV4(args) => crate::capability::deepseek_v4(args),
         SafetensorsModelConfig::Inkling(args) => crate::capability::inkling(args),
         SafetensorsModelConfig::QwenHybrid(args) => crate::capability::qwen_hybrid(args),
-        SafetensorsModelConfig::NemotronH(args) => crate::capability::nemotron_h(args),
+        SafetensorsModelConfig::NemotronH(_) => crate::capability::nemotron_h(
+            extension
+                .nemotron_declaration()
+                .ok_or_else(|| invalid("prediction extension has no Nemotron declaration"))?,
+        ),
         _ => return Err(invalid("prediction extension has no capability estimate")),
     }
     .map_err(|error| invalid(error.to_string()))
@@ -4008,58 +3951,9 @@ pub fn validate_partitioned_prediction_extension(
     validate_extension_contract(extension)
 }
 
-/// Prepares an extension for one already admitted partitioned rank.
-pub fn prepare_partitioned_prediction_extension<B, R, Q>(
-    extension: &PredictionExtensionPlan,
-    selected: &crate::partitioned_execution::SelectedPartitionedAdmission<R, Q>,
-    tasks: &[ReplicatedTextMaterializationTask],
-    source_context: &<B::Tensor as Tensor>::Context,
-    execution_context: &<B::Tensor as Tensor>::Context,
-) -> Result<PreparedPredictionExtension<B>, eredu_core::artifact::ArtifactError>
-where
-    B: BlockwiseAttentionBackend
-        + DistributedNeuralBackend
-        + GroupedNeuralBackend
-        + HyperNeuralBackend,
-{
-    prepare(
-        extension,
-        selected.requirements().topology(),
-        tasks,
-        source_context,
-        execution_context,
-    )
-}
-
-/// Prepares an extension for a single-rank replicated target.
-pub fn prepare_replicated_prediction_extension<B>(
-    extension: &PredictionExtensionPlan,
-    tasks: &[ReplicatedTextMaterializationTask],
-    source_context: &<B::Tensor as Tensor>::Context,
-    execution_context: &<B::Tensor as Tensor>::Context,
-) -> Result<PreparedPredictionExtension<B>, eredu_core::artifact::ArtifactError>
-where
-    B: BlockwiseAttentionBackend
-        + DistributedNeuralBackend
-        + GroupedNeuralBackend
-        + HyperNeuralBackend,
-{
-    let topology = ParallelTopology::new(1, 1, 1, 1)
-        .and_then(|topology| ParallelRankTopology::new(topology, 0))
-        .map_err(|error| invalid(error.to_string()))?;
-    prepare(
-        extension,
-        topology,
-        tasks,
-        source_context,
-        execution_context,
-    )
-}
-
 pub(crate) fn prepare<B>(
-    extension: &PredictionExtensionPlan,
+    selected: &SelectedPredictionParameters,
     topology: ParallelRankTopology,
-    tasks: &[ReplicatedTextMaterializationTask],
     source_context: &<B::Tensor as Tensor>::Context,
     execution_context: &<B::Tensor as Tensor>::Context,
 ) -> Result<PreparedPredictionExtension<B>, eredu_core::artifact::ArtifactError>
@@ -4069,29 +3963,23 @@ where
         + GroupedNeuralBackend
         + HyperNeuralBackend,
 {
+    let extension = &selected.extension;
+    let tasks = selected.tasks();
     let tensor_rank = prediction_topology(extension, topology)?;
-    match extension.complete_architecture().model() {
+    if tensor_rank != selected.rank {
+        return Err(invalid(
+            "prediction construction rank differs from retained placement",
+        ));
+    }
+    let definition = selected.definition().clone();
+    let parameters = definition.parameters().clone();
+    let layout = selected.layout().as_ref().clone();
+    let mut bindings = PredictionBindingIndex::for_extension(extension, tasks)?;
+    let prepared = match extension.complete_architecture().model() {
         SafetensorsModelConfig::DeepSeekV3(args) => {
-            let mut formats = args.linear_formats.clone();
-            formats.extend(
-                tasks
-                    .iter()
-                    .filter(|task| {
-                        matches!(
-                            task.role(),
-                            eredu_runtime::ReplicatedTextParameterRole::LinearWeight
-                        )
-                    })
-                    .map(|task| (task.name().to_owned(), task.executable())),
-            );
-            let target_args =
-                crate::deepseek::v3_with_checkpoint_formats(args, formats).map_err(invalid)?;
-            let definition =
-                crate::deepseek::v3::project_parameters(&target_args, extension.definition())
-                    .map_err(|error| invalid(error.to_string()))?;
-            let parameters = definition.parameters().clone();
-            let layout = eredu_runtime::derive_partitioned_local_layout(&parameters, tensor_rank)
-                .map_err(invalid)?;
+            let SafetensorsModelConfig::DeepSeekV3(target_args) = &selected.model else {
+                return Err(invalid("prediction source and executable families differ"));
+            };
             let geometry = crate::deepseek::parallel::v3_local_geometry(&target_args, &layout)
                 .map_err(|error| invalid(error.to_string()))?;
             let source_layout = eredu_runtime::prepare_transform_source_layout(
@@ -4126,16 +4014,14 @@ where
                 .slice(target_layers..target_layers + extension.depth())
                 .map_err(|error| invalid(error.to_string()))?;
             let local = crate::deepseek::v3::V3UnitFactory::from_definition(
-                target_args,
+                target_args.clone(),
                 definition,
                 Some(geometry),
             )
             .map_err(|error| invalid(error.to_string()))?;
             let descriptor =
-                crate::processor_plan::ArtifactArchitecturePlan::from_safetensors_architecture(
-                    extension.complete_architecture().clone(),
-                )
-                .architecture_descriptor();
+                crate::processor_plan::ArtifactArchitecturePlan::prediction_source(extension)
+                    .architecture_descriptor();
             let mut units = Vec::with_capacity(extension.depth());
             for depth in 0..extension.depth() {
                 let source_unit = source
@@ -4170,8 +4056,12 @@ where
                     }
                 }
                 units.push(
-                    PreparedPredictionUnit::new(source_unit, local_unit, tasks)?
-                        .with_source_layout(source_layout.clone()),
+                    PreparedPredictionUnit::new(
+                        source_unit,
+                        local_unit,
+                        bindings.take(Some(depth))?,
+                    )?
+                    .with_source_layout(source_layout.clone()),
                 );
             }
             Ok(PreparedPredictionExtension::DeepSeekV3 {
@@ -4182,26 +4072,9 @@ where
             })
         }
         SafetensorsModelConfig::DeepSeekV4(args) => {
-            let mut formats = args.linear_formats.clone();
-            formats.extend(
-                tasks
-                    .iter()
-                    .filter(|task| {
-                        matches!(
-                            task.role(),
-                            eredu_runtime::ReplicatedTextParameterRole::LinearWeight
-                        )
-                    })
-                    .map(|task| (task.name().to_owned(), task.executable())),
-            );
-            let target_args =
-                crate::deepseek::v4_with_checkpoint_formats(args, formats).map_err(invalid)?;
-            let definition =
-                crate::deepseek::v4::project_parameters(&target_args, extension.definition())
-                    .map_err(|error| invalid(error.to_string()))?;
-            let parameters = definition.parameters().clone();
-            let layout = eredu_runtime::derive_partitioned_local_layout(&parameters, tensor_rank)
-                .map_err(invalid)?;
+            let SafetensorsModelConfig::DeepSeekV4(target_args) = &selected.model else {
+                return Err(invalid("prediction source and executable families differ"));
+            };
             let geometry = crate::deepseek::parallel::v4_local_geometry(&target_args, &layout)
                 .map_err(|error| invalid(error.to_string()))?;
             let state_layout = crate::deepseek::v4::state_layout(geometry.args())
@@ -4232,7 +4105,7 @@ where
             )
             .map_err(|error| invalid(error.to_string()))?;
             let local = crate::deepseek::v4::V4UnitFactory::from_definition(
-                target_args,
+                target_args.clone(),
                 definition,
                 Some(geometry),
             )
@@ -4240,10 +4113,8 @@ where
             let target = usize::try_from(args.num_hidden_layers)
                 .map_err(|_| invalid("DeepSeek-V4 target count exceeds usize"))?;
             let descriptor =
-                crate::processor_plan::ArtifactArchitecturePlan::from_safetensors_architecture(
-                    extension.complete_architecture().clone(),
-                )
-                .architecture_descriptor();
+                crate::processor_plan::ArtifactArchitecturePlan::prediction_source(extension)
+                    .architecture_descriptor();
             let mut units = Vec::with_capacity(extension.depth());
             let mut state = Vec::with_capacity(extension.depth());
             for depth in 0..extension.depth() {
@@ -4265,7 +4136,7 @@ where
                     }
                     crate::deepseek::v4::Unit::Dspark(block) => &mut block.feed_forward,
                     crate::deepseek::v4::Unit::Target(_) => {
-                        return Err(invalid("prediction construction returned a target unit"))
+                        return Err(invalid("prediction construction returned a target unit"));
                     }
                 };
                 {
@@ -4296,8 +4167,12 @@ where
                     );
                 }
                 units.push(
-                    PreparedPredictionUnit::new(source_unit, local_unit, tasks)?
-                        .with_source_layout(source_layout.clone()),
+                    PreparedPredictionUnit::new(
+                        source_unit,
+                        local_unit,
+                        bindings.take(Some(depth))?,
+                    )?
+                    .with_source_layout(source_layout.clone()),
                 );
                 state.push((ordinal, policy));
             }
@@ -4323,10 +4198,10 @@ where
                     parameters: std::sync::Arc::new(parameters),
                     extension: PreparedDsparkPredictionExtension {
                         strategy,
-                        static_modules: PreparedPredictionUnit::new_shared(
+                        static_modules: PreparedPredictionUnit::new(
                             source_static,
                             local_static,
-                            tasks,
+                            bindings.take(None)?,
                         )?
                         .with_source_layout(source_layout.clone()),
                     },
@@ -4345,27 +4220,9 @@ where
             }
         }
         SafetensorsModelConfig::Inkling(args) => {
-            let mut formats = args
-                .text_config
-                .quantized_weight_configs
-                .clone()
-                .unwrap_or_default();
-            for task in tasks {
-                match task.executable().weight_quantization() {
-                    Some(format) => {
-                        formats.insert(task.name().to_owned(), format);
-                    }
-                    None => {
-                        formats.remove(task.name());
-                    }
-                }
-            }
-            let target_args =
-                crate::inkling::with_checkpoint_formats(args, formats).map_err(invalid)?;
-            let parameters = crate::inkling::parameter_description(&target_args)
-                .map_err(|error| invalid(error.to_string()))?;
-            let layout = eredu_runtime::derive_partitioned_local_layout(&parameters, tensor_rank)
-                .map_err(invalid)?;
+            let SafetensorsModelConfig::Inkling(target_args) = &selected.model else {
+                return Err(invalid("prediction source and executable families differ"));
+            };
             let source = crate::inkling::MtpModel::<B>::new(args, source_context)
                 .map_err(|error| invalid(error.to_string()))?
                 .ok_or_else(|| invalid("Inkling prediction extension has no configured depth"))?;
@@ -4376,23 +4233,26 @@ where
                 .map_err(|error| invalid(error.to_string()))?
                 .ok_or_else(|| invalid("Inkling prediction extension has no state layout"))?;
             let shared = match (source.chain_norm, local.chain_norm) {
-                (Some(source), Some(local)) => Some(PreparedPredictionUnit::new_shared(
+                (Some(source), Some(local)) => Some(PreparedPredictionUnit::new(
                     crate::inkling::MtpShared { chain_norm: source },
                     crate::inkling::MtpShared { chain_norm: local },
-                    tasks,
+                    bindings.take(None)?,
                 )?),
                 (None, None) => None,
                 _ => {
                     return Err(invalid(
                         "Inkling source and executable chain norms disagree",
-                    ))
+                    ));
                 }
             };
             let units = source
                 .layers
                 .into_iter()
                 .zip(local.layers)
-                .map(|(source, local)| PreparedPredictionUnit::new(source, local, tasks))
+                .enumerate()
+                .map(|(depth, (source, local))| {
+                    PreparedPredictionUnit::new(source, local, bindings.take(Some(depth))?)
+                })
                 .collect::<Result<_, _>>()?;
             Ok(PreparedPredictionExtension::Inkling {
                 layout: std::sync::Arc::new(layout),
@@ -4403,47 +4263,76 @@ where
             })
         }
         SafetensorsModelConfig::QwenHybrid(args) => {
-            // Prediction units carry their own resident expert banks, populated
-            // by the same exact parameter tasks as their attention and shared
-            // projections. Execution uses ResidentExpertProvider, independently
-            // of the target's expert residency policy.
-            let description = if args.vision.is_some() {
-                crate::qwen::hybrid::conditional_parameter_description(args)
-            } else {
-                crate::qwen::hybrid::parameter_description(&args.text)
-                    .map_err(eredu_nn::Error::backend)
-            }
-            .map_err(|error| invalid(error.to_string()))?;
-            let layout = eredu_runtime::derive_partitioned_local_layout(&description, tensor_rank)
-                .map_err(invalid)?;
-            let geometry = crate::qwen::hybrid::local_geometry(&args.text, &layout)
+            let SafetensorsModelConfig::QwenHybrid(target_args) = &selected.model else {
+                return Err(invalid("prediction source and executable families differ"));
+            };
+            let description = parameters.clone();
+            let geometry = crate::qwen::hybrid::local_geometry(&target_args.text, &layout)
+                .map_err(|error| invalid(error.to_string()))?;
+            let source_layout = eredu_runtime::prepare_transform_source_layout(
+                tasks.iter().map(|task| task.lowering()),
+                || {
+                    eredu_runtime::derive_partitioned_transform_source_layout(
+                        extension.definition().parameters(),
+                        &description,
+                        tensor_rank,
+                    )
+                    .map_err(|error| invalid(error.to_string()))
+                },
+            )?;
+            let source_geometry = source_layout
+                .as_ref()
+                .map(|layout| crate::qwen::hybrid::local_geometry(&args.text, layout))
+                .transpose()
                 .map_err(|error| invalid(error.to_string()))?;
             let target = usize::try_from(args.text.num_hidden_layers)
                 .map_err(|_| invalid("Qwen hybrid target count exceeds usize"))?;
             let descriptor =
-                crate::processor_plan::ArtifactArchitecturePlan::from_safetensors_architecture(
-                    extension.complete_architecture().clone(),
-                )
-                .architecture_descriptor();
+                crate::processor_plan::ArtifactArchitecturePlan::prediction_source(extension)
+                    .architecture_descriptor();
+            let unit_parameters = (0..extension.depth())
+                .map(|depth| {
+                    let source_config = source_geometry
+                        .as_ref()
+                        .and_then(|g| g.prediction(depth))
+                        .unwrap_or(&args.text);
+                    let local_config = geometry
+                        .prediction(depth)
+                        .ok_or_else(|| invalid("Qwen hybrid prediction has no local geometry"))?;
+                    Ok((
+                        crate::qwen::hybrid::BlockParameters::prediction(source_config, depth)
+                            .map_err(|e| invalid(e.to_string()))?,
+                        crate::qwen::hybrid::BlockParameters::prediction(local_config, depth)
+                            .map_err(|e| invalid(e.to_string()))?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, eredu_core::artifact::ArtifactError>>()?;
+            let source_shared = args
+                .text
+                .prediction_shared()
+                .cloned()
+                .ok_or_else(|| invalid("undeclared prediction shared scope"))?;
+            let local_shared = target_args
+                .text
+                .prediction_shared()
+                .cloned()
+                .ok_or_else(|| invalid("undeclared prediction shared scope"))?;
             let mut units = Vec::with_capacity(extension.depth());
-            for depth in 0..extension.depth() {
-                let source = crate::qwen::hybrid::PredictionUnit::<B>::new(
-                    &args.text,
-                    depth,
+            for (depth, (source_parameters, local_parameters)) in
+                unit_parameters.into_iter().enumerate()
+            {
+                let source = crate::qwen::hybrid::PredictionUnit::<B>::from_parameters(
+                    source_parameters,
+                    target + depth,
                     source_context,
                 )
-                .map_err(|error| invalid(error.to_string()))?;
-                let local_config = geometry.prediction(depth).ok_or_else(|| {
-                    invalid(format!(
-                        "Qwen hybrid prediction depth {depth} has no local geometry"
-                    ))
-                })?;
-                let mut local = crate::qwen::hybrid::PredictionUnit::<B>::new(
-                    local_config,
-                    depth,
+                .map_err(|e| invalid(e.to_string()))?;
+                let mut local = crate::qwen::hybrid::PredictionUnit::<B>::from_parameters(
+                    local_parameters,
+                    target + depth,
                     execution_context,
                 )
-                .map_err(|error| invalid(error.to_string()))?;
+                .map_err(|e| invalid(e.to_string()))?;
                 if let crate::qwen::hybrid::FeedForward::Routed(moe) = &mut local.block.feed_forward
                 {
                     let scope = descriptor.component_scopes.iter().find(|scope| matches!(
@@ -4465,19 +4354,29 @@ where
                         topology.topology().world_size() > 1,
                     );
                 }
-                units.push(PreparedPredictionUnit::new(source, local, tasks)?);
+                units.push(
+                    PreparedPredictionUnit::new(source, local, bindings.take(Some(depth))?)?
+                        .with_source_layout(source_layout.clone()),
+                );
             }
             let state = geometry
                 .state_layout()
                 .slice(target..target + extension.depth())
                 .map_err(|error| invalid(error.to_string()))?;
-            let shared = PreparedPredictionUnit::new_shared(
-                crate::qwen::hybrid::PredictionShared::<B>::new(&args.text, source_context)
-                    .map_err(|error| invalid(error.to_string()))?,
-                crate::qwen::hybrid::PredictionShared::<B>::new(&args.text, execution_context)
-                    .map_err(|error| invalid(error.to_string()))?,
-                tasks,
-            )?;
+            let shared = PreparedPredictionUnit::new(
+                crate::qwen::hybrid::PredictionShared::<B>::from_parameters(
+                    source_shared,
+                    source_context,
+                )
+                .map_err(|error| invalid(error.to_string()))?,
+                crate::qwen::hybrid::PredictionShared::<B>::from_parameters(
+                    local_shared,
+                    execution_context,
+                )
+                .map_err(|error| invalid(error.to_string()))?,
+                bindings.take(None)?,
+            )?
+            .with_source_layout(source_layout.clone());
             Ok(PreparedPredictionExtension::QwenHybrid {
                 shared,
                 layout: std::sync::Arc::new(layout),
@@ -4486,35 +4385,23 @@ where
                 state,
             })
         }
-        SafetensorsModelConfig::NemotronH(args) => {
-            let source_description = crate::nemotron_h::parameter_description(args)
-                .map_err(|error| invalid(error.to_string()))?;
-            // Auxiliary tasks can lower prediction matrices independently of the
-            // target. Preserve source formats elsewhere and construct executable
-            // modules from the exact selected formats, including companions.
-            let mut formats = source_description
-                .groups()
-                .iter()
-                .flat_map(|group| group.group().members())
-                .filter_map(|member| {
-                    args.weight_quantization_for(member.target())
-                        .map(|format| (member.target().to_owned(), format))
-                })
-                .collect::<std::collections::HashMap<_, _>>();
-            for task in tasks {
-                if let Some(format) = task.executable().weight_quantization() {
-                    formats.insert(task.name().to_owned(), format);
-                } else {
-                    formats.remove(task.name());
-                }
-            }
-            let target_args =
-                crate::nemotron_h::with_checkpoint_formats(args, formats).map_err(invalid)?;
-            let description = crate::nemotron_h::parameter_description(&target_args)
-                .map_err(|error| invalid(error.to_string()))?;
-            let layout = eredu_runtime::derive_partitioned_local_layout(&description, tensor_rank)
-                .map_err(invalid)?;
-            let geometry = crate::nemotron_h::local_geometry(&target_args, &layout)
+        SafetensorsModelConfig::NemotronH(_) => {
+            let SafetensorsModelConfig::NemotronH(_) = &selected.model else {
+                return Err(invalid("prediction source and executable families differ"));
+            };
+            let source_declaration = extension
+                .nemotron_declaration()
+                .ok_or_else(|| invalid("Nemotron prediction has no retained typed scope"))?;
+            let crate::configuration::PredictionScopes::Nemotron(local_declaration) =
+                &selected.scopes
+            else {
+                return Err(invalid("selected Nemotron prediction has no typed scope"));
+            };
+            let args = source_declaration.args();
+            let target_args = local_declaration.args();
+            let source_description = extension.definition().parameters();
+            let description = parameters.clone();
+            let geometry = crate::nemotron_h::local_geometry(local_declaration, &layout)
                 .map_err(|error| invalid(error.to_string()))?;
             let source_layout = eredu_runtime::prepare_transform_source_layout(
                 tasks.iter().map(|task| task.lowering()),
@@ -4529,41 +4416,50 @@ where
             )?;
             let source_geometry = source_layout
                 .as_ref()
-                .map(|layout| crate::nemotron_h::local_geometry(args, layout))
+                .map(|layout| crate::nemotron_h::local_geometry(source_declaration, layout))
                 .transpose()
                 .map_err(|error| invalid(error.to_string()))?;
-            let policies = args
-                .mtp_policies()
-                .map_err(|error| invalid(error.to_string()))?;
-            let pattern = policies
+            let pattern = source_declaration
+                .predictions
                 .len()
                 .checked_div(extension.depth())
                 .filter(|pattern| *pattern > 0)
                 .ok_or_else(|| invalid("Nemotron-H MTP pattern is empty"))?;
+            if source_declaration.predictions.len() != local_declaration.predictions.len()
+                || source_declaration
+                    .predictions
+                    .iter()
+                    .zip(&local_declaration.predictions)
+                    .any(|(source, local)| source.policy != local.policy)
+            {
+                return Err(invalid(
+                    "Nemotron-H prediction source and local invocations differ",
+                ));
+            }
             let descriptor =
-                crate::processor_plan::ArtifactArchitecturePlan::from_safetensors_architecture(
-                    extension.complete_architecture().clone(),
-                )
-                .architecture_descriptor();
+                crate::processor_plan::ArtifactArchitecturePlan::prediction_source(extension)
+                    .architecture_descriptor();
             let mut groups = Vec::with_capacity(extension.depth());
             for prediction in 0..extension.depth() {
                 let mut units = Vec::with_capacity(pattern);
                 for relative in 0..pattern {
                     let physical = prediction * pattern + relative;
-                    let source = match &source_geometry {
-                        Some(geometry) => {
-                            let geometry = geometry.prediction_unit(physical).copied()
-                                .ok_or_else(|| invalid(format!(
+                    let source_unit_geometry = source_geometry
+                        .as_ref()
+                        .map(|geometry| {
+                            geometry.prediction_unit(physical).copied().ok_or_else(|| {
+                                invalid(format!(
                                     "Nemotron-H prediction source unit {physical} has no local geometry"
-                                )))?;
-                            crate::nemotron_h::PredictionUnit::<B>::new_with_geometry(
-                                args, prediction, relative, policies[physical], geometry, source_context,
-                            )
-                        }
-                        None => crate::nemotron_h::PredictionUnit::<B>::new(
-                            args, prediction, relative, source_context,
-                        ),
-                    }
+                                ))
+                            })
+                        })
+                        .transpose()?;
+                    let source = crate::nemotron_h::PredictionUnit::<B>::from_parameters(
+                        args,
+                        source_declaration.predictions[physical].clone(),
+                        source_unit_geometry,
+                        source_context,
+                    )
                     .map_err(|error| invalid(error.to_string()))?;
                     let local_geometry =
                         geometry.prediction_unit(physical).copied().ok_or_else(|| {
@@ -4571,12 +4467,10 @@ where
                                 "Nemotron-H prediction unit {physical} has no local geometry"
                             ))
                         })?;
-                    let mut local = crate::nemotron_h::PredictionUnit::<B>::new_with_geometry(
-                        &target_args,
-                        prediction,
-                        relative,
-                        policies[physical],
-                        local_geometry,
+                    let mut local = crate::nemotron_h::PredictionUnit::<B>::from_parameters(
+                        target_args,
+                        local_declaration.predictions[physical].clone(),
+                        Some(local_geometry),
                         execution_context,
                     )
                     .map_err(|error| invalid(error.to_string()))?;
@@ -4606,7 +4500,7 @@ where
                         );
                     }
                     units.push(
-                        PreparedPredictionUnit::new(source, local, tasks)?
+                        PreparedPredictionUnit::new(source, local, bindings.take(Some(physical))?)?
                             .with_source_layout(source_layout.clone()),
                     );
                 }
@@ -4616,7 +4510,7 @@ where
                 .map_err(|_| invalid("Nemotron-H target depth exceeds usize"))?;
             let state = geometry
                 .state_layout()
-                .slice(target..target + policies.len())
+                .slice(target..target + source_declaration.predictions.len())
                 .map_err(|error| invalid(error.to_string()))?;
             Ok(PreparedPredictionExtension::NemotronH {
                 layout: std::sync::Arc::new(layout),
@@ -4628,5 +4522,7 @@ where
         _ => Err(invalid(
             "selected prediction extension has no neutral preparation",
         )),
-    }
+    }?;
+    bindings.finish()?;
+    Ok(prepared)
 }

@@ -2,7 +2,8 @@
 
 use eredu_runtime::{MemberSharding, ParallelPlanError, ParameterGroupSpec, ParameterRole};
 
-use super::{specs::rooted, VisionConfig};
+use super::specs::rooted;
+use eredu_nn::LogicalParameterRole;
 
 fn tensor<'a>(
     layout: &'a eredu_runtime::LocalModelLayout,
@@ -15,119 +16,79 @@ fn tensor<'a>(
 
 /// Rank-local head and MLP widths resolved from one vision block layout.
 pub fn local_block_geometry(
-    config: &VisionConfig,
-    root: &str,
+    declaration: &super::Declaration,
     layer: usize,
     layout: &eredu_runtime::LocalModelLayout,
 ) -> Result<(i32, i32), ParallelPlanError> {
-    let prefix = rooted(root, &format!("blocks.{layer}"));
-    let qkv = tensor(layout, &format!("{prefix}.attn.qkv.weight"))?;
-    let fc1 = tensor(layout, &format!("{prefix}.mlp.linear_fc1.weight"))?;
+    let spec = declaration.block(layer).map_err(invalid)?.clone();
+    let qkv = tensor(layout, spec.attention.qkv.weight.id.as_str())?;
+    let fc1 = tensor(layout, spec.feed_forward.up.weight.id.as_str())?;
     let qkv_rows = i32::try_from(qkv.local_shape()[0])
         .map_err(|_| ParallelPlanError::InvalidTensor("vision QKV width exceeds i32".into()))?;
     let intermediate = i32::try_from(fc1.local_shape()[0])
         .map_err(|_| ParallelPlanError::InvalidTensor("vision MLP width exceeds i32".into()))?;
-    if config.num_heads <= 0 {
-        return Err(ParallelPlanError::InvalidTensor(
-            "vision head count must be positive".into(),
-        ));
-    }
-    let head_dim = config.hidden_size / config.num_heads;
-    if qkv_rows <= 0 || intermediate <= 0 || head_dim <= 0 || qkv_rows % (3 * head_dim) != 0 {
+    let stride = spec.attention.layout.output_width() / spec.attention.geometry.query_heads();
+    if qkv_rows <= 0 || intermediate <= 0 || qkv_rows % stride != 0 {
         return Err(ParallelPlanError::InvalidTensor(
             "local vision geometry is zero or QKV splits a head".into(),
         ));
     }
-    Ok((qkv_rows / (3 * head_dim), intermediate))
+    Ok((qkv_rows / stride, intermediate))
 }
 
-#[derive(Default)]
-struct Declaration {
-    formats: std::collections::BTreeMap<String, eredu_nn::LinearFormatSpec>,
+fn norm(
+    prefix: &str,
+    spec: &eredu_nn::LayerNormalizationConstructionSpec,
+) -> Result<ParameterGroupSpec, ParallelPlanError> {
+    eredu_runtime::logical_parameter_group(prefix, ParameterRole::Replicated, None, spec, |_| {
+        MemberSharding::Replicated
+    })
 }
-impl Declaration {
-    fn linear(
-        &mut self,
-        spec: eredu_nn::LinearSpec,
-        weight: MemberSharding,
-        bias: MemberSharding,
-    ) -> Vec<eredu_runtime::ParameterMemberSpec> {
-        self.formats
-            .insert(spec.weight.id.as_str().into(), spec.format);
-        let mut members = vec![eredu_runtime::ParameterMemberSpec::new(
-            spec.weight.id.as_str(),
-            vec![spec.output as usize, spec.input as usize],
-            weight,
-        )];
-        if let Some(parameter) = spec.bias {
-            members.push(eredu_runtime::ParameterMemberSpec::new(
-                parameter.id.as_str(),
-                vec![spec.output as usize],
-                bias,
-            ));
+
+/// The paired projections share a semantic partition domain. Their identities,
+/// geometry and storage extensions remain with the neural construction specs.
+fn projections(
+    name: String,
+    role: ParameterRole,
+    units: usize,
+    specs: [eredu_nn::LinearSpec; 2],
+    column_weight: MemberSharding,
+    column_bias: MemberSharding,
+) -> Result<ParameterGroupSpec, ParallelPlanError> {
+    let column = &specs[0];
+    eredu_runtime::logical_parameter_group(name, role, Some(units), specs.as_slice(), |d| {
+        if d.parameter.id == column.weight.id {
+            column_weight.clone()
+        } else if column
+            .bias
+            .as_ref()
+            .is_some_and(|bias| bias.id == d.parameter.id)
+        {
+            column_bias.clone()
+        } else if d.role == LogicalParameterRole::LinearWeight {
+            MemberSharding::Partitioned { axis: 1 }
+        } else {
+            MemberSharding::Replicated
         }
-        members
-    }
-    fn norm(&self, prefix: &str, width: i32) -> Result<ParameterGroupSpec, ParallelPlanError> {
-        let spec = super::specs::norm_spec(prefix, width).map_err(invalid)?;
-        ParameterGroupSpec::new(
-            prefix,
-            ParameterRole::Replicated,
-            [spec.weight, spec.bias].into_iter().map(|parameter| {
-                eredu_runtime::ParameterMemberSpec::new(
-                    parameter.id.as_str(),
-                    vec![spec.dimensions as usize],
-                    MemberSharding::Replicated,
-                )
-            }),
-        )
-    }
-    fn projections(
-        &mut self,
-        name: String,
-        role: ParameterRole,
-        units: usize,
-        specs: [eredu_nn::LinearSpec; 2],
-    ) -> Result<ParameterGroupSpec, ParallelPlanError> {
-        let [column, row] = specs;
-        let mut members = self.linear(
-            column,
+    })
+}
+fn merger(
+    declaration: &super::Declaration,
+    index: usize,
+    prefix: &str,
+) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
+    let (normalization, [up, down]) = declaration.merger(index).map_err(invalid)?;
+    Ok(vec![
+        norm(&format!("{prefix}.norm"), normalization)?,
+        projections(
+            format!("{prefix}.intermediate"),
+            ParameterRole::FeedForwardIntermediate,
+            up.output as usize,
+            [up.clone(), down.clone()],
             MemberSharding::Partitioned { axis: 0 },
             MemberSharding::Partitioned { axis: 0 },
-        );
-        members.extend(self.linear(
-            row,
-            MemberSharding::Partitioned { axis: 1 },
-            MemberSharding::Replicated,
-        ));
-        ParameterGroupSpec::partitioned(name, role, units, members)
-    }
-    fn merger(
-        &mut self,
-        config: &VisionConfig,
-        prefix: &str,
-        postshuffle: bool,
-    ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-        let (_, width, norm) =
-            super::specs::merger_geometry(config, postshuffle).map_err(invalid)?;
-        Ok(vec![
-            self.norm(&format!("{prefix}.norm"), norm)?,
-            self.projections(
-                format!("{prefix}.intermediate"),
-                ParameterRole::FeedForwardIntermediate,
-                width as usize,
-                super::specs::merger_projection_specs(config, prefix, width).map_err(invalid)?,
-            )?,
-        ])
-    }
-    fn expand(
-        &self,
-        groups: Vec<ParameterGroupSpec>,
-    ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-        eredu_runtime::expand_linear_format_parameter_groups(groups, |member| {
-            Ok(self.formats.get(member.target()).cloned())
-        })
-    }
+        )?,
+    ])
 }
 fn invalid(error: impl std::fmt::Display) -> ParallelPlanError {
     ParallelPlanError::InvalidGroup(error.to_string())
@@ -135,62 +96,44 @@ fn invalid(error: impl std::fmt::Display) -> ParallelPlanError {
 
 /// Declares one canonical vision block without native resources.
 pub fn block_parallel_parameter_groups(
-    config: &VisionConfig,
-    root: &str,
+    declaration: &super::Declaration,
     layer: usize,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    config.validate().map_err(invalid)?;
-    if config.layer_policy(layer).is_none() {
-        return Err(invalid(format!("vision has no block {layer}")));
-    }
-    let prefix = rooted(root, &format!("blocks.{layer}"));
-    let hidden = config.hidden_size as usize;
+    let prefix = rooted(declaration.root(), &format!("blocks.{layer}"));
+    let spec = declaration.block(layer).map_err(invalid)?.clone();
     let segments = MemberSharding::PartitionedSegments {
         axis: 0,
-        segments: vec![0..hidden, hidden..2 * hidden, 2 * hidden..3 * hidden],
+        segments: spec.attention.segments(),
     };
-    let mut declaration = Declaration::default();
-    let [qkv, output, fc1, fc2] = super::specs::block_projection_specs(
-        config,
-        root,
-        layer,
-        config.num_heads,
-        config.intermediate_size,
-    )
-    .map_err(invalid)?;
-    let mut attention = declaration.linear(qkv, segments.clone(), segments);
-    attention.extend(declaration.linear(
-        output,
-        MemberSharding::Partitioned { axis: 1 },
-        MemberSharding::Replicated,
-    ));
-    let groups = vec![
-        declaration.norm(&format!("{prefix}.norm1"), config.hidden_size)?,
-        declaration.norm(&format!("{prefix}.norm2"), config.hidden_size)?,
-        ParameterGroupSpec::partitioned(
+    let heads = spec.attention.geometry.query_heads() as usize;
+    Ok(vec![
+        norm(&format!("{prefix}.norm1"), &spec.norms[0])?,
+        norm(&format!("{prefix}.norm2"), &spec.norms[1])?,
+        projections(
             format!("{prefix}.attention.heads"),
             ParameterRole::AttentionHeads,
-            config.num_heads as usize,
-            attention,
+            heads,
+            [spec.attention.qkv, spec.attention.output],
+            segments.clone(),
+            segments,
         )?,
-        declaration.projections(
+        projections(
             format!("{prefix}.mlp.intermediate"),
             ParameterRole::FeedForwardIntermediate,
-            config.intermediate_size as usize,
-            [fc1, fc2],
+            spec.feed_forward.up.output as usize,
+            [spec.feed_forward.up, spec.feed_forward.down],
+            MemberSharding::Partitioned { axis: 0 },
+            MemberSharding::Partitioned { axis: 0 },
         )?,
-    ];
-    declaration.expand(groups)
+    ])
 }
 
 /// Projects replicated patch/position storage and TP merger channels.
 pub fn static_parallel_parameter_groups(
-    config: &VisionConfig,
-    root: &str,
+    declaration: &super::Declaration,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
     Ok(owned_static_parallel_parameter_groups(
-        config,
-        root,
+        declaration,
         eredu_runtime::ExecutionGroupId::new("vision").map_err(invalid)?,
         "vision",
     )?
@@ -202,12 +145,11 @@ pub fn static_parallel_parameter_groups(
 /// Declares pinned vision storage at its patch, final projection and DeepStack consumers.
 /// Shared storage has one physical copy on each partition containing a consumer.
 pub fn owned_static_parallel_parameter_groups(
-    config: &VisionConfig,
-    root: &str,
+    declaration: &super::Declaration,
     execution_group: eredu_runtime::ExecutionGroupId,
     role: &str,
 ) -> Result<Vec<eredu_runtime::OwnedParameterGroupSpec>, ParallelPlanError> {
-    Ok(static_resource_groups(config, root, execution_group, role)?
+    Ok(static_resource_groups(declaration, execution_group, role)?
         .into_iter()
         .map(|(_, group)| group)
         .collect())
@@ -223,20 +165,17 @@ enum StaticResource {
 /// Exact cold selection of vision ingress and merger banks from canonical bindings.
 #[derive(Debug, Clone)]
 pub struct VisionStaticSelection {
-    pub(super) config: VisionConfig,
-    pub(super) root: String,
+    pub(super) declaration: std::sync::Arc<super::Declaration>,
     pub(super) ingress: bool,
     pub(super) merger: bool,
     pub(super) deepstack: Vec<bool>,
 }
 impl VisionStaticSelection {
     /// Selects all pinned resources for complete-tower construction.
-    pub fn all(config: VisionConfig, root: &str) -> Result<Self, ParallelPlanError> {
-        config.validate().map_err(invalid)?;
-        let deepstack = vec![true; config.deepstack_layer_count()];
+    pub fn all(declaration: std::sync::Arc<super::Declaration>) -> Result<Self, ParallelPlanError> {
+        let deepstack = vec![true; declaration.config().deepstack_layer_count()];
         Ok(Self {
-            config,
-            root: root.to_owned(),
+            declaration,
             ingress: true,
             merger: true,
             deepstack,
@@ -245,34 +184,38 @@ impl VisionStaticSelection {
 
     /// Complete-model merger widths from the same checked native construction geometry.
     pub fn unsharded_merger_intermediates(&self) -> Result<Vec<i32>, ParallelPlanError> {
-        let (_, width, _) = super::specs::merger_geometry(&self.config, false).map_err(invalid)?;
-        Ok(vec![width; self.config.deepstack_layer_count() + 1])
+        Ok((0..=self.declaration.config().deepstack_layer_count())
+            .map(|index| {
+                self.declaration
+                    .merger(index)
+                    .map(|(_, [up, _])| up.output)
+                    .map_err(invalid)
+            })
+            .collect::<Result<_, _>>()?)
     }
 
     /// Resolves complete native resources from selected canonical parameter groups.
     /// Encoded companions and normalization/projection groups remain indivisible.
     pub fn from_parameter_bindings(
-        config: VisionConfig,
-        root: &str,
+        declaration: std::sync::Arc<super::Declaration>,
         execution_group: eredu_runtime::ExecutionGroupId,
         role: &str,
         bindings: &[eredu_runtime::OwnedParameterGroupSpec],
     ) -> Result<Self, ParallelPlanError> {
-        let declared = static_resource_groups(&config, root, execution_group, role)?;
+        let declared = static_resource_groups(&declaration, execution_group, role)?;
         let resources = eredu_runtime::select_complete_pinned_resources(
-            &format!("vision {root:?}"),
+            &format!("vision {:?}", declaration.root()),
             declared.iter().map(|(resource, group)| (*resource, group)),
             bindings,
             &[role],
         )
         .map_err(|error| invalid(error.to_string()))?;
         let owns = |resource| resources.contains(&resource);
-        let deepstack = (0..config.deepstack_layer_count())
+        let deepstack = (0..declaration.config().deepstack_layer_count())
             .map(|bank| owns(StaticResource::DeepStack(bank)))
             .collect();
         Ok(Self {
-            config,
-            root: root.to_owned(),
+            declaration,
             ingress: owns(StaticResource::Ingress),
             merger: owns(StaticResource::Merger),
             deepstack,
@@ -281,41 +224,30 @@ impl VisionStaticSelection {
 }
 
 fn static_resource_groups(
-    config: &VisionConfig,
-    root: &str,
+    declaration: &super::Declaration,
     execution_group: eredu_runtime::ExecutionGroupId,
     role: &str,
 ) -> Result<Vec<(StaticResource, eredu_runtime::OwnedParameterGroupSpec)>, ParallelPlanError> {
-    use eredu_runtime::{OwnedParameterGroupSpec, ParameterGroupOwner, ParameterMemberSpec};
-    config.validate().map_err(invalid)?;
+    use eredu_runtime::{OwnedParameterGroupSpec, ParameterGroupOwner};
+    let config = declaration.config();
+    let root = declaration.root();
     let last = config
         .layer_count()
         .checked_sub(1)
         .ok_or_else(|| invalid("vision projection has no consuming unit"))?;
-    let position = super::specs::position_spec(config, root).map_err(invalid)?;
-    let patch = super::specs::patch_spec(config, root).map_err(invalid)?;
-    let patch_shape = patch
-        .weight_shape()
-        .into_iter()
-        .map(|width| width as usize)
-        .collect::<Vec<_>>();
-    let mut declaration = Declaration::default();
-    declaration
-        .formats
-        .insert(position.weight.id.as_str().into(), position.format);
+    let position = declaration.position();
+    let patch = declaration.patch();
     let mut groups = vec![
         (
             StaticResource::Ingress,
             OwnedParameterGroupSpec::new(
                 ParameterGroupOwner::static_role(role),
-                ParameterGroupSpec::new(
+                eredu_runtime::logical_parameter_group(
                     format!("{root}.position"),
                     ParameterRole::Replicated,
-                    [ParameterMemberSpec::new(
-                        position.weight.id.as_str(),
-                        vec![position.vocabulary as usize, position.dimensions as usize],
-                        MemberSharding::Replicated,
-                    )],
+                    None,
+                    position,
+                    |_| MemberSharding::Replicated,
                 )?,
             ),
         ),
@@ -323,27 +255,18 @@ fn static_resource_groups(
             StaticResource::Ingress,
             OwnedParameterGroupSpec::new(
                 ParameterGroupOwner::static_role(role),
-                ParameterGroupSpec::new(
+                eredu_runtime::logical_parameter_group(
                     format!("{root}.patch"),
                     ParameterRole::Replicated,
-                    [
-                        ParameterMemberSpec::new(
-                            patch.weight.id.as_str(),
-                            patch_shape,
-                            MemberSharding::Replicated,
-                        ),
-                        ParameterMemberSpec::new(
-                            patch.bias.id.as_str(),
-                            vec![patch.geometry.output as usize],
-                            MemberSharding::Replicated,
-                        ),
-                    ],
+                    None,
+                    patch,
+                    |_| MemberSharding::Replicated,
                 )?,
             ),
         ),
     ];
-    for (resource, prefix, unit, postshuffle) in
-        std::iter::once((StaticResource::Merger, rooted(root, "merger"), last, false)).chain(
+    for (resource, prefix, unit, index) in
+        std::iter::once((StaticResource::Merger, rooted(root, "merger"), last, 0)).chain(
             config
                 .deepstack_layers()
                 .into_iter()
@@ -353,7 +276,7 @@ fn static_resource_groups(
                         StaticResource::DeepStack(index),
                         rooted(root, &format!("deepstack_merger_list.{index}")),
                         unit as usize,
-                        true,
+                        index + 1,
                     )
                 }),
         )
@@ -361,32 +284,21 @@ fn static_resource_groups(
         let owner =
             ParameterGroupOwner::static_unit_consumers(role, [(execution_group.clone(), unit)]);
         groups.extend(
-            declaration
-                .merger(config, &prefix, postshuffle)?
+            merger(declaration, index, &prefix)?
                 .into_iter()
                 .map(|group| (resource, OwnedParameterGroupSpec::new(owner.clone(), group))),
         );
     }
-    let tagged = groups.into_iter().map(|(resource, group)| {
-        let owner = group.owner().clone();
-        ((resource, owner), group.into_group())
-    });
-    Ok(
-        eredu_runtime::expand_tagged_linear_format_parameter_groups(tagged, |member| {
-            Ok(declaration.formats.get(member.target()).cloned())
-        })?
-        .into_iter()
-        .map(|((resource, owner), group)| (resource, OwnedParameterGroupSpec::new(owner, group)))
-        .collect(),
-    )
+    Ok(groups)
 }
 
 /// Resolves local main/deepstack merger intermediate widths.
 pub fn local_merger_widths(
-    config: &VisionConfig,
-    root: &str,
+    declaration: &super::Declaration,
     layout: &eredu_runtime::LocalModelLayout,
 ) -> Result<Vec<i32>, ParallelPlanError> {
+    let config = declaration.config();
+    let root = declaration.root();
     std::iter::once(rooted(root, "merger"))
         .chain(
             (0..config.deepstack_layer_count())

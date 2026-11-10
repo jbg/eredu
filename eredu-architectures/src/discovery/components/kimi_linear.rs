@@ -1,21 +1,23 @@
 //! KDA and MLA declarations retain recurrent and latent read equations.
 use super::*;
-use crate::kimi_linear::{AttentionKind, FeedForwardPolicy, ModelArgs};
+use crate::kimi_linear::{
+    declarations::{FeedForwardParameters as F, MixerParameters as M},
+    Declaration,
+};
 
 pub(in crate::discovery) fn unit(
     g: &mut Builder,
-    c: &ModelArgs,
+    declaration: &Declaration,
     layer: usize,
     path: &str,
     attention: &str,
     ffn: &str,
 ) {
-    let width = c.hidden_size as usize;
-    let policy = c.layer_schedule.get(layer).expect("declared Kimi layer");
-    if policy.attention == AttentionKind::Kda {
-        kda(g, c, layer, path, attention);
-    } else {
-        mla(g, c, layer, path, attention);
+    let width = declaration.statics.embedding_spec().dimensions as usize;
+    let scope = &declaration.blocks[layer];
+    match &scope.mixer {
+        M::Kda(spec) => kda(g, spec, &scope.input_norm, layer, path, attention),
+        M::Mla(spec) => mla(g, spec, &scope.input_norm, layer, path, attention),
     }
     for (node, suffix) in [
         (attention, "attention.input"),
@@ -32,18 +34,17 @@ pub(in crate::discovery) fn unit(
             axes(width),
         );
     }
-    let normalization = norm(c, format!("{path}.post_attention_layernorm.weight"));
-    if policy.feed_forward == FeedForwardPolicy::Dense {
+    let normalization = declared_normalization(&scope.post_attention_norm);
+    if let F::Dense(parameters) = &scope.feed_forward {
         gated_units(
             g,
             ffn,
             layer,
             &format!("parameters:{path}.mlp"),
-            &format!("{path}.mlp"),
+            parameters.projections(),
+            parameters.policy,
             &format!("{path}.feed_forward"),
             &format!("{path}.feed_forward.input"),
-            c.intermediate_size as usize,
-            width,
             normalization,
             ComponentWritePartition::Complete,
         );
@@ -54,17 +55,17 @@ pub(in crate::discovery) fn unit(
             "Complete routed and shared contribution after expert-output interventions",
             axes(width),
         );
-        if c.num_shared_experts > 0 {
+        if let F::Sparse(parameters) = &scope.feed_forward {
+            let parameters = &parameters.shared;
             gated_units(
                 g,
                 &format!("{ffn}.shared"),
                 layer,
                 &format!("parameters:{path}.mlp"),
-                &format!("{path}.mlp.shared_experts"),
+                parameters.projections(),
+                parameters.policy,
                 &format!("{path}.mlp.shared_experts.feed_forward"),
                 &format!("{path}.feed_forward.input"),
-                (c.num_shared_experts * c.moe_intermediate_size) as usize,
-                width,
                 normalization,
                 ComponentWritePartition::Complete,
             );
@@ -72,19 +73,18 @@ pub(in crate::discovery) fn unit(
     }
 }
 
-fn kda(g: &mut Builder, c: &ModelArgs, layer: usize, path: &str, node: &str) {
-    let heads = c.kda_config.num_heads as usize;
-    let dim = c.kda_config.head_dim as usize;
-    let count = heads * dim;
+fn kda(
+    g: &mut Builder,
+    spec: &crate::kimi_linear::specs::KdaSpec,
+    input_norm: &eredu_nn::NormalizationConstructionSpec,
+    layer: usize,
+    path: &str,
+    node: &str,
+) {
     let prefix = format!("{path}.self_attn");
-    let parameter = |name: &str| {
-        let parameter = format!("{prefix}.{name}");
-        ComponentTransformParameter {
-            shared_parameter: parameter.clone(),
-            parameter,
-            parameter_group: format!("parameters:{prefix}"),
-        }
-    };
+    let heads = spec.geometry.value_heads() as usize;
+    let dim = spec.geometry.value_dimensions() as usize;
+    let count = spec.output.input as usize;
     let head_rows = |read_head_width| ComponentRowMapping::HeadRows {
         offset: 0,
         component_head_width: dim,
@@ -106,39 +106,40 @@ fn kda(g: &mut Builder, c: &ModelArgs, layer: usize, path: &str, node: &str) {
             groups: 1,
         },
     };
-    let read = |field: &str, role, rows, projections, head_normalization, projection_output| {
-        let weight = format!("{prefix}.{field}.weight");
+    let read = |projection: &eredu_nn::LinearSpec,
+                role,
+                rows,
+                projections,
+                head_normalization,
+                projection_output| {
         ComponentRead {
-            source: None,
-            shared_weight: weight.clone(),
-            weight,
-            parameter_group: format!("parameters:{prefix}"),
-            role,
-            rows,
-            bias: None,
-            input_projections: projections,
-            head_normalization,
             projection_output,
+            head_normalization,
+            input_projections: projections,
+            ..declared_component_read(projection, format!("parameters:{prefix}"), role, rows)
         }
     };
     let mut reads = Vec::new();
-    for (field, suffix, role, rows, normalization) in [
+    for (projection, convolution, suffix, role, rows, normalization) in [
         (
-            "q",
+            &spec.q,
+            &spec.convolutions[0],
             "query",
             ComponentReadRole::Query,
             head_rows(dim),
             Some(head_norm()),
         ),
         (
-            "k",
+            &spec.k,
+            &spec.convolutions[1],
             "key",
             ComponentReadRole::Key,
             head_rows(dim),
             Some(head_norm()),
         ),
         (
-            "v",
+            &spec.v,
+            &spec.convolutions[2],
             "value",
             ComponentReadRole::Value,
             ComponentRowMapping::Direct { offset: 0 },
@@ -148,7 +149,7 @@ fn kda(g: &mut Builder, c: &ModelArgs, layer: usize, path: &str, node: &str) {
         let input = format!("{path}.attention.{suffix}.projected");
         let output = format!("{path}.attention.{suffix}.convolved");
         reads.push(read(
-            &format!("{field}_proj"),
+            projection,
             role,
             rows,
             vec![],
@@ -172,59 +173,71 @@ fn kda(g: &mut Builder, c: &ModelArgs, layer: usize, path: &str, node: &str) {
                 output,
                 effective_output: None,
                 equation: ComponentTensorTransformEquation::CausalDepthwiseConvolution {
-                    kernel: parameter(&format!("{field}_conv1d.weight")),
-                    channels: count,
-                    taps: c.kda_config.short_conv_kernel_size as usize,
+                    kernel: declared_transform_parameter(
+                        &convolution.weight,
+                        format!("parameters:{prefix}"),
+                    ),
+                    channels: convolution.channels as usize,
+                    taps: convolution.kernel_size as usize,
                     residual: false,
-                    activation: Some(ComponentNonlinearity::Silu {
-                        multiplier: ComponentScalar::new(1.0),
-                    }),
+                    activation: match convolution.activation {
+                        eredu_nn::ConvolutionActivation::Identity => None,
+                        eredu_nn::ConvolutionActivation::Silu => {
+                            Some(ComponentNonlinearity::Silu {
+                                multiplier: ComponentScalar::new(1.0),
+                            })
+                        }
+                    },
                 },
             });
     }
-    for (prefix_field, suffix, role, rows) in [
-        ("f", "decay", ComponentReadRole::Decay, head_rows(dim)),
+    for (first, second, suffix, role, rows) in [
         (
-            "g",
+            &spec.f_a,
+            &spec.f_b,
+            "decay",
+            ComponentReadRole::Decay,
+            head_rows(dim),
+        ),
+        (
+            &spec.g_a,
+            &spec.g_b,
             "gate",
             ComponentReadRole::OutputGate,
             ComponentRowMapping::Direct { offset: 0 },
         ),
     ] {
-        let weight = format!("{prefix}.{prefix_field}_a_proj.weight");
         let output = format!("{path}.attention.{suffix}.latent");
         g.read_only_observation(
             node,
             output.clone(),
             "Current-position low-rank recurrent control input",
-            axes(dim),
+            axes(first.output as usize),
         );
         reads.push(read(
-            &format!("{prefix_field}_b_proj"),
+            second,
             role,
             rows,
-            vec![ComponentInputProjection {
-                shared_weight: weight.clone(),
-                weight,
-                parameter_group: format!("parameters:{prefix}"),
-                bias: None,
-                rows: 0..dim,
-                normalization: None,
+            vec![declared_input_projection(
+                first,
+                format!("parameters:{prefix}"),
+                0..first.output as usize,
+                None,
                 output,
-            }],
+            )],
             None,
             None,
         ));
     }
     reads.push(read(
-        "b_proj",
+        &spec.beta,
         ComponentReadRole::Update,
         head_rows(1),
         vec![],
         None,
         None,
     ));
-    let write = format!("{prefix}.o_proj.weight");
+    let write = spec.output.weight.id.as_str().to_owned();
     g.descriptor.components.push(ComponentGroup {
         id: format!("{node}.channels"),
         node_id: node.into(),
@@ -239,11 +252,11 @@ fn kda(g: &mut Builder, c: &ModelArgs, layer: usize, path: &str, node: &str) {
         input: format!("{path}.attention.input"),
         reads,
         routed_reads: vec![],
-        shared_write_weight: write.clone(),
+        shared_write_weight: declared_shared_weight(&spec.output.weight).into(),
         write_weight: write,
         write_input_projection: None,
         write_parameter_group: format!("parameters:{prefix}"),
-        write_bias: None,
+        write_bias: spec.output.bias.as_ref().map(|bias| bias.id.to_string()),
         activation_equation: ComponentActivation::GatedDeltaAttention {
             key_heads: heads,
             value_heads: heads,
@@ -252,18 +265,18 @@ fn kda(g: &mut Builder, c: &ModelArgs, layer: usize, path: &str, node: &str) {
             decay_layout: ComponentDeltaDecay::KeyChannel,
             query_scale: ComponentScalar::new(1.0 / dim as f32),
             key_scale: ComponentScalar::new((dim as f32).sqrt().recip()),
-            decay_rate: parameter("A_log"),
-            decay_bias: parameter("dt_bias"),
+            decay_rate: declared_transform_parameter(&spec.a_log, format!("parameters:{prefix}")),
+            decay_bias: declared_transform_parameter(&spec.dt_bias, format!("parameters:{prefix}")),
             channel_normalization: ComponentHeadNormalization {
                 output_scale: ComponentScalar::new(1.0),
                 heads,
                 head_width: dim,
                 independent_gains: false,
-                normalization: norm(c, format!("{prefix}.o_norm.weight")),
+                normalization: declared_normalization(&spec.norm),
             },
             output_gate: ComponentNonlinearity::Sigmoid,
         },
-        input_normalization: norm(c, format!("{path}.input_layernorm.weight")),
+        input_normalization: declared_normalization(input_norm),
         output_gate: None,
         output_normalization: None,
         residual_scale: ComponentScalar::new(1.0),
@@ -278,50 +291,35 @@ fn kda(g: &mut Builder, c: &ModelArgs, layer: usize, path: &str, node: &str) {
     );
 }
 
-fn norm(c: &ModelArgs, gain: String) -> ComponentNormalization {
-    ComponentNormalization {
-        kind: ComponentNormalizationKind::Rms,
-        epsilon: ComponentScalar::new(c.rms_norm_eps),
-        gain: Some(gain),
-        gain_offset: ComponentScalar::new(0.0),
-        bias: None,
-        groups: 1,
-    }
-}
-
-fn mla(g: &mut Builder, c: &ModelArgs, layer: usize, path: &str, attention: &str) {
-    let heads = c.num_attention_heads as usize;
-    let value = c.v_head_dim as usize;
-    let nope = c.qk_nope_head_dim as usize;
-    let rope = c.qk_rope_head_dim as usize;
-    let latent = c.kv_lora_rank as usize;
+fn mla(
+    g: &mut Builder,
+    spec: &crate::kimi_linear::specs::MlaSpec,
+    input_norm: &eredu_nn::NormalizationConstructionSpec,
+    layer: usize,
+    path: &str,
+    attention: &str,
+) {
+    use crate::kimi_linear::specs::{LatentSpec, QuerySpec};
     let prefix = format!("{path}.self_attn");
-    let read = |field: &str, role, rows, input_projections| {
-        let weight = format!("{prefix}.{field}.weight");
-        ComponentRead {
-            source: None,
-            projection_output: None,
-            role,
-            shared_weight: weight.clone(),
-            weight,
-            parameter_group: format!("parameters:{prefix}"),
-            bias: None,
-            rows,
-            head_normalization: None,
-            input_projections,
-        }
+    let heads = spec.geometry.heads() as usize;
+    let value = spec.geometry.value_dimensions() as usize;
+    let nope = spec.geometry.non_positional_dimensions() as usize;
+    let rope = spec.geometry.positional_dimensions() as usize;
+    let latent = spec.geometry.latent_dimensions() as usize;
+    let read = |projection: &eredu_nn::LinearSpec, role, rows, input_projections| ComponentRead {
+        input_projections,
+        ..declared_component_read(projection, format!("parameters:{prefix}"), role, rows)
     };
-    let stage = |field: &str, gain: &str, count: usize, output: &str| {
-        let weight = format!("{prefix}.{field}.weight");
-        ComponentInputProjection {
-            shared_weight: weight.clone(),
-            weight,
-            parameter_group: format!("parameters:{prefix}"),
-            bias: None,
-            rows: 0..count,
-            normalization: Some(norm(c, format!("{prefix}.{gain}.weight"))),
-            output: format!("{path}.attention.{output}.effective"),
-        }
+    let stage = |projection: &eredu_nn::LinearSpec,
+                 normalization: &eredu_nn::NormalizationConstructionSpec,
+                 output: &str| {
+        declared_input_projection(
+            projection,
+            format!("parameters:{prefix}"),
+            0..normalization.dimensions as usize,
+            Some(declared_normalization(normalization)),
+            format!("{path}.attention.{output}.effective"),
+        )
     };
     let head_rows = |offset, count, sharing, stride| ComponentRowMapping::HeadRows {
         offset,
@@ -330,69 +328,90 @@ fn mla(g: &mut Builder, c: &ModelArgs, layer: usize, path: &str, attention: &str
         component_heads_per_read_head: sharing,
         read_head_stride: stride,
     };
-    let (query_field, query_input) = match c.q_lora_rank {
-        Some(rank) => (
-            "q_b_proj",
+    let (query, query_input, query_rank) = match &spec.query {
+        QuerySpec::LowRank(query) => (
+            &query.second,
             vec![stage(
-                "q_a_proj",
-                "q_a_layernorm",
-                rank as usize,
+                query
+                    .first
+                    .as_ref()
+                    .expect("declared query input projection"),
+                &query.normalization,
                 "query.latent",
             )],
+            Some(query.normalization.dimensions as usize),
         ),
-        None => ("q_proj", vec![]),
+        QuerySpec::Direct(query) => (query, vec![], None),
     };
-    let kv_stage = stage(
-        "kv_a_proj_with_mqa",
-        "kv_a_layernorm",
-        latent,
-        "key_value.latent",
-    );
-    let mut reads = vec![
+    let kv_stage = stage(&spec.kv_a, &spec.kv_norm, "key_value.latent");
+    let (key, key_rows, read_value, value_rows) = match &spec.kv_b {
+        LatentSpec::Fused(projection) => (
+            projection,
+            head_rows(
+                0,
+                nope,
+                1,
+                Some(
+                    spec.geometry
+                        .reconstruction_head_dimensions()
+                        .expect("admitted fused MLA head geometry") as usize,
+                ),
+            ),
+            projection,
+            ComponentRowMapping::Blocked {
+                offset: nope,
+                block_width: value,
+                block_stride: spec
+                    .geometry
+                    .reconstruction_head_dimensions()
+                    .expect("admitted fused MLA head geometry")
+                    as usize,
+            },
+        ),
+        LatentSpec::Split {
+            key,
+            value: projection,
+        } => (
+            key,
+            head_rows(0, nope, 1, None),
+            projection,
+            ComponentRowMapping::Direct { offset: 0 },
+        ),
+    };
+    let reads = vec![
         read(
-            query_field,
+            query,
             ComponentReadRole::Query,
-            head_rows(0, nope + rope, 1, None),
+            head_rows(0, spec.geometry.query_head_dimensions() as usize, 1, None),
             query_input,
         ),
         read(
-            "kv_b_proj",
+            key,
             ComponentReadRole::Key,
-            head_rows(0, nope, 1, Some(nope + value)),
+            key_rows,
             vec![kv_stage.clone()],
         ),
-        // The rotary key is shared by all heads and bypasses latent normalization.
+        // The nominal positional key is shared by all heads and bypasses latent normalization.
         read(
-            "kv_a_proj_with_mqa",
+            &spec.kv_a,
             ComponentReadRole::Key,
             head_rows(latent, rope, heads, None),
             vec![],
         ),
         read(
-            "kv_b_proj",
+            read_value,
             ComponentReadRole::Value,
-            ComponentRowMapping::Blocked {
-                offset: nope,
-                block_width: value,
-                block_stride: nope + value,
-            },
+            value_rows,
             vec![kv_stage],
         ),
     ];
-    if c.split_kv_b {
-        reads[1].weight = format!("{prefix}.k_b_proj.weight");
-        reads[1].shared_weight = reads[1].weight.clone();
-        reads[1].rows = head_rows(0, nope, 1, None);
-        reads[3].weight = format!("{prefix}.v_b_proj.weight");
-        reads[3].shared_weight = reads[3].weight.clone();
-        reads[3].rows = ComponentRowMapping::Direct { offset: 0 };
-    }
-    let write = format!("{prefix}.o_proj.weight");
+    let count = spec.output.input as usize;
+    let write = &spec.output.weight;
     g.descriptor.components.push(ComponentGroup {
         id: format!("{attention}.channels"),
         node_id: attention.into(),
         layer_index: layer,
-        count: heads * value,
+        count,
         activation: format!("{path}.attention.channels"),
         effective_activation: format!("{path}.attention.channels.effective"),
         write_input: Some(format!("{path}.attention.write_input")),
@@ -402,8 +421,8 @@ fn mla(g: &mut Builder, c: &ModelArgs, layer: usize, path: &str, attention: &str
         input: format!("{path}.attention.input"),
         reads,
         routed_reads: vec![],
-        shared_write_weight: write.clone(),
-        write_weight: write,
+        shared_write_weight: write.alias_of.as_ref().unwrap_or(&write.id).as_str().into(),
+        write_weight: write.id.as_str().into(),
         write_input_projection: None,
         write_parameter_group: format!("parameters:{prefix}"),
         write_bias: None,
@@ -414,12 +433,12 @@ fn mla(g: &mut Builder, c: &ModelArgs, layer: usize, path: &str, attention: &str
             head_width: value,
             output_gate: None,
         },
-        input_normalization: norm(c, format!("{path}.input_layernorm.weight")),
+        input_normalization: declared_normalization(input_norm),
         output_gate: None,
         output_normalization: None,
         residual_scale: ComponentScalar::new(1.0),
     });
-    let mut channels = axes(heads * value);
+    let mut channels = axes(count);
     channels[2].name = "component".into();
     g.component_observation(
         attention,
@@ -428,7 +447,7 @@ fn mla(g: &mut Builder, c: &ModelArgs, layer: usize, path: &str, attention: &str
         channels,
     );
     for (suffix, count) in [
-        ("query.latent", c.q_lora_rank.map(|n| n as usize)),
+        ("query.latent", query_rank),
         ("key_value.latent", Some(latent)),
     ] {
         if let Some(count) = count {
@@ -442,15 +461,21 @@ fn mla(g: &mut Builder, c: &ModelArgs, layer: usize, path: &str, attention: &str
     }
 }
 
-pub(in crate::discovery) fn readout(g: &mut Builder, c: &ModelArgs) {
-    readout_observations(g, c.hidden_size as usize, c.vocab_size as usize);
+pub(in crate::discovery) fn readout(g: &mut Builder, declaration: &Declaration) {
+    let statics = &declaration.statics;
+    let embedding = statics.embedding_spec();
+    readout_observations(
+        g,
+        embedding.dimensions as usize,
+        embedding.vocabulary as usize,
+    );
     g.descriptor.component_readout = Some(ComponentReadout {
         token_embedding_normalization: None,
         embedding_normalization: None,
         embedding: "readout.embedding".into(),
-        embedding_weight: "model.embed_tokens.weight".into(),
+        embedding_weight: embedding.weight.id.as_str().into(),
         embedding_scale: ComponentScalar::new(1.0),
-        tied_embeddings: c.tie_word_embeddings,
+        tied_embeddings: statics.head_spec().is_none(),
         equation: ComponentReadoutEquation {
             residual_cycles: vec![],
             block_transforms: vec![],
@@ -461,21 +486,20 @@ pub(in crate::discovery) fn readout(g: &mut Builder, c: &ModelArgs) {
             projection_input: Some("readout.projection_input".into()),
             linear_scores: "readout.linear".into(),
             logits: MODEL_LOGITS_OBSERVATION_PATH.into(),
-            normalization: norm(c, "model.norm.weight".into()),
-            weight: if c.tie_word_embeddings {
-                "model.embed_tokens.weight"
-            } else {
-                "lm_head.weight"
-            }
-            .into(),
+            normalization: declared_normalization(statics.normalization_spec()),
+            weight: statics
+                .head_spec()
+                .map(|p| p.weight.id.as_str())
+                .unwrap_or(embedding.weight.id.as_str())
+                .into(),
             bias: None,
             output_transform: ComponentOutputTransform::Identity,
             block_normalizations: vec![],
-            other_writes: c
-                .layer_schedule
+            other_writes: declaration
+                .blocks
                 .iter()
                 .enumerate()
-                .filter(|(_, p)| p.feed_forward == FeedForwardPolicy::SparseMoe)
+                .filter(|(_, p)| matches!(p.feed_forward, F::Sparse(_)))
                 .map(|(layer, _)| ComponentResidualWrite {
                     input: Some(format!("model.layers.{layer}.feed_forward.input")),
                     layer_index: layer,

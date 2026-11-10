@@ -12,8 +12,8 @@ use eredu_runtime::execution_control::{
 use eredu_nn::RetainedTensorRoots;
 
 use eredu_nn::{
-    LayerNorm, NeuralBackend, PadMode, Parameter, ParameterMetadata, ParameterSpec,
-    ParameterVisitor, Parameterized, Tensor, TensorElementType,
+    LayerNorm, NeuralBackend, Parameter, ParameterMetadata, ParameterVisitor, Parameterized,
+    Tensor, TensorElementType,
 };
 
 use crate::{
@@ -174,16 +174,9 @@ impl DecoderUnitSpec {
     pub fn initial_state<T: Tensor>(self) -> Result<DecoderUnitState<T>, Error> {
         self.validate()?;
         let convolution = match self {
-            Self::Block { width, kernel, .. } => Some(Conv1dState::new(Conv1dSpec {
-                input_channels: width,
-                output_channels: width,
-                kernel_size: kernel,
-                stride: 1,
-                dilation: 1,
-                groups: width,
-                bias: true,
-                pad_mode: PadMode::Constant,
-            })?),
+            Self::Block { width, kernel, .. } => Some(Conv1dState::new(
+                crate::ear_specs::ConvNextSpec::causal_geometry(width, kernel),
+            )?),
             _ => None,
         };
         Ok(DecoderUnitState {
@@ -193,7 +186,7 @@ impl DecoderUnitSpec {
             batch: None,
         })
     }
-    fn validate(self) -> Result<(), Error> {
+    pub(crate) fn validate(self) -> Result<(), Error> {
         match self {
             Self::Upsample {
                 input,
@@ -370,25 +363,14 @@ pub struct Pointwise<T: Tensor> {
 }
 impl<T: Tensor> Pointwise<T> {
     pub(crate) fn new(
-        prefix: &str,
-        group: &str,
-        input: i32,
-        output: i32,
-        bias: bool,
+        spec: crate::ear_specs::ConvolutionSpec,
         context: &T::Context,
     ) -> Result<Self, Error> {
         Ok(Self {
-            weight: slot(
-                &format!("{prefix}.weight"),
-                group,
-                &[output, input, 1],
-                context,
-            )?,
-            bias: bias
-                .then(|| slot(&format!("{prefix}.bias"), group, &[output], context))
-                .transpose()?,
-            input,
-            output,
+            weight: spec.weight_parameter(context)?,
+            bias: spec.bias_parameter(context)?,
+            input: spec.geometry.input_channels,
+            output: spec.geometry.output_channels,
         })
     }
     pub(crate) fn forward(&self, input: &T, context: &T::Context) -> Result<T, Error> {
@@ -443,46 +425,20 @@ pub struct ConvNextBlock<T: Tensor> {
 }
 impl<T: Tensor> ConvNextBlock<T> {
     pub(crate) fn new(
-        prefix: &str,
-        group: &str,
-        width: i32,
-        intermediate: i32,
-        kernel: i32,
+        spec: crate::ear_specs::ConvNextSpec,
         context: &T::Context,
     ) -> Result<Self, Error> {
         Ok(Self {
-            depthwise: slot(
-                &format!("{prefix}.dwconv.weight"),
-                group,
-                &[width, 1, kernel],
-                context,
-            )?,
-            bias: slot(&format!("{prefix}.dwconv.bias"), group, &[width], context)?,
-            norm: LayerNorm::unloaded(
-                width,
-                1e-6,
-                Some(parameter(&format!("{prefix}.norm.weight"), group)?),
-                Some(parameter(&format!("{prefix}.norm.bias"), group)?),
-                context,
-            )?,
-            expand: Pointwise::new(
-                &format!("{prefix}.pwconv1"),
-                group,
-                width,
-                intermediate,
-                true,
-                context,
-            )?,
-            project: Pointwise::new(
-                &format!("{prefix}.pwconv2"),
-                group,
-                intermediate,
-                width,
-                true,
-                context,
-            )?,
-            width,
-            kernel,
+            depthwise: spec.depthwise.weight_parameter(context)?,
+            bias: spec
+                .depthwise
+                .bias_parameter(context)?
+                .ok_or_else(|| invalid("EAR depthwise bias is absent"))?,
+            width: spec.depthwise.geometry.input_channels,
+            kernel: spec.depthwise.geometry.kernel_size,
+            norm: LayerNorm::new(spec.norm, context)?,
+            expand: Pointwise::new(spec.expand, context)?,
+            project: Pointwise::new(spec.project, context)?,
         })
     }
 
@@ -507,17 +463,9 @@ impl<T: Tensor> ConvNextBlock<T> {
     }
 
     fn convolution_spec(&self) -> Conv1dSpec {
-        Conv1dSpec {
-            input_channels: self.width,
-            output_channels: self.width,
-            kernel_size: self.kernel,
-            stride: 1,
-            dilation: 1,
-            groups: self.width,
-            bias: true,
-            pad_mode: PadMode::Constant,
-        }
+        crate::ear_specs::ConvNextSpec::causal_geometry(self.width, self.kernel)
     }
+
     fn step(
         &self,
         input: &T,
@@ -590,107 +538,31 @@ pub struct DecoderUnit<T: Tensor> {
 }
 impl<T: Tensor> DecoderUnit<T> {
     /// Declares one unit with canonical `prefix.layers.N` parameter IDs.
-    pub fn new(spec: DecoderUnitSpec, prefix: &str, context: &T::Context) -> Result<Self, Error> {
-        Self::new_selected(spec, prefix, None, context)
-    }
-    pub(crate) fn new_selected(
-        spec: DecoderUnitSpec,
-        prefix: &str,
-        local: Option<crate::ear_decoder_layered::DecoderUnitLocalDimensions>,
+    pub fn new(
+        declaration: crate::ear_specs::DecoderParameterSpec,
         context: &T::Context,
     ) -> Result<Self, Error> {
-        spec.validate()?;
-        if prefix.is_empty() {
-            return Err(invalid("empty EAR decoder parameter prefix"));
-        }
-        let name = format!("{prefix}.layers.{}", spec.layer());
-        let group = name.clone();
-        let physical = match (spec, local) {
-            (
-                DecoderUnitSpec::Upsample {
-                    layer,
-                    input,
-                    output: _,
-                    rate,
-                    groups,
-                },
-                Some(local),
-            ) => DecoderUnitSpec::Upsample {
-                layer,
-                input,
-                output: local.width * groups,
-                rate,
-                groups,
-            },
-            (
-                DecoderUnitSpec::Block {
-                    layer,
-                    width,
-                    intermediate: _,
-                    kernel,
-                },
-                Some(local),
-            ) => DecoderUnitSpec::Block {
-                layer,
-                width,
-                intermediate: local.width,
-                kernel,
-            },
-            (
-                DecoderUnitSpec::Output {
-                    layer,
-                    input,
-                    output: _,
-                },
-                Some(local),
-            ) => DecoderUnitSpec::Output {
-                layer,
-                input,
-                output: local.width,
-            },
-            _ => spec,
-        };
-        let operation = match physical {
-            DecoderUnitSpec::Upsample {
-                input,
-                output,
-                rate,
-                groups,
-                ..
-            } => DecoderOperation::Upsample(Upsample {
-                weight: slot(
-                    &format!("{name}.weight"),
-                    &group,
-                    &[input, output / groups, rate],
-                    context,
-                )?,
-                input,
-                output,
-                rate,
-                groups,
+        use crate::ear_specs::DecoderParameters;
+        let operation = match declaration.parameters {
+            DecoderParameters::Upsample(spec) => DecoderOperation::Upsample(Upsample {
+                weight: spec.weight_parameter(context)?,
+                input: spec.geometry.input_channels,
+                output: spec.geometry.output_channels,
+                rate: spec.geometry.stride,
+                groups: spec.geometry.groups,
             }),
-            DecoderUnitSpec::Block {
-                width,
-                intermediate,
-                kernel,
-                ..
-            } => DecoderOperation::Block(ConvNextBlock::new(
-                &name,
-                &group,
-                width,
-                intermediate,
-                kernel,
-                context,
-            )?),
-            DecoderUnitSpec::Output { input, output, .. } => DecoderOperation::Output(
-                Pointwise::new(&name, &group, input, output, false, context)?,
-            ),
+            DecoderParameters::Block(spec) => {
+                DecoderOperation::Block(ConvNextBlock::new(spec, context)?)
+            }
+            DecoderParameters::Output(spec) => {
+                DecoderOperation::Output(Pointwise::new(spec, context)?)
+            }
         };
         Ok(Self {
-            spec,
+            spec: declaration.unit,
+            prefix: declaration.prefix,
+            local: declaration.local,
             operation,
-            prefix: prefix.into(),
-            local,
         })
     }
 
@@ -757,7 +629,7 @@ impl<T: Tensor> DecoderUnit<T> {
             _ => {
                 return Err(invalid(
                     "EAR decoder unit state kind does not match parameters",
-                ))
+                ));
             }
         };
         next.batch = Some(input.dim(0));
@@ -823,24 +695,28 @@ impl<B: NeuralBackend> NeuralDecoder<B> {
         prefix: &str,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let units = config
-            .unit_specs()?
-            .into_iter()
-            .map(|spec| DecoderUnit::new(spec, prefix, context))
+        let declaration = crate::declarations::DecoderDeclaration::new(config, prefix)?;
+        let units = declaration
+            .spec()
+            .units()
+            .iter()
+            .cloned()
+            .map(|spec| DecoderUnit::new(spec, context))
             .collect::<Result<_, _>>()?;
-        Self::from_units(config, units)
+        Self::from_units(declaration, units)
     }
     /// Adopts exact ordered units without allocating or copying learned parameters.
     pub fn from_units(
-        config: DecoderConfig,
+        declaration: crate::declarations::DecoderDeclaration,
         units: Vec<DecoderUnit<B::Tensor>>,
     ) -> Result<Self, Error> {
-        let specs = config.unit_specs()?;
-        let prefix = units
-            .first()
-            .ok_or_else(|| invalid("EAR decoder has no units"))?
-            .prefix()
-            .to_owned();
+        let specs = declaration
+            .spec()
+            .units()
+            .iter()
+            .map(|spec| spec.unit())
+            .collect::<Vec<_>>();
+        let prefix = declaration.prefix();
         if units.len() != specs.len()
             || units.iter().zip(specs).any(|(unit, spec)| {
                 unit.spec() != spec || unit.prefix() != prefix || unit.local().is_some()
@@ -851,11 +727,12 @@ impl<B: NeuralBackend> NeuralDecoder<B> {
             ));
         }
         let architecture =
-            crate::ear_decoder_layered::DecoderKernel::new(config, &prefix)?.into_component()?;
+            crate::ear_decoder_layered::DecoderKernel::new(declaration)?.into_component()?;
         let runtime = eredu_runtime::ResidentRuntime::from_units(architecture, vec![units])
             .map_err(eredu_runtime::ResidentUnitsError::into_architecture)?;
         Ok(Self { runtime })
     }
+
     /// Exact decoder-order geometry.
     pub fn config(&self) -> &DecoderConfig {
         self.runtime.architecture().kernel().config()
@@ -915,24 +792,6 @@ impl<B: NeuralBackend> crate::ear_decoder_layered::DecoderExecution<B> for Neura
     }
 }
 
-fn parameter(name: &str, group: &str) -> Result<ParameterSpec, Error> {
-    let mut spec = ParameterSpec::trainable(name).map_err(|error| invalid(&error.to_string()))?;
-    spec.trainable = false;
-    spec.group = Some(group.into());
-    Ok(spec)
-}
-pub(crate) fn slot<T: Tensor>(
-    name: &str,
-    group: &str,
-    shape: &[i32],
-    context: &T::Context,
-) -> Result<Parameter<T>, Error> {
-    Ok(Parameter::unloaded(
-        parameter(name, group)?,
-        shape,
-        context,
-    )?)
-}
 fn validate_input<T: Tensor>(input: &T, channels: i32) -> Result<(), Error> {
     if !matches!(input.shape(), [batch, width, time] if *batch > 0 && *width == channels && *time > 0)
     {

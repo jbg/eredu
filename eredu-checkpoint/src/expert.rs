@@ -143,6 +143,7 @@ impl GatedExpertProjectionFamilyRecipes {
 }
 
 /// Preserves encoded companions while assembling the selected expert bank.
+/// Leading expert-axis ranges and indices select each companion with its primary.
 pub fn gated_product_materialization_recipes<C: RecipeCatalog + ?Sized>(
     catalog: &C,
     bank: &GatedProductExpertRecipes,
@@ -159,10 +160,7 @@ pub fn gated_product_materialization_recipes<C: RecipeCatalog + ?Sized>(
         kind: Companion,
     ) -> Result<Option<DerivedWeightRecipe>, String> {
         let (axis, inputs, stack) = match weight {
-            DerivedWeightRecipe::Source {
-                key,
-                selection: TensorSelection::Full,
-            } => {
+            DerivedWeightRecipe::Source { key, selection } => {
                 let prefix = key.strip_suffix(".weight").unwrap_or(key);
                 let names = match kind {
                     Companion::Bias => vec![format!("{key}_biases"), format!("{prefix}.biases")],
@@ -180,15 +178,34 @@ pub fn gated_product_materialization_recipes<C: RecipeCatalog + ?Sized>(
                         format!("{prefix}.scales"),
                     ],
                 };
+                let supported = matches!(selection, TensorSelection::Full)
+                    || matches!(
+                        selection,
+                        TensorSelection::Range { axis: 0, .. }
+                            | TensorSelection::Indices { axis: 0, .. }
+                    ) && catalog
+                        .tensor_metadata(key)
+                        .map_err(|error| error.to_string())?
+                        .logical_shape
+                        .len()
+                        >= 3;
+                if !supported {
+                    return Err(
+                        "expert companion requires a full source or leading expert-axis selection"
+                            .into(),
+                    );
+                }
                 return Ok(names
                     .into_iter()
                     .find(|name| catalog.tensor_metadata(name).is_ok())
-                    .map(|name| DerivedWeightRecipe::source(name, TensorSelection::Full)));
+                    .map(|name| DerivedWeightRecipe::source(name, selection.clone())));
             }
             DerivedWeightRecipe::Stack { axis, inputs } => (*axis, inputs, true),
             DerivedWeightRecipe::Concatenate { axis, inputs } => (*axis, inputs, false),
             _ => {
-                return Err("expert companion requires the selected full-source bank layout".into())
+                return Err(
+                    "expert companion requires the selected full-source bank layout".into(),
+                );
             }
         };
         let mapped = inputs
@@ -234,8 +251,23 @@ pub fn gated_product_materialization_recipes<C: RecipeCatalog + ?Sized>(
         let Some(global) = outputs.get(&format!("{target}_global_scale")) else {
             continue;
         };
-        global.infer(catalog).map_err(|error| error.to_string())?;
+        let global_metadata = global.infer(catalog).map_err(|error| error.to_string())?;
         let metadata = weight.infer(catalog).map_err(|error| error.to_string())?;
+        // A fused source may share one NVFP4 multiplier across its gate/up halves.
+        // The canonical bank retains independent slots; repeating the multiplier
+        // preserves every packed value and scale without floating conversion.
+        if target == &bank.target_gate_up
+            && metadata.shape.len() == 3
+            && global_metadata.shape == metadata.shape[..1]
+        {
+            outputs.insert(
+                format!("{target}_global_scale"),
+                DerivedWeightRecipe::Stack {
+                    axis: 1,
+                    inputs: vec![global.clone(), global.clone()],
+                },
+            );
+        }
         if metadata.dtype == RecipeDtype::U8 {
             let mut shape = metadata.shape;
             let columns = shape.last_mut().ok_or("NVFP4 weight is scalar")?;

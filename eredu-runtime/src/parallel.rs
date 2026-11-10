@@ -10,7 +10,7 @@ use std::{
 };
 
 use eredu_checkpoint::LinearFormat;
-use eredu_nn::{LinearFormatSpec, ParameterMetadata, ParameterVisitor, Parameterized, Tensor};
+use eredu_nn::{LinearFormatSpec, ParameterMetadata};
 
 /// Architecture-neutral information for one rank-local parallel model.
 #[derive(Debug, Clone)]
@@ -114,17 +114,6 @@ pub enum ParameterRole {
     Segmented,
 }
 
-/// Logical sharding behavior for a parameterized affine projection.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum ProjectionSharding {
-    /// Keep every projection parameter complete on every rank.
-    Replicated,
-    /// Partition projection output features.
-    Column,
-    /// Partition projection input features and replicate output bias.
-    Row,
-}
-
 /// Rank-local selection rule for one physical checkpoint tensor.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum MemberSharding {
@@ -181,11 +170,11 @@ pub enum MemberSharding {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ParameterMemberSpec {
     target: String,
+    metadata: Option<ParameterMetadata>,
+    logical: Option<(Vec<usize>, eredu_nn::LogicalParameterRole)>,
+    logical_linear_format: Option<LinearFormatSpec>,
     global_shape: Vec<usize>,
     sharding: MemberSharding,
-    linear_companion: Option<eredu_nn::LinearCompanionRole>,
-    linear_companion_of: Option<String>,
-    linear_row_layout: eredu_nn::LinearRowLayout,
 }
 
 impl ParameterMemberSpec {
@@ -197,22 +186,85 @@ impl ParameterMemberSpec {
     ) -> Self {
         Self {
             target: target.into(),
+            metadata: None,
+            logical: None,
+            logical_linear_format: None,
             global_shape: global_shape.into(),
             sharding,
-            linear_companion: None,
-            linear_companion_of: None,
-            linear_row_layout: eredu_nn::LinearRowLayout::Contiguous,
         }
     }
 
-    /// Retains canonical encoding relationships from a backend-neutral parameter declaration.
+    /// Projects one logical construction declaration into an explicit placement rule.
+    /// Encoding expansion remains separate and retains the construction metadata.
+    pub fn from_logical_declaration(
+        declaration: &eredu_nn::LogicalParameterDeclaration<'_>,
+        sharding: MemberSharding,
+    ) -> Self {
+        let mut member = Self::new(
+            declaration.parameter.id.as_str(),
+            declaration.shape.clone(),
+            sharding,
+        )
+        .with_parameter_metadata(&ParameterMetadata::from_spec(
+            declaration.parameter,
+            declaration.parameter.trainable,
+        ));
+        member.logical = Some((declaration.shape.clone(), declaration.role));
+        member.logical_linear_format = declaration.linear_format.cloned();
+        member
+    }
+
+    /// Exact logical geometry retained before physical encoding expansion.
+    /// Raw placement members and physical format companions have no logical slot.
+    pub fn logical_shape(&self) -> Option<&[usize]> {
+        self.logical.as_ref().map(|(shape, _)| shape.as_slice())
+    }
+
+    /// Neural meaning retained from the construction declaration.
+    /// Encoding companions retain their separate typed companion role.
+    pub fn logical_role(&self) -> Option<eredu_nn::LogicalParameterRole> {
+        self.logical.as_ref().map(|(_, role)| *role)
+    }
+
+    /// Complete construction-owned encoding, companion identities and row layout,
+    /// retained independently of expanded physical axes.
+    pub fn logical_linear_format(&self) -> Option<&LinearFormatSpec> {
+        self.logical_linear_format.as_ref()
+    }
+
+    /// Retains complete construction metadata, including typed sharing and companion references.
+    /// Group validation rejects metadata whose identity differs from the member target.
     pub fn with_parameter_metadata(mut self, metadata: &ParameterMetadata) -> Self {
-        self.linear_row_layout = metadata.linear_row_layout;
-        self.linear_companion = metadata.linear_companion;
-        self.linear_companion_of = metadata
-            .linear_companion_of
+        self.metadata = Some(metadata.clone());
+        self
+    }
+
+    /// Construction metadata, when supplied by a logical declaration or storage extension.
+    /// A raw placement member does not infer construction state or storage preferences.
+    pub fn parameter_metadata(&self) -> Option<&ParameterMetadata> {
+        self.metadata.as_ref()
+    }
+
+    /// Authoritative slot reused by this parameter, independently of invocation ownership.
+    pub fn alias_of(&self) -> Option<&eredu_nn::ParameterId> {
+        self.metadata
             .as_ref()
-            .map(|parameter| parameter.as_str().to_owned());
+            .and_then(|metadata| metadata.alias_of.as_ref())
+    }
+
+    fn metadata_mut(&mut self) -> Result<&mut ParameterMetadata, ParallelPlanError> {
+        if let Some(ref mut metadata) = self.metadata {
+            return Ok(metadata);
+        }
+        let spec = eredu_nn::ParameterSpec::trainable(&self.target)
+            .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+        Ok(self
+            .metadata
+            .insert(ParameterMetadata::from_spec(&spec, spec.trainable)))
+    }
+
+    fn with_shape(mut self, shape: Vec<usize>) -> Self {
+        self.global_shape = shape;
         self
     }
 
@@ -221,20 +273,32 @@ impl ParameterMemberSpec {
         self
     }
 
-    fn with_linear_row_layout(mut self, layout: eredu_nn::LinearRowLayout) -> Self {
-        self.linear_row_layout = layout;
-        self
+    fn with_linear_row_layout(
+        mut self,
+        layout: eredu_nn::LinearRowLayout,
+    ) -> Result<Self, ParallelPlanError> {
+        self.metadata_mut()?.linear_row_layout = layout;
+        Ok(self)
     }
 
     /// Independent row-block origins of the primary encoded weight.
-    pub const fn linear_row_layout(&self) -> eredu_nn::LinearRowLayout {
-        self.linear_row_layout
+    pub fn linear_row_layout(&self) -> eredu_nn::LinearRowLayout {
+        self.metadata
+            .as_ref()
+            .map_or(eredu_nn::LinearRowLayout::Contiguous, |metadata| {
+                metadata.linear_row_layout
+            })
     }
 
-    fn with_linear_companion(mut self, role: eredu_nn::LinearCompanionRole, primary: &str) -> Self {
-        self.linear_companion = Some(role);
-        self.linear_companion_of = Some(primary.to_owned());
-        self
+    fn with_linear_companion(
+        mut self,
+        role: eredu_nn::LinearCompanionRole,
+        primary: &eredu_nn::ParameterId,
+    ) -> Result<Self, ParallelPlanError> {
+        let metadata = self.metadata_mut()?;
+        metadata.linear_companion = Some(role);
+        metadata.linear_companion_of = Some(primary.clone());
+        Ok(self)
     }
 
     /// Returns the rewritten checkpoint target.
@@ -253,16 +317,84 @@ impl ParameterMemberSpec {
     }
 
     /// Returns this member's encoded-linear companion role, when present.
-    pub const fn linear_companion(&self) -> Option<eredu_nn::LinearCompanionRole> {
-        self.linear_companion
+    pub fn linear_companion(&self) -> Option<eredu_nn::LinearCompanionRole> {
+        self.metadata
+            .as_ref()
+            .and_then(|metadata| metadata.linear_companion)
     }
 
-    /// Returns the primary linear weight owning this companion.
-    pub fn linear_companion_of(&self) -> Option<&str> {
-        self.linear_companion_of.as_deref()
+    /// Returns the typed identity of the primary linear weight owning this companion.
+    pub fn linear_companion_of(&self) -> Option<&eredu_nn::ParameterId> {
+        self.metadata
+            .as_ref()
+            .and_then(|metadata| metadata.linear_companion_of.as_ref())
     }
 }
 
+/// Projects typed construction declarations into caller-authored placement rules.
+/// Geometry, identities and sharing metadata come from the construction specs;
+/// this visitor neither selects an encoding nor allocates a backend value.
+pub fn logical_parameter_members(
+    spec: &(impl eredu_nn::DeclareLogicalParameters + ?Sized),
+    mut sharding: impl FnMut(&eredu_nn::LogicalParameterDeclaration<'_>) -> MemberSharding,
+) -> Result<Vec<ParameterMemberSpec>, ParallelPlanError> {
+    Ok(spec
+        .logical_parameters()
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?
+        .iter()
+        .map(|declaration| {
+            ParameterMemberSpec::from_logical_declaration(declaration, sharding(declaration))
+        })
+        .collect())
+}
+
+/// Projects logical slots and their retained encoding extensions into one physical group.
+/// The caller supplies semantic ownership and sharding; construction specs supply
+/// geometry, sharing and exact formats. `partition_units` supplies the caller's
+/// semantic domain before storage alignment. External sharing targets are resolved
+/// by the complete architecture description before allocation. This does not select
+/// execution mechanisms.
+pub fn logical_parameter_group(
+    name: impl Into<String>,
+    role: ParameterRole,
+    partition_units: Option<usize>,
+    spec: &(impl eredu_nn::DeclareLogicalParameters + ?Sized),
+    mut sharding: impl FnMut(&eredu_nn::LogicalParameterDeclaration<'_>) -> MemberSharding,
+) -> Result<ParameterGroupSpec, ParallelPlanError> {
+    let declarations = spec
+        .logical_parameters()
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+    eredu_nn::validate_logical_parameter_scope(&declarations)
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+    for declaration in &declarations {
+        if let Some(format) = declaration.linear_format {
+            format
+                .validate_for_weight(declaration.parameter)
+                .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+        }
+    }
+    let formats = declarations
+        .iter()
+        .filter_map(|declaration| {
+            declaration
+                .linear_format
+                .map(|format| (declaration.parameter.id.as_str(), format))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let members = declarations
+        .iter()
+        .map(|declaration| {
+            ParameterMemberSpec::from_logical_declaration(declaration, sharding(declaration))
+        })
+        .collect::<Vec<_>>();
+    let group = match partition_units {
+        Some(units) => ParameterGroupSpec::partitioned(name, role, units, members)?,
+        None => ParameterGroupSpec::new(name, role, members)?,
+    };
+    expand_linear_format_parameter_group(group, |member| {
+        Ok(formats.get(member.target()).map(|format| (*format).clone()))
+    })
+}
 /// Assignment of a group's logical partition units to tensor ranks.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
 pub enum PartitionUnitAssignment {
@@ -292,7 +424,8 @@ pub struct ParameterGroupSpec {
 }
 
 impl ParameterGroupSpec {
-    /// Creates a non-empty logical group.
+    /// Creates a non-empty atomic group with resolved, unique companion roles.
+    /// Tied aliases may reference authoritative slots in other architecture groups.
     pub fn new(
         logical_name: impl Into<String>,
         role: ParameterRole,
@@ -333,7 +466,7 @@ impl ParameterGroupSpec {
                 "parallel parameter group {logical_name:?} must contain at least one tensor"
             )));
         }
-        let mut targets = BTreeSet::new();
+        let mut targets = BTreeMap::new();
         let mut has_partitioned_member = false;
         for member in &members {
             if member.target.trim().is_empty() {
@@ -341,7 +474,16 @@ impl ParameterGroupSpec {
                     "parallel parameter group {logical_name:?} contains an empty tensor target"
                 )));
             }
-            if !targets.insert(member.target.clone()) {
+            if let Some(metadata) = member.parameter_metadata() {
+                if metadata.id.as_str() != member.target() {
+                    return Err(ParallelPlanError::InvalidGroup(format!(
+                        "parallel parameter target {:?} conflicts with declared identity {}",
+                        member.target(),
+                        metadata.id
+                    )));
+                }
+            }
+            if targets.insert(member.target(), member).is_some() {
                 return Err(ParallelPlanError::InvalidGroup(format!(
                     "parallel parameter group {logical_name:?} repeats tensor target {:?}",
                     member.target
@@ -398,6 +540,37 @@ impl ParameterGroupSpec {
                     return Err(ParallelPlanError::InvalidGroup(
                         "physical chunks do not match the shared logical partition".into(),
                     ));
+                }
+            }
+        }
+        let mut companion_roles = BTreeSet::new();
+        for member in &members {
+            match (member.linear_companion(), member.linear_companion_of()) {
+                (None, None) => {}
+                (Some(role), Some(primary)) => {
+                    let target = targets.get(primary.as_str()).ok_or_else(|| {
+                        ParallelPlanError::InvalidGroup(format!(
+                            "physical companion {:?} names primary {primary} outside atomic parameter group {logical_name:?}",
+                            member.target()
+                        ))
+                    })?;
+                    if target.linear_companion().is_some() {
+                        return Err(ParallelPlanError::InvalidGroup(format!(
+                            "physical companion {:?} names non-primary parameter {primary}",
+                            member.target()
+                        )));
+                    }
+                    if !companion_roles.insert((primary, role)) {
+                        return Err(ParallelPlanError::InvalidGroup(format!(
+                            "primary {primary} repeats {role:?} companions in atomic parameter group {logical_name:?}"
+                        )));
+                    }
+                }
+                _ => {
+                    return Err(ParallelPlanError::InvalidGroup(format!(
+                        "physical parameter {:?} has incomplete companion metadata",
+                        member.target()
+                    )));
                 }
             }
         }
@@ -504,440 +677,6 @@ impl ParameterGroupSpec {
     pub fn members(&self) -> &[ParameterMemberSpec] {
         &self.members
     }
-}
-
-/// Describes every parameter in a neutral module as one logical group.
-pub fn module_parameter_group<T, M>(
-    logical_name: impl Into<String>,
-    role: ParameterRole,
-    module: &M,
-    mut sharding: impl FnMut(&ParameterMetadata, &[usize]) -> Result<MemberSharding, ParallelPlanError>,
-) -> Result<ParameterGroupSpec, ParallelPlanError>
-where
-    T: Tensor,
-    M: Parameterized<T>,
-{
-    struct Collector<'a, F> {
-        members: Vec<ParameterMemberSpec>,
-        sharding: &'a mut F,
-        error: Option<ParallelPlanError>,
-    }
-
-    impl<'a, 'tensor, T, F> ParameterVisitor<'tensor, T> for Collector<'a, F>
-    where
-        T: Tensor,
-        F: FnMut(&ParameterMetadata, &[usize]) -> Result<MemberSharding, ParallelPlanError>,
-    {
-        fn visit(&mut self, metadata: ParameterMetadata, value: &'tensor T) {
-            if self.error.is_some() {
-                return;
-            }
-            let shape = value
-                .shape()
-                .iter()
-                .map(|dimension| {
-                    usize::try_from(*dimension).map_err(|_| {
-                        ParallelPlanError::InvalidTensor(format!(
-                            "parameter {} has negative dimension {dimension}",
-                            metadata.id.as_str()
-                        ))
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>();
-            let shape = match shape {
-                Ok(shape) => shape,
-                Err(error) => {
-                    self.error = Some(error);
-                    return;
-                }
-            };
-            match (self.sharding)(&metadata, &shape) {
-                Ok(sharding) => self.members.push(
-                    ParameterMemberSpec::new(metadata.id.as_str(), shape, sharding)
-                        .with_parameter_metadata(&metadata),
-                ),
-                Err(error) => self.error = Some(error),
-            }
-        }
-    }
-
-    let mut collector = Collector {
-        members: Vec::new(),
-        sharding: &mut sharding,
-        error: None,
-    };
-    module.visit_parameters(&mut collector);
-    if let Some(error) = collector.error {
-        return Err(error);
-    }
-    ParameterGroupSpec::new(logical_name, role, collector.members)
-}
-
-/// Describes every parameter in a neutral module as one shared logical partition.
-pub fn partitioned_module_parameter_group<T, M>(
-    logical_name: impl Into<String>,
-    role: ParameterRole,
-    preferred_units: usize,
-    module: &M,
-    mut sharding: impl FnMut(&ParameterMetadata, &[usize]) -> Result<MemberSharding, ParallelPlanError>,
-) -> Result<ParameterGroupSpec, ParallelPlanError>
-where
-    T: Tensor,
-    M: Parameterized<T>,
-{
-    if preferred_units == 0 {
-        return Err(ParallelPlanError::InvalidGroup(
-            "partitioned module group has zero preferred units".into(),
-        ));
-    }
-    struct Collector<'a, F> {
-        members: Vec<ParameterMemberSpec>,
-        sharding: &'a mut F,
-        error: Option<ParallelPlanError>,
-    }
-    impl<'a, 'tensor, T, F> ParameterVisitor<'tensor, T> for Collector<'a, F>
-    where
-        T: Tensor,
-        F: FnMut(&ParameterMetadata, &[usize]) -> Result<MemberSharding, ParallelPlanError>,
-    {
-        fn visit(&mut self, metadata: ParameterMetadata, value: &'tensor T) {
-            if self.error.is_some() {
-                return;
-            }
-            let shape = value
-                .shape()
-                .iter()
-                .map(|dimension| {
-                    usize::try_from(*dimension).map_err(|_| {
-                        ParallelPlanError::InvalidTensor(format!(
-                            "parameter {} has negative dimension {dimension}",
-                            metadata.id.as_str()
-                        ))
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>();
-            match shape.and_then(|shape| {
-                (self.sharding)(&metadata, &shape).map(|sharding| {
-                    ParameterMemberSpec::new(metadata.id.as_str(), shape, sharding)
-                        .with_parameter_metadata(&metadata)
-                })
-            }) {
-                Ok(member) => self.members.push(member),
-                Err(error) => self.error = Some(error),
-            }
-        }
-    }
-    let mut collector = Collector {
-        members: Vec::new(),
-        sharding: &mut sharding,
-        error: None,
-    };
-    module.visit_parameters(&mut collector);
-    if let Some(error) = collector.error {
-        return Err(error);
-    }
-    partitioned_group_with_preferred_units(logical_name, role, preferred_units, collector.members)
-}
-
-/// Declares the replicated logical resources of a top-k group selector.
-/// Encoding companions are expanded before placement by
-/// `expand_linear_format_parameter_groups`.
-pub fn top_k_group_selector_logical_group(
-    logical_name: impl Into<String>,
-    spec: &eredu_nn::TopKGroupSelectorSpec,
-) -> Result<ParameterGroupSpec, ParallelPlanError> {
-    spec.validate()
-        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    let groups = spec.selection().group_count() as usize;
-    let input = spec.input_dimensions() as usize;
-    let mut members = Vec::new();
-    for (parameter, shape) in std::iter::once((spec.weight(), vec![groups, input]))
-        .chain(spec.bias().map(|parameter| (parameter, vec![groups])))
-        .chain(
-            spec.correction_bias()
-                .map(|parameter| (parameter, vec![groups])),
-        )
-        .chain(
-            spec.coefficient_scale()
-                .map(|parameter| (parameter, vec![groups])),
-        )
-        .chain(
-            spec.input_transform()
-                .map(|transform| (transform.scale(), vec![input])),
-        )
-    {
-        members.push(
-            ParameterMemberSpec::new(parameter.id.as_str(), shape, MemberSharding::Replicated)
-                .with_parameter_metadata(&ParameterMetadata::from_spec(parameter, true)),
-        );
-    }
-    ParameterGroupSpec::new(logical_name, ParameterRole::Replicated, members)
-}
-
-/// Declares logical matrices and biases for a packed gated-product bank.
-/// The caller selects semantic partition units and expands the exact encoding
-/// companions through `expand_linear_format_parameter_groups` before placement.
-pub fn packed_gated_product_logical_group(
-    logical_name: impl Into<String>,
-    spec: &eredu_nn::GroupedGatedProductSpec,
-    preferred_units: usize,
-) -> Result<ParameterGroupSpec, ParallelPlanError> {
-    spec.validate()
-        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    let eredu_nn::GatedProductGroupLayout::Packed { gate_up, down } = spec.layout() else {
-        return Err(ParallelPlanError::InvalidGroup(
-            "packed parameter geometry requires a packed gated-product layout".into(),
-        ));
-    };
-    let groups = spec.group_count() as usize;
-    let intermediate = spec.intermediate_dimensions() as usize;
-    let doubled = intermediate.checked_mul(2).ok_or_else(|| {
-        ParallelPlanError::InvalidGroup("gated-product width overflowed usize".into())
-    })?;
-    let mut members = Vec::new();
-    for (projection, output, input, weight_sharding, bias_sharding) in [
-        (
-            gate_up,
-            doubled,
-            spec.input_dimensions() as usize,
-            MemberSharding::PartitionedSegments {
-                axis: 1,
-                segments: vec![0..intermediate, intermediate..doubled],
-            },
-            MemberSharding::PartitionedSegments {
-                axis: 1,
-                segments: vec![0..intermediate, intermediate..doubled],
-            },
-        ),
-        (
-            down,
-            spec.output_dimensions() as usize,
-            intermediate,
-            MemberSharding::Partitioned { axis: 2 },
-            MemberSharding::Replicated,
-        ),
-    ] {
-        members.push(
-            ParameterMemberSpec::new(
-                projection.weight().id.as_str(),
-                vec![groups, output, input],
-                weight_sharding,
-            )
-            .with_parameter_metadata(&ParameterMetadata::from_spec(projection.weight(), true)),
-        );
-        if let Some(bias) = projection.bias() {
-            members.push(
-                ParameterMemberSpec::new(bias.id.as_str(), vec![groups, output], bias_sharding)
-                    .with_parameter_metadata(&ParameterMetadata::from_spec(bias, true)),
-            );
-        }
-    }
-    ParameterGroupSpec::partitioned(
-        logical_name,
-        ParameterRole::ExpertIntermediate,
-        preferred_units,
-        members,
-    )
-}
-
-/// Declares logical matrices and biases for a packed ReLU-squared bank.
-/// Encoding companions are expanded before placement by
-/// `expand_linear_format_parameter_groups`.
-pub fn packed_relu2_logical_group(
-    logical_name: impl Into<String>,
-    spec: &eredu_nn::GroupedRelu2Spec,
-    preferred_units: usize,
-) -> Result<ParameterGroupSpec, ParallelPlanError> {
-    spec.validate()
-        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    let groups = spec.group_count() as usize;
-    let hidden = spec.hidden_dimensions() as usize;
-    let intermediate = spec.intermediate_dimensions() as usize;
-    let mut members = Vec::new();
-    for (projection, output, input, axis) in [
-        (spec.up(), intermediate, hidden, 1),
-        (spec.down(), hidden, intermediate, 2),
-    ] {
-        members.push(
-            ParameterMemberSpec::new(
-                projection.weight().id.as_str(),
-                vec![groups, output, input],
-                MemberSharding::Partitioned { axis },
-            )
-            .with_parameter_metadata(&ParameterMetadata::from_spec(projection.weight(), true)),
-        );
-        if let Some(bias) = projection.bias() {
-            members.push(
-                ParameterMemberSpec::new(
-                    bias.id.as_str(),
-                    vec![groups, output],
-                    if axis == 1 {
-                        MemberSharding::Partitioned { axis: 1 }
-                    } else {
-                        MemberSharding::Replicated
-                    },
-                )
-                .with_parameter_metadata(&ParameterMetadata::from_spec(bias, true)),
-            );
-        }
-    }
-    ParameterGroupSpec::partitioned(
-        logical_name,
-        ParameterRole::ExpertIntermediate,
-        preferred_units,
-        members,
-    )
-}
-
-/// Describes one affine projection and all encoding companions.
-pub fn projection_parameter_group<T, M>(
-    logical_name: impl Into<String>,
-    role: ParameterRole,
-    module: &M,
-    placement: ProjectionSharding,
-) -> Result<ParameterGroupSpec, ParallelPlanError>
-where
-    T: Tensor,
-    M: Parameterized<T>,
-{
-    module_parameter_group(
-        logical_name,
-        role,
-        module,
-        |metadata, shape| match placement {
-            ProjectionSharding::Replicated => Ok(MemberSharding::Replicated),
-            ProjectionSharding::Column if shape.is_empty() => {
-                Err(ParallelPlanError::InvalidTensor(format!(
-                    "column projection parameter {} is scalar",
-                    metadata.id.as_str()
-                )))
-            }
-            ProjectionSharding::Column => Ok(MemberSharding::Equal { axis: 0 }),
-            ProjectionSharding::Row if shape.len() >= 2 => Ok(MemberSharding::Equal { axis: 1 }),
-            ProjectionSharding::Row => Ok(MemberSharding::Replicated),
-        },
-    )
-}
-
-/// Describes projections that consume one shared logical partition.
-pub fn partitioned_projection_group<T, M>(
-    logical_name: impl Into<String>,
-    role: ParameterRole,
-    projections: &[(&M, ProjectionSharding)],
-    preferred_units: usize,
-) -> Result<ParameterGroupSpec, ParallelPlanError>
-where
-    T: Tensor,
-    M: Parameterized<T>,
-{
-    if preferred_units == 0 {
-        return Err(ParallelPlanError::InvalidGroup(
-            "partitioned projection group has zero preferred units".into(),
-        ));
-    }
-    let mut members = Vec::new();
-    for (module, placement) in projections {
-        let group = projection_parameter_group::<T, M>("projection", role, *module, *placement)?;
-        for member in group.members {
-            let sharding = match (placement, member.global_shape.len()) {
-                (ProjectionSharding::Replicated, _) | (ProjectionSharding::Row, 0 | 1) => {
-                    MemberSharding::Replicated
-                }
-                (ProjectionSharding::Column, 0) => unreachable!("validated above"),
-                (ProjectionSharding::Column, _) => MemberSharding::Partitioned { axis: 0 },
-                (ProjectionSharding::Row, _) => MemberSharding::Partitioned { axis: 1 },
-            };
-            members.push(member.with_sharding(sharding));
-        }
-    }
-    partitioned_group_with_preferred_units(logical_name, role, preferred_units, members)
-}
-
-/// Describes a component-major fused column projection and its row-parallel
-/// output as one shared logical partition.
-///
-/// The same ordered segment selection is attached to the fused weight and all
-/// encoding companions exposed by the module. The row projection consumes the
-/// corresponding local hidden partition and is reduced once by the backend.
-pub fn segmented_projection_group<T, M>(
-    logical_name: impl Into<String>,
-    role: ParameterRole,
-    fused: &M,
-    row: &M,
-    segments: Vec<Range<usize>>,
-    preferred_units: usize,
-) -> Result<ParameterGroupSpec, ParallelPlanError>
-where
-    T: Tensor,
-    M: Parameterized<T>,
-{
-    if preferred_units == 0 || segments.is_empty() {
-        return Err(ParallelPlanError::InvalidGroup(
-            "segmented projection requires positive logical units and at least one segment".into(),
-        ));
-    }
-    let mut previous_end = 0usize;
-    for segment in &segments {
-        if segment.start != previous_end || segment.start >= segment.end {
-            return Err(ParallelPlanError::InvalidGroup(format!(
-                "segmented projection ranges must be positive, contiguous, and ordered, got {segments:?}"
-            )));
-        }
-        previous_end = segment.end;
-    }
-
-    let fused_group =
-        projection_parameter_group::<T, M>("fused", role, fused, ProjectionSharding::Column)?;
-    let row_group = projection_parameter_group::<T, M>("row", role, row, ProjectionSharding::Row)?;
-    assemble_segmented_projection_group(
-        logical_name,
-        role,
-        fused_group,
-        row_group,
-        segments,
-        preferred_units,
-        previous_end,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn assemble_segmented_projection_group(
-    logical_name: impl Into<String>,
-    role: ParameterRole,
-    fused_group: ParameterGroupSpec,
-    row_group: ParameterGroupSpec,
-    segments: Vec<Range<usize>>,
-    units: usize,
-    expected_fused_width: usize,
-) -> Result<ParameterGroupSpec, ParallelPlanError> {
-    let mut members = Vec::new();
-    for member in fused_group.members {
-        let dimension = member.global_shape.first().copied().ok_or_else(|| {
-            ParallelPlanError::InvalidTensor(format!(
-                "segmented projection parameter {} is scalar",
-                member.target
-            ))
-        })?;
-        if dimension != expected_fused_width {
-            return Err(ParallelPlanError::InvalidTensor(format!(
-                "segmented projection parameter {} has output dimension {dimension}, expected {expected_fused_width}",
-                member.target
-            )));
-        }
-        members.push(member.with_sharding(MemberSharding::PartitionedSegments {
-            axis: 0,
-            segments: segments.clone(),
-        }));
-    }
-    for member in row_group.members {
-        let sharding = if member.global_shape.len() >= 2 {
-            MemberSharding::Partitioned { axis: 1 }
-        } else {
-            MemberSharding::Replicated
-        };
-        members.push(member.with_sharding(sharding));
-    }
-    partitioned_group_with_preferred_units(logical_name, role, units, members)
 }
 
 /// Returns the finest legal logical-unit count for an aligned partition.
@@ -1087,7 +826,7 @@ pub fn expand_linear_format_parameter_group(
     let mut members = Vec::new();
     for source in group.members() {
         members.extend(match declaration(source)? {
-            Some(declaration) => expand_linear_format_member(source, &declaration)?,
+            Some(declaration) => expand_linear_format_parameter(source, &declaration)?,
             None => vec![source.clone()],
         });
     }
@@ -1101,36 +840,6 @@ pub fn expand_linear_format_parameter_group(
         None => ParameterGroupSpec::new(group.logical_name(), group.role(), members),
     }?;
     expanded.with_partition_unit_assignment(group.partition_unit_assignment())
-}
-
-/// Projects physical groups while retaining caller-owned typed resource tags.
-/// Tags move with their group and require neither cloning nor ordering.
-pub fn expand_tagged_linear_format_parameter_groups<Tag>(
-    groups: impl IntoIterator<Item = (Tag, ParameterGroupSpec)>,
-    declaration: impl Fn(&ParameterMemberSpec) -> Result<Option<LinearFormatSpec>, ParallelPlanError>,
-) -> Result<Vec<(Tag, ParameterGroupSpec)>, ParallelPlanError> {
-    groups
-        .into_iter()
-        .map(|(tag, group)| {
-            expand_linear_format_parameter_group(group, &declaration).map(|group| (tag, group))
-        })
-        .collect()
-}
-
-/// Projects physical storage for canonical owned groups without rebuilding their
-/// ownership, sharing or replica-consumer declarations.
-pub fn expand_owned_linear_format_parameter_groups(
-    groups: Vec<crate::OwnedParameterGroupSpec>,
-    declaration: impl Fn(&ParameterMemberSpec) -> Result<Option<LinearFormatSpec>, ParallelPlanError>,
-) -> Result<Vec<crate::OwnedParameterGroupSpec>, ParallelPlanError> {
-    groups
-        .into_iter()
-        .map(|owned| {
-            let owner = owned.owner().clone();
-            expand_linear_format_parameter_group(owned.into_group(), &declaration)
-                .map(|group| crate::OwnedParameterGroupSpec::new(owner, group))
-        })
-        .collect()
 }
 
 fn partitioned_group_with_preferred_units(
@@ -1307,11 +1016,19 @@ fn remap_fp8_rows(
     }
 }
 
-fn expand_linear_format_member(
+/// Projects one logical matrix and its typed encoding companions into exact
+/// physical geometry and sharding, including independent row-block origins.
+/// The source member supplies logical axes; no backend allocation occurs.
+pub fn expand_linear_format_parameter(
     source: &ParameterMemberSpec,
     declaration: &LinearFormatSpec,
 ) -> Result<Vec<ParameterMemberSpec>, ParallelPlanError> {
     let name = source.target();
+    let primary = match source.parameter_metadata() {
+        Some(metadata) => metadata.id.clone(),
+        None => eredu_nn::ParameterId::new(name)
+            .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?,
+    };
     let shape = source.global_shape();
     let format = declaration.encoding();
     if format == LinearFormat::Dense {
@@ -1360,9 +1077,10 @@ fn expand_linear_format_member(
             Ok(vec![
                 source
                     .clone()
-                    .with_linear_row_layout(declaration.row_layout()),
+                    .with_linear_row_layout(declaration.row_layout())?,
                 ParameterMemberSpec::new(scale.id.as_str(), scale_shape, scale_sharding)
-                    .with_linear_companion(eredu_nn::LinearCompanionRole::Scale, name),
+                    .with_parameter_metadata(&ParameterMetadata::from_spec(scale, scale.trainable))
+                    .with_linear_companion(eredu_nn::LinearCompanionRole::Scale, &primary)?,
             ])
         }
         LinearFormat::GgufIQuant { ggml_type, .. } => {
@@ -1434,7 +1152,10 @@ fn expand_linear_format_member(
                 }
                 other => other,
             };
-            Ok(vec![ParameterMemberSpec::new(name, packed, sharding)])
+            Ok(vec![source
+                .clone()
+                .with_shape(packed)
+                .with_sharding(sharding)])
         }
         LinearFormat::Affine(_) | LinearFormat::MxFp4 | LinearFormat::NvFp4 => {
             let quantization = format.weight_quantization().expect("packed format");
@@ -1449,29 +1170,26 @@ fn expand_linear_format_member(
                     "packed linear parameter {name} declares companions inconsistent with its format"
                 )));
             }
-            let bits = usize::try_from(quantization.bits())
-                .map_err(|_| invalid(format!("packed bit width for {name} exceeds usize")))?;
-            let group = usize::try_from(quantization.group_size())
-                .map_err(|_| invalid(format!("packed group width for {name} exceeds usize")))?;
-            let input = shape[column_axis];
-            let packed_bits = input
-                .checked_mul(bits)
-                .ok_or_else(|| invalid(format!("packed matrix {name} overflows")))?;
-            if group == 0 || !input.is_multiple_of(group) || !packed_bits.is_multiple_of(32) {
-                return Err(invalid(format!(
-                    "packed matrix {name} input {input} is incompatible with group {group} and {bits} bits"
-                )));
-            }
+            let geometry = quantization
+                .packed_word_geometry(shape[column_axis])
+                .map_err(|error| invalid(format!("packed matrix {name}: {error}")))?;
+            // Descriptor validation and checked conversions belong to the projection.
+            let bits = quantization.bits() as usize;
+            let group = quantization.group_size() as usize;
             let mut packed = shape.to_vec();
-            packed[column_axis] = packed_bits / 32;
+            packed[column_axis] = geometry.word_columns();
             let mut companion = shape.to_vec();
-            companion[column_axis] = input / group;
-            let mut members = vec![ParameterMemberSpec::new(
-                name,
-                packed,
-                remap_linear_segments(source.sharding(), column_axis, 32 / bits, name)?,
-            )
-            .with_linear_row_layout(declaration.row_layout())];
+            companion[column_axis] = geometry.group_columns();
+            let mut members = vec![source
+                .clone()
+                .with_shape(packed)
+                .with_sharding(remap_linear_segments(
+                    source.sharding(),
+                    column_axis,
+                    32 / bits,
+                    name,
+                )?)
+                .with_linear_row_layout(declaration.row_layout())?];
             let companion_sharding =
                 remap_linear_segments(source.sharding(), column_axis, group, name)?;
             members.push(
@@ -1480,12 +1198,20 @@ fn expand_linear_format_member(
                     companion.clone(),
                     companion_sharding.clone(),
                 )
-                .with_linear_companion(eredu_nn::LinearCompanionRole::Scale, name),
+                .with_parameter_metadata(&ParameterMetadata::from_spec(scale, scale.trainable))
+                .with_linear_companion(eredu_nn::LinearCompanionRole::Scale, &primary)?,
             );
             if let Some(bias) = bias {
                 members.push(
                     ParameterMemberSpec::new(bias.id.as_str(), companion, companion_sharding)
-                        .with_linear_companion(eredu_nn::LinearCompanionRole::AffineBias, name),
+                        .with_parameter_metadata(&ParameterMetadata::from_spec(
+                            bias,
+                            bias.trainable,
+                        ))
+                        .with_linear_companion(
+                            eredu_nn::LinearCompanionRole::AffineBias,
+                            &primary,
+                        )?,
                 );
             }
             if let Some(global) = declaration.global_scale() {
@@ -1504,7 +1230,11 @@ fn expand_linear_format_member(
                         global_shape,
                         MemberSharding::Replicated,
                     )
-                    .with_linear_companion(eredu_nn::LinearCompanionRole::GlobalScale, name),
+                    .with_parameter_metadata(&ParameterMetadata::from_spec(
+                        global,
+                        global.trainable,
+                    ))
+                    .with_linear_companion(eredu_nn::LinearCompanionRole::GlobalScale, &primary)?,
                 );
             }
             Ok(members)
@@ -2038,8 +1768,18 @@ mod tests {
                 assert_eq!(first.end, last.start);
                 assert_eq!(last.end, extent);
             }
-            assert_eq!(members[1].linear_companion_of(), Some("read"));
-            assert_eq!(members[3].linear_companion_of(), Some("write"));
+            assert_eq!(
+                members[1]
+                    .linear_companion_of()
+                    .map(eredu_nn::ParameterId::as_str),
+                Some("read")
+            );
+            assert_eq!(
+                members[3]
+                    .linear_companion_of()
+                    .map(eredu_nn::ParameterId::as_str),
+                Some("write")
+            );
         }
     }
 
@@ -2361,106 +2101,5 @@ mod tests {
             expanded[0].members()[1].sharding(),
             &MemberSharding::Partitioned { axis: 0 }
         );
-    }
-
-    #[test]
-    fn segmented_projection_applies_identical_ranges_to_every_fused_companion() {
-        let fused = ParameterGroupSpec::new(
-            "fused",
-            ParameterRole::FeedForwardIntermediate,
-            [
-                ParameterMemberSpec::new(
-                    "gate_up.weight",
-                    [12, 8],
-                    MemberSharding::Equal { axis: 0 },
-                ),
-                ParameterMemberSpec::new(
-                    "gate_up.scales",
-                    [12, 2],
-                    MemberSharding::Equal { axis: 0 },
-                ),
-                ParameterMemberSpec::new(
-                    "gate_up.biases",
-                    [12, 2],
-                    MemberSharding::Equal { axis: 0 },
-                ),
-            ],
-        )
-        .unwrap();
-        let row = ParameterGroupSpec::new(
-            "row",
-            ParameterRole::FeedForwardIntermediate,
-            [
-                ParameterMemberSpec::new("down.weight", [8, 6], MemberSharding::Equal { axis: 1 }),
-                ParameterMemberSpec::new("down.scales", [8, 2], MemberSharding::Equal { axis: 1 }),
-                ParameterMemberSpec::new("down.bias", [8], MemberSharding::Replicated),
-            ],
-        )
-        .unwrap();
-        let segments = vec![0..4, 4..8, 8..12];
-        let group = assemble_segmented_projection_group(
-            "mlp.projections",
-            ParameterRole::FeedForwardIntermediate,
-            fused,
-            row,
-            segments.clone(),
-            2,
-            12,
-        )
-        .unwrap();
-        assert_eq!(group.partition_units(), Some(2));
-        for member in &group.members()[..3] {
-            assert_eq!(
-                member.sharding(),
-                &MemberSharding::PartitionedSegments {
-                    axis: 0,
-                    segments: segments.clone(),
-                }
-            );
-        }
-        assert_eq!(
-            group.members()[3].sharding(),
-            &MemberSharding::Partitioned { axis: 1 }
-        );
-        assert_eq!(
-            group.members()[4].sharding(),
-            &MemberSharding::Partitioned { axis: 1 }
-        );
-        assert_eq!(group.members()[5].sharding(), &MemberSharding::Replicated);
-    }
-
-    #[test]
-    fn segmented_projection_rejects_one_misaligned_companion_atomically() {
-        let fused = ParameterGroupSpec::new(
-            "fused",
-            ParameterRole::AttentionHeads,
-            [
-                ParameterMemberSpec::new("qkv.weight", [12, 8], MemberSharding::Equal { axis: 0 }),
-                ParameterMemberSpec::new("qkv.scales", [11, 2], MemberSharding::Equal { axis: 0 }),
-            ],
-        )
-        .unwrap();
-        let row = ParameterGroupSpec::new(
-            "row",
-            ParameterRole::AttentionHeads,
-            [ParameterMemberSpec::new(
-                "output.weight",
-                [8, 4],
-                MemberSharding::Equal { axis: 1 },
-            )],
-        )
-        .unwrap();
-        assert!(matches!(
-            assemble_segmented_projection_group(
-                "attention.projections",
-                ParameterRole::AttentionHeads,
-                fused,
-                row,
-                vec![0..4, 4..8, 8..12],
-                2,
-                12,
-            ),
-            Err(ParallelPlanError::InvalidTensor(_))
-        ));
     }
 }

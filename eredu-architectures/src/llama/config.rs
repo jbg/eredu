@@ -114,6 +114,28 @@ impl ModelArgs {
         validate_model_args(self)
     }
 
+    pub(crate) fn validate_declaration_formats(
+        &self,
+        declaration: &crate::decoder::DecoderDeclaration,
+    ) -> Result<(), eredu_nn::Error> {
+        let formats = self
+            .quantized_weight_configs
+            .iter()
+            .flat_map(|formats| formats.iter())
+            .map(|(name, format)| (name.as_str(), Some((*format).into())));
+        let selected = self
+            .quantized_weights
+            .iter()
+            .flat_map(|names| names.iter())
+            .map(|name| {
+                (
+                    name.as_str(),
+                    self.weight_quantization_for(name).map(Into::into),
+                )
+            });
+        crate::format_references::validate_logical(declaration, formats.chain(selected))
+    }
+
     /// Returns the model-wide checkpoint encoding, if packed.
     pub fn weight_quantization(&self) -> Option<WeightQuantization> {
         self.quantization
@@ -148,6 +170,12 @@ impl Config for ModelArgs {
     }
     fn validate_config(&self) -> Result<(), eredu_nn::Error> {
         self.validate().map_err(eredu_nn::Error::backend)
+    }
+    fn validate_parameter_formats(
+        &self,
+        declaration: &crate::decoder::DecoderDeclaration,
+    ) -> Result<(), eredu_nn::Error> {
+        self.validate_declaration_formats(declaration)
     }
     fn hidden_size(&self) -> i32 {
         self.hidden_size

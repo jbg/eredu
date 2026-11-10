@@ -1,9 +1,10 @@
 //! Exact shared text, draft-only low-rank, and independently owned Pixtral semantics.
 use super::*;
 use crate::{decoder::Config, nemotron_labs_diffusion::FamilyConfig};
+use eredu_nn::DeclareLogicalParameters;
 
 pub(super) fn describe(g: &mut Builder, config: &FamilyConfig) {
-    families::dense(g, config, None);
+    families::dense(g, config, None, config.text_declaration().as_ref());
     for layer in 0..config.num_hidden_layers() as usize {
         let node = format!("decoder.layers.{layer}.attention");
         g.get_mut(&node).label =
@@ -11,8 +12,10 @@ pub(super) fn describe(g: &mut Builder, config: &FamilyConfig) {
         if let Some(attention) = &mut g.get_mut(&node).attention {
             attention.causal = None;
         }
-        if let Some(adapter) = config.draft_adapter() {
-            let root = format!("draft_adapter.layers.{layer}.o_proj");
+        if let Some(adapter) = config.draft_parameters() {
+            let declaration = adapter.layer(layer).expect("retained draft adapter layer");
+            let root = &declaration.root;
+            let projection = declaration.projection();
             let down = format!("{root}.down");
             let up = format!("{root}.up");
             let sum = format!("{root}.sum");
@@ -21,25 +24,43 @@ pub(super) fn describe(g: &mut Builder, config: &FamilyConfig) {
                 &down,
                 ArchitectureNodeKind::Projector,
                 Some(&parent),
-                Some(&format!("{root}.lora_A")),
-                Some(adapter.rank() as usize),
+                Some(
+                    projection
+                        .down
+                        .weight
+                        .id
+                        .as_str()
+                        .strip_suffix(".weight")
+                        .expect("declared adapter matrix"),
+                ),
+                Some(projection.down.output as usize),
             );
             g.get_mut(&down).label = "Draft-only low-rank reduction of attention channels".into();
             g.node(
                 &up,
                 ArchitectureNodeKind::Projector,
                 Some(&parent),
-                Some(&format!("{root}.lora_B")),
-                Some(config.hidden_size() as usize),
+                Some(
+                    projection
+                        .up
+                        .weight
+                        .id
+                        .as_str()
+                        .strip_suffix(".weight")
+                        .expect("declared adapter matrix"),
+                ),
+                Some(projection.up.output as usize),
             );
-            g.get_mut(&up).label =
-                format!("Draft-only expansion, alpha/rank scale {}", adapter.scale());
+            g.get_mut(&up).label = format!(
+                "Draft-only expansion, alpha/rank scale {}",
+                projection.scale
+            );
             g.node(
                 &sum,
                 ArchitectureNodeKind::Sum,
                 Some(&parent),
                 None,
-                Some(config.hidden_size() as usize),
+                Some(projection.up.output as usize),
             );
             g.get_mut(&sum).label = "Shared attention output plus draft-only low-rank write".into();
             g.edge(&node, &down, ArchitectureEdgeKind::Data);
@@ -57,7 +78,8 @@ pub(super) fn describe(g: &mut Builder, config: &FamilyConfig) {
     let Some(vision) = &config.vision else {
         return;
     };
-    let width = vision.hidden_size as usize;
+    let declaration = vision.tower();
+    let width = declaration.embedding.shape[0] as usize;
     g.node(
         "vision",
         ArchitectureNodeKind::Encoder,
@@ -101,9 +123,9 @@ pub(super) fn describe(g: &mut Builder, config: &FamilyConfig) {
     );
     let mut previous = "vision.pre_norm".to_owned();
     let mut executions = Vec::new();
-    for layer in 0..vision.num_hidden_layers as usize {
+    for (layer, spec) in declaration.layers.iter().enumerate() {
         let block = format!("vision.layers.{layer}");
-        let root = format!("model.vision_tower.transformer.layers.{layer}");
+        let root = &spec.root;
         g.node(
             &block,
             ArchitectureNodeKind::Encoder,
@@ -124,10 +146,10 @@ pub(super) fn describe(g: &mut Builder, config: &FamilyConfig) {
         );
         g.get_mut(&attention).attention = Some(AttentionAttributes {
             head_sharing: Some(HeadSharing::MultiHead),
-            query_heads: Some(vision.num_attention_heads as usize),
-            key_value_heads: Some(vision.num_attention_heads as usize),
-            key_head_dimension: Some(vision.head_dim as usize),
-            value_head_dimension: Some(vision.head_dim as usize),
+            query_heads: Some(spec.attention.geometry.query_heads() as usize),
+            key_value_heads: Some(spec.attention.geometry.key_value_heads() as usize),
+            key_head_dimension: Some(spec.attention.geometry.key_dimensions() as usize),
+            value_head_dimension: Some(spec.attention.geometry.value_dimensions() as usize),
             receptive_field: Some(ReceptiveField::Local { window: None }),
             mechanism: Some(AttentionMechanism::Softmax),
             recurrent: Some(false),
@@ -155,47 +177,59 @@ pub(super) fn describe(g: &mut Builder, config: &FamilyConfig) {
     g.descriptor.layer_groups.push(ArchitectureLayerGroup {
         id: "vision".into(),
         label: "Pixtral".into(),
-        physical_layer_count: vision.num_hidden_layers as usize,
+        physical_layer_count: declaration.layers.len(),
         passes: vec![ArchitectureExecutionPass {
             index: 0,
             executions,
         }],
         weight_sharing: LayerWeightSharing::None,
     });
+    let projector = config.projector().expect("validated Pixtral projector");
+    let norms = projector
+        .norm
+        .logical_parameters()
+        .expect("declared projector norm");
+    let parameter_root = |p: &eredu_nn::ParameterSpec| {
+        p.id.as_str()
+            .strip_suffix(".weight")
+            .expect("declared projector weight")
+            .to_owned()
+    };
+    let text_width = projector.second.output as usize;
     g.node(
         "vision.projector",
         ArchitectureNodeKind::Projector,
         None,
         None,
-        Some(config.hidden_size() as usize),
+        Some(text_width),
     );
     for (node, kind, parameter, label) in [
         (
             "vision.projector.norm",
             ArchitectureNodeKind::Normalization,
-            "model.multi_modal_projector.norm",
+            parameter_root(norms[0].parameter),
             "Pre-merger RMS normalization",
         ),
         (
             "vision.projector.merge",
             ArchitectureNodeKind::Projector,
-            "model.multi_modal_projector.patch_merger.merging_layer",
+            parameter_root(&projector.merger.weight),
             "Channel-major spatial unfold and learned merger",
         ),
         (
             "vision.projector.linear_1",
             ArchitectureNodeKind::Projector,
-            "model.multi_modal_projector.linear_1",
+            parameter_root(&projector.first.weight),
             "Image-to-text projection followed by GELU",
         ),
         (
             "vision.projector.linear_2",
             ArchitectureNodeKind::Projector,
-            "model.multi_modal_projector.linear_2",
+            parameter_root(&projector.second.weight),
             "Final image-to-text projection",
         ),
     ] {
-        g.node(node, kind, Some("vision.projector"), Some(parameter), None);
+        g.node(node, kind, Some("vision.projector"), Some(&parameter), None);
         g.get_mut(node).label = label.into();
         g.edge(&previous, node, ArchitectureEdgeKind::Data);
         previous = node.into();
@@ -206,7 +240,7 @@ pub(super) fn describe(g: &mut Builder, config: &FamilyConfig) {
         ArchitectureNodeKind::ModalityMerge,
         None,
         None,
-        Some(config.hidden_size() as usize),
+        Some(text_width),
     );
     g.get_mut("assembly").label = "Projected image features replace image-pad positions; row and end markers remain token embeddings".into();
     for edge in &mut g.descriptor.edges {
@@ -220,31 +254,31 @@ pub(super) fn describe(g: &mut Builder, config: &FamilyConfig) {
         (
             "vision.projector.norm",
             "model.multi_modal_projector.norm.output",
-            width,
+            projector.norm.dimensions as usize,
             false,
         ),
         (
             "vision.projector.merge",
             "model.multi_modal_projector.patch_merger.output",
-            width,
+            projector.merger.output as usize,
             true,
         ),
         (
             "vision.projector.linear_1",
             "model.multi_modal_projector.linear_1.output",
-            config.hidden_size() as usize,
+            projector.first.output as usize,
             true,
         ),
         (
             "vision.projector.linear_1",
             "model.multi_modal_projector.gelu.output",
-            config.hidden_size() as usize,
+            projector.first.output as usize,
             true,
         ),
         (
             "vision.projector.linear_2",
             "model.multi_modal_projector.linear_2.output",
-            config.hidden_size() as usize,
+            projector.second.output as usize,
             true,
         ),
     ] {

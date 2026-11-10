@@ -10,6 +10,7 @@ use eredu_runtime::{AppendStreamBinding, ReplicatedTextPhysicalSource, SelectedR
 #[derive(Clone)]
 pub struct GgufTargetPlan {
     text: GgufTextPlan,
+    parameters: Arc<TargetParameters>,
 }
 
 impl std::fmt::Debug for GgufTargetPlan {
@@ -46,9 +47,12 @@ impl GgufTargetPlan {
 
     /// Validates published metadata and derives recipes from container headers.
     pub fn prepare(checkpoint: &eredu_gguf::Checkpoint) -> Result<Self, PreparationError> {
-        Ok(Self {
-            text: GgufTextPlan::prepare(checkpoint)?,
-        })
+        let text = GgufTextPlan::prepare(checkpoint)?;
+        let parameters = Arc::new(super::execution::target_parameters_from_formats(
+            &text.parameters,
+            &ParameterFormats(text.formats.clone(), BTreeMap::new()),
+        )?);
+        Ok(Self { text, parameters })
     }
 
     /// Normalizes published physical encodings and family recipes before selection.
@@ -81,16 +85,9 @@ impl GgufTargetPlan {
         if self.text.config().tied_embeddings {
             static_recipes.retain(|name, _| !name.starts_with("lm_head."));
         }
-        let mut unit_recipes = Vec::new();
-        for layer in 0..self.text.config().layers.len() {
-            if self.text.config().ngram.layers.contains(&layer) {
-                unit_recipes.push(
-                    self.text
-                        .parameter_recipes(ParameterScope::Lexical(layer))?,
-                );
-            }
-            unit_recipes.push(self.text.parameter_recipes(ParameterScope::Target(layer))?);
-        }
+        let unit_recipes = TargetInvocation::schedule(self.text.config())
+            .map(|invocation| self.text.parameter_recipes(invocation.parameter_scope()))
+            .collect::<Result<Vec<_>, _>>()?;
         let formats = ParameterFormats(self.text.formats.clone(), BTreeMap::new());
         let banks = self.expert_banks()?;
         let metadata = catalog
@@ -98,9 +95,9 @@ impl GgufTargetPlan {
             .into_iter()
             .map(|key| Ok((key.clone(), catalog.metadata(&key)?)))
             .collect::<Result<_, StoreError>>()?;
+        let declaration = self.parameters.clone();
         let parameters = super::requirements::target_parameters(
-            self.text.config(),
-            &formats,
+            &declaration,
             catalog,
             &physical,
             &static_recipes,
@@ -113,6 +110,7 @@ impl GgufTargetPlan {
             ),
         );
         Ok(TargetArtifactDeclaration {
+            parameters: declaration,
             config: self.text.config().clone(),
             formats,
             normalized,
@@ -156,26 +154,22 @@ impl GgufTargetPlan {
     ) -> Result<TargetSpec, PreparationError> {
         let config = self.text.config();
         limits.validate_for_config(config)?;
-        let formats = ParameterFormats(self.text.formats.clone(), BTreeMap::new());
         let mut rows = BTreeMap::new();
-        let mut ordinal = 0;
-        for layer in 0..config.layers.len() {
-            if config.ngram.layers.contains(&layer) {
+        for (ordinal, invocation) in TargetInvocation::schedule(config).enumerate() {
+            if let TargetInvocation::Lexical { layer } = invocation {
                 rows.insert(
                     layer,
                     self.text
                         .table
                         .lookup_spec(layer, rows.len() + 1, ordinal, limits.element)?,
                 );
-                ordinal += 1;
             }
-            ordinal += 1;
         }
-        Ok(super::execution::target_spec_from_formats(
+        Ok(super::execution::target_spec_from_parameters(
             config.clone(),
             &rows,
             limits,
-            &formats,
+            &self.parameters,
             selected,
         )?)
     }
@@ -263,20 +257,38 @@ impl GgufTargetPlan {
     fn expert_banks(
         &self,
     ) -> Result<BTreeMap<String, Arc<ParameterBankRecipes>>, PreparationError> {
-        (0..self.text.config().layers.len())
-            .map(|layer| {
-                let root = format!("model.layers.{layer}.mlp.experts");
+        self.parameters
+            .units
+            .iter()
+            .filter_map(|unit| match unit {
+                crate::qwen4_exp::target::declarations::UnitParameters::Decoder {
+                    layer,
+                    feed_forward,
+                    ..
+                } => Some((*layer, &feed_forward.feed_forward.parameters.routed.experts)),
+                _ => None,
+            })
+            .map(|(layer, declared)| {
+                let packed = declared.packed_parameters()?;
+                let root = checkpoint::experts::source_root(&packed)
+                    .map_err(PreparationError::Contract)?
+                    .to_owned();
+                let prefix = format!("{root}.");
                 let recipes = self
                     .text
                     .expert_bank_recipes(layer)?
                     .into_iter()
-                    .map(|(name, recipe)| (name[root.len() + 1..].to_owned(), recipe))
-                    .collect();
-                let bank = ParameterBankRecipes::new(
-                    self.text.catalog(),
-                    recipes,
-                    self.text.config().experts.count as usize,
-                )?;
+                    .map(|(name, recipe)| {
+                        let relative = name.strip_prefix(&prefix).ok_or_else(|| {
+                            PreparationError::Contract(format!(
+                                "expert recipe {name} has no declared bank owner"
+                            ))
+                        })?;
+                        Ok((relative.to_owned(), recipe))
+                    })
+                    .collect::<Result<_, PreparationError>>()?;
+                let bank =
+                    ParameterBankRecipes::new(self.text.catalog(), recipes, packed.group_count())?;
                 Ok((root, Arc::new(bank)))
             })
             .collect()

@@ -75,26 +75,34 @@ impl FamilyConfig {
         else {
             unreachable!()
         };
+        let adapter_geometry = self
+            .draft_parameters()
+            .map(|adapter| {
+                let declaration = adapter.layer(0).map_err(|_| {
+                    DecodingModeError::Unsupported("invalid draft adapter declaration")
+                })?;
+                let projection = declaration.projection();
+                Ok::<_, DecodingModeError>(
+                    eredu_runtime::speculative::shared_backbone::SharedDraftAdapterGeometry {
+                        rank: std::num::NonZeroU32::new(projection.down.output as u32)
+                            .expect("validated positive adapter rank"),
+                        input: std::num::NonZeroU32::new(projection.down.input as u32)
+                            .expect("validated attention channels"),
+                        output: std::num::NonZeroU32::new(projection.up.output as u32)
+                            .expect("validated residual width"),
+                        layers: std::num::NonZeroU32::new(adapter.layers().len() as u32)
+                            .expect("validated layer count"),
+                    },
+                )
+            })
+            .transpose()?;
         SharedBackboneExecutionPolicy::new(
             self.generation_geometry(),
             self.mask_token_id,
             defaults,
             diffusion,
             self.model_identity() == "nemotron_labs_diffusion",
-            self.draft_adapter().map(|adapter| {
-                eredu_runtime::speculative::shared_backbone::SharedDraftAdapterGeometry {
-                    rank: std::num::NonZeroU32::new(adapter.rank() as u32)
-                        .expect("validated positive adapter rank"),
-                    input: std::num::NonZeroU32::new(
-                        (self.num_attention_heads() * self.head_dim()) as u32,
-                    )
-                    .expect("validated attention channels"),
-                    output: std::num::NonZeroU32::new(self.hidden_size() as u32)
-                        .expect("validated residual width"),
-                    layers: std::num::NonZeroU32::new(self.num_hidden_layers() as u32)
-                        .expect("validated layer count"),
-                }
-            }),
+            adapter_geometry,
             true,
         )
     }

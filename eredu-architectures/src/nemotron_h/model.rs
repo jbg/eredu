@@ -10,8 +10,8 @@ use eredu_runtime::{
 };
 
 use super::{
-    state_layout, Block, EmbeddedInput, ForwardMode, LocalGeometry, ModelArgs, Operator,
-    PredictionUnit, RetainedValues, TargetReadout,
+    Block, EmbeddedInput, ForwardMode, LocalGeometry, ModelArgs, Operator, PredictionUnit,
+    RetainedValues, TargetReadout,
 };
 use crate::decoder::{ComponentInstrumentation, DecoderStaticResources, StaticModules};
 use eredu_runtime::{ComponentEquations as _, ParallelComponentKernel as _};
@@ -60,10 +60,10 @@ pub struct TargetBoundarySchema {
 }
 
 impl TargetBoundarySchema {
-    /// Derives the boundary schema from the normalized target configuration.
-    pub const fn from_args(args: &ModelArgs) -> Self {
+    /// Projects target boundary dimensions from retained static parameters.
+    pub fn from_declaration(declaration: &super::Declaration) -> Self {
         Self {
-            hidden_size: args.hidden_size,
+            hidden_size: declaration.statics.embedding_spec().dimensions,
             signed_tokens: false,
         }
     }
@@ -259,6 +259,7 @@ pub struct CompleteNemotronKernel<B: GroupedNeuralBackend + eredu_nn::Distribute
     static_modules: StaticModules<B>,
     definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
     target_units: usize,
+    declaration: std::sync::Arc<super::Declaration>,
     prediction_steps: usize,
     prediction_pattern: usize,
     parallel_geometry: Option<std::sync::Arc<LocalGeometry>>,
@@ -266,29 +267,44 @@ pub struct CompleteNemotronKernel<B: GroupedNeuralBackend + eredu_nn::Distribute
 }
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> CompleteNemotronKernel<B> {
-    /// Materializes serial resources from the cold retained declaration.
-    pub fn from_definition(
-        args: ModelArgs,
-        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
+    /// Materializes target and prediction units from the exact retained neural scopes.
+    pub fn from_declaration(
+        declaration: std::sync::Arc<super::Declaration>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredModel<B>, Error> {
-        Self::materialize(args, definition, None, context)
+        crate::operator_requirements::require::<B>(
+            "Nemotron-H",
+            crate::operator_requirements::NEMOTRON_H,
+        )?;
+        let args = declaration.args().clone();
+        let statics = &declaration.statics;
+        let boundary = crate::decoder::NormalizedBoundary::new(
+            statics.normalization_spec().clone().with_groups(1)?,
+            context,
+        )?;
+        let modules = StaticModules::from_boundary(
+            statics.embedding_spec().clone(),
+            statics.head_spec().cloned(),
+            boundary,
+            context,
+        )?;
+        Self::with_selected_resources(
+            args,
+            std::sync::Arc::clone(declaration.definition()),
+            modules,
+            None,
+            declaration,
+        )
     }
-    /// Materializes the same target/MTP equations with admitted rank-local geometry.
-    pub fn from_parallel_definition(
-        args: ModelArgs,
-        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
-        geometry: LocalGeometry,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredModel<B>, Error> {
-        Self::materialize(args, definition, Some(geometry), context)
-    }
-    fn materialize(
-        args: ModelArgs,
+
+    /// Materializes exact retained scopes against selected parameter and state ownership.
+    pub fn from_selected_declaration(
+        declaration: std::sync::Arc<super::Declaration>,
         definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         geometry: Option<LocalGeometry>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredModel<B>, Error> {
+        let args = declaration.args().clone();
         crate::operator_requirements::require::<B>(
             "Nemotron-H",
             crate::operator_requirements::NEMOTRON_H,
@@ -296,9 +312,11 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> CompleteNemot
         args.validate().map_err(Error::backend)?;
         let definition = match &geometry {
             Some(geometry) => {
-                geometry.validate_for(&args).map_err(Error::backend)?;
+                geometry
+                    .validate_for(&declaration)
+                    .map_err(Error::backend)?;
                 super::parameters::select_definition(
-                    &args,
+                    &declaration,
                     definition,
                     geometry.state_layout(),
                     (
@@ -314,17 +332,15 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> CompleteNemot
                 )?
             }
             None => {
-                let state = state_layout(&args).map_err(Error::backend)?;
+                let state = declaration.definition().state_layout().clone();
                 let full = eredu_nn::VocabularyParallelRange {
                     global_vocabulary: args.vocab_size as usize,
                     local: 0..args.vocab_size as usize,
                 };
-                let targets = super::parallel::global_target_geometry(&args)
-                    .map_err(Error::backend_source)?;
-                let predictions = super::parallel::global_prediction_geometry(&args)
-                    .map_err(Error::backend_source)?;
+                let targets = super::parallel::global_target_geometry(&declaration);
+                let predictions = super::parallel::global_prediction_geometry(&declaration);
                 super::parameters::select_definition(
-                    &args,
+                    &declaration,
                     definition,
                     &state,
                     (full.clone(), (!args.tie_word_embeddings).then_some(full)),
@@ -332,19 +348,28 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> CompleteNemot
                 )?
             }
         };
+        let statics = &declaration.statics;
+        let boundary = crate::decoder::NormalizedBoundary::new(
+            statics.normalization_spec().clone().with_groups(1)?,
+            context,
+        )?;
         let static_modules = match &geometry {
-            Some(geometry) => StaticModules::from_parallel_spec(
-                super::static_spec(&args, super::FinalNormalization::Float32),
+            Some(geometry) => StaticModules::from_parallel_boundary(
+                statics.embedding_spec().clone(),
+                statics.head_spec().cloned(),
+                boundary,
                 geometry.embedding_range().clone(),
                 geometry.output_range().cloned(),
                 context,
             )?,
-            None => StaticModules::from_spec(
-                super::static_spec(&args, super::FinalNormalization::Float32),
+            None => StaticModules::from_boundary(
+                statics.embedding_spec().clone(),
+                statics.head_spec().cloned(),
+                boundary,
                 context,
             )?,
         };
-        Self::with_selected_resources(args, definition, static_modules, geometry)
+        Self::with_selected_resources(args, definition, static_modules, geometry, declaration)
     }
 
     fn with_selected_resources(
@@ -352,6 +377,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> CompleteNemot
         definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         static_modules: StaticModules<B>,
         geometry: Option<LocalGeometry>,
+        declaration: std::sync::Arc<super::Declaration>,
     ) -> Result<LayeredModel<B>, Error> {
         let target_units = definition.unit_count(0)?;
         let prediction_steps = definition.prediction_groups().len();
@@ -365,6 +391,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> CompleteNemot
             static_modules,
             definition: std::sync::Arc::clone(&definition),
             target_units,
+            declaration,
             prediction_steps,
             prediction_pattern,
             parallel_geometry: geometry.map(std::sync::Arc::new),
@@ -394,7 +421,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> CompleteNemot
     }
     /// Returns the authoritative target plus MTP state layout.
     pub fn state_layout(&self) -> Result<StateLayout, Error> {
-        state_layout(&self.args).map_err(Error::backend)
+        Ok(self.declaration.definition().state_layout().clone())
     }
 
     /// Returns planner-derived geometry for a rank-local realization.
@@ -439,7 +466,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> CompleteNemot
         topology: eredu_core::ParallelRankTopology,
     ) -> Result<Option<super::ExpertProviderDescriptor>, Error> {
         let realization =
-            super::expert_realization_plan(&self.args, self.parallel_geometry(), topology)?;
+            super::expert_realization_plan(&self.declaration, self.parallel_geometry(), topology)?;
         if let Some(realization) = realization {
             self.install_expert_realization(realization);
         }
@@ -455,50 +482,45 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> CompleteNemot
     ) -> Result<Unit<B>, Error> {
         self.unit_path_inner(group, index)?;
         let mut unit = if group == 0 {
-            let block = match &self.parallel_geometry {
-                Some(geometry) => Block::new_with_geometry(
-                    &self.args,
-                    index,
-                    *geometry.target_unit(index).ok_or_else(|| {
-                        Error::backend(format!(
-                            "rank-local Nemotron-H geometry is missing target unit {index}"
-                        ))
-                    })?,
-                    context,
-                )?,
-                None => Block::new(&self.args, index, context)?,
-            };
+            let mut parameters = self
+                .declaration
+                .blocks
+                .get(index)
+                .cloned()
+                .ok_or_else(|| Error::backend("target declaration omits requested unit"))?;
+            if let Some(geometry) = &self.parallel_geometry {
+                parameters = parameters.local(
+                    *geometry
+                        .target_unit(index)
+                        .ok_or_else(|| Error::backend("target geometry omits requested unit"))?,
+                    None,
+                )?;
+            }
+            let block = Block::from_parameters(&self.args, index, parameters, context)?;
             Unit::Target(block)
         } else {
             let depth = group - 1;
-            let unit = match &self.parallel_geometry {
-                Some(geometry) => {
-                    let physical = depth
-                        .checked_mul(self.prediction_pattern)
-                        .and_then(|start| start.checked_add(index))
-                        .ok_or_else(|| {
-                            Error::backend("Nemotron-H MTP physical index overflowed")
-                        })?;
-                    let policies = self.args.mtp_policies().map_err(Error::backend)?;
-                    PredictionUnit::new_with_geometry(
-                        &self.args,
-                        depth,
-                        index,
-                        *policies.get(physical).ok_or_else(|| {
-                            Error::backend(format!(
-                                "Nemotron-H MTP policy is missing physical unit {physical}"
-                            ))
-                        })?,
-                        *geometry.prediction_unit(physical).ok_or_else(|| {
-                            Error::backend(format!(
-                                "rank-local Nemotron-H geometry is missing MTP unit {physical}"
-                            ))
-                        })?,
-                        context,
-                    )?
-                }
-                None => PredictionUnit::new(&self.args, depth, index, context)?,
-            };
+            let physical = depth
+                .checked_mul(self.prediction_pattern)
+                .and_then(|start| start.checked_add(index))
+                .ok_or_else(|| Error::backend("prediction physical index overflowed"))?;
+            let parameters = self
+                .declaration
+                .predictions
+                .get(physical)
+                .cloned()
+                .ok_or_else(|| Error::backend("retained prediction scope omits requested unit"))?;
+            let geometry = self
+                .parallel_geometry
+                .as_ref()
+                .map(|geometry| {
+                    geometry
+                        .prediction_unit(physical)
+                        .copied()
+                        .ok_or_else(|| Error::backend("local geometry omits prediction unit"))
+                })
+                .transpose()?;
+            let unit = PredictionUnit::from_parameters(&self.args, parameters, geometry, context)?;
             Unit::Prediction(unit)
         };
         if let Some(realization) = &self.expert_realization {
@@ -1516,7 +1538,7 @@ where
 {
     type Boundary = TargetBoundarySchema;
     fn boundary_schema(&self) -> Result<Self::Boundary, Self::Error> {
-        Ok(TargetBoundarySchema::from_args(self.args()))
+        Ok(TargetBoundarySchema::from_declaration(&self.declaration))
     }
     fn begin_partition(
         &mut self,

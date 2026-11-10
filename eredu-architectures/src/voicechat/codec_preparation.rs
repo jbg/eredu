@@ -46,13 +46,10 @@ pub fn prepare_neural_decoder(
     let source = artifacts.component_source(Component::CodecDecoder).ok_or(
         SpeechParameterError::MissingComponent(Component::CodecDecoder),
     )?;
-    let config = super::codec::waveform_decoder_config(&artifacts.plan().config().codec)?;
-    PreparedDecoderBindings::from_recipes(
-        config.neural,
-        "tts_model.audio_codec.decoder",
-        source.clone(),
-        |name| component_recipe(artifacts, Component::CodecDecoder, name),
-    )
+    let declared = super::codec::released_declarations()?;
+    PreparedDecoderBindings::from_recipes(declared.decoder.clone(), source.clone(), |name| {
+        component_recipe(artifacts, Component::CodecDecoder, name)
+    })
     .map_err(CodecPreparationError::Preparation)
 }
 
@@ -66,13 +63,10 @@ pub fn prepare_quantizer(
         .ok_or(SpeechParameterError::MissingComponent(
             Component::CodecQuantizer,
         ))?;
-    let config = super::codec::waveform_decoder_config(&artifacts.plan().config().codec)?;
-    PreparedQuantizerBindings::from_recipes(
-        config.quantizer,
-        "tts_model.audio_codec.prvq",
-        source.clone(),
-        |name| component_recipe(artifacts, Component::CodecQuantizer, name),
-    )
+    let declared = super::codec::released_declarations()?;
+    PreparedQuantizerBindings::from_recipes(declared.quantizer.clone(), source.clone(), |name| {
+        component_recipe(artifacts, Component::CodecQuantizer, name)
+    })
     .map_err(CodecPreparationError::Preparation)
 }
 
@@ -86,12 +80,9 @@ pub fn prepare_neural_encoder(
     let source = artifacts.component_source(Component::CodecEncoder).ok_or(
         SpeechParameterError::MissingComponent(Component::CodecEncoder),
     )?;
-    let config = super::codec::waveform_encoder_config(&artifacts.plan().config().codec)?;
-    PreparedEncoderBindings::from_recipes(
-        config.neural,
-        "tts_model.audio_codec.encoder",
-        source.clone(),
-        |name| component_recipe(artifacts, Component::CodecEncoder, name),
-    )
+    let declared = super::codec::released_declarations()?;
+    PreparedEncoderBindings::from_recipes(declared.encoder.clone(), source.clone(), |name| {
+        component_recipe(artifacts, Component::CodecEncoder, name)
+    })
     .map_err(CodecPreparationError::Preparation)
 }

@@ -1093,7 +1093,7 @@ impl ExecutionPlanBackendFactory for MockBackend {
             _ => {
                 return Err(AutomaticPlanningError::Invalid(
                     "unsupported drafting plan".into(),
-                ))
+                ));
             }
         })
     }
@@ -2126,8 +2126,10 @@ fn write_loadable_assistant_artifact(root: &std::path::Path) {
 
     let config = eredu_architectures::gemma4::AssistantConfig::from_json(config.as_bytes())
         .expect("assistant fixture configuration is valid");
-    let plan = eredu_architectures::gemma4::assistant_safetensors_plan(&config)
-        .expect("assistant fixture has a strict checkpoint plan");
+    let plan = eredu_architectures::gemma4::assistant_safetensors_plan(
+        &eredu_architectures::gemma4::AssistantDefinition::new(config.clone()).unwrap(),
+    )
+    .expect("assistant fixture has a strict checkpoint plan");
     assert!(plan.layout_groups.is_empty());
     let mut offset = 0usize;
     let mut header = serde_json::Map::new();
@@ -3318,11 +3320,11 @@ fn live_observations_skip_content_discovery_and_exact_provenance_is_explicit() {
                         .unwrap()
                         .token_ids
                 };
-                assert!(records
-                    .iter()
-                    .all(|record| record.artifact_identity.as_deref()
+                assert!(records.iter().all(|record| {
+                    record.artifact_identity.as_deref()
                         == (provenance == CaptureProvenance::ContentExact)
-                            .then_some("conformance-mock-artifact")));
+                            .then_some("conformance-mock-artifact")
+                }));
                 if !controlled || !captures {
                     assert_eq!(
                         observed_mock::content_discovery_calls(),

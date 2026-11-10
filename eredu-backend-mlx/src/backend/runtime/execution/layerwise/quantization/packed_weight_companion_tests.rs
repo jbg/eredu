@@ -149,9 +149,9 @@ fn exact_affine_tasks_preserve_source_precision_through_unloaded_f32_slots() {
             group: "layers".into(),
             unit: 0,
         };
-        let task = ReplicatedTextMaterializationTask::from_exact_source(
+        let task = ReplicatedTextMaterializationTask::from_exact_sources(
             "projection.kernel",
-            ReplicatedTextPhysicalSource::new(
+            vec![ReplicatedTextPhysicalSource::new(
                 "projection.kernel",
                 "projection.kernel",
                 "weights.safetensors",
@@ -159,7 +159,7 @@ fn exact_affine_tasks_preserve_source_precision_through_unloaded_f32_slots() {
                 encoding.clone(),
                 bytes.len() as u64,
             )
-            .unwrap(),
+            .unwrap()],
             vec![],
             vec![8, 64],
             vec![8, 64],
@@ -169,6 +169,7 @@ fn exact_affine_tasks_preserve_source_precision_through_unloaded_f32_slots() {
             WeightLoweringKind::Transform,
             WeightLoweringDescriptor::new(encoding, format, vec![8, 64], vec![8, 64], Some(1))
                 .unwrap(),
+            None,
         )
         .unwrap()
         .with_output_companions(vec![
@@ -425,9 +426,9 @@ fn exact_affine_tp_input_slices_convert_before_binding_without_double_placement(
             group: "decoder".into(),
             unit: 0,
         };
-        let task = ReplicatedTextMaterializationTask::from_exact_source(
+        let task = ReplicatedTextMaterializationTask::from_exact_sources(
             "projection.kernel",
-            ReplicatedTextPhysicalSource::new(
+            vec![ReplicatedTextPhysicalSource::new(
                 provenance.catalog_key,
                 provenance.physical_tensor,
                 provenance.backing_shard.unwrap(),
@@ -435,7 +436,7 @@ fn exact_affine_tp_input_slices_convert_before_binding_without_double_placement(
                 provenance.source_encoding,
                 bytes.len() as u64,
             )
-            .unwrap(),
+            .unwrap()],
             Vec::new(),
             vec![8, 192],
             vec![8, 192],
@@ -451,6 +452,7 @@ fn exact_affine_tp_input_slices_convert_before_binding_without_double_placement(
                 Some(1),
             )
             .unwrap(),
+            None,
         )
         .unwrap()
         .with_output_companions(vec![

@@ -110,11 +110,11 @@ fn complete_state(
     match geometry {
         Some(geometry) => {
             geometry
-                .validate_for(config)
+                .validate_with_declaration(config, config.text_declaration().as_ref())
                 .map_err(Error::backend_source)?;
             Ok(geometry.state_layout().clone())
         }
-        None => decoder::state_layout(config),
+        None => Ok(config.text_declaration().state_layout().clone()),
     }
 }
 
@@ -194,7 +194,7 @@ fn validate_state(config: &FamilyConfig, state: &StateLayout, id: &str) -> Resul
     if state.len() != layers {
         return Err(invalid("complete context slot count"));
     }
-    let expected = decoder::state_layout(config)?;
+    let expected = config.text_declaration().state_layout().clone();
     if state.segments() != expected.segments() {
         return Err(invalid("context segment lifetime or ownership"));
     }

@@ -81,6 +81,10 @@ impl PreparedVision {
     pub fn config(&self) -> &VisionConfig {
         self.plan.config()
     }
+    /// Immutable construction scopes retained by source admission.
+    pub fn scopes(&self) -> &Arc<crate::qwen::vision::Declaration> {
+        self.plan.scopes()
+    }
     /// Token identities supplied by target/tokenizer policy.
     pub fn media_tokens(&self) -> &MediaTokens {
         self.plan.media_tokens()

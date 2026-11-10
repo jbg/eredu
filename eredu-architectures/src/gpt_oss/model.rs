@@ -12,6 +12,15 @@ pub type PartitionedLayeredModel<B> =
     crate::decoder::PartitionedLayeredModel<B, ModelArgs, GptOssBlockFactory>;
 
 impl crate::decoder::PartitionedConfig for ModelArgs {
+    fn restore_global_geometry(&mut self, global: &Self) -> Result<(), Error> {
+        self.num_local_experts = global.num_local_experts;
+        self.set_local_geometry(
+            global.num_attention_heads,
+            global.num_key_value_heads,
+            global.intermediate_size,
+        )
+    }
+
     fn set_local_geometry(
         &mut self,
         query_heads: i32,
@@ -34,13 +43,23 @@ impl crate::decoder::PartitionedConfig for ModelArgs {
         layer: usize,
         layout: &eredu_runtime::LocalModelLayout,
     ) -> Result<Self, Error> {
-        super::parallel::local_block_args(self, layer, layout).map_err(Error::backend)
+        super::parallel::local_block_args(
+            self,
+            &super::moe::routed_spec(self, layer)?.experts,
+            layer,
+            layout,
+        )
+        .map_err(Error::backend)
     }
 
     fn partition_parameter_description(
         &self,
     ) -> Result<eredu_runtime::ArchitectureParameterDescription, eredu_runtime::ParallelPlanError>
     {
-        super::parallel::parameter_description(self)
+        super::parallel::parameter_description(
+            &super::Declaration::new(self.clone())
+                .map_err(|e| eredu_runtime::ParallelPlanError::InvalidGroup(e.to_string()))?,
+            crate::decoder::ParameterEncoding::Stored,
+        )
     }
 }

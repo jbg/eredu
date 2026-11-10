@@ -4,6 +4,7 @@ use crate::{
         checked_rows, invalid, lookup_codes, quantize_residual_with_score_reduction, require_f32,
         Codebook, DistanceMetric, Geometry, Quantized,
     },
+    prvq_specs::QuantizerSpec,
     Error,
 };
 use eredu_core::BackendFailure;
@@ -15,8 +16,8 @@ use eredu_runtime::{
     ComponentKernel, ComponentUnit, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress,
     ExecutionUnitLayout, LayeredForwardState, LayeredInvocation, LayeredTraversalHook,
     LayerwisePolicy, LayerwiseRuntime, LocalModelLayout, MemberSharding, OwnedParameterGroupSpec,
-    ParallelComponentKernel, ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec,
-    ParameterRole, StatelessComponentState, SubmissionBackend,
+    ParallelComponentKernel, ParameterGroupOwner, ParameterGroupSpec, ParameterRole,
+    StatelessComponentState, SubmissionBackend,
 };
 use std::marker::PhantomData;
 use std::ops::Range;
@@ -30,15 +31,14 @@ pub struct QuantizerLocalDimensions {
     pub channels: i32,
 }
 
-/// Validates every physical mean and replicated variance against one exact channel slice.
-pub fn quantizer_local_dimensions(
-    geometry: Geometry,
-    prefix: &str,
+pub(crate) fn declared_local_dimensions(
+    declaration: &QuantizerSpec,
     layout: &LocalModelLayout,
 ) -> Result<QuantizerLocalDimensions, Error> {
-    let description = quantizer_parameter_description(geometry, prefix)?;
+    let geometry = declaration.geometry;
+    let description = declared_parameters(declaration)?;
     let range = layout
-        .tensor(&format!("{prefix}.mus_list.0"))
+        .tensor(declaration.codebooks[0].means().id.as_str())
         .ok_or_else(|| invalid("quantizer layout omits first codebook"))?
         .expanded_logical_range(geometry.channels as usize)?;
     if range.is_empty() || range.end > geometry.channels as usize {
@@ -144,36 +144,37 @@ impl<T> QuantizerForward<T> {
 }
 /// Codec-owned canonical codebook order and parameter namespaces.
 pub struct QuantizerKernel<B: NeuralBackend> {
+    definition: ComponentDefinition,
     geometry: Geometry,
     prefix: String,
+    declaration: QuantizerSpec,
     parallel: Option<(QuantizerLocalDimensions, LocalModelLayout)>,
     backend: PhantomData<fn() -> B>,
 }
 impl<B: NeuralBackend> QuantizerKernel<B> {
     /// Validates geometry and namespace without constructing backend resources.
-    pub fn new(geometry: Geometry, prefix: &str) -> Result<Self, Error> {
-        geometry.validate()?;
-        if prefix.is_empty() {
-            return Err(invalid("empty residual quantizer parameter prefix"));
-        }
+    pub fn new(declared: crate::declarations::QuantizerDeclaration) -> Result<Self, Error> {
+        let (geometry, prefix, declaration, definition) = declared.into_parts();
         Ok(Self {
             geometry,
-            prefix: prefix.into(),
+            prefix,
+            declaration,
+            definition,
             parallel: None,
             backend: PhantomData,
         })
     }
     /// Constructs rank-local codebooks from a complete physical placement declaration.
     pub fn new_parallel(
-        geometry: Geometry,
-        prefix: &str,
+        declared: crate::declarations::QuantizerDeclaration,
         layout: &LocalModelLayout,
     ) -> Result<Self, Error> {
-        let local = quantizer_local_dimensions(geometry, prefix, layout)?;
-        let mut architecture = Self::new(geometry, prefix)?;
+        let mut architecture = Self::new(declared)?;
+        let local = declared_local_dimensions(&architecture.declaration, layout)?;
         architecture.parallel = Some((local, layout.clone()));
         Ok(architecture)
     }
+
     /// Whether construction selected tensor-parallel parameter placement.
     pub fn is_parallel(&self) -> bool {
         self.parallel.is_some()
@@ -193,10 +194,7 @@ impl<B: NeuralBackend> QuantizerKernel<B> {
     }
     /// Couples codec equations with the validated shared component definition.
     pub fn into_component(self) -> Result<ComponentAdapter<ComponentDefinition, Self>, Error> {
-        Ok(ComponentAdapter::new(
-            quantizer_component_definition(self.geometry, &self.prefix)?,
-            self,
-        )?)
+        Ok(ComponentAdapter::new(self.definition.clone(), self)?)
     }
     /// Constructs only the requested unloaded codebook.
     pub fn build_unit(
@@ -208,7 +206,12 @@ impl<B: NeuralBackend> QuantizerKernel<B> {
         if group >= self.geometry.depth || index != 0 {
             return Err(invalid("unknown residual codebook unit"));
         }
-        Codebook::unloaded(self.local_geometry(), &self.prefix, group, context)
+        Codebook::new(
+            self.declaration.codebooks[group]
+                .clone()
+                .local(self.local_geometry().channels)?,
+            context,
+        )
     }
 }
 impl<B: NeuralBackend> QuantizerKernel<B> {
@@ -367,12 +370,12 @@ impl<B: NeuralBackend> QuantizerKernel<B> {
 pub fn codebook_group_name(depth: usize) -> String {
     format!("prvq.codebook.{depth}")
 }
-/// Validated selected-depth invocations over independently leased codebooks.
-pub fn quantizer_component_definition(
-    geometry: Geometry,
-    prefix: &str,
+pub(crate) fn declared_component_definition(
+    declaration: &QuantizerSpec,
 ) -> Result<ComponentDefinition, Error> {
-    let parameters = quantizer_parameter_description(geometry, prefix)?;
+    let geometry = declaration.geometry;
+    let prefix = &declaration.prefix;
+    let parameters = declared_parameters(declaration)?;
     let transport = ArchitectureGroupTransport {
         placement: ArchitectureGroupPlacement::Pipeline,
         kind: ArchitectureGroupKind::Projector,
@@ -418,15 +421,11 @@ fn quantizer_graph(geometry: Geometry) -> Result<ExecutionGraph, Error> {
         codebook_group_name(geometry.depth - 1),
     )?)
 }
-/// Cold canonical means/scalar geometry with one independently owned group per depth.
-pub fn quantizer_parameter_description(
-    geometry: Geometry,
-    prefix: &str,
+pub(crate) fn declared_parameters(
+    declaration: &QuantizerSpec,
 ) -> Result<ArchitectureParameterDescription, Error> {
-    geometry.validate()?;
-    if prefix.is_empty() {
-        return Err(invalid("empty residual quantizer parameter prefix"));
-    }
+    let geometry = declaration.geometry;
+    let prefix = &declaration.prefix;
     let graph = quantizer_graph(geometry)?;
     let layout = ExecutionUnitLayout::new(&graph, vec![1; geometry.depth])?;
     let mut owned = Vec::with_capacity(geometry.depth);
@@ -435,18 +434,13 @@ pub fn quantizer_parameter_description(
             format!("{prefix}.codebook.{depth}"),
             ParameterRole::Channels,
             geometry.channels as usize,
-            [
-                ParameterMemberSpec::new(
-                    format!("{prefix}.mus_list.{depth}"),
-                    vec![geometry.cardinality as usize, geometry.channels as usize],
-                    MemberSharding::Partitioned { axis: 1 },
-                ),
-                ParameterMemberSpec::new(
-                    format!("{prefix}._variance_list.{depth}.variance"),
-                    vec![],
-                    MemberSharding::Replicated,
-                ),
-            ],
+            eredu_runtime::logical_parameter_members(&declaration.codebooks[depth], |parameter| {
+                if parameter.parameter.id == declaration.codebooks[depth].means().id {
+                    MemberSharding::Partitioned { axis: 1 }
+                } else {
+                    MemberSharding::Replicated
+                }
+            })?,
         )?;
         owned.push(OwnedParameterGroupSpec::new(
             ParameterGroupOwner::execution_unit(
@@ -600,7 +594,7 @@ impl<B: DistributedNeuralBackend> QuantizerKernel<B> {
             B::parallel_rank(parallel),
         )
         .map_err(|_| invalid("invalid quantizer tensor rank"))?;
-        let description = quantizer_parameter_description(self.geometry, &self.prefix)?;
+        let description = declared_parameters(&self.declaration)?;
         let expected = eredu_runtime::derive_partitioned_local_layout(&description, topology)
             .map_err(|_| invalid("quantizer tensor placement cannot be derived"))?;
         if selected != &expected {

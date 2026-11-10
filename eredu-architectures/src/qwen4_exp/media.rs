@@ -84,7 +84,7 @@ impl MediaAdmissionConfig {
             ));
         }
         if let Some(expected) = &spec.config.vision {
-            let mut expected = expected.clone();
+            let mut expected = expected.config().clone();
             let mut actual = vision.clone();
             expected.linear_formats.clear();
             actual.linear_formats.clear();

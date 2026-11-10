@@ -3,11 +3,11 @@
 use eredu_core::AttentionPolicy;
 use eredu_nn::{
     AttentionCache, AttentionRequest, AuxiliaryConvolutionState, CausalDepthwiseConvolution,
-    CausalDepthwiseConvolutionSpec, ConvolutionActivation, EmbeddingOperator, Error,
-    GatedProductGroupLayout, GroupSelection, GroupedGatedProductSpec, GroupedNeuralBackend,
-    JointGroupSelectionInput, JointGroupSelectionSpec, LinearOperator, LinearSpec, NeuralBackend,
-    NormalizationConstructionSpec, NormalizationOperator, Parameter, ParameterSpec, Parameterized,
-    RelativeAttentionInput, Tensor,
+    DeclareLogicalParameters, EmbeddingOperator, Error, GatedProductGroupLayout, GroupSelection,
+    GroupedGatedProductSpec, GroupedNeuralBackend, JointGroupSelectionInput,
+    JointGroupSelectionSpec, LinearOperator, LinearSpec, LogicalParameterDeclaration,
+    LogicalParameterRole, NeuralBackend, NormalizationOperator, Parameter, ParameterSpec,
+    Parameterized, RelativeAttentionInput, Tensor,
 };
 use eredu_runtime::{
     ExpertPass, ParameterProvider, RoutedExpertRequest, TensorParallelParameterProvider,
@@ -16,7 +16,12 @@ use eredu_runtime::{
 use crate::decoder::ComponentInstrumentation;
 use crate::linear_format::standard_expert_projection;
 
-use super::{FeedForwardPolicy, LayerPolicy, ModelArgs, TextArgs};
+use super::{FeedForwardPolicy, ModelArgs, TextArgs};
+
+mod pinned;
+mod specs;
+pub(crate) use pinned::PinnedParameters;
+pub(crate) use specs::{AttentionParameters, CommonParameters, SparseParameters};
 
 /// Four bounded causal histories owned by every Inkling decoder layer.
 #[derive(Debug, Clone)]
@@ -153,120 +158,43 @@ pub struct Attention<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
 }
 
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> {
-    /// Builds one attention layer under the released parameter root.
+    /// Builds one retained target attention invocation.
     pub fn new(
-        args: &TextArgs,
+        args: &ModelArgs,
         layer: usize,
-        policy: AttentionPolicy,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        Self::new_at(args, policy, &format!("model.layers.{layer}"), context)
+        Self::from_parameters(args.common(layer)?.attention.clone(), context)
     }
 
-    /// Builds attention under an explicit architecture-owned block root.
-    pub fn new_at(
-        args: &TextArgs,
-        policy: AttentionPolicy,
-        block_root: &str,
+    fn from_parameters(
+        parameters: AttentionParameters,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let local = policy.window().is_some();
-        let query_heads = args.query_heads(local);
-        let key_value_heads = args.key_value_heads(local);
-        let head_dimensions = args.attention_head_dim(local);
-        let relative_extent = policy
-            .window()
-            .map(|window| window.get() as i32)
-            .unwrap_or(args.rel_extent);
-        let prefix = format!("{block_root}.self_attn");
-        let linear = |field: &str, input: i32, output: i32, bias: bool| {
-            let weight = format!("{prefix}.{field}.weight");
-            B::linear(
-                LinearSpec {
-                    input,
-                    output,
-                    weight: ParameterSpec::trainable(&weight).map_err(Error::backend)?,
-                    bias: bias
-                        .then(|| ParameterSpec::trainable(format!("{prefix}.{field}.bias")))
-                        .transpose()
-                        .map_err(Error::backend)?,
-                    format: crate::linear_format::standard_linear_format(
-                        &weight,
-                        args.linear_format_for(&weight),
-                    )?,
-                },
-                context,
-            )
-        };
-        let norm = |field: &str| {
-            B::normalization(
-                NormalizationConstructionSpec::learned(
-                    head_dimensions,
-                    args.rms_norm_eps,
-                    ParameterSpec::trainable(format!("{prefix}.{field}.weight"))
-                        .map_err(Error::backend)?,
-                ),
-                context,
-            )
-        };
-        let convolution = |field: &str, channels| {
-            CausalDepthwiseConvolution::new(
-                CausalDepthwiseConvolutionSpec {
-                    arithmetic: eredu_nn::ConvolutionArithmetic::Native,
-                    dilation: 1,
-                    channels,
-                    kernel_size: args.sconv_kernel_size,
-                    weight: ParameterSpec::trainable(format!("{prefix}.{field}.weight"))
-                        .map_err(Error::backend)?,
-                    bias: None,
-                    activation: ConvolutionActivation::Identity,
-                },
-                context,
-            )
-        };
+        parameters.logical_parameters()?;
+        let geometry = parameters.projection.geometry;
         Ok(Self {
-            query_heads,
-            key_value_heads,
-            head_dimensions,
-            relative_dimensions: args.d_rel,
-            relative_extent,
-            policy,
-            log_scaling_floor: args.log_scaling_n_floor,
-            log_scaling_alpha: args.log_scaling_alpha,
-            query: linear(
-                "q_proj",
-                args.hidden_size,
-                query_heads * head_dimensions,
-                args.q_bias,
-            )?,
-            key: linear(
-                "k_proj",
-                args.hidden_size,
-                key_value_heads * head_dimensions,
-                false,
-            )?,
-            value: linear(
-                "v_proj",
-                args.hidden_size,
-                key_value_heads * head_dimensions,
-                false,
-            )?,
-            relative: linear("r_proj", args.hidden_size, query_heads * args.d_rel, false)?,
-            output: linear(
-                "o_proj",
-                query_heads * head_dimensions,
-                args.hidden_size,
-                args.o_bias,
-            )?,
-            query_norm: norm("q_norm")?,
-            key_norm: norm("k_norm")?,
-            relative_projection: Parameter::unloaded(
-                ParameterSpec::trainable(format!("{prefix}.rel_proj")).map_err(Error::backend)?,
-                &[args.d_rel, relative_extent],
+            query_heads: geometry.query_heads(),
+            key_value_heads: geometry.key_value_heads(),
+            head_dimensions: geometry.key_dimensions(),
+            relative_dimensions: parameters.relative_projection.shape[0],
+            relative_extent: parameters.relative_projection.shape[1],
+            policy: parameters.policy,
+            log_scaling_floor: parameters.log_scaling_floor,
+            log_scaling_alpha: parameters.log_scaling_alpha,
+            query: B::linear(parameters.projection.query, context)?,
+            key: B::linear(parameters.projection.key, context)?,
+            value: B::linear(parameters.projection.value, context)?,
+            relative: B::linear(parameters.relative, context)?,
+            output: B::linear(parameters.projection.output, context)?,
+            query_norm: B::normalization(parameters.query_norm, context)?,
+            key_norm: B::normalization(parameters.key_norm, context)?,
+            relative_projection: parameters.relative_projection.unloaded(context)?,
+            key_convolution: CausalDepthwiseConvolution::new(parameters.key_convolution, context)?,
+            value_convolution: CausalDepthwiseConvolution::new(
+                parameters.value_convolution,
                 context,
             )?,
-            key_convolution: convolution("k_sconv", key_value_heads * head_dimensions)?,
-            value_convolution: convolution("v_sconv", key_value_heads * head_dimensions)?,
         })
     }
 
@@ -440,10 +368,106 @@ fn residual_convolution<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
     input.add(&output.output, context)
 }
 
+/// Dense branch parameters shared by target and embedded prediction construction.
+#[derive(Debug, Clone)]
+pub(crate) struct DenseParameters {
+    pub product: eredu_nn::SplitGatedProductSpec,
+    pub global_scale: ParameterSpec,
+}
+impl DenseParameters {
+    pub(crate) const SCALE_SHAPE: [i32; 1] = [1];
+
+    pub(in crate::inkling) fn new_at(args: &TextArgs, block_root: &str) -> Result<Self, Error> {
+        let prefix = format!("{block_root}.dense");
+        let intermediate = args.dense_intermediate_size();
+        let linear = |field: &str, input, output| {
+            let weight = format!("{prefix}.{field}.weight");
+            Ok::<_, Error>(LinearSpec {
+                input,
+                output,
+                weight: ParameterSpec::trainable(&weight).map_err(Error::backend)?,
+                bias: None,
+                format: crate::linear_format::standard_linear_format(
+                    &weight,
+                    args.linear_format_for(&weight),
+                )?,
+            })
+        };
+        let parameters = Self {
+            product: eredu_nn::SplitGatedProductSpec::new(
+                linear("gate_proj", args.hidden_size, intermediate)?,
+                linear("up_proj", args.hidden_size, intermediate)?,
+                linear("down_proj", intermediate, args.hidden_size)?,
+                eredu_nn::GatedProductPolicy::ordinary_silu(),
+            )?,
+            global_scale: ParameterSpec::trainable(format!("{block_root}.dense_global_scale"))
+                .map_err(Error::backend)?,
+        };
+        eredu_nn::validate_logical_parameter_topology(&parameters.logical_parameters()?)
+            .map_err(Error::backend_source)?;
+        Ok(parameters)
+    }
+
+    pub(in crate::inkling) fn project_formats(&mut self, args: &TextArgs) -> Result<(), Error> {
+        for spec in [
+            &mut self.product.gate,
+            &mut self.product.up,
+            &mut self.product.down,
+        ] {
+            let mut format = crate::linear_format::standard_linear_format(
+                spec.weight.id.as_str(),
+                args.linear_format_for(spec.weight.id.as_str()),
+            )?
+            .with_arithmetic(spec.format.arithmetic())?;
+            if spec.format.exact_zero_inputs() {
+                format = format.with_exact_zero_inputs();
+            }
+            spec.format = format;
+        }
+        eredu_nn::validate_logical_parameter_topology(&self.logical_parameters()?)
+            .map_err(Error::backend_source)
+    }
+    fn localized(&self, width: i32) -> Result<Self, Error> {
+        if width <= 0 || width > self.product.gate.output {
+            return Err(Error::backend(
+                "Inkling local dense width exceeds its source",
+            ));
+        }
+        let mut parameters = self.clone();
+        parameters.product.gate.output = width;
+        parameters.product.up.output = width;
+        parameters.product.down.input = width;
+        eredu_nn::validate_logical_parameter_topology(&parameters.logical_parameters()?)
+            .map_err(Error::backend_source)?;
+        Ok(parameters)
+    }
+    pub(crate) fn scale_declaration(&self) -> Result<LogicalParameterDeclaration<'_>, Error> {
+        LogicalParameterDeclaration::new(
+            &self.global_scale,
+            &Self::SCALE_SHAPE,
+            LogicalParameterRole::ResidualScale,
+        )
+    }
+}
+impl DeclareLogicalParameters for DenseParameters {
+    fn logical_parameters(&self) -> Result<Vec<LogicalParameterDeclaration<'_>>, Error> {
+        if self.product.gate.input != self.product.down.output {
+            return Err(Error::backend(
+                "Inkling dense branch changes residual width",
+            ));
+        }
+        let mut parameters = self.product.logical_parameters()?;
+        parameters.push(self.scale_declaration()?);
+        Ok(parameters)
+    }
+}
+
 /// Dense SwiGLU branch with its learned global scalar.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct DenseMlp<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
+    #[parameter(skip)]
+    policy: eredu_nn::GatedProductPolicy,
     /// Gate projection.
     pub gate: B::Linear,
     /// Up projection.
@@ -455,37 +479,18 @@ pub struct DenseMlp<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
 }
 
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DenseMlp<B> {
-    fn new_at(
-        args: &TextArgs,
-        block_root: &str,
+    pub(crate) fn from_parameters(
+        parameters: DenseParameters,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let prefix = format!("{block_root}.dense");
-        let intermediate = args.dense_intermediate_size();
-        let linear = |field: &str, input, output| {
-            let weight = format!("{prefix}.{field}.weight");
-            B::linear(
-                LinearSpec {
-                    input,
-                    output,
-                    weight: ParameterSpec::trainable(&weight).map_err(Error::backend)?,
-                    bias: None,
-                    format: crate::linear_format::standard_linear_format(
-                        &weight,
-                        args.linear_format_for(&weight),
-                    )?,
-                },
-                context,
-            )
-        };
         Ok(Self {
-            gate: linear("gate_proj", args.hidden_size, intermediate)?,
-            up: linear("up_proj", args.hidden_size, intermediate)?,
-            down: linear("down_proj", intermediate, args.hidden_size)?,
+            policy: parameters.product.policy,
+            gate: B::linear(parameters.product.gate, context)?,
+            up: B::linear(parameters.product.up, context)?,
+            down: B::linear(parameters.product.down, context)?,
             global_scale: Parameter::unloaded(
-                ParameterSpec::trainable(format!("{block_root}.dense_global_scale"))
-                    .map_err(Error::backend)?,
-                &[1],
+                parameters.global_scale,
+                &DenseParameters::SCALE_SHAPE,
                 context,
             )?,
         })
@@ -501,7 +506,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DenseMlp<B> {
     ) -> Result<B::Tensor, Error> {
         let gate = self.gate.forward(hidden, context)?;
         let up = self.up.forward(hidden, context)?;
-        let units = B::gated_product(gate, up, eredu_nn::GatedProductPolicy::default(), context)?;
+        let units = B::gated_product(gate, up, self.policy, context)?;
         let units = instrumentation.apply("feed_forward.units", units)?;
         let write = instrumentation.project::<B>(
             "feed_forward.write_input",
@@ -521,13 +526,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DenseMlp<B> {
 #[parameterized(tensor = "B::Tensor")]
 pub struct SparseMlp<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     #[parameter(skip)]
-    routed_count: i32,
-    #[parameter(skip)]
-    shared_count: i32,
-    #[parameter(skip)]
-    top_k: i32,
-    #[parameter(skip)]
-    coefficient_scale: f32,
+    selection: JointGroupSelectionSpec,
     /// Joint routed/shared router projection.
     pub router_weight: Parameter<B::Tensor>,
     /// Routed top-k correction bias.
@@ -561,53 +560,31 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMlp<B> 
         B::Tensor::from_i32_slice(&indices, &[tokens, shared_count], context)
     }
 
-    fn new_at(
-        args: &TextArgs,
-        block_root: &str,
+    fn from_parameters(
+        parameters: SparseParameters,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let prefix = format!("{block_root}.moe");
-        let routed = expert_bank_spec_at(args, &prefix, "experts", args.n_routed_experts)?;
-        let shared = expert_bank_spec_at(args, &prefix, "shared_experts", args.n_shared_experts)?;
-        Self::new_at_with_specs(args, block_root, routed, shared, context)
-    }
-
-    fn new_at_with_specs(
-        args: &TextArgs,
-        block_root: &str,
-        routed: GroupedGatedProductSpec,
-        shared: GroupedGatedProductSpec,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        let prefix = format!("{block_root}.moe");
+        parameters.validate()?;
+        let router = parameters.router;
         Ok(Self {
-            routed_count: args.n_routed_experts,
-            shared_count: args.n_shared_experts,
-            top_k: args.num_experts_per_tok,
-            coefficient_scale: args.route_scale,
+            selection: router.selection(),
             router_weight: Parameter::unloaded(
-                ParameterSpec::trainable(format!("{prefix}.router.weight"))
-                    .map_err(Error::backend)?,
-                &[
-                    args.n_routed_experts + args.n_shared_experts,
-                    args.hidden_size,
-                ],
+                router.weight().clone(),
+                &router.weight_shape()?,
                 context,
             )?,
             router_bias: Parameter::unloaded(
-                ParameterSpec::trainable(format!("{prefix}.router.bias"))
-                    .map_err(Error::backend)?,
-                &[args.n_routed_experts],
+                router.correction_bias().clone(),
+                &router.correction_bias_shape(),
                 context,
             )?,
             global_scale: Parameter::unloaded(
-                ParameterSpec::trainable(format!("{prefix}.router.global_scale"))
-                    .map_err(Error::backend)?,
-                &[1],
+                router.coefficient_scale().clone(),
+                &router.coefficient_scale_shape(),
                 context,
             )?,
-            routed_experts: B::grouped_gated_product(routed, context)?,
-            shared_experts: B::grouped_gated_product(shared, context)?,
+            routed_experts: B::grouped_gated_product(parameters.routed, context)?,
+            shared_experts: B::grouped_gated_product(parameters.shared, context)?,
         })
     }
 
@@ -631,12 +608,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMlp<B> 
                 self.router_weight.as_ref(),
                 self.router_bias.as_ref(),
                 self.global_scale.as_ref(),
-                JointGroupSelectionSpec::new(
-                    self.routed_count,
-                    self.shared_count,
-                    self.top_k,
-                    self.coefficient_scale,
-                )?,
+                self.selection,
             )?,
             context,
         )?;
@@ -661,7 +633,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMlp<B> 
             .iter()
             .try_fold(1_i32, |tokens, dimension| tokens.checked_mul(*dimension))
             .ok_or_else(|| Error::backend("Inkling token count overflowed"))?;
-        let shared_ids = Self::shared_group_indices(tokens, self.shared_count, context)?;
+        let shared_ids =
+            Self::shared_group_indices(tokens, self.selection.always_on_groups(), context)?;
         let shared_routes = GroupSelection::new(
             shared_ids,
             routes.always_on_coefficients().clone(),
@@ -703,12 +676,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMlp<B> 
                 self.router_weight.as_ref(),
                 self.router_bias.as_ref(),
                 self.global_scale.as_ref(),
-                JointGroupSelectionSpec::new(
-                    self.routed_count,
-                    self.shared_count,
-                    self.top_k,
-                    self.coefficient_scale,
-                )?,
+                self.selection,
             )?,
             context,
         )?;
@@ -740,7 +708,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMlp<B> 
             .iter()
             .try_fold(1_i32, |tokens, dimension| tokens.checked_mul(*dimension))
             .ok_or_else(|| Error::backend("Inkling token count overflowed"))?;
-        let shared_ids = Self::shared_group_indices(tokens, self.shared_count, context)?;
+        let shared_ids =
+            Self::shared_group_indices(tokens, self.selection.always_on_groups(), context)?;
         let shared_routes = GroupSelection::new(
             shared_ids,
             routes.always_on_coefficients().clone(),
@@ -771,47 +740,17 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMlp<B> 
     }
 }
 
-/// Returns the architecture-owned routed or shared expert specification for one cache layer.
-pub fn expert_bank_spec(
-    args: &ModelArgs,
-    cache_layer: usize,
-) -> Result<GroupedGatedProductSpec, Error> {
-    let layers = args.text_config.num_hidden_layers as usize;
-    let (layer, field, count) = if cache_layer < layers {
-        (cache_layer, "experts", args.text_config.n_routed_experts)
-    } else {
-        (
-            cache_layer - layers,
-            "shared_experts",
-            args.text_config.n_shared_experts,
-        )
-    };
-    expert_bank_spec_at(
-        &args.text_config,
-        &format!("model.layers.{layer}.moe"),
-        field,
-        count,
-    )
-}
-
-/// Exact routed and shared bank specifications for one localized sparse layer.
-pub(crate) fn localized_expert_bank_specs(
-    args: &ModelArgs,
-    layer: usize,
-    local: &TextArgs,
-    routed_expert_count: i32,
-) -> Result<(GroupedGatedProductSpec, GroupedGatedProductSpec), Error> {
-    let routed = expert_bank_spec(args, layer)?
-        .with_group_geometry(routed_expert_count, local.moe_intermediate_size())?;
-    let cache_layer = usize::try_from(args.text_config.num_hidden_layers)
-        .map_err(Error::backend)?
+/// Resolves a shared bank's cache identity independently of its decoder invocation.
+pub(crate) fn shared_expert_cache_layer(args: &TextArgs, layer: usize) -> Result<usize, Error> {
+    let layers = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
+    if layer >= layers {
+        return Err(Error::backend(format!(
+            "Inkling layer {layer} is outside {layers} declared layers"
+        )));
+    }
+    layers
         .checked_add(layer)
-        .ok_or_else(|| Error::backend("Inkling shared expert layer overflowed"))?;
-    let shared = expert_bank_spec(args, cache_layer)?.with_group_geometry(
-        args.text_config.n_shared_experts,
-        local.moe_intermediate_size(),
-    )?;
-    Ok((routed, shared))
+        .ok_or_else(|| Error::backend("Inkling shared expert unit overflowed"))
 }
 
 fn expert_bank_spec_at(
@@ -829,10 +768,62 @@ fn expert_bank_spec_at(
         args.hidden_size,
         eredu_nn::GatedProductPolicy::ordinary_silu(),
         GatedProductGroupLayout::Packed {
-            gate_up: standard_expert_projection(&gate_up, None, args.linear_format_for(&gate_up))?,
-            down: standard_expert_projection(&down, None, args.linear_format_for(&down))?,
+            gate_up: standard_expert_projection(
+                &gate_up,
+                None,
+                args.linear_format_for(&gate_up),
+                eredu_nn::LinearRowLayout::equal_partitions(2)?,
+            )?,
+            down: standard_expert_projection(
+                &down,
+                None,
+                args.linear_format_for(&down),
+                eredu_nn::LinearRowLayout::Contiguous,
+            )?,
         },
     )
+}
+
+/// One target invocation's exact feed-forward ownership, separate from execution state.
+#[derive(Debug, Clone)]
+pub(crate) enum FeedForwardParameters {
+    Dense(DenseParameters),
+    Sparse(SparseParameters),
+}
+impl FeedForwardParameters {
+    pub(in crate::inkling) fn new(args: &TextArgs, layer: usize) -> Result<Self, Error> {
+        let root = format!("model.layers.{layer}");
+        match args
+            .layer_policy(layer)
+            .ok_or_else(|| Error::backend("Inkling feed-forward invocation is out of range"))?
+            .feed_forward
+        {
+            FeedForwardPolicy::Dense => Ok(Self::Dense(DenseParameters::new_at(args, &root)?)),
+            FeedForwardPolicy::SparseMoe => {
+                Ok(Self::Sparse(SparseParameters::new_at(args, &root)?))
+            }
+        }
+    }
+    pub(in crate::inkling) fn project_formats(&mut self, args: &TextArgs) -> Result<(), Error> {
+        match self {
+            Self::Dense(p) => p.project_formats(args),
+            Self::Sparse(p) => p.project_formats(args),
+        }
+    }
+    pub(in crate::inkling) fn localized(&self, local: &TextArgs) -> Result<Self, Error> {
+        Ok(match self {
+            Self::Dense(p) => Self::Dense(p.localized(local.dense_intermediate_size())?),
+            Self::Sparse(p) => Self::Sparse(p.localized(local.moe_intermediate_size())?),
+        })
+    }
+}
+impl DeclareLogicalParameters for FeedForwardParameters {
+    fn logical_parameters(&self) -> Result<Vec<LogicalParameterDeclaration<'_>>, Error> {
+        match self {
+            Self::Dense(p) => p.logical_parameters(),
+            Self::Sparse(p) => p.logical_parameters(),
+        }
+    }
 }
 
 /// Dense or sparse feed-forward branch selected by the normalized schedule.
@@ -932,115 +923,68 @@ pub struct DecoderLayer<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBac
 }
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DecoderLayer<B> {
-    /// Builds one scheduled decoder layer.
+    /// Builds one scheduled decoder layer from retained target scopes.
     pub fn new(
-        args: &TextArgs,
+        args: &ModelArgs,
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let policy = args
-            .layer_policy(layer)
-            .ok_or_else(|| Error::backend(format!("missing Inkling layer policy {layer}")))?;
-        Self::new_at_with_expert_layers(
-            args,
-            policy,
-            &format!("model.layers.{layer}"),
-            layer,
-            args.num_hidden_layers as usize + layer,
-            context,
-            None,
-        )
+        Self::from_selection(args, &args.text_config, layer, None, context)
     }
-
-    /// Builds one layer under an explicit architecture-owned block root.
-    pub fn new_at(
-        args: &TextArgs,
-        policy: LayerPolicy,
-        block_root: &str,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        Self::new_at_with_expert_layers(args, policy, block_root, 0, 0, context, None)
-    }
-
-    pub(crate) fn new_with_expert_realization(
-        args: &TextArgs,
+    pub(crate) fn from_selection(
+        args: &ModelArgs,
+        local: &TextArgs,
         layer: usize,
-        realization: crate::inkling::ExpertBankRealization,
+        realization: Option<crate::inkling::ExpertBankRealization>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let policy = args
-            .layer_policy(layer)
-            .ok_or_else(|| Error::backend(format!("missing Inkling layer policy {layer}")))?;
-        Self::new_at_with_expert_layers(
-            args,
-            policy,
-            &format!("model.layers.{layer}"),
-            layer,
-            args.num_hidden_layers as usize + layer,
-            context,
-            Some(realization),
-        )
+        let parameters = args.local_common(layer, local)?;
+        let mut feed_forward = args.local_feed_forward(layer, local)?;
+        if let Some(realization) = realization {
+            let FeedForwardParameters::Sparse(parameters) = &mut feed_forward else {
+                return Err(Error::backend(
+                    "Inkling dense invocation cannot bind expert banks",
+                ));
+            };
+            *parameters = parameters
+                .clone()
+                .with_banks(realization.routed, realization.shared)?;
+        }
+        let shared_layer = shared_expert_cache_layer(&args.text_config, layer)?;
+        Self::from_parameters(parameters, layer, shared_layer, context, |context| {
+            Ok(match feed_forward {
+                FeedForwardParameters::Dense(parameters) => {
+                    FeedForward::Dense(DenseMlp::from_parameters(parameters, context)?)
+                }
+                FeedForwardParameters::Sparse(parameters) => {
+                    FeedForward::Sparse(SparseMlp::from_parameters(parameters, context)?)
+                }
+            })
+        })
     }
 
-    fn new_at_with_expert_layers(
-        args: &TextArgs,
-        policy: LayerPolicy,
-        block_root: &str,
+    pub(crate) fn from_parameters(
+        parameters: CommonParameters,
         layer: usize,
         shared_expert_layer: usize,
         context: &<B::Tensor as Tensor>::Context,
-        realization: Option<crate::inkling::ExpertBankRealization>,
+        feed_forward: impl FnOnce(&<B::Tensor as Tensor>::Context) -> Result<FeedForward<B>, Error>,
     ) -> Result<Self, Error> {
-        let prefix = block_root;
-        let norm = |field: &str| {
-            B::normalization(
-                NormalizationConstructionSpec::learned(
-                    args.hidden_size,
-                    args.rms_norm_eps,
-                    ParameterSpec::trainable(format!("{prefix}.{field}.weight"))
-                        .map_err(Error::backend)?,
-                ),
-                context,
-            )
-        };
-        let convolution = |field: &str| {
-            CausalDepthwiseConvolution::new(
-                CausalDepthwiseConvolutionSpec {
-                    arithmetic: eredu_nn::ConvolutionArithmetic::Native,
-                    dilation: 1,
-                    channels: args.hidden_size,
-                    kernel_size: args.sconv_kernel_size,
-                    weight: ParameterSpec::trainable(format!("{prefix}.{field}.weight"))
-                        .map_err(Error::backend)?,
-                    bias: None,
-                    activation: ConvolutionActivation::Identity,
-                },
-                context,
-            )
-        };
         Ok(Self {
             layer,
             shared_expert_layer,
-            input_norm: norm("input_layernorm")?,
-            attention: Attention::new_at(args, policy.attention, block_root, context)?,
-            attention_convolution: convolution("attn_sconv")?,
-            post_attention_norm: norm("post_attention_layernorm")?,
-            feed_forward: match policy.feed_forward {
-                FeedForwardPolicy::Dense => {
-                    FeedForward::Dense(DenseMlp::new_at(args, block_root, context)?)
-                }
-                FeedForwardPolicy::SparseMoe => FeedForward::Sparse(match realization {
-                    Some(realization) => SparseMlp::new_at_with_specs(
-                        args,
-                        block_root,
-                        realization.routed,
-                        realization.shared,
-                        context,
-                    )?,
-                    None => SparseMlp::new_at(args, block_root, context)?,
-                }),
-            },
-            feed_forward_convolution: convolution("mlp_sconv")?,
+            input_norm: B::normalization(parameters.input_norm, context)?,
+            attention: Attention::from_parameters(parameters.attention, context)?,
+            attention_convolution: CausalDepthwiseConvolution::new(
+                parameters.attention_convolution,
+                context,
+            )?,
+            post_attention_norm: B::normalization(parameters.post_attention_norm, context)?,
+            feed_forward: feed_forward(context)?,
+            feed_forward_convolution: CausalDepthwiseConvolution::new(
+                parameters.feed_forward_convolution,
+                context,
+            )?,
         })
     }
 
@@ -1268,15 +1212,6 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DecoderLayer<
     }
 }
 
-/// Inkling normalizes complete text/media assembly before decoder ingress.
-pub(crate) fn embedding_norm_spec(args: &TextArgs) -> Result<NormalizationConstructionSpec, Error> {
-    Ok(NormalizationConstructionSpec::learned(
-        args.hidden_size,
-        args.rms_norm_eps,
-        ParameterSpec::trainable("model.embed_norm.weight").map_err(Error::backend)?,
-    ))
-}
-
 /// Inkling token embedding, ordinary decoder layers, and final norm.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
@@ -1298,20 +1233,24 @@ pub struct TextModel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBacken
 }
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TextModel<B> {
-    /// Builds the complete neutral text model.
-    pub fn new(args: &TextArgs, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
-        let common =
-            crate::decoder::StaticModules::<B>::from_spec(super::static_spec(args), context)?;
+    /// Builds the complete neutral text model from retained source statics.
+    pub fn new(args: &ModelArgs, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
+        let pinned = args.pinned();
+        let text = &args.text_config;
+        let common = crate::decoder::StaticModules::<B>::from_construction(
+            pinned.ordinary.clone(),
+            context,
+        )?;
         Ok(Self {
             embeddings: common.embeddings,
-            embedding_norm: B::normalization(embedding_norm_spec(args)?, context)?,
-            layers: (0..args.num_hidden_layers as usize)
+            embedding_norm: B::normalization(pinned.embedding_norm.clone(), context)?,
+            layers: (0..text.num_hidden_layers as usize)
                 .map(|layer| DecoderLayer::new(args, layer, context))
                 .collect::<Result<_, _>>()?,
             final_norm: common.boundary.norm,
             output: common.lm_head.expect("Inkling declares an untied readout"),
-            logits_scale: args.logits_mup_width_multiplier,
-            output_vocabulary: args.unpadded_vocab_size.unwrap_or(args.vocab_size),
+            logits_scale: text.logits_mup_width_multiplier,
+            output_vocabulary: text.unpadded_vocab_size.unwrap_or(text.vocab_size),
         })
     }
 
@@ -1342,16 +1281,4 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TextModel<B> 
             eredu_nn::Index::Range(0, self.output_vocabulary);
         logits.index(&indexes, context)
     }
-}
-
-/// Returns the exact history tensor shape for one convolution channel count.
-pub fn convolution_history_shape(
-    batch: i32,
-    kernel_size: i32,
-    channels: i32,
-) -> Result<[i32; 3], Error> {
-    if batch <= 0 || kernel_size <= 0 || channels <= 0 {
-        return Err(Error::backend("invalid Inkling convolution state geometry"));
-    }
-    Ok([batch, kernel_size - 1, channels])
 }

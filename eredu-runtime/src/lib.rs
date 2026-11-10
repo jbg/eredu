@@ -370,14 +370,11 @@ pub use mechanism_synthesis::{
 pub use media_load_request::{MediaExecutionPolicy, MediaExecutionPolicyError, MediaLoadRequest};
 pub use parallel::{
     aligned_partition_units, aligned_partition_units_with_tail, derive_transform_source_layout,
-    expand_linear_format_parameter_group, expand_linear_format_parameter_groups,
-    expand_owned_linear_format_parameter_groups, expand_tagged_linear_format_parameter_groups,
-    module_parameter_group, packed_gated_product_logical_group, packed_relu2_logical_group,
-    partition_chunk_range, partition_parameter_group_chunks, partitioned_module_parameter_group,
-    partitioned_projection_group, projection_parameter_group, segmented_projection_group,
-    top_k_group_selector_logical_group, LocalModelLayout, LocalTensorLayout, MemberSharding,
-    ParallelModelInfo, ParallelPlanError, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
-    PartitionUnitAssignment, ProjectionSharding, ShardingPolicy, TensorPlacement,
+    expand_linear_format_parameter, expand_linear_format_parameter_group,
+    expand_linear_format_parameter_groups, logical_parameter_group, logical_parameter_members,
+    partition_chunk_range, partition_parameter_group_chunks, LocalModelLayout, LocalTensorLayout,
+    MemberSharding, ParallelModelInfo, ParallelPlanError, ParameterGroupSpec, ParameterMemberSpec,
+    ParameterRole, PartitionUnitAssignment, ShardingPolicy, TensorPlacement,
 };
 pub use parameter::{
     apply_parameter_storage_layouts, bind_materialized_unit, bind_materialized_unit_excluding,
@@ -523,7 +520,8 @@ pub use replicated_text::{
     partitioned_replicated_text_materialization_tasks,
     plan_local_replicated_text_materialization_tasks, plan_replicated_text_materialization_tasks,
     replicated_text_materialization_tasks, select_replicated_text_realization,
-    select_state_realization, selected_materialization_task_bytes, AddressableStorageCapabilities,
+    select_state_realization, selected_materialization_task_bytes,
+    validate_executable_component_projection, AddressableStorageCapabilities,
     AddressableStorageTiers, BackendMechanismCapabilities, GroupedOperationRequirement,
     ParameterTransformConstraint, ParameterTransformTarget, ReplicatedTextArchitecture,
     ReplicatedTextContractError, ReplicatedTextMaterializationPartitionPlan,

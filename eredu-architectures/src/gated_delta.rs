@@ -7,9 +7,9 @@ pub use state::GatedDeltaStateGeometry;
 use crate::decoder::ComponentInstrumentation;
 use eredu_core::cache::StateTensorRole;
 use eredu_nn::{
-    CausalDepthwiseConvolution, CausalDepthwiseConvolutionSpec, Error, GatedDeltaScanInput,
-    HeadExpansion, LinearOperator, LinearSpec, NeuralBackend, OutputGateActivation, Parameter,
-    ParameterSpec, Tensor, TensorElementType,
+    CausalDepthwiseConvolution, CausalDepthwiseConvolutionSpec, Error, GatedDeltaHeadGeometry,
+    GatedDeltaScanInput, HeadExpansion, LinearOperator, LinearSpec, NeuralBackend,
+    OutputGateActivation, Parameter, ParameterSpec, Tensor, TensorElementType,
 };
 use eredu_runtime::RuntimeStateComponents;
 
@@ -29,14 +29,8 @@ pub const REQUIRED_OPERATORS: eredu_nn::NeuralOperatorCapabilities = {
 /// Exact parameter identities, formats, geometry and arithmetic for a mixer.
 #[derive(Debug, Clone)]
 pub struct GatedDeltaMixerSpec {
-    /// Query and key heads before repetition to value heads.
-    pub key_heads: i32,
-    /// Value heads and recurrent state matrices.
-    pub value_heads: i32,
-    /// Dimensions per query/key head.
-    pub key_head_dim: i32,
-    /// Dimensions per value head.
-    pub value_head_dim: i32,
+    /// Checked independent key/value axes, including value-head expansion.
+    pub geometry: GatedDeltaHeadGeometry,
     /// Component-major query, key and value projection.
     pub input_qkv: LinearSpec,
     /// Per-value-channel output gate projection.
@@ -65,15 +59,50 @@ pub struct GatedDeltaMixerSpec {
     pub output_arithmetic: eredu_nn::OutputGatedNormArithmetic,
 }
 
+impl eredu_nn::DeclareLogicalParameters for GatedDeltaMixerSpec {
+    fn logical_parameters(&self) -> Result<Vec<eredu_nn::LogicalParameterDeclaration<'_>>, Error> {
+        use eredu_nn::{LogicalParameterDeclaration as D, LogicalParameterRole as R};
+        self.validate_geometry()?;
+        let mut declarations = Vec::new();
+        for projection in [
+            &self.input_qkv,
+            &self.input_gate,
+            &self.input_beta,
+            &self.input_decay,
+            &self.output,
+        ] {
+            declarations.extend(projection.logical_parameters()?);
+        }
+        declarations.extend(self.convolution.logical_parameters()?);
+        declarations.extend([
+            D::new(
+                &self.decay_bias,
+                &[self.geometry.value_heads()],
+                R::RecurrentBias,
+            )?,
+            D::new(
+                &self.transition_log,
+                &[self.geometry.value_heads()],
+                R::RecurrentTransition,
+            )?,
+            D::new(
+                &self.normalization_weight,
+                &[self.geometry.value_dimensions()],
+                R::Normalization,
+            )?,
+        ]);
+        eredu_nn::validate_logical_parameter_topology(&declarations)
+            .map_err(Error::backend_source)?;
+        Ok(declarations)
+    }
+}
+
 impl GatedDeltaMixerSpec {
     /// Declares exactly the rank-local mutable components consumed by this mixer.
     pub fn state_policy(&self) -> Result<eredu_core::cache::LayerCachePolicy, Error> {
         self.validate()?;
         GatedDeltaStateGeometry {
-            key_heads: self.key_heads,
-            value_heads: self.value_heads,
-            key_dim: self.key_head_dim,
-            value_dim: self.value_head_dim,
+            heads: self.geometry,
             kernel: self.convolution.kernel_size,
             dilation: self.convolution.dilation,
         }
@@ -82,14 +111,10 @@ impl GatedDeltaMixerSpec {
 
     /// Validates the full construction before backend parameter allocation.
     pub fn validate(&self) -> Result<(), Error> {
-        if self.key_heads <= 0
-            || self.value_heads <= 0
-            || self.value_heads % self.key_heads != 0
-            || self.key_head_dim <= 0
-            || self.value_head_dim <= 0
-        {
-            return Err(Error::backend("invalid gated-delta head geometry"));
-        }
+        eredu_nn::DeclareLogicalParameters::logical_parameters(self).map(|_| ())
+    }
+
+    fn validate_geometry(&self) -> Result<(), Error> {
         for epsilon in [self.l2_epsilon, self.output_epsilon] {
             if !epsilon.is_finite() || epsilon <= 0.0 {
                 return Err(Error::backend(
@@ -97,18 +122,8 @@ impl GatedDeltaMixerSpec {
                 ));
             }
         }
-        let key = self
-            .key_heads
-            .checked_mul(self.key_head_dim)
-            .ok_or_else(|| Error::backend("gated-delta key width overflowed"))?;
-        let value = self
-            .value_heads
-            .checked_mul(self.value_head_dim)
-            .ok_or_else(|| Error::backend("gated-delta value width overflowed"))?;
-        let qkv = key
-            .checked_mul(2)
-            .and_then(|k| k.checked_add(value))
-            .ok_or_else(|| Error::backend("gated-delta QKV width overflowed"))?;
+        let value = self.geometry.value_width();
+        let qkv = self.geometry.qkv_width()?;
         let hidden = self.input_qkv.input;
         if hidden <= 0 {
             return Err(Error::backend("gated-delta input width must be positive"));
@@ -116,8 +131,8 @@ impl GatedDeltaMixerSpec {
         for (spec, input, output) in [
             (&self.input_qkv, hidden, qkv),
             (&self.input_gate, hidden, value),
-            (&self.input_beta, hidden, self.value_heads),
-            (&self.input_decay, hidden, self.value_heads),
+            (&self.input_beta, hidden, self.geometry.value_heads()),
+            (&self.input_decay, hidden, self.geometry.value_heads()),
             (&self.output, value, hidden),
         ] {
             if spec.input != input || spec.output != output {
@@ -182,12 +197,12 @@ impl<B: NeuralBackend> GatedDeltaMixer<B> {
         spec.validate()?;
         B::require_operator_capabilities("gated-delta mixer", REQUIRED_OPERATORS)?;
         Ok(Self {
-            key_heads: spec.key_heads,
-            value_heads: spec.value_heads,
-            key_head_dim: spec.key_head_dim,
-            value_head_dim: spec.value_head_dim,
-            key_width: spec.key_heads * spec.key_head_dim,
-            value_width: spec.value_heads * spec.value_head_dim,
+            key_heads: spec.geometry.key_heads(),
+            value_heads: spec.geometry.value_heads(),
+            key_head_dim: spec.geometry.key_dimensions(),
+            value_head_dim: spec.geometry.value_dimensions(),
+            key_width: spec.geometry.key_width(),
+            value_width: spec.geometry.value_width(),
             l2_epsilon: spec.l2_epsilon,
             output_epsilon: spec.output_epsilon,
             output_gate: spec.output_gate,
@@ -197,11 +212,19 @@ impl<B: NeuralBackend> GatedDeltaMixer<B> {
             input_beta: B::linear(spec.input_beta, context)?,
             input_decay: B::linear(spec.input_decay, context)?,
             convolution: CausalDepthwiseConvolution::new(spec.convolution, context)?,
-            decay_bias: Parameter::unloaded(spec.decay_bias, &[spec.value_heads], context)?,
-            transition_log: Parameter::unloaded(spec.transition_log, &[spec.value_heads], context)?,
+            decay_bias: Parameter::unloaded(
+                spec.decay_bias,
+                &[spec.geometry.value_heads()],
+                context,
+            )?,
+            transition_log: Parameter::unloaded(
+                spec.transition_log,
+                &[spec.geometry.value_heads()],
+                context,
+            )?,
             normalization_weight: Parameter::unloaded(
                 spec.normalization_weight,
-                &[spec.value_head_dim],
+                &[spec.geometry.value_dimensions()],
                 context,
             )?,
             output: B::linear(spec.output, context)?,

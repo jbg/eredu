@@ -3,16 +3,20 @@
 use std::collections::{BTreeMap, HashMap};
 
 use eredu_checkpoint::schema::{
-    AlternativeLayoutGroup, CatalogPolicy, DepthwiseConvolutionSchema, FusedProjectionSegment,
-    FusedSegmentedProjectionSchema, GgufCheckpointPlan, GgufTensorConstraint, GgufTypeConstraint,
-    LayoutVariant, SafetensorsCheckpointPlan, SafetensorsTensorConstraint, StoredDtypeConstraint,
-    TensorOperation,
+    AlternativeLayoutGroup, CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint,
+    GgufTypeConstraint, LayoutVariant, SafetensorsCheckpointPlan, SafetensorsTensorConstraint,
+    StoredDtypeConstraint, TensorOperation,
 };
+use eredu_checkpoint::WeightQuantization;
 use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::TensorSelection};
-use eredu_checkpoint::{StoredDtype, WeightQuantization};
 use eredu_core::AttentionPolicy;
+use eredu_nn::{DeclareLogicalParameters, LogicalParameterRole};
 
-use super::config::{FeedForwardPolicy, ModelArgs, OperatorPolicy};
+use super::config::ModelArgs;
+use super::{
+    declarations::{FeedForwardParameters, MixerParameters},
+    Declaration,
+};
 
 /// Derives an LFM2 configuration whose physical matrix formats reflect
 /// load-time quantization instead of checkpoint-specific format selections.
@@ -35,7 +39,28 @@ pub fn with_checkpoint_formats(
     args: &ModelArgs,
     mut formats: HashMap<String, WeightQuantization>,
 ) -> Result<ModelArgs, String> {
-    normalize_weight_formats(args, &mut formats);
+    let source = Declaration::new(args.clone()).map_err(|error| error.to_string())?;
+    for scope in &source.blocks {
+        let FeedForwardParameters::Routed(spec) = &scope.feed_forward else {
+            continue;
+        };
+        let packed = spec
+            .experts
+            .packed_parameters()
+            .map_err(|error| error.to_string())?;
+        let prefix = packed
+            .gate_up()
+            .parameter
+            .id
+            .as_str()
+            .strip_suffix(".gate_up_proj")
+            .ok_or("expert bank has no declared source root")?;
+        crate::format_references::rehome_split_matrix_format(
+            &mut formats,
+            &packed.gate_up().parameter.id,
+            [format!("{prefix}.gate_proj"), format!("{prefix}.up_proj")],
+        )?;
+    }
     let mut target = args.clone();
     target.quantized_weights = Some(formats.keys().cloned().collect());
     target.quantized_weight_configs = Some(formats);
@@ -64,43 +89,60 @@ fn expert_source(
 /// Returns the complete derived-weight catalog for one LFM2 execution unit.
 pub fn unit_recipes(
     store: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
-    args: &ModelArgs,
+    declaration: &Declaration,
     layer: usize,
 ) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
+    let scope = declaration
+        .blocks
+        .get(layer)
+        .ok_or_else(|| format!("LFM2 has no declared layer {layer}"))?;
     let mut recipes = BTreeMap::new();
-    let root = format!("model.layers.{layer}");
-    let conv = format!("{root}.conv.conv.weight");
-    if let Ok(metadata) = store.source_metadata(&conv) {
-        let expected = vec![args.hidden_size as usize, 1, args.conv_l_cache as usize];
-        let recipe = if metadata.logical_shape.len() == 2 {
-            Some(DerivedWeightRecipe::Reshape {
-                input: Box::new(DerivedWeightRecipe::source(&conv, TensorSelection::Full)),
-                shape: expected.clone(),
-            })
-        } else if metadata.logical_shape == [expected[0], expected[2], expected[1]]
-            && metadata.logical_shape != expected
-        {
-            Some(DerivedWeightRecipe::Transpose {
-                input: Box::new(DerivedWeightRecipe::source(&conv, TensorSelection::Full)),
-                axes: vec![0, 2, 1],
-            })
-        } else {
-            None
-        };
-        if let Some(recipe) = recipe {
-            recipes.insert(conv.clone(), recipe);
+    if let MixerParameters::Convolution(spec) = &scope.mixer {
+        let conv = spec.convolution.weight.id.as_str();
+        if let Ok(metadata) = store.source_metadata(conv) {
+            let expected = spec
+                .convolution
+                .logical_parameters()
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .find(|d| d.parameter.id == spec.convolution.weight.id)
+                .expect("declared convolution weight")
+                .shape;
+            let recipe = if metadata.logical_shape.len() == 2 {
+                Some(DerivedWeightRecipe::Reshape {
+                    input: Box::new(DerivedWeightRecipe::source(conv, TensorSelection::Full)),
+                    shape: expected.clone(),
+                })
+            } else if metadata.logical_shape == [expected[0], expected[2], expected[1]]
+                && metadata.logical_shape != expected
+            {
+                Some(DerivedWeightRecipe::Transpose {
+                    input: Box::new(DerivedWeightRecipe::source(conv, TensorSelection::Full)),
+                    axes: vec![0, 2, 1],
+                })
+            } else {
+                None
+            };
+            if let Some(recipe) = recipe {
+                recipes.insert(conv.to_owned(), recipe);
+            }
         }
     }
-    let policy = args
-        .layer_policy(layer)
-        .ok_or_else(|| format!("LFM2 has no layer policy {layer}"))?;
-    if policy.feed_forward != FeedForwardPolicy::SparseMoe {
+    let FeedForwardParameters::Routed(parameters) = &scope.feed_forward else {
         return Ok(recipes);
-    }
-    let prefix = format!("{root}.feed_forward.experts");
+    };
     let keys = store.source_keys();
-    let gate_up = format!("{prefix}.gate_up_proj");
-    let down = format!("{prefix}.down_proj");
+    let bank = &parameters.experts;
+    let source = bank.packed_parameters().map_err(|e| e.to_string())?;
+    let gate_up = source.gate_up().parameter.id.as_str().to_owned();
+    let down = source.down().parameter.id.as_str().to_owned();
+    let prefix = source
+        .gate_up()
+        .parameter
+        .id
+        .as_str()
+        .strip_suffix(".gate_up_proj")
+        .ok_or("unresolved LFM2 expert source root")?;
     if keys.contains(&gate_up) {
         return Ok(recipes);
     }
@@ -125,15 +167,20 @@ pub fn unit_recipes(
     }
     let mut gate_up_inputs = Vec::new();
     let mut down_inputs = Vec::new();
-    for expert in 0..args.num_experts {
+    for expert in 0..source.group_count() {
         gate_up_inputs.push(DerivedWeightRecipe::Concatenate {
             axis: 0,
             inputs: vec![
-                expert_source(store, &prefix, expert, &["w1", "gate_proj"])?,
-                expert_source(store, &prefix, expert, &["w3", "up_proj"])?,
+                expert_source(store, &prefix, expert as i32, &["w1", "gate_proj"])?,
+                expert_source(store, &prefix, expert as i32, &["w3", "up_proj"])?,
             ],
         });
-        down_inputs.push(expert_source(store, &prefix, expert, &["w2", "down_proj"])?);
+        down_inputs.push(expert_source(
+            store,
+            &prefix,
+            expert as i32,
+            &["w2", "down_proj"],
+        )?);
     }
     recipes.insert(
         gate_up,
@@ -155,22 +202,39 @@ pub fn unit_recipes(
 /// Returns canonical lazy-loading recipes for one LFM2 routed expert.
 pub fn expert_recipes(
     store: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
-    args: &ModelArgs,
+    declaration: &Declaration,
     layer: usize,
     expert: usize,
 ) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
-    let policy = args
-        .layer_policy(layer)
-        .ok_or_else(|| format!("LFM2 has no layer policy {layer}"))?;
-    if policy.feed_forward != FeedForwardPolicy::SparseMoe {
-        return Err(format!("LFM2 layer {layer} is not sparse MoE"));
-    }
-    if expert >= args.num_experts as usize {
+    let scope = declaration
+        .blocks
+        .get(layer)
+        .ok_or_else(|| format!("LFM2 has no declared layer {layer}"))?;
+    let FeedForwardParameters::Routed(parameters) = &scope.feed_forward else {
+        return Err(format!("LFM2 layer {layer} has no declared expert bank"));
+    };
+    expert_recipes_for_bank(store, layer, expert, &parameters.experts)
+}
+
+fn expert_recipes_for_bank(
+    store: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
+    layer: usize,
+    expert: usize,
+    bank: &eredu_nn::GroupedGatedProductSpec,
+) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
+    let source = bank.packed_parameters().map_err(|e| e.to_string())?;
+    if expert >= source.group_count() {
         return Err(format!("LFM2 has no expert {expert} in layer {layer}"));
     }
-    let prefix = format!("model.layers.{layer}.feed_forward.experts");
-    let packed_gate_up = format!("{prefix}.gate_up_proj");
-    let packed_down = format!("{prefix}.down_proj");
+    let prefix = source
+        .gate_up()
+        .parameter
+        .id
+        .as_str()
+        .strip_suffix(".gate_up_proj")
+        .ok_or("unresolved LFM2 expert source root")?;
+    let packed_gate_up = source.gate_up().parameter.id.as_str().to_owned();
+    let packed_down = source.down().parameter.id.as_str().to_owned();
     let keys = store.source_keys();
     let selection = TensorSelection::Range {
         axis: 0,
@@ -243,8 +307,11 @@ pub fn expert_recipes(
             }
         }
     } else {
-        if args.weight_quantization_for(&packed_gate_up).is_some()
-            || args.weight_quantization_for(&packed_down).is_some()
+        if source
+            .encodings()
+            .map_err(|e| e.to_string())?
+            .iter()
+            .any(|format| format.weight_quantization().is_some())
         {
             return Err("split LFM2 experts cannot be lazily load-time quantized".into());
         }
@@ -275,23 +342,19 @@ pub fn expert_recipes(
 /// Builds the complete architecture-owned schedule for independently resident experts.
 pub fn expert_residency_catalog(
     store: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
-    args: &ModelArgs,
+    declaration: &Declaration,
 ) -> Result<crate::ExpertResidencyCatalog, String> {
-    if !args.has_sparse_moe_layers() {
+    if declaration.expert_banks().is_empty() {
         return Err("independent expert residency requires LFM2-MoE".into());
     }
-    let experts = dimension(args.num_experts, "expert count")?;
     let owner_group = eredu_runtime::ExecutionGroupId::new(crate::decoder::TARGET_EXECUTION_GROUP)
         .map_err(|error| error.to_string())?;
     let mut units = Vec::new();
-    for (layer, policy) in args.layer_schedule.iter().enumerate() {
-        if policy.feed_forward != FeedForwardPolicy::SparseMoe {
-            continue;
-        }
+    for (layer, bank) in declaration.expert_banks() {
         let unit_path = format!("model.layers.{layer}");
-        let expert_root = format!("{unit_path}.feed_forward.experts");
-        for expert in 0..experts {
-            let recipes = expert_recipes(store, args, layer, expert)?;
+        let source = bank.packed_parameters().map_err(|e| e.to_string())?;
+        for expert in 0..source.group_count() {
+            let recipes = expert_recipes_for_bank(store, layer, expert, &bank)?;
             let gate_up_quantizable = !recipes.contains_key("gate_up_proj_scales")
                 && !recipes.contains_key("gate_up_proj_biases");
             let down_quantizable = !recipes.contains_key("down_proj_scales")
@@ -314,7 +377,17 @@ pub fn expert_residency_catalog(
                         }
                         _ => crate::ExpertParameterRole::Preserved,
                     };
-                    let target = format!("{expert_root}.{binding}");
+                    let (primary, suffix) = binding
+                        .strip_prefix("gate_up_proj")
+                        .map(|suffix| (source.gate_up(), suffix))
+                        .or_else(|| {
+                            binding
+                                .strip_prefix("down_proj")
+                                .map(|suffix| (source.down(), suffix))
+                        })
+                        .filter(|(_, suffix)| matches!(*suffix, "" | "_scales" | "_biases"))
+                        .ok_or_else(|| format!("undeclared expert binding {binding}"))?;
+                    let target = format!("{}{suffix}", primary.parameter.id);
                     crate::ExpertParameterRecipe::new(binding, target, recipe, role)
                         .map_err(|error| error.to_string())
                 })
@@ -337,219 +410,153 @@ pub fn expert_residency_catalog(
         .map_err(|error| error.to_string())
 }
 
-/// Rehomes split expert GGUF formats onto their canonical fused runtime weights.
-pub fn normalize_weight_formats<V>(args: &ModelArgs, formats: &mut HashMap<String, V>) {
-    for (layer, policy) in args.layer_schedule.iter().enumerate() {
-        if policy.feed_forward != FeedForwardPolicy::SparseMoe {
-            continue;
-        }
-        let prefix = format!("model.layers.{layer}.feed_forward.experts");
-        if let Some(format) = formats.remove(&format!("{prefix}.gate_proj")) {
-            formats.remove(&format!("{prefix}.up_proj"));
-            formats.insert(format!("{prefix}.gate_up_proj"), format);
-        }
-    }
-}
-
 /// Builds the complete alternative-layout SafeTensors contract.
 pub fn safetensors_plan(
-    args: &ModelArgs,
+    declaration: &Declaration,
     allow_derived_packed: bool,
 ) -> Result<SafetensorsCheckpointPlan, String> {
-    let hidden = dimension(args.hidden_size, "hidden size")?;
-    let vocab = dimension(args.vocab_size, "vocabulary size")?;
-    let layers = dimension(args.num_hidden_layers, "layer count")?;
-    let heads = dimension(args.num_attention_heads, "attention head count")?;
-    let kv_heads = dimension(args.num_key_value_heads, "key/value head count")?;
-    if !hidden.is_multiple_of(heads) {
-        return Err(format!(
-            "LFM2 hidden size {hidden} is not divisible by attention head count {heads}"
-        ));
-    }
-    let head = hidden / heads;
-    let key_value = checked_mul(kv_heads, head, "key/value projection width")?;
+    let statics = &declaration.statics;
     let mut common = Vec::new();
     let mut groups = Vec::new();
-    add_safe_matrix(
-        args,
-        &mut common,
-        "model.embed_tokens.weight",
-        vec![vocab, hidden],
-        true,
-    )?;
-    common.push(safe("model.embedding_norm.weight", vec![hidden]));
-    if !args.tie_word_embeddings {
-        add_safe_matrix(
-            args,
-            &mut common,
-            "lm_head.weight",
-            vec![vocab, hidden],
-            true,
-        )?;
+    add_safe_spec(&mut common, statics.embedding_spec())?;
+    add_safe_spec(&mut common, statics.normalization_spec())?;
+    if let Some(head) = statics.head_spec() {
+        add_safe_spec(&mut common, head)?;
     }
-
-    for layer in 0..layers {
-        let root = format!("model.layers.{layer}");
-        common.extend([
-            safe(format!("{root}.operator_norm.weight"), vec![hidden]),
-            safe(format!("{root}.ffn_norm.weight"), vec![hidden]),
-        ]);
-        let policy = args
-            .layer_policy(layer)
-            .ok_or_else(|| format!("LFM2 layer schedule has no policy for layer {layer}"))?;
-        match policy.operator {
-            OperatorPolicy::CausalConvolution => {
-                let kernel = dimension(args.conv_l_cache, "short-convolution width")?;
-                let convolution = DepthwiseConvolutionSchema::new(hidden, kernel, args.conv_bias)?;
-                let fused = FusedSegmentedProjectionSchema::new(
-                    hidden,
-                    ["gate", "value", "convolution"]
-                        .into_iter()
-                        .map(|name| FusedProjectionSegment::new(name, hidden))
-                        .collect::<Result<Vec<_>, _>>()?,
-                )?;
-                common.push(
-                    safe(
-                        format!("{root}.conv.conv.weight"),
-                        convolution.storage_shape(),
-                    )
-                    .with_alternate_shapes([
-                        DepthwiseConvolutionSchema::with_axes(
-                            hidden,
-                            kernel,
-                            eredu_checkpoint::schema::DepthwiseKernelAxes::ChannelsKernelSingleton,
-                            eredu_checkpoint::schema::DepthwiseKernelAxes::ChannelsSingletonKernel,
-                            args.conv_bias,
-                        )?
-                        .storage_shape(),
-                    ]),
-                );
-                add_safe_matrix(
-                    args,
-                    &mut common,
-                    &format!("{root}.conv.in_proj.weight"),
-                    fused.matrix_shape(),
-                    true,
-                )?;
-                add_safe_matrix(
-                    args,
-                    &mut common,
-                    &format!("{root}.conv.out_proj.weight"),
-                    vec![hidden, hidden],
-                    true,
-                )?;
-                if args.conv_bias {
-                    common.extend([
-                        safe(format!("{root}.conv.conv.bias"), vec![hidden]),
-                        safe(format!("{root}.conv.in_proj.bias"), fused.bias_shape()),
-                        safe(format!("{root}.conv.out_proj.bias"), vec![hidden]),
-                    ]);
-                }
-            }
-            OperatorPolicy::SelfAttention(AttentionPolicy::Full) => {
-                for (local, shape, matrix) in [
-                    ("q_proj.weight", vec![hidden, hidden], true),
-                    ("k_proj.weight", vec![key_value, hidden], true),
-                    ("v_proj.weight", vec![key_value, hidden], true),
-                    ("out_proj.weight", vec![hidden, hidden], true),
-                    ("q_layernorm.weight", vec![head], false),
-                    ("k_layernorm.weight", vec![head], false),
-                ] {
-                    let name = format!("{root}.self_attn.{local}");
-                    if matrix {
-                        add_safe_matrix(args, &mut common, &name, shape, true)?;
+    for (layer, scope) in declaration.blocks.iter().enumerate() {
+        for spec in [&scope.operator_norm, &scope.feed_forward_norm] {
+            add_safe_spec(&mut common, spec)?;
+        }
+        match &scope.mixer {
+            MixerParameters::Convolution(spec) => {
+                let mut declarations = spec.logical_parameters().map_err(|e| e.to_string())?;
+                declarations.sort_by_key(|d| convolution_storage_order(d.parameter.id.as_str()));
+                for declaration in declarations {
+                    let name = declaration.parameter.id.as_str();
+                    if declaration.parameter.id == spec.convolution.weight.id {
+                        let mut alternative = declaration.shape.clone();
+                        alternative.swap(1, 2);
+                        common.push(
+                            safe(name, declaration.shape).with_alternate_shapes([alternative]),
+                        );
+                    } else if declaration.role == LogicalParameterRole::LinearWeight {
+                        common.extend(source_matrix_constraints(
+                            name,
+                            declaration.shape,
+                            declaration
+                                .linear_format
+                                .and_then(|format| format.encoding().weight_quantization()),
+                        )?);
                     } else {
-                        common.push(safe(name, shape));
+                        common.push(safe(name, declaration.shape));
                     }
                 }
             }
-            OperatorPolicy::SelfAttention(AttentionPolicy::Sliding { .. }) => {
+            MixerParameters::Attention(spec, AttentionPolicy::Full) => {
+                add_safe_spec(&mut common, spec)?;
+            }
+            MixerParameters::Attention(_, AttentionPolicy::Sliding { .. }) => {
                 return Err("LFM2 structural admission does not support sliding attention".into());
             }
         }
-
-        match policy.feed_forward {
-            FeedForwardPolicy::Dense => {
-                let intermediate =
-                    dimension(args.dense_intermediate_size, "dense intermediate size")?;
-                for (local, shape) in [
-                    ("w1.weight", vec![intermediate, hidden]),
-                    ("w2.weight", vec![hidden, intermediate]),
-                    ("w3.weight", vec![intermediate, hidden]),
-                ] {
-                    add_safe_matrix(
-                        args,
-                        &mut common,
-                        &format!("{root}.feed_forward.{local}"),
-                        shape,
-                        true,
-                    )?;
+        match &scope.feed_forward {
+            FeedForwardParameters::Dense(spec) => {
+                for spec in [&spec.gate, &spec.down, &spec.up] {
+                    add_safe_spec(&mut common, spec)?;
                 }
             }
-            FeedForwardPolicy::SparseMoe => {
-                add_safe_moe(
-                    args,
-                    layer,
-                    &root,
-                    allow_derived_packed,
-                    &mut common,
-                    &mut groups,
-                )?;
-            }
+            FeedForwardParameters::Routed(parameters) => add_safe_moe(
+                parameters,
+                layer,
+                allow_derived_packed,
+                &mut common,
+                &mut groups,
+            )?,
         }
     }
-
     let mut policy = CatalogPolicy::non_strict();
     policy.allowed_suffixes.push(".rotary_emb.inv_freq".into());
     SafetensorsCheckpointPlan::new("LFM2 SafeTensors", common, groups, policy)
-        .map_err(|error| error.to_string())
+        .map_err(|e| e.to_string())
+}
+
+fn add_safe_spec(
+    output: &mut Vec<SafetensorsTensorConstraint>,
+    spec: &impl DeclareLogicalParameters,
+) -> Result<(), String> {
+    for declaration in spec.logical_parameters().map_err(|e| e.to_string())? {
+        let name = declaration.parameter.id.as_str();
+        if matches!(
+            declaration.role,
+            LogicalParameterRole::LinearWeight | LogicalParameterRole::Embedding
+        ) {
+            output.extend(source_matrix_constraints(
+                name,
+                declaration.shape,
+                declaration
+                    .linear_format
+                    .and_then(|format| format.encoding().weight_quantization()),
+            )?);
+        } else {
+            output.push(safe(name, declaration.shape));
+        }
+    }
+    Ok(())
+}
+
+fn convolution_storage_order(name: &str) -> usize {
+    [
+        "conv.weight",
+        "in_proj.weight",
+        "out_proj.weight",
+        "conv.bias",
+        "in_proj.bias",
+        "out_proj.bias",
+    ]
+    .iter()
+    .position(|field| name.ends_with(&format!(".{field}")))
+    .expect("declared short-convolution slot")
 }
 
 fn add_safe_moe(
-    args: &ModelArgs,
+    parameters: &eredu_nn::RoutedGatedProductSpec,
     layer: usize,
-    root: &str,
     allow_derived_packed: bool,
     common: &mut Vec<SafetensorsTensorConstraint>,
     groups: &mut Vec<AlternativeLayoutGroup<SafetensorsTensorConstraint>>,
 ) -> Result<(), String> {
-    let hidden = dimension(args.hidden_size, "hidden size")?;
-    let experts = dimension(args.num_experts, "expert count")?;
-    let intermediate = dimension(args.moe_intermediate_size, "MoE intermediate size")?;
-    common.push(safe(
-        format!("{root}.feed_forward.gate.weight"),
-        vec![experts, hidden],
-    ));
-    if args.use_expert_bias {
-        common.push(safe(
-            format!("{root}.feed_forward.expert_bias"),
-            vec![experts],
-        ));
+    // The released router stays floating while expert projections may be encoded.
+    for declaration in parameters
+        .selector
+        .logical_parameters()
+        .map_err(|e| e.to_string())?
+    {
+        common.push(safe(declaration.parameter.id.as_str(), declaration.shape));
     }
-    let prefix = format!("{root}.feed_forward.experts");
-    let gate_up = format!("{prefix}.gate_up_proj");
+    let bank = &parameters.experts;
+    let source = bank.packed_parameters().map_err(|e| e.to_string())?;
+    let gate_up_shape = source.gate_up().shape.clone();
+    let down_shape = source.down().shape.clone();
+    let read_shape = source.unfused_shape();
+    let prefix = source
+        .gate_up()
+        .parameter
+        .id
+        .as_str()
+        .strip_suffix(".gate_up_proj")
+        .ok_or("unresolved LFM2 expert source root")?;
+    let gate_up = source.gate_up().parameter.id.as_str().to_owned();
+    let down = source.down().parameter.id.as_str().to_owned();
     let gate = format!("{prefix}.gate_proj");
     let up = format!("{prefix}.up_proj");
-    let down = format!("{prefix}.down_proj");
-    let gate_up_quantization = args.weight_quantization_for(&gate_up);
-    let down_quantization = args.weight_quantization_for(&down);
+    let [gate_up_format, down_format] = source.encodings().map_err(|e| e.to_string())?;
+    let gate_up_quantization = gate_up_format.weight_quantization();
+    let down_quantization = down_format.weight_quantization();
     let mut variants = vec![LayoutVariant {
         id: "fused packed".into(),
         tensors: [
-            safe_matrix_constraints(
-                &gate_up,
-                vec![
-                    experts,
-                    checked_mul(2, intermediate, "fused expert width")?,
-                    hidden,
-                ],
-                gate_up_quantization,
-            )?,
-            safe_matrix_constraints(
-                &down,
-                vec![experts, hidden, intermediate],
-                down_quantization,
-            )?,
+            source_matrix_constraints(&gate_up, gate_up_shape, gate_up_quantization)?,
+            source_matrix_constraints(&down, down_shape.clone(), down_quantization)?,
         ]
         .concat(),
         discriminator_keys: vec![gate_up.clone()],
@@ -558,21 +565,9 @@ fn add_safe_moe(
         variants.push(LayoutVariant {
             id: "separate packed".into(),
             tensors: [
-                safe_matrix_constraints(
-                    &gate,
-                    vec![experts, intermediate, hidden],
-                    gate_up_quantization,
-                )?,
-                safe_matrix_constraints(
-                    &up,
-                    vec![experts, intermediate, hidden],
-                    gate_up_quantization,
-                )?,
-                safe_matrix_constraints(
-                    &down,
-                    vec![experts, hidden, intermediate],
-                    down_quantization,
-                )?,
+                source_matrix_constraints(&gate, read_shape.clone(), gate_up_quantization)?,
+                source_matrix_constraints(&up, read_shape.clone(), gate_up_quantization)?,
+                source_matrix_constraints(&down, down_shape.clone(), down_quantization)?,
             ]
             .concat(),
             discriminator_keys: vec![gate, up],
@@ -581,28 +576,11 @@ fn add_safe_moe(
     if gate_up_quantization.is_none() && down_quantization.is_none() {
         let mut tensors = Vec::new();
         let mut discriminators = Vec::new();
-        for expert in 0..experts {
-            for (canonical, alias, shape) in [
-                (
-                    format!("{prefix}.{expert}.w1.weight"),
-                    format!("{prefix}.{expert}.gate_proj.weight"),
-                    vec![intermediate, hidden],
-                ),
-                (
-                    format!("{prefix}.{expert}.w2.weight"),
-                    format!("{prefix}.{expert}.down_proj.weight"),
-                    vec![hidden, intermediate],
-                ),
-                (
-                    format!("{prefix}.{expert}.w3.weight"),
-                    format!("{prefix}.{expert}.up_proj.weight"),
-                    vec![intermediate, hidden],
-                ),
-            ] {
-                discriminators.push(canonical.clone());
-                tensors.push(safe(canonical, shape).with_aliases([alias]));
-            }
-        }
+        visit_independent_expert_sources(&source, |_, canonical, alias, shape| {
+            discriminators.push(canonical.clone());
+            tensors.push(safe(canonical, shape).with_aliases([alias]));
+            Ok(())
+        })?;
         variants.push(LayoutVariant {
             id: "per-expert split".into(),
             tensors,
@@ -617,21 +595,86 @@ fn add_safe_moe(
     Ok(())
 }
 
-fn add_safe_matrix(
-    args: &ModelArgs,
-    output: &mut Vec<SafetensorsTensorConstraint>,
-    name: &str,
-    shape: Vec<usize>,
-    quantizable: bool,
+/// Projects admitted ordinary matrix geometry from neural declarations and exact
+/// source-layout extensions, before physical packing. Packed banks retain their
+/// grouped geometry in the expert realization plan.
+pub(crate) fn source_linear_shapes(
+    declaration: &Declaration,
+) -> Result<BTreeMap<String, Vec<usize>>, String> {
+    let mut shapes = declaration
+        .definition()
+        .parameters()
+        .groups()
+        .iter()
+        .flat_map(|group| group.members())
+        .filter(|member| member.logical_role() == Some(LogicalParameterRole::LinearWeight))
+        .filter_map(|member| {
+            member
+                .logical_shape()
+                .filter(|shape| shape.len() == 2)
+                .map(|shape| (member.target().to_owned(), shape.to_vec()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    for bank in declaration.expert_banks().values() {
+        let source = bank.packed_parameters().map_err(|e| e.to_string())?;
+        let [gate_up, down] = source.encodings().map_err(|e| e.to_string())?;
+        if gate_up.weight_quantization().is_none() && down.weight_quantization().is_none() {
+            visit_independent_expert_sources(&source, |_, canonical, _, shape| {
+                shapes.insert(canonical, shape);
+                Ok(())
+            })?;
+        }
+    }
+    Ok(shapes)
+}
+
+/// Physical per-expert names reference the declared fused or down projection;
+/// each source selects one group and, for gate/up, one row half.
+fn visit_independent_expert_sources(
+    source: &eredu_nn::PackedGatedProductParameters<'_>,
+    mut visit: impl FnMut(
+        &eredu_nn::LogicalParameterDeclaration<'_>,
+        String,
+        String,
+        Vec<usize>,
+    ) -> Result<(), String>,
 ) -> Result<(), String> {
-    let quantization = quantizable
-        .then(|| args.weight_quantization_for(name))
-        .flatten();
-    output.extend(safe_matrix_constraints(name, shape, quantization)?);
+    let root = source
+        .gate_up()
+        .parameter
+        .id
+        .as_str()
+        .strip_suffix(".gate_up_proj")
+        .ok_or("LFM2 expert source has no declared gate/up root")?;
+    let read_shape = source.unfused_shape();
+    for expert in 0..source.group_count() {
+        for (logical, physical, alias, shape) in [
+            (
+                source.gate_up(),
+                "w1",
+                "gate_proj",
+                read_shape[1..].to_vec(),
+            ),
+            (
+                source.down(),
+                "w2",
+                "down_proj",
+                source.down().shape[1..].to_vec(),
+            ),
+            (source.gate_up(), "w3", "up_proj", read_shape[1..].to_vec()),
+        ] {
+            visit(
+                logical,
+                format!("{root}.{expert}.{physical}.weight"),
+                format!("{root}.{expert}.{alias}.weight"),
+                shape,
+            )?;
+        }
+    }
     Ok(())
 }
 
-fn safe_matrix_constraints(
+fn source_matrix_constraints(
     name: &str,
     shape: Vec<usize>,
     quantization: Option<WeightQuantization>,
@@ -639,235 +682,107 @@ fn safe_matrix_constraints(
     let Some(quantization) = quantization else {
         return Ok(vec![safe(name, shape)]);
     };
-    let input = *shape
-        .last()
-        .ok_or_else(|| format!("LFM2 matrix {name:?} has scalar shape"))?;
-    let bits = dimension(quantization.bits(), "quantization bit width")?;
-    let group = dimension(quantization.group_size(), "quantization group size")?;
-    let packed_bits = checked_mul(input, bits, "affine packing")?;
-    if !input.is_multiple_of(group) || !input.is_multiple_of(32) || !packed_bits.is_multiple_of(32)
-    {
-        return Err(format!(
-            "quantized tensor {name:?} input dimension {input} is incompatible with group size {group} and {bits}-bit packing"
-        ));
-    }
-    let mut packed = shape.clone();
-    *packed.last_mut().expect("matrix shape") = packed_bits / 32;
-    let mut companion = shape;
-    *companion.last_mut().expect("matrix shape") = input / group;
-    let prefix = outer_prefix(name);
-    let companion_dtype = || {
-        StoredDtypeConstraint::OneOf(vec![
-            StoredDtype::F16,
-            StoredDtype::BF16,
-            StoredDtype::F32,
-            StoredDtype::U8,
-        ])
-    };
-    let mut constraints = vec![SafetensorsTensorConstraint::required(
+    eredu_checkpoint::schema::matrix_for_packed_words(
         name,
-        packed,
-        StoredDtypeConstraint::Exact(StoredDtype::U32),
-    )];
-    constraints.push(
-        SafetensorsTensorConstraint::required(
-            format!("{prefix}.scales"),
-            companion.clone(),
-            companion_dtype(),
-        )
-        .linear_companion(name, eredu_checkpoint::schema::LinearCompanionKind::Scale),
-    );
-    if quantization.has_biases() {
-        constraints.push(
-            SafetensorsTensorConstraint::required(
-                format!("{prefix}.biases"),
-                companion,
-                companion_dtype(),
-            )
-            .linear_companion(
-                name,
-                eredu_checkpoint::schema::LinearCompanionKind::AffineBias,
-            ),
-        );
-    }
-    Ok(constraints)
+        Vec::<String>::new(),
+        shape,
+        quantization,
+        None,
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn safe(key: impl Into<String>, shape: Vec<usize>) -> SafetensorsTensorConstraint {
     SafetensorsTensorConstraint::required(key, shape, StoredDtypeConstraint::Floating)
 }
 
-fn outer_prefix(name: &str) -> &str {
-    name.strip_suffix(".weight").unwrap_or(name)
-}
-
 /// Builds the complete physical GGUF tensor contract.
-pub fn gguf_plan(args: &ModelArgs) -> Result<GgufCheckpointPlan, String> {
-    let hidden = dimension(args.hidden_size, "hidden size")?;
-    let vocab = dimension(args.vocab_size, "vocabulary size")?;
-    let heads = dimension(args.num_attention_heads, "attention head count")?;
-    let kv_heads = dimension(args.num_key_value_heads, "key/value head count")?;
-    if !hidden.is_multiple_of(heads) {
-        return Err(format!(
-            "LFM2 hidden size {hidden} is not divisible by attention head count {heads}"
-        ));
+pub fn gguf_plan(declaration: &Declaration) -> Result<GgufCheckpointPlan, String> {
+    let is_moe = !declaration.expert_banks().is_empty();
+    let statics = &declaration.statics;
+    let mut tensors = Vec::new();
+    add_gguf_spec(&mut tensors, statics.embedding_spec(), is_moe)?;
+    add_gguf_spec(&mut tensors, statics.normalization_spec(), is_moe)?;
+    if let Some(head) = statics.head_spec() {
+        add_gguf_spec(&mut tensors, head, is_moe)?;
     }
-    let head = hidden / heads;
-    let key_value = checked_mul(kv_heads, head, "key/value projection width")?;
-    let mut tensors = vec![
-        gguf(
-            "token_embd.weight",
-            vec![vocab, hidden],
-            TensorOperation::Matrix,
-        ),
-        gguf(
-            "token_embd_norm.weight",
-            vec![hidden],
-            TensorOperation::Vector,
-        ),
-    ];
-    if !args.tie_word_embeddings {
-        tensors.push(gguf(
-            "output.weight",
-            vec![vocab, hidden],
-            TensorOperation::Matrix,
-        ));
-    }
-    for (layer, policy) in args.layer_schedule.iter().enumerate() {
+    for (layer, scope) in declaration.blocks.iter().enumerate() {
         let block = format!("blk.{layer}");
-        tensors.extend([
-            gguf(
-                format!("{block}.attn_norm.weight"),
-                vec![hidden],
-                TensorOperation::Vector,
-            ),
-            gguf(
-                format!("{block}.ffn_norm.weight"),
-                vec![hidden],
-                TensorOperation::Vector,
-            ),
-        ]);
-        match policy.operator {
-            OperatorPolicy::CausalConvolution => {
-                let kernel = dimension(args.conv_l_cache, "short-convolution width")?;
-                tensors.push(gguf(
-                    format!("{block}.shortconv.conv.weight"),
-                    vec![hidden, kernel],
-                    TensorOperation::Dense,
-                ));
-                tensors.extend([
-                    gguf(
-                        format!("{block}.shortconv.in_proj.weight"),
-                        vec![
-                            checked_mul(3, hidden, "short-convolution input width")?,
-                            hidden,
-                        ],
-                        TensorOperation::Matrix,
-                    ),
-                    gguf(
-                        format!("{block}.shortconv.out_proj.weight"),
-                        vec![hidden, hidden],
-                        TensorOperation::Matrix,
-                    ),
-                ]);
-                if args.conv_bias {
-                    tensors.extend([
-                        gguf(
-                            format!("{block}.shortconv.conv.bias"),
-                            vec![hidden],
-                            TensorOperation::Vector,
-                        ),
-                        gguf(
-                            format!("{block}.shortconv.in_proj.bias"),
-                            vec![checked_mul(3, hidden, "short-convolution bias width")?],
-                            TensorOperation::Vector,
-                        ),
-                        gguf(
-                            format!("{block}.shortconv.out_proj.bias"),
-                            vec![hidden],
-                            TensorOperation::Vector,
-                        ),
-                    ]);
+        for spec in [&scope.operator_norm, &scope.feed_forward_norm] {
+            add_gguf_spec(&mut tensors, spec, is_moe)?;
+        }
+        match &scope.mixer {
+            MixerParameters::Convolution(spec) => {
+                let mut declarations = spec.logical_parameters().map_err(|e| e.to_string())?;
+                declarations.sort_by_key(|d| convolution_storage_order(d.parameter.id.as_str()));
+                for declaration in declarations {
+                    let mut shape = declaration.shape;
+                    let operation = if declaration.parameter.id == spec.convolution.weight.id {
+                        shape.remove(1); // GGUF omits the singleton input-channel axis.
+                        TensorOperation::Dense
+                    } else if declaration.role == LogicalParameterRole::LinearWeight {
+                        TensorOperation::Matrix
+                    } else {
+                        TensorOperation::Vector
+                    };
+                    tensors.push(gguf(
+                        gguf_parameter_name(declaration.parameter.id.as_str(), is_moe)?,
+                        shape,
+                        operation,
+                    ));
                 }
             }
-            OperatorPolicy::SelfAttention(AttentionPolicy::Full) => {
-                for (local, shape, operation) in [
-                    (
-                        "attn_q.weight",
-                        vec![hidden, hidden],
-                        TensorOperation::Matrix,
-                    ),
-                    (
-                        "attn_k.weight",
-                        vec![key_value, hidden],
-                        TensorOperation::Matrix,
-                    ),
-                    (
-                        "attn_v.weight",
-                        vec![key_value, hidden],
-                        TensorOperation::Matrix,
-                    ),
-                    (
-                        "attn_output.weight",
-                        vec![hidden, hidden],
-                        TensorOperation::Matrix,
-                    ),
-                    ("attn_q_norm.weight", vec![head], TensorOperation::Vector),
-                    ("attn_k_norm.weight", vec![head], TensorOperation::Vector),
-                ] {
-                    tensors.push(gguf(format!("{block}.{local}"), shape, operation));
-                }
+            MixerParameters::Attention(spec, AttentionPolicy::Full) => {
+                add_gguf_spec(&mut tensors, spec, is_moe)?;
             }
-            OperatorPolicy::SelfAttention(AttentionPolicy::Sliding { .. }) => {
+            MixerParameters::Attention(_, AttentionPolicy::Sliding { .. }) => {
                 return Err("LFM2 structural admission does not support sliding attention".into());
             }
         }
-        match policy.feed_forward {
-            FeedForwardPolicy::Dense => {
-                let intermediate =
-                    dimension(args.dense_intermediate_size, "dense intermediate size")?;
-                for (local, shape) in [
-                    ("ffn_gate.weight", vec![intermediate, hidden]),
-                    ("ffn_down.weight", vec![hidden, intermediate]),
-                    ("ffn_up.weight", vec![intermediate, hidden]),
+        match &scope.feed_forward {
+            FeedForwardParameters::Dense(spec) => {
+                for spec in [&spec.gate, &spec.down, &spec.up] {
+                    add_gguf_spec(&mut tensors, spec, is_moe)?;
+                }
+            }
+            FeedForwardParameters::Routed(parameters) => {
+                let declarations = parameters
+                    .selector
+                    .logical_parameters()
+                    .map_err(|e| e.to_string())?;
+                // The correction bias follows the independent expert projections in GGUF.
+                for declaration in declarations
+                    .iter()
+                    .filter(|d| d.role == LogicalParameterRole::LinearWeight)
+                {
+                    tensors.push(gguf(
+                        gguf_parameter_name(declaration.parameter.id.as_str(), true)?,
+                        declaration.shape.clone(),
+                        TensorOperation::Matrix,
+                    ));
+                }
+                let bank = &parameters.experts;
+                let source = bank.packed_parameters().map_err(|e| e.to_string())?;
+                let read_shape = source.unfused_shape();
+                for (name, shape) in [
+                    ("ffn_gate_exps.weight", read_shape.clone()),
+                    ("ffn_up_exps.weight", read_shape.clone()),
+                    ("ffn_down_exps.weight", source.down().shape.clone()),
                 ] {
                     tensors.push(gguf(
-                        format!("{block}.{local}"),
+                        format!("{block}.{name}"),
                         shape,
                         TensorOperation::Matrix,
                     ));
                 }
-            }
-            FeedForwardPolicy::SparseMoe => {
-                let experts = dimension(args.num_experts, "expert count")?;
-                let intermediate = dimension(args.moe_intermediate_size, "MoE intermediate size")?;
-                tensors.extend([
-                    gguf(
-                        format!("{block}.ffn_gate_inp.weight"),
-                        vec![experts, hidden],
-                        TensorOperation::Matrix,
-                    ),
-                    gguf(
-                        format!("{block}.ffn_gate_exps.weight"),
-                        vec![experts, intermediate, hidden],
-                        TensorOperation::Matrix,
-                    ),
-                    gguf(
-                        format!("{block}.ffn_up_exps.weight"),
-                        vec![experts, intermediate, hidden],
-                        TensorOperation::Matrix,
-                    ),
-                    gguf(
-                        format!("{block}.ffn_down_exps.weight"),
-                        vec![experts, hidden, intermediate],
-                        TensorOperation::Matrix,
-                    ),
-                ]);
-                if args.use_expert_bias {
+                for declaration in declarations
+                    .into_iter()
+                    .filter(|d| d.role != LogicalParameterRole::LinearWeight)
+                {
                     tensors.push(
                         gguf(
-                            format!("{block}.ffn_exp_probs_b.bias"),
-                            vec![experts],
+                            gguf_parameter_name(declaration.parameter.id.as_str(), true)?,
+                            declaration.shape,
                             TensorOperation::Vector,
                         )
                         .with_aliases([format!("{block}.exp_probs_b.bias")]),
@@ -882,7 +797,30 @@ pub fn gguf_plan(args: &ModelArgs) -> Result<GgufCheckpointPlan, String> {
         Vec::new(),
         CatalogPolicy::non_strict(),
     )
-    .map_err(|error| error.to_string())
+    .map_err(|e| e.to_string())
+}
+
+fn add_gguf_spec(
+    output: &mut Vec<GgufTensorConstraint>,
+    spec: &impl DeclareLogicalParameters,
+    is_moe: bool,
+) -> Result<(), String> {
+    for declaration in spec.logical_parameters().map_err(|e| e.to_string())? {
+        let operation = if matches!(
+            declaration.role,
+            LogicalParameterRole::LinearWeight | LogicalParameterRole::Embedding
+        ) {
+            TensorOperation::Matrix
+        } else {
+            TensorOperation::Vector
+        };
+        output.push(gguf(
+            gguf_parameter_name(declaration.parameter.id.as_str(), is_moe)?,
+            declaration.shape,
+            operation,
+        ));
+    }
+    Ok(())
 }
 
 fn gguf(
@@ -893,25 +831,90 @@ fn gguf(
     GgufTensorConstraint::required(key, shape, GgufTypeConstraint::OperationClass(operation))
 }
 
-fn dimension(value: i32, name: &str) -> Result<usize, String> {
-    usize::try_from(value)
-        .ok()
-        .filter(|value| *value > 0)
-        .ok_or_else(|| format!("LFM2 {name} must be positive, got {value}"))
-}
+const GGUF_ROOTS: [(&str, &str); 3] = [
+    ("token_embd", "model.embed_tokens"),
+    ("token_embd_norm", "model.embedding_norm"),
+    ("output", "lm_head"),
+];
 
-fn checked_mul(left: usize, right: usize, name: &str) -> Result<usize, String> {
-    left.checked_mul(right)
-        .ok_or_else(|| format!("LFM2 {name} geometry overflows"))
+const GGUF_MOE_PARAMETERS: [(&str, &str); 6] = [
+    ("ffn_gate_inp", "feed_forward.gate"),
+    ("ffn_gate_exps", "feed_forward.experts.gate_proj"),
+    ("ffn_up_exps", "feed_forward.experts.up_proj"),
+    ("ffn_down_exps", "feed_forward.experts.down_proj"),
+    ("ffn_exp_probs_b", "feed_forward.expert_bias"),
+    ("exp_probs_b", "feed_forward.expert_bias"),
+];
+
+const GGUF_PARAMETERS: [(&str, &str); 14] = [
+    ("shortconv.conv", "conv.conv"),
+    ("shortconv.in_proj", "conv.in_proj"),
+    ("shortconv.out_proj", "conv.out_proj"),
+    ("attn_q_norm", "self_attn.q_layernorm"),
+    ("attn_k_norm", "self_attn.k_layernorm"),
+    ("attn_q", "self_attn.q_proj"),
+    ("attn_k", "self_attn.k_proj"),
+    ("attn_v", "self_attn.v_proj"),
+    ("attn_output", "self_attn.out_proj"),
+    ("attn_norm", "operator_norm"),
+    ("ffn_norm", "ffn_norm"),
+    ("ffn_gate", "feed_forward.w1"),
+    ("ffn_down", "feed_forward.w2"),
+    ("ffn_up", "feed_forward.w3"),
+];
+
+fn gguf_parameter_name(canonical: &str, is_moe: bool) -> Result<String, String> {
+    for (source, target) in GGUF_ROOTS {
+        if canonical == target || canonical.starts_with(&format!("{target}.")) {
+            return Ok(canonical.replacen(target, source, 1));
+        }
+    }
+    if let Some((layer, parameter)) = canonical
+        .strip_prefix("model.layers.")
+        .and_then(|s| s.split_once('.'))
+    {
+        if is_moe {
+            // Prefer the most specific target, retaining the primary spelling for aliases.
+            let mapping = GGUF_MOE_PARAMETERS
+                .iter()
+                .copied()
+                .filter(|&(_, target)| {
+                    parameter == target || parameter.starts_with(&format!("{target}."))
+                })
+                .fold(None, |best: Option<(&str, &str)>, candidate| {
+                    if best.is_none_or(|(_, target)| candidate.1.len() > target.len()) {
+                        Some(candidate)
+                    } else {
+                        best
+                    }
+                });
+            if let Some((source, target)) = mapping {
+                let suffix = parameter.strip_prefix(target).expect("matched parameter");
+                let suffix = if target.ends_with("expert_bias") && suffix.is_empty() {
+                    ".bias"
+                } else if target.contains("experts.") && suffix.is_empty() {
+                    ".weight"
+                } else {
+                    suffix
+                };
+                return Ok(format!("blk.{layer}.{source}{suffix}"));
+            }
+        }
+        for (source, target) in GGUF_PARAMETERS {
+            if parameter == target || parameter.starts_with(&format!("{target}.")) {
+                return Ok(format!(
+                    "blk.{layer}.{}",
+                    parameter.replacen(target, source, 1)
+                ));
+            }
+        }
+    }
+    Err(format!("unresolved LFM2 GGUF parameter {canonical}"))
 }
 
 /// Translates one physical GGUF tensor name to its canonical parameter identity.
 pub fn translate_gguf_weight_name(name: &str, is_moe: bool) -> String {
-    for (source, target) in [
-        ("token_embd", "model.embed_tokens"),
-        ("token_embd_norm", "model.embedding_norm"),
-        ("output", "lm_head"),
-    ] {
+    for (source, target) in GGUF_ROOTS {
         if name == source || name.starts_with(&format!("{source}.")) {
             return name.replacen(source, target, 1);
         }
@@ -923,14 +926,7 @@ pub fn translate_gguf_weight_name(name: &str, is_moe: bool) -> String {
         return name.to_string();
     };
     if is_moe {
-        for (source, target) in [
-            ("ffn_gate_inp", "feed_forward.gate"),
-            ("ffn_gate_exps", "feed_forward.experts.gate_proj"),
-            ("ffn_up_exps", "feed_forward.experts.up_proj"),
-            ("ffn_down_exps", "feed_forward.experts.down_proj"),
-            ("ffn_exp_probs_b", "feed_forward.expert_bias"),
-            ("exp_probs_b", "feed_forward.expert_bias"),
-        ] {
+        for (source, target) in GGUF_MOE_PARAMETERS {
             if parameter == source || parameter.starts_with(&format!("{source}.")) {
                 let suffix = parameter.strip_prefix(source).unwrap_or_default();
                 let suffix = if target.ends_with("expert_bias") && suffix == ".bias" {
@@ -949,22 +945,7 @@ pub fn translate_gguf_weight_name(name: &str, is_moe: bool) -> String {
             }
         }
     }
-    for (source, target) in [
-        ("shortconv.conv", "conv.conv"),
-        ("shortconv.in_proj", "conv.in_proj"),
-        ("shortconv.out_proj", "conv.out_proj"),
-        ("attn_q_norm", "self_attn.q_layernorm"),
-        ("attn_k_norm", "self_attn.k_layernorm"),
-        ("attn_q", "self_attn.q_proj"),
-        ("attn_k", "self_attn.k_proj"),
-        ("attn_v", "self_attn.v_proj"),
-        ("attn_output", "self_attn.out_proj"),
-        ("attn_norm", "operator_norm"),
-        ("ffn_norm", "ffn_norm"),
-        ("ffn_gate", "feed_forward.w1"),
-        ("ffn_down", "feed_forward.w2"),
-        ("ffn_up", "feed_forward.w3"),
-    ] {
+    for (source, target) in GGUF_PARAMETERS {
         if parameter == source || parameter.starts_with(&format!("{source}.")) {
             return format!(
                 "model.layers.{layer}.{}",

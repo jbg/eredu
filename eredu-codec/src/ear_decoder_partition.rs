@@ -1,9 +1,7 @@
 //! Streaming decoder pipeline ownership and exact cut-dependent channel/cadence transport.
 use crate::{
     ear_decoder::{invalid, DecoderConfig, DecoderState, DecoderUnitSpec, DecoderUnitState},
-    ear_decoder_layered::{
-        decoder_local_dimensions, DecoderForward, DecoderKernel, DecoderRuntimeState,
-    },
+    ear_decoder_layered::{DecoderForward, DecoderKernel, DecoderRuntimeState},
     streaming::StreamPhase,
     Error,
 };
@@ -254,34 +252,32 @@ fn ownership<G>(
 }
 /// Checks stage ownership and complete tensor placement before materialization.
 pub fn validate_decoder_partition<G>(
-    definition: &ComponentDefinition,
-    config: &DecoderConfig,
-    prefix: &str,
+    declaration: &crate::declarations::DecoderDeclaration,
     layout: Option<&LocalModelLayout>,
     partition: &ArchitecturePartition<G, DecoderBoundarySchema>,
 ) -> Result<(), Error> {
     if let Some(layout) = layout {
-        decoder_local_dimensions(config, prefix, layout)?;
+        crate::ear_decoder_layered::declared_local_dimensions(declaration.spec(), layout)?;
     }
-    ownership(definition, config, partition).map(|_| ())
+    ownership(declaration.definition(), declaration.config(), partition).map(|_| ())
 }
 impl<B: NeuralBackend> DecoderKernel<B> {
     /// Consumes the retained definition and selects exact stage units and route geometry.
     pub fn new_partition<G>(
-        definition: ComponentDefinition,
-        config: DecoderConfig,
-        prefix: &str,
+        declaration: crate::declarations::DecoderDeclaration,
         layout: Option<&LocalModelLayout>,
         partition: &ArchitecturePartition<G, DecoderBoundarySchema>,
         cuts: &DecoderPipelineCuts,
     ) -> Result<ComponentAdapter<ComponentDefinition, Self>, Error> {
-        let range = ownership(&definition, &config, partition)?;
-        if cuts.schema != DecoderBoundarySchema::new(&config)? {
+        let definition = declaration.definition().clone();
+        let config = declaration.config();
+        let range = ownership(&definition, config, partition)?;
+        if cuts.schema != DecoderBoundarySchema::new(config)? {
             return Err(invalid("decoder pipeline cuts belong to another geometry"));
         }
         let mut value = match layout {
-            Some(layout) => Self::new_parallel(config, prefix, layout)?,
-            None => Self::new(config, prefix)?,
+            Some(layout) => Self::new_parallel(declaration, layout)?,
+            None => Self::new(declaration)?,
         };
         let layout = definition.state_layout().slice(range.clone())?;
         value.partition = Some(DecoderPartition {

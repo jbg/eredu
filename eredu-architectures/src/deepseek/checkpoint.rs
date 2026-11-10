@@ -8,16 +8,16 @@ use eredu_checkpoint::schema::{
     SafetensorsCheckpointPlan, SafetensorsTensorConstraint, StoredDtypeConstraint, TensorOperation,
 };
 use eredu_checkpoint::{
-    expert::{
-        resolve_gated_product_expert_recipes, GatedProductExpertLayoutNames,
-        GatedProductExpertRecipes, IndependentGatedProductExpertNames,
-    },
+    expert::{resolve_gated_product_expert_recipes, GatedProductExpertRecipes},
     recipe::RecipeCatalog,
 };
 use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::TensorSelection};
 use eredu_checkpoint::{LinearFormat, StoredDtype, WeightQuantization};
 
-use super::config::{LayerPolicy, V3Args, V4Args, V4AttentionPolicy};
+use super::config::{LayerPolicy, V3Args, V4Args};
+use eredu_nn::{DeclareLogicalParameters, LogicalParameterRole};
+
+mod expert_sources;
 
 /// Recipes for one independently resident DeepSeek routed expert.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -31,11 +31,7 @@ pub struct ExpertUnitRecipes {
 /// Translates canonical llama.cpp DeepSeek2/V3 tensor names to neutral model
 /// parameter identities.
 pub fn translate_v3_gguf_weight_name(name: &str) -> String {
-    for (source, target) in [
-        ("token_embd", "model.embed_tokens"),
-        ("output_norm", "model.norm"),
-        ("output", "lm_head"),
-    ] {
+    for (source, target) in V3_GGUF_ROOTS {
         if name == source || name.starts_with(&format!("{source}.")) {
             return name.replacen(source, target, 1);
         }
@@ -46,11 +42,7 @@ pub fn translate_v3_gguf_weight_name(name: &str) -> String {
     let Some((layer, parameter)) = rest.split_once('.') else {
         return name.to_string();
     };
-    for (source, target) in [
-        ("ffn_gate_exps", "mlp.experts.gate_proj"),
-        ("ffn_up_exps", "mlp.experts.up_proj"),
-        ("ffn_down_exps", "mlp.experts.down_proj"),
-    ] {
+    for (source, target) in V3_GGUF_EXPERT_PARAMETERS {
         if parameter == source || parameter.starts_with(&format!("{source}.")) {
             let suffix = match parameter.strip_prefix(source).unwrap_or_default() {
                 ".weight" => "",
@@ -64,28 +56,7 @@ pub fn translate_v3_gguf_weight_name(name: &str) -> String {
     if matches!(parameter, "exp_probs_b.bias" | "ffn_exp_probs_b.bias") {
         return format!("model.layers.{layer}.mlp.gate.e_score_correction_bias");
     }
-    for (source, target) in [
-        ("attn_q", "self_attn.q_proj"),
-        ("attn_q_a", "self_attn.q_a_proj"),
-        ("attn_q_b", "self_attn.q_b_proj"),
-        ("attn_kv_a_mqa", "self_attn.kv_a_proj_with_mqa"),
-        ("attn_kv_b", "self_attn.kv_b_proj"),
-        ("attn_k_b", "self_attn.k_b_proj"),
-        ("attn_v_b", "self_attn.v_b_proj"),
-        ("attn_q_a_norm", "self_attn.q_a_layernorm"),
-        ("attn_kv_a_norm", "self_attn.kv_a_layernorm"),
-        ("attn_output", "self_attn.o_proj"),
-        ("attn_norm", "input_layernorm"),
-        ("ffn_norm", "post_attention_layernorm"),
-        ("ffn_gate", "mlp.gate_proj"),
-        ("ffn_up", "mlp.up_proj"),
-        ("ffn_down", "mlp.down_proj"),
-        ("ffn_gate_shexp", "mlp.shared_experts.gate_proj"),
-        ("ffn_up_shexp", "mlp.shared_experts.up_proj"),
-        ("ffn_down_shexp", "mlp.shared_experts.down_proj"),
-        ("ffn_gate_inp", "mlp.gate"),
-        ("rope_freqs", "rope_freqs"),
-    ] {
+    for (source, target) in V3_GGUF_PARAMETERS {
         if parameter == source || parameter.starts_with(&format!("{source}.")) {
             return format!(
                 "model.layers.{layer}.{}",
@@ -94,6 +65,67 @@ pub fn translate_v3_gguf_weight_name(name: &str) -> String {
         }
     }
     name.to_string()
+}
+
+const V3_GGUF_ROOTS: [(&str, &str); 3] = [
+    ("token_embd", "model.embed_tokens"),
+    ("output_norm", "model.norm"),
+    ("output", "lm_head"),
+];
+
+const V3_GGUF_EXPERT_PARAMETERS: [(&str, &str); 3] = [
+    ("ffn_gate_exps", "mlp.experts.gate_proj"),
+    ("ffn_up_exps", "mlp.experts.up_proj"),
+    ("ffn_down_exps", "mlp.experts.down_proj"),
+];
+
+const V3_GGUF_PARAMETERS: [(&str, &str); 20] = [
+    ("attn_q", "self_attn.q_proj"),
+    ("attn_q_a", "self_attn.q_a_proj"),
+    ("attn_q_b", "self_attn.q_b_proj"),
+    ("attn_kv_a_mqa", "self_attn.kv_a_proj_with_mqa"),
+    ("attn_kv_b", "self_attn.kv_b_proj"),
+    ("attn_k_b", "self_attn.k_b_proj"),
+    ("attn_v_b", "self_attn.v_b_proj"),
+    ("attn_q_a_norm", "self_attn.q_a_layernorm"),
+    ("attn_kv_a_norm", "self_attn.kv_a_layernorm"),
+    ("attn_output", "self_attn.o_proj"),
+    ("attn_norm", "input_layernorm"),
+    ("ffn_norm", "post_attention_layernorm"),
+    ("ffn_gate", "mlp.gate_proj"),
+    ("ffn_up", "mlp.up_proj"),
+    ("ffn_down", "mlp.down_proj"),
+    ("ffn_gate_shexp", "mlp.shared_experts.gate_proj"),
+    ("ffn_up_shexp", "mlp.shared_experts.up_proj"),
+    ("ffn_down_shexp", "mlp.shared_experts.down_proj"),
+    ("ffn_gate_inp", "mlp.gate"),
+    ("rope_freqs", "rope_freqs"),
+];
+
+fn v3_gguf_parameter_name(parameter: &eredu_nn::ParameterSpec) -> Result<String, String> {
+    let canonical = parameter.id.as_str();
+    for (source, target) in V3_GGUF_ROOTS {
+        if canonical == target || canonical.starts_with(&format!("{target}.")) {
+            return Ok(canonical.replacen(target, source, 1));
+        }
+    }
+    if let Some((layer, parameter)) = canonical
+        .strip_prefix("model.layers.")
+        .and_then(|s| s.split_once('.'))
+    {
+        if parameter == "mlp.gate.e_score_correction_bias" {
+            return Ok(format!("blk.{layer}.exp_probs_b.bias"));
+        }
+        for (source, target) in V3_GGUF_PARAMETERS {
+            if parameter == target || parameter.starts_with(&format!("{target}.")) {
+                return Ok(format!(
+                    "blk.{layer}.{}",
+                    parameter.replacen(target, source, 1)
+                ));
+            }
+        }
+    }
+    Err(format!("unresolved V3 GGUF declaration {canonical}"))
 }
 
 /// Translates canonical llama.cpp DeepSeek-V4 tensor names to neutral model
@@ -227,11 +259,8 @@ pub fn v3_load_time_quantization(
     quantization: WeightQuantization,
 ) -> Result<V3Args, String> {
     quantization.validate().map_err(|error| error.to_string())?;
-    let mut target = args.clone();
-    target.linear_format = quantization.into();
-    target.linear_formats.clear();
-    target.validate().map_err(|error| error.to_string())?;
-    Ok(target)
+    args.with_formats(quantization.into(), BTreeMap::new())
+        .map_err(|e| e.to_string())
 }
 
 /// Derives a V4 configuration whose target and MTP expert formats reflect load-time quantization.
@@ -240,24 +269,20 @@ pub fn v4_load_time_quantization(
     quantization: WeightQuantization,
 ) -> Result<V4Args, String> {
     quantization.validate().map_err(|error| error.to_string())?;
-    let mut target = args.clone();
-    target.linear_format = quantization.into();
-    target.linear_formats.clear();
-    let target_layers = count(target.num_hidden_layers, "V4 target layer count")?;
-    let prediction_layers = count(target.num_nextn_predict_layers, "V4 prediction layer count")?;
-    let total = target_layers
-        .checked_add(prediction_layers)
-        .ok_or_else(|| "V4 load-time quantization layer count overflowed".to_string())?;
-    for layer in 0..total {
-        let (_, expert_root) = v4_expert_roots(&target, layer)?;
-        for projection in ["gate_up_proj", "down_proj"] {
-            target
-                .linear_formats
-                .insert(format!("{expert_root}.{projection}"), quantization.into());
+    let mut formats = BTreeMap::new();
+    for bank in super::v4::expert_bank_specs(args)
+        .map_err(|e| e.to_string())?
+        .values()
+    {
+        let eredu_nn::GatedProductGroupLayout::Packed { gate_up, down } = bank.layout() else {
+            return Err("V4 requires packed experts".into());
+        };
+        for p in [gate_up, down] {
+            formats.insert(p.weight().id.to_string(), quantization.into());
         }
     }
-    target.validate().map_err(|error| error.to_string())?;
-    Ok(target)
+    args.with_formats(quantization.into(), formats)
+        .map_err(|e| e.to_string())
 }
 
 /// Applies canonical checkpoint formats to a complete DeepSeek V3
@@ -267,10 +292,8 @@ pub fn v3_with_checkpoint_formats(
     mut formats: BTreeMap<String, LinearFormat>,
 ) -> Result<V3Args, String> {
     normalize_v3_weight_formats(args, &mut formats);
-    let mut target = args.clone();
-    target.linear_formats = formats;
-    target.validate().map_err(|error| error.to_string())?;
-    Ok(target)
+    args.with_formats(args.linear_format, formats)
+        .map_err(|e| e.to_string())
 }
 
 /// Applies canonical checkpoint formats to a complete DeepSeek V4
@@ -280,10 +303,86 @@ pub fn v4_with_checkpoint_formats(
     mut formats: BTreeMap<String, LinearFormat>,
 ) -> Result<V4Args, String> {
     normalize_v4_weight_formats(args, &mut formats);
-    let mut target = args.clone();
-    target.linear_formats = formats;
-    target.validate().map_err(|error| error.to_string())?;
-    Ok(target)
+    args.with_formats(args.linear_format, formats)
+        .map_err(|e| e.to_string())
+}
+
+pub(super) fn validate_v3_format_references(args: &V3Args) -> Result<(), eredu_nn::Error> {
+    crate::format_references::validate(
+        args.parameters(),
+        args.linear_formats
+            .iter()
+            .map(|(name, format)| (name.as_str(), Some(*format))),
+        || {
+            let target = args.prediction_target().map_err(|e| e.to_string())?;
+            Ok(gguf_format_references(
+                v3_gguf_plan(&target)?,
+                translate_v3_gguf_weight_name,
+                |name| args.linear_format_for(name),
+            ))
+        },
+        || v3_safetensors_plan(args, true),
+    )
+}
+
+pub(super) fn validate_v4_format_references(args: &V4Args) -> Result<(), eredu_nn::Error> {
+    crate::format_references::validate(
+        args.parameters(),
+        args.linear_formats
+            .iter()
+            .map(|(name, format)| (name.as_str(), Some(*format))),
+        || {
+            let target = args.prediction_target().map_err(|e| e.to_string())?;
+            let mut references = gguf_format_references(
+                v4_gguf_plan(&target)?,
+                translate_v4_gguf_weight_name,
+                |name| args.linear_format_for(name),
+            );
+            // Both normalized packed-bank spellings resolve to the same native source.
+            references.extend(
+                references
+                    .iter()
+                    .filter(|(name, _)| name.contains(".expert_banks."))
+                    .filter_map(|(name, format)| {
+                        name.strip_suffix(".weight")
+                            .map(|name| (name.to_owned(), *format))
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            Ok(references)
+        },
+        || v4_safetensors_plan(args),
+    )
+}
+
+/// Projects primary GGUF matrix references without applying SafeTensors word packing.
+fn gguf_format_references(
+    plan: GgufCheckpointPlan,
+    translate: impl Fn(&str) -> String,
+    ordinary_format: impl Fn(&str) -> LinearFormat,
+) -> Vec<(String, LinearFormat)> {
+    plan.common_tensors
+        .into_iter()
+        .chain(
+            plan.layout_groups
+                .into_iter()
+                .flat_map(|group| group.variants)
+                .flat_map(|variant| variant.tensors),
+        )
+        .filter_map(|tensor| {
+            let name = translate(&tensor.key);
+            let format = match tensor.encoding {
+                GgufTypeConstraint::OperationClass(TensorOperation::Matrix) => {
+                    ordinary_format(&name)
+                }
+                GgufTypeConstraint::OperationClass(TensorOperation::MxFp4Matrix) => {
+                    LinearFormat::MxFp4
+                }
+                _ => return None,
+            };
+            Some((name, format))
+        })
+        .collect()
 }
 
 /// Builds the canonical llama.cpp DeepSeek2 GGUF plan. Fused and split MLA
@@ -294,163 +393,97 @@ pub fn v3_gguf_plan(args: &V3Args) -> Result<GgufCheckpointPlan, String> {
     if args.num_nextn_predict_layers != 0 {
         return Err("DeepSeek2 base GGUF does not embed MTP layers".into());
     }
-    let hidden = dimension(args.hidden_size, "hidden size")?;
-    let vocab = dimension(args.vocab_size, "vocabulary size")?;
-    let heads = dimension(args.num_attention_heads, "attention heads")?;
-    let nope = dimension(args.qk_nope_head_dim, "non-rotary head width")?;
-    let rope = dimension(args.qk_rope_head_dim, "rotary head width")?;
-    let value = dimension(args.v_head_dim, "value head width")?;
-    let query_head = checked_add(nope, rope, "query head width")?;
-    let kv_rank = dimension(args.kv_lora_rank, "KV rank")?;
-    let mut tensors = vec![
-        gguf_tensor(
-            "token_embd.weight",
-            vec![vocab, hidden],
-            TensorOperation::Matrix,
-        ),
-        gguf_tensor("output_norm.weight", vec![hidden], TensorOperation::Vector),
-        gguf_tensor(
-            "output.weight",
-            vec![vocab, hidden],
-            TensorOperation::Matrix,
-        ),
-    ];
+    let statics = &args.parameters().statics;
+    let mut tensors = Vec::new();
+    add_v3_gguf_declared(&mut tensors, statics.embedding_spec())?;
+    add_v3_gguf_declared(&mut tensors, statics.normalization_spec())?;
+    add_v3_gguf_declared(
+        &mut tensors,
+        statics.head_spec().expect("untied V3 readout"),
+    )?;
     let mut fused = Vec::new();
     let mut fused_keys = Vec::new();
     let mut split = Vec::new();
     let mut split_keys = Vec::new();
     for (layer, policy) in args.layer_schedule.iter().copied().enumerate() {
-        let root = format!("blk.{layer}");
-        for (local, shape, operation) in [
-            ("attn_norm.weight", vec![hidden], TensorOperation::Vector),
-            ("ffn_norm.weight", vec![hidden], TensorOperation::Vector),
-        ] {
-            tensors.push(gguf_tensor(format!("{root}.{local}"), shape, operation));
+        let root = format!("model.layers.{layer}");
+        let block = format!("blk.{layer}");
+        for field in ["input_layernorm", "post_attention_layernorm"] {
+            let spec = super::v3_specs::normalization_spec(
+                args,
+                &format!("{root}.{field}.weight"),
+                args.hidden_size,
+            )
+            .map_err(|e| e.to_string())?;
+            add_v3_gguf_declared(&mut tensors, &spec)?;
         }
-        if let Some(rank) = args.q_lora_rank {
-            let rank = dimension(rank, "query rank")?;
-            for (local, shape, operation) in [
-                (
-                    "attn_q_a.weight",
-                    vec![rank, hidden],
-                    TensorOperation::Matrix,
-                ),
-                ("attn_q_a_norm.weight", vec![rank], TensorOperation::Vector),
-                (
-                    "attn_q_b.weight",
-                    vec![checked_mul(heads, query_head, "query width")?, rank],
-                    TensorOperation::Matrix,
-                ),
-            ] {
-                tensors.push(gguf_tensor(format!("{root}.{local}"), shape, operation));
-            }
-        } else {
-            tensors.push(gguf_tensor(
-                format!("{root}.attn_q.weight"),
-                vec![checked_mul(heads, query_head, "query width")?, hidden],
-                TensorOperation::Matrix,
-            ));
-        }
-        tensors.extend([
-            gguf_tensor(
-                format!("{root}.attn_kv_a_mqa.weight"),
-                vec![checked_add(kv_rank, rope, "KV-A width")?, hidden],
-                TensorOperation::Matrix,
-            ),
-            gguf_tensor(
-                format!("{root}.attn_kv_a_norm.weight"),
-                vec![kv_rank],
-                TensorOperation::Vector,
-            ),
-            gguf_tensor(
-                format!("{root}.attn_output.weight"),
-                vec![hidden, checked_mul(heads, value, "output width")?],
-                TensorOperation::Matrix,
-            ),
-        ]);
-        let fused_key = format!("{root}.attn_kv_b.weight");
+        let attention = super::v3_specs::attention_spec(args, &format!("{root}.self_attn"))
+            .map_err(|e| e.to_string())?;
+        add_v3_gguf_declared(&mut tensors, &attention.query)?;
+        add_v3_gguf_declared(&mut tensors, &attention.kv_a)?;
+        add_v3_gguf_declared(&mut tensors, &attention.kv_norm)?;
+        add_v3_gguf_declared(&mut tensors, &attention.output)?;
+        let parameter = attention
+            .kv_b
+            .logical_parameters()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .next()
+            .expect("declared KV-B weight");
+        let fused_key = v3_gguf_parameter_name(parameter.parameter)?;
         fused_keys.push(fused_key.clone());
         fused.push(gguf_tensor(
             fused_key,
-            vec![
-                checked_mul(
-                    heads,
-                    checked_add(nope, value, "KV-B head width")?,
-                    "KV-B width",
-                )?,
-                kv_rank,
-            ],
+            parameter.shape,
             TensorOperation::Matrix,
         ));
+        // GGUF split keys transpose their final two axes before concatenation.
         for (local, shape) in [
-            ("attn_k_b.weight", vec![heads, kv_rank, nope]),
-            ("attn_v_b.weight", vec![heads, value, kv_rank]),
+            (
+                "attn_k_b.weight",
+                vec![
+                    attention.geometry.heads() as usize,
+                    attention.kv_b.input as usize,
+                    attention.geometry.non_positional_dimensions() as usize,
+                ],
+            ),
+            (
+                "attn_v_b.weight",
+                vec![
+                    attention.geometry.heads() as usize,
+                    attention.geometry.value_dimensions() as usize,
+                    attention.kv_b.input as usize,
+                ],
+            ),
         ] {
-            let key = format!("{root}.{local}");
+            let key = format!("{block}.{local}");
             split_keys.push(key.clone());
             split.push(gguf_tensor(key, shape, TensorOperation::Matrix));
         }
         if policy == LayerPolicy::SparseMoe {
-            let experts = dimension(args.n_routed_experts, "expert count")?;
-            let intermediate = dimension(args.moe_intermediate_size, "expert width")?;
-            let shared = checked_mul(
-                intermediate,
-                dimension(args.n_shared_experts, "shared expert count")?,
-                "shared expert width",
-            )?;
-            for (local, shape, operation) in [
-                (
-                    "ffn_gate_inp.weight",
-                    vec![experts, hidden],
-                    TensorOperation::Matrix,
-                ),
-                ("exp_probs_b.bias", vec![experts], TensorOperation::Vector),
-                (
-                    "ffn_gate_shexp.weight",
-                    vec![shared, hidden],
-                    TensorOperation::Matrix,
-                ),
-                (
-                    "ffn_up_shexp.weight",
-                    vec![shared, hidden],
-                    TensorOperation::Matrix,
-                ),
-                (
-                    "ffn_down_shexp.weight",
-                    vec![hidden, shared],
-                    TensorOperation::Matrix,
-                ),
-                (
-                    "ffn_gate_exps.weight",
-                    vec![experts, intermediate, hidden],
-                    TensorOperation::Matrix,
-                ),
-                (
-                    "ffn_up_exps.weight",
-                    vec![experts, intermediate, hidden],
-                    TensorOperation::Matrix,
-                ),
-                (
-                    "ffn_down_exps.weight",
-                    vec![experts, hidden, intermediate],
-                    TensorOperation::Matrix,
-                ),
-            ] {
-                tensors.push(gguf_tensor(format!("{root}.{local}"), shape, operation));
-            }
-        } else {
-            let intermediate = dimension(args.intermediate_size, "dense MLP width")?;
+            let moe = super::v3::routed_spec(args, layer, None).map_err(|e| e.to_string())?;
+            add_v3_gguf_declared(&mut tensors, &moe.parameters.selector)?;
+            add_v3_gguf_declared(&mut tensors, &moe.shared)?;
+            let bank = &moe.parameters.experts;
+            let source = bank
+                .packed_parameters()
+                .map_err(|error| error.to_string())?;
+            let read = source.unfused_shape();
             for (local, shape) in [
-                ("ffn_gate.weight", vec![intermediate, hidden]),
-                ("ffn_up.weight", vec![intermediate, hidden]),
-                ("ffn_down.weight", vec![hidden, intermediate]),
+                ("ffn_gate_exps.weight", read.clone()),
+                ("ffn_up_exps.weight", read.clone()),
+                ("ffn_down_exps.weight", source.down().shape.clone()),
             ] {
                 tensors.push(gguf_tensor(
-                    format!("{root}.{local}"),
+                    format!("{block}.{local}"),
                     shape,
                     TensorOperation::Matrix,
                 ));
             }
+        } else {
+            let parameters = super::v3_specs::dense_parameters(args, &format!("{root}.mlp"))
+                .map_err(|e| e.to_string())?;
+            add_v3_gguf_declared(&mut tensors, &parameters)?;
         }
     }
     let layouts = vec![AlternativeLayoutGroup {
@@ -475,6 +508,20 @@ pub fn v3_gguf_plan(args: &V3Args) -> Result<GgufCheckpointPlan, String> {
         .map_err(|error| error.to_string())
 }
 
+fn add_v3_gguf_declared(
+    tensors: &mut Vec<GgufTensorConstraint>,
+    spec: &impl DeclareLogicalParameters,
+) -> Result<(), String> {
+    for parameter in spec.logical_parameters().map_err(|e| e.to_string())? {
+        tensors.push(gguf_tensor(
+            v3_gguf_parameter_name(parameter.parameter)?,
+            parameter.shape,
+            declared_operation(parameter.role),
+        ));
+    }
+    Ok(())
+}
+
 /// Builds the canonical fused KV-B loading recipe for one DeepSeek2 GGUF
 /// layer. Split K/V storage is transposed and concatenated into the exact
 /// parameter identity consumed by neutral MLA.
@@ -497,36 +544,42 @@ pub fn v3_gguf_kv_b_recipe(
             TensorSelection::Full,
         ));
     }
-    let heads = dimension(args.num_attention_heads, "attention heads")?;
-    let rank = dimension(args.kv_lora_rank, "KV rank")?;
-    let width = checked_mul(
-        heads,
-        checked_add(
-            dimension(args.qk_nope_head_dim, "non-rotary width")?,
-            dimension(args.v_head_dim, "value width")?,
-            "KV-B head width",
-        )?,
-        "KV-B width",
+    let spec = super::v3_specs::attention_spec(args, &format!("model.layers.{layer}.self_attn"))
+        .map_err(|e| e.to_string())?;
+    let (_, recipe) = v3_split_kv_b_recipe(
+        &spec.kv_b,
+        format!("{root}.attn_k_b.weight"),
+        format!("{root}.attn_v_b.weight"),
     )?;
-    Ok(DerivedWeightRecipe::Reshape {
+    Ok(recipe)
+}
+
+/// Applies the split storage axes to the construction-owned fused matrix.
+fn v3_split_kv_b_recipe(
+    spec: &eredu_nn::LinearSpec,
+    key: String,
+    value: String,
+) -> Result<(String, DerivedWeightRecipe), String> {
+    let parameter = spec
+        .logical_parameters()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|parameter| parameter.parameter.id == spec.weight.id)
+        .ok_or_else(|| "unresolved declared KV-B weight".to_string())?;
+    let recipe = DerivedWeightRecipe::Reshape {
         input: Box::new(DerivedWeightRecipe::Concatenate {
             axis: 1,
             inputs: vec![
                 DerivedWeightRecipe::Transpose {
-                    input: Box::new(DerivedWeightRecipe::source(
-                        format!("{root}.attn_k_b.weight"),
-                        TensorSelection::Full,
-                    )),
+                    input: Box::new(DerivedWeightRecipe::source(key, TensorSelection::Full)),
                     axes: vec![0, 2, 1],
                 },
-                DerivedWeightRecipe::source(
-                    format!("{root}.attn_v_b.weight"),
-                    TensorSelection::Full,
-                ),
+                DerivedWeightRecipe::source(value, TensorSelection::Full),
             ],
         }),
-        shape: vec![width, rank],
-    })
+        shape: parameter.shape,
+    };
+    Ok((parameter.parameter.id.to_string(), recipe))
 }
 
 /// Returns the complete neutral recipe catalog for one DeepSeek V3 unit.
@@ -536,57 +589,52 @@ pub fn v3_unit_recipes<C: RecipeCatalog + ?Sized>(
     layer: usize,
     include_experts: bool,
 ) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
+    args.validate().map_err(|error| error.to_string())?;
+    let target = count(args.num_hidden_layers, "target layer count")?;
+    let prediction = count(args.num_nextn_predict_layers, "prediction layer count")?;
+    let total = target
+        .checked_add(prediction)
+        .ok_or_else(|| "V3 layer count overflowed".to_string())?;
+    if layer >= total {
+        return Err(format!(
+            "V3 unit {layer} is outside {total} declared layers"
+        ));
+    }
     let mut recipes = BTreeMap::new();
     let physical = format!("blk.{layer}");
     let logical = format!("model.layers.{layer}.self_attn");
-    if catalog
+    let sources = if catalog
         .tensor_metadata(&format!("{logical}.k_b_proj.weight"))
         .is_ok()
     {
-        let heads = dimension(args.num_attention_heads, "attention heads")?;
-        let rank = dimension(args.kv_lora_rank, "KV rank")?;
-        let width = checked_mul(
-            heads,
-            checked_add(
-                dimension(args.qk_nope_head_dim, "non-rotary width")?,
-                dimension(args.v_head_dim, "value width")?,
-                "KV-B head width",
-            )?,
-            "KV-B width",
-        )?;
-        recipes.insert(
-            format!("{logical}.kv_b_proj.weight"),
-            DerivedWeightRecipe::Reshape {
-                input: Box::new(DerivedWeightRecipe::Concatenate {
-                    axis: 1,
-                    inputs: vec![
-                        DerivedWeightRecipe::Transpose {
-                            input: Box::new(DerivedWeightRecipe::source(
-                                format!("{logical}.k_b_proj.weight"),
-                                TensorSelection::Full,
-                            )),
-                            axes: vec![0, 2, 1],
-                        },
-                        DerivedWeightRecipe::source(
-                            format!("{logical}.v_b_proj.weight"),
-                            TensorSelection::Full,
-                        ),
-                    ],
-                }),
-                shape: vec![width, rank],
-            },
-        );
+        Some((
+            format!("{logical}.k_b_proj.weight"),
+            format!("{logical}.v_b_proj.weight"),
+        ))
     } else if catalog
         .tensor_metadata(&format!("{physical}.attn_k_b.weight"))
         .is_ok()
     {
-        recipes.insert(
-            format!("{logical}.kv_b_proj.weight"),
-            v3_gguf_kv_b_recipe(args, layer, true)?,
-        );
+        // The published GGUF layout contains target layers only.
+        if layer >= target {
+            return Err(format!(
+                "DeepSeek2 layer {layer} is outside {target} layers"
+            ));
+        }
+        Some((
+            format!("{physical}.attn_k_b.weight"),
+            format!("{physical}.attn_v_b.weight"),
+        ))
+    } else {
+        None
+    };
+    if let Some((key, value)) = sources {
+        let spec =
+            super::v3_specs::attention_spec(args, &logical).map_err(|error| error.to_string())?;
+        let (target, recipe) = v3_split_kv_b_recipe(&spec.kv_b, key, value)?;
+        recipes.insert(target, recipe);
     }
 
-    let target = count(args.num_hidden_layers, "target layer count")?;
     if include_experts
         && (layer >= target || args.layer_schedule.get(layer) == Some(&LayerPolicy::SparseMoe))
     {
@@ -612,28 +660,13 @@ pub fn v3_expert_recipes<C: RecipeCatalog + ?Sized>(
     if layer >= total {
         return Err(format!("V3 expert layer {layer} is outside {total} layers"));
     }
-    let count = dimension(args.n_routed_experts, "expert count")?;
+    let bank = super::v3::expert_bank_spec(args, layer).map_err(|error| error.to_string())?;
+    let source = bank
+        .packed_parameters()
+        .map_err(|error| error.to_string())?;
     let root = format!("model.layers.{layer}.mlp.experts");
-    resolve_gated_product_expert_recipes(
-        catalog,
-        &GatedProductExpertLayoutNames {
-            target_gate_up: format!("{root}.gate_up_proj"),
-            target_down: format!("{root}.down_proj"),
-            packed_gate_up: format!("{root}.gate_up_proj"),
-            packed_down: format!("{root}.down_proj"),
-            separate_gate: format!("{root}.gate_proj"),
-            separate_up: format!("{root}.up_proj"),
-            separate_down: format!("{root}.down_proj"),
-            independent: (0..count)
-                .map(|expert| IndependentGatedProductExpertNames {
-                    gate: format!("{root}.{expert}.gate_proj.weight"),
-                    up: format!("{root}.{expert}.up_proj.weight"),
-                    down: format!("{root}.{expert}.down_proj.weight"),
-                })
-                .collect(),
-        },
-    )
-    .map_err(|error| error.to_string())
+    resolve_gated_product_expert_recipes(catalog, &expert_sources::v3_names(&source, &root))
+        .map_err(|error| error.to_string())
 }
 
 /// Resolves SafeTensors independent experts or GGUF projection banks into the
@@ -643,31 +676,16 @@ pub fn v4_expert_recipes<C: RecipeCatalog + ?Sized>(
     args: &V4Args,
     layer: usize,
 ) -> Result<GatedProductExpertRecipes, String> {
-    let count = dimension(args.n_routed_experts, "expert count")?;
-    let (physical, target) = v4_expert_roots(args, layer)?;
-    resolve_gated_product_expert_recipes(
-        catalog,
-        &GatedProductExpertLayoutNames {
-            target_gate_up: format!("{target}.gate_up_proj"),
-            target_down: format!("{target}.down_proj"),
-            packed_gate_up: format!("{target}.gate_up_proj"),
-            packed_down: format!("{target}.down_proj"),
-            separate_gate: format!("{physical}.expert_banks.w1"),
-            separate_up: format!("{physical}.expert_banks.w3"),
-            separate_down: format!("{physical}.expert_banks.w2"),
-            independent: (0..count)
-                .map(|expert| IndependentGatedProductExpertNames {
-                    gate: format!("{physical}.experts.{expert}.w1.weight"),
-                    up: format!("{physical}.experts.{expert}.w3.weight"),
-                    down: format!("{physical}.experts.{expert}.w2.weight"),
-                })
-                .collect(),
-        },
-    )
-    .map_err(|error| error.to_string())
+    let bank = super::v4::expert_bank_spec(args, layer).map_err(|e| e.to_string())?;
+    let source = bank
+        .packed_parameters()
+        .map_err(|error| error.to_string())?;
+    let physical = v4_expert_source_root(args, layer)?;
+    resolve_gated_product_expert_recipes(catalog, &expert_sources::v4_names(&source, &physical))
+        .map_err(|error| error.to_string())
 }
 
-fn v4_expert_roots(args: &V4Args, layer: usize) -> Result<(String, String), String> {
+fn v4_expert_source_root(args: &V4Args, layer: usize) -> Result<String, String> {
     let target_layers = count(args.num_hidden_layers, "V4 target layer count")?;
     let prediction_layers = count(args.num_nextn_predict_layers, "V4 prediction layer count")?;
     let total = target_layers
@@ -681,9 +699,7 @@ fn v4_expert_roots(args: &V4Args, layer: usize) -> Result<(String, String), Stri
     } else {
         format!("mtp.{}", layer - target_layers)
     };
-    let physical = format!("{block}.ffn");
-    let target = format!("{physical}.switch_mlp");
-    Ok((physical, target))
+    Ok(format!("{block}.ffn"))
 }
 
 /// Derives one independently resident expert from a canonical DeepSeek bank.
@@ -774,30 +790,22 @@ pub fn v3_expert_residency_catalog<C: RecipeCatalog + ?Sized>(
     args: &V3Args,
     intermediate: Option<Range<usize>>,
 ) -> Result<crate::ExpertResidencyCatalog, String> {
-    let target = count(args.num_hidden_layers, "V3 target layer count")?;
-    let prediction = count(args.num_nextn_predict_layers, "V3 prediction layer count")?;
-    let total = target
-        .checked_add(prediction)
-        .ok_or_else(|| "V3 expert residency layer count overflowed".to_string())?;
-    let experts = dimension(args.n_routed_experts, "V3 expert count")?;
+    let (_, layout) = super::parallel::execution_layout(
+        count(args.num_hidden_layers, "V3 target layer count")?,
+        count(args.num_nextn_predict_layers, "V3 prediction layer count")?,
+    )
+    .map_err(|error| error.to_string())?;
     let mut units = Vec::new();
-    for layer in 0..total {
-        if layer < target && args.layer_schedule.get(layer) != Some(&LayerPolicy::SparseMoe) {
-            continue;
-        }
-        let (owner, owner_unit) = if layer < target {
-            ("target".to_string(), layer)
-        } else {
-            (format!("mtp.{}", layer - target), 0)
-        };
+    for (layer, declared) in
+        super::v3::expert_bank_specs(args).map_err(|error| error.to_string())?
+    {
+        let (owner, owner_unit) =
+            super::expert_unit_owner(&layout, layer).map_err(|error| error.to_string())?;
         let unit_path = format!("model.layers.{layer}");
         let bank = v3_expert_recipes(catalog, args, layer)?;
-        let policy = if layer < target {
-            super::v3::moe_policy(args, layer)
-        } else {
-            super::v3::prediction_moe_policy(args, layer)
-        }
-        .map_err(|error| error.to_string())?;
+        let source = declared
+            .packed_parameters()
+            .map_err(|error| error.to_string())?;
         append_expert_residency_units(
             &mut units,
             catalog,
@@ -805,10 +813,10 @@ pub fn v3_expert_residency_catalog<C: RecipeCatalog + ?Sized>(
             &owner,
             owner_unit,
             &unit_path,
-            experts,
+            source.group_count(),
             &bank,
             intermediate.clone(),
-            [policy.expert_gate_up_format, policy.expert_down_format],
+            source.encodings().map_err(|error| error.to_string())?,
         )?;
     }
     crate::ExpertResidencyCatalog::new(units)
@@ -822,25 +830,30 @@ pub fn v4_expert_residency_catalog<C: RecipeCatalog + ?Sized>(
     args: &V4Args,
     intermediate: Option<Range<usize>>,
 ) -> Result<crate::ExpertResidencyCatalog, String> {
-    let target = count(args.num_hidden_layers, "V4 target layer count")?;
-    let prediction = count(args.num_nextn_predict_layers, "V4 prediction layer count")?;
-    let total = target
-        .checked_add(prediction)
-        .ok_or_else(|| "V4 expert residency layer count overflowed".to_string())?;
-    let experts = dimension(args.n_routed_experts, "V4 expert count")?;
-    let capacity = total
-        .checked_mul(experts)
-        .ok_or_else(|| "V4 expert residency catalog size overflowed".to_string())?;
+    let (_, layout) = super::parallel::execution_layout(
+        count(args.num_hidden_layers, "V4 target layer count")?,
+        count(args.num_nextn_predict_layers, "V4 prediction layer count")?,
+    )
+    .map_err(|error| error.to_string())?;
+    let banks = super::v4::expert_bank_specs(args).map_err(|error| error.to_string())?;
+    let capacity = banks.values().try_fold(0usize, |capacity, bank| {
+        capacity
+            .checked_add(bank.group_count() as usize)
+            .ok_or_else(|| "V4 expert residency catalog size overflowed".to_string())
+    })?;
     let mut units = Vec::with_capacity(capacity);
-    for layer in 0..total {
-        let (owner, owner_unit, unit_path) = if layer < target {
-            ("target".to_string(), layer, format!("layers.{layer}"))
+    for (layer, declared) in banks {
+        let (owner, owner_unit) =
+            super::expert_unit_owner(&layout, layer).map_err(|error| error.to_string())?;
+        let target = layout.group_range(0).expect("declared target group").len();
+        let unit_path = if layer < target {
+            format!("layers.{layer}")
         } else {
-            let depth = layer - target;
-            (format!("mtp.{depth}"), 0, format!("mtp.{depth}"))
+            format!("mtp.{}", layer - target)
         };
         let bank = v4_expert_recipes(catalog, args, layer)?;
-        let policy = super::v4::moe_policy_at(args, layer, &format!("{unit_path}.ffn"))
+        let source = declared
+            .packed_parameters()
             .map_err(|error| error.to_string())?;
         append_expert_residency_units(
             &mut units,
@@ -849,10 +862,10 @@ pub fn v4_expert_residency_catalog<C: RecipeCatalog + ?Sized>(
             &owner,
             owner_unit,
             &unit_path,
-            experts,
+            source.group_count(),
             &bank,
             intermediate.clone(),
-            [policy.expert_gate_up_format, policy.expert_down_format],
+            source.encodings().map_err(|error| error.to_string())?,
         )?;
     }
     crate::ExpertResidencyCatalog::new(units)
@@ -865,7 +878,7 @@ fn append_expert_residency_units<C: RecipeCatalog + ?Sized>(
     units: &mut Vec<crate::ExpertResidencyUnit>,
     catalog: &C,
     identity_layer: usize,
-    owner_group: &str,
+    owner_group: &eredu_runtime::ExecutionGroupId,
     owner_unit: usize,
     unit_path: &str,
     experts: usize,
@@ -873,8 +886,6 @@ fn append_expert_residency_units<C: RecipeCatalog + ?Sized>(
     intermediate: Option<Range<usize>>,
     formats: [LinearFormat; 2],
 ) -> Result<(), String> {
-    let owner_group =
-        eredu_runtime::ExecutionGroupId::new(owner_group).map_err(|error| error.to_string())?;
     let outputs = eredu_checkpoint::expert::gated_product_materialization_recipes(catalog, bank)?;
     let selected_outputs = outputs
         .into_iter()
@@ -922,29 +933,25 @@ pub fn v3_safetensors_plan(
     args.validate().map_err(|error| error.to_string())?;
     let mut tensors = Vec::new();
     let mut groups = Vec::new();
-    let hidden = dimension(args.hidden_size, "hidden size")?;
-    let vocab = dimension(args.vocab_size, "vocabulary size")?;
-    add_v3_tensor(
-        &mut tensors,
-        "model.embed_tokens.weight",
-        vec![vocab, hidden],
-        TensorOperation::Matrix,
-        LinearFormat::Dense,
-    )?;
-    add_v3_tensor(
-        &mut tensors,
-        "model.norm.weight",
-        vec![hidden],
-        TensorOperation::Vector,
-        LinearFormat::Dense,
-    )?;
-    add_v3_tensor(
-        &mut tensors,
-        "lm_head.weight",
-        vec![vocab, hidden],
-        TensorOperation::Matrix,
-        LinearFormat::Dense,
-    )?;
+    let statics = &args.parameters().statics;
+    for parameters in [
+        statics.embedding_spec().logical_parameters(),
+        statics.normalization_spec().logical_parameters(),
+        statics
+            .head_spec()
+            .expect("untied V3 readout")
+            .logical_parameters(),
+    ] {
+        for parameter in parameters.map_err(|e| e.to_string())? {
+            add_v3_tensor(
+                &mut tensors,
+                parameter.parameter.id.as_str(),
+                parameter.shape,
+                declared_operation(parameter.role),
+                LinearFormat::Dense,
+            )?;
+        }
+    }
     for (layer, policy) in args.layer_schedule.iter().copied().enumerate() {
         add_v3_layer(
             args,
@@ -968,34 +975,9 @@ pub fn v3_safetensors_plan(
             allow_packed_experts,
         )?;
         let root = format!("model.layers.{layer}");
-        for (name, shape, operation) in [
-            ("enorm.weight", vec![hidden], TensorOperation::Vector),
-            ("hnorm.weight", vec![hidden], TensorOperation::Vector),
-            (
-                "eh_proj.weight",
-                vec![hidden, checked_mul(2, hidden, "MTP input width")?],
-                TensorOperation::Matrix,
-            ),
-            (
-                "shared_head.norm.weight",
-                vec![hidden],
-                TensorOperation::Vector,
-            ),
-            (
-                "shared_head.head.weight",
-                vec![vocab, hidden],
-                TensorOperation::Matrix,
-            ),
-        ] {
-            let full = format!("{root}.{name}");
-            add_v3_tensor(
-                &mut tensors,
-                &full,
-                shape,
-                operation,
-                v3_format(args, &full, operation),
-            )?;
-        }
+        let prediction =
+            super::v3_specs::prediction_spec(args, &root).map_err(|e| e.to_string())?;
+        add_v3_declared(args, &mut tensors, &prediction)?;
     }
     let mut policy = CatalogPolicy::strict();
     policy.allowed_prefixes.push("rope_freqs.".into());
@@ -1012,162 +994,162 @@ fn add_v3_layer(
     groups: &mut Vec<AlternativeLayoutGroup<SafetensorsTensorConstraint>>,
     allow_packed_experts: bool,
 ) -> Result<(), String> {
-    let hidden = dimension(args.hidden_size, "hidden size")?;
-    let heads = dimension(args.num_attention_heads, "attention heads")?;
-    let nope = dimension(args.qk_nope_head_dim, "non-rotary head width")?;
-    let rope = dimension(args.qk_rope_head_dim, "rotary head width")?;
-    let value = dimension(args.v_head_dim, "value head width")?;
-    let kv_rank = dimension(args.kv_lora_rank, "KV rank")?;
-    let query_head = nope
-        .checked_add(rope)
-        .ok_or_else(|| "query head width overflowed".to_string())?;
     let root = format!("model.layers.{layer}");
-    let mut entries = vec![
-        (
-            "input_layernorm.weight".to_string(),
-            vec![hidden],
-            TensorOperation::Vector,
-        ),
-        (
-            "post_attention_layernorm.weight".to_string(),
-            vec![hidden],
-            TensorOperation::Vector,
-        ),
-    ];
-    if let Some(rank) = args.q_lora_rank {
-        let rank = dimension(rank, "query rank")?;
-        entries.extend([
-            (
-                "self_attn.q_a_proj.weight".into(),
-                vec![rank, hidden],
-                TensorOperation::Matrix,
-            ),
-            (
-                "self_attn.q_a_layernorm.weight".into(),
-                vec![rank],
-                TensorOperation::Vector,
-            ),
-            (
-                "self_attn.q_b_proj.weight".into(),
-                vec![checked_mul(heads, query_head, "query width")?, rank],
-                TensorOperation::Matrix,
-            ),
-        ]);
-    } else {
-        entries.push((
-            "self_attn.q_proj.weight".into(),
-            vec![checked_mul(heads, query_head, "query width")?, hidden],
-            TensorOperation::Matrix,
-        ));
+    for field in ["input_layernorm", "post_attention_layernorm"] {
+        let spec = super::v3_specs::normalization_spec(
+            args,
+            &format!("{root}.{field}.weight"),
+            args.hidden_size,
+        )
+        .map_err(|e| e.to_string())?;
+        add_v3_declared(args, tensors, &spec)?;
     }
-    entries.extend([
-        (
-            "self_attn.kv_a_proj_with_mqa.weight".into(),
-            vec![kv_rank + rope, hidden],
-            TensorOperation::Matrix,
-        ),
-        (
-            "self_attn.kv_a_layernorm.weight".into(),
-            vec![kv_rank],
-            TensorOperation::Vector,
-        ),
-        (
-            "self_attn.kv_b_proj.weight".into(),
-            vec![checked_mul(heads, nope + value, "KV-B width")?, kv_rank],
-            TensorOperation::Matrix,
-        ),
-        (
-            "self_attn.o_proj.weight".into(),
-            vec![hidden, checked_mul(heads, value, "attention output")?],
-            TensorOperation::Matrix,
-        ),
-    ]);
+    let attention = super::v3_specs::attention_spec(args, &format!("{root}.self_attn"))
+        .map_err(|e| e.to_string())?;
+    add_v3_declared(args, tensors, &attention)?;
     if policy == LayerPolicy::SparseMoe {
-        let experts = dimension(args.n_routed_experts, "expert count")?;
-        let intermediate = dimension(args.moe_intermediate_size, "expert width")?;
-        let shared = checked_mul(
-            intermediate,
-            dimension(args.n_shared_experts, "shared expert count")?,
-            "shared expert width",
+        let moe = super::v3::routed_spec(args, layer, None).map_err(|e| e.to_string())?;
+        add_v3_declared(args, tensors, &moe.parameters.selector)?;
+        add_v3_declared(args, tensors, &moe.shared)?;
+        let bank = &moe.parameters.experts;
+        let source = bank
+            .packed_parameters()
+            .map_err(|error| error.to_string())?;
+        let expert_root = format!("{root}.mlp.experts");
+        visit_v3_expert_sources(
+            &source,
+            &expert_root,
+            |projection, packed_name, independent, shape| {
+                groups.push(v3_expert_group(
+                    args,
+                    &expert_root,
+                    projection,
+                    packed_name,
+                    independent,
+                    shape,
+                    allow_packed_experts,
+                )?);
+                Ok(())
+            },
         )?;
-        entries.extend([
-            (
-                "mlp.gate.weight".into(),
-                vec![experts, hidden],
-                TensorOperation::Matrix,
-            ),
-            (
-                "mlp.gate.e_score_correction_bias".into(),
-                vec![experts],
-                TensorOperation::Vector,
-            ),
-            (
-                "mlp.shared_experts.gate_proj.weight".into(),
-                vec![shared, hidden],
-                TensorOperation::Matrix,
-            ),
-            (
-                "mlp.shared_experts.up_proj.weight".into(),
-                vec![shared, hidden],
-                TensorOperation::Matrix,
-            ),
-            (
-                "mlp.shared_experts.down_proj.weight".into(),
-                vec![hidden, shared],
-                TensorOperation::Matrix,
-            ),
-        ]);
-        for (projection, split, packed) in [
-            (
-                "gate_proj",
-                vec![intermediate, hidden],
-                vec![experts, intermediate, hidden],
-            ),
-            (
-                "up_proj",
-                vec![intermediate, hidden],
-                vec![experts, intermediate, hidden],
-            ),
-            (
-                "down_proj",
-                vec![hidden, intermediate],
-                vec![experts, hidden, intermediate],
-            ),
-        ] {
-            groups.push(v3_expert_group(
-                args,
-                &format!("{root}.mlp.experts"),
-                projection,
-                experts,
-                split,
-                packed,
-                allow_packed_experts,
-            )?);
-        }
     } else {
-        let intermediate = dimension(args.intermediate_size, "dense MLP width")?;
-        for projection in ["gate_proj", "up_proj"] {
-            entries.push((
-                format!("mlp.{projection}.weight"),
-                vec![intermediate, hidden],
-                TensorOperation::Matrix,
-            ));
-        }
-        entries.push((
-            "mlp.down_proj.weight".into(),
-            vec![hidden, intermediate],
-            TensorOperation::Matrix,
-        ));
+        let parameters = super::v3_specs::dense_parameters(args, &format!("{root}.mlp"))
+            .map_err(|e| e.to_string())?;
+        add_v3_declared(args, tensors, &parameters)?;
     }
-    for (local, shape, operation) in entries {
-        let name = format!("{root}.{local}");
+    Ok(())
+}
+
+fn declared_operation(role: LogicalParameterRole) -> TensorOperation {
+    if matches!(
+        role,
+        LogicalParameterRole::LinearWeight | LogicalParameterRole::Embedding
+    ) {
+        TensorOperation::Matrix
+    } else {
+        TensorOperation::Vector
+    }
+}
+
+fn add_v3_declared(
+    args: &V3Args,
+    tensors: &mut Vec<SafetensorsTensorConstraint>,
+    spec: &impl DeclareLogicalParameters,
+) -> Result<(), String> {
+    for parameter in spec.logical_parameters().map_err(|e| e.to_string())? {
+        let operation = declared_operation(parameter.role);
+        let name = parameter.parameter.id.as_str();
         add_v3_tensor(
             tensors,
-            &name,
-            shape,
+            name,
+            parameter.shape,
             operation,
-            v3_format(args, &name, operation),
+            v3_format(args, name, operation),
         )?;
+    }
+    Ok(())
+}
+
+/// Logical ordinary and independent-expert source matrix geometry. Storage
+/// layouts reference the retained construction slots before scalar encoding.
+pub(crate) fn v3_source_linear_shapes(
+    args: &V3Args,
+) -> Result<BTreeMap<String, Vec<usize>>, String> {
+    let declaration = super::parallel::v3_parameter_description(args).map_err(|e| e.to_string())?;
+    let mut shapes = declaration
+        .groups()
+        .iter()
+        .flat_map(|group| group.members())
+        .filter(|member| member.logical_role() == Some(LogicalParameterRole::LinearWeight))
+        .filter_map(|member| {
+            member
+                .logical_shape()
+                .filter(|shape| shape.len() == 2)
+                .map(|shape| (member.target().to_owned(), shape.to_vec()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    for bank in super::v3::expert_bank_specs(args)
+        .map_err(|e| e.to_string())?
+        .values()
+    {
+        let source = bank.packed_parameters().map_err(|e| e.to_string())?;
+        let root = source
+            .gate_up()
+            .parameter
+            .id
+            .as_str()
+            .strip_suffix(".gate_up_proj")
+            .ok_or("DeepSeek-V3 expert source has no declared gate/up root")?;
+        visit_v3_expert_sources(&source, root, |_, _, independent, shape| {
+            for name in independent {
+                shapes.insert(name.to_owned(), shape[1..].to_vec());
+            }
+            Ok(())
+        })?;
+    }
+    Ok(shapes)
+}
+
+fn visit_v3_expert_sources(
+    source: &eredu_nn::PackedGatedProductParameters<'_>,
+    root: &str,
+    mut visit: impl FnMut(&str, &str, Vec<&str>, Vec<usize>) -> Result<(), String>,
+) -> Result<(), String> {
+    let names = expert_sources::v3_names(source, root);
+    let read = source.unfused_shape();
+    for (projection, packed_name, independent, shape) in [
+        (
+            "gate_proj",
+            names.separate_gate.as_str(),
+            names
+                .independent
+                .iter()
+                .map(|expert| expert.gate.as_str())
+                .collect::<Vec<_>>(),
+            read.clone(),
+        ),
+        (
+            "up_proj",
+            names.separate_up.as_str(),
+            names
+                .independent
+                .iter()
+                .map(|expert| expert.up.as_str())
+                .collect::<Vec<_>>(),
+            read,
+        ),
+        (
+            "down_proj",
+            names.separate_down.as_str(),
+            names
+                .independent
+                .iter()
+                .map(|expert| expert.down.as_str())
+                .collect::<Vec<_>>(),
+            source.down().shape.clone(),
+        ),
+    ] {
+        visit(projection, packed_name, independent, shape)?;
     }
     Ok(())
 }
@@ -1176,20 +1158,19 @@ fn v3_expert_group(
     args: &V3Args,
     root: &str,
     projection: &str,
-    experts: usize,
-    split_shape: Vec<usize>,
+    packed_name: &str,
+    independent: Vec<&str>,
     packed_shape: Vec<usize>,
     allow_packed: bool,
 ) -> Result<AlternativeLayoutGroup<SafetensorsTensorConstraint>, String> {
     let mut split = Vec::new();
     let mut split_keys = Vec::new();
-    for expert in 0..experts {
-        let name = format!("{root}.{expert}.{projection}.weight");
-        split_keys.push(name.clone());
+    for name in independent {
+        split_keys.push(name.to_owned());
         split.extend(v3_matrix_constraints(
-            &name,
-            split_shape.clone(),
-            args.linear_format_for(&name),
+            name,
+            packed_shape[1..].to_vec(),
+            args.linear_format_for(name),
         )?);
     }
     let mut variants = vec![LayoutVariant {
@@ -1198,11 +1179,14 @@ fn v3_expert_group(
         discriminator_keys: split_keys,
     }];
     if allow_packed {
-        let name = format!("{root}.{projection}");
         variants.push(LayoutVariant {
             id: "packed".into(),
-            discriminator_keys: vec![name.clone()],
-            tensors: v3_matrix_constraints(&name, packed_shape, args.linear_format_for(&name))?,
+            discriminator_keys: vec![packed_name.to_owned()],
+            tensors: v3_matrix_constraints(
+                packed_name,
+                packed_shape,
+                args.linear_format_for(packed_name),
+            )?,
         });
     }
     Ok(AlternativeLayoutGroup {
@@ -1265,6 +1249,7 @@ struct V4TensorSpec {
     shape: Vec<usize>,
     operation: TensorOperation,
     format: LinearFormat,
+    role: LogicalParameterRole,
 }
 
 /// Logical matrices consumed by V4's configurable projection operators.
@@ -1272,29 +1257,15 @@ struct V4TensorSpec {
 /// compressor positions and dense hyper-connection coefficients. Those retain
 /// their own storage and must never acquire a packed-linear transform merely
 /// because their shapes have two axes.
-pub(crate) fn v4_linear_parameter_shapes(
+pub(crate) fn v4_source_linear_shapes(
     args: &V4Args,
 ) -> Result<BTreeMap<String, Vec<usize>>, String> {
     args.validate().map_err(|error| error.to_string())?;
-    let mut specs = v4_target_specs(args)?;
+    let mut specs = v4_target_specs(args, V4ExpertStorage::Independent)?;
     append_v4_draft_specs(&mut specs, args)?;
     Ok(specs
         .into_iter()
-        .filter(|spec| {
-            matches!(
-                spec.operation,
-                TensorOperation::Matrix | TensorOperation::MxFp4Matrix
-            )
-        })
-        .filter(|spec| {
-            // Vocabulary lookup and the Markov lookup are constructed as dense
-            // embeddings; hyper functions are parameters of their own operator.
-            spec.name != "embed.weight"
-                && !spec.name.ends_with(".markov_head.markov_w1.weight")
-                && !["hc_head_fn", "hc_attn_fn", "hc_ffn_fn"]
-                    .iter()
-                    .any(|name| spec.name == *name || spec.name.ends_with(&format!(".{name}")))
-        })
+        .filter(|spec| spec.role == LogicalParameterRole::LinearWeight)
         .map(|spec| (spec.name, spec.shape))
         .collect())
 }
@@ -1303,7 +1274,7 @@ pub(crate) fn v4_linear_parameter_shapes(
 /// native UE8M0 block-FP8 companions and typed integer hash tables.
 pub fn v4_safetensors_plan(args: &V4Args) -> Result<SafetensorsCheckpointPlan, String> {
     args.validate().map_err(|error| error.to_string())?;
-    let mut specs = v4_target_specs(args)?;
+    let mut specs = v4_target_specs(args, V4ExpertStorage::Independent)?;
     append_v4_draft_specs(&mut specs, args)?;
     let mut tensors = Vec::new();
     for spec in specs {
@@ -1338,31 +1309,15 @@ pub fn v4_gguf_plan(args: &V4Args) -> Result<GgufCheckpointPlan, String> {
     if args.num_nextn_predict_layers != 0 {
         return Err("DeepSeek-V4 MTP GGUF files are companion artifacts, not base models".into());
     }
-    let specs = v4_target_specs(args)?;
+    let specs = v4_target_specs(args, V4ExpertStorage::GgufPacked)?;
     let mut tensors = Vec::new();
-    for spec in specs
-        .into_iter()
-        .filter(|spec| !spec.name.contains(".ffn.experts."))
-    {
-        let physical = v4_gguf_physical_name(&spec.name)?;
+    for spec in specs {
+        let physical = if spec.operation == TensorOperation::MxFp4Matrix {
+            spec.name
+        } else {
+            v4_gguf_physical_name(&spec.name)?
+        };
         tensors.push(gguf_tensor(physical, spec.shape, spec.operation));
-    }
-    let hidden = dimension(args.hidden_size, "hidden size")?;
-    let intermediate = dimension(args.moe_intermediate_size, "expert width")?;
-    let experts = dimension(args.n_routed_experts, "expert count")?;
-    for layer in 0..dimension(args.num_hidden_layers, "target layers")? {
-        let root = format!("blk.{layer}");
-        for (local, shape) in [
-            ("ffn_gate_exps.weight", vec![experts, intermediate, hidden]),
-            ("ffn_down_exps.weight", vec![experts, hidden, intermediate]),
-            ("ffn_up_exps.weight", vec![experts, intermediate, hidden]),
-        ] {
-            tensors.push(gguf_tensor(
-                format!("{root}.{local}"),
-                shape,
-                TensorOperation::MxFp4Matrix,
-            ));
-        }
     }
     GgufCheckpointPlan::new(
         "DeepSeek-V4 GGUF",
@@ -1430,460 +1385,169 @@ fn v4_gguf_physical_name(name: &str) -> Result<String, String> {
     Ok(format!("blk.{layer}.{physical}"))
 }
 
-fn v4_target_specs(args: &V4Args) -> Result<Vec<V4TensorSpec>, String> {
-    let hidden = dimension(args.hidden_size, "hidden size")?;
-    let vocab = dimension(args.vocab_size, "vocabulary size")?;
-    let streams = dimension(args.hc_mult, "hyper streams")?;
-    let stream_hidden = checked_mul(streams, hidden, "hyper width")?;
-    let mix = checked_mul(
-        checked_add(streams, 2, "hyper mixing input")?,
-        streams,
-        "hyper mixing width",
-    )?;
-    let mut specs = vec![
-        v4_spec(
-            "embed.weight",
-            vec![vocab, hidden],
-            TensorOperation::Matrix,
-            LinearFormat::Dense,
-        ),
-        v4_spec(
-            "norm.weight",
-            vec![hidden],
-            TensorOperation::Vector,
-            LinearFormat::Dense,
-        ),
-        v4_spec(
-            "head.weight",
-            vec![vocab, hidden],
-            TensorOperation::Matrix,
-            args.linear_format,
-        ),
-        v4_spec(
-            "hc_head_fn",
-            vec![streams, stream_hidden],
-            TensorOperation::Matrix,
-            LinearFormat::Dense,
-        ),
-        v4_spec(
-            "hc_head_base",
-            vec![streams],
-            TensorOperation::Vector,
-            LinearFormat::Dense,
-        ),
-        v4_spec(
-            "hc_head_scale",
-            vec![1],
-            TensorOperation::Vector,
-            LinearFormat::Dense,
-        ),
-    ];
-    let heads = dimension(args.num_attention_heads, "attention heads")?;
-    let head_dim = dimension(args.head_dim, "head width")?;
-    let query_rank = dimension(args.q_lora_rank, "query rank")?;
-    let output_rank = dimension(args.o_lora_rank, "output rank")?;
-    let output_groups = dimension(args.o_groups, "output groups")?;
-    let experts = dimension(args.n_routed_experts, "expert count")?;
-    let routed = dimension(args.num_experts_per_tok, "routes per token")?;
-    let shared = checked_mul(
-        dimension(args.moe_intermediate_size, "expert width")?,
-        dimension(args.n_shared_experts, "shared expert count")?,
-        "shared expert width",
-    )?;
-    let index_heads = dimension(args.index_n_heads, "index heads")?;
-    let index_dim = dimension(args.index_head_dim, "index head width")?;
-    let query_width = checked_mul(heads, head_dim, "query width")?;
-    let output_a_rows = checked_mul(output_groups, output_rank, "output A rows")?;
-    let output_a_columns = query_width / output_groups;
+#[derive(Clone, Copy)]
+enum V4ExpertStorage {
+    Independent,
+    GgufPacked,
+}
+
+fn v4_target_specs(args: &V4Args, experts: V4ExpertStorage) -> Result<Vec<V4TensorSpec>, String> {
+    let mut specs = v4_declared_specs(args, &args.parameters().statics)?;
+    specs.extend(v4_declared_specs(
+        args,
+        &super::v4_specs::hyper_head_spec(args, "hc_head").map_err(|e| e.to_string())?,
+    )?);
     for layer in 0..dimension(args.num_hidden_layers, "target layers")? {
-        let root = format!("layers.{layer}");
-        for (local, shape, operation) in [
-            (
-                "attn.wq_a.weight",
-                vec![query_rank, hidden],
-                TensorOperation::Matrix,
-            ),
-            (
-                "attn.q_norm.weight",
-                vec![query_rank],
-                TensorOperation::Vector,
-            ),
-            (
-                "attn.wq_b.weight",
-                vec![query_width, query_rank],
-                TensorOperation::Matrix,
-            ),
-            (
-                "attn.wkv.weight",
-                vec![head_dim, hidden],
-                TensorOperation::Matrix,
-            ),
-            (
-                "attn.kv_norm.weight",
-                vec![head_dim],
-                TensorOperation::Vector,
-            ),
-            (
-                "attn.wo_a.weight",
-                vec![output_a_rows, output_a_columns],
-                TensorOperation::Matrix,
-            ),
-            (
-                "attn.wo_b.weight",
-                vec![hidden, output_a_rows],
-                TensorOperation::Matrix,
-            ),
-            ("attn.attn_sink", vec![heads], TensorOperation::Vector),
-            ("attn_norm.weight", vec![hidden], TensorOperation::Vector),
-            ("ffn_norm.weight", vec![hidden], TensorOperation::Vector),
-            (
-                "hc_attn_fn",
-                vec![mix, stream_hidden],
-                TensorOperation::Matrix,
-            ),
-            ("hc_attn_base", vec![mix], TensorOperation::Vector),
-            ("hc_attn_scale", vec![3], TensorOperation::Vector),
-            (
-                "hc_ffn_fn",
-                vec![mix, stream_hidden],
-                TensorOperation::Matrix,
-            ),
-            ("hc_ffn_base", vec![mix], TensorOperation::Vector),
-            ("hc_ffn_scale", vec![3], TensorOperation::Vector),
-            (
-                "ffn.gate.weight",
-                vec![experts, hidden],
-                TensorOperation::Matrix,
-            ),
-            (
-                "ffn.shared_experts.w1.weight",
-                vec![shared, hidden],
-                TensorOperation::Matrix,
-            ),
-            (
-                "ffn.shared_experts.w2.weight",
-                vec![hidden, shared],
-                TensorOperation::Matrix,
-            ),
-            (
-                "ffn.shared_experts.w3.weight",
-                vec![shared, hidden],
-                TensorOperation::Matrix,
-            ),
-        ] {
-            let format = if operation == TensorOperation::Matrix
-                && !local.starts_with("hc_")
-                && local != "ffn.gate.weight"
-            {
-                args.linear_format
-            } else {
-                LinearFormat::Dense
-            };
-            specs.push(v4_spec(format!("{root}.{local}"), shape, operation, format));
-        }
-        if layer < args.num_hash_layers as usize {
-            specs.push(v4_spec(
-                format!("{root}.ffn.gate.tid2eid"),
-                vec![vocab, routed],
-                TensorOperation::I32,
-                LinearFormat::Dense,
-            ));
-        } else {
-            specs.push(v4_spec(
-                format!("{root}.ffn.gate.bias"),
-                vec![experts],
-                TensorOperation::Vector,
-                LinearFormat::Dense,
-            ));
-        }
-        let policy = args
-            .attention_policy(layer)
-            .ok_or_else(|| format!("missing attention policy for layer {layer}"))?;
-        if let V4AttentionPolicy::Compressed { ratio } = policy {
-            let output = checked_mul(head_dim, if ratio == 4 { 2 } else { 1 }, "pool output")?;
-            let ratio = dimension(ratio, "compression ratio")?;
-            for (local, shape, operation) in [
-                (
-                    "attn.compressor.wkv.weight",
-                    vec![output, hidden],
-                    TensorOperation::Matrix,
-                ),
-                (
-                    "attn.compressor.wgate.weight",
-                    vec![output, hidden],
-                    TensorOperation::Matrix,
-                ),
-                (
-                    "attn.compressor.ape",
-                    vec![ratio, output],
-                    TensorOperation::Dense,
-                ),
-                (
-                    "attn.compressor.norm.weight",
-                    vec![head_dim],
-                    TensorOperation::Vector,
-                ),
-            ] {
-                let format = if operation == TensorOperation::Matrix {
-                    args.linear_format
-                } else {
-                    LinearFormat::Dense
-                };
-                specs.push(v4_spec(format!("{root}.{local}"), shape, operation, format));
-            }
-            if ratio == 4 {
-                let index_output = checked_mul(2, index_dim, "index compressor width")?;
-                for (local, shape, operation) in [
-                    (
-                        "attn.indexer.wq_b.weight",
-                        vec![
-                            checked_mul(index_heads, index_dim, "index query width")?,
-                            query_rank,
-                        ],
-                        TensorOperation::Matrix,
-                    ),
-                    (
-                        "attn.indexer.weights_proj.weight",
-                        vec![index_heads, hidden],
-                        TensorOperation::Matrix,
-                    ),
-                    (
-                        "attn.indexer.compressor.wkv.weight",
-                        vec![index_output, hidden],
-                        TensorOperation::Matrix,
-                    ),
-                    (
-                        "attn.indexer.compressor.wgate.weight",
-                        vec![index_output, hidden],
-                        TensorOperation::Matrix,
-                    ),
-                    (
-                        "attn.indexer.compressor.ape",
-                        vec![4, index_output],
-                        TensorOperation::Dense,
-                    ),
-                    (
-                        "attn.indexer.compressor.norm.weight",
-                        vec![index_dim],
-                        TensorOperation::Vector,
-                    ),
-                ] {
-                    let format = if operation == TensorOperation::Matrix {
-                        args.linear_format
-                    } else {
-                        LinearFormat::Dense
-                    };
-                    specs.push(v4_spec(format!("{root}.{local}"), shape, operation, format));
-                }
-            }
-        }
-        append_v4_experts(&mut specs, args, &root, experts, hidden)?;
+        specs.extend(v4_block_specs(
+            args,
+            layer,
+            &format!("layers.{layer}"),
+            experts,
+        )?);
     }
     Ok(specs)
 }
 
-fn append_v4_experts(
-    specs: &mut Vec<V4TensorSpec>,
+fn v4_block_specs(
     args: &V4Args,
+    layer: usize,
     root: &str,
-    experts: usize,
-    hidden: usize,
-) -> Result<(), String> {
-    let intermediate = dimension(args.moe_intermediate_size, "expert width")?;
-    let format = args.expert_linear_format();
-    for expert in 0..experts {
-        for (projection, shape) in [
-            ("w1", vec![intermediate, hidden]),
-            ("w2", vec![hidden, intermediate]),
-            ("w3", vec![intermediate, hidden]),
-        ] {
-            specs.push(v4_spec(
-                format!("{root}.ffn.experts.{expert}.{projection}.weight"),
-                shape,
-                TensorOperation::Matrix,
-                format,
-            ));
+    expert_storage: V4ExpertStorage,
+) -> Result<Vec<V4TensorSpec>, String> {
+    let mut specs = v4_declared_specs(
+        args,
+        &super::v4_specs::attention_spec(args, layer, &format!("{root}.attn"))
+            .map_err(|e| e.to_string())?,
+    )?;
+    for normalization in
+        super::v4_specs::block_normalizations(args, root).map_err(|e| e.to_string())?
+    {
+        specs.extend(v4_declared_specs(args, &normalization)?);
+    }
+    specs.extend(v4_declared_specs(
+        args,
+        &super::v4_specs::hyper_block_spec(args, root).map_err(|e| e.to_string())?,
+    )?);
+    let moe = super::v4_specs::moe_spec(args, layer, &format!("{root}.ffn"), None)
+        .map_err(|e| e.to_string())?;
+    // Published routers retain floating source storage, independently of materialization overrides.
+    let mut router = v4_declared_specs(args, &moe.routed.parameters.selector)?;
+    for tensor in &mut router {
+        tensor.format = LinearFormat::Dense;
+    }
+    specs.extend(router);
+    specs.extend(v4_declared_specs(args, &moe.routed.shared)?);
+    if let Some(table) = &moe.token_table {
+        specs.extend(v4_declared_specs(args, table)?);
+    }
+    let bank = &moe.routed.parameters.experts;
+    let source = bank
+        .packed_parameters()
+        .map_err(|error| error.to_string())?;
+    let read = source.unfused_shape();
+    // Independent SafeTensors and packed GGUF banks are explicit layouts of the declared bank.
+    match expert_storage {
+        V4ExpertStorage::Independent => {
+            let names = expert_sources::v4_names(&source, &format!("{root}.ffn"));
+            for expert in &names.independent {
+                for (name, shape) in [
+                    (&expert.gate, read[1..].to_vec()),
+                    (&expert.down, source.down().shape[1..].to_vec()),
+                    (&expert.up, read[1..].to_vec()),
+                ] {
+                    specs.push(v4_spec(
+                        name,
+                        shape,
+                        TensorOperation::Matrix,
+                        args.expert_linear_format(),
+                        LogicalParameterRole::LinearWeight,
+                    ));
+                }
+            }
+        }
+        V4ExpertStorage::GgufPacked => {
+            for (projection, shape) in [
+                ("ffn_gate_exps.weight", read.clone()),
+                ("ffn_down_exps.weight", source.down().shape.clone()),
+                ("ffn_up_exps.weight", read),
+            ] {
+                specs.push(v4_spec(
+                    format!("blk.{layer}.{projection}"),
+                    shape,
+                    TensorOperation::MxFp4Matrix,
+                    LinearFormat::MxFp4,
+                    LogicalParameterRole::LinearWeight,
+                ));
+            }
+        }
+    }
+    Ok(specs)
+}
+
+fn append_v4_draft_specs(specs: &mut Vec<V4TensorSpec>, args: &V4Args) -> Result<(), String> {
+    let drafts = count(args.num_nextn_predict_layers, "draft layer count")?;
+    if drafts == 0 {
+        return Ok(());
+    }
+    let targets = dimension(args.num_hidden_layers, "target layer count")?;
+    for depth in 0..drafts {
+        specs.extend(v4_block_specs(
+            args,
+            targets + depth,
+            &format!("mtp.{depth}"),
+            V4ExpertStorage::Independent,
+        )?);
+    }
+    if args.dspark.is_some() {
+        specs.extend(v4_declared_specs(
+            args,
+            &super::v4_specs::dspark_spec(args).map_err(|e| e.to_string())?,
+        )?);
+    } else {
+        for depth in 0..drafts {
+            specs.extend(v4_declared_specs(
+                args,
+                &super::v4_specs::prediction_spec(args, &format!("mtp.{depth}"))
+                    .map_err(|e| e.to_string())?,
+            )?);
         }
     }
     Ok(())
 }
 
-fn append_v4_draft_specs(specs: &mut Vec<V4TensorSpec>, args: &V4Args) -> Result<(), String> {
-    let draft_layers = count(args.num_nextn_predict_layers, "draft layer count")?;
-    if draft_layers == 0 {
-        return Ok(());
-    }
-    let target_layers = dimension(args.num_hidden_layers, "target layer count")?;
-    let hidden = dimension(args.hidden_size, "hidden size")?;
-    let vocab = dimension(args.vocab_size, "vocabulary size")?;
-    let streams = dimension(args.hc_mult, "hyper streams")?;
-    let stream_hidden = checked_mul(streams, hidden, "hyper width")?;
-    let experts = dimension(args.n_routed_experts, "expert count")?;
-    let routed = dimension(args.num_experts_per_tok, "routes per token")?;
-    let template_root = format!("layers.{}", target_layers - 1);
-    let template_prefix = format!("{template_root}.");
-    let template = specs
-        .iter()
-        .filter(|spec| spec.name.starts_with(&template_prefix))
-        .filter(|spec| {
-            !spec.name.contains(".attn.compressor.")
-                && !spec.name.contains(".attn.indexer.")
-                && !spec.name.ends_with(".ffn.gate.bias")
-                && !spec.name.ends_with(".ffn.gate.tid2eid")
+fn v4_declared_specs(
+    args: &V4Args,
+    spec: &impl DeclareLogicalParameters,
+) -> Result<Vec<V4TensorSpec>, String> {
+    spec.logical_parameters()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|parameter| {
+            let (operation, format) = match parameter.role {
+                LogicalParameterRole::LinearWeight => (TensorOperation::Matrix, args.linear_format),
+                LogicalParameterRole::Embedding | LogicalParameterRole::ResidualMixWeight => {
+                    (TensorOperation::Matrix, LinearFormat::Dense)
+                }
+                LogicalParameterRole::RoutingTable => (TensorOperation::I32, LinearFormat::Dense),
+                LogicalParameterRole::PositionBias => (TensorOperation::Dense, LinearFormat::Dense),
+                LogicalParameterRole::Normalization
+                | LogicalParameterRole::RoutingCorrection
+                | LogicalParameterRole::AttentionSink
+                | LogicalParameterRole::ResidualMixBias
+                | LogicalParameterRole::ResidualMixScale => {
+                    (TensorOperation::Vector, LinearFormat::Dense)
+                }
+                _ => return Err("unsupported V4 checkpoint declaration role".into()),
+            };
+            Ok(v4_spec(
+                parameter.parameter.id.as_str(),
+                parameter.shape,
+                operation,
+                format,
+                parameter.role,
+            ))
         })
-        .cloned()
-        .collect::<Vec<_>>();
-    for depth in 0..draft_layers {
-        let root = format!("mtp.{depth}");
-        for source in &template {
-            let suffix = source.name.strip_prefix(&template_prefix).unwrap();
-            let mut cloned = source.clone();
-            cloned.name = format!("{root}.{suffix}");
-            specs.push(cloned);
-        }
-        if target_layers + depth < args.num_hash_layers as usize {
-            specs.push(v4_spec(
-                format!("{root}.ffn.gate.tid2eid"),
-                vec![vocab, routed],
-                TensorOperation::I32,
-                LinearFormat::Dense,
-            ));
-        } else {
-            specs.push(v4_spec(
-                format!("{root}.ffn.gate.bias"),
-                vec![experts],
-                TensorOperation::Vector,
-                LinearFormat::Dense,
-            ));
-        }
-    }
-    if let Some(dspark) = &args.dspark {
-        let last = draft_layers - 1;
-        let markov = dimension(dspark.markov_rank, "DSpark Markov rank")?;
-        let captured = checked_mul(
-            hidden,
-            args.target_capture_policy
-                .as_ref()
-                .expect("validated DSpark target capture policy")
-                .len(),
-            "captured hidden",
-        )?;
-        for (name, shape, operation, format) in [
-            (
-                "mtp.0.main_proj.weight".to_string(),
-                vec![hidden, captured],
-                TensorOperation::Matrix,
-                args.linear_format,
-            ),
-            (
-                "mtp.0.main_norm.weight".to_string(),
-                vec![hidden],
-                TensorOperation::Vector,
-                LinearFormat::Dense,
-            ),
-            (
-                format!("mtp.{last}.norm.weight"),
-                vec![hidden],
-                TensorOperation::Vector,
-                LinearFormat::Dense,
-            ),
-            (
-                format!("mtp.{last}.hc_head_fn"),
-                vec![streams, stream_hidden],
-                TensorOperation::Matrix,
-                LinearFormat::Dense,
-            ),
-            (
-                format!("mtp.{last}.hc_head_base"),
-                vec![streams],
-                TensorOperation::Vector,
-                LinearFormat::Dense,
-            ),
-            (
-                format!("mtp.{last}.hc_head_scale"),
-                vec![1],
-                TensorOperation::Vector,
-                LinearFormat::Dense,
-            ),
-            (
-                format!("mtp.{last}.markov_head.markov_w1.weight"),
-                vec![vocab, markov],
-                TensorOperation::Matrix,
-                LinearFormat::Dense,
-            ),
-            (
-                format!("mtp.{last}.markov_head.markov_w2.weight"),
-                vec![vocab, markov],
-                TensorOperation::Matrix,
-                args.linear_format,
-            ),
-            (
-                format!("mtp.{last}.confidence_head.proj.weight"),
-                vec![1, checked_add(hidden, markov, "DSpark confidence width")?],
-                TensorOperation::Matrix,
-                args.linear_format,
-            ),
-        ] {
-            specs.push(v4_spec(name, shape, operation, format));
-        }
-    } else {
-        for depth in 0..draft_layers {
-            let root = format!("mtp.{depth}");
-            for (local, shape, operation, format) in [
-                (
-                    "e_proj.weight",
-                    vec![hidden, hidden],
-                    TensorOperation::Matrix,
-                    args.linear_format,
-                ),
-                (
-                    "h_proj.weight",
-                    vec![hidden, hidden],
-                    TensorOperation::Matrix,
-                    args.linear_format,
-                ),
-                (
-                    "enorm.weight",
-                    vec![hidden],
-                    TensorOperation::Vector,
-                    LinearFormat::Dense,
-                ),
-                (
-                    "hnorm.weight",
-                    vec![hidden],
-                    TensorOperation::Vector,
-                    LinearFormat::Dense,
-                ),
-                (
-                    "norm.weight",
-                    vec![hidden],
-                    TensorOperation::Vector,
-                    LinearFormat::Dense,
-                ),
-                (
-                    "hc_head_fn",
-                    vec![streams, stream_hidden],
-                    TensorOperation::Matrix,
-                    LinearFormat::Dense,
-                ),
-                (
-                    "hc_head_base",
-                    vec![streams],
-                    TensorOperation::Vector,
-                    LinearFormat::Dense,
-                ),
-                (
-                    "hc_head_scale",
-                    vec![1],
-                    TensorOperation::Vector,
-                    LinearFormat::Dense,
-                ),
-            ] {
-                specs.push(v4_spec(format!("{root}.{local}"), shape, operation, format));
-            }
-        }
-    }
-    Ok(())
+        .collect()
 }
 
 fn v4_spec(
@@ -1891,12 +1555,14 @@ fn v4_spec(
     shape: Vec<usize>,
     operation: TensorOperation,
     format: LinearFormat,
+    role: LogicalParameterRole,
 ) -> V4TensorSpec {
     V4TensorSpec {
         name: name.into(),
         shape,
         operation,
         format,
+        role,
     }
 }
 
@@ -1940,14 +1606,4 @@ fn dimension(value: i32, name: &str) -> Result<usize, String> {
 
 fn count(value: i32, name: &str) -> Result<usize, String> {
     usize::try_from(value).map_err(|_| format!("{name} must be nonnegative, got {value}"))
-}
-
-fn checked_mul(left: usize, right: usize, name: &str) -> Result<usize, String> {
-    left.checked_mul(right)
-        .ok_or_else(|| format!("{name} overflowed"))
-}
-
-fn checked_add(left: usize, right: usize, name: &str) -> Result<usize, String> {
-    left.checked_add(right)
-        .ok_or_else(|| format!("{name} overflowed"))
 }

@@ -2,13 +2,11 @@
 
 use eredu_core::cache::StateTensorRole;
 use eredu_nn::{
-    CausalDepthwiseConvolution, CausalDepthwiseConvolutionSpec, ConvolutionActivation, Error,
-    GatedDeltaScanInput, LinearOperator, LinearSpec, NeuralBackend, NormalizationConstructionSpec,
-    NormalizationOperator, Parameter, ParameterSpec, Tensor,
+    CausalDepthwiseConvolution, Error, GatedDeltaScanInput, LinearOperator, NeuralBackend,
+    NormalizationOperator, Parameter, Tensor,
 };
 use eredu_runtime::RuntimeStateComponents;
 
-use super::ModelArgs;
 use crate::decoder::ComponentInstrumentation;
 
 /// Backend-neutral Kimi Delta Attention operator.
@@ -39,91 +37,34 @@ pub struct KimiDeltaAttention<B: NeuralBackend> {
 }
 
 impl<B: NeuralBackend> KimiDeltaAttention<B> {
-    /// Creates unloaded KDA parameters for one physical layer.
-    pub fn new(
-        args: &ModelArgs,
-        layer: usize,
+    pub(crate) fn from_spec(
+        spec: super::specs::KdaSpec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        Self::new_with_heads(args, layer, args.kda_config.num_heads, context)
-    }
-
-    /// Creates unloaded KDA parameters for a placement-resolved head count.
-    pub fn new_with_heads(
-        args: &ModelArgs,
-        layer: usize,
-        heads: i32,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        let head_dim = args.kda_config.head_dim;
-        let projection = heads
-            .checked_mul(head_dim)
-            .ok_or_else(|| Error::backend("Kimi KDA projection width overflowed"))?;
-        let prefix = format!("model.layers.{layer}.self_attn");
-        let parameter = |name: String| ParameterSpec::trainable(name).map_err(Error::backend);
-        let linear = |name: &str, input, output| {
-            let weight = format!("{prefix}.{name}.weight");
-            B::linear(
-                LinearSpec {
-                    input,
-                    output,
-                    weight: parameter(weight.clone())?,
-                    bias: None,
-                    format: crate::linear_format::standard_linear_format(
-                        &weight,
-                        args.weight_quantization_for(&weight).into(),
-                    )?,
-                },
-                context,
-            )
-        };
-        let convolution = |name: &str| {
-            CausalDepthwiseConvolution::new(
-                CausalDepthwiseConvolutionSpec {
-                    arithmetic: eredu_nn::ConvolutionArithmetic::Native,
-                    dilation: 1,
-                    channels: projection,
-                    kernel_size: args.kda_config.short_conv_kernel_size,
-                    weight: parameter(format!("{prefix}.{name}.weight"))?,
-                    bias: None,
-                    activation: ConvolutionActivation::Silu,
-                },
-                context,
-            )
-        };
+        use eredu_nn::DeclareLogicalParameters;
+        spec.logical_parameters()?;
+        let geometry = spec.geometry;
+        let transition_shape = spec.transition_shape();
+        let decay_shape = spec.decay_bias_shape();
+        let [query_conv, key_conv, value_conv] = spec.convolutions;
         Ok(Self {
-            num_heads: heads,
-            head_dim,
-            q_proj: linear("q_proj", args.hidden_size, projection)?,
-            k_proj: linear("k_proj", args.hidden_size, projection)?,
-            v_proj: linear("v_proj", args.hidden_size, projection)?,
-            q_conv1d: convolution("q_conv1d")?,
-            k_conv1d: convolution("k_conv1d")?,
-            v_conv1d: convolution("v_conv1d")?,
-            f_a_proj: linear("f_a_proj", args.hidden_size, head_dim)?,
-            f_b_proj: linear("f_b_proj", head_dim, projection)?,
-            b_proj: linear("b_proj", args.hidden_size, heads)?,
-            g_a_proj: linear("g_a_proj", args.hidden_size, head_dim)?,
-            g_b_proj: linear("g_b_proj", head_dim, projection)?,
-            a_log: Parameter::unloaded(
-                parameter(format!("{prefix}.A_log"))?,
-                &[1, 1, heads, 1],
-                context,
-            )?,
-            dt_bias: Parameter::unloaded(
-                parameter(format!("{prefix}.dt_bias"))?,
-                &[projection],
-                context,
-            )?,
-            o_norm: B::normalization(
-                NormalizationConstructionSpec::learned(
-                    head_dim,
-                    args.rms_norm_eps,
-                    parameter(format!("{prefix}.o_norm.weight"))?,
-                ),
-                context,
-            )?,
-            o_proj: linear("o_proj", projection, args.hidden_size)?,
+            num_heads: geometry.value_heads(),
+            head_dim: geometry.value_dimensions(),
+            q_proj: B::linear(spec.q, context)?,
+            k_proj: B::linear(spec.k, context)?,
+            v_proj: B::linear(spec.v, context)?,
+            q_conv1d: CausalDepthwiseConvolution::new(query_conv, context)?,
+            k_conv1d: CausalDepthwiseConvolution::new(key_conv, context)?,
+            v_conv1d: CausalDepthwiseConvolution::new(value_conv, context)?,
+            f_a_proj: B::linear(spec.f_a, context)?,
+            f_b_proj: B::linear(spec.f_b, context)?,
+            b_proj: B::linear(spec.beta, context)?,
+            g_a_proj: B::linear(spec.g_a, context)?,
+            g_b_proj: B::linear(spec.g_b, context)?,
+            a_log: Parameter::unloaded(spec.a_log, &transition_shape, context)?,
+            dt_bias: Parameter::unloaded(spec.dt_bias, &decay_shape, context)?,
+            o_norm: B::normalization(spec.norm, context)?,
+            o_proj: B::linear(spec.output, context)?,
         })
     }
 

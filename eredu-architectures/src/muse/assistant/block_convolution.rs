@@ -1,7 +1,8 @@
 //! Dynamic input/output kernels whose history is confined to one proposal block.
 
 use eredu_nn::{
-    Error, Index, LinearFormatSpec, LinearOperator, LinearSpec, NeuralBackend, PadMode, Parameter,
+    DeclareLogicalParameters, Error, Index, LinearOperator, LinearSpec,
+    LogicalParameterDeclaration, LogicalParameterRole, NeuralBackend, PadMode, Parameter,
     ParameterSpec, Parameterized, Tensor,
 };
 
@@ -37,6 +38,75 @@ impl BlockConvolutionGeometry {
     }
 }
 
+/// Architecture-owned dynamic kernels and their exact coefficient projection.
+#[derive(Debug, Clone)]
+pub struct BlockConvolutionSpec {
+    geometry: BlockConvolutionGeometry,
+    owner: String,
+    base_kernel: ParameterSpec,
+    base_shape: [i32; 3],
+    kernel_projection: LinearSpec,
+}
+impl BlockConvolutionSpec {
+    /// Exact proposal boundary and channel geometry retained by this declaration.
+    pub const fn geometry(&self) -> BlockConvolutionGeometry {
+        self.geometry
+    }
+    pub(super) fn project_formats(
+        &self,
+        format: &impl Fn(&str) -> eredu_checkpoint::LinearFormat,
+    ) -> Result<Self, Error> {
+        let mut projected = self.clone();
+        super::body::project_linear_encoding(&mut projected.kernel_projection, format)?;
+        eredu_nn::validate_logical_parameter_topology(&projected.logical_parameters()?)
+            .map_err(Error::backend_source)?;
+        Ok(projected)
+    }
+    /// Declares both input/output kernels and selected projection companions before allocation.
+    pub fn new(
+        geometry: BlockConvolutionGeometry,
+        prefix: impl Into<String>,
+        format: eredu_checkpoint::LinearFormat,
+    ) -> Result<Self, Error> {
+        let output = geometry.projection_width()?;
+        let owner = prefix.into();
+        if owner.is_empty() {
+            return Err(Error::backend(
+                "assistant convolution requires a parameter prefix",
+            ));
+        }
+        let name = format!("{owner}.kernel_projection.weight");
+        let spec = Self {
+            geometry,
+            owner: owner.clone(),
+            base_kernel: ParameterSpec::trainable(format!("{owner}.base_kernel"))
+                .map_err(Error::backend)?,
+            base_shape: [2, geometry.taps, geometry.hidden],
+            kernel_projection: LinearSpec {
+                input: geometry.hidden,
+                output,
+                weight: ParameterSpec::trainable(&name).map_err(Error::backend)?,
+                bias: None,
+                format: crate::linear_format::standard_linear_format(&name, format)?,
+            },
+        };
+        eredu_nn::validate_logical_parameter_topology(&spec.logical_parameters()?)
+            .map_err(Error::backend_source)?;
+        Ok(spec)
+    }
+}
+impl DeclareLogicalParameters for BlockConvolutionSpec {
+    fn logical_parameters(&self) -> Result<Vec<LogicalParameterDeclaration<'_>>, Error> {
+        let mut parameters = vec![LogicalParameterDeclaration::new(
+            &self.base_kernel,
+            &self.base_shape,
+            LogicalParameterRole::LinearWeight,
+        )?];
+        parameters.extend(self.kernel_projection.logical_parameters()?);
+        Ok(parameters)
+    }
+}
+
 /// Output-side coefficients projected from the sublayer's original input.
 /// Consuming this value in `finish` prevents accidentally reprojecting the branch
 /// output or carrying a kernel into the next proposal.
@@ -63,57 +133,20 @@ pub struct BlockConvolution<B: NeuralBackend> {
 }
 
 impl<B: NeuralBackend> BlockConvolution<B> {
-    /// Constructs unloaded parameters under the supplied sublayer prefix.
+    /// Constructs the declared kernels and projection without reconstructing parameter facts.
     pub fn new(
-        geometry: BlockConvolutionGeometry,
-        prefix: impl Into<String>,
+        spec: BlockConvolutionSpec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        Self::new_with_format(
-            geometry,
-            prefix,
-            eredu_checkpoint::LinearFormat::Dense,
-            context,
-        )
-    }
-
-    /// Constructs the dynamic projection with its exact selected physical encoding.
-    pub fn new_with_format(
-        geometry: BlockConvolutionGeometry,
-        prefix: impl Into<String>,
-        format: eredu_checkpoint::LinearFormat,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        let output = geometry.projection_width()?;
         B::require_operator_capabilities(
             "DFlash block convolution",
             eredu_nn::NeuralOperatorCapabilities::ZEROS_LIKE,
         )?;
-        let owner = prefix.into();
-        if owner.is_empty() {
-            return Err(Error::backend(
-                "assistant convolution requires a parameter prefix",
-            ));
-        }
         Ok(Self {
-            base_kernel: Parameter::unloaded(
-                ParameterSpec::trainable(format!("{owner}.base_kernel")).map_err(Error::backend)?,
-                &[2, geometry.taps, geometry.hidden],
-                context,
-            )?,
-            kernel_projection: B::linear(
-                LinearSpec {
-                    input: geometry.hidden,
-                    output,
-                    weight: ParameterSpec::trainable(format!("{owner}.kernel_projection.weight"))
-                        .map_err(Error::backend)?,
-                    bias: None,
-                    format: LinearFormatSpec::unscaled(format)?,
-                },
-                context,
-            )?,
-            geometry,
-            owner,
+            base_kernel: Parameter::unloaded(spec.base_kernel, &spec.base_shape, context)?,
+            kernel_projection: B::linear(spec.kernel_projection, context)?,
+            geometry: spec.geometry,
+            owner: spec.owner,
         })
     }
 

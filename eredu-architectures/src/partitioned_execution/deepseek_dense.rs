@@ -36,8 +36,8 @@ where
         .requirements()
         .shared_component_definition()
         .ok_or_else(|| architecture("V3 selection has no retained definition"))?;
-    let definition =
-        crate::deepseek::v3::project_parameters(&selected_args, &retained).map_err(architecture)?;
+    let definition = crate::replicated_text::executable_component(selected.base())
+        .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
     let parameters = definition.parameters().clone();
     let rank = selected.requirements().topology();
     let layout = derive_partitioned_local_layout(&parameters, rank).map_err(architecture)?;

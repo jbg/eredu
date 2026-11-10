@@ -210,7 +210,7 @@ pub fn materialize_voicechat_tts_transformer_partition<G>(
             )))
         }
     }
-    let (config, definition, local_layout, invocations, source, units, state_layout) =
+    let (declaration, local_layout, invocations, source, units, state_layout) =
         prepared.into_parts();
     if !invocations.logical_addresses().eq(partition.units())
         || state_layout.as_ref() != partition.state().map(|state| state.layout())
@@ -220,8 +220,7 @@ pub fn materialize_voicechat_tts_transformer_partition<G>(
         )));
     }
     let mut architecture = TransformerKernel::<MlxNeuralBackend>::from_partition(
-        definition,
-        config,
+        declaration,
         local_layout.as_ref(),
         partition,
     )

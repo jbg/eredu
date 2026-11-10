@@ -34,13 +34,8 @@ impl PreparedPerceptionPipelineBindings {
             component: "perception",
             reason,
         };
-        validate_perception_partition(
-            bindings.definition(),
-            bindings.dimensions(),
-            bindings.local_layout(),
-            &partition,
-        )
-        .map_err(ComponentPipelinePreparationError::Component)?;
+        validate_perception_partition(bindings.declaration(), bindings.local_layout(), &partition)
+            .map_err(ComponentPipelinePreparationError::Component)?;
         if activation_dtype != PipelineActivationDtype::Float32 {
             return Err(contract("perception requires Float32 activation transport"));
         }

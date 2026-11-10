@@ -4,8 +4,12 @@ use super::tts_mog::{
     f32_shape, MogBlock, MogComponentBank, MogDimensions, MogPrediction, MogPredictionHead,
     MogSample, TtsError,
 };
+use super::tts_mog_specs::{Declaration, MogDeclaration};
 use eredu_core::BackendFailure;
-use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Parameterized, Tensor, TensorElementType};
+use eredu_nn::{
+    DeclareLogicalParameters, DistributedNeuralBackend, NeuralBackend, Parameterized, Tensor,
+    TensorElementType,
+};
 use eredu_runtime::{
     ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitectureGroupTransport,
     ArchitectureMergeDestination, ArchitectureParameterDescription, ArchitectureStatePartitionPlan,
@@ -13,8 +17,8 @@ use eredu_runtime::{
     ComponentKernel, ComponentUnit, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress,
     ExecutionUnitLayout, LayeredForwardState, LayeredInvocation, LayeredTraversalHook,
     LayerwisePolicy, LayerwiseRuntime, LocalModelLayout, MemberSharding, OwnedParameterGroupSpec,
-    ParallelComponentKernel, ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec,
-    ParameterRole, StatelessComponentState, SubmissionBackend,
+    ParallelComponentKernel, ParameterGroupOwner, ParameterGroupSpec, ParameterRole,
+    StatelessComponentState, SubmissionBackend,
 };
 use std::marker::PhantomData;
 
@@ -31,13 +35,11 @@ pub struct MogLocalDimensions {
     pub rank: i32,
 }
 
-/// Checks every declared parameter, including coherent mixture segments and replicas.
-/// The actual communicator is checked separately before a parallel invocation.
-pub fn mog_local_dimensions(
-    dimensions: MogDimensions,
+pub(crate) fn local_dimensions(
     layout: &LocalModelLayout,
+    declaration: &Declaration,
 ) -> Result<MogLocalDimensions, TtsError> {
-    let description = mog_parameter_description(dimensions)?;
+    let description = declared_parameters(declaration)?;
     let range = |name: &str, width: i32| {
         layout
             .tensor(name)
@@ -48,10 +50,13 @@ pub fn mog_local_dimensions(
             .map_err(TtsError::from)
     };
     let intermediate = range(
-        "tts_model.tts_model.mog_head.mlp_stack.0.mlp.gate_proj.weight",
-        dimensions.intermediate,
+        declaration.blocks[0].product.gate.weight.id.as_str(),
+        declaration.blocks[0].product.gate.output,
     )?;
-    let rank = range("tts_model.tts_model.mog_head.low_mat", dimensions.rank)?;
+    let rank = range(
+        declaration.components.low.weight.id.as_str(),
+        declaration.components.low.rank,
+    )?;
     eredu_runtime::validate_parameter_layout(
         description.groups().iter().map(|owned| owned.group()),
         layout,
@@ -156,6 +161,8 @@ impl<T> MogForward<T> {
 pub struct MogKernel<B: NeuralBackend> {
     precision: super::precision::SpeechPrecision,
     dimensions: MogDimensions,
+    declaration: Declaration,
+    definition: ComponentDefinition,
     parallel: Option<(MogLocalDimensions, LocalModelLayout)>,
     backend: PhantomData<fn() -> B>,
 }
@@ -169,32 +176,32 @@ impl<B: NeuralBackend> MogKernel<B> {
         self.precision = precision;
         Ok(self)
     }
-    /// Validates dimensions without native allocation.
-    pub fn new(dimensions: MogDimensions) -> Result<Self, TtsError> {
-        dimensions.validate()?;
+    /// Retains validated scopes without native allocation.
+    pub fn new(declaration: MogDeclaration) -> Result<Self, TtsError> {
+        let dimensions = declaration.dimensions();
+        let (declaration, definition) = declaration.into_parts();
         Ok(Self {
             precision: Default::default(),
             dimensions,
+            declaration,
+            definition,
             parallel: None,
             backend: PhantomData,
         })
     }
     /// Retains exact physical rank ownership without materializing any parameters.
     pub fn new_parallel(
-        dimensions: MogDimensions,
+        declaration: MogDeclaration,
         layout: &LocalModelLayout,
     ) -> Result<Self, TtsError> {
-        let local = mog_local_dimensions(dimensions, layout)?;
-        let mut architecture = Self::new(dimensions)?;
+        let mut architecture = Self::new(declaration)?;
+        let local = local_dimensions(layout, &architecture.declaration)?;
         architecture.parallel = Some((local, layout.clone()));
         Ok(architecture)
     }
     /// Combines selected semantic equations with the validated component declaration.
     pub fn into_component(self) -> Result<ComponentAdapter<ComponentDefinition, Self>, TtsError> {
-        Ok(ComponentAdapter::new(
-            tts_mog_component_definition(self.dimensions)?,
-            self,
-        )?)
+        Ok(ComponentAdapter::new(self.definition.clone(), self)?)
     }
     /// Whether execution requires the selected tensor communicator.
     pub fn is_parallel(&self) -> bool {
@@ -267,13 +274,14 @@ impl<B: NeuralBackend> MogKernel<B> {
         self.dimensions
     }
 }
-/// Validated logical invocations, independent parameter units and transport semantics.
-pub fn tts_mog_component_definition(
-    dimensions: MogDimensions,
+pub(crate) fn declared_definition(
+    declaration: &Declaration,
 ) -> Result<ComponentDefinition, TtsError> {
-    let parameters = mog_parameter_description(dimensions)?;
-    let paths: Vec<String> = (0..dimensions.layers)
-        .map(|index| format!("tts_model.tts_model.mog_head.mlp_stack.{index}"))
+    let parameters = declared_parameters(declaration)?;
+    let paths: Vec<String> = declaration
+        .blocks
+        .iter()
+        .map(|block| block.root.clone())
         .chain([PREDICTION.into(), COMPONENTS.into()])
         .collect();
     let transport = (0..parameters.graph().groups().len())
@@ -320,18 +328,13 @@ fn mog_graph() -> Result<ExecutionGraph, TtsError> {
     )?)
 }
 
-/// Symbolic MoG parameter shapes and independent head ownership, without native work.
-pub fn mog_parameter_description(
-    d: MogDimensions,
+fn declared_parameters(
+    declaration: &Declaration,
 ) -> Result<ArchitectureParameterDescription, TtsError> {
-    d.validate()?;
     let graph = mog_graph()?;
-    let layout = ExecutionUnitLayout::new(&graph, [d.layers, 1, 1])?;
+    let layout = ExecutionUnitLayout::new(&graph, [declaration.blocks.len(), 1, 1])?;
     let mut owned = Vec::new();
-    let member = |name: String, shape: Vec<usize>| {
-        ParameterMemberSpec::new(name, shape, MemberSharding::Replicated)
-    };
-    let mut add = |group: usize, index: usize, spec: ParameterGroupSpec| -> Result<(), TtsError> {
+    let mut add = |group: usize, index: usize, spec: ParameterGroupSpec| {
         owned.push(OwnedParameterGroupSpec::new(
             ParameterGroupOwner::execution_unit(
                 layout.group_id(group).expect("declared group").clone(),
@@ -339,105 +342,97 @@ pub fn mog_parameter_description(
             ),
             spec,
         ));
-        Ok(())
     };
-    let h = d.hidden as usize;
-    let i = d.intermediate as usize;
-    let m = d.mixtures as usize;
-    let l = d.latent as usize;
-    let r = d.rank as usize;
-    let root = "tts_model.tts_model.mog_head";
-    for index in 0..d.layers {
-        let path = format!("{root}.mlp_stack.{index}");
+    for (index, spec) in declaration.blocks.iter().enumerate() {
+        let mut gains = spec.pre.logical_parameters()?;
+        gains.extend(spec.post.logical_parameters()?);
         add(
             0,
             index,
-            ParameterGroupSpec::new(
-                format!("{path}.norms"),
+            eredu_runtime::logical_parameter_group(
+                format!("{}.norms", spec.root),
                 ParameterRole::Replicated,
-                [
-                    member(format!("{path}.pre_norm.weight"), vec![h]),
-                    member(format!("{path}.post_norm.weight"), vec![h]),
-                ],
+                None,
+                &gains,
+                |_| MemberSharding::Replicated,
             )?,
-        )?;
+        );
         add(
             0,
             index,
-            ParameterGroupSpec::partitioned(
-                format!("{path}.mlp"),
+            eredu_runtime::logical_parameter_group(
+                format!("{}.mlp", spec.root),
                 ParameterRole::FeedForwardIntermediate,
-                i,
-                [
-                    ParameterMemberSpec::new(
-                        format!("{path}.mlp.gate_proj.weight"),
-                        vec![i, h],
-                        MemberSharding::Partitioned { axis: 0 },
-                    ),
-                    ParameterMemberSpec::new(
-                        format!("{path}.mlp.up_proj.weight"),
-                        vec![i, h],
-                        MemberSharding::Partitioned { axis: 0 },
-                    ),
-                    ParameterMemberSpec::new(
-                        format!("{path}.mlp.down_proj.weight"),
-                        vec![h, i],
-                        MemberSharding::Partitioned { axis: 1 },
-                    ),
-                ],
+                Some(spec.product.gate.output as usize),
+                &spec.product,
+                |parameter| {
+                    if parameter.parameter.id == spec.product.down.weight.id {
+                        MemberSharding::Partitioned { axis: 1 }
+                    } else if spec
+                        .product
+                        .down
+                        .bias
+                        .as_ref()
+                        .is_some_and(|bias| bias.id == parameter.parameter.id)
+                    {
+                        MemberSharding::Replicated
+                    } else {
+                        MemberSharding::Partitioned { axis: 0 }
+                    }
+                },
             )?,
-        )?;
+        );
     }
     add(
         1,
         0,
-        ParameterGroupSpec::new(
+        eredu_runtime::logical_parameter_group(
             PREDICTION,
             ParameterRole::Replicated,
-            [
-                member(format!("{root}.mlp_stack.{}.weight", d.layers), vec![h]),
-                member(format!("{root}.proj_logits.weight"), vec![m, h]),
-            ],
+            None,
+            &declaration.prediction,
+            |_| MemberSharding::Replicated,
         )?,
-    )?;
+    );
+    let bank = &declaration.components;
+    let mut replicated = bank.residual.logical_parameters()?;
+    replicated.extend(bank.logs.logical_parameters()?);
     add(
         2,
         0,
-        ParameterGroupSpec::new(
+        eredu_runtime::logical_parameter_group(
             COMPONENTS,
             ParameterRole::Replicated,
-            [
-                member(format!("{root}.proj_else.weight"), vec![l, h]),
-                member(format!("{root}.proj_logs.weight"), vec![1, h]),
-            ],
+            None,
+            &replicated,
+            |_| MemberSharding::Replicated,
         )?,
-    )?;
+    );
+    let rank = bank.low.rank as usize;
+    let mut factors = bank.means.logical_parameters()?;
+    factors.extend(bank.low.logical_parameters()?);
     add(
         2,
         0,
-        ParameterGroupSpec::partitioned(
+        eredu_runtime::logical_parameter_group(
             format!("{COMPONENTS}.low_rank"),
             ParameterRole::FeedForwardIntermediate,
-            r,
-            [
-                ParameterMemberSpec::new(
-                    format!("{root}.proj_mus.weight"),
-                    vec![m * r, h],
+            Some(rank),
+            &factors,
+            |parameter| {
+                if parameter.parameter.id == bank.low.weight.id {
+                    MemberSharding::Partitioned { axis: 2 }
+                } else {
                     MemberSharding::PartitionedSegments {
                         axis: 0,
-                        segments: (0..m)
-                            .map(|mixture| mixture * r..(mixture + 1) * r)
+                        segments: (0..bank.low.mixtures as usize)
+                            .map(|mixture| mixture * rank..(mixture + 1) * rank)
                             .collect(),
-                    },
-                ),
-                ParameterMemberSpec::new(
-                    format!("{root}.low_mat"),
-                    vec![m, l, r],
-                    MemberSharding::Partitioned { axis: 2 },
-                ),
-            ],
+                    }
+                }
+            },
         )?,
-    )?;
+    );
     Ok(ArchitectureParameterDescription::from_owned(
         &graph, &layout, owned,
     )?)
@@ -497,13 +492,23 @@ impl<B: NeuralBackend> ComponentKernel<B> for MogKernel<B> {
             });
         Ok(match group {
             0 => MogUnit::Block(
-                MogBlock::new_local(self.dimensions, local.intermediate, index, context)?
-                    .with_precision(self.precision)?,
+                MogBlock::new(
+                    self.declaration
+                        .blocks
+                        .get(index)
+                        .ok_or(TtsError::Configuration("MoG block outside declared stack"))?
+                        .clone()
+                        .local(local.intermediate)?,
+                    context,
+                )?
+                .with_precision(self.precision)?,
             ),
-            1 => MogUnit::Prediction(MogPredictionHead::new(self.dimensions, context)?),
-            _ => MogUnit::Components(MogComponentBank::new_local(
-                self.dimensions,
-                local.rank,
+            1 => MogUnit::Prediction(MogPredictionHead::new(
+                self.declaration.prediction.clone(),
+                context,
+            )?),
+            _ => MogUnit::Components(MogComponentBank::new(
+                self.declaration.components.clone().local(local.rank)?,
                 context,
             )?),
         })
@@ -620,10 +625,10 @@ impl<B: DistributedNeuralBackend> MogKernel<B> {
         let (_, selected) = self.parallel.as_ref().ok_or(TtsError::Configuration(
             "parallel MoG execution requires rank-local construction",
         ))?;
-        let description = mog_parameter_description(self.dimensions)?;
+        let description = self.definition.parameters();
         eredu_runtime::validate_tensor_parallel_layout(
             "voicechat.tts.mog",
-            &description,
+            description,
             selected,
             B::parallel_size(parallel),
             B::parallel_rank(parallel),

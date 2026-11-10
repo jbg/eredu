@@ -29,7 +29,7 @@ pub fn family_from_gguf_metadata(
     projector: Option<&HashMap<String, MetadataValue>>,
 ) -> Result<FamilyConfig, FamilyConfigError> {
     let Some(projector) = projector else {
-        let family = FamilyConfig {
+        let family = super::family::FamilyPolicy {
             model_type: text.model_type.clone(),
             text,
             vision: None,
@@ -38,15 +38,14 @@ pub fn family_from_gguf_metadata(
             audio: None,
             audio_token_id: None,
         };
-        family.validate()?;
-        return Ok(family);
+        return FamilyConfig::new(family);
     };
     validate_projector_identity(projector)?;
     let has_vision = optional_bool(projector, "clip.has_vision_encoder")?.unwrap_or(false);
     let has_audio = optional_bool(projector, "clip.has_audio_encoder")?.unwrap_or(false);
     let vision = has_vision.then(|| vision_config(projector)).transpose()?;
     let audio = has_audio.then(|| audio_config(projector)).transpose()?;
-    let family = FamilyConfig {
+    let family = super::family::FamilyPolicy {
         model_type: text.model_type.clone(),
         image_token_id: optional_i32(model, "gemma4.image_token_id")?,
         video_token_id: optional_i32(model, "gemma4.video_token_id")?,
@@ -55,8 +54,7 @@ pub fn family_from_gguf_metadata(
         vision,
         audio,
     };
-    family.validate()?;
-    Ok(family)
+    FamilyConfig::new(family)
 }
 
 /// Validates the closed sibling-projector architecture and component flags.
@@ -97,7 +95,7 @@ fn vision_config(
 ) -> Result<VisionConfig, FamilyConfigError> {
     let hidden = required_i32(metadata, "clip.vision.embedding_length")?;
     let heads = required_i32(metadata, "clip.vision.attention.head_count")?;
-    let config = VisionConfig {
+    let config = super::vision::VisionPolicy {
         hidden_size: hidden,
         intermediate_size: required_i32(metadata, "clip.vision.feed_forward_length")?,
         num_hidden_layers: required_i32(metadata, "clip.vision.block_count")?,
@@ -129,8 +127,10 @@ fn vision_config(
         quantized_weights: None,
         quantized_weight_configs: None,
     };
-    config.validate()?;
-    Ok(config)
+    Ok(VisionConfig::new(
+        config,
+        super::vision::VisionOwner::Gemma4,
+    )?)
 }
 
 fn audio_config(
@@ -143,7 +143,7 @@ fn audio_config(
                 .map_err(|_| invalid("Gemma 4 audio subsampling channel exceeds the i32 range"))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let config = AudioConfig {
+    let config = super::audio::AudioPolicy {
         hidden_size: required_i32(metadata, "clip.audio.embedding_length")?,
         num_hidden_layers: required_i32(metadata, "clip.audio.block_count")?,
         num_attention_heads: required_i32(metadata, "clip.audio.attention.head_count")?,
@@ -165,8 +165,7 @@ fn audio_config(
         quantized_weights: None,
         quantized_weight_configs: None,
     };
-    config.validate()?;
-    Ok(config)
+    Ok(AudioConfig::new(config)?)
 }
 
 fn invalid(message: impl Into<String>) -> FamilyConfigError {

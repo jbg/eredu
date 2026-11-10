@@ -1,8 +1,8 @@
 //! Rank-local target geometry and exact physical parameter selections.
 use super::*;
 use eredu_checkpoint::store::TensorSelection;
-use eredu_nn::{GatedProductGroupLayout, GroupedProjectionSpec};
-use eredu_runtime::{MemberSharding, ParameterGroupSpec, ParameterMemberSpec, ParameterRole};
+use eredu_nn::{GatedProductGroupLayout, GroupedProjectionSpec, LogicalParameterDeclaration};
+use eredu_runtime::{MemberSharding, ParameterRole};
 use std::ops::Range;
 
 #[path = "parallel_layout.rs"]
@@ -81,15 +81,18 @@ impl Selections {
     }
     fn projection(
         &mut self,
-        weight: &ParameterSpec,
+        declaration: &LogicalParameterDeclaration<'_>,
         bias: Option<&ParameterSpec>,
-        format: &LinearFormatSpec,
-        shape: Vec<usize>,
         axis: usize,
         segments: Vec<Range<usize>>,
         rank: usize,
         ranks: usize,
     ) -> Result<(), Error> {
+        let weight = declaration.parameter;
+        let shape = &declaration.shape;
+        let format = declaration
+            .linear_format
+            .ok_or_else(|| invalid(format!("projection {} has no declared encoding", weight.id)))?;
         let row_axis = shape.len() - 2;
         if let eredu_checkpoint::LinearFormat::GgufIQuant { ggml_type, .. } = format.encoding() {
             if axis == shape.len() - 1 {
@@ -106,24 +109,18 @@ impl Selections {
                 }
             }
         }
-        let group = ParameterGroupSpec::new(
+        // Retained declarations supply geometry, sharing and exact encoding companions.
+        // Family semantics still decide the independently split source segments.
+        let group = eredu_runtime::logical_parameter_group(
             weight.id.as_str(),
             ParameterRole::Segmented,
-            [ParameterMemberSpec::new(
-                weight.id.as_str(),
-                shape,
-                MemberSharding::Segmented {
-                    axis,
-                    segments: segments.clone(),
-                },
-            )],
+            None,
+            &vec![declaration.clone()],
+            |_| MemberSharding::Segmented {
+                axis,
+                segments: segments.clone(),
+            },
         )
-        .map_err(invalid)?;
-        // Reuse the shared encoding rules for FP8 scale blocks, affine packing,
-        // GGUF blocks and exact companion identities. Unaligned shards fail here.
-        let group = eredu_runtime::expand_linear_format_parameter_group(group, |_| {
-            Ok(Some(format.clone()))
-        })
         .map_err(invalid)?;
         for member in group.members() {
             let MemberSharding::Segmented { axis, segments } = member.sharding() else {
@@ -146,38 +143,30 @@ impl Selections {
         rank: usize,
         ranks: usize,
     ) -> Result<(), Error> {
-        self.projection(
-            &spec.weight,
-            spec.bias.as_ref(),
-            &spec.format,
-            vec![spec.output as usize, spec.input as usize],
-            axis,
-            segments,
-            rank,
-            ranks,
-        )
+        let parameters = spec.logical_parameters()?;
+        let declaration = parameters
+            .iter()
+            .find(|parameter| parameter.parameter.id == spec.weight.id)
+            .ok_or_else(|| invalid(format!("undeclared projection {}", spec.weight.id)))?;
+        self.projection(declaration, spec.bias.as_ref(), axis, segments, rank, ranks)
     }
     fn grouped(
         &mut self,
         spec: &GroupedProjectionSpec,
-        shape: Vec<usize>,
+        parameters: &BTreeMap<&str, &LogicalParameterDeclaration<'_>>,
         axis: usize,
         segments: Vec<Range<usize>>,
         rank: usize,
         ranks: usize,
     ) -> Result<(), Error> {
-        self.projection(
-            spec.weight(),
-            spec.bias(),
-            spec.format(),
-            shape,
-            axis,
-            segments,
-            rank,
-            ranks,
-        )
+        let declaration = parameters
+            .get(spec.weight().id.as_str())
+            .copied()
+            .ok_or_else(|| invalid(format!("undeclared expert projection {}", spec.weight().id)))?;
+        self.projection(declaration, spec.bias(), axis, segments, rank, ranks)
     }
 }
+
 impl Selections {
     #[allow(clippy::single_range_in_vec_init)]
     pub(crate) fn partition_sublayers(
@@ -196,9 +185,7 @@ impl Selections {
         match mixer {
             MixerSpec::Recurrent(s) => {
                 let r = &mut s.mixer;
-                let key = (r.key_heads * r.key_head_dim) as usize;
-                let value = (r.value_heads * r.value_head_dim) as usize;
-                let segments = vec![0..key, key..2 * key, 2 * key..2 * key + value];
+                let segments = r.geometry.qkv_ranges()?.to_vec();
                 self.linear(&r.input_qkv, 0, segments.clone(), rank, ranks)?;
                 self.raw(r.convolution.weight.id.as_str(), 0, &segments, rank, ranks)?;
                 if let Some(bias) = &r.convolution.bias {
@@ -218,13 +205,17 @@ impl Selections {
                     self.raw(
                         parameter.id.as_str(),
                         0,
-                        &[0..r.value_heads as usize],
+                        &[0..r.geometry.value_heads() as usize],
                         rank,
                         ranks,
                     )?;
                 }
-                r.key_heads = divide(r.key_heads, ranks)?;
-                r.value_heads = divide(r.value_heads, ranks)?;
+                r.geometry = eredu_nn::GatedDeltaHeadGeometry::new(
+                    divide(r.geometry.key_heads(), ranks)?,
+                    divide(r.geometry.value_heads(), ranks)?,
+                    r.geometry.key_dimensions(),
+                    r.geometry.value_dimensions(),
+                )?;
                 r.input_qkv.output = divide(r.input_qkv.output, ranks)?;
                 r.input_gate.output = divide(r.input_gate.output, ranks)?;
                 r.input_beta.output = divide(r.input_beta.output, ranks)?;
@@ -234,7 +225,7 @@ impl Selections {
                 s.validate()?;
             }
             MixerSpec::Indexed(s) => {
-                let kv = s.kv_heads as usize;
+                let kv = s.parameters.projection.geometry.key_value_heads() as usize;
                 let (kv_rank, kv_ranks) = if kv >= ranks {
                     if !kv.is_multiple_of(ranks) {
                         return Err(invalid("K/V heads do not divide tensor ranks"));
@@ -247,41 +238,52 @@ impl Selections {
                     (rank / (ranks / kv), kv)
                 };
                 self.linear(
-                    &s.projections[0],
+                    &s.parameters.projection.query,
                     0,
-                    vec![0..s.projections[0].output as usize],
+                    vec![0..s.parameters.projection.query.output as usize],
                     rank,
                     ranks,
                 )?;
-                for p in &s.projections[1..3] {
+                for p in [&s.parameters.projection.key, &s.parameters.projection.value] {
                     self.linear(p, 0, vec![0..p.output as usize], kv_rank, kv_ranks)?;
                 }
                 self.linear(
-                    &s.projections[3],
+                    &s.parameters.projection.output,
                     1,
-                    vec![0..s.projections[3].input as usize],
+                    vec![0..s.parameters.projection.output.input as usize],
                     rank,
                     ranks,
                 )?;
-                s.heads = divide(s.heads, ranks)?;
-                s.kv_heads = divide(s.kv_heads, kv_ranks)?;
-                s.projections[0].output = divide(s.projections[0].output, ranks)?;
-                s.projections[1].output = divide(s.projections[1].output, kv_ranks)?;
-                s.projections[2].output = divide(s.projections[2].output, kv_ranks)?;
-                s.projections[3].input = divide(s.projections[3].input, ranks)?;
+                let geometry = s.parameters.projection.geometry;
+                s.parameters.projection.geometry = eredu_nn::AttentionHeadGeometry::new(
+                    divide(geometry.query_heads(), ranks)?,
+                    divide(geometry.key_value_heads(), kv_ranks)?,
+                    geometry.key_dimensions(),
+                    geometry.value_dimensions(),
+                )?;
+                s.parameters.projection.query.output =
+                    divide(s.parameters.projection.query.output, ranks)?;
+                s.parameters.projection.key.output =
+                    divide(s.parameters.projection.key.output, kv_ranks)?;
+                s.parameters.projection.value.output =
+                    divide(s.parameters.projection.value.output, kv_ranks)?;
+                s.parameters.projection.output.input =
+                    divide(s.parameters.projection.output.input, ranks)?;
                 s.validate().map_err(Error::backend_source)?;
             }
         }
         let ff = &mut feed_forward.feed_forward;
-        let groups = ff.experts.group_count() as usize;
-        let intermediate = ff.experts.intermediate_dimensions() as usize;
-        let input = ff.experts.input_dimensions() as usize;
-        let output = ff.experts.output_dimensions() as usize;
-        match ff.experts.layout() {
+        let expert_parameters = ff.parameters.routed.experts.logical_parameters()?;
+        let expert_declarations = expert_parameters
+            .iter()
+            .map(|parameter| (parameter.parameter.id.as_str(), parameter))
+            .collect::<BTreeMap<_, _>>();
+        let intermediate = ff.parameters.routed.experts.intermediate_dimensions() as usize;
+        match ff.parameters.routed.experts.layout() {
             GatedProductGroupLayout::Packed { gate_up, down } => {
                 self.grouped(
                     gate_up,
-                    vec![groups, 2 * intermediate, input],
+                    &expert_declarations,
                     1,
                     vec![0..intermediate, intermediate..2 * intermediate],
                     rank,
@@ -289,7 +291,7 @@ impl Selections {
                 )?;
                 self.grouped(
                     down,
-                    vec![groups, output, intermediate],
+                    &expert_declarations,
                     2,
                     vec![0..intermediate],
                     rank,
@@ -301,7 +303,7 @@ impl Selections {
                     for projection in [expert.gate(), expert.up()] {
                         self.grouped(
                             projection,
-                            vec![intermediate, input],
+                            &expert_declarations,
                             0,
                             vec![0..intermediate],
                             rank,
@@ -310,7 +312,7 @@ impl Selections {
                     }
                     self.grouped(
                         expert.down(),
-                        vec![output, intermediate],
+                        &expert_declarations,
                         1,
                         vec![0..intermediate],
                         rank,
@@ -320,23 +322,26 @@ impl Selections {
             }
             _ => return Err(invalid("unsupported expert layout")),
         }
-        ff.experts = ff.experts.clone().with_group_geometry(
-            ff.experts.group_count(),
-            divide(ff.experts.intermediate_dimensions(), ranks)?,
+        ff.parameters.routed.experts = ff.parameters.routed.experts.clone().with_group_geometry(
+            ff.parameters.routed.experts.group_count(),
+            divide(
+                ff.parameters.routed.experts.intermediate_dimensions(),
+                ranks,
+            )?,
         )?;
-        for p in &ff.shared[..2] {
+        for p in [&ff.parameters.shared.gate, &ff.parameters.shared.up] {
             self.linear(p, 0, vec![0..p.output as usize], rank, ranks)?;
         }
         self.linear(
-            &ff.shared[2],
+            &ff.parameters.shared.down,
             1,
-            vec![0..ff.shared[2].input as usize],
+            vec![0..ff.parameters.shared.down.input as usize],
             rank,
             ranks,
         )?;
-        ff.shared[0].output = divide(ff.shared[0].output, ranks)?;
-        ff.shared[1].output = divide(ff.shared[1].output, ranks)?;
-        ff.shared[2].input = divide(ff.shared[2].input, ranks)?;
+        ff.parameters.shared.gate.output = divide(ff.parameters.shared.gate.output, ranks)?;
+        ff.parameters.shared.up.output = divide(ff.parameters.shared.up.output, ranks)?;
+        ff.parameters.shared.down.input = divide(ff.parameters.shared.down.input, ranks)?;
         feed_forward.validate()?;
         Ok(())
     }
@@ -461,7 +466,10 @@ impl TargetSpec {
                 let UnitSpec::Decoder { feed_forward, .. } = unit else {
                     return None;
                 };
-                Some((ordinal, &feed_forward.feed_forward.experts))
+                Some((
+                    ordinal,
+                    &feed_forward.feed_forward.parameters.routed.experts,
+                ))
             })
             .map(|(ordinal, spec)| {
                 if spec.group_count() != self.config.experts.count {
@@ -506,7 +514,7 @@ impl TargetSpec {
             let UnitSpec::Decoder { feed_forward, .. } = unit else {
                 continue;
             };
-            let experts = &feed_forward.feed_forward.experts;
+            let experts = &feed_forward.feed_forward.parameters.routed.experts;
             if experts.group_count() as usize != global {
                 return Err(invalid("expert realization is already bound"));
             }
@@ -519,7 +527,7 @@ impl TargetSpec {
                     "expert realization differs from selected target parameters or equation",
                 ));
             }
-            feed_forward.feed_forward.experts = selected.clone();
+            feed_forward.feed_forward.parameters.routed.experts = selected.clone();
             feed_forward.validate()?;
             count += 1;
         }

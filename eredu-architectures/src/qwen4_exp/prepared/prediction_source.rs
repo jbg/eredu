@@ -13,8 +13,9 @@ use eredu_runtime::ReplicatedTextPhysicalSource;
 #[derive(Debug, Clone)]
 pub struct SafetensorsPredictionPlan {
     config: Config,
-    formats: ParameterFormats,
-    banks: BTreeMap<String, Arc<ParameterBankRecipes>>,
+    pub(super) parameters: Arc<crate::qwen4_exp::mtp::declarations::PredictionParameters>,
+    pub(super) formats: ParameterFormats,
+    pub(super) banks: BTreeMap<String, Arc<ParameterBankRecipes>>,
     shared_recipes: BTreeMap<String, DerivedWeightRecipe>,
     unit_recipes: Vec<BTreeMap<String, DerivedWeightRecipe>>,
     catalog: HeaderCatalog,
@@ -25,12 +26,28 @@ impl SafetensorsPredictionPlan {
     /// Resolves prediction aliases and companions without reading any payload.
     pub fn prepare<C: SafetensorsCatalog + ?Sized>(
         catalog: &C,
-        config: Config,
+        declaration: Arc<crate::qwen4_exp::Declaration>,
         encoding: SafetensorsEncoding,
         physical: BTreeMap<String, ReplicatedTextPhysicalSource>,
     ) -> Result<Self, PreparationError> {
-        let mut plan = Self::prepare_metadata(catalog, config, encoding)?;
-        plan.physical = plan
+        let parameters = declaration
+            .prediction_parameters
+            .clone()
+            .ok_or(PreparationError::MissingPrediction)?;
+        Self::prepare_from_parameters(
+            catalog,
+            declaration.configuration().clone(),
+            encoding,
+            parameters,
+        )?
+        .with_physical(physical)
+    }
+
+    pub(super) fn with_physical(
+        mut self,
+        physical: BTreeMap<String, ReplicatedTextPhysicalSource>,
+    ) -> Result<Self, PreparationError> {
+        self.physical = self
             .resolution
             .source_keys()
             .iter()
@@ -40,7 +57,7 @@ impl SafetensorsPredictionPlan {
                         "missing prediction physical declaration {key}"
                     ))
                 })?;
-                let header = &plan.catalog.0[key];
+                let header = &self.catalog.0[key];
                 if entry.catalog_key() != key
                     || entry.source_encoding()
                         != &eredu_checkpoint::SourceTensorEncoding::Safetensors(
@@ -55,7 +72,7 @@ impl SafetensorsPredictionPlan {
                 Ok((key.clone(), entry.clone()))
             })
             .collect::<Result<_, PreparationError>>()?;
-        Ok(plan)
+        Ok(self)
     }
 
     // Already retained in-memory or generated sources need exact tensor metadata,
@@ -64,6 +81,17 @@ impl SafetensorsPredictionPlan {
         catalog: &C,
         config: Config,
         encoding: SafetensorsEncoding,
+    ) -> Result<Self, PreparationError> {
+        let parameters = checkpoint::schema::prediction_parameters(&config)
+            .map_err(PreparationError::Contract)?;
+        Self::prepare_from_parameters(catalog, config, encoding, Arc::new(parameters))
+    }
+
+    pub(super) fn prepare_from_parameters<C: SafetensorsCatalog + ?Sized>(
+        catalog: &C,
+        config: Config,
+        encoding: SafetensorsEncoding,
+        parameters: Arc<crate::qwen4_exp::mtp::declarations::PredictionParameters>,
     ) -> Result<Self, PreparationError> {
         if config.prediction.is_none() {
             return Err(PreparationError::MissingPrediction);
@@ -82,33 +110,22 @@ impl SafetensorsPredictionPlan {
             }
         }
         let catalog = HeaderCatalog(headers);
-        let checkpoint = checkpoint::schema::prediction_safetensors_plan(&config, &encoding)
+        let checkpoint = checkpoint::schema::prediction_safetensors_plan(&parameters, &encoding)
             .map_err(PreparationError::Contract)?;
         let resolution = resolve_safetensors_plan(&catalog, &checkpoint)
             .map_err(|error| PreparationError::Contract(format!("{error:?}")))?;
         let keys = resolution.source_keys().iter().cloned().collect::<Vec<_>>();
-        let depth = config
-            .prediction
-            .as_ref()
-            .expect("prediction admission")
-            .layers
-            .len();
-        let roots = (0..depth).map(|d| format!("mtp.layers.{d}.mlp.experts"));
-        let (formats, recipes) =
-            safetensors_format_recipes(&catalog, &keys, &config, &encoding, roots)?;
-        let banks = recipes
-            .into_iter()
-            .map(|(root, recipes)| {
-                Ok((
-                    root,
-                    Arc::new(ParameterBankRecipes::new(
-                        &catalog,
-                        recipes,
-                        config.experts.count as usize,
-                    )?),
-                ))
-            })
-            .collect::<Result<_, PreparationError>>()?;
+        let depth = parameters.units.len();
+        let (formats, banks) = safetensors_formats_and_banks(
+            &catalog,
+            &keys,
+            &encoding,
+            parameters
+                .units
+                .iter()
+                .filter_map(|unit| unit.expert_bank()),
+        )?;
+        let parameters = Arc::new(prediction_parameters_from_formats(&parameters, &formats)?);
         let mut shared_recipes =
             recipes::parameter_recipes(keys.clone(), &config, ParameterScope::Static)
                 .map_err(PreparationError::Contract)?;
@@ -120,6 +137,7 @@ impl SafetensorsPredictionPlan {
             })
             .collect::<Result<_, _>>()?;
         Ok(Self {
+            parameters,
             config,
             formats,
             banks,
@@ -173,27 +191,20 @@ impl SafetensorsPredictionPlan {
         ),
         PreparationError,
     > {
-        let formats = &self.formats;
         let bank = eredu_runtime::RoutedBankId::new(
             u32::try_from(self.config.ngram.layers.len() + 1).map_err(|_| {
                 PreparationError::Contract("prediction bank identity exceeds u32".into())
             })?,
         );
-        let spec = PredictionSpec::from_prepared(
+        let spec = PredictionSpec::from_parameters(
             &self.config,
             limits,
             bank,
-            |depth| {
-                expert_spec(
-                    &self.config,
-                    formats,
-                    &format!("mtp.layers.{depth}.mlp.experts"),
-                )
-            },
-            |name| formats.ordinary(name),
+            self.parameters.as_ref().clone(),
         )?;
         Ok((spec, self.formats.clone(), self.banks.clone()))
     }
+
     /// Pins the exact admitted prediction headers and provenance. Target payloads
     /// of a complete companion checkpoint are excluded from the retained source.
     pub fn bind(
@@ -240,6 +251,7 @@ impl SafetensorsPredictionPlan {
             }
         }
         Ok(PreparedPredictionSource {
+            parameters: self.parameters,
             config: self.config,
             artifact,
             formats: self.formats,
@@ -262,6 +274,7 @@ impl RecipeCatalog for SafetensorsPredictionPlan {
 /// intended checkpoint revisions. Physical source provenance is retained unchanged.
 #[derive(Clone)]
 pub struct PreparedPredictionSource {
+    parameters: Arc<crate::qwen4_exp::mtp::declarations::PredictionParameters>,
     config: Config,
     artifact: SharedCheckpointSource,
     formats: ParameterFormats,
@@ -309,6 +322,7 @@ impl PreparedTarget {
         self.formats.1.extend(source.formats.1);
         self.expert_banks.extend(source.expert_banks);
         self.prediction_recipes = Some(source.recipes);
+        self.prediction_parameters = Some(source.parameters);
         self.spec.config.prediction = source.config.prediction;
         Ok(self)
     }
@@ -369,4 +383,14 @@ fn match_target(target: &Config, prediction: &Config) -> Result<(), PreparationE
         return Err(PreparationError::PredictionMismatch { field: "ngram" });
     }
     Ok(())
+}
+
+pub(super) fn prediction_parameters_from_formats(
+    source: &crate::qwen4_exp::mtp::declarations::PredictionParameters,
+    formats: &ParameterFormats,
+) -> Result<crate::qwen4_exp::mtp::declarations::PredictionParameters, Error> {
+    source.with_formats(
+        |weight, _| formats.ordinary(weight.id.as_str()),
+        |_, bank| super::execution::packed_bank_from_formats(bank, formats),
+    )
 }

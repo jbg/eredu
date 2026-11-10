@@ -32,24 +32,20 @@ pub enum ProposalLayout {
     AnchorThenMasks,
 }
 
+mod checkpoint;
 mod decoder_config;
+mod dflash_specs;
+pub use checkpoint::translate_dflash_gguf_weight_name;
 pub use decoder_config::{
     DFlashContextProjectionLayout, DFlashDecoderConfig, DFlashDecoderEquation, DFlashSublayerPolicy,
 };
 
 use std::collections::HashMap;
 
-use eredu_checkpoint::{
-    schema::{
-        matrix_for_linear_format, CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint,
-        GgufTypeConstraint, SafetensorsCheckpointPlan, SafetensorsTensorConstraint,
-        StoredDtypeConstraint, TensorOperation,
-    },
-    WeightQuantization,
-};
+use eredu_checkpoint::WeightQuantization;
 use eredu_gguf::{MetadataArray, MetadataValue};
 use eredu_nn::{
-    Error, Index, LinearOperator, LinearSpec, NeuralBackend, NormalizationOperator, ParameterSpec,
+    DeclareLogicalParameters, Error, Index, LinearOperator, NeuralBackend, NormalizationOperator,
     Parameterized, RotaryOperator, RotaryPosition, RotarySpec, Tensor,
 };
 use serde::Deserialize;
@@ -121,7 +117,7 @@ impl DFlashCompatibility {
 }
 
 /// Canonical DFlash checkpoint geometry.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DFlashConfig {
     /// Assistant artifact identity.
     pub model_type: String,
@@ -258,7 +254,7 @@ impl DFlashConfig {
             _ => {
                 return Err(DFlashConfigError::Invalid(
                     "DFlash GGUF requires Int32 dflash.target_layers".into(),
-                ))
+                ));
             }
         };
         let target_layer_ids = target_layers
@@ -318,35 +314,16 @@ impl DFlashConfig {
                 "assistant does not match released Muse-Glimmer DFlash geometry".into(),
             ));
         }
+        for format in self
+            .quantization
+            .iter()
+            .chain(self.quantized_weights.values())
+        {
+            format
+                .validate()
+                .map_err(|e| DFlashConfigError::Invalid(e.to_string()))?;
+        }
         Ok(())
-    }
-
-    /// Derives the complete assistant configuration for load-time
-    /// quantization, replacing any checkpoint-specific formats.
-    pub fn load_time_quantization(
-        &self,
-        quantization: WeightQuantization,
-    ) -> Result<Self, DFlashConfigError> {
-        quantization
-            .validate()
-            .map_err(|error| DFlashConfigError::Invalid(error.to_string()))?;
-        let mut target = self.clone();
-        target.quantization = Some(quantization);
-        target.quantized_weights.clear();
-        target.validate_released()?;
-        Ok(target)
-    }
-
-    /// Applies canonical checkpoint formats to a complete DFlash
-    /// configuration.
-    pub fn with_checkpoint_formats(
-        &self,
-        formats: HashMap<String, WeightQuantization>,
-    ) -> Result<Self, DFlashConfigError> {
-        let mut target = self.clone();
-        target.quantized_weights = formats;
-        target.validate_released()?;
-        Ok(target)
     }
 
     /// Proves that the target exposes every state and token required by DFlash.
@@ -389,204 +366,6 @@ impl DFlashConfig {
             target_vocabulary,
         })
     }
-
-    fn linear_format_for(&self, name: &str) -> eredu_checkpoint::LinearFormat {
-        self.quantized_weights
-            .get(name)
-            .copied()
-            .or(self.quantization)
-            .map(Into::into)
-            .unwrap_or(eredu_checkpoint::LinearFormat::Dense)
-    }
-}
-
-/// Builds the strict released DFlash SafeTensors catalog.
-pub fn dflash_safetensors_plan(config: &DFlashConfig) -> Result<SafetensorsCheckpointPlan, String> {
-    fn add_matrix(
-        config: &DFlashConfig,
-        tensors: &mut Vec<SafetensorsTensorConstraint>,
-        name: String,
-        shape: Vec<usize>,
-    ) -> Result<(), String> {
-        let format = config.linear_format_for(&name);
-        tensors.extend(
-            matrix_for_linear_format(name, std::iter::empty::<String>(), shape, format, None)
-                .map_err(|error| error.to_string())?,
-        );
-        Ok(())
-    }
-
-    config
-        .validate_released()
-        .map_err(|error| error.to_string())?;
-    let dimension = |value: i32, name: &str| {
-        usize::try_from(value)
-            .ok()
-            .filter(|value| *value > 0)
-            .ok_or_else(|| format!("DFlash {name} must be positive"))
-    };
-    let hidden = dimension(config.hidden_size, "hidden size")?;
-    let intermediate = dimension(config.intermediate_size, "intermediate size")?;
-    let head = dimension(config.head_dim, "head width")?;
-    let query = dimension(config.num_attention_heads, "query heads")?
-        .checked_mul(head)
-        .ok_or_else(|| "DFlash query width overflows".to_string())?;
-    let key_value = dimension(config.num_key_value_heads, "KV heads")?
-        .checked_mul(head)
-        .ok_or_else(|| "DFlash KV width overflows".to_string())?;
-    let encoded = hidden
-        .checked_mul(config.target_layer_ids.len())
-        .ok_or_else(|| "DFlash encoder width overflows".to_string())?;
-    let vector = |name: String, shape: Vec<usize>| {
-        SafetensorsTensorConstraint::required(name, shape, StoredDtypeConstraint::Floating)
-    };
-    let mut tensors = vec![
-        vector("encoder.output_norm_enc.weight".into(), vec![hidden]),
-        vector("norm.weight".into(), vec![hidden]),
-    ];
-    add_matrix(
-        config,
-        &mut tensors,
-        "encoder.fc.weight".into(),
-        vec![hidden, encoded],
-    )?;
-    for layer in 0..config.num_hidden_layers as usize {
-        let root = format!("layers.{layer}");
-        tensors.extend([
-            vector(format!("{root}.input_layernorm.weight"), vec![hidden]),
-            vector(
-                format!("{root}.post_attention_layernorm.weight"),
-                vec![hidden],
-            ),
-            vector(format!("{root}.self_attn.q_norm.weight"), vec![head]),
-            vector(format!("{root}.self_attn.k_norm.weight"), vec![head]),
-        ]);
-        for (local, shape) in [
-            ("self_attn.q_proj.weight", vec![query, hidden]),
-            ("self_attn.k_proj.weight", vec![key_value, hidden]),
-            ("self_attn.v_proj.weight", vec![key_value, hidden]),
-            ("self_attn.o_proj.weight", vec![hidden, query]),
-            ("mlp.gate_proj.weight", vec![intermediate, hidden]),
-            ("mlp.up_proj.weight", vec![intermediate, hidden]),
-            ("mlp.down_proj.weight", vec![hidden, intermediate]),
-        ] {
-            add_matrix(config, &mut tensors, format!("{root}.{local}"), shape)?;
-        }
-    }
-    SafetensorsCheckpointPlan::new(
-        "Muse-Glimmer DFlash SafeTensors",
-        tensors,
-        Vec::new(),
-        CatalogPolicy::strict(),
-    )
-    .map_err(|error| error.to_string())
-}
-
-/// Builds the strict released DFlash GGUF tensor catalog.
-pub fn dflash_gguf_plan(config: &DFlashConfig) -> Result<GgufCheckpointPlan, String> {
-    config
-        .validate_released()
-        .map_err(|error| error.to_string())?;
-    let dimension = |value: i32, name: &str| {
-        usize::try_from(value)
-            .ok()
-            .filter(|value| *value > 0)
-            .ok_or_else(|| format!("DFlash {name} must be positive"))
-    };
-    let hidden = dimension(config.hidden_size, "hidden size")?;
-    let intermediate = dimension(config.intermediate_size, "intermediate size")?;
-    let head = dimension(config.head_dim, "head width")?;
-    let query = dimension(config.num_attention_heads, "query heads")?
-        .checked_mul(head)
-        .ok_or_else(|| "DFlash query width overflows".to_string())?;
-    let key_value = dimension(config.num_key_value_heads, "KV heads")?
-        .checked_mul(head)
-        .ok_or_else(|| "DFlash KV width overflows".to_string())?;
-    let matrix = |name: String, shape: Vec<usize>| {
-        GgufTensorConstraint::required(
-            name,
-            shape,
-            GgufTypeConstraint::OperationClass(TensorOperation::Matrix),
-        )
-    };
-    let vector = |name: String, shape: Vec<usize>| {
-        GgufTensorConstraint::required(
-            name,
-            shape,
-            GgufTypeConstraint::OperationClass(TensorOperation::Vector),
-        )
-    };
-    let encoded = hidden
-        .checked_mul(config.target_layer_ids.len())
-        .ok_or_else(|| "DFlash encoder width overflows".to_string())?;
-    let mut tensors = vec![
-        matrix("fc.weight".into(), vec![hidden, encoded]),
-        vector("enc.output_norm.weight".into(), vec![hidden]),
-        vector("output_norm.weight".into(), vec![hidden]),
-    ];
-    for layer in 0..config.num_hidden_layers as usize {
-        let root = format!("blk.{layer}");
-        tensors.extend([
-            vector(format!("{root}.attn_norm.weight"), vec![hidden]),
-            vector(format!("{root}.ffn_norm.weight"), vec![hidden]),
-            vector(format!("{root}.attn_q_norm.weight"), vec![head]),
-            vector(format!("{root}.attn_k_norm.weight"), vec![head]),
-            matrix(format!("{root}.attn_q.weight"), vec![query, hidden]),
-            matrix(format!("{root}.attn_k.weight"), vec![key_value, hidden]),
-            matrix(format!("{root}.attn_v.weight"), vec![key_value, hidden]),
-            matrix(format!("{root}.attn_output.weight"), vec![hidden, query]),
-            matrix(
-                format!("{root}.ffn_gate.weight"),
-                vec![intermediate, hidden],
-            ),
-            matrix(format!("{root}.ffn_up.weight"), vec![intermediate, hidden]),
-            matrix(
-                format!("{root}.ffn_down.weight"),
-                vec![hidden, intermediate],
-            ),
-        ]);
-    }
-    GgufCheckpointPlan::new(
-        "Muse-Glimmer DFlash GGUF",
-        tensors,
-        Vec::new(),
-        CatalogPolicy::strict(),
-    )
-    .map_err(|error| error.to_string())
-}
-
-/// Translates one released DFlash GGUF tensor to neutral parameter identity.
-pub fn translate_dflash_gguf_weight_name(name: &str) -> String {
-    match name {
-        "fc.weight" => return "encoder.fc.weight".into(),
-        "enc.output_norm.weight" => return "encoder.output_norm_enc.weight".into(),
-        "output_norm.weight" => return "norm.weight".into(),
-        _ => {}
-    }
-    let Some(rest) = name.strip_prefix("blk.") else {
-        return name.into();
-    };
-    let Some((layer, parameter)) = rest.split_once('.') else {
-        return name.into();
-    };
-    for (source, target) in [
-        ("attn_norm", "input_layernorm"),
-        ("ffn_norm", "post_attention_layernorm"),
-        ("attn_q_norm", "self_attn.q_norm"),
-        ("attn_k_norm", "self_attn.k_norm"),
-        ("attn_q", "self_attn.q_proj"),
-        ("attn_k", "self_attn.k_proj"),
-        ("attn_v", "self_attn.v_proj"),
-        ("attn_output", "self_attn.o_proj"),
-        ("ffn_gate", "mlp.gate_proj"),
-        ("ffn_up", "mlp.up_proj"),
-        ("ffn_down", "mlp.down_proj"),
-    ] {
-        if parameter == source || parameter.starts_with(&format!("{source}.")) {
-            return format!("layers.{layer}.{}", parameter.replacen(source, target, 1));
-        }
-    }
-    name.into()
 }
 
 /// Per-layer K/V projection of committed target context.
@@ -643,60 +422,19 @@ struct DFlashAttention<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DFlashAttention<B> {
     fn new(
         config: &DFlashDecoderConfig,
-        layer: usize,
+        spec: &dflash_specs::AttentionParameters,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let prefix = format!("layers.{layer}.self_attn");
-        let linear = |field: &str, input, output| {
-            let name = format!("{prefix}.{field}.weight");
-            B::linear(
-                LinearSpec {
-                    input,
-                    output,
-                    weight: ParameterSpec::trainable(&name).map_err(Error::backend)?,
-                    bias: None,
-                    format: crate::linear_format::standard_linear_format(
-                        &name,
-                        config.linear_format_for(&name),
-                    )?,
-                },
-                context,
-            )
-        };
-        let norm = |field: &str| {
-            B::normalization(
-                config.equation.normalization(
-                    config.head_dim,
-                    config.rms_norm_eps,
-                    ParameterSpec::trainable(format!("{prefix}.{field}.weight"))
-                        .map_err(Error::backend)?,
-                ),
-                context,
-            )
-        };
+        spec.logical_parameters()?;
+        let heads = spec.projection.geometry;
+        let [query, key, value, output] = spec.projection.projections();
         Ok(Self {
-            query: linear(
-                "q_proj",
-                config.hidden_size,
-                config.num_attention_heads * config.head_dim,
-            )?,
-            key: linear(
-                "k_proj",
-                config.hidden_size,
-                config.num_key_value_heads * config.head_dim,
-            )?,
-            value: linear(
-                "v_proj",
-                config.hidden_size,
-                config.num_key_value_heads * config.head_dim,
-            )?,
-            output: linear(
-                "o_proj",
-                config.num_attention_heads * config.head_dim,
-                config.hidden_size,
-            )?,
-            query_norm: norm("q_norm")?,
-            key_norm: norm("k_norm")?,
+            query: B::linear(query.clone(), context)?,
+            key: B::linear(key.clone(), context)?,
+            value: B::linear(value.clone(), context)?,
+            output: B::linear(output.clone(), context)?,
+            query_norm: B::normalization(spec.norms[0].clone(), context)?,
+            key_norm: B::normalization(spec.norms[1].clone(), context)?,
             rotary: B::rotary(
                 RotarySpec {
                     arithmetic: match config.equation {
@@ -705,17 +443,17 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DFlashAttention<B> {
                             eredu_nn::RotaryArithmetic::InputProducts
                         }
                     },
-                    dimensions: config.head_dim,
+                    dimensions: heads.key_dimensions(),
                     base: config.rope_theta,
                     traditional: false,
                     algorithm: eredu_nn::RotaryAlgorithm::Default,
                 },
                 context,
             )?,
-            query_heads: config.num_attention_heads,
-            key_value_heads: config.num_key_value_heads,
-            head_dim: config.head_dim,
-            scale: (config.head_dim as f32).sqrt().recip(),
+            query_heads: heads.query_heads(),
+            key_value_heads: heads.key_value_heads(),
+            head_dim: heads.key_dimensions(),
+            scale: (heads.key_dimensions() as f32).sqrt().recip(),
             arithmetic: match config.equation {
                 DFlashDecoderEquation::InputRounded => eredu_nn::AttentionArithmetic::Fused,
                 DFlashDecoderEquation::Float32ResidualNorm => {
@@ -819,6 +557,8 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DFlashAttention<B> {
 struct DFlashBlock<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     #[parameter(skip)]
     equation: DFlashDecoderEquation,
+    #[parameter(skip)]
+    mlp_policy: eredu_nn::GatedProductPolicy,
     input_norm: B::Normalization,
     attention: DFlashAttention<B>,
     post_attention_norm: B::Normalization,
@@ -832,64 +572,26 @@ struct DFlashBlock<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DFlashBlock<B> {
     fn new(
         config: &DFlashDecoderConfig,
-        layer: usize,
+        spec: &dflash_specs::BlockParameters,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let root = format!("layers.{layer}");
-        let norm = |field: &str| {
-            B::normalization(
-                config.equation.normalization(
-                    config.hidden_size,
-                    config.rms_norm_eps,
-                    ParameterSpec::trainable(format!("{root}.{field}.weight"))
-                        .map_err(Error::backend)?,
-                ),
-                context,
-            )
-        };
-        let linear = |field: &str, input, output| {
-            let name = format!("{root}.mlp.{field}.weight");
-            B::linear(
-                LinearSpec {
-                    input,
-                    output,
-                    weight: ParameterSpec::trainable(&name).map_err(Error::backend)?,
-                    bias: None,
-                    format: crate::linear_format::standard_linear_format(
-                        &name,
-                        config.linear_format_for(&name),
-                    )?,
-                },
-                context,
-            )
-        };
-        let convolution = |field: &str| match config.sublayer {
-            DFlashSublayerPolicy::Direct => Ok(None),
-            DFlashSublayerPolicy::BlockConvolution { taps, group_size } => {
-                block_convolution::BlockConvolution::new_with_format(
-                    block_convolution::BlockConvolutionGeometry {
-                        hidden: config.hidden_size,
-                        block_size: config.block_size as i32,
-                        taps,
-                        group_size,
-                    },
-                    format!("{root}.{field}"),
-                    config.linear_format_for(&format!("{root}.{field}.kernel_projection.weight")),
-                    context,
-                )
-                .map(Some)
-            }
+        spec.logical_parameters()?;
+        let convolution = |spec: &Option<block_convolution::BlockConvolutionSpec>| {
+            spec.as_ref()
+                .map(|spec| block_convolution::BlockConvolution::new(spec.clone(), context))
+                .transpose()
         };
         Ok(Self {
             equation: config.equation,
-            input_norm: norm("input_layernorm")?,
-            attention: DFlashAttention::new(config, layer, context)?,
-            post_attention_norm: norm("post_attention_layernorm")?,
-            gate: linear("gate_proj", config.hidden_size, config.intermediate_size)?,
-            up: linear("up_proj", config.hidden_size, config.intermediate_size)?,
-            down: linear("down_proj", config.intermediate_size, config.hidden_size)?,
-            attention_conv: convolution("attention_conv")?,
-            mlp_conv: convolution("mlp_conv")?,
+            mlp_policy: spec.mlp.policy,
+            input_norm: B::normalization(spec.input_norm.clone(), context)?,
+            attention: DFlashAttention::new(config, &spec.attention, context)?,
+            post_attention_norm: B::normalization(spec.post_attention_norm.clone(), context)?,
+            gate: B::linear(spec.mlp.gate.clone(), context)?,
+            up: B::linear(spec.mlp.up.clone(), context)?,
+            down: B::linear(spec.mlp.down.clone(), context)?,
+            attention_conv: convolution(&spec.convolutions[0])?,
+            mlp_conv: convolution(&spec.convolutions[1])?,
         })
     }
 
@@ -965,8 +667,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DFlashBlock<B> {
         };
         let gate = self.gate.forward(&normalized, context)?;
         let up = self.up.forward(&normalized, context)?;
-        let feed_forward =
-            B::gated_product(gate, up, eredu_nn::GatedProductPolicy::default(), context)?;
+        let feed_forward = B::gated_product(gate, up, self.mlp_policy, context)?;
         let feed_forward = self.down.forward(&feed_forward, context)?;
         let feed_forward = match (&self.mlp_conv, mlp_kernel) {
             (Some(conv), Some(kernel)) => conv.finish(&feed_forward, kernel, context)?,
@@ -1010,7 +711,10 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DFlash<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         config.validate_released().map_err(Error::backend)?;
-        Self::from_decoder_config(config.into(), context)
+        let definition = body::DFlashBodyDefinition::new(config.clone().into())?;
+        checkpoint::validate_formats(&definition, &config.quantized_weights)
+            .map_err(Error::backend)?;
+        Self::from_definition(definition, context)
     }
     /// Constructs the shared body from normalized architecture equations.
     pub fn from_decoder_config(
@@ -1018,6 +722,12 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DFlash<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         let definition = body::DFlashBodyDefinition::new(config)?;
+        Self::from_definition(definition, context)
+    }
+    fn from_definition(
+        definition: body::DFlashBodyDefinition,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
         let units = body::AssistantBodyDefinition::<B>::build_units(&definition, context)?;
         Ok(Self {
             units: eredu_runtime::ResidentUnitWindow::new(units),

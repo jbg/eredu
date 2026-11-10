@@ -2,12 +2,14 @@
 
 mod checkpoint;
 mod config;
+mod declarations;
+pub use declarations::Declaration;
 mod memory;
 mod model;
 mod parallel;
 mod specs;
 
-pub(crate) use checkpoint::{gguf_plan, temporal_patch_recipe};
+pub(crate) use checkpoint::{gguf_plan, source_linear_shapes, temporal_patch_recipe};
 pub use checkpoint::{safetensors_plan, translate_gguf_weight_name};
 pub(crate) use config::config_from_gguf_catalog;
 pub use config::{
@@ -24,3 +26,5 @@ pub use parallel::{
     owned_static_parallel_parameter_groups, static_parallel_parameter_groups,
     VisionStaticSelection,
 };
+
+pub(crate) use specs::BlockSpec;

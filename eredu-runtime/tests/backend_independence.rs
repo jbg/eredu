@@ -9316,9 +9316,9 @@ fn independent_materialization_task(
         Some(1),
     )
     .unwrap();
-    ReplicatedTextMaterializationTask::from_exact_source(
+    ReplicatedTextMaterializationTask::from_exact_sources(
         name,
-        source,
+        vec![source],
         Vec::new(),
         shape.clone(),
         shape,
@@ -9327,6 +9327,7 @@ fn independent_materialization_task(
         executable,
         lowering,
         descriptor,
+        None,
     )
     .unwrap()
 }

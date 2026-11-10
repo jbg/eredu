@@ -1,14 +1,140 @@
 //! Graph-visible embedded multi-token prediction units.
 
 use eredu_nn::{
-    AttentionCache, Error, GroupedNeuralBackend, LinearSpec, NormalizationConstructionSpec,
-    NormalizationOperator, ParameterSpec, Parameterized, Tensor,
+    AttentionCache, Error, GroupedNeuralBackend, LinearSpec, NormalizationOperator, Parameterized,
+    Tensor,
 };
 use eredu_runtime::{ParameterProvider, RuntimeStateComponents};
 
 use crate::decoder::ComponentInstrumentation;
 
 use super::{Block, LayerGeometry, LayerPolicy, ModelArgs};
+
+/// Boundary slots and invocation identity of one physical prediction unit.
+/// Intermediate units have no boundary parameters; their block remains an
+/// independent invocation with its own mutable state and placement.
+#[derive(Debug, Clone)]
+pub(crate) struct PredictionUnitParameters {
+    pub physical: usize,
+    pub policy: LayerPolicy,
+    pub block: super::declarations::TargetBlockParameters,
+    pub embedding_norm: Option<eredu_nn::NormalizationConstructionSpec>,
+    pub hidden_norm: Option<eredu_nn::NormalizationConstructionSpec>,
+    pub fusion: Option<LinearSpec>,
+    pub final_norm: Option<eredu_nn::NormalizationConstructionSpec>,
+}
+
+impl PredictionUnitParameters {
+    pub(crate) fn all(args: &ModelArgs) -> Result<Vec<Self>, Error> {
+        let steps = usize::try_from(args.num_nextn_predict_layers).map_err(Error::backend)?;
+        if steps == 0 {
+            return Ok(Vec::new());
+        }
+        let count = args.mtp_policies().map_err(Error::backend)?.len() / steps;
+        (0..steps)
+            .flat_map(|depth| (0..count).map(move |relative| (depth, relative)))
+            .map(|(depth, relative)| Self::new(args, depth, relative))
+            .collect()
+    }
+    pub(crate) fn with_formats(mut self, args: &ModelArgs) -> Result<Self, Error> {
+        self.block = self.block.with_formats(args)?;
+        if let Some(fusion) = &mut self.fusion {
+            fusion.format = crate::linear_format::project_matrix_format(
+                &fusion.weight,
+                &fusion.format,
+                args.weight_quantization_for(fusion.weight.id.as_str())
+                    .into(),
+            )?;
+        }
+        Ok(self)
+    }
+    pub fn new(args: &ModelArgs, depth: usize, relative: usize) -> Result<Self, Error> {
+        let steps = usize::try_from(args.num_nextn_predict_layers).map_err(Error::backend)?;
+        let policies = args.mtp_policies().map_err(Error::backend)?;
+        let count = policies
+            .len()
+            .checked_div(steps)
+            .filter(|count| *count > 0)
+            .ok_or_else(|| Error::backend("Nemotron-H MTP pattern is empty"))?;
+        if depth >= steps || relative >= count {
+            return Err(Error::backend(
+                "Nemotron-H MTP unit is outside its schedule",
+            ));
+        }
+        let physical = depth
+            .checked_mul(count)
+            .and_then(|start| start.checked_add(relative))
+            .ok_or_else(|| Error::backend("Nemotron-H MTP physical index overflowed"))?;
+        let root = format!("model.mtp.layers.{physical}");
+        let norm =
+            |field: &str| super::block::normalization_spec(args, &format!("{root}.{field}.weight"));
+        let first = relative == 0;
+        let parameters = Self {
+            physical,
+            policy: policies[physical],
+            block: super::declarations::TargetBlockParameters::at(
+                args,
+                &root,
+                policies[physical],
+                (args.num_hidden_layers as usize)
+                    .checked_add(physical)
+                    .ok_or_else(|| Error::backend("prediction identity overflowed"))?,
+                true,
+            )?,
+            embedding_norm: first.then(|| norm("enorm")).transpose()?,
+            hidden_norm: first.then(|| norm("hnorm")).transpose()?,
+            fusion: first
+                .then(|| {
+                    let input = args.hidden_size.checked_mul(2).ok_or_else(|| {
+                        Error::backend("Nemotron prediction fusion width overflowed")
+                    })?;
+                    super::attention::linear_spec(
+                        args,
+                        &format!("{root}.eh_proj"),
+                        input,
+                        args.hidden_size,
+                        false,
+                    )
+                })
+                .transpose()?,
+            final_norm: (relative + 1 == count)
+                .then(|| norm("final_layernorm"))
+                .transpose()?,
+        };
+        use eredu_nn::DeclareLogicalParameters;
+        parameters.logical_parameters()?;
+        Ok(parameters)
+    }
+}
+
+impl PredictionUnitParameters {
+    pub(crate) fn boundary_parameters(
+        &self,
+    ) -> Result<Vec<eredu_nn::LogicalParameterDeclaration<'_>>, Error> {
+        use eredu_nn::DeclareLogicalParameters;
+        let mut parameters = Vec::new();
+        for norm in self.embedding_norm.iter().chain(self.hidden_norm.iter()) {
+            parameters.extend(norm.logical_parameters()?);
+        }
+        if let Some(fusion) = &self.fusion {
+            parameters.extend(fusion.logical_parameters()?);
+        }
+        if let Some(norm) = &self.final_norm {
+            parameters.extend(norm.logical_parameters()?);
+        }
+        eredu_nn::validate_logical_parameter_scope(&parameters).map_err(Error::backend)?;
+        Ok(parameters)
+    }
+}
+
+impl eredu_nn::DeclareLogicalParameters for PredictionUnitParameters {
+    fn logical_parameters(&self) -> Result<Vec<eredu_nn::LogicalParameterDeclaration<'_>>, Error> {
+        let mut parameters = self.boundary_parameters()?;
+        parameters.extend(self.block.logical_parameters()?);
+        eredu_nn::validate_logical_parameter_scope(&parameters).map_err(Error::backend)?;
+        Ok(parameters)
+    }
+}
 
 /// Output selected for a target invocation; prediction passes retain vocabulary readout.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
@@ -167,127 +293,37 @@ pub struct PredictionUnit<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralB
 }
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> PredictionUnit<B> {
-    /// Builds one physical unit at a prediction-depth-relative position.
-    pub fn new(
+    pub(crate) fn from_parameters(
         args: &ModelArgs,
-        depth: usize,
-        relative: usize,
+        parameters: PredictionUnitParameters,
+        geometry: Option<LayerGeometry>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let steps = usize::try_from(args.num_nextn_predict_layers).map_err(Error::backend)?;
-        if depth >= steps {
-            return Err(Error::backend(format!(
-                "Nemotron-H MTP depth {depth} is outside {steps} prediction steps"
-            )));
-        }
-        let policies = args.mtp_policies().map_err(Error::backend)?;
-        let pattern_len = policies
-            .len()
-            .checked_div(steps)
-            .filter(|length| *length > 0)
-            .ok_or_else(|| Error::backend("Nemotron-H MTP pattern is empty"))?;
-        if relative >= pattern_len {
-            return Err(Error::backend(format!(
-                "Nemotron-H MTP unit {relative} is outside pattern length {pattern_len}"
-            )));
-        }
-        let physical = depth
-            .checked_mul(pattern_len)
-            .and_then(|start| start.checked_add(relative))
-            .ok_or_else(|| Error::backend("Nemotron-H MTP physical index overflowed"))?;
-        let policy = policies[physical];
-        let geometry = match policy {
-            LayerPolicy::SelfAttention(_) => LayerGeometry::Attention {
-                query_heads: args.num_attention_heads,
-                kv_heads: args.num_key_value_heads,
-            },
-            LayerPolicy::SparseMoe => LayerGeometry::SparseMoe {
-                routed: args.moe_intermediate_size,
-                shared: args.moe_shared_expert_intermediate_size,
-            },
-            _ => {
-                return Err(Error::backend(format!(
-                    "unsupported Nemotron-H MTP policy {policy:?}"
-                )))
-            }
+        let identity = (args.num_hidden_layers as usize)
+            .checked_add(parameters.physical)
+            .ok_or_else(|| Error::backend("prediction identity overflowed"))?;
+        let block = match geometry {
+            Some(geometry) => parameters.block.local(geometry, None)?,
+            None => parameters.block,
         };
-        Self::new_with_geometry(args, depth, relative, policy, geometry, context)
-    }
-
-    /// Builds one prediction unit from placement-resolved local geometry.
-    pub fn new_with_geometry(
-        args: &ModelArgs,
-        depth: usize,
-        relative: usize,
-        policy: LayerPolicy,
-        geometry: LayerGeometry,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        let steps = usize::try_from(args.num_nextn_predict_layers).map_err(Error::backend)?;
-        let policies = args.mtp_policies().map_err(Error::backend)?;
-        let pattern_len = policies
-            .len()
-            .checked_div(steps)
-            .filter(|length| *length > 0)
-            .ok_or_else(|| Error::backend("Nemotron-H MTP pattern is empty"))?;
-        if depth >= steps || relative >= pattern_len {
-            return Err(Error::backend(
-                "Nemotron-H MTP unit is outside its schedule",
-            ));
-        }
-        let physical = depth
-            .checked_mul(pattern_len)
-            .and_then(|start| start.checked_add(relative))
-            .ok_or_else(|| Error::backend("Nemotron-H MTP physical index overflowed"))?;
-        if policies[physical] != policy {
-            return Err(Error::backend(format!(
-                "Nemotron-H MTP policy {policy:?} does not match schedule {:?}",
-                policies[physical]
-            )));
-        }
-        let root = format!("model.mtp.layers.{physical}");
-        let parameter = |name: String| ParameterSpec::trainable(name).map_err(Error::backend);
-        let norm = |name: String| {
-            B::normalization(
-                NormalizationConstructionSpec::learned(
-                    args.hidden_size,
-                    args.layer_norm_epsilon,
-                    parameter(name)?,
-                ),
-                context,
-            )
-        };
-        let first = relative == 0;
-        let last = relative + 1 == pattern_len;
-        let fusion_name = format!("{root}.eh_proj.weight");
         Ok(Self {
             experts: args.n_routed_experts,
-            embedding_norm: first
-                .then(|| norm(format!("{root}.enorm.weight")))
+            embedding_norm: parameters
+                .embedding_norm
+                .map(|spec| B::normalization(spec, context))
                 .transpose()?,
-            hidden_norm: first
-                .then(|| norm(format!("{root}.hnorm.weight")))
+            hidden_norm: parameters
+                .hidden_norm
+                .map(|spec| B::normalization(spec, context))
                 .transpose()?,
-            fusion: first
-                .then(|| {
-                    B::linear(
-                        LinearSpec {
-                            input: args.hidden_size * 2,
-                            output: args.hidden_size,
-                            weight: parameter(fusion_name.clone())?,
-                            bias: None,
-                            format: crate::linear_format::standard_linear_format(
-                                &fusion_name,
-                                args.weight_quantization_for(&fusion_name).into(),
-                            )?,
-                        },
-                        context,
-                    )
-                })
+            fusion: parameters
+                .fusion
+                .map(|spec| B::linear(spec, context))
                 .transpose()?,
-            block: Block::new_mtp_with_geometry(args, physical, policy, geometry, context)?,
-            final_norm: last
-                .then(|| norm(format!("{root}.final_layernorm.weight")))
+            block: Block::from_scope(args, identity, parameters.policy, block, context)?,
+            final_norm: parameters
+                .final_norm
+                .map(|spec| B::normalization(spec, context))
                 .transpose()?,
         })
     }

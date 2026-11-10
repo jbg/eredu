@@ -12,9 +12,11 @@ use eredu_runtime::{
 
 use super::{
     artifact::{ParameterAdmission, RetainedVoiceChatArtifacts},
-    channels::{ChannelError, TEXT_VOCABULARY_SIZE},
+    channels::ChannelError,
     checkpoint::Component,
-    function_head_layered::{function_head_component_definition, FunctionHeadDimensions},
+    function_head_layered::{
+        released_declaration, FunctionHeadDeclaration, FunctionHeadDimensions,
+    },
     parameters::{admitted_member, SpeechParameterError},
 };
 
@@ -57,9 +59,7 @@ pub enum FunctionHeadPreparationError {
 /// conversion bounds use the shared checkpoint recipe machinery. This component
 /// contract declares no full VoiceChat execution capability.
 pub struct PreparedFunctionHeadBindings {
-    dimensions: FunctionHeadDimensions,
-    format: eredu_nn::LinearFormatSpec,
-    prepared: PreparedComponent<eredu_runtime::ComponentDefinition>,
+    prepared: PreparedComponent<FunctionHeadDeclaration>,
     parameter: ParameterAdmission,
 }
 
@@ -72,12 +72,7 @@ impl PreparedFunctionHeadBindings {
             SpeechParameterError::MissingComponent(Component::FunctionHead),
         )?;
         Self::from_parameters(
-            FunctionHeadDimensions::new(
-                i32::try_from(artifacts.plan().config().perception.output_dim).map_err(|_| {
-                    ChannelError::Configuration("function head width exceeds native indexing")
-                })?,
-                TEXT_VOCABULARY_SIZE as i32,
-            )?,
+            released_declaration()?.clone(),
             source.clone(),
             artifacts.plan().parameters(),
         )
@@ -87,25 +82,25 @@ impl PreparedFunctionHeadBindings {
     /// discovery or native allocation. Shapes follow the symbolic architecture;
     /// neighboring component payloads are excluded.
     pub fn from_parameters(
-        dimensions: FunctionHeadDimensions,
+        declaration: FunctionHeadDeclaration,
         source: SharedCheckpointSource,
         parameters: &BTreeMap<String, ParameterAdmission>,
     ) -> Result<Self, FunctionHeadPreparationError> {
-        let weight = "stt_model.function_head.weight";
+        let weight = declaration.spec().projection.weight.id.as_str().to_owned();
         let primary = parameters
-            .get(weight)
+            .get(&weight)
             .filter(|p| p.component == Component::FunctionHead)
             .ok_or_else(|| SpeechParameterError::MissingParameter {
                 component: Component::FunctionHead,
-                name: weight.into(),
+                name: weight.clone(),
             })?;
-        let format = crate::linear_format::standard_linear_format(weight, primary.linear_format)
+        let format = crate::linear_format::standard_linear_format(&weight, primary.linear_format)
             .map_err(ChannelError::from)?;
-        let definition = function_head_component_definition(dimensions, &format)?;
+        let declaration = declaration.with_format(format)?;
         let mut selected_parameter = None;
         let prepared = PreparedComponent::prepare(
             "voicechat/function_head/leased-units",
-            definition,
+            declaration,
             source.clone(),
             |member| {
                 let name = member.target();
@@ -134,7 +129,7 @@ impl PreparedFunctionHeadBindings {
                 }
                 if !matches!(parameter.output.dtype, RecipeDtype::F32 | RecipeDtype::U32)
                     && !(parameter.output.dtype == RecipeDtype::U8
-                        && super::parameters::is_byte_scale(parameters, name))
+                        && super::parameters::is_mxfp4_scale(parameters, member))
                 {
                     return Err(FunctionHeadPreparationError::Geometry(name.into()));
                 }
@@ -142,8 +137,6 @@ impl PreparedFunctionHeadBindings {
             },
         )?;
         Ok(Self {
-            dimensions,
-            format,
             prepared,
             parameter: selected_parameter.expect("one declared function head parameter"),
         })
@@ -165,16 +158,11 @@ impl PreparedFunctionHeadBindings {
         mut self,
         layout: &LocalModelLayout,
     ) -> Result<Self, FunctionHeadPreparationError> {
-        let format = self.format.clone();
-        super::function_head_layered::function_head_parallel_range(
-            self.dimensions,
-            &format,
-            layout,
-        )?;
+        self.declaration().parallel_range(layout)?;
         self.prepared = self.prepared.select(layout)?;
         self.parameter.recipe = self.prepared.unit_bindings()[0]
             .iter()
-            .find(|b| b.name() == "stt_model.function_head.weight")
+            .find(|b| b.name() == self.declaration().spec().projection.weight.id.as_str())
             .expect("validated primary function weight")
             .source_recipe();
         self.parameter.output = self
@@ -204,9 +192,14 @@ impl PreparedFunctionHeadBindings {
         &self.parameter
     }
 
+    /// Typed scope retained through source restriction, physical encoding and rank selection.
+    pub fn declaration(&self) -> &FunctionHeadDeclaration {
+        self.prepared.declaration()
+    }
+
     /// Validated function head geometry; no other speech stack is selected.
     pub fn dimensions(&self) -> FunctionHeadDimensions {
-        self.dimensions
+        self.declaration().dimensions()
     }
 
     /// Exact prepared unit bindings for cold resource accounting.
@@ -221,34 +214,24 @@ impl PreparedFunctionHeadBindings {
 
     /// Complete semantic declaration retained through precision and placement selection.
     pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
-        self.prepared.declaration()
+        self.prepared.declaration().definition()
     }
 
     /// Consumes exact source authority and the canonical ordered binding plan.
     pub fn into_parts(
         self,
     ) -> (
-        FunctionHeadDimensions,
-        eredu_nn::LinearFormatSpec,
-        eredu_runtime::ComponentDefinition,
+        FunctionHeadDeclaration,
         Option<LocalModelLayout>,
         eredu_runtime::ExecutionUnitAddressMap,
         SharedCheckpointSource,
         Vec<Vec<WeightBinding>>,
     ) {
-        let (definition, local, layout, source, units) = self
+        let (declaration, local, layout, source, units) = self
             .prepared
             .into_declared_unit_parts()
             .expect("function head declares only independently leased units");
-        (
-            self.dimensions,
-            self.format,
-            definition,
-            local,
-            layout,
-            source,
-            units,
-        )
+        (declaration, local, layout, source, units)
     }
 }
 

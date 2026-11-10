@@ -1,9 +1,9 @@
 //! Exact source projection from RNNT bindings into one recurrent pipeline stage.
 use super::{
     rnnt::RnntDimensions,
-    rnnt_predictor::rnnt_predictor_component_definition,
     rnnt_predictor_partition::{validate_rnnt_predictor_partition, RnntPredictorBoundarySchema},
     rnnt_preparation::{PreparedRnntBindings, RnntPreparationError},
+    rnnt_specs::RnntPredictorDeclaration,
 };
 use eredu_checkpoint::store::SharedCheckpointSource;
 use eredu_runtime::{
@@ -11,8 +11,7 @@ use eredu_runtime::{
 };
 /// Retained canonical LSTM recipes and explicit optional replica placement.
 pub struct PreparedRnntPredictorBindings {
-    dimensions: RnntDimensions,
-    prepared: PreparedComponent<eredu_runtime::ComponentDefinition>,
+    prepared: PreparedComponent<RnntPredictorDeclaration>,
 }
 impl PreparedRnntPredictorBindings {
     /// Selects only a stage's predictor units; embedding and joint sources are excluded.
@@ -20,21 +19,18 @@ impl PreparedRnntPredictorBindings {
         bindings: PreparedRnntBindings,
         partition: &ArchitecturePartition<G, RnntPredictorBoundarySchema>,
     ) -> Result<Self, RnntPreparationError> {
-        let dimensions = bindings.dimensions();
-        let definition = rnnt_predictor_component_definition(dimensions)?;
-        validate_rnnt_predictor_partition(&definition, dimensions, partition)?;
+        let declaration = bindings.declaration().predictor()?;
+        validate_rnnt_predictor_partition(&declaration, partition)?;
         let prepared = bindings
             .prepared
-            .project("voicechat/rnnt/predictor-stage", definition)?
+            .project("voicechat/rnnt/predictor-stage", declaration)?
             .select_units(partition.units())?;
-        Ok(Self {
-            dimensions,
-            prepared,
-        })
+        Ok(Self { prepared })
     }
 
-    /// Selects explicit tensor replicas for a combined TP/PP execution cohort.
-    /// Recurrent parameters retain their complete payload on every participant.
+    /// Selects explicit tensor-cohort replicas for a recurrent pipeline stage.
+    /// Pipeline rank selection remains separate. Recurrent parameters retain their
+    /// complete payload on every tensor participant.
     pub fn select_parallel(
         mut self,
         topology: eredu_core::ParallelRankTopology,
@@ -53,11 +49,15 @@ impl PreparedRnntPredictorBindings {
                 .expect("validated nonempty stage")
                 .index()
                 + 1;
-        Ok(super::rnnt_predictor::rnnt_predictor_prediction_state_bytes(self.dimensions, range)?)
+        Ok(super::rnnt_predictor::rnnt_predictor_prediction_state_bytes(self.dimensions(), range)?)
+    }
+    /// Global recurrent scope retained alongside the selected stage's exact sources.
+    pub fn declaration(&self) -> &RnntPredictorDeclaration {
+        self.prepared.declaration()
     }
     /// Complete RNNT geometry describing these recurrent layers.
     pub fn dimensions(&self) -> RnntDimensions {
-        self.dimensions
+        self.prepared.declaration().dimensions()
     }
     /// Exact optional full-replica declaration used by cold pipeline validation.
     pub fn local_layout(&self) -> Option<&LocalModelLayout> {
@@ -75,22 +75,21 @@ impl PreparedRnntPredictorBindings {
     }
     /// Complete predictor definition, including global recurrent carry ownership.
     pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
-        self.prepared.declaration()
+        self.prepared.declaration().definition()
     }
     /// Transfers prepared recipes in the same globally addressed order as execution.
     pub fn into_parts(
         self,
     ) -> (
-        RnntDimensions,
-        eredu_runtime::ComponentDefinition,
+        RnntPredictorDeclaration,
         eredu_runtime::ExecutionUnitAddressMap,
         SharedCheckpointSource,
         Vec<(ExecutionUnitAddress, Vec<WeightBinding>)>,
     ) {
-        let (definition, _, layout, source, units) = self
+        let (declaration, _, layout, source, units) = self
             .prepared
             .into_addressed_unit_parts()
             .expect("predictor declares only independently leased units");
-        (self.dimensions, definition, layout, source, units)
+        (declaration, layout, source, units)
     }
 }

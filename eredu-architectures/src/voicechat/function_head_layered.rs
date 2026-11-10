@@ -1,12 +1,13 @@
 //! Independent function-vocabulary projection over shared bounded execution.
 use super::channels::{
-    agree_parallel_projection, compute_type, head_spec, validate_logits, ChannelError,
-    DualChannelLogits, FunctionHead,
+    agree_parallel_projection, compute_type, validate_logits, ChannelError, DualChannelLogits,
+    FunctionHead,
 };
 use crate::decoder::StaticModules;
 use eredu_core::BackendFailure;
 use eredu_nn::{
-    DistributedNeuralBackend, LinearFormatSpec, NeuralBackend, Tensor, VocabularyParallelRange,
+    DeclareLogicalParameters, DistributedNeuralBackend, LinearFormatSpec, LinearSpec,
+    NeuralBackend, ParameterSpec, Tensor, VocabularyParallelRange,
 };
 use eredu_runtime::{
     ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitectureGroupTransport,
@@ -15,9 +16,8 @@ use eredu_runtime::{
     ComponentKernel, ComponentUnit, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress,
     ExecutionUnitLayout, LayeredForwardState, LayeredInvocation, LayeredTraversalHook,
     LayerwisePolicy, LayerwiseRuntime, LocalModelLayout, MemberSharding, OwnedParameterGroupSpec,
-    ParallelComponentKernel, ParallelLayeredInvocation, ParameterGroupOwner, ParameterGroupSpec,
-    ParameterMemberSpec, ParameterRole, StatelessComponentState, SubmissionBackend,
-    TensorPlacement,
+    ParallelComponentKernel, ParallelLayeredInvocation, ParameterGroupOwner, ParameterRole,
+    StatelessComponentState, SubmissionBackend, TensorPlacement,
 };
 use std::marker::PhantomData;
 
@@ -46,6 +46,13 @@ impl FunctionHeadDimensions {
         }
         Ok(())
     }
+    /// Projects the normalized configuration's shared function-vocabulary domain.
+    pub fn from_config(config: &super::config::VoiceChatConfig) -> Result<Self, ChannelError> {
+        let width = i32::try_from(config.perception.output_dim).map_err(|_| {
+            ChannelError::Configuration("function head width exceeds native indexing")
+        })?;
+        Self::new(width, super::channels::TEXT_VOCABULARY_SIZE as i32)
+    }
     /// Validates normalized hidden rank, width and floating arithmetic before acquisition.
     pub fn validate_hidden<T: Tensor>(self, hidden: &T) -> Result<(), ChannelError> {
         self.validate()?;
@@ -61,6 +68,128 @@ impl FunctionHeadDimensions {
         Ok(())
     }
 }
+/// Authoritative function-head parameter identity, logical geometry and selected encoding.
+#[derive(Debug, Clone)]
+pub struct FunctionHeadSpec {
+    pub(super) projection: LinearSpec,
+}
+impl FunctionHeadSpec {
+    /// Validates the complete function projection before any backend allocation.
+    pub fn new(
+        dimensions: FunctionHeadDimensions,
+        format: LinearFormatSpec,
+    ) -> Result<Self, ChannelError> {
+        dimensions.validate()?;
+        let mut weight = ParameterSpec::trainable("stt_model.function_head.weight")
+            .map_err(eredu_nn::Error::backend)?;
+        weight.group = Some(FUNCTION.into());
+        let declaration = Self {
+            projection: LinearSpec {
+                input: dimensions.width,
+                output: dimensions.vocabulary,
+                weight,
+                bias: None,
+                format,
+            },
+        };
+        declaration.validate()?;
+        Ok(declaration)
+    }
+    fn validate(&self) -> Result<(), ChannelError> {
+        eredu_nn::validate_logical_parameter_topology(&self.logical_parameters()?)
+            .map_err(eredu_nn::Error::backend_source)?;
+        Ok(())
+    }
+    /// Selects exact storage companions while preserving logical geometry and ownership.
+    pub fn with_format(mut self, format: LinearFormatSpec) -> Result<Self, ChannelError> {
+        self.projection.format = format;
+        self.validate()?;
+        Ok(self)
+    }
+    /// Logical vocabulary projection dimensions, independent of physical encoding.
+    pub fn dimensions(&self) -> FunctionHeadDimensions {
+        FunctionHeadDimensions {
+            width: self.projection.input,
+            vocabulary: self.projection.output,
+        }
+    }
+    /// Exact selected matrix encoding and companion identities.
+    pub fn format(&self) -> &LinearFormatSpec {
+        &self.projection.format
+    }
+}
+impl DeclareLogicalParameters for FunctionHeadSpec {
+    fn logical_parameters(
+        &self,
+    ) -> Result<Vec<eredu_nn::LogicalParameterDeclaration<'_>>, eredu_nn::Error> {
+        self.projection.logical_parameters()
+    }
+}
+
+/// Retained readout slots and their parameter, invocation and placement projection.
+#[derive(Debug, Clone)]
+pub struct FunctionHeadDeclaration {
+    spec: FunctionHeadSpec,
+    definition: ComponentDefinition,
+}
+impl FunctionHeadDeclaration {
+    /// Validates logical ownership and exact selected storage companions before allocation.
+    pub fn new(spec: FunctionHeadSpec) -> Result<Self, ChannelError> {
+        let definition = declared_definition(&spec)?;
+        Ok(Self { spec, definition })
+    }
+    /// Authoritative typed projection used by module construction and source extensions.
+    pub fn spec(&self) -> &FunctionHeadSpec {
+        &self.spec
+    }
+    /// Logical geometry retained independently of physical encoding.
+    pub fn dimensions(&self) -> FunctionHeadDimensions {
+        self.spec.dimensions()
+    }
+    /// Validated parameter ownership and separately leased execution boundary.
+    pub fn definition(&self) -> &ComponentDefinition {
+        &self.definition
+    }
+    /// Selects physical storage companions while preserving declared identities and geometry.
+    pub fn with_format(self, format: LinearFormatSpec) -> Result<Self, ChannelError> {
+        Self::new(self.spec.with_format(format)?)
+    }
+    /// Validates vocabulary rows and coherent physical companion placement.
+    pub fn parallel_range(
+        &self,
+        layout: &LocalModelLayout,
+    ) -> Result<VocabularyParallelRange, ChannelError> {
+        declared_parallel_range(&self.spec, layout)
+    }
+    fn into_parts(self) -> (FunctionHeadSpec, ComponentDefinition) {
+        (self.spec, self.definition)
+    }
+}
+impl eredu_runtime::ComponentPreparationDeclaration for FunctionHeadDeclaration {
+    fn parameters(&self) -> &ArchitectureParameterDescription {
+        self.definition.parameters()
+    }
+}
+
+/// Every admitted VoiceChat configuration validates against this published profile.
+/// The retained source-free scope carries no payloads, backend resources or invocation state.
+pub(crate) fn released_declaration() -> Result<&'static FunctionHeadDeclaration, ChannelError> {
+    static DECLARATION: std::sync::OnceLock<Result<FunctionHeadDeclaration, String>> =
+        std::sync::OnceLock::new();
+    DECLARATION
+        .get_or_init(|| {
+            let config = super::config::released_configuration().map_err(|e| e.to_string())?;
+            let dimensions =
+                FunctionHeadDimensions::from_config(&config).map_err(|e| e.to_string())?;
+            let format = LinearFormatSpec::unscaled(eredu_checkpoint::LinearFormat::Dense)
+                .map_err(|e| e.to_string())?;
+            let spec = FunctionHeadSpec::new(dimensions, format).map_err(|e| e.to_string())?;
+            FunctionHeadDeclaration::new(spec).map_err(|e| e.to_string())
+        })
+        .as_ref()
+        .map_err(|reason| eredu_nn::Error::backend(reason.clone()).into())
+}
+
 /// Portable independent function readout from an already normalized backbone result.
 pub trait FunctionHeadExecution<B: NeuralBackend> {
     /// Logical geometry used by shared dual-head preflight.
@@ -203,29 +332,23 @@ struct ParallelFunctionHeadDefinition<B: NeuralBackend> {
     range: VocabularyParallelRange,
     layout: LocalModelLayout,
     build: fn(
-        i32,
-        i32,
-        LinearFormatSpec,
+        FunctionHeadSpec,
         VocabularyParallelRange,
         &<B::Tensor as Tensor>::Context,
     ) -> Result<FunctionHead<B>, ChannelError>,
 }
 
-/// Validates every physical vocabulary member and returns its common row ownership.
-/// Communicator rank and degree are checked at invocation, since uneven row ranges
-/// do not uniquely identify a topology.
-pub fn function_head_parallel_range(
-    dimensions: FunctionHeadDimensions,
-    format: &LinearFormatSpec,
+pub(super) fn declared_parallel_range(
+    declaration: &FunctionHeadSpec,
     layout: &LocalModelLayout,
 ) -> Result<VocabularyParallelRange, ChannelError> {
-    let description = function_head_parameter_description(dimensions, format)?;
-    let weight =
-        layout
-            .tensor("stt_model.function_head.weight")
-            .ok_or(ChannelError::Configuration(
-                "function-head layout lacks its weight",
-            ))?;
+    let dimensions = declaration.dimensions();
+    let description = declared_parameters(declaration)?;
+    let weight = layout
+        .tensor(declaration.projection.weight.id.as_str())
+        .ok_or(ChannelError::Configuration(
+            "function-head layout lacks its weight",
+        ))?;
     let local = match weight.placement() {
         TensorPlacement::Range {
             axis: 0,
@@ -259,21 +382,18 @@ pub fn function_head_parallel_range(
 
 /// Architecture-owned independent readout and physical matrix declaration.
 pub struct FunctionHeadKernel<B: NeuralBackend> {
-    dimensions: FunctionHeadDimensions,
-    format: LinearFormatSpec,
+    declaration: FunctionHeadSpec,
+    definition: ComponentDefinition,
     parallel: Option<ParallelFunctionHeadDefinition<B>>,
     backend: PhantomData<fn() -> B>,
 }
 impl<B: NeuralBackend> FunctionHeadKernel<B> {
     /// Validates dimensions and exact physical companions without allocating tensors.
-    pub fn new(
-        dimensions: FunctionHeadDimensions,
-        format: LinearFormatSpec,
-    ) -> Result<Self, ChannelError> {
-        function_head_parameter_description(dimensions, &format)?;
+    pub fn new(declaration: FunctionHeadDeclaration) -> Result<Self, ChannelError> {
+        let (declaration, definition) = declaration.into_parts();
         Ok(Self {
-            dimensions,
-            format,
+            declaration,
+            definition,
             parallel: None,
             backend: PhantomData,
         })
@@ -282,10 +402,7 @@ impl<B: NeuralBackend> FunctionHeadKernel<B> {
     pub fn into_component(
         self,
     ) -> Result<ComponentAdapter<ComponentDefinition, Self>, ChannelError> {
-        Ok(ComponentAdapter::new(
-            function_head_component_definition(self.dimensions, &self.format)?,
-            self,
-        )?)
+        Ok(ComponentAdapter::new(self.definition.clone(), self)?)
     }
     /// Whether projection requires collective execution.
     pub fn is_parallel(&self) -> bool {
@@ -293,7 +410,7 @@ impl<B: NeuralBackend> FunctionHeadKernel<B> {
     }
     /// Validates an ordinary invocation before either head or its provider runs.
     pub fn validate_replicated_projection(&self, hidden: &B::Tensor) -> Result<(), ChannelError> {
-        self.dimensions.validate_hidden(hidden)?;
+        self.dimensions().validate_hidden(hidden)?;
         if self.is_parallel() {
             return Err(ChannelError::Configuration(
                 "rank-local function head requires collective projection",
@@ -303,24 +420,24 @@ impl<B: NeuralBackend> FunctionHeadKernel<B> {
     }
     /// Logical selected projection geometry.
     pub fn dimensions(&self) -> FunctionHeadDimensions {
-        self.dimensions
+        self.declaration.dimensions()
     }
     /// Exact selected physical weight/companion encoding.
     pub fn format(&self) -> &LinearFormatSpec {
-        &self.format
+        self.declaration.format()
     }
 }
 impl<B: DistributedNeuralBackend> FunctionHeadKernel<B> {
     /// Admits exact vocabulary rows and their physical companions without allocation.
     pub fn new_parallel(
-        dimensions: FunctionHeadDimensions,
-        format: LinearFormatSpec,
+        declaration: FunctionHeadDeclaration,
         layout: &LocalModelLayout,
     ) -> Result<Self, ChannelError> {
-        let range = function_head_parallel_range(dimensions, &format, layout)?;
+        let range = declaration.parallel_range(layout)?;
+        let (declaration, definition) = declaration.into_parts();
         Ok(Self {
-            dimensions,
-            format,
+            declaration,
+            definition,
             parallel: Some(ParallelFunctionHeadDefinition {
                 range,
                 layout: layout.clone(),
@@ -335,17 +452,17 @@ impl<B: DistributedNeuralBackend> FunctionHeadKernel<B> {
         hidden: &B::Tensor,
         parallel: &B::ParallelContext,
     ) -> Result<(), ChannelError> {
-        self.dimensions.validate_hidden(hidden)?;
+        self.dimensions().validate_hidden(hidden)?;
         let selected = self.parallel.as_ref().ok_or(ChannelError::Configuration(
             "collective function projection requires rank-local construction",
         ))?;
         selected
             .range
             .balanced_peer_widths(B::parallel_size(parallel), B::parallel_rank(parallel))?;
-        let description = function_head_parameter_description(self.dimensions, &self.format)?;
+        let description = self.definition.parameters();
         eredu_runtime::validate_tensor_parallel_layout(
             "voicechat.function_head",
-            &description,
+            description,
             &selected.layout,
             B::parallel_size(parallel),
             B::parallel_rank(parallel),
@@ -356,8 +473,8 @@ impl<B: DistributedNeuralBackend> FunctionHeadKernel<B> {
         let selected = self.parallel.as_ref().ok_or(ChannelError::Configuration(
             "collective function projection requires rank-local construction",
         ))?;
-        if unit.dimensions() != self.dimensions
-            || unit.format() != &self.format
+        if unit.dimensions() != self.dimensions()
+            || unit.format() != self.format()
             || unit.parallel_range() != Some(&selected.range)
         {
             return Err(ChannelError::Configuration(
@@ -368,12 +485,10 @@ impl<B: DistributedNeuralBackend> FunctionHeadKernel<B> {
     }
 }
 
-/// Validated logical invocations, independent parameter units and transport semantics.
-pub fn function_head_component_definition(
-    dimensions: FunctionHeadDimensions,
-    format: &LinearFormatSpec,
+pub(super) fn declared_definition(
+    declaration: &FunctionHeadSpec,
 ) -> Result<ComponentDefinition, ChannelError> {
-    let parameters = function_head_parameter_description(dimensions, format)?;
+    let parameters = declared_parameters(declaration)?;
     let paths: Vec<String> = vec!["stt_model.function_head".into()];
     let transport = (0..parameters.graph().groups().len())
         .map(|group| {
@@ -410,26 +525,18 @@ fn function_head_graph() -> Result<ExecutionGraph, ChannelError> {
         FUNCTION,
     )?)
 }
-/// Cold vocabulary-axis partitioning preserving every physical format companion.
-pub fn function_head_parameter_description(
-    dimensions: FunctionHeadDimensions,
-    format: &LinearFormatSpec,
+fn declared_parameters(
+    declaration: &FunctionHeadSpec,
 ) -> Result<ArchitectureParameterDescription, ChannelError> {
-    dimensions.validate()?;
-    head_spec(dimensions.width, dimensions.vocabulary, format.clone())?;
     let graph = function_head_graph()?;
     let layout = ExecutionUnitLayout::new(&graph, [1])?;
-    let logical = ParameterGroupSpec::new(
+    let group = eredu_runtime::logical_parameter_group(
         FUNCTION,
         ParameterRole::Vocabulary,
-        [ParameterMemberSpec::new(
-            "stt_model.function_head.weight",
-            vec![dimensions.vocabulary as usize, dimensions.width as usize],
-            MemberSharding::Balanced { axis: 0 },
-        )],
+        None,
+        declaration,
+        |_| MemberSharding::Balanced { axis: 0 },
     )?;
-    let group =
-        eredu_runtime::expand_linear_format_parameter_group(logical, |_| Ok(Some(format.clone())))?;
     let owned = OwnedParameterGroupSpec::new(
         ParameterGroupOwner::execution_unit(layout.group_id(0).expect("function group").clone(), 0),
         group,
@@ -468,8 +575,8 @@ impl<B: NeuralBackend> ComponentKernel<B> for FunctionHeadKernel<B> {
             "function_head",
             format!(
                 "{:?}:{:?}:{:?}",
-                self.dimensions,
-                self.format,
+                self.dimensions(),
+                self.format(),
                 self.parallel.as_ref().map(|selected| &selected.layout)
             ),
             1,
@@ -484,20 +591,9 @@ impl<B: NeuralBackend> ComponentKernel<B> for FunctionHeadKernel<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<FunctionHead<B>, ChannelError> {
         if let Some(parallel) = &self.parallel {
-            return (parallel.build)(
-                self.dimensions.width,
-                self.dimensions.vocabulary,
-                self.format.clone(),
-                parallel.range.clone(),
-                context,
-            );
+            return (parallel.build)(self.declaration.clone(), parallel.range.clone(), context);
         }
-        FunctionHead::new(
-            self.dimensions.width,
-            self.dimensions.vocabulary,
-            self.format.clone(),
-            context,
-        )
+        FunctionHead::new(self.declaration.clone(), context)
     }
 
     fn executes_group(&self, _: usize, _: &Self::ForwardContext) -> bool {
@@ -550,7 +646,7 @@ impl<B: NeuralBackend> ComponentEquations<B, StatelessComponentState> for Functi
         _: &mut (),
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, ChannelError> {
-        if unit.dimensions() != self.dimensions || unit.format() != &self.format {
+        if unit.dimensions() != self.dimensions() || unit.format() != self.format() {
             return Err(ChannelError::Configuration(
                 "leased function head differs from selected geometry or format",
             ));

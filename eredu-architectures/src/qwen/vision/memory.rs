@@ -165,7 +165,9 @@ impl VisionConfig {
             )?,
         )
     }
+}
 
+impl super::Declaration {
     /// Composes exact shared-tower normalization, projection, rotary and segmented-attention geometry
     /// with side-effect-free backend facts. `element` is explicit: promotion and
     /// physical dtype are unresolved until the selected binding establishes them.
@@ -200,7 +202,6 @@ impl VisionConfig {
             return Ok(report);
         }
         let (patches, full, windows) = segments(self, grids)?;
-        let hidden = self.hidden_size as u64;
         let unit = mul(
             self.spatial_merge_size as u64,
             self.spatial_merge_size as u64,
@@ -214,14 +215,10 @@ impl VisionConfig {
             )?,
             element_bytes(element),
         )?;
-        let invocation = eredu_nn::multimodal::FlattenedPatchSpec {
-            channels: self.in_channels,
-            temporal: self.temporal_patch_size,
-            height: self.patch_size,
-            width: self.patch_size,
-            output: self.hidden_size,
-        }
-        .memory_invocation(patches, element, true)?;
+        let invocation = self
+            .patch()
+            .geometry
+            .memory_invocation(patches, element, true)?;
         // Patch embedding uses Tensor::linear after reshaping a dense kernel,
         // not the backend's constructed/optimized linear module. Keep the
         // generic unbound projection query and unknown weight representation.
@@ -244,25 +241,54 @@ impl VisionConfig {
             invocation,
             memory,
         });
+        let declarations = &self.slots;
+        let relative = |name: &str| -> String {
+            name.strip_prefix(&format!("{}.", self.root()))
+                .unwrap_or(name)
+                .trim_end_matches(".weight")
+                .to_owned()
+        };
+        let blocks = declarations
+            .iter()
+            .filter_map(|spec| match spec {
+                super::specs::ParameterConstruction::Block(spec) => Some(spec),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let projections = declarations
+            .iter()
+            .flat_map(|spec| spec.projections())
+            .map(|spec| (relative(spec.weight.id.as_str()), spec))
+            .collect::<BTreeMap<_, _>>();
+        let normalizations = declarations
+            .iter()
+            .flat_map(|spec| spec.normalizations())
+            .filter_map(|spec| {
+                spec.weight
+                    .as_ref()
+                    .map(|weight| (relative(weight.id.as_str()), spec))
+            })
+            .collect::<BTreeMap<_, _>>();
         let projected = |report: &mut VisionMemoryReport,
                          mechanism: &mut dyn FnMut(
             &MechanismInvocation,
         )
             -> Result<MechanismMemoryContract, Error>,
                          name: String,
-                         rows,
-                         input,
-                         output|
+                         rows|
          -> Result<(), Error> {
+            let spec = projections
+                .get(name.as_str())
+                .ok_or_else(|| Error::backend(format!("unresolved vision projection {name}")))?;
             let invocation = MechanismInvocation::Projection {
                 arithmetic: eredu_nn::LinearArithmetic::Native,
                 rows,
-                input,
-                output,
-                format: self.linear_format(&format!("{name}.weight")),
+                input: spec.input as u64,
+                output: spec.output as u64,
+                format: spec.format.encoding(),
                 element,
                 weight_element: None,
-                bias: true,
+                bias: spec.bias.is_some(),
                 bias_element: None,
             };
             let memory = mechanism(&invocation)?;
@@ -281,17 +307,19 @@ impl VisionConfig {
         )
             -> Result<MechanismMemoryContract, Error>,
                           name: String,
-                          rows,
-                          width|
+                          rows|
          -> Result<(), Error> {
+            let spec = normalizations
+                .get(name.as_str())
+                .ok_or_else(|| Error::backend(format!("unresolved vision normalization {name}")))?;
             let invocation = MechanismInvocation::LayerNormalization {
-                arithmetic: eredu_nn::LayerNormalizationArithmetic::Native,
+                arithmetic: spec.arithmetic,
                 rows,
-                width,
+                width: spec.dimensions as u64,
                 element,
-                weight: true,
+                weight: spec.weight.is_some(),
                 weight_element: None,
-                bias: true,
+                bias: spec.bias.is_some(),
                 bias_element: None,
             };
             invocation.logical_values()?;
@@ -306,21 +334,19 @@ impl VisionConfig {
             Ok(())
         };
         for layer in 0..self.layer_count() {
+            let geometry = blocks[layer].attention.geometry;
             let prefix = format!("blocks.{layer}");
             normalized(
                 &mut report,
                 &mut mechanism,
                 format!("{prefix}.norm1"),
                 patches,
-                hidden,
             )?;
             projected(
                 &mut report,
                 &mut mechanism,
                 format!("{prefix}.attn.qkv"),
                 patches,
-                hidden,
-                mul(hidden, 3)?,
             )?;
             let policy = self.layer_policy(layer).expect("validated schedule");
             let histogram = match policy.attention {
@@ -330,12 +356,12 @@ impl VisionConfig {
             for (&length, &repetitions) in histogram {
                 let invocation = MechanismInvocation::Attention {
                     batch: 1,
-                    query_heads: self.num_heads as u64,
-                    kv_heads: self.num_heads as u64,
+                    query_heads: geometry.query_heads() as u64,
+                    kv_heads: geometry.key_value_heads() as u64,
                     queries: length,
                     keys: length,
-                    key_width: hidden / self.num_heads as u64,
-                    value_width: hidden / self.num_heads as u64,
+                    key_width: geometry.key_dimensions() as u64,
+                    value_width: geometry.value_dimensions() as u64,
                     element,
                     arithmetic: AttentionArithmetic::Fused,
                     softcap: false,
@@ -355,82 +381,58 @@ impl VisionConfig {
                 &mut mechanism,
                 format!("{prefix}.attn.proj"),
                 patches,
-                hidden,
-                hidden,
             )?;
             normalized(
                 &mut report,
                 &mut mechanism,
                 format!("{prefix}.norm2"),
                 patches,
-                hidden,
             )?;
             projected(
                 &mut report,
                 &mut mechanism,
                 format!("{prefix}.mlp.linear_fc1"),
                 patches,
-                hidden,
-                self.intermediate_size as u64,
             )?;
             projected(
                 &mut report,
                 &mut mechanism,
                 format!("{prefix}.mlp.linear_fc2"),
                 patches,
-                self.intermediate_size as u64,
-                hidden,
             )?;
             if let Some(index) = policy.deepstack_merger {
-                let width = mul(hidden, unit)?;
                 normalized(
                     &mut report,
                     &mut mechanism,
                     format!("deepstack_merger_list.{index}.norm"),
                     merged,
-                    width,
                 )?;
                 projected(
                     &mut report,
                     &mut mechanism,
                     format!("deepstack_merger_list.{index}.linear_fc1"),
                     merged,
-                    width,
-                    width,
                 )?;
                 projected(
                     &mut report,
                     &mut mechanism,
                     format!("deepstack_merger_list.{index}.linear_fc2"),
                     merged,
-                    width,
-                    self.out_hidden_size as u64,
                 )?;
             }
         }
-        let width = mul(hidden, unit)?;
-        normalized(
-            &mut report,
-            &mut mechanism,
-            "merger.norm".into(),
-            patches,
-            hidden,
-        )?;
+        normalized(&mut report, &mut mechanism, "merger.norm".into(), patches)?;
         projected(
             &mut report,
             &mut mechanism,
             "merger.linear_fc1".into(),
             merged,
-            width,
-            width,
         )?;
         projected(
             &mut report,
             &mut mechanism,
             "merger.linear_fc2".into(),
             merged,
-            width,
-            self.out_hidden_size as u64,
         )?;
         report.missing = [
             "activation representation is caller-declared; parameter dtype, promotion and mixed intermediate representations are not established",

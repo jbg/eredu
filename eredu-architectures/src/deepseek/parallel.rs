@@ -2,13 +2,12 @@
 
 use std::ops::Range;
 
-use eredu_checkpoint::LinearFormat;
-use eredu_nn::VocabularyParallelRange;
+use eredu_nn::{DeclareLogicalParameters, VocabularyParallelRange};
 use eredu_runtime::{
     ArchitectureParameterDescription, ArchitecturePartition, ExecutionGraph, ExecutionUnitLayout,
     LocalModelLayout, MemberSharding, OwnedParameterGroupSpec, ParallelPlanError,
-    ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
-    PartitionOwnership, StateLayout, TensorPlacement,
+    ParameterGroupOwner, ParameterGroupSpec, ParameterRole, PartitionOwnership, StateLayout,
+    TensorPlacement,
 };
 
 use super::{
@@ -24,6 +23,7 @@ pub struct V3LocalGeometry {
     state_layout: StateLayout,
     routed_expert_intermediate_range: Option<Range<usize>>,
     shared_expert_intermediate_range: Option<Range<usize>>,
+    parameters: std::sync::Arc<ArchitectureParameterDescription>,
     architecture_fingerprint: String,
 }
 
@@ -59,7 +59,10 @@ impl V3LocalGeometry {
     }
 
     pub(super) fn validate_for(&self, args: &V3Args) -> Result<(), ParallelPlanError> {
-        if self.architecture_fingerprint != v3_architecture_fingerprint(args) {
+        let parameters = v3_parameters(args)?;
+        if self.parameters.as_ref() != &parameters
+            || self.architecture_fingerprint != v3_architecture_fingerprint(args)
+        {
             return Err(invalid(
                 "rank-local V3 geometry belongs to a different model configuration",
             ));
@@ -95,7 +98,7 @@ impl V3LocalGeometry {
             _ => {
                 return Err(invalid(
                     "rank-local V3 routed/shared expert channel ranges drifted",
-                ))
+                ));
             }
         }
         Ok(())
@@ -111,6 +114,7 @@ pub struct V4LocalGeometry {
     state_layout: StateLayout,
     routed_expert_intermediate_range: Option<Range<usize>>,
     shared_expert_intermediate_range: Option<Range<usize>>,
+    parameters: std::sync::Arc<ArchitectureParameterDescription>,
     architecture_fingerprint: String,
 }
 
@@ -146,7 +150,10 @@ impl V4LocalGeometry {
     }
 
     pub(super) fn validate_for(&self, args: &V4Args) -> Result<(), ParallelPlanError> {
-        if self.architecture_fingerprint != v4_architecture_fingerprint(args) {
+        let parameters = v4_parameters(args)?;
+        if self.parameters.as_ref() != &parameters
+            || self.architecture_fingerprint != v4_architecture_fingerprint(args)
+        {
             return Err(invalid(
                 "rank-local V4 geometry belongs to a different model configuration",
             ));
@@ -182,7 +189,7 @@ impl V4LocalGeometry {
             _ => {
                 return Err(invalid(
                     "rank-local V4 routed/shared expert channel ranges drifted",
-                ))
+                ));
             }
         }
         Ok(())
@@ -236,7 +243,8 @@ fn vocabulary_range(
     {
         return Err(invalid(format!(
             "{family} vocabulary weight {weight} has group {:?} and shape {:?}, expected {logical_name} with {global_vocabulary} rows",
-            tensor.logical_name(), tensor.global_shape()
+            tensor.logical_name(),
+            tensor.global_shape()
         )));
     }
     let local = match tensor.placement() {
@@ -249,7 +257,7 @@ fn vocabulary_range(
         placement => {
             return Err(invalid(format!(
                 "{family} vocabulary weight {weight} has non-row placement {placement:?}"
-            )))
+            )));
         }
     };
     let range = VocabularyParallelRange {
@@ -329,24 +337,30 @@ pub fn v3_local_geometry(
         .map_err(|_| invalid("V3 target layer count exceeds usize"))?;
     let total = usize::try_from(args.num_hidden_layers + args.num_nextn_predict_layers)
         .map_err(|_| invalid("V3 total layer count exceeds usize"))?;
-    let head_width = usize::try_from(args.qk_nope_head_dim + args.qk_rope_head_dim)
-        .map_err(|_| invalid("V3 query head width exceeds usize"))?;
-    let query_targets = (0..total).map(|layer| {
-        let root = format!("model.layers.{layer}.self_attn");
-        if args.q_lora_rank.is_some() {
-            format!("{root}.q_b_proj.weight")
-        } else {
-            format!("{root}.q_proj.weight")
-        }
-    });
+    let attention =
+        super::v3_specs::attention_spec(args, "model.layers.0.self_attn").map_err(nn_invalid)?;
+    let head_width = attention.geometry.query_head_dimensions() as usize;
+    let query_targets = (0..total)
+        .map(|layer| {
+            let declaration =
+                super::v3_specs::attention_spec(args, &format!("model.layers.{layer}.self_attn"))
+                    .map_err(nn_invalid)?;
+            let query = match declaration.query {
+                super::v3_specs::QuerySpec::Direct(query) => query,
+                super::v3_specs::QuerySpec::LowRank(query) => query.second,
+            };
+            Ok(query.weight.id.as_str().to_owned())
+        })
+        .collect::<Result<Vec<_>, ParallelPlanError>>()?;
     let query_width = same_local_axis(layout, query_targets, 0, "V3", "attention heads")?;
     if query_width % head_width != 0 {
         return Err(invalid(
             "local V3 query width does not contain complete heads",
         ));
     }
-    let mut local = args.clone();
-    local.num_attention_heads = i32::try_from(query_width / head_width)
+    let mut dense = args.intermediate_size;
+    let mut routed_width = args.moe_intermediate_size;
+    let heads = i32::try_from(query_width / head_width)
         .map_err(|_| invalid("local V3 attention head count exceeds i32"))?;
 
     let dense_layers = (0..target)
@@ -359,8 +373,7 @@ pub fn v3_local_geometry(
             "V3",
             "dense intermediate",
         )?;
-        local.intermediate_size =
-            i32::try_from(width).map_err(|_| invalid("local V3 dense width exceeds i32"))?;
+        dense = i32::try_from(width).map_err(|_| invalid("local V3 dense width exceeds i32"))?;
         let _ = first;
     }
     let sparse_layers = (0..total)
@@ -384,7 +397,7 @@ pub fn v3_local_geometry(
             if fused % 2 != 0 {
                 return Err(invalid("local V3 packed expert width is not even"));
             }
-            local.moe_intermediate_size = i32::try_from(fused / 2)
+            routed_width = i32::try_from(fused / 2)
                 .map_err(|_| invalid("local V3 expert width exceeds i32"))?;
             let global_routed = dim(args.moe_intermediate_size)?;
             let routed = same_logical_range(
@@ -410,6 +423,9 @@ pub fn v3_local_geometry(
             )?;
             (routed, shared)
         };
+    let local = args
+        .with_local_geometry(heads, dense, routed_width)
+        .map_err(|e| invalid(e.to_string()))?;
     local
         .validate()
         .map_err(|error| invalid(error.to_string()))?;
@@ -434,6 +450,7 @@ pub fn v3_local_geometry(
         )?,
         routed_expert_intermediate_range,
         shared_expert_intermediate_range,
+        parameters: std::sync::Arc::new(v3_parameters(args)?),
         architecture_fingerprint: v3_architecture_fingerprint(args),
         args: local,
     };
@@ -459,14 +476,31 @@ pub fn v4_local_geometry(
             }
         })
         .collect::<Vec<_>>();
+    let attention = roots
+        .iter()
+        .enumerate()
+        .map(|(layer, root)| {
+            super::v4_specs::attention_spec(args, layer, &format!("{root}.attn"))
+                .map_err(nn_invalid)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let routed = roots
+        .iter()
+        .enumerate()
+        .map(|(layer, root)| {
+            super::v4_specs::moe_spec(args, layer, &format!("{root}.ffn"), None).map_err(nn_invalid)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let query_width = same_local_axis(
         layout,
-        roots.iter().map(|root| format!("{root}.attn.wq_b.weight")),
+        attention
+            .iter()
+            .map(|spec| spec.query.second.weight.id.as_str().to_owned()),
         0,
         "V4",
         "attention heads",
     )?;
-    let head_dim = usize::try_from(args.head_dim)
+    let head_dim = usize::try_from(attention[0].geometry.key_dimensions())
         .map_err(|_| invalid("V4 attention head width exceeds usize"))?;
     if query_width % head_dim != 0 {
         return Err(invalid(
@@ -475,13 +509,15 @@ pub fn v4_local_geometry(
     }
     let output_width = same_local_axis(
         layout,
-        roots.iter().map(|root| format!("{root}.attn.wo_a.weight")),
+        attention
+            .iter()
+            .map(|spec| spec.output_a.weight.id.as_str().to_owned()),
         0,
         "V4",
         "attention output groups",
     )?;
-    let output_rank =
-        usize::try_from(args.o_lora_rank).map_err(|_| invalid("V4 output rank exceeds usize"))?;
+    let output_rank = usize::try_from(attention[0].output_rank())
+        .map_err(|_| invalid("V4 output rank exceeds usize"))?;
     if output_width % output_rank != 0 {
         return Err(invalid(
             "local V4 output projection does not contain complete groups",
@@ -489,9 +525,14 @@ pub fn v4_local_geometry(
     }
     let fused = same_local_axis(
         layout,
-        roots
-            .iter()
-            .map(|root| format!("{root}.ffn.switch_mlp.gate_up_proj")),
+        routed.iter().map(|spec| {
+            let eredu_nn::GatedProductGroupLayout::Packed { gate_up, .. } =
+                spec.routed.parameters.experts.layout()
+            else {
+                unreachable!("V4 declares packed experts")
+            };
+            gate_up.weight().id.as_str().to_owned()
+        }),
         1,
         "V4",
         "expert intermediate",
@@ -499,19 +540,27 @@ pub fn v4_local_geometry(
     if fused % 2 != 0 {
         return Err(invalid("local V4 packed expert width is not even"));
     }
-    let mut local = args.clone();
-    local.num_attention_heads = i32::try_from(query_width / head_dim)
+    let heads = i32::try_from(query_width / head_dim)
         .map_err(|_| invalid("local V4 attention head count exceeds i32"))?;
-    local.o_groups = i32::try_from(output_width / output_rank)
+    let groups = i32::try_from(output_width / output_rank)
         .map_err(|_| invalid("local V4 output group count exceeds i32"))?;
-    local.moe_intermediate_size =
+    let routed_width =
         i32::try_from(fused / 2).map_err(|_| invalid("local V4 expert width exceeds i32"))?;
-    let global_routed = dim(args.moe_intermediate_size)?;
+    let global_routed = dim(routed[0]
+        .routed
+        .parameters
+        .experts
+        .intermediate_dimensions())?;
     let routed_expert_intermediate_range = same_logical_range(
         layout,
-        roots
-            .iter()
-            .map(|root| format!("{root}.ffn.switch_mlp.gate_up_proj")),
+        routed.iter().map(|spec| {
+            let eredu_nn::GatedProductGroupLayout::Packed { gate_up, .. } =
+                spec.routed.parameters.experts.layout()
+            else {
+                unreachable!("V4 declares packed experts")
+            };
+            gate_up.weight().id.as_str().to_owned()
+        }),
         global_routed,
         "V4",
         "routed expert intermediate",
@@ -528,6 +577,9 @@ pub fn v4_local_geometry(
         "V4",
         "shared expert intermediate",
     )?;
+    let local = args
+        .with_local_geometry(heads, groups, routed_width)
+        .map_err(|e| invalid(e.to_string()))?;
     local
         .validate()
         .map_err(|error| invalid(error.to_string()))?;
@@ -546,6 +598,7 @@ pub fn v4_local_geometry(
         output_range: vocabulary_range(layout, "head", "head.weight", global_vocabulary, "V4")?,
         routed_expert_intermediate_range,
         shared_expert_intermediate_range,
+        parameters: std::sync::Arc::new(v4_parameters(args)?),
         architecture_fingerprint: v4_architecture_fingerprint(args),
         args: local,
     };
@@ -833,25 +886,23 @@ pub fn v3_partition_local_geometry(
         .map_err(|_| invalid("V3 target count exceeds usize"))?;
     let target_units = target_range(group_ranges, target_count)?;
     let local = v3_local_geometry(args, layout)?;
-    let global_experts = usize::try_from(args.n_routed_experts)
-        .map_err(|_| invalid("V3 expert count exceeds usize"))?;
+    let banks = v3::expert_bank_specs(args).map_err(nn_invalid)?;
+    let global_experts = banks
+        .values()
+        .next()
+        .ok_or_else(|| invalid("V3 routed target has no declared expert banks"))?
+        .group_count() as usize;
     let global_experts = validate_expert_topology(global_experts, topology, realization)?;
-    let routed_units = (0..target_count)
-        .filter(|unit| args.layer_schedule.get(*unit) == Some(&LayerPolicy::SparseMoe))
-        .collect::<Vec<_>>();
-    if realization.unit_specs().len() != routed_units.len() {
+    if realization.unit_specs().len() != banks.len() {
         return Err(invalid("selected V3 expert unit schedule drifted"));
     }
     let local_expert_count = i32::try_from(global_experts.len())
         .map_err(|_| invalid("V3 local expert count exceeds i32"))?;
-    for unit in &routed_units {
-        let expected = v3::localized_expert_bank_spec(
-            args,
-            *unit,
-            local_expert_count,
-            local.args().moe_intermediate_size,
-        )
-        .map_err(|error| invalid(error.to_string()))?;
+    for (unit, bank) in &banks {
+        let expected = bank
+            .clone()
+            .with_group_geometry(local_expert_count, local.args().moe_intermediate_size)
+            .map_err(|error| invalid(error.to_string()))?;
         if realization.unit_spec(crate::decoder::TARGET_EXECUTION_GROUP, *unit) != Some(&expected) {
             return Err(invalid(format!(
                 "selected V3 expert bank geometry drifted at target unit {unit}"
@@ -865,7 +916,7 @@ pub fn v3_partition_local_geometry(
         expected_static_roles(&target_units, target_count, ownership, &["norm", "output"])?;
     let expert_banks = compact_banks(
         target_units.clone(),
-        |unit| args.layer_schedule.get(unit) == Some(&LayerPolicy::SparseMoe),
+        |unit| banks.contains_key(&unit),
         &global_experts,
         intermediate_range,
     );
@@ -892,22 +943,23 @@ pub fn v4_partition_local_geometry(
         .map_err(|_| invalid("V4 target count exceeds usize"))?;
     let target_units = target_range(group_ranges, target_count)?;
     let local = v4_local_geometry(args, layout)?;
-    let global_experts = usize::try_from(args.n_routed_experts)
-        .map_err(|_| invalid("V4 expert count exceeds usize"))?;
+    let banks = v4::expert_bank_specs(args).map_err(nn_invalid)?;
+    let global_experts = banks
+        .values()
+        .next()
+        .ok_or_else(|| invalid("V4 routed target has no declared expert banks"))?
+        .group_count() as usize;
     let global_experts = validate_expert_topology(global_experts, topology, realization)?;
-    if realization.unit_specs().len() != target_count {
+    if realization.unit_specs().len() != banks.len() {
         return Err(invalid("selected V4 expert unit schedule drifted"));
     }
     let local_expert_count = i32::try_from(global_experts.len())
         .map_err(|_| invalid("V4 local expert count exceeds i32"))?;
-    for unit in 0..target_count {
-        let expected = v4::localized_expert_bank_spec(
-            args,
-            unit,
-            local_expert_count,
-            local.args().moe_intermediate_size,
-        )
-        .map_err(|error| invalid(error.to_string()))?;
+    for (&unit, bank) in &banks {
+        let expected = bank
+            .clone()
+            .with_group_geometry(local_expert_count, local.args().moe_intermediate_size)
+            .map_err(|error| invalid(error.to_string()))?;
         if realization.unit_spec(crate::decoder::TARGET_EXECUTION_GROUP, unit) != Some(&expected) {
             return Err(invalid(format!(
                 "selected V4 expert bank geometry drifted at target unit {unit}"
@@ -1121,19 +1173,12 @@ pub fn v3_static_parameter_groups(
 fn v3_pinned_parameter_groups(
     args: &V3Args,
 ) -> Result<Vec<(&'static str, ParameterGroupSpec)>, ParallelPlanError> {
-    let groups = v3::static_spec(args).logical_pinned_parameter_groups(
+    args.parameters().statics.pinned_parameter_groups(
+        crate::decoder::ParameterEncoding::Stored,
         "model.embed_tokens",
         "model.norm",
         "lm_head",
-    )?;
-    // Published V3 statics are dense even when the layer default is FP8.
-    // Explicit admitted formats cover GGUF and transformed embedding/head data.
-    expand_pinned_formats(groups, |name| {
-        args.linear_formats
-            .get(name)
-            .copied()
-            .unwrap_or(LinearFormat::Dense)
-    })
+    )
 }
 
 /// Declares one V3 target or embedded-prediction unit's semantic groups.
@@ -1152,109 +1197,147 @@ pub fn v3_layer_parameter_groups(
     }
     let root = format!("model.layers.{layer}");
     let attention = format!("{root}.self_attn");
-    let heads = dim(args.num_attention_heads)?;
-    let query_width = dim(args.qk_nope_head_dim + args.qk_rope_head_dim)?;
-    let kv_width = dim(args.qk_nope_head_dim + args.v_head_dim)?;
-    let rank = dim(args.kv_lora_rank)?;
-    let hidden = dim(args.hidden_size)?;
-    let mut members = Vec::new();
-    if let Some(query_rank) = args.q_lora_rank {
-        members.push(member(
-            format!("{attention}.q_b_proj.weight"),
-            vec![heads * query_width, dim(query_rank)?],
-            MemberSharding::Partitioned { axis: 0 },
-        ));
-    } else {
-        members.push(member(
-            format!("{attention}.q_proj.weight"),
-            vec![heads * query_width, hidden],
-            MemberSharding::Partitioned { axis: 0 },
-        ));
+    let spec = super::v3_specs::attention_spec(args, &attention).map_err(nn_invalid)?;
+    let query = match &spec.query {
+        super::v3_specs::QuerySpec::Direct(projection) => projection,
+        super::v3_specs::QuerySpec::LowRank(query) => &query.second,
+    };
+    let mut heads = Vec::new();
+    for projection in [query, &spec.kv_b, &spec.output] {
+        heads.extend(projection.logical_parameters().map_err(nn_invalid)?);
     }
-    members.extend([
-        member(
-            format!("{attention}.kv_b_proj.weight"),
-            vec![heads * kv_width, rank],
-            MemberSharding::Partitioned { axis: 0 },
-        ),
-        member(
-            format!("{attention}.o_proj.weight"),
-            vec![hidden, heads * dim(args.v_head_dim)?],
-            MemberSharding::Partitioned { axis: 1 },
-        ),
-    ]);
-    let mut groups = vec![ParameterGroupSpec::partitioned(
+    let mut groups = vec![eredu_runtime::logical_parameter_group(
         format!("{attention}.heads"),
         ParameterRole::AttentionHeads,
-        heads,
-        members,
+        Some(spec.geometry.heads() as usize),
+        &heads,
+        |p| {
+            if p.parameter.id == spec.output.weight.id {
+                MemberSharding::Partitioned { axis: 1 }
+            } else {
+                MemberSharding::Partitioned { axis: 0 }
+            }
+        },
     )?];
-    groups.push(replicated(
-        format!("{root}.attention_rank"),
-        [
-            (
-                format!("{attention}.kv_a_proj_with_mqa.weight"),
-                vec![rank + dim(args.qk_rope_head_dim)?, hidden],
-            ),
-            (format!("{attention}.kv_a_layernorm.weight"), vec![rank]),
-        ],
-    )?);
-    if let Some(query_rank) = args.q_lora_rank {
-        groups.push(replicated(
-            format!("{root}.query_rank"),
-            [
-                (
-                    format!("{attention}.q_a_proj.weight"),
-                    vec![dim(query_rank)?, hidden],
-                ),
-                (
-                    format!("{attention}.q_a_layernorm.weight"),
-                    vec![dim(query_rank)?],
-                ),
-            ],
-        )?);
+    let mut rank = spec.kv_a.logical_parameters().map_err(nn_invalid)?;
+    rank.extend(spec.kv_norm.logical_parameters().map_err(nn_invalid)?);
+    groups.push(replicated_group(format!("{root}.attention_rank"), &rank)?);
+    if let super::v3_specs::QuerySpec::LowRank(query) = &spec.query {
+        let mut rank = Vec::new();
+        if let Some(first) = &query.first {
+            rank.extend(first.logical_parameters().map_err(nn_invalid)?);
+        }
+        rank.extend(
+            query
+                .normalization
+                .logical_parameters()
+                .map_err(nn_invalid)?,
+        );
+        groups.push(replicated_group(format!("{root}.query_rank"), &rank)?);
     }
-    groups.push(replicated(
-        format!("{root}.norms"),
-        [
-            (format!("{root}.input_layernorm.weight"), vec![hidden]),
-            (
-                format!("{root}.post_attention_layernorm.weight"),
-                vec![hidden],
-            ),
-        ],
-    )?);
+    let norms = ["input_layernorm", "post_attention_layernorm"]
+        .into_iter()
+        .map(|field| {
+            super::v3_specs::normalization_spec(
+                args,
+                &format!("{root}.{field}.weight"),
+                args.hidden_size,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(nn_invalid)?;
+    groups.push(replicated_group(format!("{root}.norms"), norms.as_slice())?);
     if layer >= target {
-        groups.push(replicated(
-            format!("{root}.prediction"),
-            [
-                (format!("{root}.enorm.weight"), vec![hidden]),
-                (format!("{root}.hnorm.weight"), vec![hidden]),
-                (format!("{root}.eh_proj.weight"), vec![hidden, 2 * hidden]),
-                (format!("{root}.shared_head.norm.weight"), vec![hidden]),
-                (
-                    format!("{root}.shared_head.head.weight"),
-                    vec![dim(args.vocab_size)?, hidden],
-                ),
-            ],
-        )?);
+        let prediction = super::v3_specs::prediction_spec(args, &root).map_err(nn_invalid)?;
+        groups.push(replicated_group(format!("{root}.prediction"), &prediction)?);
     }
     let sparse = layer >= target || args.layer_schedule.get(layer) == Some(&LayerPolicy::SparseMoe);
-    groups.extend(if sparse {
-        expert_groups_v3(args, layer)?
+    if sparse {
+        let declaration = v3::routed_spec(args, layer, None).map_err(nn_invalid)?;
+        groups.push(packed_expert_group(
+            format!("{root}.mlp.routed_expert_intermediate"),
+            &declaration.parameters.experts,
+        )?);
+        groups.push(replicated_group(
+            format!("{root}.mlp.router"),
+            &declaration.parameters.selector,
+        )?);
+        groups.push(gated_projection_group(
+            format!("{root}.mlp.shared_expert_intermediate"),
+            ParameterRole::ExpertIntermediate,
+            &declaration.shared,
+        )?);
     } else {
-        dense_v3_group(args, layer)?.into_iter().collect()
-    });
-    expand_linear_formats(groups, |name| {
-        if name == format!("{root}.mlp.gate.weight") {
-            args.linear_formats
-                .get(name)
-                .copied()
-                .unwrap_or(LinearFormat::Dense)
-        } else {
-            args.linear_format_for(name)
-        }
+        let dense =
+            super::v3_specs::dense_parameters(args, &format!("{root}.mlp")).map_err(nn_invalid)?;
+        groups.push(gated_projection_group(
+            format!("{root}.mlp.intermediate"),
+            ParameterRole::FeedForwardIntermediate,
+            &dense,
+        )?);
+    }
+    Ok(groups)
+}
+
+fn nn_invalid(error: eredu_nn::Error) -> ParallelPlanError {
+    invalid(error.to_string())
+}
+
+fn replicated_group(
+    name: impl Into<String>,
+    spec: &(impl DeclareLogicalParameters + ?Sized),
+) -> Result<ParameterGroupSpec, ParallelPlanError> {
+    eredu_runtime::logical_parameter_group(name, ParameterRole::Replicated, None, spec, |_| {
+        MemberSharding::Replicated
     })
+}
+fn gated_projection_group(
+    name: String,
+    role: ParameterRole,
+    parameters: &eredu_nn::SplitGatedProductSpec,
+) -> Result<ParameterGroupSpec, ParallelPlanError> {
+    eredu_runtime::logical_parameter_group(
+        name,
+        role,
+        Some(parameters.down.input as usize),
+        parameters,
+        |p| {
+            if p.parameter.id == parameters.down.weight.id {
+                MemberSharding::Partitioned { axis: 1 }
+            } else {
+                MemberSharding::Partitioned { axis: 0 }
+            }
+        },
+    )
+}
+fn packed_expert_group(
+    name: String,
+    bank: &eredu_nn::GroupedGatedProductSpec,
+) -> Result<ParameterGroupSpec, ParallelPlanError> {
+    let eredu_nn::GatedProductGroupLayout::Packed { gate_up, .. } = bank.layout() else {
+        return Err(invalid("DeepSeek placement requires packed experts"));
+    };
+    let width = bank.intermediate_dimensions() as usize;
+    eredu_runtime::logical_parameter_group(
+        name,
+        ParameterRole::ExpertIntermediate,
+        Some(width),
+        bank,
+        |p| {
+            if p.parameter.id == gate_up.weight().id
+                || gate_up.bias().is_some_and(|bias| p.parameter.id == bias.id)
+            {
+                MemberSharding::PartitionedSegments {
+                    axis: 1,
+                    segments: vec![0..width, width..2 * width],
+                }
+            } else if p.role == eredu_nn::LogicalParameterRole::LinearWeight {
+                MemberSharding::Partitioned { axis: 2 }
+            } else {
+                MemberSharding::Replicated
+            }
+        },
+    )
 }
 
 /// Declares pinned V4 vocabulary, target hyper-head, and final norm groups.
@@ -1270,77 +1353,29 @@ pub fn v4_static_parameter_groups(
 fn v4_pinned_parameter_groups(
     args: &V4Args,
 ) -> Result<Vec<(&'static str, ParameterGroupSpec)>, ParallelPlanError> {
-    let hidden = dim(args.hidden_size)?;
-    let streams = dim(args.hc_mult)?;
-    let mut groups =
-        v4::text_static_spec(args).logical_pinned_parameter_groups("embed", "norm", "head")?;
+    let mut groups = args.parameters().statics.pinned_parameter_groups(
+        crate::decoder::ParameterEncoding::Stored,
+        "embed",
+        "norm",
+        "head",
+    )?;
     groups.push((
         "hyper_head",
-        replicated(
+        replicated_group(
             "hyper_head",
-            [
-                ("hc_head_fn", vec![streams, streams * hidden]),
-                ("hc_head_base", vec![streams]),
-                ("hc_head_scale", vec![1]),
-            ],
+            &super::v4_specs::hyper_head_spec(args, "hc_head").map_err(nn_invalid)?,
         )?,
     ));
-    if let Some(config) = &args.dspark {
-        let last = usize::try_from(args.num_nextn_predict_layers)
-            .map_err(|_| invalid("V4 DSpark depth exceeds usize"))?
-            .checked_sub(1)
-            .ok_or_else(|| invalid("V4 DSpark requires at least one draft layer"))?;
-        let captures = args
-            .target_capture_policy
-            .as_ref()
-            .expect("validated DSpark target capture policy")
-            .len();
-        let markov = dim(config.markov_rank)?;
+    if args.dspark.is_some() {
         groups.push((
             "mtp",
-            replicated(
+            replicated_group(
                 "dspark",
-                [
-                    (
-                        "mtp.0.main_proj.weight".to_string(),
-                        vec![hidden, hidden * captures],
-                    ),
-                    ("mtp.0.main_norm.weight".to_string(), vec![hidden]),
-                    (format!("mtp.{last}.norm.weight"), vec![hidden]),
-                    (
-                        format!("mtp.{last}.hc_head_fn"),
-                        vec![streams, streams * hidden],
-                    ),
-                    (format!("mtp.{last}.hc_head_base"), vec![streams]),
-                    (format!("mtp.{last}.hc_head_scale"), vec![1]),
-                    (
-                        format!("mtp.{last}.markov_head.markov_w1.weight"),
-                        vec![dim(args.vocab_size)?, markov],
-                    ),
-                    (
-                        format!("mtp.{last}.markov_head.markov_w2.weight"),
-                        vec![dim(args.vocab_size)?, markov],
-                    ),
-                    (
-                        format!("mtp.{last}.confidence_head.proj.weight"),
-                        vec![1, hidden + markov],
-                    ),
-                ],
+                &super::v4_specs::dspark_spec(args).map_err(nn_invalid)?,
             )?,
         ));
     }
-    expand_pinned_formats(groups, |name| {
-        // Published embedding tables remain dense under the FP8 linear default.
-        // Retain any separately admitted source/transform encoding explicitly.
-        if name == "embed.weight" || name.ends_with(".markov_head.markov_w1.weight") {
-            args.linear_formats
-                .get(name)
-                .copied()
-                .unwrap_or(LinearFormat::Dense)
-        } else {
-            args.linear_format_for(name)
-        }
-    })
+    Ok(groups)
 }
 
 /// Describes every V3 target/prediction parameter with explicit graph ownership.
@@ -1386,14 +1421,13 @@ pub(super) fn v4_parameters(
     )
 }
 
-fn deepseek_parameter_description(
+/// Projects the shared target/prediction invocation layout independently of parameter namespaces.
+pub(super) fn execution_layout(
     targets: usize,
     predictions: usize,
-    static_groups: Vec<(&'static str, ParameterGroupSpec)>,
-    mut unit_groups: impl FnMut(usize) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError>,
-) -> Result<ArchitectureParameterDescription, ParallelPlanError> {
+) -> Result<(ExecutionGraph, ExecutionUnitLayout), ParallelPlanError> {
     let graph = ExecutionGraph::chain(
-        std::iter::once("target".to_owned())
+        std::iter::once(crate::decoder::TARGET_EXECUTION_GROUP.to_owned())
             .chain((0..predictions).map(|depth| format!("mtp.{depth}"))),
     )
     .map_err(|error| invalid(error.to_string()))?;
@@ -1402,6 +1436,16 @@ fn deepseek_parameter_description(
         std::iter::once(targets).chain(std::iter::repeat_n(1, predictions)),
     )
     .map_err(|error| invalid(error.to_string()))?;
+    Ok((graph, layout))
+}
+
+fn deepseek_parameter_description(
+    targets: usize,
+    predictions: usize,
+    static_groups: Vec<(&'static str, ParameterGroupSpec)>,
+    mut unit_groups: impl FnMut(usize) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError>,
+) -> Result<ArchitectureParameterDescription, ParallelPlanError> {
+    let (graph, layout) = execution_layout(targets, predictions)?;
     let mut owned = static_groups
         .into_iter()
         .map(|(role, group)| {
@@ -1413,19 +1457,15 @@ fn deepseek_parameter_description(
             OwnedParameterGroupSpec::new(owner, group)
         })
         .collect::<Vec<_>>();
-    for flat in 0..targets + predictions {
-        let (group_index, global_unit) = if flat < targets {
-            (0, flat)
-        } else {
-            (flat - targets + 1, 0)
-        };
+    for flat in 0..layout.len() {
+        let address = layout.address(flat).expect("declared invocation");
         let groups = unit_groups(flat)?;
         let owner = ParameterGroupOwner::execution_unit(
             layout
-                .group_id(group_index)
-                .expect("DeepSeek layout group")
+                .group_id(address.group())
+                .expect("declared group")
                 .clone(),
-            global_unit,
+            address.index(),
         );
         owned.extend(
             groups
@@ -1457,402 +1497,104 @@ pub fn v4_layer_parameter_groups(
     } else {
         format!("mtp.{}", layer - target)
     };
-    let heads = dim(args.num_attention_heads)?;
-    let hidden = dim(args.hidden_size)?;
-    let head = dim(args.head_dim)?;
-    let groups_count = dim(args.o_groups)?;
-    let rank = dim(args.o_lora_rank)?;
-    let mut groups = vec![ParameterGroupSpec::partitioned(
+    let attention = super::v4_specs::attention_spec(args, layer, &format!("{root}.attn"))
+        .map_err(nn_invalid)?;
+    let mut output = Vec::new();
+    for projection in [
+        &attention.query.second,
+        &attention.output_a,
+        &attention.output_b,
+    ] {
+        output.extend(projection.logical_parameters().map_err(nn_invalid)?);
+    }
+    let declarations = attention.logical_parameters().map_err(nn_invalid)?;
+    let sink = declarations
+        .iter()
+        .find(|p| p.role == eredu_nn::LogicalParameterRole::AttentionSink)
+        .expect("V4 attention declares its sink");
+    output.push(sink.clone());
+    let mut groups = vec![eredu_runtime::logical_parameter_group(
         format!("{root}.attn.output_groups"),
         ParameterRole::AttentionHeads,
-        groups_count,
-        [
-            member(
-                format!("{root}.attn.wq_b.weight"),
-                vec![heads * head, dim(args.q_lora_rank)?],
-                MemberSharding::Partitioned { axis: 0 },
-            ),
-            member(
-                format!("{root}.attn.wo_a.weight"),
-                vec![groups_count * rank, heads * head / groups_count],
-                MemberSharding::Partitioned { axis: 0 },
-            ),
-            member(
-                format!("{root}.attn.wo_b.weight"),
-                vec![hidden, groups_count * rank],
-                MemberSharding::Partitioned { axis: 1 },
-            ),
-            member(
-                format!("{root}.attn.attn_sink"),
-                vec![heads],
-                MemberSharding::Partitioned { axis: 0 },
-            ),
-        ],
+        Some(dim(attention.groups)?),
+        &output,
+        |p| {
+            if p.parameter.id == attention.output_b.weight.id {
+                MemberSharding::Partitioned { axis: 1 }
+            } else {
+                MemberSharding::Partitioned { axis: 0 }
+            }
+        },
     )?];
-    groups.push(replicated(
+    let mut shared = Vec::new();
+    if let Some(first) = &attention.query.first {
+        shared.extend(first.logical_parameters().map_err(nn_invalid)?);
+    }
+    shared.extend(
+        attention
+            .query
+            .normalization
+            .logical_parameters()
+            .map_err(nn_invalid)?,
+    );
+    shared.extend(attention.kv.logical_parameters().map_err(nn_invalid)?);
+    shared.extend(attention.kv_norm.logical_parameters().map_err(nn_invalid)?);
+    let norms = super::v4_specs::block_normalizations(args, &root).map_err(nn_invalid)?;
+    for norm in &norms {
+        shared.extend(norm.logical_parameters().map_err(nn_invalid)?);
+    }
+    groups.push(replicated_group(
         format!("{root}.attention_shared"),
-        [
-            (
-                format!("{root}.attn.wq_a.weight"),
-                vec![dim(args.q_lora_rank)?, hidden],
-            ),
-            (
-                format!("{root}.attn.q_norm.weight"),
-                vec![dim(args.q_lora_rank)?],
-            ),
-            (format!("{root}.attn.wkv.weight"), vec![head, hidden]),
-            (format!("{root}.attn.kv_norm.weight"), vec![head]),
-            (format!("{root}.attn_norm.weight"), vec![hidden]),
-            (format!("{root}.ffn_norm.weight"), vec![hidden]),
-        ],
+        &shared,
     )?);
-    let streams = dim(args.hc_mult)?;
-    groups.push(replicated(
-        format!("{root}.hyper_streams"),
-        [
-            (
-                format!("{root}.hc_attn_fn"),
-                vec![(2 + streams) * streams, streams * hidden],
-            ),
-            (
-                format!("{root}.hc_attn_base"),
-                vec![(2 + streams) * streams],
-            ),
-            (format!("{root}.hc_attn_scale"), vec![3]),
-            (
-                format!("{root}.hc_ffn_fn"),
-                vec![(2 + streams) * streams, streams * hidden],
-            ),
-            (format!("{root}.hc_ffn_base"), vec![(2 + streams) * streams]),
-            (format!("{root}.hc_ffn_scale"), vec![3]),
-        ],
-    )?);
-    if layer < target
-        && matches!(
-            args.attention_policy(layer),
-            Some(super::V4AttentionPolicy::Compressed { ratio: 4 })
-        )
-    {
-        groups.push(replicated(
+    let hyper = super::v4_specs::hyper_block_spec(args, &root).map_err(nn_invalid)?;
+    groups.push(replicated_group(format!("{root}.hyper_streams"), &hyper)?);
+    if let Some(indexer) = &attention.indexer {
+        let mut parameters = indexer.query.logical_parameters().map_err(nn_invalid)?;
+        parameters.extend(indexer.weights.logical_parameters().map_err(nn_invalid)?);
+        groups.push(replicated_group(
             format!("{root}.attn.index_heads"),
-            [
-                (
-                    format!("{root}.attn.indexer.wq_b.weight"),
-                    vec![
-                        dim(args.index_n_heads)? * dim(args.index_head_dim)?,
-                        dim(args.q_lora_rank)?,
-                    ],
-                ),
-                (
-                    format!("{root}.attn.indexer.weights_proj.weight"),
-                    vec![dim(args.index_n_heads)?, hidden],
-                ),
-            ],
+            &parameters,
         )?);
     }
-    if layer < target {
-        if let Some(super::V4AttentionPolicy::Compressed { ratio }) = args.attention_policy(layer) {
-            let output = head
-                .checked_mul(if ratio == 4 { 2 } else { 1 })
-                .ok_or_else(|| invalid("V4 compressor output width overflowed"))?;
-            groups.push(replicated(
-                format!("{root}.attn.compressor"),
-                [
-                    (
-                        format!("{root}.attn.compressor.wkv.weight"),
-                        vec![output, hidden],
-                    ),
-                    (
-                        format!("{root}.attn.compressor.wgate.weight"),
-                        vec![output, hidden],
-                    ),
-                    (
-                        format!("{root}.attn.compressor.ape"),
-                        vec![dim(ratio)?, output],
-                    ),
-                    (format!("{root}.attn.compressor.norm.weight"), vec![head]),
-                ],
-            )?);
-            if ratio == 4 {
-                let index = dim(args.index_head_dim)?;
-                let index_output = index
-                    .checked_mul(2)
-                    .ok_or_else(|| invalid("V4 index compressor output width overflowed"))?;
-                groups.push(replicated(
-                    format!("{root}.attn.indexer.compressor"),
-                    [
-                        (
-                            format!("{root}.attn.indexer.compressor.wkv.weight"),
-                            vec![index_output, hidden],
-                        ),
-                        (
-                            format!("{root}.attn.indexer.compressor.wgate.weight"),
-                            vec![index_output, hidden],
-                        ),
-                        (
-                            format!("{root}.attn.indexer.compressor.ape"),
-                            vec![4, index_output],
-                        ),
-                        (
-                            format!("{root}.attn.indexer.compressor.norm.weight"),
-                            vec![index],
-                        ),
-                    ],
-                )?);
-            }
-        }
+    if let Some(compressor) = &attention.compressor {
+        groups.push(replicated_group(
+            format!("{root}.attn.compressor"),
+            compressor,
+        )?);
+    }
+    if let Some(indexer) = &attention.indexer {
+        groups.push(replicated_group(
+            format!("{root}.attn.indexer.compressor"),
+            &indexer.compressor,
+        )?);
     }
     if layer >= target && args.dspark.is_none() {
-        groups.push(replicated(
-            format!("{root}.prediction"),
-            [
-                (format!("{root}.e_proj.weight"), vec![hidden, hidden]),
-                (format!("{root}.h_proj.weight"), vec![hidden, hidden]),
-                (format!("{root}.enorm.weight"), vec![hidden]),
-                (format!("{root}.hnorm.weight"), vec![hidden]),
-                (format!("{root}.norm.weight"), vec![hidden]),
-                (
-                    format!("{root}.hc_head_fn"),
-                    vec![streams, streams * hidden],
-                ),
-                (format!("{root}.hc_head_base"), vec![streams]),
-                (format!("{root}.hc_head_scale"), vec![1]),
-            ],
-        )?);
+        let prediction = super::v4_specs::prediction_spec(args, &root).map_err(nn_invalid)?;
+        groups.push(replicated_group(format!("{root}.prediction"), &prediction)?);
     }
-    groups.extend(expert_groups_v4(args, layer, &root)?);
-    expand_linear_formats(groups, |name| {
-        if name == format!("{root}.ffn.gate.weight") {
-            args.linear_formats
-                .get(name)
-                .copied()
-                .unwrap_or(LinearFormat::Dense)
-        } else {
-            args.linear_format_for(name)
-        }
-    })
-}
-
-fn dense_v3_group(
-    args: &V3Args,
-    layer: usize,
-) -> Result<Option<ParameterGroupSpec>, ParallelPlanError> {
-    let root = format!("model.layers.{layer}.mlp");
-    let width = dim(args.intermediate_size)?;
-    let hidden = dim(args.hidden_size)?;
-    Ok(Some(ParameterGroupSpec::partitioned(
-        format!("{root}.intermediate"),
-        ParameterRole::FeedForwardIntermediate,
-        width,
-        [
-            member(
-                format!("{root}.gate_proj.weight"),
-                vec![width, hidden],
-                MemberSharding::Partitioned { axis: 0 },
-            ),
-            member(
-                format!("{root}.up_proj.weight"),
-                vec![width, hidden],
-                MemberSharding::Partitioned { axis: 0 },
-            ),
-            member(
-                format!("{root}.down_proj.weight"),
-                vec![hidden, width],
-                MemberSharding::Partitioned { axis: 1 },
-            ),
-        ],
-    )?))
-}
-
-fn expert_groups_v3(
-    args: &V3Args,
-    layer: usize,
-) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    let root = format!("model.layers.{layer}.mlp");
-    let experts = dim(args.n_routed_experts)?;
-    let hidden = dim(args.hidden_size)?;
-    let mut groups = expert_groups(
-        &root,
-        experts,
-        dim(args.moe_intermediate_size)?,
-        hidden,
-        "experts.gate_up_proj",
-        "experts.down_proj",
-    )?;
-    groups.push(replicated(
-        format!("{root}.router"),
-        [
-            (format!("{root}.gate.weight"), vec![experts, hidden]),
-            (
-                format!("{root}.gate.e_score_correction_bias"),
-                vec![experts],
-            ),
-        ],
+    let moe =
+        super::v4_specs::moe_spec(args, layer, &format!("{root}.ffn"), None).map_err(nn_invalid)?;
+    groups.push(packed_expert_group(
+        format!("{root}.ffn.routed_expert_intermediate"),
+        &moe.routed.parameters.experts,
     )?);
-    groups.push(shared_expert_group(
-        &root,
-        dim(args.moe_intermediate_size)? * dim(args.n_shared_experts)?,
-        hidden,
-        "shared_experts.gate_proj.weight",
-        "shared_experts.up_proj.weight",
-        "shared_experts.down_proj.weight",
+    groups.push(gated_projection_group(
+        format!("{root}.ffn.shared_expert_intermediate"),
+        ParameterRole::ExpertIntermediate,
+        &moe.routed.shared,
     )?);
-    Ok(groups)
-}
-
-fn expert_groups_v4(
-    args: &V4Args,
-    layer: usize,
-    root: &str,
-) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    let root = format!("{root}.ffn");
-    let mut groups = expert_groups(
-        &root,
-        dim(args.n_routed_experts)?,
-        dim(args.moe_intermediate_size)?,
-        dim(args.hidden_size)?,
-        "switch_mlp.gate_up_proj",
-        "switch_mlp.down_proj",
-    )?;
-    groups.push(shared_expert_group(
-        &root,
-        dim(args.moe_intermediate_size)? * dim(args.n_shared_experts)?,
-        dim(args.hidden_size)?,
-        "shared_experts.w1.weight",
-        "shared_experts.w3.weight",
-        "shared_experts.w2.weight",
-    )?);
-    let experts = dim(args.n_routed_experts)?;
-    let mut router = vec![(
-        format!("{root}.gate.weight"),
-        vec![experts, dim(args.hidden_size)?],
-    )];
-    let hash_layers = usize::try_from(args.num_hash_layers)
-        .map_err(|_| invalid("V4 hash layer count must not be negative"))?;
-    if layer < hash_layers {
-        router.push((
-            format!("{root}.gate.tid2eid"),
-            vec![dim(args.vocab_size)?, dim(args.num_experts_per_tok)?],
-        ));
-    } else {
-        router.push((format!("{root}.gate.bias"), vec![experts]));
+    let mut router = moe
+        .routed
+        .parameters
+        .selector
+        .logical_parameters()
+        .map_err(nn_invalid)?;
+    if let Some(table) = &moe.token_table {
+        router.extend(table.logical_parameters().map_err(nn_invalid)?);
     }
-    groups.push(replicated(format!("{root}.router"), router)?);
+    groups.push(replicated_group(format!("{root}.ffn.router"), &router)?);
     Ok(groups)
-}
-
-fn shared_expert_group(
-    root: &str,
-    width: usize,
-    hidden: usize,
-    gate: &str,
-    up: &str,
-    down: &str,
-) -> Result<ParameterGroupSpec, ParallelPlanError> {
-    ParameterGroupSpec::partitioned(
-        format!("{root}.shared_expert_intermediate"),
-        ParameterRole::ExpertIntermediate,
-        width,
-        [
-            member(
-                format!("{root}.{gate}"),
-                vec![width, hidden],
-                MemberSharding::Partitioned { axis: 0 },
-            ),
-            member(
-                format!("{root}.{up}"),
-                vec![width, hidden],
-                MemberSharding::Partitioned { axis: 0 },
-            ),
-            member(
-                format!("{root}.{down}"),
-                vec![hidden, width],
-                MemberSharding::Partitioned { axis: 1 },
-            ),
-        ],
-    )
-}
-
-fn expert_groups(
-    root: &str,
-    experts: usize,
-    width: usize,
-    hidden: usize,
-    gate_up: &str,
-    down: &str,
-) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    Ok(vec![ParameterGroupSpec::partitioned(
-        format!("{root}.routed_expert_intermediate"),
-        ParameterRole::ExpertIntermediate,
-        width,
-        [
-            member(
-                format!("{root}.{gate_up}"),
-                vec![experts, 2 * width, hidden],
-                MemberSharding::PartitionedSegments {
-                    axis: 1,
-                    segments: vec![0..width, width..2 * width],
-                },
-            ),
-            member(
-                format!("{root}.{down}"),
-                vec![experts, hidden, width],
-                MemberSharding::Partitioned { axis: 2 },
-            ),
-        ],
-    )?])
-}
-
-fn expand_linear_formats(
-    groups: Vec<ParameterGroupSpec>,
-    format: impl Fn(&str) -> LinearFormat,
-) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    eredu_runtime::expand_linear_format_parameter_groups(groups, |member| {
-        crate::linear_format::standard_parallel_linear_format(member, format(member.target()))
-    })
-}
-
-fn replicated<N, I>(
-    name: impl Into<String>,
-    members: I,
-) -> Result<ParameterGroupSpec, ParallelPlanError>
-where
-    N: Into<String>,
-    I: IntoIterator<Item = (N, Vec<usize>)>,
-{
-    group(
-        name,
-        ParameterRole::Replicated,
-        members
-            .into_iter()
-            .map(|(name, shape)| (name, shape, MemberSharding::Replicated)),
-    )
-}
-
-fn group<N, I>(
-    name: impl Into<String>,
-    role: ParameterRole,
-    members: I,
-) -> Result<ParameterGroupSpec, ParallelPlanError>
-where
-    N: Into<String>,
-    I: IntoIterator<Item = (N, Vec<usize>, MemberSharding)>,
-{
-    ParameterGroupSpec::new(
-        name,
-        role,
-        members
-            .into_iter()
-            .map(|(name, shape, sharding)| member(name, shape, sharding)),
-    )
-}
-
-fn member(
-    name: impl Into<String>,
-    shape: Vec<usize>,
-    sharding: MemberSharding,
-) -> ParameterMemberSpec {
-    ParameterMemberSpec::new(name, shape, sharding)
 }
 
 fn dim(value: i32) -> Result<usize, ParallelPlanError> {
@@ -1864,13 +1606,4 @@ fn dim(value: i32) -> Result<usize, ParallelPlanError> {
 
 fn invalid(message: impl Into<String>) -> ParallelPlanError {
     ParallelPlanError::InvalidGroup(message.into())
-}
-
-fn expand_pinned_formats(
-    groups: Vec<(&'static str, ParameterGroupSpec)>,
-    format: impl Fn(&str) -> LinearFormat,
-) -> Result<Vec<(&'static str, ParameterGroupSpec)>, ParallelPlanError> {
-    eredu_runtime::expand_tagged_linear_format_parameter_groups(groups, |member| {
-        crate::linear_format::standard_parallel_linear_format(member, format(member.target()))
-    })
 }

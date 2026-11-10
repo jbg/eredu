@@ -5,6 +5,9 @@
 //! implementation in target and speculative-decoder code.
 
 use eredu_backend_mlx_macros::PhysicalParameters;
+use eredu_nn::{
+    DeclareLogicalParameters, HyperConnectionSpec, HyperHeadSpec, LogicalParameterRole,
+};
 use safemlx::{
     error::Exception,
     ops::{einsum, indexing::TryIndexOp, matmul, mean_axis, rsqrt, sigmoid, softmax_axis},
@@ -49,31 +52,16 @@ pub struct HyperConnection {
 
 impl HyperConnection {
     /// Creates an unloaded hyper-connection.
-    pub fn unloaded(
-        streams: i32,
-        hidden_size: i32,
-        iterations: usize,
-        epsilon: f32,
-        stream: &Stream,
-    ) -> Result<Self, Exception> {
-        if streams <= 0 || hidden_size <= 0 {
-            return Err(Exception::custom(
-                "hyper-connection streams and hidden size must be positive",
-            ));
-        }
-        let width = (2 + streams) * streams;
+    pub fn unloaded(spec: &HyperConnectionSpec, stream: &Stream) -> Result<Self, Exception> {
+        let [function, base, scale] = unloaded_parameters(spec, stream)?;
         Ok(Self {
-            streams,
-            hidden_size,
-            iterations,
-            epsilon,
-            function: PhysicalParam::unloaded(
-                &[width, streams * hidden_size],
-                Dtype::Float32,
-                stream,
-            )?,
-            base: PhysicalParam::unloaded(&[width], Dtype::Float32, stream)?,
-            scale: PhysicalParam::unloaded(&[3], Dtype::Float32, stream)?,
+            streams: spec.streams,
+            hidden_size: spec.hidden_size,
+            iterations: spec.sinkhorn_iterations,
+            epsilon: spec.epsilon,
+            function,
+            base,
+            scale,
         })
     }
 
@@ -175,25 +163,16 @@ pub struct HyperHead {
 
 impl HyperHead {
     /// Creates an unloaded final hyper-head.
-    pub fn unloaded(
-        streams: i32,
-        hidden_size: i32,
-        norm_epsilon: f32,
-        epsilon: f32,
-        stream: &Stream,
-    ) -> Result<Self, Exception> {
+    pub fn unloaded(spec: &HyperHeadSpec, stream: &Stream) -> Result<Self, Exception> {
+        let [function, base, scale] = unloaded_parameters(spec, stream)?;
         Ok(Self {
-            streams,
-            hidden_size,
-            norm_epsilon,
-            epsilon,
-            function: PhysicalParam::unloaded(
-                &[streams, streams * hidden_size],
-                Dtype::Float32,
-                stream,
-            )?,
-            base: PhysicalParam::unloaded(&[streams], Dtype::Float32, stream)?,
-            scale: PhysicalParam::unloaded(&[1], Dtype::Float32, stream)?,
+            streams: spec.streams,
+            hidden_size: spec.hidden_size,
+            norm_epsilon: spec.norm_epsilon,
+            epsilon: spec.epsilon,
+            function,
+            base,
+            scale,
         })
     }
 
@@ -376,4 +355,37 @@ fn normalize_axis(
             .add(Array::from_f32(epsilon), stream)?,
         stream,
     )
+}
+
+fn unloaded_parameters(
+    spec: &impl DeclareLogicalParameters,
+    stream: &Stream,
+) -> Result<[PhysicalParam<Array>; 3], Exception> {
+    let parameters = spec
+        .logical_parameters()
+        .map_err(|e| Exception::custom(e.to_string()))?;
+    let shape = |role| -> Result<Vec<i32>, Exception> {
+        let declaration = parameters
+            .iter()
+            .find(|parameter| parameter.role == role)
+            .ok_or_else(|| Exception::custom("missing residual-mixing parameter declaration"))?;
+        declaration
+            .shape
+            .iter()
+            .map(|&dimension| {
+                i32::try_from(dimension)
+                    .map_err(|_| Exception::custom("residual-mixing dimension exceeds i32"))
+            })
+            .collect()
+    };
+    let shapes = [
+        shape(LogicalParameterRole::ResidualMixWeight)?,
+        shape(LogicalParameterRole::ResidualMixBias)?,
+        shape(LogicalParameterRole::ResidualMixScale)?,
+    ];
+    Ok([
+        PhysicalParam::unloaded(&shapes[0], Dtype::Float32, stream)?,
+        PhysicalParam::unloaded(&shapes[1], Dtype::Float32, stream)?,
+        PhysicalParam::unloaded(&shapes[2], Dtype::Float32, stream)?,
+    ])
 }

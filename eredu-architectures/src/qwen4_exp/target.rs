@@ -8,13 +8,15 @@ use super::{
     ple::{LexicalInjectionSpec, LexicalSublayer, LexicalSublayerInput},
     qsa::QsaExecutionLimits,
     recurrent::{RecurrentSublayer, RecurrentSublayerSpec},
-    residual::{mixer_spec, ResidualBoundary},
+    residual::ResidualBoundary,
+    static_parameters::StaticParameters,
 };
-use crate::decoder::{BoundaryModules, ComponentInstrumentation, StaticModules};
+use crate::decoder::{BoundaryModules, ComponentInstrumentation};
 use eredu_core::{cache::LayerCachePolicy, LayerSchedule};
 use eredu_nn::{
-    AttentionCache, DistributedNeuralBackend, EmbeddingSpec, Error, GroupedGatedProductSpec,
-    GroupedNeuralBackend, LinearFormatSpec, LinearSpec, ParameterSpec, Tensor, TensorElementType,
+    AttentionCache, DeclareLogicalParameters, DistributedNeuralBackend, Error,
+    GroupedGatedProductSpec, GroupedNeuralBackend, LinearFormatSpec, LinearSpec, ParameterSpec,
+    Tensor, TensorElementType,
 };
 use eredu_runtime::{
     ParameterBankAccess, ParameterProvider, RoutedBankId, RoutedObservationPoints,
@@ -22,6 +24,7 @@ use eredu_runtime::{
 };
 use std::collections::BTreeMap;
 
+pub(crate) mod declarations;
 mod parameters;
 
 /// Bounds retained by target construction, independently of table/cache residency.
@@ -119,7 +122,10 @@ impl MixerSpec {
             Self::Recurrent(spec) => spec.mixer.state_policy(),
             Self::Indexed(spec) => spec
                 .state
-                .cache_policy(spec.kv_heads, spec.head_dim)
+                .cache_policy(
+                    spec.parameters.projection.geometry.key_value_heads(),
+                    spec.parameters.projection.geometry.key_dimensions(),
+                )
                 .map_err(Error::backend_source),
         }
     }
@@ -168,18 +174,45 @@ impl UnitSpec {
         }
     }
 }
+impl DeclareLogicalParameters for MixerSpec {
+    fn logical_parameters(&self) -> Result<Vec<eredu_nn::LogicalParameterDeclaration<'_>>, Error> {
+        match self {
+            Self::Recurrent(spec) => spec.logical_parameters(),
+            Self::Indexed(spec) => spec.logical_parameters(),
+        }
+    }
+}
+impl DeclareLogicalParameters for UnitSpec {
+    fn logical_parameters(&self) -> Result<Vec<eredu_nn::LogicalParameterDeclaration<'_>>, Error> {
+        let parameters = match self {
+            Self::Lexical { spec, .. } => {
+                spec.validate()?;
+                spec.logical_parameters()?
+            }
+            Self::Decoder {
+                mixer,
+                feed_forward,
+                ..
+            } => {
+                let mut parameters = mixer.logical_parameters()?;
+                parameters.extend(feed_forward.logical_parameters()?);
+                parameters
+            }
+        };
+        eredu_nn::validate_logical_parameter_topology(&parameters)
+            .map_err(Error::backend_source)?;
+        Ok(parameters)
+    }
+}
+
 /// Fully specified target parameters. Table/expert payloads remain with providers.
 #[derive(Debug, Clone)]
 pub struct TargetSpec {
     pub(crate) config: Config,
     /// Bounded request/coordinator contract.
     pub limits: TargetLimits,
-    /// Shared token lookup.
-    pub embedding: EmbeddingSpec,
-    /// Independent output projection; `None` shares the embedding parameter.
-    pub head: Option<LinearSpec>,
-    /// Released final gated collapse, without another RMSNorm.
-    pub boundary: eredu_nn::residual_streams::GatedResidualSpec,
+    /// Canonical vocabulary slots and final residual collapse, shared by cold consumers.
+    pub static_parameters: StaticParameters,
     /// Ordered execution owners; each owns one matching state slot.
     pub units: Vec<UnitSpec>,
 }
@@ -188,14 +221,12 @@ impl TargetSpec {
     pub fn configuration(&self) -> &Config {
         &self.config
     }
-    /// Builds global target geometry from metadata-only row contracts and independent experts.
-    /// The expert callback receives checkpoint layer and execution owner separately.
-    pub fn from_headers(
+    /// Attaches bounded state and row-provider contracts to retained parameter declarations.
+    pub(crate) fn from_parameters(
         config: Config,
         tables: &BTreeMap<usize, eredu_runtime::RowLookupSpec>,
         limits: TargetLimits,
-        mut experts: impl FnMut(usize, usize) -> Result<GroupedGatedProductSpec, Error>,
-        mut format: impl FnMut(&str) -> Result<LinearFormatSpec, Error>,
+        parameters: declarations::TargetParameters,
     ) -> Result<Self, Error> {
         limits.validate_for_config(&config)?;
         if tables.len() != config.ngram.layers.len()
@@ -205,96 +236,63 @@ impl TargetSpec {
                 "target prepared tables or request bounds differ from configuration",
             ));
         }
-        let parameter = |name: &str| ParameterSpec::trainable(name).map_err(Error::backend);
-        let embedding = EmbeddingSpec {
-            vocabulary: config.vocabulary,
-            dimensions: config.hidden_size,
-            weight: parameter("model.embed_tokens.weight")?,
-            format: format("model.embed_tokens.weight")?,
-        };
-        let head = if config.tied_embeddings {
-            None
-        } else {
-            Some(LinearSpec {
-                input: config.hidden_size,
-                output: config.vocabulary,
-                weight: parameter("lm_head.weight")?,
-                bias: None,
-                format: format("lm_head.weight")?,
-            })
-        };
-        let boundary = mixer_spec(&config, "model.hyper_connection_mixer", false, &mut format)?;
-        let mut units = Vec::new();
-        for layer in 0..config.layers.len() {
-            let root = format!("model.layers.{layer}");
-            if let Some(table) = tables.get(&layer) {
-                if table.unit != units.len() {
-                    return Err(Error::backend(
-                        "prepared table owner differs from lexical execution ordinal",
-                    ));
-                }
-                let spec = LexicalInjectionSpec::from_header(
-                    &config,
-                    layer,
-                    &root,
-                    table,
-                    limits.lookup_rows,
-                    &mut format,
-                )
-                .map_err(Error::backend_source)?;
-                if spec.embedding.max_tokens() < limits.invocation_tokens {
-                    return Err(Error::backend(
-                        "lexical lookup cannot cover admitted invocation tokens",
-                    ));
-                }
-                units.push(UnitSpec::Lexical { layer, spec });
-            }
-            let mixer =
-                match config
-                    .layers
-                    .get(layer)
-                    .ok_or_else(|| Error::backend("missing target layer kind"))?
-                {
-                    LayerKind::Recurrent => MixerSpec::Recurrent(
-                        RecurrentSublayerSpec::from_config(&config, &root, &mut format)?,
-                    ),
-                    LayerKind::Indexed => MixerSpec::Indexed(
-                        IndexedSublayerSpec::from_config(
+        let declarations::TargetParameters {
+            static_parameters,
+            units,
+        } = parameters;
+        let units = units
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, unit)| {
+                Ok(match unit {
+                    declarations::UnitParameters::Lexical { layer, parameters } => {
+                        let table = tables
+                            .get(&layer)
+                            .ok_or_else(|| Error::backend("missing lexical row contract"))?;
+                        if table.unit != ordinal {
+                            return Err(Error::backend(
+                                "prepared table owner differs from lexical execution ordinal",
+                            ));
+                        }
+                        let spec = LexicalInjectionSpec::from_parameters(
                             &config,
-                            &root,
+                            parameters,
+                            table,
+                            limits.lookup_rows,
+                        )
+                        .map_err(Error::backend_source)?;
+                        if spec.embedding.max_tokens() < limits.invocation_tokens {
+                            return Err(Error::backend(
+                                "lexical lookup cannot cover admitted invocation tokens",
+                            ));
+                        }
+                        UnitSpec::Lexical { layer, spec }
+                    }
+                    declarations::UnitParameters::Decoder {
+                        layer,
+                        mixer,
+                        feed_forward,
+                    } => UnitSpec::Decoder {
+                        layer,
+                        mixer: mixer.into_spec(
+                            &config,
                             limits.tile_blocks,
                             limits.selection_workspace,
                             limits.qsa,
                             limits.element,
-                            TensorElementType::F32,
-                            &mut format,
-                        )
-                        .map_err(Error::backend_source)?,
-                    ),
-                };
-            let owner = units.len();
-            let feed_forward = FeedForwardSublayerSpec::from_config(
-                &config,
-                owner,
-                &root,
-                experts(layer, owner)?,
-                &mut format,
-            )?;
-            units.push(UnitSpec::Decoder {
-                layer,
-                mixer,
-                feed_forward,
-            });
-        }
+                        )?,
+                        feed_forward,
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
         let spec = Self {
             config,
             limits,
-            embedding,
-            head,
-            boundary,
+            static_parameters,
             units,
         };
-        spec.state_layout()?;
+        spec.logical_parameters()?;
         Ok(spec)
     }
     /// Optional mechanisms required by the complete target, before allocation.
@@ -320,11 +318,14 @@ impl TargetSpec {
     /// Header-derived identity for cold geometry, independent of hash literals.
     pub fn geometry_fingerprint(&self) -> String {
         eredu_core::cache::derive_prompt_cache_architecture_fingerprint(
-            "qwen4_exp.target.geometry.v1",
+            "qwen4_exp.target.geometry.v11",
             [
-                ("embedding", format!("{:?}", self.embedding)),
-                ("head", format!("{:?}", self.head)),
-                ("readout", format!("{:?}", self.boundary)),
+                (
+                    "embedding",
+                    format!("{:?}", self.static_parameters.embedding),
+                ),
+                ("head", format!("{:?}", self.static_parameters.head)),
+                ("readout", format!("{:?}", self.static_parameters.readout)),
                 ("eos", format!("{:?}", self.config.eos)),
                 ("history_tokens", self.limits.history_tokens.to_string()),
                 ("units", format!("{:?}", self.units)),
@@ -334,49 +335,55 @@ impl TargetSpec {
 
     /// Authoritative state ownership matches bounded execution units one-for-one.
     pub fn state_layout(&self) -> Result<StateLayout, Error> {
-        self.boundary.validate()?;
-        let mut ordinal = 0;
-        for (layer, kind) in self.config.layers.iter().enumerate() {
-            if self.config.ngram.layers.contains(&layer) {
-                match self.units.get(ordinal) {
-                    Some(UnitSpec::Lexical { layer: owner, spec })
-                        if *owner == layer && spec.geometry == self.boundary.geometry => {}
-                    _ => {
-                        return Err(Error::backend(
-                            "target lexical unit schedule or geometry mismatch",
-                        ));
-                    }
-                }
-                ordinal += 1;
-            }
-            match self.units.get(ordinal) {
-                Some(UnitSpec::Decoder {
-                    layer: owner,
-                    mixer,
-                    feed_forward,
-                }) if *owner == layer
-                    && feed_forward.residual.geometry == self.boundary.geometry =>
-                {
-                    let valid = match (kind, mixer) {
-                        (LayerKind::Recurrent, MixerSpec::Recurrent(s)) => {
-                            s.residual.geometry == self.boundary.geometry
-                        }
-                        (LayerKind::Indexed, MixerSpec::Indexed(s)) => {
-                            s.residual.geometry == self.boundary.geometry
-                        }
-                        _ => false,
-                    };
-                    if !valid {
-                        return Err(Error::backend(
-                            "target mixer schedule or residual geometry mismatch",
-                        ));
-                    }
-                }
-                _ => return Err(Error::backend("target decoder unit schedule mismatch")),
-            }
-            ordinal += 1;
+        self.static_parameters.validate()?;
+        if self.static_parameters.embedding.vocabulary != self.config.vocabulary
+            || self.static_parameters.embedding.dimensions != self.config.hidden_size
+            || self.static_parameters.head.is_none() != self.config.tied_embeddings
+        {
+            return Err(Error::backend(
+                "target static declaration differs from validated configuration",
+            ));
         }
-        if ordinal != self.units.len() {
+        let mut count = 0;
+        for (ordinal, invocation) in
+            declarations::TargetInvocation::schedule(&self.config).enumerate()
+        {
+            let geometry = self.static_parameters.readout.geometry;
+            let valid = match (invocation, self.units.get(ordinal)) {
+                (
+                    declarations::TargetInvocation::Lexical { layer },
+                    Some(UnitSpec::Lexical { layer: owner, spec }),
+                ) => layer == *owner && spec.parameters.geometry == geometry,
+                (
+                    declarations::TargetInvocation::Decoder { layer, kind },
+                    Some(UnitSpec::Decoder {
+                        layer: owner,
+                        mixer,
+                        feed_forward,
+                    }),
+                ) => {
+                    layer == *owner
+                        && feed_forward.residual.geometry == geometry
+                        && match (kind, mixer) {
+                            (LayerKind::Recurrent, MixerSpec::Recurrent(spec)) => {
+                                spec.residual.geometry == geometry
+                            }
+                            (LayerKind::Indexed, MixerSpec::Indexed(spec)) => {
+                                spec.residual.geometry == geometry
+                            }
+                            _ => false,
+                        }
+                }
+                _ => false,
+            };
+            if !valid {
+                return Err(Error::backend(
+                    "target unit schedule or residual geometry mismatch",
+                ));
+            }
+            count += 1;
+        }
+        if count != self.units.len() {
             return Err(Error::backend("target has undeclared execution units"));
         }
         let policies = self
@@ -398,7 +405,7 @@ impl TargetSpec {
     /// Complete residual streams and original request provenance cross every cut.
     pub fn boundary_schema(&self) -> Result<RequestBoundarySchema, Error> {
         RequestBoundarySchema::new(
-            self.boundary.geometry,
+            self.static_parameters.readout.geometry,
             self.config.attention.rotary.dimensions,
         )
     }
@@ -421,6 +428,20 @@ impl TargetSpec {
         parameter_recipes(source.source_keys(), &self.config, scope)
     }
 }
+
+impl DeclareLogicalParameters for TargetSpec {
+    fn logical_parameters(&self) -> Result<Vec<eredu_nn::LogicalParameterDeclaration<'_>>, Error> {
+        self.state_layout()?;
+        let mut parameters = self.static_parameters.logical_parameters()?;
+        for unit in &self.units {
+            parameters.extend(unit.logical_parameters()?);
+        }
+        eredu_nn::validate_logical_parameter_topology(&parameters)
+            .map_err(Error::backend_source)?;
+        Ok(parameters)
+    }
+}
+
 /// Concrete mixer module, never selected by a native backend.
 #[derive(Debug, eredu_nn::Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
@@ -615,13 +636,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> TargetKernel<B> {
             }
         }
         B::require_operator_capabilities("qwen4_exp target", spec.required_operators())?;
-        let boundary = ResidualBoundary::new(spec.boundary.clone(), context)?;
-        let statics = StaticModules::from_boundary(
-            spec.embedding.clone(),
-            spec.head.clone(),
-            boundary,
-            context,
-        )?;
+        let statics = spec.static_parameters.materialize(context)?;
         let partition_state =
             eredu_runtime::PartitionState::new(definition.state_layout().clone(), 0)
                 .map_err(Error::backend)?;
@@ -852,7 +867,12 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> TargetKernel<B> {
                     RoutedObservationPoints::new(
                         RoutedBankId::new(0),
                         format!("model.layers.{layer}.mlp"),
-                        ff.feed_forward.router.selection().group_count(),
+                        ff.feed_forward
+                            .parameters
+                            .routed
+                            .selector
+                            .selection()
+                            .group_count(),
                     ),
                     provider,
                     instrumentation,

@@ -4,8 +4,12 @@ use crate::discovery::routed_components::{self as routed_units, Site as RoutedUn
 use eredu_core::speculative::{SpeculativeCaptureBinding, SpeculativeCaptureScope};
 
 pub(in crate::discovery) fn declare(g: &mut Builder, c: &V4Args, target_output: &str) {
-    let config = c.dspark.as_ref().expect("selected fused configuration");
-    let width = c.hidden_size as usize;
+    let text = &c.parameters().statics;
+    let embedding_spec = text.embedding_spec();
+    let embedding_prefix = declared_weight_prefix(&embedding_spec.weight);
+    let output = text.head_spec().expect("V4 declares an untied output head");
+    let spec = v4_specs::dspark_spec(c).expect("validated V4 DSpark declaration");
+    let width = spec.main_projection.output as usize;
     let count = c.num_nextn_predict_layers as usize;
     let last = count - 1;
     let root = "prediction.proposal";
@@ -31,7 +35,7 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &V4Args, target_output: 
         &embedding,
         ArchitectureNodeKind::Embedding,
         Some(root),
-        Some("embed"),
+        Some(embedding_prefix),
         Some(width),
     );
     g.component_observation(
@@ -44,7 +48,7 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &V4Args, target_output: 
         root,
         format!("{base}.input"),
         "Embedding residual expanded over proposal streams",
-        stream_axes(c),
+        stream_axes(&spec.hyper_head),
     );
     g.edge(&embedding, root, ArchitectureEdgeKind::Data);
     let component_start = g.descriptor.components.len();
@@ -55,6 +59,8 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &V4Args, target_output: 
     for depth in 0..count {
         let layer = c.num_hidden_layers as usize + depth;
         let parameters = format!("mtp.{depth}");
+        let attention_spec = v4_specs::attention_spec(c, layer, &format!("{parameters}.attn"))
+            .expect("validated V4 attention declaration");
         let node = format!("{root}.layers.{depth}");
         let path = format!("{base}.layers.{depth}");
         let attention = format!("{node}.attention");
@@ -67,7 +73,7 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &V4Args, target_output: 
             None,
         );
         g.get_mut(&node).layer_index = Some(layer);
-        g.get_mut(&node).output_axes = Some(stream_axes(c));
+        g.get_mut(&node).output_axes = Some(stream_axes(&spec.hyper_head));
         g.edge(&previous, &node, ArchitectureEdgeKind::Data);
         previous = node.clone();
         g.descriptor.layer_groups.push(ArchitectureLayerGroup {
@@ -89,7 +95,7 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &V4Args, target_output: 
                 &node,
                 format!("{path}.{suffix}"),
                 "Fused proposal decoder residual streams",
-                stream_axes(c),
+                stream_axes(&spec.hyper_head),
             );
         }
         g.node(
@@ -103,10 +109,10 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &V4Args, target_output: 
             mechanism: Some(AttentionMechanism::CompressedSparse),
             causal: Some(false),
             recurrent: Some(false),
-            query_heads: Some(c.num_attention_heads as usize),
-            key_value_heads: Some(1),
-            key_head_dimension: Some(c.head_dim as usize),
-            value_head_dimension: Some(c.head_dim as usize),
+            query_heads: Some(attention_spec.geometry.query_heads() as usize),
+            key_value_heads: Some(attention_spec.geometry.key_value_heads() as usize),
+            key_head_dimension: Some(attention_spec.geometry.key_dimensions() as usize),
+            value_head_dimension: Some(attention_spec.geometry.value_dimensions() as usize),
             positional_encoding: Some(PositionalEncoding::Rotary),
             ..Default::default()
         });
@@ -117,14 +123,22 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &V4Args, target_output: 
             Some(&format!("{parameters}.ffn")),
             Some(width),
         );
+        let routed_spec = v4_specs::moe_spec(c, layer, &format!("{parameters}.ffn"), None)
+            .expect("validated V4 routed declaration");
+        let selector = &routed_spec.routed.parameters.selector;
         g.moe(
             &ffn,
             &format!("{parameters}.ffn"),
             moe(
-                c.n_routed_experts,
-                c.num_experts_per_tok,
-                c.n_shared_experts,
-                c.norm_topk_prob,
+                selector.selection().group_count(),
+                selector.selection().top_k(),
+                routed_spec.routed.shared.gate.output
+                    / routed_spec
+                        .routed
+                        .parameters
+                        .experts
+                        .intermediate_dimensions(),
+                selector.selection().normalize_selected(),
                 RoutingScoreTransform::SqrtSoftplus,
             ),
             Some(&format!("{path}.feed_forward")),
@@ -137,14 +151,13 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &V4Args, target_output: 
                 layer,
                 routing: &format!("{path}.feed_forward"),
                 input: Some(format!("{path}.feed_forward.input")),
-                normalization: Some(routed_units::rms(
-                    format!("{parameters}.ffn_norm.weight"),
-                    c.rms_norm_eps,
-                    0.0,
+                normalization: Some(declared_normalization(
+                    &v4_specs::block_normalizations(c, &parameters)
+                        .expect("validated V4 block normalization")[1],
                 )),
                 residual_scale: None,
             },
-            crate::deepseek::v4::expert_bank_spec(c, layer),
+            Ok(routed_spec.routed.parameters.experts),
         );
         unit(g, c, layer, &path, &parameters, &attention, &ffn);
         cycles.extend(stream_cycles(
@@ -173,14 +186,14 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &V4Args, target_output: 
         &head_norm,
         ArchitectureNodeKind::Normalization,
         Some(root),
-        Some(&format!("mtp.{last}.norm")),
+        declared_normalization_prefix(&spec.output_norm),
         Some(width),
     );
     g.node(
         &head,
         ArchitectureNodeKind::OutputHead,
         Some(root),
-        Some("head"),
+        Some(declared_weight_prefix(&output.weight)),
         None,
     );
     g.edge(&previous, &collapse, ArchitectureEdgeKind::Data);
@@ -190,9 +203,9 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &V4Args, target_output: 
         &collapse,
         format!("{readout}.streams"),
         "Proposal streams consumed by final learned collapse",
-        stream_axes(c),
+        stream_axes(&spec.hyper_head),
     );
-    let mut coefficient_axes = axes(c.hc_mult as usize);
+    let mut coefficient_axes = axes(spec.hyper_head.streams as usize);
     coefficient_axes[2].name = "stream".into();
     g.read_only_observation(
         &collapse,
@@ -212,7 +225,7 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &V4Args, target_output: 
         "Normalized proposal residual consumed by shared head",
         axes(width),
     );
-    let mut vocabulary = axes(c.vocab_size as usize);
+    let mut vocabulary = axes(output.output as usize);
     vocabulary[2].name = "vocabulary".into();
     g.get_mut(&head).output_axes = Some(vocabulary.clone());
     g.component_observation(
@@ -225,24 +238,24 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &V4Args, target_output: 
     let markov_embedding = format!("{markov}.embedding");
     let markov_input = format!("{base}.markov.input");
     let markov_output = format!("{base}.markov.output");
-    let first = format!("mtp.{last}.markov_head.markov_w1.weight");
-    let second = format!("mtp.{last}.markov_head.markov_w2.weight");
+    let first = spec.markov_embedding.weight.id.as_str().to_owned();
+    let second = spec.markov_output.weight.id.as_str().to_owned();
     g.node(
         &markov_embedding,
         ArchitectureNodeKind::Embedding,
         Some(root),
-        Some(&format!("mtp.{last}.markov_head.markov_w1")),
-        Some(config.markov_rank as usize),
+        Some(declared_weight_prefix(&spec.markov_embedding.weight)),
+        Some(spec.markov_embedding.dimensions as usize),
     );
     g.node(
         &markov,
         ArchitectureNodeKind::Projector,
         Some(root),
-        Some(&format!("mtp.{last}.markov_head.markov_w2")),
+        Some(declared_weight_prefix(&spec.markov_output.weight)),
         None,
     );
     g.edge(&markov_embedding, &markov, ArchitectureEdgeKind::Data);
-    let mut anchor_axes = axes(config.markov_rank as usize);
+    let mut anchor_axes = axes(spec.markov_embedding.dimensions as usize);
     anchor_axes[1].dimension = SymbolicDimension::Known(1);
     g.component_observation(
         &markov_embedding,
@@ -285,16 +298,16 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &V4Args, target_output: 
         residual_base: ComponentResidualBase::Source {
             source: ComponentFusionSource::TokenEmbedding {
                 normalization: None,
-                weight: "embed.weight".into(),
-                shared_weight: "embed.weight".into(),
-                parameter_group: "parameters:embed".into(),
+                weight: embedding_spec.weight.id.as_str().into(),
+                shared_weight: declared_shared_weight(&embedding_spec.weight).into(),
+                parameter_group: format!("parameters:{embedding_prefix}"),
                 scale: ComponentScalar::new(1.0),
             },
             input: format!("{base}.embedding.effective"),
             expansion: ComponentFusionExpansion::BroadcastAxis {
                 axis: 2,
                 name: "stream".into(),
-                extent: c.hc_mult as usize,
+                extent: spec.hyper_head.streams as usize,
             },
             output: format!("{base}.input"),
             effective_output: format!("{base}.input.effective"),
@@ -303,7 +316,7 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &V4Args, target_output: 
             residual_cycles: vec![],
             block_transforms: vec![],
             stream_residual: Some(ComponentStreamResidual {
-                streams: c.hc_mult as usize,
+                streams: spec.hyper_head.streams as usize,
                 base: ComponentStreamBase::Streams {
                     input: format!("{base}.input.effective"),
                 },
@@ -311,10 +324,9 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &V4Args, target_output: 
                 head: ComponentStreamHead {
                     input: format!("{readout}.streams.effective"),
                     coefficients: format!("{readout}.stream_coefficients"),
-                    parameters: coefficients(
-                        c,
+                    parameters: head_coefficients(
                         &format!("parameters:mtp.{last}"),
-                        &format!("mtp.{last}.hc_head"),
+                        &spec.hyper_head,
                     ),
                 },
             }),
@@ -323,24 +335,34 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &V4Args, target_output: 
             projection_input: Some(format!("{readout}.projection_input")),
             linear_scores: format!("{readout}.linear"),
             logits: format!("{base}.logits.effective"),
-            normalization: norm(c, Some(format!("mtp.{last}.norm.weight"))),
-            weight: "head.weight".into(),
-            bias: None,
+            normalization: declared_normalization(&spec.output_norm),
+            weight: output.weight.id.as_str().into(),
+            bias: output.bias.as_ref().map(|bias| bias.id.to_string()),
             score_writes: vec![ComponentScoreWrite {
                 node_id: markov,
                 source: ComponentFusionSource::TokenEmbedding {
                     normalization: None,
                     weight: first.clone(),
-                    shared_weight: first,
-                    parameter_group: format!("parameters:mtp.{last}.markov_head.markov_w1"),
+                    shared_weight: declared_shared_weight(&spec.markov_embedding.weight).into(),
+                    parameter_group: format!(
+                        "parameters:{}",
+                        declared_weight_prefix(&spec.markov_embedding.weight)
+                    ),
                     scale: ComponentScalar::new(1.0),
                 },
                 input: format!("{markov_input}.effective"),
                 projection_input: format!("{base}.markov.projection_input"),
                 weight: second.clone(),
-                shared_weight: second,
-                parameter_group: format!("parameters:mtp.{last}.markov_head.markov_w2"),
-                bias: None,
+                shared_weight: declared_shared_weight(&spec.markov_output.weight).into(),
+                parameter_group: format!(
+                    "parameters:{}",
+                    declared_weight_prefix(&spec.markov_output.weight)
+                ),
+                bias: spec
+                    .markov_output
+                    .bias
+                    .as_ref()
+                    .map(|bias| bias.id.to_string()),
                 output: markov_output.clone(),
                 effective_output: format!("{markov_output}.effective"),
                 broadcast_axes: vec!["sequence".into()],
@@ -355,7 +377,8 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &V4Args, target_output: 
 fn context(g: &mut Builder, c: &V4Args) {
     let root = "prediction.context";
     let path = "dspark.context";
-    let width = c.hidden_size as usize;
+    let spec = v4_specs::dspark_spec(c).expect("validated V4 DSpark declaration");
+    let width = spec.main_projection.output as usize;
     g.node(
         root,
         ArchitectureNodeKind::Prediction,
@@ -375,24 +398,18 @@ fn context(g: &mut Builder, c: &V4Args) {
         &projection,
         ArchitectureNodeKind::Projector,
         Some(root),
-        Some("mtp.0.main_proj"),
+        Some(declared_weight_prefix(&spec.main_projection.weight)),
         Some(width),
     );
     g.node(
         &normalization,
         ArchitectureNodeKind::Normalization,
         Some(root),
-        Some("mtp.0.main_norm"),
+        declared_normalization_prefix(&spec.main_norm),
         Some(width),
     );
     g.edge(&projection, &normalization, ArchitectureEdgeKind::Data);
-    let input_axes = axes(
-        width
-            * c.target_capture_policy
-                .as_ref()
-                .expect("DSpark capture policy")
-                .len(),
-    );
+    let input_axes = axes(spec.main_projection.input as usize);
     g.read_only_observation(
         &projection,
         format!("{path}.input"),
@@ -416,7 +433,7 @@ fn context(g: &mut Builder, c: &V4Args) {
         root,
         format!("{path}.streams"),
         "Accepted context repeated over streams independently for each cache",
-        stream_axes(c),
+        stream_axes(&spec.hyper_head),
     );
     for depth in 0..c.num_nextn_predict_layers as usize {
         let node = format!("{root}.layers.{depth}");
@@ -433,7 +450,7 @@ fn context(g: &mut Builder, c: &V4Args) {
             &node,
             format!("{prefix}.input"),
             "Independent context input used only to update this block's cache",
-            stream_axes(c),
+            stream_axes(&spec.hyper_head),
         );
         g.component_observation(
             &node,

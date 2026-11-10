@@ -21,7 +21,10 @@ fn assistant_artifact_values(nonzero: bool) -> tempfile::TempDir {
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(directory.path().join("config.json"), ASSISTANT_CONFIG).unwrap();
     let config = gemma4::AssistantConfig::from_json(ASSISTANT_CONFIG.as_bytes()).unwrap();
-    let plan = gemma4::assistant_safetensors_plan(&config).unwrap();
+    let plan = gemma4::assistant_safetensors_plan(
+        &gemma4::AssistantDefinition::new(config.clone()).unwrap(),
+    )
+    .unwrap();
     assert!(plan.layout_groups.is_empty());
     let tensors = plan
         .common_tensors

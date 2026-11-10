@@ -48,26 +48,128 @@ impl ArtifactArchitecturePlan {
     fn discovery_builder(&self) -> Builder {
         let mut graph = Builder::new();
         if let (Some(projector), Some(primary)) = (self.gguf_media_projector(), self.gguf_plan()) {
-            families::gguf_composite(&mut graph, projector.model(), primary.model());
+            families::gguf_composite(
+                &mut graph,
+                projector.model(),
+                primary.model(),
+                projector.qwen_text_declaration().map(|d| d.as_ref()),
+            );
             return graph;
         }
         if let Some(plan) = self.safetensors_architecture() {
             match plan.model() {
-                SafetensorsModelConfig::Llama(c) => families::dense(&mut graph, c, None),
-                SafetensorsModelConfig::Gemma2(c) => families::dense(&mut graph, c, None),
-                SafetensorsModelConfig::Qwen(c) => families::qwen(&mut graph, c),
-                SafetensorsModelConfig::GptOss(c) => families::gpt_oss(&mut graph, c),
+                SafetensorsModelConfig::Llama(c) => families::dense(
+                    &mut graph,
+                    c,
+                    None,
+                    self.dense_declaration().expect("admitted dense scopes"),
+                ),
+                SafetensorsModelConfig::Gemma2(c) => families::dense(
+                    &mut graph,
+                    c,
+                    None,
+                    self.dense_declaration().expect("admitted dense scopes"),
+                ),
+                SafetensorsModelConfig::Nanbeige(c) => families::nanbeige(
+                    &mut graph,
+                    c,
+                    self.dense_declaration().expect("admitted dense scopes"),
+                ),
+                SafetensorsModelConfig::K2Horizon(c) => families::k2_horizon(
+                    &mut graph,
+                    self.k2_declaration(c)
+                        .expect("admitted K2 declaration")
+                        .as_ref(),
+                ),
+                SafetensorsModelConfig::Qwen(c) => families::qwen(
+                    &mut graph,
+                    self.qwen_declaration(c)
+                        .expect("admitted Qwen declaration")
+                        .as_ref(),
+                ),
+                SafetensorsModelConfig::GptOss(c) => families::gpt_oss(
+                    &mut graph,
+                    self.gpt_oss_declaration(c)
+                        .expect("admitted GPT-OSS declaration")
+                        .as_ref(),
+                ),
                 SafetensorsModelConfig::QwenHybrid(c) => families::qwen_hybrid(&mut graph, c),
-                other => families::remaining_safetensors(&mut graph, other),
+                SafetensorsModelConfig::Lfm2(args) => families::lfm2(
+                    &mut graph,
+                    &self
+                        .lfm2_declaration(args)
+                        .expect("admitted LFM2 declaration"),
+                ),
+                SafetensorsModelConfig::KimiLinear(args) => families::kimi(
+                    &mut graph,
+                    &self
+                        .kimi_declaration(args)
+                        .expect("admitted Kimi declaration"),
+                ),
+                SafetensorsModelConfig::NemotronH(args) => families::nemotron(
+                    &mut graph,
+                    &self
+                        .nemotron_declaration(args)
+                        .expect("admitted Nemotron declaration"),
+                ),
+                other => families::remaining_safetensors(&mut graph, other, self),
             }
         } else if let Some(plan) = self.gguf_plan() {
             match plan.model() {
-                GgufModelConfig::Llama(c) => families::dense(&mut graph, c, None),
-                GgufModelConfig::Gemma2(c) => families::dense(&mut graph, c, None),
-                GgufModelConfig::Nanbeige(c) => families::nanbeige(&mut graph, c),
-                GgufModelConfig::Qwen(c) => families::qwen(&mut graph, c),
-                GgufModelConfig::GptOss(c) => families::gpt_oss(&mut graph, c),
+                GgufModelConfig::Llama(c) => families::dense(
+                    &mut graph,
+                    c,
+                    None,
+                    self.dense_declaration().expect("admitted dense scopes"),
+                ),
+                GgufModelConfig::Gemma2(c) => families::dense(
+                    &mut graph,
+                    c,
+                    None,
+                    self.dense_declaration().expect("admitted dense scopes"),
+                ),
+                GgufModelConfig::Nanbeige(c) => families::nanbeige(
+                    &mut graph,
+                    c,
+                    self.dense_declaration().expect("admitted dense scopes"),
+                ),
+                GgufModelConfig::K2Horizon(c) => families::k2_horizon(
+                    &mut graph,
+                    self.k2_declaration(c)
+                        .expect("admitted K2 declaration")
+                        .as_ref(),
+                ),
+                GgufModelConfig::Qwen(c) => families::qwen(
+                    &mut graph,
+                    self.qwen_declaration(c)
+                        .expect("admitted Qwen declaration")
+                        .as_ref(),
+                ),
+                GgufModelConfig::GptOss(c) => families::gpt_oss(
+                    &mut graph,
+                    self.gpt_oss_declaration(c)
+                        .expect("admitted GPT-OSS declaration")
+                        .as_ref(),
+                ),
                 GgufModelConfig::QwenHybrid(c) => families::qwen_hybrid(&mut graph, c),
+                GgufModelConfig::Lfm2(args) => families::lfm2(
+                    &mut graph,
+                    &self
+                        .lfm2_declaration(args)
+                        .expect("admitted LFM2 declaration"),
+                ),
+                GgufModelConfig::KimiLinear(args) => families::kimi(
+                    &mut graph,
+                    &self
+                        .kimi_declaration(args)
+                        .expect("admitted Kimi declaration"),
+                ),
+                GgufModelConfig::NemotronH(args) => families::nemotron(
+                    &mut graph,
+                    &self
+                        .nemotron_declaration(args)
+                        .expect("admitted Nemotron declaration"),
+                ),
                 other => families::remaining_gguf(&mut graph, other),
             }
         }
@@ -463,7 +565,7 @@ impl Builder {
     }
 
     /// Retains invocation identities while projecting a shared stack's lowering.
-    fn repeated_decoder(&mut self, root: &str, physical_layers: usize, passes: usize) {
+    fn repeated_decoder(&mut self, physical_layers: usize, passes: usize) {
         let group = &mut self.descriptor.layer_groups[0];
         let executions = std::mem::take(&mut group.passes[0].executions);
         assert_eq!(executions.len(), physical_layers * passes);
@@ -490,46 +592,88 @@ impl Builder {
                     .collect(),
             })
             .collect();
+    }
 
-        for group in &mut self.descriptor.components {
-            group.shared_write_weight =
-                crate::decoder::repeated::source_name(root, physical_layers, &group.write_weight);
-            if let Some(projection) = &mut group.write_input_projection {
-                projection.shared_weight = crate::decoder::repeated::source_name(
-                    root,
-                    physical_layers,
-                    &projection.weight,
-                );
-            }
-            for read in group
-                .reads
-                .iter_mut()
-                .chain(group.output_gate.iter_mut().map(|gate| &mut gate.read))
-            {
-                read.shared_weight =
-                    crate::decoder::repeated::source_name(root, physical_layers, &read.weight);
-                for projection in &mut read.input_projections {
-                    projection.shared_weight = crate::decoder::repeated::source_name(
-                        root,
-                        physical_layers,
-                        &projection.weight,
-                    );
+    /// Projects module sharing from declared owners and relative identities.
+    /// Explicit child groups retain independently owned boundaries.
+    fn declared_parameter_sharing(
+        &mut self,
+        declarations: &[eredu_nn::LogicalParameterDeclaration<'_>],
+    ) -> Result<(), String> {
+        eredu_nn::validate_logical_parameter_topology(declarations)
+            .map_err(|error| error.to_string())?;
+        let groups = &self.descriptor.parameter_groups;
+        let sharing = groups
+            .iter()
+            .map(|group| {
+                let prefix = &group.canonical_prefix;
+                let mut owner = None;
+                for parameter in declarations {
+                    let Some(suffix) = parameter.parameter.id.as_str().strip_prefix(prefix) else {
+                        continue;
+                    };
+                    if !suffix.is_empty() && !suffix.starts_with('.') {
+                        continue;
+                    }
+                    let source = parameter
+                        .parameter
+                        .alias_of
+                        .as_ref()
+                        .unwrap_or(&parameter.parameter.id)
+                        .as_str();
+                    let target = match source.strip_suffix(suffix) {
+                        Some(target) => target,
+                        None if groups.iter().any(|child| {
+                            child.canonical_prefix.len() > prefix.len()
+                                && child
+                                    .canonical_prefix
+                                    .strip_prefix(prefix)
+                                    .is_some_and(|rest| rest.starts_with('.'))
+                                && parameter
+                                    .parameter
+                                    .id
+                                    .as_str()
+                                    .strip_prefix(&child.canonical_prefix)
+                                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+                        }) =>
+                        {
+                            // Explicit child groups retain their own sharing boundary,
+                            // such as normalization between repeated passes.
+                            continue;
+                        }
+                        None => {
+                            return Err(format!(
+                                "discovery group {prefix} has incompatible declared sharing for {}",
+                                parameter.parameter.id,
+                            ));
+                        }
+                    };
+                    if owner.is_some_and(|owner| owner != target) {
+                        return Err(format!(
+                            "discovery group {prefix} has conflicting declared owners"
+                        ));
+                    }
+                    owner = Some(target);
                 }
-            }
+                let owner = owner.ok_or_else(|| {
+                    format!("discovery group {prefix} has no declared sharing members")
+                })?;
+                if owner == prefix {
+                    return Ok(None);
+                }
+                let target = groups
+                    .iter()
+                    .find(|candidate| candidate.canonical_prefix == owner)
+                    .ok_or_else(|| {
+                        format!("discovery group {prefix} has unresolved owner {owner}")
+                    })?;
+                Ok(Some(target.id.clone()))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        for (group, owner) in self.descriptor.parameter_groups.iter_mut().zip(sharing) {
+            group.shared_with = owner;
         }
-
-        // Use the same exact alias mapping as checkpoint lowering, including
-        // inter-pass normalization. Logical prefixes and capture paths stay intact.
-        for parameters in &mut self.descriptor.parameter_groups {
-            let logical = format!("{}.weight", parameters.canonical_prefix);
-            let source = crate::decoder::repeated::source_name(root, physical_layers, &logical);
-            if source != logical {
-                parameters.shared_with = Some(format!(
-                    "parameters:{}",
-                    source.strip_suffix(".weight").expect("weight module")
-                ));
-            }
-        }
+        Ok(())
     }
 
     /// One pre-normalized residual sublayer. The bypass is a distinct data-flow edge.
@@ -941,6 +1085,27 @@ fn attention(heads: i32, kv: i32, dim: i32, policy: AttentionPolicy) -> Attentio
         positional_encoding: Some(PositionalEncoding::Rotary),
         sink_logits: None,
     }
+}
+
+/// Projects the retained neural routing equation without establishing hook support.
+fn declared_routing(
+    selection: eredu_nn::TopKGroupSelectionSpec,
+    shared: i32,
+) -> Option<MoeAttributes> {
+    let score = match selection.scoring() {
+        eredu_nn::GroupScoring::Softmax => RoutingScoreTransform::Softmax,
+        eredu_nn::GroupScoring::SelectedSoftmax => RoutingScoreTransform::SelectedSoftmax,
+        eredu_nn::GroupScoring::Sigmoid => RoutingScoreTransform::Sigmoid,
+        eredu_nn::GroupScoring::SqrtSoftplus => RoutingScoreTransform::SqrtSoftplus,
+        _ => return None,
+    };
+    Some(moe(
+        selection.group_count(),
+        selection.top_k(),
+        shared,
+        selection.normalize_selected(),
+        score,
+    ))
 }
 
 fn moe(

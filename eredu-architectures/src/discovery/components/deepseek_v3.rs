@@ -6,14 +6,9 @@ mod prediction;
 pub(in crate::discovery) use prediction::declare as prediction_scopes;
 
 fn norm(c: &V3Args, gain: String) -> ComponentNormalization {
-    ComponentNormalization {
-        kind: ComponentNormalizationKind::Rms,
-        epsilon: ComponentScalar::new(c.rms_norm_eps),
-        gain: Some(gain),
-        gain_offset: ComponentScalar::new(0.0),
-        bias: None,
-        groups: 1,
-    }
+    let spec = crate::deepseek::v3_specs::normalization_spec(c, &gain, c.hidden_size)
+        .expect("admitted V3 normalization declaration");
+    declared_normalization(&spec)
 }
 
 pub(in crate::discovery) fn unit(
@@ -25,38 +20,28 @@ pub(in crate::discovery) fn unit(
     ffn: &str,
 ) {
     let width = c.hidden_size as usize;
-    let heads = c.num_attention_heads as usize;
-    let value = c.v_head_dim as usize;
-    let nope = c.qk_nope_head_dim as usize;
-    let rope = c.qk_rope_head_dim as usize;
-    let latent = c.kv_lora_rank as usize;
     let prefix = format!("{path}.self_attn");
-    let read = |field: &str, role, rows, input_projections| {
-        let weight = format!("{prefix}.{field}.weight");
-        ComponentRead {
-            source: None,
-            projection_output: None,
-            role,
-            shared_weight: weight.clone(),
-            weight,
-            parameter_group: format!("parameters:{prefix}"),
-            bias: None,
-            rows,
-            head_normalization: None,
-            input_projections,
-        }
+    let spec =
+        crate::deepseek::v3_specs::attention_spec(c, &prefix).expect("admitted V3 MLA declaration");
+    let heads = spec.geometry.heads() as usize;
+    let value = spec.geometry.value_dimensions() as usize;
+    let nope = spec.geometry.non_positional_dimensions() as usize;
+    let rope = spec.geometry.positional_dimensions() as usize;
+    let latent = spec.geometry.latent_dimensions() as usize;
+    let read = |projection: &eredu_nn::LinearSpec, role, rows, input_projections| ComponentRead {
+        input_projections,
+        ..declared_component_read(projection, format!("parameters:{prefix}"), role, rows)
     };
-    let stage = |field: &str, gain: &str, count: usize, output: &str| {
-        let weight = format!("{prefix}.{field}.weight");
-        ComponentInputProjection {
-            shared_weight: weight.clone(),
-            weight,
-            parameter_group: format!("parameters:{prefix}"),
-            bias: None,
-            rows: 0..count,
-            normalization: Some(norm(c, format!("{prefix}.{gain}.weight"))),
-            output: format!("{path}.attention.{output}.effective"),
-        }
+    let stage = |projection: &eredu_nn::LinearSpec,
+                 normalization: &eredu_nn::NormalizationConstructionSpec,
+                 output: &str| {
+        declared_input_projection(
+            projection,
+            format!("parameters:{prefix}"),
+            0..normalization.dimensions as usize,
+            Some(declared_normalization(normalization)),
+            format!("{path}.attention.{output}.effective"),
+        )
     };
     let head_rows = |offset, count, sharing, stride| ComponentRowMapping::HeadRows {
         offset,
@@ -65,61 +50,72 @@ pub(in crate::discovery) fn unit(
         component_heads_per_read_head: sharing,
         read_head_stride: stride,
     };
-    let (query_field, query_input) = match c.q_lora_rank {
-        Some(rank) => (
-            "q_b_proj",
+    let (query, query_input, query_rank) = match &spec.query {
+        crate::deepseek::v3_specs::QuerySpec::LowRank(query) => (
+            &query.second,
             vec![stage(
-                "q_a_proj",
-                "q_a_layernorm",
-                rank as usize,
+                query
+                    .first
+                    .as_ref()
+                    .expect("declared query input projection"),
+                &query.normalization,
                 "query.latent",
             )],
+            Some(query.normalization.dimensions as usize),
         ),
-        None => ("q_proj", vec![]),
+        crate::deepseek::v3_specs::QuerySpec::Direct(query) => (query, vec![], None),
     };
-    let kv_stage = stage(
-        "kv_a_proj_with_mqa",
-        "kv_a_layernorm",
-        latent,
-        "key_value.latent",
-    );
+    let kv_stage = stage(&spec.kv_a, &spec.kv_norm, "key_value.latent");
     let reads = vec![
         read(
-            query_field,
+            query,
             ComponentReadRole::Query,
-            head_rows(0, nope + rope, 1, None),
+            head_rows(0, spec.geometry.query_head_dimensions() as usize, 1, None),
             query_input,
         ),
         read(
-            "kv_b_proj",
+            &spec.kv_b,
             ComponentReadRole::Key,
-            head_rows(0, nope, 1, Some(nope + value)),
+            head_rows(
+                0,
+                nope,
+                1,
+                Some(
+                    spec.geometry
+                        .reconstruction_head_dimensions()
+                        .expect("admitted fused MLA head geometry") as usize,
+                ),
+            ),
             vec![kv_stage.clone()],
         ),
         // The rotary key is shared by all heads and bypasses latent normalization.
         read(
-            "kv_a_proj_with_mqa",
+            &spec.kv_a,
             ComponentReadRole::Key,
             head_rows(latent, rope, heads, None),
             vec![],
         ),
         read(
-            "kv_b_proj",
+            &spec.kv_b,
             ComponentReadRole::Value,
             ComponentRowMapping::Blocked {
                 offset: nope,
                 block_width: value,
-                block_stride: nope + value,
+                block_stride: spec
+                    .geometry
+                    .reconstruction_head_dimensions()
+                    .expect("admitted fused MLA head geometry")
+                    as usize,
             },
             vec![kv_stage],
         ),
     ];
-    let write = format!("{prefix}.o_proj.weight");
+    let write = spec.output.weight.id.as_str().to_owned();
     g.descriptor.components.push(ComponentGroup {
         id: format!("{attention}.channels"),
         node_id: attention.into(),
         layer_index: layer,
-        count: heads * value,
+        count: spec.output.input as usize,
         activation: format!("{path}.attention.channels"),
         effective_activation: format!("{path}.attention.channels.effective"),
         write_input: Some(format!("{path}.attention.write_input")),
@@ -146,7 +142,7 @@ pub(in crate::discovery) fn unit(
         output_normalization: None,
         residual_scale: ComponentScalar::new(1.0),
     });
-    let mut channels = axes(heads * value);
+    let mut channels = axes(spec.output.input as usize);
     channels[2].name = "component".into();
     g.component_observation(
         attention,
@@ -155,7 +151,7 @@ pub(in crate::discovery) fn unit(
         channels,
     );
     for (suffix, count) in [
-        ("query.latent", c.q_lora_rank.map(|n| n as usize)),
+        ("query.latent", query_rank),
         ("key_value.latent", Some(latent)),
     ] {
         if let Some(count) = count {
@@ -183,16 +179,17 @@ pub(in crate::discovery) fn unit(
         );
     }
     if c.layer_schedule.get(layer) == Some(&LayerPolicy::DenseMlp) {
+        let projections = crate::deepseek::v3_specs::dense_parameters(c, &format!("{path}.mlp"))
+            .expect("admitted V3 dense declaration");
         gated_units(
             g,
             ffn,
             layer,
             &format!("parameters:{path}.mlp"),
-            &format!("{path}.mlp"),
+            projections.projections(),
+            projections.policy,
             &format!("{path}.feed_forward"),
             &format!("{path}.feed_forward.input"),
-            c.intermediate_size as usize,
-            width,
             norm(c, format!("{path}.post_attention_layernorm.weight")),
             ComponentWritePartition::Complete,
         );
@@ -219,30 +216,39 @@ pub(in crate::discovery) fn shared_units(
         "Normalized shared-expert input",
         axes(c.hidden_size as usize),
     );
+    let declaration = crate::deepseek::v3::routed_spec(c, layer, None)
+        .expect("admitted V3 routed/shared declaration");
+    let projections = &declaration.shared;
     gated_units(
         g,
         &format!("{ffn}.shared"),
         layer,
         &format!("parameters:{path}.mlp"),
-        &format!("{path}.mlp.shared_experts"),
+        projections.projections(),
+        projections.policy,
         &format!("{path}.feed_forward.shared"),
         &format!("{path}.feed_forward.shared.input"),
-        (c.moe_intermediate_size * c.n_shared_experts) as usize,
-        c.hidden_size as usize,
         norm(c, format!("{path}.post_attention_layernorm.weight")),
         ComponentWritePartition::TensorParallelSum,
     );
 }
 
 pub(in crate::discovery) fn readout(g: &mut Builder, c: &V3Args) {
-    readout_observations(g, c.hidden_size as usize, c.vocab_size as usize);
+    let statics = &c.parameters().statics;
+    let embedding = statics.embedding_spec();
+    let output = statics.head_spec().expect("untied V3 output declaration");
+    readout_observations(
+        g,
+        embedding.dimensions as usize,
+        embedding.vocabulary as usize,
+    );
     g.descriptor.component_readout = Some(ComponentReadout {
         token_embedding_normalization: None,
         embedding_normalization: None,
         embedding: "readout.embedding".into(),
-        embedding_weight: "model.embed_tokens.weight".into(),
+        embedding_weight: embedding.weight.id.as_str().into(),
         embedding_scale: ComponentScalar::new(1.0),
-        tied_embeddings: false,
+        tied_embeddings: statics.head_spec().is_none(),
         equation: ComponentReadoutEquation {
             residual_cycles: vec![],
             block_transforms: vec![],
@@ -253,8 +259,8 @@ pub(in crate::discovery) fn readout(g: &mut Builder, c: &V3Args) {
             projection_input: Some("readout.projection_input".into()),
             linear_scores: "readout.linear".into(),
             logits: MODEL_LOGITS_OBSERVATION_PATH.into(),
-            normalization: norm(c, "model.norm.weight".into()),
-            weight: "lm_head.weight".into(),
+            normalization: declared_normalization(statics.normalization_spec()),
+            weight: output.weight.id.as_str().into(),
             bias: None,
             output_transform: ComponentOutputTransform::Identity,
             block_normalizations: vec![],

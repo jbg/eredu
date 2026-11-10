@@ -3,18 +3,17 @@ use super::*;
 use crate::{
     decoder::{ComponentInstrumentation, DecoderBoundary},
     qwen4_exp::{
-        config::{Config, LayerKind},
+        config::Config,
         feed_forward::{FeedForwardSublayer, FeedForwardSublayerSpec},
-        indexed::{IndexedSublayerInput, IndexedSublayerSpec},
+        indexed::IndexedSublayerInput,
         qsa::QsaExecutionLimits,
-        recurrent::RecurrentSublayerSpec,
         residual::{mixer_spec, ResidualBoundary},
         target::{Mixer, MixerSpec},
     },
 };
 use eredu_nn::{
-    AttentionCache, DistributedNeuralBackend, GroupedGatedProductSpec, GroupedNeuralBackend,
-    LinearFormatSpec, NormalizationScale, ParameterSpec, RotaryPosition, TensorElementType,
+    AttentionCache, DeclareLogicalParameters, DistributedNeuralBackend, GroupedNeuralBackend,
+    LinearFormatSpec, RotaryPosition, TensorElementType,
 };
 use eredu_runtime::{
     ParameterProvider, RoutedBankId, RoutedObservationPoints, RuntimeAppendStreams,
@@ -33,6 +32,49 @@ pub struct PredictionLimits {
     /// Activation/cache representation.
     pub element: TensorElementType,
 }
+/// Parameter slots shared by prediction invocations, without state or execution bounds.
+#[derive(Debug, Clone)]
+pub struct PredictionSharedSpec {
+    /// Full-residual fusion with the next-token embedding.
+    pub fusion: PredictionFusionSpec,
+    /// Prediction-specific gated collapse, without target readout parameters.
+    pub readout: eredu_nn::residual_streams::GatedResidualSpec,
+}
+impl PredictionSharedSpec {
+    /// Builds the shared parameter namespace independently of decoder invocation limits.
+    pub fn from_config(
+        config: &Config,
+        mut format: impl FnMut(&str) -> Result<LinearFormatSpec, Error>,
+    ) -> Result<Self, Error> {
+        let spec = Self {
+            fusion: PredictionFusionSpec::from_config(config, &mut format)?,
+            readout: mixer_spec(config, "mtp.hyper_connection_mixer", false, format)?,
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+    /// Validates geometry and complete shared-slot identity before allocation.
+    pub fn validate(&self) -> Result<(), Error> {
+        self.logical_parameters().map(|_| ())
+    }
+}
+impl DeclareLogicalParameters for PredictionSharedSpec {
+    fn logical_parameters(&self) -> Result<Vec<eredu_nn::LogicalParameterDeclaration<'_>>, Error> {
+        self.fusion.validate()?;
+        self.readout.validate()?;
+        if self.fusion.geometry != self.readout.geometry || self.readout.injection.is_some() {
+            return Err(Error::backend(
+                "prediction fusion/readout residual geometry mismatch",
+            ));
+        }
+        let mut parameters = self.fusion.logical_parameters()?;
+        parameters.extend(self.readout.logical_parameters()?);
+        eredu_nn::validate_logical_parameter_topology(&parameters)
+            .map_err(Error::backend_source)?;
+        Ok(parameters)
+    }
+}
+
 /// One independently materialized prediction depth and separately owned state slot.
 #[derive(Debug, Clone)]
 pub struct PredictionUnitSpec {
@@ -46,10 +88,8 @@ pub struct PredictionUnitSpec {
 /// Prediction-only modules; embedding and vocabulary projection stay on the target.
 #[derive(Debug, Clone)]
 pub struct PredictionSpec {
-    /// Shared full-residual fusion.
-    pub fusion: PredictionFusionSpec,
-    /// Prediction-specific gated readout, without the target readout or extra RMSNorm.
-    pub readout: eredu_nn::residual_streams::GatedResidualSpec,
+    /// Shared fusion and readout slots, independent of decoder state ownership.
+    pub shared: PredictionSharedSpec,
     /// One bounded owner per configured prediction depth.
     pub units: Vec<PredictionUnitSpec>,
     /// Explicit finite invocation limits.
@@ -64,133 +104,143 @@ impl PredictionSpec {
             |required, unit| required.union(unit.mixer.required_operators()),
         )
     }
-    /// Constructs exact released names from retained formats and expert declarations.
-    pub fn from_prepared(
+    /// Attaches independent state, invocation limits and bank binding to retained slots.
+    pub(crate) fn from_parameters(
         config: &Config,
         limits: PredictionLimits,
         bank: RoutedBankId,
-        mut experts: impl FnMut(usize) -> Result<GroupedGatedProductSpec, Error>,
-        mut format: impl FnMut(&str) -> Result<LinearFormatSpec, Error>,
+        parameters: super::declarations::PredictionParameters,
     ) -> Result<Self, Error> {
+        use crate::qwen4_exp::target::declarations::UnitParameters;
         let prediction = config
             .prediction
             .as_ref()
             .ok_or_else(|| Error::backend("artifact has no embedded prediction schedule"))?;
-        if prediction.layers.is_empty() || limits.qsa.batch <= 0 || limits.qsa.tokens <= 0 {
+        if prediction.layers.is_empty()
+            || limits.qsa.batch <= 0
+            || limits.qsa.tokens <= 0
+            || parameters.units.len() != prediction.layers.len()
+        {
             return Err(Error::backend(
                 "invalid prediction schedule or invocation bounds",
             ));
         }
+        parameters.logical_parameters()?;
+        for (unit, kind) in parameters.units.iter().zip(prediction.layers.iter()) {
+            use crate::qwen4_exp::{config::LayerKind, target::declarations::MixerParameters};
+            let valid = matches!(
+                (unit, kind),
+                (
+                    UnitParameters::Decoder {
+                        mixer: MixerParameters::Recurrent(_),
+                        ..
+                    },
+                    LayerKind::Recurrent
+                ) | (
+                    UnitParameters::Decoder {
+                        mixer: MixerParameters::Indexed { .. },
+                        ..
+                    },
+                    LayerKind::Indexed
+                )
+            );
+            if !valid {
+                return Err(Error::backend(
+                    "prediction mixer differs from the retained invocation schedule",
+                ));
+            }
+        }
         let mut config = config.clone();
         config.attention.rotary.base = prediction.rope_theta;
-        let geometry = ResidualStreamGeometry::new(config.residual.streams, config.hidden_size)?;
-        let norm = |name: &str, dimensions| -> Result<_, Error> {
-            Ok(NormalizationConstructionSpec {
-                reduction: eredu_nn::NormalizationReduction::Native,
-                dimensions,
-                groups: None,
-                epsilon: config.norm_epsilon,
-                scale: NormalizationScale::LearnedOffset {
-                    weight: ParameterSpec::trainable(name).map_err(Error::backend)?,
-                    offset: 1.,
-                },
-            })
-        };
-        let mut projection = |name: &str| -> Result<_, Error> {
-            Ok(LinearSpec {
-                input: config.hidden_size,
-                output: config.hidden_size,
-                weight: ParameterSpec::trainable(name).map_err(Error::backend)?,
-                bias: None,
-                format: format(name)?,
-            })
-        };
-        let fusion = PredictionFusionSpec {
-            geometry,
-            embedding_norm: norm("mtp.pre_fc_norm_embedding.weight", config.hidden_size)?,
-            hidden_norm: norm("mtp.pre_fc_norm_hidden.weight", geometry.flattened_width())?,
-            embedding_projection: projection("mtp.fc_embedding.weight")?,
-            hidden_projection: projection("mtp.fc_hidden.weight")?,
-        };
-        fusion.validate()?;
-        let readout = mixer_spec(&config, "mtp.hyper_connection_mixer", false, &mut format)?;
-        let units = prediction
-            .layers
-            .iter()
-            .enumerate()
-            .map(|(depth, kind)| {
-                let root = format!("mtp.layers.{depth}");
-                let mixer = match kind {
-                    LayerKind::Recurrent => MixerSpec::Recurrent(
-                        RecurrentSublayerSpec::from_config(&config, &root, &mut format)?,
-                    ),
-                    LayerKind::Indexed => MixerSpec::Indexed(
-                        IndexedSublayerSpec::from_config(
-                            &config,
-                            &root,
-                            limits.tile_blocks,
-                            limits.selection_workspace,
-                            limits.qsa,
-                            limits.element,
-                            TensorElementType::F32,
-                            &mut format,
-                        )
-                        .map_err(Error::backend_source)?,
-                    ),
+        let units = parameters
+            .units
+            .into_iter()
+            .map(|unit| {
+                let UnitParameters::Decoder {
+                    layer: depth,
+                    mixer,
+                    mut feed_forward,
+                } = unit
+                else {
+                    return Err(Error::backend("prediction cannot own a lexical invocation"));
                 };
-                let mut feed_forward = FeedForwardSublayerSpec::from_config(
-                    &config,
-                    depth,
-                    &root,
-                    experts(depth)?,
-                    &mut format,
-                )?;
                 feed_forward.feed_forward.bank = bank;
                 Ok(PredictionUnitSpec {
                     depth,
-                    mixer,
+                    mixer: mixer.into_spec(
+                        &config,
+                        limits.tile_blocks,
+                        limits.selection_workspace,
+                        limits.qsa,
+                        limits.element,
+                    )?,
                     feed_forward,
                 })
             })
             .collect::<Result<Vec<_>, Error>>()?;
         let spec = Self {
-            fusion,
-            readout,
+            shared: parameters.shared,
             units,
             limits,
         };
         spec.state_layout()?;
         Ok(spec)
     }
+    /// Projects parameter scopes from the retained executable declaration.
+    pub(crate) fn parameter_declaration(&self) -> super::declarations::PredictionParameters {
+        use crate::qwen4_exp::target::declarations::{MixerParameters, UnitParameters};
+        super::declarations::PredictionParameters {
+            shared: self.shared.clone(),
+            units: self
+                .units
+                .iter()
+                .map(|unit| UnitParameters::Decoder {
+                    layer: unit.depth,
+                    mixer: match &unit.mixer {
+                        MixerSpec::Recurrent(spec) => MixerParameters::Recurrent(spec.clone()),
+                        MixerSpec::Indexed(spec) => MixerParameters::Indexed {
+                            residual: spec.residual.clone(),
+                            parameters: spec.parameters.clone(),
+                        },
+                    },
+                    feed_forward: unit.feed_forward.clone(),
+                })
+                .collect(),
+        }
+    }
+
     /// Prediction state never aliases the target's lexical, recurrent or QSA slots.
     pub fn state_layout(&self) -> Result<StateLayout, Error> {
-        self.fusion.validate()?;
-        self.readout.validate()?;
-        if self.fusion.geometry != self.readout.geometry
-            || self.readout.injection.is_some()
-            || self.units.is_empty()
-            || self.limits.qsa.batch <= 0
-            || self.limits.qsa.tokens <= 0
-        {
+        let layout = self.state_geometry()?;
+        self.declarations()?;
+        Ok(layout)
+    }
+    fn declarations(&self) -> Result<Vec<eredu_nn::LogicalParameterDeclaration<'_>>, Error> {
+        let mut parameters = self.shared.logical_parameters()?;
+        for unit in &self.units {
+            parameters.extend(unit.logical_parameters()?);
+        }
+        eredu_nn::validate_logical_parameter_topology(&parameters)
+            .map_err(Error::backend_source)?;
+        Ok(parameters)
+    }
+    fn state_geometry(&self) -> Result<StateLayout, Error> {
+        self.shared.validate()?;
+        if self.units.is_empty() || self.limits.qsa.batch <= 0 || self.limits.qsa.tokens <= 0 {
             return Err(Error::backend(
                 "prediction shared geometry, schedule or bounds are invalid",
             ));
         }
         for (depth, unit) in self.units.iter().enumerate() {
             let geometry = match &unit.mixer {
-                MixerSpec::Recurrent(mixer) => {
-                    mixer.validate()?;
-                    mixer.residual.geometry
-                }
-                MixerSpec::Indexed(mixer) => {
-                    mixer.validate().map_err(Error::backend_source)?;
-                    mixer.residual.geometry
-                }
+                MixerSpec::Recurrent(mixer) => mixer.residual.geometry,
+                MixerSpec::Indexed(mixer) => mixer.residual.geometry,
             };
-            unit.feed_forward.validate()?;
+            unit.validate()?;
             if unit.depth != depth
-                || unit.feed_forward.feed_forward.layer != depth
-                || geometry != self.fusion.geometry
+                || unit.feed_forward.feed_forward.bank
+                    != self.units[0].feed_forward.feed_forward.bank
+                || geometry != self.shared.fusion.geometry
                 || unit.feed_forward.residual.geometry != geometry
             {
                 return Err(Error::backend(
@@ -209,6 +259,39 @@ impl PredictionSpec {
         .map_err(Error::backend)
     }
 }
+impl PredictionUnitSpec {
+    /// Validates one complete decoder depth independently of backend resources.
+    pub fn validate(&self) -> Result<(), Error> {
+        self.logical_parameters().map(|_| ())
+    }
+}
+impl DeclareLogicalParameters for PredictionUnitSpec {
+    fn logical_parameters(&self) -> Result<Vec<eredu_nn::LogicalParameterDeclaration<'_>>, Error> {
+        let geometry = match &self.mixer {
+            MixerSpec::Recurrent(spec) => spec.residual.geometry,
+            MixerSpec::Indexed(spec) => spec.residual.geometry,
+        };
+        if geometry != self.feed_forward.residual.geometry
+            || self.feed_forward.feed_forward.layer != self.depth
+        {
+            return Err(Error::backend(
+                "prediction mixer/feed-forward depth or residual geometry mismatch",
+            ));
+        }
+        let mut parameters = self.mixer.logical_parameters()?;
+        parameters.extend(self.feed_forward.logical_parameters()?);
+        eredu_nn::validate_logical_parameter_topology(&parameters)
+            .map_err(Error::backend_source)?;
+        Ok(parameters)
+    }
+}
+impl DeclareLogicalParameters for PredictionSpec {
+    fn logical_parameters(&self) -> Result<Vec<eredu_nn::LogicalParameterDeclaration<'_>>, Error> {
+        self.state_geometry()?;
+        self.declarations()
+    }
+}
+
 /// Shared weights remain pinned while one prediction depth is acquired.
 #[derive(Debug, eredu_nn::Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
@@ -230,14 +313,9 @@ impl<B: NeuralBackend> PredictionShared<B> {
     ) -> Result<Self, Error> {
         spec.state_layout()?;
         B::require_operator_capabilities("qwen4_exp prediction", spec.required_operators())?;
-        if spec.fusion.geometry != spec.readout.geometry {
-            return Err(Error::backend(
-                "prediction fusion/readout residual geometry mismatch",
-            ));
-        }
         Ok(Self {
-            fusion: PredictionFusion::new(spec.fusion.clone(), context)?,
-            readout: ResidualBoundary::new(spec.readout.clone(), context)?,
+            fusion: PredictionFusion::new(spec.shared.fusion.clone(), context)?,
+            readout: ResidualBoundary::new(spec.shared.readout.clone(), context)?,
             limits: spec.limits,
         })
     }
@@ -281,22 +359,11 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> PredictionUnit<B> {
         spec: PredictionUnitSpec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        spec.feed_forward.validate()?;
+        spec.validate()?;
         B::require_operator_capabilities(
             "qwen4_exp prediction mixer",
             spec.mixer.required_operators(),
         )?;
-        let geometry = match &spec.mixer {
-            MixerSpec::Recurrent(s) => s.residual.geometry,
-            MixerSpec::Indexed(s) => s.residual.geometry,
-        };
-        if geometry != spec.feed_forward.residual.geometry
-            || spec.feed_forward.feed_forward.layer != spec.depth
-        {
-            return Err(Error::backend(
-                "prediction mixer/feed-forward owner or geometry mismatch",
-            ));
-        }
         Ok(Self {
             mixer: Mixer::new(spec.mixer.clone(), context)?,
             feed_forward: FeedForwardSublayer::new(spec.feed_forward.clone(), context)?,
@@ -500,7 +567,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> PredictionUnit<B> {
             RoutedObservationPoints::new(
                 ff.bank,
                 format!("mtp.layers.{}.mlp", self.spec.depth),
-                ff.router.selection().group_count(),
+                ff.parameters.routed.selector.selection().group_count(),
             ),
             provider,
             instrumentation,

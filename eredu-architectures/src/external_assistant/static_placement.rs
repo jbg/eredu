@@ -110,7 +110,7 @@ impl PreparedTargetStaticPlacement {
             _ => {
                 return Err(Error::backend(
                     "target static input rank or hidden width differs",
-                ))
+                ));
             }
         };
         if batch <= 0 || sequence <= 0 {

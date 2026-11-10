@@ -1,30 +1,24 @@
 //! Backend-neutral Muse-Glimmer decoder equations.
 
 use eredu_nn::{
-    AttentionCache, AttentionRequest, EmbeddingOperator, Error, GatedProductGroupLayout,
-    GroupScoring, GroupedGatedProductOperator, GroupedGatedProductSpec, GroupedNeuralBackend,
-    LinearOperator, LinearSpec, NormalizationConstructionSpec, NormalizationOperator,
-    ParameterSpec, Parameterized, RotaryOperator, RotaryPosition, RotarySpec, Tensor,
-    TopKGroupSelectionSpec, TopKGroupSelectorSpec,
+    AttentionCache, AttentionRequest, DeclareLogicalParameters, EmbeddingOperator, Error,
+    GroupedGatedProductOperator, GroupedGatedProductSpec, GroupedNeuralBackend, LinearOperator,
+    NormalizationOperator, Parameterized, RotaryOperator, RotaryPosition, Tensor,
 };
 use eredu_runtime::{
     ExpertPass, ParameterProvider, RoutedExpertRequest, TensorParallelParameterProvider,
 };
 
 use crate::decoder::{ComponentInstrumentation, DecoderStaticResources};
-use crate::linear_format::standard_expert_projection;
 
-use super::config::{
-    AttentionEquation, BlockNormalization, ResidualEquation, RoutedFeedForwardEquation,
-    VocabularyArithmetic,
-};
-use super::equations::{
-    weightless_rms_norm, BranchNorm, LearnedResidualCombination, LearnedRmsNorm,
-    ResidualCombination, RmsNormEquation,
-};
-use super::{DecoderConfig, LocalGeometry, WeightConvention};
+use super::config::{AttentionEquation, VocabularyArithmetic};
+use super::equations::{weightless_rms_norm, BranchNorm, LearnedRmsNorm, ResidualCombination};
+use super::{DecoderConfig, DecoderPolicy, LocalGeometry};
 
 mod mask;
+/// Source-free routed construction, ownership, and placement declarations.
+pub mod routed;
+pub(crate) mod specs;
 
 /// Gated grouped-query attention with per-layer RoPE/NoPE policy.
 #[derive(Debug, Clone, Parameterized)]
@@ -77,120 +71,46 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> 
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        Self::new_with_layout(
-            args,
-            layer,
-            &format!("model.layers.{layer}.self_attn"),
-            "gate_proj",
-            context,
-        )
+        Self::from_spec(args.selected_attention(layer)?, context)
     }
 
-    pub(crate) fn new_with_layout(
-        args: &DecoderConfig,
-        layer: usize,
-        prefix: &str,
-        gate_projection: &str,
+    fn from_spec(
+        spec: specs::AttentionSpec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let policy = args
-            .attention_schedule
-            .get(layer)
-            .copied()
-            .ok_or_else(|| Error::backend(format!("missing Muse-Glimmer layer {layer}")))?;
-        let linear = |field: &str, input, output| {
-            let weight = format!("{prefix}.{field}.weight");
-            B::linear(
-                LinearSpec {
-                    input,
-                    output,
-                    weight: ParameterSpec::trainable(&weight).map_err(Error::backend)?,
-                    bias: None,
-                    format: crate::linear_format::standard_linear_format(
-                        &weight,
-                        args.linear_format_for(&weight),
-                    )?,
-                },
-                context,
-            )
-        };
-        let gguf = args.weight_convention == WeightConvention::Gguf;
-        let norm = |field: &str| {
-            B::normalization(
-                NormalizationConstructionSpec::learned(
-                    args.head_dim,
-                    args.rms_norm_eps,
-                    ParameterSpec::trainable(format!("{prefix}.{field}.weight"))
-                        .map_err(Error::backend)?,
-                ),
-                context,
-            )
-        };
+        spec.parameters.logical_parameters()?;
+        let window = spec.policy.sliding_window_i32().map_err(Error::backend)?;
+        let geometry = spec.parameters.projection.geometry;
+        let mut norms = spec.parameters.norms.into_iter();
         Ok(Self {
-            query_heads: args.num_attention_heads,
-            key_value_heads: args.num_key_value_heads,
-            head_dimensions: args.head_dim,
-            scale: match args.attention_equation {
-                super::config::AttentionEquation::QueryScaled => {
-                    (args.head_dim as f32).sqrt().recip()
-                }
-                super::config::AttentionEquation::NormalizedHeads => {
-                    (args.head_dim as f64).powf(-0.5) as f32
-                }
-                super::config::AttentionEquation::NormalizedHeadsScoreScaled => {
-                    ((args.head_dim as f64).powf(-0.5) * args.qk_scale_factor as f64) as f32
-                }
-            },
-            window: policy.window().map(|window| window.get() as i32),
-            uses_rope: *args
-                .layer_uses_rope
-                .get(layer)
-                .ok_or_else(|| Error::backend("missing Muse-Glimmer RoPE policy"))?,
-            qk_norm_epsilon: args.rms_norm_eps,
-            equation: args.attention_equation,
-            arithmetic: args.attention_arithmetic(),
-            qk_scale_factor: args.qk_scale_factor,
-            query_scale: (!gguf)
-                .then(|| B::Tensor::full_f32(args.qk_scale_factor, &[args.head_dim], context))
+            query_heads: geometry.query_heads(),
+            key_value_heads: geometry.key_value_heads(),
+            head_dimensions: geometry.key_dimensions(),
+            scale: spec.scale,
+            window,
+            uses_rope: spec.uses_rope,
+            qk_norm_epsilon: spec.epsilon,
+            equation: spec.equation,
+            arithmetic: spec.arithmetic,
+            qk_scale_factor: spec.qk_scale_factor,
+            query_scale: spec
+                .query_scale
+                .map(|scale| B::Tensor::full_f32(scale, &[geometry.key_dimensions()], context))
                 .transpose()?,
-            query: linear(
-                "q_proj",
-                args.hidden_size,
-                args.num_attention_heads * args.head_dim,
-            )?,
-            key: linear(
-                "k_proj",
-                args.hidden_size,
-                args.num_key_value_heads * args.head_dim,
-            )?,
-            value: linear(
-                "v_proj",
-                args.hidden_size,
-                args.num_key_value_heads * args.head_dim,
-            )?,
-            gate: linear(
-                gate_projection,
-                args.hidden_size,
-                args.num_attention_heads * args.head_dim,
-            )?,
-            output: linear(
-                "o_proj",
-                args.num_attention_heads * args.head_dim,
-                args.hidden_size,
-            )?,
-            query_norm: gguf.then(|| norm("q_norm")).transpose()?,
-            key_norm: gguf.then(|| norm("k_norm")).transpose()?,
-            rotary: B::rotary(
-                RotarySpec {
-                    arithmetic: args.rotary_arithmetic(),
-                    dimensions: args.head_dim,
-                    base: args.rope_theta,
-                    traditional: args.weight_convention.uses_traditional_rope(),
-                    algorithm: crate::rotary::normalize_algorithm(args.rope_scaling.as_ref())
-                        .expect("validated Muse-Glimmer RoPE algorithm"),
-                },
-                context,
-            )?,
+            query: B::linear(spec.parameters.projection.query, context)?,
+            key: B::linear(spec.parameters.projection.key, context)?,
+            value: B::linear(spec.parameters.projection.value, context)?,
+            gate: B::linear(spec.parameters.gate, context)?,
+            output: B::linear(spec.parameters.projection.output, context)?,
+            query_norm: norms
+                .next()
+                .map(|norm| B::normalization(norm, context))
+                .transpose()?,
+            key_norm: norms
+                .next()
+                .map(|norm| B::normalization(norm, context))
+                .transpose()?,
+            rotary: B::rotary(spec.rotary, context)?,
         })
     }
 
@@ -429,42 +349,20 @@ pub struct Mlp<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     pub up: B::Linear,
     /// Down projection.
     pub down: B::Linear,
+    #[parameter(skip)]
+    policy: eredu_nn::GatedProductPolicy,
 }
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Mlp<B> {
-    fn new(
-        args: &DecoderConfig,
-        layer: usize,
+    fn from_parameters(
+        parameters: eredu_nn::SplitGatedProductSpec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        Self::new_with_prefix(args, &format!("model.layers.{layer}.mlp"), context)
-    }
-
-    pub(crate) fn new_with_prefix(
-        args: &DecoderConfig,
-        prefix: &str,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        let linear = |field: &str, input, output| {
-            let weight = format!("{prefix}.{field}.weight");
-            B::linear(
-                LinearSpec {
-                    input,
-                    output,
-                    weight: ParameterSpec::trainable(&weight).map_err(Error::backend)?,
-                    bias: None,
-                    format: crate::linear_format::standard_linear_format(
-                        &weight,
-                        args.linear_format_for(&weight),
-                    )?,
-                },
-                context,
-            )
-        };
         Ok(Self {
-            gate: linear("gate_proj", args.hidden_size, args.intermediate_size)?,
-            up: linear("up_proj", args.hidden_size, args.intermediate_size)?,
-            down: linear("down_proj", args.intermediate_size, args.hidden_size)?,
+            gate: B::linear(parameters.gate, context)?,
+            up: B::linear(parameters.up, context)?,
+            down: B::linear(parameters.down, context)?,
+            policy: parameters.policy,
         })
     }
 
@@ -477,7 +375,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Mlp<B> {
     ) -> Result<B::Tensor, Error> {
         let gate = self.gate.forward(hidden, context)?;
         let up = self.up.forward(hidden, context)?;
-        let hidden = B::gated_product(gate, up, eredu_nn::GatedProductPolicy::default(), context)?;
+        let hidden = B::gated_product(gate, up, self.policy, context)?;
         let hidden = instrumentation.apply("feed_forward.units", hidden)?;
         instrumentation.project::<B>(
             "feed_forward.write_input",
@@ -510,49 +408,18 @@ pub enum ExpertComposition<B: GroupedNeuralBackend> {
 
 impl<B: GroupedNeuralBackend> ExpertComposition<B> {
     fn new(
-        args: &DecoderConfig,
-        layer: usize,
+        spec: Option<routed::CompressionSpec>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let RoutedFeedForwardEquation::CompressedSigmoid { expert_width, .. } =
-            args.routed_feed_forward
-        else {
+        let Some(spec) = spec else {
             return Ok(Self::Direct);
         };
-        let prefix = format!("model.layers.{layer}.mlp");
-        let linear = |field: &str, input, output| {
-            let weight = format!("{prefix}.{field}.weight");
-            B::linear(
-                LinearSpec {
-                    input,
-                    output,
-                    weight: ParameterSpec::trainable(&weight).map_err(Error::backend)?,
-                    bias: None,
-                    format: crate::linear_format::standard_linear_format(
-                        &weight,
-                        args.linear_format_for(&weight),
-                    )?,
-                },
-                context,
-            )
-        };
+        let [input_norm, output_norm] = spec.norms;
         Ok(Self::Compressed {
-            pre_projection: linear("pre_expert_proj", args.hidden_size, expert_width)?,
-            pre_norm: LearnedRmsNorm::new(
-                expert_width,
-                args.rms_norm_eps,
-                RmsNormEquation::OutputScaledFp32(args.weight_convention),
-                format!("{prefix}.pre_expert_norm.weight"),
-                context,
-            )?,
-            expert_norm: LearnedRmsNorm::new(
-                expert_width,
-                args.post_norm_eps,
-                RmsNormEquation::InputScaled(args.weight_convention),
-                format!("{prefix}.experts.post_expert_norm.weight"),
-                context,
-            )?,
-            post_projection: linear("post_expert_proj", expert_width, args.hidden_size)?,
+            pre_projection: B::linear(spec.input, context)?,
+            pre_norm: LearnedRmsNorm::new(input_norm, context)?,
+            expert_norm: LearnedRmsNorm::new(output_norm, context)?,
+            post_projection: B::linear(spec.output, context)?,
         })
     }
 
@@ -623,46 +490,18 @@ pub struct SparseMoe<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBacken
 }
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> {
-    fn new(
-        args: &DecoderConfig,
-        layer: usize,
+    fn from_declaration(
+        declaration: routed::Declaration,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        Self::new_with_spec(args, layer, expert_bank_spec(args, layer)?, context)
-    }
-
-    pub(crate) fn new_with_spec(
-        args: &DecoderConfig,
-        layer: usize,
-        spec: GroupedGatedProductSpec,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        let prefix = format!("model.layers.{layer}.mlp");
-        let selection = routing_selection_spec(args)?;
-        let weight = format!("{prefix}.gate.weight");
-        let mut selector = TopKGroupSelectorSpec::new(
-            args.hidden_size,
-            ParameterSpec::trainable(&weight).map_err(Error::backend)?,
-            crate::linear_format::standard_linear_format(&weight, args.linear_format_for(&weight))?,
-            selection,
-        )?;
-        if let RoutedFeedForwardEquation::CompressedSigmoid { logit_scale, .. } =
-            args.routed_feed_forward
-        {
-            let mut correction =
-                ParameterSpec::trainable(format!("{prefix}.gate.e_score_correction_bias"))
-                    .map_err(Error::backend)?;
-            correction.trainable = false;
-            selector = selector
-                .with_logit_scale(logit_scale)?
-                .with_correction_bias(correction)?;
-        }
+        declaration.validate()?;
+        let (selector, bank, compression) = declaration.into_parts();
         Ok(Self {
+            hidden_size: selector.input_dimensions(),
+            expert_count: selector.selection().group_count(),
             router: B::top_k_group_selector(selector, context)?,
-            composition: ExpertComposition::new(args, layer, context)?,
-            experts: B::grouped_gated_product(spec, context)?,
-            hidden_size: args.hidden_size,
-            expert_count: args.num_experts,
+            composition: ExpertComposition::new(compression, context)?,
+            experts: B::grouped_gated_product(bank, context)?,
         })
     }
 
@@ -789,75 +628,6 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
     }
 }
 
-/// Complete neutral router policy shared by construction and cold intervention admission.
-pub(crate) fn routing_selection_spec(
-    args: &DecoderConfig,
-) -> Result<TopKGroupSelectionSpec, Error> {
-    Ok(match args.routed_feed_forward {
-        RoutedFeedForwardEquation::DirectSoftmax => TopKGroupSelectionSpec::new(
-            args.num_experts,
-            args.num_experts_per_tok,
-            GroupScoring::Softmax,
-            args.norm_topk_prob,
-        )?,
-        RoutedFeedForwardEquation::CompressedSigmoid {
-            coefficient_scale, ..
-        } => TopKGroupSelectionSpec::new(
-            args.num_experts,
-            args.num_experts_per_tok,
-            GroupScoring::Sigmoid,
-            true,
-        )?
-        .with_weight_policy(1e-15, coefficient_scale)?
-        .with_order(if args.weight_convention == WeightConvention::HuggingFace {
-            eredu_nn::GroupSelectionOrder::Partition
-        } else {
-            eredu_nn::GroupSelectionOrder::Ranked
-        }),
-    })
-}
-
-/// Returns the architecture-owned routed expert specification for one layer.
-pub fn expert_bank_spec(
-    args: &DecoderConfig,
-    layer: usize,
-) -> Result<GroupedGatedProductSpec, Error> {
-    let prefix = format!("model.layers.{layer}.mlp.experts");
-    let gate_up = format!("{prefix}.gate_up_proj");
-    let down = format!("{prefix}.down_proj");
-    let width = match args.routed_feed_forward {
-        RoutedFeedForwardEquation::DirectSoftmax => args.hidden_size,
-        RoutedFeedForwardEquation::CompressedSigmoid { expert_width, .. } => expert_width,
-    };
-    let spec = GroupedGatedProductSpec::new(
-        args.num_experts,
-        width,
-        args.moe_intermediate_size,
-        width,
-        eredu_nn::GatedProductPolicy::ordinary_silu(),
-        GatedProductGroupLayout::Packed {
-            gate_up: standard_expert_projection(&gate_up, None, args.linear_format_for(&gate_up))?,
-            down: standard_expert_projection(&down, None, args.linear_format_for(&down))?,
-        },
-    )?;
-    Ok(match args.routed_feed_forward {
-        RoutedFeedForwardEquation::DirectSoftmax => spec,
-        RoutedFeedForwardEquation::CompressedSigmoid { .. } => {
-            spec.with_reduction(eredu_nn::GroupReduction::SequentialGroupOrder)
-        }
-    })
-}
-
-/// Returns the same architecture-owned bank at placement-resolved geometry.
-pub(crate) fn localized_expert_bank_spec(
-    args: &DecoderConfig,
-    layer: usize,
-    expert_count: i32,
-    intermediate_dimensions: i32,
-) -> Result<GroupedGatedProductSpec, Error> {
-    expert_bank_spec(args, layer)?.with_group_geometry(expert_count, intermediate_dimensions)
-}
-
 /// Dense or routed feed-forward branch selected by normalized checkpoint geometry.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
@@ -868,20 +638,23 @@ pub enum FeedForward<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBacken
     Sparse(SparseMoe<B>),
 }
 
+enum PreparedFeedForward {
+    Dense(eredu_nn::SplitGatedProductSpec),
+    Routed(routed::Declaration),
+}
+
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B> {
-    fn new_with_routed_spec(
-        args: &DecoderConfig,
-        layer: usize,
-        routed_spec: Option<GroupedGatedProductSpec>,
+    fn from_prepared(
+        declaration: PreparedFeedForward,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        if args.is_moe() {
-            Ok(Self::Sparse(match routed_spec {
-                Some(spec) => SparseMoe::new_with_spec(args, layer, spec, context)?,
-                None => SparseMoe::new(args, layer, context)?,
-            }))
-        } else {
-            Ok(Self::Dense(Mlp::new(args, layer, context)?))
+        match declaration {
+            PreparedFeedForward::Routed(declaration) => Ok(Self::Sparse(
+                SparseMoe::from_declaration(declaration, context)?,
+            )),
+            PreparedFeedForward::Dense(parameters) => {
+                Ok(Self::Dense(Mlp::from_parameters(parameters, context)?))
+            }
         }
     }
 
@@ -972,74 +745,31 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TransformerBl
     /// Constructs the released dense assistant topology over the same block
     /// equation driver. Its input norms return compute precision while the
     /// caller supplies and retains an FP32 residual stream.
-    pub(crate) fn new_dspark(
-        args: &DecoderConfig,
+    pub(crate) fn from_dspark_parameters(
+        args: &DecoderPolicy,
+        parameters: specs::DsparkBlockParameters,
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let root = format!("layers.{layer}");
-        let norm = |name: &str, epsilon, equation| {
-            LearnedRmsNorm::new(
-                args.hidden_size,
-                epsilon,
-                equation,
-                format!("{root}.{name}.weight"),
-                context,
-            )
-        };
-        let ResidualEquation::Learned {
-            temperature,
-            minimum_variance,
-        } = args.residual_equation
-        else {
-            return Err(Error::backend(
-                "DSpark requires learned FP32 residual gates",
-            ));
-        };
-        let residual = |name: &str| {
-            LearnedResidualCombination::new(
-                args.hidden_size,
-                temperature,
-                minimum_variance,
-                format!("{root}.{name}.gate"),
-                context,
-            )
-            .map(ResidualCombination::Learned)
-        };
+        let specs::DsparkBlockParameters {
+            attention,
+            dense,
+            scalar,
+        } = parameters;
+        let [attention_residual, feed_forward_residual] = scalar.residuals;
         Ok(Self {
             layer,
-            attention: Attention::new_with_layout(
-                args,
-                layer,
-                &format!("{root}.self_attn"),
-                "o_gate_proj",
+            attention: Attention::from_spec(
+                specs::AttentionSpec::with_parameters(args, layer, attention)?,
                 context,
             )?,
-            feed_forward: FeedForward::Dense(Mlp::new_with_prefix(
-                args,
-                &format!("{root}.feed_forward"),
-                context,
-            )?),
-            input_norm: norm(
-                "self_attn.pre_qkv_proj_norm",
-                args.rms_norm_eps,
-                RmsNormEquation::OutputScaledComputeFp32(super::equations::RmsGain::Centered),
-            )?,
-            post_attention_norm: BranchNorm::Weightless {
-                epsilon: args.post_norm_eps,
-            },
-            pre_feed_forward_norm: norm(
-                "pre_ffn_norm",
-                args.rms_norm_eps,
-                RmsNormEquation::OutputScaledComputeFp32(super::equations::RmsGain::Centered),
-            )?,
-            post_feed_forward_norm: norm(
-                "post_ffn_norm",
-                args.post_norm_eps,
-                RmsNormEquation::InputScaledFp32(super::equations::RmsGain::Centered),
-            )?,
-            attention_residual: residual("add_attn")?,
-            feed_forward_residual: residual("add_ffn")?,
+            feed_forward: FeedForward::Dense(Mlp::from_parameters(dense, context)?),
+            input_norm: LearnedRmsNorm::new(scalar.input, context)?,
+            post_attention_norm: BranchNorm::new(scalar.post_attention, context)?,
+            pre_feed_forward_norm: LearnedRmsNorm::new(scalar.pre_feed_forward, context)?,
+            post_feed_forward_norm: LearnedRmsNorm::new(scalar.post_feed_forward, context)?,
+            attention_residual: ResidualCombination::new(attention_residual, context)?,
+            feed_forward_residual: ResidualCombination::new(feed_forward_residual, context)?,
         })
     }
 
@@ -1058,80 +788,31 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TransformerBl
         routed_spec: Option<GroupedGatedProductSpec>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let root = format!("model.layers.{layer}");
-        let norm = |field: &str, epsilon, equation| {
-            LearnedRmsNorm::new(
-                args.hidden_size,
-                epsilon,
-                equation,
-                format!("{root}.{field}.weight"),
-                context,
-            )
-        };
-        let pre_equation = match args.block_normalization {
-            BlockNormalization::OutputScaled => {
-                RmsNormEquation::OutputScaled(args.weight_convention)
+        let declaration = if args.is_moe() {
+            let source = args.selected_routed(layer)?;
+            PreparedFeedForward::Routed(match routed_spec {
+                Some(bank) => source.with_bank(bank)?,
+                None => source,
+            })
+        } else {
+            if routed_spec.is_some() {
+                return Err(Error::backend("dense Muse invocation has no routed bank"));
             }
-            BlockNormalization::InputScaledFeedForward => {
-                RmsNormEquation::OutputScaledFp32(args.weight_convention)
-            }
+            PreparedFeedForward::Dense(args.selected_dense(layer)?)
         };
-        let (post_attention_norm, post_ff_equation) = match args.block_normalization {
-            BlockNormalization::OutputScaled => (
-                BranchNorm::Learned(norm(
-                    "post_attention_layernorm",
-                    args.post_norm_eps,
-                    pre_equation,
-                )?),
-                pre_equation,
-            ),
-            BlockNormalization::InputScaledFeedForward => (
-                BranchNorm::Weightless {
-                    epsilon: args.post_norm_eps,
-                },
-                RmsNormEquation::InputScaled(args.weight_convention),
-            ),
-        };
-        let residual = |field| match args.residual_equation {
-            ResidualEquation::Add => Ok(ResidualCombination::Add),
-            ResidualEquation::StoredCoefficients => {
-                super::equations::StoredResidualCombination::new(
-                    args.hidden_size,
-                    &format!("{root}.{field}"),
-                    context,
-                )
-                .map(ResidualCombination::Stored)
-            }
-            ResidualEquation::Learned {
-                temperature,
-                minimum_variance,
-            } => LearnedResidualCombination::new(
-                args.hidden_size,
-                temperature,
-                minimum_variance,
-                format!("{root}.{field}.gate"),
-                context,
-            )
-            .map(ResidualCombination::Learned),
-        };
+        let attention = args.selected_attention(layer)?;
+        let scalar = args.scalar(layer)?.clone();
+        let [attention_residual, feed_forward_residual] = scalar.residuals;
         Ok(Self {
             layer,
-            attention: Attention::new(args, layer, context)?,
-            feed_forward: FeedForward::new_with_routed_spec(args, layer, routed_spec, context)?,
-            input_norm: norm("input_layernorm", args.rms_norm_eps, pre_equation)?,
-            post_attention_norm,
-            pre_feed_forward_norm: norm(
-                "pre_feedforward_layernorm",
-                args.rms_norm_eps,
-                pre_equation,
-            )?,
-            post_feed_forward_norm: norm(
-                "post_feedforward_layernorm",
-                args.post_norm_eps,
-                post_ff_equation,
-            )?,
-            attention_residual: residual("post_attention_residual_gate")?,
-            feed_forward_residual: residual("post_feedforward_residual_gate")?,
+            attention: Attention::from_spec(attention, context)?,
+            feed_forward: FeedForward::from_prepared(declaration, context)?,
+            input_norm: LearnedRmsNorm::new(scalar.input, context)?,
+            post_attention_norm: BranchNorm::new(scalar.post_attention, context)?,
+            pre_feed_forward_norm: LearnedRmsNorm::new(scalar.pre_feed_forward, context)?,
+            post_feed_forward_norm: LearnedRmsNorm::new(scalar.post_feed_forward, context)?,
+            attention_residual: ResidualCombination::new(attention_residual, context)?,
+            feed_forward_residual: ResidualCombination::new(feed_forward_residual, context)?,
         })
     }
 
@@ -1471,26 +1152,6 @@ pub struct StaticModules<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBa
     logit_cap: f32,
 }
 
-/// Pinned resource geometry and formats for every vocabulary arithmetic policy.
-pub(super) fn static_spec(args: &DecoderConfig) -> crate::decoder::StaticModuleSpec {
-    crate::decoder::StaticModuleSpec {
-        normalization_groups: match args.vocabulary_arithmetic() {
-            VocabularyArithmetic::Backend => None,
-            VocabularyArithmetic::StageRounded | VocabularyArithmetic::Float32 => Some(1),
-        },
-        embedding_weight: "model.embed_tokens.weight".into(),
-        normalization_weight: "model.norm.weight".into(),
-        head_weight: "lm_head.weight".into(),
-        vocabulary: args.vocab_size,
-        hidden_size: args.hidden_size,
-        normalization_epsilon: args.rms_norm_eps,
-        normalization_offset: 0.0,
-        embedding_format: args.linear_format_for("model.embed_tokens.weight"),
-        head_format: args.linear_format_for("lm_head.weight"),
-        tied_head: args.tie_word_embeddings,
-    }
-}
-
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> StaticModules<B> {
     /// Builds all canonical pinned resources for ordinary execution.
     pub fn new(
@@ -1530,8 +1191,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> StaticModules
         stores: impl Fn(&str) -> bool,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let resources = crate::decoder::PartitionStaticModules::<B>::from_selected_spec(
-            static_spec(args),
+        let resources = crate::decoder::PartitionStaticModules::<B>::from_selected_construction(
+            args.pinned().clone(),
             geometry.map(|geometry| {
                 (
                     geometry.embedding_range().clone(),

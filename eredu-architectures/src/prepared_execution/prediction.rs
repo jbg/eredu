@@ -113,9 +113,8 @@ where
     ) -> Result<MaterializedPredictionExtension<B, M>, E>,
 {
     let prepared = crate::prediction_extension::prepare::<B>(
-        &prediction.extension,
+        &prediction.parameters,
         prediction.topology,
-        &prediction.tasks,
         source_context,
         context,
     )

@@ -19,6 +19,7 @@ use eredu_checkpoint::{
 use eredu_gguf::Checkpoint as GgufCheckpoint;
 
 use super::config::ModelArgs;
+use eredu_nn::{DeclareLogicalParameters, LogicalParameterRole};
 
 const MXFP4_GROUP_SIZE: usize = 32;
 const MXFP4_BLOCK_BYTES: usize = 16;
@@ -55,89 +56,56 @@ pub fn with_checkpoint_formats(
 }
 
 /// Builds the exact published GPT-OSS SafeTensors catalog.
-pub fn safetensors_plan(args: &ModelArgs) -> Result<SafetensorsCheckpointPlan, String> {
-    let geometry = Geometry::new(args)?;
-    let root = &args.parameter_root;
+pub fn safetensors_plan(
+    declaration: &super::Declaration,
+) -> Result<SafetensorsCheckpointPlan, String> {
+    let declarations = super::parallel::parameter_description(
+        declaration,
+        crate::decoder::ParameterEncoding::Logical,
+    )
+    .map_err(|error| error.to_string())?;
     let mut tensors = Vec::new();
-    add_matrix(
-        args,
-        &mut tensors,
-        format!("{root}.embed_tokens.weight"),
-        vec![geometry.vocabulary, geometry.hidden],
-        true,
-    )?;
-    tensors.push(floating(
-        format!("{root}.norm.weight"),
-        vec![geometry.hidden],
-    ));
-    add_matrix(
-        args,
-        &mut tensors,
-        "lm_head.weight",
-        vec![geometry.vocabulary, geometry.hidden],
-        true,
-    )?;
-
-    for layer in 0..geometry.layers {
-        let block = format!("{root}.layers.{layer}");
-        tensors.extend([
-            floating(
-                format!("{block}.input_layernorm.weight"),
-                vec![geometry.hidden],
-            ),
-            floating(
-                format!("{block}.post_attention_layernorm.weight"),
-                vec![geometry.hidden],
-            ),
-            floating(
-                format!("{block}.self_attn.sinks"),
-                vec![geometry.query_heads],
-            ),
-        ]);
-        for (projection, shape) in [
-            ("q_proj", vec![geometry.query, geometry.hidden]),
-            ("k_proj", vec![geometry.key_value, geometry.hidden]),
-            ("v_proj", vec![geometry.key_value, geometry.hidden]),
-            ("o_proj", vec![geometry.hidden, geometry.query]),
-        ] {
-            add_matrix(
-                args,
-                &mut tensors,
-                format!("{block}.self_attn.{projection}.weight"),
-                shape,
-                true,
-            )?;
+    let routers = declaration
+        .projections()
+        .owner_layers()
+        .map(|layer| {
+            declaration
+                .projections()
+                .parameters(layer)
+                .map(|spec| spec.selector.weight().id.as_str().to_owned())
+                .map_err(|error| error.to_string())
+        })
+        .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+    for group in declarations.groups() {
+        if group.role() == eredu_runtime::ParameterRole::ExpertIntermediate {
+            continue;
         }
-        for (projection, width) in [
-            ("q_proj", geometry.query),
-            ("k_proj", geometry.key_value),
-            ("v_proj", geometry.key_value),
-            ("o_proj", geometry.hidden),
-        ] {
-            tensors.push(floating(
-                format!("{block}.self_attn.{projection}.bias"),
-                vec![width],
-            ));
+        for parameter in group.members() {
+            if let Some(format) = parameter.logical_linear_format() {
+                let source_format = if routers.contains(parameter.target()) {
+                    LinearFormat::Dense
+                } else {
+                    format.encoding()
+                };
+                tensors.extend(
+                    matrix_for_linear_format(
+                        parameter.target(),
+                        Vec::<String>::new(),
+                        parameter.global_shape().to_vec(),
+                        source_format,
+                        None,
+                    )
+                    .map_err(|error| error.to_string())?,
+                );
+            } else {
+                tensors.push(floating(
+                    parameter.target(),
+                    parameter.global_shape().to_vec(),
+                ));
+            }
         }
-        // Published routers are ordinary floating-point projections. They are
-        // deliberately excluded from model-wide load-time matrix formats.
-        add_matrix(
-            args,
-            &mut tensors,
-            format!("{block}.mlp.router.weight"),
-            vec![geometry.experts, geometry.hidden],
-            false,
-        )?;
-        tensors.push(floating(
-            format!("{block}.mlp.router.bias"),
-            vec![geometry.experts],
-        ));
-        tensors.extend(safetensors_expert_constraints(
-            &format!("{block}.mlp.experts"),
-            geometry,
-        )?);
     }
-
+    tensors.extend(safetensors_expert_tensors(declaration)?);
     let mut policy = CatalogPolicy::strict();
     policy.allowed_prefixes.push("rope_freqs.".into());
     policy.allowed_suffixes.push(".rotary_emb.inv_freq".into());
@@ -150,139 +118,95 @@ pub fn safetensors_plan(args: &ModelArgs) -> Result<SafetensorsCheckpointPlan, S
 /// This keeps physical native-MXFP4 names and companions in the architecture
 /// checkpoint contract instead of requiring backends to classify path text.
 pub fn safetensors_expert_tensors(
-    args: &ModelArgs,
+    declaration: &super::Declaration,
 ) -> Result<Vec<SafetensorsTensorConstraint>, String> {
-    let geometry = Geometry::new(args)?;
     let mut tensors = Vec::new();
-    for layer in 0..geometry.layers {
-        tensors.extend(safetensors_expert_constraints(
-            &format!("{}.layers.{layer}.mlp.experts", args.parameter_root),
-            geometry,
-        )?);
+    for bank in declaration
+        .expert_banks()
+        .map_err(|error| error.to_string())?
+        .values()
+    {
+        tensors.extend(safetensors_expert_constraints(bank)?);
     }
     Ok(tensors)
 }
 
 /// Builds the exact canonical llama.cpp GPT-OSS GGUF catalog.
-pub fn gguf_plan(args: &ModelArgs) -> Result<GgufCheckpointPlan, String> {
-    let geometry = Geometry::new(args)?;
-    let mut tensors = vec![
-        gguf(
-            "token_embd.weight",
-            vec![geometry.vocabulary, geometry.hidden],
-            TensorOperation::Matrix,
-        ),
-        gguf(
-            "output_norm.weight",
-            vec![geometry.hidden],
-            TensorOperation::Vector,
-        ),
-        gguf(
-            "output.weight",
-            vec![geometry.vocabulary, geometry.hidden],
-            TensorOperation::Matrix,
-        ),
-    ];
-    for layer in 0..geometry.layers {
-        let block = format!("blk.{layer}");
-        tensors.extend([
-            gguf(
-                format!("{block}.attn_norm.weight"),
-                vec![geometry.hidden],
-                TensorOperation::Vector,
-            ),
-            gguf(
-                format!("{block}.attn_post_norm.weight"),
-                vec![geometry.hidden],
-                TensorOperation::Vector,
-            ),
-            gguf(
-                format!("{block}.attn_sinks.weight"),
-                vec![geometry.query_heads],
-                TensorOperation::Vector,
-            )
-            .with_aliases([format!("{block}.attn_sinks")]),
-            gguf(
-                format!("{block}.attn_q.weight"),
-                vec![geometry.query, geometry.hidden],
-                TensorOperation::Matrix,
-            ),
-            gguf(
-                format!("{block}.attn_q.bias"),
-                vec![geometry.query],
-                TensorOperation::Vector,
-            ),
-            gguf(
-                format!("{block}.attn_k.weight"),
-                vec![geometry.key_value, geometry.hidden],
-                TensorOperation::Matrix,
-            ),
-            gguf(
-                format!("{block}.attn_k.bias"),
-                vec![geometry.key_value],
-                TensorOperation::Vector,
-            ),
-            gguf(
-                format!("{block}.attn_v.weight"),
-                vec![geometry.key_value, geometry.hidden],
-                TensorOperation::Matrix,
-            ),
-            gguf(
-                format!("{block}.attn_v.bias"),
-                vec![geometry.key_value],
-                TensorOperation::Vector,
-            ),
-            gguf(
-                format!("{block}.attn_output.weight"),
-                vec![geometry.hidden, geometry.query],
-                TensorOperation::Matrix,
-            ),
-            gguf(
-                format!("{block}.attn_output.bias"),
-                vec![geometry.hidden],
-                TensorOperation::Vector,
-            ),
-            gguf(
-                format!("{block}.ffn_gate_inp.weight"),
-                vec![geometry.experts, geometry.hidden],
-                TensorOperation::Matrix,
-            ),
-            gguf(
-                format!("{block}.ffn_gate_inp.bias"),
-                vec![geometry.experts],
-                TensorOperation::Vector,
-            ),
-            gguf(
-                format!("{block}.ffn_gate_exps.weight"),
-                vec![geometry.experts, geometry.intermediate, geometry.hidden],
-                TensorOperation::MxFp4Matrix,
-            ),
-            gguf(
-                format!("{block}.ffn_gate_exps.bias"),
-                vec![geometry.experts, geometry.intermediate],
-                TensorOperation::Vector,
-            ),
-            gguf(
-                format!("{block}.ffn_up_exps.weight"),
-                vec![geometry.experts, geometry.intermediate, geometry.hidden],
-                TensorOperation::MxFp4Matrix,
-            ),
-            gguf(
-                format!("{block}.ffn_up_exps.bias"),
-                vec![geometry.experts, geometry.intermediate],
-                TensorOperation::Vector,
-            ),
-            gguf(
-                format!("{block}.ffn_down_exps.weight"),
-                vec![geometry.experts, geometry.hidden, geometry.intermediate],
-                TensorOperation::MxFp4Matrix,
-            ),
-            gguf(
-                format!("{block}.ffn_down_exps.bias"),
-                vec![geometry.experts, geometry.hidden],
-                TensorOperation::Vector,
-            ),
-        ]);
+pub fn gguf_plan(declaration: &super::Declaration) -> Result<GgufCheckpointPlan, String> {
+    let args = declaration.args();
+    let declarations = super::parallel::parameter_description(
+        declaration,
+        crate::decoder::ParameterEncoding::Logical,
+    )
+    .map_err(|error| error.to_string())?;
+    let mut tensors = Vec::new();
+    for group in declarations.groups() {
+        if group.role() == eredu_runtime::ParameterRole::ExpertIntermediate {
+            continue;
+        }
+        for parameter in group.members() {
+            let key = gguf_parameter_name(parameter.target(), &args.parameter_root)?;
+            let constraint = gguf(
+                &key,
+                parameter.global_shape().to_vec(),
+                if parameter.logical_linear_format().is_some() {
+                    TensorOperation::Matrix
+                } else {
+                    TensorOperation::Vector
+                },
+            );
+            tensors.push(
+                if let Some(prefix) = key.strip_suffix(".attn_sinks.weight") {
+                    constraint.with_aliases([format!("{prefix}.attn_sinks")])
+                } else {
+                    constraint
+                },
+            );
+        }
+    }
+    for (layer, bank) in declaration
+        .expert_banks()
+        .map_err(|error| error.to_string())?
+    {
+        let source = bank
+            .packed_parameters()
+            .map_err(|error| error.to_string())?;
+        for declaration in bank
+            .logical_parameters()
+            .map_err(|error| error.to_string())?
+        {
+            let fused = declaration.parameter.id == source.gate_up().parameter.id
+                || source
+                    .gate_up_bias()
+                    .is_some_and(|bias| bias.parameter.id == declaration.parameter.id);
+            let shape = if fused {
+                if declaration.role == LogicalParameterRole::LinearWeight {
+                    source.unfused_shape()
+                } else {
+                    source
+                        .unfused_bias_shape()
+                        .ok_or("undeclared GPT-OSS gate/up bias")?
+                }
+            } else {
+                declaration.shape
+            };
+            let (suffix, operation) = if declaration.role == LogicalParameterRole::LinearWeight {
+                ("weight", TensorOperation::MxFp4Matrix)
+            } else {
+                ("bias", TensorOperation::Vector)
+            };
+            for field in if fused {
+                &["ffn_gate_exps", "ffn_up_exps"][..]
+            } else {
+                &["ffn_down_exps"][..]
+            } {
+                tensors.push(gguf(
+                    format!("blk.{layer}.{field}.{suffix}"),
+                    shape.clone(),
+                    operation,
+                ));
+            }
+        }
     }
     GgufCheckpointPlan::new("GPT-OSS GGUF", tensors, Vec::new(), CatalogPolicy::strict())
         .map_err(|error| error.to_string())
@@ -293,8 +217,8 @@ pub fn gguf_plan(args: &ModelArgs) -> Result<GgufCheckpointPlan, String> {
 /// These are source-layout targets, before the architecture's expert recipes
 /// normalize separate gate/up/down matrices into the runtime expert bank.
 pub fn gguf_expert_quantization_targets(args: &ModelArgs) -> Result<Vec<String>, String> {
-    let geometry = Geometry::new(args)?;
-    Ok((0..geometry.layers)
+    args.validate().map_err(|error| error.to_string())?;
+    Ok((0..dimension(args.num_hidden_layers, "layer count")?)
         .flat_map(|layer| {
             ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"].map(move |projection| {
                 translate_gguf_weight_name(&format!("blk.{layer}.{projection}.weight"))
@@ -304,8 +228,12 @@ pub fn gguf_expert_quantization_targets(args: &ModelArgs) -> Result<Vec<String>,
 }
 
 /// Validates the portable GGUF catalog and matching gate/up physical encodings.
-pub fn validate_gguf(checkpoint: &GgufCheckpoint, args: &ModelArgs) -> CheckpointValidation {
-    let plan = match gguf_plan(args) {
+pub fn validate_gguf(
+    checkpoint: &GgufCheckpoint,
+    declaration: &super::Declaration,
+) -> CheckpointValidation {
+    let args = declaration.args();
+    let plan = match gguf_plan(declaration) {
         Ok(plan) => plan,
         Err(error) => {
             return CheckpointValidation::Invalid(vec![
@@ -337,13 +265,27 @@ pub fn validate_gguf(checkpoint: &GgufCheckpoint, args: &ModelArgs) -> Checkpoin
     CheckpointValidation::from_issues(issues)
 }
 
+const GGUF_ROOT_NAMES: &[(&str, &str)] = &[
+    ("token_embd", "model.embed_tokens"),
+    ("output_norm", "model.norm"),
+    ("output", "lm_head"),
+];
+const GGUF_LAYER_NAMES: &[(&str, &str)] = &[
+    ("attn_norm", "input_layernorm"),
+    ("attn_post_norm", "post_attention_layernorm"),
+    ("attn_q", "self_attn.q_proj"),
+    ("attn_k", "self_attn.k_proj"),
+    ("attn_v", "self_attn.v_proj"),
+    ("attn_output", "self_attn.o_proj"),
+    ("ffn_gate_inp", "mlp.router"),
+    ("ffn_gate_exps", "mlp.experts.gate_proj"),
+    ("ffn_up_exps", "mlp.experts.up_proj"),
+    ("ffn_down_exps", "mlp.experts.down_proj"),
+];
+
 /// Translates a physical llama.cpp tensor name to its neutral parameter identity.
 pub fn translate_gguf_weight_name(name: &str) -> String {
-    for (source, target) in [
-        ("token_embd", "model.embed_tokens"),
-        ("output_norm", "model.norm"),
-        ("output", "lm_head"),
-    ] {
+    for &(source, target) in GGUF_ROOT_NAMES {
         if name == source || name.starts_with(&format!("{source}.")) {
             return name.replacen(source, target, 1);
         }
@@ -357,18 +299,7 @@ pub fn translate_gguf_weight_name(name: &str) -> String {
     if matches!(parameter, "attn_sinks" | "attn_sinks.weight") {
         return format!("model.layers.{layer}.self_attn.sinks");
     }
-    for (source, target) in [
-        ("attn_norm", "input_layernorm"),
-        ("attn_post_norm", "post_attention_layernorm"),
-        ("attn_q", "self_attn.q_proj"),
-        ("attn_k", "self_attn.k_proj"),
-        ("attn_v", "self_attn.v_proj"),
-        ("attn_output", "self_attn.o_proj"),
-        ("ffn_gate_inp", "mlp.router"),
-        ("ffn_gate_exps", "mlp.experts.gate_proj"),
-        ("ffn_up_exps", "mlp.experts.up_proj"),
-        ("ffn_down_exps", "mlp.experts.down_proj"),
-    ] {
+    for &(source, target) in GGUF_LAYER_NAMES {
         if parameter == source || parameter.starts_with(&format!("{source}.")) {
             return format!(
                 "model.layers.{layer}.{}",
@@ -379,33 +310,81 @@ pub fn translate_gguf_weight_name(name: &str) -> String {
     name.to_string()
 }
 
+fn gguf_parameter_name(name: &str, root: &str) -> Result<String, String> {
+    for &(physical, canonical) in GGUF_ROOT_NAMES {
+        let canonical = canonical.replacen("model", root, 1);
+        if name == canonical
+            || name
+                .strip_prefix(&canonical)
+                .is_some_and(|suffix| suffix.starts_with('.'))
+        {
+            return Ok(name.replacen(&canonical, physical, 1));
+        }
+    }
+    if let Some((layer, parameter)) = name
+        .strip_prefix(&format!("{root}.layers."))
+        .and_then(|rest| rest.split_once('.'))
+    {
+        if parameter == "self_attn.sinks" {
+            return Ok(format!("blk.{layer}.attn_sinks.weight"));
+        }
+        for &(physical, canonical) in GGUF_LAYER_NAMES {
+            if parameter == canonical
+                || parameter
+                    .strip_prefix(canonical)
+                    .is_some_and(|suffix| suffix.starts_with('.'))
+            {
+                return Ok(format!(
+                    "blk.{layer}.{}",
+                    parameter.replacen(canonical, physical, 1)
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "GPT-OSS GGUF has no storage declaration for {name}"
+    ))
+}
+
 /// Resolves SafeTensors alternating rows or translated GGUF separate matrices
 /// into one atomic component-major logical-MXFP4 expert family.
 pub fn expert_recipes<C: RecipeCatalog + ?Sized>(
     catalog: &C,
-    args: &ModelArgs,
+    declaration: &super::Declaration,
     layer: usize,
 ) -> Result<GatedExpertProjectionFamilyRecipes, String> {
-    let layers = dimension(args.num_hidden_layers, "layer count")?;
-    if layer >= layers {
-        return Err(format!(
-            "GPT-OSS expert recipe layer {layer} is outside {layers} layers"
-        ));
-    }
-    let root = format!("{}.layers.{layer}.mlp.experts", args.parameter_root);
-    canonical_gated_expert_projection_family_recipes(catalog, &expert_names(&root))
+    let bank = declaration
+        .expert_bank(layer)
+        .map_err(|error| error.to_string())?;
+    expert_recipes_for_bank(catalog, &bank)
+}
+
+fn expert_recipes_for_bank<C: RecipeCatalog + ?Sized>(
+    catalog: &C,
+    bank: &eredu_nn::GroupedGatedProductSpec,
+) -> Result<GatedExpertProjectionFamilyRecipes, String> {
+    let source = bank
+        .packed_parameters()
+        .map_err(|error| error.to_string())?;
+    canonical_gated_expert_projection_family_recipes(catalog, &expert_names(&source)?)
         .map_err(|error| error.to_string())
 }
 
 /// Returns architecture-owned recipes for one rank-local GPT-OSS expert bank.
 pub fn rank_local_expert_recipes<C: RecipeCatalog + ?Sized>(
     catalog: &C,
-    args: &ModelArgs,
+    declaration: &super::Declaration,
     layer: usize,
     group_indices: &[usize],
 ) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
-    let experts = dimension(args.num_local_experts, "expert count")?;
-    let outputs = expert_recipes(catalog, args, layer)?
+    let declared = declaration
+        .expert_bank(layer)
+        .map_err(|error| error.to_string())?;
+    let experts = declared
+        .packed_parameters()
+        .map_err(|error| error.to_string())?
+        .group_count();
+    let outputs = expert_recipes_for_bank(catalog, &declared)?
         .into_outputs()
         .into_outputs();
     eredu_runtime::select_parameter_bank_recipes(catalog, experts, 0, group_indices, outputs)
@@ -415,20 +394,34 @@ pub fn rank_local_expert_recipes<C: RecipeCatalog + ?Sized>(
 /// Builds the complete architecture-owned schedule for independently resident experts.
 pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
     catalog: &C,
-    args: &ModelArgs,
+    declaration: &super::Declaration,
 ) -> Result<crate::ExpertResidencyCatalog, String> {
-    let layers = dimension(args.num_hidden_layers, "layer count")?;
-    let experts = dimension(args.num_local_experts, "expert count")?;
-    let capacity = layers
-        .checked_mul(experts)
-        .ok_or_else(|| "GPT-OSS expert residency catalog size overflowed".to_string())?;
+    let args = declaration.args();
+    let banks = declaration
+        .expert_banks()
+        .map_err(|error| error.to_string())?;
+    let capacity = banks.values().try_fold(0usize, |capacity, bank| {
+        capacity
+            .checked_add(bank.group_count() as usize)
+            .ok_or_else(|| "GPT-OSS expert residency catalog size overflowed".to_string())
+    })?;
     let owner_group =
         eredu_runtime::ExecutionGroupId::new("text_decoder").map_err(|error| error.to_string())?;
     let mut units = Vec::with_capacity(capacity);
-    for layer in 0..layers {
+    for (layer, declared) in banks {
         let unit_path = format!("{}.layers.{layer}", args.parameter_root);
-        let expert_root = format!("{unit_path}.mlp.experts");
-        let canonical = expert_recipes(catalog, args, layer)?
+        let source = declared
+            .packed_parameters()
+            .map_err(|error| error.to_string())?;
+        let expert_root = source
+            .gate_up()
+            .parameter
+            .id
+            .as_str()
+            .strip_suffix(".gate_up_proj")
+            .ok_or("GPT-OSS bank has no declared source root")?;
+        let experts = source.group_count();
+        let canonical = expert_recipes_for_bank(catalog, &declared)?
             .into_outputs()
             .into_outputs();
         let bank = eredu_runtime::ParameterBankRecipes::new(catalog, canonical, experts)
@@ -440,7 +433,7 @@ pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
                 .iter()
                 .map(|(target, recipe)| {
                     let binding = target
-                        .strip_prefix(&expert_root)
+                        .strip_prefix(expert_root)
                         .and_then(|suffix| suffix.strip_prefix('.'))
                         .ok_or_else(|| {
                             format!(
@@ -474,33 +467,44 @@ pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
         .map_err(|error| error.to_string())
 }
 
-fn expert_names(root: &str) -> GatedExpertProjectionFamilyNames {
+fn expert_names(
+    source: &eredu_nn::PackedGatedProductParameters<'_>,
+) -> Result<GatedExpertProjectionFamilyNames, String> {
     let projection = |weight: String, scales: String, bias: String| ExpertProjectionFamilyNames {
         weight,
         scales,
         bias,
     };
-    GatedExpertProjectionFamilyNames {
-        target_gate_up: projection(
-            format!("{root}.gate_up_proj"),
-            format!("{root}.gate_up_proj_scales"),
-            format!("{root}.gate_up_proj_bias"),
-        ),
-        target_down: projection(
-            format!("{root}.down_proj"),
-            format!("{root}.down_proj_scales"),
-            format!("{root}.down_proj_bias"),
-        ),
-        alternating_gate_up: projection(
-            format!("{root}.gate_up_proj_blocks"),
-            format!("{root}.gate_up_proj_scales"),
-            format!("{root}.gate_up_proj_bias"),
-        ),
-        alternating_down: projection(
-            format!("{root}.down_proj_blocks"),
-            format!("{root}.down_proj_scales"),
-            format!("{root}.down_proj_bias"),
-        ),
+    let declared = |weight: &eredu_nn::LogicalParameterDeclaration<'_>,
+                    bias: Option<&eredu_nn::LogicalParameterDeclaration<'_>>|
+     -> Result<ExpertProjectionFamilyNames, String> {
+        let scale = weight
+            .linear_format
+            .and_then(|format| format.scale())
+            .ok_or("GPT-OSS expert scale is undeclared")?;
+        let bias = bias.ok_or("GPT-OSS expert additive bias is undeclared")?;
+        Ok(projection(
+            weight.parameter.id.to_string(),
+            scale.id.to_string(),
+            bias.parameter.id.to_string(),
+        ))
+    };
+    let target_gate_up = declared(source.gate_up(), source.gate_up_bias())?;
+    let target_down = declared(source.down(), source.down_bias())?;
+    let alternating = |target: &ExpertProjectionFamilyNames| {
+        projection(
+            format!("{}_blocks", target.weight),
+            target.scales.clone(),
+            target.bias.clone(),
+        )
+    };
+    let root = target_gate_up
+        .weight
+        .strip_suffix(".gate_up_proj")
+        .ok_or("GPT-OSS bank has no declared source root")?;
+    Ok(GatedExpertProjectionFamilyNames {
+        alternating_gate_up: alternating(&target_gate_up),
+        alternating_down: alternating(&target_down),
         separate_gate: projection(
             format!("{root}.gate_proj.weight"),
             format!("{root}.gate_proj.scales"),
@@ -516,92 +520,63 @@ fn expert_names(root: &str) -> GatedExpertProjectionFamilyNames {
             format!("{root}.down_proj.scales"),
             format!("{root}.down_proj.bias"),
         ),
-    }
+        target_gate_up,
+        target_down,
+    })
 }
 
 fn safetensors_expert_constraints(
-    root: &str,
-    geometry: Geometry,
+    bank: &eredu_nn::GroupedGatedProductSpec,
 ) -> Result<Vec<SafetensorsTensorConstraint>, String> {
-    let fused = checked_mul(2, geometry.intermediate, "fused expert width")?;
-    Ok(vec![
-        SafetensorsTensorConstraint::required(
-            format!("{root}.gate_up_proj_blocks"),
-            vec![
-                geometry.experts,
-                fused,
-                geometry.hidden / MXFP4_GROUP_SIZE,
-                MXFP4_BLOCK_BYTES,
-            ],
-            StoredDtypeConstraint::Exact(StoredDtype::U8),
-        ),
-        SafetensorsTensorConstraint::required(
-            format!("{root}.gate_up_proj_scales"),
-            vec![geometry.experts, fused, geometry.hidden / MXFP4_GROUP_SIZE],
-            StoredDtypeConstraint::Exact(StoredDtype::U8),
-        )
-        .linear_companion(
-            format!("{root}.gate_up_proj_blocks"),
-            eredu_checkpoint::schema::LinearCompanionKind::Scale,
-        ),
-        floating(
-            format!("{root}.gate_up_proj_bias"),
-            vec![geometry.experts, fused],
-        )
-        .companion(),
-        SafetensorsTensorConstraint::required(
-            format!("{root}.down_proj_blocks"),
-            vec![
-                geometry.experts,
-                geometry.hidden,
-                geometry.intermediate / MXFP4_GROUP_SIZE,
-                MXFP4_BLOCK_BYTES,
-            ],
-            StoredDtypeConstraint::Exact(StoredDtype::U8),
-        ),
-        SafetensorsTensorConstraint::required(
-            format!("{root}.down_proj_scales"),
-            vec![
-                geometry.experts,
-                geometry.hidden,
-                geometry.intermediate / MXFP4_GROUP_SIZE,
-            ],
-            StoredDtypeConstraint::Exact(StoredDtype::U8),
-        )
-        .linear_companion(
-            format!("{root}.down_proj_blocks"),
-            eredu_checkpoint::schema::LinearCompanionKind::Scale,
-        ),
-        floating(
-            format!("{root}.down_proj_bias"),
-            vec![geometry.experts, geometry.hidden],
-        )
-        .companion(),
-    ])
-}
-
-fn add_matrix(
-    args: &ModelArgs,
-    output: &mut Vec<SafetensorsTensorConstraint>,
-    name: impl Into<String>,
-    shape: Vec<usize>,
-    permit_configured_format: bool,
-) -> Result<(), String> {
-    let name = name.into();
-    let format = permit_configured_format
-        .then(|| args.weight_quantization_for(&name))
-        .flatten();
-    output.extend(
-        matrix_for_linear_format(
-            &name,
-            Vec::<String>::new(),
-            shape,
-            LinearFormat::from(format),
-            None,
-        )
-        .map_err(|error| error.to_string())?,
-    );
-    Ok(())
+    let source = bank
+        .packed_parameters()
+        .map_err(|error| error.to_string())?;
+    let mut tensors = Vec::new();
+    for (weight, bias) in [
+        (source.gate_up(), source.gate_up_bias()),
+        (source.down(), source.down_bias()),
+    ] {
+        let format = weight
+            .linear_format
+            .ok_or("GPT-OSS expert encoding declaration is missing")?;
+        if format.encoding() != LinearFormat::MxFp4 {
+            return Err("GPT-OSS released expert storage requires MXFP4".into());
+        }
+        let mut blocks = weight.shape.clone();
+        let input = blocks
+            .last_mut()
+            .ok_or_else(|| "GPT-OSS expert weight is scalar".to_owned())?;
+        if !input.is_multiple_of(MXFP4_GROUP_SIZE) {
+            return Err("GPT-OSS MXFP4 expert input splits an encoded block".into());
+        }
+        *input /= MXFP4_GROUP_SIZE;
+        let scales = blocks.clone();
+        blocks.push(MXFP4_BLOCK_BYTES);
+        let key = format!("{}_blocks", weight.parameter.id);
+        let scale = format
+            .scale()
+            .ok_or_else(|| "GPT-OSS MXFP4 scale declaration is missing".to_owned())?;
+        tensors.push(
+            SafetensorsTensorConstraint::required(
+                &key,
+                blocks,
+                StoredDtypeConstraint::Exact(StoredDtype::U8),
+            )
+            .with_linear_format(format.encoding()),
+        );
+        tensors.push(
+            SafetensorsTensorConstraint::required(
+                scale.id.as_str(),
+                scales,
+                StoredDtypeConstraint::Exact(StoredDtype::U8),
+            )
+            .linear_companion(&key, eredu_checkpoint::schema::LinearCompanionKind::Scale),
+        );
+        if let Some(bias) = bias {
+            tensors.push(floating(bias.parameter.id.as_str(), bias.shape.clone()));
+        }
+    }
+    Ok(tensors)
 }
 
 fn floating(key: impl Into<String>, shape: Vec<usize>) -> SafetensorsTensorConstraint {
@@ -616,58 +591,9 @@ fn gguf(
     GgufTensorConstraint::required(key, shape, GgufTypeConstraint::OperationClass(operation))
 }
 
-#[derive(Clone, Copy)]
-struct Geometry {
-    hidden: usize,
-    intermediate: usize,
-    layers: usize,
-    query_heads: usize,
-    query: usize,
-    key_value: usize,
-    vocabulary: usize,
-    experts: usize,
-}
-
-impl Geometry {
-    fn new(args: &ModelArgs) -> Result<Self, String> {
-        let hidden = dimension(args.hidden_size, "hidden size")?;
-        let intermediate = dimension(args.intermediate_size, "expert intermediate size")?;
-        if !hidden.is_multiple_of(MXFP4_GROUP_SIZE)
-            || !intermediate.is_multiple_of(MXFP4_GROUP_SIZE)
-        {
-            return Err(format!(
-                "GPT-OSS MXFP4 dimensions must be divisible by {MXFP4_GROUP_SIZE}, got hidden size {hidden} and intermediate size {intermediate}"
-            ));
-        }
-        let query_heads = dimension(args.num_attention_heads, "attention head count")?;
-        let key_value_heads = dimension(args.num_key_value_heads, "key/value head count")?;
-        if !query_heads.is_multiple_of(key_value_heads) {
-            return Err(format!(
-                "GPT-OSS query head count {query_heads} is not divisible by key/value head count {key_value_heads}"
-            ));
-        }
-        let head = dimension(args.head_dim, "attention head width")?;
-        Ok(Self {
-            hidden,
-            intermediate,
-            layers: dimension(args.num_hidden_layers, "layer count")?,
-            query_heads,
-            query: checked_mul(query_heads, head, "query projection width")?,
-            key_value: checked_mul(key_value_heads, head, "key/value projection width")?,
-            vocabulary: dimension(args.vocab_size, "vocabulary size")?,
-            experts: dimension(args.num_local_experts, "expert count")?,
-        })
-    }
-}
-
 fn dimension(value: i32, name: &str) -> Result<usize, String> {
     usize::try_from(value)
         .ok()
         .filter(|value| *value > 0)
         .ok_or_else(|| format!("GPT-OSS {name} must be positive, got {value}"))
-}
-
-fn checked_mul(left: usize, right: usize, name: &str) -> Result<usize, String> {
-    left.checked_mul(right)
-        .ok_or_else(|| format!("GPT-OSS {name} geometry overflows"))
 }

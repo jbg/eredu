@@ -1,12 +1,12 @@
 //! Canonical hybrid target and prediction parameter declarations without native resources.
 
-use std::collections::BTreeMap;
-
-use eredu_nn::{GatedProductGroupLayout, LinearFormatSpec, LinearSpec};
+use eredu_nn::{
+    DeclareLogicalParameters, GatedProductGroupLayout, LinearFormatSpec, LogicalParameterRole,
+};
 use eredu_runtime::{
     ArchitectureParameterDescription, ExecutionUnitLayout, MemberSharding as S,
     OwnedParameterGroupSpec, ParallelPlanError, ParameterGroupOwner, ParameterGroupSpec,
-    ParameterMemberSpec, ParameterRole,
+    ParameterRole,
 };
 
 use super::{HybridConfig, HybridLayerPolicy};
@@ -15,70 +15,75 @@ fn invalid(error: impl std::fmt::Display) -> ParallelPlanError {
     ParallelPlanError::InvalidGroup(error.to_string())
 }
 
-#[derive(Default)]
-struct Declaration {
-    formats: BTreeMap<String, LinearFormatSpec>,
+/// Owned comparison projection of construction identities, geometry and encodings.
+#[derive(Debug, PartialEq)]
+struct ConstructionParameterGeometry {
+    parameter: eredu_nn::ParameterSpec,
+    shape: Vec<usize>,
+    role: LogicalParameterRole,
+    format: Option<LinearFormatSpec>,
 }
-
-impl Declaration {
-    fn linear(&mut self, spec: LinearSpec, weight: S, bias: S) -> Vec<ParameterMemberSpec> {
-        self.formats
-            .insert(spec.weight.id.as_str().into(), spec.format);
-        let mut members = vec![ParameterMemberSpec::new(
-            spec.weight.id.as_str(),
-            vec![spec.output as usize, spec.input as usize],
-            weight,
-        )];
-        if let Some(parameter) = spec.bias {
-            members.push(ParameterMemberSpec::new(
-                parameter.id.as_str(),
-                vec![spec.output as usize],
-                bias,
-            ));
-        }
-        members
-    }
-
-    fn norm(
-        &self,
-        name: &str,
-        parameter: &str,
-        width: i32,
+#[derive(Debug, PartialEq)]
+pub(super) struct UnitParameterGeometry {
+    groups: Vec<ParameterGroupSpec>,
+    parameters: Vec<ConstructionParameterGeometry>,
+}
+struct GroupProjection<'a> {
+    schedule: &'a crate::decoder::SequentialPredictionGroups,
+    encoding: crate::decoder::ParameterEncoding,
+    geometry: Option<&'a mut Vec<ConstructionParameterGeometry>>,
+}
+impl GroupProjection<'_> {
+    fn group(
+        &mut self,
+        name: impl Into<String>,
+        role: ParameterRole,
+        units: Option<usize>,
+        spec: &(impl DeclareLogicalParameters + ?Sized),
+        sharding: impl FnMut(&eredu_nn::LogicalParameterDeclaration<'_>) -> S,
     ) -> Result<ParameterGroupSpec, ParallelPlanError> {
-        ParameterGroupSpec::new(
-            name,
-            ParameterRole::Replicated,
-            [ParameterMemberSpec::new(
-                parameter,
-                vec![width as usize],
-                S::Replicated,
-            )],
-        )
+        if let Some(geometry) = &mut self.geometry {
+            geometry.extend(
+                spec.logical_parameters()
+                    .map_err(invalid)?
+                    .into_iter()
+                    .map(|d| ConstructionParameterGeometry {
+                        parameter: d.parameter.clone(),
+                        shape: d.shape,
+                        role: d.role,
+                        format: d.linear_format.cloned(),
+                    }),
+            );
+        }
+        match self.encoding {
+            crate::decoder::ParameterEncoding::Stored => {
+                eredu_runtime::logical_parameter_group(name, role, units, spec, sharding)
+            }
+            crate::decoder::ParameterEncoding::Logical => {
+                let members = eredu_runtime::logical_parameter_members(spec, sharding)?;
+                match units {
+                    Some(units) => ParameterGroupSpec::partitioned(name, role, units, members),
+                    None => ParameterGroupSpec::new(name, role, members),
+                }
+            }
+        }
     }
-
     fn mlp(
         &mut self,
-        config: &HybridConfig,
-        prefix: &str,
+        spec: &eredu_nn::SplitGatedProductSpec,
         logical: &str,
-        width: i32,
         role: ParameterRole,
     ) -> Result<ParameterGroupSpec, ParallelPlanError> {
-        let mut members = Vec::new();
-        for (index, spec) in super::block::mlp_projection_specs(config, prefix, width)
-            .map_err(invalid)?
-            .into_iter()
-            .enumerate()
-        {
-            members.extend(self.linear(
-                spec,
-                S::Partitioned {
-                    axis: if index == 2 { 1 } else { 0 },
-                },
-                S::Replicated,
-            ));
-        }
-        ParameterGroupSpec::partitioned(logical, role, width as usize, members)
+        let down = &spec.down;
+        self.group(logical, role, Some(spec.gate.output as usize), spec, |d| {
+            if d.parameter.id == down.weight.id {
+                S::Partitioned { axis: 1 }
+            } else if d.role == LogicalParameterRole::LinearWeight {
+                S::Partitioned { axis: 0 }
+            } else {
+                S::Replicated
+            }
+        })
     }
 
     fn unit(
@@ -87,25 +92,17 @@ impl Declaration {
         group: usize,
         index: usize,
     ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-        if group == 0 {
-            let policy = config
+        let path = self.schedule.unit_path(group, index).map_err(invalid)?;
+        let policy = if group == 0 {
+            config
                 .layer_schedule
                 .get(index)
                 .copied()
-                .ok_or_else(|| invalid(format!("Qwen hybrid has no target unit {index}")))?;
-            self.block(config, &format!("model.layers.{index}"), policy, index)
-        } else if index == 0 && group <= config.mtp_num_hidden_layers as usize {
-            self.block(
-                config,
-                &format!("mtp.layers.{}", group - 1),
-                HybridLayerPolicy::SelfAttention(eredu_core::attention::AttentionPolicy::Full),
-                config.num_hidden_layers as usize + group - 1,
-            )
+                .ok_or_else(|| invalid(format!("Qwen hybrid has no target unit {index}")))?
         } else {
-            Err(invalid(format!(
-                "Qwen hybrid has no unit ({group}, {index})"
-            )))
-        }
+            HybridLayerPolicy::SelfAttention(eredu_core::attention::AttentionPolicy::Full)
+        };
+        self.block(config, &path, policy)
     }
 
     fn block(
@@ -113,144 +110,127 @@ impl Declaration {
         config: &HybridConfig,
         root: &str,
         policy: HybridLayerPolicy,
-        layer: usize,
     ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
+        let scope = super::BlockParameters::at(config, root, policy).map_err(invalid)?;
         let mut groups = vec![
-            self.norm(
-                &format!("{root}.input_norm"),
-                &format!("{root}.input_layernorm.weight"),
-                config.hidden_size,
+            self.group(
+                format!("{root}.input_norm"),
+                ParameterRole::Replicated,
+                None,
+                &scope.norms[0],
+                |_| S::Replicated,
             )?,
-            self.norm(
-                &format!("{root}.post_attention_norm"),
-                &format!("{root}.post_attention_layernorm.weight"),
-                config.hidden_size,
+            self.group(
+                format!("{root}.post_attention_norm"),
+                ParameterRole::Replicated,
+                None,
+                &scope.norms[1],
+                |_| S::Replicated,
             )?,
         ];
-        match policy {
-            HybridLayerPolicy::LinearAttention => {
-                let spec = super::recurrent_spec(config, layer).map_err(invalid)?;
-                let key = spec.key_heads as usize * spec.key_head_dim as usize;
-                let value = spec.value_heads as usize * spec.value_head_dim as usize;
+        match &scope.mixer {
+            super::specs::MixerParameters::Recurrent(spec) => {
                 let segments = S::PartitionedSegments {
                     axis: 0,
-                    segments: vec![0..key, key..2 * key, 2 * key..2 * key + value],
+                    segments: spec.geometry.qkv_ranges().map_err(invalid)?.to_vec(),
                 };
-                let mut members = self.linear(spec.input_qkv, segments.clone(), S::Replicated);
-                for projection in [spec.input_gate, spec.input_beta, spec.input_decay] {
-                    members.extend(self.linear(
-                        projection,
-                        S::Partitioned { axis: 0 },
-                        S::Replicated,
-                    ));
-                }
-                members.push(ParameterMemberSpec::new(
-                    spec.convolution.weight.id.as_str(),
-                    vec![
-                        spec.convolution.channels as usize,
-                        1,
-                        spec.convolution.kernel_size as usize,
-                    ],
-                    segments,
-                ));
-                for parameter in [spec.decay_bias, spec.transition_log] {
-                    members.push(ParameterMemberSpec::new(
-                        parameter.id.as_str(),
-                        vec![spec.value_heads as usize],
-                        S::Partitioned { axis: 0 },
-                    ));
-                }
-                members.push(ParameterMemberSpec::new(
-                    spec.normalization_weight.id.as_str(),
-                    vec![spec.value_head_dim as usize],
-                    S::Replicated,
-                ));
-                members.extend(self.linear(spec.output, S::Partitioned { axis: 1 }, S::Replicated));
-                groups.push(ParameterGroupSpec::partitioned(
+                groups.push(self.group(
                     format!("{root}.linear_attn.heads"),
                     ParameterRole::Channels,
-                    spec.key_heads as usize,
-                    members,
-                )?);
-            }
-            HybridLayerPolicy::SelfAttention(_) => {
-                let mut members = Vec::new();
-                for (index, spec) in super::block::attention_projection_specs(config, root)
-                    .map_err(invalid)?
-                    .into_iter()
-                    .enumerate()
-                {
-                    members.extend(self.linear(
-                        spec,
-                        S::Partitioned {
-                            axis: if index == 3 { 1 } else { 0 },
-                        },
-                        if index == 3 {
+                    Some(spec.geometry.key_heads() as usize),
+                    spec,
+                    |declaration| {
+                        let id = &declaration.parameter.id;
+                        let sharding = if id == &spec.input_qkv.weight.id
+                            || id == &spec.convolution.weight.id
+                        {
+                            segments.clone()
+                        } else if id == &spec.output.weight.id {
+                            S::Partitioned { axis: 1 }
+                        } else if id == &spec.normalization_weight.id
+                            || spec.output.bias.as_ref().is_some_and(|bias| &bias.id == id)
+                        {
                             S::Replicated
                         } else {
                             S::Partitioned { axis: 0 }
-                        },
-                    ));
-                }
-                for name in ["q_norm", "k_norm"] {
-                    members.push(ParameterMemberSpec::new(
-                        format!("{root}.self_attn.{name}.weight"),
-                        vec![config.head_dim as usize],
-                        S::Replicated,
-                    ));
-                }
-                groups.push(ParameterGroupSpec::partitioned(
+                        };
+                        sharding
+                    },
+                )?);
+            }
+            super::specs::MixerParameters::Attention(spec) => {
+                let output = &spec.projection.output;
+                groups.push(self.group(
                     format!("{root}.attention.heads"),
                     ParameterRole::AttentionHeads,
-                    config.num_key_value_heads as usize,
-                    members,
+                    Some(spec.projection.geometry.key_value_heads() as usize),
+                    spec,
+                    |d| {
+                        if d.parameter.id == output.weight.id {
+                            S::Partitioned { axis: 1 }
+                        } else if d.role == LogicalParameterRole::Normalization
+                            || output
+                                .bias
+                                .as_ref()
+                                .is_some_and(|bias| bias.id == d.parameter.id)
+                        {
+                            S::Replicated
+                        } else {
+                            S::Partitioned { axis: 0 }
+                        }
+                    },
                 )?);
             }
         }
-        if config.is_moe() {
-            let spec =
-                super::block::shared_routed_spec(config, layer, root, None).map_err(invalid)?;
-            self.formats.insert(
-                spec.router.weight().id.as_str().into(),
-                spec.router.format().clone(),
-            );
-            groups.push(eredu_runtime::top_k_group_selector_logical_group(
+        if let super::specs::FeedForwardParameters::Routed(spec) = &scope.feed_forward {
+            groups.push(self.group(
                 format!("{root}.mlp.router"),
-                &spec.router,
+                ParameterRole::Replicated,
+                None,
+                &spec.routed.selector,
+                |_| S::Replicated,
             )?);
-            let GatedProductGroupLayout::Packed { gate_up, down } = spec.experts.layout() else {
+            let GatedProductGroupLayout::Packed { gate_up, .. } = spec.routed.experts.layout()
+            else {
                 unreachable!("hybrid declares packed experts")
             };
-            for projection in [gate_up, down] {
-                self.formats.insert(
-                    projection.weight().id.as_str().into(),
-                    projection.format().clone(),
-                );
-            }
-            groups.push(eredu_runtime::packed_gated_product_logical_group(
+            let intermediate = spec.routed.experts.intermediate_dimensions() as usize;
+            groups.push(self.group(
                 format!("{root}.mlp.experts.intermediate"),
-                &spec.experts,
-                config.moe_intermediate_size as usize,
+                ParameterRole::ExpertIntermediate,
+                Some(intermediate),
+                &spec.routed.experts,
+                |d| {
+                    if d.parameter.id == gate_up.weight().id
+                        || gate_up.bias().is_some_and(|bias| bias.id == d.parameter.id)
+                    {
+                        S::PartitionedSegments {
+                            axis: 1,
+                            segments: vec![0..intermediate, intermediate..2 * intermediate],
+                        }
+                    } else if d.role == LogicalParameterRole::LinearWeight {
+                        S::Partitioned { axis: 2 }
+                    } else {
+                        S::Replicated
+                    }
+                },
             )?);
             groups.push(self.mlp(
-                config,
-                &format!("{root}.mlp.shared_expert"),
+                &spec.shared,
                 &format!("{root}.mlp.shared.intermediate"),
-                config.shared_expert_intermediate_size,
                 ParameterRole::ExpertIntermediate,
             )?);
-            let members = self.linear(spec.shared_gate, S::Replicated, S::Replicated);
-            groups.push(ParameterGroupSpec::new(
+            groups.push(self.group(
                 format!("{root}.mlp.shared_gate"),
                 ParameterRole::Replicated,
-                members,
+                None,
+                &spec.shared_gate,
+                |_| S::Replicated,
             )?);
-        } else {
+        } else if let super::specs::FeedForwardParameters::Dense(spec) = &scope.feed_forward {
             groups.push(self.mlp(
-                config,
-                &format!("{root}.mlp"),
+                spec,
                 &format!("{root}.mlp.intermediate"),
-                config.intermediate_size,
                 ParameterRole::FeedForwardIntermediate,
             )?);
         }
@@ -258,36 +238,58 @@ impl Declaration {
     }
 }
 
-/// Declares global checkpoint geometry and canonical ownership before native materialization.
-pub fn parameter_description(
+/// Declares target and prediction invocation identities independently of storage and state.
+pub(super) fn execution_schedule(
     config: &HybridConfig,
-) -> Result<ArchitectureParameterDescription, ParallelPlanError> {
-    config.validate().map_err(invalid)?;
-    let targets = config.num_hidden_layers as usize;
-    let steps = config.mtp_num_hidden_layers as usize;
-    let graph = crate::decoder::SequentialPredictionGroups::new_pattern(
+) -> Result<
+    (
+        crate::decoder::SequentialPredictionGroups,
+        eredu_runtime::ExecutionGraph,
+        ExecutionUnitLayout,
+    ),
+    eredu_nn::Error,
+> {
+    let targets = usize::try_from(config.num_hidden_layers).map_err(eredu_nn::Error::backend)?;
+    let steps = usize::try_from(config.mtp_num_hidden_layers).map_err(eredu_nn::Error::backend)?;
+    let schedule = crate::decoder::SequentialPredictionGroups::new_pattern(
         "model.layers",
         targets,
         "mtp.layers",
         steps,
         1,
-    )
-    .map_err(invalid)?
-    .execution_graph()
-    .map_err(invalid)?;
+    )?;
+    let graph = schedule.execution_graph()?;
     let layout = ExecutionUnitLayout::new(
         &graph,
-        std::iter::once(targets).chain(std::iter::repeat_n(1, steps)),
+        (0..=steps)
+            .map(|group| schedule.unit_count(group))
+            .collect::<Result<Vec<_>, _>>()?,
     )
-    .map_err(invalid)?;
-    let mut declaration = Declaration::default();
-    let statics = super::static_module_spec(config);
+    .map_err(eredu_nn::Error::backend_source)?;
+    Ok((schedule, graph, layout))
+}
+
+/// Declares global checkpoint geometry and canonical ownership before native materialization.
+pub fn parameter_description(
+    config: &HybridConfig,
+    encoding: crate::decoder::ParameterEncoding,
+) -> Result<ArchitectureParameterDescription, ParallelPlanError> {
+    config.validate().map_err(invalid)?;
+    let (schedule, graph, layout) = execution_schedule(config).map_err(invalid)?;
+    let steps = layout.group_count() - 1;
+    let mut declaration = GroupProjection {
+        schedule: &schedule,
+        encoding,
+        geometry: None,
+    };
+    let statics = config.statics();
     let mut roles = vec!["embedding", "mtp"];
     if config.tie_word_embeddings {
         roles.push("output");
     }
-    let mut owned = statics
-        .pinned_parameter_groups("model.embed_tokens", "model.norm", "lm_head")?
+    let pinned =
+        statics.pinned_parameter_groups(encoding, "model.embed_tokens", "model.norm", "lm_head")?;
+    let mut owned = pinned
         .into_iter()
         .map(|(role, group)| {
             let owner = if role == "embedding" {
@@ -299,37 +301,44 @@ pub fn parameter_description(
         })
         .collect::<Vec<_>>();
     if steps > 0 {
-        let consumers = (0..steps)
-            .map(|depth| {
-                eredu_runtime::ExecutionGroupId::new(format!("mtp.{depth}")).map(|group| (group, 0))
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(invalid)?;
+        let consumers = (1..layout.group_count())
+            .map(|group| (layout.group_id(group).expect("declared group").clone(), 0))
+            .collect::<Vec<_>>();
         let owner = ParameterGroupOwner::static_unit_consumers("mtp", consumers);
-        for name in [
-            "mtp.pre_fc_norm_hidden",
-            "mtp.pre_fc_norm_embedding",
-            "mtp.norm",
-        ] {
+        let shared = config
+            .prediction_shared()
+            .ok_or_else(|| invalid("undeclared hybrid prediction shared scope"))?;
+        for norm in shared.normalizations() {
+            let parameters = norm.logical_parameters().map_err(invalid)?;
+            let name = parameters[0]
+                .parameter
+                .id
+                .as_str()
+                .strip_suffix(".weight")
+                .expect("prediction normalization weight");
             owned.push(OwnedParameterGroupSpec::new(
                 owner.clone(),
-                declaration.norm(name, &format!("{name}.weight"), config.hidden_size)?,
+                declaration.group(name, ParameterRole::Replicated, None, norm, |_| {
+                    S::Replicated
+                })?,
             ));
         }
-        let members = declaration.linear(
-            super::mtp::fusion_spec(config).map_err(invalid)?,
-            S::Replicated,
-            S::Replicated,
-        );
+        let fusion = &shared.fusion;
+        let name = fusion
+            .weight
+            .id
+            .as_str()
+            .strip_suffix(".weight")
+            .expect("prediction fusion weight");
         owned.push(OwnedParameterGroupSpec::new(
             owner,
-            ParameterGroupSpec::new("mtp.fc", ParameterRole::Replicated, members)?,
+            declaration.group(name, ParameterRole::Replicated, None, fusion, |_| {
+                S::Replicated
+            })?,
         ));
     }
-    for (group, count) in std::iter::once(targets)
-        .chain(std::iter::repeat_n(1, steps))
-        .enumerate()
-    {
+    for group in 0..layout.group_count() {
+        let count = schedule.unit_count(group).map_err(invalid)?;
         for index in 0..count {
             let owner = ParameterGroupOwner::execution_unit(
                 layout.group_id(group).expect("declared group").clone(),
@@ -343,10 +352,7 @@ pub fn parameter_description(
             );
         }
     }
-    let expanded = eredu_runtime::expand_owned_linear_format_parameter_groups(owned, |member| {
-        Ok(declaration.formats.get(member.target()).cloned())
-    })?;
-    ArchitectureParameterDescription::from_owned(&graph, &layout, expanded).map_err(invalid)
+    ArchitectureParameterDescription::from_owned(&graph, &layout, owned).map_err(invalid)
 }
 
 /// Declares one target or prediction unit from normalized global geometry.
@@ -356,23 +362,31 @@ pub fn unit_parallel_parameter_groups(
     index: usize,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
     config.validate().map_err(invalid)?;
-    let (groups, formats) = unit_parameter_geometry(config, group, index)?;
-    eredu_runtime::expand_linear_format_parameter_groups(groups, |member| {
-        Ok(formats.get(member.target()).cloned())
-    })
+    let (schedule, _, _) = execution_schedule(config).map_err(invalid)?;
+    GroupProjection {
+        schedule: &schedule,
+        encoding: crate::decoder::ParameterEncoding::Stored,
+        geometry: None,
+    }
+    .unit(config, group, index)
 }
 
-/// Logical matrices and formats from the actual rank-local construction specs.
-/// Encoding/placement expansion remains checkpoint-global; local geometry is not
-/// reinterpreted as a new global sharding plan.
+/// Compares retained logical construction and encoding facts without expanding
+/// rank-local shapes into a new checkpoint-global sharding plan.
 pub(super) fn unit_parameter_geometry(
     config: &HybridConfig,
     group: usize,
     index: usize,
-) -> Result<(Vec<ParameterGroupSpec>, BTreeMap<String, LinearFormatSpec>), ParallelPlanError> {
-    let mut declaration = Declaration::default();
-    let groups = declaration.unit(config, group, index)?;
-    Ok((groups, declaration.formats))
+) -> Result<UnitParameterGeometry, ParallelPlanError> {
+    let (schedule, _, _) = execution_schedule(config).map_err(invalid)?;
+    let mut parameters = Vec::new();
+    let groups = GroupProjection {
+        schedule: &schedule,
+        encoding: crate::decoder::ParameterEncoding::Logical,
+        geometry: Some(&mut parameters),
+    }
+    .unit(config, group, index)?;
+    Ok(UnitParameterGeometry { groups, parameters })
 }
 
 /// Validates target and prediction invocation, storage, transport and state projections.
@@ -381,9 +395,10 @@ pub fn component_definition(
     config: &HybridConfig,
     geometry: Option<&super::LocalGeometry>,
 ) -> Result<eredu_runtime::ComponentDefinition, eredu_nn::Error> {
-    let parameters = parameter_description(config).map_err(eredu_nn::Error::backend)?;
+    let parameters = parameter_description(config, crate::decoder::ParameterEncoding::Stored)
+        .map_err(eredu_nn::Error::backend)?;
     let state = component_state(config, geometry)?;
-    let units = component_units(&parameters);
+    let units = component_units(config, &parameters)?;
     let prediction = prediction_groups(&parameters);
     let transport = (0..parameters.graph().groups().len())
         .map(group_transport)
@@ -417,24 +432,24 @@ fn component_state(
     }
 }
 fn component_units(
+    config: &HybridConfig,
     parameters: &ArchitectureParameterDescription,
-) -> Vec<eredu_runtime::ComponentUnit> {
+) -> Result<Vec<eredu_runtime::ComponentUnit>, eredu_nn::Error> {
+    let (schedule, _, _) = execution_schedule(config)?;
     let layout = parameters.unit_layout();
     (0..layout.len())
         .map(|ordinal| {
             let address = layout.address(ordinal).expect("declared invocation");
-            eredu_runtime::ComponentUnit {
-                path: if address.group() == 0 {
-                    format!("model.layers.{}", address.index())
-                } else {
-                    format!("mtp.layers.{}", address.group() - 1)
-                },
+            Ok(eredu_runtime::ComponentUnit {
+                path: schedule.unit_path(address.group(), address.index())?,
                 state: ordinal..ordinal + 1,
-            }
+            })
         })
         .collect()
 }
-fn prediction_groups(parameters: &ArchitectureParameterDescription) -> Vec<String> {
+
+/// Ordered prediction groups of the text declaration; the target group is first.
+pub(super) fn prediction_groups(parameters: &ArchitectureParameterDescription) -> Vec<String> {
     let layout = parameters.unit_layout();
     let groups = parameters.graph().groups().len();
     (1..groups)
@@ -475,7 +490,8 @@ pub fn project_parameters(
     definition: &std::sync::Arc<eredu_runtime::ComponentDefinition>,
 ) -> Result<std::sync::Arc<eredu_runtime::ComponentDefinition>, eredu_nn::Error> {
     validate_text_identity(definition)?;
-    let parameters = parameter_description(config).map_err(eredu_nn::Error::backend)?;
+    let parameters = parameter_description(config, crate::decoder::ParameterEncoding::Stored)
+        .map_err(eredu_nn::Error::backend)?;
     definition
         .project_parameters(parameters)
         .map_err(eredu_nn::Error::from)
@@ -498,7 +514,8 @@ pub(crate) fn select_definition(
 ) -> Result<std::sync::Arc<eredu_runtime::ComponentDefinition>, eredu_nn::Error> {
     validate_text_identity(&definition)?;
     definition.validate_parameter_topology(
-        &parameter_description(config).map_err(eredu_nn::Error::backend)?,
+        &parameter_description(config, crate::decoder::ParameterEncoding::Stored)
+            .map_err(eredu_nn::Error::backend)?,
     )?;
     let state = component_state(config, geometry)?;
     let global = component_state(config, None)?;
@@ -547,7 +564,7 @@ pub(crate) fn select_definition(
     definition.validate_execution_contract(
         crate::decoder::TARGET_EXECUTION_GROUP,
         &prediction_groups(parameters),
-        &component_units(parameters),
+        &component_units(config, parameters)?,
         &(0..parameters.graph().groups().len())
             .map(group_transport)
             .collect::<Vec<_>>(),
@@ -570,20 +587,26 @@ pub(crate) fn conditional_execution_graph(
         .ok_or_else(|| eredu_nn::Error::backend("conditional Qwen requires vision config"))?
         .validate_for(crate::qwen::vision::VisionMode::WindowScheduled)
         .map_err(eredu_nn::Error::backend)?;
+    if parsed
+        .vision
+        .as_ref()
+        .is_some_and(|v| v.root() != "model.visual")
+    {
+        return Err(eredu_nn::Error::backend(
+            "conditional vision namespace differs from component",
+        ));
+    }
+    let (_, text, _) = execution_schedule(&parsed.text)?;
     let mut groups = vec![
         ExecutionGroupSpec::root(super::VISION_EXECUTION_GROUP),
         ExecutionGroupSpec::with_dependencies(
-            crate::decoder::TARGET_EXECUTION_GROUP,
+            text.groups()[0].id(),
             [super::VISION_EXECUTION_GROUP],
         ),
     ];
-    let mut output = crate::decoder::TARGET_EXECUTION_GROUP.to_owned();
-    for depth in 0..parsed.text.mtp_num_hidden_layers {
-        let id = format!("mtp.{depth}");
-        groups.push(ExecutionGroupSpec::with_dependencies(id.clone(), [output]));
-        output = id;
-    }
-    eredu_runtime::ExecutionGraph::new(groups, output).map_err(eredu_nn::Error::backend)
+    groups.extend(text.groups().iter().skip(1).cloned());
+    eredu_runtime::ExecutionGraph::new(groups, text.groups()[text.output()].id())
+        .map_err(eredu_nn::Error::backend_source)
 }
 
 /// Declares canonical vision, target and prediction ownership without native modules.
@@ -592,7 +615,8 @@ pub fn conditional_parameter_description(
 ) -> Result<ArchitectureParameterDescription, eredu_nn::Error> {
     let graph = conditional_execution_graph(parsed)?;
     let vision = parsed.vision.as_ref().expect("validated vision config");
-    let text = parameter_description(&parsed.text).map_err(eredu_nn::Error::backend)?;
+    let text = parameter_description(&parsed.text, crate::decoder::ParameterEncoding::Stored)
+        .map_err(eredu_nn::Error::backend)?;
     let counts = std::iter::once(vision.layer_count()).chain(
         (0..text.unit_layout().group_count()).map(|group| {
             text.unit_layout()
@@ -608,7 +632,6 @@ pub fn conditional_parameter_description(
     owned.extend(
         crate::qwen::vision::owned_static_parallel_parameter_groups(
             vision,
-            "model.visual",
             group.clone(),
             "vision",
         )
@@ -616,7 +639,7 @@ pub fn conditional_parameter_description(
     );
     for layer in 0..vision.layer_count() {
         owned.extend(
-            crate::qwen::vision::block_parallel_parameter_groups(vision, "model.visual", layer)
+            crate::qwen::vision::block_parallel_parameter_groups(vision, layer)
                 .map_err(eredu_nn::Error::backend)?
                 .into_iter()
                 .map(|group_spec| {
@@ -638,7 +661,7 @@ pub fn conditional_component_definition(
 ) -> Result<eredu_runtime::ComponentDefinition, eredu_nn::Error> {
     let parameters = conditional_parameter_description(parsed)?;
     let state = conditional_state(parsed, geometry)?;
-    let units = conditional_units(&parameters);
+    let units = conditional_units(parsed, &parameters)?;
     let prediction = conditional_prediction_groups(&parameters);
     let transport = (0..parameters.graph().groups().len())
         .map(conditional_group_transport)
@@ -673,26 +696,25 @@ fn conditional_state(
 }
 
 fn conditional_units(
+    parsed: &super::ParsedHybridConfig,
     parameters: &ArchitectureParameterDescription,
-) -> Vec<eredu_runtime::ComponentUnit> {
+) -> Result<Vec<eredu_runtime::ComponentUnit>, eredu_nn::Error> {
+    let (schedule, _, _) = execution_schedule(&parsed.text)?;
     let layout = parameters.unit_layout();
     let vision_units = layout.group_range(0).expect("declared vision group").len();
     (0..layout.len())
         .map(|ordinal| {
             let address = layout.address(ordinal).expect("declared invocation");
-            let (path, state) = match address.group() {
-                0 => (format!("model.visual.blocks.{}", address.index()), 0..0),
-                group => {
-                    let slot = ordinal - vision_units;
-                    let path = if group == 1 {
-                        format!("model.layers.{}", address.index())
-                    } else {
-                        format!("mtp.layers.{}", group - 2)
-                    };
-                    (path, slot..slot + 1)
-                }
+            let (path, state) = if address.group() == 0 {
+                (format!("model.visual.blocks.{}", address.index()), 0..0)
+            } else {
+                let slot = ordinal - vision_units;
+                (
+                    schedule.unit_path(address.group() - 1, address.index())?,
+                    slot..slot + 1,
+                )
             };
-            eredu_runtime::ComponentUnit { path, state }
+            Ok(eredu_runtime::ComponentUnit { path, state })
         })
         .collect()
 }
@@ -822,10 +844,9 @@ pub(crate) fn select_conditional_definition(
                     .unwrap_or(&full),
             )
         };
-        let unsharded =
-            crate::qwen::vision::VisionStaticSelection::all(vision.clone(), "model.visual")
-                .and_then(|s| s.unsharded_merger_intermediates())
-                .map_err(eredu_nn::Error::backend_source)?;
+        let unsharded = crate::qwen::vision::VisionStaticSelection::all(vision.clone())
+            .and_then(|s| s.unsharded_merger_intermediates())
+            .map_err(eredu_nn::Error::backend_source)?;
         if retained.state_layout() != &state
             || retained.text().embedding_range()
                 != geometry.map_or(&full, |g| g.text().embedding_range())
@@ -871,7 +892,7 @@ pub(crate) fn select_conditional_definition(
     definition.validate_execution_contract(
         crate::decoder::TARGET_EXECUTION_GROUP,
         &conditional_prediction_groups(parameters),
-        &conditional_units(parameters),
+        &conditional_units(parsed, parameters)?,
         &(0..parameters.graph().groups().len())
             .map(conditional_group_transport)
             .collect::<Vec<_>>(),

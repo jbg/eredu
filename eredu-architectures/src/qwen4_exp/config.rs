@@ -1,5 +1,5 @@
 //! Distinct normalization of the released qwen4_exp/qwen4_exp_text contract.
-use crate::qwen::vision::{VisionConfig, VisionConfigSource};
+use crate::qwen::vision::VisionConfigSource;
 use eredu_core::LayerSchedule;
 use eredu_nn::OutputGateActivation;
 use serde_json::Value;
@@ -165,8 +165,8 @@ pub struct Config {
     pub ngram: NGramGeometry,
     /// Embedded prediction declaration, when present.
     pub prediction: Option<PredictionGeometry>,
-    /// Shared vision encoder normalization.
-    pub vision: Option<VisionConfig>,
+    /// Retained shared vision construction scopes and normalized invocation policy.
+    pub vision: Option<std::sync::Arc<crate::qwen::vision::Declaration>>,
     /// Media placeholder policy accompanying vision.
     pub media: Option<MediaTokens>,
 }
@@ -589,7 +589,13 @@ impl Config {
             experts,
             ngram,
             prediction,
-            vision,
+            vision: vision
+                .map(|config| {
+                    crate::qwen::vision::Declaration::new(config, "model.visual")
+                        .map(std::sync::Arc::new)
+                })
+                .transpose()
+                .map_err(|e| invalid(e.to_string()))?,
             media,
         })
     }

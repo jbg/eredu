@@ -1,14 +1,15 @@
 //! Graph-visible Qwen embedded multi-token prediction component.
 
 use eredu_nn::{
-    AttentionCache, Error, GroupedNeuralBackend, LinearSpec, NormalizationConstructionSpec,
-    NormalizationOperator, NormalizationScale, ParameterSpec, Parameterized, Tensor,
+    AttentionCache, DeclareLogicalParameters, Error, GroupedNeuralBackend, LinearSpec,
+    LogicalParameterDeclaration, NormalizationConstructionSpec, NormalizationOperator,
+    ParameterSpec, Parameterized, Tensor,
 };
 use eredu_runtime::{ParameterProvider, ResidentExpertProvider, RuntimeStateComponents};
 
 use crate::decoder::ComponentInstrumentation;
 
-use super::{Block, HybridConfig};
+use super::Block;
 
 /// Concatenates decoder token identity for embedded prediction in request order.
 pub fn prompt_token_identity<T: Tensor>(tokens: &[T], context: &T::Context) -> Result<T, Error> {
@@ -90,51 +91,96 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Clone for Pre
     }
 }
 
-impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> PredictionShared<B> {
-    /// Builds the canonical shared modules used by every configured depth.
-    pub fn new(
-        config: &HybridConfig,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        let norm = |name: &str| {
-            B::normalization(
-                NormalizationConstructionSpec {
-                    reduction: eredu_nn::NormalizationReduction::Native,
-                    groups: None,
-                    dimensions: config.hidden_size,
-                    epsilon: config.rms_norm_eps,
-                    scale: NormalizationScale::LearnedOffset {
-                        weight: ParameterSpec::trainable(name).map_err(Error::backend)?,
-                        offset: 1.0,
-                    },
-                },
-                context,
-            )
-        };
-        Ok(Self {
+/// Shared prediction parameters used by construction and cold consumers.
+#[derive(Debug, Clone)]
+pub struct PredictionSharedSpec {
+    /// Normalization of the retained hidden state before fusion.
+    pub(crate) hidden_norm: NormalizationConstructionSpec,
+    /// Normalization of the next-token embedding before fusion.
+    pub(crate) embedding_norm: NormalizationConstructionSpec,
+    /// Shared projection of concatenated normalized inputs.
+    pub(crate) fusion: LinearSpec,
+    /// Shared normalization before the tied decoder readout.
+    pub(crate) final_norm: NormalizationConstructionSpec,
+}
+
+impl PredictionSharedSpec {
+    /// Declares the canonical shared fusion and normalization slots.
+    pub(super) fn new(config: &super::HybridPolicy) -> Result<Self, Error> {
+        let norm = |name| super::block::normalization_spec(config, name, config.hidden_size);
+        let spec = Self {
             hidden_norm: norm("mtp.pre_fc_norm_hidden.weight")?,
             embedding_norm: norm("mtp.pre_fc_norm_embedding.weight")?,
-            fusion: B::linear(fusion_spec(config)?, context)?,
+            fusion: LinearSpec {
+                input: config
+                    .hidden_size
+                    .checked_mul(2)
+                    .ok_or_else(|| Error::backend("prediction fusion width overflow"))?,
+                output: config.hidden_size,
+                weight: ParameterSpec::trainable("mtp.fc.weight").map_err(Error::backend)?,
+                bias: None,
+                format: crate::linear_format::standard_linear_format(
+                    "mtp.fc.weight",
+                    config
+                        .linear_formats
+                        .get("mtp.fc.weight")
+                        .copied()
+                        .unwrap_or(eredu_checkpoint::LinearFormat::Dense),
+                )?,
+            },
             final_norm: norm("mtp.norm.weight")?,
-        })
+        };
+        eredu_nn::validate_logical_parameter_topology(&spec.logical_parameters()?)
+            .map_err(Error::backend_source)?;
+        Ok(spec)
+    }
+
+    /// Visits normalization slots in their construction order.
+    pub fn normalizations(&self) -> [&NormalizationConstructionSpec; 3] {
+        [&self.hidden_norm, &self.embedding_norm, &self.final_norm]
     }
 }
 
-/// The exact shared fusion constructor consumed by ordinary prediction execution.
-pub(super) fn fusion_spec(config: &HybridConfig) -> Result<LinearSpec, Error> {
-    Ok(LinearSpec {
-        input: config
-            .hidden_size
-            .checked_mul(2)
-            .ok_or_else(|| Error::backend("prediction fusion width overflow"))?,
-        output: config.hidden_size,
-        weight: ParameterSpec::trainable("mtp.fc.weight").map_err(Error::backend)?,
-        bias: None,
-        format: crate::linear_format::standard_linear_format(
-            "mtp.fc.weight",
-            eredu_checkpoint::LinearFormat::Dense,
-        )?,
-    })
+impl DeclareLogicalParameters for PredictionSharedSpec {
+    fn logical_parameters(&self) -> Result<Vec<LogicalParameterDeclaration<'_>>, Error> {
+        let width = self.hidden_norm.dimensions;
+        if self.embedding_norm.dimensions != width
+            || self.final_norm.dimensions != width
+            || self.fusion.input
+                != width
+                    .checked_mul(2)
+                    .ok_or_else(|| Error::backend("prediction fusion width overflow"))?
+            || self.fusion.output != width
+            || self.fusion.bias.is_some()
+        {
+            return Err(Error::backend(
+                "prediction shared residual geometry mismatch",
+            ));
+        }
+        let mut parameters = Vec::new();
+        for norm in self.normalizations() {
+            parameters.extend(norm.logical_parameters()?);
+        }
+        parameters.extend(self.fusion.logical_parameters()?);
+        Ok(parameters)
+    }
+}
+
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> PredictionShared<B> {
+    /// Binds shared fusion/normalization slots declared before allocation.
+    pub fn from_parameters(
+        spec: PredictionSharedSpec,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        eredu_nn::validate_logical_parameter_topology(&spec.logical_parameters()?)
+            .map_err(Error::backend_source)?;
+        Ok(Self {
+            hidden_norm: B::normalization(spec.hidden_norm, context)?,
+            embedding_norm: B::normalization(spec.embedding_norm, context)?,
+            fusion: B::linear(spec.fusion, context)?,
+            final_norm: B::normalization(spec.final_norm, context)?,
+        })
+    }
 }
 
 /// One prediction depth with independently streamable decoder parameters.
@@ -148,21 +194,16 @@ pub struct PredictionUnit<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralB
 }
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> PredictionUnit<B> {
-    /// Builds one actual configured prediction depth.
-    pub fn new(
-        config: &HybridConfig,
-        depth: usize,
+    /// Binds one prepared prediction owner without rebuilding parameter geometry.
+    pub fn from_parameters(
+        parameters: super::BlockParameters,
+        layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let steps = usize::try_from(config.mtp_num_hidden_layers).map_err(Error::backend)?;
-        if depth >= steps {
-            return Err(Error::backend(format!(
-                "Qwen hybrid MTP depth {depth} is outside {steps} configured layers"
-            )));
-        }
+        let experts = parameters.experts();
         Ok(Self {
-            block: Block::new_mtp(config, depth, context)?,
-            experts: config.num_experts,
+            block: Block::from_parameters(parameters, layer, context)?,
+            experts,
         })
     }
 

@@ -386,7 +386,6 @@ impl SelectedConditionalPartitionExecution {
                     target: self.plan.header.target_header(),
                     vision: self.plan.header.vision_plan(),
                 },
-                None,
                 mechanisms,
             )
     }

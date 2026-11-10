@@ -113,7 +113,9 @@ pub fn composite_partitioned_production_decision(
         );
     }
     match composite_config(plan) {
-        Ok(Some(CompositeConfig::NemotronLabsDiffusion(_))) => CompositePartitionedProductionDecision::Resident,
+        Ok(Some(CompositeConfig::NemotronLabsDiffusion(_))) => {
+            CompositePartitionedProductionDecision::Resident
+        }
         Ok(Some(CompositeConfig::Diffusion(_))) => CompositePartitionedProductionDecision::Resident,
         Ok(Some(CompositeConfig::Gemma4(_))) => CompositePartitionedProductionDecision::Resident,
         Ok(Some(CompositeConfig::QwenVl(_))) => CompositePartitionedProductionDecision::Resident,
@@ -1574,8 +1576,7 @@ where
         .shared_component_definition()
         .ok_or_else(|| error("composite selection has no retained definition".into()))?;
     let definition =
-        crate::nemotron_labs_diffusion::definition::project_composite_parameters(&args, &retained)
-            .map_err(|e| error(e.to_string()))?;
+        crate::replicated_text::executable_component(selected.base().execution()).map_err(error)?;
     let parameters = definition.parameters().clone();
     let layout = derive_partitioned_local_layout(&parameters, selected.requirements().topology())
         .map_err(error)?;
@@ -1870,7 +1871,9 @@ where
         }
 
         CompositeConfig::Diffusion(source) => {
-            let args = source.with_checkpoint_formats(target_formats);
+            let args = source
+                .with_checkpoint_formats(target_formats)
+                .map_err(|e| CompositePartitionPreparationError::Architecture(e.to_string()))?;
             let retained = selected
                 .base()
                 .execution()
@@ -1881,10 +1884,9 @@ where
                         "composite selection has no retained definition".into(),
                     )
                 })?;
-            let definition = crate::diffusion_gemma::composite::project_parameters(
-                &args, &retained,
-            )
-            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
+            let definition =
+                crate::replicated_text::executable_component(selected.base().execution())
+                    .map_err(CompositePartitionPreparationError::Architecture)?;
             let parameters = definition.parameters().clone();
             let rank = selected.requirements().topology();
             let layout = derive_partitioned_local_layout(&parameters, rank)
@@ -2122,20 +2124,9 @@ where
                         .into(),
                 ));
             }
-            let retained = selected
-                .base()
-                .execution()
-                .requirements()
-                .shared_component_definition()
-                .ok_or_else(|| {
-                    CompositePartitionPreparationError::Architecture(
-                        "composite selection has no retained definition".into(),
-                    )
-                })?;
             let definition =
-                crate::gemma4::model::project_parameters(&args, &retained).map_err(|error| {
-                    CompositePartitionPreparationError::Architecture(error.to_string())
-                })?;
+                crate::replicated_text::executable_component(selected.base().execution())
+                    .map_err(CompositePartitionPreparationError::Architecture)?;
             let parameters = definition.parameters().clone();
             let layout =
                 derive_partitioned_local_layout(&parameters, selected.requirements().topology())
@@ -2171,16 +2162,9 @@ where
                 )
             }
             .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
-            let mut architecture = crate::gemma4::GemmaKernel::<B>::from_parallel_definition(
-                args.clone(),
-                definition,
-                local,
-                context,
-            )
-            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
             let realization = if routed {
                 Some(
-                    crate::gemma4::expert_realization_plan(&architecture, rank)
+                    crate::gemma4::expert_realization_plan(&args, Some(&local), rank)
                         .map_err(|error| {
                             CompositePartitionPreparationError::Architecture(error.to_string())
                         })?
@@ -2193,6 +2177,13 @@ where
             } else {
                 None
             };
+            let mut architecture = crate::gemma4::GemmaKernel::<B>::from_parallel_definition(
+                args.clone(),
+                definition,
+                local,
+                context,
+            )
+            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
             if let Some(plan) = &realization {
                 architecture =
                     architecture
@@ -2287,20 +2278,9 @@ where
                         .into(),
                 ));
             }
-            let retained = selected
-                .base()
-                .execution()
-                .requirements()
-                .shared_component_definition()
-                .ok_or_else(|| {
-                    CompositePartitionPreparationError::Architecture(
-                        "composite selection has no retained definition".into(),
-                    )
-                })?;
             let definition =
-                crate::muse::model::project_parameters(&args, &retained).map_err(|error| {
-                    CompositePartitionPreparationError::Architecture(error.to_string())
-                })?;
+                crate::replicated_text::executable_component(selected.base().execution())
+                    .map_err(CompositePartitionPreparationError::Architecture)?;
             let parameters = definition.parameters().clone();
             let layout =
                 derive_partitioned_local_layout(&parameters, selected.requirements().topology())
@@ -2465,7 +2445,7 @@ where
             )
         }
         CompositeConfig::QwenVl(source) => {
-            let args = qwen_vl_with_formats(source, target_linear_formats)
+            let args = qwen_vl_with_formats(&source, target_linear_formats)
                 .map_err(CompositePartitionPreparationError::Architecture)?;
             if routed != args.text.is_moe() {
                 return Err(CompositePartitionPreparationError::Architecture(
@@ -2473,20 +2453,9 @@ where
                         .into(),
                 ));
             }
-            let retained = selected
-                .base()
-                .execution()
-                .requirements()
-                .shared_component_definition()
-                .ok_or_else(|| {
-                    CompositePartitionPreparationError::Architecture(
-                        "composite selection has no retained definition".into(),
-                    )
-                })?;
             let definition =
-                crate::qwen::vl::project_parameters(&args, &retained).map_err(|error| {
-                    CompositePartitionPreparationError::Architecture(error.to_string())
-                })?;
+                crate::replicated_text::executable_component(selected.base().execution())
+                    .map_err(CompositePartitionPreparationError::Architecture)?;
             let parameters = definition.parameters().clone();
             let layout =
                 derive_partitioned_local_layout(&parameters, selected.requirements().topology())
@@ -2588,7 +2557,7 @@ where
                 CompositePartitionPreparationError::Architecture(error.to_string())
             })?;
             let source_architecture = qwen_vl_transform_source::<B, S>(
-                source,
+                &source,
                 &selected,
                 &parameters,
                 &geometry,
@@ -2625,20 +2594,9 @@ where
                         .into(),
                 ));
             }
-            let retained = selected
-                .base()
-                .execution()
-                .requirements()
-                .shared_component_definition()
-                .ok_or_else(|| {
-                    CompositePartitionPreparationError::Architecture(
-                        "composite selection has no retained definition".into(),
-                    )
-                })?;
-            let definition = crate::qwen::hybrid::project_conditional_parameters(&args, &retained)
-                .map_err(|error| {
-                    CompositePartitionPreparationError::Architecture(error.to_string())
-                })?;
+            let definition =
+                crate::replicated_text::executable_component(selected.base().execution())
+                    .map_err(CompositePartitionPreparationError::Architecture)?;
             let parameters = definition.parameters().clone();
             let layout =
                 derive_partitioned_local_layout(&parameters, selected.requirements().topology())
@@ -2802,20 +2760,9 @@ where
                         .into(),
                 ));
             }
-            let retained = selected
-                .base()
-                .execution()
-                .requirements()
-                .shared_component_definition()
-                .ok_or_else(|| {
-                    CompositePartitionPreparationError::Architecture(
-                        "composite selection has no retained definition".into(),
-                    )
-                })?;
             let definition =
-                crate::inkling::model::project_parameters(&args, &retained).map_err(|error| {
-                    CompositePartitionPreparationError::Architecture(error.to_string())
-                })?;
+                crate::replicated_text::executable_component(selected.base().execution())
+                    .map_err(CompositePartitionPreparationError::Architecture)?;
             let parameters = definition.parameters().clone();
             let layout =
                 derive_partitioned_local_layout(&parameters, selected.requirements().topology())
@@ -2967,7 +2914,7 @@ where
 
 // The source keeps its original physical format through the shared materializer.
 fn qwen_vl_transform_source<B, S>(
-    source: &crate::qwen::vl::ModelArgs,
+    source: &crate::qwen::vl::Declaration,
     selected: &SelectedPartitionedAdmission<
         SelectedCompositeTextRealization,
         CompositeTextRequirements,
@@ -3146,15 +3093,8 @@ where
     {
         return Err("Gemma 4 transform source changed partition state or ownership".into());
     }
-    let mut architecture = crate::gemma4::GemmaKernel::<B>::from_parallel_definition(
-        source.clone(),
-        definition,
-        local,
-        context,
-    )
-    .map_err(|error| error.to_string())?;
-    if sparse {
-        let realization = crate::gemma4::expert_realization_plan(&architecture, rank)
+    let realization = if sparse {
+        let realization = crate::gemma4::expert_realization_plan(source, Some(&local), rank)
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "Gemma 4 transform source has no expert realization".to_owned())?;
         routed_gemma4_partition_foundation(
@@ -3165,6 +3105,18 @@ where
             rank,
             &realization,
         )?;
+        Some(realization)
+    } else {
+        None
+    };
+    let mut architecture = crate::gemma4::GemmaKernel::<B>::from_parallel_definition(
+        source.clone(),
+        definition,
+        local,
+        context,
+    )
+    .map_err(|error| error.to_string())?;
+    if let Some(realization) = realization {
         architecture = architecture
             .with_expert_realization(realization)
             .map_err(|error| error.to_string())?;
@@ -3220,8 +3172,7 @@ where
         .requirements()
         .shared_component_definition()
         .ok_or_else(|| "composite selection has no retained definition".to_owned())?;
-    let definition = crate::muse::model::project_parameters(source, &retained)
-        .map_err(|error| error.to_string())?;
+    let definition = retained;
     let parameters = definition.parameters().clone();
     let rank = selected.requirements().topology();
     let layout = eredu_runtime::derive_partitioned_transform_source_layout(
@@ -3567,20 +3518,9 @@ where
                         .into(),
                 ));
             }
-            let retained = selected
-                .base()
-                .execution()
-                .requirements()
-                .shared_component_definition()
-                .ok_or_else(|| {
-                    CompositePartitionPreparationError::Architecture(
-                        "composite selection has no retained definition".into(),
-                    )
-                })?;
-            let definition = crate::qwen::hybrid::project_conditional_parameters(&args, &retained)
-                .map_err(|error| {
-                    CompositePartitionPreparationError::Architecture(error.to_string())
-                })?;
+            let definition =
+                crate::replicated_text::executable_component(selected.base().execution())
+                    .map_err(CompositePartitionPreparationError::Architecture)?;
             let parameters = definition.parameters().clone();
             let layout =
                 derive_partitioned_local_layout(&parameters, selected.requirements().topology())
@@ -3745,20 +3685,9 @@ where
                         .into(),
                 ));
             }
-            let retained = selected
-                .base()
-                .execution()
-                .requirements()
-                .shared_component_definition()
-                .ok_or_else(|| {
-                    CompositePartitionPreparationError::Architecture(
-                        "composite selection has no retained definition".into(),
-                    )
-                })?;
             let definition =
-                crate::inkling::model::project_parameters(&args, &retained).map_err(|error| {
-                    CompositePartitionPreparationError::Architecture(error.to_string())
-                })?;
+                crate::replicated_text::executable_component(selected.base().execution())
+                    .map_err(CompositePartitionPreparationError::Architecture)?;
             let parameters = definition.parameters().clone();
             let layout =
                 derive_partitioned_local_layout(&parameters, selected.requirements().topology())

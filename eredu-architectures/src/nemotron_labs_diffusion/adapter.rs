@@ -8,10 +8,13 @@ use eredu_checkpoint::{
     },
     StoredDtype,
 };
-use eredu_nn::{low_rank::LowRankProjection, Error, NeuralBackend, ParameterSpec, Tensor};
+use eredu_nn::{
+    low_rank::LowRankProjectionSpec, DeclareLogicalParameters, Error, LinearSpec,
+    LogicalParameterDeclaration, ParameterSpec,
+};
 
 /// Validated bias-free, ordinary low-rank output projection adapter.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DraftAdapterConfig {
     rank: i32,
     scale: f32,
@@ -81,77 +84,227 @@ impl DraftAdapterConfig {
     pub fn scale(&self) -> f32 {
         self.scale
     }
+}
 
-    pub(crate) fn layer<B: NeuralBackend>(
-        &self,
+/// One draft-only invocation's separately owned low-rank matrices and head partition domain.
+#[derive(Debug, Clone)]
+pub struct DraftAdapterLayerSpec {
+    pub(crate) root: String,
+    pub(crate) projection: LowRankProjectionSpec,
+    heads: i32,
+    head_dim: i32,
+}
+impl DraftAdapterLayerSpec {
+    /// Declares global adapter geometry without a backend or a second base projection.
+    fn new(
+        config: &FamilyConfig,
+        adapter: &DraftAdapterConfig,
         index: usize,
-        input: i32,
-        output: i32,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LowRankProjection<B>, Error> {
-        let name = format!("draft_adapter.layers.{index}.o_proj");
-        LowRankProjection::new(
-            input,
-            output,
-            self.rank,
-            self.scale,
-            ParameterSpec::trainable(format!("{name}.lora_A.weight")).map_err(Error::backend)?,
-            ParameterSpec::trainable(format!("{name}.lora_B.weight")).map_err(Error::backend)?,
-            context,
+    ) -> Result<Self, Error> {
+        config.validate_config()?;
+        if index >= config.num_hidden_layers() as usize {
+            return Err(Error::backend(
+                "draft adapter layer outside shared backbone",
+            ));
+        }
+        let root = format!("draft_adapter.layers.{index}.o_proj");
+        let linear = |field: &str, input, output| {
+            let mut weight = ParameterSpec::trainable(format!("{root}.{field}.weight"))
+                .map_err(Error::backend)?;
+            weight.group = Some(root.clone());
+            Ok::<_, Error>(LinearSpec {
+                input,
+                output,
+                weight,
+                bias: None,
+                format: eredu_nn::LinearFormatSpec::unscaled(
+                    eredu_checkpoint::LinearFormat::Dense,
+                )?,
+            })
+        };
+        let input = config
+            .num_attention_heads()
+            .checked_mul(config.head_dim())
+            .ok_or_else(|| Error::backend("draft adapter input width overflow"))?;
+        let projection = LowRankProjectionSpec {
+            down: linear("lora_A", input, adapter.rank)?,
+            up: linear("lora_B", adapter.rank, config.hidden_size())?,
+            scale: adapter.scale,
+        };
+        projection.validate()?;
+        Ok(Self {
+            root,
+            projection,
+            heads: config.num_attention_heads(),
+            head_dim: config.head_dim(),
+        })
+    }
+
+    /// Exact shared-rank affine construction policy.
+    pub fn projection(&self) -> &LowRankProjectionSpec {
+        &self.projection
+    }
+
+    /// Selects the same complete heads already admitted for the base attention invocation.
+    pub(crate) fn with_local_heads(mut self, heads: i32) -> Result<Self, Error> {
+        if heads <= 0 || heads > self.heads {
+            return Err(Error::backend(
+                "draft adapter head selection outside base attention",
+            ));
+        }
+        self.projection.down.input = heads
+            .checked_mul(self.head_dim)
+            .ok_or_else(|| Error::backend("draft adapter local input width overflow"))?;
+        self.heads = heads;
+        self.projection.validate()?;
+        Ok(self)
+    }
+
+    /// Input channels follow the base heads; rank activations and the up matrix remain replicated.
+    pub fn parameter_group(
+        &self,
+    ) -> Result<eredu_runtime::ParameterGroupSpec, eredu_runtime::ParallelPlanError> {
+        use eredu_runtime::{
+            logical_parameter_members, MemberSharding, ParameterGroupSpec, ParameterRole,
+        };
+        let mut members = logical_parameter_members(&self.projection.down, |_| {
+            MemberSharding::Partitioned { axis: 1 }
+        })?;
+        members.extend(logical_parameter_members(&self.projection.up, |_| {
+            MemberSharding::Replicated
+        })?);
+        ParameterGroupSpec::partitioned(
+            &self.root,
+            ParameterRole::AttentionHeads,
+            self.heads as usize,
+            members,
         )
     }
 }
-
-/// Strict separate-parameter admission; no merged or duplicate base weight is accepted.
-pub fn safetensors_plan(
-    config: &FamilyConfig,
-    adapter: &DraftAdapterConfig,
-) -> Result<SafetensorsCheckpointPlan, String> {
-    config.validate_config().map_err(|e| e.to_string())?;
-    let mut tensors = Vec::new();
-    for layer in 0..config.num_hidden_layers() {
-        for (suffix, shape) in [
-            (
-                "lora_A",
-                vec![
-                    adapter.rank as usize,
-                    (config.num_attention_heads() * config.head_dim()) as usize,
-                ],
-            ),
-            (
-                "lora_B",
-                vec![config.hidden_size() as usize, adapter.rank as usize],
-            ),
-        ] {
-            let key = format!("draft_adapter.layers.{layer}.o_proj.{suffix}.weight");
-            let mut tensor = SafetensorsTensorConstraint::required(
-                key,
-                shape,
-                StoredDtypeConstraint::OneOf(vec![
-                    StoredDtype::F32,
-                    StoredDtype::F16,
-                    StoredDtype::BF16,
-                ]),
-            );
-            tensor.aliases.push(format!(
-                "base_model.model.encoder.layers.{layer}.self_attn.o_proj.{suffix}.weight"
-            ));
-            tensors.push(tensor);
-        }
+impl DeclareLogicalParameters for DraftAdapterLayerSpec {
+    fn logical_parameters(&self) -> Result<Vec<LogicalParameterDeclaration<'_>>, Error> {
+        self.projection.logical_parameters()
     }
-    SafetensorsCheckpointPlan::new(
-        "Nemotron-Labs-Diffusion draft LoRA",
-        tensors,
-        Vec::new(),
-        CatalogPolicy::strict(),
-    )
-    .map_err(|e| e.to_string())
+}
+
+/// Complete source-owned draft matrices, distinct from shared-backbone invocations.
+#[derive(Debug, Clone)]
+pub struct DraftAdapterDeclaration {
+    policy: DraftAdapterConfig,
+    layers: Vec<DraftAdapterLayerSpec>,
+}
+impl DraftAdapterDeclaration {
+    pub(in crate::nemotron_labs_diffusion) fn new(
+        config: &FamilyConfig,
+        policy: DraftAdapterConfig,
+    ) -> Result<Self, Error> {
+        config.validate_config()?;
+        let layers = (0..config.num_hidden_layers() as usize)
+            .map(|layer| DraftAdapterLayerSpec::new(config, &policy, layer))
+            .collect::<Result<Vec<_>, _>>()?;
+        let declaration = Self { policy, layers };
+        declaration.validate_for(config)?;
+        Ok(declaration)
+    }
+    /// Released ancestry and alpha/rank policy retained independently of placement.
+    pub fn policy(&self) -> &DraftAdapterConfig {
+        &self.policy
+    }
+    /// Source scopes in backbone execution order.
+    pub fn layers(&self) -> &[DraftAdapterLayerSpec] {
+        &self.layers
+    }
+    /// Resolves one independently acquired depth before native allocation.
+    pub fn layer(&self, index: usize) -> Result<&DraftAdapterLayerSpec, Error> {
+        self.layers
+            .get(index)
+            .ok_or_else(|| Error::backend("draft adapter layer outside retained backbone"))
+    }
+    /// Projects input heads while retaining rank, output ownership and operator arithmetic.
+    pub fn project_heads(&self, heads: i32) -> Result<Self, Error> {
+        let mut selected = self.clone();
+        selected.layers = self
+            .layers
+            .iter()
+            .cloned()
+            .map(|layer| layer.with_local_heads(heads))
+            .collect::<Result<_, _>>()?;
+        eredu_nn::validate_logical_parameter_topology(&selected.logical_parameters()?)
+            .map_err(Error::backend_source)?;
+        Ok(selected)
+    }
+    pub(crate) fn validate_for(&self, config: &impl Config) -> Result<(), Error> {
+        let input = config
+            .num_attention_heads()
+            .checked_mul(config.head_dim())
+            .ok_or_else(|| Error::backend("draft adapter input width overflow"))?;
+        if self.layers.len() != config.num_hidden_layers() as usize
+            || self.layers.iter().any(|layer| {
+                layer.heads != config.num_attention_heads()
+                    || layer.head_dim != config.head_dim()
+                    || layer.projection.down.input != input
+                    || layer.projection.down.output != self.policy.rank
+                    || layer.projection.up.input != self.policy.rank
+                    || layer.projection.up.output != config.hidden_size()
+                    || layer.projection.scale != self.policy.scale
+            })
+        {
+            return Err(Error::backend(
+                "draft adapter scopes differ from retained backbone geometry or policy",
+            ));
+        }
+        eredu_nn::validate_logical_parameter_topology(&self.logical_parameters()?)
+            .map_err(Error::backend_source)?;
+        Ok(())
+    }
+    /// Strict separate-source admission with explicit released aliases and floating dtype rules.
+    pub fn safetensors_plan(&self) -> Result<SafetensorsCheckpointPlan, String> {
+        let mut tensors = Vec::new();
+        for (layer, declaration) in self.layers.iter().enumerate() {
+            for parameter in declaration
+                .logical_parameters()
+                .map_err(|e| e.to_string())?
+            {
+                let suffix = parameter
+                    .parameter
+                    .id
+                    .as_str()
+                    .strip_prefix(&format!("{}.", declaration.root))
+                    .expect("declared adapter identity under its owner");
+                let mut tensor = SafetensorsTensorConstraint::required(
+                    parameter.parameter.id.as_str(),
+                    parameter.shape,
+                    StoredDtypeConstraint::OneOf(vec![
+                        StoredDtype::F32,
+                        StoredDtype::F16,
+                        StoredDtype::BF16,
+                    ]),
+                );
+                tensor.aliases.push(format!(
+                    "base_model.model.encoder.layers.{layer}.self_attn.o_proj.{suffix}"
+                ));
+                tensors.push(tensor);
+            }
+        }
+        SafetensorsCheckpointPlan::new(
+            "Nemotron-Labs-Diffusion draft LoRA",
+            tensors,
+            Vec::new(),
+            CatalogPolicy::strict(),
+        )
+        .map_err(|e| e.to_string())
+    }
+}
+impl DeclareLogicalParameters for DraftAdapterDeclaration {
+    fn logical_parameters(&self) -> Result<Vec<LogicalParameterDeclaration<'_>>, Error> {
+        self.layers.logical_parameters()
+    }
 }
 
 /// Strictly admitted source authority retained with the execution selection.
 #[derive(Debug, Clone)]
 pub(crate) struct AdmittedDraftAdapter {
-    pub config: DraftAdapterConfig,
+    pub declaration: std::sync::Arc<DraftAdapterDeclaration>,
     pub schema: SafetensorsCheckpointPlan,
     pub resolution: eredu_checkpoint::validation::ResolvedCheckpointPlan,
     pub catalog: eredu_checkpoint::safetensors::SafetensorsMetadataCatalog,
@@ -189,7 +342,10 @@ impl AdmittedDraftAdapter {
         );
         let config_bytes = std::fs::read(&config_path).map_err(|e| e.to_string())?;
         let adapter = DraftAdapterConfig::from_json(&config_bytes, source.expected_base())?;
-        let schema = safetensors_plan(config, &adapter)?;
+        let declaration = std::sync::Arc::new(
+            DraftAdapterDeclaration::new(config, adapter).map_err(|e| e.to_string())?,
+        );
+        let schema = declaration.safetensors_plan()?;
         let catalog =
             eredu_checkpoint::safetensors::SafetensorsMetadataCatalog::discover(weight_path)
                 .map_err(|e| e.to_string())?;
@@ -220,7 +376,7 @@ impl AdmittedDraftAdapter {
             .validate_unchanged()
             .map_err(|e| e.to_string())?;
         Ok(Self {
-            config: adapter,
+            declaration,
             schema,
             resolution,
             catalog,

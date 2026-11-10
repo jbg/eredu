@@ -12,16 +12,15 @@ pub mod vision;
 
 pub use audio::{AudioInput, AudioTower};
 pub use checkpoint::{
-    dense_w13_recipes, expert_residency_catalog, expert_w13_recipe, gguf_plan,
-    load_time_quantization, mmproj_gguf_plan, mtp_safetensors_recipes,
-    normalize_gguf_weight_formats, safetensors_aliases, safetensors_plan, safetensors_recipes,
-    static_safetensors_recipes, translate_gguf_weight_name, translate_gguf_weight_name_for_model,
-    translate_mmproj_weight_name, unit_safetensors_recipes, with_checkpoint_formats,
-    DenseW13Recipes, ParameterAlias,
+    expert_residency_catalog, gguf_plan, load_time_quantization, mmproj_gguf_plan,
+    mtp_safetensors_recipes, normalize_gguf_weight_formats, safetensors_aliases, safetensors_plan,
+    safetensors_recipes, static_safetensors_recipes, translate_gguf_weight_name,
+    translate_gguf_weight_name_for_model, translate_mmproj_weight_name, unit_safetensors_recipes,
+    with_checkpoint_formats, ParameterAlias,
 };
 pub use config::{
-    AudioConfig, ConfigError, FeedForwardPolicy, LayerPolicy, ModelArgs, MtpConfig, TextArgs,
-    VisionConfig,
+    AudioConfig, AudioPolicy, ConfigError, FeedForwardPolicy, LayerPolicy, ModelArgs, ModelPolicy,
+    MtpConfig, TextArgs, VisionConfig, VisionPolicy,
 };
 pub use graph::{
     component_graph, composite_state_layout, mtp_state_layout, parallel_state_layout, state_layout,
@@ -33,35 +32,14 @@ pub use model::{
     PartitionMtpOutput, PreparedInput, StaticModules, TextPartitionInput, Unit,
     AUDIO_EXECUTION_GROUP, MTP_STATIC_ROLE, TEXT_EXECUTION_GROUP, VISION_EXECUTION_GROUP,
 };
-pub(crate) use mtp::mtp_text_args;
 pub use mtp::{MtpDepth, MtpModel, MtpOutput, MtpShared};
 pub use parallel::{
     layer_parameter_groups, local_geometry, local_text_args, mtp_parameter_groups,
     partition_local_geometry, static_parameter_groups, vision_layer_parameter_groups,
     LocalGeometry, PartitionLocalFoundation, PartitionLocalGeometry,
 };
-pub use text::{
-    convolution_history_shape, Attention, ConvolutionState, DecoderLayer, FeedForward, LayerState,
-    TextModel,
-};
+pub use text::{Attention, ConvolutionState, DecoderLayer, FeedForward, LayerState, TextModel};
 pub use vision::{VisionLayer, VisionStatic, VisionTower};
-
-/// Common vocabulary and final-normalization declaration for every text owner.
-pub(crate) fn static_spec(args: &TextArgs) -> crate::decoder::StaticModuleSpec {
-    crate::decoder::StaticModuleSpec {
-        normalization_groups: None,
-        embedding_weight: "model.embed_tokens.weight".into(),
-        normalization_weight: "model.norm.weight".into(),
-        head_weight: "lm_head.weight".into(),
-        vocabulary: args.vocab_size,
-        hidden_size: args.hidden_size,
-        normalization_epsilon: args.rms_norm_eps,
-        normalization_offset: 0.0,
-        embedding_format: args.linear_format_for("model.embed_tokens.weight"),
-        head_format: args.linear_format_for("lm_head.weight"),
-        tied_head: false,
-    }
-}
 
 /// Rank-local construction specifications for one Inkling sparse unit.
 #[derive(Debug, Clone)]
@@ -84,16 +62,10 @@ pub fn expert_realization_plan(
             .validate_for(args)
             .map_err(eredu_nn::Error::backend_source)?;
     }
-    let sparse = args
-        .text_config
-        .layer_schedule
-        .iter()
-        .any(|policy| policy.feed_forward == FeedForwardPolicy::SparseMoe);
-    if !sparse {
+    let Some((_, first)) = args.sparse_layers().next() else {
         return Ok(None);
-    }
-    let global_experts =
-        usize::try_from(args.text_config.n_routed_experts).map_err(eredu_nn::Error::backend)?;
+    };
+    let global_experts = first.routed.group_count() as usize;
     let local_experts = i32::try_from(
         eredu_core::balanced_contiguous_range(
             global_experts,
@@ -108,15 +80,21 @@ pub fn expert_realization_plan(
     let owner_group = eredu_runtime::ExecutionGroupId::new(TEXT_EXECUTION_GROUP)
         .map_err(eredu_nn::Error::backend)?;
     let mut unit_specs = std::collections::BTreeMap::new();
-    for (layer, policy) in args.text_config.layer_schedule.iter().enumerate() {
-        if policy.feed_forward != FeedForwardPolicy::SparseMoe {
-            continue;
-        }
-        let local = geometry
-            .and_then(|geometry| geometry.text_layer(layer).cloned())
-            .unwrap_or_else(|| args.text_config.clone());
-        let (routed, shared) =
-            text::localized_expert_bank_specs(args, layer, &local, local_experts)?;
+    for (layer, parameters) in args.sparse_layers() {
+        let width = geometry
+            .and_then(|geometry| geometry.text_layer(layer))
+            .map_or(parameters.routed.intermediate_dimensions(), |local| {
+                local.moe_intermediate_size()
+            });
+        let shared_count = parameters.shared.group_count();
+        let routed = parameters
+            .routed
+            .clone()
+            .with_group_geometry(local_experts, width)?;
+        let shared = parameters
+            .shared
+            .clone()
+            .with_group_geometry(shared_count, width)?;
         unit_specs.insert(
             (owner_group.clone(), layer),
             ExpertBankRealization { routed, shared },
@@ -124,5 +102,51 @@ pub fn expert_realization_plan(
     }
     crate::ExpertRealizationPlan::balanced(global_experts, topology, unit_specs)
         .map(Some)
+        .map_err(eredu_nn::Error::backend)
+}
+
+/// Projects routed and shared cache-layer identities for replicated expert residency.
+pub(crate) fn replicated_expert_realization_plan(
+    args: &ModelArgs,
+) -> Result<
+    (
+        crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
+        std::collections::BTreeMap<usize, usize>,
+    ),
+    eredu_nn::Error,
+> {
+    let global_experts = args
+        .sparse_layers()
+        .next()
+        .ok_or_else(|| {
+            eredu_nn::Error::backend("Inkling expert realization requires a sparse invocation")
+        })?
+        .1
+        .routed
+        .group_count() as usize;
+    let owner_group = eredu_runtime::ExecutionGroupId::new(TEXT_EXECUTION_GROUP)
+        .map_err(eredu_nn::Error::backend)?;
+    let mut specs = std::collections::BTreeMap::new();
+    let mut routes = std::collections::BTreeMap::new();
+    for (layer, parameters) in args.sparse_layers() {
+        let shared_unit = text::shared_expert_cache_layer(&args.text_config, layer)?;
+        routes.insert(layer, parameters.router.selection().top_k() as usize);
+        routes.insert(
+            shared_unit,
+            parameters.router.selection().always_on_groups() as usize,
+        );
+        specs.insert((owner_group.clone(), layer), parameters.routed.clone());
+        specs.insert(
+            (owner_group.clone(), shared_unit),
+            parameters.shared.clone(),
+        );
+    }
+    let topology = eredu_core::ParallelRankTopology::new(
+        eredu_core::ParallelTopology::new(1, 1, 1, 1).map_err(eredu_nn::Error::backend)?,
+        0,
+    )
+    .map_err(eredu_nn::Error::backend)?;
+    crate::ExpertRealizationPlan::balanced(global_experts, topology, specs)
+        .map(|plan| (plan, routes))
         .map_err(eredu_nn::Error::backend)
 }

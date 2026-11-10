@@ -14,6 +14,7 @@ use checkpoint::table::TableDeclaration;
 #[derive(Clone)]
 pub struct TargetArtifactDeclaration {
     pub(super) config: Config,
+    pub(super) parameters: Arc<TargetParameters>,
     pub(super) formats: ParameterFormats,
     pub(super) normalized: Arc<crate::artifact_preparation::NormalizedArtifactPreparation>,
     pub(super) binding_keys: BTreeSet<String>,
@@ -84,22 +85,22 @@ impl TargetArtifactDeclaration {
     ) -> Result<TargetSpec, PreparationError> {
         limits.validate_for_config(&self.config)?;
         let mut rows = BTreeMap::new();
-        let mut ordinal = 0;
-        for layer in 0..self.config.layers.len() {
-            if let Some(table) = self.tables.get(&layer) {
+        for (ordinal, invocation) in TargetInvocation::schedule(&self.config).enumerate() {
+            if let TargetInvocation::Lexical { layer } = invocation {
+                let table = self.tables.get(&layer).ok_or_else(|| {
+                    PreparationError::Contract("missing declared lexical table".into())
+                })?;
                 rows.insert(
                     layer,
                     table.lookup_spec(rows.len() + 1, ordinal, limits.element)?,
                 );
-                ordinal += 1;
             }
-            ordinal += 1;
         }
-        Ok(super::execution::target_spec_from_formats(
+        Ok(super::execution::target_spec_from_parameters(
             self.config.clone(),
             &rows,
             limits,
-            &self.formats,
+            &self.parameters,
             selected,
         )?)
     }
@@ -262,7 +263,12 @@ impl TargetArtifactDeclaration {
                 .collect(),
         )?;
         Ok(PreparedTarget {
+            prediction_parameters: self
+                .embedded_prediction
+                .as_ref()
+                .map(|p| p.parameters.clone()),
             prediction_recipes: self.embedded_prediction.as_ref().map(|p| p.recipes()),
+            parameters: self.parameters.clone(),
             artifact: source.clone(),
             formats: self.formats.clone(),
             expert_banks: self.banks.clone(),
@@ -420,16 +426,11 @@ impl TargetPreparationPlan {
         &self,
         selected: &SelectedRoutedTextRealization,
     ) -> Result<PredictionSpec, PreparationError> {
-        let (header, _, spec, formats, _) = self
+        let (header, _, spec, _, _) = self
             .prediction
             .as_ref()
             .ok_or(PreparationError::MissingPrediction)?;
-        super::prediction_plan::selected_prediction_spec(
-            header.configuration(),
-            spec,
-            formats,
-            selected,
-        )
+        super::prediction_plan::selected_prediction_spec(header.configuration(), spec, selected)
     }
 
     /// Adds a source-free vision role before selecting the combined graph.
@@ -560,7 +561,7 @@ impl SelectedTargetPreparation {
         mechanisms: &impl crate::PreparationMechanismProvider,
     ) -> Result<eredu_core::ParameterMaterializationWorkspace, String> {
         crate::SelectedExecution::routed(self.selected.clone())
-            .parameter_materialization_workspace(&self.plan, None, mechanisms)
+            .parameter_materialization_workspace(&self.plan, mechanisms)
     }
     /// Exact retained cold mechanism selection.
     pub fn selected(&self) -> &SelectedRoutedTextRealization {

@@ -2,8 +2,9 @@
 //! Preparation is header-only; materialization is restricted to one owner/expert.
 use super::recipes::ParameterScope;
 use crate::qwen4_exp::{
-    config::{Config, LayerKind},
+    config::Config,
     prepared::PreparationError,
+    target::declarations::{MixerParameters, TargetParameters, UnitParameters},
 };
 use eredu_checkpoint::{
     gguf_store::GgufCatalog,
@@ -101,320 +102,365 @@ impl Entry {
         }
     }
 }
-fn entries(c: &Config) -> Vec<Entry> {
-    let h = c.hidden_size as usize;
-    let width = h * c.residual.streams as usize;
-    let mut e = vec![Entry::new(
-        "token_embd.weight",
-        "model.embed_tokens.weight",
-        vec![c.vocabulary as usize, h],
-        ParameterScope::Static,
-    )];
-    if !c.tied_embeddings {
+/// One published split projection, referring to its fused logical slot.
+struct IndexerSourceProjection {
+    canonical: String,
+    logical: eredu_nn::ParameterId,
+    shape: Vec<usize>,
+}
+fn indexer_sources(
+    parameters: &crate::qwen4_exp::indexed::IndexedParameters,
+) -> Result<[IndexerSourceProjection; 2], String> {
+    use eredu_nn::DeclareLogicalParameters;
+    parameters.validate().map_err(|e| e.to_string())?;
+    let declarations = parameters
+        .index_projection
+        .logical_parameters()
+        .map_err(|e| e.to_string())?;
+    let projection = &declarations[0];
+    let root = projection
+        .parameter
+        .id
+        .as_str()
+        .strip_suffix("index_qk_proj.weight")
+        .ok_or("GGUF indexer source does not reference the released fused identity")?;
+    let geometry = parameters.index_geometry;
+    Ok([
+        ("index_q_proj", geometry.query_width() as usize),
+        ("index_k_proj", geometry.key_width() as usize),
+    ]
+    .map(|(suffix, rows)| IndexerSourceProjection {
+        canonical: format!("{root}{suffix}.weight"),
+        logical: projection.parameter.id.clone(),
+        shape: vec![rows, projection.shape[1]],
+    }))
+}
+fn entries(parameters: &TargetParameters) -> Result<Vec<Entry>, String> {
+    use eredu_nn::DeclareLogicalParameters;
+    parameters.logical_parameters().map_err(|e| e.to_string())?;
+    let statics = &parameters.static_parameters;
+    let mut e = Vec::new();
+    for parameter in statics
+        .embedding
+        .logical_parameters()
+        .map_err(|e| e.to_string())?
+    {
         e.push(Entry::new(
-            "output.weight",
-            "lm_head.weight",
-            vec![c.vocabulary as usize, h],
+            "token_embd.weight",
+            parameter.parameter.id.to_string(),
+            parameter.shape,
             ParameterScope::Static,
         ));
     }
-    let residual = |e: &mut Vec<Entry>, physical: &str, canonical: &str, scope, inject| {
-        e.push(
-            Entry::new(
-                format!("{physical}_norm.weight"),
-                format!("{canonical}.hc_norm.weight"),
-                vec![width],
-                scope,
-            )
-            .offset(),
-        );
-        for (p, n, s) in [
-            (
-                "down",
-                "input_mix_weight_down",
-                vec![c.residual.rank as usize, width],
-            ),
-            (
-                "up",
-                "input_mix_weight_up",
-                vec![width, c.residual.rank as usize],
-            ),
-        ] {
+    if let Some(head) = &statics.head {
+        for parameter in head.logical_parameters().map_err(|e| e.to_string())? {
             e.push(Entry::new(
-                format!("{physical}_{p}.weight"),
-                format!("{canonical}.{n}.weight"),
-                s,
-                scope,
+                "output.weight",
+                parameter.parameter.id.to_string(),
+                parameter.shape,
+                ParameterScope::Static,
             ));
         }
-        if inject {
-            e.push(Entry::new(
-                format!("{physical}_inject.weight"),
-                format!("{canonical}.block_inject_weight.weight"),
-                vec![c.residual.streams as usize, width],
-                scope,
-            ));
+    }
+    let residual = |e: &mut Vec<Entry>,
+                    physical: &str,
+                    spec: &eredu_nn::residual_streams::GatedResidualSpec,
+                    scope|
+     -> Result<(), String> {
+        for parameter in spec
+            .normalization
+            .logical_parameters()
+            .map_err(|e| e.to_string())?
+        {
+            e.push(
+                Entry::new(
+                    format!("{physical}_norm.weight"),
+                    parameter.parameter.id.to_string(),
+                    parameter.shape,
+                    scope,
+                )
+                .offset(),
+            );
         }
+        for (suffix, projection) in [("down", &spec.down), ("up", &spec.up)]
+            .into_iter()
+            .chain(spec.injection.as_ref().map(|p| ("inject", p)))
+        {
+            for parameter in projection.logical_parameters().map_err(|e| e.to_string())? {
+                e.push(Entry::new(
+                    format!("{physical}_{suffix}.weight"),
+                    parameter.parameter.id.to_string(),
+                    parameter.shape,
+                    scope,
+                ));
+            }
+        }
+        Ok(())
     };
     residual(
         &mut e,
         "output_hc",
-        "model.hyper_connection_mixer",
+        &statics.readout,
         ParameterScope::Static,
-        false,
-    );
-    for (l, kind) in c.layers.iter().enumerate() {
+    )?;
+    for unit in &parameters.units {
+        let UnitParameters::Decoder {
+            layer: l,
+            mixer,
+            feed_forward,
+        } = unit
+        else {
+            continue;
+        };
+        let l = *l;
         let scope = ParameterScope::Target(l);
         let p = format!("blk.{l}");
-        let n = format!("model.layers.{l}");
-        residual(
-            &mut e,
-            &format!("{p}.hc_attn"),
-            &format!("{n}.attn_hyper_connection"),
-            scope,
-            true,
-        );
+        let mixer_residual = match mixer {
+            MixerParameters::Recurrent(spec) => &spec.residual,
+            MixerParameters::Indexed { residual, .. } => residual,
+        };
+        residual(&mut e, &format!("{p}.hc_attn"), mixer_residual, scope)?;
         residual(
             &mut e,
             &format!("{p}.hc_ffn"),
-            &format!("{n}.mlp_hyper_connection"),
+            &feed_forward.residual,
             scope,
-            true,
-        );
-        match kind {
-            LayerKind::Recurrent => {
-                let r = &c.recurrent;
-                let k = r.key_heads as usize * r.key_dim as usize;
-                let v = r.value_heads as usize * r.value_dim as usize;
-                let n = format!("{n}.linear_attn");
-                for (physical, name, shape, axis, prefix) in [
-                    ("attn_qkv", "in_proj_qkv", vec![2 * k + v, h], 0, 2 * k),
-                    ("attn_gate", "in_proj_z", vec![v, h], 0, 0),
-                    (
-                        "ssm_alpha",
-                        "in_proj_a",
-                        vec![r.value_heads as usize, h],
-                        0,
-                        0,
-                    ),
-                    (
-                        "ssm_beta",
-                        "in_proj_b",
-                        vec![r.value_heads as usize, h],
-                        0,
-                        0,
-                    ),
-                    ("ssm_out", "out_proj", vec![h, v], 1, 0),
+        )?;
+        match mixer {
+            MixerParameters::Recurrent(sublayer) => {
+                let spec = &sublayer.mixer;
+                let key_prefix = spec.geometry.qkv_ranges().map_err(|e| e.to_string())?[2].start;
+                for (physical, projection, axis, prefix) in [
+                    ("attn_qkv", &spec.input_qkv, 0, key_prefix),
+                    ("attn_gate", &spec.input_gate, 0, 0),
+                    ("ssm_alpha", &spec.input_decay, 0, 0),
+                    ("ssm_beta", &spec.input_beta, 0, 0),
+                    ("ssm_out", &spec.output, 1, 0),
                 ] {
+                    for parameter in projection.logical_parameters().map_err(|e| e.to_string())? {
+                        e.push(
+                            Entry::new(
+                                format!("{p}.{physical}.weight"),
+                                parameter.parameter.id.to_string(),
+                                parameter.shape,
+                                scope,
+                            )
+                            .heads(axis, prefix),
+                        );
+                    }
+                }
+                for parameter in spec
+                    .convolution
+                    .logical_parameters()
+                    .map_err(|e| e.to_string())?
+                {
                     e.push(
                         Entry::new(
-                            format!("{p}.{physical}.weight"),
-                            format!("{n}.{name}.weight"),
-                            shape,
+                            format!("{p}.ssm_conv1d.weight"),
+                            parameter.parameter.id.to_string(),
+                            vec![parameter.shape[0], parameter.shape[2]],
                             scope,
                         )
-                        .heads(axis, prefix),
+                        .heads(0, key_prefix)
+                        .reshape(parameter.shape),
                     );
                 }
-                e.push(
-                    Entry::new(
-                        format!("{p}.ssm_conv1d.weight"),
-                        format!("{n}.conv1d.weight"),
-                        vec![2 * k + v, r.kernel as usize],
-                        scope,
-                    )
-                    .heads(0, 2 * k)
-                    .reshape(vec![2 * k + v, 1, r.kernel as usize]),
-                );
-                e.push(
-                    Entry::new(
-                        format!("{p}.ssm_dt.bias"),
-                        format!("{n}.dt_bias"),
-                        vec![r.value_heads as usize],
-                        scope,
-                    )
-                    .heads(0, 0),
-                );
-                e.push(
-                    Entry::new(
-                        format!("{p}.ssm_a"),
-                        format!("{n}.A_log"),
-                        vec![r.value_heads as usize],
-                        scope,
-                    )
-                    .heads(0, 0)
-                    .neg_log(),
-                );
-                e.push(Entry::new(
-                    format!("{p}.ssm_norm.weight"),
-                    format!("{n}.norm.weight"),
-                    vec![r.value_dim as usize],
-                    scope,
-                ));
-            }
-            LayerKind::Indexed => {
-                let a = &c.attention;
-                let n = format!("{n}.self_attn");
-                for (pname, name, rows, cols) in [
-                    ("attn_q", "q_proj", 2 * a.heads * a.head_dim, c.hidden_size),
-                    ("attn_k", "k_proj", a.kv_heads * a.head_dim, c.hidden_size),
-                    ("attn_v", "v_proj", a.kv_heads * a.head_dim, c.hidden_size),
-                    ("attn_output", "o_proj", c.hidden_size, a.heads * a.head_dim),
-                    (
-                        "indexer.q_proj",
-                        "indexer.index_q_proj",
-                        a.index_heads * a.index_head_dim,
-                        c.hidden_size,
-                    ),
-                    (
-                        "indexer.k_proj",
-                        "indexer.index_k_proj",
-                        a.index_kv_heads * a.index_head_dim,
-                        c.hidden_size,
-                    ),
+                let declarations = spec.logical_parameters().map_err(|e| e.to_string())?;
+                for (physical, parameter, heads, neg_log) in [
+                    ("ssm_dt.bias", &spec.decay_bias, true, false),
+                    ("ssm_a", &spec.transition_log, true, true),
+                    ("ssm_norm.weight", &spec.normalization_weight, false, false),
                 ] {
+                    let declaration = declarations
+                        .iter()
+                        .find(|d| d.parameter.id == parameter.id)
+                        .ok_or_else(|| {
+                            format!("unresolved recurrent source slot {}", parameter.id)
+                        })?;
+                    let mut entry = Entry::new(
+                        format!("{p}.{physical}"),
+                        parameter.id.to_string(),
+                        declaration.shape.clone(),
+                        scope,
+                    );
+                    if heads {
+                        entry = entry.heads(0, 0);
+                    }
+                    if neg_log {
+                        entry = entry.neg_log();
+                    }
+                    e.push(entry);
+                }
+            }
+            MixerParameters::Indexed { parameters, .. } => {
+                use eredu_nn::{DeclareLogicalParameters, LogicalParameterRole};
+                for (physical, projection) in ["attn_q", "attn_k", "attn_v", "attn_output"]
+                    .into_iter()
+                    .zip(parameters.projection.projections())
+                {
+                    for parameter in projection.logical_parameters().map_err(|e| e.to_string())? {
+                        if parameter.role == LogicalParameterRole::LinearWeight {
+                            e.push(Entry::new(
+                                format!("{p}.{physical}.weight"),
+                                parameter.parameter.id.to_string(),
+                                parameter.shape,
+                                scope,
+                            ));
+                        }
+                    }
+                }
+                for (physical, source) in ["indexer.q_proj", "indexer.k_proj"]
+                    .into_iter()
+                    .zip(indexer_sources(&parameters)?)
+                {
                     e.push(Entry::new(
-                        format!("{p}.{pname}.weight"),
-                        format!("{n}.{name}.weight"),
-                        vec![rows as usize, cols as usize],
+                        format!("{p}.{physical}.weight"),
+                        source.canonical,
+                        source.shape,
                         scope,
                     ));
                 }
-                for (pname, name, d) in [
-                    ("attn_q_norm", "q_norm", a.head_dim),
-                    ("attn_k_norm", "k_norm", a.head_dim),
-                    ("indexer.q_norm", "indexer.q_layernorm", a.index_head_dim),
-                    ("indexer.k_norm", "indexer.k_layernorm", a.index_head_dim),
+                for (physical, norm) in [
+                    ("attn_q_norm", &parameters.query_norm),
+                    ("attn_k_norm", &parameters.key_norm),
+                    ("indexer.q_norm", &parameters.index_query_norm),
+                    ("indexer.k_norm", &parameters.index_key_norm),
                 ] {
+                    for parameter in norm.logical_parameters().map_err(|e| e.to_string())? {
+                        e.push(
+                            Entry::new(
+                                format!("{p}.{physical}.weight"),
+                                parameter.parameter.id.to_string(),
+                                parameter.shape,
+                                scope,
+                            )
+                            .offset(),
+                        );
+                    }
+                }
+                for (physical, projection) in ["attn_q", "attn_k", "attn_v"]
+                    .into_iter()
+                    .zip(parameters.projection.projections())
+                {
+                    for parameter in projection.logical_parameters().map_err(|e| e.to_string())? {
+                        if parameter.role == LogicalParameterRole::LinearBias {
+                            e.push(Entry::new(
+                                format!("{p}.{physical}.bias"),
+                                parameter.parameter.id.to_string(),
+                                parameter.shape,
+                                scope,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(parameters) = parameters.units.iter().find_map(|unit| match unit {
+            UnitParameters::Lexical { layer, parameters } if *layer == l => Some(parameters),
+            _ => None,
+        }) {
+            let scope = ParameterScope::Lexical(l);
+            for (physical, spec) in [
+                ("ple_key", &parameters.key),
+                ("ple_value", &parameters.value),
+            ] {
+                for parameter in spec.logical_parameters().map_err(|e| e.to_string())? {
+                    e.push(Entry::new(
+                        format!("{p}.{physical}.weight"),
+                        parameter.parameter.id.as_str(),
+                        parameter.shape,
+                        scope,
+                    ));
+                }
+            }
+            for (physical, spec) in [
+                ("norm_key", &parameters.key_norm),
+                ("norm_query", &parameters.query_norm),
+                ("norm_conv", &parameters.convolution_norm),
+            ] {
+                for parameter in spec.logical_parameters().map_err(|e| e.to_string())? {
                     e.push(
                         Entry::new(
-                            format!("{p}.{pname}.weight"),
-                            format!("{n}.{name}.weight"),
-                            vec![d as usize],
+                            format!("{p}.ple_{physical}.weight"),
+                            parameter.parameter.id.as_str(),
+                            parameter.shape,
                             scope,
                         )
                         .offset(),
                     );
                 }
-                if a.bias {
-                    for (physical, name, rows) in [
-                        ("attn_q", "q_proj", 2 * a.heads * a.head_dim),
-                        ("attn_k", "k_proj", a.kv_heads * a.head_dim),
-                        ("attn_v", "v_proj", a.kv_heads * a.head_dim),
-                    ] {
-                        e.push(Entry::new(
-                            format!("{p}.{physical}.bias"),
-                            format!("{n}.{name}.bias"),
-                            vec![rows as usize],
-                            scope,
-                        ));
-                    }
-                }
             }
-        }
-        if c.ngram.layers.contains(&l) {
-            let scope = ParameterScope::Lexical(l);
-            let n = format!("{n}.ple");
-            for (physical, name, rows) in [
-                ("ple_key", "key_proj", width),
-                ("ple_value", "value_proj", h),
-            ] {
-                e.push(Entry::new(
-                    format!("{p}.{physical}.weight"),
-                    format!("{n}.{name}.weight"),
-                    vec![rows, c.ngram.embedding_dim as usize],
-                    scope,
-                ));
-            }
-            for name in ["norm_key", "norm_query", "norm_conv"] {
+            for parameter in parameters
+                .convolution
+                .logical_parameters()
+                .map_err(|e| e.to_string())?
+            {
                 e.push(
                     Entry::new(
-                        format!("{p}.ple_{name}.weight"),
-                        format!("{n}.{name}.weight"),
-                        vec![width],
+                        format!("{p}.ple_conv1d.weight"),
+                        parameter.parameter.id.as_str(),
+                        vec![parameter.shape[0], parameter.shape[2]],
                         scope,
                     )
-                    .offset(),
+                    .reshape(parameter.shape),
                 );
             }
-            e.push(
-                Entry::new(
-                    format!("{p}.ple_conv1d.weight"),
-                    format!("{n}.conv1d.weight"),
-                    vec![width, c.ngram.kernel as usize],
-                    scope,
-                )
-                .reshape(vec![width, 1, c.ngram.kernel as usize]),
-            );
         }
-        let ex = &c.experts;
-        e.push(Entry::new(
-            format!("{p}.ffn_gate_inp.weight"),
-            format!("{n}.mlp.gate.weight"),
-            vec![ex.count as usize, h],
-            scope,
-        ));
-        e.push(Entry::new(
-            format!("{p}.ffn_gate_inp_shexp.weight"),
-            format!("{n}.mlp.shared_expert_gate.weight"),
-            vec![1, h],
-            scope,
-        ));
-        for (pname, name, shape) in [
-            (
-                "gate",
-                "gate_proj",
-                vec![ex.shared_intermediate as usize, h],
-            ),
-            ("up", "up_proj", vec![ex.shared_intermediate as usize, h]),
-            (
-                "down",
-                "down_proj",
-                vec![h, ex.shared_intermediate as usize],
-            ),
-        ] {
+        use eredu_nn::DeclareLogicalParameters;
+        let parameters = &feed_forward.feed_forward.parameters;
+        for parameter in parameters
+            .routed
+            .selector
+            .logical_parameters()
+            .map_err(|e| e.to_string())?
+        {
             e.push(Entry::new(
-                format!("{p}.ffn_{pname}_shexp.weight"),
-                format!("{n}.mlp.shared_expert.{name}.weight"),
-                shape,
+                format!("{p}.ffn_gate_inp.weight"),
+                parameter.parameter.id.to_string(),
+                parameter.shape,
                 scope,
             ));
         }
-        for (pname, name, shape) in [
-            (
-                "gate",
-                "gate_proj",
-                vec![ex.count as usize, ex.intermediate as usize, h],
-            ),
-            (
-                "up",
-                "up_proj",
-                vec![ex.count as usize, ex.intermediate as usize, h],
-            ),
-            (
-                "down",
-                "down_proj",
-                vec![ex.count as usize, h, ex.intermediate as usize],
-            ),
+        for (physical, projection) in [
+            ("gate_inp_shexp", &parameters.shared_gate),
+            ("gate_shexp", &parameters.shared.gate),
+            ("up_shexp", &parameters.shared.up),
+            ("down_shexp", &parameters.shared.down),
         ] {
+            for parameter in projection.logical_parameters().map_err(|e| e.to_string())? {
+                e.push(Entry::new(
+                    format!("{p}.ffn_{physical}.weight"),
+                    parameter.parameter.id.to_string(),
+                    parameter.shape,
+                    scope,
+                ));
+            }
+        }
+        for (physical, source) in ["gate", "up", "down"]
+            .into_iter()
+            .zip(super::experts::sources(
+                &feed_forward.feed_forward.parameters.routed.experts,
+                super::experts::SourceLayout::SplitBanks,
+            )?)
+        {
             e.push(
                 Entry::new(
-                    format!("{p}.ffn_{pname}_exps.weight"),
-                    format!("{n}.mlp.experts.{name}"),
-                    shape,
+                    format!("{p}.ffn_{physical}_exps.weight"),
+                    source.name,
+                    source.shape,
                     scope,
                 )
                 .expert(),
             );
         }
     }
-    e
+    Ok(e)
 }
-
 /// Metadata-only text layout, representation and recipe authority. Binding consumes
 /// an existing exact source; this plan never opens a store or reads tensor payloads.
 #[derive(Clone)]
 pub struct GgufTextPlan {
+    pub(in crate::qwen4_exp) parameters: Arc<TargetParameters>,
     config: Config,
     pub(in crate::qwen4_exp) table: super::GgufTableSourcePlan,
     checkpoint: Checkpoint,
@@ -448,26 +494,27 @@ impl GgufTextPlan {
             a.kv_heads.checked_mul(a.head_dim),
             a.index_heads.checked_mul(a.index_head_dim),
             a.index_kv_heads.checked_mul(a.index_head_dim),
-            r.key_heads
-                .checked_mul(r.key_dim)
-                .and_then(|k| k.checked_mul(2))
-                .and_then(|k| {
-                    r.value_heads
-                        .checked_mul(r.value_dim)
-                        .and_then(|v| k.checked_add(v))
-                }),
+            eredu_nn::GatedDeltaHeadGeometry::new(
+                r.key_heads,
+                r.value_heads,
+                r.key_dim,
+                r.value_dim,
+            )
+            .and_then(|geometry| geometry.qkv_width())
+            .ok(),
             config.experts.intermediate.checked_mul(2),
         ];
         if products.iter().any(Option::is_none) {
             return Err(fail("GGUF projection geometry exceeds i32".into()));
         }
-        let mut entries = entries(&config);
+        let parameters = Arc::new(super::schema::target_parameters(&config).map_err(fail)?);
+        let mut entries = entries(&parameters).map_err(fail)?;
         // The published gate is [1,h]; accept its equivalent squeezed vector too.
         for entry in &mut entries {
             if entry.canonical.ends_with(".shared_expert_gate.weight")
                 && checkpoint.tensors().any(|t| {
                     t.descriptor().name == entry.physical
-                        && t.descriptor().row_major_shape() == [config.hidden_size as u64]
+                        && t.descriptor().row_major_shape() == [entry.shape[1] as u64]
                 })
             {
                 entry.transform.reshape = Some(entry.shape.clone());
@@ -498,7 +545,10 @@ impl GgufTextPlan {
         }
         // Concatenated Q/K and gate/up matrices must have one exact encoding.
         // Differently encoded inputs get bounded F32 views, never a full bank read.
-        for layer in 0..config.layers.len() {
+        for layer in parameters.units.iter().filter_map(|unit| match unit {
+            UnitParameters::Decoder { layer, .. } => Some(*layer),
+            _ => None,
+        }) {
             for pair in [
                 [
                     format!("blk.{layer}.indexer.q_proj.weight"),
@@ -593,29 +643,39 @@ impl GgufTextPlan {
         let resolution = resolve_gguf_plan(&checkpoint, &plan)
             .map_err(|e| fail(format!("GGUF text contract did not resolve: {e:?}")))?;
         let catalog = GgufCatalog::from_resolved_checkpoint(&checkpoint, &resolution, &mapping)?;
-        for layer in 0..config.layers.len() {
-            for (target, member) in [
-                (
-                    format!("model.layers.{layer}.self_attn.indexer.index_qk_proj.weight"),
-                    format!("model.layers.{layer}.self_attn.indexer.index_q_proj.weight"),
-                ),
-                (
-                    format!("model.layers.{layer}.mlp.experts.gate_up_proj"),
-                    format!("model.layers.{layer}.mlp.experts.gate_proj"),
-                ),
-            ] {
+        for unit in &parameters.units {
+            let UnitParameters::Decoder {
+                mixer,
+                feed_forward,
+                ..
+            } = unit
+            else {
+                continue;
+            };
+            let mut sources = super::experts::sources(
+                &feed_forward.feed_forward.parameters.routed.experts,
+                super::experts::SourceLayout::SplitBanks,
+            )
+            .map_err(fail)?;
+            let gate = sources.remove(0);
+            let mut links = vec![(gate.logical.to_string(), gate.name)];
+            if let MixerParameters::Indexed { parameters, .. } = mixer {
+                let [query, _] = indexer_sources(parameters).map_err(fail)?;
+                links.push((query.logical.to_string(), query.canonical));
+            }
+            for (target, member) in links {
                 if let Some(&format) = formats.get(&member) {
                     formats.insert(target, format);
                 }
             }
         }
-        if config.tied_embeddings {
-            formats.insert(
-                "lm_head.weight".into(),
-                formats["model.embed_tokens.weight"],
-            );
+        if parameters.static_parameters.head.is_none() {
+            let statics = &parameters.static_parameters;
+            let output = statics.output_projection();
+            formats.insert("lm_head.weight".into(), formats[output.weight.id.as_str()]);
         }
         let this = Self {
+            parameters,
             config,
             table,
             checkpoint,
@@ -628,15 +688,20 @@ impl GgufTextPlan {
         };
         // Validate transformed shape/dtype contracts now without reading payloads.
         this.parameter_recipes(ParameterScope::Static)?;
-        for l in 0..this.config.layers.len() {
-            this.parameter_recipes(ParameterScope::Target(l))?;
-            if this.config.ngram.layers.contains(&l) {
-                this.parameter_recipes(ParameterScope::Lexical(l))?;
+        for unit in &this.parameters.units {
+            match unit {
+                UnitParameters::Decoder { layer, .. } => {
+                    this.parameter_recipes(ParameterScope::Target(*layer))?;
+                    this.expert_recipes(*layer, 0)?;
+                }
+                UnitParameters::Lexical { layer, .. } => {
+                    this.parameter_recipes(ParameterScope::Lexical(*layer))?;
+                }
             }
-            this.expert_recipes(l, 0)?;
         }
         Ok(this)
     }
+
     /// Retained checkpoint after table and projection representation selection.
     pub fn checkpoint(&self) -> &Checkpoint {
         &self.checkpoint
@@ -694,6 +759,9 @@ impl GgufTextPlan {
     pub fn config(&self) -> &Config {
         &self.config
     }
+    pub(crate) fn parameter_declaration(&self) -> &TargetParameters {
+        &self.parameters
+    }
     /// Actual selected format, including scalar fallback for unaligned head blocks.
     pub fn format(&self, name: &str) -> Option<LinearFormat> {
         self.formats.get(name).copied()
@@ -743,8 +811,8 @@ impl GgufTextPlan {
                         &shape,
                         axis,
                         prefix,
-                        self.config.recurrent.key_heads as usize,
-                        self.config.recurrent.value_heads as usize,
+                        self.recurrent_geometry(scope)?.key_heads() as usize,
+                        self.recurrent_geometry(scope)?.value_heads() as usize,
                     )
                     .map_err(fail)?;
                 }
@@ -758,33 +826,68 @@ impl GgufTextPlan {
             }
         }
         if let ParameterScope::Target(l) = scope {
-            let root = format!("model.layers.{l}.self_attn.indexer");
-            for suffix in ["weight", "scales", "biases"] {
-                let q = format!("{root}.index_q_proj.{suffix}");
-                let k = format!("{root}.index_k_proj.{suffix}");
-                if let Some(q) = result.remove(&q) {
-                    let k = result
-                        .remove(&k)
-                        .ok_or_else(|| fail("incomplete indexer companion pair".into()))?;
-                    result.insert(
-                        format!("{root}.index_qk_proj.{suffix}"),
-                        Recipe::Concatenate {
-                            axis: 0,
-                            inputs: self.uniform_inputs(vec![q, k])?,
-                        },
-                    );
+            if let Some((MixerParameters::Indexed { parameters, .. }, _)) =
+                self.parameters.decoder(l)
+            {
+                let [query, key] = indexer_sources(parameters).map_err(fail)?;
+                let companion = |weight: &str, suffix: &str| {
+                    format!(
+                        "{}.{}",
+                        weight
+                            .strip_suffix(".weight")
+                            .expect("declared indexer weight"),
+                        suffix
+                    )
+                };
+                for suffix in ["weight", "scales", "biases"] {
+                    let q = companion(&query.canonical, suffix);
+                    let k = companion(&key.canonical, suffix);
+                    if let Some(q) = result.remove(&q) {
+                        let k = result
+                            .remove(&k)
+                            .ok_or_else(|| fail("incomplete indexer companion pair".into()))?;
+                        result.insert(
+                            companion(query.logical.as_str(), suffix),
+                            Recipe::Concatenate {
+                                axis: 0,
+                                inputs: self.uniform_inputs(vec![q, k])?,
+                            },
+                        );
+                    }
                 }
             }
         }
-        if scope == ParameterScope::Static && self.config.tied_embeddings {
+        if scope == ParameterScope::Static && self.parameters.static_parameters.head.is_none() {
+            let statics = &self.parameters.static_parameters;
+            let output = statics.output_projection();
+            let prefix = output
+                .weight
+                .id
+                .as_str()
+                .strip_suffix(".weight")
+                .expect("declared vocabulary weight");
             for suffix in ["weight", "scales", "biases"] {
-                if let Some(r) = result.get(&format!("model.embed_tokens.{suffix}")).cloned() {
+                if let Some(r) = result.get(&format!("{prefix}.{suffix}")).cloned() {
                     result.insert(format!("lm_head.{suffix}"), r);
                 }
             }
         }
         self.validate_recipes(result)
     }
+    fn recurrent_geometry(
+        &self,
+        scope: ParameterScope,
+    ) -> Result<eredu_nn::GatedDeltaHeadGeometry, PreparationError> {
+        if let ParameterScope::Target(layer) = scope {
+            if let Some((MixerParameters::Recurrent(spec), _)) = self.parameters.decoder(layer) {
+                return Ok(spec.mixer.geometry);
+            }
+        }
+        Err(PreparationError::Contract(
+            "recurrent transform has no declared recurrent owner".into(),
+        ))
+    }
+
     fn uniform_inputs(&self, inputs: Vec<Recipe>) -> Result<Vec<Recipe>, PreparationError> {
         let dtypes = inputs
             .iter()
@@ -819,7 +922,18 @@ impl GgufTextPlan {
         layer: usize,
         expert: usize,
     ) -> Result<BTreeMap<String, Recipe>, PreparationError> {
-        if expert >= self.config.experts.count as usize {
+        let (_, feed_forward) = self
+            .parameters
+            .decoder(layer)
+            .ok_or_else(|| PreparationError::Contract("expert layer is outside target".into()))?;
+        if expert
+            >= feed_forward
+                .feed_forward
+                .parameters
+                .routed
+                .experts
+                .group_count() as usize
+        {
             return Err(PreparationError::Contract(
                 "expert is outside the declared routed unit".into(),
             ));
@@ -849,16 +963,21 @@ impl GgufTextPlan {
         &self,
         layer: usize,
     ) -> Result<BTreeMap<String, Recipe>, PreparationError> {
-        if layer >= self.config.layers.len() {
-            return Err(PreparationError::Contract(
-                "expert layer is outside target".into(),
-            ));
-        }
-        let root = format!("model.layers.{layer}.mlp.experts");
+        let (_, feed_forward) = self
+            .parameters
+            .decoder(layer)
+            .ok_or_else(|| PreparationError::Contract("expert layer is outside target".into()))?;
+        let source = feed_forward
+            .feed_forward
+            .parameters
+            .routed
+            .experts
+            .packed_parameters()?;
+        let root = super::experts::source_root(&source).map_err(PreparationError::Contract)?;
         let mut recipes = crate::shared_routed::checkpoint::gated_expert_recipes(
             &self.catalog,
-            &root,
-            0..self.config.experts.count as usize,
+            root,
+            0..source.group_count(),
             TensorSelection::Full,
             super::schema::aliases,
         )
@@ -871,8 +990,11 @@ impl GgufTextPlan {
         self.validate_recipes(
             recipes
                 .into_iter()
-                .map(|(n, r)| (format!("{root}.{n}"), r))
-                .collect(),
+                .map(|(name, recipe)| {
+                    super::experts::binding_target(&source, &name).map(|target| (target, recipe))
+                })
+                .collect::<Result<_, _>>()
+                .map_err(PreparationError::Contract)?,
         )
     }
 }

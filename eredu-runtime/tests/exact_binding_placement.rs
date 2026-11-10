@@ -102,9 +102,9 @@ fn owned_task(
     executable: LinearFormat,
 ) -> ReplicatedTextMaterializationTask {
     let encoding = SourceTensorEncoding::Safetensors(StoredDtype::F32);
-    ReplicatedTextMaterializationTask::from_exact_source(
+    ReplicatedTextMaterializationTask::from_exact_sources(
         name,
-        ReplicatedTextPhysicalSource::new(
+        vec![ReplicatedTextPhysicalSource::new(
             "checkpoint.weight",
             "checkpoint.weight",
             "/exact/model.safetensors",
@@ -112,7 +112,7 @@ fn owned_task(
             encoding.clone(),
             (shape.iter().product::<usize>() * 4) as u64,
         )
-        .unwrap(),
+        .unwrap()],
         Vec::new(),
         shape.to_vec(),
         shape.to_vec(),
@@ -128,6 +128,7 @@ fn owned_task(
             Some(shape.len() - 1),
         )
         .unwrap(),
+        None,
     )
     .unwrap()
 }

@@ -224,7 +224,7 @@ pub(super) struct PreparedAssistantParameters<A: eredu_architectures::ExternalAs
 {
     store: eredu_checkpoint::store::SharedCheckpointSource,
     config: A::Config,
-    module_config: A::ModuleConfig,
+    module_config: eredu_architectures::external_assistant::PreparedAssistantModule<A>,
     pub(super) module: MlxModule<A::Module<MlxNeuralBackend>>,
     units: Vec<Vec<WeightBinding>>,
     layout: Option<eredu_runtime::ExecutionUnitLayout>,
@@ -330,7 +330,7 @@ fn materialize_external_assistant<A: eredu_architectures::ExternalAssistantArchi
     weights_stream: &Stream,
 ) -> Result<MlxExternalAssistant<A>, Error> {
     let mut prepared = prepare_external_assistant_parameters::<A>(prepared, stream)?;
-    let memory_topology = A::memory_topology(&prepared.module_config)
+    let memory_topology = A::memory_topology(prepared.module_config.config())
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     // Query exact binding extents and the native host-buffer capacity mechanism
     // before units are consumed. No artifact reopening or payload materialization.

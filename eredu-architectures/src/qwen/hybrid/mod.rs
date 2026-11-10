@@ -1,5 +1,10 @@
 //! One backend-neutral hybrid decoder shared by Qwen3-Next and Qwen3.5.
 
+mod declarations;
+pub use declarations::HybridConfig;
+mod specs;
+pub use specs::BlockParameters;
+pub(crate) use specs::{FeedForwardParameters, MixerParameters};
 /// Target-only causal text passes preserve convolution, recurrent and attention state.
 pub(crate) const CHUNKED_TEXT_PREFILL: bool = true;
 
@@ -15,6 +20,7 @@ mod parameters;
 mod safetensors;
 pub(crate) mod topology;
 
+pub(crate) use checkpoint::{conditional_source_linear_shapes, source_linear_shapes};
 pub(crate) use safetensors::catalog_plan as safetensors_catalog_plan;
 
 /// Checkpoint spellings shared by tensor admission and FP8 exclusion policy.
@@ -31,6 +37,7 @@ fn text_checkpoint_aliases(name: &str) -> Vec<String> {
 }
 
 pub use block::{expert_bank_spec, Block, FeedForward, TokenMixer};
+pub(crate) use checkpoint::qwen3_next_global_sources;
 pub use checkpoint::{
     composite_safetensors_plan, conditional_load_time_quantization,
     conditional_projector_gguf_plan, conditional_unit_recipes, conditional_with_checkpoint_formats,
@@ -47,18 +54,18 @@ pub use conditional::{
 pub use config::{
     conditional_prompt_cache_architecture_fingerprint, fp8_block_row_widths,
     fused_projection_widths, model_args_from_config_value, model_args_from_gguf_catalog,
-    prompt_cache_architecture_fingerprint, state_layout, state_layout_with_geometry,
+    prompt_cache_architecture_fingerprint, state_layout, state_layout_with_block_configs,
     vision_config_from_gguf_catalog, with_gguf_vision_projector, with_media_token_ids,
-    HybridConfig, HybridConfigError, HybridLayerPolicy, HybridStateGeometry, HybridVariant,
-    ParsedHybridConfig, QwenFp8QuantizationConfig, PREDICTION_STATE_SEGMENT, TARGET_STATE_SEGMENT,
+    HybridConfigError, HybridLayerPolicy, HybridPolicy, HybridVariant, ParsedHybridConfig,
+    QwenFp8QuantizationConfig, PREDICTION_STATE_SEGMENT, TARGET_STATE_SEGMENT,
 };
-pub use linear_attention::recurrent_spec;
 pub use model::{
     state_identity, ForwardContext, LayeredModel, QwenKernel, QwenStaticModules,
     TargetPartitionInput, Unit,
 };
 pub use mtp::{
-    prompt_token_identity, EmbeddedInput, ForwardMode, PredictionShared, PredictionUnit,
+    prompt_token_identity, EmbeddedInput, ForwardMode, PredictionShared, PredictionSharedSpec,
+    PredictionUnit,
 };
 pub(crate) use parallel::routed_conditional_partition_local_geometry;
 pub use parallel::{
@@ -72,22 +79,6 @@ pub use parameters::{
     unit_parallel_parameter_groups,
 };
 pub(crate) use parameters::{select_conditional_definition, select_definition};
-
-/// Derives the complete replicated target/MTP expert plan from normalized geometry.
-pub fn replicated_expert_realization_plan(
-    config: &HybridConfig,
-) -> Result<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>, eredu_nn::Error> {
-    expert_realization_plan(
-        config,
-        None,
-        eredu_core::ParallelRankTopology::new(
-            eredu_core::ParallelTopology::new(1, 1, 1, 1).map_err(eredu_nn::Error::backend)?,
-            0,
-        )
-        .map_err(eredu_nn::Error::backend)?,
-    )?
-    .ok_or_else(|| eredu_nn::Error::backend("Qwen hybrid routed text requires sparse units"))
-}
 
 /// Derives conditional text/MTP expert ownership from neutral policy and optional local geometry.
 pub fn conditional_expert_realization_plan(
@@ -116,16 +107,6 @@ pub fn conditional_expert_realization_plan(
     )
 }
 
-/// Derives the selected text expert bank without constructing native modules.
-pub(crate) fn partition_expert_realization_plan(
-    config: &HybridConfig,
-    geometry: &LocalGeometry,
-    topology: eredu_core::ParallelRankTopology,
-) -> Result<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>, eredu_nn::Error> {
-    expert_realization_plan(config, Some(geometry), topology)?
-        .ok_or_else(|| eredu_nn::Error::backend("Qwen partition has no routed units"))
-}
-
 /// Derives target and MTP bank ownership without a backend type or native resources.
 pub fn expert_realization_plan(
     config: &HybridConfig,
@@ -142,7 +123,12 @@ pub fn expert_realization_plan(
     if !config.is_moe() {
         return Ok(None);
     }
-    let global_experts = usize::try_from(config.num_experts).map_err(eredu_nn::Error::backend)?;
+    let banks = block::expert_bank_specs(config)?;
+    let global_experts = banks
+        .values()
+        .next()
+        .ok_or_else(|| eredu_nn::Error::backend("Qwen hybrid has no declared expert banks"))?
+        .group_count() as usize;
     let local_experts = i32::try_from(
         eredu_core::balanced_contiguous_range(
             global_experts,
@@ -154,40 +140,30 @@ pub fn expert_realization_plan(
         .len(),
     )
     .map_err(eredu_nn::Error::backend)?;
-    let targets = usize::try_from(config.num_hidden_layers).map_err(eredu_nn::Error::backend)?;
-    let predictions =
-        usize::try_from(config.mtp_num_hidden_layers).map_err(eredu_nn::Error::backend)?;
-    let target_group =
-        eredu_runtime::ExecutionGroupId::new("target").map_err(eredu_nn::Error::backend)?;
+    let (schedule, _, layout) = parameters::execution_schedule(config)?;
+    let targets = schedule.unit_count(0)?;
     let mut unit_specs = std::collections::BTreeMap::new();
-    for layer in 0..targets {
-        let local = geometry
-            .and_then(|geometry| geometry.target(layer))
-            .unwrap_or(config);
+    for (layer, bank) in banks {
+        let address = layout
+            .address(layer)
+            .ok_or_else(|| eredu_nn::Error::backend("unresolved Qwen hybrid bank invocation"))?;
+        let local = if address.group() == 0 {
+            geometry.and_then(|geometry| geometry.target(layer))
+        } else {
+            geometry.and_then(|geometry| geometry.prediction(layer - targets))
+        };
+        let width = local.map_or(bank.intermediate_dimensions(), |local| {
+            local.moe_intermediate_size
+        });
         unit_specs.insert(
-            (target_group.clone(), layer),
-            block::localized_expert_bank_spec(
-                config,
-                layer,
-                local_experts,
-                local.moe_intermediate_size,
-            )?,
-        );
-    }
-    for depth in 0..predictions {
-        let local = geometry
-            .and_then(|geometry| geometry.prediction(depth))
-            .unwrap_or(config);
-        let group = eredu_runtime::ExecutionGroupId::new(format!("mtp.{depth}"))
-            .map_err(eredu_nn::Error::backend)?;
-        unit_specs.insert(
-            (group, 0),
-            block::localized_expert_bank_spec(
-                config,
-                targets + depth,
-                local_experts,
-                local.moe_intermediate_size,
-            )?,
+            (
+                layout
+                    .group_id(address.group())
+                    .ok_or_else(|| eredu_nn::Error::backend("unresolved Qwen hybrid bank owner"))?
+                    .clone(),
+                address.index(),
+            ),
+            bank.with_group_geometry(local_experts, width)?,
         );
     }
     crate::ExpertRealizationPlan::balanced(global_experts, topology, unit_specs)
@@ -196,7 +172,7 @@ pub fn expert_realization_plan(
 }
 
 /// Shared static construction consumed by ordinary execution and cold topology.
-pub(crate) fn static_module_spec(config: &HybridConfig) -> crate::decoder::StaticModuleSpec {
+pub(super) fn static_module_spec(config: &HybridPolicy) -> crate::decoder::StaticModuleSpec {
     crate::decoder::StaticModuleSpec {
         normalization_groups: None,
         embedding_weight: "model.embed_tokens.weight".into(),

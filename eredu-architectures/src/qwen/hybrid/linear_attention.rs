@@ -1,5 +1,5 @@
 //! Qwen hybrid parameter identities and formats for the shared recurrent mixer.
-use super::{HybridConfig, HybridVariant};
+use super::{HybridPolicy, HybridVariant};
 use crate::gated_delta::GatedDeltaMixerSpec;
 use eredu_nn::{
     CausalDepthwiseConvolutionSpec, ConvolutionActivation, Error, LinearSpec, OutputGateActivation,
@@ -7,25 +7,14 @@ use eredu_nn::{
 };
 
 /// Declares the rank-local mixer using the family's normalized configuration.
-pub fn recurrent_spec(config: &HybridConfig, layer: usize) -> Result<GatedDeltaMixerSpec, Error> {
-    let key_heads = config.linear_num_key_heads;
-    let value_heads = config.linear_num_value_heads;
-    if key_heads <= 0 || value_heads <= 0 || value_heads % key_heads != 0 {
-        return Err(Error::backend(format!(
-            "invalid rank-local recurrent heads: key={key_heads}, value={value_heads}"
-        )));
-    }
-    let key_width = key_heads
-        .checked_mul(config.linear_key_head_dim)
-        .ok_or_else(|| Error::backend("recurrent key width overflowed"))?;
-    let value_width = value_heads
-        .checked_mul(config.linear_value_head_dim)
-        .ok_or_else(|| Error::backend("recurrent value width overflowed"))?;
-    let qkv_width = key_width
-        .checked_mul(2)
-        .and_then(|width| width.checked_add(value_width))
-        .ok_or_else(|| Error::backend("recurrent QKV width overflowed"))?;
-    let prefix = format!("model.layers.{layer}.linear_attn");
+pub(super) fn recurrent_spec(
+    config: &HybridPolicy,
+    root: &str,
+) -> Result<GatedDeltaMixerSpec, Error> {
+    let geometry = config.recurrent_head_geometry()?;
+    let value_width = geometry.value_width();
+    let qkv_width = geometry.qkv_width()?;
+    let prefix = format!("{root}.linear_attn");
     let parameter = |suffix: &str| {
         ParameterSpec::trainable(format!("{prefix}.{suffix}")).map_err(Error::backend)
     };
@@ -48,14 +37,21 @@ pub fn recurrent_spec(config: &HybridConfig, layer: usize) -> Result<GatedDeltaM
     };
     let dense_ba = config.variant == HybridVariant::Qwen3Next && config.fp8.is_some();
     let spec = GatedDeltaMixerSpec {
-        key_heads,
-        value_heads,
-        key_head_dim: config.linear_key_head_dim,
-        value_head_dim: config.linear_value_head_dim,
+        geometry,
         input_qkv: linear("in_proj_qkv", config.hidden_size, qkv_width, false)?,
         input_gate: linear("in_proj_z", config.hidden_size, value_width, false)?,
-        input_beta: linear("in_proj_b", config.hidden_size, value_heads, dense_ba)?,
-        input_decay: linear("in_proj_a", config.hidden_size, value_heads, dense_ba)?,
+        input_beta: linear(
+            "in_proj_b",
+            config.hidden_size,
+            geometry.value_heads(),
+            dense_ba,
+        )?,
+        input_decay: linear(
+            "in_proj_a",
+            config.hidden_size,
+            geometry.value_heads(),
+            dense_ba,
+        )?,
         convolution: CausalDepthwiseConvolutionSpec {
             arithmetic: eredu_nn::ConvolutionArithmetic::Native,
             channels: qkv_width,

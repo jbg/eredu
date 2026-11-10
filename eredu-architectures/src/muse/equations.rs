@@ -1,11 +1,17 @@
 //! Parameterized Muse normalization and residual equations.
 
 use eredu_nn::{
-    Error, NeuralBackend, NormalizationOperator, Parameter, ParameterSpec, Parameterized, Tensor,
-    TensorElementType,
+    DeclareLogicalParameters, Error, NeuralBackend, NormalizationOperator, Parameter,
+    Parameterized, Tensor, TensorElementType,
 };
 
 use super::WeightConvention;
+
+/// Typed family construction declarations and logical scalar parameter visitors.
+pub mod specs;
+use specs::{
+    BranchNormSpec, LearnedResidualSpec, LearnedRmsNormSpec, ResidualSpec, StoredResidualSpec,
+};
 
 /// Meaning of an independently stored normalization gain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +40,21 @@ pub enum RmsNormEquation {
     InputScaledFp32(RmsGain),
 }
 
+impl RmsNormEquation {
+    /// Meaning of the stored gain under this exact equation.
+    pub const fn gain(self) -> RmsGain {
+        match self {
+            Self::OutputScaled(convention)
+            | Self::OutputScaledFp32(convention)
+            | Self::InputScaled(convention) => match convention {
+                WeightConvention::HuggingFace => RmsGain::Centered,
+                WeightConvention::Gguf => RmsGain::Direct,
+            },
+            Self::OutputScaledComputeFp32(gain) | Self::InputScaledFp32(gain) => gain,
+        }
+    }
+}
+
 /// RMS normalization with an authoritative, replaceable scale parameter.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
@@ -49,17 +70,11 @@ pub struct LearnedRmsNorm<B: NeuralBackend> {
 impl<B: NeuralBackend> LearnedRmsNorm<B> {
     /// Constructs an unloaded normalization parameter.
     pub fn new(
-        dimensions: i32,
-        epsilon: f32,
-        equation: RmsNormEquation,
-        name: impl Into<String>,
+        spec: LearnedRmsNormSpec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        if dimensions <= 0 || !epsilon.is_finite() || epsilon <= 0.0 {
-            return Err(Error::backend(
-                "Muse RMS normalization requires positive width and epsilon",
-            ));
-        }
+        spec.logical_parameters()?;
+        let equation = spec.equation;
         if !matches!(equation, RmsNormEquation::OutputScaled(_)) {
             B::require_operator_capabilities(
                 "ordered RMS normalization",
@@ -69,11 +84,11 @@ impl<B: NeuralBackend> LearnedRmsNorm<B> {
         }
         Ok(Self {
             weight: Parameter::unloaded(
-                ParameterSpec::trainable(name.into()).map_err(Error::backend)?,
-                &[dimensions],
+                spec.weight().clone(),
+                &[spec.normalization.dimensions],
                 context,
             )?,
-            epsilon,
+            epsilon: spec.normalization.epsilon,
             equation,
         })
     }
@@ -84,16 +99,7 @@ impl<B: NeuralBackend> LearnedRmsNorm<B> {
         input: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let gain = match self.equation {
-            RmsNormEquation::OutputScaled(convention)
-            | RmsNormEquation::OutputScaledFp32(convention)
-            | RmsNormEquation::InputScaled(convention) => match convention {
-                WeightConvention::HuggingFace => RmsGain::Centered,
-                WeightConvention::Gguf => RmsGain::Direct,
-            },
-            RmsNormEquation::OutputScaledComputeFp32(gain)
-            | RmsNormEquation::InputScaledFp32(gain) => gain,
-        };
+        let gain = self.equation.gain();
         match self.equation {
             RmsNormEquation::OutputScaled(_) => {
                 // Retain the backend's established output-normalization arithmetic.
@@ -242,6 +248,18 @@ pub enum BranchNorm<B: NeuralBackend> {
 }
 
 impl<B: NeuralBackend> BranchNorm<B> {
+    /// Materializes the declared branch without inferring parameters from execution.
+    pub fn new(
+        spec: BranchNormSpec,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        spec.logical_parameters()?;
+        match spec {
+            BranchNormSpec::Learned(spec) => LearnedRmsNorm::new(spec, context).map(Self::Learned),
+            BranchNormSpec::Weightless { epsilon } => Ok(Self::Weightless { epsilon }),
+        }
+    }
+
     /// Returns the learned normalization when this branch declares a scale.
     pub fn learned(&self) -> Option<&LearnedRmsNorm<B>> {
         match self {
@@ -284,6 +302,23 @@ pub enum ResidualCombination<B: NeuralBackend> {
 }
 
 impl<B: NeuralBackend> ResidualCombination<B> {
+    /// Materializes exactly the declared learned, stored, or absent coefficients.
+    pub fn new(
+        spec: ResidualSpec,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        spec.logical_parameters()?;
+        match spec {
+            ResidualSpec::Add => Ok(Self::Add),
+            ResidualSpec::Learned(spec) => {
+                LearnedResidualCombination::new(spec, context).map(Self::Learned)
+            }
+            ResidualSpec::Stored(spec) => {
+                StoredResidualCombination::new(spec, context).map(Self::Stored)
+            }
+        }
+    }
+
     /// Combines the branch and residual using the declared arithmetic.
     pub fn forward(
         &mut self,
@@ -312,27 +347,17 @@ pub struct StoredResidualCombination<B: NeuralBackend> {
 impl<B: NeuralBackend> StoredResidualCombination<B> {
     /// Constructs independent, replaceable coefficient parameters.
     pub fn new(
-        dimensions: i32,
-        prefix: &str,
+        spec: StoredResidualSpec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        if dimensions <= 0 {
-            return Err(Error::backend("Muse residual width must be positive"));
-        }
+        spec.logical_parameters()?;
         B::require_operator_capabilities(
             "FP32 residual coefficients",
             eredu_nn::NeuralOperatorCapabilities::CAST_FLOAT,
         )?;
-        let parameter = |suffix| {
-            Parameter::unloaded(
-                ParameterSpec::trainable(format!("{prefix}.{suffix}")).map_err(Error::backend)?,
-                &[dimensions],
-                context,
-            )
-        };
         Ok(Self {
-            alpha: parameter("alpha")?,
-            beta: parameter("beta")?,
+            alpha: Parameter::unloaded(spec.alpha, &[spec.dimensions], context)?,
+            beta: Parameter::unloaded(spec.beta, &[spec.dimensions], context)?,
         })
     }
 
@@ -410,22 +435,10 @@ pub struct LearnedResidualCombination<B: NeuralBackend> {
 impl<B: NeuralBackend> LearnedResidualCombination<B> {
     /// Constructs an unloaded residual gate with explicit temperature and clamp.
     pub fn new(
-        dimensions: i32,
-        temperature: f32,
-        minimum_variance: f32,
-        name: impl Into<String>,
+        spec: LearnedResidualSpec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        if dimensions <= 0
-            || !temperature.is_finite()
-            || temperature <= 0.0
-            || !minimum_variance.is_finite()
-            || minimum_variance <= 0.0
-        {
-            return Err(Error::backend(
-                "Muse residual combination requires positive width, temperature, and clamp",
-            ));
-        }
+        spec.logical_parameters()?;
         B::require_operator_capabilities(
             "learned residual combination",
             eredu_nn::NeuralOperatorCapabilities::CAST_FLOAT
@@ -434,13 +447,9 @@ impl<B: NeuralBackend> LearnedResidualCombination<B> {
                 .union(eredu_nn::NeuralOperatorCapabilities::FULL_F32),
         )?;
         Ok(Self {
-            gate: Parameter::unloaded(
-                ParameterSpec::trainable(name.into()).map_err(Error::backend)?,
-                &[dimensions],
-                context,
-            )?,
-            temperature,
-            minimum_variance,
+            gate: Parameter::unloaded(spec.gate, &[spec.dimensions], context)?,
+            temperature: spec.temperature,
+            minimum_variance: spec.minimum_variance,
         })
     }
 

@@ -61,34 +61,15 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> MuseKernel<B>
         let vision_active = vision_input.is_some();
         let (vision_hidden, vision) = match vision_input {
             Some(input) => {
-                let config = self.args.vision_config.as_ref().ok_or_else(|| {
+                let vision = self.static_modules.vision.as_mut().ok_or_else(|| {
                     Error::backend("Muse input requires an admitted vision tower")
                 })?;
-                eredu_nn::sequence_layout::validate_patch_grid(
-                    input.grid,
-                    config.merge_size,
-                    Some(input.pixels.dim(0)),
-                )
-                .map_err(Error::backend)?;
-                if input.pixels.shape().len() != 2
-                    || input.pixels.dim(1)
-                        != config.temporal_patch_size * 3 * config.patch_size * config.patch_size
-                {
-                    return Err(Error::backend(
-                        "Muse vision input has incompatible patch geometry",
-                    ));
-                }
-                match self
-                    .static_modules
-                    .vision
-                    .as_mut()
-                    .filter(|vision| vision.has_parameters())
-                {
-                    Some(vision) => {
-                        let (hidden, state) = vision.begin(input, context)?;
-                        (Some(hidden), Some(state))
-                    }
-                    None => (None, None),
+                if vision.has_parameters() {
+                    let (hidden, state) = vision.begin(input, context)?;
+                    (Some(hidden), Some(state))
+                } else {
+                    vision.validate_input(&input)?;
+                    (None, None)
                 }
             }
             None => (None, None),

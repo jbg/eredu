@@ -226,13 +226,13 @@ fn materialize(
     detached_preparation(
         Vec::<Array>::new(),
         || {
-            let (dimensions, definition, local_layout, layout, source, units) =
-                prepared.into_parts();
+            let (declaration, local_layout, layout, source, units) = prepared.into_parts();
+            let definition = declaration.definition().clone();
             let kernel = match local_layout.as_ref() {
                 Some(local) => {
-                    RnntKernel::<MlxNeuralBackend, false>::new_parallel(dimensions, local)
+                    RnntKernel::<MlxNeuralBackend, false>::new_parallel(declaration, local)
                 }
-                None => RnntKernel::<MlxNeuralBackend, false>::new(dimensions),
+                None => RnntKernel::<MlxNeuralBackend, false>::new(declaration),
             }
             .map_err(BackendFailure::from_error)?;
             let mut architecture = eredu_runtime::ComponentAdapter::new(definition, kernel)

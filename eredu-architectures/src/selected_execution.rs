@@ -304,11 +304,20 @@ pub trait SelectedExecutionDispatcher: Sized {
 pub struct SelectedExecution {
     kind: Box<SelectedExecutionKind>,
     authored_projection: Option<Arc<SelectedQwen4Construction>>,
+    pub(crate) prediction_parameters:
+        Option<Arc<crate::prediction_extension::SelectedPredictionParameters>>,
     pub(crate) input_score_attention_workspace:
         Option<eredu_runtime::memory_estimation::InputScoreAttentionMechanism>,
 }
 
 impl SelectedExecution {
+    /// Independently owned executable prediction parameters selected before allocation.
+    pub fn prediction_parameters(
+        &self,
+    ) -> Option<&Arc<crate::prediction_extension::SelectedPredictionParameters>> {
+        self.prediction_parameters.as_ref()
+    }
+
     fn authored_layout(
         &self,
         parameters: &eredu_runtime::ArchitectureParameterDescription,
@@ -561,6 +570,7 @@ impl SelectedExecution {
             kind: Box::new(SelectedExecutionKind::Replicated(selected)),
             input_score_attention_workspace: None,
             authored_projection: None,
+            prediction_parameters: None,
         }
     }
 
@@ -569,6 +579,7 @@ impl SelectedExecution {
             kind: Box::new(SelectedExecutionKind::Routed(selected)),
             input_score_attention_workspace: None,
             authored_projection: None,
+            prediction_parameters: None,
         }
     }
 
@@ -577,6 +588,7 @@ impl SelectedExecution {
             kind: Box::new(SelectedExecutionKind::Composite(selected)),
             input_score_attention_workspace: None,
             authored_projection: None,
+            prediction_parameters: None,
         }
     }
 
@@ -585,6 +597,7 @@ impl SelectedExecution {
             kind: Box::new(SelectedExecutionKind::PartitionedDense(selected)),
             input_score_attention_workspace: None,
             authored_projection: None,
+            prediction_parameters: None,
         }
     }
 
@@ -593,6 +606,7 @@ impl SelectedExecution {
             kind: Box::new(SelectedExecutionKind::PartitionedRouted(selected)),
             input_score_attention_workspace: None,
             authored_projection: None,
+            prediction_parameters: None,
         }
     }
 
@@ -601,6 +615,7 @@ impl SelectedExecution {
             kind: Box::new(SelectedExecutionKind::PartitionedComposite(selected)),
             input_score_attention_workspace: None,
             authored_projection: None,
+            prediction_parameters: None,
         }
     }
 
@@ -677,6 +692,24 @@ impl SelectedExecution {
         }
     }
 
+    /// Projects ordinary cache bytes from the same selected state used by construction.
+    pub(crate) fn rank_attention_cache_bytes_per_position(&self) -> Result<u64, String> {
+        let state = self.text_realization().state();
+        match self.partitioned_ownership() {
+            Some((_, rank)) => match rank.state() {
+                Some(partition) => state
+                    .for_partitioned_geometry(partition)
+                    .map_err(|error| error.to_string())?
+                    .attention_cache_bytes_per_position()
+                    .map_err(|error| error.to_string()),
+                None => Ok(0),
+            },
+            None => state
+                .attention_cache_bytes_per_position()
+                .map_err(|error| error.to_string()),
+        }
+    }
+
     /// Complete unsharded executable parameter accounting from retained tasks.
     /// The artifact resource profile describes the model before rank replication;
     /// native session reports separately account for the selected local placement.
@@ -697,7 +730,7 @@ impl SelectedExecution {
 
     fn bank_parameter_targets(&self) -> (BTreeSet<String>, BTreeSet<String>) {
         let routed = self.routed_realization();
-        let bank_targets = routed
+        let mut bank_targets = routed
             .into_iter()
             .flat_map(|selected| selected.banks().values())
             .flat_map(|bank| bank.addressable_members())
@@ -714,6 +747,9 @@ impl SelectedExecution {
         } else {
             BTreeSet::new()
         };
+        if let Some(prediction) = self.prediction_parameters() {
+            bank_targets.extend(prediction.routed_parameters());
+        }
         (bank_targets, excluded)
     }
 
@@ -739,9 +775,18 @@ impl SelectedExecution {
     >(
         &self,
         source: &C,
-        layout: Option<&eredu_runtime::LocalModelLayout>,
         mechanisms: &impl crate::PreparationMechanismProvider,
     ) -> Result<eredu_core::ParameterMaterializationWorkspace, String> {
+        // Component routes retain global parameters and project their rank here.
+        // Prepared-source routes already retain rank cuts in their exact recipes.
+        let local_layout = self
+            .parallel_topology()
+            .zip(self.text_realization().executable_component())
+            .map(|(rank, definition)| {
+                eredu_runtime::derive_partitioned_local_layout(definition.parameters(), rank)
+            })
+            .transpose()?;
+        let layout = local_layout.as_ref();
         let (_, independent) = self.bank_parameter_targets();
         let tasks = match self.kind.as_ref() {
             SelectedExecutionKind::PartitionedDense(selected) => selected.materialization_tasks(),
@@ -768,39 +813,68 @@ impl SelectedExecution {
         };
         let mut conversion_outputs = 0u64;
         let mut conversion_source_peak = 0u64;
-        let mut ordinary_groups = Vec::<(eredu_runtime::ReplicatedTextParameterOwner, u64)>::new();
+        #[derive(PartialEq, Eq)]
+        enum WorkspaceOwner {
+            Primary(eredu_runtime::ReplicatedTextParameterOwner),
+            Auxiliary(eredu_runtime::AuxiliaryModuleResidency),
+        }
+        let mut ordinary_groups = Vec::<(WorkspaceOwner, u64)>::new();
         let mut record_group = |task: &eredu_runtime::ReplicatedTextMaterializationTask,
                                 bytes: u64|
          -> Result<(), String> {
+            let owner = match task.auxiliary_residency() {
+                Some(owner) => WorkspaceOwner::Auxiliary(owner.clone()),
+                None => WorkspaceOwner::Primary(task.owner().clone()),
+            };
             if let Some((_, total)) = ordinary_groups
                 .iter_mut()
-                .find(|(owner, _)| owner == task.owner())
+                .find(|(previous, _)| previous == &owner)
             {
                 *total = total
                     .checked_add(bytes)
                     .ok_or("native group workspace overflow")?;
             } else {
-                ordinary_groups.push((task.owner().clone(), bytes));
+                ordinary_groups.push((owner, bytes));
             }
             Ok(())
         };
-        let target =
-            |task: &eredu_runtime::ReplicatedTextMaterializationTask| -> Result<String, String> {
-                std::iter::once(task.name())
-                    .chain(task.aliases().iter().map(String::as_str))
-                    .find(|name| layout.is_none_or(|layout| layout.contains(name)))
-                    .map(str::to_owned)
-                    .ok_or_else(|| format!("missing local target {}", task.name()))
-            };
-        for task in tasks
+        let target = |task: &eredu_runtime::ReplicatedTextMaterializationTask,
+                      task_layout: Option<&eredu_runtime::LocalModelLayout>|
+         -> Result<String, String> {
+            std::iter::once(task.name())
+                .chain(task.aliases().iter().map(String::as_str))
+                .find(|name| task_layout.is_none_or(|layout| layout.contains(name)))
+                .map(str::to_owned)
+                .ok_or_else(|| format!("missing local target {}", task.name()))
+        };
+        if !self
+            .text_realization()
+            .auxiliary_materialization_tasks()
+            .is_empty()
+            && self.prediction_parameters().is_none()
+        {
+            return Err("auxiliary workspace has no retained prediction declaration".into());
+        }
+        let prediction_tasks = self
+            .prediction_parameters()
+            .into_iter()
+            .flat_map(|prediction| {
+                prediction
+                    .tasks()
+                    .iter()
+                    .map(move |task| (task, layout.map(|_| prediction.layout().as_ref())))
+            });
+        for (task, task_layout) in tasks
             .iter()
-            .filter(|task| !independent.contains(task.name()))
+            .map(|task| (task, layout))
+            .chain(prediction_tasks)
+            .filter(|(task, _)| !independent.contains(task.name()))
         {
             let recipe = eredu_runtime::placed_source_recipe(
                 &task.source_recipe().map_err(|error| error.to_string())?,
-                &target(task)?,
+                &target(task, task_layout)?,
                 source,
-                layout,
+                task_layout,
                 false,
             )?;
             let native_peak = mechanisms.recipe_materialization_workspace(&recipe, source)?;
@@ -824,9 +898,9 @@ impl SelectedExecution {
                 if let Some(task) = companion.materialization_task() {
                     let recipe = eredu_runtime::placed_source_recipe(
                         &task.source_recipe().map_err(|error| error.to_string())?,
-                        &target(task)?,
+                        &target(task, task_layout)?,
                         source,
-                        layout,
+                        task_layout,
                         false,
                     )?;
                     record_group(
@@ -864,7 +938,7 @@ impl SelectedExecution {
                         let mut native_retained = 0u64;
                         for parameter in member.parameters() {
                             let task = parameter.task();
-                            let name = target(task)?;
+                            let name = target(task, layout)?;
                             if let Some(tensor) = layout.and_then(|layout| layout.tensor(&name)) {
                                 if tensor.additional_placements().iter().chain(std::iter::once(tensor.placement())).any(|p| matches!(p, eredu_runtime::TensorPlacement::Range { axis: 0, start, end } if !( *start..*end).contains(&member.key().member()))) { continue; }
                             }
@@ -936,7 +1010,6 @@ impl SelectedExecution {
     /// target's pipeline and expert axes, independently of target storage ownership.
     pub fn partition_parameter_resources(
         &self,
-        parameters: &eredu_runtime::ArchitectureParameterDescription,
     ) -> Result<
         Option<(
             eredu_runtime::SelectedParameterResources,
@@ -947,6 +1020,8 @@ impl SelectedExecution {
         let Some(rank) = self.parallel_topology() else {
             return Ok(None);
         };
+        let definition = crate::replicated_text::executable_component(self.text_realization())?;
+        let parameters = definition.parameters();
         let layout = eredu_runtime::derive_partitioned_local_layout(parameters, rank)?;
         let (routed, independent) = self.bank_parameter_targets();
         fn size<R, Q>(
@@ -990,19 +1065,20 @@ impl SelectedExecution {
         };
         let auxiliary = self.text_realization().auxiliary_materialization_tasks();
         if !auxiliary.is_empty() {
-            let prediction_rank = crate::prediction_extension::tensor_rank(rank)
-                .map_err(|error| error.to_string())?;
-            let prediction_layout =
-                eredu_runtime::derive_partitioned_local_layout(parameters, prediction_rank)?;
-            let owned = parameters
+            let prediction = self
+                .prediction_parameters()
+                .ok_or("auxiliary tasks have no retained executable prediction declaration")?;
+            let owned = prediction
+                .definition()
+                .parameters()
                 .groups()
                 .iter()
                 .flat_map(|group| group.members())
                 .map(|member| member.target().to_owned())
                 .collect();
             let auxiliary = eredu_runtime::selected_parameter_resources_for_layout(
-                auxiliary,
-                &prediction_layout,
+                prediction.tasks(),
+                prediction.layout(),
                 &owned,
                 &routed,
                 &BTreeSet::new(),

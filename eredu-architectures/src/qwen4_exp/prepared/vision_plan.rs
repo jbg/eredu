@@ -43,7 +43,7 @@ impl GgufVisionSourcePlan {
 /// Token-independent projector geometry, recipes and exact physical source identities.
 #[derive(Clone)]
 struct VisionDeclaration {
-    config: VisionConfig,
+    scopes: Arc<vision::Declaration>,
     expected: BTreeMap<String, PreparedTensorSource>,
     physical: BTreeMap<String, ReplicatedTextPhysicalSource>,
     recipes: BTreeMap<String, DerivedWeightRecipe>,
@@ -129,8 +129,7 @@ impl VisionPlan {
                 };
                 Ok((key, PreparedTensorSource { metadata, provenance }))
             }).collect::<Result<BTreeMap<_, _>, StoreError>>()?;
-        let checkpoint = vision::safetensors_plan(&config, "model.visual")
-            .map_err(PreparationError::Contract)?;
+        let checkpoint = vision::safetensors_plan(&config).map_err(PreparationError::Contract)?;
         resolve_safetensors_plan(&expected, &checkpoint).map_err(|error| {
             PreparationError::Contract(format!("vision contract did not resolve: {error:?}"))
         })?;
@@ -149,13 +148,13 @@ impl VisionPlan {
     }
 
     fn new(
-        config: VisionConfig,
+        scopes: Arc<vision::Declaration>,
         media: MediaTokens,
         expected: BTreeMap<String, PreparedTensorSource>,
         recipes: BTreeMap<String, DerivedWeightRecipe>,
     ) -> Result<Self, PreparationError> {
         Ok(Self {
-            declaration: VisionDeclaration::new(config, expected, recipes)?,
+            declaration: VisionDeclaration::new(scopes, expected, recipes)?,
             processor: None,
             media,
             gguf: None,
@@ -168,7 +167,7 @@ impl VisionPlan {
         target: &Config,
         ngram_image_token: Option<u32>,
     ) -> Result<(), PreparationError> {
-        validate_target_geometry(&self.declaration.config, target)?;
+        validate_target_geometry(&self.declaration.scopes, target)?;
         validate_media_tokens(&self.media, target, ngram_image_token)
     }
 
@@ -213,11 +212,15 @@ impl VisionPlan {
                 field: "processor media framing",
             });
         }
-        validate_processor(&self.declaration.config, self.processor.as_ref())
+        validate_processor(&self.declaration.scopes, self.processor.as_ref())
     }
     /// Exact shared vision equations and per-matrix encodings.
     pub fn config(&self) -> &VisionConfig {
-        &self.declaration.config
+        &self.declaration.scopes
+    }
+    /// Immutable construction scopes retained by source admission.
+    pub fn scopes(&self) -> &Arc<vision::Declaration> {
+        &self.declaration.scopes
     }
     /// Original token IDs supplied by target policy.
     pub fn media_tokens(&self) -> &MediaTokens {
@@ -316,7 +319,7 @@ fn validate_target_geometry(
         });
     }
     if let Some(expected) = &target.vision {
-        let mut expected = expected.clone();
+        let mut expected = expected.config().clone();
         expected.linear_formats.clear();
         let mut actual = config.clone();
         actual.linear_formats.clear();
@@ -369,11 +372,11 @@ fn validate_processor(
 
 impl VisionDeclaration {
     fn new(
-        config: VisionConfig,
+        scopes: Arc<vision::Declaration>,
         expected: BTreeMap<String, PreparedTensorSource>,
         recipes: BTreeMap<String, DerivedWeightRecipe>,
     ) -> Result<Self, PreparationError> {
-        config
+        scopes
             .validate_for(VisionMode::DeepStack)
             .map_err(|error| PreparationError::Contract(error.to_string()))?;
         let physical = expected
@@ -400,7 +403,7 @@ impl VisionDeclaration {
             .filter(|(key, _)| !key.starts_with("model.visual.blocks."))
             .map(|(key, recipe)| (key.clone(), recipe.clone()))
             .collect();
-        let blocks = (0..config.layer_count())
+        let blocks = (0..scopes.layer_count())
             .map(|layer| {
                 let prefix = format!("model.visual.blocks.{layer}.");
                 recipes
@@ -411,7 +414,7 @@ impl VisionDeclaration {
             })
             .collect();
         let plan = Self {
-            config,
+            scopes,
             expected,
             physical,
             recipes,
@@ -471,7 +474,8 @@ impl GgufVisionPlan {
         )
         .map_err(|e| invalid(e.to_string()))?;
         validate_target_geometry(&config, target)?;
-        let plan = vision::gguf_plan(&config, target.hidden_size).map_err(invalid)?;
+        let scopes = Arc::new(vision::Declaration::new(config.clone(), "model.visual")?);
+        let plan = vision::gguf_plan(&scopes).map_err(invalid)?;
         for shard in checkpoint.shards() {
             for tensor in shard.tensors() {
                 let name = vision::translate_gguf_weight_name(&tensor.descriptor().name, &[]);
@@ -556,7 +560,8 @@ impl GgufVisionPlan {
             resolution,
             catalog,
         };
-        let declaration = VisionDeclaration::new(config, expected, recipes)?;
+        let scopes = Arc::new(scopes.with_formats(config)?);
+        let declaration = VisionDeclaration::new(scopes, expected, recipes)?;
         let mut vision = Self {
             target: target.clone(),
             declaration,
@@ -574,7 +579,7 @@ impl GgufVisionPlan {
             )
             .map_err(|e| PreparationError::Contract(e.to_string()))?;
             vision.processor = Some(processor);
-            validate_processor(&vision.declaration.config, vision.processor.as_ref())?;
+            validate_processor(&vision.declaration.scopes, vision.processor.as_ref())?;
         }
         Ok(vision)
     }
@@ -585,7 +590,11 @@ impl GgufVisionPlan {
     }
     /// Exact shared vision equations and per-matrix encodings.
     pub fn config(&self) -> &VisionConfig {
-        &self.declaration.config
+        &self.declaration.scopes
+    }
+    /// Immutable construction scopes retained before media token binding.
+    pub fn scopes(&self) -> &Arc<vision::Declaration> {
+        &self.declaration.scopes
     }
     /// Retained host processor policy; framing IDs have not yet been bound.
     pub fn processor(&self) -> Option<&crate::processor_plan::QwenProcessorPlan> {

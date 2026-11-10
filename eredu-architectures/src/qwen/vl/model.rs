@@ -1085,6 +1085,12 @@ pub type LayeredModel<B> = eredu_runtime::ComponentAdapter<
 /// Qwen3-VL equations, media geometry and typed resource factories.
 pub struct VlKernel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     args: ModelArgs,
+    declaration: std::sync::Arc<super::Declaration>,
+    vision_construction: std::collections::BTreeMap<usize, crate::qwen::vision::BlockSpec>,
+    text_construction: std::collections::BTreeMap<
+        usize,
+        crate::decoder::PreparedDecoderBody<qwen::FeedForwardParameters>,
+    >,
     definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
     owns_input: bool,
     static_modules: StaticModules<B>,
@@ -1129,10 +1135,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> eredu_runtime
         std::collections::BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
         String,
     > {
-        crate::static_parameters::module_recipes(
-            &self.static_modules,
-            super::static_recipes(source),
-        )
+        Ok(super::static_recipes(source))
     }
     fn build_unit(
         &self,
@@ -1360,26 +1363,26 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> VlKernel<B> {
 
     /// Builds all canonical pinned resources from a validated declaration.
     pub fn from_definition(
-        args: ModelArgs,
+        declaration: std::sync::Arc<super::Declaration>,
         definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredModel<B>, Error> {
-        Self::materialize(args, definition, None, None, context)
+        Self::materialize(declaration, definition, None, None, context)
     }
 
     /// Builds complete planner-derived text and vision modules.
     pub fn from_parallel_definition(
-        args: ModelArgs,
+        declaration: std::sync::Arc<super::Declaration>,
         definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         geometry: LocalGeometry,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredModel<B>, Error> {
-        Self::materialize(args, definition, Some(geometry), None, context)
+        Self::materialize(declaration, definition, Some(geometry), None, context)
     }
 
     /// Materializes exactly the pinned roots and factories owned by a cold partition.
     pub fn from_partition(
-        args: ModelArgs,
+        declaration: std::sync::Arc<super::Declaration>,
         definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         geometry: LocalGeometry,
         partition: &eredu_runtime::ArchitecturePartition<
@@ -1388,11 +1391,17 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> VlKernel<B> {
         >,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredModel<B>, Error> {
-        Self::materialize(args, definition, Some(geometry), Some(partition), context)
+        Self::materialize(
+            declaration,
+            definition,
+            Some(geometry),
+            Some(partition),
+            context,
+        )
     }
 
     fn materialize(
-        args: ModelArgs,
+        declaration: std::sync::Arc<super::Declaration>,
         definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         geometry: Option<LocalGeometry>,
         partition: Option<
@@ -1403,7 +1412,18 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> VlKernel<B> {
         >,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredModel<B>, Error> {
-        let definition = super::select_definition(&args, definition, geometry.as_ref())?;
+        let args = declaration.args().clone();
+        let definition = super::select_definition(&declaration, definition, geometry.as_ref())?;
+        let text_construction = Self::prepare_text_scopes(
+            &declaration,
+            geometry.as_ref(),
+            partition.map(|p| p.local_geometry()),
+        )?;
+        let vision_construction = Self::prepare_vision_scopes(
+            &declaration,
+            geometry.as_ref(),
+            partition.map(|p| p.local_geometry()),
+        )?;
         let ownership = if let Some(partition) = partition {
             super::PartitionLocalFoundation::from_partition(&args, partition)
                 .map_err(Error::backend_source)?;
@@ -1412,7 +1432,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> VlKernel<B> {
             })?;
             partition
                 .local_geometry()
-                .validate_complete_geometry(&args, complete)
+                .validate_complete_geometry(&declaration, complete)
                 .map_err(Error::backend_source)?;
             Some(definition.select_partition(partition)?)
         } else {
@@ -1422,8 +1442,12 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> VlKernel<B> {
             "Qwen3-VL",
             crate::operator_requirements::QWEN_VL,
         )?;
-        let text = crate::decoder::PartitionStaticModules::<B>::from_selected_spec(
-            crate::decoder::StaticModuleSpec::from_config(&args.text),
+        let text = crate::decoder::PartitionStaticModules::<B>::from_selected_construction(
+            declaration
+                .text_declaration()
+                .common()
+                .static_construction()
+                .clone(),
             geometry.as_ref().map(|geometry| {
                 (
                     geometry.text().embedding_range().clone(),
@@ -1440,16 +1464,15 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> VlKernel<B> {
         )?;
         let selection = match partition {
             Some(partition) => crate::qwen::vision::VisionStaticSelection::from_parameter_bindings(
-                args.vision.clone(),
-                "model.visual",
+                declaration.vision_declaration().clone(),
                 eredu_runtime::ExecutionGroupId::new(VISION_EXECUTION_GROUP)
                     .map_err(Error::backend_source)?,
                 "vision",
                 partition.parameter_bindings(),
             ),
-            None => {
-                crate::qwen::vision::VisionStaticSelection::all(args.vision.clone(), "model.visual")
-            }
+            None => crate::qwen::vision::VisionStaticSelection::all(
+                declaration.vision_declaration().clone(),
+            ),
         }
         .map_err(Error::backend_source)?;
         let complete_widths;
@@ -1465,6 +1488,9 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> VlKernel<B> {
         let vision = VisionStatic::from_selection(selection, widths, context)?;
         let kernel = Self {
             args,
+            declaration,
+            text_construction,
+            vision_construction,
             definition: std::sync::Arc::clone(&definition),
             owns_input: partition.is_none_or(|partition| partition.ownership().owns_input()),
             static_modules: StaticModules { text, vision },
@@ -1493,7 +1519,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> VlKernel<B> {
             .map_err(Error::backend_source)?;
         if let Some(complete) = self.parallel_geometry.as_deref() {
             geometry
-                .validate_complete_geometry(&self.args, complete)
+                .validate_complete_geometry(&self.declaration, complete)
                 .map_err(Error::backend_source)?;
         }
         if self
@@ -1505,6 +1531,16 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> VlKernel<B> {
                 "Qwen3-VL retained partition geometry is incompatible",
             ));
         }
+        self.vision_construction = Self::prepare_vision_scopes(
+            &self.declaration,
+            self.parallel_geometry.as_deref(),
+            Some(&geometry),
+        )?;
+        self.text_construction = Self::prepare_text_scopes(
+            &self.declaration,
+            self.parallel_geometry.as_deref(),
+            Some(&geometry),
+        )?;
         self.partition_geometry = Some(std::sync::Arc::new(geometry));
         Ok(self)
     }
@@ -1543,6 +1579,62 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> VlKernel<B> {
         self.parallel_geometry.as_ref().map(std::sync::Arc::clone)
     }
 
+    fn prepare_vision_scopes(
+        declaration: &super::Declaration,
+        geometry: Option<&LocalGeometry>,
+        partition: Option<&super::PartitionLocalGeometry>,
+    ) -> Result<std::collections::BTreeMap<usize, crate::qwen::vision::BlockSpec>, Error> {
+        (0..declaration.vision.layer_count())
+            .filter(|&layer| partition.is_none_or(|p| p.vision_block(layer).is_some()))
+            .map(|layer| {
+                let (heads, intermediate) = partition
+                    .and_then(|p| p.vision_block(layer))
+                    .or_else(|| geometry.and_then(|g| g.vision_block(layer)))
+                    .unwrap_or((
+                        declaration.vision.num_heads,
+                        declaration.vision.intermediate_size,
+                    ));
+                Ok((
+                    layer,
+                    declaration
+                        .vision_declaration()
+                        .local_block(layer, heads, intermediate)?,
+                ))
+            })
+            .collect()
+    }
+
+    fn prepare_text_scopes(
+        declaration: &super::Declaration,
+        geometry: Option<&LocalGeometry>,
+        partition: Option<&super::PartitionLocalGeometry>,
+    ) -> Result<
+        std::collections::BTreeMap<
+            usize,
+            crate::decoder::PreparedDecoderBody<qwen::FeedForwardParameters>,
+        >,
+        Error,
+    > {
+        (0..declaration.text.num_hidden_layers as usize)
+            .filter(|&layer| partition.is_none_or(|p| p.text_block(layer).is_some()))
+            .map(|layer| {
+                let local = partition
+                    .and_then(|p| p.text_block(layer))
+                    .or_else(|| geometry.and_then(|g| g.text().block(layer)))
+                    .unwrap_or(&declaration.text);
+                let scope =
+                    crate::decoder::prepare_retained_body::<B, _, qwen::RoutedQwenBlockFactory>(
+                        &declaration.text,
+                        local,
+                        layer,
+                        declaration.text_declaration().common(),
+                        declaration.text_declaration().projections(),
+                    )?;
+                Ok((layer, scope))
+            })
+            .collect()
+    }
+
     fn construct_unit(
         &self,
         address: eredu_runtime::ExecutionUnitAddress,
@@ -1551,26 +1643,14 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> VlKernel<B> {
         let (group, index) = (address.group(), address.index());
         match group {
             0 => {
-                let geometry = self
-                    .parallel_geometry
-                    .as_ref()
-                    .and_then(|geometry| geometry.vision_block(index));
-                Ok(Unit::Vision(match geometry {
-                    Some((heads, intermediate)) => VisionBlock::new_parallel_with_root(
-                        &self.args.vision,
-                        "model.visual",
-                        index,
-                        heads,
-                        intermediate,
-                        context,
-                    )?,
-                    None => VisionBlock::new_with_root(
-                        &self.args.vision,
-                        "model.visual",
-                        index,
-                        context,
-                    )?,
-                }))
+                let scope = self
+                    .vision_construction
+                    .get(&index)
+                    .ok_or_else(|| Error::backend("VL vision unit has no prepared scope"))?;
+                Ok(Unit::Vision(VisionBlock::from_spec(
+                    scope.clone(),
+                    context,
+                )?))
             }
             1 => {
                 let local = self
@@ -1582,13 +1662,21 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> VlKernel<B> {
                             .as_ref()
                             .and_then(|geometry| geometry.text().block(index))
                     });
-                Ok(Unit::Text(match local {
-                    Some(local) if self.args.text.is_moe() => {
-                        qwen::new_partitioned_routed_block(&self.args.text, local, index, context)?
-                    }
-                    Some(local) => qwen::new_routed_block(local, index, context)?,
-                    None => qwen::new_routed_block(&self.args.text, index, context)?,
-                }))
+                let scope = self
+                    .text_construction
+                    .get(&index)
+                    .ok_or_else(|| Error::backend("VL text unit has no prepared scope"))?;
+                Ok(Unit::Text(qwen::RoutedTransformerBlock::from_prepared::<
+                    _,
+                    qwen::RoutedQwenBlockFactory,
+                >(
+                    &self.args.text,
+                    local.unwrap_or(&self.args.text),
+                    index,
+                    &scope.common,
+                    &scope.parameters,
+                    context,
+                )?))
             }
             _ => unreachable!(),
         }

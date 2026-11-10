@@ -70,7 +70,7 @@ impl ConditionalHeaderExecutionPlan {
         let requirements = super::conditional::joint_requirements(
             target.requirements(),
             &spec,
-            vision.config(),
+            vision.scopes(),
             vision.static_recipes(),
             &blocks,
             &JointCatalog {
@@ -247,7 +247,6 @@ impl SelectedConditionalHeaderExecution {
                 target: &self.plan.target,
                 vision: &self.plan.vision,
             },
-            None,
             mechanisms,
         )
     }

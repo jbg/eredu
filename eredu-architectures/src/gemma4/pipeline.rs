@@ -50,34 +50,6 @@ pub(crate) fn media_transport(
     }
 }
 
-/// Exact tensor-local cache geometry before pipeline receiver replicas.
-pub(crate) fn tensor_state_layout(
-    args: &ModelArgs,
-    rank: eredu_core::ParallelRankTopology,
-) -> Result<StateLayout, String> {
-    let mut local = args.clone();
-    let policies = args
-        .layer_schedule
-        .iter()
-        .copied()
-        .map(|mut policy| {
-            let range = eredu_core::balanced_contiguous_range(
-                policy.num_key_value_heads.get() as usize,
-                rank.tensor_parallel_size(),
-                rank.tensor_parallel_rank(),
-                false,
-            )
-            .map_err(|error| error.to_string())?;
-            policy.num_key_value_heads = std::num::NonZeroU32::new(range.len() as u32)
-                .ok_or_else(|| "Gemma local KV head count is zero".to_owned())?;
-            Ok(policy)
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    local.layer_schedule =
-        LayerSchedule::new(policies.len(), policies).map_err(|error| error.to_string())?;
-    super::state_layout(&local).map_err(|error| error.to_string())
-}
-
 /// One receiver cache per remote publisher, attached to its first local consumer.
 /// Local consumers of the same publication reuse that cache during the pass.
 pub(crate) fn receiver_caches(args: &ModelArgs, units: Range<usize>) -> Vec<(usize, usize)> {

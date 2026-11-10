@@ -3,7 +3,10 @@ use super::*;
 use crate::discovery::routed_components::{self as routed_units, Site as RoutedUnitSite};
 
 pub(in crate::discovery) fn declare(g: &mut Builder, c: &V4Args, target_output: &str) {
-    let width = c.hidden_size as usize;
+    let text = &c.parameters().statics;
+    let embedding_spec = text.embedding_spec();
+    let embedding_prefix = declared_weight_prefix(&embedding_spec.weight);
+    let output = text.head_spec().expect("V4 declares an untied output head");
     g.node(
         "prediction",
         ArchitectureNodeKind::Prediction,
@@ -15,6 +18,11 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &V4Args, target_output: 
     for depth in 0..c.num_nextn_predict_layers as usize {
         let layer = c.num_hidden_layers as usize + depth;
         let parameters = format!("mtp.{depth}");
+        let attention_spec = v4_specs::attention_spec(c, layer, &format!("{parameters}.attn"))
+            .expect("validated V4 attention declaration");
+        let spec =
+            v4_specs::prediction_spec(c, &parameters).expect("validated V4 prediction declaration");
+        let width = spec.hyper_head.hidden_size as usize;
         let root = format!("prediction.layers.{depth}");
         let decoder = format!("{root}.decoder");
         let path = format!("{parameters}.decoder");
@@ -36,8 +44,8 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &V4Args, target_output: 
             None,
         );
         g.get_mut(&decoder).layer_index = Some(layer);
-        g.get_mut(&decoder).output_axes = Some(stream_axes(c));
-        g.get_mut(&fusion).output_axes = Some(stream_axes(c));
+        g.get_mut(&decoder).output_axes = Some(stream_axes(&spec.hyper_head));
+        g.get_mut(&fusion).output_axes = Some(stream_axes(&spec.hyper_head));
         g.descriptor.layer_groups.push(ArchitectureLayerGroup {
             id: parameters.clone(),
             label: format!("Prediction depth {depth}"),
@@ -58,26 +66,34 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &V4Args, target_output: 
                 &root,
                 format!("{parameters}.{suffix}"),
                 "Sequential prediction invocation boundary",
-                stream_axes(c),
+                stream_axes(&spec.hyper_head),
             );
             g.component_observation(
                 &decoder,
                 format!("{path}.{suffix}"),
                 "Sequential prediction decoder residual streams",
-                stream_axes(c),
+                stream_axes(&spec.hyper_head),
             );
         }
         g.read_only_observation(
             &root,
             format!("{parameters}.capture"),
             "Hidden state supplied to this prediction invocation",
-            stream_axes(c),
+            stream_axes(&spec.hyper_head),
         );
         let mut inputs = Vec::new();
-        for (term, norm_field, projection_field, broadcast) in [
-            ("embedding", "enorm", "e_proj", true),
-            ("hidden", "hnorm", "h_proj", false),
+        for (term, norm_spec, projection_spec, broadcast) in [
+            (
+                "embedding",
+                &spec.embedding_norm,
+                &spec.embedding_projection,
+                true,
+            ),
+            ("hidden", &spec.hidden_norm, &spec.hidden_projection, false),
         ] {
+            let normalization_declaration = declared_normalization(norm_spec);
+            let norm_group = declared_normalization_prefix(norm_spec);
+            let projection_group = declared_weight_prefix(&projection_spec.weight);
             let source = format!("{root}.{term}");
             let normalization = format!("{source}.norm");
             let projection = format!("{source}.projection");
@@ -85,7 +101,7 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &V4Args, target_output: 
             let shape = if broadcast {
                 axes(width)
             } else {
-                stream_axes(c)
+                stream_axes(&spec.hyper_head)
             };
             g.node(
                 &source,
@@ -95,21 +111,21 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &V4Args, target_output: 
                     ArchitectureNodeKind::Processor
                 },
                 Some(&root),
-                broadcast.then_some("embed"),
+                broadcast.then_some(embedding_prefix),
                 None,
             );
             g.node(
                 &normalization,
                 ArchitectureNodeKind::Normalization,
                 Some(&root),
-                Some(&format!("{parameters}.{norm_field}")),
+                norm_group,
                 None,
             );
             g.node(
                 &projection,
                 ArchitectureNodeKind::Projector,
                 Some(&root),
-                Some(&format!("{parameters}.{projection_field}")),
+                Some(projection_group),
                 None,
             );
             g.edge(&source, &normalization, ArchitectureEdgeKind::Data);
@@ -133,15 +149,15 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &V4Args, target_output: 
                 "Projected prediction source before stream expansion and summation",
                 shape,
             );
-            let weight = format!("{parameters}.{projection_field}.weight");
+            let weight = projection_spec.weight.id.as_str().to_owned();
             inputs.push(ComponentProjectedFusionInput {
                 input: observation.clone(),
                 source: if broadcast {
                     ComponentFusionSource::TokenEmbedding {
                         normalization: None,
-                        weight: "embed.weight".into(),
-                        shared_weight: "embed.weight".into(),
-                        parameter_group: "parameters:embed".into(),
+                        weight: embedding_spec.weight.id.as_str().into(),
+                        shared_weight: declared_shared_weight(&embedding_spec.weight).into(),
+                        parameter_group: format!("parameters:{embedding_prefix}"),
                         scale: ComponentScalar::new(1.0),
                     }
                 } else {
@@ -149,12 +165,15 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &V4Args, target_output: 
                         path: observation.clone(),
                     }
                 },
-                normalization: norm(c, Some(format!("{parameters}.{norm_field}.weight"))),
+                normalization: normalization_declaration,
                 normalized: format!("{observation}.normalized.effective"),
                 weight: weight.clone(),
-                shared_weight: weight,
-                parameter_group: format!("parameters:{parameters}.{projection_field}"),
-                bias: None,
+                shared_weight: declared_shared_weight(&projection_spec.weight).into(),
+                parameter_group: format!("parameters:{projection_group}"),
+                bias: projection_spec
+                    .bias
+                    .as_ref()
+                    .map(|bias| bias.id.to_string()),
                 projection_input: format!("{observation}.projection_input"),
                 output: format!("{observation}.projected"),
                 effective_output: format!("{observation}.projected.effective"),
@@ -162,7 +181,7 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &V4Args, target_output: 
                     ComponentFusionExpansion::BroadcastAxis {
                         axis: 2,
                         name: "stream".into(),
-                        extent: c.hc_mult as usize,
+                        extent: spec.hyper_head.streams as usize,
                     }
                 } else {
                     ComponentFusionExpansion::Identity
@@ -174,7 +193,7 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &V4Args, target_output: 
             &fusion,
             fusion_output.clone(),
             "Sum of separate embedding and hidden projections after declared stream broadcast",
-            stream_axes(c),
+            stream_axes(&spec.hyper_head),
         );
         g.edge(&fusion, &decoder, ArchitectureEdgeKind::Data);
         let attention = format!("{decoder}.attention");
@@ -190,10 +209,10 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &V4Args, target_output: 
             mechanism: Some(AttentionMechanism::CompressedSparse),
             causal: Some(true),
             recurrent: Some(false),
-            query_heads: Some(c.num_attention_heads as usize),
-            key_value_heads: Some(1),
-            key_head_dimension: Some(c.head_dim as usize),
-            value_head_dimension: Some(c.head_dim as usize),
+            query_heads: Some(attention_spec.geometry.query_heads() as usize),
+            key_value_heads: Some(attention_spec.geometry.key_value_heads() as usize),
+            key_head_dimension: Some(attention_spec.geometry.key_dimensions() as usize),
+            value_head_dimension: Some(attention_spec.geometry.value_dimensions() as usize),
             receptive_field: Some(ReceptiveField::Sliding {
                 window: c.sliding_window as usize,
             }),
@@ -209,14 +228,22 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &V4Args, target_output: 
         );
         let component_start = g.descriptor.components.len();
         let routed_start = g.descriptor.routed_components.len();
+        let routed_spec = v4_specs::moe_spec(c, layer, &format!("{parameters}.ffn"), None)
+            .expect("validated V4 routed declaration");
+        let selector = &routed_spec.routed.parameters.selector;
         g.moe(
             &ffn,
             &format!("{parameters}.ffn"),
             moe(
-                c.n_routed_experts,
-                c.num_experts_per_tok,
-                c.n_shared_experts,
-                c.norm_topk_prob,
+                selector.selection().group_count(),
+                selector.selection().top_k(),
+                routed_spec.routed.shared.gate.output
+                    / routed_spec
+                        .routed
+                        .parameters
+                        .experts
+                        .intermediate_dimensions(),
+                selector.selection().normalize_selected(),
                 RoutingScoreTransform::SqrtSoftplus,
             ),
             Some(&format!("{path}.feed_forward")),
@@ -229,14 +256,13 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &V4Args, target_output: 
                 layer,
                 routing: &format!("{path}.feed_forward"),
                 input: Some(format!("{path}.feed_forward.input")),
-                normalization: Some(routed_units::rms(
-                    format!("{parameters}.ffn_norm.weight"),
-                    c.rms_norm_eps,
-                    0.0,
+                normalization: Some(declared_normalization(
+                    &v4_specs::block_normalizations(c, &parameters)
+                        .expect("validated V4 block normalization")[1],
                 )),
                 residual_scale: None,
             },
-            crate::deepseek::v4::expert_bank_spec(c, layer),
+            Ok(routed_spec.routed.parameters.experts),
         );
         unit(g, c, layer, &path, &parameters, &attention, &ffn);
         let components = g.descriptor.components.split_off(component_start);
@@ -255,14 +281,14 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &V4Args, target_output: 
             &head_norm,
             ArchitectureNodeKind::Normalization,
             Some(&root),
-            Some(&format!("{parameters}.norm")),
+            declared_normalization_prefix(&spec.output_norm),
             Some(width),
         );
         g.node(
             &head,
             ArchitectureNodeKind::OutputHead,
             Some(&root),
-            Some("head"),
+            Some(declared_weight_prefix(&output.weight)),
             None,
         );
         g.edge(&decoder, &collapse, ArchitectureEdgeKind::Data);
@@ -272,9 +298,9 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &V4Args, target_output: 
             &collapse,
             format!("{readout}.streams"),
             "Prediction streams consumed by final learned collapse",
-            stream_axes(c),
+            stream_axes(&spec.hyper_head),
         );
-        let mut coefficients_shape = axes(c.hc_mult as usize);
+        let mut coefficients_shape = axes(spec.hyper_head.streams as usize);
         coefficients_shape[2].name = "stream".into();
         g.read_only_observation(
             &collapse,
@@ -294,7 +320,7 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &V4Args, target_output: 
             "Normalized prediction residual consumed by shared vocabulary head",
             axes(width),
         );
-        let mut vocabulary = axes(c.vocab_size as usize);
+        let mut vocabulary = axes(output.output as usize);
         vocabulary[2].name = "vocabulary".into();
         g.get_mut(&head).output_axes = Some(vocabulary.clone());
         g.component_observation(
@@ -321,7 +347,7 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &V4Args, target_output: 
                 block_transforms: vec![],
                 score_writes: vec![],
                 stream_residual: Some(ComponentStreamResidual {
-                    streams: c.hc_mult as usize,
+                    streams: spec.hyper_head.streams as usize,
                     base: ComponentStreamBase::Streams {
                         input: format!("{fusion_output}.effective"),
                     },
@@ -329,10 +355,9 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &V4Args, target_output: 
                     head: ComponentStreamHead {
                         input: format!("{readout}.streams.effective"),
                         coefficients: format!("{readout}.stream_coefficients"),
-                        parameters: coefficients(
-                            c,
+                        parameters: head_coefficients(
                             &format!("parameters:{parameters}"),
-                            &format!("{parameters}.hc_head"),
+                            &spec.hyper_head,
                         ),
                     },
                 }),
@@ -341,9 +366,9 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &V4Args, target_output: 
                 projection_input: Some(format!("{readout}.projection_input")),
                 linear_scores: format!("{readout}.linear"),
                 logits: format!("{readout}.linear.effective"),
-                normalization: norm(c, Some(format!("{parameters}.norm.weight"))),
-                weight: "head.weight".into(),
-                bias: None,
+                normalization: declared_normalization(&spec.output_norm),
+                weight: output.weight.id.as_str().into(),
+                bias: output.bias.as_ref().map(|bias| bias.id.to_string()),
                 output_transform: ComponentOutputTransform::Identity,
                 block_normalizations: vec![],
                 other_writes: vec![],

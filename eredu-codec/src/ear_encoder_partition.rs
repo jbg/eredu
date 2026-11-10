@@ -1,7 +1,7 @@
 //! Finite encoder pipeline ownership and exact cut-dependent channel/cadence transport.
 use crate::{
     ear_encoder::{invalid, EncoderConfig, EncoderUnitSpec},
-    ear_encoder_layered::{encoder_local_dimensions, EncoderForward, EncoderKernel},
+    ear_encoder_layered::{EncoderForward, EncoderKernel},
     Error,
 };
 use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Tensor, TensorElementType};
@@ -238,34 +238,32 @@ fn ownership<G>(
 }
 /// Checks stage ownership and complete tensor placement before materialization.
 pub fn validate_encoder_partition<G>(
-    definition: &ComponentDefinition,
-    config: &EncoderConfig,
-    prefix: &str,
+    declaration: &crate::declarations::EncoderDeclaration,
     layout: Option<&LocalModelLayout>,
     partition: &ArchitecturePartition<G, EncoderBoundarySchema>,
 ) -> Result<(), Error> {
     if let Some(layout) = layout {
-        encoder_local_dimensions(config, prefix, layout)?;
+        crate::ear_encoder_layered::declared_local_dimensions(declaration.spec(), layout)?;
     }
-    ownership(definition, config, partition).map(|_| ())
+    ownership(declaration.definition(), declaration.config(), partition).map(|_| ())
 }
 impl<B: NeuralBackend> EncoderKernel<B> {
     /// Consumes the retained definition and selects exact stage units and route geometry.
     pub fn new_partition<G>(
-        definition: ComponentDefinition,
-        config: EncoderConfig,
-        prefix: &str,
+        declaration: crate::declarations::EncoderDeclaration,
         layout: Option<&LocalModelLayout>,
         partition: &ArchitecturePartition<G, EncoderBoundarySchema>,
         cuts: &EncoderPipelineCuts,
     ) -> Result<ComponentAdapter<ComponentDefinition, Self>, Error> {
-        let range = ownership(&definition, &config, partition)?;
-        if cuts.schema != EncoderBoundarySchema::new(&config)? {
+        let definition = declaration.definition().clone();
+        let config = declaration.config();
+        let range = ownership(&definition, config, partition)?;
+        if cuts.schema != EncoderBoundarySchema::new(config)? {
             return Err(invalid("encoder pipeline cuts belong to another geometry"));
         }
         let mut value = match layout {
-            Some(layout) => Self::new_parallel(config, prefix, layout)?,
-            None => Self::new(config, prefix)?,
+            Some(layout) => Self::new_parallel(declaration, layout)?,
+            None => Self::new(declaration)?,
         };
         value.partition = Some(EncoderPartition {
             range,

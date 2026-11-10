@@ -91,7 +91,10 @@ impl ArtifactArchitecturePlan {
         for source in &admitted {
             let selected = source.configuration();
             if selected.vision_config.is_some() {
-                effective.vision_config = selected.vision_config.clone();
+                effective = effective.with_media(
+                    selected.vision_config.clone(),
+                    effective.audio_config.clone(),
+                )?;
                 if let Some(current) = &mut processor {
                     current.image = source.processor().image.clone();
                     current.video = source.processor().video.clone();
@@ -103,7 +106,10 @@ impl ArtifactArchitecturePlan {
                 }
             }
             if selected.audio_config.is_some() {
-                effective.audio_config = selected.audio_config.clone();
+                effective = effective.with_media(
+                    effective.vision_config.clone(),
+                    selected.audio_config.clone(),
+                )?;
                 if let Some(current) = &mut processor {
                     current.waveform = source.processor().waveform;
                 } else {

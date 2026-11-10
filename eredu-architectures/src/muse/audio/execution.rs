@@ -15,8 +15,8 @@ use eredu_runtime::{
     ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitectureGroupTransport,
     ArchitectureMergeDestination, ArchitectureParameterDescription, ArchitectureStatePartitionPlan,
     ArchitectureStatePartitionRule, ExecutionGraph, ExecutionUnitLayout, LayerRuntimeState,
-    LayeredForwardState, MemberSharding, OwnedParameterGroupSpec, ParameterGroupOwner,
-    ParameterGroupSpec, ParameterMemberSpec, ParameterRole, RuntimeStateComponents, StateLayout,
+    LayeredForwardState, OwnedParameterGroupSpec, ParameterGroupOwner, ParameterGroupSpec,
+    RuntimeStateComponents, StateLayout,
 };
 
 use super::{AudioConfig, AudioUnit, AudioUnitKind};
@@ -34,28 +34,7 @@ pub fn unit_parameter_groups(
     config: &AudioConfig,
     kind: AudioUnitKind,
 ) -> Result<Vec<ParameterGroupSpec>, Error> {
-    if !config.execution_units()?.contains(&kind) {
-        return Err(Error::backend(
-            "Muse audio unit is outside its configured pyramid",
-        ));
-    }
-    let members = super::super::checkpoint::audio_tensor_layouts(config)
-        .map_err(Error::backend)?
-        .into_iter()
-        .filter(|tensor| kind.owns_parameter(&tensor.canonical))
-        .map(|tensor| {
-            ParameterMemberSpec::new(tensor.canonical, tensor.shape, MemberSharding::Replicated)
-        })
-        .collect::<Vec<_>>();
-    let group = ParameterGroupSpec::new(kind.path(), ParameterRole::Replicated, members)
-        .map_err(Error::backend)?;
-    eredu_runtime::expand_linear_format_parameter_groups(vec![group], |member| {
-        crate::linear_format::standard_parallel_linear_format(
-            member,
-            config.linear_format_for(member.target()),
-        )
-    })
-    .map_err(Error::backend)
+    config.declaration().unit(kind)?.parameter_groups(kind)
 }
 
 /// Full-width bounded histories, aligned one-for-one with the tower's small units.
@@ -65,19 +44,22 @@ pub fn state_layout(config: &AudioConfig) -> Result<StateLayout, Error> {
             .map(StateTensorDimension::Fixed)
             .ok_or_else(|| Error::backend("Muse audio state dimension must be positive"))
     };
-    let layers = config
-        .execution_units()?
-        .into_iter()
-        .map(|kind| {
-            Ok(match kind {
-                AudioUnitKind::Convolution { stage, .. } if config.conv_kernel_size > 1 => {
+    let declarations = config.declaration();
+    let layers = declarations
+        .units
+        .iter()
+        .map(|(_, spec)| {
+            Ok(match spec {
+                super::specs::UnitSpec::Convolution(spec)
+                    if spec.convolution.history_len()? > 0 =>
+                {
                     LayerCachePolicy::FixedState {
                         tensors: vec![StateTensorPolicy {
                             role: StateTensorRole::Convolution { slot: 0 },
                             shape: vec![
                                 StateTensorDimension::Batch,
-                                fixed(config.conv_kernel_size - 1)?,
-                                fixed(config.hidden_sizes[stage])?,
+                                fixed(spec.convolution.history_len()?)?,
+                                fixed(spec.convolution.channels)?,
                             ],
                             dtype: StateTensorDtype::Floating,
                             residency: StateResidencyClass::AlwaysDeviceMutable,
@@ -98,12 +80,13 @@ pub fn parameter_description(
     config: &AudioConfig,
 ) -> Result<ArchitectureParameterDescription, Error> {
     let graph = graph()?;
-    let kinds = config.execution_units()?;
-    let layout = ExecutionUnitLayout::new(&graph, [kinds.len()]).map_err(Error::backend)?;
+    let declarations = config.declaration();
+    let layout =
+        ExecutionUnitLayout::new(&graph, [declarations.units.len()]).map_err(Error::backend)?;
     let owner = layout.group_id(0).expect("one audio group").clone();
     let mut owned = Vec::new();
-    for (index, kind) in kinds.into_iter().enumerate() {
-        for group in unit_parameter_groups(config, kind)? {
+    for (index, (kind, spec)) in declarations.units.iter().enumerate() {
+        for group in spec.parameter_groups(*kind)? {
             owned.push(OwnedParameterGroupSpec::new(
                 ParameterGroupOwner::execution_unit(owner.clone(), index),
                 group,
@@ -345,7 +328,7 @@ pub(crate) fn execute_audio_unit<B: NeuralBackend, L: RuntimeStateComponents<B>>
         _ => {
             return Err(Error::backend(
                 "Muse audio lease differs from its declared operation",
-            ))
+            ));
         }
     };
     forward.next_unit += 1;

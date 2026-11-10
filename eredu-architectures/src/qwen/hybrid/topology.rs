@@ -7,61 +7,64 @@ fn layer(
     config: &HybridConfig,
     root: &str,
     policy: HybridLayerPolicy,
-    index: usize,
 ) -> Result<TextLayerTopology, Error> {
-    let mixer = match policy {
-        HybridLayerPolicy::SelfAttention(_) => TokenMixerTopology::Attention {
-            query_heads: config.num_attention_heads as u64,
-            kv_heads: config.num_key_value_heads as u64,
-            key_width: config.head_dim as u64,
-            value_width: config.head_dim as u64,
+    let parameters = super::BlockParameters::at(config, root, policy)?;
+    let mixer = match &parameters.mixer {
+        super::specs::MixerParameters::Attention(spec) => TokenMixerTopology::Attention {
+            query_heads: spec.projection.geometry.query_heads() as u64,
+            kv_heads: spec.projection.geometry.key_value_heads() as u64,
+            key_width: spec.projection.geometry.key_dimensions() as u64,
+            value_width: spec.projection.geometry.value_dimensions() as u64,
             input_scores: false,
             softcap: false,
             sinks: false,
             output_gate: true,
-            projections: super::block::attention_projection_specs(config, root)?
-                .iter()
+            projections: spec
+                .projection
+                .projections()
+                .into_iter()
                 .map(ProjectionTopology::from_spec)
                 .collect::<Result<_, _>>()?,
             query_key_normalization: true,
             rotary: true,
         },
-        HybridLayerPolicy::LinearAttention => {
-            let spec = super::linear_attention::recurrent_spec(config, index)?;
-            TokenMixerTopology::GatedDelta {
-                value_heads: spec.value_heads as u64,
-                key_width: spec.key_head_dim as u64,
-                value_width: spec.value_head_dim as u64,
-                convolution_channels: spec.convolution.channels as u64,
-                kernel: spec.convolution.kernel_size as u64,
-                projections: [
-                    &spec.input_qkv,
-                    &spec.input_gate,
-                    &spec.input_beta,
-                    &spec.input_decay,
-                    &spec.output,
-                ]
+        super::specs::MixerParameters::Recurrent(spec) => TokenMixerTopology::GatedDelta {
+            value_heads: spec.geometry.value_heads() as u64,
+            key_width: spec.geometry.key_dimensions() as u64,
+            value_width: spec.geometry.value_dimensions() as u64,
+            convolution_channels: spec.convolution.channels as u64,
+            kernel: spec.convolution.kernel_size as u64,
+            projections: [
+                &spec.input_qkv,
+                &spec.input_gate,
+                &spec.input_beta,
+                &spec.input_decay,
+                &spec.output,
+            ]
+            .into_iter()
+            .map(ProjectionTopology::from_spec)
+            .collect::<Result<_, _>>()?,
+        },
+    };
+    let feed_forward = if let super::specs::FeedForwardParameters::Routed(_) =
+        &parameters.feed_forward
+    {
+        FeedForwardTopology::Unknown {
+            reason: format!(
+                "{root}: routed experts with gated shared-expert reduction invocation topology is unavailable"
+            ),
+        }
+    } else {
+        let super::specs::FeedForwardParameters::Dense(spec) = &parameters.feed_forward else {
+            unreachable!()
+        };
+        FeedForwardTopology::Gated {
+            intermediate_size: spec.down.input as u64,
+            projections: spec
+                .projections()
                 .into_iter()
                 .map(ProjectionTopology::from_spec)
                 .collect::<Result<_, _>>()?,
-            }
-        }
-    };
-    let feed_forward = if config.is_moe() {
-        FeedForwardTopology::Unknown {
-            reason: format!("{root}: routed experts with gated shared-expert reduction invocation topology is unavailable"),
-        }
-    } else {
-        FeedForwardTopology::Gated {
-            intermediate_size: config.intermediate_size as u64,
-            projections: super::block::mlp_projection_specs(
-                config,
-                &format!("{root}.mlp"),
-                config.intermediate_size,
-            )?
-            .iter()
-            .map(ProjectionTopology::from_spec)
-            .collect::<Result<_, _>>()?,
         }
     };
     Ok(TextLayerTopology {
@@ -81,7 +84,7 @@ fn stack(
         hidden_size: config.hidden_size as u64,
         vocabulary_size: config.vocab_size as u64,
         layers,
-        output: super::static_module_spec(config).output_topology()?,
+        output: ProjectionTopology::from_spec(&config.statics().output_projection_spec())?,
         output_invocations: 1,
         output_softcap: false,
         selected_parameter_promotion_bytes: None,
@@ -100,26 +103,28 @@ pub(crate) fn target(config: &HybridConfig) -> Result<TextExecutionTopology, Err
         .iter()
         .copied()
         .enumerate()
-        .map(|(index, policy)| layer(config, &format!("model.layers.{index}"), policy, index))
+        .map(|(index, policy)| layer(config, &format!("model.layers.{index}"), policy))
         .collect::<Result<_, _>>()?;
     stack(config, layers)
 }
 
 pub(crate) fn prediction(config: &HybridConfig) -> Result<TextExecutionTopology, Error> {
     config.validate().map_err(Error::backend)?;
-    let fusion = ProjectionTopology::from_spec(&super::mtp::fusion_spec(config)?)?;
+    let shared = config
+        .prediction_shared()
+        .ok_or_else(|| Error::backend("undeclared prediction shared scope"))?;
+    let fusion = ProjectionTopology::from_spec(&shared.fusion)?;
     let layers = (0..config.mtp_num_hidden_layers)
         .map(|index| {
-            // Ordinary Block::new_mtp always selects full attention regardless of the
+            // Prediction block declarations select full attention regardless of the
             // target schedule; every depth invokes the shared fusion and final norm.
             let mut layer = layer(
                 config,
                 &format!("mtp.layers.{index}"),
                 HybridLayerPolicy::SelfAttention(eredu_core::AttentionPolicy::Full),
-                index as usize,
             )?;
             layer.input_projections.push(fusion.clone());
-            layer.normalization_count += 3;
+            layer.normalization_count += shared.normalizations().len() as u64;
             Ok(layer)
         })
         .collect::<Result<_, Error>>()?;

@@ -8,9 +8,11 @@ use eredu_nn::{
         attention_chunk_lengths, bilinear_interpolation_samples, inverse_permutation,
         patch_positions, validate_patch_grid, window_partition, InterpolationMode, PatchTraversal,
     },
-    EmbeddingOperator, EmbeddingSpec, Error, Index, LinearOperator, LinearSpec, NeuralBackend,
-    Parameter, ParameterSpec, Parameterized, Tensor,
+    DeclareLogicalParameters, EmbeddingOperator, Error, Index, LinearOperator, NeuralBackend,
+    Parameterized, Tensor,
 };
+
+pub(crate) mod specs;
 
 use super::parallel::VisionStaticResource;
 use super::{VisionArithmetic, VisionAttentionPolicy, VisionConfig};
@@ -164,106 +166,19 @@ impl<T> VisionState<T> {
 
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-struct CenteredLayerNorm<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
-    weight: Parameter<B::Tensor>,
-    bias: Parameter<B::Tensor>,
-    #[parameter(skip)]
-    epsilon: f32,
-    #[parameter(skip)]
-    arithmetic: VisionArithmetic,
-}
-
-impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> CenteredLayerNorm<B> {
-    fn new(
-        prefix: &str,
-        dimensions: i32,
-        epsilon: f32,
-        arithmetic: VisionArithmetic,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        if arithmetic == VisionArithmetic::Rounded {
-            B::require_operator_capabilities(
-                "rounded vision normalization",
-                eredu_nn::NeuralOperatorCapabilities::CASCADED_LAYER_NORM,
-            )?;
-        }
-        let parameter = |suffix: &str| {
-            Parameter::unloaded(
-                ParameterSpec::trainable(format!("{prefix}.{suffix}")).map_err(Error::backend)?,
-                &[dimensions],
-                context,
-            )
-        };
-        Ok(Self {
-            weight: parameter("weight")?,
-            bias: parameter("bias")?,
-            epsilon,
-            arithmetic,
-        })
-    }
-
-    fn forward(
-        &self,
-        input: &B::Tensor,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        B::Tensor::layer_norm(
-            input,
-            Some(self.weight.as_ref()),
-            Some(self.bias.as_ref()),
-            self.epsilon,
-            match self.arithmetic {
-                VisionArithmetic::Native => eredu_nn::LayerNormalizationArithmetic::Native,
-                VisionArithmetic::Rounded => {
-                    eredu_nn::LayerNormalizationArithmetic::CascadedMoments
-                }
-            },
-            context,
-        )
-    }
-}
-
-#[derive(Debug, Clone, Parameterized)]
-#[parameterized(tensor = "B::Tensor")]
 struct PatchEmbedder<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     projection: B::Linear,
     position_table: B::Embedding,
-    #[parameter(skip)]
-    input_width: i32,
 }
 
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> PatchEmbedder<B> {
-    fn new(config: &VisionConfig, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
-        let input_width = config.temporal_patch_size * 3 * config.patch_size * config.patch_size;
-        let weight = "model.vision_tower.patch_embedder.patch_embedding.weight";
-        let position = "model.vision_tower.patch_embedder.position_embedding_table.weight";
+    fn new(
+        spec: &specs::StaticSpec,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
         Ok(Self {
-            projection: B::linear(
-                LinearSpec {
-                    input: input_width,
-                    output: config.hidden_size,
-                    weight: ParameterSpec::trainable(weight).map_err(Error::backend)?,
-                    bias: None,
-                    format: crate::linear_format::standard_linear_format(
-                        weight,
-                        config.linear_format_for(weight),
-                    )?,
-                },
-                context,
-            )?,
-            position_table: B::embedding(
-                EmbeddingSpec {
-                    vocabulary: config.position_height * config.position_width,
-                    dimensions: config.hidden_size,
-                    weight: ParameterSpec::trainable(position).map_err(Error::backend)?,
-                    format: crate::linear_format::standard_linear_format(
-                        position,
-                        config.linear_format_for(position),
-                    )?,
-                },
-                context,
-            )?,
-            input_width,
+            projection: B::linear(spec.patch.clone(), context)?,
+            position_table: B::embedding(spec.position.clone(), context)?,
         })
     }
 
@@ -274,13 +189,6 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> PatchEmbedder<B> {
         config: &VisionConfig,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        if pixels.shape().len() != 2 || pixels.dim(1) != self.input_width {
-            return Err(Error::backend(format!(
-                "Muse-Glimmer vision pixels must be shaped [patches, {}], got {:?}",
-                self.input_width,
-                pixels.shape()
-            )));
-        }
         let pixels =
             config
                 .arithmetic
@@ -337,47 +245,18 @@ struct VisionAttention<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
 
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionAttention<B> {
     fn new(
-        config: &VisionConfig,
-        layer: usize,
+        spec: &specs::BlockSpec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let prefix = format!("model.vision_tower.layers.{layer}.attn");
-        let linear = |field: &str, input, output| {
-            let weight = format!("{prefix}.{field}.weight");
-            B::linear(
-                LinearSpec {
-                    input,
-                    output,
-                    weight: ParameterSpec::trainable(&weight).map_err(Error::backend)?,
-                    bias: Some(
-                        ParameterSpec::trainable(format!("{prefix}.{field}.bias"))
-                            .map_err(Error::backend)?,
-                    ),
-                    format: crate::linear_format::standard_linear_format(
-                        &weight,
-                        config.linear_format_for(&weight),
-                    )?
-                    .with_arithmetic(match config.arithmetic {
-                        VisionArithmetic::Native => eredu_nn::LinearArithmetic::Native,
-                        VisionArithmetic::Rounded => eredu_nn::LinearArithmetic::RowMajorAffine,
-                    })?,
-                },
-                context,
-            )
-        };
-        let head_dimensions = config.hidden_size / config.num_heads;
         Ok(Self {
-            query: linear("q_proj", config.hidden_size, config.hidden_size)?,
-            key: linear("k_proj", config.hidden_size, config.hidden_size)?,
-            value: linear("v_proj", config.hidden_size, config.hidden_size)?,
-            output: linear("proj", config.hidden_size, config.hidden_size)?,
-            heads: config.num_heads,
-            head_dimensions,
-            scale: match config.arithmetic {
-                VisionArithmetic::Native => (head_dimensions as f32).sqrt().recip(),
-                VisionArithmetic::Rounded => (head_dimensions as f64).powf(-0.5) as f32,
-            },
-            arithmetic: config.arithmetic,
+            query: B::linear(spec.attention.query.clone(), context)?,
+            key: B::linear(spec.attention.key.clone(), context)?,
+            value: B::linear(spec.attention.value.clone(), context)?,
+            output: B::linear(spec.attention.output.clone(), context)?,
+            heads: spec.attention.geometry.query_heads(),
+            head_dimensions: spec.attention.geometry.key_dimensions(),
+            scale: spec.scale,
+            arithmetic: spec.arithmetic,
         })
     }
 
@@ -463,9 +342,11 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionAttention<B> {
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct VisionBlock<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
-    norm1: CenteredLayerNorm<B>,
+    norm1: eredu_nn::LayerNorm<B::Tensor>,
     attention: VisionAttention<B>,
-    norm2: CenteredLayerNorm<B>,
+    norm2: eredu_nn::LayerNorm<B::Tensor>,
+    #[parameter(skip)]
+    activation: eredu_nn::UnaryActivation,
     fc1: B::Linear,
     fc2: B::Linear,
 }
@@ -477,48 +358,33 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionBlock<B> {
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let prefix = format!("model.vision_tower.layers.{layer}");
-        let linear = |field: &str, input, output| {
-            let weight = format!("{prefix}.mlp.{field}.weight");
-            B::linear(
-                LinearSpec {
-                    input,
-                    output,
-                    weight: ParameterSpec::trainable(&weight).map_err(Error::backend)?,
-                    bias: Some(
-                        ParameterSpec::trainable(format!("{prefix}.mlp.{field}.bias"))
-                            .map_err(Error::backend)?,
-                    ),
-                    format: crate::linear_format::standard_linear_format(
-                        &weight,
-                        config.linear_format_for(&weight),
-                    )?
-                    .with_arithmetic(match config.arithmetic {
-                        VisionArithmetic::Native => eredu_nn::LinearArithmetic::Native,
-                        VisionArithmetic::Rounded => eredu_nn::LinearArithmetic::RowMajorAffine,
-                    })?,
-                },
-                context,
-            )
-        };
+        let spec = config
+            .declaration()
+            .blocks
+            .get(layer)
+            .cloned()
+            .ok_or_else(|| Error::backend("Muse vision block is outside its declared tower"))?;
+        Self::from_spec(spec, context)
+    }
+
+    fn from_spec(
+        spec: specs::BlockSpec,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        spec.logical_parameters()?;
+        for norm in &spec.norms {
+            let requirements = norm.arithmetic.required_operator_capabilities();
+            if requirements != eredu_nn::NeuralOperatorCapabilities::NONE {
+                B::require_operator_capabilities("Muse vision normalization", requirements)?;
+            }
+        }
         Ok(Self {
-            norm1: CenteredLayerNorm::new(
-                &format!("{prefix}.norm1"),
-                config.hidden_size,
-                config.layer_norm_eps,
-                config.arithmetic,
-                context,
-            )?,
-            attention: VisionAttention::new(config, layer, context)?,
-            norm2: CenteredLayerNorm::new(
-                &format!("{prefix}.norm2"),
-                config.hidden_size,
-                config.layer_norm_eps,
-                config.arithmetic,
-                context,
-            )?,
-            fc1: linear("fc1", config.hidden_size, config.intermediate_size)?,
-            fc2: linear("fc2", config.intermediate_size, config.hidden_size)?,
+            norm1: eredu_nn::LayerNorm::new(spec.norms[0].clone(), context)?,
+            attention: VisionAttention::new(&spec, context)?,
+            norm2: eredu_nn::LayerNorm::new(spec.norms[1].clone(), context)?,
+            activation: spec.mlp.activation,
+            fc1: B::linear(spec.mlp.up.clone(), context)?,
+            fc2: B::linear(spec.mlp.down.clone(), context)?,
         })
     }
 
@@ -561,7 +427,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionBlock<B> {
         hook(VisionBlockPhase::FeedForwardInput, &normalized, context)?;
         let expansion = self.fc1.forward(&normalized, context)?;
         hook(VisionBlockPhase::Expansion, &expansion, context)?;
-        let feed_forward = B::Tensor::gelu(&expansion, context)?;
+        let feed_forward = self.activation.apply::<B>(expansion, context)?;
         hook(VisionBlockPhase::Activation, &feed_forward, context)?;
         let write = self.fc2.forward(&feed_forward, context)?;
         hook(VisionBlockPhase::Contraction, &write, context)?;
@@ -639,9 +505,15 @@ fn missing_resource(resource: &str) -> Error {
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct VisionStatic<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
+    #[parameter(skip)]
+    patch_input_width: i32,
     patch_embedder: Option<PatchEmbedder<B>>,
-    pre_norm: Option<CenteredLayerNorm<B>>,
-    post_norm: Option<CenteredLayerNorm<B>>,
+    pre_norm: Option<eredu_nn::LayerNorm<B::Tensor>>,
+    post_norm: Option<eredu_nn::LayerNorm<B::Tensor>>,
+    #[parameter(skip)]
+    adapter_input_width: i32,
+    #[parameter(skip)]
+    adapter_activations: [eredu_nn::UnaryActivation; 2],
     adapter_fc1: Option<B::Linear>,
     adapter_fc2: Option<B::Linear>,
     projection: Option<B::Linear>,
@@ -676,80 +548,42 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
                     .union(eredu_nn::NeuralOperatorCapabilities::CAST_FLOAT),
             )?;
         }
-        let linear = |name: &str, input, output| {
-            B::linear(
-                LinearSpec {
-                    input,
-                    output,
-                    weight: ParameterSpec::trainable(name).map_err(Error::backend)?,
-                    bias: None,
-                    format: crate::linear_format::standard_linear_format(
-                        name,
-                        config.linear_format_for(name),
-                    )?,
-                },
-                context,
-            )
-        };
-        let shuffled = config.hidden_size * config.merge_size * config.merge_size;
+        let spec = &config.declaration().statics;
+        if resources.contains(&VisionStaticResource::Norms) {
+            for norm in &spec.norms {
+                let requirements = norm.arithmetic.required_operator_capabilities();
+                if requirements != eredu_nn::NeuralOperatorCapabilities::NONE {
+                    B::require_operator_capabilities("Muse vision normalization", requirements)?;
+                }
+            }
+        }
         Ok(Self {
+            patch_input_width: spec.patch.input,
             patch_embedder: resources
                 .contains(&VisionStaticResource::Patch)
-                .then(|| PatchEmbedder::new(&config, context))
+                .then(|| PatchEmbedder::new(spec, context))
                 .transpose()?,
             pre_norm: resources
                 .contains(&VisionStaticResource::Norms)
-                .then(|| {
-                    CenteredLayerNorm::new(
-                        "model.vision_tower.ln_pre",
-                        config.hidden_size,
-                        config.layer_norm_eps,
-                        config.arithmetic,
-                        context,
-                    )
-                })
+                .then(|| eredu_nn::LayerNorm::new(spec.norms[0].clone(), context))
                 .transpose()?,
             post_norm: resources
                 .contains(&VisionStaticResource::Norms)
-                .then(|| {
-                    CenteredLayerNorm::new(
-                        "model.vision_tower.ln_post",
-                        config.hidden_size,
-                        config.layer_norm_eps,
-                        config.arithmetic,
-                        context,
-                    )
-                })
+                .then(|| eredu_nn::LayerNorm::new(spec.norms[1].clone(), context))
                 .transpose()?,
+            adapter_input_width: spec.adapter.up.input,
+            adapter_activations: [spec.adapter.activation, spec.adapter_output_activation],
             adapter_fc1: resources
                 .contains(&VisionStaticResource::Adapter)
-                .then(|| {
-                    linear(
-                        "model.vision_adapter.fc1.weight",
-                        shuffled,
-                        config.projector_hidden_size,
-                    )
-                })
+                .then(|| B::linear(spec.adapter.up.clone(), context))
                 .transpose()?,
             adapter_fc2: resources
                 .contains(&VisionStaticResource::Adapter)
-                .then(|| {
-                    linear(
-                        "model.vision_adapter.fc2.weight",
-                        config.projector_hidden_size,
-                        config.projector_hidden_size,
-                    )
-                })
+                .then(|| B::linear(spec.adapter.down.clone(), context))
                 .transpose()?,
             projection: resources
                 .contains(&VisionStaticResource::Projection)
-                .then(|| {
-                    linear(
-                        "model.vision_projection.weight",
-                        config.projector_hidden_size,
-                        config.language_hidden_size,
-                    )
-                })
+                .then(|| B::linear(spec.projection.clone(), context))
                 .transpose()?,
             config,
         })
@@ -772,12 +606,27 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
         Ok(())
     }
 
+    /// Validates media input even when this rank owns no pinned vision resources.
+    pub(crate) fn validate_input(&self, input: &VisionInput<'_, B::Tensor>) -> Result<(), Error> {
+        let shape = input.pixels.shape();
+        if shape.len() != 2 || shape[1] != self.patch_input_width {
+            return Err(Error::backend(format!(
+                "Muse vision pixels must be shaped [patches, {}], got {:?}",
+                self.patch_input_width, shape
+            )));
+        }
+        validate_patch_grid(input.grid, self.config.merge_size, Some(shape[0]))
+            .map_err(Error::backend)?;
+        Ok(())
+    }
+
     /// Embeds and window-permutes patches and constructs reusable placement state.
     pub fn begin(
         &mut self,
         input: VisionInput<'_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<(B::Tensor, VisionState<B::Tensor>), Error> {
+        self.validate_input(&input)?;
         let patch = self
             .patch_embedder
             .as_mut()
@@ -786,12 +635,6 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
             .pre_norm
             .as_ref()
             .ok_or_else(|| missing_resource("ingress normalization"))?;
-        validate_patch_grid(
-            input.grid,
-            self.config.merge_size,
-            Some(input.pixels.dim(0)),
-        )
-        .map_err(Error::backend)?;
         let hidden = patch.forward(input.pixels, input.grid, &self.config, context)?;
         let hidden = pre_norm.forward(&hidden, context)?;
         let full_chunks = attention_chunk_lengths(input.grid).map_err(Error::backend)?;
@@ -906,8 +749,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
         self.require_adapter()?;
         if hidden.shape().len() != 2
             || hidden.dim(0) <= 0
-            || hidden.dim(1)
-                != self.config.hidden_size * self.config.merge_size * self.config.merge_size
+            || hidden.dim(1) != self.adapter_input_width
         {
             return Err(Error::backend(
                 "Muse media adapter input has incompatible geometry",
@@ -923,7 +765,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
             &hidden,
             context,
         )?;
-        let hidden = B::Tensor::gelu(&hidden, context)?;
+        let hidden = self.adapter_activations[0].apply::<B>(hidden, context)?;
         hook(
             VisionObservation::Readout(VisionReadoutPhase::FirstActivation),
             &hidden,
@@ -939,7 +781,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
             &hidden,
             context,
         )?;
-        let hidden = B::Tensor::gelu(&hidden, context)?;
+        let hidden = self.adapter_activations[1].apply::<B>(hidden, context)?;
         hook(
             VisionObservation::Readout(VisionReadoutPhase::SecondActivation),
             &hidden,
@@ -984,8 +826,12 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionTower<B> {
         config: VisionConfig,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let blocks = (0..config.layer_count())
-            .map(|layer| VisionBlock::new(&config, layer, context))
+        let blocks = config
+            .declaration()
+            .blocks
+            .iter()
+            .cloned()
+            .map(|spec| VisionBlock::from_spec(spec, context))
             .collect::<Result<Vec<_>, _>>()?;
         let schedule = config.schedule.clone();
         Ok(Self {

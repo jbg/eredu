@@ -14,7 +14,7 @@ use eredu_runtime::{ModelStateIdentity, StateLayout};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::decoder::{self, AttentionProjection, Config};
+use crate::decoder::{AttentionProjection, Config};
 
 const DEFAULT_HEAD_DIM: i32 = 64;
 const DEFAULT_SLIDING_WINDOW: i64 = 128;
@@ -391,11 +391,6 @@ pub fn model_args_from_gguf_catalog(
     };
     args.validate()?;
     Ok(args)
-}
-
-/// Declares the exact full/sliding key/value state layout.
-pub fn state_layout(args: &ModelArgs) -> Result<StateLayout, ConfigError> {
-    decoder::state_layout(args).map_err(|error| invalid(error.to_string()))
 }
 
 /// Declares rank-local prompt-cache identity without constructing backend state.

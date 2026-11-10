@@ -75,12 +75,6 @@ pub enum PendingAudioError {
 /// Invalid cold geometry for the two coupled neural cache families.
 #[derive(Debug, thiserror::Error)]
 pub enum NeuralStateGeometryError {
-    /// The retained Nemotron configuration cannot describe its mutable state.
-    #[error("invalid VoiceChat backbone state: {0}")]
-    Backbone(#[source] crate::nemotron_h::ConfigError),
-    /// The retained causal TTS configuration cannot describe its attention state.
-    #[error("invalid VoiceChat TTS state: {0}")]
-    Tts(#[source] eredu_nn::Error),
     /// The bidirectional character encoder has no persistent causal cache.
     #[error("VoiceChat persistent TTS state requires the causal generator configuration")]
     NonCausalTts,
@@ -103,20 +97,17 @@ pub struct NeuralStateGeometry {
 }
 
 impl NeuralStateGeometry {
-    /// Derives state through the existing Nemotron and shared decoder contracts.
+    /// Projects state from the retained backbone and causal speech declarations.
     pub fn new(
-        backbone: &crate::nemotron_h::ModelArgs,
-        tts: &super::config::GemmaConfig,
+        backbone: &crate::nemotron_h::Declaration,
+        tts: &super::tts_transformer_specs::TransformerDeclaration,
     ) -> Result<Self, NeuralStateGeometryError> {
-        if !tts.causal {
+        if !tts.config().geometry().causal {
             return Err(NeuralStateGeometryError::NonCausalTts);
         }
-        let tts = super::tts_transformer::TransformerConfig::new(tts)
-            .map_err(NeuralStateGeometryError::Tts)?;
         Ok(Self {
-            backbone: crate::nemotron_h::state_layout(backbone)
-                .map_err(NeuralStateGeometryError::Backbone)?,
-            tts: crate::decoder::state_layout(&tts).map_err(NeuralStateGeometryError::Tts)?,
+            backbone: backbone.definition().state_layout().clone(),
+            tts: tts.definition().state_layout().clone(),
         })
     }
 

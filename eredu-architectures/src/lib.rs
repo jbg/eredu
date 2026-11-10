@@ -31,7 +31,7 @@ pub use configuration::{GgufArchitecture, ModelKind};
 pub mod external_assistant;
 pub mod external_draft;
 pub use external_assistant::{
-    prepare_execution_plan_assistant, prepare_external_assistant,
+    prepare_execution_plan_assistant, prepare_external_assistant, AssistantParameterDeclarations,
     CompatibleExternalAssistantPreparation, ExternalAssistantArchitecture,
     ExternalAssistantCheckpoint, ExternalAssistantExecutionMechanisms,
     ExternalAssistantExecutorVisitor, ExternalAssistantPreparation,
@@ -53,6 +53,7 @@ mod gguf_admission;
 mod gguf_catalog;
 pub use gguf_catalog::GgufTensorCatalog;
 pub mod artifact_preparation;
+mod format_references;
 /// Backend-neutral family and checkpoint admission for sibling GGUF projectors.
 pub mod gguf_companion;
 mod inspection_validation;
@@ -108,7 +109,6 @@ pub mod rotary;
 pub mod routed_text;
 /// Backend-generic speculative execution over architecture-owned strategies.
 pub mod speculative_execution;
-mod static_parameters;
 mod transport;
 pub use expert_residency::{
     agree_expert_route_counts, exchange_expert_rows, execute_expert_route_exchange,

@@ -28,8 +28,7 @@ where
         .shared_component_definition()
         .ok_or_else(|| error("shared-backbone selection has no retained definition".into()))?;
     let definition =
-        crate::nemotron_labs_diffusion::definition::project_text_parameters(&target, &retained)
-            .map_err(|e| error(e.to_string()))?;
+        crate::replicated_text::executable_component(selected.base()).map_err(error)?;
     let parameters = definition.parameters();
     let rank = selected.requirements().topology();
     let layout = derive_partitioned_local_layout(parameters, rank).map_err(error)?;

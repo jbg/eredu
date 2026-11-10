@@ -53,24 +53,140 @@ fn individual_or_packed<C: RecipeCatalog + ?Sized>(
     }
 }
 
+/// Borrowed format-extension view of construction-owned bank parameters.
+enum BankParameters<'a> {
+    FeedForward(eredu_nn::PackedGatedProductParameters<'a>),
+    AttentionValue(&'a eredu_nn::GroupedLinearSpec),
+}
+impl<'a> BankParameters<'a> {
+    fn from_block(
+        block: &'a super::specs::BlockSpec,
+        bank: ExpertBank,
+    ) -> Result<Option<Self>, String> {
+        match bank {
+            ExpertBank::FeedForward => block
+                .routed
+                .as_ref()
+                .map(|routed| {
+                    routed
+                        .parameters
+                        .experts
+                        .packed_parameters()
+                        .map(Self::FeedForward)
+                        .map_err(|error| error.to_string())
+                })
+                .transpose(),
+            ExpertBank::AttentionValue => Ok(block
+                .values
+                .as_ref()
+                .map(|values| Self::AttentionValue(&values.experts))),
+        }
+    }
+    fn group_count(&self) -> usize {
+        match self {
+            Self::FeedForward(parameters) => parameters.group_count(),
+            Self::AttentionValue(spec) => spec.group_count() as usize,
+        }
+    }
+    fn primary(
+        &self,
+        binding: &str,
+    ) -> Result<(&eredu_nn::ParameterSpec, &eredu_nn::LinearFormatSpec), String> {
+        match (self, binding) {
+            (Self::FeedForward(parameters), "gate_up_proj" | "down_proj") => {
+                let parameter = if binding == "gate_up_proj" {
+                    parameters.gate_up()
+                } else {
+                    parameters.down()
+                };
+                Ok((
+                    parameter.parameter,
+                    parameter
+                        .linear_format
+                        .ok_or("bank projection has no declared encoding")?,
+                ))
+            }
+            (Self::AttentionValue(spec), "weight") => {
+                Ok((spec.projection().weight(), spec.projection().format()))
+            }
+            _ => Err(format!("undeclared expert projection {binding}")),
+        }
+    }
+    fn source_root(&self) -> Result<&str, String> {
+        let (binding, suffix) = match self {
+            Self::FeedForward(_) => ("gate_up_proj", ".gate_up_proj"),
+            Self::AttentionValue(_) => ("weight", ".weight"),
+        };
+        self.primary(binding)?
+            .0
+            .id
+            .as_str()
+            .strip_suffix(suffix)
+            .ok_or_else(|| "expert projection has no declared source root".into())
+    }
+    fn target(&self, binding: &str) -> Result<&eredu_nn::ParameterSpec, String> {
+        if let Ok((parameter, _)) = self.primary(binding) {
+            return Ok(parameter);
+        }
+        let (primary, scale) = match self {
+            Self::AttentionValue(_) => (
+                "weight",
+                match binding {
+                    "scales" | "weight_scale_inv" => true,
+                    "biases" => false,
+                    _ => return Err(format!("undeclared value-bank binding {binding}")),
+                },
+            ),
+            Self::FeedForward(_) => {
+                if let Some(primary) = binding.strip_suffix("_scales") {
+                    (primary, true)
+                } else if let Some(primary) = binding.strip_suffix("_biases") {
+                    (primary, false)
+                } else {
+                    return Err(format!("undeclared feed-forward binding {binding}"));
+                }
+            }
+        };
+        let format = self.primary(primary)?.1;
+        (if scale {
+            format.scale()
+        } else {
+            format.affine_bias()
+        })
+        .ok_or_else(|| format!("expert binding {binding} has no declared companion"))
+    }
+}
+
 /// Recipes for one selected expert. Every source is one individual tensor or
 /// a bounded slice of the published packed GGUF expert axis.
 pub fn expert_unit_recipes<C: RecipeCatalog + ?Sized>(
     catalog: &C,
-    args: &ModelArgs,
+    declaration: &super::Declaration,
     layer: usize,
     bank: ExpertBank,
     expert: usize,
 ) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
-    let count = match bank {
-        ExpertBank::AttentionValue if args.is_mova_layer(layer) => args.mova_num_experts,
-        ExpertBank::FeedForward if args.is_sparse_layer(layer) => args.num_experts,
-        _ => return Err("layer does not declare this expert bank".into()),
-    };
-    if expert >= count as usize {
+    let args = declaration.args();
+    let block = declaration
+        .block(layer)
+        .map_err(|error| error.to_string())?;
+    let parameters = BankParameters::from_block(&block, bank)?
+        .ok_or("layer does not declare this expert bank")?;
+    declared_expert_unit_recipes(catalog, args, layer, bank, &parameters, expert)
+}
+
+fn declared_expert_unit_recipes<C: RecipeCatalog + ?Sized>(
+    catalog: &C,
+    args: &ModelArgs,
+    layer: usize,
+    bank: ExpertBank,
+    parameters: &BankParameters<'_>,
+    expert: usize,
+) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
+    if expert >= parameters.group_count() {
         return Err("expert identity exceeds the selected bank cardinality".into());
     }
-    let root = format!("model.layers.{layer}");
+    let root = parameters.source_root()?;
     let mut recipes = BTreeMap::new();
     match bank {
         ExpertBank::AttentionValue => {
@@ -78,8 +194,8 @@ pub fn expert_unit_recipes<C: RecipeCatalog + ?Sized>(
                 "weight".into(),
                 individual_or_packed(
                     catalog,
-                    format!("{root}.self_attn.v_experts.{expert}.weight"),
-                    format!("{root}.self_attn.v_experts.weight"),
+                    format!("{root}.{expert}.weight"),
+                    format!("{root}.weight"),
                     format!("blk.{layer}.attn_v_exps.weight"),
                     expert,
                 )?,
@@ -89,8 +205,8 @@ pub fn expert_unit_recipes<C: RecipeCatalog + ?Sized>(
             let projection = |field: &str, gguf: &str| {
                 individual_or_packed(
                     catalog,
-                    format!("{root}.mlp.experts.{expert}.{field}.weight"),
-                    format!("{root}.mlp.experts.{field}.weight"),
+                    format!("{root}.{expert}.{field}.weight"),
+                    format!("{root}.{field}.weight"),
                     format!("blk.{layer}.{gguf}.weight"),
                     expert,
                 )
@@ -111,21 +227,22 @@ pub fn expert_unit_recipes<C: RecipeCatalog + ?Sized>(
             );
         }
     }
-    let fp8 = |name: &str| {
-        matches!(
-            args.linear_format_for(name),
+    let encoding = |binding: &str| {
+        parameters
+            .primary(binding)
+            .map(|(_, format)| format.encoding())
+    };
+    let fp8 = |binding: &str| -> Result<bool, String> {
+        Ok(matches!(
+            encoding(binding)?,
             eredu_checkpoint::LinearFormat::E4M3BlockFp8(_)
-        )
+        ))
     };
     match bank {
-        ExpertBank::AttentionValue if fp8(&format!("{root}.self_attn.v_experts.weight")) => {
+        ExpertBank::AttentionValue if fp8("weight")? => {
             recipes.insert(
                 "weight_scale_inv".into(),
-                stack_scale(
-                    catalog,
-                    args,
-                    &format!("{root}.self_attn.v_experts.{expert}.weight"),
-                )?,
+                stack_scale(catalog, args, &format!("{root}.{expert}.weight"))?,
             );
         }
         ExpertBank::FeedForward => {
@@ -133,15 +250,11 @@ pub fn expert_unit_recipes<C: RecipeCatalog + ?Sized>(
                 ("gate_up_proj", &["gate_proj", "up_proj"][..]),
                 ("down_proj", &["down_proj"][..]),
             ] {
-                if fp8(&format!("{root}.mlp.experts.{binding}")) {
+                if fp8(binding)? {
                     let inputs = fields
                         .iter()
                         .map(|field| {
-                            stack_scale(
-                                catalog,
-                                args,
-                                &format!("{root}.mlp.experts.{expert}.{field}.weight"),
-                            )
+                            stack_scale(catalog, args, &format!("{root}.{expert}.{field}.weight"))
                         })
                         .collect::<Result<Vec<_>, _>>()?;
                     recipes.insert(
@@ -160,22 +273,18 @@ pub fn expert_unit_recipes<C: RecipeCatalog + ?Sized>(
     // Canonical GGUF conversion exposes compact companions alongside each
     // physical expert axis. Slice and concatenate them with the same rows.
     for companion in ["scales", "biases"] {
-        let primary = match bank {
-            ExpertBank::AttentionValue => format!("{root}.self_attn.v_experts.weight"),
-            ExpertBank::FeedForward => format!("{root}.mlp.experts.gate_up_proj"),
-        };
         let needs = |format: eredu_checkpoint::LinearFormat| {
             matches!(format, eredu_checkpoint::LinearFormat::Affine(_))
                 || (companion == "scales" && format == eredu_checkpoint::LinearFormat::MxFp4)
         };
         match bank {
-            ExpertBank::AttentionValue if needs(args.linear_format_for(&primary)) => {
+            ExpertBank::AttentionValue if needs(encoding("weight")?) => {
                 recipes.insert(
                     companion.into(),
                     individual_or_packed(
                         catalog,
-                        format!("{root}.self_attn.v_experts.{expert}.{companion}"),
-                        format!("{root}.self_attn.v_experts.{companion}"),
+                        format!("{root}.{expert}.{companion}"),
+                        format!("{root}.{companion}"),
                         format!("blk.{layer}.attn_v_exps.{companion}"),
                         expert,
                     )?,
@@ -189,7 +298,7 @@ pub fn expert_unit_recipes<C: RecipeCatalog + ?Sized>(
                     ),
                     ("down_proj", &[("down_proj", "ffn_down_exps")][..]),
                 ] {
-                    if !needs(args.linear_format_for(&format!("{root}.mlp.experts.{binding}"))) {
+                    if !needs(encoding(binding)?) {
                         continue;
                     }
                     let inputs = fields
@@ -197,8 +306,8 @@ pub fn expert_unit_recipes<C: RecipeCatalog + ?Sized>(
                         .map(|(field, gguf)| {
                             individual_or_packed(
                                 catalog,
-                                format!("{root}.mlp.experts.{expert}.{field}.{companion}"),
-                                format!("{root}.mlp.experts.{field}.{companion}"),
+                                format!("{root}.{expert}.{field}.{companion}"),
+                                format!("{root}.{field}.{companion}"),
                                 format!("blk.{layer}.{gguf}.{companion}"),
                                 expert,
                             )
@@ -219,31 +328,37 @@ pub fn expert_unit_recipes<C: RecipeCatalog + ?Sized>(
     Ok(recipes)
 }
 
-fn target(layer: usize, bank: ExpertBank, binding: &str) -> String {
-    match bank {
-        ExpertBank::AttentionValue => format!("model.layers.{layer}.self_attn.v_experts.{binding}"),
-        ExpertBank::FeedForward => format!("model.layers.{layer}.mlp.experts.{binding}"),
-    }
-}
-
 /// Complete resident or rank-local bank recipes assembled from bounded members.
 pub fn expert_recipes<C: RecipeCatalog + ?Sized>(
     catalog: &C,
-    args: &ModelArgs,
+    declaration: &super::Declaration,
     layer: usize,
     bank: ExpertBank,
     experts: &[usize],
 ) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
+    let args = declaration.args();
+    let block = declaration
+        .block(layer)
+        .map_err(|error| error.to_string())?;
+    let parameters = BankParameters::from_block(&block, bank)?
+        .ok_or("layer does not declare this expert bank")?;
     let unique = experts
         .iter()
         .copied()
         .collect::<std::collections::BTreeSet<_>>();
-    if experts.is_empty() || unique.len() != experts.len() {
+    if experts.is_empty()
+        || unique.len() != experts.len()
+        || experts
+            .iter()
+            .any(|&expert| expert >= parameters.group_count())
+    {
         return Err("expert recipe identities must be nonempty and distinct".into());
     }
     let mut grouped = BTreeMap::<String, Vec<DerivedWeightRecipe>>::new();
     for &expert in experts {
-        for (binding, recipe) in expert_unit_recipes(catalog, args, layer, bank, expert)? {
+        for (binding, recipe) in
+            declared_expert_unit_recipes(catalog, args, layer, bank, &parameters, expert)?
+        {
             grouped.entry(binding).or_default().push(recipe);
         }
     }
@@ -252,7 +367,7 @@ pub fn expert_recipes<C: RecipeCatalog + ?Sized>(
         .map(|(binding, inputs)| {
             let recipe = DerivedWeightRecipe::Concatenate { axis: 0, inputs };
             recipe.infer(catalog).map_err(|e| e.to_string())?;
-            Ok((target(layer, bank, &binding), recipe))
+            Ok((parameters.target(&binding)?.id.to_string(), recipe))
         })
         .collect()
 }
@@ -261,44 +376,44 @@ pub fn expert_recipes<C: RecipeCatalog + ?Sized>(
 /// unchanged and each catalog owns its own cardinality and parameter targets.
 pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
     catalog: &C,
-    args: &ModelArgs,
+    declaration: &super::Declaration,
     bank: ExpertBank,
 ) -> Result<crate::ExpertResidencyCatalog, String> {
-    let group = ExecutionGroupId::new("text_decoder").map_err(|e| e.to_string())?;
+    let args = declaration.args();
+    let blocks = declaration.blocks().map_err(|e| e.to_string())?;
+    let group = ExecutionGroupId::new(crate::decoder::TEXT_DECODER_EXECUTION_GROUP)
+        .map_err(|e| e.to_string())?;
     let mut units = Vec::new();
-    for layer in 0..args.num_hidden_layers as usize {
-        let count = match bank {
-            ExpertBank::AttentionValue if args.is_mova_layer(layer) => args.mova_num_experts,
-            ExpertBank::FeedForward if args.is_sparse_layer(layer) => args.num_experts,
-            _ => continue,
+    for (layer, block) in blocks.iter().enumerate() {
+        let Some(parameters) = BankParameters::from_block(block, bank)? else {
+            continue;
         };
-        for expert in 0..count as usize {
-            let parameters = expert_unit_recipes(catalog, args, layer, bank, expert)?
-                .into_iter()
-                .map(|(binding, recipe)| {
-                    let (scales, biases) = if bank == ExpertBank::AttentionValue {
-                        ("scales".into(), "biases".into())
-                    } else {
-                        (format!("{binding}_scales"), format!("{binding}_biases"))
-                    };
-                    crate::ExpertParameterRecipe::new(
-                        &binding,
-                        target(layer, bank, &binding),
-                        recipe,
-                        if binding.ends_with("_scales")
-                            || binding.ends_with("_biases")
-                            || matches!(binding.as_str(), "scales" | "biases" | "weight_scale_inv")
-                            || args.linear_format_for(&target(layer, bank, &binding))
-                                != eredu_checkpoint::LinearFormat::Dense
-                        {
-                            crate::ExpertParameterRole::Preserved
+        for expert in 0..parameters.group_count() {
+            let recipes =
+                declared_expert_unit_recipes(catalog, args, layer, bank, &parameters, expert)?
+                    .into_iter()
+                    .map(|(binding, recipe)| {
+                        let (scales, biases) = if bank == ExpertBank::AttentionValue {
+                            ("scales".into(), "biases".into())
                         } else {
-                            crate::ExpertParameterRole::quantizable_projection(scales, biases)
-                        },
-                    )
-                    .map_err(|e| e.to_string())
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+                            (format!("{binding}_scales"), format!("{binding}_biases"))
+                        };
+                        crate::ExpertParameterRecipe::new(
+                            &binding,
+                            parameters.target(&binding)?.id.to_string(),
+                            recipe,
+                            if parameters.primary(&binding).is_err()
+                                || parameters.primary(&binding)?.1.encoding()
+                                    != eredu_checkpoint::LinearFormat::Dense
+                            {
+                                crate::ExpertParameterRole::Preserved
+                            } else {
+                                crate::ExpertParameterRole::quantizable_projection(scales, biases)
+                            },
+                        )
+                        .map_err(|e| e.to_string())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
             units.push(
                 crate::ExpertResidencyUnit::new(
                     ParameterBankKey::new(bank.id().value() as usize, layer, expert),
@@ -312,7 +427,7 @@ pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
                         }
                     ),
                     crate::ExpertResidencyDistribution::ExpertParallel,
-                    parameters,
+                    recipes,
                 )
                 .map_err(|e| e.to_string())?,
             );
@@ -357,10 +472,13 @@ fn stack_scale<C: RecipeCatalog + ?Sized>(
 /// Resolves source scale spelling for ordinary FP8 projections before binding.
 pub fn linear_companion_recipes<C: RecipeCatalog + ?Sized>(
     catalog: &C,
-    args: &ModelArgs,
+    declaration: &super::Declaration,
 ) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
+    let args = declaration.args();
     let mut recipes = BTreeMap::new();
-    for (name, shape) in super::parameter_shapes(args, false)? {
+    for super::SourceParameter { name, shape, .. } in
+        super::source_parameters(declaration, super::SourceLayout::Safetensors)?
+    {
         if shape.len() == 2
             && !name.contains(".mlp.experts.")
             && !name.contains(".self_attn.v_experts.")

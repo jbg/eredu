@@ -154,9 +154,16 @@ impl<B: DistributedNeuralBackend>
             }
             .into());
         }
-        let (definition, base, _) =
-            decoder::DecoderKernel::from_partition(config, definition, partition, context)?
-                .into_parts();
+        let scopes = std::sync::Arc::clone(config.text_declaration());
+        let (definition, base, _) = decoder::DecoderKernel::from_partition(
+            config,
+            definition,
+            scopes.as_ref(),
+            None,
+            partition,
+            context,
+        )?
+        .into_parts();
         let kernel = Self {
             definition: definition.clone(),
             base,

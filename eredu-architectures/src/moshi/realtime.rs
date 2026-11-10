@@ -27,8 +27,8 @@ use eredu_runtime::{
 };
 
 use super::{
-    observation_points, parameter_contract, select_parallel_execution, DecisionBoundary,
-    MoshiConfig, MoshiParallelSelection, MoshiParameterContract, MoshiPreparationPlan,
+    observation_points, select_parallel_execution, DecisionBoundary, MoshiConfig,
+    MoshiParallelSelection, MoshiParameterContract, MoshiPreparationPlan,
 };
 
 /// Derives portable input validation from normalized Moshi architecture policy.
@@ -1281,8 +1281,8 @@ where
     validate_store_metadata(&prepared, store.as_ref())
         .map_err(MoshiRealtimeDispatchError::Architecture)?;
     let (
-        preparation,
-        execution_config,
+        _preparation,
+        _execution_config,
         source_parameters,
         execution_parameters,
         parallel,
@@ -1298,14 +1298,13 @@ where
         .weight_lowerings()
         .iter()
         .any(|lowering| lowering.kind().transforms_payload());
-    let source_config = transforms.then(|| preparation.config().clone());
 
     visitor.construction_started();
-    let source_architecture = source_config
-        .map(|config| {
+    let source_architecture = transforms
+        .then(|| {
             super::MoshiKernel::<B>::from_prepared(
-                config,
-                source_parameters.into_definition(),
+                source_parameters.clone(),
+                source_parameters.retained_definition(),
                 None,
                 None,
                 context,
@@ -1316,15 +1315,15 @@ where
         .map_err(|error| MoshiRealtimeDispatchError::Architecture(error.to_string()))?;
     let architecture = match parallel.as_ref() {
         Some(parallel) => super::MoshiKernel::<B>::from_prepared(
-            execution_config,
+            execution_parameters.clone(),
             parallel.retained_definition(),
             Some(parallel.geometry().clone()),
             Some(parallel.execution_identity().to_owned()),
             context,
         ),
         None => super::MoshiKernel::<B>::from_prepared(
-            execution_config,
-            execution_parameters.into_definition(),
+            execution_parameters.clone(),
+            execution_parameters.retained_definition(),
             None,
             None,
             context,
@@ -1493,9 +1492,9 @@ fn build_candidate(
     }
     let source_config = preparation.config().clone();
     let execution_config = execution_config(&source_config, request.quantization())?;
-    let source_parameters = parameter_contract(&source_config)
-        .map_err(|error| MoshiRealtimeSelectionError::InvalidArchitecture(error.to_string()))?;
-    let execution_parameters = parameter_contract(&execution_config)
+    let source_parameters = preparation.parameter_contract().clone();
+    let execution_parameters = source_parameters
+        .with_quantization(execution_config.native_quantization())
         .map_err(|error| MoshiRealtimeSelectionError::InvalidArchitecture(error.to_string()))?;
 
     validate_observations(&execution_config, request.observations())?;
@@ -1838,7 +1837,10 @@ fn append_matrix_companion(
             ));
         }
     };
-    if execution_member.linear_companion_of() != Some(primary)
+    if execution_member
+        .linear_companion_of()
+        .map(eredu_nn::ParameterId::as_str)
+        != Some(primary)
         || execution_member.linear_companion() != Some(member_role)
     {
         return Err(invalid_architecture(format!(
@@ -1857,7 +1859,10 @@ fn append_matrix_companion(
             ))
         })?;
         if source_member.global_shape() != execution_member.global_shape()
-            || source_member.linear_companion_of() != Some(primary)
+            || source_member
+                .linear_companion_of()
+                .map(eredu_nn::ParameterId::as_str)
+                != Some(primary)
             || source_member.linear_companion() != Some(member_role)
         {
             return Err(invalid_architecture(format!(
@@ -2051,12 +2056,12 @@ fn recipe_stored_dtype(dtype: &RecipeDtype) -> Result<StoredDtype, MoshiRealtime
         RecipeDtype::Other(value) => {
             return Err(invalid_architecture(format!(
                 "unsupported Moshi recipe dtype {value:?}"
-            )))
+            )));
         }
         _ => {
             return Err(invalid_architecture(
                 "unsupported future Moshi recipe dtype",
-            ))
+            ));
         }
     })
 }

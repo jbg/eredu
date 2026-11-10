@@ -366,13 +366,52 @@ impl ArchitectureParameterDescription {
         for tagged in &groups {
             tagged.owner().validate(graph, layout)?;
             for member in tagged.group().members() {
-                if let Some(previous) = actual.insert(member.target(), tagged.owner()) {
+                if let Some((previous, _)) =
+                    actual.insert(member.target(), (tagged.owner(), member))
+                {
                     return Err(ArchitectureParameterError::DuplicateOwnership {
                         target: member.target().to_owned(),
                         first: previous.clone(),
                         second: tagged.owner().clone(),
                     });
                 }
+            }
+        }
+        for (name, (_, member)) in &actual {
+            let Some(destination) = member.alias_of() else {
+                continue;
+            };
+            let alias = || {
+                eredu_nn::ParameterId::new((*name).to_owned())
+                    .expect("validated parameter identity")
+            };
+            let Some((_, target)) = actual.get(destination.as_str()) else {
+                return Err(eredu_nn::ParameterTopologyError::MissingAliasDestination {
+                    alias: alias(),
+                    destination: destination.clone(),
+                }
+                .into());
+            };
+            if target.alias_of().is_some() {
+                return Err(eredu_nn::ParameterTopologyError::AliasTargetsAlias {
+                    alias: alias(),
+                    destination: destination.clone(),
+                }
+                .into());
+            }
+            if member.global_shape() != target.global_shape()
+                || member.logical_shape() != target.logical_shape()
+                || member
+                    .logical_linear_format()
+                    .map(|format| (format.encoding(), format.row_layout()))
+                    != target
+                        .logical_linear_format()
+                        .map(|format| (format.encoding(), format.row_layout()))
+            {
+                return Err(ArchitectureParameterError::InconsistentSharing {
+                    alias: (*name).to_owned(),
+                    destination: destination.as_str().to_owned(),
+                });
             }
         }
         if let Some(expected) = expected {
@@ -790,6 +829,17 @@ fn parameter_declarations(
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ArchitectureParameterError {
+    /// Sharing references do not identify an authoritative member of this scope.
+    #[error(transparent)]
+    ParameterTopology(#[from] eredu_nn::ParameterTopologyError),
+    /// Sharing slots disagree on geometry after the selected storage projection.
+    #[error("parameter alias {alias} differs from authoritative storage geometry {destination}")]
+    InconsistentSharing {
+        /// Aliasing logical slot.
+        alias: String,
+        /// Authoritative shared slot.
+        destination: String,
+    },
     /// A projected pinned role is absent from the canonical declaration.
     #[error("unknown projected static parameter role {0:?}")]
     UnknownProjectedStaticRole(String),

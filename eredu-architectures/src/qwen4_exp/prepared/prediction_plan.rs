@@ -8,11 +8,10 @@ use crate::{
     ExpertResidencyDistribution, ExpertResidencyUnit,
 };
 use eredu_runtime::{
-    AppendStreamBinding, AuxiliaryModuleResidency, ExecutionGroupId, ParameterBankKey,
-    ReplicatedTextParameterOwner as Owner,
+    AppendStreamBinding, ExecutionGroupId, ParameterBankKey, ReplicatedTextParameterOwner as Owner,
 };
 
-const GROUP: &str = "prediction";
+const GROUP: &str = crate::qwen4_exp::mtp::PREDICTION_EXECUTION_GROUP;
 fn invalid(error: impl std::fmt::Display) -> PreparationError {
     PreparationError::Contract(error.to_string())
 }
@@ -75,7 +74,18 @@ pub(super) fn prediction_requirements<C: eredu_checkpoint::recipe::RecipeCatalog
     ),
     PreparationError,
 > {
+    use eredu_nn::DeclareLogicalParameters;
     let state = prediction.state_layout()?;
+    let mut scope = target.logical_parameters()?;
+    scope.extend(prediction.logical_parameters()?);
+    eredu_nn::validate_logical_parameter_topology(&scope)
+        .map_err(eredu_nn::Error::backend_source)?;
+    if unit_recipes.len() != prediction.units.len() {
+        return Err(invalid(
+            "prediction recipe owners do not match declared depths",
+        ));
+    }
+    let global_experts = prediction.global_expert_count()?;
     AppendStreamBinding::validate_layout(&state, &streams)?;
     for binding in &streams {
         if binding.lanes != prediction.limits.qsa.batch as u32
@@ -84,17 +94,36 @@ pub(super) fn prediction_requirements<C: eredu_checkpoint::recipe::RecipeCatalog
             return Err(eredu_runtime::AppendStreamError::Geometry.into());
         }
     }
-    let bank = prediction.units[0].feed_forward.feed_forward.bank;
-    let mut declared = ParameterRequirements::new(source, physical, formats);
-    let shared =
-        AuxiliaryModuleResidency::new("qwen4_exp.prediction.shared", true).map_err(invalid)?;
-    for (name, recipe) in shared_recipes {
-        declared.add(
-            name,
-            recipe,
-            Owner::StaticRole("prediction_shared".into()),
-            false,
+    let bank = prediction
+        .units
+        .first()
+        .ok_or_else(|| invalid("prediction has no depth owners"))?
+        .feed_forward
+        .feed_forward
+        .bank;
+    let mut declared = ParameterRequirements::new(source, physical);
+    declared.declare(&prediction.shared, None, |_| {
+        Ok(Owner::StaticRole("prediction_shared".into()))
+    })?;
+    for unit in &prediction.units {
+        declared.declare(
+            unit,
+            Some(&unit.feed_forward.feed_forward.parameters.routed.experts),
+            |_| {
+                Ok(Owner::ExecutionUnit {
+                    group: GROUP.into(),
+                    unit: unit.depth,
+                })
+            },
         )?;
+    }
+    let shared = crate::prediction_extension::residency::module_residency(
+        crate::prediction_extension::residency::PredictionModuleNamespace::Qwen4Exp,
+        None,
+    )
+    .map_err(invalid)?;
+    for (name, recipe) in shared_recipes {
+        declared.add(name, recipe)?;
     }
     for parameter in &mut declared.parameters {
         *parameter = parameter.clone().with_auxiliary_residency(shared.clone());
@@ -106,28 +135,29 @@ pub(super) fn prediction_requirements<C: eredu_checkpoint::recipe::RecipeCatalog
     for unit in &prediction.units {
         let depth = unit.depth;
         let first = declared.parameters.len();
-        let parameter_owner = Owner::ExecutionUnit {
-            group: GROUP.into(),
-            unit: depth,
-        };
         for (name, recipe) in &unit_recipes[depth] {
-            declared.add(name, recipe, parameter_owner.clone(), false)?;
+            declared.add(name, recipe)?;
         }
-        let root = format!("mtp.layers.{depth}.mlp.experts");
+        let packed = unit
+            .feed_forward
+            .feed_forward
+            .parameters
+            .routed
+            .experts
+            .packed_parameters()?;
+        let root = checkpoint::experts::source_root(&packed).map_err(invalid)?;
         let complete = expert_banks
-            .get(&root)
+            .get(root)
             .ok_or_else(|| invalid("missing prepared prediction bank"))?;
         for (local, recipe) in complete.recipes() {
-            declared.add(
-                &format!("{root}.{local}"),
-                recipe,
-                parameter_owner.clone(),
-                true,
-            )?;
+            let target = checkpoint::experts::binding_target(&packed, local).map_err(invalid)?;
+            declared.add(&target, recipe)?;
         }
-        let residency =
-            AuxiliaryModuleResidency::new(format!("qwen4_exp.prediction.depth.{depth}"), false)
-                .map_err(invalid)?;
+        let residency = crate::prediction_extension::residency::module_residency(
+            crate::prediction_extension::residency::PredictionModuleNamespace::Qwen4Exp,
+            Some(depth),
+        )
+        .map_err(invalid)?;
         for parameter in &mut declared.parameters[first..] {
             *parameter = parameter
                 .clone()
@@ -135,18 +165,34 @@ pub(super) fn prediction_requirements<C: eredu_checkpoint::recipe::RecipeCatalog
         }
         specs.insert(
             (owner.clone(), depth),
-            unit.feed_forward.feed_forward.experts.clone(),
+            unit.feed_forward
+                .feed_forward
+                .parameters
+                .routed
+                .experts
+                .clone(),
         );
-        routes.insert(depth, target.config.experts.selected as usize);
-        for expert in 0..target.config.experts.count as usize {
-            let recipes = select_expert(expert_banks, &root, expert)?;
+        routes.insert(
+            depth,
+            unit.feed_forward
+                .feed_forward
+                .parameters
+                .routed
+                .selector
+                .selection()
+                .top_k() as usize,
+        );
+        for expert in 0..packed.group_count() {
+            let recipes = select_expert(expert_banks, root, expert)?;
             let parameters = recipes
                 .into_iter()
                 .map(|(local, recipe)| {
-                    let target = format!("{root}.{local}");
-                    let role = if matches!(local.as_str(), "gate_up_proj" | "down_proj")
-                        && formats.get(&target)? == LinearFormat::Dense
-                    {
+                    let target =
+                        checkpoint::experts::binding_target(&packed, &local).map_err(invalid)?;
+                    let primary = [packed.gate_up(), packed.down()]
+                        .into_iter()
+                        .any(|parameter| parameter.parameter.id.as_str() == target.as_str());
+                    let role = if primary && formats.get(&target)? == LinearFormat::Dense {
                         ExpertParameterRole::quantizable_projection(
                             format!("{local}_scales"),
                             format!("{local}_biases"),
@@ -175,7 +221,7 @@ pub(super) fn prediction_requirements<C: eredu_checkpoint::recipe::RecipeCatalog
         .with_inferred_byte_geometry(source)
         .map_err(invalid)?;
     let plan = ExpertRealizationPlan::balanced(
-        target.config.experts.count as usize,
+        global_experts,
         eredu_core::ParallelRankTopology::new(
             eredu_core::ParallelTopology::new(1, 1, 1, 1).map_err(invalid)?,
             0,
@@ -189,8 +235,9 @@ pub(super) fn prediction_requirements<C: eredu_checkpoint::recipe::RecipeCatalog
         bank,
         RoutedBankRequirements::new(owner, plan.into(), catalog, routes).map_err(invalid)?,
     );
+    declared.validate_complete()?;
     let identity = eredu_core::cache::derive_prompt_cache_architecture_fingerprint(
-        "qwen4_exp.target_prediction.v1",
+        "qwen4_exp.target_prediction.v4",
         [
             ("target", target.geometry_fingerprint()),
             ("prediction", format!("{prediction:?}")),
@@ -237,7 +284,6 @@ impl SelectedTargetExecution {
         selected_prediction_spec(
             &self.plan.target.spec.config,
             &prediction.spec,
-            &self.plan.target.formats,
             &self.selected,
         )
     }
@@ -246,7 +292,6 @@ impl SelectedTargetExecution {
 pub(super) fn selected_prediction_spec(
     config: &Config,
     prediction: &PredictionSpec,
-    source_formats: &ParameterFormats,
     selected: &crate::routed_text::SelectedRoutedTextRealization,
 ) -> Result<PredictionSpec, PreparationError> {
     let bank = prediction.units[0].feed_forward.feed_forward.bank;
@@ -262,28 +307,28 @@ pub(super) fn selected_prediction_spec(
         .iter()
         .map(|p| (p.name(), p.executable()))
         .collect();
-    PredictionSpec::from_prepared(
-        config,
-        prediction.limits,
-        bank,
-        |depth| {
+    let source = prediction.parameter_declaration();
+    let parameters = source.with_formats(
+        |weight, source| {
+            let name = weight.id.as_str();
+            let format = *formats
+                .get(name)
+                .ok_or_else(|| Error::backend(format!("missing prediction format {name}")))?;
+            if format == source.encoding() {
+                Ok(source.clone())
+            } else {
+                crate::linear_format::standard_linear_format(name, format)
+            }
+        },
+        |depth, _| {
             experts
                 .unit_spec(GROUP, depth)
                 .cloned()
                 .ok_or_else(|| Error::backend("selected prediction expert owner missing"))
         },
-        |name| {
-            let format = *formats
-                .get(name)
-                .ok_or_else(|| Error::backend(format!("missing prediction format {name}")))?;
-            if format == source_formats.get(name)? {
-                source_formats.ordinary(name)
-            } else {
-                crate::linear_format::standard_linear_format(name, format)
-            }
-        },
-    )
-    .map_err(PreparationError::Neural)
+    )?;
+    PredictionSpec::from_parameters(config, prediction.limits, bank, parameters)
+        .map_err(PreparationError::Neural)
 }
 
 impl SelectedTargetExecution {

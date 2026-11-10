@@ -1,4 +1,5 @@
 //! EAR decoder units over the shared resident and bounded traversal.
+use crate::ear_specs::DecoderSpec;
 use crate::{
     ear_decoder::{invalid, DecoderConfig, DecoderState, DecoderUnit, DecoderUnitSpec},
     streaming::StreamPhase,
@@ -12,9 +13,8 @@ use eredu_runtime::{
     ArchitectureStatePartitionRule, ComponentAdapter, ComponentDefinition, ComponentEquations,
     ComponentKernel, ComponentUnit, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress,
     ExecutionUnitLayout, LayeredForwardState, LayeredInvocation, LayerwisePolicy, LayerwiseRuntime,
-    LocalModelLayout, MemberSharding, OwnedParameterGroupSpec, ParallelComponentKernel,
-    ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec, ParameterRole, RuntimeState,
-    StateError, StateLayout, SubmissionBackend,
+    LocalModelLayout, OwnedParameterGroupSpec, ParallelComponentKernel, ParameterGroupOwner,
+    RuntimeState, StateError, StateLayout, SubmissionBackend,
 };
 use std::marker::PhantomData;
 
@@ -39,13 +39,11 @@ pub struct DecoderLocalDimensions {
     /// Upsample per-group output, block intermediate, and spectral output ranges.
     pub units: Vec<DecoderUnitLocalDimensions>,
 }
-/// Validates the complete physical declaration including replicated companions.
-pub fn decoder_local_dimensions(
-    config: &DecoderConfig,
-    prefix: &str,
+pub(crate) fn declared_local_dimensions(
+    declaration: &DecoderSpec,
     layout: &LocalModelLayout,
 ) -> Result<DecoderLocalDimensions, Error> {
-    let description = decoder_parameter_description(config, prefix)?;
+    let description = declared_parameters(declaration)?;
     let mut units = Vec::new();
     eredu_runtime::validate_parameter_layout(
         description.groups().iter().map(|owned| owned.group()),
@@ -202,12 +200,12 @@ pub fn decoder_state_layout(config: &DecoderConfig) -> Result<StateLayout, Error
         policies,
     )?)?)
 }
-/// Streaming neural decoder operations, independent leases and per-unit carry identities.
-pub fn decoder_component_definition(
+pub(crate) fn declared_component_definition(
     config: &DecoderConfig,
     prefix: &str,
+    declaration: &DecoderSpec,
 ) -> Result<ComponentDefinition, Error> {
-    let parameters = decoder_parameter_description(config, prefix)?;
+    let parameters = declared_parameters(declaration)?;
     let count = parameters.unit_layout().len();
     let units = (0..count)
         .map(|index| ComponentUnit {
@@ -246,8 +244,10 @@ pub struct DecoderForward {
 }
 /// Codec-owned canonical unit construction and causal state geometry.
 pub struct DecoderKernel<B: NeuralBackend> {
+    definition: ComponentDefinition,
     pub(crate) config: DecoderConfig,
     pub(crate) specs: Vec<DecoderUnitSpec>,
+    declaration: DecoderSpec,
     pub(crate) prefix: String,
     pub(crate) partition: Option<crate::ear_decoder_partition::DecoderPartition>,
     parallel: Option<(DecoderLocalDimensions, LocalModelLayout)>,
@@ -255,15 +255,15 @@ pub struct DecoderKernel<B: NeuralBackend> {
 }
 impl<B: NeuralBackend> DecoderKernel<B> {
     /// Validates the complete decoder before constructing native resources.
-    pub fn new(config: DecoderConfig, prefix: &str) -> Result<Self, Error> {
-        let specs = config.unit_specs()?;
-        if prefix.is_empty() {
-            return Err(invalid("empty EAR decoder parameter prefix"));
-        }
+    pub fn new(declared: crate::declarations::DecoderDeclaration) -> Result<Self, Error> {
+        let (config, prefix, declaration, definition) = declared.into_parts();
+        let specs = declaration.units.iter().map(|unit| unit.unit).collect();
         Ok(Self {
             config,
             specs,
-            prefix: prefix.into(),
+            declaration,
+            definition,
+            prefix,
             partition: None,
             parallel: None,
             backend: PhantomData,
@@ -271,22 +271,19 @@ impl<B: NeuralBackend> DecoderKernel<B> {
     }
     /// Constructs unloaded rank-local units after exact physical layout validation.
     pub fn new_parallel(
-        config: DecoderConfig,
-        prefix: &str,
+        declared: crate::declarations::DecoderDeclaration,
         layout: &LocalModelLayout,
     ) -> Result<Self, Error> {
-        let local = decoder_local_dimensions(&config, prefix, layout)?;
-        let mut value = Self::new(config, prefix)?;
+        let mut value = Self::new(declared)?;
+        let local = declared_local_dimensions(&value.declaration, layout)?;
         value.parallel = Some((local, layout.clone()));
         Ok(value)
     }
     /// Retains the validated decoder operations and their shared execution adapter.
     pub fn into_component(self) -> Result<ComponentAdapter<ComponentDefinition, Self>, Error> {
-        Ok(ComponentAdapter::new(
-            decoder_component_definition(&self.config, &self.prefix)?,
-            self,
-        )?)
+        Ok(ComponentAdapter::new(self.definition.clone(), self)?)
     }
+
     /// Whether this decoder requires tensor-parallel invocation.
     pub fn is_parallel(&self) -> bool {
         self.parallel.is_some()
@@ -351,91 +348,26 @@ fn decoder_graph() -> Result<ExecutionGraph, Error> {
         DECODER_GROUP,
     )?)
 }
-/// Cold canonical convolution layouts and exact independent unit ownership.
-pub fn decoder_parameter_description(
-    config: &DecoderConfig,
-    prefix: &str,
+pub(crate) fn declared_parameters(
+    declaration: &DecoderSpec,
 ) -> Result<ArchitectureParameterDescription, Error> {
-    let specs = config.unit_specs()?;
-    if prefix.is_empty() {
-        return Err(invalid("empty EAR decoder parameter prefix"));
-    }
     let graph = decoder_graph()?;
-    let layout = ExecutionUnitLayout::new(&graph, [specs.len()])?;
-    let mut owned = Vec::with_capacity(specs.len());
-    for spec in specs {
-        let index = spec.layer();
-        let name = format!("{prefix}.layers.{index}");
-        let member = |suffix: &str, shape: Vec<usize>, axis: Option<usize>| {
-            ParameterMemberSpec::new(
-                format!("{name}.{suffix}"),
-                shape,
-                axis.map_or(MemberSharding::Replicated, |axis| {
-                    MemberSharding::Partitioned { axis }
-                }),
-            )
-        };
-        let members = match spec {
-            DecoderUnitSpec::Upsample {
-                input,
-                output,
-                rate,
-                groups,
-                ..
-            } => vec![member(
-                "weight",
-                vec![input as usize, (output / groups) as usize, rate as usize],
-                Some(1),
-            )],
-            DecoderUnitSpec::Output { input, output, .. } => {
-                vec![member(
-                    "weight",
-                    vec![output as usize, input as usize, 1],
-                    Some(0),
-                )]
-            }
-            DecoderUnitSpec::Block {
-                width,
-                intermediate,
-                kernel,
-                ..
-            } => {
-                let w = width as usize;
-                let h = intermediate as usize;
-                vec![
-                    member("dwconv.weight", vec![w, 1, kernel as usize], None),
-                    member("dwconv.bias", vec![w], None),
-                    member("norm.weight", vec![w], None),
-                    member("norm.bias", vec![w], None),
-                    member("pwconv1.weight", vec![h, w, 1], Some(0)),
-                    member("pwconv1.bias", vec![h], Some(0)),
-                    member("pwconv2.weight", vec![w, h, 1], Some(1)),
-                    member("pwconv2.bias", vec![w], None),
-                ]
-            }
-        };
-        let (size, role) = match spec {
-            DecoderUnitSpec::Upsample { output, groups, .. } => {
-                (output / groups, ParameterRole::Channels)
-            }
-            DecoderUnitSpec::Block { intermediate, .. } => {
-                (intermediate, ParameterRole::FeedForwardIntermediate)
-            }
-            DecoderUnitSpec::Output { output, .. } => (output, ParameterRole::Channels),
-        };
-        let group = ParameterGroupSpec::partitioned(&name, role, size as usize, members)?;
+    let layout = ExecutionUnitLayout::new(&graph, [declaration.units.len()])?;
+    let mut owned = Vec::with_capacity(declaration.units.len());
+    for unit in &declaration.units {
         owned.push(OwnedParameterGroupSpec::new(
             ParameterGroupOwner::execution_unit(
-                layout.group_id(0).expect("decoder group").clone(),
-                index,
+                layout.group_id(0).expect("declared group").clone(),
+                unit.unit.layer(),
             ),
-            group,
+            unit.group()?,
         ));
     }
     Ok(ArchitectureParameterDescription::from_owned(
         &graph, &layout, owned,
     )?)
 }
+
 impl<B: NeuralBackend> ComponentKernel<B> for DecoderKernel<B> {
     type Input<'a> = &'a B::Tensor;
     type Unit = DecoderUnit<B::Tensor>;
@@ -477,12 +409,11 @@ impl<B: NeuralBackend> ComponentKernel<B> for DecoderKernel<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<DecoderUnit<B::Tensor>, Error> {
         let index = address.index();
-        DecoderUnit::new_selected(
-            self.specs[index],
-            &self.prefix,
-            self.local_unit(index),
-            context,
-        )
+        let mut declaration = self.declaration.units[index].clone();
+        if let Some(local) = self.local_unit(index) {
+            declaration = declaration.local(local)?;
+        }
+        DecoderUnit::new(declaration, context)
     }
     fn executes_group(&self, _: usize, _: &DecoderForward) -> bool {
         true
@@ -565,7 +496,7 @@ impl<B: DistributedNeuralBackend> DecoderKernel<B> {
         )
         .map_err(|_| invalid("invalid decoder tensor rank"))?;
         let expected = eredu_runtime::derive_partitioned_local_layout(
-            &decoder_parameter_description(&self.config, &self.prefix)?,
+            &declared_parameters(&self.declaration)?,
             topology,
         )
         .map_err(|_| invalid("decoder tensor placement cannot be derived"))?;

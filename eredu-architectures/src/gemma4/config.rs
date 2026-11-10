@@ -92,7 +92,7 @@ impl LayerPolicy {
 }
 
 /// Normalized Gemma 4 decoder configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModelArgs {
     /// Keep learned normalization products in FP32 until the final cast.
     pub float32_normalization: bool,
@@ -267,7 +267,7 @@ impl ModelArgs {
                 Some(previous) if previous != reuses_key => {
                     return Err(invalid(
                         "Gemma 4 GGUF key-as-value policy differs between full-attention owners",
-                    ))
+                    ));
                 }
                 None => key_as_value = Some(reuses_key),
                 _ => {}
@@ -361,6 +361,39 @@ impl ModelArgs {
     /// Returns one complete layer policy without fallback.
     pub fn layer_policy(&self, layer: usize) -> Option<LayerPolicy> {
         self.layer_schedule.get(layer).copied()
+    }
+
+    /// Resolves the in-stack publisher for an ordinary decoder invocation.
+    pub(crate) fn attention_state_owner(&self, layer: usize) -> Result<usize, ConfigError> {
+        let policy = self
+            .layer_policy(layer)
+            .ok_or_else(|| invalid(format!("Gemma 4 layer {layer} is outside its schedule")))?;
+        if policy.key_value != AttentionStateSource::Shared {
+            return Ok(layer);
+        }
+        let publisher = (0..layer)
+            .rev()
+            .find(|&candidate| {
+                self.layer_policy(candidate).is_some_and(|source| {
+                    source.attention == policy.attention && source.key_value.publishes_state()
+                })
+            })
+            .ok_or_else(|| {
+                invalid(format!(
+                    "Gemma 4 shared-KV layer {layer} has no earlier matching attention publisher"
+                ))
+            })?;
+        let source = self
+            .layer_policy(publisher)
+            .expect("resolved Gemma publisher");
+        if source.num_key_value_heads != policy.num_key_value_heads
+            || source.head_dim != policy.head_dim
+        {
+            return Err(invalid(format!(
+                "Gemma 4 shared-KV layer {layer} geometry does not match publisher {publisher}"
+            )));
+        }
+        Ok(publisher)
     }
 
     /// Returns the rotary base selected for one attention kind.

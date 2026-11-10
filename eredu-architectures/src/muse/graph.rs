@@ -1,6 +1,6 @@
 //! Typed Muse-Glimmer component and mutable-state graphs.
 
-use eredu_core::{cache::LayerCachePolicy, LayerSchedule};
+use eredu_core::LayerSchedule;
 use eredu_runtime::{
     ComponentDomain, ComponentGraph, ComponentGraphError, ComponentKind, ComponentResidencyClass,
     ComponentSpec, StateError, StateLayout,
@@ -115,11 +115,10 @@ pub fn component_graph(args: &DecoderConfig) -> Result<ComponentGraph, Component
 
 /// Declares the exact per-layer full/sliding key/value state geometry.
 pub fn state_layout(args: &DecoderConfig) -> Result<StateLayout, StateError> {
-    let mut layers = args
-        .attention_schedule
-        .iter()
-        .map(|policy| {
-            LayerCachePolicy::key_value(*policy, args.num_key_value_heads, args.head_dim)
+    let mut layers = (0..args.attention_schedule.len())
+        .map(|layer| {
+            args.selected_attention(layer)
+                .and_then(|spec| spec.state_policy())
                 .map_err(|error| StateError::InvalidResidency(error.to_string()))
         })
         .collect::<Result<Vec<_>, _>>()?;

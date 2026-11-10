@@ -328,54 +328,73 @@ pub fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String {
     )
 }
 
-/// Declares ordinary KV state plus the persisted decode position delta.
-pub fn state_layout(args: &ModelArgs) -> Result<StateLayout, VlConfigError> {
-    state_layout_with_key_value_heads(
-        args,
-        &vec![args.text.num_key_value_heads; args.text.num_hidden_layers as usize],
-    )
-}
-
-/// Declares rank-local ordinary KV state plus the replicated position delta.
-pub fn state_layout_with_key_value_heads(
-    args: &ModelArgs,
-    key_value_heads: &[i32],
+/// Adds persisted multimodal position state to the declared selected text cache.
+pub fn state_layout_with_text_state(
+    declaration: &crate::qwen::Declaration,
+    text: &StateLayout,
 ) -> Result<StateLayout, VlConfigError> {
-    let layers = usize::try_from(args.text.num_hidden_layers)
-        .map_err(|_| invalid("invalid text layer count"))?;
-    if key_value_heads.len() != layers || key_value_heads.iter().any(|heads| *heads <= 0) {
-        return Err(invalid("rank-local Qwen3-VL KV-head layout is incomplete"));
+    let args = declaration.args();
+    let layers =
+        usize::try_from(args.num_hidden_layers).map_err(|_| invalid("invalid text layer count"))?;
+    if text.len() != layers {
+        return Err(invalid("rank-local Qwen3-VL text state is incomplete"));
     }
-    let policies = (0..layers)
-        .map(|layer| {
-            let attention = *args
-                .text
-                .attention_schedule
-                .get(layer)
-                .ok_or_else(|| invalid(format!("missing attention layer {layer}")))?;
+    let policies = text
+        .layers()
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(layer, policy)| {
+            let LayerCachePolicy::KeyValue {
+                attention,
+                num_key_value_heads,
+                head_dim,
+            } = policy
+            else {
+                return Err(invalid(
+                    "Qwen3-VL requires ordinary text KV state before position extension",
+                ));
+            };
+            if Some(&attention) != args.attention_schedule.get(layer) {
+                return Err(invalid(
+                    "Qwen3-VL text state attention policy differs from its invocation",
+                ));
+            }
+            let geometry = declaration
+                .common()
+                .block_parameters(layer)
+                .attention
+                .geometry;
+            if head_dim.get() != geometry.key_dimensions() as u32
+                || num_key_value_heads.get() > geometry.key_value_heads() as u32
+            {
+                return Err(invalid(
+                    "Qwen3-VL selected text state differs from declared head geometry",
+                ));
+            }
             if layer == 0 {
-                LayerCachePolicy::key_value_with_state(
+                Ok(LayerCachePolicy::KeyValueWithState {
                     attention,
-                    key_value_heads[layer],
-                    args.text.head_dim,
-                    vec![StateTensorPolicy::new(
+                    num_key_value_heads,
+                    head_dim,
+                    tensors: vec![StateTensorPolicy::new(
                         StateTensorRole::PositionDelta,
                         vec![StateTensorDimension::Scalar],
                         StateTensorDtype::Int32,
                         MutableStateResidency::AlwaysDeviceMutable,
                     )
                     .map_err(|error| invalid(error.to_string()))?],
-                    Vec::new(),
-                )
+                    streams: Vec::new(),
+                })
             } else {
-                LayerCachePolicy::key_value(attention, key_value_heads[layer], args.text.head_dim)
+                Ok(policy)
             }
-            .map_err(|error| invalid(error.to_string()))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let schedule =
-        LayerSchedule::new(layers, policies).map_err(|error| invalid(error.to_string()))?;
-    StateLayout::new(schedule).map_err(|error| invalid(error.to_string()))
+    StateLayout::new(
+        LayerSchedule::new(layers, policies).map_err(|error| invalid(error.to_string()))?,
+    )
+    .map_err(|error| invalid(error.to_string()))
 }
 
 /// Declares Qwen3-VL prompt identity independently of concrete cache storage.

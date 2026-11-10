@@ -2,10 +2,10 @@
 
 use eredu_core::cache::StateTensorRole;
 use eredu_nn::{
-    AttentionCache, CausalDepthwiseConvolutionSpec, ConvolutionActivation, Error,
-    GatedShortConvolution, GatedShortConvolutionSpec, GroupedNeuralBackend, LinearSpec,
-    NeuralBackend, NormalizationConstructionSpec, NormalizationOperator, ParameterSpec,
-    Parameterized, RotarySpec, Tensor,
+    AttentionCache, CausalDepthwiseConvolutionSpec, ConvolutionActivation,
+    DeclareLogicalParameters, Error, GatedShortConvolution, GatedShortConvolutionSpec,
+    GroupedNeuralBackend, LinearSpec, NeuralBackend, NormalizationConstructionSpec,
+    NormalizationOperator, ParameterSpec, Parameterized, RotarySpec, Tensor,
 };
 use eredu_runtime::RuntimeStateComponents;
 
@@ -14,7 +14,35 @@ use crate::decoder::{
     TensorParallelProjectionOperator,
 };
 
-use super::{FeedForward, ModelArgs, OperatorPolicy};
+use super::{FeedForward, ModelArgs};
+
+pub(crate) fn normalization_spec(
+    args: &ModelArgs,
+    parameter: &str,
+    dimensions: i32,
+) -> Result<NormalizationConstructionSpec, Error> {
+    let spec = NormalizationConstructionSpec::learned(
+        dimensions,
+        args.norm_eps,
+        ParameterSpec::trainable(parameter).map_err(Error::backend)?,
+    );
+    spec.logical_parameters()?;
+    Ok(spec)
+}
+
+fn attention_head_dim(args: &ModelArgs) -> Result<i32, Error> {
+    let head = args
+        .hidden_size
+        .checked_div(args.num_attention_heads)
+        .filter(|&n| {
+            args.hidden_size > 0
+                && args.num_attention_heads > 0
+                && n > 0
+                && args.hidden_size % args.num_attention_heads == 0
+        })
+        .ok_or_else(|| Error::backend("invalid LFM2 attention head width"))?;
+    Ok(head)
+}
 
 /// Scheduled LFM2 token mixer.
 #[derive(Debug, Clone, Parameterized)]
@@ -51,99 +79,29 @@ pub(crate) struct ReplicatedBlock<B: NeuralBackend> {
 }
 
 impl<B: NeuralBackend> ReplicatedBlock<B> {
-    pub(crate) fn new(
-        args: &ModelArgs,
-        layer: usize,
+    pub(crate) fn from_parameters(
+        parameters: super::declarations::BlockParameters,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let policy = args
-            .layer_policy(layer)
-            .ok_or_else(|| Error::backend(format!("LFM2 has no layer {layer}")))?;
-        if policy.feed_forward != super::FeedForwardPolicy::Dense {
+        use super::declarations::{FeedForwardParameters as F, MixerParameters as M};
+        let F::Dense(feed_forward) = parameters.feed_forward else {
             return Err(Error::backend(
-                "replicated LFM2 unit requires a dense feed-forward policy",
+                "replicated LFM2 requires a dense feed-forward scope",
             ));
-        }
-        let root = format!("model.layers.{layer}");
-        let mixer = match policy.operator {
-            OperatorPolicy::CausalConvolution => {
-                TokenMixer::ShortConvolution(GatedShortConvolution::new(
-                    short_convolution_spec(args, &root, args.hidden_size)?,
-                    context,
-                )?)
-            }
-            OperatorPolicy::SelfAttention(attention) => {
-                let head_dim = args.hidden_size / args.num_attention_heads;
-                let prefix = format!("{root}.self_attn");
-                let specs =
-                    attention_projection_specs(args, &root, BlockGeometry::replicated(args))?;
-                let linear = |field: &str| {
-                    let spec = specs
-                        .iter()
-                        .find(|(name, _)| name == field)
-                        .ok_or_else(|| Error::backend("attention projection absent"))?;
-                    B::linear(spec.1.clone(), context)
-                };
-                let norm = |field: &str| {
-                    B::normalization(
-                        NormalizationConstructionSpec::learned(
-                            head_dim,
-                            args.norm_eps,
-                            ParameterSpec::trainable(format!("{prefix}.{field}.weight"))
-                                .map_err(Error::backend)?,
-                        ),
-                        context,
-                    )
-                };
-                let mut mixer = Attention::from_parts(
-                    args.num_attention_heads,
-                    args.num_key_value_heads,
-                    head_dim,
-                    linear("q_proj")?,
-                    linear("k_proj")?,
-                    linear("v_proj")?,
-                    linear("out_proj")?,
-                    Some(norm("q_layernorm")?),
-                    Some(norm("k_layernorm")?),
-                    Some(B::rotary(
-                        RotarySpec {
-                            arithmetic: eredu_nn::RotaryArithmetic::InputProducts,
-                            dimensions: head_dim,
-                            base: args.rope.theta,
-                            traditional: false,
-                            algorithm: eredu_nn::RotaryAlgorithm::Default,
-                        },
-                        context,
-                    )?),
-                    attention.sliding_window_i32().map_err(Error::backend)?,
-                )?;
-                // Match the released equation's input-dtype score and
-                // probability boundaries, including low-precision inference.
-                mixer.arithmetic = eredu_nn::AttentionArithmetic::InputScores;
-                TokenMixer::Attention(mixer)
-            }
         };
-        let normalization = |field: &str| {
-            B::normalization(
-                NormalizationConstructionSpec::learned(
-                    args.hidden_size,
-                    args.norm_eps,
-                    ParameterSpec::trainable(format!("{root}.{field}.weight"))
-                        .map_err(Error::backend)?,
-                ),
-                context,
-            )
+        let mixer = match parameters.mixer {
+            M::Convolution(spec) => {
+                TokenMixer::ShortConvolution(GatedShortConvolution::new(spec, context)?)
+            }
+            M::Attention(spec, policy) => {
+                TokenMixer::Attention(spec.construct::<B>(policy, context)?)
+            }
         };
         Ok(Self {
             mixer,
-            feed_forward: super::moe::DenseSwiGlu::new(
-                args,
-                layer,
-                args.dense_intermediate_size,
-                context,
-            )?,
-            operator_norm: normalization("operator_norm")?,
-            feed_forward_norm: normalization("ffn_norm")?,
+            feed_forward: super::moe::DenseSwiGlu::from_parameters(feed_forward, context)?,
+            operator_norm: B::normalization(parameters.operator_norm, context)?,
+            feed_forward_norm: B::normalization(parameters.feed_forward_norm, context)?,
         })
     }
 
@@ -231,116 +189,26 @@ impl BlockGeometry {
 }
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
-    /// Builds one unloaded block from the normalized physical schedule.
-    pub fn new(
-        args: &ModelArgs,
+    pub(crate) fn from_parameters(
         layer: usize,
+        parameters: super::declarations::BlockParameters,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        Self::new_with_geometry(args, layer, BlockGeometry::replicated(args), context)
-    }
-
-    /// Builds one unloaded block from placement-resolved local geometry.
-    pub fn new_with_geometry(
-        args: &ModelArgs,
-        layer: usize,
-        geometry: BlockGeometry,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        Self::new_with_geometry_and_routed_spec(args, layer, geometry, None, context)
-    }
-
-    pub(crate) fn new_with_geometry_and_routed_spec(
-        args: &ModelArgs,
-        layer: usize,
-        geometry: BlockGeometry,
-        routed_spec: Option<eredu_nn::GroupedGatedProductSpec>,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        let policy = args
-            .layer_policy(layer)
-            .ok_or_else(|| Error::backend(format!("LFM2 has no layer {layer}")))?;
-        let root = format!("model.layers.{layer}");
-        let mixer = match policy.operator {
-            OperatorPolicy::CausalConvolution => {
-                TokenMixer::ShortConvolution(GatedShortConvolution::new(
-                    short_convolution_spec(args, &root, geometry.convolution_channels)?,
-                    context,
-                )?)
+        eredu_nn::validate_logical_parameter_topology(&parameters.logical_parameters()?)
+            .map_err(Error::backend_source)?;
+        let mixer = match parameters.mixer {
+            super::declarations::MixerParameters::Convolution(spec) => {
+                TokenMixer::ShortConvolution(GatedShortConvolution::new(spec, context)?)
             }
-            OperatorPolicy::SelfAttention(attention) => {
-                let head_dim = args.hidden_size / args.num_attention_heads;
-                let prefix = format!("{root}.self_attn");
-                let specs = attention_projection_specs(args, &root, geometry)?;
-                let linear = |field: &str| {
-                    let spec = specs
-                        .iter()
-                        .find(|(name, _)| name == field)
-                        .ok_or_else(|| Error::backend("attention projection absent"))?;
-                    B::linear(spec.1.clone(), context)
-                };
-                let norm = |field: &str| {
-                    B::normalization(
-                        NormalizationConstructionSpec::learned(
-                            head_dim,
-                            args.norm_eps,
-                            ParameterSpec::trainable(format!("{prefix}.{field}.weight"))
-                                .map_err(Error::backend)?,
-                        ),
-                        context,
-                    )
-                };
-                let mut mixer = Attention::from_parts(
-                    geometry.query_heads,
-                    geometry.key_value_heads,
-                    head_dim,
-                    linear("q_proj")?,
-                    linear("k_proj")?,
-                    linear("v_proj")?,
-                    linear("out_proj")?,
-                    Some(norm("q_layernorm")?),
-                    Some(norm("k_layernorm")?),
-                    Some(B::rotary(
-                        RotarySpec {
-                            arithmetic: eredu_nn::RotaryArithmetic::InputProducts,
-                            dimensions: head_dim,
-                            base: args.rope.theta,
-                            traditional: false,
-                            algorithm: eredu_nn::RotaryAlgorithm::Default,
-                        },
-                        context,
-                    )?),
-                    attention.sliding_window_i32().map_err(Error::backend)?,
-                )?;
-                // Match the released equation's input-dtype score and
-                // probability boundaries, including low-precision inference.
-                mixer.arithmetic = eredu_nn::AttentionArithmetic::InputScores;
-                TokenMixer::Attention(mixer)
+            super::declarations::MixerParameters::Attention(spec, policy) => {
+                TokenMixer::Attention(spec.construct::<B>(policy, context)?)
             }
-        };
-        let normalization = |field: &str| {
-            B::normalization(
-                NormalizationConstructionSpec::learned(
-                    args.hidden_size,
-                    args.norm_eps,
-                    ParameterSpec::trainable(format!("{root}.{field}.weight"))
-                        .map_err(Error::backend)?,
-                ),
-                context,
-            )
         };
         Ok(Self {
             mixer,
-            feed_forward: FeedForward::new_with_geometry_and_routed_spec(
-                args,
-                layer,
-                geometry.dense_intermediate,
-                geometry.expert_intermediate,
-                routed_spec,
-                context,
-            )?,
-            operator_norm: normalization("operator_norm")?,
-            feed_forward_norm: normalization("ffn_norm")?,
+            feed_forward: FeedForward::from_parameters(layer, parameters.feed_forward, context)?,
+            operator_norm: B::normalization(parameters.operator_norm, context)?,
+            feed_forward_norm: B::normalization(parameters.feed_forward_norm, context)?,
         })
     }
 
@@ -680,11 +548,12 @@ pub(crate) fn short_convolution_spec(
             )?,
         })
     };
-    Ok(GatedShortConvolutionSpec {
+    let fused = GatedShortConvolutionSpec::input_layout(channels)?.output_width();
+    let spec = GatedShortConvolutionSpec {
         input_dimensions: args.hidden_size,
         channels,
         output_dimensions: args.hidden_size,
-        input_projection: linear("in_proj", args.hidden_size, 3 * channels)?,
+        input_projection: linear("in_proj", args.hidden_size, fused)?,
         output_projection: linear("out_proj", channels, args.hidden_size)?,
         convolution: CausalDepthwiseConvolutionSpec {
             arithmetic: eredu_nn::ConvolutionArithmetic::Native,
@@ -698,38 +567,105 @@ pub(crate) fn short_convolution_spec(
                 .transpose()?,
             activation: ConvolutionActivation::Identity,
         },
-    })
+    };
+    spec.validate()?;
+    Ok(spec)
 }
 
-fn attention_projection_specs(
-    args: &ModelArgs,
-    root: &str,
-    geometry: BlockGeometry,
-) -> Result<Vec<(String, LinearSpec)>, Error> {
-    let head = args.hidden_size / args.num_attention_heads;
-    let query = geometry
-        .query_heads
-        .checked_mul(head)
-        .ok_or_else(|| Error::backend("query projection width overflow"))?;
-    let kv = geometry
-        .key_value_heads
-        .checked_mul(head)
-        .ok_or_else(|| Error::backend("key/value projection width overflow"))?;
-    let prefix = format!("{root}.self_attn");
-    [
-        ("q_proj", args.hidden_size, query),
-        ("k_proj", args.hidden_size, kv),
-        ("v_proj", args.hidden_size, kv),
-        ("out_proj", query, args.hidden_size),
-    ]
-    .into_iter()
-    .map(|(field, input, output)| {
-        Ok((
-            field.into(),
-            attention_projection_spec(args, &prefix, field, input, output)?,
-        ))
-    })
-    .collect()
+/// Exact global or rank-local attention slots, head geometry and arithmetic.
+#[derive(Debug, Clone)]
+pub(crate) struct AttentionParameters {
+    pub projection: eredu_nn::SelfAttentionProjectionSpec,
+    pub query_norm: NormalizationConstructionSpec,
+    pub key_norm: NormalizationConstructionSpec,
+    pub rotary: RotarySpec,
+    pub arithmetic: eredu_nn::AttentionArithmetic,
+}
+
+impl AttentionParameters {
+    pub fn new(args: &ModelArgs, root: &str, geometry: BlockGeometry) -> Result<Self, Error> {
+        let head = attention_head_dim(args)?;
+        let heads = eredu_nn::AttentionHeadGeometry::new(
+            geometry.query_heads,
+            geometry.key_value_heads,
+            head,
+            head,
+        )?;
+        let prefix = format!("{root}.self_attn");
+        let projection =
+            |field, input, output| attention_projection_spec(args, &prefix, field, input, output);
+        let norm = |field| normalization_spec(args, &format!("{prefix}.{field}.weight"), head);
+        let spec = Self {
+            projection: eredu_nn::SelfAttentionProjectionSpec::new(
+                heads,
+                eredu_nn::AttentionQueryLayout::QueryOnly,
+                projection("q_proj", args.hidden_size, heads.query_width())?,
+                projection("k_proj", args.hidden_size, heads.key_width())?,
+                projection("v_proj", args.hidden_size, heads.value_width())?,
+                projection("out_proj", heads.attended_width(), args.hidden_size)?,
+            )?,
+            query_norm: norm("q_layernorm")?,
+            key_norm: norm("k_layernorm")?,
+            rotary: RotarySpec {
+                arithmetic: eredu_nn::RotaryArithmetic::InputProducts,
+                dimensions: head,
+                base: args.rope.theta,
+                traditional: false,
+                algorithm: eredu_nn::RotaryAlgorithm::Default,
+            },
+            arithmetic: eredu_nn::AttentionArithmetic::InputScores,
+        };
+        spec.logical_parameters()?;
+        Ok(spec)
+    }
+
+    pub(crate) fn construct<B: NeuralBackend>(
+        self,
+        policy: eredu_core::AttentionPolicy,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Attention<B>, Error> {
+        self.logical_parameters()?;
+        let heads = self.projection.geometry;
+        let window = policy.sliding_window_i32().map_err(Error::backend)?;
+        let mut attention = Attention::from_parts(
+            heads.query_heads(),
+            heads.key_value_heads(),
+            heads.key_dimensions(),
+            B::linear(self.projection.query, context)?,
+            B::linear(self.projection.key, context)?,
+            B::linear(self.projection.value, context)?,
+            B::linear(self.projection.output, context)?,
+            Some(B::normalization(self.query_norm, context)?),
+            Some(B::normalization(self.key_norm, context)?),
+            Some(B::rotary(self.rotary, context)?),
+            window,
+        )?;
+        attention.arithmetic = self.arithmetic;
+        Ok(attention)
+    }
+}
+
+impl DeclareLogicalParameters for AttentionParameters {
+    fn logical_parameters(&self) -> Result<Vec<eredu_nn::LogicalParameterDeclaration<'_>>, Error> {
+        let heads = self.projection.geometry;
+        if self.projection.query_layout != eredu_nn::AttentionQueryLayout::QueryOnly
+            || self.projection.query.input != self.projection.output.output
+            || heads.key_dimensions() != heads.value_dimensions()
+            || self.query_norm.dimensions != heads.key_dimensions()
+            || self.key_norm.dimensions != heads.key_dimensions()
+            || self.rotary.dimensions != heads.key_dimensions()
+        {
+            return Err(Error::backend(
+                "LFM2 attention residual, normalization or rotary geometry mismatch",
+            ));
+        }
+        let mut parameters = self.projection.logical_parameters()?;
+        parameters.extend(self.query_norm.logical_parameters()?);
+        parameters.extend(self.key_norm.logical_parameters()?);
+        eredu_nn::validate_logical_parameter_topology(&parameters)
+            .map_err(Error::backend_source)?;
+        Ok(parameters)
+    }
 }
 
 fn attention_projection_spec(
@@ -740,7 +676,7 @@ fn attention_projection_spec(
     output: i32,
 ) -> Result<LinearSpec, Error> {
     let name = format!("{prefix}.{field}.weight");
-    Ok(LinearSpec {
+    let spec = LinearSpec {
         input,
         output,
         weight: ParameterSpec::trainable(&name).map_err(Error::backend)?,
@@ -749,77 +685,76 @@ fn attention_projection_spec(
             &name,
             args.weight_quantization_for(&name).into(),
         )?,
-    })
+    };
+    spec.logical_parameters()?;
+    Ok(spec)
 }
 
 /// Ordinary block construction topology, independent of native memory policy.
 pub(crate) fn execution_topology(
-    args: &ModelArgs,
+    declaration: &super::Declaration,
 ) -> Result<eredu_runtime::execution_topology::TextExecutionTopology, Error> {
     use eredu_runtime::execution_topology::*;
+    let gain = |spec: &NormalizationConstructionSpec| -> Result<String, Error> {
+        match &spec.scale {
+            eredu_nn::NormalizationScale::Learned(weight) => Ok(weight.id.to_string()),
+            _ => Err(Error::backend(
+                "LFM2 topology requires learned normalization",
+            )),
+        }
+    };
     let positive = |n: i32| {
         u64::try_from(n)
             .ok()
             .filter(|n| *n > 0)
             .ok_or_else(|| Error::backend("text topology dimensions must be positive"))
     };
-    let layers = args
-        .layer_schedule
+    use super::declarations::{FeedForwardParameters as F, MixerParameters as M};
+    let layers = declaration
+        .blocks
         .iter()
-        .enumerate()
-        .map(|(layer, policy)| {
-            let root = format!("model.layers.{layer}");
-            let mixer = match policy.operator {
-                OperatorPolicy::CausalConvolution => {
-                    let spec = short_convolution_spec(args, &root, args.hidden_size)?;
-                    TokenMixerTopology::GatedConvolution {
-                        channels: positive(spec.channels)?,
-                        kernel: positive(spec.convolution.kernel_size)?,
-                        dilation: positive(spec.convolution.dilation)?,
-                        projections: [&spec.input_projection, &spec.output_projection]
-                            .into_iter()
-                            .map(ProjectionTopology::from_spec)
-                            .collect::<Result<_, _>>()?,
-                    }
-                }
-                OperatorPolicy::SelfAttention(_) => {
-                    let head = args.hidden_size / args.num_attention_heads;
-                    let specs =
-                        attention_projection_specs(args, &root, BlockGeometry::replicated(args))?;
-                    TokenMixerTopology::Attention {
-                        query_heads: positive(args.num_attention_heads)?,
-                        kv_heads: positive(args.num_key_value_heads)?,
-                        key_width: positive(head)?,
-                        value_width: positive(head)?,
-                        input_scores: true,
-                        softcap: false,
-                        sinks: false,
-                        projections: specs
-                            .iter()
-                            .map(|(_, spec)| ProjectionTopology::from_spec(spec))
-                            .collect::<Result<_, _>>()?,
-                        output_gate: false,
-                        query_key_normalization: true,
-                        rotary: true,
-                    }
-                }
-            };
-            let feed_forward = match policy.feed_forward {
-                super::FeedForwardPolicy::Dense => FeedForwardTopology::Gated {
-                    intermediate_size: positive(args.dense_intermediate_size)?,
-                    projections: super::moe::dense_projection_specs(
-                        args,
-                        layer,
-                        args.dense_intermediate_size,
-                    )?
-                    .iter()
-                    .map(|(_, s)| ProjectionTopology::from_spec(s))
-                    .collect::<Result<_, _>>()?,
+        .map(|scope| {
+            let mixer = match &scope.mixer {
+                M::Convolution(spec) => TokenMixerTopology::GatedConvolution {
+                    channels: positive(spec.channels)?,
+                    kernel: positive(spec.convolution.kernel_size)?,
+                    dilation: positive(spec.convolution.dilation)?,
+                    projections: [&spec.input_projection, &spec.output_projection]
+                        .into_iter()
+                        .map(ProjectionTopology::from_spec)
+                        .collect::<Result<_, _>>()?,
                 },
-                super::FeedForwardPolicy::SparseMoe => FeedForwardTopology::from_grouped_specs(
-                    &super::moe::selector_spec(args, layer)?,
-                    &super::moe::expert_bank_spec(args, layer)?,
-                )?,
+                M::Attention(spec, _) => TokenMixerTopology::Attention {
+                    query_heads: positive(spec.projection.geometry.query_heads())?,
+                    kv_heads: positive(spec.projection.geometry.key_value_heads())?,
+                    key_width: positive(spec.projection.geometry.key_dimensions())?,
+                    value_width: positive(spec.projection.geometry.value_dimensions())?,
+                    input_scores: spec.arithmetic == eredu_nn::AttentionArithmetic::InputScores,
+                    softcap: false,
+                    sinks: false,
+                    projections: spec
+                        .projection
+                        .projections()
+                        .into_iter()
+                        .map(ProjectionTopology::from_spec)
+                        .collect::<Result<_, _>>()?,
+                    output_gate: false,
+                    query_key_normalization: true,
+                    rotary: true,
+                },
+            };
+            let feed_forward = match &scope.feed_forward {
+                F::Dense(spec) => FeedForwardTopology::Gated {
+                    intermediate_size: positive(spec.down.input)?,
+                    projections: spec
+                        .projections()
+                        .into_iter()
+                        .map(ProjectionTopology::from_spec)
+                        .collect::<Result<_, _>>()?,
+                },
+                F::Routed(spec) => {
+                    FeedForwardTopology::from_grouped_specs(&spec.selector, &spec.experts)?
+                }
             };
             Ok(TextLayerTopology {
                 input_projections: Vec::new(),
@@ -834,14 +769,14 @@ pub(crate) fn execution_topology(
     // through their downstream projections (there is no narrowing cast).
     let mut projection_input_normalizations = std::collections::BTreeMap::new();
     for (index, layer) in layers.iter().enumerate() {
-        let root = format!("model.layers.{index}");
+        let scope = &declaration.blocks[index];
         if let TokenMixerTopology::Attention { projections, .. }
         | TokenMixerTopology::GatedConvolution { projections, .. } = &layer.mixer
         {
             for projection in projections {
                 projection_input_normalizations.insert(
                     projection.parameter.clone(),
-                    vec![format!("{root}.operator_norm.weight")],
+                    vec![gain(&scope.operator_norm)?],
                 );
             }
         }
@@ -850,19 +785,21 @@ pub(crate) fn execution_topology(
             for projection in projections {
                 projection_input_normalizations.insert(
                     projection.parameter.clone(),
-                    vec![format!("{root}.ffn_norm.weight")],
+                    vec![gain(&scope.feed_forward_norm)?],
                 );
             }
         }
     }
-    let spec = super::static_spec(args);
-    let output = spec.output_topology()?;
-    projection_input_normalizations
-        .insert(output.parameter.clone(), vec![spec.normalization_weight]);
+    let statics = &declaration.statics;
+    let output = ProjectionTopology::from_spec(&statics.output_projection_spec())?;
+    projection_input_normalizations.insert(
+        output.parameter.clone(),
+        vec![gain(statics.normalization_spec())?],
+    );
     Ok(TextExecutionTopology {
         iterative: None,
-        hidden_size: positive(args.hidden_size)?,
-        vocabulary_size: positive(args.vocab_size)?,
+        hidden_size: positive(statics.embedding_spec().dimensions)?,
+        vocabulary_size: positive(statics.embedding_spec().vocabulary)?,
         layers,
         output,
         output_invocations: 1,

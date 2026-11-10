@@ -6,31 +6,23 @@
 
 use crate::decoder::Config;
 
-use eredu_codec::{
-    ear::{AudioDecoderConfig, AudioEncoderConfig},
-    ear_decoder::DecoderUnit,
-    ear_encoder::EncoderUnit,
-    prvq::Codebook,
-};
-use eredu_nn::{LinearFormatSpec, NeuralBackend, Parameterized, Tensor};
+use eredu_codec::{ear_decoder::DecoderUnit, ear_encoder::EncoderUnit, prvq::Codebook};
+use eredu_nn::{NeuralBackend, Parameterized, Tensor};
 
 use super::{
     artifact::RetainedVoiceChatArtifacts,
     channels::{ChannelError, FunctionHead},
     checkpoint::Component,
-    codec::{waveform_decoder_config, waveform_encoder_config},
     config::{ConfigError, VoiceChatConfig},
     conformer::{ConformerBlock, ConformerError},
     parameters::{PreparedSpeechParameterUnit, SpeechParameterError},
-    perception::{PerceptionDimensions, PerceptionError},
-    rnnt::{Rnnt, RnntDimensions, RnntError},
+    perception::PerceptionError,
+    rnnt::{Rnnt, RnntError},
     subsampling::{CausalSubsampling, SubsamplingError},
-    tts_conditioning::{CharacterDimensions, CharacterEmbedding, GatedFusion},
+    tts_conditioning::{CharacterEmbedding, GatedFusion},
     tts_ingress::TtsIngress,
-    tts_mog::{MogBlock, MogComponentBank, MogDimensions, MogPredictionHead, TtsError},
-    tts_prompt::AriaPromptPlan,
-    tts_rvq::{RvqBank, RvqDimensions, RvqProjection},
-    tts_transformer::TransformerConfig,
+    tts_mog::{MogBlock, MogComponentBank, MogPredictionHead, TtsError},
+    tts_rvq::{RvqBank, RvqProjection},
 };
 
 /// One independently constructed and bound learned unit in the speech graph.
@@ -156,14 +148,15 @@ pub enum ConstructionError {
 /// Cold, validated construction geometry without artifacts or native resources.
 pub struct SpeechConstructionPlan {
     config: VoiceChatConfig,
-    perception: PerceptionDimensions,
-    rnnt: RnntDimensions,
-    character: TransformerConfig,
-    tts: TransformerConfig,
-    mog: MogDimensions,
-    encoder: AudioEncoderConfig,
-    decoder: AudioDecoderConfig,
-    speaker_frames: i32,
+    pub(super) perception: &'static super::perception_specs::PerceptionDeclaration,
+    rnnt: &'static super::rnnt_specs::RnntDeclaration,
+    function: &'static super::function_head_layered::FunctionHeadDeclaration,
+    pub(super) character: &'static super::tts_transformer_specs::TransformerDeclaration,
+    pub(super) tts: &'static super::tts_transformer_specs::TransformerDeclaration,
+    pub(super) mog: &'static super::tts_mog_specs::MogDeclaration,
+    pub(super) conditioning: &'static super::tts_conditioning_specs::ConditioningDeclaration,
+    pub(super) rvq: &'static super::tts_rvq_specs::RvqDeclaration,
+    pub(super) codec: &'static super::codec::CodecDeclarations,
     units: Vec<SpeechUnitId>,
 }
 
@@ -171,38 +164,41 @@ impl SpeechConstructionPlan {
     /// Normalizes every component's geometry before creating any backend module.
     pub fn from_config(config: &VoiceChatConfig) -> Result<Self, ConstructionError> {
         config.validate()?;
-        let perception = PerceptionDimensions::from_config(&config.perception)?;
-        let rnnt = RnntDimensions::from_config(&config.rnnt)?;
-        let character = TransformerConfig::new(&config.tts.character_encoder)?;
-        let tts = TransformerConfig::new(&config.tts.backbone)?;
-        let mog = MogDimensions::from_config(&config.tts)?;
-        let encoder = waveform_encoder_config(&config.codec)?;
-        let decoder = waveform_decoder_config(&config.codec)?;
-        let speaker_frames = AriaPromptPlan::from_config(config, usize::MAX)?.frames();
+        let perception = super::perception_specs::released_declaration()?;
+        let rnnt = super::rnnt_specs::released_declaration()?;
+        let function = super::function_head_layered::released_declaration()?;
+        let transformers = super::tts_transformer_specs::released_declarations()?;
+        let character = &transformers.character;
+        let tts = &transformers.causal;
+        let mog = super::tts_mog_specs::released_declaration()?;
+        let codec = super::codec::released_declarations()?;
+        let conditioning = super::tts_conditioning_specs::released_declaration()?;
+        let rvq = super::tts_rvq_specs::released_declaration()?;
         use SpeechUnitId::*;
         let mut units = vec![PerceptionSubsampling];
-        units.extend((0..perception.layers).map(PerceptionBlock));
+        units.extend((0..perception.spec().blocks.len()).map(PerceptionBlock));
         units.extend([PerceptionProjection, Rnnt, FunctionHead, CharacterEmbedding]);
-        units.extend((0..config.tts.character_encoder.num_hidden_layers).map(CharacterBlock));
+        units.extend((0..character.spec().parameters.blocks.len()).map(CharacterBlock));
         units.extend([CharacterNorm, TtsIngress, TtsFusion]);
-        units.extend((0..config.tts.backbone.num_hidden_layers).map(TtsBlock));
+        units.extend((0..tts.spec().parameters.blocks.len()).map(TtsBlock));
         units.extend([TtsNorm, TtsRvqBank, TtsRvqProjection]);
-        units.extend((0..mog.layers).map(MogBlock));
+        units.extend((0..mog.spec().blocks.len()).map(MogBlock));
         units.push(MogPredictionHead);
         units.push(MogComponentBank);
-        units.extend((0..encoder.neural.unit_specs()?.len()).map(CodecEncoder));
-        units.extend((0..decoder.neural.unit_specs()?.len()).map(CodecDecoder));
-        units.extend((0..decoder.quantizer.depth).map(CodecCodebook));
+        units.extend((0..codec.encoder.spec().units().len()).map(CodecEncoder));
+        units.extend((0..codec.decoder.spec().units().len()).map(CodecDecoder));
+        units.extend((0..codec.quantizer.spec().codebooks().len()).map(CodecCodebook));
         Ok(Self {
             config: config.clone(),
             perception,
             rnnt,
+            function,
             character,
             tts,
             mog,
-            encoder,
-            decoder,
-            speaker_frames,
+            conditioning,
+            rvq,
+            codec,
             units,
         })
     }
@@ -244,24 +240,12 @@ impl SpeechConstructionPlan {
                     _ => (perception::PROJECTION.into(), 0),
                 };
                 (
-                    perception::perception_parameter_description(self.perception)?,
+                    self.perception.definition().parameters().clone(),
                     Some(unit),
                 )
             }
-            Rnnt => (
-                super::rnnt_layered::rnnt_parameter_description(self.rnnt)?,
-                None,
-            ),
-            FunctionHead => (
-                super::function_head_layered::function_head_parameter_description(
-                    super::function_head_layered::FunctionHeadDimensions::new(
-                        self.perception.output_width,
-                        131072,
-                    )?,
-                    &LinearFormatSpec::unscaled(eredu_checkpoint::LinearFormat::Dense)?,
-                )?,
-                None,
-            ),
+            Rnnt => (self.rnnt.definition().parameters().clone(), None),
+            FunctionHead => (self.function.definition().parameters().clone(), None),
             CharacterEmbedding | TtsIngress | TtsFusion => {
                 let group = match id {
                     CharacterEmbedding => conditioning::CHARACTER,
@@ -269,31 +253,23 @@ impl SpeechConstructionPlan {
                     _ => conditioning::FUSION,
                 };
                 (
-                    conditioning::conditioning_parameter_description(
-                        conditioning::ConditioningDimensions::from_config(
-                            &self.config.tts,
-                            256,
-                            self.speaker_frames,
-                        )?,
-                    )?,
+                    self.conditioning.definition().parameters().clone(),
                     Some((group.into(), 0)),
                 )
             }
             CharacterBlock(_) | CharacterNorm | TtsBlock(_) | TtsNorm => {
-                let config = match id {
-                    CharacterBlock(_) | CharacterNorm => &self.character,
-                    _ => &self.tts,
+                let declaration = match id {
+                    CharacterBlock(_) | CharacterNorm => self.character,
+                    _ => self.tts,
                 };
+                let config = declaration.config();
                 let unit = match id {
                     CharacterBlock(index) | TtsBlock(index) => {
                         (config.parameter_root().into(), index)
                     }
                     _ => (format!("{}.normalization", config.parameter_root()), 0),
                 };
-                (
-                    super::tts_transformer_layered::tts_transformer_parameter_description(config)?,
-                    Some(unit),
-                )
+                (declaration.definition().parameters().clone(), Some(unit))
             }
             TtsRvqBank | TtsRvqProjection => {
                 let group = if id == TtsRvqBank {
@@ -302,7 +278,7 @@ impl SpeechConstructionPlan {
                     rvq::PROJECTION
                 };
                 (
-                    rvq::rvq_parameter_description(RvqDimensions::from_config(&self.config.tts)?)?,
+                    self.rvq.definition().parameters().clone(),
                     Some((group.into(), 0)),
                 )
             }
@@ -312,27 +288,18 @@ impl SpeechConstructionPlan {
                     MogPredictionHead => (mog::PREDICTION.into(), 0),
                     _ => (mog::COMPONENTS.into(), 0),
                 };
-                (mog::mog_parameter_description(self.mog)?, Some(unit))
+                (self.mog.definition().parameters().clone(), Some(unit))
             }
             CodecEncoder(index) => (
-                encoder::encoder_parameter_description(
-                    &self.encoder.neural,
-                    "tts_model.audio_codec.encoder",
-                )?,
+                self.codec.encoder.spec().parameter_description()?,
                 Some((encoder::ENCODER_GROUP.into(), index)),
             ),
             CodecDecoder(index) => (
-                decoder::decoder_parameter_description(
-                    &self.decoder.neural,
-                    "tts_model.audio_codec.decoder",
-                )?,
+                self.codec.decoder.spec().parameter_description()?,
                 Some((decoder::DECODER_GROUP.into(), index)),
             ),
             CodecCodebook(depth) => (
-                quantizer::quantizer_parameter_description(
-                    self.decoder.quantizer,
-                    "tts_model.audio_codec.prvq",
-                )?,
+                self.codec.quantizer.spec().parameter_description()?,
                 Some((quantizer::codebook_group_name(depth), 0)),
             ),
         };
@@ -369,81 +336,84 @@ impl SpeechConstructionPlan {
         if !self.units.contains(&id) {
             return Err(ConstructionError::Unit(id));
         }
-        let config = &self.config.tts;
-        let hidden = config.backbone.hidden_size as i32;
         Ok(match id {
             SpeechUnitId::PerceptionSubsampling => SpeechUnit::PerceptionSubsampling(
-                CausalSubsampling::new(self.perception.subsampling, context)?,
+                CausalSubsampling::new(self.perception.spec().pinned.subsampling.clone(), context)?,
             ),
             SpeechUnitId::PerceptionBlock(index) => SpeechUnit::PerceptionBlock(
-                ConformerBlock::new(self.perception.block, index, context)?,
+                ConformerBlock::new(self.perception.spec().blocks[index].clone(), context)?,
             ),
-            SpeechUnitId::PerceptionProjection => {
-                SpeechUnit::PerceptionProjection(self.perception.build_projection::<B>(context)?)
-            }
-            SpeechUnitId::Rnnt => SpeechUnit::Rnnt(Rnnt::new(self.rnnt, context)?),
-            SpeechUnitId::FunctionHead => SpeechUnit::FunctionHead(FunctionHead::new(
-                self.perception.output_width,
-                131072,
-                LinearFormatSpec::unscaled(eredu_checkpoint::LinearFormat::Dense)?,
+            SpeechUnitId::PerceptionProjection => SpeechUnit::PerceptionProjection(B::linear(
+                self.perception.spec().pinned.projection.clone(),
                 context,
             )?),
-            SpeechUnitId::CharacterEmbedding => {
-                SpeechUnit::CharacterEmbedding(CharacterEmbedding::new(
-                    CharacterDimensions {
-                        characters: 256,
-                        width: config.character_encoder.hidden_size as i32,
-                        output_width: hidden,
-                        use_continuation: config.use_subword_flag_emb,
-                        use_special: config.use_bos_eos_emb,
-                    },
+            SpeechUnitId::Rnnt => SpeechUnit::Rnnt(Rnnt::new(self.rnnt.clone(), context)?),
+            SpeechUnitId::FunctionHead => {
+                SpeechUnit::FunctionHead(FunctionHead::new(self.function.spec().clone(), context)?)
+            }
+            SpeechUnitId::CharacterEmbedding => SpeechUnit::CharacterEmbedding(
+                CharacterEmbedding::new(self.conditioning.spec().character.clone(), context)?,
+            ),
+            SpeechUnitId::CharacterBlock(index) => {
+                SpeechUnit::CharacterBlock(crate::decoder::TransformerBlock::from_parameters(
+                    self.character.config(),
+                    index,
+                    &self.character.spec().parameters.blocks[index],
                     context,
                 )?)
             }
-            SpeechUnitId::CharacterBlock(index) => {
-                SpeechUnit::CharacterBlock(self.character.build_block::<B>(index, context)?)
-            }
-            SpeechUnitId::CharacterNorm => {
-                SpeechUnit::CharacterNorm(self.character.build_final_norm::<B>(context)?)
-            }
-            SpeechUnitId::TtsIngress => {
-                SpeechUnit::TtsIngress(TtsIngress::new(hidden, self.speaker_frames, context)?)
-            }
-            SpeechUnitId::TtsFusion => SpeechUnit::TtsFusion(GatedFusion::new(hidden, context)?),
-            SpeechUnitId::TtsBlock(index) => {
-                SpeechUnit::TtsBlock(self.tts.build_block::<B>(index, context)?)
-            }
-            SpeechUnitId::TtsNorm => SpeechUnit::TtsNorm(self.tts.build_final_norm::<B>(context)?),
-            SpeechUnitId::TtsRvqBank => {
-                SpeechUnit::TtsRvqBank(RvqBank::new(RvqDimensions::from_config(config)?, context)?)
-            }
-            SpeechUnitId::TtsRvqProjection => SpeechUnit::TtsRvqProjection(RvqProjection::new(
-                RvqDimensions::from_config(config)?,
+            SpeechUnitId::CharacterNorm => SpeechUnit::CharacterNorm(B::normalization(
+                self.character.spec().parameters.normalization.clone(),
                 context,
             )?),
-            SpeechUnitId::MogBlock(index) => {
-                SpeechUnit::MogBlock(MogBlock::new(self.mog, index, context)?)
+            SpeechUnitId::TtsIngress => SpeechUnit::TtsIngress(TtsIngress::new(
+                self.conditioning.spec().ingress.clone(),
+                context,
+            )?),
+            SpeechUnitId::TtsFusion => SpeechUnit::TtsFusion(GatedFusion::new(
+                self.conditioning.spec().fusion.clone(),
+                context,
+            )?),
+            SpeechUnitId::TtsBlock(index) => {
+                SpeechUnit::TtsBlock(crate::decoder::TransformerBlock::from_parameters(
+                    self.tts.config(),
+                    index,
+                    &self.tts.spec().parameters.blocks[index],
+                    context,
+                )?)
             }
-            SpeechUnitId::MogPredictionHead => {
-                SpeechUnit::MogPredictionHead(MogPredictionHead::new(self.mog, context)?)
+            SpeechUnitId::TtsNorm => SpeechUnit::TtsNorm(B::normalization(
+                self.tts.spec().parameters.normalization.clone(),
+                context,
+            )?),
+            SpeechUnitId::TtsRvqBank => {
+                SpeechUnit::TtsRvqBank(RvqBank::new(self.rvq.spec().bank.clone(), context)?)
             }
-            SpeechUnitId::MogComponentBank => {
-                SpeechUnit::MogComponentBank(MogComponentBank::new(self.mog, context)?)
-            }
+            SpeechUnitId::TtsRvqProjection => SpeechUnit::TtsRvqProjection(RvqProjection::new(
+                self.rvq.spec().projection.clone(),
+                context,
+            )?),
+            SpeechUnitId::MogBlock(index) => SpeechUnit::MogBlock(MogBlock::new(
+                self.mog.spec().blocks[index].clone(),
+                context,
+            )?),
+            SpeechUnitId::MogPredictionHead => SpeechUnit::MogPredictionHead(
+                MogPredictionHead::new(self.mog.spec().prediction.clone(), context)?,
+            ),
+            SpeechUnitId::MogComponentBank => SpeechUnit::MogComponentBank(MogComponentBank::new(
+                self.mog.spec().components.clone(),
+                context,
+            )?),
             SpeechUnitId::CodecEncoder(index) => SpeechUnit::CodecEncoder(EncoderUnit::new(
-                self.encoder.neural.unit_specs()?[index],
-                "tts_model.audio_codec.encoder",
+                self.codec.encoder.spec().units()[index].clone(),
                 context,
             )?),
             SpeechUnitId::CodecDecoder(index) => SpeechUnit::CodecDecoder(DecoderUnit::new(
-                self.decoder.neural.unit_specs()?[index],
-                "tts_model.audio_codec.decoder",
+                self.codec.decoder.spec().units()[index].clone(),
                 context,
             )?),
-            SpeechUnitId::CodecCodebook(index) => SpeechUnit::CodecCodebook(Codebook::unloaded(
-                self.decoder.quantizer,
-                "tts_model.audio_codec.prvq",
-                index,
+            SpeechUnitId::CodecCodebook(index) => SpeechUnit::CodecCodebook(Codebook::new(
+                self.codec.quantizer.spec().codebooks()[index].clone(),
                 context,
             )?),
         })

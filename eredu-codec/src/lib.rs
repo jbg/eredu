@@ -9,8 +9,11 @@
 /// Mimi neural audio tokenizer support.
 pub mod mimi;
 
+pub mod declarations;
 /// EAR residual-code waveform decoding and transactional streaming composition.
 pub mod ear;
+/// Shared parameter declarations for EAR neural encoder and decoder units.
+pub mod ear_specs;
 
 /// Coordinated waveform composition over stage-owned decoder carry.
 pub mod ear_pipeline;
@@ -18,6 +21,8 @@ pub mod ear_pipeline;
 /// Fixed-mean probabilistic residual vector quantization.
 pub mod prvq;
 pub mod prvq_layered;
+/// Shared typed ownership declarations for fixed-mean residual codebooks.
+pub mod prvq_specs;
 
 /// Cold exact bindings for independently leased PRVQ codebooks.
 pub mod prvq_preparation;

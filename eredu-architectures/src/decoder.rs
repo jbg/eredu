@@ -8,31 +8,32 @@ use std::ops::Range;
 // Shared by cold architecture requirements and the concrete layered executor.
 pub(crate) const CHUNKED_TEXT_PREFILL: bool = true;
 
+mod attention_parameters;
 pub(crate) mod attention_partition;
 mod boundary_modules;
 pub use boundary_modules::BoundaryModules;
+mod declarations;
 /// Shared-weight repeated stacks with independent state for each invocation.
 pub(crate) mod repeated;
 pub(crate) mod topology;
+pub use declarations::{DecoderDeclaration, DecoderLocalProjection, ProjectionDeclarations};
 
 use eredu_checkpoint::{LinearFormat, WeightQuantization};
 use eredu_core::cache::LayerCachePolicy;
 use eredu_core::{AttentionPolicy, LayerSchedule};
 use eredu_nn::{
-    AttentionCache, AttentionRequest, EmbeddingLookupPolicy, EmbeddingOperator, EmbeddingSpec,
-    Error, FusedProjectionLayout, FusedProjectionSegment, GatedProductPolicy, GroupedNeuralBackend,
-    Index, LinearOperator, LinearSpec, NeuralBackend, NormalizationConstructionSpec,
-    NormalizationOperator, Parameter, ParameterSpec, RotaryOperator, RotaryPosition, RotarySpec,
-    RotarySubspace, Tensor, VocabularyParallelRange,
+    AttentionCache, AttentionRequest, DeclareLogicalParameters, EmbeddingLookupPolicy,
+    EmbeddingOperator, EmbeddingSpec, Error, FusedProjectionLayout, FusedProjectionSegment,
+    GatedProductPolicy, GroupedNeuralBackend, Index, LinearOperator, LinearSpec, NeuralBackend,
+    NormalizationConstructionSpec, NormalizationOperator, Parameter, ParameterSpec, RotaryOperator,
+    RotaryPosition, RotarySpec, RotarySubspace, Tensor, VocabularyParallelRange,
 };
 use eredu_runtime::PartitionComponentKernel as _;
 use eredu_runtime::{
-    module_parameter_group, partitioned_module_parameter_group, partitioned_projection_group,
-    segmented_projection_group, ArchitectureParameterDescription, ExecutionGraph,
-    ExecutionUnitLayout, LayerRuntimeState, LayeredForwardState, LayeredPartitionInput,
-    LocalModelLayout, MemberSharding, OwnedParameterGroupSpec, ParallelPlanError,
-    ParameterGroupOwner, ParameterGroupSpec, ParameterRole, ProjectionSharding, StateLayout,
-    VocabularyModulePlacement,
+    ArchitectureParameterDescription, ExecutionGraph, ExecutionUnitLayout, LayerRuntimeState,
+    LayeredForwardState, LayeredPartitionInput, LocalModelLayout, MemberSharding,
+    OwnedParameterGroupSpec, ParallelPlanError, ParameterGroupOwner, ParameterGroupSpec,
+    ParameterRole, StateLayout, VocabularyModulePlacement,
 };
 
 /// Narrows a causal decoder's position-independent readout before projection.
@@ -554,6 +555,22 @@ pub trait Config: 'static {
     }
     /// Validates architecture-owned configuration policy.
     fn validate_config(&self) -> Result<(), Error>;
+
+    /// Resolves family storage references after complete common scopes are declared.
+    /// Provider families validate their additional owners at the enclosing boundary.
+    fn validate_parameter_formats(&self, _declaration: &DecoderDeclaration) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// Adds independently owned family parameters to the common decoder topology.
+    /// The supplied common groups already project retained neural scopes.
+    fn extend_common_parameters(
+        &self,
+        common: ArchitectureParameterDescription,
+    ) -> Result<ArchitectureParameterDescription, ParallelPlanError> {
+        Ok(common)
+    }
+
     /// Transformer hidden size.
     fn hidden_size(&self) -> i32;
     /// Number of decoder layers.
@@ -748,6 +765,15 @@ pub(crate) fn operator_requirements(config: &impl Config) -> eredu_nn::NeuralOpe
 /// Configuration that can derive one tensor-parallel local block without
 /// backend module construction.
 pub trait PartitionedConfig: Config + Clone {
+    /// Restores all partition-owned dimensions before comparing source execution policy.
+    fn restore_global_geometry(&mut self, global: &Self) -> Result<(), Error> {
+        self.set_local_geometry(
+            global.num_attention_heads(),
+            global.num_key_value_heads(),
+            global.intermediate_size(),
+        )
+    }
+
     /// Ordered routed invocations inside a logical decoder block.
     fn routed_bank_order(&self, _layer: usize) -> Vec<eredu_runtime::RoutedBankId> {
         vec![eredu_runtime::RoutedBankId::new(0)]
@@ -775,7 +801,7 @@ pub trait PartitionedConfig: Config + Clone {
     /// families override this hook because their expert bank has an additional
     /// owner-local group axis that is not the dense MLP intermediate axis.
     fn local_block_config(&self, layer: usize, layout: &LocalModelLayout) -> Result<Self, Error> {
-        dense_local_block_config(self, layer, layout)
+        dense_local_block_config(self, layer, layout, None)
     }
 
     /// Declares the canonical topology admitted by partition construction.
@@ -1057,13 +1083,13 @@ fn parameter_spec<C: Config>(
 
 /// Derives the canonical backend-neutral cache layout for this decoder.
 pub fn cache_layout<C: Config>(config: &C) -> Result<LayerSchedule<LayerCachePolicy>, Error> {
-    cache_layout_with_key_value_heads(
-        config,
-        std::iter::repeat_n(
-            config.num_key_value_heads(),
-            config.attention_schedule().len(),
-        ),
-    )
+    let geometry = (0..config.attention_schedule().len())
+        .map(|layer| {
+            topology::AttentionParameters::new(config, config.block_parameter_owner(layer))
+                .map(|parameters| parameters.geometry)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    cache_layout_with_attention_geometry(config, geometry)
 }
 
 /// Declares the complete mutable-state geometry consumed by either resident
@@ -1118,6 +1144,83 @@ impl<C: Config> LocalGeometry<C> {
         let layers = usize::try_from(config.num_hidden_layers()).map_err(|_| {
             ParallelPlanError::InvalidGroup("decoder layer count exceeds usize".into())
         })?;
+        self.validate_header(
+            config,
+            layers,
+            config.vocabulary_size(),
+            config.tie_word_embeddings(),
+        )?;
+        let expected = StateLayout::new(
+            cache_layout_with_attention_geometry(
+                config,
+                self.blocks
+                    .iter()
+                    .enumerate()
+                    .map(|(layer, block)| {
+                        topology::AttentionParameters::new(
+                            block,
+                            config.block_parameter_owner(layer),
+                        )
+                        .map(|parameters| parameters.geometry)
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?,
+            )
+            .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?,
+        )
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+        self.validate_state(&expected)
+    }
+
+    /// Validates complete local state and ranges using the retained dense slots.
+    pub fn validate_with_declaration(
+        &self,
+        config: &C,
+        declaration: &DecoderDeclaration,
+    ) -> Result<(), ParallelPlanError>
+    where
+        C: PartitionedConfig,
+    {
+        let invalid = |e: Error| ParallelPlanError::InvalidGroup(e.to_string());
+        declaration.validate_for(config).map_err(invalid)?;
+        self.validate_header(
+            config,
+            declaration.blocks.len(),
+            declaration.statics.embedding_spec().vocabulary,
+            declaration.statics.head_spec().is_none(),
+        )?;
+        let geometry = self
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(layer, local)| {
+                declaration.validate_local_policy(config, local)?;
+                let old = declaration.blocks[layer].attention.geometry;
+                Ok((
+                    eredu_nn::AttentionHeadGeometry::new(
+                        local.num_attention_heads(),
+                        local.num_key_value_heads(),
+                        old.key_dimensions(),
+                        old.value_dimensions(),
+                    )?,
+                    local.intermediate_size(),
+                ))
+            })
+            .collect::<Result<Vec<_>, Error>>()
+            .map_err(invalid)?;
+        let projected = declaration
+            .local_projection(config, &geometry)
+            .map_err(invalid)?;
+        self.validate_state(projected.state_layout())
+    }
+
+    fn validate_header(
+        &self,
+        config: &C,
+        layers: usize,
+        vocabulary: i32,
+        tied: bool,
+    ) -> Result<(), ParallelPlanError> {
         if self.architecture_fingerprint != config.architecture_fingerprint()
             || self.blocks.len() != layers
         {
@@ -1127,12 +1230,12 @@ impl<C: Config> LocalGeometry<C> {
             ));
         }
         self.embedding_range
-            .validate_global_rows(config.vocabulary_size())
+            .validate_global_rows(vocabulary)
             .map_err(|error| ParallelPlanError::InvalidTensor(error.to_string()))?;
-        match (config.tie_word_embeddings(), &self.output_range) {
+        match (tied, &self.output_range) {
             (true, None) => {}
             (false, Some(range)) => range
-                .validate_global_rows(config.vocabulary_size())
+                .validate_global_rows(vocabulary)
                 .map_err(|error| ParallelPlanError::InvalidTensor(error.to_string()))?,
             (true, Some(_)) => {
                 return Err(ParallelPlanError::InvalidTensor(
@@ -1145,15 +1248,11 @@ impl<C: Config> LocalGeometry<C> {
                 ));
             }
         }
-        let expected = StateLayout::new(
-            cache_layout_with_key_value_heads(
-                config,
-                self.blocks.iter().map(Config::num_key_value_heads),
-            )
-            .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?,
-        )
-        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-        if expected != self.state_layout {
+        Ok(())
+    }
+
+    fn validate_state(&self, expected: &StateLayout) -> Result<(), ParallelPlanError> {
+        if expected != &self.state_layout {
             return Err(ParallelPlanError::InvalidGroup(
                 "rank-local decoder state layout drifted from block geometry".into(),
             ));
@@ -1165,26 +1264,63 @@ impl<C: Config> LocalGeometry<C> {
 /// Derives one shared decoder's complete rank-local geometry from a typed plan.
 pub fn local_geometry<C, F>(
     config: &C,
+    decoder_scopes: &DecoderDeclaration,
     layout: &LocalModelLayout,
     mut local_block: F,
 ) -> Result<LocalGeometry<C>, ParallelPlanError>
 where
-    C: Config,
+    C: PartitionedConfig,
     F: FnMut(&C, usize, &LocalModelLayout) -> Result<C, ParallelPlanError>,
 {
+    decoder_scopes
+        .validate_for(config)
+        .map_err(|e| ParallelPlanError::InvalidGroup(e.to_string()))?;
     let layers = usize::try_from(config.num_hidden_layers())
         .map_err(|_| ParallelPlanError::InvalidGroup("decoder layer count exceeds usize".into()))?;
     let blocks = (0..layers)
-        .map(|index| local_block(config, config.block_parameter_owner(index), layout))
+        .map(|index| match decoder_scopes {
+            scopes
+                if scopes
+                    .block_parameters(config.block_parameter_owner(index))
+                    .feed_forward
+                    .is_some() =>
+            {
+                dense_local_block_config(
+                    config,
+                    config.block_parameter_owner(index),
+                    layout,
+                    Some(scopes.block_parameters(config.block_parameter_owner(index))),
+                )
+                .map_err(|e| ParallelPlanError::InvalidTensor(e.to_string()))
+            }
+            _ => local_block(config, config.block_parameter_owner(index), layout),
+        })
         .collect::<Result<Vec<_>, _>>()?;
-    let key_value_heads = blocks.iter().map(Config::num_key_value_heads);
+    let geometry = blocks
+        .iter()
+        .enumerate()
+        .map(|(layer, block)| {
+            let old = decoder_scopes
+                .block_parameters(config.block_parameter_owner(layer))
+                .attention
+                .geometry;
+            eredu_nn::AttentionHeadGeometry::new(
+                block.num_attention_heads(),
+                block.num_key_value_heads(),
+                old.key_dimensions(),
+                old.value_dimensions(),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
     let state_layout = StateLayout::new(
-        cache_layout_with_key_value_heads(config, key_value_heads)
+        cache_layout_with_attention_geometry(config, geometry)
             .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?,
     )
     .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
     let root = config.parameter_root();
-    let (embedding_range, output_range) = StaticModuleSpec::from_config(config).vocabulary_ranges(
+    let statics = &decoder_scopes.statics;
+    let (embedding_range, output_range) = statics.vocabulary_ranges(
         layout,
         &format!("{root}.embed_tokens"),
         &format!("{root}.norm"),
@@ -1197,30 +1333,41 @@ where
         state_layout,
         architecture_fingerprint: config.architecture_fingerprint(),
     };
-    geometry.validate_for(config)?;
+    geometry.validate_with_declaration(config, decoder_scopes)?;
     Ok(geometry)
 }
 
-/// Declares the complete mutable-state geometry consumed by resident or bounded execution.
-pub fn cache_layout_with_key_value_heads<C: Config>(
+/// Projects invocation cache policies from exact construction-declared head geometry.
+/// Logical invocation order and attention windows come from the retained family
+/// schedule; parameter sharing does not merge mutable cache owners.
+pub fn cache_layout_with_attention_geometry<C: Config>(
     config: &C,
-    key_value_heads: impl IntoIterator<Item = i32>,
+    geometry: impl IntoIterator<Item = eredu_nn::AttentionHeadGeometry>,
 ) -> Result<LayerSchedule<LayerCachePolicy>, Error> {
     let layers = usize::try_from(config.num_hidden_layers()).map_err(Error::backend)?;
-    let key_value_heads = key_value_heads.into_iter().collect::<Vec<_>>();
-    if key_value_heads.len() != layers {
+    let geometry = geometry.into_iter().collect::<Vec<_>>();
+    if geometry.len() != layers {
         return Err(Error::backend(format!(
             "decoder cache geometry has {} layers, expected {layers}",
-            key_value_heads.len()
+            geometry.len()
         )));
     }
     let policies = config
         .attention_schedule()
         .iter()
-        .zip(key_value_heads)
-        .map(|(attention, key_value_heads)| {
-            LayerCachePolicy::key_value(*attention, key_value_heads, config.head_dim())
-                .map_err(Error::backend)
+        .zip(geometry)
+        .map(|(attention, geometry)| {
+            if geometry.key_dimensions() != geometry.value_dimensions() {
+                return Err(Error::backend(
+                    "ordinary decoder cache requires equal key/value head widths",
+                ));
+            }
+            LayerCachePolicy::key_value(
+                *attention,
+                geometry.key_value_heads(),
+                geometry.key_dimensions(),
+            )
+            .map_err(Error::backend)
         })
         .collect::<Result<Vec<_>, _>>()?;
     LayerSchedule::new(layers, policies).map_err(Error::backend)
@@ -1612,6 +1759,24 @@ impl<B: NeuralBackend> Attention<B> {
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        let parameters = topology::AttentionParameters::new(config, layer)?;
+        Self::from_parameters(
+            config,
+            layer,
+            &parameters,
+            topology::attention_normalizations(config, layer, parameters.geometry)?,
+            topology::attention_sink(config, layer, parameters.geometry)?,
+            context,
+        )
+    }
+    fn from_parameters<C: Config>(
+        config: &C,
+        layer: usize,
+        parameters: &topology::AttentionParameters,
+        normalizations: [Option<NormalizationConstructionSpec>; 2],
+        sinks: Option<topology::AttentionSinkSpec>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
         config
             .query_position_scaling()
             .map(PositionQueryScaling::validate)
@@ -1622,80 +1787,49 @@ impl<B: NeuralBackend> Attention<B> {
                 eredu_nn::NeuralOperatorCapabilities::ATTENTION_SINKS,
             )?;
         }
-        let fields = config.block_parameter_fields().validate()?;
-        let prefix = format!(
-            "{}.layers.{layer}.{}",
-            config.parameter_root(),
-            fields.attention
-        );
-        let head = config.head_dim();
-        let query_heads = config.num_attention_heads();
-        let key_value_heads = config.num_key_value_heads();
-        let projection_specs = topology::attention_projections(config, layer)?;
-        let linear = |field: &str| {
-            let spec = projection_specs
-                .iter()
-                .find(|(name, _)| name == field)
-                .ok_or_else(|| Error::backend("attention construction projection is absent"))?;
-            B::linear(spec.1.clone(), context)
-        };
+        eredu_nn::validate_logical_parameter_scope(&parameters.logical_parameters()?)
+            .map_err(Error::backend_source)?;
+        let geometry = parameters.geometry;
+        let head = geometry.key_dimensions();
+        let query_heads = geometry.query_heads();
+        let key_value_heads = geometry.key_value_heads();
+        let [query_normalization, key_normalization] = normalizations;
+        let linear = |spec: &LinearSpec| B::linear(spec.clone(), context);
         let policy = config.attention_schedule().get(layer).ok_or_else(|| {
             Error::backend(format!(
                 "decoder attention schedule has no policy for layer {layer}"
             ))
         })?;
-        let query_width = query_heads
-            .checked_mul(head)
-            .ok_or_else(|| Error::backend("decoder query projection width overflowed"))?;
-        let key_value_width = key_value_heads
-            .checked_mul(head)
-            .ok_or_else(|| Error::backend("decoder key/value projection width overflowed"))?;
-        let input_projection = match config.attention_projection_layout() {
-            AttentionProjectionLayout::Split if config.external_attention_value(layer) => {
-                AttentionInputProjection::ExternalValue {
-                    query: linear(fields.attention_query)?,
-                    key: linear(fields.attention_key)?,
-                }
-            }
-            AttentionProjectionLayout::Split => AttentionInputProjection::Split {
-                query: linear(fields.attention_query)?,
-                key: linear(fields.attention_key)?,
-                value: linear(fields.attention_value)?,
+        let input_projection = match &parameters.input {
+            topology::AttentionInputParameters::Split { query, key, value } => match value {
+                Some(value) => AttentionInputProjection::Split {
+                    query: linear(query)?,
+                    key: linear(key)?,
+                    value: linear(value)?,
+                },
+                None => AttentionInputProjection::ExternalValue {
+                    query: linear(query)?,
+                    key: linear(key)?,
+                },
             },
-            AttentionProjectionLayout::Fused { field } => {
-                if field.trim().is_empty() {
-                    return Err(Error::backend(
-                        "fused QKV projection field must not be empty",
-                    ));
-                }
-                let biases = [
-                    config.attention_bias(AttentionProjection::Query),
-                    config.attention_bias(AttentionProjection::Key),
-                    config.attention_bias(AttentionProjection::Value),
-                ];
-                if biases.iter().any(|bias| *bias != biases[0]) {
-                    return Err(Error::backend(
-                        "fused QKV projection requires identical query/key/value bias policy",
-                    ));
-                }
-                let layout = FusedProjectionLayout::new([
-                    FusedProjectionSegment::new("query", query_width)?,
-                    FusedProjectionSegment::new("key", key_value_width)?,
-                    FusedProjectionSegment::new("value", key_value_width)?,
-                ])?;
-                let projection = linear(field)?;
-                AttentionInputProjection::Fused(FusedAttentionProjection { projection, layout })
+            topology::AttentionInputParameters::Fused { projection, layout } => {
+                AttentionInputProjection::Fused(FusedAttentionProjection {
+                    projection: linear(projection)?,
+                    layout: layout.clone(),
+                })
             }
         };
         Ok(Self {
             query_position_scaling: config.query_position_scaling(),
-            output_gate: config
-                .attention_output_gate()
-                .map(|(field, _)| linear(field))
+            output_gate: parameters
+                .gate
+                .as_ref()
+                .map(|(spec, _)| linear(spec))
                 .transpose()?,
-            output_gate_activation: config
-                .attention_output_gate()
-                .map_or(OutputGateActivation::Sigmoid, |(_, activation)| activation),
+            output_gate_activation: parameters
+                .gate
+                .as_ref()
+                .map_or(OutputGateActivation::Sigmoid, |(_, activation)| *activation),
             query_key_norm_per_head_weights: config.query_key_norm_per_head_weights(),
             rotary_pair_dimensions: config.rotary_pair_dimensions(),
             query_heads,
@@ -1704,81 +1838,15 @@ impl<B: NeuralBackend> Attention<B> {
             softcap: config.attention_softcap(),
             arithmetic: config.attention_arithmetic(),
             input_projection,
-            output: linear(fields.attention_output)?,
-            sinks: config
-                .learned_attention_sinks()
-                .then(|| {
-                    Parameter::unloaded(
-                        parameter_spec(config, format!("{prefix}.{}", fields.attention_sinks))
-                            .map_err(Error::backend)?,
-                        &[query_heads],
-                        context,
-                    )
-                })
+            output: linear(&parameters.output)?,
+            sinks: sinks
+                .map(|spec| Parameter::unloaded(spec.weight, &[spec.heads], context))
                 .transpose()?,
-            query_norm: config
-                .query_key_norm_epsilon()
-                .map(|epsilon| {
-                    let mut spec = NormalizationConstructionSpec::learned(
-                        if config.query_key_norm_per_head_weights() {
-                            query_width
-                        } else {
-                            head
-                        },
-                        epsilon,
-                        parameter_spec(
-                            config,
-                            format!("{prefix}.{}.weight", fields.attention_query_norm),
-                        )
-                        .map_err(Error::backend)?,
-                    );
-                    if config.query_key_norm_per_head_weights() {
-                        spec = spec.with_groups(query_heads)?;
-                    } else {
-                        spec.groups = config.query_key_normalization_groups();
-                    }
-                    spec.scale = normalization_scale(
-                        parameter_spec(
-                            config,
-                            format!("{prefix}.{}.weight", fields.attention_query_norm),
-                        )
-                        .map_err(Error::backend)?,
-                        config.query_key_normalization_offset(),
-                    );
-                    B::normalization(spec, context)
-                })
+            query_norm: query_normalization
+                .map(|spec| B::normalization(spec, context))
                 .transpose()?,
-            key_norm: config
-                .query_key_norm_epsilon()
-                .map(|epsilon| {
-                    let mut spec = NormalizationConstructionSpec::learned(
-                        if config.query_key_norm_per_head_weights() {
-                            key_value_width
-                        } else {
-                            head
-                        },
-                        epsilon,
-                        parameter_spec(
-                            config,
-                            format!("{prefix}.{}.weight", fields.attention_key_norm),
-                        )
-                        .map_err(Error::backend)?,
-                    );
-                    if config.query_key_norm_per_head_weights() {
-                        spec = spec.with_groups(key_value_heads)?;
-                    } else {
-                        spec.groups = config.query_key_normalization_groups();
-                    }
-                    spec.scale = normalization_scale(
-                        parameter_spec(
-                            config,
-                            format!("{prefix}.{}.weight", fields.attention_key_norm),
-                        )
-                        .map_err(Error::backend)?,
-                        config.query_key_normalization_offset(),
-                    );
-                    B::normalization(spec, context)
-                })
+            key_norm: key_normalization
+                .map(|spec| B::normalization(spec, context))
                 .transpose()?,
             rotary: config
                 .rotary_enabled()
@@ -2240,7 +2308,7 @@ pub enum GatedInputProjection<B: NeuralBackend> {
     Fused(FusedGatedProjection<B>),
 }
 
-/// Shared dense SwiGLU feed-forward network.
+/// Shared dense gated feed-forward network.
 #[derive(Debug, Clone, eredu_nn::Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct Mlp<B: NeuralBackend> {
@@ -2248,9 +2316,9 @@ pub struct Mlp<B: NeuralBackend> {
     pub input_projection: GatedInputProjection<B>,
     /// Down projection.
     pub down: B::Linear,
-    /// Optional shared pre-activation bound.
+    /// Resolved activation, clipping and scaling before the down projection.
     #[parameter(skip)]
-    pub limit: Option<GatedProductPolicy>,
+    pub policy: GatedProductPolicy,
 }
 
 impl<B: NeuralBackend> Mlp<B> {
@@ -2259,55 +2327,45 @@ impl<B: NeuralBackend> Mlp<B> {
         gate: B::Linear,
         up: B::Linear,
         down: B::Linear,
-        policy: Option<GatedProductPolicy>,
+        policy: GatedProductPolicy,
     ) -> Self {
         Self {
             input_projection: GatedInputProjection::Split { gate, up },
             down,
-            limit: policy,
+            policy,
         }
     }
 
-    /// Builds an unloaded dense SwiGLU network for one global layer.
+    /// Builds an unloaded dense gated network for one global layer.
     pub fn new<C: Config>(
         config: &C,
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let fields = config.block_parameter_fields().validate()?;
-        let projection_specs = topology::gated_projections(config, layer)?;
-        let build = |field: &str| {
-            let spec = projection_specs
-                .iter()
-                .find(|(name, _)| name == field)
-                .ok_or_else(|| Error::backend("gated construction projection is absent"))?;
-            B::linear(spec.1.clone(), context)
-        };
-        let input_projection = match config.gated_projection_layout() {
-            GatedProjectionLayout::Split => GatedInputProjection::Split {
-                gate: build(fields.feed_forward_gate)?,
-                up: build(fields.feed_forward_up)?,
+        Self::from_parameters(&topology::gated_parameters(config, layer)?, context)
+    }
+    pub(crate) fn from_parameters(
+        parameters: &eredu_nn::GatedProductSpec,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        parameters.logical_parameters()?;
+        let input_projection = match parameters {
+            eredu_nn::GatedProductSpec::Split(spec) => GatedInputProjection::Split {
+                gate: B::linear(spec.gate.clone(), context)?,
+                up: B::linear(spec.up.clone(), context)?,
             },
-            GatedProjectionLayout::Fused { field } => {
-                if field.trim().is_empty() {
-                    return Err(Error::backend(
-                        "fused gate/up projection field must not be empty",
-                    ));
-                }
-                let layout = FusedProjectionLayout::new([
-                    FusedProjectionSegment::new("gate", config.intermediate_size())?,
-                    FusedProjectionSegment::new("up", config.intermediate_size())?,
-                ])?;
+            eredu_nn::GatedProductSpec::Fused(spec) => {
+                let layout = spec.layout()?;
                 GatedInputProjection::Fused(FusedGatedProjection {
-                    projection: build(field)?,
+                    projection: B::linear(spec.gate_up.clone(), context)?,
                     layout,
                 })
             }
         };
         Ok(Self {
             input_projection,
-            down: build(fields.feed_forward_output)?,
-            limit: config.gated_product_policy(),
+            down: B::linear(parameters.down().clone(), context)?,
+            policy: parameters.policy(),
         })
     }
 
@@ -2337,7 +2395,7 @@ impl<B: NeuralBackend> Mlp<B> {
                 (gate, up)
             }
         };
-        B::gated_product(gate, up, self.limit.unwrap_or_default(), context)
+        B::gated_product(gate, up, self.policy, context)
     }
 
     fn forward(
@@ -2531,133 +2589,187 @@ impl<B: NeuralBackend> TransformerBlockBody<B, Mlp<B>> {
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        Self::from_factory::<C, DenseBlockFactory>(config, config, layer, context)
+        Self::from_factory::<C, DenseBlockFactory>(
+            config,
+            config,
+            layer,
+            &topology::BlockParameters::new(config, layer)?,
+            context,
+        )
     }
 }
 
 impl<B: NeuralBackend, F> TransformerBlockBody<B, F> {
     /// Constructs a body from shared attention/residual policy and a typed
     /// feed-forward factory. Global routing and rank-local bank geometry remain distinct.
-    pub fn from_factory<C: Config, P: BlockFactory<B, C, FeedForward = F>>(
+    pub(crate) fn from_factory<C: Config, P: BlockFactory<B, C, FeedForward = F>>(
         global: &C,
         local: &C,
         layer: usize,
+        spec: &topology::BlockParameters,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let parameters =
+            prepare_projection::<B, C, P>(global, local, layer, spec.feed_forward.as_ref(), None)?;
+        validate_prepared_projection(spec, &parameters)?;
+        Self::from_prepared::<C, P>(global, local, layer, spec, &parameters, context)
+    }
+
+    pub(crate) fn from_prepared<C: Config, P: BlockFactory<B, C, FeedForward = F>>(
+        global: &C,
+        local: &C,
+        layer: usize,
+        spec: &topology::BlockParameters,
+        parameters: &P::Parameters,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         P::validate_partitioned(global, local)?;
-        Self::construct_with_terminal(
-            local,
-            layer,
+        Self::construct_from_specs(
+            spec.normalizations.clone(),
             context,
+            || {
+                Attention::from_parameters(
+                    local,
+                    layer,
+                    &spec.attention,
+                    spec.query_key.clone(),
+                    spec.sinks.clone(),
+                    context,
+                )
+            },
             || Ok(()),
-            || P::build_partitioned_feed_forward(global, local, layer, context),
+            || P::build_feed_forward(global, local, layer, parameters, context),
         )
         .map(|(body, ())| body)
     }
 
-    fn construct_with_terminal<C: Config, T>(
-        config: &C,
-        layer: usize,
+    fn construct_from_specs<T>(
+        normalizations: topology::BlockNormalizations,
         context: &<B::Tensor as Tensor>::Context,
+        attention: impl FnOnce() -> Result<Attention<B>, Error>,
         terminal: impl FnOnce() -> Result<T, Error>,
         feed_forward: impl FnOnce() -> Result<F, Error>,
     ) -> Result<(Self, T), Error> {
-        let fields = config.block_parameter_fields().validate()?;
-        let norm = |name: String| {
-            B::normalization(
-                NormalizationConstructionSpec {
-                    reduction: eredu_nn::NormalizationReduction::Native,
-                    groups: config.normalization_groups(),
-                    dimensions: config.hidden_size(),
-                    epsilon: config.rms_norm_epsilon(),
-                    scale: normalization_scale(
-                        parameter_spec(config, name).map_err(Error::backend)?,
-                        config.normalization_offset(),
-                    ),
-                },
-                context,
-            )
-        };
-        let attention_output_norm = config
-            .attention_output_normalization(layer)
-            .map(&norm)
+        let attention_output_norm = normalizations
+            .attention_output
+            .map(|spec| B::normalization(spec, context))
             .transpose()?;
-        let feed_forward_output_norm = config
-            .feed_forward_output_normalization(layer)
-            .map(&norm)
+        let feed_forward_output_norm = normalizations
+            .feed_forward_output
+            .map(|spec| B::normalization(spec, context))
             .transpose()?;
         let terminal = terminal()?;
         Ok((
             Self {
                 attention_output_norm,
                 feed_forward_output_norm,
-                self_attention: Attention::new(config, layer, context)?,
+                self_attention: attention()?,
                 mlp: feed_forward()?,
-                input_norm: norm(format!(
-                    "{}.layers.{layer}.{}.weight",
-                    config.parameter_root(),
-                    fields.input_norm
-                ))?,
-                post_attention_norm: norm(format!(
-                    "{}.layers.{layer}.{}.weight",
-                    config.parameter_root(),
-                    fields.post_attention_norm
-                ))?,
+                input_norm: B::normalization(normalizations.input, context)?,
+                post_attention_norm: B::normalization(normalizations.post_attention, context)?,
             },
             terminal,
         ))
     }
 }
 
-/// Constructs only a declared invocation's terminal normalization.
-/// Body parameters and mutable attention state are not allocated by this operation.
-pub fn terminal_normalization<B: NeuralBackend>(
-    config: &impl Config,
-    layer: usize,
-    context: &<B::Tensor as Tensor>::Context,
-) -> Result<Option<B::Normalization>, Error> {
-    config
-        .block_output_normalization(layer)
-        .map(|name| {
-            B::normalization(
-                NormalizationConstructionSpec::learned(
-                    config.hidden_size(),
-                    config.rms_norm_epsilon(),
-                    parameter_spec(config, name).map_err(Error::backend)?,
-                ),
-                context,
-            )
-        })
-        .transpose()
-}
-
 impl<B: NeuralBackend> TransformerBlock<B, Mlp<B>> {
+    /// Materializes exact retained ordinary block slots; configuration supplies execution policy.
+    pub(crate) fn from_parameters<C: Config>(
+        config: &C,
+        layer: usize,
+        spec: &topology::BlockParameters,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let feed_forward = spec
+            .feed_forward
+            .as_ref()
+            .ok_or_else(|| Error::backend("ordinary block has no gated declaration"))?;
+        spec.logical_parameters()?;
+        let (body, output_norm) = TransformerBlockBody::construct_from_specs(
+            spec.normalizations.clone(),
+            context,
+            || {
+                Attention::from_parameters(
+                    config,
+                    layer,
+                    &spec.attention,
+                    spec.query_key.clone(),
+                    spec.sinks.clone(),
+                    context,
+                )
+            },
+            || {
+                spec.terminal
+                    .clone()
+                    .map(|spec| B::normalization(spec, context))
+                    .transpose()
+            },
+            || Mlp::from_parameters(feed_forward, context),
+        )?;
+        Ok(Self { body, output_norm })
+    }
     /// Constructs one unloaded dense body and its optional terminal normalization.
     pub fn new<C: Config>(
         config: &C,
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        Self::from_factory::<C, DenseBlockFactory>(config, config, layer, context)
+        Self::from_factory::<C, DenseBlockFactory>(
+            config,
+            config,
+            layer,
+            &topology::BlockParameters::new(config, layer)?,
+            context,
+        )
     }
 }
 
 impl<B: NeuralBackend, F> TransformerBlock<B, F> {
     /// Assembles the shared body and declared terminal without changing their
     /// independent construction interfaces or canonical parameter names.
-    pub fn from_factory<C: Config, P: BlockFactory<B, C, FeedForward = F>>(
+    pub(crate) fn from_factory<C: Config, P: BlockFactory<B, C, FeedForward = F>>(
         global: &C,
         local: &C,
         layer: usize,
+        spec: &topology::BlockParameters,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let parameters =
+            prepare_projection::<B, C, P>(global, local, layer, spec.feed_forward.as_ref(), None)?;
+        validate_prepared_projection(spec, &parameters)?;
+        Self::from_prepared::<C, P>(global, local, layer, spec, &parameters, context)
+    }
+
+    pub(crate) fn from_prepared<C: Config, P: BlockFactory<B, C, FeedForward = F>>(
+        global: &C,
+        local: &C,
+        layer: usize,
+        spec: &topology::BlockParameters,
+        parameters: &P::Parameters,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         P::validate_partitioned(global, local)?;
-        let (body, output_norm) = TransformerBlockBody::construct_with_terminal(
-            local,
-            layer,
+        let (body, output_norm) = TransformerBlockBody::construct_from_specs(
+            spec.normalizations.clone(),
             context,
-            || terminal_normalization::<B>(local, layer, context),
-            || P::build_partitioned_feed_forward(global, local, layer, context),
+            || {
+                Attention::from_parameters(
+                    local,
+                    layer,
+                    &spec.attention,
+                    spec.query_key.clone(),
+                    spec.sinks.clone(),
+                    context,
+                )
+            },
+            || {
+                spec.terminal
+                    .clone()
+                    .map(|spec| B::normalization(spec, context))
+                    .transpose()
+            },
+            || P::build_feed_forward(global, local, layer, parameters, context),
         )?;
         Ok(Self { body, output_norm })
     }
@@ -3149,436 +3261,242 @@ where
     }
 }
 
-/// Declares attention and normalization groups shared by dense and routed blocks.
-pub fn body_common_parallel_parameter_groups<B: NeuralBackend, F>(
-    block: &TransformerBlockBody<B, F>,
-    config: &impl Config,
-    layer: usize,
-) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    let prefix = format!("{}.layers.{layer}", config.parameter_root());
-    let fields = config
-        .block_parameter_fields()
-        .validate()
-        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    let attention_prefix = format!("{prefix}.{}", fields.attention);
-    let query_heads = usize::try_from(config.num_attention_heads()).map_err(|_| {
-        ParallelPlanError::InvalidGroup("decoder query-head count exceeds usize".into())
-    })?;
-    let key_value_heads = usize::try_from(config.num_key_value_heads()).map_err(|_| {
-        ParallelPlanError::InvalidGroup("decoder key/value-head count exceeds usize".into())
-    })?;
-    let head_dimension = usize::try_from(config.head_dim()).map_err(|_| {
-        ParallelPlanError::InvalidGroup("decoder head dimension exceeds usize".into())
-    })?;
-    if head_dimension == 0 || key_value_heads == 0 || !query_heads.is_multiple_of(key_value_heads) {
-        return Err(ParallelPlanError::InvalidGroup(format!(
-            "decoder attention geometry q={query_heads}, kv={key_value_heads}, dim={head_dimension} does not form positive integral GQA groups"
-        )));
-    }
-    let head_partition = attention_partition::AttentionPartition::new(config, layer)?;
-    let attention_units = head_partition.preferred_units();
-    let attention = match &block.self_attention.input_projection {
-        AttentionInputProjection::ExternalValue { query, key } => {
-            let mut projections = vec![
-                (query, ProjectionSharding::Column),
-                (key, ProjectionSharding::Column),
-                (&block.self_attention.output, ProjectionSharding::Row),
-            ];
-            if let Some(gate) = &block.self_attention.output_gate {
-                projections.push((gate, ProjectionSharding::Column));
-            }
-            partitioned_projection_group::<B::Tensor, B::Linear>(
-                format!("{attention_prefix}.projections"),
-                ParameterRole::AttentionHeads,
-                &projections,
-                attention_units,
-            )?
-        }
-        AttentionInputProjection::Split { query, key, value } => {
-            let mut projections = vec![
-                (query, ProjectionSharding::Column),
-                (key, ProjectionSharding::Column),
-                (value, ProjectionSharding::Column),
-                (&block.self_attention.output, ProjectionSharding::Row),
-            ];
-            if let Some(gate) = &block.self_attention.output_gate {
-                projections.push((gate, ProjectionSharding::Column));
-            }
-            partitioned_projection_group::<B::Tensor, B::Linear>(
-                format!("{attention_prefix}.projections"),
-                ParameterRole::AttentionHeads,
-                &projections,
-                attention_units,
-            )?
-        }
-        AttentionInputProjection::Fused(fused) => {
-            segmented_projection_group::<B::Tensor, B::Linear>(
-                format!("{attention_prefix}.projections"),
-                ParameterRole::AttentionHeads,
-                &fused.projection,
-                &block.self_attention.output,
-                fused_projection_ranges(&fused.layout)?,
-                attention_units,
-            )?
-        }
-    };
-
-    let input_norm = module_parameter_group::<B::Tensor, _>(
-        format!("{prefix}.{}", fields.input_norm),
-        ParameterRole::Replicated,
-        &block.input_norm,
-        |_, _| Ok(MemberSharding::Replicated),
-    )?;
-    let post_attention_norm = module_parameter_group::<B::Tensor, _>(
-        format!("{prefix}.{}", fields.post_attention_norm),
-        ParameterRole::Replicated,
-        &block.post_attention_norm,
-        |_, _| Ok(MemberSharding::Replicated),
-    )?;
-    let mut groups = vec![attention];
-    if let Some(sinks) = &block.self_attention.sinks {
-        groups.push(partitioned_module_parameter_group::<B::Tensor, _>(
-            format!("{attention_prefix}.{}", fields.attention_sinks),
-            ParameterRole::AttentionHeads,
-            query_heads,
-            sinks,
-            |_, shape| {
-                if shape != [query_heads] {
-                    return Err(ParallelPlanError::InvalidTensor(format!(
-                        "decoder attention sinks have shape {shape:?}, expected [{query_heads}]"
-                    )));
-                }
-                Ok(MemberSharding::Partitioned { axis: 0 })
-            },
-        )?);
-    }
-    for (norm, field, heads) in [
-        (
-            &block.self_attention.query_norm,
-            fields.attention_query_norm,
-            query_heads,
-        ),
-        (
-            &block.self_attention.key_norm,
-            fields.attention_key_norm,
-            key_value_heads,
-        ),
-    ] {
-        if let Some(norm) = norm {
-            let name = format!("{attention_prefix}.{field}");
-            groups.push(if config.query_key_norm_per_head_weights() {
-                partitioned_module_parameter_group::<B::Tensor, _>(
-                    name,
-                    ParameterRole::AttentionHeads,
-                    heads,
-                    norm,
-                    |_, _| Ok(MemberSharding::Partitioned { axis: 0 }),
-                )?
-            } else {
-                module_parameter_group::<B::Tensor, _>(
-                    name,
-                    ParameterRole::Replicated,
-                    norm,
-                    |_, _| Ok(MemberSharding::Replicated),
-                )?
-            });
-        }
-    }
-    for (name, norm) in [
-        (
-            config.attention_output_normalization(layer),
-            &block.attention_output_norm,
-        ),
-        (
-            config.feed_forward_output_normalization(layer),
-            &block.feed_forward_output_norm,
-        ),
-    ] {
-        if let (Some(name), Some(norm)) = (name, norm) {
-            groups.push(module_parameter_group::<B::Tensor, _>(
-                name.trim_end_matches(".weight"),
-                ParameterRole::Replicated,
-                norm,
-                |_, _| Ok(MemberSharding::Replicated),
-            )?);
-        }
-    }
-    groups.extend([input_norm, post_attention_norm]);
-    groups
-        .into_iter()
-        .map(|group| head_partition.apply(group, |name| config.linear_format(name)))
-        .collect()
-}
-
-/// Projects common body resources and the enclosing invocation's terminal normalization.
-pub fn block_common_parallel_parameter_groups<B: NeuralBackend, F>(
-    block: &TransformerBlock<B, F>,
-    config: &impl Config,
-    layer: usize,
-) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    with_terminal_parameter_group::<B>(
-        body_common_parallel_parameter_groups(&block.body, config, layer)?,
-        block.output_norm.as_ref(),
-        config,
-        layer,
-    )
-}
-
-fn with_terminal_parameter_group<B: NeuralBackend>(
-    mut groups: Vec<ParameterGroupSpec>,
-    terminal: Option<&B::Normalization>,
-    config: &impl Config,
-    layer: usize,
-) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    if let Some(norm) = terminal {
-        let name = config.block_output_normalization(layer).ok_or_else(|| {
-            ParallelPlanError::InvalidGroup(
-                "block output normalization is absent from configuration".into(),
-            )
-        })?;
-        groups.insert(
-            1,
-            module_parameter_group::<B::Tensor, _>(
-                name.trim_end_matches(".weight"),
-                ParameterRole::Replicated,
-                norm,
-                |_, _| Ok(MemberSharding::Replicated),
-            )?,
-        );
-    }
-    Ok(groups)
-}
-
-/// Projects every parameter owned by one dense body, excluding invocation terminals.
-pub fn body_parallel_parameter_groups<B: NeuralBackend>(
-    body: &TransformerBlockBody<B>,
-    config: &impl Config,
-    layer: usize,
-) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    let mut groups = body_common_parallel_parameter_groups(body, config, layer)?;
-    groups.push(dense_mlp_parallel_parameter_group(
-        &body.mlp, config, layer,
-    )?);
-    Ok(groups)
-}
-
-/// Declares the dense SwiGLU placement group shared by dense decoder families.
-pub fn dense_mlp_parallel_parameter_group<B: NeuralBackend>(
-    mlp: &Mlp<B>,
-    config: &impl Config,
-    layer: usize,
-) -> Result<ParameterGroupSpec, ParallelPlanError> {
-    let fields = config
-        .block_parameter_fields()
-        .validate()
-        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    let prefix = format!(
-        "{}.layers.{layer}.{}",
-        config.parameter_root(),
-        fields.feed_forward
-    );
-    let intermediate = usize::try_from(config.intermediate_size()).map_err(|_| {
-        ParallelPlanError::InvalidGroup("decoder feed-forward width exceeds usize".into())
-    })?;
-    let output_format =
-        config.linear_format(&format!("{prefix}.{}.weight", fields.feed_forward_output));
-    let units =
-        crate::linear_format::input_partition_units(&prefix, intermediate, 1, output_format)?;
-    let group = match &mlp.input_projection {
-        GatedInputProjection::Split { gate, up } => {
-            partitioned_projection_group::<B::Tensor, B::Linear>(
-                format!("{prefix}.projections"),
-                ParameterRole::FeedForwardIntermediate,
-                &[
-                    (gate, ProjectionSharding::Column),
-                    (up, ProjectionSharding::Column),
-                    (&mlp.down, ProjectionSharding::Row),
-                ],
-                units,
-            )
-        }
-        GatedInputProjection::Fused(fused) => segmented_projection_group::<B::Tensor, B::Linear>(
-            format!("{prefix}.projections"),
-            ParameterRole::FeedForwardIntermediate,
-            &fused.projection,
-            &mlp.down,
-            fused_projection_ranges(&fused.layout)?,
-            units,
-        ),
-    }?;
-    crate::linear_format::dense_ffn_partition_tail(group, intermediate, output_format, |name| {
-        config.linear_format(name)
-    })
-}
-
-fn fused_projection_ranges(
-    layout: &FusedProjectionLayout,
-) -> Result<Vec<std::ops::Range<usize>>, ParallelPlanError> {
-    let mut start = 0usize;
-    layout
-        .segments()
-        .iter()
-        .map(|segment| {
-            let width = usize::try_from(segment.width()).map_err(|_| {
-                ParallelPlanError::InvalidTensor(format!(
-                    "fused projection segment {} exceeds usize",
-                    segment.name()
-                ))
-            })?;
-            let end = start.checked_add(width).ok_or_else(|| {
-                ParallelPlanError::InvalidTensor(
-                    "fused projection segment ranges overflowed usize".into(),
-                )
-            })?;
-            let range = start..end;
-            start = end;
-            Ok(range)
-        })
-        .collect()
-}
-
-/// Declares every rank-local placement group for one dense shared decoder block.
-pub fn layer_parallel_parameter_groups<B: NeuralBackend>(
-    block: &TransformerBlock<B>,
-    config: &impl Config,
-    layer: usize,
-) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    with_terminal_parameter_group::<B>(
-        body_parallel_parameter_groups(&block.body, config, layer)?,
-        block.output_norm.as_ref(),
-        config,
-        layer,
-    )
-}
-
 /// Derives the complete dense-decoder parameter topology from normalized
 /// configuration without constructing backend modules.
 pub fn dense_parameter_description(
     config: &impl Config,
 ) -> Result<ArchitectureParameterDescription, ParallelPlanError> {
-    parameter_description(config, |_| true, |_| Ok(None))
+    DecoderDeclaration::new(config)
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?
+        .parameter_description(config, ParameterEncoding::Stored)
 }
 
-/// Declares a decoder with optional provider-owned values and
-/// replacement feed-forward groups, without constructing backend tensors.
-pub(crate) fn parameter_description(
+/// Logical dense parameter declaration before physical encoding expansion.
+/// Construction specifications supply geometry; ownership, invocation sharing
+/// and semantic partition rules remain architecture-authored.
+pub fn dense_logical_parameter_description(
     config: &impl Config,
-    ordinary_value_projection: impl Fn(usize) -> bool,
-    replacement_groups: impl Fn(usize) -> Result<Option<Vec<ParameterGroupSpec>>, ParallelPlanError>,
 ) -> Result<ArchitectureParameterDescription, ParallelPlanError> {
-    parameter_description_with_vocabulary(
-        config,
-        ordinary_value_projection,
-        replacement_groups,
-        true,
-    )
+    DecoderDeclaration::new(config)
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?
+        .parameter_description(config, ParameterEncoding::Logical)
 }
 
 /// Neutral router and packed-bank declaration for one ordinary routed block.
 pub(crate) struct RoutedBlockParameters {
     pub selector_name: String,
     pub bank_name: String,
-    pub selector: eredu_nn::TopKGroupSelectorSpec,
-    pub bank: eredu_nn::GroupedGatedProductSpec,
+    pub parameters: eredu_nn::RoutedGatedProductSpec,
+}
+
+/// Geometry projection applied to a source-free parameter declaration.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ParameterEncoding {
+    /// Logical tensor geometry with retained encoding declarations, before physical
+    /// expansion, alignment and format companions.
+    Logical,
+    /// Stored tensor geometry, including exact encoding companions and alignment.
+    Stored,
+}
+
+impl ParameterEncoding {
+    pub(crate) fn format(self, format: LinearFormat) -> LinearFormat {
+        match self {
+            Self::Logical => LinearFormat::Dense,
+            Self::Stored => format,
+        }
+    }
+
+    pub(crate) fn parameter_group(
+        self,
+        name: impl Into<String>,
+        role: ParameterRole,
+        units: Option<usize>,
+        spec: &(impl DeclareLogicalParameters + ?Sized),
+        sharding: impl FnMut(&eredu_nn::LogicalParameterDeclaration<'_>) -> MemberSharding,
+    ) -> Result<ParameterGroupSpec, ParallelPlanError> {
+        match self {
+            Self::Stored => {
+                eredu_runtime::logical_parameter_group(name, role, units, spec, sharding)
+            }
+            Self::Logical => {
+                let declarations = spec
+                    .logical_parameters()
+                    .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+                eredu_nn::validate_logical_parameter_scope(&declarations)
+                    .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+                let members = eredu_runtime::logical_parameter_members(&declarations, sharding)?;
+                match units {
+                    Some(units) => ParameterGroupSpec::partitioned(name, role, units, members),
+                    None => ParameterGroupSpec::new(name, role, members),
+                }
+            }
+        }
+    }
+
+    fn projection_group(
+        self,
+        name: impl Into<String>,
+        role: ParameterRole,
+        units: usize,
+        projections: &[(&LinearSpec, MemberSharding)],
+    ) -> Result<ParameterGroupSpec, ParallelPlanError> {
+        let mut declarations = Vec::new();
+        for (spec, _) in projections {
+            declarations.extend(
+                spec.logical_parameters()
+                    .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?,
+            );
+        }
+        self.parameter_group(name, role, Some(units), &declarations, |declaration| {
+            let (_, sharding) = projections
+                .iter()
+                .find(|(spec, _)| {
+                    spec.weight.id == declaration.parameter.id
+                        || spec
+                            .bias
+                            .as_ref()
+                            .is_some_and(|bias| bias.id == declaration.parameter.id)
+                })
+                .expect("projection owns its declared parameter");
+            if declaration.role == eredu_nn::LogicalParameterRole::LinearWeight
+                || matches!(
+                    sharding,
+                    MemberSharding::Partitioned { axis: 0 }
+                        | MemberSharding::PartitionedSegments { axis: 0, .. }
+                )
+            {
+                sharding.clone()
+            } else {
+                MemberSharding::Replicated
+            }
+        })
+    }
 }
 
 /// Projects ordinary routed blocks into the common decoder topology.
 pub(crate) fn routed_parameter_description(
     config: &impl Config,
+    encoding: ParameterEncoding,
+    declaration: &DecoderDeclaration,
     block: impl Fn(usize) -> Result<RoutedBlockParameters, Error>,
 ) -> Result<ArchitectureParameterDescription, ParallelPlanError> {
     let invalid = |error: Error| ParallelPlanError::InvalidGroup(error.to_string());
     config.validate_config().map_err(invalid)?;
+    declaration.validate_for(config).map_err(invalid)?;
     let layers = usize::try_from(config.num_hidden_layers())
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
     let mut groups = Vec::with_capacity(layers);
-    let mut formats = std::collections::BTreeMap::new();
     for layer in 0..layers {
         let block = block(layer).map_err(invalid)?;
-        block.selector.validate().map_err(invalid)?;
-        block.bank.validate().map_err(invalid)?;
-        if block.selector.selection().group_count() != block.bank.group_count()
-            || block.selector.input_dimensions() != block.bank.input_dimensions()
-            || block.bank.input_dimensions() != config.hidden_size()
-            || block.bank.output_dimensions() != config.hidden_size()
+        block.parameters.validate().map_err(invalid)?;
+        let selector = &block.parameters.selector;
+        let bank = &block.parameters.experts;
+        if selector.selection().group_count() != bank.group_count()
+            || bank.input_dimensions() != config.hidden_size()
+            || bank.output_dimensions() != config.hidden_size()
         {
             return Err(ParallelPlanError::InvalidGroup(format!(
                 "routed decoder unit {layer} has incompatible selector and bank geometry"
             )));
         }
-        formats.insert(
-            block.selector.weight().id.as_str().to_owned(),
-            block.selector.format().encoding(),
-        );
-        let eredu_nn::GatedProductGroupLayout::Packed { gate_up, down } = block.bank.layout()
-        else {
+        let eredu_nn::GatedProductGroupLayout::Packed { gate_up, down } = bank.layout() else {
             return Err(ParallelPlanError::InvalidGroup(
                 "ordinary routed decoder topology requires packed expert projections".into(),
             ));
         };
-        for projection in [gate_up, down] {
-            formats.insert(
-                projection.weight().id.as_str().to_owned(),
-                projection.format().encoding(),
-            );
-        }
         let units = eredu_runtime::aligned_partition_units(
             &block.bank_name,
-            block.bank.intermediate_dimensions() as usize,
+            bank.intermediate_dimensions() as usize,
             1,
-            crate::linear_format::input_partition_alignment(down.format().encoding()) as usize,
+            crate::linear_format::input_partition_alignment(
+                encoding.format(down.format().encoding()),
+            ) as usize,
         )?;
+        let intermediate = bank.intermediate_dimensions() as usize;
         groups.push(vec![
-            eredu_runtime::top_k_group_selector_logical_group(
+            encoding.parameter_group(
                 block.selector_name,
-                &block.selector,
+                ParameterRole::Replicated,
+                None,
+                selector,
+                |_| MemberSharding::Replicated,
             )?,
-            eredu_runtime::packed_gated_product_logical_group(block.bank_name, &block.bank, units)?,
+            encoding.parameter_group(
+                block.bank_name,
+                ParameterRole::ExpertIntermediate,
+                Some(units),
+                bank,
+                |declaration| {
+                    let parameter = &declaration.parameter.id;
+                    if parameter == &gate_up.weight().id
+                        || gate_up.bias().is_some_and(|bias| parameter == &bias.id)
+                    {
+                        MemberSharding::PartitionedSegments {
+                            axis: 1,
+                            segments: vec![0..intermediate, intermediate..2 * intermediate],
+                        }
+                    } else if declaration.role == eredu_nn::LogicalParameterRole::LinearWeight {
+                        MemberSharding::Partitioned { axis: 2 }
+                    } else {
+                        MemberSharding::Replicated
+                    }
+                },
+            )?,
         ]);
     }
-    parameter_description_with_formats(
+    parameter_description_with_encoding(
         config,
-        |_| true,
         |layer| Ok(Some(groups[layer].clone())),
         true,
-        |name| {
-            formats
-                .get(name)
-                .copied()
-                .unwrap_or_else(|| config.linear_format(name))
-        },
+        ParameterConstruction::Decoder(declaration),
+        encoding,
     )
 }
 
 /// Derives block and final-normalization topology for supplied-embedding execution,
 /// without declaring a vocabulary table or a language-model output head.
-pub fn embedded_parameter_description(
+pub(crate) fn embedded_parameter_description(
     config: &impl Config,
+    declaration: &topology::EmbeddedParameters,
 ) -> Result<ArchitectureParameterDescription, ParallelPlanError> {
-    parameter_description_with_vocabulary(config, |_| true, |_| Ok(None), false)
-}
-
-fn parameter_description_with_vocabulary(
-    config: &impl Config,
-    ordinary_value_projection: impl Fn(usize) -> bool,
-    replacement_groups: impl Fn(usize) -> Result<Option<Vec<ParameterGroupSpec>>, ParallelPlanError>,
-    include_vocabulary: bool,
-) -> Result<ArchitectureParameterDescription, ParallelPlanError> {
-    parameter_description_with_formats(
+    declaration
+        .validate_for(config)
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+    parameter_description_with_encoding(
         config,
-        ordinary_value_projection,
-        replacement_groups,
-        include_vocabulary,
-        |name| config.linear_format(name),
+        |_| Ok(None),
+        false,
+        ParameterConstruction::Embedded(declaration),
+        ParameterEncoding::Stored,
     )
 }
 
-pub(crate) fn parameter_description_with_formats(
+enum ParameterConstruction<'a> {
+    Embedded(&'a topology::EmbeddedParameters),
+    Decoder(&'a DecoderDeclaration),
+}
+impl ParameterConstruction<'_> {
+    fn blocks(&self) -> &[topology::BlockParameters] {
+        match self {
+            Self::Embedded(spec) => &spec.blocks,
+            Self::Decoder(spec) => &spec.blocks,
+        }
+    }
+    fn normalization(&self) -> &NormalizationConstructionSpec {
+        match self {
+            Self::Embedded(spec) => &spec.normalization,
+            Self::Decoder(spec) => spec.statics.normalization_spec(),
+        }
+    }
+}
+
+fn parameter_description_with_encoding(
     config: &impl Config,
-    ordinary_value_projection: impl Fn(usize) -> bool,
     replacement_groups: impl Fn(usize) -> Result<Option<Vec<ParameterGroupSpec>>, ParallelPlanError>,
     include_vocabulary: bool,
-    format: impl Fn(&str) -> LinearFormat,
+    declaration: ParameterConstruction<'_>,
+    encoding: ParameterEncoding,
 ) -> Result<ArchitectureParameterDescription, ParallelPlanError> {
     config
         .validate_config()
@@ -3587,29 +3505,8 @@ pub(crate) fn parameter_description_with_formats(
         .block_parameter_fields()
         .validate()
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    let dimension = |name: &str, value: i32| {
-        usize::try_from(value)
-            .map_err(|_| ParallelPlanError::InvalidTensor(format!("decoder {name} exceeds usize")))
-    };
-    let hidden = dimension("hidden width", config.hidden_size())?;
     let schedule = DecoderSchedule::new(config)
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    let query_heads = dimension("query-head count", config.num_attention_heads())?;
-    let key_value_heads = dimension("key/value-head count", config.num_key_value_heads())?;
-    let head = dimension("head width", config.head_dim())?;
-    let intermediate = dimension("feed-forward width", config.intermediate_size())?;
-    let query_width = query_heads.checked_mul(head).ok_or_else(|| {
-        ParallelPlanError::InvalidTensor("decoder query width overflowed usize".into())
-    })?;
-    let key_value_width = key_value_heads.checked_mul(head).ok_or_else(|| {
-        ParallelPlanError::InvalidTensor("decoder key/value width overflowed usize".into())
-    })?;
-    if head == 0 || key_value_heads == 0 || !query_heads.is_multiple_of(key_value_heads) {
-        return Err(ParallelPlanError::InvalidGroup(
-            "decoder attention geometry does not form positive integral GQA groups".into(),
-        ));
-    }
-
     let graph = ExecutionGraph::chain([TEXT_DECODER_EXECUTION_GROUP])
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
     let layout = ExecutionUnitLayout::new(&graph, [schedule.len()])
@@ -3619,17 +3516,23 @@ pub(crate) fn parameter_description_with_formats(
         .expect("dense decoder layout contains its text group")
         .clone();
     let root = config.parameter_root();
-    let statics = StaticModuleSpec::from_config(config);
     let mut owned = if include_vocabulary {
+        let ParameterConstruction::Decoder(spec) = &declaration else {
+            return Err(ParallelPlanError::InvalidGroup(
+                "vocabulary requires a decoder declaration".into(),
+            ));
+        };
+        let statics = &spec.statics;
         statics
-            .logical_pinned_parameter_groups(
+            .pinned_parameter_groups(
+                encoding,
                 &format!("{root}.embed_tokens"),
                 &format!("{root}.norm"),
                 "lm_head",
             )?
             .into_iter()
             .map(|(role, group)| {
-                let owner = if role == "embedding" && statics.tied_head {
+                let owner = if role == "embedding" && statics.head_spec().is_none() {
                     ParameterGroupOwner::static_any_of(["embedding", "output"])
                 } else {
                     ParameterGroupOwner::static_role(role)
@@ -3640,14 +3543,12 @@ pub(crate) fn parameter_description_with_formats(
     } else {
         vec![OwnedParameterGroupSpec::new(
             ParameterGroupOwner::static_role("norm"),
-            ParameterGroupSpec::new(
+            encoding.parameter_group(
                 format!("{root}.norm"),
                 ParameterRole::Replicated,
-                [eredu_runtime::ParameterMemberSpec::new(
-                    &statics.normalization_weight,
-                    vec![hidden],
-                    MemberSharding::Replicated,
-                )],
+                None,
+                declaration.normalization(),
+                |_| MemberSharding::Replicated,
             )?,
         )]
     };
@@ -3657,292 +3558,184 @@ pub(crate) fn parameter_description_with_formats(
             .operation(owner)
             .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
         let layer = operation.layer();
+        let block = &declaration.blocks()[layer];
         if let DecoderOperation::Terminal { .. } = operation {
             let name = config
                 .block_output_normalization(layer)
                 .expect("declared terminal");
             owned.push(OwnedParameterGroupSpec::new(
                 ParameterGroupOwner::execution_unit_consumers(group_id.clone(), owner, consumers),
-                ParameterGroupSpec::new(
+                encoding.parameter_group(
                     name.trim_end_matches(".weight"),
                     ParameterRole::Replicated,
-                    [eredu_runtime::ParameterMemberSpec::new(
-                        &name,
-                        vec![hidden],
-                        MemberSharding::Replicated,
-                    )],
+                    None,
+                    &block.terminal.clone().ok_or_else(|| {
+                        ParallelPlanError::InvalidGroup(
+                            "terminal operation has no declared normalization".into(),
+                        )
+                    })?,
+                    |_| MemberSharding::Replicated,
                 )?,
             ));
             continue;
         }
         let prefix = format!("{root}.layers.{layer}");
         let attention_prefix = format!("{prefix}.{}", fields.attention);
-        let head_partition = attention_partition::AttentionPartition::new(config, layer)?;
+        let attention_specs = &block.attention;
+        let head_partition = attention_partition::AttentionPartition::from_parameters(
+            &attention_specs,
+            config.attention_value_format(layer),
+        )?;
         let attention_units = head_partition.preferred_units();
-        let mut attention_members = Vec::new();
-        let mut projection =
-            |field: &str, shape: Vec<usize>, sharding: MemberSharding, bias: bool| {
-                let output_width = shape[0];
-                attention_members.push(eredu_runtime::ParameterMemberSpec::new(
-                    format!("{attention_prefix}.{field}.weight"),
-                    shape,
-                    sharding.clone(),
-                ));
-                if bias {
-                    let bias_sharding = if matches!(
-                        sharding,
-                        MemberSharding::Partitioned { axis: 0 }
-                            | MemberSharding::PartitionedSegments { axis: 0, .. }
-                    ) {
-                        sharding
-                    } else {
-                        MemberSharding::Replicated
-                    };
-                    attention_members.push(eredu_runtime::ParameterMemberSpec::new(
-                        format!("{attention_prefix}.{field}.bias"),
-                        vec![output_width],
-                        bias_sharding,
-                    ));
-                }
-            };
-        match config.attention_projection_layout() {
-            AttentionProjectionLayout::Split => {
-                projection(
-                    fields.attention_query,
-                    vec![query_width, hidden],
-                    MemberSharding::Partitioned { axis: 0 },
-                    config.attention_bias(AttentionProjection::Query),
-                );
-                projection(
-                    fields.attention_key,
-                    vec![key_value_width, hidden],
-                    MemberSharding::Partitioned { axis: 0 },
-                    config.attention_bias(AttentionProjection::Key),
-                );
-                if ordinary_value_projection(layer) {
-                    projection(
-                        fields.attention_value,
-                        vec![key_value_width, hidden],
-                        MemberSharding::Partitioned { axis: 0 },
-                        config.attention_bias(AttentionProjection::Value),
-                    );
-                }
-            }
-            AttentionProjectionLayout::Fused { field } => {
-                if !ordinary_value_projection(layer) {
-                    return Err(ParallelPlanError::InvalidGroup(
-                        "fused QKV requires an ordinary value projection".into(),
-                    ));
-                }
-                let key_end = query_width.checked_add(key_value_width).ok_or_else(|| {
-                    ParallelPlanError::InvalidTensor("fused QK width overflowed usize".into())
-                })?;
-                let end = key_end.checked_add(key_value_width).ok_or_else(|| {
-                    ParallelPlanError::InvalidTensor("fused QKV width overflowed usize".into())
-                })?;
-                projection(
-                    field,
-                    vec![end, hidden],
-                    MemberSharding::PartitionedSegments {
-                        axis: 0,
-                        segments: vec![0..query_width, query_width..key_end, key_end..end],
-                    },
-                    config.attention_bias(AttentionProjection::Query),
-                );
-            }
-        }
-        projection(
-            fields.attention_output,
-            vec![hidden, query_width],
-            MemberSharding::Partitioned { axis: 1 },
-            config.attention_bias(AttentionProjection::Output),
-        );
-        if let Some((field, _)) = config.attention_output_gate() {
-            projection(
-                field,
-                vec![query_width, hidden],
-                MemberSharding::Partitioned { axis: 0 },
-                false,
-            );
-        }
-        let attention = ParameterGroupSpec::partitioned(
+        let attention_projections = attention_specs.partitioned_projections();
+        let attention = encoding.projection_group(
             format!("{attention_prefix}.projections"),
             ParameterRole::AttentionHeads,
             attention_units,
-            attention_members,
+            &attention_projections,
         )?;
+        let attention_format = |name: &str| {
+            attention_specs
+                .projections()
+                .into_iter()
+                .find(|spec| spec.weight.id.as_str() == name)
+                .map_or(LinearFormat::Dense, |spec| {
+                    encoding.format(spec.format.encoding())
+                })
+        };
 
         let feed_forward_groups = match replacement_groups(layer)? {
             Some(groups) => groups,
             None => {
                 let feed_forward_prefix = format!("{prefix}.{}", fields.feed_forward);
+                let parameters = block.feed_forward.as_ref().ok_or_else(|| {
+                    ParallelPlanError::InvalidGroup(
+                        "ordinary block has no gated declaration".into(),
+                    )
+                })?;
+                let output = parameters.down();
+                let intermediate = output.input as usize;
+                let output_format = encoding.format(output.format.encoding());
                 let feed_forward_units = crate::linear_format::input_partition_units(
                     &feed_forward_prefix,
                     intermediate,
                     1,
-                    format(&format!(
-                        "{feed_forward_prefix}.{}.weight",
-                        fields.feed_forward_output
-                    )),
+                    output_format,
                 )?;
-                let mut feed_forward_members = Vec::new();
-                let inputs = match config.gated_projection_layout() {
-                    GatedProjectionLayout::Split => vec![
-                        (
-                            fields.feed_forward_gate,
-                            intermediate,
-                            MemberSharding::Partitioned { axis: 0 },
-                        ),
-                        (
-                            fields.feed_forward_up,
-                            intermediate,
-                            MemberSharding::Partitioned { axis: 0 },
-                        ),
-                    ],
-                    GatedProjectionLayout::Fused { field } => {
-                        let width = intermediate.checked_mul(2).ok_or_else(|| {
-                            ParallelPlanError::InvalidTensor(
-                                "fused gate/up width overflowed usize".into(),
-                            )
-                        })?;
-                        vec![(
-                            field,
-                            width,
-                            MemberSharding::PartitionedSegments {
-                                axis: 0,
-                                segments: vec![0..intermediate, intermediate..width],
-                            },
-                        )]
-                    }
-                };
-                for (field, width, sharding) in inputs {
-                    feed_forward_members.push(eredu_runtime::ParameterMemberSpec::new(
-                        format!("{feed_forward_prefix}.{field}.weight"),
-                        vec![width, hidden],
-                        sharding.clone(),
-                    ));
-                    if config.mlp_bias() {
-                        feed_forward_members.push(eredu_runtime::ParameterMemberSpec::new(
-                            format!("{feed_forward_prefix}.{field}.bias"),
-                            vec![width],
-                            sharding,
-                        ));
-                    }
+                let mut feed_forward_projections = Vec::new();
+                for spec in parameters.projections() {
+                    let sharding = if spec.weight.id == output.weight.id {
+                        MemberSharding::Partitioned { axis: 1 }
+                    } else if matches!(&parameters, eredu_nn::GatedProductSpec::Fused(_)) {
+                        MemberSharding::PartitionedSegments {
+                            axis: 0,
+                            segments: vec![0..intermediate, intermediate..spec.output as usize],
+                        }
+                    } else {
+                        MemberSharding::Partitioned { axis: 0 }
+                    };
+                    feed_forward_projections.push((spec, sharding));
                 }
-                feed_forward_members.push(eredu_runtime::ParameterMemberSpec::new(
-                    format!(
-                        "{feed_forward_prefix}.{}.weight",
-                        fields.feed_forward_output
-                    ),
-                    vec![hidden, intermediate],
-                    MemberSharding::Partitioned { axis: 1 },
-                ));
-                if config.mlp_bias() {
-                    feed_forward_members.push(eredu_runtime::ParameterMemberSpec::new(
-                        format!("{feed_forward_prefix}.{}.bias", fields.feed_forward_output),
-                        vec![hidden],
-                        MemberSharding::Replicated,
-                    ));
-                }
-                let feed_forward = ParameterGroupSpec::partitioned(
+                let feed_forward = encoding.projection_group(
                     format!("{feed_forward_prefix}.projections"),
                     ParameterRole::FeedForwardIntermediate,
                     feed_forward_units,
-                    feed_forward_members,
+                    &feed_forward_projections,
                 )?;
-                let feed_forward = crate::linear_format::dense_ffn_partition_tail(
+                vec![crate::linear_format::dense_ffn_partition_tail(
                     feed_forward,
                     intermediate,
-                    format(&format!(
-                        "{feed_forward_prefix}.{}.weight",
-                        fields.feed_forward_output
-                    )),
-                    |name| format(name),
-                )?;
-                vec![feed_forward]
+                    output_format,
+                    |name| {
+                        parameters
+                            .projections()
+                            .find(|spec| spec.weight.id.as_str() == name)
+                            .map_or(LinearFormat::Dense, |spec| {
+                                encoding.format(spec.format.encoding())
+                            })
+                    },
+                )?]
             }
         };
-        let input_norm = ParameterGroupSpec::new(
-            format!("{prefix}.{}", fields.input_norm),
-            ParameterRole::Replicated,
-            [eredu_runtime::ParameterMemberSpec::new(
-                format!("{prefix}.{}.weight", fields.input_norm),
-                vec![hidden],
-                MemberSharding::Replicated,
-            )],
-        )?;
-        let post_attention_norm = ParameterGroupSpec::new(
-            format!("{prefix}.{}", fields.post_attention_norm),
-            ParameterRole::Replicated,
-            [eredu_runtime::ParameterMemberSpec::new(
-                format!("{prefix}.{}.weight", fields.post_attention_norm),
-                vec![hidden],
-                MemberSharding::Replicated,
-            )],
-        )?;
+        let normalization_group = |spec: &NormalizationConstructionSpec| {
+            let declarations = spec
+                .logical_parameters()
+                .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+            let name = declarations
+                .first()
+                .ok_or_else(|| {
+                    ParallelPlanError::InvalidGroup(
+                        "residual normalization must declare its gain".into(),
+                    )
+                })?
+                .parameter
+                .id
+                .as_str();
+            encoding.parameter_group(
+                name.trim_end_matches(".weight"),
+                ParameterRole::Replicated,
+                None,
+                &declarations,
+                |_| MemberSharding::Replicated,
+            )
+        };
+        let residual = &block.normalizations;
+        let input_norm = normalization_group(&residual.input)?;
+        let post_attention_norm = normalization_group(&residual.post_attention)?;
         let mut unit_groups = vec![attention];
-        if config.learned_attention_sinks() {
-            let name = format!("{attention_prefix}.{}", fields.attention_sinks);
-            unit_groups.push(ParameterGroupSpec::partitioned(
-                name.clone(),
+        if let Some(spec) = block.sinks.clone() {
+            unit_groups.push(encoding.parameter_group(
+                spec.weight.id.as_str(),
                 ParameterRole::AttentionHeads,
-                query_heads,
-                [eredu_runtime::ParameterMemberSpec::new(
-                    name,
-                    vec![query_heads],
-                    MemberSharding::Partitioned { axis: 0 },
-                )],
+                Some(spec.heads as usize),
+                &spec,
+                |_| MemberSharding::Partitioned { axis: 0 },
             )?);
         }
-        if config.query_key_norm_epsilon().is_some() {
-            for (field, heads) in [
-                (fields.attention_query_norm, query_heads),
-                (fields.attention_key_norm, key_value_heads),
-            ] {
-                let name = format!("{attention_prefix}.{field}");
-                let owned = config.query_key_norm_per_head_weights();
-                let members = [eredu_runtime::ParameterMemberSpec::new(
-                    format!("{name}.weight"),
-                    vec![if owned { heads * head } else { head }],
+        let normalizations = block.query_key.clone();
+        for (spec, (field, heads)) in normalizations.into_iter().zip([
+            (
+                fields.attention_query_norm,
+                attention_specs.geometry.query_heads() as usize,
+            ),
+            (
+                fields.attention_key_norm,
+                attention_specs.geometry.key_value_heads() as usize,
+            ),
+        ]) {
+            let Some(spec) = spec else {
+                continue;
+            };
+            let name = format!("{attention_prefix}.{field}");
+            let owned = config.query_key_norm_per_head_weights();
+            unit_groups.push(encoding.parameter_group(
+                name,
+                if owned {
+                    ParameterRole::AttentionHeads
+                } else {
+                    ParameterRole::Replicated
+                },
+                owned.then_some(heads),
+                &spec,
+                |_| {
                     if owned {
                         MemberSharding::Partitioned { axis: 0 }
                     } else {
                         MemberSharding::Replicated
-                    },
-                )];
-                unit_groups.push(if owned {
-                    ParameterGroupSpec::partitioned(
-                        name,
-                        ParameterRole::AttentionHeads,
-                        heads,
-                        members,
-                    )?
-                } else {
-                    ParameterGroupSpec::new(name, ParameterRole::Replicated, members)?
-                });
-            }
-        }
-        for name in [
-            config.attention_output_normalization(layer),
-            config.feed_forward_output_normalization(layer),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            unit_groups.push(ParameterGroupSpec::new(
-                name.trim_end_matches(".weight"),
-                ParameterRole::Replicated,
-                [eredu_runtime::ParameterMemberSpec::new(
-                    &name,
-                    vec![hidden],
-                    MemberSharding::Replicated,
-                )],
+                    }
+                },
             )?);
         }
+        for spec in residual
+            .attention_output
+            .iter()
+            .chain(residual.feed_forward_output.iter())
+        {
+            unit_groups.push(normalization_group(spec)?);
+        }
         unit_groups.extend([input_norm, post_attention_norm]);
-        unit_groups.extend(feed_forward_groups);
         for group in unit_groups {
-            let group = head_partition.apply(group, |name| format(name))?;
+            let group = head_partition.apply(group, attention_format)?;
             owned.push(OwnedParameterGroupSpec::new(
                 ParameterGroupOwner::execution_unit_consumers(
                     group_id.clone(),
@@ -3952,62 +3745,20 @@ pub(crate) fn parameter_description_with_formats(
                 group,
             ));
         }
+        for group in feed_forward_groups {
+            owned.push(OwnedParameterGroupSpec::new(
+                ParameterGroupOwner::execution_unit_consumers(
+                    group_id.clone(),
+                    owner,
+                    consumers.iter().copied(),
+                ),
+                head_partition.apply(group, |name| encoding.format(config.linear_format(name)))?,
+            ));
+        }
     }
 
-    let expanded = eredu_runtime::expand_owned_linear_format_parameter_groups(owned, |member| {
-        crate::linear_format::standard_parallel_linear_format(member, format(member.target()))
-    })?;
-    ArchitectureParameterDescription::from_owned(&graph, &layout, expanded)
+    ArchitectureParameterDescription::from_owned(&graph, &layout, owned)
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))
-}
-
-/// Derives the rank-local construction geometry of one tensor-parallel block
-/// from the neutral placement layout.
-pub fn static_parallel_parameter_groups<B: NeuralBackend>(
-    embeddings: &B::Embedding,
-    norm: &B::Normalization,
-    head: Option<&B::Linear>,
-    parameter_root: &str,
-) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    let mut groups = vec![
-        module_parameter_group::<B::Tensor, _>(
-            format!("{parameter_root}.embed_tokens"),
-            ParameterRole::Vocabulary,
-            embeddings,
-            |_, shape| {
-                if shape.is_empty() {
-                    Err(ParallelPlanError::InvalidTensor(
-                        "decoder embedding parameter is scalar".into(),
-                    ))
-                } else {
-                    Ok(MemberSharding::Balanced { axis: 0 })
-                }
-            },
-        )?,
-        module_parameter_group::<B::Tensor, _>(
-            format!("{parameter_root}.norm"),
-            ParameterRole::Replicated,
-            norm,
-            |_, _| Ok(MemberSharding::Replicated),
-        )?,
-    ];
-    if let Some(head) = head {
-        groups.push(module_parameter_group::<B::Tensor, _>(
-            "lm_head",
-            ParameterRole::Vocabulary,
-            head,
-            |_, shape| {
-                if shape.is_empty() {
-                    Err(ParallelPlanError::InvalidTensor(
-                        "decoder language-model head parameter is scalar".into(),
-                    ))
-                } else {
-                    Ok(MemberSharding::Balanced { axis: 0 })
-                }
-            },
-        )?);
-    }
-    Ok(groups)
 }
 
 /// Pinned modules shared by resident and bounded-residency execution.
@@ -4061,13 +3812,43 @@ pub struct StaticModuleSpec {
 }
 
 /// Validated ordinary pinned construction, retaining the full normalization policy.
+#[derive(Debug, Clone)]
 pub(crate) struct StaticModuleConstruction {
     embedding: EmbeddingSpec,
     head: Option<LinearSpec>,
     normalization: NormalizationConstructionSpec,
 }
 
+impl DeclareLogicalParameters for StaticModuleConstruction {
+    fn logical_parameters(&self) -> Result<Vec<eredu_nn::LogicalParameterDeclaration<'_>>, Error> {
+        let mut declarations = self.embedding.logical_parameters()?;
+        declarations.extend(self.normalization.logical_parameters()?);
+        if let Some(head) = &self.head {
+            declarations.extend(head.logical_parameters()?);
+        }
+        Ok(declarations)
+    }
+}
+
 impl StaticModuleConstruction {
+    pub(crate) fn embedding_spec(&self) -> &EmbeddingSpec {
+        &self.embedding
+    }
+    pub(crate) fn head_spec(&self) -> Option<&LinearSpec> {
+        self.head.as_ref()
+    }
+    /// A tied projection retains the embedding identity and encoding without adding a slot.
+    pub(crate) fn output_projection_spec(&self) -> std::borrow::Cow<'_, LinearSpec> {
+        match &self.head {
+            Some(head) => std::borrow::Cow::Borrowed(head),
+            None => std::borrow::Cow::Owned(self.embedding.output_projection()),
+        }
+    }
+
+    pub(crate) fn normalization_spec(&self) -> &NormalizationConstructionSpec {
+        &self.normalization
+    }
+
     pub(crate) fn new(
         embedding: EmbeddingSpec,
         head: Option<LinearSpec>,
@@ -4080,111 +3861,68 @@ impl StaticModuleConstruction {
                 "final normalization and embedding widths differ",
             ));
         }
-        Ok(Self {
+        let construction = Self {
             embedding,
             head,
             normalization,
-        })
+        };
+        eredu_nn::validate_logical_parameter_topology(&construction.logical_parameters()?)
+            .map_err(Error::backend_source)?;
+        Ok(construction)
     }
 
-    /// Projects logical embedding, normalization and readout resources before
-    /// encoding expansion. Families retain group names and format admission;
-    /// explicit resource roles remain independent of group ordering.
-    pub(crate) fn logical_pinned_parameter_groups(
+    /// Projects pinned roles from construction declarations and their encoding extensions.
+    pub(crate) fn pinned_parameter_groups(
         &self,
+        encoding: ParameterEncoding,
         embedding_group: &str,
         normalization_group: &str,
         output_group: &str,
     ) -> Result<Vec<(&'static str, ParameterGroupSpec)>, ParallelPlanError> {
-        let embedding = &self.embedding;
-        let head = &self.head;
-        let normalization_weight = match &self.normalization.scale {
-            eredu_nn::NormalizationScale::Learned(weight)
-            | eredu_nn::NormalizationScale::LearnedOffset { weight, .. } => weight,
+        match &self.normalization.scale {
+            eredu_nn::NormalizationScale::Learned(_)
+            | eredu_nn::NormalizationScale::LearnedOffset { .. } => (),
             eredu_nn::NormalizationScale::Unit => {
                 return Err(ParallelPlanError::InvalidGroup(
                     "pinned normalization catalog requires a learned scale".into(),
                 ));
             }
         };
-        let group = |name: &str, role, target: &str, shape, sharding| {
-            ParameterGroupSpec::new(
-                name,
-                role,
-                [eredu_runtime::ParameterMemberSpec::new(
-                    target, shape, sharding,
-                )],
-            )
-        };
         let mut groups = vec![
             (
                 "embedding",
-                group(
+                encoding.parameter_group(
                     embedding_group,
                     ParameterRole::Vocabulary,
-                    embedding.weight.id.as_str(),
-                    vec![embedding.vocabulary as usize, embedding.dimensions as usize],
-                    MemberSharding::Balanced { axis: 0 },
+                    None,
+                    &self.embedding,
+                    |_| MemberSharding::Balanced { axis: 0 },
                 )?,
             ),
             (
                 "norm",
-                group(
+                encoding.parameter_group(
                     normalization_group,
                     ParameterRole::Replicated,
-                    normalization_weight.id.as_str(),
-                    vec![embedding.dimensions as usize],
-                    MemberSharding::Replicated,
+                    None,
+                    &self.normalization,
+                    |_| MemberSharding::Replicated,
                 )?,
             ),
         ];
-        if let Some(head) = head {
-            let mut members = vec![eredu_runtime::ParameterMemberSpec::new(
-                head.weight.id.as_str(),
-                vec![head.output as usize, head.input as usize],
-                MemberSharding::Balanced { axis: 0 },
-            )];
-            if let Some(bias) = &head.bias {
-                members.push(eredu_runtime::ParameterMemberSpec::new(
-                    bias.id.as_str(),
-                    vec![head.output as usize],
-                    MemberSharding::Balanced { axis: 0 },
-                ));
-            }
+        if let Some(head) = &self.head {
             groups.push((
                 "output",
-                ParameterGroupSpec::new(output_group, ParameterRole::Vocabulary, members)?,
+                encoding.parameter_group(
+                    output_group,
+                    ParameterRole::Vocabulary,
+                    None,
+                    head,
+                    |_| MemberSharding::Balanced { axis: 0 },
+                )?,
             ));
         }
         Ok(groups)
-    }
-
-    /// Projects physical pinned groups from the same admitted formats used by
-    /// construction. Resource roles survive encoding and companion expansion.
-    pub(crate) fn pinned_parameter_groups(
-        &self,
-        embedding_group: &str,
-        normalization_group: &str,
-        output_group: &str,
-    ) -> Result<Vec<(&'static str, ParameterGroupSpec)>, ParallelPlanError> {
-        eredu_runtime::expand_tagged_linear_format_parameter_groups(
-            self.logical_pinned_parameter_groups(
-                embedding_group,
-                normalization_group,
-                output_group,
-            )?,
-            |member| {
-                let format = if member.target() == self.embedding.weight.id.as_str() {
-                    Some(self.embedding.format.clone())
-                } else {
-                    self.head
-                        .as_ref()
-                        .filter(|head| member.target() == head.weight.id.as_str())
-                        .map(|head| head.format.clone())
-                };
-                Ok(format)
-            },
-        )
     }
 
     /// Projects only vocabulary resources physically retained by a selected layout.
@@ -4201,8 +3939,12 @@ impl StaticModuleConstruction {
         ),
         ParallelPlanError,
     > {
-        let groups =
-            self.pinned_parameter_groups(embedding_group, normalization_group, output_group)?;
+        let groups = self.pinned_parameter_groups(
+            ParameterEncoding::Stored,
+            embedding_group,
+            normalization_group,
+            output_group,
+        )?;
         let global_vocabulary = self.embedding.vocabulary as usize;
         let range = |role| -> Result<_, ParallelPlanError> {
             let Some((_, group)) = groups.iter().find(|(resource, _)| *resource == role) else {
@@ -4299,44 +4041,6 @@ impl StaticModuleSpec {
         StaticModuleConstruction::new(embedding, head, normalization)
     }
 
-    /// Projects logical pinned roles from the validated construction declaration.
-    pub(crate) fn logical_pinned_parameter_groups(
-        &self,
-        embedding_group: &str,
-        normalization_group: &str,
-        output_group: &str,
-    ) -> Result<Vec<(&'static str, ParameterGroupSpec)>, ParallelPlanError> {
-        self.construction_specs()
-            .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?
-            .logical_pinned_parameter_groups(embedding_group, normalization_group, output_group)
-    }
-
-    /// Projects physical storage and companions from the same construction declaration.
-    pub(crate) fn pinned_parameter_groups(
-        &self,
-        embedding_group: &str,
-        normalization_group: &str,
-        output_group: &str,
-    ) -> Result<Vec<(&'static str, ParameterGroupSpec)>, ParallelPlanError> {
-        self.construction_specs()
-            .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?
-            .pinned_parameter_groups(embedding_group, normalization_group, output_group)
-    }
-
-    /// Projects exact vocabulary intervals from declared physical storage.
-    /// Runtime validates row companions and replicas; tied readout retains one owner.
-    pub(crate) fn vocabulary_ranges(
-        &self,
-        layout: &LocalModelLayout,
-        embedding_group: &str,
-        normalization_group: &str,
-        output_group: &str,
-    ) -> Result<(VocabularyParallelRange, Option<VocabularyParallelRange>), ParallelPlanError> {
-        self.construction_specs()
-            .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?
-            .vocabulary_ranges(layout, embedding_group, normalization_group, output_group)
-    }
-
     /// Shared ordinary static-module specification before backend binding.
     pub(crate) fn from_config<C: Config>(config: &C) -> Self {
         let embedding_name = format!("{}.embed_tokens.weight", config.parameter_root());
@@ -4353,31 +4057,6 @@ impl StaticModuleSpec {
             head_format: config.linear_format("lm_head.weight"),
             tied_head: config.tie_word_embeddings(),
         }
-    }
-
-    /// Actual output projection, including the embedding owner and encoding when tied.
-    pub(crate) fn output_topology(
-        &self,
-    ) -> Result<eredu_runtime::execution_topology::ProjectionTopology, Error> {
-        if self.hidden_size <= 0 || self.vocabulary <= 0 {
-            return Err(Error::backend("static module dimensions must be positive"));
-        }
-        Ok(eredu_runtime::execution_topology::ProjectionTopology {
-            arithmetic: eredu_nn::LinearArithmetic::Native,
-            input: self.hidden_size as u64,
-            output: self.vocabulary as u64,
-            format: if self.tied_head {
-                self.embedding_format
-            } else {
-                self.head_format
-            },
-            bias: false,
-            parameter: if self.tied_head {
-                self.embedding_weight.clone()
-            } else {
-                self.head_weight.clone()
-            },
-        })
     }
 }
 
@@ -4616,7 +4295,7 @@ impl<B: NeuralBackend, D: DecoderBoundary<B>> StaticModules<B, D> {
     }
 }
 
-fn validate_vocabulary_specs(
+pub(crate) fn validate_vocabulary_specs(
     embedding: &EmbeddingSpec,
     head: Option<&LinearSpec>,
 ) -> Result<(), Error> {
@@ -4644,11 +4323,18 @@ impl<B: NeuralBackend> StaticModules<B> {
         spec: StaticModuleSpec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        Self::from_construction(spec.construction_specs()?, context)
+    }
+
+    pub(crate) fn from_construction(
+        construction: StaticModuleConstruction,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
         let StaticModuleConstruction {
             embedding,
             head,
             normalization,
-        } = spec.construction_specs()?;
+        } = construction;
         let boundary = NormalizedBoundary::new(normalization, context)?;
         Self::from_boundary(embedding, head, boundary, context)
     }
@@ -4663,11 +4349,28 @@ impl<B: NeuralBackend> StaticModules<B> {
     where
         B: eredu_nn::DistributedNeuralBackend,
     {
+        Self::from_parallel_construction(
+            spec.construction_specs()?,
+            embedding_range,
+            output_range,
+            context,
+        )
+    }
+
+    pub(crate) fn from_parallel_construction(
+        construction: StaticModuleConstruction,
+        embedding_range: VocabularyParallelRange,
+        output_range: Option<VocabularyParallelRange>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error>
+    where
+        B: eredu_nn::DistributedNeuralBackend,
+    {
         let StaticModuleConstruction {
             embedding,
             head,
             normalization,
-        } = spec.construction_specs()?;
+        } = construction;
         let boundary = NormalizedBoundary::new(normalization, context)?;
         Self::from_parallel_boundary(
             embedding,
@@ -5027,29 +4730,41 @@ pub trait BlockFactory<B: NeuralBackend, C: Config>: 'static {
         Self::validate(local)
     }
 
-    /// Builds the family-selected projection resources inside an ordinary body.
-    fn build_feed_forward(
-        config: &C,
-        layer: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self::FeedForward, Error>;
+    /// Backend-neutral typed parameters for the factory's dense or provider-owned stages.
+    type Parameters: Clone + eredu_nn::DeclareLogicalParameters;
 
-    /// Retains global routing cardinality while constructing owner-local banks.
-    /// Ordinary dense projection policies consume only the localized configuration.
-    fn build_partitioned_feed_forward(
+    /// Prepares complete local stage geometry before any backend allocation.
+    /// Supplied dense or typed projection slots are mutually exclusive construction authorities.
+    fn prepare_parameters(
         global: &C,
         local: &C,
         layer: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self::FeedForward, Error> {
-        let _ = global;
-        Self::build_feed_forward(local, layer, context)
-    }
+        dense: Option<&eredu_nn::GatedProductSpec>,
+        retained: Option<&Self::Parameters>,
+    ) -> Result<Self::Parameters, Error>;
 
-    /// Declares canonical global parameter topology without native resources.
+    /// Projects the complete typed source topology before native construction.
     fn parameter_description(
         config: &C,
-    ) -> Result<ArchitectureParameterDescription, ParallelPlanError>;
+        common: &DecoderDeclaration,
+        _projections: Option<&ProjectionDeclarations<Self::Parameters>>,
+    ) -> Result<ArchitectureParameterDescription, Error> {
+        let common = common
+            .parameter_description(config, ParameterEncoding::Stored)
+            .map_err(Error::backend_source)?;
+        config
+            .extend_common_parameters(common)
+            .map_err(Error::backend_source)
+    }
+
+    /// Materializes the exact prepared stages without redeclaring parameter geometry.
+    fn build_feed_forward(
+        global: &C,
+        local: &C,
+        layer: usize,
+        parameters: &Self::Parameters,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self::FeedForward, Error>;
 }
 
 /// Feed-forward policy that can delegate routed experts to runtime residency.
@@ -5198,18 +4913,31 @@ pub struct DenseBlockFactory;
 impl<B: NeuralBackend, C: Config> BlockFactory<B, C> for DenseBlockFactory {
     type FeedForward = Mlp<B>;
 
-    fn build_feed_forward(
-        config: &C,
-        layer: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self::FeedForward, Error> {
-        Mlp::new(config, layer, context)
+    type Parameters = eredu_nn::GatedProductSpec;
+
+    fn prepare_parameters(
+        _global: &C,
+        local: &C,
+        _layer: usize,
+        dense: Option<&eredu_nn::GatedProductSpec>,
+        retained: Option<&Self::Parameters>,
+    ) -> Result<Self::Parameters, Error> {
+        if let Some(parameters) = retained {
+            return parameters.with_intermediate_dimensions(local.intermediate_size());
+        }
+        dense.cloned().ok_or_else(|| {
+            Error::backend("dense construction requires retained feed-forward slots")
+        })
     }
 
-    fn parameter_description(
-        config: &C,
-    ) -> Result<ArchitectureParameterDescription, ParallelPlanError> {
-        dense_parameter_description(config)
+    fn build_feed_forward(
+        _global: &C,
+        _local: &C,
+        _layer: usize,
+        parameters: &Self::Parameters,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self::FeedForward, Error> {
+        Mlp::from_parameters(parameters, context)
     }
 }
 
@@ -5238,13 +4966,12 @@ pub struct PartitionStaticModules<B: NeuralBackend> {
 
 impl<B: eredu_nn::DistributedNeuralBackend> PartitionStaticModules<B> {
     /// Materializes only canonical pinned roles selected before native allocation.
-    pub(crate) fn from_selected_spec(
-        spec: StaticModuleSpec,
+    pub(crate) fn from_selected_construction(
+        construction: StaticModuleConstruction,
         vocabulary: Option<(VocabularyParallelRange, Option<VocabularyParallelRange>)>,
         owns: impl Fn(&str) -> bool,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let construction = spec.construction_specs()?;
         if let Some((embedding_range, output_range)) = &vocabulary {
             embedding_range.validate_global_rows(construction.embedding.vocabulary)?;
             if construction.head.is_some() != output_range.is_some() {
@@ -5550,6 +5277,10 @@ pub trait DecoderGeometry<C: Config>: 'static {
     fn owned_units(&self) -> Range<usize>;
     /// Logical cache slots owned independently of operation addresses.
     fn owned_state(&self) -> Option<Range<usize>>;
+    /// Physical construction authority, independent of invocation placement.
+    fn owns_construction_unit(&self, owner: usize) -> bool {
+        self.owned_units().contains(&owner)
+    }
     /// Construction geometry of one selected canonical physical owner.
     /// Mutable-state ownership is checked independently by `state_index`.
     fn block<'a>(&'a self, global: &'a C, index: usize, layer: usize) -> Result<&'a C, Error>;
@@ -5586,6 +5317,7 @@ pub trait DecoderGeometry<C: Config>: 'static {
 #[derive(Clone)]
 pub struct CompleteDecoderGeometry<C> {
     parallel: Option<std::sync::Arc<LocalGeometry<C>>>,
+    ordinary_state: StateLayout,
     state: StateLayout,
     units: usize,
 }
@@ -5612,12 +5344,9 @@ impl<C: Config> DecoderGeometry<C> for CompleteDecoderGeometry<C> {
     }
     fn ordinary_state_layout<'a>(
         &'a self,
-        global: &C,
+        _global: &C,
     ) -> Result<std::borrow::Cow<'a, StateLayout>, Error> {
-        match self.parallel {
-            Some(_) => state_layout(global).map(std::borrow::Cow::Owned),
-            None => Ok(std::borrow::Cow::Borrowed(&self.state)),
-        }
+        Ok(std::borrow::Cow::Borrowed(&self.ordinary_state))
     }
     fn parallel_state_layout(&self) -> Result<&StateLayout, Error> {
         self.parallel
@@ -5630,6 +5359,9 @@ impl<C: Config> DecoderGeometry<C> for CompleteDecoderGeometry<C> {
     }
 }
 impl<C: Config> DecoderGeometry<C> for PartitionLocalGeometry<C> {
+    fn owns_construction_unit(&self, owner: usize) -> bool {
+        self.blocks.contains_key(&owner)
+    }
     fn complete_state_layout(&self) -> &StateLayout {
         &self.complete_state_layout
     }
@@ -5720,11 +5452,179 @@ pub fn component_definition<C: Config>(
     .map_err(Error::from)
 }
 
+fn prepare_projection<B: NeuralBackend, C: Config, P: BlockFactory<B, C>>(
+    global: &C,
+    local: &C,
+    layer: usize,
+    dense: Option<&eredu_nn::GatedProductSpec>,
+    retained: Option<&P::Parameters>,
+) -> Result<P::Parameters, Error> {
+    if dense.is_some() && retained.is_some() {
+        return Err(Error::backend(
+            "conflicting projection declaration authorities",
+        ));
+    }
+    P::validate_partitioned(global, local)?;
+    P::prepare_parameters(global, local, layer, dense, retained)
+}
+
+fn validate_prepared_projection(
+    common: &topology::BlockParameters,
+    parameters: &impl eredu_nn::DeclareLogicalParameters,
+) -> Result<(), Error> {
+    let mut common = common.clone();
+    common.feed_forward = None;
+    let mut declarations = common.logical_parameters()?;
+    declarations.extend(parameters.logical_parameters()?);
+    eredu_nn::validate_logical_parameter_scope(&declarations).map_err(Error::backend_source)
+}
+
+#[derive(Clone)]
+pub(crate) struct PreparedDecoderBody<S> {
+    pub(crate) common: topology::BlockParameters,
+    pub(crate) parameters: S,
+}
+fn prepare_decoder_body<C: Config, S: Clone + eredu_nn::DeclareLogicalParameters>(
+    args: &C,
+    config: &C,
+    layer: usize,
+    decoder_scopes: &DecoderDeclaration,
+    projection_declarations: Option<&ProjectionDeclarations<S>>,
+    prepare: &impl Fn(
+        &C,
+        &C,
+        usize,
+        Option<&eredu_nn::GatedProductSpec>,
+        Option<&S>,
+    ) -> Result<S, Error>,
+) -> Result<PreparedDecoderBody<S>, Error> {
+    let mut body = {
+        let source = decoder_scopes
+            .blocks
+            .get(layer)
+            .ok_or_else(|| Error::backend("missing retained dense block"))?;
+        let old = source.attention.geometry;
+        source.with_geometry(
+            eredu_nn::AttentionHeadGeometry::new(
+                config.num_attention_heads(),
+                config.num_key_value_heads(),
+                old.key_dimensions(),
+                old.value_dimensions(),
+            )?,
+            source
+                .feed_forward
+                .as_ref()
+                .map(|_| config.intermediate_size()),
+            args.query_key_norm_per_head_weights(),
+        )?
+    };
+    body.terminal = None;
+    let retained = projection_declarations
+        .map(|declarations| declarations.parameters(layer))
+        .transpose()?;
+    if body.feed_forward.is_some() && retained.is_some() {
+        return Err(Error::backend(
+            "conflicting projection declaration authorities",
+        ));
+    }
+    let parameters = prepare(args, config, layer, body.feed_forward.as_ref(), retained)?;
+    body.feed_forward = None;
+    validate_prepared_projection(&body, &parameters)?;
+    Ok(PreparedDecoderBody {
+        common: body,
+        parameters,
+    })
+}
+/// Projects retained common/provider slots before any module allocation.
+pub(crate) fn prepare_retained_body<
+    B: NeuralBackend,
+    C: PartitionedConfig,
+    P: BlockFactory<B, C>,
+>(
+    global: &C,
+    local: &C,
+    layer: usize,
+    common: &DecoderDeclaration,
+    projections: Option<&ProjectionDeclarations<P::Parameters>>,
+) -> Result<PreparedDecoderBody<P::Parameters>, Error> {
+    common.validate_local_policy(global, local)?;
+    if let Some(scopes) = projections {
+        scopes.validate_for(global)?;
+    }
+    prepare_decoder_body(
+        global,
+        local,
+        layer,
+        common,
+        projections,
+        &prepare_projection::<B, C, P>,
+    )
+}
+
+#[derive(Clone)]
+enum DecoderUnitConstruction<S> {
+    Body {
+        common: topology::BlockParameters,
+        parameters: S,
+    },
+    Terminal(NormalizationConstructionSpec),
+}
+
+fn decoder_unit_construction<C: Config, S: Clone + eredu_nn::DeclareLogicalParameters>(
+    args: &C,
+    geometry: &impl DecoderGeometry<C>,
+    decoder_scopes: &DecoderDeclaration,
+    projection_declarations: Option<&ProjectionDeclarations<S>>,
+    prepare: impl Fn(&C, &C, usize, Option<&eredu_nn::GatedProductSpec>, Option<&S>) -> Result<S, Error>,
+) -> Result<std::collections::BTreeMap<usize, DecoderUnitConstruction<S>>, Error> {
+    decoder_scopes.validate_for(args)?;
+    if let Some(declarations) = projection_declarations {
+        declarations.validate_for(args)?;
+    }
+    let schedule = DecoderSchedule::new(args)?;
+    schedule
+        .resources()
+        .into_iter()
+        .filter(|(owner, _)| geometry.owns_construction_unit(*owner))
+        .map(|(owner, _)| {
+            let operation = schedule.operation(owner)?;
+            let layer = operation.layer();
+            let config = geometry.block(args, owner, layer)?;
+            let scope = match operation {
+                DecoderOperation::Body { .. } => {
+                    let prepared = prepare_decoder_body(
+                        args,
+                        config,
+                        layer,
+                        decoder_scopes,
+                        projection_declarations,
+                        &prepare,
+                    )?;
+                    DecoderUnitConstruction::Body {
+                        common: prepared.common,
+                        parameters: prepared.parameters,
+                    }
+                }
+                DecoderOperation::Terminal { .. } => DecoderUnitConstruction::Terminal(
+                    decoder_scopes
+                        .blocks
+                        .get(layer)
+                        .and_then(|block| block.terminal.clone())
+                        .ok_or_else(|| {
+                            Error::backend("decoder terminal has no normalization policy")
+                        })?,
+                ),
+            };
+            Ok((owner, scope))
+        })
+        .collect()
+}
+
 /// Typed decoder equations over exact admitted pipeline geometry.
 pub struct DecoderKernel<
     B: NeuralBackend,
     C: Config,
-    P = DenseBlockFactory,
+    P: BlockFactory<B, C> = DenseBlockFactory,
     M = PartitionStaticModules<B>,
     G = PartitionLocalGeometry<C>,
 > {
@@ -5732,10 +5632,11 @@ pub struct DecoderKernel<
     schedule: DecoderSchedule,
     static_modules: M,
     geometry: G,
+    construction: std::collections::BTreeMap<usize, DecoderUnitConstruction<P::Parameters>>,
     block_factory: std::marker::PhantomData<fn() -> (B, P)>,
 }
 
-impl<B: NeuralBackend, C: Config + Clone, P, M: Clone, G: Clone> Clone
+impl<B: NeuralBackend, C: Config + Clone, P: BlockFactory<B, C>, M: Clone, G: Clone> Clone
     for DecoderKernel<B, C, P, M, G>
 {
     fn clone(&self) -> Self {
@@ -5744,6 +5645,7 @@ impl<B: NeuralBackend, C: Config + Clone, P, M: Clone, G: Clone> Clone
             schedule: self.schedule.clone(),
             static_modules: self.static_modules.clone(),
             geometry: self.geometry.clone(),
+            construction: self.construction.clone(),
             block_factory: std::marker::PhantomData,
         }
     }
@@ -5759,18 +5661,24 @@ where
     pub fn from_partition<A>(
         args: C,
         definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
+        decoder_scopes: &DecoderDeclaration,
+        projection_declarations: Option<&ProjectionDeclarations<P::Parameters>>,
         partition: &eredu_runtime::ArchitecturePartition<PartitionLocalGeometry<C>, A>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<PartitionedLayeredModel<B, C, P>, Error> {
         args.validate_config()?;
+        if let Some(declarations) = projection_declarations {
+            declarations.validate_against(&args, definition.parameters())?;
+        }
         P::validate(&args)?;
         crate::operator_requirements::require::<B>(
             "shared decoder equations",
             operator_requirements(&args),
         )?;
-        let expected = args
-            .partition_parameter_description()
-            .map_err(Error::backend_source)?;
+        for local in partition.local_geometry().blocks.values() {
+            decoder_scopes.validate_local_policy(&args, local)?;
+        }
+        let expected = P::parameter_description(&args, decoder_scopes, projection_declarations)?;
         definition.validate_parameter_topology(&expected)?;
         let [group] = partition.groups() else {
             return Err(Error::backend(
@@ -5818,15 +5726,23 @@ where
             _ => {
                 return Err(Error::backend(
                     "decoder partition state ownership differs from its operations",
-                ))
+                ));
             }
         }
         let geometry = partition.local_geometry().clone();
         let definition = definition.select_state_layout(geometry.complete_state_layout())?;
         validate_complete_definition(&args, &definition, geometry.complete_state_layout())?;
         let selection = definition.select_partition(partition)?;
-        let static_modules = PartitionStaticModules::from_selected_spec(
-            StaticModuleSpec::from_config(&args),
+        let construction = decoder_unit_construction(
+            &args,
+            &geometry,
+            decoder_scopes,
+            projection_declarations,
+            prepare_projection::<B, C, P>,
+        )?;
+        let statics = decoder_scopes.statics.clone();
+        let static_modules = PartitionStaticModules::from_selected_construction(
+            statics,
             Some((
                 geometry.embedding_range.clone(),
                 geometry.output_range.clone(),
@@ -5841,6 +5757,7 @@ where
             args,
             static_modules,
             geometry,
+            construction,
             block_factory: std::marker::PhantomData,
         };
         eredu_runtime::ComponentAdapter::with_partition_resources::<B, _, _>(
@@ -5901,7 +5818,35 @@ where
             .schedule
             .owner(self.schedule.body_operation(global_unit));
         let config = self.geometry.block(&self.args, owner, global_unit)?;
-        TransformerBlock::from_factory::<C, P>(&self.args, config, global_unit, context)
+        let Some(DecoderUnitConstruction::Body {
+            common: spec,
+            parameters,
+        }) = self.construction.get(&owner)
+        else {
+            return Err(Error::backend(
+                "decoder body has no retained construction scope",
+            ));
+        };
+        let mut spec = spec.clone();
+        if self.schedule.has_terminal(global_unit) {
+            let operation = self.schedule.body_operation(global_unit) + 1;
+            let owner = self.schedule.owner(operation);
+            let Some(DecoderUnitConstruction::Terminal(terminal)) = self.construction.get(&owner)
+            else {
+                return Err(Error::backend(
+                    "decoder terminal has no retained construction scope",
+                ));
+            };
+            spec.terminal = Some(terminal.clone());
+        }
+        TransformerBlock::from_prepared::<C, P>(
+            &self.args,
+            config,
+            global_unit,
+            &spec,
+            parameters,
+            context,
+        )
     }
     /// Materializes exactly one declared body or stateless terminal resource.
     pub fn construct_unit(
@@ -5912,14 +5857,27 @@ where
         let equation = self.schedule.operation(operation)?;
         let layer = equation.layer();
         let config = self.geometry.block(&self.args, operation, layer)?;
-        match equation {
-            DecoderOperation::Body { .. } => Ok(DecoderUnit::Body(
-                TransformerBlockBody::from_factory::<C, P>(&self.args, config, layer, context)?,
-            )),
-            DecoderOperation::Terminal { .. } => Ok(DecoderUnit::Terminal(
-                terminal_normalization::<B>(config, layer, context)?.ok_or_else(|| {
-                    Error::backend("decoder terminal has no normalization policy")
-                })?,
+        match (equation, self.construction.get(&operation)) {
+            (
+                DecoderOperation::Body { .. },
+                Some(DecoderUnitConstruction::Body {
+                    common: spec,
+                    parameters,
+                }),
+            ) => Ok(DecoderUnit::Body(TransformerBlockBody::from_prepared::<
+                C,
+                P,
+            >(
+                &self.args, config, layer, spec, parameters, context,
+            )?)),
+            (DecoderOperation::Terminal { .. }, Some(DecoderUnitConstruction::Terminal(spec))) => {
+                Ok(DecoderUnit::Terminal(B::normalization(
+                    spec.clone(),
+                    context,
+                )?))
+            }
+            _ => Err(Error::backend(
+                "decoder operation has no retained construction scope",
             )),
         }
     }
@@ -5928,12 +5886,14 @@ where
 /// Projects physical factory geometry from a complete invocation map and a selected PP range.
 pub fn partition_local_geometry<C: PartitionedConfig>(
     config: &C,
+    decoder_scopes: &DecoderDeclaration,
     invocations: &eredu_runtime::ExecutionUnitAddressMap,
     layout: &LocalModelLayout,
     owned_units: Range<usize>,
 ) -> Result<PartitionLocalGeometry<C>, ParallelPlanError> {
     partition_local_geometry_with(
         config,
+        decoder_scopes,
         invocations,
         layout,
         owned_units,
@@ -5948,6 +5908,7 @@ pub fn partition_local_geometry<C: PartitionedConfig>(
 /// configuration. Static ownership and state geometry stay centralized here.
 pub(crate) fn partition_local_geometry_with<C, F>(
     config: &C,
+    decoder_scopes: &DecoderDeclaration,
     invocations: &eredu_runtime::ExecutionUnitAddressMap,
     layout: &LocalModelLayout,
     owned_units: Range<usize>,
@@ -5957,6 +5918,9 @@ where
     C: PartitionedConfig,
     F: FnMut(&C, usize, &LocalModelLayout) -> Result<C, Error>,
 {
+    decoder_scopes
+        .validate_for(config)
+        .map_err(|e| ParallelPlanError::InvalidGroup(e.to_string()))?;
     let schedule = DecoderSchedule::new(config)
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
     let count = schedule.len();
@@ -6006,13 +5970,18 @@ where
             .operation(owner)
             .map_err(|error| invalid(error.to_string()))?
         {
-            DecoderOperation::Body { layer } => localize(config, layer, layout)
-                .map_err(|error| ParallelPlanError::InvalidTensor(error.to_string()))?,
+            DecoderOperation::Body { layer } => match decoder_scopes.block_parameters(layer) {
+                block if block.feed_forward.is_some() => {
+                    dense_local_block_config(config, layer, layout, Some(block))
+                }
+                _ => localize(config, layer, layout),
+            }
+            .map_err(|error| ParallelPlanError::InvalidTensor(error.to_string()))?,
             DecoderOperation::Terminal { .. } => config.clone(),
         };
         physical.insert(owner, local);
     }
-    let mut local_key_value_heads = Vec::with_capacity(count);
+    let mut attention_geometry = Vec::with_capacity(count);
     for layer in 0..config.num_hidden_layers() as usize {
         let ordinal = range.start + schedule.body_operation(layer);
         let address = logical[ordinal];
@@ -6022,7 +5991,38 @@ where
             .storage_location()
             .address()
             .index();
-        local_key_value_heads.push(physical[&owner].num_key_value_heads());
+        let DecoderOperation::Body {
+            layer: parameter_layer,
+        } = schedule
+            .operation(owner)
+            .map_err(|error| invalid(error.to_string()))?
+        else {
+            return Err(invalid(
+                "decoder body resolves to a stateless parameter owner".into(),
+            ));
+        };
+        let block = decoder_scopes.block_parameters(parameter_layer);
+        let local = &physical[&owner];
+        attention_geometry.push(
+            block
+                .with_geometry(
+                    eredu_nn::AttentionHeadGeometry::new(
+                        local.num_attention_heads(),
+                        local.num_key_value_heads(),
+                        block.attention.geometry.key_dimensions(),
+                        block.attention.geometry.value_dimensions(),
+                    )
+                    .map_err(|e| invalid(e.to_string()))?,
+                    block
+                        .feed_forward
+                        .as_ref()
+                        .map(|_| local.intermediate_size()),
+                    config.query_key_norm_per_head_weights(),
+                )
+                .map_err(|e| invalid(e.to_string()))?
+                .attention
+                .geometry,
+        );
     }
     let mut blocks = std::collections::BTreeMap::new();
     for ordinal in selected
@@ -6041,12 +6041,13 @@ where
         );
     }
     let complete_state_layout = StateLayout::new(
-        cache_layout_with_key_value_heads(config, local_key_value_heads)
+        cache_layout_with_attention_geometry(config, attention_geometry)
             .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?,
     )
     .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
     let root = config.parameter_root();
-    let (embedding_range, output_range) = StaticModuleSpec::from_config(config).vocabulary_ranges(
+    let statics = &decoder_scopes.statics;
+    let (embedding_range, output_range) = statics.vocabulary_ranges(
         layout,
         &format!("{root}.embed_tokens"),
         &format!("{root}.norm"),
@@ -6066,6 +6067,7 @@ fn dense_local_block_config<C: PartitionedConfig>(
     config: &C,
     layer: usize,
     layout: &LocalModelLayout,
+    scope: Option<&topology::BlockParameters>,
 ) -> Result<C, Error> {
     let prefix = format!("{}.layers.{layer}", config.parameter_root());
     let fields = config.block_parameter_fields().validate()?;
@@ -6074,76 +6076,103 @@ fn dense_local_block_config<C: PartitionedConfig>(
             .tensor(&path)
             .ok_or_else(|| Error::backend(format!("missing local decoder layout for {path}")))
     };
-    let (query_width, key_width) = match config.attention_projection_layout() {
-        AttentionProjectionLayout::Split => {
-            let query = tensor(format!(
-                "{prefix}.{}.{}.weight",
-                fields.attention, fields.attention_query
-            ))?;
-            let key = tensor(format!(
-                "{prefix}.{}.{}.weight",
-                fields.attention, fields.attention_key
-            ))?;
-            (
-                i32::try_from(query.local_shape()[0]).map_err(Error::backend)?,
-                i32::try_from(key.local_shape()[0]).map_err(Error::backend)?,
-            )
+    let generated;
+    let attention = match scope {
+        Some(block) => &block.attention,
+        None => {
+            generated = topology::AttentionParameters::new(config, layer)?;
+            &generated
         }
-        AttentionProjectionLayout::Fused { field } => {
-            let fused = tensor(format!("{prefix}.{}.{field}.weight", fields.attention))?;
+    };
+    let geometry = attention.geometry;
+    let (query_width, key_width) = match &attention.input {
+        topology::AttentionInputParameters::Split { query, key, .. } => (
+            i32::try_from(tensor(query.weight.id.to_string())?.local_shape()[0])
+                .map_err(Error::backend)?,
+            i32::try_from(tensor(key.weight.id.to_string())?.local_shape()[0])
+                .map_err(Error::backend)?,
+        ),
+        topology::AttentionInputParameters::Fused { projection, .. } => {
+            let fused = tensor(projection.weight.id.to_string())?;
             let heads = fused
-                .expanded_logical_range(config.num_key_value_heads() as usize)
+                .expanded_logical_range(geometry.key_value_heads() as usize)
                 .map_err(Error::backend)?
                 .len();
-            let key_width = i32::try_from(heads)
-                .map_err(Error::backend)?
-                .checked_mul(config.head_dim())
-                .ok_or_else(|| Error::backend("local fused KV width overflowed"))?;
-            let query_width = key_width
-                .checked_mul(config.num_attention_heads() / config.num_key_value_heads())
-                .ok_or_else(|| Error::backend("local fused query width overflowed"))?;
-            let width = key_width
-                .checked_mul(2)
-                .and_then(|width| query_width.checked_add(width))
+            let local = eredu_nn::AttentionHeadGeometry::new(
+                i32::try_from(heads)
+                    .map_err(Error::backend)?
+                    .checked_mul(geometry.query_heads() / geometry.key_value_heads())
+                    .ok_or_else(|| Error::backend("local fused query heads overflowed"))?,
+                i32::try_from(heads).map_err(Error::backend)?,
+                geometry.key_dimensions(),
+                geometry.value_dimensions(),
+            )?;
+            let width = local
+                .query_width()
+                .checked_add(local.key_width())
+                .and_then(|width| width.checked_add(local.value_width()))
                 .ok_or_else(|| Error::backend("local fused QKV width overflowed"))?;
-            if usize::try_from(width).map_err(Error::backend)? != fused.local_shape()[0] {
+            if width as usize != fused.local_shape()[0] {
                 return Err(Error::backend(
                     "local fused QKV shape differs from its head partition",
                 ));
             }
-            (query_width, key_width)
+            (local.query_width(), local.key_width())
         }
     };
-    let intermediate = match config.gated_projection_layout() {
-        GatedProjectionLayout::Split => {
-            let gate = tensor(format!(
-                "{prefix}.{}.{}.weight",
-                fields.feed_forward, fields.feed_forward_gate
-            ))?;
-            i32::try_from(gate.local_shape()[0]).map_err(Error::backend)?
+    let intermediate = if let Some(block) = scope {
+        let feed = block
+            .feed_forward
+            .as_ref()
+            .ok_or_else(|| Error::backend("dense localizer has no declared feed-forward"))?;
+        let (weight, fused) = match feed {
+            eredu_nn::GatedProductSpec::Split(spec) => (&spec.gate.weight, false),
+            eredu_nn::GatedProductSpec::Fused(spec) => (&spec.gate_up.weight, true),
+        };
+        let width = i32::try_from(tensor(weight.id.to_string())?.local_shape()[0])
+            .map_err(Error::backend)?;
+        if fused && (width <= 0 || width % 2 != 0) {
+            return Err(Error::backend(
+                "local fused gate/up shape splits a component",
+            ));
         }
-        GatedProjectionLayout::Fused { field } => {
-            let gate = tensor(format!("{prefix}.{}.{field}.weight", fields.feed_forward))?;
-            let width = i32::try_from(gate.local_shape()[0]).map_err(Error::backend)?;
-            if width <= 0 || width % 2 != 0 {
-                return Err(Error::backend(
-                    "local fused gate/up shape splits a component",
-                ));
-            }
+        if fused {
             width / 2
+        } else {
+            width
+        }
+    } else {
+        match config.gated_projection_layout() {
+            GatedProjectionLayout::Split => {
+                let gate = tensor(format!(
+                    "{prefix}.{}.{}.weight",
+                    fields.feed_forward, fields.feed_forward_gate
+                ))?;
+                i32::try_from(gate.local_shape()[0]).map_err(Error::backend)?
+            }
+            GatedProjectionLayout::Fused { field } => {
+                let gate = tensor(format!("{prefix}.{}.{field}.weight", fields.feed_forward))?;
+                let width = i32::try_from(gate.local_shape()[0]).map_err(Error::backend)?;
+                if width <= 0 || width % 2 != 0 {
+                    return Err(Error::backend(
+                        "local fused gate/up shape splits a component",
+                    ));
+                }
+                width / 2
+            }
         }
     };
     if query_width <= 0
         || key_width <= 0
-        || query_width % config.head_dim() != 0
-        || key_width % config.head_dim() != 0
+        || query_width % geometry.key_dimensions() != 0
+        || key_width % geometry.key_dimensions() != 0
     {
         return Err(Error::backend("invalid local decoder attention geometry"));
     }
     let mut local = config.clone();
     local.set_local_geometry(
-        query_width / config.head_dim(),
-        key_width / config.head_dim(),
+        query_width / geometry.key_dimensions(),
+        key_width / geometry.key_dimensions(),
         intermediate,
     )?;
     Ok(local)
@@ -7000,26 +7029,45 @@ where
     pub fn from_definition(
         args: C,
         definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
+        decoder_scopes: &DecoderDeclaration,
+        projection_declarations: Option<&ProjectionDeclarations<P::Parameters>>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredModel<B, C, P>, Error> {
         args.validate_config()?;
+        if let Some(declarations) = projection_declarations {
+            declarations.validate_against(&args, definition.parameters())?;
+        }
         P::validate(&args)?;
+        let expected = P::parameter_description(&args, decoder_scopes, projection_declarations)?;
+        definition.validate_parameter_topology(&expected)?;
         crate::operator_requirements::require::<B>(
             "shared decoder equations",
             operator_requirements(&args),
         )?;
-        validate_complete_definition(&args, &definition, &state_layout(&args)?)?;
-        let static_modules = StaticModules::new(&args, context)?;
+        decoder_scopes.validate_for(&args)?;
+        let state = decoder_scopes.state_layout().clone();
+        validate_complete_definition(&args, &definition, &state)?;
         let geometry = CompleteDecoderGeometry {
+            ordinary_state: definition.state_layout().clone(),
             parallel: None,
             state: definition.state_layout().clone(),
             units: definition.parameters().unit_layout().len(),
         };
+        let construction = decoder_unit_construction(
+            &args,
+            &geometry,
+            decoder_scopes,
+            projection_declarations,
+            prepare_projection::<B, C, P>,
+        )?;
+        let statics = decoder_scopes.statics.clone();
+        let static_modules = StaticModules::from_construction(statics, context)?;
         let kernel = Self {
             schedule: DecoderSchedule::new(&args)?,
             args,
             static_modules,
             geometry,
+            construction,
             block_factory: std::marker::PhantomData,
         };
         eredu_runtime::ComponentAdapter::with_pinned_resources::<B>(definition, kernel)
@@ -7030,32 +7078,62 @@ where
     pub fn from_parallel_definition(
         args: C,
         definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
+        decoder_scopes: &DecoderDeclaration,
+        projection_declarations: Option<&ProjectionDeclarations<P::Parameters>>,
         geometry: LocalGeometry<C>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredModel<B, C, P>, Error>
     where
         B: eredu_nn::DistributedNeuralBackend,
+        C: PartitionedConfig,
     {
         args.validate_config()?;
+        if let Some(declarations) = projection_declarations {
+            declarations.validate_against(&args, definition.parameters())?;
+        }
         P::validate(&args)?;
+        let expected = P::parameter_description(&args, decoder_scopes, projection_declarations)?;
+        definition.validate_parameter_topology(&expected)?;
         crate::operator_requirements::require::<B>(
             "shared decoder equations",
             operator_requirements(&args),
         )?;
-        geometry.validate_for(&args).map_err(Error::backend)?;
+        geometry
+            .validate_with_declaration(&args, decoder_scopes)
+            .map_err(Error::backend)?;
+        let ordinary_state = definition.state_layout().clone();
         let definition = definition.select_state_layout(geometry.state_layout())?;
         validate_complete_definition(&args, &definition, geometry.state_layout())?;
-        let static_modules = StaticModules::new_parallel(&args, &geometry, context)?;
         let geometry = CompleteDecoderGeometry {
+            ordinary_state,
             parallel: Some(std::sync::Arc::new(geometry)),
             state: definition.state_layout().clone(),
             units: definition.parameters().unit_layout().len(),
         };
+        let construction = decoder_unit_construction(
+            &args,
+            &geometry,
+            decoder_scopes,
+            projection_declarations,
+            prepare_projection::<B, C, P>,
+        )?;
+        let statics = decoder_scopes.statics.clone();
+        let parallel = geometry
+            .parallel
+            .as_ref()
+            .expect("selected parallel geometry");
+        let static_modules = StaticModules::from_parallel_construction(
+            statics,
+            parallel.embedding_range.clone(),
+            parallel.output_range.clone(),
+            context,
+        )?;
         let kernel = Self {
             schedule: DecoderSchedule::new(&args)?,
             args,
             static_modules,
             geometry,
+            construction,
             block_factory: std::marker::PhantomData,
         };
         eredu_runtime::ComponentAdapter::with_pinned_resources::<B>(definition, kernel)

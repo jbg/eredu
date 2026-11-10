@@ -26,58 +26,49 @@ pub struct DenseSwiGlu<B: NeuralBackend> {
     pub down: B::Linear,
     /// Up projection (`w3`).
     pub up: B::Linear,
+    #[parameter(skip)]
+    policy: eredu_nn::GatedProductPolicy,
 }
 
-pub(crate) fn dense_projection_specs(
+/// Declares one dense SwiGLU branch at global or rank-local intermediate width.
+pub(crate) fn dense_parameters(
     args: &ModelArgs,
     layer: usize,
     intermediate: i32,
-) -> Result<Vec<(String, LinearSpec)>, Error> {
+) -> Result<eredu_nn::SplitGatedProductSpec, Error> {
     let prefix = format!("model.layers.{layer}.feed_forward");
-    [
-        ("w1", args.hidden_size, intermediate),
-        ("w3", args.hidden_size, intermediate),
-        ("w2", intermediate, args.hidden_size),
-    ]
-    .into_iter()
-    .map(|(field, input, output)| {
+    let linear = |field: &str, input, output| -> Result<LinearSpec, Error> {
         let name = format!("{prefix}.{field}.weight");
-        Ok((
-            field.into(),
-            LinearSpec {
-                input,
-                output,
-                weight: ParameterSpec::trainable(&name).map_err(Error::backend)?,
-                bias: None,
-                format: crate::linear_format::standard_linear_format(
-                    &name,
-                    args.weight_quantization_for(&name).into(),
-                )?,
-            },
-        ))
-    })
-    .collect()
+        Ok(LinearSpec {
+            input,
+            output,
+            weight: ParameterSpec::trainable(&name).map_err(Error::backend)?,
+            bias: None,
+            format: crate::linear_format::standard_linear_format(
+                &name,
+                args.weight_quantization_for(&name).into(),
+            )?,
+        })
+    };
+    eredu_nn::SplitGatedProductSpec::new(
+        linear("w1", args.hidden_size, intermediate)?,
+        linear("w3", args.hidden_size, intermediate)?,
+        linear("w2", intermediate, args.hidden_size)?,
+        eredu_nn::GatedProductPolicy::default(),
+    )
 }
 
 impl<B: NeuralBackend> DenseSwiGlu<B> {
-    pub(crate) fn new(
-        args: &ModelArgs,
-        layer: usize,
-        intermediate: i32,
+    pub(crate) fn from_parameters(
+        parameters: eredu_nn::SplitGatedProductSpec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let specs = dense_projection_specs(args, layer, intermediate)?;
-        let linear = |field: &str| {
-            let spec = specs
-                .iter()
-                .find(|(name, _)| name == field)
-                .ok_or_else(|| Error::backend("dense feed-forward projection absent"))?;
-            B::linear(spec.1.clone(), context)
-        };
+        eredu_nn::DeclareLogicalParameters::logical_parameters(&parameters)?;
         Ok(Self {
-            gate: linear("w1")?,
-            down: linear("w2")?,
-            up: linear("w3")?,
+            gate: B::linear(parameters.gate, context)?,
+            down: B::linear(parameters.down, context)?,
+            up: B::linear(parameters.up, context)?,
+            policy: parameters.policy,
         })
     }
 
@@ -88,7 +79,7 @@ impl<B: NeuralBackend> DenseSwiGlu<B> {
     ) -> Result<B::Tensor, Error> {
         let gate = self.gate.forward(input, context)?;
         let up = self.up.forward(input, context)?;
-        B::gated_product(gate, up, eredu_nn::GatedProductPolicy::default(), context)
+        B::gated_product(gate, up, self.policy, context)
     }
 
     pub(crate) fn forward_instrumented(
@@ -124,37 +115,46 @@ pub struct RoutedGatedProduct<B: GroupedNeuralBackend + eredu_nn::DistributedNeu
 }
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedGatedProduct<B> {
-    fn new(
-        args: &ModelArgs,
+    pub(crate) fn from_spec(
         layer: usize,
-        intermediate: i32,
+        spec: eredu_nn::RoutedGatedProductSpec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let spec = expert_bank_spec_with_width(args, layer, intermediate)?;
-        Self::new_with_spec(args, layer, spec, context)
-    }
-
-    pub(crate) fn new_with_spec(
-        args: &ModelArgs,
-        layer: usize,
-        spec: GroupedGatedProductSpec,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        let selector = selector_spec(args, layer)?;
-        let router = B::top_k_group_selector(selector, context)?;
-        let experts = B::grouped_gated_product(spec, context)?;
+        validate_routed_spec(&spec)?;
         Ok(Self {
             layer,
-            router,
-            experts,
+            router: B::top_k_group_selector(spec.selector, context)?,
+            experts: B::grouped_gated_product(spec.experts, context)?,
         })
     }
 }
 
-pub(crate) fn selector_spec(
+fn validate_routed_spec(spec: &eredu_nn::RoutedGatedProductSpec) -> Result<(), Error> {
+    if spec.experts.input_dimensions() != spec.experts.output_dimensions()
+        || spec.experts.policy() != eredu_nn::GatedProductPolicy::ordinary_silu()
+        || spec.experts.reduction() != eredu_nn::GroupReduction::SequentialGroupOrder
+    {
+        return Err(Error::backend(
+            "incompatible LFM2 routed residual geometry or equation",
+        ));
+    }
+    spec.validate()
+}
+
+/// Complete selector/bank parameter scope, independent of invocation and provider ownership.
+pub(crate) fn routed_spec(
     args: &ModelArgs,
     layer: usize,
-) -> Result<TopKGroupSelectorSpec, Error> {
+) -> Result<eredu_nn::RoutedGatedProductSpec, Error> {
+    let spec = eredu_nn::RoutedGatedProductSpec {
+        selector: selector(args, layer)?,
+        experts: grouped_experts(args, layer)?,
+    };
+    validate_routed_spec(&spec)?;
+    Ok(spec)
+}
+
+fn selector(args: &ModelArgs, layer: usize) -> Result<TopKGroupSelectorSpec, Error> {
     let prefix = format!("model.layers.{layer}.feed_forward");
     let gate_name = format!("{prefix}.gate.weight");
     let routing = TopKGroupSelectionSpec::new(
@@ -190,23 +190,23 @@ pub(crate) fn selector_spec(
     Ok(selector)
 }
 
-/// Returns the architecture-owned routed expert specification for one layer.
-pub fn expert_bank_spec(args: &ModelArgs, layer: usize) -> Result<GroupedGatedProductSpec, Error> {
-    expert_bank_spec_with_width(args, layer, args.moe_intermediate_size)
-}
-
-fn expert_bank_spec_with_width(
-    args: &ModelArgs,
-    layer: usize,
-    intermediate: i32,
-) -> Result<GroupedGatedProductSpec, Error> {
+fn grouped_experts(args: &ModelArgs, layer: usize) -> Result<GroupedGatedProductSpec, Error> {
+    args.validate().map_err(Error::backend_source)?;
+    let policy = args
+        .layer_policy(layer)
+        .ok_or_else(|| Error::backend(format!("LFM2 has no layer {layer}")))?;
+    if policy.feed_forward != FeedForwardPolicy::SparseMoe {
+        return Err(Error::backend(format!(
+            "LFM2 layer {layer} is not sparse MoE"
+        )));
+    }
     let experts_prefix = format!("model.layers.{layer}.feed_forward.experts");
     let gate_up_name = format!("{experts_prefix}.gate_up_proj");
     let down_name = format!("{experts_prefix}.down_proj");
     GroupedGatedProductSpec::new(
         args.num_experts,
         args.hidden_size,
-        intermediate,
+        args.moe_intermediate_size,
         args.hidden_size,
         eredu_nn::GatedProductPolicy::ordinary_silu(),
         GatedProductGroupLayout::Packed {
@@ -214,32 +214,38 @@ fn expert_bank_spec_with_width(
                 &gate_up_name,
                 None,
                 args.weight_quantization_for(&gate_up_name).into(),
+                eredu_nn::LinearRowLayout::equal_partitions(2)?,
             )?,
             down: standard_expert_projection(
                 &down_name,
                 None,
                 args.weight_quantization_for(&down_name).into(),
+                eredu_nn::LinearRowLayout::Contiguous,
             )?,
         },
     )
     .map(|spec| spec.with_reduction(eredu_nn::GroupReduction::SequentialGroupOrder))
 }
 
-/// Derives expert ownership from normalized policy and optional admitted local geometry.
+/// Derives expert ownership from retained banks and optional admitted local geometry.
 /// This operation allocates no native modules and requires no backend context.
 pub fn expert_realization_plan(
-    args: &ModelArgs,
+    declaration: &super::Declaration,
     geometry: Option<&super::LocalGeometry>,
     topology: eredu_core::ParallelRankTopology,
 ) -> Result<Option<crate::ExpertRealizationPlan<GroupedGatedProductSpec>>, Error> {
-    args.validate().map_err(Error::backend)?;
     if let Some(geometry) = geometry {
-        geometry.validate_for(args).map_err(Error::backend)?;
+        geometry.validate_for(declaration).map_err(Error::backend)?;
     }
-    if !args.has_sparse_moe_layers() {
+    if declaration.expert_banks().is_empty() {
         return Ok(None);
     }
-    let global_experts = usize::try_from(args.num_experts).map_err(Error::backend)?;
+    let banks = declaration.expert_banks();
+    let global_experts = banks
+        .values()
+        .next()
+        .ok_or_else(|| Error::backend("sparse schedule has no declared expert bank"))?
+        .group_count() as usize;
     let local_experts = i32::try_from(
         eredu_core::balanced_contiguous_range(
             global_experts,
@@ -254,38 +260,18 @@ pub fn expert_realization_plan(
     let owner_group = eredu_runtime::ExecutionGroupId::new(crate::decoder::TARGET_EXECUTION_GROUP)
         .map_err(Error::backend)?;
     let mut unit_specs = std::collections::BTreeMap::new();
-    for (layer, policy) in args.layer_schedule.iter().enumerate() {
-        if policy.feed_forward != FeedForwardPolicy::SparseMoe {
-            continue;
-        }
+    for (layer, bank) in banks {
         let width = geometry
             .and_then(|geometry| geometry.block(layer))
-            .map_or(args.moe_intermediate_size, |geometry| {
+            .map_or(bank.intermediate_dimensions(), |geometry| {
                 geometry.expert_intermediate
             });
-        let spec = expert_bank_spec_with_width(args, layer, width)?
-            .with_group_geometry(local_experts, width)?;
+        let spec = bank.with_group_geometry(local_experts, width)?;
         unit_specs.insert((owner_group.clone(), layer), spec);
     }
     crate::ExpertRealizationPlan::balanced(global_experts, topology, unit_specs)
         .map(Some)
         .map_err(Error::backend)
-}
-
-/// Derives the complete replicated target expert plan from normalized geometry.
-pub fn replicated_expert_realization_plan(
-    args: &ModelArgs,
-) -> Result<crate::ExpertRealizationPlan<GroupedGatedProductSpec>, Error> {
-    if !args.has_sparse_moe_layers() {
-        return Err(Error::backend("LFM2 routed text requires sparse units"));
-    }
-    let topology = eredu_core::ParallelRankTopology::new(
-        eredu_core::ParallelTopology::new(1, 1, 1, 1).map_err(Error::backend)?,
-        0,
-    )
-    .map_err(Error::backend)?;
-    expert_realization_plan(args, None, topology)?
-        .ok_or_else(|| Error::backend("LFM2 routed text requires sparse units"))
 }
 
 /// Per-layer dense or routed feed-forward policy.
@@ -299,60 +285,18 @@ pub enum FeedForward<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBacken
 }
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B> {
-    /// Builds the exact scheduled feed-forward operator.
-    pub fn new(
-        args: &ModelArgs,
+    pub(crate) fn from_parameters(
         layer: usize,
+        parameters: super::declarations::FeedForwardParameters,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        Self::new_with_geometry(
-            args,
-            layer,
-            args.dense_intermediate_size,
-            args.moe_intermediate_size,
-            context,
-        )
-    }
-
-    /// Builds the scheduled operator from placement-resolved local widths.
-    pub fn new_with_geometry(
-        args: &ModelArgs,
-        layer: usize,
-        dense_intermediate: i32,
-        expert_intermediate: i32,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        Self::new_with_geometry_and_routed_spec(
-            args,
-            layer,
-            dense_intermediate,
-            expert_intermediate,
-            None,
-            context,
-        )
-    }
-
-    pub(crate) fn new_with_geometry_and_routed_spec(
-        args: &ModelArgs,
-        layer: usize,
-        dense_intermediate: i32,
-        expert_intermediate: i32,
-        routed_spec: Option<GroupedGatedProductSpec>,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        match args
-            .layer_policy(layer)
-            .ok_or_else(|| Error::backend(format!("LFM2 has no layer {layer}")))?
-            .feed_forward
-        {
-            FeedForwardPolicy::Dense => {
-                DenseSwiGlu::new(args, layer, dense_intermediate, context).map(Self::Dense)
+        match parameters {
+            super::declarations::FeedForwardParameters::Dense(spec) => {
+                DenseSwiGlu::from_parameters(spec, context).map(Self::Dense)
             }
-            FeedForwardPolicy::SparseMoe => match routed_spec {
-                Some(spec) => RoutedGatedProduct::new_with_spec(args, layer, spec, context),
-                None => RoutedGatedProduct::new(args, layer, expert_intermediate, context),
+            super::declarations::FeedForwardParameters::Routed(spec) => {
+                RoutedGatedProduct::from_spec(layer, spec, context).map(Self::Routed)
             }
-            .map(Self::Routed),
         }
     }
 

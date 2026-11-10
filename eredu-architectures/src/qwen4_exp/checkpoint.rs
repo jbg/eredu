@@ -2,6 +2,7 @@
 pub(super) mod gguf;
 /// Header-only published table admission and retained-source binding.
 pub use gguf::GgufTableSourcePlan;
+pub(in crate::qwen4_exp) mod experts;
 /// Exact published GGUF text tensor recipes and restricted source owners.
 pub mod gguf_text;
 /// Layer-sized and independently addressable expert source recipes.

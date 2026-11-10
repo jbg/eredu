@@ -7,7 +7,7 @@
 use eredu_nn::{NeuralBackend, Parameter, Parameterized, Tensor};
 
 use crate::{
-    ear_decoder::{require_f32, slot, ConvNextBlock, Pointwise},
+    ear_decoder::{require_f32, ConvNextBlock, Pointwise},
     Error,
 };
 
@@ -158,7 +158,7 @@ impl EncoderUnitSpec {
             Self::Block { width, .. } => width,
         }
     }
-    fn validate(self) -> Result<(), Error> {
+    pub(crate) fn validate(self) -> Result<(), Error> {
         let valid = match self {
             Self::Input { input, output, .. } => input > 0 && output > 0,
             Self::Block {
@@ -192,11 +192,19 @@ impl EncoderUnitSpec {
 
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "T")]
+struct Downsample<T: Tensor> {
+    weight: Parameter<T>,
+    #[parameter(skip)]
+    declaration: crate::ear_specs::ConvolutionSpec,
+}
+
+#[derive(Debug, Clone, Parameterized)]
+#[parameterized(tensor = "T")]
 #[allow(clippy::large_enum_variant)]
 enum EncoderOperation<T: Tensor> {
     Input(Pointwise<T>),
     Block(ConvNextBlock<T>),
-    Downsample(Parameter<T>),
+    Downsample(Downsample<T>),
 }
 
 /// One independently bindable layer in the finite encoder.
@@ -213,57 +221,29 @@ pub struct EncoderUnit<T: Tensor> {
 }
 
 impl<T: Tensor> EncoderUnit<T> {
-    /// Declares one canonical `prefix.layers.N` layer with frozen parameters.
-    pub fn new(spec: EncoderUnitSpec, prefix: &str, context: &T::Context) -> Result<Self, Error> {
-        Self::new_selected(spec, prefix, None, context)
-    }
-    pub(crate) fn new_selected(
-        spec: EncoderUnitSpec,
-        prefix: &str,
-        local: Option<crate::ear_encoder_layered::EncoderUnitLocalDimensions>,
+    /// Constructs one declared `prefix.layers.N` layer with frozen parameters.
+    pub fn new(
+        declaration: crate::ear_specs::EncoderParameterSpec,
         context: &T::Context,
     ) -> Result<Self, Error> {
-        spec.validate()?;
-        if prefix.is_empty() {
-            return Err(invalid("empty EAR encoder parameter prefix"));
-        }
-        let name = format!("{prefix}.layers.{}", spec.layer());
-        let physical = local_spec(spec, local);
-        let operation = match physical {
-            EncoderUnitSpec::Input { input, output, .. } => EncoderOperation::Input(
-                Pointwise::new(&name, &name, input, output, false, context)?,
-            ),
-            EncoderUnitSpec::Block {
-                width,
-                intermediate,
-                kernel,
-                ..
-            } => EncoderOperation::Block(ConvNextBlock::new(
-                &name,
-                &name,
-                width,
-                intermediate,
-                kernel,
-                context,
-            )?),
-            EncoderUnitSpec::Downsample {
-                input,
-                output,
-                rate,
-                groups,
-                ..
-            } => EncoderOperation::Downsample(slot(
-                &format!("{name}.weight"),
-                &name,
-                &[output, input / groups, rate],
-                context,
-            )?),
+        use crate::ear_specs::EncoderParameters;
+        let operation = match declaration.parameters {
+            EncoderParameters::Input(spec) => {
+                EncoderOperation::Input(Pointwise::new(spec, context)?)
+            }
+            EncoderParameters::Block(spec) => {
+                EncoderOperation::Block(ConvNextBlock::new(spec, context)?)
+            }
+            EncoderParameters::Downsample(spec) => EncoderOperation::Downsample(Downsample {
+                weight: spec.weight_parameter(context)?,
+                declaration: spec,
+            }),
         };
         Ok(Self {
+            spec: declaration.unit,
+            prefix: declaration.prefix,
+            local: declaration.local,
             operation,
-            spec,
-            prefix: prefix.into(),
-            local,
         })
     }
 
@@ -305,27 +285,21 @@ impl<T: Tensor> EncoderUnit<T> {
             ));
         }
         require_f32(self, input)?;
-        match (&self.operation, local_spec(self.spec, self.local)) {
-            (EncoderOperation::Input(unit), _) => gather(unit.forward(input, context)?),
-            (EncoderOperation::Block(unit), _) => {
+        match &self.operation {
+            EncoderOperation::Input(unit) => gather(unit.forward(input, context)?),
+            EncoderOperation::Block(unit) => {
                 if self.local.is_some() {
                     unit.forward_with_reduction(input, context, reduce)
                 } else {
                     unit.forward(input, context)
                 }
             }
-            (
-                EncoderOperation::Downsample(weight),
-                EncoderUnitSpec::Downsample {
-                    input: channels,
-                    output,
-                    rate,
-                    groups,
-                    ..
-                },
-            ) => {
-                if input.dim(2) < rate
-                    || weight.as_ref().shape() != [output, channels / groups, rate]
+            EncoderOperation::Downsample(unit) => {
+                let geometry = unit.declaration.geometry;
+                let rate = geometry.stride;
+                let groups = geometry.groups;
+                let weight = &unit.weight;
+                if input.dim(2) < rate || weight.as_ref().shape() != unit.declaration.weight_shape()
                 {
                     return Err(invalid(
                         "EAR encoder downsampling input or canonical kernel has invalid geometry",
@@ -344,52 +318,7 @@ impl<T: Tensor> EncoderUnit<T> {
                     .swap_axes(1, 2, context)?,
                 )
             }
-            _ => Err(invalid("EAR encoder operation does not match its geometry")),
         }
-    }
-}
-
-fn local_spec(
-    spec: EncoderUnitSpec,
-    local: Option<crate::ear_encoder_layered::EncoderUnitLocalDimensions>,
-) -> EncoderUnitSpec {
-    match (spec, local) {
-        (EncoderUnitSpec::Input { layer, input, .. }, Some(local)) => EncoderUnitSpec::Input {
-            layer,
-            input,
-            output: local.width,
-        },
-        (
-            EncoderUnitSpec::Block {
-                layer,
-                width,
-                kernel,
-                ..
-            },
-            Some(local),
-        ) => EncoderUnitSpec::Block {
-            layer,
-            width,
-            kernel,
-            intermediate: local.width,
-        },
-        (
-            EncoderUnitSpec::Downsample {
-                layer,
-                input,
-                rate,
-                groups,
-                ..
-            },
-            Some(local),
-        ) => EncoderUnitSpec::Downsample {
-            layer,
-            input,
-            rate,
-            groups,
-            output: local.width * groups,
-        },
-        _ => spec,
     }
 }
 
@@ -441,24 +370,28 @@ impl<B: NeuralBackend> NeuralEncoder<B> {
         prefix: &str,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let units = config
-            .unit_specs()?
-            .into_iter()
-            .map(|spec| EncoderUnit::new(spec, prefix, context))
+        let declaration = crate::declarations::EncoderDeclaration::new(config, prefix)?;
+        let units = declaration
+            .spec()
+            .units()
+            .iter()
+            .cloned()
+            .map(|spec| EncoderUnit::new(spec, context))
             .collect::<Result<_, _>>()?;
-        Self::from_units(config, units)
+        Self::from_units(declaration, units)
     }
     /// Adopts complete canonical units without copying learned tensors.
     pub fn from_units(
-        config: EncoderConfig,
+        declaration: crate::declarations::EncoderDeclaration,
         units: Vec<EncoderUnit<B::Tensor>>,
     ) -> Result<Self, Error> {
-        let specs = config.unit_specs()?;
-        let prefix = units
-            .first()
-            .ok_or_else(|| invalid("EAR encoder has no units"))?
-            .prefix()
-            .to_owned();
+        let specs = declaration
+            .spec()
+            .units()
+            .iter()
+            .map(|spec| spec.unit())
+            .collect::<Vec<_>>();
+        let prefix = declaration.prefix();
         if units.len() != specs.len()
             || units.iter().zip(specs).any(|(unit, spec)| {
                 unit.spec() != spec || unit.prefix() != prefix || unit.local().is_some()
@@ -469,11 +402,12 @@ impl<B: NeuralBackend> NeuralEncoder<B> {
             ));
         }
         let architecture =
-            crate::ear_encoder_layered::EncoderKernel::new(config, &prefix)?.into_component()?;
+            crate::ear_encoder_layered::EncoderKernel::new(declaration)?.into_component()?;
         let runtime = eredu_runtime::ResidentRuntime::from_units(architecture, vec![units])
             .map_err(eredu_runtime::ResidentUnitsError::into_architecture)?;
         Ok(Self { runtime })
     }
+
     /// Exact finite encoder geometry.
     pub fn config(&self) -> &EncoderConfig {
         self.runtime.architecture().kernel().config()

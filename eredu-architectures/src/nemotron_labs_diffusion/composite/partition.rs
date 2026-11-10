@@ -56,6 +56,7 @@ pub fn geometry(
             .map_err(Error::backend)?;
     let complete = crate::decoder::partition_local_geometry(
         config,
+        config.text_declaration().as_ref(),
         parameters.invocations(),
         &layout,
         0..config.num_hidden_layers() as usize,
@@ -66,6 +67,7 @@ pub fn geometry(
         .map(|range| {
             crate::decoder::partition_local_geometry(
                 config,
+                config.text_declaration().as_ref(),
                 parameters.invocations(),
                 &layout,
                 range,
@@ -482,6 +484,17 @@ where
                     .map_err(|error| error.to_string())
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            let adapter_rank = self
+                .kernel()
+                .config
+                .draft_parameters()
+                .map(|adapter| {
+                    adapter
+                        .layer(0)
+                        .map(|declaration| declaration.projection().down.output)
+                        .map_err(|error| error.to_string())
+                })
+                .transpose()?;
             let last = self.kernel().config.num_hidden_layers() as usize;
             return Ok(Some(stage_units.iter().map(|range| {
                 let mut operations = Vec::new();
@@ -491,8 +504,8 @@ where
                 for _ in range.clone() {
                     operations.push(crate::composite_execution::CompositeTensorCollective::Sum { shape: vec![1, sequence, width] });
                     if input.attention_invocation().is_some_and(|invocation| invocation.adapters == eredu_core::decoding::AdapterScope::Draft) {
-                        if let Some(adapter) = self.kernel().config.draft_adapter() {
-                            operations.push(crate::composite_execution::CompositeTensorCollective::Sum { shape: vec![1, sequence, adapter.rank()] });
+                        if let Some(rank) = adapter_rank {
+                            operations.push(crate::composite_execution::CompositeTensorCollective::Sum { shape: vec![1, sequence, rank] });
                         }
                     }
                     operations.push(crate::composite_execution::CompositeTensorCollective::Sum { shape: vec![1, sequence, width] });

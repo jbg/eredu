@@ -2,13 +2,279 @@
 
 use eredu_core::cache::StateTensorRole;
 use eredu_nn::{
-    CausalDepthwiseConvolution, CausalDepthwiseConvolutionSpec, ConvolutionActivation, Error,
-    Index, LinearOperator, LinearSpec, NeuralBackend, Parameter, ParameterSpec, Parameterized,
-    SelectiveStateSpaceScanInput, Tensor,
+    CausalDepthwiseConvolution, CausalDepthwiseConvolutionSpec, ConvolutionActivation,
+    DeclareLogicalParameters, Error, Index, LinearOperator, LinearSpec,
+    LogicalParameterDeclaration, LogicalParameterRole, NeuralBackend, Parameter, ParameterSpec,
+    Parameterized, SelectiveStateSpaceScanInput, Tensor,
 };
 use eredu_runtime::RuntimeStateComponents;
 
 use super::ModelArgs;
+
+/// Checked head/group axes and component-major input rows of a Mamba2 mixer.
+#[derive(Debug, Clone)]
+pub(crate) struct Mamba2Geometry {
+    heads: i32,
+    groups: i32,
+    head_dim: i32,
+    state_dim: i32,
+    input: eredu_nn::FusedProjectionLayout,
+}
+
+impl Mamba2Geometry {
+    pub(crate) fn new(
+        heads: i32,
+        groups: i32,
+        head_dim: i32,
+        state_dim: i32,
+    ) -> Result<Self, Error> {
+        if heads <= 0 || groups <= 0 || heads % groups != 0 || head_dim <= 0 || state_dim <= 0 {
+            return Err(Error::backend("invalid Mamba head or state geometry"));
+        }
+        let intermediate = heads
+            .checked_mul(head_dim)
+            .ok_or_else(|| Error::backend("Mamba intermediate width overflowed"))?;
+        let grouped = groups
+            .checked_mul(state_dim)
+            .ok_or_else(|| Error::backend("Mamba grouped state width overflowed"))?;
+        let input = eredu_nn::FusedProjectionLayout::new(
+            [
+                ("gate", intermediate),
+                ("value", intermediate),
+                ("input_state", grouped),
+                ("output_state", grouped),
+                ("time_step", heads),
+            ]
+            .into_iter()
+            .map(|(name, width)| eredu_nn::FusedProjectionSegment::new(name, width))
+            .collect::<Result<Vec<_>, _>>()?,
+        )?;
+        Ok(Self {
+            heads,
+            groups,
+            head_dim,
+            state_dim,
+            input,
+        })
+    }
+    pub(crate) fn groups(&self) -> i32 {
+        self.groups
+    }
+    pub(crate) fn heads(&self) -> i32 {
+        self.heads
+    }
+    pub(crate) fn state_dim(&self) -> i32 {
+        self.state_dim
+    }
+    fn intermediate(&self) -> i32 {
+        self.input.segments()[0].width()
+    }
+    fn projection_width(&self) -> i32 {
+        self.input.output_width()
+    }
+    fn convolution_width(&self) -> i32 {
+        self.projection_width() - self.intermediate() - self.heads
+    }
+    fn input_range(&self, component: usize) -> std::ops::Range<i32> {
+        let start = self.input.segments()[..component]
+            .iter()
+            .map(|s| s.width())
+            .sum::<i32>();
+        start..start + self.input.segments()[component].width()
+    }
+    fn input_segments(&self) -> Vec<std::ops::Range<usize>> {
+        (0..self.input.segments().len())
+            .map(|component| {
+                let range = self.input_range(component);
+                range.start as usize..range.end as usize
+            })
+            .collect()
+    }
+    fn convolution_segments(&self) -> Vec<std::ops::Range<usize>> {
+        let offset = self.intermediate() as usize;
+        self.input_segments()[1..4]
+            .iter()
+            .map(|range| range.start - offset..range.end - offset)
+            .collect()
+    }
+}
+
+/// Typed construction and logical geometry of one global or rank-local Mamba2 mixer.
+#[derive(Debug, Clone)]
+pub(crate) struct Mamba2Spec {
+    pub(crate) in_proj: LinearSpec,
+    pub(crate) convolution: CausalDepthwiseConvolutionSpec,
+    pub(crate) dt_bias: ParameterSpec,
+    pub(crate) a_log: ParameterSpec,
+    pub(crate) d: ParameterSpec,
+    pub(crate) norm_weight: ParameterSpec,
+    pub(crate) out_proj: LinearSpec,
+    pub(crate) geometry: Mamba2Geometry,
+    pub(crate) chunk_size: usize,
+    pub(crate) time_step_floor: f32,
+    pub(crate) epsilon: f32,
+}
+
+impl Mamba2Spec {
+    pub(crate) fn local(mut self, heads: i32, groups: i32) -> Result<Self, Error> {
+        if heads > self.geometry.heads || groups > self.geometry.groups {
+            return Err(Error::backend(
+                "local Mamba scope exceeds retained geometry",
+            ));
+        }
+        self.geometry = Mamba2Geometry::new(
+            heads,
+            groups,
+            self.geometry.head_dim,
+            self.geometry.state_dim,
+        )?;
+        self.in_proj.output = self.geometry.projection_width();
+        self.convolution.channels = self.geometry.convolution_width();
+        self.out_proj.input = self.geometry.intermediate();
+        self.logical_parameters()?;
+        Ok(self)
+    }
+
+    fn validate_geometry(&self) -> Result<(), Error> {
+        self.convolution.validate()?;
+        if self.in_proj.output != self.geometry.projection_width()
+            || self.convolution.channels != self.geometry.convolution_width()
+            || self.out_proj.input != self.geometry.intermediate()
+            || self.in_proj.input != self.out_proj.output
+            || self.convolution.dilation != 1
+            || self.convolution.activation != ConvolutionActivation::Silu
+            || self.convolution.arithmetic != eredu_nn::ConvolutionArithmetic::Native
+            || self.chunk_size == 0
+        {
+            return Err(Error::backend(
+                "incompatible Mamba projection, convolution or execution geometry",
+            ));
+        }
+        Ok(())
+    }
+    /// Joint projection row boundaries retain gate, value, B, C and timestep axes.
+    pub(crate) fn input_segments(&self) -> Vec<std::ops::Range<usize>> {
+        self.geometry.input_segments()
+    }
+    /// Convolution channels carry values and the two grouped state projections.
+    pub(crate) fn convolution_segments(&self) -> Vec<std::ops::Range<usize>> {
+        self.geometry.convolution_segments()
+    }
+    /// Exact mutable state associated with this invocation, independent of parameter sharing.
+    pub(crate) fn state_policy(&self) -> Result<eredu_core::cache::LayerCachePolicy, Error> {
+        use eredu_core::cache::{
+            LayerCachePolicy, MutableStateResidency, StateTensorDimension as D, StateTensorDtype,
+            StateTensorPolicy,
+        };
+        self.validate_geometry()?;
+        let fixed = |n| D::fixed(n).map_err(Error::backend_source);
+        let mut tensors = Vec::new();
+        let history = self.convolution.history_len()?;
+        if history > 0 {
+            tensors.push(
+                StateTensorPolicy::new(
+                    StateTensorRole::Convolution { slot: 0 },
+                    vec![
+                        D::Batch,
+                        fixed(history)?,
+                        fixed(self.geometry.convolution_width())?,
+                    ],
+                    StateTensorDtype::Floating,
+                    MutableStateResidency::AlwaysDeviceMutable,
+                )
+                .map_err(Error::backend_source)?,
+            );
+        }
+        tensors.push(
+            StateTensorPolicy::new(
+                StateTensorRole::Recurrent,
+                vec![
+                    D::Batch,
+                    fixed(self.geometry.heads)?,
+                    fixed(self.geometry.head_dim)?,
+                    fixed(self.geometry.state_dim)?,
+                ],
+                StateTensorDtype::Float32,
+                MutableStateResidency::LayerScopedOffloadable,
+            )
+            .map_err(Error::backend_source)?,
+        );
+        LayerCachePolicy::fixed_only(tensors).map_err(Error::backend_source)
+    }
+}
+
+impl DeclareLogicalParameters for Mamba2Spec {
+    fn logical_parameters(&self) -> Result<Vec<LogicalParameterDeclaration<'_>>, Error> {
+        self.validate_geometry()?;
+        use LogicalParameterDeclaration as D;
+        use LogicalParameterRole as R;
+        let mut declarations = self.in_proj.logical_parameters()?;
+        declarations.extend(self.convolution.logical_parameters()?);
+        declarations.extend([
+            D::new(&self.dt_bias, &[self.geometry.heads], R::RecurrentBias)?,
+            D::new(&self.a_log, &[self.geometry.heads], R::RecurrentTransition)?,
+            D::new(&self.d, &[self.geometry.heads], R::RecurrentSkip)?,
+            D::new(&self.norm_weight, &[self.out_proj.input], R::Normalization)?,
+        ]);
+        declarations.extend(self.out_proj.logical_parameters()?);
+        eredu_nn::validate_logical_parameter_topology(&declarations)
+            .map_err(Error::backend_source)?;
+        Ok(declarations)
+    }
+}
+
+/// Declares parameter identities and exact geometry at an explicit target or prediction path.
+pub(crate) fn mixer_spec(
+    args: &ModelArgs,
+    prefix: &str,
+    heads: i32,
+    groups: i32,
+) -> Result<Mamba2Spec, Error> {
+    let geometry = Mamba2Geometry::new(heads, groups, args.mamba_head_dim, args.ssm_state_size)?;
+    let parameter =
+        |field: &str| ParameterSpec::trainable(format!("{prefix}.{field}")).map_err(Error::backend);
+    let spec = Mamba2Spec {
+        in_proj: super::attention::linear_spec(
+            args,
+            &format!("{prefix}.in_proj"),
+            args.hidden_size,
+            geometry.projection_width(),
+            args.use_bias,
+        )?,
+        convolution: CausalDepthwiseConvolutionSpec {
+            arithmetic: eredu_nn::ConvolutionArithmetic::Native,
+            dilation: 1,
+            channels: geometry.convolution_width(),
+            kernel_size: args.conv_kernel,
+            weight: parameter("conv1d.weight")?,
+            bias: args
+                .use_conv_bias
+                .then(|| parameter("conv1d.bias"))
+                .transpose()?,
+            activation: ConvolutionActivation::Silu,
+        },
+        dt_bias: parameter("dt_bias")?,
+        a_log: parameter("A_log")?,
+        d: parameter("D")?,
+        norm_weight: parameter("norm.weight")?,
+        out_proj: super::attention::linear_spec(
+            args,
+            &format!("{prefix}.out_proj"),
+            geometry.intermediate(),
+            args.hidden_size,
+            args.use_bias,
+        )?,
+        geometry,
+        chunk_size: usize::try_from(args.chunk_size)
+            .ok()
+            .filter(|&n| n > 0)
+            .ok_or_else(|| Error::backend("invalid Mamba chunk size"))?,
+        time_step_floor: args.time_step_min,
+        epsilon: args.layer_norm_epsilon,
+    };
+    spec.logical_parameters()?;
+    Ok(spec)
+}
 
 /// One unloaded Mamba2 mixer with architecture-authored parameter identity.
 #[derive(Debug, Clone, Parameterized)]
@@ -29,17 +295,7 @@ pub struct Mamba2<B: NeuralBackend> {
     /// Output projection.
     pub out_proj: B::Linear,
     #[parameter(skip)]
-    heads: i32,
-    #[parameter(skip)]
-    groups: i32,
-    #[parameter(skip)]
-    head_dim: i32,
-    #[parameter(skip)]
-    state_dim: i32,
-    #[parameter(skip)]
-    intermediate: i32,
-    #[parameter(skip)]
-    convolution_width: i32,
+    geometry: Mamba2Geometry,
     #[parameter(skip)]
     chunk_size: usize,
     #[parameter(skip)]
@@ -49,87 +305,25 @@ pub struct Mamba2<B: NeuralBackend> {
 }
 
 impl<B: NeuralBackend> Mamba2<B> {
-    /// Builds one global-geometry mixer.
-    pub fn new(
-        args: &ModelArgs,
-        layer: usize,
+    /// Constructs a mixer from its validated declaration before allocating backend parameters.
+    pub(crate) fn from_spec(
+        spec: Mamba2Spec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        Self::new_with_geometry(args, layer, args.mamba_num_heads, args.n_groups, context)
-    }
-
-    /// Builds one placement-resolved mixer.
-    pub fn new_with_geometry(
-        args: &ModelArgs,
-        layer: usize,
-        heads: i32,
-        groups: i32,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        let intermediate = heads
-            .checked_mul(args.mamba_head_dim)
-            .ok_or_else(|| Error::backend("Mamba intermediate width overflowed"))?;
-        let convolution_width = intermediate
-            .checked_add(2 * groups * args.ssm_state_size)
-            .ok_or_else(|| Error::backend("Mamba convolution width overflowed"))?;
-        let projection = intermediate
-            .checked_add(convolution_width)
-            .and_then(|width| width.checked_add(heads))
-            .ok_or_else(|| Error::backend("Mamba input projection width overflowed"))?;
-        let prefix = format!("model.layers.{layer}.mamba");
-        let parameter = |field: &str| {
-            ParameterSpec::trainable(format!("{prefix}.{field}")).map_err(Error::backend)
-        };
-        let linear = |field: &str, input, output, bias: bool| {
-            let weight = format!("{prefix}.{field}.weight");
-            B::linear(
-                LinearSpec {
-                    input,
-                    output,
-                    weight: ParameterSpec::trainable(&weight).map_err(Error::backend)?,
-                    bias: bias
-                        .then(|| ParameterSpec::trainable(format!("{prefix}.{field}.bias")))
-                        .transpose()
-                        .map_err(Error::backend)?,
-                    format: crate::linear_format::standard_linear_format(
-                        &weight,
-                        args.weight_quantization_for(&weight).into(),
-                    )?,
-                },
-                context,
-            )
-        };
+        spec.logical_parameters()?;
+        let intermediate = spec.geometry.intermediate();
         Ok(Self {
-            in_proj: linear("in_proj", args.hidden_size, projection, args.use_bias)?,
-            conv1d: CausalDepthwiseConvolution::new(
-                CausalDepthwiseConvolutionSpec {
-                    arithmetic: eredu_nn::ConvolutionArithmetic::Native,
-                    dilation: 1,
-                    channels: convolution_width,
-                    kernel_size: args.conv_kernel,
-                    weight: parameter("conv1d.weight")?,
-                    bias: args
-                        .use_conv_bias
-                        .then(|| parameter("conv1d.bias"))
-                        .transpose()?,
-                    activation: ConvolutionActivation::Silu,
-                },
-                context,
-            )?,
-            dt_bias: Parameter::unloaded(parameter("dt_bias")?, &[heads], context)?,
-            a_log: Parameter::unloaded(parameter("A_log")?, &[heads], context)?,
-            d: Parameter::unloaded(parameter("D")?, &[heads], context)?,
-            norm_weight: Parameter::unloaded(parameter("norm.weight")?, &[intermediate], context)?,
-            out_proj: linear("out_proj", intermediate, args.hidden_size, args.use_bias)?,
-            heads,
-            groups,
-            head_dim: args.mamba_head_dim,
-            state_dim: args.ssm_state_size,
-            intermediate,
-            convolution_width,
-            chunk_size: usize::try_from(args.chunk_size).map_err(Error::backend)?,
-            time_step_floor: args.time_step_min,
-            epsilon: args.layer_norm_epsilon,
+            in_proj: B::linear(spec.in_proj, context)?,
+            conv1d: CausalDepthwiseConvolution::new(spec.convolution, context)?,
+            dt_bias: Parameter::unloaded(spec.dt_bias, &[spec.geometry.heads], context)?,
+            a_log: Parameter::unloaded(spec.a_log, &[spec.geometry.heads], context)?,
+            d: Parameter::unloaded(spec.d, &[spec.geometry.heads], context)?,
+            norm_weight: Parameter::unloaded(spec.norm_weight, &[intermediate], context)?,
+            out_proj: B::linear(spec.out_proj, context)?,
+            geometry: spec.geometry,
+            chunk_size: spec.chunk_size,
+            time_step_floor: spec.time_step_floor,
+            epsilon: spec.epsilon,
         })
     }
 
@@ -171,8 +365,9 @@ impl<B: NeuralBackend> Mamba2<B> {
         }
         let (batch, sequence) = (shape[0], shape[1]);
         let projected = self.in_proj.forward(input, context)?;
-        let gate_end = self.intermediate;
-        let convolution_end = gate_end + self.convolution_width;
+        let gate_end = self.geometry.input_range(0).end;
+        let time_step_range = self.geometry.input_range(4);
+        let convolution_end = time_step_range.start;
         let gate = projected.index(
             &[Index::Full, Index::Full, Index::Range(0, gate_end)],
             context,
@@ -189,7 +384,7 @@ impl<B: NeuralBackend> Mamba2<B> {
             &[
                 Index::Full,
                 Index::Full,
-                Index::Range(convolution_end, convolution_end + self.heads),
+                Index::Range(time_step_range.start, time_step_range.end),
             ],
             context,
         )?;
@@ -204,11 +399,15 @@ impl<B: NeuralBackend> Mamba2<B> {
             .fixed_component(StateTensorRole::Convolution { slot: 0 })
             .map_err(Error::backend)? = convolved.history;
         let values = convolved.output.index(
-            &[Index::Full, Index::Full, Index::Range(0, self.intermediate)],
+            &[
+                Index::Full,
+                Index::Full,
+                Index::Range(0, self.geometry.intermediate()),
+            ],
             context,
         )?;
-        let input_start = self.intermediate;
-        let output_start = input_start + self.groups * self.state_dim;
+        let input_start = self.geometry.input_range(2).start - gate_end;
+        let output_start = self.geometry.input_range(3).start - gate_end;
         let input_state = convolved.output.index(
             &[
                 Index::Full,
@@ -221,26 +420,50 @@ impl<B: NeuralBackend> Mamba2<B> {
             &[
                 Index::Full,
                 Index::Full,
-                Index::Range(output_start, self.convolution_width),
+                Index::Range(output_start, self.geometry.convolution_width()),
             ],
             context,
         )?;
         let expand_groups = |value: B::Tensor| -> Result<B::Tensor, Error> {
-            let repeats = self.heads / self.groups;
-            let grouped =
-                value.reshape(&[batch, sequence, self.groups, self.state_dim], context)?;
+            let repeats = self.geometry.heads / self.geometry.groups;
+            let grouped = value.reshape(
+                &[
+                    batch,
+                    sequence,
+                    self.geometry.groups,
+                    self.geometry.state_dim,
+                ],
+                context,
+            )?;
             if repeats == 1 {
                 return Ok(grouped);
             }
             grouped
                 .expand_dims(3, context)?
                 .broadcast_to(
-                    &[batch, sequence, self.groups, repeats, self.state_dim],
+                    &[
+                        batch,
+                        sequence,
+                        self.geometry.groups,
+                        repeats,
+                        self.geometry.state_dim,
+                    ],
                     context,
                 )?
-                .reshape(&[batch, sequence, self.heads, self.state_dim], context)
+                .reshape(
+                    &[
+                        batch,
+                        sequence,
+                        self.geometry.heads,
+                        self.geometry.state_dim,
+                    ],
+                    context,
+                )
         };
-        let values = values.reshape(&[batch, sequence, self.heads, self.head_dim], context)?;
+        let values = values.reshape(
+            &[batch, sequence, self.geometry.heads, self.geometry.head_dim],
+            context,
+        )?;
         let input_state = expand_groups(input_state)?;
         let output_state = expand_groups(output_state)?;
         let scan = {
@@ -269,12 +492,12 @@ impl<B: NeuralBackend> Mamba2<B> {
         state.advance_fixed(sequence).map_err(Error::backend)?;
         let scan = scan
             .output
-            .reshape(&[batch, sequence, self.intermediate], context)?;
+            .reshape(&[batch, sequence, self.geometry.intermediate()], context)?;
         let normalized = B::gated_group_rms_norm(
             &scan,
             &gate,
             self.norm_weight.as_ref(),
-            self.groups,
+            self.geometry.groups,
             self.epsilon,
             context,
         )?;

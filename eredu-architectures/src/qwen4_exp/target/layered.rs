@@ -104,7 +104,12 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> TargetKernel<B> {
                 .embedding_mut()?
                 .forward(&request.boundary().ids, context)?,
         };
-        let hidden = self.spec.boundary.geometry.expand(&embeddings, context)?;
+        let hidden = self
+            .spec
+            .static_parameters
+            .readout
+            .geometry
+            .expand(&embeddings, context)?;
         Ok(LayeredForwardState {
             hidden,
             context: TargetForward {
@@ -123,7 +128,8 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> TargetKernel<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, TargetForward<B::Tensor>>, Error> {
         self.spec
-            .boundary
+            .static_parameters
+            .readout
             .geometry
             .validate_streams(hidden.shape())?;
         if hidden.dim(0) > self.spec.limits.qsa.batch || hidden.dim(1) > self.spec.limits.qsa.tokens
@@ -229,13 +235,10 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ComponentKernel<B> for 
         &self,
         source: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>, String> {
-        crate::static_parameters::module_recipes(
-            &self.statics,
-            super::super::checkpoint::recipes::parameter_recipes(
-                source.source_keys(),
-                &self.spec.config,
-                super::super::checkpoint::recipes::ParameterScope::Static,
-            )?,
+        super::super::checkpoint::recipes::parameter_recipes(
+            source.source_keys(),
+            &self.spec.config,
+            super::super::checkpoint::recipes::ParameterScope::Static,
         )
     }
     fn prediction_target_capture(forward: &Self::ForwardContext) -> Option<&B::Tensor> {

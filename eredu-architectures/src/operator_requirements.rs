@@ -113,14 +113,14 @@ pub fn muse(config: &crate::muse::DecoderConfig) -> C {
     if config.audio_config.is_some() {
         requirements = requirements.union(MUSE_AUDIO);
     }
-    if config
-        .vision_config
-        .as_ref()
-        .is_some_and(|vision| vision.arithmetic == crate::muse::VisionArithmetic::Rounded)
-    {
-        requirements = requirements
-            .union(C::CASCADED_LAYER_NORM)
-            .union(C::CAST_FLOAT);
+    if let Some(vision) = &config.vision_config {
+        requirements = requirements.union(
+            crate::muse::vision::specs::normalization_arithmetic(vision)
+                .required_operator_capabilities(),
+        );
+        if vision.arithmetic == crate::muse::VisionArithmetic::Rounded {
+            requirements = requirements.union(C::CAST_FLOAT);
+        }
     }
     requirements
 }

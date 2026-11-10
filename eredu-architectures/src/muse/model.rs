@@ -2,8 +2,8 @@
 
 mod observation;
 mod parameters;
-pub(crate) use parameters::select_definition;
 pub use parameters::{component_definition, project_parameters};
+pub(crate) use parameters::{describe as parameter_description, select_definition};
 mod prefill;
 mod waveform;
 use prefill::DecoderPrefill;
@@ -994,10 +994,7 @@ where
         std::collections::BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
         String,
     > {
-        crate::static_parameters::module_recipes(
-            &self.static_modules,
-            super::static_safetensors_recipes(&self.args, source)?,
-        )
+        super::static_safetensors_recipes(&self.args, source)
     }
     fn build_unit(
         &self,
@@ -1704,12 +1701,12 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> MuseKernel<B>
                     "Muse-Glimmer projected media has shape {:?}, expected [{media_tokens}, {}]",
                     vision.shape(),
                     self.args.hidden_size
-                )))
+                )));
             }
             None if media_tokens != 0 => {
                 return Err(Error::backend(
                     "Muse-Glimmer media placeholders require projected media",
-                ))
+                ));
             }
             _ => {}
         }
@@ -1735,12 +1732,12 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> MuseKernel<B>
             Some(value) if value.shape() != [batch, audio_tokens, self.args.hidden_size] => {
                 return Err(Error::backend(
                     "Muse projected waveform geometry differs from its ordered placeholders",
-                ))
+                ));
             }
             None if audio_tokens != 0 => {
                 return Err(Error::backend(
                     "Muse audio placeholders require projected waveform input",
-                ))
+                ));
             }
             _ => {}
         }

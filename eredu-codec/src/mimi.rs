@@ -21,9 +21,7 @@ use eredu_checkpoint::{
     SourceTensorEncoding, StoredDtype,
 };
 use eredu_nn::{
-    AttentionMask, Index, LayerNorm, Linear, LinearSpec, NeuralBackend, PadMode, Parameter,
-    ParameterId, ParameterMetadata, ParameterSpec, ParameterVisitor, ParameterVisitorMut,
-    Parameterized, Rope, Tensor,
+    AttentionMask, Index, LayerNorm, Linear, NeuralBackend, Parameter, Parameterized, Rope, Tensor,
 };
 use eredu_runtime::{
     bind_materialized_unit, materialize_selected_bindings, select_bindings, ParameterBackend,
@@ -36,65 +34,16 @@ use std::{
 };
 
 use crate::{
-    streaming::{
-        Conv1dSpec, ConvTranspose1dSpec, StreamableConv1d, StreamableConvTranspose1d, TransposeTail,
-    },
+    streaming::{StreamableConv1d, StreamableConvTranspose1d},
     AudioTokenizer, AudioTokenizerConfig, Error,
 };
 
 const EPSILON: f32 = 1e-5;
 
-fn parameter_name(prefix: &str, field: &str) -> String {
-    if prefix.is_empty() {
-        field.to_owned()
-    } else {
-        format!("{prefix}.{field}")
-    }
-}
-
-fn parameter_spec(id: &str) -> ParameterSpec {
-    ParameterSpec::trainable(id).expect("Mimi parameter identities are non-empty")
-}
-
-fn unloaded_parameter<T: Tensor>(
-    shape: &[i32],
-    context: &T::Context,
-) -> Result<Parameter<T>, eredu_nn::Error> {
-    Parameter::unloaded(parameter_spec("value"), shape, context)
-}
-
-fn unloaded_linear<T: Tensor>(
-    input: i32,
-    output: i32,
-    bias: bool,
-    context: &T::Context,
-) -> Result<Linear<T>, eredu_nn::Error> {
-    Linear::unloaded(
-        LinearSpec {
-            input,
-            output,
-            weight: parameter_spec("weight"),
-            bias: bias.then(|| parameter_spec("bias")),
-            format: eredu_nn::LinearFormatSpec::unscaled(eredu_checkpoint::LinearFormat::Dense)
-                .unwrap(),
-        },
-        context,
-    )
-}
-
-fn unloaded_layer_norm<T: Tensor>(
-    dimensions: i32,
-    epsilon: f32,
-    context: &T::Context,
-) -> Result<LayerNorm<T>, eredu_nn::Error> {
-    LayerNorm::unloaded(
-        dimensions,
-        epsilon,
-        Some(parameter_spec("weight")),
-        Some(parameter_spec("bias")),
-        context,
-    )
-}
+/// Shared backend-free Mimi construction and logical parameter declarations.
+#[path = "mimi/specs.rs"]
+pub mod specs;
+use specs::{DeclareCheckpointParameters, MimiSpec};
 
 /// Mimi resampling strategy.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -188,7 +137,8 @@ impl Config {
 }
 
 /// Mimi audio tokenizer.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Parameterized)]
+#[parameterized(tensor = "T")]
 pub struct Mimi<T: Tensor> {
     /// Split residual vector quantizer.
     pub quantizer: SplitResidualVectorQuantizer<T>,
@@ -198,40 +148,25 @@ pub struct Mimi<T: Tensor> {
     upsample: StreamableConvTranspose1d<T>,
     decoder_transformer: MimiTransformer<T>,
     decoder: SeaNetDecoder<T>,
+    #[parameter(skip)]
     config: Config,
 }
 
 impl<T: Tensor> Mimi<T> {
     /// Creates an unloaded Mimi tokenizer from config.
     pub fn new(config: Config, context: &T::Context) -> Result<Self, Error> {
-        config.validate()?;
+        Self::from_spec(MimiSpec::new(config)?, context)
+    }
+    fn from_spec(spec: MimiSpec, context: &T::Context) -> Result<Self, Error> {
         Ok(Self {
-            quantizer: SplitResidualVectorQuantizer::unloaded(&config, context)?,
-            encoder: SeaNetEncoder::unloaded(context)?,
-            encoder_transformer: MimiTransformer::unloaded(context)?,
-            downsample: StreamableConv1d::unloaded(
-                Conv1dSpec {
-                    bias: false,
-                    pad_mode: PadMode::Edge,
-                    ..Conv1dSpec::causal(config.latent_dim, config.latent_dim, 4, 2)
-                },
-                context,
-            )?,
-            upsample: StreamableConvTranspose1d::unloaded(
-                ConvTranspose1dSpec {
-                    input_channels: config.latent_dim,
-                    output_channels: config.latent_dim,
-                    kernel_size: 4,
-                    stride: 2,
-                    groups: config.latent_dim,
-                    bias: false,
-                    tail: TransposeTail::Trim,
-                },
-                context,
-            )?,
-            decoder_transformer: MimiTransformer::unloaded(context)?,
-            decoder: SeaNetDecoder::unloaded(context)?,
-            config,
+            quantizer: SplitResidualVectorQuantizer::unloaded(spec.quantizer, context)?,
+            encoder: SeaNetEncoder::unloaded(spec.encoder, context)?,
+            encoder_transformer: MimiTransformer::unloaded(spec.encoder_transformer, context)?,
+            downsample: spec.downsample.construct(context)?,
+            upsample: spec.upsample.construct(context)?,
+            decoder_transformer: MimiTransformer::unloaded(spec.decoder_transformer, context)?,
+            decoder: SeaNetDecoder::unloaded(spec.decoder, context)?,
+            config: spec.config,
         })
     }
 
@@ -397,7 +332,7 @@ impl MimiParameterRequirement {
 
 /// Header-admitted Mimi artifact with an immutable exact parameter plan.
 pub struct PreparedMimiArtifact {
-    config: Config,
+    declaration: MimiSpec,
     source: SharedCheckpointSource,
     requirements: Vec<MimiParameterRequirement>,
     bindings: Vec<WeightBinding>,
@@ -407,7 +342,7 @@ impl std::fmt::Debug for PreparedMimiArtifact {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("PreparedMimiArtifact")
-            .field("config", &self.config)
+            .field("config", &self.declaration.config)
             .field("requirements", &self.requirements)
             .field("bindings", &self.bindings)
             .finish_non_exhaustive()
@@ -417,7 +352,7 @@ impl std::fmt::Debug for PreparedMimiArtifact {
 impl PreparedMimiArtifact {
     /// Released configuration fixed by neutral preparation.
     pub const fn config(&self) -> &Config {
-        &self.config
+        &self.declaration.config
     }
 
     /// Exact full-checkpoint requirements, including inactive codebooks.
@@ -439,14 +374,14 @@ impl PreparedMimiArtifact {
         B: ParameterBackend<Parameter = <B as NeuralBackend>::Tensor>,
     {
         let Self {
-            config,
+            declaration,
             source,
             requirements,
             bindings,
         } = self;
         let selected = select_bindings::<B>(source, bindings)?;
         Ok(SelectedMimiArtifact {
-            config,
+            declaration,
             requirements,
             selected,
         })
@@ -458,7 +393,7 @@ pub struct SelectedMimiArtifact<B>
 where
     B: ParameterBackend<Parameter = <B as NeuralBackend>::Tensor>,
 {
-    config: Config,
+    declaration: MimiSpec,
     requirements: Vec<MimiParameterRequirement>,
     selected: SelectedBindingPlan<B>,
 }
@@ -470,7 +405,7 @@ where
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("SelectedMimiArtifact")
-            .field("config", &self.config)
+            .field("config", &self.declaration.config)
             .field("requirements", &self.requirements)
             .field("selected", &self.selected)
             .finish_non_exhaustive()
@@ -489,11 +424,11 @@ where
         materialization_context: &B::MaterializationContext,
     ) -> Result<Mimi<<B as NeuralBackend>::Tensor>, MimiConstructionError<B::ParameterError>> {
         let SelectedMimiArtifact {
-            config,
+            declaration,
             requirements: _,
             selected,
         } = self;
-        let mut mimi = Mimi::new(config, tensor_context)?;
+        let mut mimi = Mimi::from_spec(declaration, tensor_context)?;
         let materialized = materialize_selected_bindings::<B>(selected, materialization_context)?;
         bind_materialized_unit::<B, _>(&mut mimi, materialized)?;
         Ok(mimi)
@@ -549,7 +484,7 @@ pub fn prepare_checkpoint(
     path: impl AsRef<Path>,
     config: Config,
 ) -> Result<PreparedMimiArtifact, MimiArtifactError> {
-    let (plan, requirements, bindings) = prepare_catalog(&config)?;
+    let (declaration, plan, requirements, bindings) = prepare_catalog(&config)?;
     let catalog = SafetensorsMetadataCatalog::discover(path)?;
     let resolution =
         resolve_safetensors_plan(&catalog, &plan).map_err(MimiArtifactError::Catalog)?;
@@ -557,7 +492,7 @@ pub fn prepare_checkpoint(
         catalog.into_admitted_shards(),
         1,
     )?);
-    prepared_from_resolution(config, store, resolution, requirements, bindings)
+    prepared_from_resolution(declaration, store, resolution, requirements, bindings)
 }
 
 /// Returns the complete released-checkpoint schema derived from Mimi's
@@ -565,7 +500,7 @@ pub fn prepare_checkpoint(
 pub fn released_checkpoint_requirements(
     config: &Config,
 ) -> Result<Vec<MimiParameterRequirement>, MimiArtifactError> {
-    prepare_catalog(config).map(|(_, requirements, _)| requirements)
+    prepare_catalog(config).map(|(_, _, requirements, _)| requirements)
 }
 
 /// Admits an already opened backend-neutral SafeTensors-compatible source.
@@ -574,10 +509,10 @@ pub fn prepare_source(
     source: SharedCheckpointSource,
     config: Config,
 ) -> Result<PreparedMimiArtifact, MimiArtifactError> {
-    let (plan, requirements, bindings) = prepare_catalog(&config)?;
+    let (declaration, plan, requirements, bindings) = prepare_catalog(&config)?;
     let resolution =
         resolve_safetensors_plan(source.as_ref(), &plan).map_err(MimiArtifactError::Catalog)?;
-    prepared_from_resolution(config, source, resolution, requirements, bindings)
+    prepared_from_resolution(declaration, source, resolution, requirements, bindings)
 }
 
 /// Selects generic backend mechanisms, then constructs Mimi through the exact
@@ -603,6 +538,7 @@ fn prepare_catalog(
     config: &Config,
 ) -> Result<
     (
+        MimiSpec,
         SafetensorsCheckpointPlan,
         Vec<MimiParameterRequirement>,
         Vec<WeightBinding>,
@@ -610,10 +546,22 @@ fn prepare_catalog(
     MimiArtifactError,
 > {
     config.validate()?;
-    let active_topology = parameter_topology(config.clone())?;
     let mut full_config = config.clone();
     full_config.num_codebooks = full_config.total_codebooks;
-    let full_topology = parameter_topology(full_config)?;
+    let full_declaration = MimiSpec::new(full_config)?;
+    let declaration = full_declaration.select_codebooks(config.num_codebooks)?;
+    let active_topology = parameter_topology(&declaration)?;
+    let full_topology = full_declaration
+        .checkpoint_parameters()
+        .map_err(Error::from)?
+        .into_iter()
+        .map(|parameter| {
+            (
+                parameter.logical.parameter.id.to_string(),
+                (parameter.logical.shape, parameter.axes),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     if active_topology
         .keys()
         .any(|name| !full_topology.contains_key(name))
@@ -626,7 +574,7 @@ fn prepare_catalog(
     let mut physical_names = BTreeSet::new();
     let mut requirements = Vec::with_capacity(full_topology.len());
     let mut bindings = Vec::with_capacity(active_topology.len());
-    for (logical_name, logical_shape) in full_topology {
+    for (logical_name, (logical_shape, axes)) in full_topology {
         let checkpoint_key = checkpoint_key_for_parameter(&logical_name).ok_or_else(|| {
             MimiArtifactError::Topology(format!(
                 "parameter {logical_name:?} has no released checkpoint identity"
@@ -642,7 +590,6 @@ fn prepare_catalog(
                 "checkpoint identity {checkpoint_key:?} does not round-trip to {logical_name:?}"
             )));
         }
-        let axes = checkpoint_layout_axes(&logical_name);
         let physical_shape = match axes {
             Some(axes) => inverse_permuted_shape(&logical_shape, axes)?,
             None => logical_shape.clone(),
@@ -697,11 +644,11 @@ fn prepare_catalog(
         Vec::new(),
         CatalogPolicy::strict(),
     )?;
-    Ok((plan, requirements, bindings))
+    Ok((declaration, plan, requirements, bindings))
 }
 
 fn prepared_from_resolution(
-    config: Config,
+    declaration: MimiSpec,
     source: SharedCheckpointSource,
     resolution: ResolvedCheckpointPlan,
     requirements: Vec<MimiParameterRequirement>,
@@ -746,7 +693,7 @@ fn prepared_from_resolution(
         Arc::new(ResolvedCheckpointSource::new(source, resolution));
     validate_requirement_recipes(source.as_ref(), &requirements)?;
     Ok(PreparedMimiArtifact {
-        config,
+        declaration,
         source,
         requirements,
         bindings,
@@ -781,245 +728,16 @@ fn validate_requirement_recipes(
     Ok(())
 }
 
-#[derive(Debug, Clone)]
-struct PlanningTensor(Vec<i32>);
-
-impl PlanningTensor {
-    fn unavailable() -> Result<Self, eredu_nn::Error> {
-        Err(eredu_nn::Error::backend(
-            "Mimi planning tensors cannot execute neural operations",
-        ))
-    }
-}
-
-impl Tensor for PlanningTensor {
-    type Context = ();
-
-    fn compact(&self, _: &Self::Context) -> Result<Self, eredu_nn::Error> {
-        Self::unavailable()
-    }
-
-    fn shape(&self) -> &[i32] {
-        &self.0
-    }
-
-    fn unloaded_f32(shape: &[i32], _: &Self::Context) -> Result<Self, eredu_nn::Error> {
-        Ok(Self(shape.to_vec()))
-    }
-
-    fn from_f32_slice(_: &[f32], _: &[i32], _: &Self::Context) -> Result<Self, eredu_nn::Error> {
-        Self::unavailable()
-    }
-
-    fn add(&self, _: &Self, _: &Self::Context) -> Result<Self, eredu_nn::Error> {
-        Self::unavailable()
-    }
-
-    fn subtract(&self, _: &Self, _: &Self::Context) -> Result<Self, eredu_nn::Error> {
-        Self::unavailable()
-    }
-
-    fn multiply(&self, _: &Self, _: &Self::Context) -> Result<Self, eredu_nn::Error> {
-        Self::unavailable()
-    }
-
-    fn multiply_scalar(&self, _: f32, _: &Self::Context) -> Result<Self, eredu_nn::Error> {
-        Self::unavailable()
-    }
-
-    fn divide(&self, _: &Self, _: &Self::Context) -> Result<Self, eredu_nn::Error> {
-        Self::unavailable()
-    }
-
-    fn square(&self, _: &Self::Context) -> Result<Self, eredu_nn::Error> {
-        Self::unavailable()
-    }
-
-    fn maximum_scalar(&self, _: f32, _: &Self::Context) -> Result<Self, eredu_nn::Error> {
-        Self::unavailable()
-    }
-
-    fn reshape(&self, _: &[i32], _: &Self::Context) -> Result<Self, eredu_nn::Error> {
-        Self::unavailable()
-    }
-
-    fn transpose_axes(&self, _: &[i32], _: &Self::Context) -> Result<Self, eredu_nn::Error> {
-        Self::unavailable()
-    }
-
-    fn swap_axes(&self, _: i32, _: i32, _: &Self::Context) -> Result<Self, eredu_nn::Error> {
-        Self::unavailable()
-    }
-
-    fn transpose(&self, _: &Self::Context) -> Result<Self, eredu_nn::Error> {
-        Self::unavailable()
-    }
-
-    fn expand_dims(&self, _: i32, _: &Self::Context) -> Result<Self, eredu_nn::Error> {
-        Self::unavailable()
-    }
-
-    fn squeeze_axes(&self, _: &[i32], _: &Self::Context) -> Result<Self, eredu_nn::Error> {
-        Self::unavailable()
-    }
-
-    fn index(&self, _: &[Index], _: &Self::Context) -> Result<Self, eredu_nn::Error> {
-        Self::unavailable()
-    }
-
-    fn take_axis(&self, _: &Self, _: i32, _: &Self::Context) -> Result<Self, eredu_nn::Error> {
-        Self::unavailable()
-    }
-
-    fn concatenate(_: &[Self], _: i32, _: &Self::Context) -> Result<Self, eredu_nn::Error> {
-        Self::unavailable()
-    }
-
-    fn stack(_: &[Self], _: i32, _: &Self::Context) -> Result<Self, eredu_nn::Error> {
-        Self::unavailable()
-    }
-
-    fn matmul(_: &Self, _: &Self, _: &Self::Context) -> Result<Self, eredu_nn::Error> {
-        Self::unavailable()
-    }
-
-    fn sum_axis(_: &Self, _: i32, _: bool, _: &Self::Context) -> Result<Self, eredu_nn::Error> {
-        Self::unavailable()
-    }
-
-    fn argmin_axis(_: &Self, _: i32, _: bool, _: &Self::Context) -> Result<Self, eredu_nn::Error> {
-        Self::unavailable()
-    }
-
-    fn pad(
-        _: &Self,
-        _: &[(i32, i32)],
-        _: PadMode,
-        _: &Self::Context,
-    ) -> Result<Self, eredu_nn::Error> {
-        Self::unavailable()
-    }
-
-    fn conv1d(
-        _: &Self,
-        _: &Self,
-        _: i32,
-        _: i32,
-        _: i32,
-        _: i32,
-        _: &Self::Context,
-    ) -> Result<Self, eredu_nn::Error> {
-        Self::unavailable()
-    }
-
-    fn conv_transpose1d(
-        _: &Self,
-        _: &Self,
-        _: i32,
-        _: i32,
-        _: i32,
-        _: i32,
-        _: i32,
-        _: &Self::Context,
-    ) -> Result<Self, eredu_nn::Error> {
-        Self::unavailable()
-    }
-
-    fn linear(
-        _: &Self,
-        _: &Self,
-        _: Option<&Self>,
-        _: &Self::Context,
-    ) -> Result<Self, eredu_nn::Error> {
-        Self::unavailable()
-    }
-
-    fn layer_norm(
-        _: &Self,
-        _: Option<&Self>,
-        _: Option<&Self>,
-        _: f32,
-        _: eredu_nn::LayerNormalizationArithmetic,
-        _: &Self::Context,
-    ) -> Result<Self, eredu_nn::Error> {
-        Self::unavailable()
-    }
-
-    fn gelu(_: &Self, _: &Self::Context) -> Result<Self, eredu_nn::Error> {
-        Self::unavailable()
-    }
-
-    fn elu(_: &Self, _: f32, _: &Self::Context) -> Result<Self, eredu_nn::Error> {
-        Self::unavailable()
-    }
-
-    fn rope(
-        _: &Self,
-        _: i32,
-        _: bool,
-        _: f32,
-        _: f32,
-        _: i32,
-        _: &Self::Context,
-    ) -> Result<Self, eredu_nn::Error> {
-        Self::unavailable()
-    }
-
-    fn scaled_dot_product_attention(
-        _: &Self,
-        _: &Self,
-        _: &Self,
-        _: f32,
-        _: AttentionMask<'_, Self>,
-        _: &Self::Context,
-    ) -> Result<Self, eredu_nn::Error> {
-        Self::unavailable()
-    }
-}
-
-fn parameter_topology(config: Config) -> Result<BTreeMap<String, Vec<usize>>, MimiArtifactError> {
-    let mimi = Mimi::<PlanningTensor>::new(config, &())?;
-    let mut topology = BTreeMap::new();
-    let mut duplicate = None;
-    mimi.visit_mimi_parameters("", &mut |metadata, parameter| {
-        let shape = parameter
-            .shape()
-            .iter()
-            .map(|dimension| {
-                usize::try_from(*dimension).map_err(|_| {
-                    MimiArtifactError::Topology(format!(
-                        "parameter {:?} has invalid shape {:?}",
-                        metadata.id,
-                        parameter.shape()
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>, _>>();
-        match shape {
-            Ok(shape) => {
-                if topology.insert(metadata.id.to_string(), shape).is_some() {
-                    duplicate = Some(metadata.id.to_string());
-                }
-            }
-            Err(error) => duplicate = Some(error.to_string()),
-        }
-    });
-    if let Some(duplicate) = duplicate {
-        return Err(MimiArtifactError::Topology(format!(
-            "duplicate or invalid parameter identity {duplicate:?}"
-        )));
-    }
-    Ok(topology)
-}
-
-fn checkpoint_layout_axes(parameter: &str) -> Option<[usize; 3]> {
-    (parameter.ends_with(".weight") && is_conv_weight_key(parameter)).then(|| {
-        if parameter.contains(".upsample.") {
-            [1, 2, 0]
-        } else {
-            [0, 2, 1]
-        }
-    })
+fn parameter_topology(
+    declaration: &MimiSpec,
+) -> Result<BTreeMap<String, Vec<usize>>, MimiArtifactError> {
+    use eredu_nn::DeclareLogicalParameters;
+    Ok(declaration
+        .logical_parameters()
+        .map_err(Error::from)?
+        .into_iter()
+        .map(|p| (p.parameter.id.to_string(), p.shape))
+        .collect())
 }
 
 fn inverse_permuted_shape(
@@ -1222,16 +940,6 @@ fn transform_seanet_key(key: &str, mappings: &[(&str, &str)]) -> Option<String> 
     Some(format!("{target}{}", &key[source.len()..]))
 }
 
-fn is_conv_weight_key(key: &str) -> bool {
-    key.starts_with("upsample.")
-        || key.starts_with("downsample.")
-        || key.contains(".upsample.")
-        || key.contains(".downsample.")
-        || key.contains(".init_conv1d.")
-        || key.contains(".final_conv1d.")
-        || key.contains(".block.")
-}
-
 impl<T: Tensor> AudioTokenizer for Mimi<T> {
     type Tensor = T;
 
@@ -1254,7 +962,8 @@ impl<T: Tensor> AudioTokenizer for Mimi<T> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Parameterized)]
+#[parameterized(tensor = "T")]
 struct SeaNetEncoder<T: Tensor> {
     init_conv1d: StreamableConv1d<T>,
     layers: Vec<EncoderLayer<T>>,
@@ -1262,23 +971,15 @@ struct SeaNetEncoder<T: Tensor> {
 }
 
 impl<T: Tensor> SeaNetEncoder<T> {
-    fn unloaded(context: &T::Context) -> Result<Self, Error> {
-        let ratios = [4, 5, 6, 8];
-        let mut channels = 64;
-        let mut layers = Vec::with_capacity(ratios.len());
-        for ratio in ratios {
-            layers.push(EncoderLayer::unloaded(
-                channels,
-                channels * 2,
-                ratio,
-                context,
-            )?);
-            channels *= 2;
-        }
+    fn unloaded(spec: specs::Encoder, context: &T::Context) -> Result<Self, Error> {
         Ok(Self {
-            init_conv1d: StreamableConv1d::unloaded(Conv1dSpec::causal(1, 64, 7, 1), context)?,
-            layers,
-            final_conv1d: StreamableConv1d::unloaded(Conv1dSpec::causal(1024, 512, 3, 1), context)?,
+            init_conv1d: spec.init.construct(context)?,
+            layers: spec
+                .layers
+                .into_iter()
+                .map(|s| EncoderLayer::unloaded(s, context))
+                .collect::<Result<_, _>>()?,
+            final_conv1d: spec.final_conv.construct(context)?,
         })
     }
 
@@ -1316,25 +1017,22 @@ impl<T: Tensor> SeaNetEncoder<T> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Parameterized)]
+#[parameterized(tensor = "T")]
 struct EncoderLayer<T: Tensor> {
     residuals: Vec<SeaNetResnetBlock<T>>,
     downsample: StreamableConv1d<T>,
 }
 
 impl<T: Tensor> EncoderLayer<T> {
-    fn unloaded(
-        in_channels: i32,
-        out_channels: i32,
-        ratio: i32,
-        context: &T::Context,
-    ) -> Result<Self, Error> {
+    fn unloaded(spec: specs::EncoderLayer, context: &T::Context) -> Result<Self, Error> {
         Ok(Self {
-            residuals: vec![SeaNetResnetBlock::unloaded(in_channels, context)?],
-            downsample: StreamableConv1d::unloaded(
-                Conv1dSpec::causal(in_channels, out_channels, ratio * 2, ratio),
-                context,
-            )?,
+            residuals: spec
+                .residuals
+                .into_iter()
+                .map(|s| SeaNetResnetBlock::unloaded(s, context))
+                .collect::<Result<_, _>>()?,
+            downsample: spec.downsample.construct(context)?,
         })
     }
 
@@ -1362,17 +1060,20 @@ impl<T: Tensor> EncoderLayer<T> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Parameterized)]
+#[parameterized(tensor = "T")]
 struct MimiTransformer<T: Tensor> {
     layers: Vec<MimiTransformerLayer<T>>,
 }
 
 impl<T: Tensor> MimiTransformer<T> {
-    fn unloaded(context: &T::Context) -> Result<Self, Error> {
+    fn unloaded(spec: specs::Transformer, context: &T::Context) -> Result<Self, Error> {
         Ok(Self {
-            layers: (0..8)
-                .map(|_| MimiTransformerLayer::unloaded(context))
-                .collect::<Result<Vec<_>, _>>()?,
+            layers: spec
+                .layers
+                .into_iter()
+                .map(|s| MimiTransformerLayer::unloaded(s, context))
+                .collect::<Result<_, _>>()?,
         })
     }
 
@@ -1399,7 +1100,8 @@ impl<T: Tensor> MimiTransformer<T> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Parameterized)]
+#[parameterized(tensor = "T")]
 struct MimiTransformerLayer<T: Tensor> {
     norm1: LayerNorm<T>,
     norm2: LayerNorm<T>,
@@ -1410,14 +1112,14 @@ struct MimiTransformerLayer<T: Tensor> {
 }
 
 impl<T: Tensor> MimiTransformerLayer<T> {
-    fn unloaded(context: &T::Context) -> Result<Self, Error> {
+    fn unloaded(spec: specs::TransformerLayer, context: &T::Context) -> Result<Self, Error> {
         Ok(Self {
-            norm1: unloaded_layer_norm(512, 1e-5, context)?,
-            norm2: unloaded_layer_norm(512, 1e-5, context)?,
-            self_attn: MimiSelfAttention::unloaded(context)?,
-            mlp: MimiMlp::unloaded(context)?,
-            layer_scale_1: LayerScale::unloaded(512, context)?,
-            layer_scale_2: LayerScale::unloaded(512, context)?,
+            norm1: LayerNorm::new(spec.norm1, context)?,
+            norm2: LayerNorm::new(spec.norm2, context)?,
+            self_attn: MimiSelfAttention::unloaded(spec.attention, context)?,
+            mlp: MimiMlp::unloaded(spec.mlp, context)?,
+            layer_scale_1: LayerScale::unloaded(spec.scale1, context)?,
+            layer_scale_2: LayerScale::unloaded(spec.scale2, context)?,
         })
     }
 
@@ -1456,30 +1158,32 @@ impl<T: Tensor> MimiTransformerLayer<T> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Parameterized)]
+#[parameterized(tensor = "T")]
 struct LayerScale<T: Tensor> {
     scale: Parameter<T>,
 }
 
 impl<T: Tensor> LayerScale<T> {
-    fn unloaded(dim: i32, context: &T::Context) -> Result<Self, Error> {
+    fn unloaded(spec: specs::Slot, context: &T::Context) -> Result<Self, Error> {
         Ok(Self {
-            scale: unloaded_parameter(&[dim], context)?,
+            scale: spec.construct(context)?,
         })
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Parameterized)]
+#[parameterized(tensor = "T")]
 struct MimiMlp<T: Tensor> {
     linear1: Linear<T>,
     linear2: Linear<T>,
 }
 
 impl<T: Tensor> MimiMlp<T> {
-    fn unloaded(context: &T::Context) -> Result<Self, Error> {
+    fn unloaded(spec: specs::Mlp, context: &T::Context) -> Result<Self, Error> {
         Ok(Self {
-            linear1: unloaded_linear(512, 2048, false, context)?,
-            linear2: unloaded_linear(2048, 512, false, context)?,
+            linear1: Linear::unloaded(spec.up, context)?,
+            linear2: Linear::unloaded(spec.down, context)?,
         })
     }
 
@@ -1490,30 +1194,37 @@ impl<T: Tensor> MimiMlp<T> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Parameterized)]
+#[parameterized(tensor = "T")]
 struct MimiSelfAttention<T: Tensor> {
     in_proj: Linear<T>,
     out_proj: Linear<T>,
+    #[parameter(skip)]
     rope: Rope,
+    #[parameter(skip)]
     num_heads: i32,
+    #[parameter(skip)]
     head_dim: i32,
+    #[parameter(skip)]
     scale: f32,
+    #[parameter(skip)]
     context: i32,
+    #[parameter(skip)]
     key_cache: Option<T>,
+    #[parameter(skip)]
     value_cache: Option<T>,
 }
 
 impl<T: Tensor> MimiSelfAttention<T> {
-    fn unloaded(context: &T::Context) -> Result<Self, Error> {
-        let head_dim = 64;
+    fn unloaded(spec: specs::Attention, context: &T::Context) -> Result<Self, Error> {
         Ok(Self {
-            in_proj: unloaded_linear(512, 1536, false, context)?,
-            out_proj: unloaded_linear(512, 512, false, context)?,
-            rope: Rope::new(head_dim, true, 10_000.0, 1.0),
-            num_heads: 8,
-            head_dim,
-            scale: (head_dim as f32).sqrt().recip(),
-            context: 250,
+            in_proj: Linear::unloaded(spec.input, context)?,
+            out_proj: Linear::unloaded(spec.output, context)?,
+            rope: Rope::new(spec.head_dim, true, 10_000.0, 1.0),
+            num_heads: spec.heads,
+            head_dim: spec.head_dim,
+            scale: (spec.head_dim as f32).sqrt().recip(),
+            context: spec.context,
             key_cache: None,
             value_cache: None,
         })
@@ -1722,7 +1433,8 @@ fn streaming_attention_mask<T: Tensor>(
     )?)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Parameterized)]
+#[parameterized(tensor = "T")]
 struct SeaNetDecoder<T: Tensor> {
     init_conv1d: StreamableConv1d<T>,
     layers: Vec<DecoderLayer<T>>,
@@ -1730,24 +1442,15 @@ struct SeaNetDecoder<T: Tensor> {
 }
 
 impl<T: Tensor> SeaNetDecoder<T> {
-    fn unloaded(context: &T::Context) -> Result<Self, Error> {
-        let ratios = [8, 6, 5, 4];
-        let mut channels = 1024;
-        let mut layers = Vec::with_capacity(ratios.len());
-        for ratio in ratios {
-            let out_channels = channels / 2;
-            layers.push(DecoderLayer::unloaded(
-                channels,
-                out_channels,
-                ratio,
-                context,
-            )?);
-            channels = out_channels;
-        }
+    fn unloaded(spec: specs::Decoder, context: &T::Context) -> Result<Self, Error> {
         Ok(Self {
-            init_conv1d: StreamableConv1d::unloaded(Conv1dSpec::causal(512, 1024, 7, 1), context)?,
-            layers,
-            final_conv1d: StreamableConv1d::unloaded(Conv1dSpec::causal(64, 1, 3, 1), context)?,
+            init_conv1d: spec.init.construct(context)?,
+            layers: spec
+                .layers
+                .into_iter()
+                .map(|s| DecoderLayer::unloaded(s, context))
+                .collect::<Result<_, _>>()?,
+            final_conv1d: spec.final_conv.construct(context)?,
         })
     }
 
@@ -1781,33 +1484,22 @@ impl<T: Tensor> SeaNetDecoder<T> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Parameterized)]
+#[parameterized(tensor = "T")]
 struct DecoderLayer<T: Tensor> {
     upsample: StreamableConvTranspose1d<T>,
     residuals: Vec<SeaNetResnetBlock<T>>,
 }
 
 impl<T: Tensor> DecoderLayer<T> {
-    fn unloaded(
-        in_channels: i32,
-        out_channels: i32,
-        ratio: i32,
-        context: &T::Context,
-    ) -> Result<Self, Error> {
+    fn unloaded(spec: specs::DecoderLayer, context: &T::Context) -> Result<Self, Error> {
         Ok(Self {
-            upsample: StreamableConvTranspose1d::unloaded(
-                ConvTranspose1dSpec {
-                    input_channels: in_channels,
-                    output_channels: out_channels,
-                    kernel_size: ratio * 2,
-                    stride: ratio,
-                    groups: 1,
-                    bias: true,
-                    tail: TransposeTail::Trim,
-                },
-                context,
-            )?,
-            residuals: vec![SeaNetResnetBlock::unloaded(out_channels, context)?],
+            upsample: spec.upsample.construct(context)?,
+            residuals: spec
+                .residuals
+                .into_iter()
+                .map(|s| SeaNetResnetBlock::unloaded(s, context))
+                .collect::<Result<_, _>>()?,
         })
     }
 
@@ -1835,24 +1527,20 @@ impl<T: Tensor> DecoderLayer<T> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Parameterized)]
+#[parameterized(tensor = "T")]
 struct SeaNetResnetBlock<T: Tensor> {
     block: Vec<StreamableConv1d<T>>,
 }
 
 impl<T: Tensor> SeaNetResnetBlock<T> {
-    fn unloaded(channels: i32, context: &T::Context) -> Result<Self, Error> {
+    fn unloaded(spec: specs::Residual, context: &T::Context) -> Result<Self, Error> {
         Ok(Self {
-            block: vec![
-                StreamableConv1d::unloaded(
-                    Conv1dSpec::causal(channels, channels / 2, 3, 1),
-                    context,
-                )?,
-                StreamableConv1d::unloaded(
-                    Conv1dSpec::causal(channels / 2, channels, 1, 1),
-                    context,
-                )?,
-            ],
+            block: spec
+                .block
+                .into_iter()
+                .map(|s| s.construct(context))
+                .collect::<Result<_, _>>()?,
         })
     }
 
@@ -1884,33 +1572,23 @@ impl<T: Tensor> SeaNetResnetBlock<T> {
 }
 
 /// Split residual vector quantizer used by Mimi.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Parameterized)]
+#[parameterized(tensor = "T")]
 pub struct SplitResidualVectorQuantizer<T: Tensor> {
     /// First semantic codebook branch.
     pub rvq_first: ResidualVectorQuantizer<T>,
     /// Remaining acoustic codebook branch.
     pub rvq_rest: ResidualVectorQuantizer<T>,
+    #[parameter(skip)]
     n_q: i32,
 }
 
 impl<T: Tensor> SplitResidualVectorQuantizer<T> {
-    fn unloaded(config: &Config, context: &T::Context) -> Result<Self, Error> {
+    fn unloaded(spec: specs::Quantizer, context: &T::Context) -> Result<Self, Error> {
         Ok(Self {
-            rvq_first: ResidualVectorQuantizer::unloaded(
-                config.latent_dim,
-                config.quantizer_dim,
-                1,
-                config.bins,
-                context,
-            )?,
-            rvq_rest: ResidualVectorQuantizer::unloaded(
-                config.latent_dim,
-                config.quantizer_dim,
-                config.num_codebooks - 1,
-                config.bins,
-                context,
-            )?,
-            n_q: config.num_codebooks,
+            rvq_first: ResidualVectorQuantizer::unloaded(spec.first, context)?,
+            rvq_rest: ResidualVectorQuantizer::unloaded(spec.rest, context)?,
+            n_q: spec.count,
         })
     }
 
@@ -1943,7 +1621,8 @@ impl<T: Tensor> SplitResidualVectorQuantizer<T> {
 }
 
 /// Residual vector quantizer branch.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Parameterized)]
+#[parameterized(tensor = "T")]
 pub struct ResidualVectorQuantizer<T: Tensor> {
     /// Input projection from Mimi latent dimension into codebook dimension.
     pub input_proj: Conv1x1NoBias<T>,
@@ -1954,17 +1633,11 @@ pub struct ResidualVectorQuantizer<T: Tensor> {
 }
 
 impl<T: Tensor> ResidualVectorQuantizer<T> {
-    fn unloaded(
-        latent_dim: i32,
-        codebook_dim: i32,
-        layers: i32,
-        bins: i32,
-        context: &T::Context,
-    ) -> Result<Self, Error> {
+    fn unloaded(spec: specs::QuantizerBranch, context: &T::Context) -> Result<Self, Error> {
         Ok(Self {
-            input_proj: Conv1x1NoBias::unloaded(latent_dim, codebook_dim, context)?,
-            output_proj: Conv1x1NoBias::unloaded(codebook_dim, latent_dim, context)?,
-            vq: ResidualVectorQuantization::unloaded(layers, codebook_dim, bins, context)?,
+            input_proj: Conv1x1NoBias::unloaded(spec.input, context)?,
+            output_proj: Conv1x1NoBias::unloaded(spec.output, context)?,
+            vq: ResidualVectorQuantization::unloaded(spec.books, context)?,
         })
     }
 
@@ -1980,18 +1653,20 @@ impl<T: Tensor> ResidualVectorQuantizer<T> {
 }
 
 /// Residual vector quantization layers.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Parameterized)]
+#[parameterized(tensor = "T")]
 pub struct ResidualVectorQuantization<T: Tensor> {
     /// Ordered residual quantization layers.
     pub layers: Vec<VectorQuantization<T>>,
 }
 
 impl<T: Tensor> ResidualVectorQuantization<T> {
-    fn unloaded(layers: i32, dim: i32, bins: i32, context: &T::Context) -> Result<Self, Error> {
+    fn unloaded(specs: Vec<specs::Codebook>, context: &T::Context) -> Result<Self, Error> {
         Ok(Self {
-            layers: (0..layers)
-                .map(|_| VectorQuantization::unloaded(dim, bins, context))
-                .collect::<Result<Vec<_>, _>>()?,
+            layers: specs
+                .into_iter()
+                .map(|s| VectorQuantization::unloaded(s, context))
+                .collect::<Result<_, _>>()?,
         })
     }
 
@@ -2035,16 +1710,17 @@ impl<T: Tensor> ResidualVectorQuantization<T> {
 }
 
 /// Single vector-quantization layer.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Parameterized)]
+#[parameterized(tensor = "T")]
 pub struct VectorQuantization<T: Tensor> {
     /// Euclidean codebook.
     pub _codebook: EuclideanCodebook<T>,
 }
 
 impl<T: Tensor> VectorQuantization<T> {
-    fn unloaded(dim: i32, bins: i32, context: &T::Context) -> Result<Self, Error> {
+    fn unloaded(spec: specs::Codebook, context: &T::Context) -> Result<Self, Error> {
         Ok(Self {
-            _codebook: EuclideanCodebook::unloaded(dim, bins, context)?,
+            _codebook: EuclideanCodebook::unloaded(spec, context)?,
         })
     }
 
@@ -2062,7 +1738,8 @@ impl<T: Tensor> VectorQuantization<T> {
 }
 
 /// Euclidean codebook backed by EMA cluster statistics.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Parameterized)]
+#[parameterized(tensor = "T")]
 pub struct EuclideanCodebook<T: Tensor> {
     /// Checkpoint initialization flag.
     pub _initialized: Parameter<T>,
@@ -2073,11 +1750,11 @@ pub struct EuclideanCodebook<T: Tensor> {
 }
 
 impl<T: Tensor> EuclideanCodebook<T> {
-    fn unloaded(dim: i32, bins: i32, context: &T::Context) -> Result<Self, Error> {
+    fn unloaded(spec: specs::Codebook, context: &T::Context) -> Result<Self, Error> {
         Ok(Self {
-            _initialized: unloaded_parameter(&[1], context)?,
-            cluster_usage: unloaded_parameter(&[bins], context)?,
-            embedding_sum: unloaded_parameter(&[bins, dim], context)?,
+            _initialized: spec.initialized.construct(context)?,
+            cluster_usage: spec.usage.construct(context)?,
+            embedding_sum: spec.sum.construct(context)?,
         })
     }
 
@@ -2130,16 +1807,17 @@ impl<T: Tensor> EuclideanCodebook<T> {
 }
 
 /// Bias-free 1x1 convolution over `[batch, channels, frames]` tensors.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Parameterized)]
+#[parameterized(tensor = "T")]
 pub struct Conv1x1NoBias<T: Tensor> {
     /// Weight shaped `[out_channels, in_channels, 1]`.
     pub weight: Parameter<T>,
 }
 
 impl<T: Tensor> Conv1x1NoBias<T> {
-    fn unloaded(in_channels: i32, out_channels: i32, context: &T::Context) -> Result<Self, Error> {
+    fn unloaded(spec: specs::Slot, context: &T::Context) -> Result<Self, Error> {
         Ok(Self {
-            weight: unloaded_parameter(&[out_channels, in_channels, 1], context)?,
+            weight: spec.construct(context)?,
         })
     }
 
@@ -2153,307 +1831,6 @@ impl<T: Tensor> Conv1x1NoBias<T> {
         let x = latent.swap_axes(1, 2, context)?;
         let weight = self.weight.as_ref().squeeze_axes(&[-1], context)?;
         Ok(T::matmul(&x, &weight.transpose(context)?, context)?.swap_axes(1, 2, context)?)
-    }
-}
-
-trait MimiModuleParameters<T: Tensor> {
-    fn visit_mimi_parameters<'a>(
-        &'a self,
-        prefix: &str,
-        visitor: &mut dyn FnMut(ParameterMetadata, &'a T),
-    );
-    fn visit_mimi_parameters_mut<'a>(
-        &'a mut self,
-        prefix: &str,
-        visitor: &mut dyn FnMut(ParameterMetadata, &'a mut T),
-    );
-    fn set_mimi_trainable(&mut self, trainable: bool);
-}
-
-struct PrefixVisitor<'a, F: ?Sized> {
-    prefix: &'a str,
-    visitor: &'a mut F,
-    exact: bool,
-}
-
-impl<'a, 'value, T, F: ?Sized> ParameterVisitor<'value, T> for PrefixVisitor<'a, F>
-where
-    T: 'value,
-    F: FnMut(ParameterMetadata, &'value T),
-{
-    fn visit(&mut self, mut metadata: ParameterMetadata, value: &'value T) {
-        let id = if self.exact {
-            self.prefix.to_owned()
-        } else {
-            parameter_name(self.prefix, metadata.id.as_str())
-        };
-        metadata.id = ParameterId::new(id).expect("Mimi parameter identities are non-empty");
-        (self.visitor)(metadata, value);
-    }
-}
-
-struct PrefixVisitorMut<'a, F: ?Sized> {
-    prefix: &'a str,
-    visitor: &'a mut F,
-    exact: bool,
-}
-
-impl<'a, 'value, T, F: ?Sized> ParameterVisitorMut<'value, T> for PrefixVisitorMut<'a, F>
-where
-    T: 'value,
-    F: FnMut(ParameterMetadata, &'value mut T),
-{
-    fn visit_mut(&mut self, mut metadata: ParameterMetadata, value: &'value mut T) {
-        let id = if self.exact {
-            self.prefix.to_owned()
-        } else {
-            parameter_name(self.prefix, metadata.id.as_str())
-        };
-        metadata.id = ParameterId::new(id).expect("Mimi parameter identities are non-empty");
-        (self.visitor)(metadata, value);
-    }
-}
-
-impl<T: Tensor> MimiModuleParameters<T> for Parameter<T> {
-    fn visit_mimi_parameters<'a>(
-        &'a self,
-        prefix: &str,
-        visitor: &mut dyn FnMut(ParameterMetadata, &'a T),
-    ) {
-        self.visit_parameters(&mut PrefixVisitor {
-            prefix,
-            visitor,
-            exact: true,
-        });
-    }
-
-    fn visit_mimi_parameters_mut<'a>(
-        &'a mut self,
-        prefix: &str,
-        visitor: &mut dyn FnMut(ParameterMetadata, &'a mut T),
-    ) {
-        self.visit_parameters_mut(&mut PrefixVisitorMut {
-            prefix,
-            visitor,
-            exact: true,
-        });
-    }
-
-    fn set_mimi_trainable(&mut self, trainable: bool) {
-        self.set_trainable(trainable);
-    }
-}
-
-macro_rules! structured_leaf_parameters {
-    ($type:ty) => {
-        impl<T: Tensor> MimiModuleParameters<T> for $type {
-            fn visit_mimi_parameters<'a>(
-                &'a self,
-                prefix: &str,
-                visitor: &mut dyn FnMut(ParameterMetadata, &'a T),
-            ) {
-                self.visit_parameters(&mut PrefixVisitor {
-                    prefix,
-                    visitor,
-                    exact: false,
-                });
-            }
-
-            fn visit_mimi_parameters_mut<'a>(
-                &'a mut self,
-                prefix: &str,
-                visitor: &mut dyn FnMut(ParameterMetadata, &'a mut T),
-            ) {
-                self.visit_parameters_mut(&mut PrefixVisitorMut {
-                    prefix,
-                    visitor,
-                    exact: false,
-                });
-            }
-
-            fn set_mimi_trainable(&mut self, trainable: bool) {
-                self.set_trainable(trainable);
-            }
-        }
-    };
-}
-
-structured_leaf_parameters!(Linear<T>);
-structured_leaf_parameters!(LayerNorm<T>);
-
-impl<T: Tensor, M: MimiModuleParameters<T>> MimiModuleParameters<T> for Vec<M> {
-    fn visit_mimi_parameters<'a>(
-        &'a self,
-        prefix: &str,
-        visitor: &mut dyn FnMut(ParameterMetadata, &'a T),
-    ) {
-        for (index, module) in self.iter().enumerate() {
-            module.visit_mimi_parameters(&parameter_name(prefix, &index.to_string()), visitor);
-        }
-    }
-
-    fn visit_mimi_parameters_mut<'a>(
-        &'a mut self,
-        prefix: &str,
-        visitor: &mut dyn FnMut(ParameterMetadata, &'a mut T),
-    ) {
-        for (index, module) in self.iter_mut().enumerate() {
-            module.visit_mimi_parameters_mut(&parameter_name(prefix, &index.to_string()), visitor);
-        }
-    }
-
-    fn set_mimi_trainable(&mut self, trainable: bool) {
-        for module in self {
-            module.set_mimi_trainable(trainable);
-        }
-    }
-}
-
-impl<T: Tensor, M: MimiModuleParameters<T>> MimiModuleParameters<T> for Option<M> {
-    fn visit_mimi_parameters<'a>(
-        &'a self,
-        prefix: &str,
-        visitor: &mut dyn FnMut(ParameterMetadata, &'a T),
-    ) {
-        if let Some(module) = self {
-            module.visit_mimi_parameters(prefix, visitor);
-        }
-    }
-
-    fn visit_mimi_parameters_mut<'a>(
-        &'a mut self,
-        prefix: &str,
-        visitor: &mut dyn FnMut(ParameterMetadata, &'a mut T),
-    ) {
-        if let Some(module) = self {
-            module.visit_mimi_parameters_mut(prefix, visitor);
-        }
-    }
-
-    fn set_mimi_trainable(&mut self, trainable: bool) {
-        if let Some(module) = self {
-            module.set_mimi_trainable(trainable);
-        }
-    }
-}
-
-macro_rules! module_parameters {
-    ($module:ident { $($field:ident),+ $(,)? }) => {
-        impl<T: Tensor> MimiModuleParameters<T> for $module<T> {
-            fn visit_mimi_parameters<'a>(
-                &'a self,
-                prefix: &str,
-                visitor: &mut dyn FnMut(ParameterMetadata, &'a T),
-            ) {
-                $(
-                    self.$field.visit_mimi_parameters(
-                        &parameter_name(prefix, stringify!($field)),
-                        visitor,
-                    );
-                )+
-            }
-
-            fn visit_mimi_parameters_mut<'a>(
-                &'a mut self,
-                prefix: &str,
-                visitor: &mut dyn FnMut(ParameterMetadata, &'a mut T),
-            ) {
-                $(
-                    self.$field.visit_mimi_parameters_mut(
-                        &parameter_name(prefix, stringify!($field)),
-                        visitor,
-                    );
-                )+
-            }
-
-            fn set_mimi_trainable(&mut self, trainable: bool) {
-                $(self.$field.set_mimi_trainable(trainable);)+
-            }
-        }
-    };
-}
-
-module_parameters!(Mimi {
-    quantizer,
-    encoder,
-    encoder_transformer,
-    downsample,
-    upsample,
-    decoder_transformer,
-    decoder,
-});
-module_parameters!(SeaNetEncoder {
-    init_conv1d,
-    layers,
-    final_conv1d,
-});
-module_parameters!(EncoderLayer {
-    residuals,
-    downsample,
-});
-module_parameters!(MimiTransformer { layers });
-module_parameters!(MimiTransformerLayer {
-    norm1,
-    norm2,
-    self_attn,
-    mlp,
-    layer_scale_1,
-    layer_scale_2,
-});
-module_parameters!(LayerScale { scale });
-module_parameters!(MimiMlp { linear1, linear2 });
-module_parameters!(MimiSelfAttention { in_proj, out_proj });
-module_parameters!(SeaNetDecoder {
-    init_conv1d,
-    layers,
-    final_conv1d,
-});
-module_parameters!(DecoderLayer {
-    upsample,
-    residuals,
-});
-module_parameters!(SeaNetResnetBlock { block });
-structured_leaf_parameters!(StreamableConv1d<T>);
-structured_leaf_parameters!(StreamableConvTranspose1d<T>);
-module_parameters!(SplitResidualVectorQuantizer {
-    rvq_first,
-    rvq_rest,
-});
-module_parameters!(ResidualVectorQuantizer {
-    input_proj,
-    output_proj,
-    vq,
-});
-module_parameters!(ResidualVectorQuantization { layers });
-module_parameters!(VectorQuantization { _codebook });
-module_parameters!(EuclideanCodebook {
-    _initialized,
-    cluster_usage,
-    embedding_sum,
-});
-module_parameters!(Conv1x1NoBias { weight });
-
-impl<T: Tensor> Parameterized<T> for Mimi<T> {
-    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
-    where
-        V: ParameterVisitor<'a, T>,
-    {
-        self.visit_mimi_parameters("", &mut |metadata, value| {
-            visitor.visit(metadata, value);
-        });
-    }
-
-    fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
-    where
-        V: ParameterVisitorMut<'a, T>,
-    {
-        self.visit_mimi_parameters_mut("", &mut |metadata, value| {
-            visitor.visit_mut(metadata, value);
-        });
-    }
-
-    fn set_trainable(&mut self, trainable: bool) {
-        self.set_mimi_trainable(trainable);
     }
 }
 

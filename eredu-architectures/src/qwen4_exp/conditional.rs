@@ -3,7 +3,7 @@ use super::{
     media::{MediaIngress, PreparedMediaInput},
     target::{BoundTargetSpec, TargetForward, TargetInput, TargetKernel, Unit as TargetUnit},
 };
-use crate::qwen::vision::{VisionBlock, VisionConfig, VisionState, VisionStatic};
+use crate::qwen::vision::{VisionBlock, VisionState, VisionStatic};
 use eredu_nn::{
     AttentionCache, DistributedNeuralBackend, EmbeddingOperator, Error, GroupedNeuralBackend,
     Tensor,
@@ -36,7 +36,7 @@ fn graph() -> Result<ExecutionGraph, Error> {
 /// Composes retained target storage and vision geometry without native resources.
 pub fn parameter_description(
     target: &ComponentDefinition,
-    vision: &VisionConfig,
+    vision: &crate::qwen::vision::Declaration,
 ) -> Result<ArchitectureParameterDescription, Error> {
     Ok(definition(target, vision)?.parameters().clone())
 }
@@ -44,7 +44,7 @@ pub fn parameter_description(
 /// Validates target and optional vision invocations before native construction.
 pub fn definition(
     target: &ComponentDefinition,
-    vision: &VisionConfig,
+    vision: &crate::qwen::vision::Declaration,
 ) -> Result<ComponentDefinition, Error> {
     let parameters = declare_parameters(target, vision)?;
     let mut units = (0..target.unit_count(TARGET_INDEX)?)
@@ -77,8 +77,13 @@ pub fn definition(
 
 fn declare_parameters(
     target: &ComponentDefinition,
-    vision: &VisionConfig,
+    vision: &crate::qwen::vision::Declaration,
 ) -> Result<ArchitectureParameterDescription, Error> {
+    if vision.root() != "model.visual" {
+        return Err(Error::backend(
+            "conditional vision namespace differs from component",
+        ));
+    }
     let graph = graph()?;
     let layout = ExecutionUnitLayout::new(
         &graph,
@@ -86,8 +91,8 @@ fn declare_parameters(
     )
     .map_err(Error::backend)?;
     let mut groups = target.parameters().groups().to_vec();
-    for group in crate::qwen::vision::static_parallel_parameter_groups(vision, "model.visual")
-        .map_err(Error::backend)?
+    for group in
+        crate::qwen::vision::static_parallel_parameter_groups(vision).map_err(Error::backend)?
     {
         groups.push(OwnedParameterGroupSpec::new(
             ParameterGroupOwner::static_role("vision"),
@@ -95,9 +100,8 @@ fn declare_parameters(
         ));
     }
     for index in 0..vision.layer_count() {
-        for group in
-            crate::qwen::vision::block_parallel_parameter_groups(vision, "model.visual", index)
-                .map_err(Error::backend)?
+        for group in crate::qwen::vision::block_parallel_parameter_groups(vision, index)
+            .map_err(Error::backend)?
         {
             groups.push(OwnedParameterGroupSpec::new(
                 ParameterGroupOwner::execution_unit(layout.group_id(1).unwrap().clone(), index),
@@ -123,11 +127,11 @@ fn vision_transport() -> ArchitectureGroupTransport {
 pub(crate) fn validate_ingress(
     spec: &super::target::TargetSpec,
     ingress: &MediaIngress,
-    vision: &VisionConfig,
+    vision: &crate::qwen::vision::Declaration,
 ) -> Result<(), Error> {
     // Formats may change at selection; semantic geometry must match the retained role.
     let mut expected = ingress.vision().config().clone();
-    let mut actual = vision.clone();
+    let mut actual = vision.config().clone();
     expected.linear_formats.clear();
     actual.linear_formats.clear();
     if expected != actual || vision.out_hidden_size != spec.configuration().hidden_size {
@@ -250,8 +254,8 @@ pub type ConditionalModel<B> = ComponentAdapter<
 pub struct ConditionalKernel<B: GroupedNeuralBackend + DistributedNeuralBackend> {
     modules: ConditionalStatic<B>,
     ingress: MediaIngress,
-    vision: VisionConfig,
-    vision_local: Option<Vec<(i32, i32)>>,
+    vision: std::sync::Arc<crate::qwen::vision::Declaration>,
+    vision_construction: std::collections::BTreeMap<usize, crate::qwen::vision::BlockSpec>,
     vision_input_owner: bool,
     partition_state: Option<PartitionState>,
     definition: std::sync::Arc<ComponentDefinition>,
@@ -279,19 +283,27 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ConditionalKernel<B> {
     pub fn new(
         spec: BoundTargetSpec,
         ingress: MediaIngress,
-        vision: VisionConfig,
+        vision: std::sync::Arc<crate::qwen::vision::Declaration>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         validate_ingress(spec.geometry(), &ingress, &vision)?;
         let definition = std::sync::Arc::new(definition(&spec.geometry().definition()?, &vision)?);
+        let vision_construction = (0..vision.layer_count())
+            .map(|index| {
+                Ok((
+                    index,
+                    vision.local_block(index, vision.num_heads, vision.intermediate_size)?,
+                ))
+            })
+            .collect::<Result<_, Error>>()?;
         Ok(Self {
             modules: ConditionalStatic {
                 target: TargetKernel::new(spec, context)?,
-                vision: VisionStatic::new_with_root(vision.clone(), "model.visual", context)?,
+                vision: VisionStatic::new(vision.clone(), context)?,
             },
             ingress,
             vision,
-            vision_local: None,
+            vision_construction,
             vision_input_owner: true,
             partition_state: None,
             definition,
@@ -400,7 +412,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ConditionalKernel<B> {
             .as_ref()
             .is_some_and(|state| state.global_layer_offset() != 0)
         {
-            let geometry = self.modules.target.spec.boundary.geometry;
+            let geometry = self.modules.target.spec.static_parameters.readout.geometry;
             let hidden = B::Tensor::full_f32(
                 0.0,
                 &[
@@ -456,7 +468,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ConditionalKernel<B> {
     /// Exact selected target/vision parameter geometry and media semantics.
     pub fn state_fingerprint(&self) -> String {
         eredu_core::cache::derive_prompt_cache_architecture_fingerprint(
-            "qwen4_exp.conditional.v1",
+            "qwen4_exp.conditional.v2",
             [
                 ("target", self.modules.target.state_fingerprint().to_owned()),
                 ("media", self.ingress.identity().to_owned()),
@@ -585,21 +597,14 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ComponentKernel<B>
         let group = address.group();
         let index = address.index();
         if group == VISION_INDEX {
-            let (heads, intermediate) = self
-                .vision_local
-                .as_ref()
-                .map(|local| local[index])
-                .unwrap_or((self.vision.num_heads, self.vision.intermediate_size));
-            Ok(ConditionalUnit::Vision(
-                VisionBlock::new_parallel_with_root(
-                    &self.vision,
-                    "model.visual",
-                    index,
-                    heads,
-                    intermediate,
-                    context,
-                )?,
-            ))
+            let scope = self
+                .vision_construction
+                .get(&index)
+                .ok_or_else(|| Error::backend("vision unit has no retained construction scope"))?;
+            Ok(ConditionalUnit::Vision(VisionBlock::from_spec(
+                scope.clone(),
+                context,
+            )?))
         } else {
             Ok(ConditionalUnit::Target(
                 self.modules.target.construct_unit(index, context)?,
@@ -744,7 +749,7 @@ where
                         .limits
                         .validate_history(offset, input.tokens)
                         .map_err(Error::backend_source)?;
-                    let geometry = self.modules.target.spec.boundary.geometry;
+                    let geometry = self.modules.target.spec.static_parameters.readout.geometry;
                     return Ok(LayeredForwardState {
                         hidden: B::Tensor::full_f32(
                             0.0,

@@ -7,124 +7,60 @@ use eredu_checkpoint::schema::{
 };
 
 use super::VisionConfig;
+use eredu_nn::{DeclareLogicalParameters, LogicalParameterRole};
+
+/// Source matrix geometry from the same typed tower declarations as construction
+/// and checkpoint admission. Patch kernels and position tables keep their roles.
+pub(crate) fn source_linear_shapes(
+    declaration: &super::Declaration,
+) -> Result<std::collections::BTreeMap<String, Vec<usize>>, String> {
+    Ok(declaration
+        .logical_parameters()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter(|parameter| {
+            parameter.role == LogicalParameterRole::LinearWeight && parameter.shape.len() == 2
+        })
+        .map(|parameter| (parameter.parameter.id.to_string(), parameter.shape))
+        .collect())
+}
 
 /// Builds the strict canonical vision catalog below an optional artifact prefix.
 pub fn safetensors_plan(
-    config: &VisionConfig,
-    prefix: &str,
+    declaration: &super::Declaration,
 ) -> Result<SafetensorsCheckpointPlan, String> {
-    config.validate().map_err(|error| error.to_string())?;
-    let hidden = dim(config.hidden_size)?;
-    let intermediate = dim(config.intermediate_size)?;
-    let merge = dim(config.spatial_merge_size)?;
-    let merged = hidden
-        .checked_mul(merge * merge)
-        .ok_or("vision merger width overflow")?;
-    let name = |relative: &str| {
-        if prefix.is_empty() {
-            relative.to_owned()
-        } else {
-            format!("{prefix}.{relative}")
+    let mut tensors = Vec::new();
+    for spec in &declaration.slots {
+        for declaration in spec
+            .logical_parameters()
+            .map_err(|error| error.to_string())?
+        {
+            if let Some(format) = declaration
+                .linear_format
+                .filter(|_| declaration.role == LogicalParameterRole::LinearWeight)
+            {
+                tensors.extend(
+                    matrix_for_linear_format(
+                        declaration.parameter.id.as_str(),
+                        Vec::<String>::new(),
+                        declaration.shape,
+                        format.encoding(),
+                        format
+                            .scale()
+                            .map(|scale| eredu_checkpoint::schema::MatrixScaleNames {
+                                key: scale.id.to_string(),
+                                aliases: Vec::new(),
+                            }),
+                    )
+                    .map_err(|error| error.to_string())?,
+                );
+            } else {
+                tensors.push(dense(
+                    declaration.parameter.id.as_str().to_owned(),
+                    declaration.shape,
+                ));
+            }
         }
-    };
-    let mut tensors = vec![
-        dense(
-            name("pos_embed.weight"),
-            vec![dim(config.num_position_embeddings)?, hidden],
-        ),
-        dense(
-            name("patch_embed.proj.weight"),
-            vec![
-                hidden,
-                dim(config.in_channels)?,
-                dim(config.temporal_patch_size)?,
-                dim(config.patch_size)?,
-                dim(config.patch_size)?,
-            ],
-        ),
-        dense(name("patch_embed.proj.bias"), vec![hidden]),
-    ];
-    for layer in 0..config.layer_count() {
-        let root = format!("blocks.{layer}");
-        for field in ["norm1.weight", "norm1.bias", "norm2.weight", "norm2.bias"] {
-            tensors.push(dense(name(&format!("{root}.{field}")), vec![hidden]));
-        }
-        matrix(
-            config,
-            &mut tensors,
-            name(&format!("{root}.attn.qkv.weight")),
-            "blocks",
-            vec![3 * hidden, hidden],
-        )?;
-        tensors.push(dense(
-            name(&format!("{root}.attn.qkv.bias")),
-            vec![3 * hidden],
-        ));
-        matrix(
-            config,
-            &mut tensors,
-            name(&format!("{root}.attn.proj.weight")),
-            "blocks",
-            vec![hidden, hidden],
-        )?;
-        tensors.push(dense(name(&format!("{root}.attn.proj.bias")), vec![hidden]));
-        matrix(
-            config,
-            &mut tensors,
-            name(&format!("{root}.mlp.linear_fc1.weight")),
-            "blocks",
-            vec![intermediate, hidden],
-        )?;
-        tensors.push(dense(
-            name(&format!("{root}.mlp.linear_fc1.bias")),
-            vec![intermediate],
-        ));
-        matrix(
-            config,
-            &mut tensors,
-            name(&format!("{root}.mlp.linear_fc2.weight")),
-            "blocks",
-            vec![hidden, intermediate],
-        )?;
-        tensors.push(dense(
-            name(&format!("{root}.mlp.linear_fc2.bias")),
-            vec![hidden],
-        ));
-    }
-    for merger in std::iter::once("merger".to_owned()).chain(
-        (0..config.deepstack_layer_count()).map(|index| format!("deepstack_merger_list.{index}")),
-    ) {
-        let norm_width = if merger == "merger" { hidden } else { merged };
-        tensors.push(dense(
-            name(&format!("{merger}.norm.weight")),
-            vec![norm_width],
-        ));
-        tensors.push(dense(
-            name(&format!("{merger}.norm.bias")),
-            vec![norm_width],
-        ));
-        matrix(
-            config,
-            &mut tensors,
-            name(&format!("{merger}.linear_fc1.weight")),
-            &merger,
-            vec![merged, merged],
-        )?;
-        tensors.push(dense(
-            name(&format!("{merger}.linear_fc1.bias")),
-            vec![merged],
-        ));
-        matrix(
-            config,
-            &mut tensors,
-            name(&format!("{merger}.linear_fc2.weight")),
-            &merger,
-            vec![dim(config.out_hidden_size)?, merged],
-        )?;
-        tensors.push(dense(
-            name(&format!("{merger}.linear_fc2.bias")),
-            vec![dim(config.out_hidden_size)?],
-        ));
     }
     SafetensorsCheckpointPlan::new(
         "Qwen shared vision SafeTensors",
@@ -135,39 +71,51 @@ pub fn safetensors_plan(
     .map_err(|error| error.to_string())
 }
 
+const GGUF_STATIC_NAMES: &[(&str, &str)] = &[
+    ("v.position_embd", "pos_embed"),
+    ("v.patch_embd", "patch_embed.proj"),
+    ("v.post_ln", "merger.norm"),
+    ("mm.0", "merger.linear_fc1"),
+    ("mm.2", "merger.linear_fc2"),
+];
+const GGUF_BLOCK_FIELDS: &[(&str, &str)] = &[
+    ("ln1", "norm1"),
+    ("ln2", "norm2"),
+    ("attn_qkv", "attn.qkv"),
+    ("attn_out", "attn.proj"),
+    ("ffn_up", "mlp.linear_fc1"),
+    ("ffn_down", "mlp.linear_fc2"),
+];
+const GGUF_MERGER_FIELDS: &[(&str, &str)] = &[("fc1", "linear_fc1"), ("fc2", "linear_fc2")];
+
 /// Translates llama.cpp Qwen projector names into the shared vision namespace.
 pub fn translate_gguf_weight_name(name: &str, deepstack_layers: &[i32]) -> String {
-    if let Some(rest) = name.strip_prefix("v.deepstack.") {
-        if let Some((layer, suffix)) = rest.split_once('.') {
-            if let Ok(layer) = layer.parse::<i32>() {
-                if let Some(index) = deepstack_layers.iter().position(|value| *value == layer) {
-                    let suffix =
-                        suffix
-                            .replacen("fc1", "linear_fc1", 1)
-                            .replacen("fc2", "linear_fc2", 1);
-                    return format!("model.visual.deepstack_merger_list.{index}.{suffix}");
-                }
+    if let Some((layer, suffix)) = name
+        .strip_prefix("v.deepstack.")
+        .and_then(|rest| rest.split_once('.'))
+    {
+        if let Ok(layer) = layer.parse::<i32>() {
+            if let Some(index) = deepstack_layers.iter().position(|value| *value == layer) {
+                let suffix = GGUF_MERGER_FIELDS
+                    .iter()
+                    .fold(suffix.to_owned(), |suffix, (physical, canonical)| {
+                        suffix.replacen(physical, canonical, 1)
+                    });
+                return format!("model.visual.deepstack_merger_list.{index}.{suffix}");
             }
         }
     }
-    for (source, target) in [
-        ("v.position_embd", "model.visual.pos_embed"),
-        ("v.patch_embd", "model.visual.patch_embed.proj"),
-        ("v.post_ln", "model.visual.merger.norm"),
-        ("mm.0", "model.visual.merger.linear_fc1"),
-        ("mm.2", "model.visual.merger.linear_fc2"),
-        ("v.blk", "model.visual.blocks"),
-    ] {
+    for &(source, target) in GGUF_STATIC_NAMES
+        .iter()
+        .chain(std::iter::once(&("v.blk", "blocks")))
+    {
         if name == source || name.starts_with(&format!("{source}.")) {
-            let mut translated = name.replacen(source, target, 1);
+            let mut translated = name.replacen(source, &format!("model.visual.{target}"), 1);
             if source == "v.blk" {
-                translated = translated
-                    .replace(".attn_out.", ".attn.proj.")
-                    .replace(".attn_qkv.", ".attn.qkv.")
-                    .replace(".ffn_up.", ".mlp.linear_fc1.")
-                    .replace(".ffn_down.", ".mlp.linear_fc2.")
-                    .replace(".ln1.", ".norm1.")
-                    .replace(".ln2.", ".norm2.");
+                for &(physical, canonical) in GGUF_BLOCK_FIELDS {
+                    translated =
+                        translated.replace(&format!(".{physical}."), &format!(".{canonical}."));
+                }
             }
             return translated;
         }
@@ -176,109 +124,45 @@ pub fn translate_gguf_weight_name(name: &str, deepstack_layers: &[i32]) -> Strin
 }
 
 /// Builds the split Qwen3-VL/Qwen3.5 projector GGUF contract.
-pub(crate) fn gguf_plan(
-    vision: &VisionConfig,
-    text_hidden_size: i32,
-) -> Result<GgufCheckpointPlan, String> {
-    let hidden = dim(vision.hidden_size)?;
-    let intermediate = dim(vision.intermediate_size)?;
-    let text_hidden = dim(text_hidden_size)?;
-    let patch = dim(vision.patch_size)?;
-    let merge = dim(vision.spatial_merge_size)?;
-    let merger_hidden = hidden
-        .checked_mul(merge)
-        .and_then(|value| value.checked_mul(merge))
-        .ok_or_else(|| "vision merger width overflows".to_string())?;
-    let mut tensors = vec![
-        gguf_tensor(
-            "v.position_embd.weight",
-            vec![dim(vision.num_position_embeddings)?, hidden],
-            TensorOperation::Dense,
-        ),
-        gguf_tensor(
-            "v.patch_embd.weight",
-            vec![hidden, 3, patch, patch],
-            TensorOperation::Dense,
-        ),
-        gguf_tensor(
-            "v.patch_embd.weight.1",
-            vec![hidden, 3, patch, patch],
-            TensorOperation::Dense,
-        ),
-        gguf_tensor("v.patch_embd.bias", vec![hidden], TensorOperation::Dense),
-    ];
-    for layer in 0..vision.layer_count() {
-        let root = format!("v.blk.{layer}");
-        for (name, shape, operation) in [
-            ("ln1.weight", vec![hidden], TensorOperation::Dense),
-            ("ln1.bias", vec![hidden], TensorOperation::Dense),
-            (
-                "attn_qkv.weight",
-                vec![3 * hidden, hidden],
-                TensorOperation::Matrix,
-            ),
-            ("attn_qkv.bias", vec![3 * hidden], TensorOperation::Dense),
-            (
-                "attn_out.weight",
-                vec![hidden, hidden],
-                TensorOperation::Matrix,
-            ),
-            ("attn_out.bias", vec![hidden], TensorOperation::Dense),
-            ("ln2.weight", vec![hidden], TensorOperation::Dense),
-            ("ln2.bias", vec![hidden], TensorOperation::Dense),
-            (
-                "ffn_up.weight",
-                vec![intermediate, hidden],
-                TensorOperation::Matrix,
-            ),
-            ("ffn_up.bias", vec![intermediate], TensorOperation::Dense),
-            (
-                "ffn_down.weight",
-                vec![hidden, intermediate],
-                TensorOperation::Matrix,
-            ),
-            ("ffn_down.bias", vec![hidden], TensorOperation::Dense),
-        ] {
-            tensors.push(gguf_tensor(format!("{root}.{name}"), shape, operation));
-        }
-    }
-    for (name, shape, operation) in [
-        ("v.post_ln.weight", vec![hidden], TensorOperation::Dense),
-        ("v.post_ln.bias", vec![hidden], TensorOperation::Dense),
-        (
-            "mm.0.weight",
-            vec![merger_hidden, merger_hidden],
-            TensorOperation::Matrix,
-        ),
-        ("mm.0.bias", vec![merger_hidden], TensorOperation::Dense),
-        (
-            "mm.2.weight",
-            vec![text_hidden, merger_hidden],
-            TensorOperation::Matrix,
-        ),
-        ("mm.2.bias", vec![text_hidden], TensorOperation::Dense),
-    ] {
-        tensors.push(gguf_tensor(name, shape, operation));
-    }
-    for layer in vision.deepstack_layers() {
-        let root = format!("v.deepstack.{layer}");
-        for (name, shape, operation) in [
-            ("norm.weight", vec![merger_hidden], TensorOperation::Dense),
-            ("norm.bias", vec![merger_hidden], TensorOperation::Dense),
-            (
-                "fc1.weight",
-                vec![merger_hidden, merger_hidden],
-                TensorOperation::Matrix,
-            ),
-            ("fc1.bias", vec![merger_hidden], TensorOperation::Dense),
-            (
-                "fc2.weight",
-                vec![text_hidden, merger_hidden],
-                TensorOperation::Matrix,
-            ),
-            ("fc2.bias", vec![text_hidden], TensorOperation::Dense),
-        ] {
-            tensors.push(gguf_tensor(format!("{root}.{name}"), shape, operation));
+pub(crate) fn gguf_plan(declaration: &super::Declaration) -> Result<GgufCheckpointPlan, String> {
+    let configured = declaration.config();
+    let scope_root = declaration.root();
+    let mut tensors = Vec::new();
+    for spec in &declaration.slots {
+        for declaration in spec
+            .logical_parameters()
+            .map_err(|error| error.to_string())?
+        {
+            let name = declaration.parameter.id.as_str();
+            let name = name
+                .strip_prefix(&format!("{}.", scope_root))
+                .unwrap_or(name);
+            if name == "patch_embed.proj.weight" {
+                // The published GGUF layout stores two temporal Conv2D slices.
+                if declaration.shape[1] != 3 || declaration.shape[2] != 2 {
+                    return Err(
+                        "Qwen projector GGUF requires three channels and two temporal patch slices"
+                            .into(),
+                    );
+                }
+                let mut shape = declaration.shape;
+                shape.remove(2);
+                for key in ["v.patch_embd.weight", "v.patch_embd.weight.1"] {
+                    tensors.push(gguf_tensor(key, shape.clone(), TensorOperation::Dense));
+                }
+            } else {
+                tensors.push(gguf_tensor(
+                    gguf_parameter_name(name, &configured)?,
+                    declaration.shape,
+                    if declaration.linear_format.is_some()
+                        && declaration.role == LogicalParameterRole::LinearWeight
+                    {
+                        TensorOperation::Matrix
+                    } else {
+                        TensorOperation::Dense
+                    },
+                ));
+            }
         }
     }
     GgufCheckpointPlan::new(
@@ -298,32 +182,53 @@ fn gguf_tensor(
     GgufTensorConstraint::required(key, shape, GgufTypeConstraint::OperationClass(operation))
 }
 
-fn matrix(
-    config: &VisionConfig,
-    output: &mut Vec<SafetensorsTensorConstraint>,
-    physical: String,
-    relative_root: &str,
-    shape: Vec<usize>,
-) -> Result<(), String> {
-    let relative = physical
-        .find(relative_root)
-        .map(|index| &physical[index..])
-        .unwrap_or(&physical);
-    let format = config.linear_format(relative);
-    output.extend(
-        matrix_for_linear_format(physical, Vec::<String>::new(), shape, format, None)
-            .map_err(|error| error.to_string())?,
-    );
-    Ok(())
-}
 fn dense(name: String, shape: Vec<usize>) -> SafetensorsTensorConstraint {
     SafetensorsTensorConstraint::required(name, shape, StoredDtypeConstraint::Floating)
 }
-fn dim(value: i32) -> Result<usize, String> {
-    usize::try_from(value)
-        .ok()
-        .filter(|v| *v > 0)
-        .ok_or_else(|| "vision dimension must be positive".into())
+fn gguf_parameter_name(name: &str, config: &VisionConfig) -> Result<String, String> {
+    for &(physical, canonical) in GGUF_STATIC_NAMES {
+        if name
+            .strip_prefix(canonical)
+            .is_some_and(|suffix| suffix.starts_with('.'))
+        {
+            return Ok(name.replacen(canonical, physical, 1));
+        }
+    }
+    if let Some((layer, suffix)) = name
+        .strip_prefix("blocks.")
+        .and_then(|rest| rest.split_once('.'))
+    {
+        for &(physical, canonical) in GGUF_BLOCK_FIELDS {
+            if suffix
+                .strip_prefix(canonical)
+                .is_some_and(|suffix| suffix.starts_with('.'))
+            {
+                return Ok(format!(
+                    "v.blk.{layer}.{}",
+                    suffix.replacen(canonical, physical, 1)
+                ));
+            }
+        }
+    }
+    if let Some((index, suffix)) = name
+        .strip_prefix("deepstack_merger_list.")
+        .and_then(|rest| rest.split_once('.'))
+    {
+        let index = index.parse::<usize>().map_err(|error| error.to_string())?;
+        let layer = *config
+            .deepstack_layers()
+            .get(index)
+            .ok_or("Qwen vision DeepStack declaration is unresolved")?;
+        let suffix = GGUF_MERGER_FIELDS
+            .iter()
+            .fold(suffix.to_owned(), |suffix, (physical, canonical)| {
+                suffix.replacen(canonical, physical, 1)
+            });
+        return Ok(format!("v.deepstack.{layer}.{suffix}"));
+    }
+    Err(format!(
+        "Qwen vision GGUF has no storage declaration for {name}"
+    ))
 }
 
 /// Reassembles the published two temporal Conv2D slices as one Conv3D kernel.

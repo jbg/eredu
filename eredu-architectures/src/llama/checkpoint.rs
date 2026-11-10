@@ -1,9 +1,9 @@
 //! Architecture-owned checkpoint contracts for Llama, Mistral and Phi-4 decoders.
 //!
-//! This module owns physical tensor names, geometry, bias policy, affine
-//! SafeTensors companions, GGUF encodings, and the small RoPE catalog
-//! exclusions accepted by the Llama-compatible loaders. Generic checkpoint
-//! code only evaluates the resulting declarative constraints.
+//! This module projects logical decoder declarations into physical tensor names,
+//! affine SafeTensors companions and GGUF encodings. It retains the dtype rules
+//! and RoPE catalog exclusions accepted by Llama-compatible loaders. Generic
+//! checkpoint code evaluates the resulting declarative constraints.
 
 use std::{collections::HashMap, fmt};
 
@@ -11,7 +11,7 @@ use eredu_checkpoint::schema::{
     CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint, GgufTypeConstraint,
     SafetensorsCheckpointPlan, SafetensorsTensorConstraint, StoredDtypeConstraint, TensorOperation,
 };
-use eredu_checkpoint::{StoredDtype, WeightQuantization};
+use eredu_checkpoint::WeightQuantization;
 
 use super::ModelArgs;
 
@@ -44,21 +44,30 @@ pub fn with_checkpoint_formats(
     Ok(target)
 }
 
+// Physical storage names and canonical construction references share one map.
+const GGUF_PARAMETER_NAMES: &[(&str, &str)] = &[
+    ("blk.", "model.layers."),
+    ("ffn_gate", "mlp.gate_proj"),
+    ("ffn_down", "mlp.down_proj"),
+    ("ffn_up", "mlp.up_proj"),
+    ("attn_q", "self_attn.q_proj"),
+    ("attn_k", "self_attn.k_proj"),
+    ("attn_v", "self_attn.v_proj"),
+    ("attn_output", "self_attn.o_proj"),
+    ("attn_norm", "input_layernorm"),
+    ("ffn_norm", "post_attention_layernorm"),
+    ("token_embd", "model.embed_tokens"),
+    ("output_norm", "model.norm"),
+    ("output", "lm_head"),
+];
+
 /// Translates one llama.cpp GGUF tensor name into the canonical HF layout.
 pub fn translate_gguf_weight_name(name: &str) -> String {
-    name.replace("blk.", "model.layers.")
-        .replace("ffn_gate", "mlp.gate_proj")
-        .replace("ffn_down", "mlp.down_proj")
-        .replace("ffn_up", "mlp.up_proj")
-        .replace("attn_q", "self_attn.q_proj")
-        .replace("attn_k", "self_attn.k_proj")
-        .replace("attn_v", "self_attn.v_proj")
-        .replace("attn_output", "self_attn.o_proj")
-        .replace("attn_norm", "input_layernorm")
-        .replace("ffn_norm", "post_attention_layernorm")
-        .replace("token_embd", "model.embed_tokens")
-        .replace("output_norm", "model.norm")
-        .replace("output", "lm_head")
+    GGUF_PARAMETER_NAMES
+        .iter()
+        .fold(name.to_owned(), |name, (physical, canonical)| {
+            name.replace(physical, canonical)
+        })
 }
 
 /// Translates the physical fused Phi layout or the ordinary split layout.
@@ -77,189 +86,49 @@ pub(crate) fn translate_gguf_weight_name_for_model(name: &str, args: &ModelArgs)
 /// Builds the complete SafeTensors catalog expected by this configuration.
 pub fn safetensors_plan(
     args: &ModelArgs,
+    declaration: &crate::decoder::DecoderDeclaration,
 ) -> Result<SafetensorsCheckpointPlan, SafetensorsPlanError> {
-    let hidden = dimension(args.hidden_size, "hidden size")?;
-    let vocab = dimension(args.vocab_size, "vocabulary size")?;
-    let intermediate = dimension(args.intermediate_size, "intermediate size")?;
-    let query = checked_mul(
-        dimension(args.num_attention_heads, "attention head count")?,
-        dimension(args.head_dim, "attention head dimension")?,
-        "query projection width",
-    )?;
-    let key_value = checked_mul(
-        dimension(args.num_key_value_heads, "key/value head count")?,
-        dimension(args.head_dim, "attention head dimension")?,
-        "key/value projection width",
-    )?;
+    let declarations = declaration
+        .parameter_description(args, crate::decoder::ParameterEncoding::Logical)
+        .map_err(|error| SafetensorsPlanError::Geometry(error.to_string()))?;
+    safetensors_plan_from_parameters(
+        declarations
+            .groups()
+            .iter()
+            .flat_map(|group| group.members()),
+    )
+}
+
+pub(crate) fn safetensors_plan_from_parameters<'a>(
+    parameters: impl IntoIterator<Item = &'a eredu_runtime::ParameterMemberSpec>,
+) -> Result<SafetensorsCheckpointPlan, SafetensorsPlanError> {
     let mut tensors = Vec::new();
-    add_safe(
-        args,
-        &mut tensors,
-        "model.embed_tokens.weight",
-        vec![vocab, hidden],
-        TensorOperation::Matrix,
-    )?;
-    tensors.push(safe("model.norm.weight", vec![hidden]));
-    if !args.tie_word_embeddings {
-        add_safe(
-            args,
-            &mut tensors,
-            "lm_head.weight",
-            vec![vocab, hidden],
-            TensorOperation::Matrix,
-        )?;
-    }
-    for layer in 0..dimension(args.num_hidden_layers, "layer count")? {
-        let block = format!("model.layers.{layer}");
-        tensors.extend([
-            safe(format!("{block}.input_layernorm.weight"), vec![hidden]),
-            safe(
-                format!("{block}.post_attention_layernorm.weight"),
-                vec![hidden],
-            ),
-        ]);
-        let attention = if args.model_type == "phi3" {
-            vec![(
-                "self_attn.qkv_proj.weight",
-                vec![fused_query_width(query, key_value)?, hidden],
-            )]
+    for parameter in parameters {
+        let quantization = parameter
+            .logical_linear_format()
+            .and_then(|format| format.encoding().weight_quantization());
+        let constraints = if let Some(quantization) = quantization {
+            eredu_checkpoint::schema::matrix_for_packed_words(
+                parameter.target(),
+                Vec::<String>::new(),
+                parameter.global_shape().to_vec(),
+                quantization,
+                None,
+            )
+            .map_err(|error| SafetensorsPlanError::Companion {
+                name: parameter.target().into(),
+                detail: error.to_string(),
+            })?
         } else {
-            vec![
-                ("self_attn.q_proj.weight", vec![query, hidden]),
-                ("self_attn.k_proj.weight", vec![key_value, hidden]),
-                ("self_attn.v_proj.weight", vec![key_value, hidden]),
-            ]
+            vec![safe(parameter.target(), parameter.global_shape().to_vec())]
         };
-        let feed_forward = if args.model_type == "phi3" {
-            vec![(
-                "mlp.gate_up_proj.weight",
-                vec![checked_mul(intermediate, 2, "gate/up width")?, hidden],
-            )]
-        } else {
-            vec![
-                ("mlp.gate_proj.weight", vec![intermediate, hidden]),
-                ("mlp.up_proj.weight", vec![intermediate, hidden]),
-            ]
-        };
-        let matrices = attention
-            .into_iter()
-            .chain([("self_attn.o_proj.weight", vec![hidden, query])])
-            .chain(feed_forward)
-            .chain([("mlp.down_proj.weight", vec![hidden, intermediate])]);
-        for (local, shape) in matrices {
-            add_safe(
-                args,
-                &mut tensors,
-                &format!("{block}.{local}"),
-                shape,
-                TensorOperation::Matrix,
-            )?;
-        }
-        if args.attention_bias {
-            for (local, size) in [
-                ("q_proj.bias", query),
-                ("k_proj.bias", key_value),
-                ("v_proj.bias", key_value),
-                ("o_proj.bias", hidden),
-            ] {
-                tensors.push(safe(format!("{block}.self_attn.{local}"), vec![size]));
-            }
-        }
-        if args.mlp_bias {
-            for (local, size) in [
-                ("gate_proj.bias", intermediate),
-                ("up_proj.bias", intermediate),
-                ("down_proj.bias", hidden),
-            ] {
-                tensors.push(safe(format!("{block}.mlp.{local}"), vec![size]));
-            }
-        }
+        tensors.extend(constraints);
     }
     let mut policy = CatalogPolicy::strict();
     policy.allowed_prefixes.push("rope_freqs.".into());
     policy.allowed_suffixes.push(".rotary_emb.inv_freq".into());
     SafetensorsCheckpointPlan::new("Llama SafeTensors", tensors, Vec::new(), policy)
         .map_err(|error| SafetensorsPlanError::Geometry(error.to_string()))
-}
-
-fn add_safe(
-    args: &ModelArgs,
-    output: &mut Vec<SafetensorsTensorConstraint>,
-    name: &str,
-    shape: Vec<usize>,
-    operation: TensorOperation,
-) -> Result<(), SafetensorsPlanError> {
-    let quantization = (operation == TensorOperation::Matrix)
-        .then(|| args.weight_quantization_for(name))
-        .flatten();
-    output.extend(safe_matrix_constraints(name, shape, quantization)?);
-    Ok(())
-}
-
-fn safe_matrix_constraints(
-    name: &str,
-    shape: Vec<usize>,
-    quantization: Option<WeightQuantization>,
-) -> Result<Vec<SafetensorsTensorConstraint>, SafetensorsPlanError> {
-    let Some(quantization) = quantization else {
-        return Ok(vec![safe(name, shape)]);
-    };
-    let input = *shape
-        .last()
-        .ok_or_else(|| format!("quantized Llama matrix {name:?} has scalar shape"))?;
-    let bits = dimension(quantization.bits(), "quantization bit width")?;
-    let group = dimension(quantization.group_size(), "quantization group size")?;
-    let packed_bits = input
-        .checked_mul(bits)
-        .ok_or_else(|| SafetensorsPlanError::Companion {
-            name: name.into(),
-            detail: format!("quantized tensor {name:?} packing geometry overflows"),
-        })?;
-    if !input.is_multiple_of(group) || !input.is_multiple_of(32) || !packed_bits.is_multiple_of(32)
-    {
-        return Err(SafetensorsPlanError::Companion {
-            name: name.into(),
-            detail: format!(
-                "quantized tensor {name:?} input dimension {input} is incompatible with group size {group} and {bits}-bit packing"
-            ),
-        });
-    }
-    let mut packed = shape.clone();
-    *packed.last_mut().expect("matrix shape") = packed_bits / 32;
-    let mut companion = shape;
-    *companion.last_mut().expect("matrix shape") = input / group;
-    let prefix = name.strip_suffix(".weight").unwrap_or(name);
-    let dtype = || {
-        StoredDtypeConstraint::OneOf(vec![
-            StoredDtype::F16,
-            StoredDtype::BF16,
-            StoredDtype::F32,
-            StoredDtype::U8,
-        ])
-    };
-    let mut constraints = vec![SafetensorsTensorConstraint::required(
-        name,
-        packed,
-        StoredDtypeConstraint::Exact(StoredDtype::U32),
-    )];
-    constraints.push(
-        SafetensorsTensorConstraint::required(
-            format!("{prefix}.scales"),
-            companion.clone(),
-            dtype(),
-        )
-        .linear_companion(name, eredu_checkpoint::schema::LinearCompanionKind::Scale),
-    );
-    if quantization.has_biases() {
-        constraints.push(
-            SafetensorsTensorConstraint::required(format!("{prefix}.biases"), companion, dtype())
-                .linear_companion(
-                    name,
-                    eredu_checkpoint::schema::LinearCompanionKind::AffineBias,
-                ),
-        );
-    }
-    Ok(constraints)
 }
 
 fn safe(key: impl Into<String>, shape: Vec<usize>) -> SafetensorsTensorConstraint {
@@ -295,106 +164,37 @@ impl From<String> for SafetensorsPlanError {
 }
 
 /// Builds the complete GGUF catalog expected by this configuration.
-pub fn gguf_plan(args: &ModelArgs) -> Result<GgufCheckpointPlan, String> {
-    let hidden = dimension(args.hidden_size, "hidden size")?;
-    let vocab = dimension(args.vocab_size, "vocabulary size")?;
-    let intermediate = dimension(args.intermediate_size, "intermediate size")?;
-    let query = checked_mul(
-        dimension(args.num_attention_heads, "attention head count")?,
-        dimension(args.head_dim, "attention head dimension")?,
-        "query projection width",
-    )?;
-    let key_value = checked_mul(
-        dimension(args.num_key_value_heads, "key/value head count")?,
-        dimension(args.head_dim, "attention head dimension")?,
-        "key/value projection width",
-    )?;
-    let mut tensors = vec![
-        gguf(
-            "token_embd.weight",
-            vec![vocab, hidden],
-            TensorOperation::Matrix,
-        ),
-        gguf("output_norm.weight", vec![hidden], TensorOperation::Vector),
-    ];
-    if !args.tie_word_embeddings {
+pub fn gguf_plan(
+    args: &ModelArgs,
+    declaration: &crate::decoder::DecoderDeclaration,
+) -> Result<GgufCheckpointPlan, String> {
+    let declarations = declaration
+        .parameter_description(args, crate::decoder::ParameterEncoding::Logical)
+        .map_err(|error| error.to_string())?;
+    gguf_plan_from_parameters(
+        args,
+        declarations
+            .groups()
+            .iter()
+            .flat_map(|group| group.members()),
+    )
+}
+
+pub(crate) fn gguf_plan_from_parameters<'a>(
+    args: &ModelArgs,
+    parameters: impl IntoIterator<Item = &'a eredu_runtime::ParameterMemberSpec>,
+) -> Result<GgufCheckpointPlan, String> {
+    let mut tensors = Vec::new();
+    for parameter in parameters {
         tensors.push(gguf(
-            "output.weight",
-            vec![vocab, hidden],
-            TensorOperation::Matrix,
+            gguf_parameter_name(parameter.target(), args),
+            parameter.global_shape().to_vec(),
+            if parameter.logical_linear_format().is_some() {
+                TensorOperation::Matrix
+            } else {
+                TensorOperation::Vector
+            },
         ));
-    }
-    for layer in 0..dimension(args.num_hidden_layers, "layer count")? {
-        let block = format!("blk.{layer}");
-        for local in ["attn_norm.weight", "ffn_norm.weight"] {
-            tensors.push(gguf(
-                format!("{block}.{local}"),
-                vec![hidden],
-                TensorOperation::Vector,
-            ));
-        }
-        let attention = if args.model_type == "phi3" {
-            vec![(
-                "attn_qkv.weight",
-                vec![fused_query_width(query, key_value)?, hidden],
-            )]
-        } else {
-            vec![
-                ("attn_q.weight", vec![query, hidden]),
-                ("attn_k.weight", vec![key_value, hidden]),
-                ("attn_v.weight", vec![key_value, hidden]),
-            ]
-        };
-        let feed_forward = if args.model_type == "phi3" {
-            vec![(
-                "ffn_up.weight",
-                vec![checked_mul(intermediate, 2, "gate/up width")?, hidden],
-            )]
-        } else {
-            vec![
-                ("ffn_gate.weight", vec![intermediate, hidden]),
-                ("ffn_up.weight", vec![intermediate, hidden]),
-            ]
-        };
-        let matrices = attention
-            .into_iter()
-            .chain([("attn_output.weight", vec![hidden, query])])
-            .chain(feed_forward)
-            .chain([("ffn_down.weight", vec![hidden, intermediate])]);
-        for (local, shape) in matrices {
-            tensors.push(gguf(
-                format!("{block}.{local}"),
-                shape,
-                TensorOperation::Matrix,
-            ));
-        }
-        if args.attention_bias {
-            for (local, size) in [
-                ("attn_q.bias", query),
-                ("attn_k.bias", key_value),
-                ("attn_v.bias", key_value),
-                ("attn_output.bias", hidden),
-            ] {
-                tensors.push(gguf(
-                    format!("{block}.{local}"),
-                    vec![size],
-                    TensorOperation::Vector,
-                ));
-            }
-        }
-        if args.mlp_bias {
-            for (local, size) in [
-                ("ffn_gate.bias", intermediate),
-                ("ffn_up.bias", intermediate),
-                ("ffn_down.bias", hidden),
-            ] {
-                tensors.push(gguf(
-                    format!("{block}.{local}"),
-                    vec![size],
-                    TensorOperation::Vector,
-                ));
-            }
-        }
     }
     let mut policy = CatalogPolicy::strict();
     policy.allowed_prefixes.push("rope_freqs.".into());
@@ -410,20 +210,17 @@ fn gguf(
     GgufTensorConstraint::required(key, shape, GgufTypeConstraint::OperationClass(operation))
 }
 
-fn dimension(value: i32, name: &str) -> Result<usize, String> {
-    usize::try_from(value)
-        .ok()
-        .filter(|value| *value > 0)
-        .ok_or_else(|| format!("Llama {name} must be positive, got {value}"))
-}
-
-fn checked_mul(left: usize, right: usize, name: &str) -> Result<usize, String> {
-    left.checked_mul(right)
-        .ok_or_else(|| format!("Llama {name} geometry overflows"))
-}
-
-fn fused_query_width(query: usize, key_value: usize) -> Result<usize, String> {
-    query
-        .checked_add(checked_mul(key_value, 2, "key/value width")?)
-        .ok_or_else(|| "Phi-4 fused QKV width overflows".into())
+/// Physical GGUF names reference the canonical construction identities.
+pub(crate) fn gguf_parameter_name(name: &str, args: &ModelArgs) -> String {
+    let name = GGUF_PARAMETER_NAMES
+        .iter()
+        .fold(name.to_owned(), |name, (physical, canonical)| {
+            name.replace(canonical, physical)
+        });
+    if args.model_type == "phi3" {
+        name.replace("self_attn.qkv_proj", "attn_qkv")
+            .replace("mlp.gate_up_proj", "ffn_up")
+    } else {
+        name
+    }
 }

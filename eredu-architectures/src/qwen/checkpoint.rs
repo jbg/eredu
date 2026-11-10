@@ -1,5 +1,6 @@
 //! Pure checkpoint schemas, name translation, and recipes for Qwen text models.
 
+use eredu_nn::DeclareLogicalParameters;
 use std::collections::{BTreeMap, HashMap};
 
 use eredu_checkpoint::schema::{
@@ -18,7 +19,7 @@ use eredu_checkpoint::{
     recipe::DerivedWeightRecipe, store::TensorSelection, LinearFormat, WeightQuantization,
 };
 
-use super::{ModelArgs, QwenVariant};
+use super::ModelArgs;
 
 /// Derives a Qwen configuration whose physical matrix formats reflect
 /// load-time quantization.
@@ -41,17 +42,31 @@ pub fn with_checkpoint_formats(
     args: &ModelArgs,
     mut formats: HashMap<String, WeightQuantization>,
 ) -> Result<ModelArgs, String> {
-    if args.is_moe() {
-        for layer in 0..args.num_hidden_layers {
-            let prefix = format!("{}.layers.{layer}.mlp.experts", args.parameter_root);
-            let gate = formats.get(&format!("{prefix}.gate_proj.weight"));
-            let up = formats.get(&format!("{prefix}.up_proj.weight"));
-            if (gate.is_some() || up.is_some()) && gate != up {
-                return Err(format!("split expert gate/up formats disagree at {prefix}"));
-            }
+    let source = super::Declaration::new(args.clone()).map_err(|error| error.to_string())?;
+    if let Some(projections) = source.projections() {
+        for layer in projections.owner_layers() {
+            let bank = source
+                .expert_bank(layer)
+                .map_err(|error| error.to_string())?;
+            let packed = bank
+                .packed_parameters()
+                .map_err(|error| error.to_string())?;
+            let prefix = expert_source_root(&packed)?;
+            crate::format_references::rehome_split_matrix_format(
+                &mut formats,
+                &packed.gate_up().parameter.id,
+                [
+                    format!("{prefix}.gate_proj.weight"),
+                    format!("{prefix}.up_proj.weight"),
+                ],
+            )?;
+            crate::format_references::rehome_matrix_format(
+                &mut formats,
+                &packed.down().parameter.id,
+                &format!("{prefix}.down_proj.weight"),
+            )?;
         }
     }
-    normalize_weight_formats(args, &mut formats);
     let mut target = args.clone();
     target.quantized_weights = Some(formats.keys().cloned().collect());
     target.quantized_weight_configs = Some(formats);
@@ -60,53 +75,66 @@ pub fn with_checkpoint_formats(
     Ok(target)
 }
 
-/// Builds the canonical Qwen SafeTensors catalog plan.
-pub fn safetensors_plan(args: &ModelArgs) -> Result<SafetensorsCheckpointPlan, String> {
-    safetensors_plan_with_root(args, &args.parameter_root, true)
-}
-
-/// Builds a SafeTensors plan under an embedding-specific decoder root.
-pub fn safetensors_plan_with_root(
-    args: &ModelArgs,
-    root: &str,
+/// Builds the canonical Qwen SafeTensors catalog with its published layout alternatives.
+pub fn safetensors_plan(
+    declaration: &super::Declaration,
     allow_derived_expert_layouts: bool,
 ) -> Result<SafetensorsCheckpointPlan, String> {
-    let hidden = dimension(args.hidden_size, "hidden_size")?;
-    let vocab = dimension(args.vocab_size, "vocab_size")?;
-    let query = checked_mul(
-        dimension(args.num_attention_heads, "num_attention_heads")?,
-        dimension(args.head_dim, "head_dim")?,
-        "query width",
-    )?;
-    let key_value = checked_mul(
-        dimension(args.num_key_value_heads, "num_key_value_heads")?,
-        dimension(args.head_dim, "head_dim")?,
-        "key/value width",
-    )?;
-    let head = dimension(args.head_dim, "head_dim")?;
+    let args = declaration.args();
+    let declarations = super::parallel::parameter_description(
+        declaration,
+        crate::decoder::ParameterEncoding::Logical,
+    )
+    .map_err(|e| e.to_string())?;
     let mut common = Vec::new();
     let mut groups = Vec::new();
-    add_tensor(
-        args,
-        &mut common,
-        format!("{root}.embed_tokens.weight"),
-        vec![vocab, hidden],
-        TensorOperation::Matrix,
-        None,
-    )?;
-    add_tensor(
-        args,
-        &mut common,
-        format!("{root}.norm.weight"),
-        vec![hidden],
-        TensorOperation::Vector,
-        None,
-    )?;
+    let mut routers = std::collections::BTreeSet::new();
+    if args.is_moe() {
+        for layer in 0..dimension(args.num_hidden_layers, "num_hidden_layers")? {
+            let spec = declaration
+                .routed(layer)
+                .map_err(|error| error.to_string())?;
+            routers.insert(spec.selector.weight().id.as_str().to_owned());
+            groups.push(expert_layout_group(
+                &spec.experts,
+                allow_derived_expert_layouts,
+            )?);
+        }
+    }
+    for group in declarations.groups() {
+        if group.role() == eredu_runtime::ParameterRole::ExpertIntermediate {
+            continue;
+        }
+        for parameter in group.members() {
+            // Released routers have floating source storage, independently of
+            // the execution encoding requested for the constructed selector.
+            let format = if routers.contains(parameter.target()) {
+                LinearFormat::Dense
+            } else {
+                parameter
+                    .logical_linear_format()
+                    .map_or(LinearFormat::Dense, |format| format.encoding())
+            };
+            common.extend(
+                matrix_for_linear_format(
+                    parameter.target(),
+                    Vec::<String>::new(),
+                    parameter.global_shape().to_vec(),
+                    format,
+                    None,
+                )
+                .map_err(|error| error.to_string())?,
+            );
+        }
+    }
     if args.tie_word_embeddings {
+        // The optional redundant head retains its own source encoding; tied
+        // execution still consumes the declared embedding storage.
+        let (name, shape) = tied_output_source(declaration)?;
         let tensors = matrix_constraints(
-            "lm_head.weight",
-            vec![vocab, hidden],
-            args.weight_quantization_for("lm_head.weight"),
+            &name,
+            shape,
+            args.weight_quantization_for(&name),
             Vec::new(),
         )?;
         groups.push(AlternativeLayoutGroup {
@@ -118,123 +146,6 @@ pub fn safetensors_plan_with_root(
                 tensors,
             }],
         });
-    } else {
-        add_tensor(
-            args,
-            &mut common,
-            "lm_head.weight",
-            vec![vocab, hidden],
-            TensorOperation::Matrix,
-            None,
-        )?;
-    }
-    for layer in 0..dimension(args.num_hidden_layers, "num_hidden_layers")? {
-        let block = format!("{root}.layers.{layer}");
-        for (name, shape, operation) in [
-            (
-                "input_layernorm.weight",
-                vec![hidden],
-                TensorOperation::Vector,
-            ),
-            (
-                "post_attention_layernorm.weight",
-                vec![hidden],
-                TensorOperation::Vector,
-            ),
-            (
-                "self_attn.q_proj.weight",
-                vec![query, hidden],
-                TensorOperation::Matrix,
-            ),
-            (
-                "self_attn.k_proj.weight",
-                vec![key_value, hidden],
-                TensorOperation::Matrix,
-            ),
-            (
-                "self_attn.v_proj.weight",
-                vec![key_value, hidden],
-                TensorOperation::Matrix,
-            ),
-            (
-                "self_attn.o_proj.weight",
-                vec![hidden, query],
-                TensorOperation::Matrix,
-            ),
-        ] {
-            add_tensor(
-                args,
-                &mut common,
-                format!("{block}.{name}"),
-                shape,
-                operation,
-                None,
-            )?;
-        }
-        if args.variant != QwenVariant::Qwen2 {
-            for name in ["q_norm.weight", "k_norm.weight"] {
-                add_tensor(
-                    args,
-                    &mut common,
-                    format!("{block}.self_attn.{name}"),
-                    vec![head],
-                    TensorOperation::Vector,
-                    None,
-                )?;
-            }
-        }
-        if args.variant == QwenVariant::Qwen2 {
-            for (name, size) in [
-                ("q_proj.bias", query),
-                ("k_proj.bias", key_value),
-                ("v_proj.bias", key_value),
-            ] {
-                add_tensor(
-                    args,
-                    &mut common,
-                    format!("{block}.self_attn.{name}"),
-                    vec![size],
-                    TensorOperation::Vector,
-                    None,
-                )?;
-            }
-        }
-        if args.is_moe() {
-            let experts = dimension(args.num_experts, "num_experts")?;
-            let intermediate = dimension(args.moe_intermediate_size, "moe_intermediate_size")?;
-            add_tensor(
-                args,
-                &mut common,
-                format!("{block}.mlp.gate.weight"),
-                vec![experts, hidden],
-                TensorOperation::Matrix,
-                Some(None),
-            )?;
-            groups.push(expert_layout_group(
-                args,
-                &format!("{block}.mlp.experts"),
-                experts,
-                hidden,
-                intermediate,
-                allow_derived_expert_layouts,
-            )?);
-        } else {
-            let intermediate = dimension(args.intermediate_size, "intermediate_size")?;
-            for (projection, shape) in [
-                ("gate_proj", vec![intermediate, hidden]),
-                ("up_proj", vec![intermediate, hidden]),
-                ("down_proj", vec![hidden, intermediate]),
-            ] {
-                add_tensor(
-                    args,
-                    &mut common,
-                    format!("{block}.mlp.{projection}.weight"),
-                    shape,
-                    TensorOperation::Matrix,
-                    None,
-                )?;
-            }
-        }
     }
     let mut policy = CatalogPolicy::strict();
     policy.allowed_prefixes.push("rope_freqs.".into());
@@ -248,13 +159,55 @@ pub fn safetensors_plan_with_root(
     .map_err(|error| error.to_string())
 }
 
+pub(super) fn expert_source_root<'a>(
+    source: &'a eredu_nn::PackedGatedProductParameters<'_>,
+) -> Result<&'a str, String> {
+    source
+        .gate_up()
+        .parameter
+        .id
+        .as_str()
+        .strip_suffix(".gate_up_proj")
+        .ok_or_else(|| "Qwen expert bank has no declared source root".into())
+}
+
+pub(super) fn expert_binding_target(
+    source: &eredu_nn::PackedGatedProductParameters<'_>,
+    binding: &str,
+) -> Result<String, String> {
+    let (primary, suffix) = binding
+        .strip_prefix("gate_up_proj")
+        .map(|suffix| (source.gate_up(), suffix))
+        .or_else(|| {
+            binding
+                .strip_prefix("down_proj")
+                .map(|suffix| (source.down(), suffix))
+        })
+        .ok_or_else(|| format!("undeclared Qwen expert binding {binding}"))?;
+    if suffix.is_empty() {
+        return Ok(primary.parameter.id.to_string());
+    }
+    let format = primary
+        .linear_format
+        .ok_or("expert projection has no declared format")?;
+    let parameter = match suffix {
+        "_scales" => format.scale(),
+        "_biases" => format.affine_bias(),
+        "_global_scale" => format.global_scale(),
+        _ => None,
+    }
+    .ok_or_else(|| format!("undeclared Qwen expert binding {binding}"))?;
+    Ok(parameter.id.to_string())
+}
+
 /// Resolves packed, separate-packed, or per-expert sources into one canonical
 /// bank under the normalized configuration's checkpoint root.
 pub fn expert_recipes<C: RecipeCatalog + ?Sized>(
     catalog: &C,
-    args: &ModelArgs,
+    declaration: &super::Declaration,
     layer: usize,
 ) -> Result<GatedProductExpertRecipes, String> {
+    let args = declaration.args();
     if !args.is_moe() {
         return Err("Qwen expert recipes require Qwen3-MoE arguments".into());
     }
@@ -264,8 +217,13 @@ pub fn expert_recipes<C: RecipeCatalog + ?Sized>(
             "Qwen expert recipe layer {layer} is outside {layer_count} layers"
         ));
     }
-    let count = dimension(args.num_experts, "num_experts")?;
-    let prefix = format!("{}.layers.{layer}.mlp.experts", args.parameter_root);
+    let bank = declaration
+        .expert_bank(layer)
+        .map_err(|error| error.to_string())?;
+    let source = bank
+        .packed_parameters()
+        .map_err(|error| error.to_string())?;
+    let prefix = expert_source_root(&source)?;
     let separate_suffix = if catalog
         .tensor_metadata(&format!("{prefix}.gate_proj"))
         .is_ok()
@@ -274,19 +232,29 @@ pub fn expert_recipes<C: RecipeCatalog + ?Sized>(
     } else {
         ".weight"
     };
+    let mut independent = Vec::new();
+    visit_independent_expert_sources(&source, |_, canonical, aliases, _| {
+        let selected = std::iter::once(canonical.clone())
+            .chain(aliases)
+            .find(|name| catalog.tensor_metadata(name).is_ok())
+            .unwrap_or(canonical);
+        independent.push(selected);
+        Ok(())
+    })?;
     let names = GatedProductExpertLayoutNames {
-        target_gate_up: format!("{prefix}.gate_up_proj"),
-        target_down: format!("{prefix}.down_proj"),
-        packed_gate_up: format!("{prefix}.gate_up_proj"),
-        packed_down: format!("{prefix}.down_proj"),
+        target_gate_up: source.gate_up().parameter.id.to_string(),
+        target_down: source.down().parameter.id.to_string(),
+        packed_gate_up: source.gate_up().parameter.id.to_string(),
+        packed_down: source.down().parameter.id.to_string(),
         separate_gate: format!("{prefix}.gate_proj{separate_suffix}"),
         separate_up: format!("{prefix}.up_proj{separate_suffix}"),
         separate_down: format!("{prefix}.down_proj{separate_suffix}"),
-        independent: (0..count)
-            .map(|expert| IndependentGatedProductExpertNames {
-                gate: format!("{prefix}.{expert}.gate_proj.weight"),
-                up: format!("{prefix}.{expert}.up_proj.weight"),
-                down: format!("{prefix}.{expert}.down_proj.weight"),
+        independent: independent
+            .chunks_exact(3)
+            .map(|names| IndependentGatedProductExpertNames {
+                gate: names[0].clone(),
+                up: names[1].clone(),
+                down: names[2].clone(),
             })
             .collect(),
     };
@@ -300,7 +268,7 @@ pub fn expert_recipes<C: RecipeCatalog + ?Sized>(
 /// packed, split, or independently stored sources.
 pub fn rank_local_expert_recipes<C: RecipeCatalog + ?Sized>(
     catalog: &C,
-    args: &ModelArgs,
+    declaration: &super::Declaration,
     layer: usize,
     group_indices: &[usize],
 ) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
@@ -315,11 +283,16 @@ pub fn rank_local_expert_recipes<C: RecipeCatalog + ?Sized>(
                 "rank-local Qwen expert recipe contains duplicate expert {expert}"
             ));
         }
-        for (binding, recipe) in expert_unit_recipes(catalog, args, layer, expert)? {
+        for (binding, recipe) in expert_unit_recipes(catalog, declaration, layer, expert)? {
             grouped.entry(binding).or_default().push(recipe);
         }
     }
-    let prefix = format!("{}.layers.{layer}.mlp.experts", args.parameter_root);
+    let bank = declaration
+        .expert_bank(layer)
+        .map_err(|error| error.to_string())?;
+    let source = bank
+        .packed_parameters()
+        .map_err(|error| error.to_string())?;
     grouped
         .into_iter()
         .map(|(binding, mut inputs)| {
@@ -329,7 +302,7 @@ pub fn rank_local_expert_recipes<C: RecipeCatalog + ?Sized>(
                 DerivedWeightRecipe::Concatenate { axis: 0, inputs }
             };
             recipe.infer(catalog).map_err(|error| error.to_string())?;
-            Ok((format!("{prefix}.{binding}"), recipe))
+            Ok((expert_binding_target(&source, &binding)?, recipe))
         })
         .collect()
 }
@@ -360,10 +333,11 @@ fn split_expert_source<C: RecipeCatalog + ?Sized>(
 /// Returns neutral lazy-loading recipes for one Qwen routed expert.
 pub fn expert_unit_recipes<C: RecipeCatalog + ?Sized>(
     catalog: &C,
-    args: &ModelArgs,
+    declaration: &super::Declaration,
     layer: usize,
     expert: usize,
 ) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
+    let args = declaration.args();
     if !args.is_moe() {
         return Err("Qwen expert recipes require Qwen3-MoE arguments".into());
     }
@@ -373,15 +347,21 @@ pub fn expert_unit_recipes<C: RecipeCatalog + ?Sized>(
             "Qwen expert recipe layer {layer} is outside {layers} layers"
         ));
     }
-    let experts = dimension(args.num_experts, "num_experts")?;
+    let bank = declaration
+        .expert_bank(layer)
+        .map_err(|error| error.to_string())?;
+    let source = bank
+        .packed_parameters()
+        .map_err(|error| error.to_string())?;
+    let experts = source.group_count();
     if expert >= experts {
         return Err(format!(
             "Qwen expert {expert} is outside {experts} experts in layer {layer}"
         ));
     }
-    let prefix = format!("{}.layers.{layer}.mlp.experts", args.parameter_root);
-    let packed_gate_up = format!("{prefix}.gate_up_proj");
-    let packed_down = format!("{prefix}.down_proj");
+    let prefix = expert_source_root(&source)?;
+    let packed_gate_up = source.gate_up().parameter.id.to_string();
+    let packed_down = source.down().parameter.id.to_string();
     let packed_gate_up_source = recipe_source_key(catalog, &packed_gate_up);
     let packed_down_source = recipe_source_key(catalog, &packed_down);
     let split_gate_source = recipe_source_key(catalog, &format!("{prefix}.gate_proj"));
@@ -391,36 +371,30 @@ pub fn expert_unit_recipes<C: RecipeCatalog + ?Sized>(
         start: expert,
         end: expert + 1,
     };
-    let mut recipes = BTreeMap::new();
+    let materialize = |layout, gate_up, down| {
+        eredu_checkpoint::expert::gated_product_materialization_recipes(
+            catalog,
+            &GatedProductExpertRecipes {
+                target_gate_up: "gate_up_proj".into(),
+                target_down: "down_proj".into(),
+                layout,
+                gate_up,
+                down,
+            },
+        )
+    };
     if let (Some(gate_up), Some(down)) = (packed_gate_up_source, packed_down_source.as_ref()) {
-        recipes.insert(
-            "gate_up_proj".into(),
+        return materialize(
+            eredu_checkpoint::expert::GatedProductExpertStorageLayout::Packed,
             DerivedWeightRecipe::source(gate_up, selection.clone()),
+            DerivedWeightRecipe::source(down, selection),
         );
-        recipes.insert(
-            "down_proj".into(),
-            DerivedWeightRecipe::source(down, selection.clone()),
-        );
-        for (target, source) in [
-            ("gate_up_proj_scales", format!("{packed_gate_up}_scales")),
-            ("gate_up_proj_biases", format!("{packed_gate_up}_biases")),
-            ("down_proj_scales", format!("{packed_down}_scales")),
-            ("down_proj_biases", format!("{packed_down}_biases")),
-        ] {
-            if catalog.tensor_metadata(&source).is_ok() {
-                recipes.insert(
-                    target.into(),
-                    DerivedWeightRecipe::source(source, selection.clone()),
-                );
-            }
-        }
-        return Ok(recipes);
     }
     if let (Some(gate), Some(up), Some(down)) =
         (split_gate_source, split_up_source, packed_down_source)
     {
-        recipes.insert(
-            "gate_up_proj".into(),
+        return materialize(
+            eredu_checkpoint::expert::GatedProductExpertStorageLayout::SeparatePacked,
             DerivedWeightRecipe::Concatenate {
                 axis: 1,
                 inputs: vec![
@@ -428,38 +402,14 @@ pub fn expert_unit_recipes<C: RecipeCatalog + ?Sized>(
                     DerivedWeightRecipe::source(up, selection.clone()),
                 ],
             },
+            DerivedWeightRecipe::source(down, selection),
         );
-        recipes.insert(
-            "down_proj".into(),
-            DerivedWeightRecipe::source(down, selection.clone()),
-        );
-        for suffix in ["_scales", "_biases"] {
-            let gate = format!("{prefix}.gate_proj{suffix}");
-            let up = format!("{prefix}.up_proj{suffix}");
-            if catalog.tensor_metadata(&gate).is_ok() && catalog.tensor_metadata(&up).is_ok() {
-                recipes.insert(
-                    format!("gate_up_proj{suffix}"),
-                    DerivedWeightRecipe::Concatenate {
-                        axis: 1,
-                        inputs: vec![
-                            DerivedWeightRecipe::source(gate, selection.clone()),
-                            DerivedWeightRecipe::source(up, selection.clone()),
-                        ],
-                    },
-                );
-            }
-            let down = format!("{packed_down}{suffix}");
-            if catalog.tensor_metadata(&down).is_ok() {
-                recipes.insert(
-                    format!("down_proj{suffix}"),
-                    DerivedWeightRecipe::source(down, selection.clone()),
-                );
-            }
-        }
-        return Ok(recipes);
     }
-    if args.weight_quantization_for(&packed_gate_up).is_some()
-        || args.weight_quantization_for(&packed_down).is_some()
+    if source
+        .encodings()
+        .map_err(|error| error.to_string())?
+        .iter()
+        .any(|format| format.weight_quantization().is_some())
     {
         return Err(
             "split Qwen experts cannot be lazily load-time quantized; use checkpoint-native packed expert weights"
@@ -469,8 +419,8 @@ pub fn expert_unit_recipes<C: RecipeCatalog + ?Sized>(
     let gate = split_expert_source(catalog, &prefix, expert, &["gate_proj", "w1"])?;
     let up = split_expert_source(catalog, &prefix, expert, &["up_proj", "w3"])?;
     let down = split_expert_source(catalog, &prefix, expert, &["down_proj", "w2"])?;
-    recipes.insert(
-        "gate_up_proj".into(),
+    materialize(
+        eredu_checkpoint::expert::GatedProductExpertStorageLayout::Independent,
         DerivedWeightRecipe::Stack {
             axis: 0,
             inputs: vec![DerivedWeightRecipe::Concatenate {
@@ -481,38 +431,40 @@ pub fn expert_unit_recipes<C: RecipeCatalog + ?Sized>(
                 ],
             }],
         },
-    );
-    recipes.insert(
-        "down_proj".into(),
         DerivedWeightRecipe::Stack {
             axis: 0,
             inputs: vec![DerivedWeightRecipe::source(down, TensorSelection::Full)],
         },
-    );
-    Ok(recipes)
+    )
 }
 
 /// Builds the complete architecture-owned schedule for independent expert residency.
 pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
     catalog: &C,
-    args: &ModelArgs,
+    declaration: &super::Declaration,
 ) -> Result<crate::ExpertResidencyCatalog, String> {
+    let args = declaration.args();
     if !args.is_moe() {
         return Err("Qwen expert residency requires Qwen3-MoE arguments".into());
     }
-    let layers = dimension(args.num_hidden_layers, "num_hidden_layers")?;
-    let experts = dimension(args.num_experts, "num_experts")?;
-    let capacity = layers
-        .checked_mul(experts)
-        .ok_or_else(|| "Qwen expert residency catalog size overflowed".to_owned())?;
+    let banks = declaration
+        .expert_banks()
+        .map_err(|error| error.to_string())?;
+    let capacity = banks.values().try_fold(0usize, |capacity, bank| {
+        capacity
+            .checked_add(bank.group_count() as usize)
+            .ok_or_else(|| "Qwen expert residency catalog size overflowed".to_owned())
+    })?;
     let owner_group =
         eredu_runtime::ExecutionGroupId::new("text_decoder").map_err(|error| error.to_string())?;
     let mut units = Vec::with_capacity(capacity);
-    for layer in 0..layers {
+    for (layer, bank) in banks {
         let unit_path = format!("{}.layers.{layer}", args.parameter_root);
-        let expert_root = format!("{unit_path}.mlp.experts");
-        for expert in 0..experts {
-            let recipes = expert_unit_recipes(catalog, args, layer, expert)?;
+        let source = bank
+            .packed_parameters()
+            .map_err(|error| error.to_string())?;
+        for expert in 0..source.group_count() {
+            let recipes = expert_unit_recipes(catalog, declaration, layer, expert)?;
             let gate_up_quantizable = !recipes.contains_key("gate_up_proj_scales")
                 && !recipes.contains_key("gate_up_proj_biases");
             let down_quantizable = !recipes.contains_key("down_proj_scales")
@@ -520,7 +472,7 @@ pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
             let parameters = recipes
                 .into_iter()
                 .map(|(binding, recipe)| {
-                    let target = format!("{expert_root}.{binding}");
+                    let target = expert_binding_target(&source, &binding)?;
                     let role = match binding.as_str() {
                         "gate_up_proj" if gate_up_quantizable => {
                             crate::ExpertParameterRole::quantizable_projection(
@@ -559,34 +511,35 @@ pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
 }
 
 fn expert_layout_group(
-    args: &ModelArgs,
-    prefix: &str,
-    experts: usize,
-    hidden: usize,
-    intermediate: usize,
+    bank: &eredu_nn::GroupedGatedProductSpec,
     allow_derived_layouts: bool,
 ) -> Result<AlternativeLayoutGroup<SafetensorsTensorConstraint>, String> {
-    let gate_up_quantization = args.weight_quantization_for(&format!("{prefix}.gate_up_proj"));
-    let down_quantization = args.weight_quantization_for(&format!("{prefix}.down_proj"));
-    let packed_gate_up = format!("{prefix}.gate_up_proj");
-    let packed_down = format!("{prefix}.down_proj");
+    let source = bank
+        .packed_parameters()
+        .map_err(|error| error.to_string())?;
+    let prefix = expert_source_root(&source)?;
+    let gate_up_shape = source.gate_up().shape.clone();
+    let down_shape = source.down().shape.clone();
+    let read_shape = source.unfused_shape();
+    let experts = source.group_count();
+    let [gate_up_format, down_format] = source.encodings().map_err(|error| error.to_string())?;
+    let gate_up_quantization = gate_up_format.weight_quantization();
+    let down_quantization = down_format.weight_quantization();
+    let packed_gate_up = source.gate_up().parameter.id.to_string();
+    let packed_down = source.down().parameter.id.to_string();
     let packed = expert_variant(
         "packed",
         vec![packed_gate_up.clone()],
         [
             (
                 packed_gate_up,
-                vec![
-                    experts,
-                    checked_mul(2, intermediate, "packed expert width")?,
-                    hidden,
-                ],
+                gate_up_shape,
                 gate_up_quantization,
                 Vec::new(),
             ),
             (
                 packed_down.clone(),
-                vec![experts, hidden, intermediate],
+                down_shape.clone(),
                 down_quantization,
                 Vec::new(),
             ),
@@ -600,19 +553,19 @@ fn expert_layout_group(
         [
             (
                 gate.clone(),
-                vec![experts, intermediate, hidden],
+                read_shape.clone(),
                 gate_up_quantization,
                 Vec::new(),
             ),
             (
                 up.clone(),
-                vec![experts, intermediate, hidden],
+                read_shape.clone(),
                 gate_up_quantization,
                 Vec::new(),
             ),
             (
                 packed_down,
-                vec![experts, hidden, intermediate],
+                down_shape.clone(),
                 down_quantization,
                 Vec::new(),
             ),
@@ -625,28 +578,11 @@ fn expert_layout_group(
     if allow_derived_layouts && gate_up_quantization.is_none() && down_quantization.is_none() {
         let mut tensors = Vec::with_capacity(checked_mul(experts, 3, "expert tensor count")?);
         let mut discriminators = Vec::with_capacity(tensors.capacity());
-        for expert in 0..experts {
-            for (canonical, aliases, shape) in [
-                (
-                    format!("{prefix}.{expert}.gate_proj.weight"),
-                    vec![format!("{prefix}.{expert}.w1.weight")],
-                    vec![intermediate, hidden],
-                ),
-                (
-                    format!("{prefix}.{expert}.up_proj.weight"),
-                    vec![format!("{prefix}.{expert}.w3.weight")],
-                    vec![intermediate, hidden],
-                ),
-                (
-                    format!("{prefix}.{expert}.down_proj.weight"),
-                    vec![format!("{prefix}.{expert}.w2.weight")],
-                    vec![hidden, intermediate],
-                ),
-            ] {
-                discriminators.push(canonical.clone());
-                tensors.push((canonical, shape, None, aliases));
-            }
-        }
+        visit_independent_expert_sources(&source, |_, canonical, aliases, shape| {
+            discriminators.push(canonical.clone());
+            tensors.push((canonical, shape, None, aliases));
+            Ok(())
+        })?;
         variants.push(expert_variant("split", discriminators, tensors)?);
     }
     Ok(AlternativeLayoutGroup {
@@ -654,6 +590,101 @@ fn expert_layout_group(
         required: true,
         variants,
     })
+}
+
+fn visit_independent_expert_sources(
+    source: &eredu_nn::PackedGatedProductParameters<'_>,
+    mut visit: impl FnMut(
+        &eredu_nn::LogicalParameterDeclaration<'_>,
+        String,
+        Vec<String>,
+        Vec<usize>,
+    ) -> Result<(), String>,
+) -> Result<(), String> {
+    let root = expert_source_root(source)?;
+    let read = source.unfused_shape();
+    for expert in 0..source.group_count() {
+        for (logical, field, alias, shape) in [
+            (source.gate_up(), "gate_proj", "w1", read[1..].to_vec()),
+            (source.gate_up(), "up_proj", "w3", read[1..].to_vec()),
+            (
+                source.down(),
+                "down_proj",
+                "w2",
+                source.down().shape[1..].to_vec(),
+            ),
+        ] {
+            visit(
+                logical,
+                format!("{root}.{expert}.{field}.weight"),
+                vec![format!("{root}.{expert}.{alias}.weight")],
+                shape,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn tied_output_source(
+    declaration: &super::Declaration,
+) -> Result<(String, Vec<usize>), String> {
+    let embedding = declaration.common().static_construction().embedding_spec();
+    let shape = embedding
+        .logical_parameters()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .next()
+        .ok_or("Qwen embedding declaration is missing")?
+        .shape;
+    Ok(("lm_head.weight".into(), shape))
+}
+
+/// Logical source matrices and admitted source-layout projections. Physical
+/// packing and optional redundant tensors do not introduce parameter owners.
+pub(crate) fn source_linear_shapes(
+    declaration: &super::Declaration,
+) -> Result<BTreeMap<String, Vec<usize>>, String> {
+    let args = declaration.args();
+    let parameters = super::parallel::parameter_description(
+        declaration,
+        crate::decoder::ParameterEncoding::Logical,
+    )
+    .map_err(|error| error.to_string())?;
+    let mut shapes = parameters
+        .groups()
+        .iter()
+        .flat_map(|group| group.members())
+        .filter(|member| {
+            member.logical_role() == Some(eredu_nn::LogicalParameterRole::LinearWeight)
+        })
+        .filter_map(|member| {
+            member
+                .logical_shape()
+                .filter(|shape| shape.len() == 2)
+                .map(|shape| (member.target().to_owned(), shape.to_vec()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    if args.tie_word_embeddings {
+        let (name, shape) = tied_output_source(declaration)?;
+        shapes.insert(name, shape);
+    }
+    for bank in declaration
+        .expert_banks()
+        .map_err(|error| error.to_string())?
+        .values()
+    {
+        let source = bank
+            .packed_parameters()
+            .map_err(|error| error.to_string())?;
+        let [gate_up, down] = source.encodings().map_err(|error| error.to_string())?;
+        if gate_up.weight_quantization().is_none() && down.weight_quantization().is_none() {
+            visit_independent_expert_sources(&source, |_, name, _, shape| {
+                shapes.insert(name, shape);
+                Ok(())
+            })?;
+        }
+    }
+    Ok(shapes)
 }
 
 fn expert_variant(
@@ -672,24 +703,6 @@ fn expert_variant(
     })
 }
 
-fn add_tensor(
-    args: &ModelArgs,
-    output: &mut Vec<SafetensorsTensorConstraint>,
-    name: impl AsRef<str>,
-    shape: Vec<usize>,
-    operation: TensorOperation,
-    quantization_override: Option<Option<WeightQuantization>>,
-) -> Result<(), String> {
-    let name = name.as_ref();
-    let quantization = if operation == TensorOperation::Matrix {
-        quantization_override.unwrap_or_else(|| args.weight_quantization_for(name))
-    } else {
-        None
-    };
-    output.extend(matrix_constraints(name, shape, quantization, Vec::new())?);
-    Ok(())
-}
-
 fn matrix_constraints(
     name: &str,
     shape: Vec<usize>,
@@ -701,109 +714,46 @@ fn matrix_constraints(
 }
 
 /// Builds the canonical Qwen GGUF catalog plan.
-pub fn gguf_plan(args: &ModelArgs) -> Result<GgufCheckpointPlan, String> {
-    let hidden = dimension(args.hidden_size, "hidden_size")?;
-    let vocab = dimension(args.vocab_size, "vocab_size")?;
-    let head = dimension(args.head_dim, "head_dim")?;
-    let query = checked_mul(
-        dimension(args.num_attention_heads, "num_attention_heads")?,
-        head,
-        "query width",
-    )?;
-    let key_value = checked_mul(
-        dimension(args.num_key_value_heads, "num_key_value_heads")?,
-        head,
-        "key/value width",
-    )?;
-    let mut tensors = vec![
-        gguf_tensor(
-            "token_embd.weight",
-            vec![vocab, hidden],
-            TensorOperation::Matrix,
-        ),
-        gguf_tensor("output_norm.weight", vec![hidden], TensorOperation::Vector),
-    ];
-    if !args.tie_word_embeddings {
-        tensors.push(gguf_tensor(
-            "output.weight",
-            vec![vocab, hidden],
-            TensorOperation::Matrix,
-        ));
+pub fn gguf_plan(declaration: &super::Declaration) -> Result<GgufCheckpointPlan, String> {
+    let args = declaration.args();
+    let declarations = super::parallel::parameter_description(
+        declaration,
+        crate::decoder::ParameterEncoding::Logical,
+    )
+    .map_err(|error| error.to_string())?;
+    let mut tensors = Vec::new();
+    for group in declarations.groups() {
+        if group.role() == eredu_runtime::ParameterRole::ExpertIntermediate {
+            continue;
+        }
+        for parameter in group.members() {
+            tensors.push(gguf_tensor(
+                gguf_parameter_name(parameter.target(), &args.parameter_root)?,
+                parameter.global_shape().to_vec(),
+                if parameter.logical_linear_format().is_some() {
+                    TensorOperation::Matrix
+                } else {
+                    TensorOperation::Vector
+                },
+            ));
+        }
     }
-    for layer in 0..dimension(args.num_hidden_layers, "num_hidden_layers")? {
-        let block = format!("blk.{layer}");
-        for (name, shape, operation) in [
-            ("attn_norm.weight", vec![hidden], TensorOperation::Vector),
-            ("ffn_norm.weight", vec![hidden], TensorOperation::Vector),
-            (
-                "attn_q.weight",
-                vec![query, hidden],
-                TensorOperation::Matrix,
-            ),
-            (
-                "attn_k.weight",
-                vec![key_value, hidden],
-                TensorOperation::Matrix,
-            ),
-            (
-                "attn_v.weight",
-                vec![key_value, hidden],
-                TensorOperation::Matrix,
-            ),
-            (
-                "attn_output.weight",
-                vec![hidden, query],
-                TensorOperation::Matrix,
-            ),
-        ] {
-            tensors.push(gguf_tensor(format!("{block}.{name}"), shape, operation));
-        }
-        if args.variant != QwenVariant::Qwen2 {
-            for name in ["attn_q_norm.weight", "attn_k_norm.weight"] {
-                tensors.push(gguf_tensor(
-                    format!("{block}.{name}"),
-                    vec![head],
-                    TensorOperation::Vector,
-                ));
-            }
-        }
-        if args.variant == QwenVariant::Qwen2 {
-            for (name, size) in [
-                ("attn_q.bias", query),
-                ("attn_k.bias", key_value),
-                ("attn_v.bias", key_value),
+    if args.is_moe() {
+        for layer in 0..dimension(args.num_hidden_layers, "num_hidden_layers")? {
+            let bank = declaration
+                .expert_bank(layer)
+                .map_err(|error| error.to_string())?;
+            let source = bank
+                .packed_parameters()
+                .map_err(|error| error.to_string())?;
+            let block = format!("blk.{layer}");
+            for (field, shape) in [
+                ("ffn_gate_exps.weight", source.unfused_shape()),
+                ("ffn_up_exps.weight", source.unfused_shape()),
+                ("ffn_down_exps.weight", source.down().shape.clone()),
             ] {
                 tensors.push(gguf_tensor(
-                    format!("{block}.{name}"),
-                    vec![size],
-                    TensorOperation::Vector,
-                ));
-            }
-        }
-        if args.is_moe() {
-            let experts = dimension(args.num_experts, "num_experts")?;
-            let intermediate = dimension(args.moe_intermediate_size, "moe_intermediate_size")?;
-            for (name, shape) in [
-                ("ffn_gate_inp.weight", vec![experts, hidden]),
-                ("ffn_gate_exps.weight", vec![experts, intermediate, hidden]),
-                ("ffn_up_exps.weight", vec![experts, intermediate, hidden]),
-                ("ffn_down_exps.weight", vec![experts, hidden, intermediate]),
-            ] {
-                tensors.push(gguf_tensor(
-                    format!("{block}.{name}"),
-                    shape,
-                    TensorOperation::Matrix,
-                ));
-            }
-        } else {
-            let intermediate = dimension(args.intermediate_size, "intermediate_size")?;
-            for (name, shape) in [
-                ("ffn_gate.weight", vec![intermediate, hidden]),
-                ("ffn_up.weight", vec![intermediate, hidden]),
-                ("ffn_down.weight", vec![hidden, intermediate]),
-            ] {
-                tensors.push(gguf_tensor(
-                    format!("{block}.{name}"),
+                    format!("{block}.{field}"),
                     shape,
                     TensorOperation::Matrix,
                 ));
@@ -841,74 +791,85 @@ fn checked_mul(left: usize, right: usize, name: &str) -> Result<usize, String> {
         .ok_or_else(|| format!("Qwen {name} geometry overflows"))
 }
 
+const GGUF_ROOT_NAMES: &[(&str, &str)] = &[
+    ("token_embd", "model.embed_tokens"),
+    ("output_norm", "model.norm"),
+    ("output", "lm_head"),
+];
+const GGUF_EXPERT_NAMES: &[(&str, &str)] = &[
+    ("ffn_gate_inp", "mlp.gate"),
+    ("ffn_gate_exps", "mlp.experts.gate_proj"),
+    ("ffn_up_exps", "mlp.experts.up_proj"),
+    ("ffn_down_exps", "mlp.experts.down_proj"),
+];
+const GGUF_LAYER_NAMES: &[(&str, &str)] = &[
+    ("attn_q_norm", "self_attn.q_norm"),
+    ("attn_k_norm", "self_attn.k_norm"),
+    ("attn_q", "self_attn.q_proj"),
+    ("attn_k", "self_attn.k_proj"),
+    ("attn_v", "self_attn.v_proj"),
+    ("attn_output", "self_attn.o_proj"),
+    ("attn_norm", "input_layernorm"),
+    ("ffn_norm", "post_attention_layernorm"),
+    ("ffn_gate", "mlp.gate_proj"),
+    ("ffn_down", "mlp.down_proj"),
+    ("ffn_up", "mlp.up_proj"),
+    ("rope_freqs", "rope_freqs"),
+];
+fn has_prefix(name: &str, prefix: &str) -> bool {
+    name == prefix
+        || name
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| suffix.starts_with('.'))
+}
+
 /// Translates one GGUF tensor name into the canonical Qwen parameter identity.
 pub fn translate_gguf_weight_name(name: &str, is_moe: bool) -> String {
-    const ROOTS: [(&str, &str); 3] = [
-        ("token_embd", "model.embed_tokens"),
-        ("output_norm", "model.norm"),
-        ("output", "lm_head"),
-    ];
-    for (source, target) in ROOTS {
-        if name == source || name.starts_with(&format!("{source}.")) {
+    for &(source, target) in GGUF_ROOT_NAMES {
+        if has_prefix(name, source) {
             return name.replacen(source, target, 1);
         }
     }
-    let Some(rest) = name.strip_prefix("blk.") else {
-        return name.to_string();
+    let Some((layer, parameter)) = name
+        .strip_prefix("blk.")
+        .and_then(|rest| rest.split_once('.'))
+    else {
+        return name.to_owned();
     };
-    let Some((layer, parameter)) = rest.split_once('.') else {
-        return name.to_string();
-    };
-    if is_moe {
-        for (source, target) in [
-            ("ffn_gate_inp", "mlp.gate"),
-            ("ffn_gate_exps", "mlp.experts.gate_proj"),
-            ("ffn_up_exps", "mlp.experts.up_proj"),
-            ("ffn_down_exps", "mlp.experts.down_proj"),
-        ] {
-            if parameter == source || parameter.starts_with(&format!("{source}.")) {
-                let suffix = parameter.strip_prefix(source).unwrap_or_default();
-                return format!("model.layers.{layer}.{target}{suffix}");
-            }
-        }
-    }
-    for (source, target) in [
-        ("attn_q_norm", "self_attn.q_norm"),
-        ("attn_k_norm", "self_attn.k_norm"),
-        ("attn_q", "self_attn.q_proj"),
-        ("attn_k", "self_attn.k_proj"),
-        ("attn_v", "self_attn.v_proj"),
-        ("attn_output", "self_attn.o_proj"),
-        ("attn_norm", "input_layernorm"),
-        ("ffn_norm", "post_attention_layernorm"),
-        ("ffn_gate", "mlp.gate_proj"),
-        ("ffn_down", "mlp.down_proj"),
-        ("ffn_up", "mlp.up_proj"),
-        ("rope_freqs", "rope_freqs"),
-    ] {
-        if parameter == source || parameter.starts_with(&format!("{source}.")) {
+    for &(source, target) in GGUF_EXPERT_NAMES
+        .iter()
+        .filter(|_| is_moe)
+        .chain(GGUF_LAYER_NAMES)
+    {
+        if has_prefix(parameter, source) {
             return format!(
                 "model.layers.{layer}.{}",
                 parameter.replacen(source, target, 1)
             );
         }
     }
-    name.to_string()
+    name.to_owned()
 }
 
-/// Rehomes split expert GGUF formats onto the canonical fused runtime weights.
-pub fn normalize_weight_formats<V>(args: &ModelArgs, formats: &mut HashMap<String, V>) {
-    if !args.is_moe() {
-        return;
-    }
-    for layer in 0..args.num_hidden_layers {
-        let prefix = format!("{}.layers.{layer}.mlp.experts", args.parameter_root);
-        if let Some(format) = formats.remove(&format!("{prefix}.gate_proj.weight")) {
-            formats.remove(&format!("{prefix}.up_proj.weight"));
-            formats.insert(format!("{prefix}.gate_up_proj"), format);
-        }
-        if let Some(format) = formats.remove(&format!("{prefix}.down_proj.weight")) {
-            formats.insert(format!("{prefix}.down_proj"), format);
+fn gguf_parameter_name(name: &str, root: &str) -> Result<String, String> {
+    for &(physical, canonical) in GGUF_ROOT_NAMES {
+        let canonical = canonical.replacen("model", root, 1);
+        if has_prefix(name, &canonical) {
+            return Ok(name.replacen(&canonical, physical, 1));
         }
     }
+    if let Some((layer, parameter)) = name
+        .strip_prefix(&format!("{root}.layers."))
+        .and_then(|rest| rest.split_once('.'))
+    {
+        for &(physical, canonical) in GGUF_EXPERT_NAMES.iter().chain(GGUF_LAYER_NAMES) {
+            if has_prefix(parameter, canonical) {
+                return Ok(format!(
+                    "blk.{layer}.{}",
+                    parameter.replacen(canonical, physical, 1)
+                ));
+            }
+        }
+    }
+    Err(format!("Qwen GGUF has no storage declaration for {name}"))
 }

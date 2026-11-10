@@ -184,14 +184,15 @@ fn main() -> anyhow::Result<()> {
                 )?),
             )
         };
+    let declaration = k2_horizon::Declaration::new(args.clone())?;
     let device_type = match std::env::var("EREDU_VALIDATION_DEVICE").as_deref() {
         Ok("gpu") => DeviceType::Gpu,
         Ok("cpu") | Err(_) => DeviceType::Cpu,
         Ok(other) => anyhow::bail!("unknown validation device {other:?}; expected cpu or gpu"),
     };
     let stream = Stream::new_with_device(&Device::new(device_type, 0));
-    let mut recipes =
-        k2_horizon::linear_companion_recipes(source.as_ref(), &args).map_err(anyhow::Error::msg)?;
+    let mut recipes = k2_horizon::linear_companion_recipes(source.as_ref(), &declaration)
+        .map_err(anyhow::Error::msg)?;
     for layer in 0..args.num_hidden_layers as usize {
         for (bank, count, enabled) in [
             (
@@ -209,7 +210,7 @@ fn main() -> anyhow::Result<()> {
                 recipes.extend(
                     k2_horizon::expert_recipes(
                         source.as_ref(),
-                        &args,
+                        &declaration,
                         layer,
                         bank,
                         &(0..count as usize).collect::<Vec<_>>(),

@@ -4,8 +4,8 @@ use super::FamilyConfig;
 use crate::gemma4::ModelArgs;
 use eredu_nn::VocabularyParallelRange;
 use eredu_runtime::{
-    expand_linear_format_parameter_groups, LocalModelLayout, MemberSharding, ParallelPlanError,
-    ParameterGroupSpec, ParameterMemberSpec, ParameterRole, StateLayout,
+    LocalModelLayout, MemberSharding, ParallelPlanError, ParameterGroupSpec, ParameterRole,
+    StateLayout,
 };
 
 fn invalid(message: impl Into<String>) -> ParallelPlanError {
@@ -16,10 +16,11 @@ fn invalid(message: impl Into<String>) -> ParallelPlanError {
 pub fn static_parameter_groups(
     config: &FamilyConfig,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    let args = &config.text;
-    let mut groups = super::text::static_construction_specs(config)
-        .map_err(|error| invalid(error.to_string()))?
+    let mut groups = config
+        .pinned()
+        .ordinary
         .pinned_parameter_groups(
+            crate::decoder::ParameterEncoding::Stored,
             "model.decoder.embed_tokens",
             "model.decoder.norm",
             "lm_head",
@@ -27,52 +28,12 @@ pub fn static_parameter_groups(
         .into_iter()
         .map(|(_, group)| group)
         .collect::<Vec<_>>();
-    let hidden =
-        usize::try_from(args.hidden_size).map_err(|_| invalid("invalid feedback hidden width"))?;
-    let width = args
-        .layer_policy(0)
-        .ok_or_else(|| invalid("empty diffusion stack"))?
-        .intermediate_size
-        .get() as usize;
-    let root = "model.decoder.self_conditioning";
-    let member = |field: &str, shape, sharding| {
-        ParameterMemberSpec::new(format!("{root}.{field}.weight"), shape, sharding)
-    };
-    let feedback = vec![
-        ParameterGroupSpec::new(
-            format!("{root}.norm"),
-            ParameterRole::Replicated,
-            [member("pre_norm", vec![hidden], MemberSharding::Replicated)],
-        )?,
-        ParameterGroupSpec::partitioned(
-            format!("{root}.intermediate"),
-            ParameterRole::FeedForwardIntermediate,
-            width,
-            [
-                member(
-                    "gate_proj",
-                    vec![width, hidden],
-                    MemberSharding::Partitioned { axis: 0 },
-                ),
-                member(
-                    "up_proj",
-                    vec![width, hidden],
-                    MemberSharding::Partitioned { axis: 0 },
-                ),
-                member(
-                    "down_proj",
-                    vec![hidden, width],
-                    MemberSharding::Partitioned { axis: 1 },
-                ),
-            ],
-        )?,
-    ];
-    groups.extend(expand_linear_format_parameter_groups(feedback, |member| {
-        crate::linear_format::standard_parallel_linear_format(
-            member,
-            args.linear_format_for(member.target()),
-        )
-    })?);
+    let declaration = config.conditioning();
+    groups.extend(
+        declaration
+            .parameter_groups()
+            .map_err(|e| invalid(e.to_string()))?,
+    );
     Ok(groups)
 }
 
@@ -85,16 +46,20 @@ pub fn layer_parameter_groups(
         &config.text,
         index,
         "model.decoder.layers",
+        config.block(index).map_err(|e| invalid(e.to_string()))?,
+        config.dense(index).map_err(|e| invalid(e.to_string()))?,
+        config
+            .attention(index)
+            .map_err(|e| invalid(e.to_string()))?,
+        config.routed(index).map_err(|e| invalid(e.to_string()))?,
     )?;
-    let target = format!("model.encoder.language_model.layers.{index}.layer_scalar");
+    let spec = config
+        .encoder_scalar(index)
+        .map_err(|e| invalid(e.to_string()))?;
     groups.push(ParameterGroupSpec::new(
-        target.clone(),
+        spec.weight.id.as_str(),
         ParameterRole::Replicated,
-        [ParameterMemberSpec::new(
-            target,
-            vec![1],
-            MemberSharding::Replicated,
-        )],
+        eredu_runtime::logical_parameter_members(spec, |_| MemberSharding::Replicated)?,
     )?);
     Ok(groups)
 }
@@ -236,22 +201,52 @@ pub fn local_geometry(
                 index,
                 layout,
                 "model.decoder.layers",
+                config
+                    .attention(index)
+                    .map_err(|e| invalid(e.to_string()))?,
+                config
+                    .attention(
+                        config
+                            .text
+                            .attention_state_owner(index)
+                            .map_err(|e| invalid(e.to_string()))?,
+                    )
+                    .map_err(|e| invalid(e.to_string()))?,
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
+    for (local, index) in blocks.iter().zip(units.clone()) {
+        if let Some(scope) = config.routed(index).map_err(|e| invalid(e.to_string()))? {
+            scope
+                .for_invocation(local, index, None)
+                .map_err(|e| invalid(e.to_string()))?;
+        }
+        let width = local
+            .layer_policy(index)
+            .ok_or_else(|| invalid("dense layer outside local schedule"))?
+            .intermediate_size
+            .get() as i32;
+        config
+            .dense(index)
+            .and_then(|spec| spec.clone().with_intermediate(width))
+            .map_err(|e| invalid(e.to_string()))?;
+        config
+            .block(index)
+            .and_then(|spec| {
+                spec.clone()
+                    .with_input_width(local.hidden_size_per_layer_input)
+            })
+            .map_err(|e| invalid(e.to_string()))?;
+    }
     let policies = blocks
         .iter()
         .zip(units.clone())
         .map(|(args, index)| {
-            let policy = args
-                .layer_policy(index)
-                .ok_or_else(|| invalid("missing local diffusion attention policy"))?;
-            eredu_core::cache::LayerCachePolicy::key_value(
-                policy.attention,
-                policy.num_key_value_heads.get() as i32,
-                policy.head_dim.get() as i32,
-            )
-            .map_err(|error| invalid(error.to_string()))
+            config
+                .attention(index)
+                .and_then(|spec| spec.for_invocation(args, index))
+                .and_then(|spec| spec.state_policy(None, Vec::new()))
+                .map_err(|error| invalid(error.to_string()))
         })
         .collect::<Result<Vec<_>, _>>()?;
     let state = if policies.is_empty() {
@@ -265,8 +260,9 @@ pub fn local_geometry(
             .map_err(|error| invalid(error.to_string()))?,
         )
     };
+    let conditioning = config.conditioning();
     let conditioning_width = layout
-        .tensor("model.decoder.self_conditioning.gate_proj.weight")
+        .tensor(conditioning.product.gate.weight.id.as_str())
         .map(|tensor| {
             let width = *tensor
                 .local_shape()
@@ -278,14 +274,12 @@ pub fn local_geometry(
                 .ok_or_else(|| invalid("feedback local width is empty or exceeds i32"))
         })
         .transpose()?;
-    let (embedding, output) = super::text::static_construction_specs(config)
-        .map_err(|error| invalid(error.to_string()))?
-        .selected_vocabulary_ranges(
-            layout,
-            "model.decoder.embed_tokens",
-            "model.decoder.norm",
-            "lm_head",
-        )?;
+    let (embedding, output) = config.pinned().ordinary.selected_vocabulary_ranges(
+        layout,
+        "model.decoder.embed_tokens",
+        "model.decoder.norm",
+        "lm_head",
+    )?;
     Ok(LocalGeometry {
         blocks,
         units,
@@ -331,28 +325,27 @@ pub fn tensor_state_layout(
     config: &FamilyConfig,
     rank: eredu_core::ParallelRankTopology,
 ) -> Result<StateLayout, ParallelPlanError> {
-    let mut local = config.clone();
-    let layers = config
-        .text
-        .layer_schedule
-        .iter()
-        .copied()
-        .map(|mut policy| {
+    let policies = (0..config.text.num_hidden_layers())
+        .map(|layer| {
+            let spec = config
+                .attention(layer)
+                .map_err(|e| invalid(e.to_string()))?;
             let range = eredu_core::balanced_contiguous_range(
-                policy.num_key_value_heads.get() as usize,
+                spec.geometry.key_value_heads() as usize,
                 rank.tensor_parallel_size(),
                 rank.tensor_parallel_rank(),
                 false,
             )
             .map_err(|error| invalid(error.to_string()))?;
-            policy.num_key_value_heads = std::num::NonZeroU32::new(range.len() as u32)
-                .ok_or_else(|| invalid("local authoritative head count is zero"))?;
-            Ok(policy)
+            spec.state_policy(Some(range), Vec::new())
+                .map_err(|error| invalid(error.to_string()))
         })
-        .collect::<Result<Vec<_>, ParallelPlanError>>()?;
-    local.text.layer_schedule = eredu_core::LayerSchedule::new(layers.len(), layers)
-        .map_err(|error| invalid(error.to_string()))?;
-    super::state_layout(&local).map_err(|error| invalid(error.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    StateLayout::new(
+        eredu_core::LayerSchedule::new(policies.len(), policies)
+            .map_err(|error| invalid(error.to_string()))?,
+    )
+    .map_err(|error| invalid(error.to_string()))
 }
 
 /// Declares global shared parameters and their semantic owners without a backend.

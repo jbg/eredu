@@ -13,7 +13,7 @@ use super::{
     checkpoint::Component,
     parameters::{admitted_member, execution_parameter, SpeechParameterError},
     perception::{PerceptionDimensions, PerceptionError},
-    perception_layered::perception_component_definition,
+    perception_specs::{released_declaration, PerceptionDeclaration},
 };
 
 /// Invalid component geometry or exact retained parameter contract.
@@ -46,9 +46,7 @@ pub enum PerceptionPreparationError {
 /// conversion bounds use the shared speech recipe projection. This component
 /// contract declares no full VoiceChat execution capability.
 pub struct PreparedPerceptionBindings {
-    precision: super::precision::SpeechPrecision,
-    dimensions: PerceptionDimensions,
-    prepared: PreparedComponent<eredu_runtime::ComponentDefinition>,
+    prepared: PreparedComponent<PerceptionDeclaration>,
 }
 
 impl PreparedPerceptionBindings {
@@ -57,7 +55,7 @@ impl PreparedPerceptionBindings {
         mut self,
         precision: super::precision::SpeechPrecision,
     ) -> Result<Self, PerceptionPreparationError> {
-        if self.precision != Default::default() && self.precision != precision {
+        if self.precision() != Default::default() && self.precision() != precision {
             return Err(PerceptionPreparationError::Precision(
                 "precision is already selected",
             ));
@@ -65,17 +63,23 @@ impl PreparedPerceptionBindings {
         precision
             .validate()
             .map_err(PerceptionPreparationError::Precision)?;
+        let declaration = super::precision::SpeechPrecisionDeclaration::from_groups(
+            self.definition().parameters().groups(),
+        );
         self.prepared = self.prepared.transform_units(|source, units| {
             precision
-                .bindings(source, units)
+                .bindings(source, units, &declaration)
                 .map_err(PerceptionPreparationError::from)
         })?;
-        self.precision = precision;
+        let declaration = self.declaration().clone().with_precision(precision)?;
+        self.prepared = self
+            .prepared
+            .project("voicechat/perception/leased-units", declaration)?;
         Ok(self)
     }
     /// Retained floating storage and arithmetic policy.
     pub fn precision(&self) -> super::precision::SpeechPrecision {
-        self.precision
+        self.declaration().precision()
     }
 
     /// Projects complete perception bindings from selected retained artifacts.
@@ -86,7 +90,7 @@ impl PreparedPerceptionBindings {
             SpeechParameterError::MissingComponent(Component::Perception),
         )?;
         Self::from_parameters(
-            PerceptionDimensions::from_config(&artifacts.plan().config().perception)?,
+            released_declaration()?.clone(),
             source.clone(),
             artifacts.plan().parameters(),
         )
@@ -96,14 +100,13 @@ impl PreparedPerceptionBindings {
     /// discovery or native allocation. Shapes follow the symbolic architecture;
     /// neighboring component and preprocessing payloads are excluded.
     pub fn from_parameters(
-        dimensions: PerceptionDimensions,
+        declaration: PerceptionDeclaration,
         source: SharedCheckpointSource,
         parameters: &BTreeMap<String, ParameterAdmission>,
     ) -> Result<Self, PerceptionPreparationError> {
-        let definition = perception_component_definition(dimensions)?;
         let prepared = PreparedComponent::prepare(
             "voicechat/perception/leased-units",
-            definition,
+            declaration,
             source.clone(),
             |member| {
                 let parameter =
@@ -112,11 +115,9 @@ impl PreparedPerceptionBindings {
                 Ok::<_, PerceptionPreparationError>(parameter.recipe)
             },
         )?;
-        Ok(Self {
-            precision: Default::default(),
-            dimensions,
-            prepared,
-        })
+        let result = Self { prepared };
+        let precision = result.precision();
+        result.with_precision(precision)
     }
 
     /// Selects complete-stack tensor placement through the shared physical planner.
@@ -132,7 +133,7 @@ impl PreparedPerceptionBindings {
         mut self,
         layout: &LocalModelLayout,
     ) -> Result<Self, PerceptionPreparationError> {
-        super::perception_layered::perception_local_dimensions(self.dimensions, layout)?;
+        self.declaration().local_dimensions(layout)?;
         self.prepared = self.prepared.select(layout)?;
         Ok(self)
     }
@@ -147,15 +148,12 @@ impl PreparedPerceptionBindings {
         >,
     ) -> Result<PreparedPerceptionPartitionBindings, PerceptionPreparationError> {
         super::perception_layered::validate_perception_partition(
-            self.prepared.declaration(),
-            self.dimensions,
+            self.declaration(),
             self.prepared.local_layout(),
             partition,
         )?;
         let prepared = self.prepared.select_units(partition.units())?;
         Ok(PreparedPerceptionPartitionBindings {
-            precision: self.precision,
-            dimensions: self.dimensions,
             prepared,
             state_layout: partition.state().map(|state| state.layout().clone()),
         })
@@ -166,9 +164,14 @@ impl PreparedPerceptionBindings {
         self.prepared.local_layout()
     }
 
+    /// Typed scope retained through precision and placement selection.
+    pub fn declaration(&self) -> &PerceptionDeclaration {
+        self.prepared.declaration()
+    }
+
     /// Validated perception geometry; no other speech stack is selected.
     pub fn dimensions(&self) -> PerceptionDimensions {
-        self.dimensions
+        self.declaration().dimensions()
     }
 
     /// Exact prepared unit bindings for cold resource accounting.
@@ -183,43 +186,46 @@ impl PreparedPerceptionBindings {
 
     /// Complete semantic declaration retained through precision and placement selection.
     pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
-        self.prepared.declaration()
+        self.prepared.declaration().definition()
     }
 
     /// Consumes exact source authority and the canonical ordered binding plan.
     pub fn into_parts(
         self,
     ) -> (
-        PerceptionDimensions,
-        eredu_runtime::ComponentDefinition,
+        PerceptionDeclaration,
+        Option<LocalModelLayout>,
         eredu_runtime::ExecutionUnitAddressMap,
         SharedCheckpointSource,
         Vec<Vec<WeightBinding>>,
     ) {
-        let (definition, _, layout, source, units) = self
+        let (declaration, selected, layout, source, units) = self
             .prepared
             .into_declared_unit_parts()
             .expect("component declares only independently leased units");
-        (self.dimensions, definition, layout, source, units)
+        (declaration, selected, layout, source, units)
     }
 }
 
 /// Exact canonical units and restricted retained sources for a pipeline stage.
 /// A parameter-only stage has no state and owns only its selected recipes.
 pub struct PreparedPerceptionPartitionBindings {
-    precision: super::precision::SpeechPrecision,
-    dimensions: PerceptionDimensions,
-    prepared: PreparedComponent<eredu_runtime::ComponentDefinition>,
+    prepared: PreparedComponent<PerceptionDeclaration>,
     state_layout: Option<eredu_runtime::StateLayout>,
 }
 impl PreparedPerceptionPartitionBindings {
+    /// Global scope retained alongside exact selected stage resources.
+    pub fn declaration(&self) -> &PerceptionDeclaration {
+        self.prepared.declaration()
+    }
+
     /// Retained floating policy for partition construction.
     pub fn precision(&self) -> super::precision::SpeechPrecision {
-        self.precision
+        self.declaration().precision()
     }
     /// Global family equations; physical TP geometry is retained separately.
     pub fn dimensions(&self) -> PerceptionDimensions {
-        self.dimensions
+        self.declaration().dimensions()
     }
     /// Exact selected physical layout when tensor parallelism is also selected.
     pub fn local_layout(&self) -> Option<&LocalModelLayout> {
@@ -242,27 +248,25 @@ impl PreparedPerceptionPartitionBindings {
     }
     /// Complete definition with global cache identities and parameter ownership.
     pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
-        self.prepared.declaration()
+        self.prepared.declaration().definition()
     }
     /// Consumes exact stage authority without rebasing canonical unit addresses.
     pub fn into_parts(
         self,
     ) -> (
-        PerceptionDimensions,
-        eredu_runtime::ComponentDefinition,
+        PerceptionDeclaration,
         Option<LocalModelLayout>,
         eredu_runtime::ExecutionUnitAddressMap,
         SharedCheckpointSource,
         Vec<(eredu_runtime::ExecutionUnitAddress, Vec<WeightBinding>)>,
         Option<eredu_runtime::StateLayout>,
     ) {
-        let (definition, local_layout, invocations, source, units) = self
+        let (declaration, local_layout, invocations, source, units) = self
             .prepared
             .into_addressed_unit_parts()
             .expect("partition declares only independently leased units");
         (
-            self.dimensions,
-            definition,
+            declaration,
             local_layout,
             invocations,
             source,

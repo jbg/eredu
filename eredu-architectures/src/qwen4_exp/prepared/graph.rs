@@ -53,7 +53,18 @@ impl Graph {
             "Token embedding and residual expansion",
             None,
         );
-        g.parameters("target.embedding", "embedding", "model.embed_tokens");
+        g.parameters(
+            "target.embedding",
+            "embedding",
+            target
+                .static_parameters
+                .embedding
+                .weight
+                .id
+                .as_str()
+                .strip_suffix(".weight")
+                .expect("declared vocabulary weight"),
+        );
         g.edge("target.tokens", "target.embedding", E::Data);
         let mut previous = "target.embedding".to_owned();
         let mut executions = vec![];
@@ -89,7 +100,7 @@ impl Graph {
                     g.get(&id).mixer = Some(MixerAttributes {
                         mechanism: MixerMechanism::ShortConvolution,
                         recurrent: true,
-                        convolution_width: Some(spec.convolution.kernel_size as usize),
+                        convolution_width: Some(spec.parameters.convolution.kernel_size as usize),
                     });
                     g.state(&id, "Token IDs, convolution history and sequence position");
                 }
@@ -129,9 +140,16 @@ impl Graph {
         });
         g.readout(
             "target",
-            "model.hyper_connection_mixer",
+            target
+                .static_parameters
+                .readout
+                .down
+                .weight
+                .group
+                .as_deref()
+                .expect("declared residual owner"),
             &previous,
-            target.config.tied_embeddings,
+            &target.static_parameters.output_projection(),
         );
         let mut prediction_executions = vec![];
         for unit in &prediction.units {
@@ -163,7 +181,18 @@ impl Graph {
                 "Shared target token embedding",
                 None,
             );
-            g.parameters(&embedding, "embedding", "model.embed_tokens");
+            g.parameters(
+                &embedding,
+                "embedding",
+                target
+                    .static_parameters
+                    .embedding
+                    .weight
+                    .id
+                    .as_str()
+                    .strip_suffix(".weight")
+                    .expect("declared vocabulary weight"),
+            );
             g.edge(&tokens, &embedding, E::Data);
             let fusion = format!("{root}.fusion");
             g.node(
@@ -173,12 +202,19 @@ impl Graph {
                 "Residual and token embedding fusion",
                 None,
             );
-            for prefix in [
-                "mtp.pre_fc_norm_embedding",
-                "mtp.pre_fc_norm_hidden",
-                "mtp.fc_embedding",
-                "mtp.fc_hidden",
-            ] {
+            use eredu_nn::DeclareLogicalParameters;
+            for parameter in prediction
+                .shared
+                .fusion
+                .logical_parameters()
+                .expect("validated prediction fusion declaration")
+            {
+                let prefix = parameter
+                    .parameter
+                    .id
+                    .as_str()
+                    .strip_suffix(".weight")
+                    .expect("declared fusion affine or scale");
                 g.parameters(&fusion, prefix, prefix);
             }
             g.edge(&embedding, &fusion, E::Data);
@@ -197,9 +233,16 @@ impl Graph {
             );
             g.readout(
                 &root,
-                "mtp.hyper_connection_mixer",
+                prediction
+                    .shared
+                    .readout
+                    .down
+                    .weight
+                    .group
+                    .as_deref()
+                    .expect("declared prediction residual owner"),
                 &format!("{root}.feed_forward.residual"),
-                target.config.tied_embeddings,
+                &target.static_parameters.output_projection(),
             );
             prediction_executions.push(ArchitectureLayerExecution {
                 node_id: root,
@@ -217,8 +260,19 @@ impl Graph {
             weight_sharing: LayerWeightSharing::None,
         });
         let streams = || {
-            let mut axes = axes("hidden", target.config.hidden_size as usize);
-            axes.insert(2, TensorAxis { name: "stream".into(), dimension: SymbolicDimension::Known(target.boundary.geometry.streams() as usize) });
+            let mut axes = axes(
+                "hidden",
+                target.static_parameters.embedding.dimensions as usize,
+            );
+            axes.insert(
+                2,
+                TensorAxis {
+                    name: "stream".into(),
+                    dimension: SymbolicDimension::Known(
+                        target.static_parameters.readout.geometry.streams() as usize,
+                    ),
+                },
+            );
             axes
         };
         g.get("target.embedding").output_axes = Some(streams());
@@ -227,14 +281,16 @@ impl Graph {
             g.get(&id).output_axes = Some(streams());
             if let UnitSpec::Lexical { spec, .. } = unit {
                 g.get(&format!("{id}.table")).output_axes =
-                    Some(axes("feature", spec.embedding_width as usize));
+                    Some(axes("feature", spec.parameters.key.input as usize));
             }
         }
         for unit in &prediction.units {
             let root = format!("prediction.{}", unit.depth);
             g.get(&root).output_axes = Some(streams());
-            g.get(&format!("{root}.embedding")).output_axes =
-                Some(axes("hidden", target.config.hidden_size as usize));
+            g.get(&format!("{root}.embedding")).output_axes = Some(axes(
+                "hidden",
+                target.static_parameters.embedding.dimensions as usize,
+            ));
             g.get(&format!("{root}.fusion")).output_axes = Some(streams());
         }
         for root in std::iter::once("target".to_owned()).chain(
@@ -243,11 +299,15 @@ impl Graph {
                 .iter()
                 .map(|u| format!("prediction.{}", u.depth)),
         ) {
-            g.get(&format!("{root}.readout")).output_axes =
-                Some(axes("hidden", target.config.hidden_size as usize));
+            g.get(&format!("{root}.readout")).output_axes = Some(axes(
+                "hidden",
+                target.static_parameters.embedding.dimensions as usize,
+            ));
             for suffix in ["head", "logits"] {
-                g.get(&format!("{root}.{suffix}")).output_axes =
-                    Some(axes("vocabulary", target.config.vocabulary as usize));
+                g.get(&format!("{root}.{suffix}")).output_axes = Some(axes(
+                    "vocabulary",
+                    target.static_parameters.output_projection().output as usize,
+                ));
             }
         }
         for root in target
@@ -274,8 +334,10 @@ impl Graph {
                 "feed_forward.shared",
                 "feed_forward.sum",
             ] {
-                g.get(&format!("{root}.{suffix}")).output_axes =
-                    Some(axes("hidden", target.config.hidden_size as usize));
+                g.get(&format!("{root}.{suffix}")).output_axes = Some(axes(
+                    "hidden",
+                    target.static_parameters.embedding.dimensions as usize,
+                ));
             }
         }
         g
@@ -367,7 +429,7 @@ impl Graph {
         self.edge(&id, owner, ArchitectureEdgeKind::State);
         self.edge(owner, &id, ArchitectureEdgeKind::State);
     }
-    fn readout(&mut self, root: &str, prefix: &str, input: &str, tied: bool) {
+    fn readout(&mut self, root: &str, prefix: &str, input: &str, output: &eredu_nn::LinearSpec) {
         use ArchitectureEdgeKind as E;
         use ArchitectureNodeKind as K;
         let readout = format!("{root}.readout");
@@ -391,11 +453,12 @@ impl Graph {
         self.parameters(
             &head,
             "vocabulary",
-            if tied {
-                "model.embed_tokens"
-            } else {
-                "lm_head"
-            },
+            output
+                .weight
+                .id
+                .as_str()
+                .strip_suffix(".weight")
+                .expect("declared vocabulary weight"),
         );
         self.edge(&readout, &head, E::Data);
         let logits = format!("{root}.logits");
@@ -436,6 +499,7 @@ impl Graph {
                 self.state(&mix, "Recurrent matrix and causal convolution history");
             }
             MixerSpec::Indexed(spec) => {
+                let geometry = spec.parameters.projection.geometry;
                 self.node(
                     &mix,
                     K::Attention,
@@ -444,17 +508,17 @@ impl Graph {
                     None,
                 );
                 self.get(&mix).attention = Some(AttentionAttributes {
-                    head_sharing: Some(if spec.heads == spec.kv_heads {
+                    head_sharing: Some(if geometry.query_heads() == geometry.key_value_heads() {
                         HeadSharing::MultiHead
-                    } else if spec.kv_heads == 1 {
+                    } else if geometry.key_value_heads() == 1 {
                         HeadSharing::MultiQuery
                     } else {
                         HeadSharing::GroupedQuery
                     }),
-                    query_heads: Some(spec.heads as usize),
-                    key_value_heads: Some(spec.kv_heads as usize),
-                    key_head_dimension: Some(spec.head_dim as usize),
-                    value_head_dimension: Some(spec.head_dim as usize),
+                    query_heads: Some(geometry.query_heads() as usize),
+                    key_value_heads: Some(geometry.key_value_heads() as usize),
+                    key_head_dimension: Some(geometry.key_dimensions() as usize),
+                    value_head_dimension: Some(geometry.value_dimensions() as usize),
                     mechanism: Some(AttentionMechanism::Softmax),
                     recurrent: Some(false),
                     causal: Some(true),
@@ -502,12 +566,12 @@ impl Graph {
             "Shared and routed gated feed-forward",
             None,
         );
-        let policy = ff.router.selection();
+        let policy = ff.parameters.routed.selector.selection();
         self.get(&f).moe = Some(MoeAttributes {
-            routed_experts: ff.experts.group_count() as usize,
+            routed_experts: ff.parameters.routed.experts.group_count() as usize,
             selected_experts: policy.top_k() as usize,
             shared_experts: Some(1),
-            shared_expert_width: Some(ff.shared[0].output as usize),
+            shared_expert_width: Some(ff.parameters.shared.gate.output as usize),
             shared_expert_gated: Some(true),
             granularity: Some(RoutingGranularity::Token),
             score_transform: Some(match policy.scoring() {

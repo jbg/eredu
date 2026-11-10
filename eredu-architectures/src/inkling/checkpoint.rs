@@ -22,11 +22,8 @@ pub fn load_time_quantization(
     quantization: WeightQuantization,
 ) -> Result<ModelArgs, String> {
     quantization.validate().map_err(|error| error.to_string())?;
-    let mut target = args.clone();
-    target.text_config.weight_quantization = Some(quantization);
-    target.text_config.quantized_weight_configs = None;
-    target.validate().map_err(|error| error.to_string())?;
-    Ok(target)
+    args.with_text_formats(Some(quantization), None)
+        .map_err(|e| e.to_string())
 }
 
 /// Applies canonical checkpoint format metadata to a complete Inkling
@@ -36,7 +33,6 @@ pub fn with_checkpoint_formats(
     mut formats: HashMap<String, WeightQuantization>,
 ) -> Result<ModelArgs, String> {
     normalize_gguf_weight_formats(args, &mut formats)?;
-    let mut target = args.clone();
     let mut audio = HashMap::new();
     let mut vision = HashMap::new();
     formats.retain(|name, format| {
@@ -50,16 +46,9 @@ pub fn with_checkpoint_formats(
             true
         }
     });
-    target.text_config.weight_quantization = None;
-    target.text_config.quantized_weight_configs = (!formats.is_empty()).then_some(formats);
-    if let Some(config) = target.audio_config.as_mut() {
-        config.quantized_weight_configs = (!audio.is_empty()).then_some(audio);
-    }
-    if let Some(config) = target.vision_config.as_mut() {
-        config.quantized_weight_configs = (!vision.is_empty()).then_some(vision);
-    }
-    target.validate().map_err(|error| error.to_string())?;
-    Ok(target)
+    args.with_text_formats(None, (!formats.is_empty()).then_some(formats))
+        .and_then(|target| target.with_media_formats(audio, vision))
+        .map_err(|e| e.to_string())
 }
 
 /// Canonical target and released source identity.
@@ -71,184 +60,246 @@ pub struct ParameterAlias {
     pub target: String,
 }
 
-/// Gate and up projections derived from one row-interleaved `w13` tensor.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct DenseW13Recipes {
-    /// Even rows forming the gate projection.
-    pub gate: DerivedWeightRecipe,
-    /// Odd rows forming the up projection.
-    pub up: DerivedWeightRecipe,
-}
-
 /// Rehomes split GGUF expert formats onto canonical fused routed and shared banks.
 pub fn normalize_gguf_weight_formats(
     args: &ModelArgs,
     formats: &mut HashMap<String, WeightQuantization>,
 ) -> Result<(), String> {
-    let layers = dimension(args.text_config.num_hidden_layers, "layer count")?;
-    for layer in 0..layers {
-        if args
-            .text_config
-            .layer_policy(layer)
-            .is_none_or(|policy| policy.feed_forward != FeedForwardPolicy::SparseMoe)
-        {
-            continue;
-        }
-        for bank in ["experts", "shared_experts"] {
+    for (layer, parameters) in args.sparse_layers() {
+        for (bank, declaration) in [
+            ("experts", &parameters.routed),
+            ("shared_experts", &parameters.shared),
+        ] {
+            let eredu_nn::GatedProductGroupLayout::Packed { gate_up, .. } = declaration.layout()
+            else {
+                return Err("Inkling format extension requires a declared packed bank".into());
+            };
             let root = format!("model.layers.{layer}.moe.{bank}");
-            let gate = formats.get(&format!("{root}.gate_proj")).copied();
-            let up = formats.get(&format!("{root}.up_proj")).copied();
+            let gate_name = format!("{root}.gate_proj");
+            let up_name = format!("{root}.up_proj");
+            let gate = formats.get(&gate_name).copied();
+            let up = formats.get(&up_name).copied();
             match (gate, up) {
                 (Some(gate), Some(up)) if gate == up => {
-                    formats.insert(format!("{root}.gate_up_proj"), gate);
+                    let target = gate_up.weight().id.as_str();
+                    if formats.get(target).is_some_and(|format| *format != gate) {
+                        return Err(format!("Inkling fused and split formats disagree for {target}"));
+                    }
+                    formats.insert(target.to_owned(), gate);
+                    formats.remove(&gate_name);
+                    formats.remove(&up_name);
                 }
                 (None, None) => {}
-                (gate, up) => {
-                    return Err(format!(
-                        "Inkling GGUF fused expert bank {root:?} requires matching gate/up formats, got {gate:?} and {up:?}"
-                    ));
-                }
+                (gate, up) => return Err(format!("Inkling GGUF fused expert bank {root:?} requires matching gate/up formats, got {gate:?} and {up:?}")),
             }
         }
     }
     Ok(())
 }
 
+fn visit_text_pinned_parameters(
+    args: &ModelArgs,
+    mut visit: impl FnMut(
+        &str,
+        &str,
+        &eredu_nn::LogicalParameterDeclaration<'_>,
+        TensorOperation,
+    ) -> Result<(), String>,
+) -> Result<(), String> {
+    let ordinary = &args.pinned().ordinary;
+    let embedding_norm = &args.pinned().embedding_norm;
+    let output = ordinary.output_projection_spec();
+    let slots: [(
+        &str,
+        &str,
+        &dyn eredu_nn::DeclareLogicalParameters,
+        TensorOperation,
+    ); 4] = [
+        (
+            "model.llm.embed.weight",
+            "token_embd.weight",
+            ordinary.embedding_spec(),
+            TensorOperation::Matrix,
+        ),
+        (
+            "model.llm.embed_norm.weight",
+            "token_embd_norm.weight",
+            embedding_norm,
+            TensorOperation::Vector,
+        ),
+        (
+            "model.llm.norm.weight",
+            "output_norm.weight",
+            ordinary.normalization_spec(),
+            TensorOperation::Vector,
+        ),
+        (
+            "model.llm.unembed.weight",
+            "output.weight",
+            output.as_ref(),
+            TensorOperation::Matrix,
+        ),
+    ];
+    for (safe, gguf, spec, operation) in slots {
+        visit(safe, gguf, &declared_parameter(spec)?, operation)?;
+    }
+    Ok(())
+}
+
+/// Exact affine and media-table geometry from construction slots and source
+/// extensions. A raw tensor operation has no affine encoding declaration.
+pub(crate) fn source_linear_shapes(
+    args: &ModelArgs,
+) -> Result<BTreeMap<String, Vec<usize>>, String> {
+    args.validate().map_err(|error| error.to_string())?;
+    let text = &args.text_config;
+    let mut shapes = BTreeMap::new();
+    visit_text_pinned_parameters(args, |_, _, parameter, _| {
+        if parameter.role == eredu_nn::LogicalParameterRole::LinearWeight {
+            insert_source_matrix(&mut shapes, parameter)?;
+        }
+        Ok(())
+    })?;
+    for (layer, policy) in text.layer_schedule.iter().enumerate() {
+        let common = args.common(layer).map_err(|error| error.to_string())?;
+        visit_block_parameters(&common, |_, _, parameter, _| {
+            insert_source_matrix(&mut shapes, parameter)
+        })?;
+        match policy.feed_forward {
+            FeedForwardPolicy::Dense => {
+                let parameters = args.dense(layer).map_err(|error| error.to_string())?;
+                project_dense_source_matrices(
+                    &mut shapes,
+                    &parameters,
+                    &format!("model.llm.layers.{layer}"),
+                )?;
+            }
+            FeedForwardPolicy::SparseMoe => {
+                let parameters = args.sparse(layer).map_err(|error| error.to_string())?;
+                project_declared_source_matrices(&mut shapes, parameters)?;
+            }
+        }
+    }
+    visit_media_parameters(args, |_, _, parameter, _| {
+        insert_source_matrix(&mut shapes, parameter)
+    })?;
+    let prediction = args.prediction();
+    for (depth, parameters) in prediction.depths.iter().enumerate() {
+        project_declared_source_matrices(&mut shapes, &parameters.fusion)?;
+        visit_block_parameters(&parameters.common, |_, _, parameter, _| {
+            insert_source_matrix(&mut shapes, parameter)
+        })?;
+        project_dense_source_matrices(
+            &mut shapes,
+            &parameters.dense,
+            &format!("model.mtp.layers.{depth}.transformer_block"),
+        )?;
+    }
+    Ok(shapes)
+}
+
+fn insert_source_geometry(
+    shapes: &mut BTreeMap<String, Vec<usize>>,
+    name: &str,
+    shape: &[usize],
+) -> Result<(), String> {
+    if shapes.get(name).is_some_and(|previous| previous != shape) {
+        return Err(format!(
+            "Inkling source matrix {name:?} has conflicting logical geometry"
+        ));
+    }
+    shapes.insert(name.to_owned(), shape.to_vec());
+    Ok(())
+}
+
+fn insert_source_matrix(
+    shapes: &mut BTreeMap<String, Vec<usize>>,
+    parameter: &eredu_nn::LogicalParameterDeclaration<'_>,
+) -> Result<(), String> {
+    if parameter.linear_format.is_some() && parameter.shape.len() == 2 {
+        insert_source_geometry(shapes, parameter.parameter.id.as_str(), &parameter.shape)?;
+    }
+    Ok(())
+}
+
+fn project_declared_source_matrices(
+    shapes: &mut BTreeMap<String, Vec<usize>>,
+    spec: &impl eredu_nn::DeclareLogicalParameters,
+) -> Result<(), String> {
+    for parameter in spec
+        .logical_parameters()
+        .map_err(|error| error.to_string())?
+    {
+        insert_source_matrix(shapes, &parameter)?;
+    }
+    Ok(())
+}
+
+fn project_dense_source_matrices(
+    shapes: &mut BTreeMap<String, Vec<usize>>,
+    parameters: &super::text::DenseParameters,
+    released: &str,
+) -> Result<(), String> {
+    project_declared_source_matrices(shapes, parameters)?;
+    let source = dense_input_sources(parameters, released)?;
+    insert_source_geometry(shapes, &source.interleaved, &source.shape)
+}
+
 /// Builds the complete released SafeTensors catalog, including native media
 /// towers and embedded prediction depths.
 pub fn safetensors_plan(args: &ModelArgs) -> Result<SafetensorsCheckpointPlan, String> {
     let text = &args.text_config;
-    let hidden = dimension(text.hidden_size, "hidden size")?;
-    let vocab = dimension(text.vocab_size, "vocabulary size")?;
+    if text.weight_quantization.is_some()
+        || text
+            .quantized_weight_configs
+            .as_ref()
+            .is_some_and(|formats| !formats.is_empty())
+        || args
+            .audio_config
+            .as_ref()
+            .and_then(|audio| audio.quantized_weight_configs.as_ref())
+            .is_some_and(|formats| !formats.is_empty())
+        || args
+            .vision_config
+            .as_ref()
+            .and_then(|vision| vision.quantized_weight_configs.as_ref())
+            .is_some_and(|formats| !formats.is_empty())
+    {
+        return Err("Inkling SafeTensors requires floating source weights; select executable quantization through the load request".into());
+    }
     let layers = dimension(text.num_hidden_layers, "layer count")?;
     let mut common = Vec::new();
     let mut groups = Vec::new();
-    for (released, canonical, shape) in [
-        (
-            "model.llm.embed.weight",
-            "model.embed_tokens.weight",
-            vec![vocab, hidden],
-        ),
-        (
-            "model.llm.embed_norm.weight",
-            "model.embed_norm.weight",
-            vec![hidden],
-        ),
-        ("model.llm.norm.weight", "model.norm.weight", vec![hidden]),
-        (
-            "model.llm.unembed.weight",
-            "lm_head.weight",
-            vec![vocab, hidden],
-        ),
-    ] {
-        common.push(safe_alias(released, canonical, shape));
-    }
+    visit_text_pinned_parameters(args, |source, _, parameter, _| {
+        common.push(safe_alias(
+            source,
+            parameter.parameter.id.as_str(),
+            parameter.shape.clone(),
+        ));
+        Ok(())
+    })?;
     for layer in 0..layers {
         let released = format!("model.llm.layers.{layer}");
         let canonical = format!("model.layers.{layer}");
-        let policy = text
-            .layer_policy(layer)
-            .ok_or_else(|| format!("Inkling layer {layer} has no normalized policy"))?;
-        let local = policy.attention.window().is_some();
-        let query_heads = dimension(text.query_heads(local), "query head count")?;
-        let key_value_heads = dimension(text.key_value_heads(local), "key/value head count")?;
-        let head = dimension(text.attention_head_dim(local), "attention head width")?;
-        let d_rel = dimension(text.d_rel, "relative-attention width")?;
-        let relative = policy
-            .attention
-            .window()
-            .map(|window| window.get() as usize)
-            .unwrap_or(dimension(text.rel_extent, "relative-attention extent")?);
-        let convolution = dimension(text.sconv_kernel_size, "short-convolution width")?;
-        let query = checked_mul(query_heads, head, "query projection width")?;
-        let key_value = checked_mul(key_value_heads, head, "key/value projection width")?;
-        let relative_query = checked_mul(query_heads, d_rel, "relative-query projection width")?;
-        for (source, target, shape) in [
-            (
-                format!("{released}.attn_norm.weight"),
-                format!("{canonical}.input_layernorm.weight"),
-                vec![hidden],
-            ),
-            (
-                format!("{released}.mlp_norm.weight"),
-                format!("{canonical}.post_attention_layernorm.weight"),
-                vec![hidden],
-            ),
-            (
-                format!("{released}.attn.wq_du.weight"),
-                format!("{canonical}.self_attn.q_proj.weight"),
-                vec![query, hidden],
-            ),
-            (
-                format!("{released}.attn.wk_dv.weight"),
-                format!("{canonical}.self_attn.k_proj.weight"),
-                vec![key_value, hidden],
-            ),
-            (
-                format!("{released}.attn.wv_dv.weight"),
-                format!("{canonical}.self_attn.v_proj.weight"),
-                vec![key_value, hidden],
-            ),
-            (
-                format!("{released}.attn.wr_du.weight"),
-                format!("{canonical}.self_attn.r_proj.weight"),
-                vec![relative_query, hidden],
-            ),
-            (
-                format!("{released}.attn.wo_ud.weight"),
-                format!("{canonical}.self_attn.o_proj.weight"),
-                vec![hidden, query],
-            ),
-            (
-                format!("{released}.attn.q_norm.weight"),
-                format!("{canonical}.self_attn.q_norm.weight"),
-                vec![head],
-            ),
-            (
-                format!("{released}.attn.k_norm.weight"),
-                format!("{canonical}.self_attn.k_norm.weight"),
-                vec![head],
-            ),
-            (
-                format!("{released}.attn.rel_logits_proj.proj"),
-                format!("{canonical}.self_attn.rel_proj"),
-                vec![d_rel, relative],
-            ),
-            (
-                format!("{released}.attn.k_sconv.weight"),
-                format!("{canonical}.self_attn.k_sconv.weight"),
-                vec![key_value, 1, convolution],
-            ),
-            (
-                format!("{released}.attn.v_sconv.weight"),
-                format!("{canonical}.self_attn.v_sconv.weight"),
-                vec![key_value, 1, convolution],
-            ),
-            (
-                format!("{released}.attn_sconv.weight"),
-                format!("{canonical}.attn_sconv.weight"),
-                vec![hidden, 1, convolution],
-            ),
-            (
-                format!("{released}.mlp_sconv.weight"),
-                format!("{canonical}.mlp_sconv.weight"),
-                vec![hidden, 1, convolution],
-            ),
-        ] {
-            common.push(safe_alias(source, target, shape));
-        }
+        let parameters = args.common(layer).map_err(|error| error.to_string())?;
+        visit_block_parameters(&parameters, |source, _, parameter, _| {
+            common.push(safe_alias(
+                format!("{released}.{source}"),
+                parameter.parameter.id.as_str(),
+                parameter.shape.clone(),
+            ));
+            Ok(())
+        })?;
         add_feed_forward_layout(
-            text,
-            policy.feed_forward,
+            args.feed_forward(layer).map_err(|e| e.to_string())?,
             &released,
             &canonical,
-            hidden,
             &mut common,
             &mut groups,
         )?;
     }
-    add_safetensors_media(args, hidden, &mut common)?;
-    add_safetensors_mtp(args, hidden, &mut common, &mut groups)?;
+    add_safetensors_media(args, &mut common)?;
+    add_safetensors_mtp(args, &mut common, &mut groups)?;
     SafetensorsCheckpointPlan::new(
         "Inkling SafeTensors",
         common,
@@ -261,158 +312,90 @@ pub fn safetensors_plan(args: &ModelArgs) -> Result<SafetensorsCheckpointPlan, S
 /// Builds the complete text GGUF catalog admitted for Inkling.
 pub fn gguf_plan(args: &ModelArgs) -> Result<GgufCheckpointPlan, String> {
     let text = &args.text_config;
-    let hidden = dimension(text.hidden_size, "hidden size")?;
-    let vocabulary = dimension(text.vocab_size, "vocabulary size")?;
     let layers = dimension(text.num_hidden_layers, "layer count")?;
-    let mut tensors = vec![
-        gguf(
-            "token_embd.weight",
-            vec![vocabulary, hidden],
-            TensorOperation::Matrix,
-        ),
-        gguf(
-            "token_embd_norm.weight",
-            vec![hidden],
-            TensorOperation::Vector,
-        ),
-        gguf("output_norm.weight", vec![hidden], TensorOperation::Vector),
-        gguf(
-            "output.weight",
-            vec![vocabulary, hidden],
-            TensorOperation::Matrix,
-        ),
-    ];
+    let mut tensors = Vec::new();
+    visit_text_pinned_parameters(args, |_, source, parameter, operation| {
+        tensors.push(gguf(source, parameter.shape.clone(), operation));
+        Ok(())
+    })?;
     for layer in 0..layers {
         let root = format!("blk.{layer}");
         let policy = text
             .layer_policy(layer)
             .ok_or_else(|| format!("Inkling layer {layer} has no normalized policy"))?;
-        let local = policy.attention.window().is_some();
-        let query_heads = dimension(text.query_heads(local), "query head count")?;
-        let key_value_heads = dimension(text.key_value_heads(local), "key/value head count")?;
-        let head = dimension(text.attention_head_dim(local), "attention head width")?;
-        let d_rel = dimension(text.d_rel, "relative-attention width")?;
-        let relative = policy
-            .attention
-            .window()
-            .map(|window| window.get() as usize)
-            .unwrap_or(dimension(text.rel_extent, "relative-attention extent")?);
-        let convolution = dimension(text.sconv_kernel_size, "short-convolution width")?;
-        let query = checked_mul(query_heads, head, "query projection width")?;
-        let key_value = checked_mul(key_value_heads, head, "key/value projection width")?;
-        tensors.extend([
-            gguf(
-                format!("{root}.attn_norm.weight"),
-                vec![hidden],
-                TensorOperation::Vector,
-            ),
-            gguf(
-                format!("{root}.ffn_norm.weight"),
-                vec![hidden],
-                TensorOperation::Vector,
-            ),
-            gguf(
-                format!("{root}.attn_q.weight"),
-                vec![query, hidden],
-                TensorOperation::Matrix,
-            ),
-            gguf(
-                format!("{root}.attn_k.weight"),
-                vec![key_value, hidden],
-                TensorOperation::Matrix,
-            ),
-            gguf(
-                format!("{root}.attn_v.weight"),
-                vec![key_value, hidden],
-                TensorOperation::Matrix,
-            ),
-            gguf(
-                format!("{root}.attn_r.weight"),
-                vec![
-                    checked_mul(query_heads, d_rel, "relative-query width")?,
-                    hidden,
-                ],
-                TensorOperation::Matrix,
-            ),
-            gguf(
-                format!("{root}.attn_output.weight"),
-                vec![hidden, query],
-                TensorOperation::Matrix,
-            ),
-            gguf(
-                format!("{root}.attn_q_norm.weight"),
-                vec![head],
-                TensorOperation::Vector,
-            ),
-            gguf(
-                format!("{root}.attn_k_norm.weight"),
-                vec![head],
-                TensorOperation::Vector,
-            ),
-            gguf(
-                format!("{root}.attn_rel_proj.weight"),
-                vec![d_rel, relative],
-                TensorOperation::Dense,
-            )
-            .with_aliases([format!("{root}.attn_rel_proj")]),
-        ]);
-        for (name, channels) in [
-            ("shortconv_k", key_value),
-            ("shortconv_v", key_value),
-            ("shortconv_attn", hidden),
-            ("shortconv_mlp", hidden),
-        ] {
-            tensors.push(
-                gguf(
-                    format!("{root}.{name}.weight"),
-                    vec![channels, convolution],
-                    TensorOperation::Dense,
+        let parameters = args.common(layer).map_err(|error| error.to_string())?;
+        visit_block_parameters(&parameters, |_, source, parameter, layout| {
+            let key = format!("{root}.{source}");
+            let tensor = match layout {
+                BlockTensorLayout::Convolution => gguf(
+                    key,
+                    vec![parameter.shape[0], parameter.shape[2]],
+                    layout.operation(),
                 )
-                .with_alternate_shapes([vec![channels, 1, convolution]]),
-            );
-        }
+                .with_alternate_shapes([parameter.shape.clone()]),
+                BlockTensorLayout::Profile => {
+                    gguf(&key, parameter.shape.clone(), layout.operation())
+                        .with_aliases([key.trim_end_matches(".weight").to_owned()])
+                }
+                _ => gguf(key, parameter.shape.clone(), layout.operation()),
+            };
+            tensors.push(tensor);
+            Ok(())
+        })?;
         match policy.feed_forward {
             FeedForwardPolicy::Dense => {
-                let intermediate =
-                    dimension(text.dense_intermediate_size(), "dense intermediate size")?;
-                tensors.extend([
-                    gguf(
-                        format!("{root}.ffn_gate.weight"),
-                        vec![intermediate, hidden],
+                let parameters = args.dense(layer).map_err(|error| error.to_string())?;
+                for (field, spec) in [
+                    ("ffn_gate", &parameters.product.gate),
+                    ("ffn_up", &parameters.product.up),
+                    ("ffn_down", &parameters.product.down),
+                ] {
+                    tensors.push(gguf(
+                        format!("{root}.{field}.weight"),
+                        declared_parameter(spec)?.shape,
                         TensorOperation::Matrix,
-                    ),
-                    gguf(
-                        format!("{root}.ffn_up.weight"),
-                        vec![intermediate, hidden],
-                        TensorOperation::Matrix,
-                    ),
-                    gguf(
-                        format!("{root}.ffn_down.weight"),
-                        vec![hidden, intermediate],
-                        TensorOperation::Matrix,
-                    ),
+                    ));
+                }
+                tensors.push(
                     gguf(
                         format!("{root}.ffn_gscale"),
-                        vec![1],
+                        parameters
+                            .scale_declaration()
+                            .map_err(|error| error.to_string())?
+                            .shape,
                         TensorOperation::Vector,
                     )
                     .with_aliases([format!("{root}.ffn_gscale.weight")]),
-                ]);
+                );
             }
             FeedForwardPolicy::SparseMoe => {
-                let routed = dimension(text.n_routed_experts, "routed expert count")?;
-                let shared = dimension(text.n_shared_experts, "shared expert count")?;
-                let intermediate =
-                    dimension(text.moe_intermediate_size(), "MoE intermediate size")?;
+                use eredu_nn::DeclareLogicalParameters;
+                let parameters = args.sparse(layer).map_err(|error| error.to_string())?;
+                let router = parameters
+                    .router
+                    .logical_parameters()
+                    .map_err(|error| error.to_string())?;
+                let shape = |slot: &eredu_nn::ParameterSpec| {
+                    router
+                        .iter()
+                        .find(|parameter| parameter.parameter.id == slot.id)
+                        .map(|parameter| parameter.shape.clone())
+                        .ok_or_else(|| {
+                            format!(
+                                "Inkling source extension references undeclared slot {}",
+                                slot.id
+                            )
+                        })
+                };
                 tensors.extend([
                     gguf(
                         format!("{root}.ffn_gate_inp.weight"),
-                        vec![checked_add(routed, shared, "router width")?, hidden],
+                        shape(parameters.router.weight())?,
                         TensorOperation::Dense,
                     ),
                     gguf(
                         format!("{root}.exp_probs_b.bias"),
-                        vec![routed],
+                        shape(parameters.router.correction_bias())?,
                         TensorOperation::Vector,
                     )
                     .with_aliases([
@@ -421,41 +404,30 @@ pub fn gguf_plan(args: &ModelArgs) -> Result<GgufCheckpointPlan, String> {
                     ]),
                     gguf(
                         format!("{root}.ffn_gscale"),
-                        vec![1],
+                        shape(parameters.router.coefficient_scale())?,
                         TensorOperation::Vector,
                     )
                     .with_aliases([format!("{root}.ffn_gscale.weight")]),
-                    gguf(
-                        format!("{root}.ffn_gate_exps.weight"),
-                        vec![routed, intermediate, hidden],
-                        TensorOperation::Matrix,
-                    ),
-                    gguf(
-                        format!("{root}.ffn_up_exps.weight"),
-                        vec![routed, intermediate, hidden],
-                        TensorOperation::Matrix,
-                    ),
-                    gguf(
-                        format!("{root}.ffn_down_exps.weight"),
-                        vec![routed, hidden, intermediate],
-                        TensorOperation::Matrix,
-                    ),
-                    gguf(
-                        format!("{root}.ffn_gate_shexp.weight"),
-                        vec![shared, intermediate, hidden],
-                        TensorOperation::Matrix,
-                    ),
-                    gguf(
-                        format!("{root}.ffn_up_shexp.weight"),
-                        vec![shared, intermediate, hidden],
-                        TensorOperation::Matrix,
-                    ),
-                    gguf(
-                        format!("{root}.ffn_down_shexp.weight"),
-                        vec![shared, hidden, intermediate],
-                        TensorOperation::Matrix,
-                    ),
                 ]);
+                for source in sparse_banks(&parameters) {
+                    let bank = source
+                        .bank
+                        .packed_parameters()
+                        .map_err(|error| error.to_string())?;
+                    let read_shape = bank.unfused_shape();
+                    for field in ["gate", "up"] {
+                        tensors.push(gguf(
+                            format!("{root}.ffn_{field}_{}.weight", source.gguf),
+                            read_shape.clone(),
+                            TensorOperation::Matrix,
+                        ));
+                    }
+                    tensors.push(gguf(
+                        format!("{root}.ffn_down_{}.weight", source.gguf),
+                        bank.down().shape.clone(),
+                        TensorOperation::Matrix,
+                    ));
+                }
             }
         }
     }
@@ -465,54 +437,17 @@ pub fn gguf_plan(args: &ModelArgs) -> Result<GgufCheckpointPlan, String> {
 
 /// Builds the sibling audio/vision projector GGUF catalog.
 pub fn mmproj_gguf_plan(args: &ModelArgs) -> Result<GgufCheckpointPlan, String> {
-    let audio = args
-        .audio_config
-        .as_ref()
-        .ok_or_else(|| "Inkling mmproj has no audio geometry".to_string())?;
-    let vision = args
-        .vision_config
-        .as_ref()
-        .ok_or_else(|| "Inkling mmproj has no vision geometry".to_string())?;
-    let hidden = dimension(args.text_config.hidden_size, "hidden size")?;
-    let codebooks = dimension(audio.num_codebooks, "audio codebook count")?;
-    let codebook_size = dimension(audio.codebook_size, "audio codebook size")?;
-    let mut tensors = vec![
-        gguf(
-            "a.dmel.embedding.weight",
-            vec![
-                checked_mul(codebooks, codebook_size, "audio vocabulary")?,
-                hidden,
-            ],
-            TensorOperation::Matrix,
-        ),
-        gguf(
-            "a.dmel.final_norm.weight",
-            vec![hidden],
-            TensorOperation::Vector,
-        ),
-    ];
-    let specs = vision.layer_specs();
-    for (layer, (input, output, _, _)) in specs.iter().copied().enumerate() {
-        let input = dimension(input, "vision layer input width")?;
-        let output = dimension(output, "vision layer output width")?;
-        tensors.push(gguf(
-            format!("v.hmlp.{layer}.linear.weight"),
-            vec![output, input],
-            TensorOperation::Matrix,
-        ));
-        if layer + 1 != specs.len() {
-            tensors.push(gguf(
-                format!("v.hmlp.{layer}.norm.weight"),
-                vec![output],
-                TensorOperation::Vector,
-            ));
-        }
+    if args.audio_config.is_none() {
+        return Err("Inkling mmproj has no audio geometry".into());
     }
-    tensors.push(gguf(
-        "v.hmlp.final_norm.weight",
-        vec![hidden],
-        TensorOperation::Vector,
-    ));
+    if args.vision_config.is_none() {
+        return Err("Inkling mmproj has no vision geometry".into());
+    }
+    let mut tensors = Vec::new();
+    visit_media_parameters(args, |_, source, parameter, operation| {
+        tensors.push(gguf(source, parameter.shape.clone(), operation));
+        Ok(())
+    })?;
     GgufCheckpointPlan::new(
         "Inkling mmproj GGUF",
         tensors,
@@ -522,344 +457,448 @@ pub fn mmproj_gguf_plan(args: &ModelArgs) -> Result<GgufCheckpointPlan, String> 
     .map_err(|error| error.to_string())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn add_feed_forward_layout(
-    text: &super::TextArgs,
-    policy: FeedForwardPolicy,
+#[derive(Clone, Copy)]
+enum BlockTensorLayout {
+    Matrix,
+    Vector,
+    Profile,
+    Convolution,
+}
+impl BlockTensorLayout {
+    fn operation(self) -> TensorOperation {
+        match self {
+            Self::Matrix => TensorOperation::Matrix,
+            Self::Vector => TensorOperation::Vector,
+            Self::Profile | Self::Convolution => TensorOperation::Dense,
+        }
+    }
+}
+
+/// Source-layout extensions borrow exact slots from the common construction scope.
+fn visit_block_parameters(
+    parameters: &super::text::CommonParameters,
+    mut visit: impl FnMut(
+        &str,
+        &str,
+        &eredu_nn::LogicalParameterDeclaration<'_>,
+        BlockTensorLayout,
+    ) -> Result<(), String>,
+) -> Result<(), String> {
+    use BlockTensorLayout::*;
+    let attention = &parameters.attention;
+    let slots: [(
+        &str,
+        &str,
+        &dyn eredu_nn::DeclareLogicalParameters,
+        BlockTensorLayout,
+    ); 14] = [
+        (
+            "attn_norm.weight",
+            "attn_norm.weight",
+            &parameters.input_norm,
+            Vector,
+        ),
+        (
+            "mlp_norm.weight",
+            "ffn_norm.weight",
+            &parameters.post_attention_norm,
+            Vector,
+        ),
+        (
+            "attn.wq_du.weight",
+            "attn_q.weight",
+            &attention.projection.query,
+            Matrix,
+        ),
+        (
+            "attn.wk_dv.weight",
+            "attn_k.weight",
+            &attention.projection.key,
+            Matrix,
+        ),
+        (
+            "attn.wv_dv.weight",
+            "attn_v.weight",
+            &attention.projection.value,
+            Matrix,
+        ),
+        (
+            "attn.wr_du.weight",
+            "attn_r.weight",
+            &attention.relative,
+            Matrix,
+        ),
+        (
+            "attn.wo_ud.weight",
+            "attn_output.weight",
+            &attention.projection.output,
+            Matrix,
+        ),
+        (
+            "attn.q_norm.weight",
+            "attn_q_norm.weight",
+            &attention.query_norm,
+            Vector,
+        ),
+        (
+            "attn.k_norm.weight",
+            "attn_k_norm.weight",
+            &attention.key_norm,
+            Vector,
+        ),
+        (
+            "attn.rel_logits_proj.proj",
+            "attn_rel_proj.weight",
+            &attention.relative_projection,
+            Profile,
+        ),
+        (
+            "attn.k_sconv.weight",
+            "shortconv_k.weight",
+            &attention.key_convolution,
+            Convolution,
+        ),
+        (
+            "attn.v_sconv.weight",
+            "shortconv_v.weight",
+            &attention.value_convolution,
+            Convolution,
+        ),
+        (
+            "attn_sconv.weight",
+            "shortconv_attn.weight",
+            &parameters.attention_convolution,
+            Convolution,
+        ),
+        (
+            "mlp_sconv.weight",
+            "shortconv_mlp.weight",
+            &parameters.feed_forward_convolution,
+            Convolution,
+        ),
+    ];
+    for (safe, gguf, spec, layout) in slots {
+        visit(safe, gguf, &declared_parameter(spec)?, layout)?;
+    }
+    Ok(())
+}
+
+struct SparseBankSource<'a> {
+    gate_up: &'static str,
+    down: &'static str,
+    gguf: &'static str,
+    bank: &'a eredu_nn::GroupedGatedProductSpec,
+}
+fn sparse_banks(parameters: &super::text::SparseParameters) -> [SparseBankSource<'_>; 2] {
+    [
+        SparseBankSource {
+            gate_up: "mlp.experts.w13_weight",
+            down: "mlp.experts.w2_weight",
+            gguf: "exps",
+            bank: &parameters.routed,
+        },
+        SparseBankSource {
+            gate_up: "mlp.shared_experts.shared_w13_weight",
+            down: "mlp.shared_experts.shared_w2_weight",
+            gguf: "shexp",
+            bank: &parameters.shared,
+        },
+    ]
+}
+fn router_aliases(
+    parameters: &eredu_nn::JointGroupSelectorSpec,
+    released: &str,
+) -> [ParameterAlias; 3] {
+    [
+        alias(
+            format!("{released}.mlp.gate.weight"),
+            parameters.weight().id.as_str(),
+        ),
+        alias(
+            format!("{released}.mlp.gate.bias"),
+            parameters.correction_bias().id.as_str(),
+        ),
+        alias(
+            format!("{released}.mlp.gate.global_scale"),
+            parameters.coefficient_scale().id.as_str(),
+        ),
+    ]
+}
+fn sparse_down_aliases(
+    parameters: &super::text::SparseParameters,
+    released: &str,
+) -> Result<Vec<ParameterAlias>, String> {
+    sparse_banks(parameters)
+        .into_iter()
+        .map(|source| {
+            let declared = source
+                .bank
+                .packed_parameters()
+                .map_err(|error| error.to_string())?;
+            Ok(alias(
+                format!("{released}.{}", source.down),
+                declared.down().parameter.id.as_str(),
+            ))
+        })
+        .collect()
+}
+
+fn dense_aliases(parameters: &super::text::DenseParameters, released: &str) -> [ParameterAlias; 2] {
+    [
+        alias(
+            format!("{released}.mlp.w2_md.weight"),
+            parameters.product.down.weight.id.as_str(),
+        ),
+        alias(
+            format!("{released}.mlp.global_scale"),
+            parameters.global_scale.id.as_str(),
+        ),
+    ]
+}
+
+struct DenseInputSources<'a> {
+    gate: eredu_nn::LogicalParameterDeclaration<'a>,
+    up: eredu_nn::LogicalParameterDeclaration<'a>,
+    interleaved: String,
+    shape: Vec<usize>,
+}
+
+fn dense_input_sources<'a>(
+    parameters: &'a super::text::DenseParameters,
+    released: &str,
+) -> Result<DenseInputSources<'a>, String> {
+    let gate = declared_parameter(&parameters.product.gate)?;
+    let up = declared_parameter(&parameters.product.up)?;
+    let shape = dense_interleaved_shape(&gate, &up)?;
+    Ok(DenseInputSources {
+        gate,
+        up,
+        interleaved: format!("{released}.mlp.w13_dn.weight"),
+        shape,
+    })
+}
+
+fn add_dense_layout(
+    parameters: &super::text::DenseParameters,
     released: &str,
     canonical: &str,
-    hidden: usize,
     common: &mut Vec<SafetensorsTensorConstraint>,
     groups: &mut Vec<AlternativeLayoutGroup<SafetensorsTensorConstraint>>,
 ) -> Result<(), String> {
-    match policy {
-        FeedForwardPolicy::Dense => {
-            let intermediate =
-                dimension(text.dense_intermediate_size(), "dense intermediate size")?;
-            let packed = format!("{released}.mlp.w13_dn.weight");
-            let gate = format!("{canonical}.dense.gate_proj.weight");
-            let up = format!("{canonical}.dense.up_proj.weight");
-            groups.push(AlternativeLayoutGroup {
-                id: format!("{canonical} dense gate/up storage"),
-                required: true,
-                variants: vec![
-                    LayoutVariant {
-                        id: "canonical split".into(),
-                        tensors: vec![
-                            safe(&gate, vec![intermediate, hidden]),
-                            safe(&up, vec![intermediate, hidden]),
-                        ],
-                        discriminator_keys: vec![gate, up],
-                    },
-                    LayoutVariant {
-                        id: "released interleaved".into(),
-                        tensors: vec![safe(
-                            &packed,
-                            vec![
-                                checked_mul(2, intermediate, "dense interleaved width")?,
-                                hidden,
-                            ],
-                        )],
-                        discriminator_keys: vec![packed],
-                    },
+    let DenseInputSources {
+        gate,
+        up,
+        interleaved: packed,
+        shape,
+    } = dense_input_sources(parameters, released)?;
+    let down = declared_parameter(&parameters.product.down)?;
+    let scale = parameters
+        .scale_declaration()
+        .map_err(|error| error.to_string())?;
+    groups.push(AlternativeLayoutGroup {
+        id: format!("{canonical} dense gate/up storage"),
+        required: true,
+        variants: vec![
+            LayoutVariant {
+                id: "canonical split".into(),
+                tensors: vec![
+                    safe(gate.parameter.id.as_str(), gate.shape.clone()),
+                    safe(up.parameter.id.as_str(), up.shape.clone()),
                 ],
-            });
-            common.extend([
-                safe_alias(
-                    format!("{released}.mlp.w2_md.weight"),
-                    format!("{canonical}.dense.down_proj.weight"),
-                    vec![hidden, intermediate],
-                ),
-                safe_alias(
-                    format!("{released}.mlp.global_scale"),
-                    format!("{canonical}.dense_global_scale"),
-                    vec![1],
-                ),
-            ]);
+                discriminator_keys: vec![
+                    gate.parameter.id.to_string(),
+                    up.parameter.id.to_string(),
+                ],
+            },
+            LayoutVariant {
+                id: "released interleaved".into(),
+                tensors: vec![
+                    safe(&packed, shape).with_linear_format(eredu_checkpoint::LinearFormat::Dense)
+                ],
+                discriminator_keys: vec![packed],
+            },
+        ],
+    });
+    for (alias, parameter) in dense_aliases(parameters, released)
+        .into_iter()
+        .zip([down, scale])
+    {
+        common.push(safe_alias(alias.source, alias.target, parameter.shape));
+    }
+    Ok(())
+}
+
+fn add_feed_forward_layout(
+    parameters: &super::text::FeedForwardParameters,
+    released: &str,
+    canonical: &str,
+    common: &mut Vec<SafetensorsTensorConstraint>,
+    groups: &mut Vec<AlternativeLayoutGroup<SafetensorsTensorConstraint>>,
+) -> Result<(), String> {
+    match parameters {
+        super::text::FeedForwardParameters::Dense(parameters) => {
+            add_dense_layout(&parameters, released, canonical, common, groups)?;
         }
-        FeedForwardPolicy::SparseMoe => {
-            let routed = dimension(text.n_routed_experts, "routed expert count")?;
-            let shared = dimension(text.n_shared_experts, "shared expert count")?;
-            let intermediate = dimension(text.moe_intermediate_size(), "MoE intermediate size")?;
-            let fused = checked_mul(2, intermediate, "fused expert width")?;
-            for (source, target, shape) in [
-                (
-                    format!("{released}.mlp.gate.weight"),
-                    format!("{canonical}.moe.router.weight"),
-                    vec![checked_add(routed, shared, "router width")?, hidden],
-                ),
-                (
-                    format!("{released}.mlp.gate.bias"),
-                    format!("{canonical}.moe.router.bias"),
-                    vec![routed],
-                ),
-                (
-                    format!("{released}.mlp.gate.global_scale"),
-                    format!("{canonical}.moe.router.global_scale"),
-                    vec![1],
-                ),
-                (
-                    format!("{released}.mlp.experts.w13_weight"),
-                    format!("{canonical}.moe.experts.gate_up_proj"),
-                    vec![routed, fused, hidden],
-                ),
-                (
-                    format!("{released}.mlp.experts.w2_weight"),
-                    format!("{canonical}.moe.experts.down_proj"),
-                    vec![routed, hidden, intermediate],
-                ),
-                (
-                    format!("{released}.mlp.shared_experts.shared_w13_weight"),
-                    format!("{canonical}.moe.shared_experts.gate_up_proj"),
-                    vec![shared, fused, hidden],
-                ),
-                (
-                    format!("{released}.mlp.shared_experts.shared_w2_weight"),
-                    format!("{canonical}.moe.shared_experts.down_proj"),
-                    vec![shared, hidden, intermediate],
-                ),
-            ] {
-                common.push(safe_alias(source, target, shape));
+        super::text::FeedForwardParameters::Sparse(parameters) => {
+            use eredu_nn::DeclareLogicalParameters;
+            let router = parameters
+                .router
+                .logical_parameters()
+                .map_err(|error| error.to_string())?;
+            for alias in router_aliases(&parameters.router, released) {
+                let parameter = router
+                    .iter()
+                    .find(|parameter| parameter.parameter.id.as_str() == alias.target)
+                    .ok_or_else(|| {
+                        format!(
+                            "Inkling source alias references undeclared slot {}",
+                            alias.target
+                        )
+                    })?;
+                common.push(safe_alias(
+                    alias.source,
+                    alias.target,
+                    parameter.shape.clone(),
+                ));
+            }
+            for source in sparse_banks(&parameters) {
+                let declared = source
+                    .bank
+                    .packed_parameters()
+                    .map_err(|error| error.to_string())?;
+                for (suffix, parameter) in [
+                    (source.gate_up, declared.gate_up()),
+                    (source.down, declared.down()),
+                ] {
+                    common.push(safe_alias(
+                        format!("{released}.{suffix}"),
+                        parameter.parameter.id.as_str(),
+                        parameter.shape.clone(),
+                    ));
+                }
             }
         }
+    }
+    Ok(())
+}
+
+fn declared_parameter(
+    spec: &dyn eredu_nn::DeclareLogicalParameters,
+) -> Result<eredu_nn::LogicalParameterDeclaration<'_>, String> {
+    let mut parameters = spec
+        .logical_parameters()
+        .map_err(|error| error.to_string())?;
+    if parameters.len() != 1 {
+        return Err(
+            "Inkling source tensor extension requires exactly one declared parameter".into(),
+        );
+    }
+    Ok(parameters.remove(0))
+}
+
+/// Format extensions reference the same slots used by construction and placement.
+fn visit_media_parameters(
+    args: &ModelArgs,
+    mut visit: impl FnMut(
+        &str,
+        &str,
+        &eredu_nn::LogicalParameterDeclaration<'_>,
+        TensorOperation,
+    ) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut add =
+        |safe: &str, gguf: &str, spec: &dyn eredu_nn::DeclareLogicalParameters, operation| {
+            visit(safe, gguf, &declared_parameter(spec)?, operation)
+        };
+    if let Some(config) = &args.audio_config {
+        let spec = config.parameters();
+        add(
+            "model.audio.encoder.weight",
+            "a.dmel.embedding.weight",
+            &spec.embedding,
+            TensorOperation::Matrix,
+        )?;
+        add(
+            "model.audio.final_norm.weight",
+            "a.dmel.final_norm.weight",
+            &spec.final_norm,
+            TensorOperation::Vector,
+        )?;
+    }
+    if let Some(config) = &args.vision_config {
+        for layer in 0..config.num_hidden_layers as usize {
+            let spec = config
+                .parameters()
+                .layer(layer)
+                .map_err(|error| error.to_string())?;
+            add(
+                &format!("model.visual.layers.linear_{layer}.weight"),
+                &format!("v.hmlp.{layer}.linear.weight"),
+                &spec.projection,
+                TensorOperation::Matrix,
+            )?;
+            if let Some(norm) = &spec.norm {
+                add(
+                    &format!("model.visual.layers.norm_{layer}.weight"),
+                    &format!("v.hmlp.{layer}.norm.weight"),
+                    norm,
+                    TensorOperation::Vector,
+                )?;
+            }
+        }
+        add(
+            "model.visual.final_norm.weight",
+            "v.hmlp.final_norm.weight",
+            &config.parameters().final_norm,
+            TensorOperation::Vector,
+        )?;
     }
     Ok(())
 }
 
 fn add_safetensors_media(
     args: &ModelArgs,
-    hidden: usize,
     output: &mut Vec<SafetensorsTensorConstraint>,
 ) -> Result<(), String> {
-    if let Some(audio) = &args.audio_config {
-        let codebooks = dimension(audio.num_codebooks, "audio codebook count")?;
-        let codebook_size = dimension(audio.codebook_size, "audio codebook size")?;
-        output.extend([
-            safe_alias(
-                "model.audio.encoder.weight",
-                "audio.encoder.weight",
-                vec![
-                    checked_mul(codebooks, codebook_size, "audio vocabulary")?,
-                    hidden,
-                ],
-            ),
-            safe_alias(
-                "model.audio.final_norm.weight",
-                "audio.final_norm.weight",
-                vec![hidden],
-            ),
-        ]);
-    }
-    if let Some(vision) = &args.vision_config {
-        let specs = vision.layer_specs();
-        for (layer, (input, output_width, _, _)) in specs.iter().copied().enumerate() {
-            let input = dimension(input, "vision layer input width")?;
-            let output_width = dimension(output_width, "vision layer output width")?;
-            output.push(safe_alias(
-                format!("model.visual.layers.linear_{layer}.weight"),
-                format!("visual.layers.{layer}.projection.weight"),
-                vec![output_width, input],
-            ));
-            if layer + 1 != specs.len() {
-                output.push(safe_alias(
-                    format!("model.visual.layers.norm_{layer}.weight"),
-                    format!("visual.layers.{layer}.layer_norm.weight"),
-                    vec![output_width],
-                ));
-            }
-        }
+    visit_media_parameters(args, |source, _, parameter, _| {
         output.push(safe_alias(
-            "model.visual.final_norm.weight",
-            "visual.final_norm.weight",
-            vec![hidden],
+            source,
+            parameter.parameter.id.as_str(),
+            parameter.shape.clone(),
         ));
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 fn add_safetensors_mtp(
     args: &ModelArgs,
-    hidden: usize,
     output: &mut Vec<SafetensorsTensorConstraint>,
     groups: &mut Vec<AlternativeLayoutGroup<SafetensorsTensorConstraint>>,
 ) -> Result<(), String> {
-    let Some(mtp) = &args.mtp_config else {
-        return Ok(());
-    };
-    let text = &args.text_config;
-    let count = nonnegative_count(mtp.num_nextn_predict_layers, "MTP layer count")?;
-    for depth in 0..count {
-        let root = format!("model.mtp.layers.{depth}");
-        output.extend([
-            safe(format!("{root}.hidden_norm.weight"), vec![hidden]),
-            safe(format!("{root}.embed_norm.weight"), vec![hidden]),
-            safe(
-                format!("{root}.input_proj.weight"),
-                vec![hidden, checked_mul(2, hidden, "MTP input width")?],
-            ),
-        ]);
-        let local = mtp.local_layer_ids.contains(&depth);
-        let query_heads = if local {
-            mtp.swa_num_attention_heads
-                .or(text.swa_num_attention_heads)
-                .unwrap_or(mtp.num_attention_heads.unwrap_or(text.num_attention_heads))
-        } else {
-            mtp.num_attention_heads.unwrap_or(text.num_attention_heads)
-        };
-        let key_value_heads = if local {
-            mtp.swa_num_key_value_heads
-                .or(text.swa_num_key_value_heads)
-                .unwrap_or(mtp.num_key_value_heads.unwrap_or(text.num_key_value_heads))
-        } else {
-            mtp.num_key_value_heads.unwrap_or(text.num_key_value_heads)
-        };
-        let head = if local {
-            mtp.swa_head_dim
-                .or(text.swa_head_dim)
-                .unwrap_or(mtp.head_dim.unwrap_or(text.head_dim))
-        } else {
-            mtp.head_dim.unwrap_or(text.head_dim)
-        };
-        let query_heads = dimension(query_heads, "MTP query head count")?;
-        let key_value_heads = dimension(key_value_heads, "MTP key/value head count")?;
-        let head = dimension(head, "MTP attention head width")?;
-        let d_rel = dimension(mtp.d_rel.unwrap_or(text.d_rel), "MTP relative width")?;
-        let relative = if local {
-            text.layer_schedule
-                .iter()
-                .find_map(|policy| policy.attention.window())
-                .map(|window| window.get() as usize)
-                .unwrap_or(dimension(
-                    mtp.rel_extent.unwrap_or(text.rel_extent),
-                    "MTP relative extent",
-                )?)
-        } else {
-            dimension(
-                mtp.rel_extent.unwrap_or(text.rel_extent),
-                "MTP relative extent",
-            )?
-        };
-        let convolution = dimension(
-            mtp.sconv_kernel_size.unwrap_or(text.sconv_kernel_size),
-            "MTP convolution width",
-        )?;
-        let intermediate = dimension(
-            mtp.dense_intermediate_size
-                .or(text.dense_intermediate_size)
-                .unwrap_or(mtp.intermediate_size.unwrap_or(text.intermediate_size)),
-            "MTP intermediate size",
-        )?;
-        let query = checked_mul(query_heads, head, "MTP query projection width")?;
-        let key_value = checked_mul(key_value_heads, head, "MTP key/value projection width")?;
-        let relative_query = checked_mul(query_heads, d_rel, "MTP relative-query width")?;
-        let released = format!("{root}.transformer_block");
-        let canonical = released.clone();
-        for (source, target, shape) in [
-            ("attn_norm.weight", "input_layernorm.weight", vec![hidden]),
-            (
-                "mlp_norm.weight",
-                "post_attention_layernorm.weight",
-                vec![hidden],
-            ),
-            (
-                "attn.wq_du.weight",
-                "self_attn.q_proj.weight",
-                vec![query, hidden],
-            ),
-            (
-                "attn.wk_dv.weight",
-                "self_attn.k_proj.weight",
-                vec![key_value, hidden],
-            ),
-            (
-                "attn.wv_dv.weight",
-                "self_attn.v_proj.weight",
-                vec![key_value, hidden],
-            ),
-            (
-                "attn.wr_du.weight",
-                "self_attn.r_proj.weight",
-                vec![relative_query, hidden],
-            ),
-            (
-                "attn.wo_ud.weight",
-                "self_attn.o_proj.weight",
-                vec![hidden, query],
-            ),
-            ("attn.q_norm.weight", "self_attn.q_norm.weight", vec![head]),
-            ("attn.k_norm.weight", "self_attn.k_norm.weight", vec![head]),
-            (
-                "attn.rel_logits_proj.proj",
-                "self_attn.rel_proj",
-                vec![d_rel, relative],
-            ),
-            (
-                "attn.k_sconv.weight",
-                "self_attn.k_sconv.weight",
-                vec![key_value, 1, convolution],
-            ),
-            (
-                "attn.v_sconv.weight",
-                "self_attn.v_sconv.weight",
-                vec![key_value, 1, convolution],
-            ),
-            (
-                "attn_sconv.weight",
-                "attn_sconv.weight",
-                vec![hidden, 1, convolution],
-            ),
-            (
-                "mlp_sconv.weight",
-                "mlp_sconv.weight",
-                vec![hidden, 1, convolution],
-            ),
-        ] {
-            output.push(safe_alias(
-                format!("{released}.{source}"),
-                format!("{canonical}.{target}"),
-                shape,
-            ));
+    use eredu_nn::DeclareLogicalParameters;
+    let parameters = args.prediction();
+    for (index, depth) in parameters.depths.iter().enumerate() {
+        for parameter in depth
+            .fusion
+            .logical_parameters()
+            .map_err(|error| error.to_string())?
+        {
+            output.push(safe(parameter.parameter.id.as_str(), parameter.shape));
         }
-        let packed = format!("{released}.mlp.w13_dn.weight");
-        let gate = format!("{canonical}.dense.gate_proj.weight");
-        let up = format!("{canonical}.dense.up_proj.weight");
-        groups.push(AlternativeLayoutGroup {
-            id: format!("{canonical} dense gate/up storage"),
-            required: true,
-            variants: vec![
-                LayoutVariant {
-                    id: "canonical split".into(),
-                    tensors: vec![
-                        safe(&gate, vec![intermediate, hidden]),
-                        safe(&up, vec![intermediate, hidden]),
-                    ],
-                    discriminator_keys: vec![gate, up],
-                },
-                LayoutVariant {
-                    id: "released interleaved".into(),
-                    tensors: vec![safe(
-                        &packed,
-                        vec![checked_mul(2, intermediate, "MTP fused MLP width")?, hidden],
-                    )],
-                    discriminator_keys: vec![packed],
-                },
-            ],
-        });
-        output.extend([
-            safe_alias(
-                format!("{released}.mlp.w2_md.weight"),
-                format!("{canonical}.dense.down_proj.weight"),
-                vec![hidden, intermediate],
-            ),
-            safe_alias(
-                format!("{released}.mlp.global_scale"),
-                format!("{canonical}.dense_global_scale"),
-                vec![1],
-            ),
-        ]);
+        let root = format!("model.mtp.layers.{index}.transformer_block");
+        visit_block_parameters(&depth.common, |source, _, parameter, _| {
+            output.push(safe_alias(
+                format!("{root}.{source}"),
+                parameter.parameter.id.as_str(),
+                parameter.shape.clone(),
+            ));
+            Ok(())
+        })?;
+        add_dense_layout(&depth.dense, &root, &root, output, groups)?;
     }
-    if mtp.chain_hidden_post_norm {
-        output.push(safe("model.mtp.chain_norm.weight", vec![hidden]));
+    if let Some(norm) = &parameters.chain_norm {
+        let parameter = declared_parameter(norm)?;
+        output.push(safe(parameter.parameter.id.as_str(), parameter.shape));
     }
     Ok(())
 }
@@ -868,119 +907,54 @@ fn add_safetensors_mtp(
 /// Interleaved dense/expert `w13` sources are intentionally represented by
 /// recipe helpers instead of aliases.
 pub fn safetensors_aliases(args: &ModelArgs) -> Result<Vec<ParameterAlias>, String> {
-    let mut aliases = vec![
-        alias("model.llm.embed.weight", "model.embed_tokens.weight"),
-        alias("model.llm.embed_norm.weight", "model.embed_norm.weight"),
-        alias("model.llm.norm.weight", "model.norm.weight"),
-        alias("model.llm.unembed.weight", "lm_head.weight"),
-    ];
+    let mut aliases = Vec::new();
+    visit_text_pinned_parameters(args, |source, _, parameter, _| {
+        aliases.push(alias(source, parameter.parameter.id.as_str()));
+        Ok(())
+    })?;
     for layer in 0..args.text_config.num_hidden_layers as usize {
         let released = format!("model.llm.layers.{layer}");
-        let canonical = format!("model.layers.{layer}");
-        aliases.extend(block_aliases(&released, &canonical));
-        match args
+        let policy = args
             .text_config
             .layer_policy(layer)
-            .ok_or_else(|| format!("Inkling checkpoint layer {layer} is out of range"))?
-            .feed_forward
-        {
-            FeedForwardPolicy::Dense => aliases.extend([
-                alias(
-                    format!("{released}.mlp.w2_md.weight"),
-                    format!("{canonical}.dense.down_proj.weight"),
-                ),
-                alias(
-                    format!("{released}.mlp.global_scale"),
-                    format!("{canonical}.dense_global_scale"),
-                ),
-            ]),
-            FeedForwardPolicy::SparseMoe => aliases.extend([
-                alias(
-                    format!("{released}.mlp.gate.weight"),
-                    format!("{canonical}.moe.router.weight"),
-                ),
-                alias(
-                    format!("{released}.mlp.gate.bias"),
-                    format!("{canonical}.moe.router.bias"),
-                ),
-                alias(
-                    format!("{released}.mlp.gate.global_scale"),
-                    format!("{canonical}.moe.router.global_scale"),
-                ),
-                alias(
-                    format!("{released}.mlp.experts.w2_weight"),
-                    format!("{canonical}.moe.experts.down_proj"),
-                ),
-                alias(
-                    format!("{released}.mlp.shared_experts.shared_w2_weight"),
-                    format!("{canonical}.moe.shared_experts.down_proj"),
-                ),
-            ]),
-        }
-    }
-    if let Some(audio) = &args.audio_config {
-        let _ = audio;
-        aliases.extend([
-            alias("model.audio.encoder.weight", "audio.encoder.weight"),
-            alias("model.audio.final_norm.weight", "audio.final_norm.weight"),
-        ]);
-    }
-    if let Some(vision) = &args.vision_config {
-        for layer in 0..vision.layer_specs().len() {
-            aliases.push(alias(
-                format!("model.visual.layers.linear_{layer}.weight"),
-                format!("visual.layers.{layer}.projection.weight"),
-            ));
-            if layer + 1 != vision.layer_specs().len() {
-                aliases.push(alias(
-                    format!("model.visual.layers.norm_{layer}.weight"),
-                    format!("visual.layers.{layer}.layer_norm.weight"),
-                ));
+            .ok_or_else(|| format!("Inkling checkpoint layer {layer} is out of range"))?;
+        let parameters = args.common(layer).map_err(|error| error.to_string())?;
+        aliases.extend(block_aliases(&released, &parameters)?);
+        match policy.feed_forward {
+            FeedForwardPolicy::Dense => {
+                let dense = args.dense(layer).map_err(|error| error.to_string())?;
+                aliases.extend(dense_aliases(&dense, &released));
+            }
+            FeedForwardPolicy::SparseMoe => {
+                let parameters = args.sparse(layer).map_err(|error| error.to_string())?;
+                aliases.extend(router_aliases(&parameters.router, &released));
+                aliases.extend(sparse_down_aliases(&parameters, &released)?);
             }
         }
-        aliases.push(alias(
-            "model.visual.final_norm.weight",
-            "visual.final_norm.weight",
-        ));
     }
-    if let Some(mtp) = &args.mtp_config {
-        for depth in 0..mtp.num_nextn_predict_layers as usize {
-            let root = format!("model.mtp.layers.{depth}");
-            aliases.extend([
-                alias(
-                    format!("{root}.hidden_norm.weight"),
-                    format!("{root}.hidden_norm.weight"),
-                ),
-                alias(
-                    format!("{root}.embed_norm.weight"),
-                    format!("{root}.embed_norm.weight"),
-                ),
-                alias(
-                    format!("{root}.input_proj.weight"),
-                    format!("{root}.input_proj.weight"),
-                ),
-            ]);
-            aliases.extend(block_aliases(
-                &format!("{root}.transformer_block"),
-                &format!("{root}.transformer_block"),
-            ));
-            aliases.extend([
-                alias(
-                    format!("{root}.transformer_block.mlp.w2_md.weight"),
-                    format!("{root}.transformer_block.dense.down_proj.weight"),
-                ),
-                alias(
-                    format!("{root}.transformer_block.mlp.global_scale"),
-                    format!("{root}.transformer_block.dense_global_scale"),
-                ),
-            ]);
+    visit_media_parameters(args, |source, _, parameter, _| {
+        aliases.push(alias(source, parameter.parameter.id.as_str()));
+        Ok(())
+    })?;
+    let prediction = args.prediction();
+    for (depth, parameters) in prediction.depths.iter().enumerate() {
+        use eredu_nn::DeclareLogicalParameters;
+        for parameter in parameters
+            .fusion
+            .logical_parameters()
+            .map_err(|error| error.to_string())?
+        {
+            let id = parameter.parameter.id.as_str();
+            aliases.push(alias(id, id));
         }
-        if mtp.chain_hidden_post_norm {
-            aliases.push(alias(
-                "model.mtp.chain_norm.weight",
-                "model.mtp.chain_norm.weight",
-            ));
-        }
+        let root = format!("model.mtp.layers.{depth}.transformer_block");
+        aliases.extend(block_aliases(&root, &parameters.common)?);
+        aliases.extend(dense_aliases(&parameters.dense, &root));
+    }
+    if let Some(norm) = &prediction.chain_norm {
+        let parameter = declared_parameter(norm)?;
+        let id = parameter.parameter.id.as_str();
+        aliases.push(alias(id, id));
     }
     Ok(aliases)
 }
@@ -1007,9 +981,9 @@ pub fn safetensors_recipes<C: RecipeCatalog + ?Sized>(
     }
 
     for layer in 0..nonnegative_count(args.text_config.num_hidden_layers, "layer count")? {
-        let canonical = format!("model.layers.{layer}");
         let released = format!("model.llm.layers.{layer}");
-        add_convolution_recipes(catalog, &released, &canonical, &mut recipes)?;
+        let parameters = args.common(layer).map_err(|error| error.to_string())?;
+        add_convolution_recipes(catalog, &released, &parameters, &mut recipes)?;
         match args
             .text_config
             .layer_policy(layer)
@@ -1017,22 +991,21 @@ pub fn safetensors_recipes<C: RecipeCatalog + ?Sized>(
             .feed_forward
         {
             FeedForwardPolicy::Dense => {
-                add_dense_recipes(catalog, &released, &canonical, &mut recipes)?;
+                let dense = args.dense(layer).map_err(|error| error.to_string())?;
+                add_dense_recipes(catalog, &released, &dense, &mut recipes)?;
             }
             FeedForwardPolicy::SparseMoe => {
-                add_expert_recipes(catalog, &released, &canonical, &mut recipes)?;
+                let parameters = args.sparse(layer).map_err(|error| error.to_string())?;
+                add_expert_recipes(catalog, &released, &parameters, &mut recipes)?;
             }
         }
     }
 
-    if let Some(mtp) = &args.mtp_config {
-        for depth in
-            0..nonnegative_count(mtp.num_nextn_predict_layers, "MTP prediction depth count")?
-        {
-            let root = format!("model.mtp.layers.{depth}.transformer_block");
-            add_convolution_recipes(catalog, &root, &root, &mut recipes)?;
-            add_dense_recipes(catalog, &root, &root, &mut recipes)?;
-        }
+    let prediction = args.prediction();
+    for (depth, parameters) in prediction.depths.iter().enumerate() {
+        let root = format!("model.mtp.layers.{depth}.transformer_block");
+        add_convolution_recipes(catalog, &root, &parameters.common, &mut recipes)?;
+        add_dense_recipes(catalog, &root, &parameters.dense, &mut recipes)?;
     }
     Ok(recipes)
 }
@@ -1158,37 +1131,41 @@ pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
     args: &ModelArgs,
     catalog: &C,
 ) -> Result<crate::ExpertResidencyCatalog, String> {
-    let layers = nonnegative_count(args.text_config.num_hidden_layers, "layer count")?;
     let recipes = safetensors_recipes(args, catalog)?;
     let owner_group = eredu_runtime::ExecutionGroupId::new(super::TEXT_EXECUTION_GROUP)
         .map_err(|error| error.to_string())?;
     let mut units = Vec::new();
-    for layer in 0..layers {
-        if args
-            .text_config
-            .layer_policy(layer)
-            .is_none_or(|policy| policy.feed_forward != FeedForwardPolicy::SparseMoe)
-        {
-            continue;
-        }
+    for (layer, parameters) in args.sparse_layers() {
         let unit_path = format!("model.layers.{layer}");
         let groups =
             super::layer_parameter_groups(args, layer).map_err(|error| error.to_string())?;
-        for (bank, cache_layer, count, distribution) in [
+        for (bank, spec, cache_layer, distribution) in [
             (
                 "experts",
+                &parameters.routed,
                 layer,
-                args.text_config.n_routed_experts,
                 crate::ExpertResidencyDistribution::ExpertParallel,
             ),
             (
                 "shared_experts",
-                layers + layer,
-                args.text_config.n_shared_experts,
+                &parameters.shared,
+                super::text::shared_expert_cache_layer(&args.text_config, layer)
+                    .map_err(|error| error.to_string())?,
                 crate::ExpertResidencyDistribution::Replicated,
             ),
         ] {
-            let count = nonnegative_count(count, "expert count")?;
+            let declared = spec
+                .packed_parameters()
+                .map_err(|error| error.to_string())?;
+            let count = declared.group_count();
+            let gate_up = declared.gate_up();
+            let down = declared.down();
+            let gate_up_format = gate_up
+                .linear_format
+                .ok_or("undeclared Inkling gate/up encoding")?;
+            let down_format = down
+                .linear_format
+                .ok_or("undeclared Inkling down encoding")?;
             let bank_root = format!("{unit_path}.moe.{bank}");
             let logical_group = format!("{bank_root}.intermediate");
             let group = groups
@@ -1226,17 +1203,10 @@ pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
                 count,
             )
             .map_err(|error| error.to_string())?;
-            let has_member = |binding: &str| {
-                let target = format!("{bank_root}.{binding}");
-                group
-                    .members()
-                    .iter()
-                    .any(|member| member.target() == target)
-            };
             let gate_up_quantizable =
-                !has_member("gate_up_proj_scales") && !has_member("gate_up_proj_biases");
+                gate_up_format.scale().is_none() && gate_up_format.affine_bias().is_none();
             let down_quantizable =
-                !has_member("down_proj_scales") && !has_member("down_proj_biases");
+                down_format.scale().is_none() && down_format.affine_bias().is_none();
             for expert in 0..count {
                 let selected = bank.member(expert).expect("validated expert bank member");
                 let parameters = group
@@ -1256,20 +1226,16 @@ pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
                             .get(target)
                             .expect("declared bank parameter")
                             .clone();
-                        let role = match binding {
-                            "gate_up_proj" if gate_up_quantizable => {
-                                crate::ExpertParameterRole::quantizable_projection(
-                                    "gate_up_proj_scales",
-                                    "gate_up_proj_biases",
-                                )
-                            }
-                            "down_proj" if down_quantizable => {
-                                crate::ExpertParameterRole::quantizable_projection(
-                                    "down_proj_scales",
-                                    "down_proj_biases",
-                                )
-                            }
-                            _ => crate::ExpertParameterRole::Preserved,
+                        let role = if (target == gate_up.parameter.id.as_str()
+                            && gate_up_quantizable)
+                            || (target == down.parameter.id.as_str() && down_quantizable)
+                        {
+                            crate::ExpertParameterRole::quantizable_projection(
+                                format!("{binding}_scales"),
+                                format!("{binding}_biases"),
+                            )
+                        } else {
+                            crate::ExpertParameterRole::Preserved
                         };
                         crate::ExpertParameterRecipe::new(binding, target, recipe, role)
                             .map_err(|error| error.to_string())
@@ -1297,74 +1263,100 @@ pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
 fn add_convolution_recipes<C: RecipeCatalog + ?Sized>(
     catalog: &C,
     released: &str,
-    canonical: &str,
+    parameters: &super::text::CommonParameters,
     recipes: &mut BTreeMap<String, DerivedWeightRecipe>,
 ) -> Result<(), String> {
-    for (source_suffix, target_suffix) in [
-        ("attn.k_sconv.weight", "self_attn.k_sconv.weight"),
-        ("attn.v_sconv.weight", "self_attn.v_sconv.weight"),
-        ("attn_sconv.weight", "attn_sconv.weight"),
-        ("mlp_sconv.weight", "mlp_sconv.weight"),
-    ] {
+    visit_block_parameters(parameters, |source_suffix, _, parameter, layout| {
+        if !matches!(layout, BlockTensorLayout::Convolution) {
+            return Ok(());
+        }
         let released_source = format!("{released}.{source_suffix}");
-        let target = format!("{canonical}.{target_suffix}");
+        let target = parameter.parameter.id.to_string();
         let source = if has_tensor(catalog, &released_source) {
             released_source
         } else if has_tensor(catalog, &target) {
             target.clone()
         } else {
-            continue;
+            return Ok(());
         };
         let metadata = catalog
             .tensor_metadata(&source)
             .map_err(|error| error.to_string())?;
         let input = DerivedWeightRecipe::source(&source, TensorSelection::Full);
         let recipe = match metadata.logical_shape.as_slice() {
-            [channels, kernel] => DerivedWeightRecipe::Reshape {
-                input: Box::new(input),
-                shape: vec![*channels, 1, *kernel],
-            },
-            _ => input,
+            [channels, kernel] if parameter.shape == [*channels, 1, *kernel] => {
+                DerivedWeightRecipe::Reshape {
+                    input: Box::new(input),
+                    shape: parameter.shape.clone(),
+                }
+            }
+            shape if shape == parameter.shape => input,
+            shape => {
+                return Err(format!(
+                    "Inkling convolution {source} has shape {shape:?}, expected {:?} or its released two-dimensional layout",
+                    parameter.shape
+                ));
+            }
         };
         recipes.insert(target, recipe);
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 fn add_dense_recipes<C: RecipeCatalog + ?Sized>(
     catalog: &C,
     released: &str,
-    canonical: &str,
+    parameters: &super::text::DenseParameters,
     recipes: &mut BTreeMap<String, DerivedWeightRecipe>,
 ) -> Result<(), String> {
-    let source = format!("{released}.mlp.w13_dn.weight");
+    let DenseInputSources {
+        gate,
+        up,
+        interleaved: source,
+        shape,
+    } = dense_input_sources(parameters, released)?;
     if !has_tensor(catalog, &source) {
         return Ok(());
     }
-    let split = dense_w13_recipes(catalog, &source)?;
-    recipes.insert(format!("{canonical}.dense.gate_proj.weight"), split.gate);
-    recipes.insert(format!("{canonical}.dense.up_proj.weight"), split.up);
+    let [gate_recipe, up_recipe] = interleaved_recipes(catalog, &source, &shape, 0)?;
+    recipes.insert(gate.parameter.id.to_string(), gate_recipe);
+    recipes.insert(up.parameter.id.to_string(), up_recipe);
     Ok(())
 }
 
 fn add_expert_recipes<C: RecipeCatalog + ?Sized>(
     catalog: &C,
     released: &str,
-    canonical: &str,
+    parameters: &super::text::SparseParameters,
     recipes: &mut BTreeMap<String, DerivedWeightRecipe>,
 ) -> Result<(), String> {
-    for (released_bank, canonical_bank) in [
-        ("mlp.experts.w13_weight", "moe.experts"),
-        ("mlp.shared_experts.shared_w13_weight", "moe.shared_experts"),
-    ] {
-        let source = format!("{released}.{released_bank}");
-        let target = format!("{canonical}.{canonical_bank}.gate_up_proj");
+    for source in sparse_banks(parameters) {
+        let declared = source
+            .bank
+            .packed_parameters()
+            .map_err(|error| error.to_string())?;
+        let gate_up = declared.gate_up();
+        let bank_root = gate_up
+            .parameter
+            .id
+            .as_str()
+            .strip_suffix(".gate_up_proj")
+            .ok_or_else(|| "Inkling source bank has an invalid primary identity".to_string())?;
+        let source = format!("{released}.{}", source.gate_up);
+        let target = gate_up.parameter.id.to_string();
         if has_tensor(catalog, &source) {
-            recipes.insert(target, expert_w13_recipe(catalog, &source)?);
+            let inputs = interleaved_recipes(catalog, &source, &gate_up.shape, 1)?;
+            recipes.insert(
+                target,
+                DerivedWeightRecipe::Concatenate {
+                    axis: 1,
+                    inputs: inputs.into(),
+                },
+            );
             continue;
         }
-        let gate = format!("{canonical}.{canonical_bank}.gate_proj");
-        let up = format!("{canonical}.{canonical_bank}.up_proj");
+        let gate = format!("{bank_root}.gate_proj");
+        let up = format!("{bank_root}.up_proj");
         if has_tensor(catalog, &gate) && has_tensor(catalog, &up) {
             recipes.insert(
                 target,
@@ -1385,31 +1377,19 @@ fn has_tensor<C: RecipeCatalog + ?Sized>(catalog: &C, name: &str) -> bool {
     catalog.tensor_metadata(name).is_ok()
 }
 
-fn block_aliases(released: &str, canonical: &str) -> Vec<ParameterAlias> {
-    [
-        ("attn_norm.weight", "input_layernorm.weight"),
-        ("mlp_norm.weight", "post_attention_layernorm.weight"),
-        ("attn.wq_du.weight", "self_attn.q_proj.weight"),
-        ("attn.wk_dv.weight", "self_attn.k_proj.weight"),
-        ("attn.wv_dv.weight", "self_attn.v_proj.weight"),
-        ("attn.wr_du.weight", "self_attn.r_proj.weight"),
-        ("attn.wo_ud.weight", "self_attn.o_proj.weight"),
-        ("attn.q_norm.weight", "self_attn.q_norm.weight"),
-        ("attn.k_norm.weight", "self_attn.k_norm.weight"),
-        ("attn.rel_logits_proj.proj", "self_attn.rel_proj"),
-        ("attn.k_sconv.weight", "self_attn.k_sconv.weight"),
-        ("attn.v_sconv.weight", "self_attn.v_sconv.weight"),
-        ("attn_sconv.weight", "attn_sconv.weight"),
-        ("mlp_sconv.weight", "mlp_sconv.weight"),
-    ]
-    .into_iter()
-    .map(|(source, target)| {
-        alias(
+fn block_aliases(
+    released: &str,
+    parameters: &super::text::CommonParameters,
+) -> Result<Vec<ParameterAlias>, String> {
+    let mut aliases = Vec::new();
+    visit_block_parameters(parameters, |source, _, parameter, _| {
+        aliases.push(alias(
             format!("{released}.{source}"),
-            format!("{canonical}.{target}"),
-        )
-    })
-    .collect()
+            parameter.parameter.id.as_str(),
+        ));
+        Ok(())
+    })?;
+    Ok(aliases)
 }
 
 fn alias(source: impl Into<String>, target: impl Into<String>) -> ParameterAlias {
@@ -1419,72 +1399,52 @@ fn alias(source: impl Into<String>, target: impl Into<String>) -> ParameterAlias
     }
 }
 
-/// Splits a released row-interleaved dense gate/up tensor into canonical
-/// projections using bounded index selections.
-pub fn dense_w13_recipes<C: RecipeCatalog + ?Sized>(
-    catalog: &C,
-    source: &str,
-) -> Result<DenseW13Recipes, String> {
-    let metadata = catalog
-        .tensor_metadata(source)
-        .map_err(|error| error.to_string())?;
-    let rows = metadata
-        .logical_shape
-        .first()
-        .copied()
-        .ok_or_else(|| format!("Inkling dense w13 tensor {source} has no row axis"))?;
-    if rows == 0 || rows % 2 != 0 {
-        return Err(format!(
-            "Inkling dense w13 tensor {source} has invalid interleaved row count {rows}"
-        ));
+/// Projects the released interleaved matrix from both declared dense projections.
+fn dense_interleaved_shape(
+    gate: &eredu_nn::LogicalParameterDeclaration<'_>,
+    up: &eredu_nn::LogicalParameterDeclaration<'_>,
+) -> Result<Vec<usize>, String> {
+    if gate.shape.len() != 2 || gate.shape != up.shape {
+        return Err("Inkling dense gate/up declarations have incompatible geometry".into());
     }
-    let selected = |parity| {
-        DerivedWeightRecipe::source(
-            source,
-            TensorSelection::Indices {
-                axis: 0,
-                indices: (parity..rows).step_by(2).collect(),
-            },
-        )
-    };
-    Ok(DenseW13Recipes {
-        gate: selected(0),
-        up: selected(1),
-    })
+    Ok(vec![
+        checked_add(gate.shape[0], up.shape[0], "dense interleaved width")?,
+        gate.shape[1],
+    ])
 }
 
-/// Converts a released interleaved expert `w13` bank into the canonical fused
-/// gate-then-up layout by selecting parity rows and concatenating them.
-pub fn expert_w13_recipe<C: RecipeCatalog + ?Sized>(
+/// Selects parity rows from an exact declared source layout without reading payloads.
+fn interleaved_recipes<C: RecipeCatalog + ?Sized>(
     catalog: &C,
     source: &str,
-) -> Result<DerivedWeightRecipe, String> {
+    shape: &[usize],
+    axis: usize,
+) -> Result<[DerivedWeightRecipe; 2], String> {
     let metadata = catalog
         .tensor_metadata(source)
         .map_err(|error| error.to_string())?;
-    let rows = metadata
-        .logical_shape
-        .get(1)
-        .copied()
-        .ok_or_else(|| format!("Inkling expert w13 tensor {source} has no row axis"))?;
-    if rows == 0 || rows % 2 != 0 {
+    if metadata.logical_shape != shape {
         return Err(format!(
-            "Inkling expert w13 tensor {source} has invalid interleaved row count {rows}"
+            "Inkling interleaved tensor {source} has shape {:?}, expected {shape:?}",
+            metadata.logical_shape
         ));
     }
-    let selected = |parity| {
+    let rows = shape
+        .get(axis)
+        .copied()
+        .filter(|rows| *rows > 0 && rows % 2 == 0)
+        .ok_or_else(|| {
+            format!("Inkling interleaved tensor {source} has invalid declared row axis {axis}")
+        })?;
+    Ok([0, 1].map(|parity| {
         DerivedWeightRecipe::source(
             source,
             TensorSelection::Indices {
-                axis: 1,
+                axis,
                 indices: (parity..rows).step_by(2).collect(),
             },
         )
-    };
-    Ok(DerivedWeightRecipe::Concatenate {
-        axis: 1,
-        inputs: vec![selected(0), selected(1)],
-    })
+    }))
 }
 
 /// Translates one Inkling text GGUF tensor into its neutral parameter identity.
@@ -1687,11 +1647,6 @@ fn dimension(value: i32, name: &str) -> Result<usize, String> {
 
 fn nonnegative_count(value: i32, name: &str) -> Result<usize, String> {
     usize::try_from(value).map_err(|_| format!("Inkling {name} cannot be negative, got {value}"))
-}
-
-fn checked_mul(left: usize, right: usize, name: &str) -> Result<usize, String> {
-    left.checked_mul(right)
-        .ok_or_else(|| format!("Inkling {name} geometry overflows"))
 }
 
 fn checked_add(left: usize, right: usize, name: &str) -> Result<usize, String> {

@@ -6,7 +6,7 @@ use eredu_runtime::{
     WeightBinding,
 };
 
-use crate::{ear_decoder::DecoderConfig, ear_decoder_layered::decoder_component_definition};
+use crate::ear_decoder::DecoderConfig;
 
 /// Invalid component geometry or exact retained parameter contract.
 #[derive(Debug, thiserror::Error)]
@@ -29,9 +29,7 @@ pub enum DecoderPreparationError {
 /// conversion bounds use the shared checkpoint recipe machinery. This component
 /// contract declares no waveform or conversational execution capability.
 pub struct PreparedDecoderBindings {
-    config: DecoderConfig,
-    prefix: String,
-    prepared: PreparedComponent<eredu_runtime::ComponentDefinition>,
+    prepared: PreparedComponent<crate::declarations::DecoderDeclaration>,
 }
 
 impl PreparedDecoderBindings {
@@ -39,15 +37,13 @@ impl PreparedDecoderBindings {
     /// discovery or native allocation. Shapes follow the symbolic architecture;
     /// neighboring component payloads are excluded.
     pub fn from_recipes<'a>(
-        config: DecoderConfig,
-        prefix: &str,
+        declaration: crate::declarations::DecoderDeclaration,
         source: SharedCheckpointSource,
         parameters: impl FnMut(&str) -> Option<&'a eredu_checkpoint::recipe::DerivedWeightRecipe>,
     ) -> Result<Self, DecoderPreparationError> {
-        let definition = decoder_component_definition(&config, prefix)?;
         let prepared = PreparedComponent::prepare_physical_recipes(
             "ear/decoder/leased-units",
-            definition,
+            declaration,
             source,
             parameters,
             Some(ComponentRecipeConversion {
@@ -56,11 +52,7 @@ impl PreparedDecoderBindings {
             }),
             |name| DecoderPreparationError::MissingParameter(name.into()),
         )?;
-        Ok(Self {
-            config,
-            prefix: prefix.into(),
-            prepared,
-        })
+        Ok(Self { prepared })
     }
 
     /// Selects exact tensor placement or validates a retained selection without
@@ -78,7 +70,10 @@ impl PreparedDecoderBindings {
         mut self,
         layout: &LocalModelLayout,
     ) -> Result<Self, DecoderPreparationError> {
-        crate::ear_decoder_layered::decoder_local_dimensions(&self.config, &self.prefix, layout)?;
+        crate::ear_decoder_layered::declared_local_dimensions(
+            self.prepared.declaration().spec(),
+            layout,
+        )?;
         self.prepared = self.prepared.select(layout)?;
         Ok(self)
     }
@@ -93,17 +88,11 @@ impl PreparedDecoderBindings {
     ) -> Result<PreparedDecoderPartitionBindings, DecoderPreparationError> {
         crate::ear_decoder_partition::validate_decoder_partition(
             self.prepared.declaration(),
-            &self.config,
-            &self.prefix,
             self.prepared.local_layout(),
             partition,
         )?;
         let prepared = self.prepared.select_units(partition.units())?;
-        Ok(PreparedDecoderPartitionBindings {
-            config: self.config,
-            prefix: self.prefix,
-            prepared,
-        })
+        Ok(PreparedDecoderPartitionBindings { prepared })
     }
 
     /// Exact retained tensor placement, when selected.
@@ -113,11 +102,11 @@ impl PreparedDecoderBindings {
 
     /// Validated neural decoder geometry.
     pub fn config(&self) -> &DecoderConfig {
-        &self.config
+        self.prepared.declaration().config()
     }
     /// Canonical parameter namespace retained from preparation.
     pub fn prefix(&self) -> &str {
-        &self.prefix
+        self.prepared.declaration().prefix()
     }
 
     /// Exact prepared unit bindings for cold resource accounting.
@@ -132,16 +121,14 @@ impl PreparedDecoderBindings {
 
     /// Validated semantic definition retained through source and placement selection.
     pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
-        self.prepared.declaration()
+        self.prepared.declaration().definition()
     }
 
     /// Consumes exact source authority and the canonical ordered binding plan.
     pub fn into_parts(
         self,
     ) -> (
-        DecoderConfig,
-        String,
-        eredu_runtime::ComponentDefinition,
+        crate::declarations::DecoderDeclaration,
         Option<LocalModelLayout>,
         eredu_runtime::ExecutionUnitAddressMap,
         SharedCheckpointSource,
@@ -151,37 +138,32 @@ impl PreparedDecoderBindings {
             .prepared
             .into_declared_unit_parts()
             .expect("component declares only independently leased units");
-        (
-            self.config,
-            self.prefix,
-            definition,
-            local,
-            layout,
-            source,
-            units,
-        )
+        (definition, local, layout, source, units)
     }
 }
 
 /// Canonically addressed streaming decoder units and their restricted retained sources.
 /// Mutable convolution state is selected separately by the architecture partition.
 pub struct PreparedDecoderPartitionBindings {
-    config: DecoderConfig,
-    prefix: String,
-    prepared: PreparedComponent<eredu_runtime::ComponentDefinition>,
+    prepared: PreparedComponent<crate::declarations::DecoderDeclaration>,
 }
 impl PreparedDecoderPartitionBindings {
+    /// Retained typed construction and execution declaration.
+    pub fn declaration(&self) -> &crate::declarations::DecoderDeclaration {
+        self.prepared.declaration()
+    }
+
     /// Global streaming decoder geometry.
     pub fn config(&self) -> &DecoderConfig {
-        &self.config
+        self.prepared.declaration().config()
     }
     /// Exact canonical parameter namespace.
     pub fn prefix(&self) -> &str {
-        &self.prefix
+        self.prepared.declaration().prefix()
     }
     /// Complete definition retained independently of the selected pipeline units.
     pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
-        self.prepared.declaration()
+        self.prepared.declaration().definition()
     }
     /// Global TP declaration retained independently of selected pipeline units.
     pub fn local_layout(&self) -> Option<&LocalModelLayout> {
@@ -203,9 +185,7 @@ impl PreparedDecoderPartitionBindings {
     pub fn into_parts(
         self,
     ) -> (
-        DecoderConfig,
-        String,
-        eredu_runtime::ComponentDefinition,
+        crate::declarations::DecoderDeclaration,
         Option<LocalModelLayout>,
         eredu_runtime::ExecutionUnitAddressMap,
         SharedCheckpointSource,
@@ -215,14 +195,6 @@ impl PreparedDecoderPartitionBindings {
             .prepared
             .into_addressed_unit_parts()
             .expect("partition declares only independently leased units");
-        (
-            self.config,
-            self.prefix,
-            definition,
-            local_layout,
-            invocations,
-            source,
-            units,
-        )
+        (definition, local_layout, invocations, source, units)
     }
 }

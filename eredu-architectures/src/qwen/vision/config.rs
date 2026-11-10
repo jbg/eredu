@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use eredu_checkpoint::{LinearFormat, WeightQuantization};
+use eredu_checkpoint::LinearFormat;
 use eredu_core::attention::LayerSchedule;
 use eredu_gguf::{MetadataArray, MetadataValue};
 use serde::Deserialize;
@@ -167,43 +167,6 @@ impl VisionConfig {
             .or_else(|| self.linear_formats.get(&format!("model.visual.{relative}")))
             .copied()
             .unwrap_or(LinearFormat::Dense)
-    }
-
-    /// Applies an explicit in-memory quantization policy to aligned vision
-    /// projections. This changes storage intent only; it performs no I/O.
-    pub(crate) fn apply_load_time_quantization(&mut self, quantization: WeightQuantization) {
-        let aligned =
-            |input: i32| input > 0 && input % quantization.group_size() == 0 && input % 32 == 0;
-        self.linear_formats.clear();
-        for index in 0..self.layer_count() {
-            for (name, input) in [
-                (format!("blocks.{index}.attn.qkv.weight"), self.hidden_size),
-                (format!("blocks.{index}.attn.proj.weight"), self.hidden_size),
-                (
-                    format!("blocks.{index}.mlp.linear_fc1.weight"),
-                    self.hidden_size,
-                ),
-                (
-                    format!("blocks.{index}.mlp.linear_fc2.weight"),
-                    self.intermediate_size,
-                ),
-            ] {
-                if aligned(input) {
-                    self.linear_formats.insert(name, quantization.into());
-                }
-            }
-        }
-        let merger_input = self.hidden_size * self.spatial_merge_size * self.spatial_merge_size;
-        for prefix in std::iter::once("merger".to_owned()).chain(
-            (0..self.deepstack_layer_count()).map(|index| format!("deepstack_merger_list.{index}")),
-        ) {
-            for name in ["linear_fc1", "linear_fc2"] {
-                if aligned(merger_input) {
-                    self.linear_formats
-                        .insert(format!("{prefix}.{name}.weight"), quantization.into());
-                }
-            }
-        }
     }
 
     /// Validates exact shared geometry and mode-specific scheduling.

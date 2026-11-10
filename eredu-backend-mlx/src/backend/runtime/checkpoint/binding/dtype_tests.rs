@@ -50,9 +50,9 @@ fn exact_bindings(
     let metadata = store.source_metadata("weight").unwrap();
     let encoding = provenance.source_encoding;
     let shape = vec![1, 4];
-    let task = ReplicatedTextMaterializationTask::from_exact_source(
+    let task = ReplicatedTextMaterializationTask::from_exact_sources(
         "weight",
-        ReplicatedTextPhysicalSource::new(
+        vec![ReplicatedTextPhysicalSource::new(
             provenance.catalog_key,
             provenance.physical_tensor,
             provenance.backing_shard.unwrap(),
@@ -60,7 +60,7 @@ fn exact_bindings(
             encoding.clone(),
             metadata.encoded_byte_len,
         )
-        .unwrap(),
+        .unwrap()],
         Vec::new(),
         shape.clone(),
         shape.clone(),
@@ -70,6 +70,7 @@ fn exact_bindings(
         WeightLoweringKind::Direct,
         WeightLoweringDescriptor::new(encoding, LinearFormat::Dense, shape.clone(), shape, Some(1))
             .unwrap(),
+        None,
     )
     .unwrap();
     build_mlx_exact_replicated_text_bindings(parameter, store, &[&task], &BTreeSet::new(), None)

@@ -1,14 +1,17 @@
 //! Backend-neutral DeepSeek-V4 local, compressed, and indexed attention.
 
 use eredu_nn::{
-    AttentionRequest, Error, Index, IndexedAttentionInput, LinearOperator, LinearSpec,
-    LowRankProjection, NeuralBackend, NormalizationConstructionSpec, NormalizationOperator,
-    Parameter, ParameterSpec, Parameterized, PooledAttentionInput, PooledPositionInput,
-    PoolingAttentionCache, PoolingOverlap, PoolingWindows, Tensor,
+    AttentionRequest, DeclareLogicalParameters, Error, Index, IndexedAttentionInput,
+    LinearOperator, LowRankProjection, NeuralBackend, NormalizationOperator, Parameter,
+    Parameterized, PooledAttentionInput, PooledPositionInput, PoolingAttentionCache,
+    PoolingOverlap, PoolingWindows, Tensor,
 };
 
 use crate::decoder::ComponentInstrumentation;
-use crate::deepseek::{projection::ProjectionPolicy, V4Args, V4AttentionPolicy};
+use crate::deepseek::{
+    v4_specs::{self, AttentionSpec, CompressorSpec, IndexerSpec},
+    V4Args, V4AttentionPolicy,
+};
 use eredu_runtime::ActivationObserver;
 
 #[derive(Debug, Clone)]
@@ -130,43 +133,24 @@ pub struct Compressor<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
 }
 
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Compressor<B> {
-    fn new(
+    fn from_spec(
         args: &V4Args,
-        ratio: i32,
-        head_dimensions: i32,
-        root: &str,
+        spec: CompressorSpec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let overlapping = ratio == 4;
-        let output = head_dimensions * if overlapping { 2 } else { 1 };
+        spec.logical_parameters()?;
+        let head_dimensions = spec.head_dimensions();
+        let overlapping = spec.overlapping();
+        let position_shape = spec.position_shape();
         Ok(Self {
-            ratio,
+            ratio: spec.ratio,
             head_dimensions,
             overlapping,
-            wkv: linear::<B>(
-                format!("{root}.wkv.weight"),
-                args.hidden_size,
-                output,
-                args.linear_format_for(&format!("{root}.wkv.weight")),
-                context,
-            )?,
-            wgate: linear::<B>(
-                format!("{root}.wgate.weight"),
-                args.hidden_size,
-                output,
-                args.linear_format_for(&format!("{root}.wgate.weight")),
-                context,
-            )?,
-            ape: Parameter::unloaded(parameter(format!("{root}.ape"))?, &[ratio, output], context)?,
-            norm: B::normalization(
-                NormalizationConstructionSpec::learned(
-                    head_dimensions,
-                    args.rms_norm_eps,
-                    parameter(format!("{root}.norm.weight"))?,
-                ),
-                context,
-            )?,
-            rope: V4Rotary::new(args, args.compress_rope_theta, true, ratio, context)?,
+            wkv: B::linear(spec.wkv, context)?,
+            wgate: B::linear(spec.wgate, context)?,
+            ape: Parameter::unloaded(spec.position, &position_shape, context)?,
+            norm: B::normalization(spec.normalization, context)?,
+            rope: V4Rotary::new(args, args.compress_rope_theta, true, spec.ratio, context)?,
         })
     }
 
@@ -353,37 +337,19 @@ pub struct Indexer<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
 }
 
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Indexer<B> {
-    fn new(
+    fn from_spec(
         args: &V4Args,
-        ratio: i32,
-        root: &str,
+        spec: IndexerSpec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        spec.logical_parameters()?;
         Ok(Self {
-            heads: args.index_n_heads,
-            head_dimensions: args.index_head_dim,
-            top_k: args.index_topk,
-            wq_b: linear::<B>(
-                format!("{root}.wq_b.weight"),
-                args.q_lora_rank,
-                args.index_n_heads * args.index_head_dim,
-                args.linear_format_for(&format!("{root}.wq_b.weight")),
-                context,
-            )?,
-            weights_projection: linear::<B>(
-                format!("{root}.weights_proj.weight"),
-                args.hidden_size,
-                args.index_n_heads,
-                args.linear_format_for(&format!("{root}.weights_proj.weight")),
-                context,
-            )?,
-            compressor: Compressor::new(
-                args,
-                ratio,
-                args.index_head_dim,
-                &format!("{root}.compressor"),
-                context,
-            )?,
+            heads: spec.geometry.query_heads(),
+            head_dimensions: spec.geometry.key_dimensions(),
+            top_k: spec.top_k,
+            wq_b: B::linear(spec.query, context)?,
+            weights_projection: B::linear(spec.weights, context)?,
+            compressor: Compressor::from_spec(args, spec.compressor, context)?,
         })
     }
 
@@ -475,82 +441,41 @@ impl<B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Att
         root: &str,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        args.validate().map_err(Error::backend)?;
-        let policy = args
-            .attention_policy(layer)
-            .ok_or_else(|| Error::backend(format!("missing V4 attention policy {layer}")))?;
-        let ratio = match policy {
-            V4AttentionPolicy::Local => 0,
-            V4AttentionPolicy::Compressed { ratio } => ratio,
-        };
-        let query = ProjectionPolicy {
-            first_weight: Some(format!("{root}.wq_a.weight")),
-            normalization_weight: format!("{root}.q_norm.weight"),
-            second_weight: format!("{root}.wq_b.weight"),
-            input_dimensions: args.hidden_size,
-            rank: args.q_lora_rank,
-            output_dimensions: args.num_attention_heads * args.head_dim,
-            epsilon: args.rms_norm_eps,
-            first_format: args.linear_format_for(&format!("{root}.wq_a.weight")),
-            second_format: args.linear_format_for(&format!("{root}.wq_b.weight")),
-        }
-        .build(context)?;
+        let spec = v4_specs::attention_spec(args, layer, root)?;
+        Self::from_spec(args, spec, context)
+    }
+
+    fn from_spec(
+        args: &V4Args,
+        spec: AttentionSpec,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        spec.logical_parameters()?;
+        let geometry = spec.geometry;
+        let output_rank = spec.output_rank();
+        let ratio = spec.ratio();
+        let sink_shape = spec.sink_shape();
         Ok(Self {
-            heads: args.num_attention_heads,
-            head_dimensions: args.head_dim,
-            groups: args.o_groups,
-            output_rank: args.o_lora_rank,
-            scale: (args.head_dim as f32).sqrt().recip(),
-            normalization_epsilon: args.rms_norm_eps,
-            policy,
-            query,
-            wkv: linear::<B>(
-                format!("{root}.wkv.weight"),
-                args.hidden_size,
-                args.head_dim,
-                args.linear_format_for(&format!("{root}.wkv.weight")),
-                context,
-            )?,
-            kv_norm: B::normalization(
-                NormalizationConstructionSpec::learned(
-                    args.head_dim,
-                    args.rms_norm_eps,
-                    parameter(format!("{root}.kv_norm.weight"))?,
-                ),
-                context,
-            )?,
-            wo_a: linear::<B>(
-                format!("{root}.wo_a.weight"),
-                args.num_attention_heads * args.head_dim / args.o_groups,
-                args.o_groups * args.o_lora_rank,
-                args.linear_format_for(&format!("{root}.wo_a.weight")),
-                context,
-            )?,
-            wo_b: linear::<B>(
-                format!("{root}.wo_b.weight"),
-                args.o_groups * args.o_lora_rank,
-                args.hidden_size,
-                args.linear_format_for(&format!("{root}.wo_b.weight")),
-                context,
-            )?,
-            sinks: Parameter::unloaded(
-                parameter(format!("{root}.attn_sink"))?,
-                &[args.num_attention_heads],
-                context,
-            )?,
-            compressor: (ratio != 0)
-                .then(|| {
-                    Compressor::new(
-                        args,
-                        ratio,
-                        args.head_dim,
-                        &format!("{root}.compressor"),
-                        context,
-                    )
-                })
+            heads: geometry.query_heads(),
+            head_dimensions: geometry.key_dimensions(),
+            groups: spec.groups,
+            output_rank,
+            scale: (geometry.key_dimensions() as f32).sqrt().recip(),
+            normalization_epsilon: spec.normalization_epsilon,
+            policy: spec.policy,
+            query: LowRankProjection::new(spec.query, context)?,
+            wkv: B::linear(spec.kv, context)?,
+            kv_norm: B::normalization(spec.kv_norm, context)?,
+            wo_a: B::linear(spec.output_a, context)?,
+            wo_b: B::linear(spec.output_b, context)?,
+            sinks: Parameter::unloaded(spec.sinks, &sink_shape, context)?,
+            compressor: spec
+                .compressor
+                .map(|spec| Compressor::from_spec(args, spec, context))
                 .transpose()?,
-            indexer: (ratio == 4)
-                .then(|| Indexer::new(args, ratio, &format!("{root}.indexer"), context))
+            indexer: spec
+                .indexer
+                .map(|spec| Indexer::from_spec(args, spec, context))
                 .transpose()?,
             rope: V4Rotary::new(
                 args,
@@ -863,28 +788,4 @@ fn slice_last<T: Tensor>(
     context: &T::Context,
 ) -> Result<T, Error> {
     slice_axis(value, value.shape().len() - 1, start, end, context)
-}
-
-fn linear<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
-    name: impl Into<String>,
-    input: i32,
-    output: i32,
-    format: eredu_checkpoint::LinearFormat,
-    context: &<B::Tensor as Tensor>::Context,
-) -> Result<B::Linear, Error> {
-    let name = name.into();
-    B::linear(
-        LinearSpec {
-            input,
-            output,
-            weight: parameter(&name)?,
-            bias: None,
-            format: crate::linear_format::standard_linear_format(&name, format)?,
-        },
-        context,
-    )
-}
-
-fn parameter(name: impl Into<String>) -> Result<ParameterSpec, Error> {
-    ParameterSpec::trainable(name).map_err(Error::backend)
 }

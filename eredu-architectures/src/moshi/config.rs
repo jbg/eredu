@@ -177,6 +177,7 @@ pub struct MoshiTransformerConfig {
     attention_schedule: LayerSchedule<AttentionPolicy>,
     native_quantization: Option<WeightQuantization>,
     parallel_local: bool,
+    shared_depth_norms: bool,
 }
 
 impl MoshiTransformerConfig {
@@ -197,6 +198,7 @@ impl MoshiTransformerConfig {
             [
                 ("model_identity", self.model_identity.clone()),
                 ("parameter_root", self.parameter_root.clone()),
+                ("shared_depth_norms", self.shared_depth_norms.to_string()),
                 ("block_fields", "self_attn:q_proj:k_proj:v_proj:out_proj:sinks:q_norm:k_norm:gating:gate:up:linear_out:norm1:norm2".into()),
                 ("hidden_size", self.hidden_size.to_string()),
                 ("layers", self.num_hidden_layers.to_string()),
@@ -424,6 +426,17 @@ impl DecoderConfig for MoshiTransformerConfig {
         }
     }
 
+    fn parameter_alias(&self, name: &str) -> Option<String> {
+        if !self.shared_depth_norms || self.parameter_root == DEPTH_SLICE_ZERO_PARAMETER_ROOT {
+            return None;
+        }
+        let local = name.strip_prefix(&format!("{}.layers.", self.parameter_root))?;
+        if !local.ends_with(".norm1.weight") && !local.ends_with(".norm2.weight") {
+            return None;
+        }
+        Some(format!("{DEPTH_SLICE_ZERO_PARAMETER_ROOT}.layers.{local}"))
+    }
+
     fn validate_config(&self) -> Result<(), eredu_nn::Error> {
         self.validate().map_err(eredu_nn::Error::backend)
     }
@@ -503,9 +516,9 @@ impl DecoderConfig for MoshiTransformerConfig {
     }
 }
 
-/// One immutable normalized Moshi-family configuration.
+/// Normalized Moshi-family policy, independent of parameter materialization.
 #[derive(Debug, Clone, PartialEq)]
-pub struct MoshiConfig {
+pub struct MoshiPolicy {
     identity: MoshiIdentity,
     checkpoint_layout: CheckpointLayout,
     frame_schedule: RealtimeSpeechConfig,
@@ -518,7 +531,42 @@ pub struct MoshiConfig {
     parameter_root: String,
 }
 
+/// Immutable normalized policy and complete temporal/depth parameter declarations.
+#[derive(Debug, Clone)]
+pub struct MoshiConfig {
+    policy: MoshiPolicy,
+    declarations: std::sync::Arc<super::declarations::Declarations>,
+}
+impl PartialEq for MoshiConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.policy == other.policy
+    }
+}
+impl std::ops::Deref for MoshiConfig {
+    type Target = MoshiPolicy;
+    fn deref(&self) -> &Self::Target {
+        &self.policy
+    }
+}
+impl eredu_nn::DeclareLogicalParameters for MoshiConfig {
+    fn logical_parameters(
+        &self,
+    ) -> Result<Vec<eredu_nn::LogicalParameterDeclaration<'_>>, eredu_nn::Error> {
+        self.declarations.logical_parameters()
+    }
+}
 impl MoshiConfig {
+    fn new(policy: MoshiPolicy) -> Result<Self, MoshiConfigError> {
+        let declarations = super::declarations::Declarations::new(&policy)
+            .map_err(|error| invalid(error.to_string()))?;
+        Ok(Self {
+            policy,
+            declarations: std::sync::Arc::new(declarations),
+        })
+    }
+    pub(crate) fn declarations(&self) -> &std::sync::Arc<super::declarations::Declarations> {
+        &self.declarations
+    }
     /// Normalizes absent configuration as original Moshi v0.1 defaults.
     pub fn native_v0_1() -> Result<Self, MoshiConfigError> {
         normalize_native(native_v0_1_source(), ArtifactProfile::NativeV0_1)
@@ -573,7 +621,8 @@ impl MoshiConfig {
             ))),
         }
     }
-
+}
+impl MoshiPolicy {
     /// Stable normalized model identity.
     pub fn identity(&self) -> &MoshiIdentity {
         &self.identity
@@ -647,7 +696,8 @@ impl MoshiConfig {
     pub const fn native_quantization(&self) -> Option<WeightQuantization> {
         self.native_quantization
     }
-
+}
+impl MoshiConfig {
     /// Returns an execution-target variant with the requested native matrix encoding.
     ///
     /// This does not mutate the source artifact configuration. Callers performing
@@ -670,7 +720,10 @@ impl MoshiConfig {
         }
         validate_quantization_geometry(quantization, &self.temporal, &self.depth_slice_zero)?;
 
-        let mut target = self.clone();
+        if quantization == self.native_quantization() {
+            return Ok(self.clone());
+        }
+        let mut target = self.policy.clone();
         target.native_quantization = quantization;
         target.temporal.native_quantization = quantization;
         target.depth_slice_zero.native_quantization = quantization;
@@ -688,9 +741,20 @@ impl MoshiConfig {
             target.native_quantization,
             &target.parameter_root,
         );
-        Ok(target)
+        let mut declarations = self
+            .declarations
+            .with_format(quantization.into())
+            .map_err(|error| invalid(error.to_string()))?;
+        for (slice, declared) in declarations.depth.iter_mut().enumerate() {
+            declared.edge.transformer = target.depth_transformer(slice)?;
+        }
+        Ok(Self {
+            policy: target,
+            declarations: std::sync::Arc::new(declarations),
+        })
     }
-
+}
+impl MoshiPolicy {
     /// Canonical family parameter root; empty means the checkpoint root itself.
     pub fn parameter_root(&self) -> &str {
         &self.parameter_root
@@ -937,7 +1001,7 @@ fn normalize(
         Some(token) => {
             return Err(invalid(format!(
                 "existing text padding id must be in 0..={text_vocabulary_size}, got {token}"
-            )))
+            )));
         }
         None => text_vocabulary_size,
     };
@@ -979,7 +1043,7 @@ fn normalize(
         vocabulary_size: text_vocabulary_size,
         native_quantization,
     })?;
-    let depth = normalize_transformer(TransformerSource {
+    let mut depth = normalize_transformer(TransformerSource {
         label: "depth",
         model_identity: "moshi.depth.0".into(),
         parameter_root: DEPTH_SLICE_ZERO_PARAMETER_ROOT.into(),
@@ -995,6 +1059,7 @@ fn normalize(
         vocabulary_size: audio_vocabulary_size,
         native_quantization,
     })?;
+    depth.shared_depth_norms = parameter_sharing == ParameterSharing::SharedDepthNorms;
     validate_quantization_geometry(native_quantization, &temporal, &depth)?;
 
     let frame_schedule = RealtimeSpeechConfig::new(
@@ -1029,7 +1094,7 @@ fn normalize(
         version,
         architecture_fingerprint,
     };
-    Ok(MoshiConfig {
+    MoshiConfig::new(MoshiPolicy {
         identity,
         checkpoint_layout,
         frame_schedule,
@@ -1178,6 +1243,7 @@ fn normalize_transformer(
         attention_schedule,
         native_quantization: source.native_quantization,
         parallel_local: false,
+        shared_depth_norms: false,
     };
     value.validate()?;
     Ok(value)
@@ -1213,39 +1279,28 @@ fn validate_quantization_geometry(
     let Some(quantization) = quantization else {
         return Ok(());
     };
-    let group = quantization.group_size();
-    let bits = quantization.bits();
-    if group <= 0 || bits <= 0 {
-        return Err(invalid(
-            "native quantization group and bits must be positive",
-        ));
-    }
     for (matrix_family, input_width) in [
         ("temporal hidden-input matrices", temporal.hidden_size),
         ("temporal gated-output matrices", temporal.gated_hidden_size),
         ("depth hidden-input matrices", depth.hidden_size),
         ("depth gated-output matrices", depth.gated_hidden_size),
     ] {
-        if input_width % group != 0 {
-            return Err(invalid(format!(
-                "{matrix_family} width {input_width} is not divisible by quantization group {group}"
-            )));
-        }
         if input_width % 32 != 0 {
             return Err(invalid(format!(
                 "{matrix_family} width {input_width} is not divisible by packed word width 32"
             )));
         }
-        let packed_bits = input_width.checked_mul(bits).ok_or_else(|| {
+        let input = usize::try_from(input_width)
+            .map_err(|_| invalid(format!("{matrix_family} width exceeds usize")))?;
+        let geometry = quantization
+            .packed_word_geometry(input)
+            .map_err(|error| invalid(format!("{matrix_family}: {error}")))?;
+        // Moshi's normalized geometry retains signed-i32 intermediate bounds.
+        i32::try_from(geometry.packed_bits()).map_err(|_| {
             invalid(format!(
                 "{matrix_family} packed quantization width overflowed"
             ))
         })?;
-        if packed_bits % 32 != 0 {
-            return Err(invalid(format!(
-                "{matrix_family} width {input_width} at {bits} bits does not form whole packed words"
-            )));
-        }
     }
     Ok(())
 }

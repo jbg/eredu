@@ -4,9 +4,10 @@
 //! execution trait owns priming, hypothesis capacity and the greedy label loop.
 
 use super::rnnt::{
-    affine, build_predictor_layer, encoder_projection_input, parameter, step_predictor_layer,
-    RnntDimensions, RnntError, RnntExecution, RnntPredictionState,
+    encoder_projection_input, step_predictor_layer, RnntDimensions, RnntError, RnntExecution,
+    RnntPredictionState,
 };
+use super::rnnt_specs::{Declaration, RnntDeclaration, UnitSpec, EMBEDDING, PREDICTOR};
 use eredu_core::BackendFailure;
 use eredu_nn::{
     recurrent::{Lstm, LstmState},
@@ -21,8 +22,7 @@ use eredu_runtime::{
     ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress, ExecutionUnitLayout,
     LayeredForwardState, LayeredInvocation, LayerwisePolicy, LayerwiseRuntime, LocalModelLayout,
     MemberSharding, OwnedParameterGroupSpec, ParallelComponentKernel, ParameterGroupOwner,
-    ParameterGroupSpec, ParameterMemberSpec, ParameterRole, StatelessComponentState,
-    SubmissionBackend, TensorPlacement,
+    ParameterRole, StatelessComponentState, SubmissionBackend, TensorPlacement,
 };
 use std::marker::PhantomData;
 
@@ -33,8 +33,8 @@ const GROUPS: [&str; 5] = [
     "voicechat.rnnt.joint.pred",
     "voicechat.rnnt.joint.joint_net.2",
 ];
-#[derive(Clone, Copy)]
-pub(super) enum RnntPhase {
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RnntPhase {
     Embedding,
     Predictor,
     Encoder,
@@ -42,18 +42,28 @@ pub(super) enum RnntPhase {
     Output,
 }
 impl RnntPhase {
-    const fn ordinal(self) -> usize {
+    pub(super) const fn ordinal(self) -> usize {
         self as usize
     }
     pub(super) const fn id(self) -> &'static str {
         GROUPS[self.ordinal()]
     }
-    fn units(self, dimensions: RnntDimensions) -> usize {
+    pub(crate) fn units(self, dimensions: RnntDimensions) -> usize {
         if matches!(self, Self::Predictor) {
             dimensions.predictor_layers
         } else {
             1
         }
+    }
+    pub(super) fn parameter_group(self, index: usize) -> String {
+        if matches!(self, Self::Predictor) {
+            format!("{}.{index}", self.id())
+        } else {
+            self.id().into()
+        }
+    }
+    fn vocabulary(self) -> bool {
+        matches!(self, Self::Embedding | Self::Output)
     }
     pub(super) fn path(self, index: usize) -> String {
         match self {
@@ -65,13 +75,13 @@ impl RnntPhase {
         }
     }
 }
-#[derive(Clone, Copy)]
-pub(super) enum RnntSelection {
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RnntSelection {
     Complete,
     Projections,
 }
 impl RnntSelection {
-    pub(super) fn phases(self) -> &'static [RnntPhase] {
+    pub(crate) fn phases(self) -> &'static [RnntPhase] {
         match self {
             Self::Complete => &[
                 RnntPhase::Embedding,
@@ -89,27 +99,21 @@ impl RnntSelection {
         }
     }
 }
-/// Complete RNNT operations, semantic groups and request-local state declaration.
-pub fn rnnt_component_definition(
-    dimensions: RnntDimensions,
-) -> Result<ComponentDefinition, RnntError> {
-    rnnt_definition_for_selection(dimensions, RnntSelection::Complete)
-}
 pub(super) fn rnnt_definition_for_selection(
-    dimensions: RnntDimensions,
     selection: RnntSelection,
+    declaration: &Declaration,
 ) -> Result<ComponentDefinition, RnntError> {
     let phases = selection.phases();
-    let parameters = rnnt_parameter_description_for_phases(dimensions, phases)?;
-    let units = phases
-        .iter()
-        .flat_map(|phase| {
-            (0..phase.units(dimensions)).map(move |index| ComponentUnit {
+    let parameters = declared_parameter_description(phases, declaration)?;
+    let mut units = Vec::new();
+    for phase in phases {
+        units.extend(
+            (0..declaration.phase(*phase)?.len()).map(|index| ComponentUnit {
                 path: phase.path(index),
                 state: 0..0,
-            })
-        })
-        .collect();
+            }),
+        );
+    }
     let transport = ArchitectureGroupTransport {
         placement: ArchitectureGroupPlacement::Pipeline,
         kind: ArchitectureGroupKind::Projector,
@@ -134,9 +138,6 @@ pub(super) fn rnnt_definition_for_selection(
         ArchitectureStatePartitionPlan::new([]),
     )?)
 }
-
-const EMBEDDING: &str = "stt_model.rnnt_decoder.prediction.embed.weight";
-const PREDICTOR: &str = "stt_model.rnnt_decoder.prediction.dec_rnn.lstm";
 
 #[derive(Debug, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
@@ -215,30 +216,22 @@ impl RnntLocalDimensions {
         }
     }
 }
-/// Validates complete physical vocabulary placement and every replicated member.
-/// Uneven vocabulary ranges do not uniquely identify a communicator; invocation
-/// independently validates the selected rank and degree.
-pub fn rnnt_local_dimensions(
-    dimensions: RnntDimensions,
-    layout: &LocalModelLayout,
-) -> Result<RnntLocalDimensions, RnntError> {
-    rnnt_local_dimensions_for_description(
-        dimensions,
-        layout,
-        &rnnt_parameter_description(dimensions)?,
-    )
-}
 pub(crate) fn rnnt_local_dimensions_for_description(
-    dimensions: RnntDimensions,
+    declaration: &Declaration,
     layout: &LocalModelLayout,
     description: &ArchitectureParameterDescription,
 ) -> Result<RnntLocalDimensions, RnntError> {
-    dimensions.validate()?;
-    let weight = layout
-        .tensor(EMBEDDING)
-        .ok_or(RnntError::InvalidConfiguration(
-            "RNNT layout omits vocabulary embedding",
-        ))?;
+    let UnitSpec::Embedding(embedding) = declaration.unit(RnntPhase::Embedding, 0)? else {
+        return Err(RnntError::InvalidConfiguration(
+            "RNNT vocabulary owner is not an embedding",
+        ));
+    };
+    let weight =
+        layout
+            .tensor(embedding.weight.id.as_str())
+            .ok_or(RnntError::InvalidConfiguration(
+                "RNNT layout omits vocabulary embedding",
+            ))?;
     let (start, end) = match weight.placement() {
         TensorPlacement::Range {
             axis: 0,
@@ -248,11 +241,11 @@ pub(crate) fn rnnt_local_dimensions_for_description(
         _ => {
             return Err(RnntError::InvalidConfiguration(
                 "RNNT embedding requires vocabulary row placement",
-            ))
+            ));
         }
     };
     let range = VocabularyParallelRange {
-        global_vocabulary: (dimensions.vocab_size + 1) as usize,
+        global_vocabulary: embedding.vocabulary as usize,
         local: start..end,
     };
     range.validate()?;
@@ -282,7 +275,6 @@ pub(crate) fn rnnt_local_dimensions_for_description(
 struct ParallelRnnt<B: NeuralBackend> {
     local: RnntLocalDimensions,
     layout: LocalModelLayout,
-    description: ArchitectureParameterDescription,
     embedding: fn(
         EmbeddingSpec,
         VocabularyParallelRange,
@@ -313,15 +305,19 @@ struct ParallelRnnt<B: NeuralBackend> {
 /// both profiles use the same phase equations and resource lifecycle.
 pub struct RnntKernel<B: NeuralBackend, const PREDICTOR: bool = true> {
     dimensions: RnntDimensions,
+    declaration: Declaration,
+    definition: ComponentDefinition,
     parallel: Option<ParallelRnnt<B>>,
     backend: PhantomData<fn() -> B>,
 }
 impl<B: NeuralBackend, const PREDICTOR: bool> RnntKernel<B, PREDICTOR> {
-    /// Validates geometry without allocating any native parameter.
-    pub fn new(dimensions: RnntDimensions) -> Result<Self, RnntError> {
-        dimensions.validate()?;
+    /// Retains validated ownership without allocating any native parameter.
+    pub fn new(declaration: RnntDeclaration<PREDICTOR>) -> Result<Self, RnntError> {
+        let (dimensions, declaration, definition) = declaration.into_parts();
         Ok(Self {
             dimensions,
+            declaration,
+            definition,
             parallel: None,
             backend: PhantomData,
         })
@@ -343,10 +339,7 @@ impl<B: NeuralBackend, const PREDICTOR: bool> RnntKernel<B, PREDICTOR> {
     }
     /// Couples selected family equations with one exact semantic declaration.
     pub fn into_component(self) -> Result<ComponentAdapter<ComponentDefinition, Self>, RnntError> {
-        Ok(ComponentAdapter::new(
-            rnnt_definition_for_selection(self.dimensions, Self::selection())?,
-            self,
-        )?)
+        Ok(ComponentAdapter::new(self.definition.clone(), self)?)
     }
     /// Declares only one requested embedding, recurrent layer or joint affine.
     fn build_resource(
@@ -357,35 +350,17 @@ impl<B: NeuralBackend, const PREDICTOR: bool> RnntKernel<B, PREDICTOR> {
     ) -> Result<RnntUnit<B>, RnntError> {
         let group = phase.ordinal();
         let d = self.dimensions;
-        let module = match group {
-            0 => {
-                let spec = EmbeddingSpec {
-                    vocabulary: d.vocab_size + 1,
-                    dimensions: d.predictor_width,
-                    weight: parameter(EMBEDDING.into(), GROUPS[0]),
-                    format: eredu_nn::LinearFormatSpec::unscaled(
-                        eredu_checkpoint::LinearFormat::Dense,
-                    )
-                    .expect("dense RNNT embedding"),
-                };
+        let module = match self.declaration.unit(phase, index)?.clone() {
+            UnitSpec::Embedding(spec) => {
                 UnitModule::Embedding(if let Some(selected) = &self.parallel {
                     (selected.embedding)(spec, selected.local.range(d), context)?
                 } else {
                     B::embedding(spec, context)?
                 })
             }
-            1 => UnitModule::Predictor(build_predictor_layer(d, index, context)?),
-            2..=4 => {
-                let (input, output) = projection_shape(d, group);
-                let path = phase.path(index);
-                let spec = affine(
-                    input,
-                    output,
-                    format!("{path}.weight"),
-                    format!("{path}.bias"),
-                    GROUPS[group],
-                );
-                UnitModule::Projection(if group == 4 {
+            UnitSpec::Predictor(spec) => UnitModule::Predictor(Lstm::new(vec![spec], context)?),
+            UnitSpec::Projection(spec) => {
+                UnitModule::Projection(if matches!(phase, RnntPhase::Output) {
                     if let Some(selected) = &self.parallel {
                         (selected.output)(spec, selected.local.range(d), context)?
                     } else {
@@ -395,7 +370,6 @@ impl<B: NeuralBackend, const PREDICTOR: bool> RnntKernel<B, PREDICTOR> {
                     B::linear(spec, context)?
                 })
             }
-            _ => unreachable!(),
         };
         Ok(RnntUnit {
             dimensions: d,
@@ -438,19 +412,20 @@ impl<B: NeuralBackend, const PREDICTOR: bool> RnntKernel<B, PREDICTOR> {
             RnntInput::Prediction(input) => (3, input.clone(), None),
             RnntInput::Output(input) => (4, input.clone(), None),
         };
-        if !Self::selection()
+        let phase = Self::selection()
             .phases()
             .iter()
-            .any(|phase| phase.ordinal() == group)
-        {
-            return Err(RnntError::InvalidState(
+            .copied()
+            .find(|phase| phase.ordinal() == group)
+            .ok_or(RnntError::InvalidState(
                 "RNNT operation is absent from the selected component",
-            ));
-        }
-        if group >= 2 && input.shape() != [1, projection_shape(self.dimensions, group).0] {
-            return Err(RnntError::InvalidState(
-                "RNNT joint input has incompatible row geometry",
-            ));
+            ))?;
+        if let UnitSpec::Projection(spec) = self.declaration.unit(phase, 0)? {
+            if input.shape() != [1, spec.input] {
+                return Err(RnntError::InvalidState(
+                    "RNNT joint input has incompatible row geometry",
+                ));
+            }
         }
         Ok(LayeredForwardState {
             hidden: input.clone(),
@@ -524,7 +499,14 @@ impl<B: NeuralBackend, const PREDICTOR: bool> RnntKernel<B, PREDICTOR> {
             }
             UnitModule::Projection(projection) if group >= 2 => {
                 let input = if group == 2 {
-                    encoder_projection_input::<B>(projection, hidden, context)?
+                    let UnitSpec::Projection(spec) =
+                        self.declaration.unit(RnntPhase::Encoder, 0)?
+                    else {
+                        return Err(RnntError::InvalidState(
+                            "RNNT encoder owner is not a projection",
+                        ));
+                    };
+                    encoder_projection_input::<B>(projection, &spec.weight.id, hidden, context)?
                 } else {
                     hidden.clone()
                 };
@@ -545,7 +527,7 @@ impl<B: NeuralBackend, const PREDICTOR: bool> RnntKernel<B, PREDICTOR> {
             _ => {
                 return Err(RnntError::InvalidState(
                     "leased RNNT unit has incompatible operation",
-                ))
+                ));
             }
         };
         forward.completed += 1;
@@ -553,14 +535,6 @@ impl<B: NeuralBackend, const PREDICTOR: bool> RnntKernel<B, PREDICTOR> {
     }
 }
 
-fn projection_shape(d: RnntDimensions, group: usize) -> (i32, i32) {
-    match group {
-        2 => (d.encoder_width, d.joint_width),
-        3 => (d.predictor_width, d.joint_width),
-        4 => (d.joint_width, d.vocab_size + 1),
-        _ => unreachable!(),
-    }
-}
 fn graph(phases: &[RnntPhase]) -> Result<ExecutionGraph, RnntError> {
     Ok(ExecutionGraph::new(
         phases
@@ -580,88 +554,39 @@ fn graph(phases: &[RnntPhase]) -> Result<ExecutionGraph, RnntError> {
             .id(),
     )?)
 }
-/// Cold exact geometry, canonical identities and separate ownership of all RNNT parameters.
-pub fn rnnt_parameter_description(
-    d: RnntDimensions,
-) -> Result<ArchitectureParameterDescription, RnntError> {
-    rnnt_parameter_description_for_phases(d, RnntSelection::Complete.phases())
-}
-pub(super) fn rnnt_parameter_description_for_phases(
-    d: RnntDimensions,
+pub(super) fn declared_parameter_description(
     phases: &[RnntPhase],
+    declaration: &Declaration,
 ) -> Result<ArchitectureParameterDescription, RnntError> {
-    d.validate()?;
     let graph = graph(phases)?;
-    let layout = ExecutionUnitLayout::new(&graph, phases.iter().map(|phase| phase.units(d)))?;
+    let counts = phases
+        .iter()
+        .map(|phase| declaration.phase(*phase).map(|units| units.len()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let layout = ExecutionUnitLayout::new(&graph, counts)?;
     let mut owned = Vec::new();
-    let member = |name: String, shape: Vec<usize>| {
-        let vocabulary = name == EMBEDDING || name.starts_with("stt_model.rnnt_joint.joint_net.2.");
-        ParameterMemberSpec::new(
-            name,
-            shape,
-            if vocabulary {
-                MemberSharding::Balanced { axis: 0 }
-            } else {
-                MemberSharding::Replicated
-            },
-        )
-    };
     for (local_group, phase) in phases.iter().enumerate() {
-        let group = phase.ordinal();
-        let group_name = phase.id();
-        let count = phase.units(d);
+        let count = declaration.phase(*phase)?.len();
         for index in 0..count {
-            let (name, members) = match group {
-                0 => (
-                    GROUPS[0].into(),
-                    vec![member(
-                        EMBEDDING.into(),
-                        vec![(d.vocab_size + 1) as usize, d.predictor_width as usize],
-                    )],
-                ),
-                1 => {
-                    let mut members = Vec::new();
-                    for matrix in ["ih", "hh"] {
-                        members.push(member(
-                            format!("{PREDICTOR}.weight_{matrix}_l{index}"),
-                            vec![4 * d.predictor_width as usize, d.predictor_width as usize],
-                        ));
-                        members.push(member(
-                            format!("{PREDICTOR}.bias_{matrix}_l{index}"),
-                            vec![4 * d.predictor_width as usize],
-                        ));
-                    }
-                    (format!("{}.{}", GROUPS[1], index), members)
-                }
-                _ => {
-                    let (input, output) = projection_shape(d, group);
-                    let path = match group {
-                        2 => "enc",
-                        3 => "pred",
-                        4 => "joint_net.2",
-                        _ => unreachable!(),
-                    };
-                    (
-                        group_name.into(),
-                        vec![
-                            member(
-                                format!("stt_model.rnnt_joint.{path}.weight"),
-                                vec![output as usize, input as usize],
-                            ),
-                            member(
-                                format!("stt_model.rnnt_joint.{path}.bias"),
-                                vec![output as usize],
-                            ),
-                        ],
-                    )
-                }
-            };
-            let role = if group == 0 || group == 4 {
+            let name = phase.parameter_group(index);
+            let role = if phase.vocabulary() {
                 ParameterRole::Vocabulary
             } else {
                 ParameterRole::Replicated
             };
-            let spec = ParameterGroupSpec::new(name, role, members)?;
+            let spec = eredu_runtime::logical_parameter_group(
+                name,
+                role,
+                None,
+                declaration.unit(*phase, index)?,
+                |_| {
+                    if phase.vocabulary() {
+                        MemberSharding::Balanced { axis: 0 }
+                    } else {
+                        MemberSharding::Replicated
+                    }
+                },
+            )?;
             owned.push(OwnedParameterGroupSpec::new(
                 ParameterGroupOwner::execution_unit(
                     layout
@@ -924,17 +849,14 @@ where
 impl<B: DistributedNeuralBackend, const PREDICTOR: bool> RnntKernel<B, PREDICTOR> {
     /// Selects exact vocabulary shards and recurrent replicas without native allocation.
     pub fn new_parallel(
-        dimensions: RnntDimensions,
+        declaration: RnntDeclaration<PREDICTOR>,
         layout: &LocalModelLayout,
     ) -> Result<Self, RnntError> {
-        let description =
-            rnnt_parameter_description_for_phases(dimensions, Self::selection().phases())?;
-        let local = rnnt_local_dimensions_for_description(dimensions, layout, &description)?;
-        let mut architecture = Self::new(dimensions)?;
+        let local = declaration.local_dimensions(layout)?;
+        let mut architecture = Self::new(declaration)?;
         architecture.parallel = Some(ParallelRnnt {
             local,
             layout: layout.clone(),
-            description,
             embedding: B::vocabulary_parallel_embedding,
             output: B::vocabulary_parallel_linear,
             lookup: B::vocabulary_parallel_lookup,
@@ -956,7 +878,7 @@ impl<B: DistributedNeuralBackend, const PREDICTOR: bool> RnntKernel<B, PREDICTOR
             .balanced_peer_widths(B::parallel_size(parallel), B::parallel_rank(parallel))?;
         eredu_runtime::validate_tensor_parallel_layout(
             "voicechat.rnnt",
-            &selected.description,
+            self.definition.parameters(),
             &selected.layout,
             B::parallel_size(parallel),
             B::parallel_rank(parallel),

@@ -16,8 +16,8 @@ use super::{
     checkpoint::Component,
     parameters::{admitted_member, execution_parameter, SpeechParameterError},
     tts_transformer::TransformerConfig,
-    tts_transformer_layered::tts_transformer_component_definition,
     tts_transformer_layered::TransformerError,
+    tts_transformer_specs::{released_declarations, TransformerDeclaration},
 };
 
 /// Selects one independently executed EAR-TTS transformer from retained artifacts.
@@ -65,8 +65,7 @@ pub enum TtsTransformerPreparationError {
 /// conversion bounds use the shared speech recipe projection. This component
 /// contract declares no full VoiceChat execution capability.
 pub struct PreparedTtsTransformerBindings {
-    config: TransformerConfig,
-    prepared: PreparedComponent<eredu_runtime::ComponentDefinition>,
+    prepared: PreparedComponent<TransformerDeclaration>,
 }
 
 impl PreparedTtsTransformerBindings {
@@ -75,7 +74,8 @@ impl PreparedTtsTransformerBindings {
         mut self,
         precision: super::precision::SpeechPrecision,
     ) -> Result<Self, TtsTransformerPreparationError> {
-        if self.config.precision() != Default::default() && self.config.precision() != precision {
+        if self.config().precision() != Default::default() && self.config().precision() != precision
+        {
             return Err(TtsTransformerPreparationError::Precision(
                 "precision is already selected",
             ));
@@ -83,12 +83,18 @@ impl PreparedTtsTransformerBindings {
         precision
             .validate()
             .map_err(TtsTransformerPreparationError::Precision)?;
+        let declaration = super::precision::SpeechPrecisionDeclaration::from_groups(
+            self.definition().parameters().groups(),
+        );
         self.prepared = self.prepared.transform_units(|source, units| {
             precision
-                .bindings(source, units)
+                .bindings(source, units, &declaration)
                 .map_err(TtsTransformerPreparationError::from)
         })?;
-        self.config = self.config.with_precision(precision);
+        let declaration = self.declaration().clone().with_precision(precision)?;
+        self.prepared = self
+            .prepared
+            .project("voicechat/tts_transformer/leased-units", declaration)?;
         Ok(self)
     }
 
@@ -101,13 +107,10 @@ impl PreparedTtsTransformerBindings {
             .component_source(Component::Tts)
             .ok_or(SpeechParameterError::MissingComponent(Component::Tts))?;
         Self::from_parameters(
-            TransformerConfig::new(match kind {
-                TtsTransformerKind::Causal => &artifacts.plan().config().tts.backbone,
-                TtsTransformerKind::CharacterEncoder => {
-                    &artifacts.plan().config().tts.character_encoder
-                }
-            })
-            .map_err(TransformerError::from)?,
+            match kind {
+                TtsTransformerKind::Causal => released_declarations()?.causal.clone(),
+                TtsTransformerKind::CharacterEncoder => released_declarations()?.character.clone(),
+            },
             source.clone(),
             artifacts.plan().parameters(),
         )
@@ -117,21 +120,28 @@ impl PreparedTtsTransformerBindings {
     /// discovery or native allocation. Shapes follow the symbolic architecture;
     /// neighboring TTS component payloads are excluded.
     pub fn from_parameters(
-        config: TransformerConfig,
+        declaration: TransformerDeclaration,
         source: SharedCheckpointSource,
         parameters: &BTreeMap<String, ParameterAdmission>,
     ) -> Result<Self, TtsTransformerPreparationError> {
-        let config = config.with_formats(
-            parameters
-                .iter()
-                .filter(|(_, p)| p.component == Component::Tts)
-                .map(|(name, p)| (name.clone(), p.linear_format))
-                .collect(),
-        );
-        let definition = tts_transformer_component_definition(&config)?;
+        use eredu_nn::DeclareLogicalParameters;
+        let formats = declaration
+            .spec()
+            .logical_parameters()
+            .map_err(TransformerError::from)?
+            .into_iter()
+            .filter_map(|slot| {
+                let name = slot.parameter.id.as_str();
+                parameters
+                    .get(name)
+                    .filter(|p| p.component == Component::Tts)
+                    .map(|p| (name.to_owned(), p.linear_format))
+            })
+            .collect();
+        let declaration = declaration.with_formats(formats)?;
         let prepared = PreparedComponent::prepare(
             "voicechat/tts_transformer/leased-units",
-            definition,
+            declaration,
             source.clone(),
             |member| {
                 let name = member.target();
@@ -139,14 +149,14 @@ impl PreparedTtsTransformerBindings {
                 let parameter = execution_parameter(parameter, &source)?;
                 if !matches!(parameter.output.dtype, RecipeDtype::F32 | RecipeDtype::U32)
                     && !(parameter.output.dtype == RecipeDtype::U8
-                        && super::parameters::is_byte_scale(parameters, name))
+                        && super::parameters::is_mxfp4_scale(parameters, member))
                 {
                     return Err(TtsTransformerPreparationError::Geometry(name.into()));
                 }
                 Ok::<_, TtsTransformerPreparationError>(parameter.recipe)
             },
         )?;
-        Ok(Self { config, prepared })
+        Ok(Self { prepared })
     }
 
     /// Selects complete-stack tensor placement using the shared physical planner.
@@ -168,14 +178,18 @@ impl PreparedTtsTransformerBindings {
         layout: &LocalModelLayout,
     ) -> Result<Self, TtsTransformerPreparationError> {
         let blocks =
-            super::tts_transformer_layered::transformer_local_configs(&self.config, layout)?;
+            super::tts_transformer_layered::transformer_local_configs(self.declaration(), layout)?;
+        let parameters = super::tts_transformer_layered::transformer_local_parameters(
+            self.declaration(),
+            &blocks,
+        )?;
         let state =
-            super::tts_transformer_layered::transformer_local_state_layout(&self.config, &blocks)?;
+            super::tts_transformer_layered::transformer_state_layout(self.config(), &parameters)?;
+        let declaration = self.declaration().clone().with_state_layout(state)?;
         self.prepared = self
             .prepared
             .select(layout)?
-            .with_state_layout(state)
-            .map_err(TransformerError::from)?;
+            .project("voicechat/tts_transformer/leased-units", declaration)?;
         Ok(self)
     }
 
@@ -190,22 +204,30 @@ impl PreparedTtsTransformerBindings {
         >,
     ) -> Result<PreparedTtsTransformerPartitionBindings, TtsTransformerPreparationError> {
         super::tts_transformer_layered::validate_transformer_partition(
-            self.prepared.declaration(),
-            &self.config,
+            self.declaration(),
             self.prepared.local_layout(),
             partition,
         )?;
         let prepared = self.prepared.select_units(partition.units())?;
         Ok(PreparedTtsTransformerPartitionBindings {
-            config: self.config,
             prepared,
             state_layout: partition.state().map(|state| state.layout().clone()),
         })
     }
 
+    /// Typed scope retained through format, precision and state selection.
+    pub fn declaration(&self) -> &TransformerDeclaration {
+        self.prepared.declaration()
+    }
+
+    /// Exact retained tensor selection, when present.
+    pub fn local_layout(&self) -> Option<&LocalModelLayout> {
+        self.prepared.local_layout()
+    }
+
     /// Validated transformer geometry; no other speech stack is selected.
     pub fn config(&self) -> &TransformerConfig {
-        &self.config
+        self.prepared.declaration().config()
     }
 
     /// Exact prepared unit bindings for cold resource accounting.
@@ -220,38 +242,42 @@ impl PreparedTtsTransformerBindings {
 
     /// Semantic definition with the selected rank's complete cache geometry.
     pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
-        self.prepared.declaration()
+        self.prepared.declaration().definition()
     }
 
     /// Consumes exact source authority and the canonical ordered binding plan.
     pub fn into_parts(
         self,
     ) -> (
-        TransformerConfig,
-        eredu_runtime::ComponentDefinition,
+        TransformerDeclaration,
+        Option<LocalModelLayout>,
         eredu_runtime::ExecutionUnitAddressMap,
         SharedCheckpointSource,
         Vec<Vec<WeightBinding>>,
     ) {
-        let (definition, _, layout, source, units) = self
+        let (declaration, selected, layout, source, units) = self
             .prepared
             .into_declared_unit_parts()
             .expect("component declares only independently leased units");
-        (self.config, definition, layout, source, units)
+        (declaration, selected, layout, source, units)
     }
 }
 
 /// Exact canonical units and restricted retained sources for a pipeline stage.
 /// A normalization-only stage has no state and owns only its normalization recipe.
 pub struct PreparedTtsTransformerPartitionBindings {
-    config: TransformerConfig,
-    prepared: PreparedComponent<eredu_runtime::ComponentDefinition>,
+    prepared: PreparedComponent<TransformerDeclaration>,
     state_layout: Option<eredu_runtime::StateLayout>,
 }
 impl PreparedTtsTransformerPartitionBindings {
+    /// Global scope retained alongside selected stage resources.
+    pub fn declaration(&self) -> &TransformerDeclaration {
+        self.prepared.declaration()
+    }
+
     /// Global family equations; physical TP geometry is retained separately.
     pub fn config(&self) -> &TransformerConfig {
-        &self.config
+        self.prepared.declaration().config()
     }
     /// Exact selected physical layout when tensor parallelism is also selected.
     pub fn local_layout(&self) -> Option<&LocalModelLayout> {
@@ -274,27 +300,25 @@ impl PreparedTtsTransformerPartitionBindings {
     }
     /// Complete definition with selected cache geometry and global unit identities.
     pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
-        self.prepared.declaration()
+        self.prepared.declaration().definition()
     }
     /// Consumes exact stage authority without rebasing canonical unit addresses.
     pub fn into_parts(
         self,
     ) -> (
-        TransformerConfig,
-        eredu_runtime::ComponentDefinition,
+        TransformerDeclaration,
         Option<LocalModelLayout>,
         eredu_runtime::ExecutionUnitAddressMap,
         SharedCheckpointSource,
         Vec<(eredu_runtime::ExecutionUnitAddress, Vec<WeightBinding>)>,
         Option<eredu_runtime::StateLayout>,
     ) {
-        let (definition, local_layout, invocations, source, units) = self
+        let (declaration, local_layout, invocations, source, units) = self
             .prepared
             .into_addressed_unit_parts()
             .expect("partition declares only independently leased units");
         (
-            self.config,
-            definition,
+            declaration,
             local_layout,
             invocations,
             source,

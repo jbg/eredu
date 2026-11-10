@@ -6294,6 +6294,7 @@ fn composite_partitioned_state_layout(
             let layout = derive_partitioned_local_layout(&parameters, rank)?;
             let geometry = crate::decoder::partition_local_geometry(
                 args,
+                args.text_declaration().as_ref(),
                 parameters.invocations(),
                 &layout,
                 0..crate::decoder::Config::num_hidden_layers(args) as usize,
@@ -6307,7 +6308,8 @@ fn composite_partitioned_state_layout(
                 .map_err(|error| error.to_string())
         }
         crate::replicated_text::CompositeConfig::Gemma4(args) => {
-            let base = crate::gemma4::pipeline::tensor_state_layout(&args.text, rank)?;
+            let base = crate::gemma4::graph::tensor_state_layout(args, rank)
+                .map_err(|error| error.to_string())?;
             let units = args
                 .text
                 .pipeline_layer_ranges(rank.pipeline_parallel_size())
@@ -6330,22 +6332,62 @@ fn composite_partitioned_state_layout(
             let heads = local_partition_head_count(args.text.num_key_value_heads, rank)?;
             let layers = usize::try_from(args.text.num_hidden_layers)
                 .map_err(|_| "Qwen3-VL layer count exceeds usize".to_owned())?;
-            crate::qwen::vl::state_layout_with_key_value_heads(args, &vec![heads; layers])
+            let geometry = (0..layers)
+                .map(|layer| {
+                    args.text_declaration()
+                        .common()
+                        .block_parameters(layer)
+                        .attention
+                        .geometry
+                        .partition_key_value_heads(0..heads as usize)
+                        .map_err(|error| error.to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let text = crate::decoder::cache_layout_with_attention_geometry(&args.text, geometry)
+                .map_err(|error| error.to_string())?;
+            let text = eredu_runtime::StateLayout::new(text).map_err(|error| error.to_string())?;
+            crate::qwen::vl::state_layout_with_text_state(args.text_declaration(), &text)
                 .map_err(|error| error.to_string())
         }
         crate::replicated_text::CompositeConfig::QwenHybrid(args) => {
             qwen_hybrid_partitioned_state_layout(&args.text, rank)
         }
         crate::replicated_text::CompositeConfig::Inkling(args) => {
-            let mut local = args.clone();
-            local.text_config.num_key_value_heads =
-                local_partition_head_count(args.text_config.num_key_value_heads, rank)?;
-            local.text_config.swa_num_key_value_heads = args
-                .text_config
-                .swa_num_key_value_heads
-                .map(|heads| local_partition_head_count(heads, rank))
-                .transpose()?;
-            let target = crate::inkling::state_layout(&local).map_err(|error| error.to_string())?;
+            let mut local = args.text_config.clone();
+            for windowed in [false, true] {
+                let Some((layer, _)) = args
+                    .text_config
+                    .layer_schedule
+                    .iter()
+                    .enumerate()
+                    .find(|(_, policy)| policy.attention.window().is_some() == windowed)
+                else {
+                    continue;
+                };
+                let spec = args.common(layer).map_err(|error| error.to_string())?;
+                let heads = local_partition_head_count(
+                    spec.attention.projection.geometry.key_value_heads(),
+                    rank,
+                )?;
+                let geometry = spec
+                    .attention
+                    .projection
+                    .geometry
+                    .partition_key_value_heads(0..heads as usize)
+                    .map_err(|error| error.to_string())?;
+                if windowed {
+                    local.swa_num_attention_heads = Some(geometry.query_heads());
+                    local.swa_num_key_value_heads = Some(geometry.key_value_heads());
+                } else {
+                    local.num_attention_heads = geometry.query_heads();
+                    local.num_key_value_heads = geometry.key_value_heads();
+                }
+            }
+            let target = crate::inkling::parallel_state_layout(
+                args,
+                &vec![local; args.text_config.layer_schedule.len()],
+            )
+            .map_err(|error| error.to_string())?;
             crate::inkling::composite_state_layout(&target, None).map_err(|error| error.to_string())
         }
     }
@@ -6355,39 +6397,43 @@ fn qwen_hybrid_partitioned_state_layout(
     text: &crate::qwen::hybrid::HybridConfig,
     rank: eredu_core::ParallelRankTopology,
 ) -> Result<eredu_runtime::StateLayout, String> {
-    use crate::qwen::hybrid::{HybridLayerPolicy, HybridStateGeometry};
-
     let attention_heads = local_partition_head_count(text.num_key_value_heads, rank)?;
-    let key_heads = local_partition_head_count(text.linear_num_key_heads, rank)?;
-    let value_heads = text
-        .linear_num_value_heads
+    let selected = text
+        .attention_head_geometry()
+        .and_then(|geometry| geometry.partition_key_value_heads(0..attention_heads as usize))
+        .map_err(|error| error.to_string())?;
+    let recurrent = text
+        .recurrent_head_geometry()
+        .map_err(|error| error.to_string())?;
+    let key_heads = local_partition_head_count(recurrent.key_heads(), rank)?;
+    let value_heads = recurrent
+        .value_heads()
         .checked_mul(key_heads)
-        .and_then(|value| value.checked_div(text.linear_num_key_heads))
+        .and_then(|value| value.checked_div(recurrent.key_heads()))
         .ok_or_else(|| {
             "Qwen hybrid recurrent state heads do not partition proportionally".to_owned()
         })?;
-    if value_heads.checked_mul(text.linear_num_key_heads)
-        != text.linear_num_value_heads.checked_mul(key_heads)
+    if value_heads.checked_mul(recurrent.key_heads())
+        != recurrent.value_heads().checked_mul(key_heads)
     {
         return Err(
             "Qwen hybrid recurrent value heads split the selected key-head partition".into(),
         );
     }
-    let geometry = text
-        .layer_schedule
-        .iter()
-        .map(|policy| match policy {
-            HybridLayerPolicy::SelfAttention(_) => HybridStateGeometry::FullAttention {
-                key_value_heads: attention_heads,
-            },
-            HybridLayerPolicy::LinearAttention => HybridStateGeometry::LinearAttention {
-                key_heads,
-                value_heads,
-            },
-        })
-        .collect::<Vec<_>>();
-    crate::qwen::hybrid::state_layout_with_geometry(text, &geometry)
-        .map_err(|error| error.to_string())
+    let mut local = text.policy().clone();
+    local.num_attention_heads = selected.query_heads();
+    local.num_key_value_heads = selected.key_value_heads();
+    local.linear_num_key_heads = key_heads;
+    local.linear_num_value_heads = value_heads;
+    let local = text.with_local_policy(local).map_err(|e| e.to_string())?;
+    let predictions = usize::try_from(text.mtp_num_hidden_layers)
+        .map_err(|_| "Qwen hybrid MTP depth is negative".to_owned())?;
+    crate::qwen::hybrid::state_layout_with_block_configs(
+        text,
+        std::iter::repeat_n(&local, text.layer_schedule.len()),
+        std::iter::repeat_n(text, predictions),
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn direct_partitioned_state_layout(
@@ -6420,45 +6466,118 @@ fn direct_partitioned_state_layout(
         | (None, Some(crate::configuration::GgufModelConfig::K2Horizon(args)))
             if args.is_moe() =>
         {
-            routed_decoder_partitioned_state_layout(args, rank).map(Some)
+            routed_decoder_partitioned_state_layout(
+                args,
+                rank,
+                inspection
+                    .architecture_plan()
+                    .k2_declaration(args)?
+                    .common(),
+            )
+            .map(Some)
         }
         (Some(crate::configuration::SafetensorsModelConfig::K2Horizon(args)), None)
         | (None, Some(crate::configuration::GgufModelConfig::K2Horizon(args)))
             if !args.is_moe() =>
         {
-            dense_decoder_partitioned_state_layout(args, rank).map(Some)
+            dense_decoder_partitioned_state_layout(
+                args,
+                rank,
+                inspection
+                    .architecture_plan()
+                    .k2_declaration(args)?
+                    .common(),
+            )
+            .map(Some)
         }
         (Some(crate::configuration::SafetensorsModelConfig::Nanbeige(args)), None)
         | (None, Some(crate::configuration::GgufModelConfig::Nanbeige(args))) => {
-            dense_decoder_partitioned_state_layout(args, rank).map(Some)
+            dense_decoder_partitioned_state_layout(
+                args,
+                rank,
+                inspection
+                    .architecture_plan()
+                    .dense_declaration()
+                    .ok_or("missing admitted dense scopes")?
+                    .as_ref(),
+            )
+            .map(Some)
         }
         (Some(crate::configuration::SafetensorsModelConfig::Gemma2(args)), None)
         | (None, Some(crate::configuration::GgufModelConfig::Gemma2(args))) => {
-            dense_decoder_partitioned_state_layout(args, rank).map(Some)
+            dense_decoder_partitioned_state_layout(
+                args,
+                rank,
+                inspection
+                    .architecture_plan()
+                    .dense_declaration()
+                    .ok_or("missing admitted dense scopes")?
+                    .as_ref(),
+            )
+            .map(Some)
         }
         (Some(crate::configuration::SafetensorsModelConfig::NemotronLabsDiffusion(args)), None) => {
-            dense_decoder_partitioned_state_layout(args, rank).map(Some)
+            dense_decoder_partitioned_state_layout(args, rank, args.text_declaration().as_ref())
+                .map(Some)
         }
         (None, Some(crate::configuration::GgufModelConfig::NemotronLabsDiffusion(plan))) => {
-            dense_decoder_partitioned_state_layout(plan.text_config(), rank).map(Some)
+            dense_decoder_partitioned_state_layout(
+                plan.text_config(),
+                rank,
+                plan.text_config().text_declaration().as_ref(),
+            )
+            .map(Some)
         }
         (Some(crate::configuration::SafetensorsModelConfig::Llama(args)), None)
         | (None, Some(crate::configuration::GgufModelConfig::Llama(args))) => {
-            dense_decoder_partitioned_state_layout(args, rank).map(Some)
+            dense_decoder_partitioned_state_layout(
+                args,
+                rank,
+                inspection
+                    .architecture_plan()
+                    .dense_declaration()
+                    .ok_or("missing admitted dense scopes")?
+                    .as_ref(),
+            )
+            .map(Some)
         }
         (Some(crate::configuration::SafetensorsModelConfig::Qwen(args)), None)
         | (None, Some(crate::configuration::GgufModelConfig::Qwen(args)))
             if args.is_moe() =>
         {
-            routed_decoder_partitioned_state_layout(args, rank).map(Some)
+            routed_decoder_partitioned_state_layout(
+                args,
+                rank,
+                inspection
+                    .architecture_plan()
+                    .qwen_declaration(args)?
+                    .common(),
+            )
+            .map(Some)
         }
         (Some(crate::configuration::SafetensorsModelConfig::Qwen(args)), None)
         | (None, Some(crate::configuration::GgufModelConfig::Qwen(args))) => {
-            dense_decoder_partitioned_state_layout(args, rank).map(Some)
+            dense_decoder_partitioned_state_layout(
+                args,
+                rank,
+                inspection
+                    .architecture_plan()
+                    .qwen_declaration(args)?
+                    .common(),
+            )
+            .map(Some)
         }
         (Some(crate::configuration::SafetensorsModelConfig::GptOss(args)), None)
         | (None, Some(crate::configuration::GgufModelConfig::GptOss(args))) => {
-            routed_decoder_partitioned_state_layout(args, rank).map(Some)
+            routed_decoder_partitioned_state_layout(
+                args,
+                rank,
+                inspection
+                    .architecture_plan()
+                    .gpt_oss_declaration(args)?
+                    .common(),
+            )
+            .map(Some)
         }
         (Some(crate::configuration::SafetensorsModelConfig::DeepSeekV3(args)), None)
         | (None, Some(crate::configuration::GgufModelConfig::DeepSeekV3(args))) => {
@@ -6485,8 +6604,9 @@ fn direct_partitioned_state_layout(
         }
         (Some(crate::configuration::SafetensorsModelConfig::Lfm2(args)), None)
         | (None, Some(crate::configuration::GgufModelConfig::Lfm2(args))) => {
+            let declaration = inspection.architecture_plan().lfm2_declaration(args)?;
             crate::lfm2::partitioned_state_layout(
-                args,
+                &declaration,
                 rank.tensor_parallel_rank(),
                 rank.tensor_parallel_size(),
             )
@@ -6495,8 +6615,9 @@ fn direct_partitioned_state_layout(
         }
         (Some(crate::configuration::SafetensorsModelConfig::KimiLinear(args)), None)
         | (None, Some(crate::configuration::GgufModelConfig::KimiLinear(args))) => {
+            let declaration = inspection.architecture_plan().kimi_declaration(args)?;
             crate::kimi_linear::partitioned_state_layout(
-                args,
+                &declaration,
                 rank.tensor_parallel_rank(),
                 rank.tensor_parallel_size(),
             )
@@ -6508,7 +6629,10 @@ fn direct_partitioned_state_layout(
             if args.num_nextn_predict_layers == 0 =>
         {
             crate::nemotron_h::partitioned_state_layout(
-                args,
+                inspection
+                    .architecture_plan()
+                    .nemotron_declaration(args)?
+                    .as_ref(),
                 rank.tensor_parallel_rank(),
                 rank.tensor_parallel_size(),
             )
@@ -6522,26 +6646,32 @@ fn direct_partitioned_state_layout(
 fn routed_decoder_partitioned_state_layout<C>(
     args: &C,
     rank: ParallelRankTopology,
+    common: &crate::decoder::DecoderDeclaration,
 ) -> Result<eredu_runtime::StateLayout, String>
 where
     C: crate::decoder::Config,
 {
     let layers = usize::try_from(args.num_hidden_layers())
         .map_err(|_| "routed decoder layer count exceeds usize".to_owned())?;
-    let heads = (0..layers)
+    let geometry = (0..layers)
         .map(|layer| {
-            crate::decoder::attention_partition::AttentionPartition::new(args, layer)
-                .and_then(|partition| {
-                    partition.head_range(rank.tensor_parallel_size(), rank.tensor_parallel_rank())
-                })
+            let owner = args.block_parameter_owner(layer);
+            let parameters = &common.block_parameters(owner).attention;
+            let range = crate::decoder::attention_partition::AttentionPartition::from_parameters(
+                &parameters,
+                args.attention_value_format(owner),
+            )
+            .and_then(|partition| {
+                partition.head_range(rank.tensor_parallel_size(), rank.tensor_parallel_rank())
+            })
+            .map_err(|error| error.to_string())?;
+            parameters
+                .geometry
+                .partition_key_value_heads(range)
                 .map_err(|error| error.to_string())
-                .and_then(|range| {
-                    i32::try_from(range.len())
-                        .map_err(|_| "routed decoder local head count exceeds i32".to_owned())
-                })
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    let cache = crate::decoder::cache_layout_with_key_value_heads(args, heads)
+        .collect::<Result<Vec<_>, String>>()?;
+    let cache = crate::decoder::cache_layout_with_attention_geometry(args, geometry)
         .map_err(|error| error.to_string())?;
     eredu_runtime::StateLayout::new(cache).map_err(|error| error.to_string())
 }
@@ -6549,17 +6679,25 @@ where
 fn dense_decoder_partitioned_state_layout<C>(
     args: &C,
     rank: ParallelRankTopology,
+    declaration: &crate::decoder::DecoderDeclaration,
 ) -> Result<eredu_runtime::StateLayout, String>
 where
     C: crate::decoder::PartitionedConfig,
 {
-    let parameters =
-        crate::decoder::dense_parameter_description(args).map_err(|error| error.to_string())?;
+    let parameters = declaration
+        .parameter_description(args, crate::decoder::ParameterEncoding::Stored)
+        .map_err(|error| error.to_string())?;
     let layout = derive_partitioned_local_layout(&parameters, rank)?;
     let count = parameters.unit_layout().len();
-    crate::decoder::partition_local_geometry(args, parameters.invocations(), &layout, 0..count)
-        .map(|geometry| geometry.complete_state_layout().clone())
-        .map_err(|error| error.to_string())
+    crate::decoder::partition_local_geometry(
+        args,
+        declaration,
+        parameters.invocations(),
+        &layout,
+        0..count,
+    )
+    .map(|geometry| geometry.complete_state_layout().clone())
+    .map_err(|error| error.to_string())
 }
 
 fn architecture_capabilities(
@@ -8536,12 +8674,30 @@ where
             let selected_args =
                 crate::replicated_text::selected_nanbeige_args(args, selected.base())
                     .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
-            let estimate = crate::capability::nanbeige(&selected_args)
+            let admitted = inspection
+                .architecture_plan()
+                .dense_declaration()
+                .ok_or_else(|| {
+                    DenseDecoderPartitionedDispatchError::Architecture(
+                        "missing admitted dense scopes".into(),
+                    )
+                })?;
+            let dense_scopes = crate::replicated_text::DecoderConstructionScopes {
+                source: std::sync::Arc::clone(admitted),
+                selected: std::sync::Arc::new(
+                    crate::nanbeige::project_declaration_formats(admitted, args, &selected_args)
+                        .map_err(|e| {
+                            DenseDecoderPartitionedDispatchError::Architecture(e.to_string())
+                        })?,
+                ),
+            };
+            let estimate = crate::capability::nanbeige(&selected_args, &dense_scopes.selected)
                 .map_err(|e| DenseDecoderPartitionedDispatchError::Architecture(e.to_string()))?;
             prepare_dense_decoder_partition::<B, S, _, crate::decoder::DenseBlockFactory, V>(
                 "nanbeige".into(),
                 selected_args,
                 source_args,
+                dense_scopes,
                 selected,
                 store,
                 context,
@@ -8559,14 +8715,42 @@ where
                 .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
             let selected_args = crate::replicated_text::selected_gemma2_args(args, selected.base())
                 .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
-            let capability_estimate =
-                crate::capability::gemma2(&selected_args).map_err(|error| {
-                    DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
+
+            let admitted = inspection
+                .architecture_plan()
+                .dense_declaration()
+                .ok_or_else(|| {
+                    DenseDecoderPartitionedDispatchError::Architecture(
+                        "missing admitted dense scopes".into(),
+                    )
                 })?;
+            let dense_scopes = crate::replicated_text::DecoderConstructionScopes {
+                selected: std::sync::Arc::new(
+                    crate::gemma2::project_declaration_formats(admitted, args, &selected_args)
+                        .map_err(|error| {
+                            DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
+                        })?,
+                ),
+                source: std::sync::Arc::new(
+                    crate::gemma2::project_declaration_formats(
+                        admitted,
+                        args,
+                        source_args.as_ref().unwrap_or(args),
+                    )
+                    .map_err(|error| {
+                        DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
+                    })?,
+                ),
+            };
+            let capability_estimate =
+                crate::capability::gemma2(&selected_args, &dense_scopes.selected).map_err(
+                    |error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()),
+                )?;
             prepare_dense_decoder_partition::<B, S, _, crate::decoder::DenseBlockFactory, V>(
                 "gemma2".to_owned(),
                 selected_args,
                 source_args,
+                dense_scopes,
                 selected,
                 store,
                 context,
@@ -8584,14 +8768,42 @@ where
                 .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
             let selected_args = crate::replicated_text::selected_llama_args(args, selected.base())
                 .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
-            let capability_estimate =
-                crate::capability::llama(&selected_args).map_err(|error| {
-                    DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
+
+            let admitted = inspection
+                .architecture_plan()
+                .dense_declaration()
+                .ok_or_else(|| {
+                    DenseDecoderPartitionedDispatchError::Architecture(
+                        "missing admitted dense scopes".into(),
+                    )
                 })?;
+            let dense_scopes = crate::replicated_text::DecoderConstructionScopes {
+                selected: std::sync::Arc::new(
+                    crate::llama::project_declaration_formats(admitted, args, &selected_args)
+                        .map_err(|error| {
+                            DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
+                        })?,
+                ),
+                source: std::sync::Arc::new(
+                    crate::llama::project_declaration_formats(
+                        admitted,
+                        args,
+                        source_args.as_ref().unwrap_or(args),
+                    )
+                    .map_err(|error| {
+                        DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
+                    })?,
+                ),
+            };
+            let capability_estimate =
+                crate::capability::llama(&selected_args, &dense_scopes.selected).map_err(
+                    |error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()),
+                )?;
             prepare_dense_decoder_partition::<B, S, _, crate::decoder::DenseBlockFactory, V>(
                 selected_args.model_type.clone(),
                 selected_args,
                 source_args,
+                dense_scopes,
                 selected,
                 store,
                 context,
@@ -8611,13 +8823,25 @@ where
                 .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
             let selected_args = crate::replicated_text::selected_qwen_args(args, selected.base())
                 .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
-            let capability_estimate = crate::capability::qwen(&selected_args).map_err(|error| {
-                DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
-            })?;
+            let source_declaration = inspection
+                .architecture_plan()
+                .qwen_declaration(source_args.as_ref().unwrap_or(args))
+                .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+            let declaration = inspection
+                .architecture_plan()
+                .qwen_declaration(&selected_args)
+                .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+            let dense_scopes = crate::replicated_text::DecoderConstructionScopes {
+                source: source_declaration.common().clone(),
+                selected: declaration.common().clone(),
+            };
+            let capability_estimate = crate::capability::qwen(&declaration)
+                .map_err(|e| DenseDecoderPartitionedDispatchError::Architecture(e.to_string()))?;
             prepare_dense_decoder_partition::<B, S, _, crate::qwen::QwenBlockFactory, V>(
                 selected_args.model_type.clone(),
                 selected_args,
                 source_args,
+                dense_scopes,
                 selected,
                 store,
                 context,
@@ -8638,13 +8862,25 @@ where
             let selected_args =
                 crate::replicated_text::selected_k2_horizon_args(args, selected.base())
                     .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
-            let capability = crate::capability::k2_horizon(&selected_args).map_err(|error| {
-                DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
-            })?;
+            let source_declaration = inspection
+                .architecture_plan()
+                .k2_declaration(source_args.as_ref().unwrap_or(args))
+                .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+            let declaration = inspection
+                .architecture_plan()
+                .k2_declaration(&selected_args)
+                .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+            let dense_scopes = crate::replicated_text::DecoderConstructionScopes {
+                source: source_declaration.common().clone(),
+                selected: declaration.common().clone(),
+            };
+            let capability = crate::capability::k2_horizon(&declaration)
+                .map_err(|e| DenseDecoderPartitionedDispatchError::Architecture(e.to_string()))?;
             prepare_dense_decoder_partition::<B, S, _, crate::k2_horizon::DenseBlockFactory, V>(
                 "k2_horizon".to_owned(),
                 selected_args,
                 source_args,
+                dense_scopes,
                 selected,
                 store,
                 context,
@@ -8748,11 +8984,16 @@ where
             .base()
             .uses_weight_transform()
             .then(|| args.clone());
-        let capability_estimate =
-            crate::capability::nemotron_h(&selected_args).map_err(|error| {
-                DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
-            })?;
+        let capability_estimate = crate::capability::nemotron_h(
+            inspection
+                .architecture_plan()
+                .nemotron_declaration(&selected_args)
+                .map_err(DenseDecoderPartitionedDispatchError::Architecture)?
+                .as_ref(),
+        )
+        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
         return prepare_nemotron_h_partition::<B, S, _>(
+            inspection.architecture_plan(),
             selected_args.model_type.clone(),
             selected_args,
             source_args,
@@ -8792,11 +9033,16 @@ where
             .base()
             .uses_weight_transform()
             .then(|| args.clone());
-        let capability_estimate =
-            crate::capability::kimi_linear(&selected_args).map_err(|error| {
-                DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
-            })?;
+        let capability_estimate = crate::capability::kimi_linear(
+            inspection
+                .architecture_plan()
+                .kimi_declaration(&selected_args)
+                .map_err(DenseDecoderPartitionedDispatchError::Architecture)?
+                .as_ref(),
+        )
+        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
         return prepare_kimi_linear_partition::<B, S, V>(
+            inspection.architecture_plan(),
             selected_args.model_type.clone(),
             selected_args,
             source_args,
@@ -8843,9 +9089,16 @@ where
         .base()
         .uses_weight_transform()
         .then(|| args.clone());
-    let capability_estimate = crate::capability::lfm2(&selected_args)
-        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    let capability_estimate = crate::capability::lfm2(
+        inspection
+            .architecture_plan()
+            .lfm2_declaration(&selected_args)
+            .map_err(DenseDecoderPartitionedDispatchError::Architecture)?
+            .as_ref(),
+    )
+    .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     prepare_lfm2_partition::<B, S, V>(
+        inspection.architecture_plan(),
         selected_args.model_type.clone(),
         selected_args,
         source_args,
@@ -8960,9 +9213,16 @@ where
         .base()
         .uses_weight_transform()
         .then(|| args.clone());
-    let capability_estimate = crate::capability::nemotron_h(&selected_args)
-        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    let capability_estimate = crate::capability::nemotron_h(
+        inspection
+            .architecture_plan()
+            .nemotron_declaration(&selected_args)
+            .map_err(DenseDecoderPartitionedDispatchError::Architecture)?
+            .as_ref(),
+    )
+    .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     prepare_nemotron_h_partition::<B, S, _>(
+        inspection.architecture_plan(),
         selected_args.model_type.clone(),
         selected_args,
         source_args,
@@ -9068,6 +9328,7 @@ where
 
 #[allow(clippy::too_many_arguments)]
 fn prepare_nemotron_h_partition<B, S, V>(
+    architecture: &ArtifactArchitecturePlan,
     effective_model_type: String,
     selected_args: crate::nemotron_h::ModelArgs,
     source_args: Option<crate::nemotron_h::ModelArgs>,
@@ -9104,8 +9365,8 @@ where
                 "Nemotron-H selection has no retained definition".into(),
             )
         })?;
-    let definition = crate::nemotron_h::project_parameters(&selected_args, &retained)
-        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    let definition = crate::replicated_text::executable_component(selected.base())
+        .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
     let parameters = definition.parameters().clone();
     let rank = selected.requirements().topology();
     let layout = derive_partitioned_local_layout(&parameters, rank)
@@ -9120,11 +9381,13 @@ where
             "Nemotron-H admission names a different execution group".into(),
         ));
     }
+    let declaration = architecture
+        .nemotron_declaration(&selected_args)
+        .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
     let geometry =
-        crate::nemotron_h::partition_local_geometry(&selected_args, &layout, owned.units())
-            .map_err(|error| {
-                DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
-            })?;
+        crate::nemotron_h::partition_local_geometry(&declaration, &layout, owned.units()).map_err(
+            |error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()),
+        )?;
     let complete_state = geometry.complete_state_layout().clone();
     let state_plan = crate::transport::pipeline_state(0, &complete_state);
     let partition = selected
@@ -9134,7 +9397,7 @@ where
             &complete_state,
             &state_plan,
             geometry,
-            crate::nemotron_h::TargetBoundarySchema::from_args(&selected_args),
+            crate::nemotron_h::TargetBoundarySchema::from_declaration(&declaration),
         )
         .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     let tasks = eredu_runtime::partition_selected_replicated_text_materialization_tasks(
@@ -9145,7 +9408,11 @@ where
     .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     let source_architecture = source_args
         .map(|source_args| {
-            let source_definition = crate::nemotron_h::project_parameters(&source_args, &retained)
+            let source_declaration = architecture
+                .nemotron_declaration(&source_args)
+                .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+            let source_definition = retained
+                .project_parameters(source_declaration.definition().parameters().clone())
                 .map_err(|error| {
                     DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
                 })?;
@@ -9156,7 +9423,7 @@ where
                     DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
                 })?;
             let source_geometry = crate::nemotron_h::partition_local_geometry(
-                &source_args,
+                &source_declaration,
                 &source_layout,
                 owned.units(),
             )
@@ -9175,13 +9442,13 @@ where
                     &complete_state,
                     &state_plan,
                     source_geometry,
-                    crate::nemotron_h::TargetBoundarySchema::from_args(&source_args),
+                    crate::nemotron_h::TargetBoundarySchema::from_declaration(&source_declaration),
                 )
                 .map_err(|error| {
                     DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
                 })?;
             let source_architecture = crate::nemotron_h::NemotronKernel::<B>::from_partition(
-                source_args,
+                source_declaration,
                 source_definition,
                 &source_partition,
                 context,
@@ -9193,7 +9460,7 @@ where
         })
         .transpose()?;
     let architecture = crate::nemotron_h::NemotronKernel::<B>::from_partition(
-        selected_args,
+        declaration,
         definition,
         &partition,
         context,
@@ -9219,6 +9486,7 @@ where
 
 #[allow(clippy::too_many_arguments)]
 fn prepare_kimi_linear_partition<B, S, V>(
+    architecture: &ArtifactArchitecturePlan,
     effective_model_type: String,
     selected_args: crate::kimi_linear::ModelArgs,
     source_args: Option<crate::kimi_linear::ModelArgs>,
@@ -9255,8 +9523,8 @@ where
                 "Kimi Linear selection has no retained definition".into(),
             )
         })?;
-    let definition = crate::kimi_linear::project_parameters(&selected_args, &retained)
-        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    let definition = crate::replicated_text::executable_component(selected.base())
+        .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
     let parameters = definition.parameters().clone();
     let rank = selected.requirements().topology();
     let layout = derive_partitioned_local_layout(&parameters, rank)
@@ -9271,8 +9539,11 @@ where
             "Kimi Linear admission names a different execution group".into(),
         ));
     }
+    let declaration = architecture
+        .kimi_declaration(&selected_args)
+        .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
     let geometry =
-        crate::kimi_linear::partition_local_geometry(&selected_args, &layout, owned.units())
+        crate::kimi_linear::partition_local_geometry(&declaration, &layout, owned.units())
             .map_err(|error| {
                 DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
             })?;
@@ -9301,7 +9572,11 @@ where
                 selected.base().requirements().native_quantized_formats(),
             )
             .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
-            let source_definition = crate::kimi_linear::project_parameters(&source_args, &retained)
+            let source_declaration = architecture
+                .kimi_declaration(&source_args)
+                .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+            let source_definition = retained
+                .project_parameters(source_declaration.definition().parameters().clone())
                 .map_err(|error| {
                     DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
                 })?;
@@ -9312,7 +9587,7 @@ where
                     DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
                 })?;
             let source_geometry = crate::kimi_linear::partition_local_geometry(
-                &source_args,
+                &source_declaration,
                 &source_layout,
                 owned.units(),
             )
@@ -9337,7 +9612,7 @@ where
                     DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
                 })?;
             let source_architecture = crate::kimi_linear::KimiKernel::<B>::from_partition(
-                source_args,
+                source_declaration,
                 source_definition,
                 &source_partition,
                 context,
@@ -9349,7 +9624,7 @@ where
         })
         .transpose()?;
     let architecture = crate::kimi_linear::KimiKernel::<B>::from_partition(
-        selected_args,
+        declaration,
         definition,
         &partition,
         context,
@@ -9375,6 +9650,7 @@ where
 
 #[allow(clippy::too_many_arguments)]
 fn prepare_lfm2_partition<B, S, V>(
+    architecture: &ArtifactArchitecturePlan,
     effective_model_type: String,
     selected_args: crate::lfm2::ModelArgs,
     source_args: Option<crate::lfm2::ModelArgs>,
@@ -9407,8 +9683,8 @@ where
                 "LFM2 selection has no retained definition".into(),
             )
         })?;
-    let definition = crate::lfm2::project_parameters(&selected_args, &retained)
-        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    let definition = crate::replicated_text::executable_component(selected.base())
+        .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
     let parameters = definition.parameters().clone();
     let rank = selected.requirements().topology();
     let layout = derive_partitioned_local_layout(&parameters, rank)
@@ -9423,7 +9699,10 @@ where
             "LFM2 admission names a different execution group".into(),
         ));
     }
-    let geometry = crate::lfm2::partition_local_geometry(&selected_args, &layout, owned.units())
+    let declaration = architecture
+        .lfm2_declaration(&selected_args)
+        .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+    let geometry = crate::lfm2::partition_local_geometry(&declaration, &layout, owned.units())
         .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     let complete_state = geometry.complete_state_layout().clone();
     let state_plan = crate::transport::pipeline_state(0, &complete_state);
@@ -9450,7 +9729,11 @@ where
                 selected.base().requirements().native_quantized_formats(),
             )
             .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
-            let source_definition = crate::lfm2::project_parameters(&source_args, &retained)
+            let source_declaration = architecture
+                .lfm2_declaration(&source_args)
+                .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+            let source_definition = retained
+                .project_parameters(source_declaration.definition().parameters().clone())
                 .map_err(|error| {
                     DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
                 })?;
@@ -9460,11 +9743,14 @@ where
                     .map_err(|error| {
                     DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
                 })?;
-            let source_geometry =
-                crate::lfm2::partition_local_geometry(&source_args, &source_layout, owned.units())
-                    .map_err(|error| {
-                        DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
-                    })?;
+            let source_geometry = crate::lfm2::partition_local_geometry(
+                &source_declaration,
+                &source_layout,
+                owned.units(),
+            )
+            .map_err(|error| {
+                DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
+            })?;
             if source_geometry.complete_state_layout() != &complete_state {
                 return Err(DenseDecoderPartitionedDispatchError::Architecture(
                     "LFM2 transform source changed rank-local state geometry".into(),
@@ -9483,7 +9769,7 @@ where
                     DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
                 })?;
             let source_architecture = crate::lfm2::Lfm2Kernel::<B>::from_partition(
-                source_args,
+                source_declaration,
                 source_definition,
                 &source_partition,
                 context,
@@ -9495,7 +9781,9 @@ where
         })
         .transpose()?;
     let architecture = crate::lfm2::Lfm2Kernel::<B>::from_partition(
-        selected_args,
+        architecture
+            .lfm2_declaration(&selected_args)
+            .map_err(DenseDecoderPartitionedDispatchError::Architecture)?,
         definition,
         &partition,
         context,
@@ -9523,6 +9811,7 @@ fn prepare_dense_decoder_partition<B, S, C, P, V>(
     effective_model_type: String,
     selected_args: C,
     source_args: Option<C>,
+    dense_scopes: crate::replicated_text::DecoderConstructionScopes,
     selected: SelectedPartitionedAdmission<
         eredu_runtime::SelectedReplicatedTextRealization,
         eredu_runtime::ReplicatedTextRequirements,
@@ -9541,11 +9830,8 @@ where
     P::FeedForward: crate::decoder::TensorParallelProjectionOperator<B>,
     V: PartitionedArchitectureVisitor<B, S>,
 {
-    let definition = crate::replicated_text::selected_decoder_definition::<B, C, P>(
-        &selected_args,
-        selected.base(),
-    )
-    .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    let definition = crate::replicated_text::executable_component(selected.base())
+        .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
     let parameters = definition.parameters();
     let rank = selected.requirements().topology();
     let layout = derive_partitioned_local_layout(parameters, rank)
@@ -9562,6 +9848,7 @@ where
     }
     let geometry = crate::decoder::partition_local_geometry(
         &selected_args,
+        dense_scopes.selected.as_ref(),
         parameters.invocations(),
         &layout,
         owned.units(),
@@ -9604,6 +9891,7 @@ where
                     })?;
             let source_geometry = crate::decoder::partition_local_geometry(
                 &source_args,
+                dense_scopes.source.as_ref(),
                 source_parameters.invocations(),
                 &source_layout,
                 owned.units(),
@@ -9640,6 +9928,8 @@ where
             let source_architecture = crate::decoder::DecoderKernel::<B, C, P>::from_partition(
                 source_args,
                 source_definition,
+                dense_scopes.source.as_ref(),
+                None,
                 &source_partition,
                 context,
             )
@@ -9652,6 +9942,8 @@ where
     let architecture = crate::decoder::DecoderKernel::<B, C, P>::from_partition(
         selected_args,
         definition,
+        dense_scopes.selected.as_ref(),
+        None,
         &partition,
         context,
     )
@@ -9951,10 +10243,16 @@ where
             let args =
                 crate::replicated_text::selected_k2_horizon_args(args, selected.base().text())
                     .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
-            let capability = crate::capability::k2_horizon(&args)
+            let declaration = inspection
+                .architecture_plan()
+                .k2_declaration(&args)
+                .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+            let capability = crate::capability::k2_horizon(&declaration)
                 .map_err(|e| DenseDecoderPartitionedDispatchError::Architecture(e.to_string()))?;
             prepare_routed_decoder_partition::<B, S, _, crate::k2_horizon::BlockFactory, V>(
                 args.model_type.clone(),
+                declaration.common().clone(),
+                declaration.projections().cloned(),
                 args,
                 selected,
                 store,
@@ -9970,11 +10268,17 @@ where
             let selected_args =
                 crate::replicated_text::selected_qwen_args(args, selected.base().text())
                     .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
-            let capability = crate::capability::qwen(&selected_args).map_err(|error| {
+            let declaration = inspection
+                .architecture_plan()
+                .qwen_declaration(&selected_args)
+                .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+            let capability = crate::capability::qwen(&declaration).map_err(|error| {
                 DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
             })?;
             prepare_routed_decoder_partition::<B, S, _, crate::qwen::RoutedQwenBlockFactory, V>(
                 selected_args.model_type.clone(),
+                declaration.common().clone(),
+                declaration.projections().cloned(),
                 selected_args,
                 selected,
                 store,
@@ -9988,11 +10292,17 @@ where
             let selected_args =
                 crate::replicated_text::selected_gpt_oss_args(args, selected.base().text())
                     .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
-            let capability = crate::capability::gpt_oss(&selected_args).map_err(|error| {
+            let declaration = inspection
+                .architecture_plan()
+                .gpt_oss_declaration(&selected_args)
+                .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+            let capability = crate::capability::gpt_oss(&declaration).map_err(|error| {
                 DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
             })?;
             prepare_routed_decoder_partition::<B, S, _, crate::gpt_oss::GptOssBlockFactory, V>(
                 selected_args.model_type.clone(),
+                declaration.common().clone(),
+                Some(declaration.projections().clone()),
                 selected_args,
                 selected,
                 store,
@@ -10008,10 +10318,18 @@ where
             let selected_args =
                 crate::replicated_text::selected_lfm2_args(args, selected.base().text())
                     .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
-            let capability = crate::capability::lfm2(&selected_args).map_err(|error| {
+            let capability = crate::capability::lfm2(
+                inspection
+                    .architecture_plan()
+                    .lfm2_declaration(&selected_args)
+                    .map_err(DenseDecoderPartitionedDispatchError::Architecture)?
+                    .as_ref(),
+            )
+            .map_err(|error| {
                 DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
             })?;
             prepare_lfm2_routed_partition::<B, S, V>(
+                inspection.architecture_plan(),
                 selected_args.model_type.clone(),
                 selected_args,
                 args.clone(),
@@ -10029,10 +10347,18 @@ where
             let selected_args =
                 crate::replicated_text::selected_kimi_linear_args(args, selected.base().text())
                     .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
-            let capability = crate::capability::kimi_linear(&selected_args).map_err(|error| {
+            let capability = crate::capability::kimi_linear(
+                inspection
+                    .architecture_plan()
+                    .kimi_declaration(&selected_args)
+                    .map_err(DenseDecoderPartitionedDispatchError::Architecture)?
+                    .as_ref(),
+            )
+            .map_err(|error| {
                 DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
             })?;
             prepare_kimi_linear_routed_partition::<B, S, V>(
+                inspection.architecture_plan(),
                 selected_args.model_type.clone(),
                 selected_args,
                 args.clone(),
@@ -10384,9 +10710,16 @@ where
     let selected_args =
         crate::replicated_text::selected_nemotron_h_args(args, selected.base().text())
             .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
-    let capability_estimate = crate::capability::nemotron_h(&selected_args)
-        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    let capability_estimate = crate::capability::nemotron_h(
+        inspection
+            .architecture_plan()
+            .nemotron_declaration(&selected_args)
+            .map_err(DenseDecoderPartitionedDispatchError::Architecture)?
+            .as_ref(),
+    )
+    .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     prepare_nemotron_h_routed_partition::<B, S, _>(
+        inspection.architecture_plan(),
         selected_args.model_type.clone(),
         selected_args,
         args.clone(),
@@ -10460,9 +10793,16 @@ where
     let selected_args =
         crate::replicated_text::selected_nemotron_h_args(args, selected.base().text())
             .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
-    let capability_estimate = crate::capability::nemotron_h(&selected_args)
-        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    let capability_estimate = crate::capability::nemotron_h(
+        inspection
+            .architecture_plan()
+            .nemotron_declaration(&selected_args)
+            .map_err(DenseDecoderPartitionedDispatchError::Architecture)?
+            .as_ref(),
+    )
+    .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     prepare_nemotron_h_routed_partition::<B, S, _>(
+        inspection.architecture_plan(),
         selected_args.model_type.clone(),
         selected_args,
         args.clone(),
@@ -10486,6 +10826,8 @@ where
 #[allow(clippy::too_many_arguments)]
 fn prepare_routed_decoder_partition<B, S, C, P, V>(
     effective_model_type: String,
+    common_declaration: std::sync::Arc<crate::decoder::DecoderDeclaration>,
+    projection_declaration: Option<crate::decoder::ProjectionDeclarations<P::Parameters>>,
     selected_args: C,
     selected: SelectedPartitionedAdmission<SelectedRoutedTextRealization, RoutedTextRequirements>,
     store: eredu_checkpoint::store::SharedCheckpointSource,
@@ -10497,16 +10839,13 @@ where
     B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: eredu_runtime::LayerRuntimeState<B>,
     S::LayerState: eredu_nn::AttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
-    C: RoutedPartitionedConfig,
+    C: RoutedPartitionedConfig<P::Parameters>,
     P: crate::decoder::BlockFactory<B, C>,
     P::FeedForward: crate::decoder::TensorParallelRoutedProjectionOperator<B>,
     V: RoutedPartitionedProductionVisitor<B, S>,
 {
-    let definition = crate::replicated_text::selected_decoder_definition::<B, C, P>(
-        &selected_args,
-        selected.base().text(),
-    )
-    .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    let definition = crate::replicated_text::executable_component(selected.base().text())
+        .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
     let parameters = definition.parameters();
     let rank = selected.requirements().topology();
     let layout = derive_partitioned_local_layout(parameters, rank)
@@ -10522,7 +10861,12 @@ where
         ));
     }
     let plans = selected_args
-        .partition_expert_plans(&layout, rank)
+        .partition_expert_plans(
+            Some(&common_declaration),
+            projection_declaration.as_ref(),
+            &layout,
+            rank,
+        )
         .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     if plans.keys().ne(selected.base().banks().keys()) {
         return Err(DenseDecoderPartitionedDispatchError::Architecture(
@@ -10530,7 +10874,14 @@ where
         ));
     }
     let geometry = selected_args
-        .routed_partition_geometry(&layout, owned.units(), rank, &plans)
+        .routed_partition_geometry(
+            Some(&common_declaration),
+            projection_declaration.as_ref(),
+            &layout,
+            owned.units(),
+            rank,
+            &plans,
+        )
         .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     let complete_state = geometry.complete_state_layout().clone();
     let state_plan = definition.state_partition_plan();
@@ -10592,6 +10943,8 @@ where
     let architecture = crate::decoder::DecoderKernel::<B, C, P>::from_partition(
         selected_args,
         definition,
+        common_declaration.as_ref(),
+        projection_declaration.as_ref(),
         &partition,
         context,
     )
@@ -10623,6 +10976,7 @@ where
 
 #[allow(clippy::too_many_arguments)]
 fn prepare_lfm2_routed_partition<B, S, V>(
+    architecture: &ArtifactArchitecturePlan,
     effective_model_type: String,
     selected_args: crate::lfm2::ModelArgs,
     source_args: crate::lfm2::ModelArgs,
@@ -10648,8 +11002,8 @@ where
                 "LFM2 selection has no retained definition".into(),
             )
         })?;
-    let definition = crate::lfm2::project_parameters(&selected_args, &retained)
-        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    let definition = crate::replicated_text::executable_component(selected.base().text())
+        .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
     let parameters = definition.parameters().clone();
     let rank = selected.requirements().topology();
     let layout = derive_partitioned_local_layout(&parameters, rank)
@@ -10664,9 +11018,12 @@ where
             "routed LFM2 admission names a different execution group".into(),
         ));
     }
-    let plan_geometry = crate::lfm2::local_geometry(&selected_args, &layout)
+    let declaration = architecture
+        .lfm2_declaration(&selected_args)
+        .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+    let plan_geometry = crate::lfm2::local_geometry(&declaration, &layout)
         .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
-    let plan = crate::lfm2::expert_realization_plan(&selected_args, Some(&plan_geometry), rank)
+    let plan = crate::lfm2::expert_realization_plan(&declaration, Some(&plan_geometry), rank)
         .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?
         .ok_or_else(|| {
             DenseDecoderPartitionedDispatchError::Architecture(
@@ -10674,7 +11031,7 @@ where
             )
         })?;
     let geometry = crate::lfm2::partition_local_routed_geometry(
-        &selected_args,
+        &declaration,
         &layout,
         owned.units(),
         rank,
@@ -10704,13 +11061,17 @@ where
                 .native_quantized_formats(),
         )
         .map_err(error)?;
-        let source_definition = crate::lfm2::project_parameters(&source_args, &retained)
+        let source_declaration = architecture
+            .lfm2_declaration(&source_args)
+            .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+        let source_definition = retained
+            .project_parameters(source_declaration.definition().parameters().clone())
             .map_err(|e| error(e.to_string()))?;
         let source_parameters = source_definition.parameters().clone();
         let source_layout =
             derive_partitioned_transform_source_layout(&source_parameters, &parameters, rank)
                 .map_err(|failure| error(failure.to_string()))?;
-        let source_local = crate::lfm2::local_geometry(&source_args, &source_layout)
+        let source_local = crate::lfm2::local_geometry(&source_declaration, &source_layout)
             .map_err(|e| error(e.to_string()))?;
         if source_local.state_layout() != &complete_state {
             return Err(error(
@@ -10718,13 +11079,13 @@ where
             ));
         }
         let source_plan =
-            crate::lfm2::expert_realization_plan(&source_args, Some(&source_local), rank)
+            crate::lfm2::expert_realization_plan(&source_declaration, Some(&source_local), rank)
                 .map_err(|e| error(e.to_string()))?
                 .ok_or_else(|| {
                     error("routed LFM2 transform source has no expert realization".into())
                 })?;
         let source_geometry = crate::lfm2::partition_local_routed_geometry(
-            &source_args,
+            &source_declaration,
             &source_layout,
             owned.units(),
             rank,
@@ -10742,7 +11103,7 @@ where
             )
             .map_err(|e| error(e.to_string()))?;
         let source = crate::lfm2::Lfm2Kernel::<B>::from_partition(
-            source_args,
+            source_declaration,
             source_definition,
             &source_partition,
             context,
@@ -10753,13 +11114,10 @@ where
         None
     };
     prepare_family_routed_partition::<B, S, _, _, _, _>(
-        crate::lfm2::Lfm2Kernel::<B>::from_partition(
-            selected_args,
-            definition,
-            &partition,
-            context,
-        )
-        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?,
+        crate::lfm2::Lfm2Kernel::<B>::from_partition(declaration, definition, &partition, context)
+            .map_err(|error| {
+                DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
+            })?,
         source_architecture,
         selected,
         partition,
@@ -10776,6 +11134,7 @@ where
 
 #[allow(clippy::too_many_arguments)]
 fn prepare_kimi_linear_routed_partition<B, S, V>(
+    architecture: &ArtifactArchitecturePlan,
     effective_model_type: String,
     selected_args: crate::kimi_linear::ModelArgs,
     source_args: crate::kimi_linear::ModelArgs,
@@ -10804,8 +11163,8 @@ where
                 "Kimi Linear selection has no retained definition".into(),
             )
         })?;
-    let definition = crate::kimi_linear::project_parameters(&selected_args, &retained)
-        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    let definition = crate::replicated_text::executable_component(selected.base().text())
+        .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
     let parameters = definition.parameters().clone();
     let rank = selected.requirements().topology();
     let layout = derive_partitioned_local_layout(&parameters, rank)
@@ -10820,10 +11179,13 @@ where
             "routed Kimi Linear admission names a different execution group".into(),
         ));
     }
-    let plan_geometry = crate::kimi_linear::local_geometry(&selected_args, &layout)
+    let declaration = architecture
+        .kimi_declaration(&selected_args)
+        .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+    let plan_geometry = crate::kimi_linear::local_geometry(&declaration, &layout)
         .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     let plan =
-        crate::kimi_linear::expert_realization_plan(&selected_args, Some(&plan_geometry), rank)
+        crate::kimi_linear::expert_realization_plan(&declaration, Some(&plan_geometry), rank)
             .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?
             .ok_or_else(|| {
                 DenseDecoderPartitionedDispatchError::Architecture(
@@ -10831,7 +11193,7 @@ where
                 )
             })?;
     let geometry = crate::kimi_linear::partition_local_routed_geometry(
-        &selected_args,
+        &declaration,
         &layout,
         owned.units(),
         rank,
@@ -10861,27 +11223,34 @@ where
                 .native_quantized_formats(),
         )
         .map_err(error)?;
-        let source_definition = crate::kimi_linear::project_parameters(&source_args, &retained)
+        let source_declaration = architecture
+            .kimi_declaration(&source_args)
+            .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+        let source_definition = retained
+            .project_parameters(source_declaration.definition().parameters().clone())
             .map_err(|e| error(e.to_string()))?;
         let source_parameters = source_definition.parameters().clone();
         let source_layout =
             derive_partitioned_transform_source_layout(&source_parameters, &parameters, rank)
                 .map_err(|failure| error(failure.to_string()))?;
-        let source_local = crate::kimi_linear::local_geometry(&source_args, &source_layout)
+        let source_local = crate::kimi_linear::local_geometry(&source_declaration, &source_layout)
             .map_err(|e| error(e.to_string()))?;
         if source_local.state_layout() != &complete_state {
             return Err(error(
                 "routed Kimi Linear transform source changed local state geometry".into(),
             ));
         }
-        let source_plan =
-            crate::kimi_linear::expert_realization_plan(&source_args, Some(&source_local), rank)
-                .map_err(|e| error(e.to_string()))?
-                .ok_or_else(|| {
-                    error("routed Kimi Linear transform source has no expert realization".into())
-                })?;
+        let source_plan = crate::kimi_linear::expert_realization_plan(
+            &source_declaration,
+            Some(&source_local),
+            rank,
+        )
+        .map_err(|e| error(e.to_string()))?
+        .ok_or_else(|| {
+            error("routed Kimi Linear transform source has no expert realization".into())
+        })?;
         let source_geometry = crate::kimi_linear::partition_local_routed_geometry(
-            &source_args,
+            &source_declaration,
             &source_layout,
             owned.units(),
             rank,
@@ -10899,7 +11268,7 @@ where
             )
             .map_err(|e| error(e.to_string()))?;
         let source = crate::kimi_linear::KimiKernel::<B>::from_partition(
-            source_args,
+            source_declaration,
             source_definition,
             &source_partition,
             context,
@@ -10911,7 +11280,7 @@ where
     };
     prepare_family_routed_partition::<B, S, _, _, _, _>(
         crate::kimi_linear::KimiKernel::<B>::from_partition(
-            selected_args,
+            declaration,
             definition,
             &partition,
             context,
@@ -10933,6 +11302,7 @@ where
 
 #[allow(clippy::too_many_arguments)]
 fn prepare_nemotron_h_routed_partition<B, S, V>(
+    architecture: &ArtifactArchitecturePlan,
     effective_model_type: String,
     selected_args: crate::nemotron_h::ModelArgs,
     source_args: crate::nemotron_h::ModelArgs,
@@ -10958,8 +11328,8 @@ where
                 "Nemotron-H selection has no retained definition".into(),
             )
         })?;
-    let definition = crate::nemotron_h::project_parameters(&selected_args, &retained)
-        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    let definition = crate::replicated_text::executable_component(selected.base().text())
+        .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
     let parameters = definition.parameters().clone();
     let rank = selected.requirements().topology();
     let layout = derive_partitioned_local_layout(&parameters, rank)
@@ -10974,18 +11344,20 @@ where
             "routed Nemotron-H admission names a different execution group".into(),
         ));
     }
-    let plan_geometry = crate::nemotron_h::local_geometry(&selected_args, &layout)
+    let declaration = architecture
+        .nemotron_declaration(&selected_args)
+        .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+    let plan_geometry = crate::nemotron_h::local_geometry(&declaration, &layout)
         .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
-    let plan =
-        crate::nemotron_h::expert_realization_plan(&selected_args, Some(&plan_geometry), rank)
-            .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?
-            .ok_or_else(|| {
-                DenseDecoderPartitionedDispatchError::Architecture(
-                    "routed Nemotron-H has no selected expert realization".into(),
-                )
-            })?;
+    let plan = crate::nemotron_h::expert_realization_plan(&declaration, Some(&plan_geometry), rank)
+        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?
+        .ok_or_else(|| {
+            DenseDecoderPartitionedDispatchError::Architecture(
+                "routed Nemotron-H has no selected expert realization".into(),
+            )
+        })?;
     let geometry = crate::nemotron_h::partition_local_routed_geometry(
-        &selected_args,
+        &declaration,
         &layout,
         owned.units(),
         rank,
@@ -11001,32 +11373,39 @@ where
             &complete_state,
             &state_plan,
             geometry,
-            crate::nemotron_h::TargetBoundarySchema::from_args(&selected_args),
+            crate::nemotron_h::TargetBoundarySchema::from_declaration(&declaration),
         )
         .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     let source_architecture = if selected.base().text().uses_weight_transform() {
         let error = |error: String| DenseDecoderPartitionedDispatchError::Architecture(error);
-        let source_definition = crate::nemotron_h::project_parameters(&source_args, &retained)
+        let source_declaration = architecture
+            .nemotron_declaration(&source_args)
+            .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+        let source_definition = retained
+            .project_parameters(source_declaration.definition().parameters().clone())
             .map_err(|e| error(e.to_string()))?;
         let source_parameters = source_definition.parameters().clone();
         let source_layout =
             derive_partitioned_transform_source_layout(&source_parameters, &parameters, rank)
                 .map_err(|failure| error(failure.to_string()))?;
-        let source_local = crate::nemotron_h::local_geometry(&source_args, &source_layout)
+        let source_local = crate::nemotron_h::local_geometry(&source_declaration, &source_layout)
             .map_err(|e| error(e.to_string()))?;
         if source_local.state_layout() != &complete_state {
             return Err(error(
                 "routed Nemotron transform source changed local state geometry".into(),
             ));
         }
-        let source_plan =
-            crate::nemotron_h::expert_realization_plan(&source_args, Some(&source_local), rank)
-                .map_err(|e| error(e.to_string()))?
-                .ok_or_else(|| {
-                    error("routed Nemotron transform source has no expert realization".into())
-                })?;
+        let source_plan = crate::nemotron_h::expert_realization_plan(
+            &source_declaration,
+            Some(&source_local),
+            rank,
+        )
+        .map_err(|e| error(e.to_string()))?
+        .ok_or_else(|| {
+            error("routed Nemotron transform source has no expert realization".into())
+        })?;
         let source_geometry = crate::nemotron_h::partition_local_routed_geometry(
-            &source_args,
+            &source_declaration,
             &source_layout,
             owned.units(),
             rank,
@@ -11040,11 +11419,11 @@ where
                 &complete_state,
                 &state_plan,
                 source_geometry,
-                crate::nemotron_h::TargetBoundarySchema::from_args(&source_args),
+                crate::nemotron_h::TargetBoundarySchema::from_declaration(&source_declaration),
             )
             .map_err(|e| error(e.to_string()))?;
         let source = crate::nemotron_h::NemotronKernel::<B>::from_partition(
-            source_args,
+            source_declaration,
             source_definition,
             &source_partition,
             context,
@@ -11056,7 +11435,7 @@ where
     };
     prepare_family_routed_partition::<B, S, _, _, _, _>(
         crate::nemotron_h::NemotronKernel::<B>::from_partition(
-            selected_args,
+            declaration,
             definition,
             &partition,
             context,
@@ -11095,6 +11474,11 @@ where
         eredu_nn::CompressedAttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
     V: FamilyRoutedPartitionVisitor<B, S, crate::deepseek::v3::Model<B>>,
 {
+    if selected_args.num_nextn_predict_layers != 0 || !selected_args.has_sparse_moe_layers() {
+        return Err(DenseDecoderPartitionedDispatchError::Architecture(
+            "DeepSeek-V3 routed partition requires sparse target units without prediction".into(),
+        ));
+    }
     if selected
         .base()
         .bank(eredu_runtime::RoutedBankId::new(0))
@@ -11117,8 +11501,8 @@ where
                 "V3 selection has no retained definition".into(),
             )
         })?;
-    let definition = crate::deepseek::v3::project_parameters(&selected_args, &retained)
-        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    let definition = crate::replicated_text::executable_component(selected.base().text())
+        .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
     let parameters = definition.parameters().clone();
     let rank = selected.requirements().topology();
     let layout = derive_partitioned_local_layout(&parameters, rank)
@@ -11135,8 +11519,13 @@ where
     }
     let local = crate::deepseek::parallel::v3_local_geometry(&selected_args, &layout)
         .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
-    let plan = crate::deepseek::v3_partition_expert_realization_plan(&selected_args, &local, rank)
-        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    let plan = crate::deepseek::v3_expert_realization_plan(&selected_args, Some(&local), rank)
+        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?
+        .ok_or_else(|| {
+            DenseDecoderPartitionedDispatchError::Architecture(
+                "V3 partition has no routed units".into(),
+            )
+        })?;
     let geometry = crate::deepseek::v3_partition_local_geometry(
         &selected_args,
         &layout,
@@ -11179,12 +11568,10 @@ where
                 "routed V3 transform source changed local state geometry".into(),
             ));
         }
-        let source_plan = crate::deepseek::v3_partition_expert_realization_plan(
-            &source_args,
-            &source_local,
-            rank,
-        )
-        .map_err(|e| error(e.to_string()))?;
+        let source_plan =
+            crate::deepseek::v3_expert_realization_plan(&source_args, Some(&source_local), rank)
+                .map_err(|e| error(e.to_string()))?
+                .ok_or_else(|| error("V3 source partition has no routed units".into()))?;
         let source_geometry = crate::deepseek::v3_partition_local_geometry(
             &source_args,
             &source_layout,
@@ -11267,6 +11654,11 @@ where
     S::LayerState: eredu_nn::PoolingAttentionCache<B::Tensor>,
     V: FamilyRoutedPartitionVisitor<B, S, crate::deepseek::v4::Model<B>>,
 {
+    if selected_args.num_nextn_predict_layers != 0 || selected_args.dspark.is_some() {
+        return Err(DenseDecoderPartitionedDispatchError::Architecture(
+            "DeepSeek-V4 routed partition requires sparse target units without prediction".into(),
+        ));
+    }
     if selected
         .base()
         .bank(eredu_runtime::RoutedBankId::new(0))
@@ -11289,8 +11681,8 @@ where
                 "V4 selection has no retained definition".into(),
             )
         })?;
-    let definition = crate::deepseek::v4::project_parameters(&selected_args, &retained)
-        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    let definition = crate::replicated_text::executable_component(selected.base().text())
+        .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
     let parameters = definition.parameters().clone();
     let rank = selected.requirements().topology();
     let layout = derive_partitioned_local_layout(&parameters, rank)
@@ -11307,7 +11699,7 @@ where
     }
     let local = crate::deepseek::parallel::v4_local_geometry(&selected_args, &layout)
         .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
-    let plan = crate::deepseek::v4_partition_expert_realization_plan(&selected_args, &local, rank)
+    let plan = crate::deepseek::v4_expert_realization_plan(&selected_args, Some(&local), rank)
         .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     let geometry = crate::deepseek::v4_partition_local_geometry(
         &selected_args,
@@ -11353,12 +11745,9 @@ where
                 "routed V4 transform source changed local state geometry".into(),
             ));
         }
-        let source_plan = crate::deepseek::v4_partition_expert_realization_plan(
-            &source_args,
-            &source_local,
-            rank,
-        )
-        .map_err(|e| error(e.to_string()))?;
+        let source_plan =
+            crate::deepseek::v4_expert_realization_plan(&source_args, Some(&source_local), rank)
+                .map_err(|e| error(e.to_string()))?;
         let source_geometry = crate::deepseek::v4_partition_local_geometry(
             &source_args,
             &source_layout,
@@ -11556,9 +11945,11 @@ where
         .map_err(DenseDecoderPartitionedDispatchError::Visitor)
 }
 
-trait RoutedPartitionedConfig: crate::decoder::PartitionedConfig {
+trait RoutedPartitionedConfig<S>: crate::decoder::PartitionedConfig {
     fn partition_expert_plans(
         &self,
+        common: Option<&std::sync::Arc<crate::decoder::DecoderDeclaration>>,
+        declarations: Option<&crate::decoder::ProjectionDeclarations<S>>,
         layout: &eredu_runtime::LocalModelLayout,
         topology: ParallelRankTopology,
     ) -> Result<
@@ -11568,6 +11959,8 @@ trait RoutedPartitionedConfig: crate::decoder::PartitionedConfig {
 
     fn routed_partition_geometry(
         &self,
+        common: Option<&std::sync::Arc<crate::decoder::DecoderDeclaration>>,
+        declarations: Option<&crate::decoder::ProjectionDeclarations<S>>,
         layout: &eredu_runtime::LocalModelLayout,
         owned_units: Range<usize>,
         topology: ParallelRankTopology,
@@ -11575,29 +11968,63 @@ trait RoutedPartitionedConfig: crate::decoder::PartitionedConfig {
     ) -> Result<crate::decoder::PartitionLocalGeometry<Self>, eredu_runtime::ParallelPlanError>;
 }
 
-impl RoutedPartitionedConfig for crate::qwen::ModelArgs {
+impl RoutedPartitionedConfig<crate::qwen::FeedForwardParameters> for crate::qwen::ModelArgs {
     fn partition_expert_plans(
         &self,
+        common: Option<&std::sync::Arc<crate::decoder::DecoderDeclaration>>,
+        declarations: Option<
+            &crate::decoder::ProjectionDeclarations<crate::qwen::FeedForwardParameters>,
+        >,
         layout: &eredu_runtime::LocalModelLayout,
         topology: ParallelRankTopology,
     ) -> Result<
         BTreeMap<eredu_runtime::RoutedBankId, crate::routed_text::RoutedGroupedPlan>,
         eredu_nn::Error,
     > {
-        crate::qwen::partition_expert_realization_plan(self, layout, topology)
-            .map(|plan| BTreeMap::from([(eredu_runtime::RoutedBankId::new(0), plan.into())]))
+        let declaration = crate::qwen::Declaration::from_scopes(
+            self.clone(),
+            common
+                .ok_or_else(|| eredu_nn::Error::backend("missing Qwen common scopes"))?
+                .clone(),
+            declarations.cloned(),
+        )?;
+        let geometry = crate::qwen::local_geometry(&declaration, layout)
+            .map_err(eredu_nn::Error::backend_source)?;
+        let plan =
+            crate::qwen::expert_realization_plan(&declaration, Some(&geometry), topology)?
+                .ok_or_else(|| eredu_nn::Error::backend("partitioned Qwen has no routed bank"))?;
+        Ok(BTreeMap::from([(
+            eredu_runtime::RoutedBankId::new(0),
+            plan.into(),
+        )]))
     }
 
     fn routed_partition_geometry(
         &self,
+        common: Option<&std::sync::Arc<crate::decoder::DecoderDeclaration>>,
+        declarations: Option<
+            &crate::decoder::ProjectionDeclarations<crate::qwen::FeedForwardParameters>,
+        >,
         layout: &eredu_runtime::LocalModelLayout,
         owned_units: Range<usize>,
         topology: ParallelRankTopology,
         realizations: &BTreeMap<eredu_runtime::RoutedBankId, crate::routed_text::RoutedGroupedPlan>,
     ) -> Result<crate::decoder::PartitionLocalGeometry<Self>, eredu_runtime::ParallelPlanError>
     {
+        let declaration = crate::qwen::Declaration::from_scopes(
+            self.clone(),
+            common
+                .ok_or_else(|| {
+                    eredu_runtime::ParallelPlanError::InvalidGroup(
+                        "missing Qwen common scopes".into(),
+                    )
+                })?
+                .clone(),
+            declarations.cloned(),
+        )
+        .map_err(|e| eredu_runtime::ParallelPlanError::InvalidGroup(e.to_string()))?;
         crate::qwen::partition_local_routed_geometry(
-            self,
+            &declaration,
             layout,
             owned_units,
             topology,
@@ -11611,29 +12038,66 @@ impl RoutedPartitionedConfig for crate::qwen::ModelArgs {
     }
 }
 
-impl RoutedPartitionedConfig for crate::gpt_oss::ModelArgs {
+impl RoutedPartitionedConfig<eredu_nn::RoutedGatedProductSpec> for crate::gpt_oss::ModelArgs {
     fn partition_expert_plans(
         &self,
+        common: Option<&std::sync::Arc<crate::decoder::DecoderDeclaration>>,
+        declarations: Option<
+            &crate::decoder::ProjectionDeclarations<eredu_nn::RoutedGatedProductSpec>,
+        >,
         layout: &eredu_runtime::LocalModelLayout,
         topology: ParallelRankTopology,
     ) -> Result<
         BTreeMap<eredu_runtime::RoutedBankId, crate::routed_text::RoutedGroupedPlan>,
         eredu_nn::Error,
     > {
-        crate::gpt_oss::partition_expert_realization_plan(self, layout, topology)
+        let declaration = crate::gpt_oss::Declaration::from_scopes(
+            self.clone(),
+            common
+                .ok_or_else(|| eredu_nn::Error::backend("missing admitted GPT-OSS common scopes"))?
+                .clone(),
+            declarations
+                .ok_or_else(|| eredu_nn::Error::backend("missing admitted GPT-OSS projections"))?
+                .clone(),
+        )?;
+        let geometry = crate::gpt_oss::local_geometry(&declaration, layout)
+            .map_err(eredu_nn::Error::backend_source)?;
+        crate::gpt_oss::expert_realization_plan(&declaration, Some(&geometry), topology)
             .map(|plan| BTreeMap::from([(eredu_runtime::RoutedBankId::new(0), plan.into())]))
     }
 
     fn routed_partition_geometry(
         &self,
+        common: Option<&std::sync::Arc<crate::decoder::DecoderDeclaration>>,
+        declarations: Option<
+            &crate::decoder::ProjectionDeclarations<eredu_nn::RoutedGatedProductSpec>,
+        >,
         layout: &eredu_runtime::LocalModelLayout,
         owned_units: Range<usize>,
         topology: ParallelRankTopology,
         realizations: &BTreeMap<eredu_runtime::RoutedBankId, crate::routed_text::RoutedGroupedPlan>,
     ) -> Result<crate::decoder::PartitionLocalGeometry<Self>, eredu_runtime::ParallelPlanError>
     {
+        let declaration = crate::gpt_oss::Declaration::from_scopes(
+            self.clone(),
+            common
+                .ok_or_else(|| {
+                    eredu_runtime::ParallelPlanError::InvalidGroup(
+                        "missing admitted GPT-OSS common scopes".into(),
+                    )
+                })?
+                .clone(),
+            declarations
+                .ok_or_else(|| {
+                    eredu_runtime::ParallelPlanError::InvalidGroup(
+                        "missing admitted GPT-OSS projections".into(),
+                    )
+                })?
+                .clone(),
+        )
+        .map_err(|e| eredu_runtime::ParallelPlanError::InvalidGroup(e.to_string()))?;
         crate::gpt_oss::partition_local_routed_geometry(
-            self,
+            &declaration,
             layout,
             owned_units,
             topology,
@@ -11647,26 +12111,61 @@ impl RoutedPartitionedConfig for crate::gpt_oss::ModelArgs {
     }
 }
 
-impl RoutedPartitionedConfig for crate::k2_horizon::ModelArgs {
+impl RoutedPartitionedConfig<crate::k2_horizon::ProjectionParameters>
+    for crate::k2_horizon::ModelArgs
+{
     fn partition_expert_plans(
         &self,
+        common: Option<&std::sync::Arc<crate::decoder::DecoderDeclaration>>,
+        declarations: Option<
+            &crate::decoder::ProjectionDeclarations<crate::k2_horizon::ProjectionParameters>,
+        >,
         layout: &eredu_runtime::LocalModelLayout,
         topology: ParallelRankTopology,
     ) -> Result<
         BTreeMap<eredu_runtime::RoutedBankId, crate::routed_text::RoutedGroupedPlan>,
         eredu_nn::Error,
     > {
-        crate::k2_horizon::expert_realization_plans(self, topology, Some(layout))
+        let declaration = crate::k2_horizon::Declaration::from_scopes(
+            self.clone(),
+            common
+                .ok_or_else(|| eredu_nn::Error::backend("missing K2 common scopes"))?
+                .clone(),
+            declarations.cloned(),
+        )?;
+        crate::k2_horizon::expert_realization_plans(&declaration, topology, Some(layout))
     }
     fn routed_partition_geometry(
         &self,
+        common: Option<&std::sync::Arc<crate::decoder::DecoderDeclaration>>,
+        declarations: Option<
+            &crate::decoder::ProjectionDeclarations<crate::k2_horizon::ProjectionParameters>,
+        >,
         layout: &eredu_runtime::LocalModelLayout,
         owned: Range<usize>,
         topology: ParallelRankTopology,
         plans: &BTreeMap<eredu_runtime::RoutedBankId, crate::routed_text::RoutedGroupedPlan>,
     ) -> Result<crate::decoder::PartitionLocalGeometry<Self>, eredu_runtime::ParallelPlanError>
     {
-        crate::k2_horizon::partition_local_routed_geometry(self, layout, owned, topology, plans)
+        let declaration = crate::k2_horizon::Declaration::from_scopes(
+            self.clone(),
+            common
+                .ok_or_else(|| {
+                    eredu_runtime::ParallelPlanError::InvalidGroup(
+                        "missing K2 common scopes".into(),
+                    )
+                })?
+                .clone(),
+            declarations.cloned(),
+        )
+        .map_err(|e| eredu_runtime::ParallelPlanError::InvalidGroup(e.to_string()))?;
+        crate::k2_horizon::partition_local_routed_geometry(
+            &declaration,
+            layout,
+            owned,
+            topology,
+            plans,
+        )
     }
 }
 

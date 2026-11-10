@@ -237,11 +237,11 @@ fn materialize(
         Vec::<Array>::new(),
         || {
             let precision = prepared.precision();
-            let (dimensions, definition, local_layout, layout, source, units) =
-                prepared.into_parts();
+            let (declaration, local_layout, layout, source, units) = prepared.into_parts();
+            let definition = declaration.definition().clone();
             let kernel = match local_layout.as_ref() {
-                Some(local) => MogKernel::<MlxNeuralBackend>::new_parallel(dimensions, local),
-                None => MogKernel::<MlxNeuralBackend>::new(dimensions),
+                Some(local) => MogKernel::<MlxNeuralBackend>::new_parallel(declaration, local),
+                None => MogKernel::<MlxNeuralBackend>::new(declaration),
             }
             .and_then(|kernel| kernel.with_precision(precision))
             .map_err(BackendFailure::from_error)?;

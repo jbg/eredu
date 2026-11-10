@@ -3,8 +3,7 @@
 
 use eredu_nn::{
     BlockwiseAttentionBackend, CompressedAttentionCache, Error, GroupedNeuralBackend, HyperHead,
-    HyperHeadSpec, HyperNeuralBackend, LinearOperator, LinearSpec, NeuralBackend,
-    NormalizationConstructionSpec, NormalizationOperator, ParameterSpec, Parameterized,
+    HyperNeuralBackend, LinearOperator, NormalizationOperator, Parameterized,
     PoolingAttentionCache, Tensor,
 };
 use eredu_runtime::{ExpertPass, ParameterProvider};
@@ -168,35 +167,14 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
         }
         let global = usize::try_from(args.num_hidden_layers).map_err(Error::backend)? + depth;
         let root = format!("model.layers.{global}");
-        let norm = |name: String| {
-            B::normalization(
-                NormalizationConstructionSpec::learned(
-                    args.hidden_size,
-                    args.rms_norm_eps,
-                    parameter(name)?,
-                ),
-                context,
-            )
-        };
+        let spec = super::v3_specs::prediction_spec(args, &root)?;
         Ok(Self {
-            embedding_norm: norm(format!("{root}.enorm.weight"))?,
-            hidden_norm: norm(format!("{root}.hnorm.weight"))?,
-            fusion: linear::<B>(
-                format!("{root}.eh_proj.weight"),
-                2 * args.hidden_size,
-                args.hidden_size,
-                args.linear_format_for(&format!("{root}.eh_proj.weight")),
-                context,
-            )?,
+            embedding_norm: B::normalization(spec.embedding_norm, context)?,
+            hidden_norm: B::normalization(spec.hidden_norm, context)?,
+            fusion: B::linear(spec.fusion, context)?,
             decoder: V3Block::new_prediction(args, global, context)?,
-            output_norm: norm(format!("{root}.shared_head.norm.weight"))?,
-            output_head: linear::<B>(
-                format!("{root}.shared_head.head.weight"),
-                args.hidden_size,
-                args.vocab_size,
-                args.linear_format_for(&format!("{root}.shared_head.head.weight")),
-                context,
-            )?,
+            output_norm: B::normalization(spec.output_norm, context)?,
+            output_head: B::linear(spec.output, context)?,
         })
     }
 
@@ -545,47 +523,15 @@ where
         }
         let global = usize::try_from(args.num_hidden_layers).map_err(Error::backend)? + depth;
         let root = format!("mtp.{depth}");
-        let norm = |name: String| {
-            B::normalization(
-                NormalizationConstructionSpec::learned(
-                    args.hidden_size,
-                    args.rms_norm_eps,
-                    parameter(name)?,
-                ),
-                context,
-            )
-        };
+        let spec = super::v4_specs::prediction_spec(args, &root)?;
         Ok(Self {
-            embedding_projection: linear::<B>(
-                format!("{root}.e_proj.weight"),
-                args.hidden_size,
-                args.hidden_size,
-                args.linear_format_for(&format!("{root}.e_proj.weight")),
-                context,
-            )?,
-            hidden_projection: linear::<B>(
-                format!("{root}.h_proj.weight"),
-                args.hidden_size,
-                args.hidden_size,
-                args.linear_format_for(&format!("{root}.h_proj.weight")),
-                context,
-            )?,
-            embedding_norm: norm(format!("{root}.enorm.weight"))?,
-            hidden_norm: norm(format!("{root}.hnorm.weight"))?,
+            embedding_projection: B::linear(spec.embedding_projection, context)?,
+            hidden_projection: B::linear(spec.hidden_projection, context)?,
+            embedding_norm: B::normalization(spec.embedding_norm, context)?,
+            hidden_norm: B::normalization(spec.hidden_norm, context)?,
             decoder: V4Block::new_at(args, global, &root, None, context)?,
-            output_norm: norm(format!("{root}.norm.weight"))?,
-            hyper_head: HyperHead::new(
-                HyperHeadSpec {
-                    streams: args.hc_mult,
-                    hidden_size: args.hidden_size,
-                    norm_epsilon: args.rms_norm_eps,
-                    epsilon: args.hc_eps,
-                    function: parameter(format!("{root}.hc_head_fn"))?,
-                    base: parameter(format!("{root}.hc_head_base"))?,
-                    scale: parameter(format!("{root}.hc_head_scale"))?,
-                },
-                context,
-            )?,
+            output_norm: B::normalization(spec.output_norm, context)?,
+            hyper_head: HyperHead::new(spec.hyper_head, context)?,
         })
     }
 
@@ -1016,28 +962,4 @@ where
             tokens: tokens.clone(),
         })
     }
-}
-
-fn linear<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
-    name: impl Into<String>,
-    input: i32,
-    output: i32,
-    format: eredu_checkpoint::LinearFormat,
-    context: &<B::Tensor as Tensor>::Context,
-) -> Result<B::Linear, Error> {
-    let name = name.into();
-    B::linear(
-        LinearSpec {
-            input,
-            output,
-            weight: parameter(&name)?,
-            bias: None,
-            format: crate::linear_format::standard_linear_format(&name, format)?,
-        },
-        context,
-    )
-}
-
-fn parameter(name: impl Into<String>) -> Result<ParameterSpec, Error> {
-    ParameterSpec::trainable(name).map_err(Error::backend)
 }

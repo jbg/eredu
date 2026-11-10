@@ -49,12 +49,24 @@ pub enum GgufMediaProjectorConfig {
 #[derive(Debug, Clone)]
 pub struct GgufMediaProjectorPlan {
     model: GgufMediaProjectorConfig,
+    qwen_text: Option<std::sync::Arc<crate::qwen::Declaration>>,
+    qwen_vision: Option<std::sync::Arc<crate::qwen::vision::Declaration>>,
     checkpoint: GgufCheckpointPlan,
     primary_tensor_mapping: Vec<eredu_gguf::TranslatedTensorLayout>,
     tensor_mapping: Vec<eredu_gguf::TranslatedTensorLayout>,
 }
 
 impl GgufMediaProjectorPlan {
+    pub(crate) fn qwen_vision_declaration(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::qwen::vision::Declaration>> {
+        self.qwen_vision.as_ref()
+    }
+    pub(crate) fn qwen_text_declaration(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::qwen::Declaration>> {
+        self.qwen_text.as_ref()
+    }
     pub(crate) fn replace_muse_execution_config(&mut self, config: crate::muse::DecoderConfig) {
         match &mut self.model {
             GgufMediaProjectorConfig::Muse(current) => *current = config,
@@ -64,11 +76,11 @@ impl GgufMediaProjectorPlan {
 
     pub(crate) fn attach_draft_adapter(
         &mut self,
-        adapter: crate::nemotron_labs_diffusion::adapter::DraftAdapterConfig,
+        adapter: std::sync::Arc<crate::nemotron_labs_diffusion::adapter::DraftAdapterDeclaration>,
     ) -> Result<(), String> {
         match &mut self.model {
             GgufMediaProjectorConfig::NemotronLabsDiffusion { config, .. } => {
-                *config = config.clone().with_draft_adapter(adapter)
+                *config = config.clone().with_draft_parameters(adapter)?
             }
             _ => return Err("draft adapter cannot attach to this media companion".into()),
         }
@@ -160,7 +172,7 @@ impl GgufMediaProjectorPlan {
             GgufMediaProjectorConfig::Qwen3Vl(_)
             | GgufMediaProjectorConfig::Qwen35(_)
             | GgufMediaProjectorConfig::Qwen4Exp(_) => {
-                return Err("Qwen GGUF media token IDs were already bound".into())
+                return Err("Qwen GGUF media token IDs were already bound".into());
             }
             _ => return Err("non-Qwen GGUF projector received Qwen token IDs".into()),
         };
@@ -200,6 +212,8 @@ pub(crate) fn resolve_media_projector(
         )
         .map_err(|error| error.to_string())?;
         return Ok(GgufMediaProjectorPlan {
+            qwen_text: None,
+            qwen_vision: None,
             checkpoint: vision.checkpoint().clone(),
             primary_tensor_mapping: text.mapping().to_vec(),
             tensor_mapping: vision.mapping().to_vec(),
@@ -211,6 +225,7 @@ pub(crate) fn resolve_media_projector(
     }
     let model_metadata = metadata(primary);
     let projector_metadata = metadata(projector);
+    let mut qwen_vision = None;
     let (model, checkpoint) = match primary_plan.model() {
         GgufModelConfig::Qwen4Exp(target) => {
             let vision = crate::qwen4_exp::prepared::GgufVisionPlan::prepare(
@@ -256,26 +271,15 @@ pub(crate) fn resolve_media_projector(
             (GgufMediaProjectorConfig::Inkling(args), checkpoint)
         }
         GgufModelConfig::Muse(args) => {
-            let audio = if projector_metadata
-                .get("clip.has_audio_encoder")
-                .and_then(MetadataValue::as_bool)
-                == Some(true)
-            {
-                Some(
-                    crate::muse::AudioConfig::from_gguf_metadata(
-                        &projector_metadata,
-                        args.hidden_size,
-                    )
-                    .map_err(|error| error.to_string())?,
-                )
-            } else {
-                None
-            };
-            let formats = weight_formats(projector, |name| {
-                crate::muse::translate_projector_gguf_name(name, audio.as_ref())
-            })?;
             let args = args
                 .clone()
+                .with_gguf_projector_metadata(&projector_metadata, HashMap::new())
+                .map_err(|error| error.to_string())?;
+            let names = crate::muse::projector_gguf_name_mapping(&args)?;
+            let formats = weight_formats(projector, |name| {
+                names.get(name).cloned().unwrap_or_else(|| name.into())
+            })?;
+            let args = args
                 .with_gguf_projector_metadata(&projector_metadata, formats)
                 .map_err(|error| error.to_string())?;
             let checkpoint = crate::muse::projector_gguf_plan(&args)?;
@@ -291,7 +295,12 @@ pub(crate) fn resolve_media_projector(
             let model =
                 crate::qwen::vl::model_args_from_gguf_parts(text.clone(), &model_metadata, vision)
                     .map_err(|error| error.to_string())?;
-            let checkpoint = crate::qwen::vision::gguf_plan(&model.vision, model.text.hidden_size)?;
+            let vision = std::sync::Arc::new(
+                crate::qwen::vision::Declaration::new(model.vision.clone(), "model.visual")
+                    .map_err(|e| e.to_string())?,
+            );
+            let checkpoint = crate::qwen::vision::gguf_plan(&vision)?;
+            qwen_vision = Some(vision);
             (GgufMediaProjectorConfig::Qwen3VlPending(model), checkpoint)
         }
         GgufModelConfig::QwenHybrid(parsed) => {
@@ -310,7 +319,7 @@ pub(crate) fn resolve_media_projector(
             return Err(format!(
                 "GGUF architecture {:?} does not admit a media-projector companion",
                 primary_plan.architecture()
-            ))
+            ));
         }
     };
     validate_gguf_plan(projector, &checkpoint)
@@ -330,8 +339,22 @@ pub(crate) fn resolve_media_projector(
         _ => primary_plan.tensor_mapping().to_vec(),
     };
     let tensor_mapping = canonical_projector_mapping(projector, &model)?;
+    let qwen_text = match &model {
+        GgufMediaProjectorConfig::Qwen3Vl(args) => {
+            Some(crate::qwen::Declaration::new(args.text.clone()))
+        }
+        GgufMediaProjectorConfig::Qwen3VlPending(args) => {
+            Some(crate::qwen::Declaration::new(args.text.clone()))
+        }
+        _ => None,
+    }
+    .transpose()
+    .map_err(|e| e.to_string())?
+    .map(std::sync::Arc::new);
     Ok(GgufMediaProjectorPlan {
         model,
+        qwen_text,
+        qwen_vision,
         checkpoint,
         primary_tensor_mapping,
         tensor_mapping,
@@ -344,7 +367,7 @@ fn canonical_projector_mapping(
 ) -> Result<Vec<eredu_gguf::TranslatedTensorLayout>, String> {
     let mapping = match model {
         GgufMediaProjectorConfig::NemotronLabsDiffusion { vision, .. } => {
-            return Ok(vision.mapping().to_vec())
+            return Ok(vision.mapping().to_vec());
         }
         GgufMediaProjectorConfig::Qwen4ExpPending { vision, .. } => {
             return Ok(vision.gguf_source().mapping().to_vec());
@@ -361,9 +384,11 @@ fn canonical_projector_mapping(
         GgufMediaProjectorConfig::Inkling(_) => {
             projector.translated_outputs(crate::inkling::translate_mmproj_weight_name)
         }
-        GgufMediaProjectorConfig::Muse(args) => projector.translated_outputs(|name| {
-            crate::muse::translate_projector_gguf_name(name, args.audio_config.as_ref())
-        }),
+        GgufMediaProjectorConfig::Muse(args) => {
+            let names = crate::muse::projector_gguf_name_mapping(args)?;
+            projector
+                .translated_outputs(|name| names.get(name).cloned().unwrap_or_else(|| name.into()))
+        }
         GgufMediaProjectorConfig::Qwen3Vl(model) => {
             let deepstack = model.vision.deepstack_layers();
             projector.translated_outputs(|name| {

@@ -47,18 +47,14 @@ pub enum BackbonePreparationError {
 /// No artifact is reopened and no backend resource is allocated here.
 #[derive(Clone)]
 pub struct PreparedBackboneParameters {
-    args: ModelArgs,
-    definition: Arc<eredu_runtime::ComponentDefinition>,
+    declaration: Arc<nemotron_h::Declaration>,
     source: SharedCheckpointSource,
     parameters: BTreeMap<String, ParameterAdmission>,
 }
 impl PreparedBackboneParameters {
-    fn define(
-        args: &ModelArgs,
-    ) -> Result<Arc<eredu_runtime::ComponentDefinition>, BackbonePreparationError> {
-        nemotron_h::component_definition(args, None)
-            .map(Arc::new)
-            .map_err(|error| BackbonePreparationError::Configuration(error.to_string()))
+    /// Typed backbone scope shared by state admission and materialization.
+    pub(crate) fn declaration(&self) -> &nemotron_h::Declaration {
+        &self.declaration
     }
 
     /// Selects encoded recipes before parameter pool admission and module construction.
@@ -66,27 +62,23 @@ impl PreparedBackboneParameters {
         mut self,
         quantization: eredu_checkpoint::WeightQuantization,
     ) -> Result<Self, BackbonePreparationError> {
-        let args = nemotron_h::load_time_quantization(&self.args, quantization)
+        let args = nemotron_h::load_time_quantization(self.args(), quantization)
             .map_err(BackbonePreparationError::Configuration)?;
-        let plan =
-            nemotron_h::safetensors_plan(&args).map_err(BackbonePreparationError::Configuration)?;
+        let declaration = Arc::new(
+            self.declaration
+                .with_formats(args)
+                .map_err(|e| BackbonePreparationError::Configuration(e.to_string()))?,
+        );
+        let plan = declaration
+            .canonical_plan()
+            .map_err(BackbonePreparationError::Configuration)?;
         let eligible = plan
             .common_tensors
             .iter()
-            .chain(plan.layout_groups.iter().flat_map(|group| {
-                group
-                    .variants
-                    .iter()
-                    .flat_map(|layout| layout.tensors.iter())
-            }))
-            .map(|tensor| {
-                nemotron_h::checkpoint::normalized_parameter_key(&tensor.key, &args)
-                    .map_err(BackbonePreparationError::Configuration)
-            })
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .filter_map(|name| {
-                name.strip_suffix(".scales")
+            .filter_map(|tensor| {
+                tensor
+                    .key
+                    .strip_suffix(".scales")
                     .map(|prefix| format!("{prefix}.weight"))
             })
             .filter(|name| self.parameters.contains_key(name))
@@ -98,8 +90,7 @@ impl PreparedBackboneParameters {
             &eligible,
             RecipeDtype::F32,
         )?;
-        self.definition = Self::define(&args)?;
-        self.args = args;
+        self.declaration = declaration;
         self.source = source;
         self.parameters = parameters;
         Ok(self)
@@ -116,7 +107,16 @@ impl PreparedBackboneParameters {
         let args =
             nemotron_h::model_args_from_config_value(artifacts.assets().backbone_configuration())
                 .map_err(|e| BackbonePreparationError::Configuration(e.to_string()))?;
-        Self::from_parameters(args, source, artifacts.plan().parameters())
+        let released = released_declaration()?;
+        let declaration = if &args == released.args() {
+            Arc::clone(released)
+        } else {
+            Arc::new(
+                nemotron_h::Declaration::new(args)
+                    .map_err(|e| BackbonePreparationError::Configuration(e.to_string()))?,
+            )
+        };
+        Self::from_parameters(declaration, source, artifacts.plan().parameters())
     }
 
     /// Admits explicit canonical component recipes against ordinary Nemotron geometry.
@@ -125,12 +125,11 @@ impl PreparedBackboneParameters {
     /// payload reads. Only the selected component's exact physical inputs remain
     /// visible, retaining source guards and any original storage transformations.
     pub fn from_parameters(
-        mut args: ModelArgs,
+        declaration: Arc<nemotron_h::Declaration>,
         source: SharedCheckpointSource,
         parameters: &BTreeMap<String, ParameterAdmission>,
     ) -> Result<Self, BackbonePreparationError> {
-        args.validate()
-            .map_err(|error| BackbonePreparationError::Configuration(error.to_string()))?;
+        let mut args = declaration.args().clone();
         if args.num_nextn_predict_layers != 0 {
             return Err(BackbonePreparationError::Configuration(
                 "VoiceChat backbone requires one target group".into(),
@@ -184,8 +183,14 @@ impl PreparedBackboneParameters {
                 },
             );
         }
-        let plan =
-            nemotron_h::safetensors_plan(&args).map_err(BackbonePreparationError::Configuration)?;
+        let declaration = Arc::new(
+            declaration
+                .with_formats(args)
+                .map_err(|e| BackbonePreparationError::Configuration(e.to_string()))?,
+        );
+        let plan = declaration
+            .canonical_plan()
+            .map_err(BackbonePreparationError::Configuration)?;
         validate_safetensors_plan(&catalog, &plan).into_loader_result()?;
         let inputs = parameters
             .values()
@@ -203,15 +208,15 @@ impl PreparedBackboneParameters {
             inputs,
         )?);
         Ok(Self {
-            definition: Self::define(&args)?,
-            args,
+            declaration,
             source,
             parameters,
         })
     }
+
     /// Existing Nemotron-H block, state and parallel geometry.
     pub fn args(&self) -> &ModelArgs {
-        &self.args
+        self.declaration.args()
     }
     /// The exact restricted source retained during artifact preparation.
     pub fn source(&self) -> &SharedCheckpointSource {
@@ -234,7 +239,7 @@ impl PreparedBackboneParameters {
         &self,
         index: usize,
     ) -> Result<BTreeMap<String, DerivedWeightRecipe>, BackbonePreparationError> {
-        if index >= self.args.num_hidden_layers as usize {
+        if index >= self.args().num_hidden_layers as usize {
             return Err(BackbonePreparationError::Configuration(
                 "backbone layer is outside its schedule".into(),
             ));
@@ -258,22 +263,8 @@ pub(crate) fn project_parameters(
         .iter()
         .filter(|(_, p)| p.component == Component::Backbone)
     {
-        let conventional = if let Some(suffix) = name.strip_prefix("stt_model.embed_tokens.") {
-            format!("backbone.embeddings.{suffix}")
-        } else if let Some(suffix) = name.strip_prefix("stt_model.lm_head.") {
-            format!("lm_head.{suffix}")
-        } else {
-            format!(
-                "backbone.{}",
-                name.strip_prefix("stt_model.llm.").ok_or_else(|| {
-                    BackbonePreparationError::Configuration(format!(
-                        "unknown backbone identity {name}"
-                    ))
-                })?
-            )
-        };
-        let runtime = nemotron_h::checkpoint::normalized_parameter_key(&conventional, args)
-            .map_err(BackbonePreparationError::Configuration)?;
+        let runtime =
+            runtime_parameter_name(args, name).map_err(BackbonePreparationError::Configuration)?;
         if output.insert(runtime.clone(), parameter.clone()).is_some() {
             return Err(BackbonePreparationError::Configuration(format!(
                 "duplicate runtime parameter {runtime}"
@@ -286,4 +277,78 @@ pub(crate) fn project_parameters(
     // VoiceChat canonical recipes already restore A_log from split GGUF -exp(A_log).
     // Applying Nemotron's physical-storage recipe a second time would change it.
     Ok(output)
+}
+
+/// Converts the enclosing checkpoint namespace to the retained Nemotron identity.
+pub(crate) fn runtime_parameter_name(args: &ModelArgs, name: &str) -> Result<String, String> {
+    let conventional = if let Some(suffix) = name.strip_prefix("stt_model.embed_tokens.") {
+        format!("backbone.embeddings.{suffix}")
+    } else if let Some(suffix) = name.strip_prefix("stt_model.lm_head.") {
+        format!("lm_head.{suffix}")
+    } else {
+        format!(
+            "backbone.{}",
+            name.strip_prefix("stt_model.llm.")
+                .ok_or_else(|| format!("unknown backbone identity {name}"))?
+        )
+    };
+    nemotron_h::checkpoint::normalized_parameter_key(&conventional, args)
+}
+/// Projects a declared runtime slot into the speech source namespace, checking the inverse.
+pub(crate) fn checkpoint_parameter_name(args: &ModelArgs, name: &str) -> Result<String, String> {
+    let source = if let Some(suffix) = name.strip_prefix("model.embeddings.") {
+        format!("stt_model.embed_tokens.{suffix}")
+    } else if let Some(suffix) = name.strip_prefix("lm_head.") {
+        format!("stt_model.lm_head.{suffix}")
+    } else if let Some(suffix) = name.strip_prefix("model.norm_f.") {
+        format!("stt_model.llm.norm_f.{suffix}")
+    } else if let Some(rest) = name.strip_prefix("model.layers.") {
+        let (layer, suffix) = rest
+            .split_once('.')
+            .ok_or_else(|| format!("invalid backbone slot {name}"))?;
+        let index = layer.parse::<usize>().map_err(|e| e.to_string())?;
+        let policy = args
+            .layer_schedule
+            .get(index)
+            .ok_or_else(|| format!("backbone slot {name} exceeds its schedule"))?;
+        let operator = match policy {
+            nemotron_h::LayerPolicy::Mamba => "mamba",
+            nemotron_h::LayerPolicy::SelfAttention(_) => "attention",
+            nemotron_h::LayerPolicy::DenseMlp => "mlp",
+            nemotron_h::LayerPolicy::SparseMoe => "moe",
+        };
+        let suffix = if let Some(field) = suffix.strip_prefix(&format!("{operator}.")) {
+            format!("mixer.{field}")
+        } else {
+            suffix.to_owned()
+        };
+        format!("stt_model.llm.layers.{layer}.{suffix}")
+    } else {
+        return Err(format!("unknown Nemotron target slot {name}"));
+    };
+    if runtime_parameter_name(args, &source)? != name {
+        return Err(format!(
+            "backbone slot {name} has an incompatible source identity"
+        ));
+    }
+    Ok(source)
+}
+
+/// Source-free published target scope, shared by speech source extensions and construction.
+pub(crate) fn released_declaration(
+) -> Result<&'static Arc<nemotron_h::Declaration>, BackbonePreparationError> {
+    static DECLARATION: std::sync::OnceLock<Result<Arc<nemotron_h::Declaration>, String>> =
+        std::sync::OnceLock::new();
+    DECLARATION
+        .get_or_init(|| {
+            let args = nemotron_h::model_args_from_config_value(
+                &super::config::released_backbone_configuration(),
+            )
+            .map_err(|e| e.to_string())?;
+            nemotron_h::Declaration::new(args)
+                .map(Arc::new)
+                .map_err(|e| e.to_string())
+        })
+        .as_ref()
+        .map_err(|e| BackbonePreparationError::Configuration(e.clone()))
 }

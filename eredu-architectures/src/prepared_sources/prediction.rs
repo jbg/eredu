@@ -12,8 +12,7 @@ use eredu_core::{
 use crate::{
     configuration::{ModelConfigurations, PortableSafetensorsCatalog, SafetensorsModelConfig},
     qwen4_exp::{
-        checkpoint::schema::SafetensorsEncoding, config::Config,
-        prepared::SafetensorsPredictionPlan,
+        checkpoint::schema::SafetensorsEncoding, prepared::SafetensorsPredictionPlan, Declaration,
     },
 };
 
@@ -77,7 +76,7 @@ impl InspectedPredictionSource {
 
 #[derive(Debug, Clone)]
 enum PredictionPlan {
-    Unadmitted(Config, SafetensorsEncoding),
+    Unadmitted(std::sync::Arc<Declaration>, SafetensorsEncoding),
     Admitted(SafetensorsPredictionPlan),
 }
 

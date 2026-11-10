@@ -1,33 +1,53 @@
 //! Inkling component equations share the ordinary decoder's normalized policy.
 use super::*;
 mod prediction;
-use crate::inkling::{FeedForwardPolicy, LayerPolicy, TextArgs};
+use crate::inkling::{FeedForwardPolicy, LayerPolicy};
 pub(in crate::discovery) use prediction::declare as prediction;
 
-fn parameter(name: String, prefix: &str) -> ComponentTransformParameter {
-    ComponentTransformParameter {
-        shared_parameter: name.clone(),
-        parameter: name,
-        parameter_group: format!("parameters:{prefix}"),
+pub(in crate::discovery) fn media(g: &mut Builder, args: &crate::inkling::ModelArgs) {
+    fn attach(g: &mut Builder, node: &str, spec: &dyn eredu_nn::DeclareLogicalParameters) {
+        for parameter in spec
+            .logical_parameters()
+            .expect("admitted Inkling media declarations")
+        {
+            let id = parameter.parameter.id.as_str();
+            g.attach_parameters(node, id.strip_suffix(".weight").unwrap_or(id));
+        }
+    }
+    if let Some(config) = &args.audio_config {
+        let spec = config.parameters();
+        attach(g, "audio", spec);
+        g.get_mut("audio").output_axes = Some(axes(spec.embedding.dimensions as usize));
+    }
+    if let Some(config) = &args.vision_config {
+        for layer in 0..config.num_hidden_layers as usize {
+            let spec = config
+                .parameters()
+                .layer(layer)
+                .expect("validated Inkling vision layer");
+            attach(g, "vision", spec);
+        }
+        let norm = &config.parameters().final_norm;
+        attach(g, "vision", norm);
+        g.get_mut("vision").output_axes = Some(axes(norm.dimensions as usize));
     }
 }
 
 pub(in crate::discovery) fn decoder_transforms(
     g: &mut Builder,
-    text: &TextArgs,
     policy: LayerPolicy,
     block: &str,
     path: &str,
+    parameters: &crate::inkling::text::CommonParameters,
+    dense: Option<&crate::inkling::text::DenseParameters>,
 ) {
-    let width = text.hidden_size as usize;
-    let local = policy.attention.window().is_some();
-    let kv_width = (text.key_value_heads(local) * text.attention_head_dim(local)) as usize;
-    for (suffix, parent, field, channels, input, output, mutable) in [
+    let heads = &parameters.attention;
+    let width = heads.projection.query.input as usize;
+    for (suffix, parent, convolution, input, output, mutable) in [
         (
             "attention.key.convolution",
             "attention",
-            "self_attn.k_sconv",
-            kv_width,
+            &heads.key_convolution,
             "attention.key.projected",
             "attention.key.convolved",
             false,
@@ -35,8 +55,7 @@ pub(in crate::discovery) fn decoder_transforms(
         (
             "attention.value.convolution",
             "attention",
-            "self_attn.v_sconv",
-            kv_width,
+            &heads.value_convolution,
             "attention.value.projected",
             "attention.value.convolved",
             false,
@@ -44,8 +63,7 @@ pub(in crate::discovery) fn decoder_transforms(
         (
             "attention.convolution",
             "attention",
-            "attn_sconv",
-            width,
+            &parameters.attention_convolution,
             "attention.write.effective",
             "attention.contribution",
             true,
@@ -53,16 +71,22 @@ pub(in crate::discovery) fn decoder_transforms(
         (
             "feed_forward.convolution",
             "feed_forward",
-            "mlp_sconv",
-            width,
+            &parameters.feed_forward_convolution,
             "feed_forward.write.effective",
             "feed_forward.contribution",
             true,
         ),
     ] {
+        let channels = convolution.channels as usize;
         let node = format!("{block}.{suffix}");
         let parent = format!("{block}.{parent}");
-        let prefix = format!("{path}.{field}");
+        let prefix = convolution
+            .weight
+            .id
+            .as_str()
+            .strip_suffix(".weight")
+            .expect("declared convolution weight")
+            .to_owned();
         let input = format!("{path}.{input}");
         let output = format!("{path}.{output}");
         g.node(
@@ -108,23 +132,23 @@ pub(in crate::discovery) fn decoder_transforms(
                 effective_output: mutable.then(|| format!("{output}.effective")),
                 output,
                 equation: ComponentTensorTransformEquation::CausalDepthwiseConvolution {
-                    kernel: parameter(format!("{prefix}.weight"), &prefix),
+                    kernel: declared_transform_parameter(
+                        &convolution.weight,
+                        format!("parameters:{prefix}"),
+                    ),
                     channels,
-                    taps: text.sconv_kernel_size as usize,
+                    taps: convolution.kernel_size as usize,
                     residual: true,
                     activation: None,
                 },
             });
     }
-    let groups = text.query_heads(local) as usize;
-    let input_width = text.d_rel as usize;
-    let output_width = policy
-        .attention
-        .window()
-        .map_or(text.rel_extent as usize, |window| window.get() as usize);
+    let groups = heads.projection.geometry.query_heads() as usize;
+    let input_width = heads.relative_projection.shape[0] as usize;
+    let output_width = heads.relative_projection.shape[1] as usize;
     let node = format!("{block}.attention.relative.projection");
     let parent = format!("{block}.attention");
-    let name = format!("{path}.self_attn.rel_proj");
+    let name = heads.relative_projection.weight.id.to_string();
     let input = format!("{path}.attention.relative.projected");
     let output = format!("{path}.attention.relative.profiles");
     g.node(
@@ -164,16 +188,23 @@ pub(in crate::discovery) fn decoder_transforms(
             output,
             effective_output: None,
             equation: ComponentTensorTransformEquation::SharedGroupedProjection {
-                weight: parameter(name.clone(), &name),
+                weight: declared_transform_parameter(
+                    &heads.relative_projection.weight,
+                    format!("parameters:{name}"),
+                ),
                 groups,
                 input_width,
                 output_width,
             },
         });
     if policy.feed_forward == FeedForwardPolicy::Dense {
+        let parameters = dense.expect("declared Inkling dense branch");
+        let scalar = parameters
+            .scale_declaration()
+            .expect("declared branch scale");
         let node = format!("{block}.feed_forward.scale");
         let parent = format!("{block}.feed_forward");
-        let name = format!("{path}.dense_global_scale");
+        let name = scalar.parameter.id.to_string();
         g.node(
             &node,
             ArchitectureNodeKind::Projector,
@@ -193,7 +224,7 @@ pub(in crate::discovery) fn decoder_transforms(
             "Effective learned scalar multiplied into the dense write",
             vec![TensorAxis {
                 name: "scalar".into(),
-                dimension: SymbolicDimension::Known(1),
+                dimension: SymbolicDimension::Known(scalar.shape[0]),
             }],
         );
         g.descriptor
@@ -205,7 +236,10 @@ pub(in crate::discovery) fn decoder_transforms(
                 output: format!("{path}.feed_forward.write"),
                 effective_output: Some(format!("{path}.feed_forward.write.effective")),
                 equation: ComponentTensorTransformEquation::LearnedScale {
-                    scale: parameter(name.clone(), &name),
+                    scale: declared_transform_parameter(
+                        scalar.parameter,
+                        format!("parameters:{name}"),
+                    ),
                 },
             });
     }
@@ -213,28 +247,21 @@ pub(in crate::discovery) fn decoder_transforms(
 
 pub(in crate::discovery) fn decoder_scalars(
     g: &mut Builder,
-    text: &TextArgs,
     policy: LayerPolicy,
     layer: usize,
     block: &str,
     path: &str,
+    parameters: &crate::inkling::text::CommonParameters,
+    dense: Option<&crate::inkling::text::DenseParameters>,
 ) {
-    let local = policy.attention.window().is_some();
-    let heads = text.query_heads(local) as usize;
-    let kv = text.key_value_heads(local) as usize;
-    let dim = text.attention_head_dim(local) as usize;
-    let width = text.hidden_size as usize;
+    let declared = &parameters.attention;
+    let heads = declared.projection.geometry.query_heads() as usize;
+    let kv = declared.projection.geometry.key_value_heads() as usize;
+    let dim = declared.projection.geometry.key_dimensions() as usize;
+    let width = declared.projection.query.input as usize;
     let attention = format!("{block}.attention");
     let feed_forward = format!("{block}.feed_forward");
     let prefix = format!("{path}.self_attn");
-    let normalization = |gain: String| ComponentNormalization {
-        kind: ComponentNormalizationKind::Rms,
-        epsilon: ComponentScalar::new(text.rms_norm_eps),
-        gain: Some(gain),
-        gain_offset: ComponentScalar::new(0.0),
-        bias: None,
-        groups: 1,
-    };
     g.attach_parameters(&attention, &prefix);
     g.attach_parameters(&format!("{block}.norm"), &format!("{path}.input_layernorm"));
     g.get_mut(&format!("{block}.norm")).completeness = DescriptionCompleteness::Complete;
@@ -253,46 +280,40 @@ pub(in crate::discovery) fn decoder_scalars(
             component_heads_per_read_head,
             read_head_stride: None,
         };
-    let read = |field: &str, role, rows, output: &str, norm: Option<(&str, usize)>, bias: bool| {
-        let weight = format!("{prefix}.{field}.weight");
+    let read = |spec: &eredu_nn::LinearSpec,
+                role,
+                rows,
+                output: &str,
+                norm: Option<(&eredu_nn::NormalizationConstructionSpec, usize)>| {
         ComponentRead {
-            source: None,
-            role,
-            shared_weight: weight.clone(),
-            weight,
-            parameter_group: format!("parameters:{prefix}"),
-            bias: bias.then(|| format!("{prefix}.{field}.bias")),
-            rows,
             projection_output: Some(format!("{path}.attention.{output}")),
-            head_normalization: norm.map(|(field, heads)| ComponentHeadNormalization {
+            head_normalization: norm.map(|(spec, heads)| ComponentHeadNormalization {
                 output_scale: ComponentScalar::new(1.0),
                 heads,
                 head_width: dim,
                 independent_gains: false,
-                normalization: normalization(format!("{prefix}.{field}.weight")),
+                normalization: super::declared_normalization(spec),
             }),
-            input_projections: Vec::new(),
+            ..declared_component_read(spec, format!("parameters:{prefix}"), role, rows)
         }
     };
     let reads = vec![
         read(
-            "q_proj",
+            &declared.projection.query,
             ComponentReadRole::Query,
             head_rows(dim, 1),
             "query.projected",
-            Some(("q_norm", heads)),
-            text.q_bias,
+            Some((&declared.query_norm, heads)),
         ),
         read(
-            "k_proj",
+            &declared.projection.key,
             ComponentReadRole::Key,
             head_rows(dim, heads / kv),
             "key.projected",
-            Some(("k_norm", kv)),
-            false,
+            Some((&declared.key_norm, kv)),
         ),
         read(
-            "v_proj",
+            &declared.projection.value,
             ComponentReadRole::Value,
             ComponentRowMapping::GroupedQuery {
                 offset: 0,
@@ -301,17 +322,13 @@ pub(in crate::discovery) fn decoder_scalars(
             },
             "value.projected",
             None,
-            false,
         ),
-        // Relative-query features are an additional query dependency. Their
-        // projection_output joins the shared learned-position table transform.
         read(
-            "r_proj",
+            &declared.relative,
             ComponentReadRole::Query,
-            head_rows(text.d_rel as usize, 1),
+            head_rows(declared.relative_projection.shape[0] as usize, 1),
             "relative.projected",
             None,
-            false,
         ),
     ];
     let mut group = ComponentGroup {
@@ -328,11 +345,16 @@ pub(in crate::discovery) fn decoder_scalars(
         input: format!("{path}.attention.input"),
         reads,
         routed_reads: Vec::new(),
-        write_weight: format!("{prefix}.o_proj.weight"),
+        write_weight: declared.projection.output.weight.id.to_string(),
         write_input_projection: None,
         write_parameter_group: format!("parameters:{prefix}"),
-        shared_write_weight: format!("{prefix}.o_proj.weight"),
-        write_bias: text.o_bias.then(|| format!("{prefix}.o_proj.bias")),
+        shared_write_weight: declared.projection.output.weight.id.to_string(),
+        write_bias: declared
+            .projection
+            .output
+            .bias
+            .as_ref()
+            .map(|bias| bias.id.to_string()),
         activation_equation: ComponentActivation::Attention {
             attended_head_normalization: None,
             query_heads: heads,
@@ -340,7 +362,7 @@ pub(in crate::discovery) fn decoder_scalars(
             head_width: dim,
             output_gate: None,
         },
-        input_normalization: normalization(format!("{path}.input_layernorm.weight")),
+        input_normalization: super::declared_normalization(&parameters.input_norm),
         output_normalization: None,
         output_gate: None,
         residual_scale: ComponentScalar::new(1.0),
@@ -375,11 +397,12 @@ pub(in crate::discovery) fn decoder_scalars(
     if policy.feed_forward != FeedForwardPolicy::Dense {
         return;
     }
+    let dense = dense.expect("declared Inkling dense component geometry");
     let prefix = format!("{path}.dense");
     g.attach_parameters(&feed_forward, &prefix);
     group.id = format!("{feed_forward}.units");
     group.node_id = feed_forward.clone();
-    group.count = text.dense_intermediate_size() as usize;
+    group.count = dense.product.gate.output as usize;
     group.activation = format!("{path}.feed_forward.units");
     group.effective_activation = format!("{path}.feed_forward.units.effective");
     group.write_input = Some(format!("{path}.feed_forward.write_input"));
@@ -387,39 +410,31 @@ pub(in crate::discovery) fn decoder_scalars(
     group.output = Some(format!("{path}.feed_forward.projection"));
     group.input = format!("{path}.feed_forward.input");
     group.reads = [
-        ("gate_proj", ComponentReadRole::Gate),
-        ("up_proj", ComponentReadRole::Value),
+        (&dense.product.gate, ComponentReadRole::Gate),
+        (&dense.product.up, ComponentReadRole::Value),
     ]
     .into_iter()
-    .map(|(field, role)| {
-        let weight = format!("{prefix}.{field}.weight");
-        ComponentRead {
-            source: None,
+    .map(|(spec, role)| {
+        declared_component_read(
+            spec,
+            format!("parameters:{prefix}"),
             role,
-            shared_weight: weight.clone(),
-            weight,
-            parameter_group: format!("parameters:{prefix}"),
-            bias: None,
-            rows: ComponentRowMapping::Direct { offset: 0 },
-            projection_output: None,
-            head_normalization: None,
-            input_projections: Vec::new(),
-        }
+            ComponentRowMapping::Direct { offset: 0 },
+        )
     })
     .collect();
-    group.write_weight = format!("{prefix}.down_proj.weight");
-    group.shared_write_weight = group.write_weight.clone();
+    group.write_weight = dense.product.down.weight.id.to_string();
+    group.shared_write_weight = declared_shared_weight(&dense.product.down.weight).into();
     group.write_parameter_group = format!("parameters:{prefix}");
-    group.write_bias = None;
-    group.activation_equation = ComponentActivation::Gated {
-        activation: ComponentNonlinearity::Silu {
-            multiplier: ComponentScalar::new(1.0),
-        },
-        gate_upper_bound: None,
-        value_absolute_bound: None,
-        value_offset: ComponentScalar::new(0.0),
-    };
-    group.input_normalization = normalization(format!("{path}.post_attention_layernorm.weight"));
+    group.write_bias = dense
+        .product
+        .down
+        .bias
+        .as_ref()
+        .map(|bias| bias.id.to_string());
+    group.activation_equation = declared_gated_product(dense.product.policy)
+        .expect("admitted Inkling dense gated-product policy");
+    group.input_normalization = super::declared_normalization(&parameters.post_attention_norm);
     let mut component_axes = axes(group.count);
     component_axes[2].name = "component".into();
     g.component_observation(
@@ -431,25 +446,39 @@ pub(in crate::discovery) fn decoder_scalars(
     g.descriptor.components.push(group);
 }
 
-pub(in crate::discovery) fn target_readout(g: &mut Builder, text: &TextArgs) {
-    let width = text.hidden_size as usize;
-    let vocabulary = text.unpadded_vocab_size.unwrap_or(text.vocab_size) as usize;
-    let normalization = |gain: &str| ComponentNormalization {
-        kind: ComponentNormalizationKind::Rms,
-        epsilon: ComponentScalar::new(text.rms_norm_eps),
-        gain: Some(gain.into()),
-        gain_offset: ComponentScalar::new(0.0),
-        bias: None,
-        groups: 1,
-    };
-    g.attach_parameters("embedding", "model.embed_tokens");
-    g.attach_parameters("assembly", "model.embed_norm");
-    g.attach_parameters("output", "lm_head");
+pub(in crate::discovery) fn target_readout(g: &mut Builder, args: &crate::inkling::ModelArgs) {
+    let declared = &args.pinned().ordinary;
+    let text = &args.text_config;
+    let embedding_norm = &args.pinned().embedding_norm;
+    let embedding_weight = declared.embedding_spec().weight.id.to_string();
+    let output = declared.output_projection_spec();
+    let output_weight = output.weight.id.to_string();
+    let norm = super::declared_normalization(declared.normalization_spec());
+    let embedding_norm = super::declared_normalization(&embedding_norm);
+    let width = declared.embedding_spec().dimensions as usize;
+    let vocabulary = text
+        .unpadded_vocab_size
+        .unwrap_or(declared.embedding_spec().vocabulary) as usize;
+    g.attach_parameters("embedding", embedding_weight.trim_end_matches(".weight"));
+    g.attach_parameters(
+        "assembly",
+        embedding_norm
+            .gain
+            .as_ref()
+            .expect("declared gain")
+            .trim_end_matches(".weight"),
+    );
+    g.attach_parameters("output", output_weight.trim_end_matches(".weight"));
     g.node(
         "output.norm",
         ArchitectureNodeKind::Normalization,
         None,
-        Some("model.norm"),
+        Some(
+            norm.gain
+                .as_ref()
+                .expect("declared gain")
+                .trim_end_matches(".weight"),
+        ),
         Some(width),
     );
     let last = format!("decoder.{}", text.num_hidden_layers - 1);
@@ -519,10 +548,10 @@ pub(in crate::discovery) fn target_readout(g: &mut Builder, text: &TextArgs) {
     g.descriptor.component_readout = Some(ComponentReadout {
         token_embedding_normalization: None,
         embedding: "readout.embedding".into(),
-        embedding_weight: "model.embed_tokens.weight".into(),
+        embedding_weight,
         embedding_scale: ComponentScalar::new(1.0),
-        embedding_normalization: Some(normalization("model.embed_norm.weight")),
-        tied_embeddings: false,
+        embedding_normalization: Some(embedding_norm),
+        tied_embeddings: declared.head_spec().is_none(),
         equation: ComponentReadoutEquation {
             residual_cycles: vec![],
             block_transforms: vec![],
@@ -531,8 +560,8 @@ pub(in crate::discovery) fn target_readout(g: &mut Builder, text: &TextArgs) {
             projection_input: Some("readout.projection_input".into()),
             linear_scores: "readout.linear".into(),
             logits: MODEL_LOGITS_OBSERVATION_PATH.into(),
-            normalization: normalization("model.norm.weight"),
-            weight: "lm_head.weight".into(),
+            normalization: norm,
+            weight: output_weight,
             bias: None,
             score_writes: vec![],
             output_transform: ComponentOutputTransform::Identity,
@@ -573,6 +602,10 @@ pub(in crate::discovery) fn decoder_routed(
     {
         return;
     }
+    let parameters = args
+        .sparse(layer)
+        .expect("admitted Inkling joint routing declaration");
+    let selection = parameters.router.selection();
     let node = format!("{block}.feed_forward");
     let prefix = format!("{path}.moe");
     g.attach_parameters(&node, &prefix);
@@ -583,31 +616,36 @@ pub(in crate::discovery) fn decoder_routed(
         .expect("declared sparse branch");
     // The joint selector does not emit the ordinary standalone router event
     // protocol. Unit evidence carries the actual jointly normalized coefficients.
-    g.moe(&node, &prefix, attributes, None, text.hidden_size as usize);
+    g.moe(
+        &node,
+        &prefix,
+        attributes,
+        None,
+        parameters.routed.input_dimensions() as usize,
+    );
     g.attach_parameters(&format!("{node}.router"), &format!("{prefix}.router"));
     g.edge(
         &format!("{node}.router"),
         &format!("{node}.shared"),
         ArchitectureEdgeKind::Routing,
     );
-    let normalization = crate::discovery::routed_components::rms(
-        format!("{path}.post_attention_layernorm.weight"),
-        text.rms_norm_eps,
-        0.0,
-    );
-    for (owner, routing, cache_layer, routes, parameter_prefix) in [
+    let common = args
+        .common(layer)
+        .expect("admitted Inkling normalization declaration");
+    let normalization = super::declared_normalization(&common.post_attention_norm);
+    for (owner, routing, bank, routes, parameter_prefix) in [
         (
             node.clone(),
             format!("{path}.routing"),
-            layer,
-            text.num_experts_per_tok as usize,
+            &parameters.routed,
+            selection.top_k() as usize,
             prefix.clone(),
         ),
         (
             format!("{node}.shared"),
             format!("{path}.shared.routing"),
-            text.num_hidden_layers as usize + layer,
-            text.n_shared_experts as usize,
+            &parameters.shared,
+            selection.always_on_groups() as usize,
             format!("{prefix}.shared_experts"),
         ),
     ] {
@@ -624,7 +662,7 @@ pub(in crate::discovery) fn decoder_routed(
                 // not a scalar residual multiplier on this grouped contribution.
                 residual_scale: None,
             },
-            crate::inkling::text::expert_bank_spec(args, cache_layer),
+            Ok(bank.clone()),
         );
         g.descriptor
             .routed_components

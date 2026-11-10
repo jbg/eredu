@@ -8,10 +8,18 @@ use eredu_runtime::{ParameterProvider, ResidentExpertProvider, RuntimeStateCompo
 
 use crate::decoder::{Attention, AttentionInput};
 
-use super::{
-    new_attention, new_attention_at, DenseMlp, LayerGeometry, LayerPolicy, Mamba2, ModelArgs,
-    SparseMoe,
-};
+use super::{DenseMlp, LayerPolicy, Mamba2, ModelArgs, SparseMoe};
+
+pub(crate) fn normalization_spec(
+    args: &ModelArgs,
+    parameter: &str,
+) -> Result<NormalizationConstructionSpec, Error> {
+    Ok(NormalizationConstructionSpec::learned(
+        args.hidden_size,
+        args.layer_norm_epsilon,
+        ParameterSpec::trainable(parameter).map_err(Error::backend)?,
+    ))
+}
 
 /// One scheduled physical operator.
 #[derive(Debug, Clone, Parameterized)]
@@ -59,32 +67,26 @@ pub(crate) struct ReplicatedBlock<B: NeuralBackend> {
 }
 
 impl<B: NeuralBackend> ReplicatedBlock<B> {
-    pub(crate) fn new(
+    pub(crate) fn from_parameters(
         args: &ModelArgs,
         layer: usize,
+        parameters: super::declarations::TargetBlockParameters,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let policy = args
-            .layer_schedule
-            .get(layer)
-            .copied()
-            .ok_or_else(|| Error::backend(format!("Nemotron-H has no layer {layer}")))?;
-        let operator = match policy {
-            LayerPolicy::Mamba => ReplicatedOperator::Mamba(Mamba2::new(args, layer, context)?),
-            LayerPolicy::SelfAttention(_) => ReplicatedOperator::Attention(new_attention(
-                args,
-                layer,
-                args.num_attention_heads,
-                args.num_key_value_heads,
-                context,
-            )?),
-            LayerPolicy::DenseMlp => ReplicatedOperator::Dense(DenseMlp::new(
-                args,
-                &format!("model.layers.{layer}.mlp"),
-                args.intermediate_size,
-                context,
-            )?),
-            LayerPolicy::SparseMoe => {
+        use super::declarations::TargetOperatorParameters as P;
+        let operator = match parameters.operator {
+            P::Mamba(spec) => ReplicatedOperator::Mamba(Mamba2::from_spec(spec, context)?),
+            P::Attention(spec) => {
+                let Some(LayerPolicy::SelfAttention(policy)) = args.layer_schedule.get(layer)
+                else {
+                    return Err(Error::backend(
+                        "attention scope differs from target schedule",
+                    ));
+                };
+                ReplicatedOperator::Attention(spec.construct::<B>(*policy, context)?)
+            }
+            P::Dense(spec) => ReplicatedOperator::Dense(spec.construct::<B>(context)?),
+            P::Sparse(_) => {
                 return Err(Error::backend(
                     "replicated Nemotron-H unit rejects routed computation",
                 ))
@@ -92,16 +94,7 @@ impl<B: NeuralBackend> ReplicatedBlock<B> {
         };
         Ok(Self {
             operator,
-            norm: B::normalization(
-                NormalizationConstructionSpec::learned(
-                    args.hidden_size,
-                    args.layer_norm_epsilon,
-                    ParameterSpec::trainable(format!("model.layers.{layer}.norm.weight"))
-                        .map_err(Error::backend)?,
-                )
-                .with_groups(1)?,
-                context,
-            )?,
+            norm: B::normalization(parameters.norm.with_groups(1)?, context)?,
             residual_in_fp32: args.residual_in_fp32,
         })
     }
@@ -179,187 +172,45 @@ impl<B: NeuralBackend> ReplicatedBlock<B> {
 }
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
-    /// Builds one global-geometry physical unit.
-    pub fn new(
+    pub(crate) fn from_parameters(
         args: &ModelArgs,
         layer: usize,
+        parameters: super::declarations::TargetBlockParameters,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let geometry = match args.layer_schedule.get(layer) {
-            Some(LayerPolicy::Mamba) => LayerGeometry::Mamba {
-                heads: args.mamba_num_heads,
-                groups: args.n_groups,
-            },
-            Some(LayerPolicy::SelfAttention(_)) => LayerGeometry::Attention {
-                query_heads: args.num_attention_heads,
-                kv_heads: args.num_key_value_heads,
-            },
-            Some(LayerPolicy::DenseMlp) => LayerGeometry::DenseMlp {
-                intermediate: args.intermediate_size,
-            },
-            Some(LayerPolicy::SparseMoe) => LayerGeometry::SparseMoe {
-                routed: args.moe_intermediate_size,
-                shared: args.moe_shared_expert_intermediate_size,
-            },
-            None => return Err(Error::backend(format!("Nemotron-H has no layer {layer}"))),
-        };
-        Self::new_with_geometry(args, layer, geometry, context)
-    }
-
-    /// Builds one placement-resolved physical unit.
-    pub fn new_with_geometry(
-        args: &ModelArgs,
-        layer: usize,
-        geometry: LayerGeometry,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        Self::new_with_geometry_and_routed_spec(args, layer, geometry, None, context)
-    }
-
-    pub(crate) fn new_with_geometry_and_routed_spec(
-        args: &ModelArgs,
-        layer: usize,
-        geometry: LayerGeometry,
-        routed_spec: Option<eredu_nn::GroupedRelu2Spec>,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        let policy = args
+        let policy = *args
             .layer_schedule
             .get(layer)
-            .copied()
-            .ok_or_else(|| Error::backend(format!("Nemotron-H has no layer {layer}")))?;
-        let operator = match (policy, geometry) {
-            (LayerPolicy::Mamba, LayerGeometry::Mamba { heads, groups }) => Operator::Mamba(
-                Mamba2::new_with_geometry(args, layer, heads, groups, context)?,
-            ),
-            (
-                LayerPolicy::SelfAttention(_),
-                LayerGeometry::Attention {
-                    query_heads,
-                    kv_heads,
-                },
-            ) => Operator::Attention(new_attention(args, layer, query_heads, kv_heads, context)?),
-            (LayerPolicy::DenseMlp, LayerGeometry::DenseMlp { intermediate }) => {
-                Operator::Dense(DenseMlp::new(
-                    args,
-                    &format!("model.layers.{layer}.mlp"),
-                    intermediate,
-                    context,
-                )?)
+            .ok_or_else(|| Error::backend("target scope is outside its schedule"))?;
+        let mut parameters = parameters;
+        parameters.norm = parameters.norm.with_groups(1)?;
+        Self::from_scope(args, layer, policy, parameters, context)
+    }
+
+    pub(crate) fn from_scope(
+        args: &ModelArgs,
+        identity: usize,
+        policy: LayerPolicy,
+        parameters: super::declarations::TargetBlockParameters,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        use super::declarations::TargetOperatorParameters as P;
+        let operator = match parameters.operator {
+            P::Mamba(spec) => Operator::Mamba(Mamba2::from_spec(spec, context)?),
+            P::Attention(spec) => {
+                let LayerPolicy::SelfAttention(attention) = policy else {
+                    return Err(Error::backend(
+                        "attention scope differs from invocation policy",
+                    ));
+                };
+                Operator::Attention(spec.construct::<B>(attention, context)?)
             }
-            (LayerPolicy::SparseMoe, LayerGeometry::SparseMoe { routed, shared }) => {
-                let sparse = match routed_spec {
-                    Some(spec) => SparseMoe::new_at_with_spec(
-                        args,
-                        layer,
-                        &format!("model.layers.{layer}.moe"),
-                        spec,
-                        shared,
-                        context,
-                    ),
-                    None => SparseMoe::new(args, layer, routed, shared, context),
-                }?;
-                Operator::Sparse(sparse)
-            }
-            _ => {
-                return Err(Error::backend(format!(
-                    "Nemotron-H layer {layer} policy {policy:?} does not match {geometry:?}"
-                )))
-            }
+            P::Dense(spec) => Operator::Dense(spec.construct::<B>(context)?),
+            P::Sparse(spec) => Operator::Sparse(SparseMoe::from_spec(identity, spec, context)?),
         };
         Ok(Self {
             operator,
-            norm: B::normalization(
-                NormalizationConstructionSpec::learned(
-                    args.hidden_size,
-                    args.layer_norm_epsilon,
-                    ParameterSpec::trainable(format!("model.layers.{layer}.norm.weight"))
-                        .map_err(Error::backend)?,
-                )
-                .with_groups(1)?,
-                context,
-            )?,
-            residual_in_fp32: args.residual_in_fp32,
-        })
-    }
-
-    /// Builds one appended MTP physical unit at its checkpoint-owned path.
-    pub fn new_mtp(
-        args: &ModelArgs,
-        physical: usize,
-        policy: LayerPolicy,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        let geometry = match policy {
-            LayerPolicy::SelfAttention(_) => LayerGeometry::Attention {
-                query_heads: args.num_attention_heads,
-                kv_heads: args.num_key_value_heads,
-            },
-            LayerPolicy::SparseMoe => LayerGeometry::SparseMoe {
-                routed: args.moe_intermediate_size,
-                shared: args.moe_shared_expert_intermediate_size,
-            },
-            _ => {
-                return Err(Error::backend(format!(
-                    "Nemotron-H MTP physical layer {physical} uses unsupported policy {policy:?}"
-                )))
-            }
-        };
-        Self::new_mtp_with_geometry(args, physical, policy, geometry, context)
-    }
-
-    /// Builds one placement-resolved appended MTP physical unit.
-    pub fn new_mtp_with_geometry(
-        args: &ModelArgs,
-        physical: usize,
-        policy: LayerPolicy,
-        geometry: LayerGeometry,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        let root = format!("model.mtp.layers.{physical}");
-        let global = usize::try_from(args.num_hidden_layers).map_err(Error::backend)? + physical;
-        let operator = match (policy, geometry) {
-            (
-                LayerPolicy::SelfAttention(attention),
-                LayerGeometry::Attention {
-                    query_heads,
-                    kv_heads,
-                },
-            ) => Operator::Attention(new_attention_at(
-                args,
-                attention,
-                &format!("{root}.mixer"),
-                query_heads,
-                kv_heads,
-                context,
-            )?),
-            (LayerPolicy::SparseMoe, LayerGeometry::SparseMoe { routed, shared }) => {
-                Operator::Sparse(SparseMoe::new_at(
-                    args,
-                    global,
-                    &format!("{root}.mixer"),
-                    routed,
-                    shared,
-                    context,
-                )?)
-            }
-            _ => {
-                return Err(Error::backend(format!(
-                    "Nemotron-H MTP physical layer {physical} policy {policy:?} does not match {geometry:?}"
-                )))
-            }
-        };
-        Ok(Self {
-            operator,
-            norm: B::normalization(
-                NormalizationConstructionSpec::learned(
-                    args.hidden_size,
-                    args.layer_norm_epsilon,
-                    ParameterSpec::trainable(format!("{root}.norm.weight"))
-                        .map_err(Error::backend)?,
-                ),
-                context,
-            )?,
+            norm: B::normalization(parameters.norm, context)?,
             residual_in_fp32: args.residual_in_fp32,
         })
     }

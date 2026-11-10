@@ -50,6 +50,15 @@ impl GroupedLinearSpec {
         spec.validate()?;
         Ok(spec)
     }
+    /// Projects storage without changing bank geometry, activation or output ownership.
+    pub fn with_projection_format(
+        mut self,
+        format: crate::LinearFormatSpec,
+    ) -> Result<Self, Error> {
+        self.projection = self.projection.with_format(format)?;
+        self.validate()?;
+        Ok(self)
+    }
     /// Selects output rows while retaining the complete input width. The
     /// activated result is an owned output shard and must never be all-summed.
     pub fn partition_output(mut self, output: Range<i32>) -> Result<Self, Error> {

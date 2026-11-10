@@ -37,8 +37,7 @@ impl PreparedTarget {
             .map(|unit| unit.recipes().clone())
             .collect::<Vec<_>>();
         let parameters = target_parameters(
-            &self.spec.config,
-            &self.formats,
+            &self.parameters,
             self.artifact.as_ref(),
             &physical,
             self.static_parameters.recipes(),
@@ -114,8 +113,7 @@ impl PreparedTarget {
 }
 
 pub(super) fn target_parameters<C: eredu_checkpoint::recipe::RecipeCatalog + ?Sized>(
-    config: &Config,
-    formats: &ParameterFormats,
+    declaration: &TargetParameters,
     source: &C,
     physical: &BTreeMap<String, eredu_runtime::ReplicatedTextPhysicalSource>,
     static_recipes: &BTreeMap<String, DerivedWeightRecipe>,
@@ -129,50 +127,58 @@ pub(super) fn target_parameters<C: eredu_checkpoint::recipe::RecipeCatalog + ?Si
     ),
     PreparationError,
 > {
-    let mut declared = ParameterRequirements::new(source, physical, formats);
+    let mut declared = ParameterRequirements::new(source, physical);
+    let static_parameters = &declaration.static_parameters;
+    declared.declare(&static_parameters.embedding, None, |_| {
+        Ok(Owner::StaticRole("embedding".into()))
+    })?;
+    declared.declare(&static_parameters.readout, None, |_| {
+        Ok(Owner::StaticRole("norm".into()))
+    })?;
+    if let Some(head) = &static_parameters.head {
+        declared.declare(head, None, |_| Ok(Owner::StaticRole("output".into())))?;
+    }
+    if unit_recipes.len() != declaration.units.len() {
+        return Err(invalid(
+            "target recipes do not match declared execution owners",
+        ));
+    }
+    let mut bank_roots = Vec::with_capacity(declaration.units.len());
+    for (ordinal, unit) in declaration.units.iter().enumerate() {
+        let bank = unit.expert_bank();
+        declared.declare(unit, bank, |_| {
+            Ok(Owner::ExecutionUnit {
+                group: crate::decoder::TARGET_EXECUTION_GROUP.into(),
+                unit: ordinal,
+            })
+        })?;
+        bank_roots.push(
+            bank.map(|bank| {
+                let packed = bank.packed_parameters()?;
+                checkpoint::experts::source_root(&packed)
+                    .map(str::to_owned)
+                    .map_err(invalid)
+            })
+            .transpose()?,
+        );
+    }
     for (name, recipe) in static_recipes {
-        let role = if name.starts_with("model.embed_tokens.") {
-            "embedding"
-        } else if name.starts_with("lm_head.") {
-            "output"
-        } else {
-            "norm"
-        };
-        declared.add(name, recipe, Owner::StaticRole(role.into()), false)?;
+        declared.add(name, recipe)?;
     }
-    let mut ordinal = 0;
-    for layer in 0..config.layers.len() {
-        if config.ngram.layers.contains(&layer) {
-            for (name, recipe) in &unit_recipes[ordinal] {
-                declared.add(
-                    name,
-                    recipe,
-                    Owner::ExecutionUnit {
-                        group: crate::decoder::TARGET_EXECUTION_GROUP.into(),
-                        unit: ordinal,
-                    },
-                    false,
-                )?;
+    for (unit, root) in unit_recipes.iter().zip(bank_roots) {
+        for (name, recipe) in unit {
+            declared.add(name, recipe)?;
+        }
+        if let Some(root) = root {
+            let bank = banks
+                .get(&root)
+                .ok_or_else(|| invalid("missing prepared expert bank"))?;
+            for (name, recipe) in bank.recipes() {
+                declared.add(&format!("{root}.{name}"), recipe)?;
             }
-            ordinal += 1;
         }
-        let owner = Owner::ExecutionUnit {
-            group: crate::decoder::TARGET_EXECUTION_GROUP.into(),
-            unit: ordinal,
-        };
-        for (name, recipe) in &unit_recipes[ordinal] {
-            declared.add(name, recipe, owner.clone(), false)?;
-        }
-        let root = format!("model.layers.{layer}.mlp.experts");
-        for (name, recipe) in banks
-            .get(&root)
-            .ok_or_else(|| invalid("missing prepared expert bank"))?
-            .recipes()
-        {
-            declared.add(&format!("{root}.{name}"), recipe, owner.clone(), true)?;
-        }
-        ordinal += 1;
     }
+    declared.validate_complete()?;
     Ok((declared.parameters, declared.derived, declared.outputs))
 }
 
@@ -212,42 +218,53 @@ pub(super) fn target_requirements<C: eredu_checkpoint::recipe::RecipeCatalog + ?
     let mut specs = BTreeMap::new();
     let mut routes = BTreeMap::new();
     let mut members = Vec::new();
+    let mut global_experts = None;
     for (ordinal, unit) in spec.units.iter().enumerate() {
-        let UnitSpec::Decoder {
-            layer,
-            feed_forward,
-            ..
-        } = unit
-        else {
+        let UnitSpec::Decoder { feed_forward, .. } = unit else {
             continue;
         };
-        let root = format!("model.layers.{layer}.mlp.experts");
+        let packed = feed_forward
+            .feed_forward
+            .parameters
+            .routed
+            .experts
+            .packed_parameters()?;
+        let root = checkpoint::experts::source_root(&packed).map_err(invalid)?;
         specs.insert(
             (owner.clone(), ordinal),
-            feed_forward.feed_forward.experts.clone(),
+            feed_forward.feed_forward.parameters.routed.experts.clone(),
         );
-        routes.insert(ordinal, spec.config.experts.selected as usize);
-        for expert in 0..spec.config.experts.count as usize {
-            let recipes = select_expert(expert_banks, &root, expert)?;
+        let parameters = &feed_forward.feed_forward.parameters;
+        let count = packed.group_count();
+        if global_experts
+            .replace(count)
+            .is_some_and(|old| old != count)
+        {
+            return Err(invalid("target declarations disagree on bank cardinality"));
+        }
+        routes.insert(
+            ordinal,
+            parameters.routed.selector.selection().top_k() as usize,
+        );
+        for expert in 0..count {
+            let recipes = select_expert(expert_banks, root, expert)?;
             let parameters = recipes
                 .into_iter()
                 .map(|(local, recipe)| {
-                    ExpertParameterRecipe::new(
-                        &local,
-                        format!("{root}.{local}"),
-                        recipe,
-                        if matches!(local.as_str(), "gate_up_proj" | "down_proj")
-                            && formats.get(&format!("{root}.{local}"))? == LinearFormat::Dense
-                        {
-                            ExpertParameterRole::quantizable_projection(
-                                format!("{local}_scales"),
-                                format!("{local}_biases"),
-                            )
-                        } else {
-                            ExpertParameterRole::Preserved
-                        },
-                    )
-                    .map_err(invalid)
+                    let target =
+                        checkpoint::experts::binding_target(&packed, &local).map_err(invalid)?;
+                    let primary = [packed.gate_up(), packed.down()]
+                        .into_iter()
+                        .any(|parameter| parameter.parameter.id.as_str() == target.as_str());
+                    let role = if primary && formats.get(&target)? == LinearFormat::Dense {
+                        ExpertParameterRole::quantizable_projection(
+                            format!("{local}_scales"),
+                            format!("{local}_biases"),
+                        )
+                    } else {
+                        ExpertParameterRole::Preserved
+                    };
+                    ExpertParameterRecipe::new(&local, target, recipe, role).map_err(invalid)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             members.push(
@@ -277,7 +294,7 @@ pub(super) fn target_requirements<C: eredu_checkpoint::recipe::RecipeCatalog + ?
             eredu_core::checkpoint::TensorDtype::Bf16
         }
         (LinearFormat::Dense, _) => {
-            return Err(invalid("target embedding must supply floating values"))
+            return Err(invalid("target embedding must supply floating values"));
         }
         _ => match spec.limits.element {
             eredu_nn::TensorElementType::F32 => eredu_core::checkpoint::TensorDtype::F32,
@@ -308,7 +325,7 @@ pub(super) fn target_requirements<C: eredu_checkpoint::recipe::RecipeCatalog + ?
         .with_inferred_byte_geometry(source)
         .map_err(invalid)?;
     let plan = ExpertRealizationPlan::balanced(
-        spec.config.experts.count as usize,
+        global_experts.ok_or_else(|| invalid("target declares no routed bank"))?,
         eredu_core::ParallelRankTopology::new(
             eredu_core::ParallelTopology::new(1, 1, 1, 1).map_err(invalid)?,
             0,
@@ -325,56 +342,23 @@ pub(super) fn target_requirements<C: eredu_checkpoint::recipe::RecipeCatalog + ?
     Ok(requirements)
 }
 
-fn companion(name: &str) -> Option<(eredu_nn::LinearCompanionRole, String)> {
-    use eredu_nn::LinearCompanionRole::{AffineBias, Scale};
-    for (suffix, role, ordinary) in [
-        ("_scale_inv", Scale, false),
-        ("_scales", Scale, false),
-        ("_biases", AffineBias, false),
-        (".scales", Scale, true),
-        (".biases", AffineBias, true),
-    ] {
-        if let Some(root) = name.strip_suffix(suffix) {
-            return Some((
-                role,
-                if ordinary {
-                    format!("{root}.weight")
-                } else {
-                    root.into()
-                },
-            ));
-        }
-    }
-    None
-}
-
-// Family checkpoint semantics: convolution kernels are rank three, norms are
-// rank one, and ordinary affine projections are rank-two `.weight` tensors.
-// Expert banks have explicit grouped geometry and separate scale identities.
-fn parameter_role(name: &str, shape: &[usize], grouped: bool) -> Role {
-    if companion(name).is_some() {
-        Role::FormatCompanion
-    } else if name == "model.embed_tokens.weight" {
-        Role::Embedding
-    } else if grouped || (name.ends_with(".weight") && shape.len() == 2) {
-        Role::LinearWeight
-    } else if name.ends_with("norm.weight")
-        || name.contains(".norm_")
-        || name.contains(".pre_fc_norm_")
-    {
-        Role::Normalization
-    } else if name.ends_with(".bias") {
-        Role::LinearBias
-    } else {
-        Role::Other
-    }
+/// One projection of a construction slot and its explicit storage extension.
+struct DeclaredSlot {
+    logical_shape: Vec<usize>,
+    stored_shape: Vec<usize>,
+    role: Role,
+    format: LinearFormat,
+    owner: Owner,
+    companion: Option<(eredu_nn::LinearCompanionRole, String)>,
+    transform_companions: Option<(String, String)>,
+    transformable: bool,
 }
 
 /// Shared architecture-authored projection of exact recipes, used by target and MTP.
 pub(super) struct ParameterRequirements<'a, C: eredu_checkpoint::recipe::RecipeCatalog + ?Sized> {
     source: &'a C,
     physical: &'a BTreeMap<String, eredu_runtime::ReplicatedTextPhysicalSource>,
-    formats: &'a ParameterFormats,
+    slots: BTreeMap<String, DeclaredSlot>,
     pub(super) parameters: Vec<Parameter>,
     pub(super) derived: BTreeMap<String, DerivedWeightRecipe>,
     pub(super) outputs: BTreeMap<String, eredu_checkpoint::recipe::RecipeMetadata>,
@@ -383,51 +367,155 @@ impl<'a, C: eredu_checkpoint::recipe::RecipeCatalog + ?Sized> ParameterRequireme
     pub(super) fn new(
         source: &'a C,
         physical: &'a BTreeMap<String, eredu_runtime::ReplicatedTextPhysicalSource>,
-        formats: &'a ParameterFormats,
     ) -> Self {
         Self {
             source,
             physical,
-            formats,
+            slots: BTreeMap::new(),
             parameters: Vec::new(),
             derived: BTreeMap::new(),
             outputs: BTreeMap::new(),
         }
     }
+    /// Registers primary and companion facts from typed construction, before recipes.
+    pub(super) fn declare(
+        &mut self,
+        spec: &(impl eredu_nn::DeclareLogicalParameters + ?Sized),
+        bank: Option<&eredu_nn::GroupedGatedProductSpec>,
+        mut owner: impl FnMut(&str) -> Result<Owner, PreparationError>,
+    ) -> Result<(), PreparationError> {
+        use eredu_nn::LogicalParameterRole as Logical;
+        let logical = spec.logical_parameters()?;
+        let bank_weights = bank
+            .map(|bank| {
+                use eredu_nn::DeclareLogicalParameters;
+                bank.logical_parameters().map(|parameters| {
+                    parameters
+                        .into_iter()
+                        .filter(|parameter| parameter.role == Logical::LinearWeight)
+                        .map(|parameter| parameter.parameter.id.clone())
+                        .collect::<std::collections::BTreeSet<_>>()
+                })
+            })
+            .transpose()?
+            .unwrap_or_default();
+        for target in &bank_weights {
+            if !logical
+                .iter()
+                .any(|parameter| parameter.parameter.id == *target)
+            {
+                return Err(invalid(format!(
+                    "expert transform target {target:?} is outside its declared scope"
+                )));
+            }
+        }
+
+        let group = eredu_runtime::logical_parameter_group(
+            "prepared",
+            eredu_runtime::ParameterRole::Replicated,
+            None,
+            spec,
+            |_| eredu_runtime::MemberSharding::Replicated,
+        )
+        .map_err(invalid)?;
+        let primary: BTreeMap<_, _> = logical
+            .iter()
+            .map(|d| (d.parameter.id.as_str(), d))
+            .collect();
+        for member in group.members() {
+            let name = member.target();
+            let (logical_shape, role, format, transform_companions) = if let Some(d) =
+                primary.get(name)
+            {
+                let format = d
+                    .linear_format
+                    .map_or(LinearFormat::Dense, |f| f.encoding());
+                let role = match (d.role, d.linear_format.is_some()) {
+                    (Logical::Embedding, _) => Role::Embedding,
+                    (Logical::PositionEmbedding, _) => Role::LookupTable,
+                    (Logical::LinearWeight, _) => Role::LinearWeight,
+                    (Logical::Normalization | Logical::NormalizationBias, _) => Role::Normalization,
+                    (Logical::LinearBias, _) => Role::LinearBias,
+                    (_, true) => Role::LinearWeight,
+                    _ => Role::Other,
+                };
+                let companions = if format == LinearFormat::Dense && d.linear_format.is_some() {
+                    // Standard ordinary and bank load-time conversion names are
+                    // storage policy; construction supplies the logical axes.
+                    Some(if bank_weights.contains(&d.parameter.id) {
+                        (format!("{name}_scales"), format!("{name}_biases"))
+                    } else {
+                        let root = name
+                            .strip_suffix(".weight")
+                            .ok_or_else(|| invalid("ordinary transform target is not a weight"))?;
+                        (format!("{root}.scales"), format!("{root}.biases"))
+                    })
+                } else {
+                    None
+                };
+                (d.shape.clone(), role, format, companions)
+            } else {
+                (
+                    member.global_shape().to_vec(),
+                    Role::FormatCompanion,
+                    LinearFormat::Dense,
+                    None,
+                )
+            };
+            let slot = DeclaredSlot {
+                logical_shape,
+                stored_shape: member.global_shape().to_vec(),
+                role,
+                format,
+                owner: owner(name)?,
+                companion: member.linear_companion().zip(
+                    member
+                        .linear_companion_of()
+                        .map(|primary| primary.as_str().to_owned()),
+                ),
+                transform_companions,
+                transformable: primary
+                    .get(name)
+                    .is_some_and(|parameter| parameter.linear_format.is_some()),
+            };
+            if self.slots.insert(name.to_owned(), slot).is_some() {
+                return Err(invalid(format!("conflicting prepared parameter {name}")));
+            }
+        }
+        Ok(())
+    }
+    pub(super) fn validate_complete(&self) -> Result<(), PreparationError> {
+        if let Some(name) = self.slots.keys().next() {
+            return Err(invalid(format!("recipes omit declared parameter {name}")));
+        }
+        Ok(())
+    }
     pub(super) fn add(
         &mut self,
         name: &str,
         recipe: &DerivedWeightRecipe,
-        owner: Owner,
-        grouped: bool,
     ) -> Result<(), PreparationError> {
         let output = recipe.infer(self.source).map_err(invalid)?;
-        let role = parameter_role(name, &output.shape, grouped);
-        let format = if matches!(role, Role::LinearWeight | Role::Embedding) {
-            self.formats.get(name)?
-        } else {
-            LinearFormat::Dense
-        };
-        let mut logical_shape = output.shape.clone();
-        if matches!(role, Role::LinearWeight | Role::Embedding) {
-            let (units, values) = match format {
-                LinearFormat::Affine(q) => (u64::try_from(q.bits).map_err(invalid)?, 32),
-                LinearFormat::MxFp4 => (4, 32),
-                LinearFormat::GgufIQuant { ggml_type, .. } => {
-                    let (values, bytes) = ggml_type.block_and_bytes().map_err(invalid)?;
-                    (bytes, values)
-                }
-                _ => (1, 1),
-            };
-            if let Some(last) = logical_shape.last_mut() {
-                let n = (*last as u64)
-                    .checked_mul(values)
-                    .filter(|n| n % units == 0)
-                    .and_then(|n| usize::try_from(n / units).ok())
-                    .ok_or_else(|| invalid("invalid packed projection extent"))?;
-                *last = n;
-            }
+        let slot = self.slots.remove(name).ok_or_else(|| {
+            invalid(format!(
+                "recipe repeats or references undeclared parameter {name}"
+            ))
+        })?;
+        if output.shape != slot.stored_shape {
+            return Err(invalid(format!(
+                "recipe geometry disagrees with declared parameter {name}"
+            )));
         }
+        let DeclaredSlot {
+            logical_shape,
+            role,
+            format,
+            owner,
+            companion,
+            transform_companions,
+            transformable,
+            ..
+        } = slot;
         let physical = recipe
             .source_keys()
             .iter()
@@ -469,9 +557,7 @@ impl<'a, C: eredu_checkpoint::recipe::RecipeCatalog + ?Sized> ParameterRequireme
                 )
             }
         };
-        let transform = if format == LinearFormat::Dense
-            && matches!(role, Role::LinearWeight | Role::Embedding)
-        {
+        let transform = if format == LinearFormat::Dense && transformable {
             ParameterTransformConstraint::LinearIfAligned {
                 packed_axis: output.shape.len() - 1,
                 // Shared packed conversion requires 32-column input alignment.
@@ -499,20 +585,12 @@ impl<'a, C: eredu_checkpoint::recipe::RecipeCatalog + ?Sized> ParameterRequireme
             transform,
         )
         .map_err(invalid)?;
-        if transform != ParameterTransformConstraint::None {
-            let (scale, bias) = if grouped {
-                (format!("{name}_scales"), format!("{name}_biases"))
-            } else {
-                let prefix = name
-                    .strip_suffix(".weight")
-                    .ok_or_else(|| invalid("ordinary transform target is not a weight"))?;
-                (format!("{prefix}.scales"), format!("{prefix}.biases"))
-            };
+        if let Some((scale, bias)) = transform_companions {
             parameter = parameter
                 .with_transform_companions(scale, bias)
                 .map_err(invalid)?;
         }
-        if let Some((kind, primary)) = companion(name) {
+        if let Some((kind, primary)) = companion {
             parameter = parameter
                 .with_linear_companion(kind, primary)
                 .map_err(invalid)?;

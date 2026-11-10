@@ -6,7 +6,7 @@ use eredu_runtime::{
     WeightBinding,
 };
 
-use crate::{prvq::Geometry, prvq_layered::quantizer_component_definition};
+use crate::prvq::Geometry;
 
 /// Invalid component geometry or exact retained parameter contract.
 #[derive(Debug, thiserror::Error)]
@@ -39,9 +39,7 @@ pub enum QuantizerPreparationError {
 /// conversion bounds use the shared checkpoint recipe machinery. This component
 /// contract declares no waveform or conversational execution capability.
 pub struct PreparedQuantizerBindings {
-    geometry: Geometry,
-    prefix: String,
-    prepared: PreparedComponent<eredu_runtime::ComponentDefinition>,
+    prepared: PreparedComponent<crate::declarations::QuantizerDeclaration>,
 }
 
 impl PreparedQuantizerBindings {
@@ -49,15 +47,13 @@ impl PreparedQuantizerBindings {
     /// discovery or native allocation. Shapes follow the symbolic architecture;
     /// neighboring component payloads are excluded.
     pub fn from_recipes<'a>(
-        geometry: Geometry,
-        prefix: &str,
+        declaration: crate::declarations::QuantizerDeclaration,
         source: SharedCheckpointSource,
         parameters: impl FnMut(&str) -> Option<&'a eredu_checkpoint::recipe::DerivedWeightRecipe>,
     ) -> Result<Self, QuantizerPreparationError> {
-        let definition = quantizer_component_definition(geometry, prefix)?;
         let prepared = PreparedComponent::prepare_physical_recipes(
             "prvq/codebooks/leased-units",
-            definition,
+            declaration,
             source,
             parameters,
             Some(ComponentRecipeConversion {
@@ -66,11 +62,7 @@ impl PreparedQuantizerBindings {
             }),
             |name| QuantizerPreparationError::MissingParameter(name.into()),
         )?;
-        Ok(Self {
-            geometry,
-            prefix: prefix.into(),
-            prepared,
-        })
+        Ok(Self { prepared })
     }
 
     /// Selects exact tensor placement or validates a retained selection without
@@ -88,7 +80,7 @@ impl PreparedQuantizerBindings {
         mut self,
         layout: &LocalModelLayout,
     ) -> Result<Self, QuantizerPreparationError> {
-        crate::prvq_layered::quantizer_local_dimensions(self.geometry, &self.prefix, layout)?;
+        crate::prvq_layered::declared_local_dimensions(self.prepared.declaration().spec(), layout)?;
         self.prepared = self.prepared.select(layout)?;
         Ok(self)
     }
@@ -100,11 +92,11 @@ impl PreparedQuantizerBindings {
 
     /// Validated neural quantizer geometry.
     pub fn geometry(&self) -> Geometry {
-        self.geometry
+        *self.prepared.declaration().config()
     }
     /// Canonical parameter namespace retained from preparation.
     pub fn prefix(&self) -> &str {
-        &self.prefix
+        self.prepared.declaration().prefix()
     }
 
     /// Exact prepared unit bindings for cold resource accounting.
@@ -119,16 +111,14 @@ impl PreparedQuantizerBindings {
 
     /// Validated semantic definition retained through source and placement selection.
     pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
-        self.prepared.declaration()
+        self.prepared.declaration().definition()
     }
 
     /// Consumes exact source authority and the canonical ordered binding plan.
     pub fn into_parts(
         self,
     ) -> (
-        Geometry,
-        String,
-        eredu_runtime::ComponentDefinition,
+        crate::declarations::QuantizerDeclaration,
         Option<LocalModelLayout>,
         eredu_runtime::ExecutionUnitAddressMap,
         SharedCheckpointSource,
@@ -138,15 +128,7 @@ impl PreparedQuantizerBindings {
             .prepared
             .into_declared_unit_parts()
             .expect("component declares only independently leased units");
-        (
-            self.geometry,
-            self.prefix,
-            definition,
-            local,
-            layout,
-            source,
-            units,
-        )
+        (definition, local, layout, source, units)
     }
 }
 

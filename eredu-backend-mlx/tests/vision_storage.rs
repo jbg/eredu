@@ -55,7 +55,8 @@ fn block(stream: &Stream) -> Block {
     .unwrap()
     .normalize_qwen3_vl()
     .unwrap();
-    let mut block = Block::new(&config, 0, stream).unwrap();
+    let declaration = eredu_architectures::qwen::vision::Declaration::new(config, "").unwrap();
+    let mut block = Block::new(&declaration, 0, stream).unwrap();
     block.visit_parameters_mut(&mut Bind(stream));
     block
 }

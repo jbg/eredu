@@ -41,7 +41,7 @@ impl PreparedTargetCapturePlacement {
                 return Err(CaptureError::Unsupported(
                     "capture transport precision is unsupported".into(),
                 )
-                .into())
+                .into());
             }
         };
         let captures = paths
@@ -66,14 +66,14 @@ impl PreparedTargetCapturePlacement {
                             _ => {
                                 return Err(CaptureError::Unsupported(
                                     "capture hidden width is unresolved".into(),
-                                ))
+                                ));
                             }
                         }
                     }
                     _ => {
                         return Err(CaptureError::Unsupported(
                             "target capture is not a complete decoder hidden sequence".into(),
-                        ))
+                        ));
                     }
                 };
                 Ok((path.clone(), vec![1, 1, width]))

@@ -9,11 +9,11 @@ use eredu_nn::{
         attention_chunk_lengths, bilinear_interpolation_samples, inverse_permutation,
         patch_positions, validate_patch_grid, window_partition, InterpolationMode, PatchTraversal,
     },
-    EmbeddingOperator, Error, Index, LinearOperator, LinearSpec, NeuralBackend, Parameter,
-    Parameterized, SegmentedAttentionInput, Tensor,
+    DeclareLogicalParameters, EmbeddingOperator, Error, Index, LinearOperator, NeuralBackend,
+    Parameter, Parameterized, SegmentedAttentionInput, Tensor,
 };
 
-use super::{specs::rooted, VisionAttentionPolicy, VisionConfig, VisionMode};
+use super::{VisionAttentionPolicy, VisionConfig, VisionMode};
 
 /// Prepared flattened patches and their `(time, height, width)` grids.
 pub struct VisionInput<'a, T> {
@@ -134,42 +134,6 @@ impl<T> VisionOutput<T> {
 
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub(super) struct LayerNorm<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
-    weight: Parameter<B::Tensor>,
-    bias: Parameter<B::Tensor>,
-}
-
-impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> LayerNorm<B> {
-    const EPSILON: f32 = 1e-6;
-    fn new(
-        prefix: &str,
-        width: i32,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        let spec = super::specs::norm_spec(prefix, width)?;
-        Ok(Self {
-            weight: Parameter::unloaded(spec.weight, &[spec.dimensions], context)?,
-            bias: Parameter::unloaded(spec.bias, &[spec.dimensions], context)?,
-        })
-    }
-    fn forward(
-        &self,
-        input: &B::Tensor,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        B::Tensor::layer_norm(
-            input,
-            Some(self.weight.as_ref()),
-            Some(self.bias.as_ref()),
-            Self::EPSILON,
-            eredu_nn::LayerNormalizationArithmetic::Native,
-            context,
-        )
-    }
-}
-
-#[derive(Debug, Clone, Parameterized)]
-#[parameterized(tensor = "B::Tensor")]
 pub(super) struct PatchEmbed<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     weight: Parameter<B::Tensor>,
     bias: Parameter<B::Tensor>,
@@ -179,11 +143,9 @@ pub(super) struct PatchEmbed<B: NeuralBackend + eredu_nn::DistributedNeuralBacke
 
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> PatchEmbed<B> {
     fn new(
-        config: &VisionConfig,
-        root: &str,
+        spec: super::specs::PatchSpec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let spec = super::specs::patch_spec(config, root)?;
         let shape = spec.weight_shape();
         Ok(Self {
             weight: Parameter::unloaded(spec.weight, &shape, context)?,
@@ -217,23 +179,24 @@ pub(super) struct Attention<B: NeuralBackend + eredu_nn::DistributedNeuralBacken
     head_dim: i32,
     #[parameter(skip)]
     scale: f32,
+    #[parameter(skip)]
+    layout: eredu_nn::FusedProjectionLayout,
 }
 
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> {
-    fn from_specs(
-        config: &VisionConfig,
-        heads: i32,
-        specs: [LinearSpec; 2],
+    fn from_spec(
+        spec: super::specs::AttentionSpec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let [qkv, output] = specs;
-        let head_dim = config.hidden_size / config.num_heads;
+        spec.logical_parameters()?;
+        let geometry = spec.geometry;
         Ok(Self {
-            qkv: B::linear(qkv, context)?,
-            output: B::linear(output, context)?,
-            heads,
-            head_dim,
-            scale: (head_dim as f32).sqrt().recip(),
+            qkv: B::linear(spec.qkv, context)?,
+            output: B::linear(spec.output, context)?,
+            heads: geometry.query_heads(),
+            head_dim: geometry.key_dimensions(),
+            scale: (geometry.key_dimensions() as f32).sqrt().recip(),
+            layout: spec.layout,
         })
     }
     fn forward_impl(
@@ -247,10 +210,15 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> {
     ) -> Result<B::Tensor, Error> {
         let sequence = hidden.dim(0);
 
-        let qkv = self
-            .qkv
-            .forward(hidden, context)?
-            .reshape(&[sequence, 3, self.heads, self.head_dim], context)?;
+        let qkv = self.qkv.forward(hidden, context)?.reshape(
+            &[
+                sequence,
+                self.layout.segments().len() as i32,
+                self.heads,
+                self.head_dim,
+            ],
+            context,
+        )?;
         let select = |n| {
             qkv.index(
                 &[
@@ -290,66 +258,49 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> {
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct VisionBlock<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
-    pub(super) norm1: LayerNorm<B>,
+    pub(super) norm1: eredu_nn::LayerNorm<B::Tensor>,
     pub(super) attention: Attention<B>,
-    pub(super) norm2: LayerNorm<B>,
+    pub(super) norm2: eredu_nn::LayerNorm<B::Tensor>,
     pub(super) fc1: B::Linear,
     pub(super) fc2: B::Linear,
     #[parameter(skip)]
-    activation: String,
+    activation: eredu_nn::UnaryActivation,
 }
 
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionBlock<B> {
-    /// Builds one unloaded canonical block.
+    /// Binds one retained global block.
     pub fn new(
-        config: &VisionConfig,
+        declaration: &super::Declaration,
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        Self::new_with_root(config, "", layer, context)
+        Self::from_spec(declaration.block(layer)?.clone(), context)
     }
-
-    /// Builds one block below an explicit canonical parameter root.
-    pub fn new_with_root(
-        config: &VisionConfig,
-        parameter_root: &str,
-        layer: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        Self::new_parallel_with_root(
-            config,
-            parameter_root,
-            layer,
-            config.num_heads,
-            config.intermediate_size,
-            context,
-        )
-    }
-
-    /// Builds rank-local attention heads and MLP channels at canonical paths.
-    pub fn new_parallel_with_root(
-        config: &VisionConfig,
-        parameter_root: &str,
+    /// Projects rank-local heads and channels from retained global slots.
+    pub fn new_parallel(
+        declaration: &super::Declaration,
         layer: usize,
         heads: i32,
         intermediate: i32,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let root = rooted(parameter_root, &format!("blocks.{layer}"));
-        let [qkv, output, fc1, fc2] = super::specs::block_projection_specs(
-            config,
-            parameter_root,
-            layer,
-            heads,
-            intermediate,
-        )?;
+        Self::from_spec(
+            declaration.local_block(layer, heads, intermediate)?,
+            context,
+        )
+    }
+    pub(crate) fn from_spec(
+        spec: super::specs::BlockSpec,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let [norm1, norm2] = spec.norms;
         Ok(Self {
-            norm1: LayerNorm::new(&format!("{root}.norm1"), config.hidden_size, context)?,
-            attention: Attention::from_specs(config, heads, [qkv, output], context)?,
-            norm2: LayerNorm::new(&format!("{root}.norm2"), config.hidden_size, context)?,
-            fc1: B::linear(fc1, context)?,
-            fc2: B::linear(fc2, context)?,
-            activation: config.hidden_act.clone(),
+            norm1: eredu_nn::LayerNorm::new(norm1, context)?,
+            attention: Attention::from_spec(spec.attention, context)?,
+            norm2: eredu_nn::LayerNorm::new(norm2, context)?,
+            fc1: B::linear(spec.feed_forward.up, context)?,
+            fc2: B::linear(spec.feed_forward.down, context)?,
+            activation: spec.feed_forward.activation,
         })
     }
     /// Executes the shared attention/MLP residual equations.
@@ -396,16 +347,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionBlock<B> {
         let normed = self.norm2.forward(&hidden, context)?;
 
         let projected = self.fc1.forward(&normed, context)?;
-        let activated = match self.activation.as_str() {
-            "silu" => B::silu(projected, context)?,
-            "gelu" => B::Tensor::gelu(&projected, context)?,
-            "gelu_pytorch_tanh" => B::gelu_approximate(projected, context)?,
-            other => {
-                return Err(Error::backend(format!(
-                    "unsupported vision activation {other:?}"
-                )))
-            }
-        };
+        let activated = self.activation.apply::<B>(projected, context)?;
 
         let projected = match parallel {
             Some(parallel) => B::row_parallel_linear(&mut self.fc2, &activated, parallel, context)?,
@@ -418,7 +360,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionBlock<B> {
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub(super) struct Merger<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
-    pub(super) norm: LayerNorm<B>,
+    pub(super) norm: eredu_nn::LayerNorm<B::Tensor>,
     pub(super) fc1: B::Linear,
     pub(super) fc2: B::Linear,
     #[parameter(skip)]
@@ -432,18 +374,19 @@ pub(super) struct Merger<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> 
 }
 
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Merger<B> {
-    fn new_with_intermediate(
-        config: &VisionConfig,
-        prefix: &str,
-        postshuffle: bool,
-        approximate: bool,
+    fn from_declared(
+        declaration: &super::Declaration,
+        index: usize,
         intermediate: i32,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let (unit, width, norm_width) = super::specs::merger_geometry(config, postshuffle)?;
-        let [fc1, fc2] = super::specs::merger_projection_specs(config, prefix, intermediate)?;
+        let (normalization, [fc1, fc2]) = declaration.local_merger(index, intermediate)?;
+        let width = fc1.input;
+        let unit = width / declaration.config().hidden_size;
+        let postshuffle = index > 0;
+        let approximate = index == 0 && declaration.config().mode == VisionMode::WindowScheduled;
         Ok(Self {
-            norm: LayerNorm::new(&format!("{prefix}.norm"), norm_width, context)?,
+            norm: eredu_nn::LayerNorm::new(normalization.clone(), context)?,
             fc1: B::linear(fc1, context)?,
             fc2: B::linear(fc2, context)?,
             unit,
@@ -500,38 +443,27 @@ pub struct VisionStatic<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
 }
 
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
-    /// Builds static modules for one explicit vision mode.
+    /// Binds complete pinned resources from one retained source declaration.
     pub fn new(
-        config: VisionConfig,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        Self::new_with_root(config, "", context)
-    }
-
-    /// Builds pinned vision modules below an explicit canonical root.
-    pub fn new_with_root(
-        config: VisionConfig,
-        parameter_root: &str,
+        declaration: std::sync::Arc<super::Declaration>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         let selection =
-            super::VisionStaticSelection::all(config, parameter_root).map_err(Error::backend)?;
-        let intermediates = selection
+            super::VisionStaticSelection::all(declaration).map_err(Error::backend_source)?;
+        let widths = selection
             .unsharded_merger_intermediates()
-            .map_err(Error::backend)?;
-        Self::from_selection(selection, &intermediates, context)
+            .map_err(Error::backend_source)?;
+        Self::from_selection(selection, &widths, context)
     }
-
-    /// Builds pinned modules with rank-local merger intermediate widths.
-    pub fn new_parallel_with_root(
-        config: VisionConfig,
-        parameter_root: &str,
-        merger_intermediates: &[i32],
+    /// Binds pinned resources with selected merger widths.
+    pub fn new_parallel(
+        declaration: std::sync::Arc<super::Declaration>,
+        widths: &[i32],
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         let selection =
-            super::VisionStaticSelection::all(config, parameter_root).map_err(Error::backend)?;
-        Self::from_selection(selection, merger_intermediates, context)
+            super::VisionStaticSelection::all(declaration).map_err(Error::backend_source)?;
+        Self::from_selection(selection, widths, context)
     }
 
     /// Materializes exactly the pinned resources selected from the canonical declaration.
@@ -541,12 +473,13 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         let super::VisionStaticSelection {
-            config,
-            root,
+            declaration,
             ingress,
             merger,
             deepstack,
         } = selection;
+        let config = declaration.config().clone();
+        let root = declaration.root().to_owned();
         if merger_intermediates.len() != config.deepstack_layer_count() + 1
             || merger_intermediates.iter().any(|width| *width <= 0)
         {
@@ -554,23 +487,24 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
                 "vision merger local-width plan is incomplete",
             ));
         }
+        // Validate selected local encodings before allocating even ingress resources.
+        for (index, &width) in merger_intermediates.iter().enumerate() {
+            if if index == 0 {
+                merger
+            } else {
+                deepstack[index - 1]
+            } {
+                declaration.local_merger(index, width)?;
+            }
+        }
         let position = ingress
-            .then(|| B::embedding(super::specs::position_spec(&config, &root)?, context))
+            .then(|| B::embedding(declaration.position().clone(), context))
             .transpose()?;
         let patch = ingress
-            .then(|| PatchEmbed::new(&config, &root, context))
+            .then(|| PatchEmbed::new(declaration.patch().clone(), context))
             .transpose()?;
         let merger = merger
-            .then(|| {
-                Merger::new_with_intermediate(
-                    &config,
-                    &rooted(&root, "merger"),
-                    false,
-                    config.mode == VisionMode::WindowScheduled,
-                    merger_intermediates[0],
-                    context,
-                )
-            })
+            .then(|| Merger::from_declared(&declaration, 0, merger_intermediates[0], context))
             .transpose()?;
         let deepstack_mergers = deepstack
             .into_iter()
@@ -578,11 +512,9 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
             .map(|(i, selected)| {
                 selected
                     .then(|| {
-                        Merger::new_with_intermediate(
-                            &config,
-                            &rooted(&root, &format!("deepstack_merger_list.{i}")),
-                            true,
-                            false,
+                        Merger::from_declared(
+                            &declaration,
+                            i + 1,
                             merger_intermediates[i + 1],
                             context,
                         )
@@ -603,8 +535,8 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
     /// Consumes pinned resources into an exact subset without rebuilding parameters.
     /// Geometry, identity and all requested resources must match the retained modules.
     pub fn select(mut self, selection: super::VisionStaticSelection) -> Result<Self, Error> {
-        if self.config != selection.config
-            || self.root != selection.root
+        if &self.config != selection.declaration.config()
+            || self.root != selection.declaration.root()
             || self.deepstack_mergers.len() != selection.deepstack.len()
             || (selection.ingress && !self.owns_ingress())
             || (selection.merger && self.merger.is_none())
@@ -872,28 +804,20 @@ pub struct VisionTower<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
 }
 
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionTower<B> {
-    /// Builds one shared tower.
+    /// Binds a complete tower from retained parameter declarations.
     pub fn new(
-        config: VisionConfig,
+        declaration: std::sync::Arc<super::Declaration>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        Self::new_with_root(config, "", context)
-    }
-
-    /// Builds the tower below an explicit canonical parameter root.
-    pub fn new_with_root(
-        config: VisionConfig,
-        parameter_root: &str,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        let blocks = (0..config.layer_count())
-            .map(|i| VisionBlock::new_with_root(&config, parameter_root, i, context))
+        let blocks = (0..declaration.config().layer_count())
+            .map(|i| VisionBlock::new(&declaration, i, context))
             .collect::<Result<_, _>>()?;
         Ok(Self {
-            static_modules: VisionStatic::new_with_root(config, parameter_root, context)?,
             blocks,
+            static_modules: VisionStatic::new(declaration, context)?,
         })
     }
+
     /// Runs the complete resident tower.
     pub fn forward(
         &mut self,
@@ -1007,8 +931,8 @@ fn rotary_embeddings<T: Tensor>(
 impl VisionConfig {
     /// Exact spatial rotary policy shared by execution and resource descriptions.
     pub fn rotary_spec(&self) -> Result<MultiAxisRotarySpec, Error> {
-        self.validate().map_err(Error::backend)?;
-        let dimensions = (self.hidden_size / self.num_heads) / 2;
+        let geometry = super::specs::attention_geometry(self, self.num_heads)?;
+        let dimensions = geometry.key_dimensions() / 2;
         let spec = MultiAxisRotarySpec {
             axes: vec![
                 RotaryAxisSpec {
@@ -1024,7 +948,7 @@ impl VisionConfig {
             minimum_position: 0,
             layout: MultiAxisRotaryLayout::SplitHalves,
         };
-        if spec.dimensions()? != self.hidden_size / self.num_heads {
+        if spec.dimensions()? != geometry.key_dimensions() {
             return Err(Error::backend(
                 "vision rotary axes do not cover the head width",
             ));

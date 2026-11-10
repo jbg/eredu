@@ -6,11 +6,10 @@
 use std::collections::BTreeMap;
 
 use eredu_nn::{
-    LinearOperator, LinearSpec, NeuralBackend, NormalizationConstructionSpec,
-    NormalizationOperator, NormalizationScale, Parameter, Parameterized, Tensor,
+    LinearOperator, NeuralBackend, NormalizationOperator, Parameter, Parameterized, Tensor,
 };
 
-use super::tts_mog::{f32_shape, linear, parameter, TtsError};
+use super::tts_mog::{f32_shape, TtsError};
 
 /// Admitted checkpoint flags, including the source's two distinct padding IDs.
 #[derive(Debug, Clone)]
@@ -284,68 +283,22 @@ pub struct CharacterEmbedding<B: NeuralBackend> {
     local_output: i32,
 }
 impl<B: NeuralBackend> CharacterEmbedding<B> {
-    /// Declares canonical character and flag parameters without a second backbone.
+    /// Constructs the declared character and flag parameters without a second backbone.
     pub fn new(
-        dimensions: CharacterDimensions,
+        spec: super::tts_conditioning_specs::CharacterSpec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, TtsError> {
-        Self::new_local(
-            dimensions,
-            dimensions.width,
-            dimensions.output_width,
-            context,
-        )
-    }
-
-    pub(super) fn new_local(
-        dimensions: CharacterDimensions,
-        local_width: i32,
-        local_output: i32,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, TtsError> {
-        dimensions.validate()?;
-        if local_width <= 0
-            || local_width > dimensions.width
-            || local_output <= 0
-            || local_output > dimensions.output_width
-        {
-            return Err(TtsError::Configuration("invalid character partition"));
-        }
-        let d = dimensions;
-        let table = |name: &str, rows: i32| -> Result<_, TtsError> {
-            Ok(Parameter::unloaded(
-                parameter(name, "voicechat.tts.character.static")?,
-                &[rows, d.width],
-                context,
-            )?)
+        let table = |spec: eredu_nn::EmbeddingSpec| {
+            Parameter::unloaded(spec.weight, &[spec.vocabulary, spec.dimensions], context)
         };
         Ok(Self {
-            tokens: Parameter::unloaded(
-                parameter(
-                    "embed_subword.embed_tokens.weight",
-                    "voicechat.tts.character.static",
-                )?,
-                &[d.characters + 1, local_width],
-                context,
-            )?,
-            projection: linear::<B>(
-                "embed_subword.proj_embedding",
-                "voicechat.tts.character.static",
-                d.width,
-                local_output,
-                context,
-            )?,
-            continuation: d
-                .use_continuation
-                .then(|| table("embed_subword.subword_flag_emb.cont_emb.weight", 2))
-                .transpose()?,
-            special: d
-                .use_special
-                .then(|| table("embed_subword.bos_eos_emb.special_emb.weight", 3))
-                .transpose()?,
-            dimensions,
-            local_width,
-            local_output,
+            dimensions: spec.dimensions,
+            local_width: spec.tokens.dimensions,
+            local_output: spec.projection.output,
+            tokens: table(spec.tokens)?,
+            projection: B::linear(spec.projection, context)?,
+            continuation: spec.continuation.map(&table).transpose()?,
+            special: spec.special.map(table).transpose()?,
         })
     }
 
@@ -485,63 +438,19 @@ pub struct GatedFusion<B: NeuralBackend> {
     local_output: i32,
 }
 impl<B: NeuralBackend> GatedFusion<B> {
-    /// Declares the released 31-codebook divisor and final RMS epsilon `1e-6`.
-    pub fn new(width: i32, context: &<B::Tensor as Tensor>::Context) -> Result<Self, TtsError> {
-        Self::new_local(width, width, context)
-    }
-
-    pub(super) fn new_local(
-        width: i32,
-        local_output: i32,
+    /// Constructs the declared projections, sigmoid controls and offset RMS normalization.
+    pub fn new(
+        spec: super::tts_conditioning_specs::FusionSpec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, TtsError> {
-        if width <= 0 || local_output <= 0 || local_output > width {
-            return Err(TtsError::Configuration("invalid gated fusion width"));
-        }
-        let prefix = "gated_fusion_audio_text";
-        let group = "voicechat.tts.fusion";
-        let projection = |name: &str| {
-            B::linear(
-                LinearSpec {
-                    input: width,
-                    output: local_output,
-                    weight: parameter(&format!("{prefix}.{name}.weight"), group)?,
-                    bias: Some(parameter(&format!("{prefix}.{name}.bias"), group)?),
-                    format: eredu_nn::LinearFormatSpec::unscaled(
-                        eredu_checkpoint::LinearFormat::Dense,
-                    )?,
-                },
-                context,
-            )
-        };
         Ok(Self {
-            audio: projection("audio_proj")?,
-            text: projection("text_proj")?,
-            gate: Parameter::unloaded(
-                parameter(&format!("{prefix}.gate"), group)?,
-                &[width],
-                context,
-            )?,
-            residual_scale: Parameter::unloaded(
-                parameter(&format!("{prefix}.residual_scale"), group)?,
-                &[],
-                context,
-            )?,
-            norm: B::normalization(
-                NormalizationConstructionSpec {
-                    reduction: eredu_nn::NormalizationReduction::Native,
-                    dimensions: width,
-                    epsilon: 1e-6,
-                    groups: Some(1),
-                    scale: NormalizationScale::LearnedOffset {
-                        weight: parameter(&format!("{prefix}.final_norm.weight"), group)?,
-                        offset: 1.0,
-                    },
-                },
-                context,
-            )?,
-            width,
-            local_output,
+            width: spec.gate.shape[0],
+            local_output: spec.audio.output,
+            audio: B::linear(spec.audio, context)?,
+            text: B::linear(spec.text, context)?,
+            gate: spec.gate.into_parameter(context)?,
+            residual_scale: spec.residual_scale.into_parameter(context)?,
+            norm: B::normalization(spec.norm, context)?,
         })
     }
 

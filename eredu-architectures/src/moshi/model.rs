@@ -141,15 +141,36 @@ pub struct StaticModules<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> 
 }
 
 /// Backend-neutral construction inputs shared by parameter planning and allocation.
+#[derive(Debug, Clone)]
 pub(super) struct StaticConstruction {
     pub(super) embeddings: Vec<NamedEmbeddingSpec>,
     pub(super) output_norm: NormalizationConstructionSpec,
     pub(super) text_output: LinearSpec,
 }
 
+impl eredu_nn::DeclareLogicalParameters for StaticConstruction {
+    fn logical_parameters(&self) -> Result<Vec<eredu_nn::LogicalParameterDeclaration<'_>>, Error> {
+        let mut parameters = Vec::new();
+        for table in &self.embeddings {
+            parameters.extend(eredu_nn::DeclareLogicalParameters::logical_parameters(
+                &table.embedding,
+            )?);
+        }
+        parameters.extend(eredu_nn::DeclareLogicalParameters::logical_parameters(
+            &self.output_norm,
+        )?);
+        parameters.extend(eredu_nn::DeclareLogicalParameters::logical_parameters(
+            &self.text_output,
+        )?);
+        eredu_nn::validate_logical_parameter_topology(&parameters)
+            .map_err(Error::backend_source)?;
+        Ok(parameters)
+    }
+}
+
 impl StaticConstruction {
-    pub(super) fn new(config: &MoshiConfig) -> Result<Self, Error> {
-        Ok(Self {
+    pub(super) fn new(config: &super::MoshiPolicy) -> Result<Self, Error> {
+        let spec = Self {
             embeddings: Self::embedding_specs(config)?,
             output_norm: NormalizationConstructionSpec::learned(
                 config.temporal().hidden_size(),
@@ -166,10 +187,12 @@ impl StaticConstruction {
                     config.native_quantization().into(),
                 )?,
             },
-        })
+        };
+        eredu_nn::DeclareLogicalParameters::logical_parameters(&spec)?;
+        Ok(spec)
     }
 
-    fn embedding_specs(config: &MoshiConfig) -> Result<Vec<NamedEmbeddingSpec>, Error> {
+    fn embedding_specs(config: &super::MoshiPolicy) -> Result<Vec<NamedEmbeddingSpec>, Error> {
         let text_input_vocabulary = config
             .text_vocabulary_size()
             .checked_add(1)
@@ -219,7 +242,7 @@ impl StaticConstruction {
 
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> StaticModules<B> {
     fn from_geometry(
-        config: &MoshiConfig,
+        declared: &StaticConstruction,
         geometry: Option<&super::LocalGeometry>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
@@ -227,7 +250,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> StaticModules<B> {
             embeddings: specs,
             output_norm,
             text_output,
-        } = StaticConstruction::new(config)?;
+        } = declared.clone();
         let output_placement = match geometry {
             None => VocabularyModulePlacement::Local,
             Some(geometry) => {
@@ -380,6 +403,7 @@ pub fn state_layout(config: &MoshiConfig) -> Result<StateLayout, Error> {
 
 /// One portable Moshi-family model shared by resident and bounded runtimes.
 pub struct MoshiKernel<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
+    parameters: super::MoshiParameterContract,
     definition: Arc<ComponentDefinition>,
     config: MoshiConfig,
     static_modules: StaticModules<B>,
@@ -419,56 +443,54 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>
 }
 
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> MoshiKernel<B> {
-    /// Builds unloaded pinned modules from one normalized configuration.
+    /// Builds unloaded modules from the retained parameter declaration.
     pub fn new(
-        config: MoshiConfig,
+        parameters: super::MoshiParameterContract,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let definition = super::parallel::parameter_contract(&config)
-            .map_err(Error::backend)?
-            .into_definition();
-        Self::from_prepared(config, definition, None, None, context)
+        let definition = parameters.retained_definition();
+        Self::from_prepared(parameters, definition, None, None, context)
     }
 
-    /// Builds the same model lifecycle with planner-derived rank-local modules.
+    /// Builds rank-local modules from the same declaration and selected geometry.
     pub fn new_parallel(
-        config: MoshiConfig,
+        parameters: super::MoshiParameterContract,
         geometry: super::LocalGeometry,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let definition = Arc::new(component_definition(&config, Some(&geometry))?);
-        Self::from_prepared(config, definition, Some(geometry), None, context)
+        geometry
+            .validate_for(parameters.configuration())
+            .map_err(Error::backend)?;
+        let definition = parameters
+            .retained_definition()
+            .select_state_layout(geometry.state_layout())?;
+        Self::from_prepared(parameters, definition, Some(geometry), None, context)
     }
 
     pub(super) fn from_prepared(
-        config: MoshiConfig,
+        parameters: super::MoshiParameterContract,
         definition: Arc<ComponentDefinition>,
         parallel_geometry: Option<super::LocalGeometry>,
         parallel_execution_identity: Option<String>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let static_modules =
-            StaticModules::from_geometry(&config, parallel_geometry.as_ref(), context)?;
+        let config = parameters.configuration().clone();
+        if let Some(geometry) = &parallel_geometry {
+            geometry.validate_for(&config).map_err(Error::backend)?;
+        }
+        let static_modules = StaticModules::from_geometry(
+            &parameters.declarations().statics,
+            parallel_geometry.as_ref(),
+            context,
+        )?;
         Ok(Self {
+            parameters,
             definition,
             config,
             static_modules,
             parallel_geometry,
             parallel_execution_identity,
         })
-    }
-
-    /// Builds unloaded rank-local modules paired with the exact selected
-    /// tensor-parallel execution identity.
-    pub fn new_selected_parallel(
-        config: MoshiConfig,
-        geometry: super::LocalGeometry,
-        execution_identity: String,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        let mut model = Self::new_parallel(config, geometry, context)?;
-        model.parallel_execution_identity = Some(execution_identity);
-        Ok(model)
     }
 
     /// Couples the validated declaration with its typed equations and pinned resources.
@@ -507,15 +529,24 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> MoshiKernel<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Unit<B>, Error> {
         if let Some(geometry) = &self.parallel_geometry {
-            return geometry.build_unit(&self.config, group, index, context);
+            return geometry.build_unit(&self.parameters, group, index, context);
         }
         match group {
             0 => Ok(Unit::Temporal(block::build(
                 self.config.temporal(),
                 index,
+                self.parameters
+                    .declarations()
+                    .temporal
+                    .get(index)
+                    .ok_or_else(|| Error::backend("missing temporal parameter owner"))?,
                 context,
             )?)),
-            1 => Ok(Unit::Depth(DepthSlice::new(&self.config, index, context)?)),
+            1 => Ok(Unit::Depth(DepthSlice::new(
+                &self.parameters,
+                index,
+                context,
+            )?)),
             _ => unreachable!("group was validated"),
         }
     }
@@ -635,8 +666,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> ComponentKernel<B> f
         std::collections::BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
         String,
     > {
-        let recipes = super::checkpoint::canonical_recipes(&self.config, source)?.into_outputs();
-        crate::static_parameters::module_recipes(&self.static_modules, recipes)
+        Ok(super::checkpoint::canonical_recipes(&self.parameters, source)?.into_outputs())
     }
     fn build_unit(
         &self,

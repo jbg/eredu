@@ -12,7 +12,7 @@ use super::{
     DFlash, DFlashConfig, DFlashContext, ProposalLayout,
 };
 use crate::muse::{DecoderConfig, MuseIdentity};
-use eredu_checkpoint::{schema::SafetensorsCheckpointPlan, LinearFormat, WeightQuantization};
+use eredu_checkpoint::{schema::SafetensorsCheckpointPlan, WeightQuantization};
 use eredu_nn::{
     DistributedNeuralBackend, Error, GroupedNeuralBackend, Index, Parameterized, Tensor,
 };
@@ -105,106 +105,6 @@ impl MuseAssistantConfig {
             Self::Spark(c) => c.released().hidden_size() as i32,
         }
     }
-    /// Exact projection format selected independently for each matrix.
-    pub fn linear_format(&self, name: &str) -> LinearFormat {
-        match self {
-            Self::Glimmer(c) => c.linear_format_for(name),
-            Self::Spark(c) => c.linear_format(name),
-        }
-    }
-    /// Physical acquisition owner for an admitted primary parameter. Decoder
-    /// blocks and auxiliary vocabulary tables remain separate bounded units.
-    pub fn parameter_owner(
-        &self,
-        name: &str,
-    ) -> Result<eredu_runtime::ReplicatedTextParameterOwner, String> {
-        let unit = |group: &str, unit| {
-            Ok(eredu_runtime::ReplicatedTextParameterOwner::ExecutionUnit {
-                group: group.into(),
-                unit,
-            })
-        };
-        if let Some(rest) = name.strip_prefix("layers.") {
-            let (index, suffix) = rest
-                .split_once('.')
-                .ok_or("invalid assistant block parameter")?;
-            let index = index.parse::<usize>().map_err(|e| e.to_string())?;
-            if index >= self.num_hidden_layers() || suffix.is_empty() {
-                return Err(format!("assistant parameter {name:?} has no decoder block"));
-            }
-            return unit("assistant.decoder", index);
-        }
-        match (self, name) {
-            (Self::Glimmer(_), "encoder.fc.weight" | "encoder.output_norm_enc.weight")
-            | (Self::Spark(_), "fc.weight" | "hidden_norm.weight") => unit("assistant.context", 0),
-            (_, "norm.weight") => unit("assistant.final_norm", 0),
-            (Self::Spark(config), name) => match (config.released().identity(), name) {
-                (SparkAssistantIdentity::DSpark, "lm_head.weight") => {
-                    unit("assistant.vocabulary", 0)
-                }
-                (SparkAssistantIdentity::DSpark, "d2t") => unit("assistant.token_mapping", 0),
-                (SparkAssistantIdentity::DSpark, "markov_head.markov_w1.weight")
-                | (SparkAssistantIdentity::DFlash2, "candidate_selector.predecessor_codebook") => {
-                    unit("assistant.predecessor_table", 0)
-                }
-                (SparkAssistantIdentity::DSpark, "markov_head.markov_w2.weight")
-                | (SparkAssistantIdentity::DFlash2, "candidate_selector.successor_codebook") => {
-                    unit("assistant.successor_table", 0)
-                }
-                (
-                    SparkAssistantIdentity::DSpark,
-                    "confidence_head.proj.weight" | "confidence_head.proj.bias",
-                ) => unit("assistant.confidence", 0),
-                (
-                    SparkAssistantIdentity::DFlash2,
-                    "candidate_selector.hidden_projection.weight",
-                ) => unit("assistant.conditional_projection", 0),
-                _ => Err(format!(
-                    "assistant parameter {name:?} has no acquisition owner"
-                )),
-            },
-            _ => Err(format!(
-                "assistant parameter {name:?} has no acquisition owner"
-            )),
-        }
-    }
-    /// Complete materialization schema for the selected physical encodings.
-    pub fn safetensors_plan(&self) -> Result<SafetensorsCheckpointPlan, String> {
-        match self {
-            Self::Glimmer(c) => super::dflash_safetensors_plan(c),
-            Self::Spark(c) => c.safetensors_plan().map_err(|e| e.to_string()),
-        }
-    }
-    /// Selects every supported matrix's encoding for an explicit load-time conversion.
-    pub fn load_time_quantization(&self, format: WeightQuantization) -> Result<Self, String> {
-        match self {
-            Self::Glimmer(c) => c
-                .load_time_quantization(format)
-                .map(Self::Glimmer)
-                .map_err(|e| e.to_string()),
-            Self::Spark(c) => c
-                .load_time_quantization(format)
-                .map(Self::Spark)
-                .map_err(|e| e.to_string()),
-        }
-    }
-    /// Retains exact per-weight checkpoint formats.
-    pub fn with_checkpoint_formats(
-        &self,
-        formats: HashMap<String, WeightQuantization>,
-    ) -> Result<Self, String> {
-        match self {
-            Self::Glimmer(c) => c
-                .with_checkpoint_formats(formats)
-                .map(Self::Glimmer)
-                .map_err(|e| e.to_string()),
-            Self::Spark(c) => c
-                .clone()
-                .with_checkpoint_formats(formats)
-                .map(Self::Spark)
-                .map_err(|e| e.to_string()),
-        }
-    }
     /// Proves target identity and ordered captures before source preparation.
     pub fn capture_request(
         &self,
@@ -221,29 +121,6 @@ impl MuseAssistantConfig {
                 .map_err(|e| e.to_string()),
         }
     }
-    /// Binds complete neural geometry after compatibility proof, before payload access.
-    pub fn construction(
-        &self,
-        target: Option<&DecoderConfig>,
-    ) -> Result<MuseAssistantConstruction, String> {
-        let definition = match self {
-            Self::Glimmer(c) => {
-                c.validate_released().map_err(|e| e.to_string())?;
-                MuseAssistantDefinition::glimmer(
-                    body::DFlashBodyDefinition::new(c.clone().into()).map_err(|e| e.to_string())?,
-                )
-            }
-            Self::Spark(c) => c
-                .construction(
-                    target.ok_or("Spark assistant construction requires a proven Muse target")?,
-                )
-                .map_err(|e| e.to_string())?
-                .execution_definition(),
-        }
-        .map_err(|e| e.to_string())?;
-        Ok(MuseAssistantConstruction { definition })
-    }
-
     /// Target-owned embedding equation selected by the trained assistant.
     pub fn embedding_operation<'a, T>(
         &self,
@@ -254,6 +131,287 @@ impl MuseAssistantConfig {
             Self::Glimmer(_) => Op::TokenEmbeddings(ids),
             Self::Spark(_) => Op::RawTokenEmbeddings(ids),
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum ParameterScopes {
+    Glimmer(MuseAssistantDefinition),
+    DFlash2 {
+        released: super::spark::SparkAssistantConfig,
+        definition: MuseAssistantDefinition,
+    },
+    DSpark {
+        released: super::spark::SparkAssistantConfig,
+        body: std::sync::Arc<body::DsparkBodyParameters>,
+        heads: super::dspark::DsparkHeadDefinition,
+    },
+}
+
+/// Family construction scopes retained before target binding and payload access.
+#[derive(Debug, Clone)]
+pub struct MuseAssistantParameterDefinition {
+    config: MuseAssistantConfig,
+    scopes: ParameterScopes,
+    parameters: crate::external_assistant::AssistantParameterDeclarations,
+}
+impl MuseAssistantParameterDefinition {
+    /// Retains complete typed body and head specs for every Muse assistant equation.
+    pub fn new(config: &MuseAssistantConfig) -> Result<Self, String> {
+        let mut parameters = crate::external_assistant::AssistantParameterDeclarations::new();
+        let scopes = match config {
+            MuseAssistantConfig::Glimmer(config) => {
+                config.validate_released().map_err(|e| e.to_string())?;
+                let body = body::DFlashBodyDefinition::new(config.clone().into())
+                    .map_err(|e| e.to_string())?;
+                body.append_parameters(&mut parameters)
+                    .map_err(|e| e.to_string())?;
+                ParameterScopes::Glimmer(
+                    MuseAssistantDefinition::glimmer(body).map_err(|e| e.to_string())?,
+                )
+            }
+            MuseAssistantConfig::Spark(config)
+                if config.released().identity() == SparkAssistantIdentity::DFlash2 =>
+            {
+                let (body, selector) = config.dflash2_scopes().map_err(|e| e.to_string())?;
+                body.append_parameters(&mut parameters)
+                    .map_err(|e| e.to_string())?;
+                selector
+                    .append_parameters(&mut parameters)
+                    .map_err(|e| e.to_string())?;
+                ParameterScopes::DFlash2 {
+                    released: config.released().clone(),
+                    definition: MuseAssistantDefinition::dflash2(body, selector)
+                        .map_err(|e| e.to_string())?,
+                }
+            }
+            MuseAssistantConfig::Spark(config) => {
+                let (body, heads) = config.dspark_scopes().map_err(|e| e.to_string())?;
+                body.append_parameters(&mut parameters)
+                    .map_err(|e| e.to_string())?;
+                heads
+                    .append_parameters(&mut parameters)
+                    .map_err(|e| e.to_string())?;
+                ParameterScopes::DSpark {
+                    released: config.released().clone(),
+                    body: std::sync::Arc::new(body),
+                    heads,
+                }
+            }
+        };
+        parameters.validate().map_err(|e| e.to_string())?;
+        let formats = match config {
+            MuseAssistantConfig::Glimmer(c) => &c.quantized_weights,
+            MuseAssistantConfig::Spark(c) => c.retained_formats(),
+        };
+        super::checkpoint::validate_selected_formats(&parameters, formats)?;
+        Ok(Self {
+            config: config.clone(),
+            scopes,
+            parameters,
+        })
+    }
+
+    fn same_policy(&self, config: &MuseAssistantConfig) -> bool {
+        match (&self.config, config) {
+            (MuseAssistantConfig::Glimmer(source), MuseAssistantConfig::Glimmer(target)) => {
+                let mut source = source.clone();
+                let mut target = target.clone();
+                source.quantization = None;
+                source.quantized_weights.clear();
+                target.quantization = None;
+                target.quantized_weights.clear();
+                source == target
+            }
+            (MuseAssistantConfig::Spark(source), MuseAssistantConfig::Spark(target)) => {
+                source.released() == target.released()
+            }
+            _ => false,
+        }
+    }
+    /// Normalizes selected storage using retained matrix identities rather than rebuilding geometry.
+    pub fn with_checkpoint_formats(
+        &self,
+        formats: HashMap<String, WeightQuantization>,
+    ) -> Result<MuseAssistantConfig, String> {
+        super::checkpoint::validate_formats(&self.parameters, &formats)?;
+        Ok(match &self.config {
+            MuseAssistantConfig::Glimmer(source) => {
+                let mut selected = source.clone();
+                selected.quantized_weights = formats;
+                MuseAssistantConfig::Glimmer(selected)
+            }
+            MuseAssistantConfig::Spark(source) => {
+                MuseAssistantConfig::Spark(source.select_retained_formats(formats))
+            }
+        })
+    }
+    /// Selects every retained matrix for uniform load-time conversion.
+    pub fn load_time_quantization(
+        &self,
+        format: WeightQuantization,
+    ) -> Result<MuseAssistantConfig, String> {
+        use eredu_nn::DeclareLogicalParameters;
+        let formats = self
+            .parameters
+            .logical_parameters()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter(|p| p.linear_format.is_some())
+            .map(|p| (p.parameter.id.to_string(), format))
+            .collect();
+        let mut config = self.with_checkpoint_formats(formats)?;
+        if let MuseAssistantConfig::Glimmer(c) = &mut config {
+            c.quantization = Some(format);
+            c.quantized_weights.clear();
+        }
+        Ok(config)
+    }
+    /// Projects all typed construction scopes while keeping acquisition and execution geometry.
+    pub fn project_formats(&self, config: &MuseAssistantConfig) -> Result<Self, String> {
+        if !self.same_policy(config) {
+            return Err("assistant encoding projection changes retained family policy".into());
+        }
+        let (formats, uniform) = match config {
+            MuseAssistantConfig::Glimmer(c) => (&c.quantized_weights, c.quantization),
+            MuseAssistantConfig::Spark(c) => (c.retained_formats(), None),
+        };
+        let format = |name: &str| {
+            formats
+                .get(name)
+                .copied()
+                .or(uniform)
+                .map(Into::into)
+                .unwrap_or(eredu_checkpoint::LinearFormat::Dense)
+        };
+        let project = || -> Result<ParameterScopes, Error> {
+            Ok(match &self.scopes {
+                ParameterScopes::Glimmer(definition) => {
+                    let Equation::Glimmer(body) = &definition.equation else {
+                        return Err(Error::backend("invalid Glimmer construction identity"));
+                    };
+                    ParameterScopes::Glimmer(MuseAssistantDefinition::glimmer(
+                        body.project_formats(formats, uniform)?,
+                    )?)
+                }
+                ParameterScopes::DFlash2 {
+                    released,
+                    definition,
+                } => {
+                    let Equation::DFlash2 { body, selector } = &definition.equation else {
+                        return Err(Error::backend("invalid DFlash2 construction identity"));
+                    };
+                    ParameterScopes::DFlash2 {
+                        released: released.clone(),
+                        definition: MuseAssistantDefinition::dflash2(
+                            body.project_formats(formats, uniform)?,
+                            selector.project_formats(&format)?,
+                        )?,
+                    }
+                }
+                ParameterScopes::DSpark {
+                    released,
+                    body,
+                    heads,
+                } => ParameterScopes::DSpark {
+                    released: released.clone(),
+                    body: std::sync::Arc::new(body.project_formats(&format)?),
+                    heads: heads.project_formats(&format)?,
+                },
+            })
+        };
+        let scopes = project().map_err(|e| e.to_string())?;
+        let mut parameters = crate::external_assistant::AssistantParameterDeclarations::new();
+        match &scopes {
+            ParameterScopes::Glimmer(d) => {
+                let Equation::Glimmer(body) = &d.equation else {
+                    unreachable!()
+                };
+                body.append_parameters(&mut parameters)
+            }
+            ParameterScopes::DFlash2 { definition, .. } => {
+                let Equation::DFlash2 { body, selector } = &definition.equation else {
+                    unreachable!()
+                };
+                body.append_parameters(&mut parameters)
+                    .and_then(|_| selector.append_parameters(&mut parameters))
+            }
+            ParameterScopes::DSpark { body, heads, .. } => body
+                .append_parameters(&mut parameters)
+                .and_then(|_| heads.append_parameters(&mut parameters)),
+        }
+        .map_err(|e| e.to_string())?;
+        self.parameters
+            .validate_projection(&parameters)
+            .map_err(|e| e.to_string())?;
+        super::checkpoint::validate_selected_formats(&parameters, formats)?;
+        Ok(Self {
+            config: config.clone(),
+            scopes,
+            parameters,
+        })
+    }
+
+    /// Projects the released source dtype and encoding contract from retained parameter scopes.
+    pub fn safetensors_plan(&self) -> Result<SafetensorsCheckpointPlan, String> {
+        super::checkpoint::safetensors_plan(&self.parameters, &self.config)
+    }
+
+    /// Projects the released GGUF geometry and naming extensions without rebuilding parameters.
+    pub fn gguf_plan(&self) -> Result<eredu_checkpoint::schema::GgufCheckpointPlan, String> {
+        super::checkpoint::gguf_plan(&self.parameters, &self.config)
+    }
+
+    /// Logical facts projected from retained scopes, with explicit acquisition owners.
+    pub fn parameter_declarations(
+        &self,
+    ) -> &crate::external_assistant::AssistantParameterDeclarations {
+        &self.parameters
+    }
+
+    /// Proves target compatibility and retains the selected construction without native resources.
+    pub fn construction(
+        &self,
+        target: Option<&DecoderConfig>,
+    ) -> Result<MuseAssistantConstruction, String> {
+        let definition = match &self.scopes {
+            ParameterScopes::Glimmer(definition) => definition.clone(),
+            ParameterScopes::DFlash2 {
+                released,
+                definition,
+            } => {
+                released
+                    .prove_compatibility(
+                        target
+                            .ok_or("Spark assistant construction requires a proven Muse target")?,
+                    )
+                    .map_err(|e| e.to_string())?;
+                definition.clone()
+            }
+            ParameterScopes::DSpark {
+                released,
+                body,
+                heads,
+            } => {
+                let args = released
+                    .dspark_decoder_policy(
+                        target
+                            .ok_or("Spark assistant construction requires a proven Muse target")?,
+                    )
+                    .map_err(|e| e.to_string())?;
+                MuseAssistantDefinition::dspark(
+                    body::DsparkBodyDefinition::from_parameters(
+                        args,
+                        body.clone(),
+                        released.block_size(),
+                    )
+                    .map_err(|e| e.to_string())?,
+                    heads.clone(),
+                )
+                .map_err(|e| e.to_string())?
+            }
+        };
+        Ok(MuseAssistantConstruction { definition })
     }
 }
 

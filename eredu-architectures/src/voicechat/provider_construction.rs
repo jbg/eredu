@@ -229,6 +229,13 @@ pub struct PreparedSpeechProviders {
 }
 
 impl PreparedSpeechProviders {
+    /// Causal transformer scope shared by state admission and materialization.
+    pub(crate) fn transformer_declaration(
+        &self,
+    ) -> &super::tts_transformer_specs::TransformerDeclaration {
+        self.transformer.declaration()
+    }
+
     /// Selects eligible packed matrices while preserving all other speech policies.
     pub fn with_quantization(
         mut self,
@@ -238,8 +245,15 @@ impl PreparedSpeechProviders {
         use eredu_checkpoint::recipe::RecipeDtype;
         let mut selected = parameters.clone();
         if let Some(quantization) = policy.function_head {
-            let eligible =
-                std::collections::BTreeSet::from(["stt_model.function_head.weight".to_owned()]);
+            let eligible = std::collections::BTreeSet::from([self
+                .function
+                .declaration()
+                .spec()
+                .projection
+                .weight
+                .id
+                .as_str()
+                .to_owned()]);
             let (source, parameters) = super::quantization::project_parameters(
                 self.function.source().clone(),
                 &selected,
@@ -249,7 +263,7 @@ impl PreparedSpeechProviders {
             )
             .map_err(FunctionHeadPreparationError::from)?;
             self.function = PreparedFunctionHeadBindings::from_parameters(
-                self.function.dimensions(),
+                self.function.declaration().clone(),
                 source,
                 &parameters,
             )?;
@@ -257,17 +271,15 @@ impl PreparedSpeechProviders {
         }
         if let Some(quantization) = policy.tts {
             let config = self.transformer.config().clone();
+            let declaration = super::precision::SpeechPrecisionDeclaration::from_groups(
+                self.transformer.definition().parameters().groups(),
+            );
             let eligible = self
                 .transformer
                 .unit_bindings()
                 .iter()
                 .flatten()
-                .filter(|binding| {
-                    let name = binding.name();
-                    config
-                        .precision()
-                        .narrows(name, selected[name].output.shape.len())
-                })
+                .filter(|binding| declaration.narrows(config.precision(), binding.name()))
                 .map(|binding| binding.name().to_owned())
                 .collect();
             let (source, parameters) = super::quantization::project_parameters(
@@ -283,7 +295,11 @@ impl PreparedSpeechProviders {
                 compute: super::precision::SpeechFloat::F32,
             };
             self.transformer = PreparedTtsTransformerBindings::from_parameters(
-                config.with_precision(Default::default()),
+                self.transformer
+                    .declaration()
+                    .clone()
+                    .with_precision(Default::default())
+                    .map_err(TtsTransformerPreparationError::from)?,
                 source,
                 &parameters,
             )?

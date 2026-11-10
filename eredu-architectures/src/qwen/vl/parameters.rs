@@ -10,12 +10,18 @@ use eredu_runtime::{
 use super::{LocalGeometry, ModelArgs, TEXT_EXECUTION_GROUP, VISION_EXECUTION_GROUP};
 
 /// Declares checkpoint-global parameters without constructing native modules.
-pub fn parameter_description(args: &ModelArgs) -> Result<ArchitectureParameterDescription, Error> {
+pub fn parameter_description(
+    declaration: &super::Declaration,
+) -> Result<ArchitectureParameterDescription, Error> {
+    let args = declaration.args();
     args.vision
         .validate_for(crate::qwen::vision::VisionMode::DeepStack)
         .map_err(Error::backend)?;
-    let text =
-        crate::qwen::parallel::parameter_description(&args.text).map_err(Error::backend_source)?;
+    let text = crate::qwen::parallel::parameter_description(
+        declaration.text_declaration(),
+        crate::decoder::ParameterEncoding::Stored,
+    )
+    .map_err(Error::backend_source)?;
     let graph = ExecutionGraph::new(
         vec![
             ExecutionGroupSpec::root(VISION_EXECUTION_GROUP),
@@ -42,8 +48,7 @@ pub fn parameter_description(args: &ModelArgs) -> Result<ArchitectureParameterDe
         .collect::<Vec<_>>();
     owned.extend(
         crate::qwen::vision::owned_static_parallel_parameter_groups(
-            &args.vision,
-            "model.visual",
+            declaration.vision_declaration(),
             vision_id.clone(),
             "vision",
         )
@@ -52,8 +57,7 @@ pub fn parameter_description(args: &ModelArgs) -> Result<ArchitectureParameterDe
     for index in 0..args.vision.layer_count() {
         owned.extend(
             crate::qwen::vision::block_parallel_parameter_groups(
-                &args.vision,
-                "model.visual",
+                declaration.vision_declaration(),
                 index,
             )
             .map_err(Error::backend_source)?
@@ -85,11 +89,12 @@ pub fn parameter_description(args: &ModelArgs) -> Result<ArchitectureParameterDe
 
 /// Validates one semantic definition before native construction or execution selection.
 pub fn component_definition(
-    args: &ModelArgs,
+    declaration: &super::Declaration,
     geometry: Option<&LocalGeometry>,
 ) -> Result<ComponentDefinition, Error> {
-    let parameters = parameter_description(args)?;
-    let state = component_state(args, geometry)?;
+    let args = declaration.args();
+    let parameters = parameter_description(declaration)?;
+    let state = component_state(declaration, geometry)?;
     let units = component_units(args, &parameters);
     let transport = component_transport();
     let partition = crate::transport::pipeline_state(1, &state);
@@ -107,15 +112,17 @@ pub fn component_definition(
 }
 
 fn component_state(
-    args: &ModelArgs,
+    declaration: &super::Declaration,
     geometry: Option<&LocalGeometry>,
 ) -> Result<eredu_runtime::StateLayout, Error> {
     match geometry {
         Some(geometry) => {
-            geometry.validate_for(args).map_err(Error::backend_source)?;
+            geometry
+                .validate_for(declaration)
+                .map_err(Error::backend_source)?;
             Ok(geometry.state_layout().clone())
         }
-        None => super::state_layout(args).map_err(Error::backend_source),
+        None => Ok(declaration.state_layout().clone()),
     }
 }
 
@@ -173,25 +180,26 @@ fn validate_identity(definition: &ComponentDefinition) -> Result<(), Error> {
 
 /// Selects physical formats while retaining canonical consumers, state and observation seams.
 pub fn project_parameters(
-    args: &ModelArgs,
+    declaration: &super::Declaration,
     definition: &std::sync::Arc<ComponentDefinition>,
 ) -> Result<std::sync::Arc<ComponentDefinition>, Error> {
     validate_identity(definition)?;
-    let parameters = parameter_description(args)?;
+    let parameters = parameter_description(declaration)?;
     definition
         .project_parameters(parameters)
         .map_err(Error::from)
 }
 
 pub(crate) fn select_definition(
-    args: &ModelArgs,
+    declaration: &super::Declaration,
     definition: std::sync::Arc<ComponentDefinition>,
     geometry: Option<&LocalGeometry>,
 ) -> Result<std::sync::Arc<ComponentDefinition>, Error> {
+    let args = declaration.args();
     validate_identity(&definition)?;
-    definition.validate_parameter_topology(&parameter_description(args)?)?;
-    let state = component_state(args, geometry)?;
-    let global = component_state(args, None)?;
+    definition.validate_parameter_topology(&parameter_description(declaration)?)?;
+    let state = component_state(declaration, geometry)?;
+    let global = component_state(declaration, None)?;
     if definition.state_layout() != &global && definition.state_layout() != &state {
         return Err(invalid(
             &definition,
@@ -199,7 +207,7 @@ pub(crate) fn select_definition(
         ));
     }
     if let Some((_, layout)) = definition.parameters().partition_layout() {
-        let retained = super::local_geometry(args, layout).map_err(Error::backend_source)?;
+        let retained = super::local_geometry(declaration, layout).map_err(Error::backend_source)?;
         let full = eredu_nn::VocabularyParallelRange {
             global_vocabulary: args.text.vocab_size as usize,
             local: 0..args.text.vocab_size as usize,
@@ -213,10 +221,11 @@ pub(crate) fn select_definition(
                     .unwrap_or(&full),
             )
         };
-        let unsharded =
-            crate::qwen::vision::VisionStaticSelection::all(args.vision.clone(), "model.visual")
-                .and_then(|selection| selection.unsharded_merger_intermediates())
-                .map_err(Error::backend_source)?;
+        let unsharded = crate::qwen::vision::VisionStaticSelection::all(
+            declaration.vision_declaration().clone(),
+        )
+        .and_then(|selection| selection.unsharded_merger_intermediates())
+        .map_err(Error::backend_source)?;
         if retained.state_layout() != &state
             || retained.text().embedding_range()
                 != geometry.map_or(&full, |geometry| geometry.text().embedding_range())

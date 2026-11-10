@@ -1,8 +1,45 @@
 //! Low-rank projection parameters, kept separate from the base matrix.
 use crate::{
-    Error, LinearFormatSpec, LinearOperator, LinearSpec, NeuralBackend, ParameterSpec,
-    Parameterized, Tensor,
+    DeclareLogicalParameters, Error, LinearOperator, LinearSpec, LogicalParameterDeclaration,
+    NeuralBackend, Parameterized, Tensor,
 };
+
+/// Exact bias-free affine slots for an additive low-rank projection.
+#[derive(Debug, Clone)]
+pub struct LowRankProjectionSpec {
+    /// Input-to-rank matrix, with invocation-local input width.
+    pub down: LinearSpec,
+    /// Rank-to-output matrix, with complete replicated rank width.
+    pub up: LinearSpec,
+    /// Finite multiplier applied in the output's floating precision.
+    pub scale: f32,
+}
+impl LowRankProjectionSpec {
+    /// Rejects incompatible geometry, identities and sharing before backend allocation.
+    pub fn validate(&self) -> Result<(), Error> {
+        crate::validate_logical_parameter_topology(&self.logical_parameters()?)
+            .map_err(Error::backend_source)
+    }
+}
+impl DeclareLogicalParameters for LowRankProjectionSpec {
+    fn logical_parameters(&self) -> Result<Vec<LogicalParameterDeclaration<'_>>, Error> {
+        if self.down.output != self.up.input
+            || !self.scale.is_finite()
+            || [&self.down, &self.up].iter().any(|spec| {
+                spec.bias.is_some()
+                    || spec.format.encoding() != eredu_checkpoint::LinearFormat::Dense
+                    || spec.format.arithmetic() != crate::LinearArithmetic::Native
+            })
+        {
+            return Err(Error::backend(
+                "invalid low-rank projection geometry, scale or affine policy",
+            ));
+        }
+        let mut parameters = self.down.logical_parameters()?;
+        parameters.extend(self.up.logical_parameters()?);
+        Ok(parameters)
+    }
+}
 
 /// A bias-free additive projection `scale * up(down(input))`.
 /// Invocation owners select whether to borrow this module; it holds no enabled flag.
@@ -17,38 +54,16 @@ pub struct LowRankProjection<B: NeuralBackend> {
     scale: f32,
 }
 impl<B: NeuralBackend> LowRankProjection<B> {
-    /// Declares separately named parameters. `input` is the invocation's local
-    /// input width, `output` the complete output width; rank is replicated.
+    /// Constructs the declared affine slots after validating their shared rank.
     pub fn new(
-        input: i32,
-        output: i32,
-        rank: i32,
-        scale: f32,
-        down_weight: ParameterSpec,
-        up_weight: ParameterSpec,
+        spec: LowRankProjectionSpec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        if input <= 0 || output <= 0 || rank <= 0 || !scale.is_finite() {
-            return Err(Error::backend(
-                "invalid low-rank projection geometry or scale",
-            ));
-        }
-        let projection = |input, output, weight| {
-            B::linear(
-                LinearSpec {
-                    input,
-                    output,
-                    weight,
-                    bias: None,
-                    format: LinearFormatSpec::unscaled(eredu_checkpoint::LinearFormat::Dense)?,
-                },
-                context,
-            )
-        };
+        spec.validate()?;
         Ok(Self {
-            down: projection(input, rank, down_weight)?,
-            up: projection(rank, output, up_weight)?,
-            scale,
+            down: B::linear(spec.down, context)?,
+            up: B::linear(spec.up, context)?,
+            scale: spec.scale,
         })
     }
 

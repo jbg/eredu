@@ -150,10 +150,10 @@ pub fn materialize_voicechat_tts_transformer_pipeline(
 > {
     let (prepared, partition, manifest, plan, tensor_group, activation_dtype) =
         prepared.into_parts();
-    let (config, definition, local_layout, invocations, source, units, state_layout) =
+    let (declaration, local_layout, invocations, source, units, state_layout) =
         prepared.into_parts();
     let architecture =
-        TransformerKernel::from_partition(definition, config, local_layout.as_ref(), &partition)
+        TransformerKernel::from_partition(declaration, local_layout.as_ref(), &partition)
             .map_err(BackendFailure::from_error)?;
     let caches = architecture
         .kernel()

@@ -5,29 +5,20 @@ pub(in crate::discovery) mod prediction;
 
 pub(in crate::discovery) fn shared_units(
     g: &mut Builder,
-    c: &crate::nemotron_h::ModelArgs,
-    layer: usize,
-    path: &str,
-    operator: &str,
-) {
-    shared_units_at(g, c, layer, path, operator, &format!("{path}.moe"));
-}
-
-fn shared_units_at(
-    g: &mut Builder,
-    c: &crate::nemotron_h::ModelArgs,
+    spec: &crate::nemotron_h::mlp::SparseMoeSpec,
+    norm: &eredu_nn::NormalizationConstructionSpec,
     layer: usize,
     path: &str,
     operator: &str,
     parameter_root: &str,
 ) {
     let node = format!("{operator}.shared");
-    let root = format!("{parameter_root}.shared_experts");
     let parameter_group = format!("parameters:{parameter_root}");
     let scope = format!("{path}.shared.feed_forward");
-    let width = c.moe_shared_expert_intermediate_size as usize;
-    let read_weight = format!("{root}.up_proj.weight");
-    let write_weight = format!("{root}.down_proj.weight");
+    let up = &spec.shared.network.up;
+    let down = &spec.shared.network.down;
+    let width = up.output as usize;
+    let write_weight = down.weight.id.as_str().to_owned();
     g.descriptor.components.push(ComponentGroup {
         id: format!("{node}.units"),
         node_id: node.clone(),
@@ -40,35 +31,22 @@ fn shared_units_at(
         output: Some(format!("{scope}.output")),
         write_partition: ComponentWritePartition::Complete,
         input: format!("{scope}.input"),
-        reads: vec![ComponentRead {
-            source: None,
-            projection_output: None,
-            role: ComponentReadRole::Input,
-            weight: read_weight.clone(),
-            shared_weight: read_weight,
-            parameter_group: parameter_group.clone(),
-            bias: c.mlp_bias.then(|| format!("{root}.up_proj.bias")),
-            rows: ComponentRowMapping::Direct { offset: 0 },
-            head_normalization: None,
-            input_projections: Vec::new(),
-        }],
+        reads: vec![declared_component_read(
+            up,
+            parameter_group.clone(),
+            ComponentReadRole::Input,
+            ComponentRowMapping::Direct { offset: 0 },
+        )],
         routed_reads: vec![],
         write_weight: write_weight.clone(),
         write_input_projection: None,
-        shared_write_weight: write_weight,
+        shared_write_weight: declared_shared_weight(&down.weight).into(),
         write_parameter_group: parameter_group,
-        write_bias: c.mlp_bias.then(|| format!("{root}.down_proj.bias")),
+        write_bias: down.bias.as_ref().map(|p| p.id.as_str().into()),
         activation_equation: ComponentActivation::Unary {
-            activation: crate::decoder::unary::Activation::ReluSquared.component(),
+            activation: crate::decoder::unary::component(spec.shared.network.activation),
         },
-        input_normalization: ComponentNormalization {
-            kind: ComponentNormalizationKind::Rms,
-            epsilon: ComponentScalar::new(c.layer_norm_epsilon),
-            gain: Some(format!("{path}.norm.weight")),
-            gain_offset: ComponentScalar::new(0.0),
-            bias: None,
-            groups: 1,
-        },
+        input_normalization: declared_normalization(norm),
         output_gate: None,
         output_normalization: None,
         residual_scale: ComponentScalar::new(1.0),
@@ -76,7 +54,7 @@ fn shared_units_at(
     for (suffix, extent, axis, meaning) in [
         (
             "input",
-            c.hidden_size as usize,
+            up.input as usize,
             "hidden",
             "Normalized shared-expert input",
         ),
@@ -88,13 +66,13 @@ fn shared_units_at(
         ),
         (
             "write",
-            c.hidden_size as usize,
+            up.input as usize,
             "hidden",
             "Shared-expert affine write",
         ),
         (
             "output",
-            c.hidden_size as usize,
+            up.input as usize,
             "hidden",
             "Shared-expert contribution to the sparse sum",
         ),

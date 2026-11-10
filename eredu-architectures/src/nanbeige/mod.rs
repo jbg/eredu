@@ -282,9 +282,19 @@ pub fn model_args_from_gguf_catalog(
 /// Exact physical checkpoint schema; shared blocks occur only once.
 pub fn safetensors_plan(
     args: &ModelArgs,
+    declaration: &crate::decoder::DecoderDeclaration,
 ) -> Result<eredu_checkpoint::schema::SafetensorsCheckpointPlan, crate::llama::SafetensorsPlanError>
 {
-    crate::llama::safetensors_plan(&args.dense)
+    let parameters = declaration
+        .parameter_description(args, crate::decoder::ParameterEncoding::Logical)
+        .map_err(|e| crate::llama::SafetensorsPlanError::Geometry(e.to_string()))?;
+    crate::llama::checkpoint::safetensors_plan_from_parameters(
+        parameters
+            .groups()
+            .iter()
+            .flat_map(|group| group.members())
+            .filter(|member| member.alias_of().is_none()),
+    )
 }
 
 /// Selects exact matrix encodings without changing the loop or cache policy.
@@ -332,6 +342,12 @@ impl Config for ModelArgs {
     }
     fn validate_config(&self) -> Result<(), Error> {
         self.dense.validate_config()
+    }
+    fn validate_parameter_formats(
+        &self,
+        declaration: &crate::decoder::DecoderDeclaration,
+    ) -> Result<(), Error> {
+        self.dense.validate_declaration_formats(declaration)
     }
     fn hidden_size(&self) -> i32 {
         self.dense.hidden_size()
@@ -401,7 +417,39 @@ impl crate::decoder::PartitionedConfig for ModelArgs {
 /// Shared dense execution with logical block invocations.
 pub type LayeredModel<B> = crate::decoder::LayeredModel<B, ModelArgs>;
 
-/// Independent attention state for every logical layer invocation.
-pub fn state_layout(args: &ModelArgs) -> Result<eredu_runtime::StateLayout, Error> {
-    eredu_runtime::StateLayout::new(crate::decoder::cache_layout(args)?).map_err(Error::backend)
+/// Physical GGUF schema projected through authoritative sharing targets.
+pub fn gguf_plan(
+    args: &ModelArgs,
+    declaration: &crate::decoder::DecoderDeclaration,
+) -> Result<eredu_checkpoint::schema::GgufCheckpointPlan, String> {
+    let parameters = declaration
+        .parameter_description(args, crate::decoder::ParameterEncoding::Logical)
+        .map_err(|e| e.to_string())?;
+    crate::llama::checkpoint::gguf_plan_from_parameters(
+        &args.dense,
+        parameters
+            .groups()
+            .iter()
+            .flat_map(|group| group.members())
+            .filter(|member| member.alias_of().is_none()),
+    )
+}
+
+/// Selects storage extensions after proving unchanged sharing and execution policy.
+pub(crate) fn project_declaration_formats(
+    declaration: &crate::decoder::DecoderDeclaration,
+    source: &ModelArgs,
+    selected: &ModelArgs,
+) -> Result<crate::decoder::DecoderDeclaration, Error> {
+    declaration.validate_for(source)?;
+    let mut policy = selected.clone();
+    policy.dense.quantization = source.dense.quantization;
+    policy.dense.quantized_weights = source.dense.quantized_weights.clone();
+    policy.dense.quantized_weight_configs = source.dense.quantized_weight_configs.clone();
+    if policy.architecture_fingerprint() != source.architecture_fingerprint() {
+        return Err(Error::backend(
+            "Nanbeige format projection changes architecture policy",
+        ));
+    }
+    declaration.with_formats(selected)
 }

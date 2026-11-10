@@ -1,20 +1,12 @@
 //! Semantic tensor-parallel placement for Kimi physical blocks.
 
-use eredu_nn::{BlockwiseAttentionBackend, GroupedNeuralBackend, VocabularyParallelRange};
+use eredu_nn::{LogicalParameterRole, VocabularyParallelRange};
 use eredu_runtime::{
-    aligned_partition_units, module_parameter_group, partitioned_module_parameter_group,
-    LocalModelLayout, MemberSharding, ParallelPlanError, ParameterGroupSpec, ParameterRole,
-    StateLayout,
+    LocalModelLayout, MemberSharding, ParallelPlanError, ParameterRole, StateLayout,
 };
 use std::ops::Range;
 
-use crate::decoder::StaticModules;
-
-use super::{
-    prompt_cache_architecture_fingerprint, state_layout_with_geometry, AttentionKind, Block,
-    BlockGeometry, DenseSwiGlu, FeedForward, FeedForwardPolicy, LayerCacheGeometry, ModelArgs,
-    TokenMixer,
-};
+use super::{prompt_cache_architecture_fingerprint, BlockGeometry, Declaration, ModelArgs};
 
 /// Complete planner-derived construction and state geometry for one Kimi rank.
 ///
@@ -28,7 +20,7 @@ pub struct LocalGeometry {
     output_range: Option<VocabularyParallelRange>,
     state_layout: StateLayout,
     architecture_fingerprint: String,
-    global_block_geometry: BlockGeometry,
+    definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
     tied_head: bool,
 }
 
@@ -41,6 +33,7 @@ pub struct PartitionLocalGeometry {
     output_range: Option<VocabularyParallelRange>,
     complete_state_layout: StateLayout,
     architecture_fingerprint: String,
+    definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
     tied_head: bool,
     static_roles: Vec<String>,
     boundary_schema: eredu_runtime::NoAuxiliaryBoundarySchema,
@@ -171,92 +164,59 @@ impl PartitionLocalGeometry {
         &self.expert_banks
     }
 
-    pub(super) fn validate_for(&self, args: &ModelArgs) -> Result<(), ParallelPlanError> {
-        args.validate()
-            .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-        if args.has_sparse_moe_layers() != self.expert_realization.is_some() {
+    pub(super) fn validate_for(&self, declaration: &Declaration) -> Result<(), ParallelPlanError> {
+        let args = declaration.args();
+        if !declaration.expert_banks().is_empty() != self.expert_realization.is_some() {
             return Err(ParallelPlanError::InvalidGroup(
                 "partition-local Kimi routed authority differs from its schedule".into(),
             ));
         }
-        let count = usize::try_from(args.num_hidden_layers).map_err(|_| {
-            ParallelPlanError::InvalidGroup("Kimi layer count exceeds usize".into())
-        })?;
+        let count = declaration.blocks.len();
         if self.owned_units.is_empty()
             || self.owned_units.end > count
             || self.blocks.len() != self.owned_units.len()
             || self.complete_state_layout.len() != count
             || self.architecture_fingerprint != prompt_cache_architecture_fingerprint(args)
-            || self.tied_head != args.tie_word_embeddings
+            || self.definition.parameters() != declaration.definition().parameters()
+            || self.tied_head != declaration.statics.head_spec().is_none()
             || self.static_roles != expected_static_roles(&self.owned_units, count)
             || self.boundary_schema
-                != eredu_runtime::NoAuxiliaryBoundarySchema::new(args.hidden_size)
+                != eredu_runtime::NoAuxiliaryBoundarySchema::new(
+                    declaration.statics.embedding_spec().dimensions,
+                )
         {
             return Err(ParallelPlanError::InvalidGroup(
                 "partition-local Kimi geometry belongs to a different model or range".into(),
             ));
         }
         self.embedding_range
-            .validate_global_rows(args.vocab_size)
+            .validate_global_rows(declaration.statics.embedding_spec().vocabulary)
             .map_err(|error| ParallelPlanError::InvalidTensor(error.to_string()))?;
-        match (args.tie_word_embeddings, &self.output_range) {
+        match (
+            declaration.statics.head_spec().is_none(),
+            &self.output_range,
+        ) {
             (true, None) => {}
             (false, Some(range)) => range
-                .validate_global_rows(args.vocab_size)
+                .validate_global_rows(declaration.statics.embedding_spec().vocabulary)
                 .map_err(|error| ParallelPlanError::InvalidTensor(error.to_string()))?,
             _ => {
                 return Err(ParallelPlanError::InvalidGroup(
                     "partition-local Kimi output vocabulary ownership is inconsistent".into(),
-                ))
+                ));
             }
         }
         for global in self.owned_units.clone() {
             let block = self.block(global).expect("validated owned Kimi block");
-            let policy = args.layer_policy(global).ok_or_else(|| {
-                ParallelPlanError::InvalidGroup(format!("Kimi has no layer {global}"))
-            })?;
             let state = self.complete_state_layout.layer(global).ok_or_else(|| {
                 ParallelPlanError::InvalidGroup("missing Kimi complete state layer".into())
             })?;
-            let matches = match (policy.attention, state) {
-                (
-                    AttentionKind::Kda,
-                    eredu_core::cache::LayerCachePolicy::FixedState { tensors },
-                ) => {
-                    let width = block.kda_heads.checked_mul(args.kda_config.head_dim);
-                    tensors.len() == 4
-                        && width.is_some_and(|width| {
-                            tensors[..3].iter().all(|tensor| {
-                                tensor.dtype == eredu_core::cache::StateTensorDtype::Floating
-                                    && matches!(
-                                        tensor.shape.get(2),
-                                        Some(eredu_core::cache::StateTensorDimension::Fixed(value))
-                                            if i32::try_from(value.get()) == Ok(width)
-                                    )
-                            })
-                        })
-                        && tensors.last().is_some_and(|tensor| {
-                            tensor.dtype == eredu_core::cache::StateTensorDtype::Float32
-                                && matches!(
-                                    tensor.shape.get(1),
-                                    Some(eredu_core::cache::StateTensorDimension::Fixed(value))
-                                        if i32::try_from(value.get()) == Ok(block.kda_heads)
-                                )
-                        })
-                }
-                (
-                    AttentionKind::Mla,
-                    eredu_core::cache::LayerCachePolicy::CompressedLatentRotary {
-                        latent_dim,
-                        rotary_dim,
-                        ..
-                    },
-                ) => {
-                    i32::try_from(latent_dim.get()) == Ok(args.kv_lora_rank)
-                        && i32::try_from(rotary_dim.get()) == Ok(args.qk_rope_head_dim)
-                }
-                _ => false,
-            };
+            let expected = declaration.blocks[global]
+                .clone()
+                .local(*block, None)
+                .and_then(|p| p.mixer.state_policy())
+                .map_err(invalid)?;
+            let matches = expected == *state;
             if !matches {
                 return Err(ParallelPlanError::InvalidGroup(format!(
                     "owned Kimi block {global} differs from complete TP-local state geometry"
@@ -293,39 +253,42 @@ impl LocalGeometry {
         &self.state_layout
     }
 
-    pub(super) fn validate_for(&self, args: &ModelArgs) -> Result<(), ParallelPlanError> {
-        let expected_layers = usize::try_from(args.num_hidden_layers).map_err(|_| {
-            ParallelPlanError::InvalidGroup("Kimi layer count exceeds usize".into())
-        })?;
+    pub(super) fn validate_for(&self, declaration: &Declaration) -> Result<(), ParallelPlanError> {
+        let args = declaration.args();
+        let expected_layers = declaration.blocks.len();
         if self.blocks.len() != expected_layers
             || self.architecture_fingerprint != prompt_cache_architecture_fingerprint(args)
-            || self.global_block_geometry != BlockGeometry::replicated(args)
-            || self.tied_head != args.tie_word_embeddings
+            || self.definition.parameters() != declaration.definition().parameters()
+            || self.tied_head != declaration.statics.head_spec().is_none()
         {
             return Err(ParallelPlanError::InvalidGroup(
                 "rank-local Kimi geometry belongs to a different model configuration".into(),
             ));
         }
         self.embedding_range
-            .validate_global_rows(args.vocab_size)
+            .validate_global_rows(declaration.statics.embedding_spec().vocabulary)
             .map_err(|error| ParallelPlanError::InvalidTensor(error.to_string()))?;
-        match (args.tie_word_embeddings, &self.output_range) {
+        match (
+            declaration.statics.head_spec().is_none(),
+            &self.output_range,
+        ) {
             (true, None) => {}
             (false, Some(range)) => range
-                .validate_global_rows(args.vocab_size)
+                .validate_global_rows(declaration.statics.embedding_spec().vocabulary)
                 .map_err(|error| ParallelPlanError::InvalidTensor(error.to_string()))?,
             (true, Some(_)) => {
                 return Err(ParallelPlanError::InvalidGroup(
                     "tied Kimi output unexpectedly owns a separate vocabulary range".into(),
-                ))
+                ));
             }
             (false, None) => {
                 return Err(ParallelPlanError::InvalidGroup(
                     "untied Kimi output is missing vocabulary ownership".into(),
-                ))
+                ));
             }
         }
-        let expected = state_layout_with_geometry(args, &state_geometry(args, &self.blocks))
+        let expected = declaration
+            .state_layout_with_geometry(&self.blocks)
             .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
         if expected != self.state_layout {
             return Err(ParallelPlanError::InvalidGroup(
@@ -334,6 +297,10 @@ impl LocalGeometry {
         }
         Ok(())
     }
+}
+
+fn invalid(error: impl std::fmt::Display) -> ParallelPlanError {
+    ParallelPlanError::InvalidGroup(error.to_string())
 }
 
 fn local_width(
@@ -361,33 +328,34 @@ fn local_width(
 
 /// Derives one block's local widths exclusively from resolved placement.
 pub fn local_block_geometry(
-    args: &ModelArgs,
+    declaration: &Declaration,
     layer: usize,
     layout: &LocalModelLayout,
 ) -> Result<BlockGeometry, ParallelPlanError> {
-    let root = format!("model.layers.{layer}");
-    let policy = args
-        .layer_policy(layer)
+    use super::declarations::{FeedForwardParameters as F, MixerParameters as M};
+    let scope = declaration
+        .blocks
+        .get(layer)
         .ok_or_else(|| ParallelPlanError::InvalidGroup(format!("Kimi has no layer {layer}")))?;
-    let mut geometry = BlockGeometry::replicated(args);
-    match policy.attention {
-        AttentionKind::Kda => {
-            let width = local_width(layout, &format!("{root}.self_attn.q_proj.weight"), 0)?;
-            if width % args.kda_config.head_dim != 0 {
+    let mut geometry = scope.geometry(declaration.args());
+    match &scope.mixer {
+        M::Kda(p) => {
+            let width = local_width(layout, p.q.weight.id.as_str(), 0)?;
+            let head = p.geometry.key_dimensions();
+            if width % head != 0 {
                 return Err(ParallelPlanError::InvalidTensor(
                     "local KDA width does not contain complete heads".into(),
                 ));
             }
-            geometry.kda_heads = width / args.kda_config.head_dim;
+            geometry.kda_heads = width / head;
         }
-        AttentionKind::Mla => {
-            let query_name = if args.q_lora_rank.is_some() {
-                format!("{root}.self_attn.q_b_proj.weight")
-            } else {
-                format!("{root}.self_attn.q_proj.weight")
+        M::Mla(p) => {
+            let query = match &p.query {
+                super::specs::QuerySpec::Direct(p) => p,
+                super::specs::QuerySpec::LowRank(p) => &p.second,
             };
-            let width = local_width(layout, &query_name, 0)?;
-            let head = args.qk_nope_head_dim + args.qk_rope_head_dim;
+            let width = local_width(layout, query.weight.id.as_str(), 0)?;
+            let head = p.geometry.query_head_dimensions();
             if width % head != 0 {
                 return Err(ParallelPlanError::InvalidTensor(
                     "local MLA width does not contain complete heads".into(),
@@ -396,38 +364,25 @@ pub fn local_block_geometry(
             geometry.mla_heads = width / head;
         }
     }
-    match policy.feed_forward {
-        FeedForwardPolicy::Dense => {
-            geometry.dense_intermediate =
-                local_width(layout, &format!("{root}.mlp.gate_proj.weight"), 0)?;
+    match &scope.feed_forward {
+        F::Dense(p) => {
+            geometry.dense_intermediate = local_width(layout, p.gate.weight.id.as_str(), 0)?
         }
-        FeedForwardPolicy::SparseMoe => {
-            let fused = local_width(layout, &format!("{root}.mlp.experts.gate_up_proj"), 1)?;
+        F::Sparse(p) => {
+            let source = p.routed.experts.packed_parameters().map_err(invalid)?;
+            let fused = local_width(layout, source.gate_up().parameter.id.as_str(), 1)?;
             if fused % 2 != 0 {
                 return Err(ParallelPlanError::InvalidTensor(
                     "local Kimi packed expert width is not even".into(),
                 ));
             }
             geometry.routed_intermediate = fused / 2;
-            geometry.shared_intermediate = local_width(
-                layout,
-                &format!("{root}.mlp.shared_experts.gate_proj.weight"),
-                0,
-            )?;
+            geometry.shared_intermediate =
+                local_width(layout, p.shared.gate.weight.id.as_str(), 0)?;
         }
     }
+    scope.clone().local(geometry, None).map_err(invalid)?;
     Ok(geometry)
-}
-
-/// Returns rank-local KDA state geometry for every physical layer.
-pub fn local_state_geometry(
-    args: &ModelArgs,
-    layout: &LocalModelLayout,
-) -> Result<Vec<LayerCacheGeometry>, ParallelPlanError> {
-    let blocks = (0..args.num_hidden_layers as usize)
-        .map(|layer| local_block_geometry(args, layer, layout))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(state_geometry(args, &blocks))
 }
 
 /// Derives the complete TP-local heterogeneous state before pipeline slicing.
@@ -436,62 +391,55 @@ pub fn local_state_geometry(
 /// heads, while MLA compressed latent/rotary state is head-independent.  This
 /// projection is used during admission, before any backend module exists.
 pub fn partitioned_state_layout(
-    args: &ModelArgs,
+    declaration: &Declaration,
     tensor_rank: usize,
     tensor_size: usize,
 ) -> Result<StateLayout, ParallelPlanError> {
-    args.validate()
-        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
     if tensor_size == 0 || tensor_rank >= tensor_size {
         return Err(ParallelPlanError::InvalidGroup(format!(
             "invalid Kimi tensor coordinate {tensor_rank}/{tensor_size}"
         )));
     }
-    let kda_heads = usize::try_from(args.kda_config.num_heads)
-        .map_err(|_| ParallelPlanError::InvalidGroup("Kimi KDA head count exceeds usize".into()))?;
-    let local_kda_heads =
-        eredu_core::balanced_contiguous_range(kda_heads, tensor_size, tensor_rank, false)
-            .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?
-            .len();
-    let local_kda_heads = i32::try_from(local_kda_heads).map_err(|_| {
-        ParallelPlanError::InvalidGroup("local Kimi KDA head count exceeds i32".into())
-    })?;
-    let geometry = args
-        .layer_schedule
+    let geometry = declaration
+        .blocks
         .iter()
-        .map(|policy| LayerCacheGeometry {
-            kda_heads: (policy.attention == AttentionKind::Kda).then_some(local_kda_heads),
+        .map(|scope| {
+            let mut geometry = scope.geometry(declaration.args());
+            if let super::declarations::MixerParameters::Kda(p) = &scope.mixer {
+                geometry.kda_heads = i32::try_from(
+                    eredu_core::balanced_contiguous_range(
+                        p.geometry.value_heads() as usize,
+                        tensor_size,
+                        tensor_rank,
+                        false,
+                    )
+                    .map_err(invalid)?
+                    .len(),
+                )
+                .map_err(invalid)?;
+            }
+            Ok(geometry)
         })
-        .collect::<Vec<_>>();
-    state_layout_with_geometry(args, &geometry)
-        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))
-}
-
-fn state_geometry(args: &ModelArgs, blocks: &[BlockGeometry]) -> Vec<LayerCacheGeometry> {
-    args.layer_schedule
-        .iter()
-        .zip(blocks)
-        .map(|(policy, block)| LayerCacheGeometry {
-            kda_heads: (policy.attention == AttentionKind::Kda).then_some(block.kda_heads),
-        })
-        .collect()
+        .collect::<Result<Vec<_>, ParallelPlanError>>()?;
+    declaration
+        .state_layout_with_geometry(&geometry)
+        .map_err(invalid)
 }
 
 /// Derives complete rank-local Kimi construction geometry from one typed plan.
 pub fn local_geometry(
-    args: &ModelArgs,
+    declaration: &Declaration,
     layout: &LocalModelLayout,
 ) -> Result<LocalGeometry, ParallelPlanError> {
-    args.validate()
-        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    let layers = usize::try_from(args.num_hidden_layers)
-        .map_err(|_| ParallelPlanError::InvalidGroup("Kimi layer count exceeds usize".into()))?;
+    let args = declaration.args();
+    let layers = declaration.blocks.len();
     let blocks = (0..layers)
-        .map(|layer| local_block_geometry(args, layer, layout))
+        .map(|layer| local_block_geometry(declaration, layer, layout))
         .collect::<Result<Vec<_>, _>>()?;
-    let state_layout = state_layout_with_geometry(args, &state_geometry(args, &blocks))
+    let state_layout = declaration
+        .state_layout_with_geometry(&blocks)
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    let (embedding_range, output_range) = super::static_spec(args).vocabulary_ranges(
+    let (embedding_range, output_range) = declaration.statics.vocabulary_ranges(
         layout,
         "model.embed_tokens",
         "model.norm",
@@ -503,32 +451,31 @@ pub fn local_geometry(
         output_range,
         state_layout,
         architecture_fingerprint: prompt_cache_architecture_fingerprint(args),
-        global_block_geometry: BlockGeometry::replicated(args),
-        tied_head: args.tie_word_embeddings,
+        definition: std::sync::Arc::clone(declaration.definition()),
+        tied_head: declaration.statics.head_spec().is_none(),
     };
-    geometry.validate_for(args)?;
+    geometry.validate_for(declaration)?;
     Ok(geometry)
 }
 
 /// Derives dense Kimi construction geometry for one exact TP/PP partition.
 pub fn partition_local_geometry(
-    args: &ModelArgs,
+    declaration: &Declaration,
     layout: &LocalModelLayout,
     owned_units: Range<usize>,
 ) -> Result<PartitionLocalGeometry, ParallelPlanError> {
-    if args.has_sparse_moe_layers() {
+    if !declaration.expert_banks().is_empty() {
         return Err(ParallelPlanError::InvalidGroup(
             "partitioned resident Kimi does not accept routed feed-forward layers".into(),
         ));
     }
-    let count = usize::try_from(args.num_hidden_layers)
-        .map_err(|_| ParallelPlanError::InvalidGroup("Kimi layer count exceeds usize".into()))?;
+    let count = declaration.blocks.len();
     if owned_units.is_empty() || owned_units.end > count {
         return Err(ParallelPlanError::InvalidGroup(format!(
             "Kimi local unit range {owned_units:?} is outside {count} layers"
         )));
     }
-    let complete = local_geometry(args, layout)?;
+    let complete = local_geometry(declaration, layout)?;
     let blocks = owned_units
         .clone()
         .map(|unit| {
@@ -544,38 +491,41 @@ pub fn partition_local_geometry(
         output_range: complete.output_range.clone(),
         complete_state_layout: complete.state_layout.clone(),
         architecture_fingerprint: complete.architecture_fingerprint.clone(),
+        definition: std::sync::Arc::clone(&complete.definition),
         tied_head: complete.tied_head,
         static_roles: expected_static_roles(&owned_units, count),
-        boundary_schema: eredu_runtime::NoAuxiliaryBoundarySchema::new(args.hidden_size),
+        boundary_schema: eredu_runtime::NoAuxiliaryBoundarySchema::new(
+            declaration.statics.embedding_spec().dimensions,
+        ),
         expert_realization: None,
         expert_intermediate_range: None,
         shared_expert_intermediate_range: None,
         expert_banks: Vec::new(),
     };
-    geometry.validate_for(args)?;
+    geometry.validate_for(declaration)?;
     Ok(geometry)
 }
 
 /// Derives prediction-free routed Kimi geometry from the selected expert plan.
 pub fn partition_local_routed_geometry(
-    args: &ModelArgs,
+    declaration: &Declaration,
     layout: &LocalModelLayout,
     owned_units: Range<usize>,
     topology: eredu_core::ParallelRankTopology,
     realization: &crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
 ) -> Result<PartitionLocalGeometry, ParallelPlanError> {
+    let args = declaration.args();
     if args.num_nextn_predict_layers != 0 {
         return Err(ParallelPlanError::InvalidGroup(
             "partition-local Kimi rejects embedded prediction".into(),
         ));
     }
-    if !args.has_sparse_moe_layers() {
+    if declaration.expert_banks().is_empty() {
         return Err(ParallelPlanError::InvalidGroup(
             "routed Kimi requires sparse units".into(),
         ));
     }
-    let count = usize::try_from(args.num_hidden_layers)
-        .map_err(|_| ParallelPlanError::InvalidGroup("Kimi layer count exceeds usize".into()))?;
+    let count = declaration.blocks.len();
     let expected_units = eredu_core::balanced_contiguous_range(
         count,
         topology.pipeline_parallel_size(),
@@ -588,28 +538,27 @@ pub fn partition_local_routed_geometry(
             "routed Kimi PP ownership differs from its Cartesian rank".into(),
         ));
     }
-    let complete = local_geometry(args, layout)?;
-    let global_experts = usize::try_from(args.num_experts)
-        .map_err(|_| ParallelPlanError::InvalidGroup("Kimi expert count exceeds usize".into()))?;
+    let complete = local_geometry(declaration, layout)?;
+    let banks = declaration.expert_banks();
+    let global_experts = banks
+        .values()
+        .next()
+        .ok_or_else(|| {
+            ParallelPlanError::InvalidGroup("sparse schedule has no declared expert bank".into())
+        })?
+        .group_count() as usize;
     let local_experts = validate_realization(topology, global_experts, realization)?;
     let local_count = i32::try_from(local_experts.len()).map_err(|_| {
         ParallelPlanError::InvalidGroup("Kimi local expert count exceeds i32".into())
     })?;
     let mut intermediate_range = None;
     let mut shared_range = None;
-    let mut expected_sparse_units = 0;
-    for unit in 0..count {
-        if args.layer_policy(unit).map(|policy| policy.feed_forward)
-            != Some(FeedForwardPolicy::SparseMoe)
-        {
-            continue;
-        }
-        expected_sparse_units += 1;
+    for (&unit, declared) in &banks {
         let block = complete.block(unit).ok_or_else(|| {
             ParallelPlanError::InvalidGroup("missing local Kimi sparse block".into())
         })?;
-        let expected = super::moe::expert_bank_spec(args, unit)
-            .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?
+        let expected = declared
+            .clone()
             .with_group_geometry(local_count, block.routed_intermediate)
             .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
         if realization.unit_spec(crate::decoder::TARGET_EXECUTION_GROUP, unit) != Some(&expected) {
@@ -617,8 +566,14 @@ pub fn partition_local_routed_geometry(
                 "Kimi expert plan drifted at unit {unit}"
             )));
         }
-        let target = format!("model.layers.{unit}.mlp.experts.gate_up_proj");
-        let range = exact_logical_range(layout, &target, args.moe_intermediate_size)?;
+        let source = declared
+            .packed_parameters()
+            .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+        let range = exact_logical_range(
+            layout,
+            source.gate_up().parameter.id.as_str(),
+            declared.intermediate_dimensions(),
+        )?;
         if intermediate_range
             .as_ref()
             .is_some_and(|current| current != &range)
@@ -628,17 +583,17 @@ pub fn partition_local_routed_geometry(
             ));
         }
         intermediate_range = Some(range);
-        let shared = exact_logical_range(
-            layout,
-            &format!("model.layers.{unit}.mlp.shared_experts.gate_proj.weight"),
-            args.moe_intermediate_size
-                .checked_mul(args.num_shared_experts)
-                .ok_or_else(|| {
-                    ParallelPlanError::InvalidTensor(
-                        "Kimi shared-expert width overflowed i32".into(),
-                    )
-                })?,
-        )?;
+        let super::declarations::FeedForwardParameters::Sparse(parameters) =
+            &declaration.blocks[unit].feed_forward
+        else {
+            return Err(ParallelPlanError::InvalidGroup(
+                "Kimi shared scope is unresolved".into(),
+            ));
+        };
+        let shared_specs = &parameters.shared;
+        let shared_gate = &shared_specs.gate;
+        let shared =
+            exact_logical_range(layout, shared_gate.weight.id.as_str(), shared_gate.output)?;
         if i32::try_from(shared.len()) != Ok(block.shared_intermediate) {
             return Err(ParallelPlanError::InvalidTensor(
                 "Kimi shared-expert TP interval differs from local block width".into(),
@@ -654,7 +609,7 @@ pub fn partition_local_routed_geometry(
         }
         shared_range = Some(shared);
     }
-    if realization.unit_specs().len() != expected_sparse_units {
+    if realization.unit_specs().len() != banks.len() {
         return Err(ParallelPlanError::InvalidGroup(
             "Kimi expert unit schedule drifted".into(),
         ));
@@ -675,10 +630,7 @@ pub fn partition_local_routed_geometry(
         .collect::<Result<Vec<_>, _>>()?;
     let expert_banks = owned_units
         .clone()
-        .filter(|unit| {
-            args.layer_policy(*unit)
-                .is_some_and(|policy| policy.feed_forward == FeedForwardPolicy::SparseMoe)
-        })
+        .filter(|unit| banks.contains_key(unit))
         .flat_map(|global_unit| {
             local_experts.iter().copied().enumerate().map({
                 let range = intermediate_range.clone();
@@ -698,15 +650,18 @@ pub fn partition_local_routed_geometry(
         output_range: complete.output_range.clone(),
         complete_state_layout: complete.state_layout.clone(),
         architecture_fingerprint: complete.architecture_fingerprint.clone(),
+        definition: std::sync::Arc::clone(&complete.definition),
         tied_head: complete.tied_head,
         static_roles: expected_static_roles(&owned_units, count),
-        boundary_schema: eredu_runtime::NoAuxiliaryBoundarySchema::new(args.hidden_size),
+        boundary_schema: eredu_runtime::NoAuxiliaryBoundarySchema::new(
+            declaration.statics.embedding_spec().dimensions,
+        ),
         expert_realization: Some(realization.clone()),
         expert_intermediate_range: Some(intermediate_range),
         shared_expert_intermediate_range: Some(shared_range),
         expert_banks,
     };
-    geometry.validate_for(args)?;
+    geometry.validate_for(declaration)?;
     Ok(geometry)
 }
 
@@ -767,31 +722,29 @@ fn validate_realization(
     Ok(local)
 }
 
-/// Declares complete KDA/MLA and dense/routed topology without native resources.
-pub fn parameter_description(
+pub(super) fn parameter_description_from_scopes(
     args: &ModelArgs,
+    statics: &crate::decoder::StaticModuleConstruction,
+    blocks: &[super::declarations::BlockParameters],
 ) -> Result<eredu_runtime::ArchitectureParameterDescription, ParallelPlanError> {
     use eredu_runtime::{
         ArchitectureParameterDescription, ExecutionGraph, ExecutionUnitLayout,
-        OwnedParameterGroupSpec, ParameterGroupOwner, ParameterMemberSpec,
+        OwnedParameterGroupSpec, ParameterGroupOwner,
     };
-    let invalid = |error: eredu_nn::Error| ParallelPlanError::InvalidGroup(error.to_string());
     args.validate()
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    let layers = args.num_hidden_layers as usize;
+    let layers = blocks.len();
     let graph = ExecutionGraph::chain([crate::decoder::TARGET_EXECUTION_GROUP])
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
     let layout = ExecutionUnitLayout::new(&graph, [layers])
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
     let owner_group = layout.group_id(0).expect("Kimi target group").clone();
-    let hidden = args.hidden_size as usize;
-    let mut formats = std::collections::BTreeMap::new();
-    let static_groups = super::static_spec(args).pinned_parameter_groups(
+    let static_groups = statics.pinned_parameter_groups(
+        crate::decoder::ParameterEncoding::Stored,
         "model.embed_tokens",
         "model.norm",
         "lm_head",
     )?;
-    let mut projections = std::collections::BTreeSet::new();
     let mut owned = static_groups
         .into_iter()
         .map(|(role, group)| {
@@ -803,245 +756,134 @@ pub fn parameter_description(
             OwnedParameterGroupSpec::new(owner, group)
         })
         .collect::<Vec<_>>();
-    let mut projection = |name: String, output: usize, input: usize, sharding| {
-        projections.insert(name.clone());
-        ParameterMemberSpec::new(name, vec![output, input], sharding)
-    };
-    let sum = |name: &str, first: i32, second: i32| {
-        first
-            .checked_add(second)
-            .map(|width| width as usize)
-            .ok_or_else(|| {
-                ParallelPlanError::InvalidGroup(format!("Kimi {name} width exceeds i32"))
-            })
-    };
-    let product = |name: &str, first: usize, second: usize| {
-        first
-            .checked_mul(second)
-            .filter(|width| i32::try_from(*width).is_ok())
-            .ok_or_else(|| {
-                ParallelPlanError::InvalidGroup(format!("Kimi {name} width exceeds i32"))
-            })
-    };
-    for (layer, policy) in args.layer_schedule.iter().enumerate() {
+    for (layer, scope) in blocks.iter().enumerate() {
         let root = format!("model.layers.{layer}");
         let attention = format!("{root}.self_attn");
-        let mut members = Vec::new();
-        let heads = match policy.attention {
-            AttentionKind::Kda => {
-                let heads = args.kda_config.num_heads as usize;
-                let head = args.kda_config.head_dim as usize;
-                let width = product(&attention, heads, head)?;
-                for field in ["q_proj", "k_proj", "v_proj"] {
-                    members.push(projection(
-                        format!("{attention}.{field}.weight"),
-                        width,
-                        hidden,
-                        MemberSharding::Partitioned { axis: 0 },
-                    ));
-                }
-                for field in ["q_conv1d", "k_conv1d", "v_conv1d"] {
-                    members.push(ParameterMemberSpec::new(
-                        format!("{attention}.{field}.weight"),
-                        vec![width, 1, args.kda_config.short_conv_kernel_size as usize],
-                        MemberSharding::Partitioned { axis: 0 },
-                    ));
-                }
-                for field in ["f_a_proj", "g_a_proj"] {
-                    members.push(projection(
-                        format!("{attention}.{field}.weight"),
-                        head,
-                        hidden,
-                        MemberSharding::Replicated,
-                    ));
-                }
-                for field in ["f_b_proj", "g_b_proj"] {
-                    members.push(projection(
-                        format!("{attention}.{field}.weight"),
-                        width,
-                        head,
-                        MemberSharding::Partitioned { axis: 0 },
-                    ));
-                }
-                members.push(projection(
-                    format!("{attention}.b_proj.weight"),
-                    heads,
-                    hidden,
-                    MemberSharding::Partitioned { axis: 0 },
-                ));
-                members.push(ParameterMemberSpec::new(
-                    format!("{attention}.A_log"),
-                    vec![1, 1, heads, 1],
-                    MemberSharding::Partitioned { axis: 2 },
-                ));
-                members.push(ParameterMemberSpec::new(
-                    format!("{attention}.dt_bias"),
-                    vec![width],
-                    MemberSharding::Partitioned { axis: 0 },
-                ));
-                members.push(ParameterMemberSpec::new(
-                    format!("{attention}.o_norm.weight"),
-                    vec![head],
-                    MemberSharding::Replicated,
-                ));
-                members.push(projection(
-                    format!("{attention}.o_proj.weight"),
-                    hidden,
-                    width,
-                    MemberSharding::Partitioned { axis: 1 },
-                ));
-                heads
+        let attention_group = match &scope.mixer {
+            super::declarations::MixerParameters::Kda(spec) => {
+                eredu_runtime::logical_parameter_group(
+                    format!("{attention}.heads"),
+                    ParameterRole::AttentionHeads,
+                    Some(spec.geometry.value_heads() as usize),
+                    spec,
+                    |declaration| {
+                        let id = &declaration.parameter.id;
+                        if id == &spec.output.weight.id {
+                            MemberSharding::Partitioned { axis: 1 }
+                        } else if id == &spec.a_log.id {
+                            MemberSharding::Partitioned { axis: 2 }
+                        } else if id == &spec.f_a.weight.id
+                            || id == &spec.g_a.weight.id
+                            || declaration.role == LogicalParameterRole::Normalization
+                        {
+                            MemberSharding::Replicated
+                        } else {
+                            MemberSharding::Partitioned { axis: 0 }
+                        }
+                    },
+                )?
             }
-            AttentionKind::Mla => {
-                let heads = args.num_attention_heads as usize;
-                let query = product(
-                    &attention,
-                    heads,
-                    sum(&attention, args.qk_nope_head_dim, args.qk_rope_head_dim)?,
-                )?;
-                if let Some(rank) = args.q_lora_rank {
-                    members.push(projection(
-                        format!("{attention}.q_a_proj.weight"),
-                        rank as usize,
-                        hidden,
-                        MemberSharding::Replicated,
-                    ));
-                    members.push(ParameterMemberSpec::new(
-                        format!("{attention}.q_a_layernorm.weight"),
-                        vec![rank as usize],
-                        MemberSharding::Replicated,
-                    ));
-                    members.push(projection(
-                        format!("{attention}.q_b_proj.weight"),
-                        query,
-                        rank as usize,
-                        MemberSharding::Partitioned { axis: 0 },
-                    ));
-                } else {
-                    members.push(projection(
-                        format!("{attention}.q_proj.weight"),
-                        query,
-                        hidden,
-                        MemberSharding::Partitioned { axis: 0 },
-                    ));
-                }
-                members.push(projection(
-                    format!("{attention}.kv_a_proj_with_mqa.weight"),
-                    sum(&attention, args.kv_lora_rank, args.qk_rope_head_dim)?,
-                    hidden,
-                    MemberSharding::Replicated,
-                ));
-                members.push(ParameterMemberSpec::new(
-                    format!("{attention}.kv_a_layernorm.weight"),
-                    vec![args.kv_lora_rank as usize],
-                    MemberSharding::Replicated,
-                ));
-                if args.split_kv_b {
-                    for (field, width) in [
-                        ("k_b_proj", args.qk_nope_head_dim),
-                        ("v_b_proj", args.v_head_dim),
-                    ] {
-                        members.push(projection(
-                            format!("{attention}.{field}.weight"),
-                            product(&attention, heads, width as usize)?,
-                            args.kv_lora_rank as usize,
-                            MemberSharding::Partitioned { axis: 0 },
-                        ));
-                    }
-                } else {
-                    members.push(projection(
-                        format!("{attention}.kv_b_proj.weight"),
-                        product(
-                            &attention,
-                            heads,
-                            sum(&attention, args.qk_nope_head_dim, args.v_head_dim)?,
-                        )?,
-                        args.kv_lora_rank as usize,
-                        MemberSharding::Partitioned { axis: 0 },
-                    ));
-                }
-                members.push(projection(
-                    format!("{attention}.o_proj.weight"),
-                    hidden,
-                    product(&attention, heads, args.v_head_dim as usize)?,
-                    MemberSharding::Partitioned { axis: 1 },
-                ));
-                heads
+            super::declarations::MixerParameters::Mla(spec) => {
+                eredu_runtime::logical_parameter_group(
+                    format!("{attention}.heads"),
+                    ParameterRole::AttentionHeads,
+                    Some(spec.geometry.heads() as usize),
+                    spec,
+                    |declaration| {
+                        let id = &declaration.parameter.id;
+                        let first = match &spec.query {
+                            super::specs::QuerySpec::LowRank(query) => {
+                                query.first.as_ref().map(|p| &p.weight.id)
+                            }
+                            _ => None,
+                        };
+                        if id == &spec.output.weight.id {
+                            MemberSharding::Partitioned { axis: 1 }
+                        } else if id == &spec.kv_a.weight.id
+                            || Some(id) == first
+                            || declaration.role == LogicalParameterRole::Normalization
+                        {
+                            MemberSharding::Replicated
+                        } else {
+                            MemberSharding::Partitioned { axis: 0 }
+                        }
+                    },
+                )?
             }
         };
-        let mut groups = vec![ParameterGroupSpec::partitioned(
-            format!("{attention}.heads"),
-            ParameterRole::AttentionHeads,
-            heads,
-            members,
-        )?];
-        for field in ["input_layernorm", "post_attention_layernorm"] {
-            groups.push(ParameterGroupSpec::new(
+        let mut groups = vec![attention_group];
+        for (field, spec) in [
+            ("input_layernorm", &scope.input_norm),
+            ("post_attention_layernorm", &scope.post_attention_norm),
+        ] {
+            groups.push(eredu_runtime::logical_parameter_group(
                 format!("{root}.{field}"),
                 ParameterRole::Replicated,
-                [ParameterMemberSpec::new(
-                    format!("{root}.{field}.weight"),
-                    vec![hidden],
-                    MemberSharding::Replicated,
-                )],
+                None,
+                spec,
+                |_| MemberSharding::Replicated,
             )?);
         }
-        if policy.feed_forward == FeedForwardPolicy::SparseMoe {
-            let selector = super::moe::selector_spec(args, layer).map_err(invalid)?;
-            formats.insert(
-                selector.weight().id.as_str().to_owned(),
-                selector.format().clone(),
-            );
-            groups.push(eredu_runtime::top_k_group_selector_logical_group(
+        let sparse = match &scope.feed_forward {
+            super::declarations::FeedForwardParameters::Sparse(spec) => Some(spec),
+            _ => None,
+        };
+        if let Some(parameters) = &sparse {
+            groups.push(eredu_runtime::logical_parameter_group(
                 format!("{root}.mlp.gate"),
-                &selector,
+                ParameterRole::Replicated,
+                None,
+                &parameters.routed.selector,
+                |_| MemberSharding::Replicated,
             )?);
-            let bank = super::moe::expert_bank_spec(args, layer).map_err(invalid)?;
-            let eredu_nn::GatedProductGroupLayout::Packed { gate_up, down } = bank.layout() else {
+            let bank = &parameters.routed.experts;
+            let eredu_nn::GatedProductGroupLayout::Packed { gate_up, .. } = bank.layout() else {
                 return Err(ParallelPlanError::InvalidGroup(
                     "Kimi requires packed experts".into(),
                 ));
             };
-            for part in [gate_up, down] {
-                formats.insert(part.weight().id.as_str().to_owned(), part.format().clone());
-            }
-            groups.push(eredu_runtime::packed_gated_product_logical_group(
+            let width = bank.intermediate_dimensions() as usize;
+            groups.push(eredu_runtime::logical_parameter_group(
                 format!("{root}.mlp.experts.intermediate"),
-                &bank,
-                args.moe_intermediate_size as usize,
+                ParameterRole::ExpertIntermediate,
+                Some(width),
+                bank,
+                |p| {
+                    if p.parameter.id == gate_up.weight().id
+                        || gate_up.bias().is_some_and(|bias| p.parameter.id == bias.id)
+                    {
+                        MemberSharding::PartitionedSegments {
+                            axis: 1,
+                            segments: vec![0..width, width..2 * width],
+                        }
+                    } else if p.role == LogicalParameterRole::LinearWeight {
+                        MemberSharding::Partitioned { axis: 2 }
+                    } else {
+                        MemberSharding::Replicated
+                    }
+                },
             )?);
         }
-        let (prefix, width) = match policy.feed_forward {
-            FeedForwardPolicy::Dense => (format!("{root}.mlp"), args.intermediate_size as usize),
-            FeedForwardPolicy::SparseMoe => (
-                format!("{root}.mlp.shared_experts"),
-                args.moe_intermediate_size as usize,
-            ),
+        let (prefix, specs) = match &scope.feed_forward {
+            super::declarations::FeedForwardParameters::Dense(spec) => {
+                (format!("{root}.mlp"), spec)
+            }
+            super::declarations::FeedForwardParameters::Sparse(spec) => {
+                (format!("{root}.mlp.shared_experts"), &spec.shared)
+            }
         };
-        groups.push(ParameterGroupSpec::partitioned(
+        groups.push(eredu_runtime::logical_parameter_group(
             format!("{prefix}.intermediate"),
             ParameterRole::FeedForwardIntermediate,
-            width,
-            [
-                projection(
-                    format!("{prefix}.gate_proj.weight"),
-                    width,
-                    hidden,
-                    MemberSharding::Partitioned { axis: 0 },
-                ),
-                projection(
-                    format!("{prefix}.up_proj.weight"),
-                    width,
-                    hidden,
-                    MemberSharding::Partitioned { axis: 0 },
-                ),
-                projection(
-                    format!("{prefix}.down_proj.weight"),
-                    hidden,
-                    width,
-                    MemberSharding::Partitioned { axis: 1 },
-                ),
-            ],
+            Some(specs.down.input as usize),
+            specs,
+            |p| {
+                if p.parameter.id == specs.down.weight.id {
+                    MemberSharding::Partitioned { axis: 1 }
+                } else {
+                    MemberSharding::Partitioned { axis: 0 }
+                }
+            },
         )?);
         owned.extend(groups.into_iter().map(|group| {
             OwnedParameterGroupSpec::new(
@@ -1050,191 +892,6 @@ pub fn parameter_description(
             )
         }));
     }
-    let expanded = eredu_runtime::expand_owned_linear_format_parameter_groups(owned, |member| {
-        let name = member.target();
-        if let Some(format) = formats.get(name) {
-            return Ok(Some(format.clone()));
-        }
-        projections
-            .contains(name)
-            .then(|| {
-                crate::linear_format::standard_linear_format(
-                    name,
-                    args.weight_quantization_for(name).into(),
-                )
-                .map_err(invalid)
-            })
-            .transpose()
-    })?;
-    ArchitectureParameterDescription::from_owned(&graph, &layout, expanded)
+    ArchitectureParameterDescription::from_owned(&graph, &layout, owned)
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))
-}
-
-/// Declares vocabulary and replicated final-normalization groups.
-pub fn static_parallel_parameter_groups<B>(
-    modules: &StaticModules<B>,
-) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError>
-where
-    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAttentionBackend,
-{
-    let mut groups = vec![
-        module_parameter_group::<B::Tensor, _>(
-            "model.embed_tokens",
-            ParameterRole::Vocabulary,
-            &modules.embeddings,
-            |_, shape| {
-                (!shape.is_empty())
-                    .then_some(MemberSharding::Balanced { axis: 0 })
-                    .ok_or_else(|| {
-                        ParallelPlanError::InvalidTensor("Kimi embedding is scalar".into())
-                    })
-            },
-        )?,
-        module_parameter_group::<B::Tensor, _>(
-            "model.norm",
-            ParameterRole::Replicated,
-            &modules.boundary.norm,
-            |_, _| Ok(MemberSharding::Replicated),
-        )?,
-    ];
-    if let Some(head) = &modules.lm_head {
-        groups.push(module_parameter_group::<B::Tensor, _>(
-            "lm_head",
-            ParameterRole::Vocabulary,
-            head,
-            |_, shape| {
-                (!shape.is_empty())
-                    .then_some(MemberSharding::Balanced { axis: 0 })
-                    .ok_or_else(|| ParallelPlanError::InvalidTensor("Kimi output is scalar".into()))
-            },
-        )?);
-    }
-    Ok(groups)
-}
-
-/// Declares semantic groups for one scheduled Kimi block.
-pub fn layer_parallel_parameter_groups<B>(
-    block: &Block<B>,
-    args: &ModelArgs,
-    layer: usize,
-) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError>
-where
-    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAttentionBackend,
-{
-    let root = format!("model.layers.{layer}");
-    let mut groups = Vec::new();
-    let (units, role) = match &block.mixer {
-        TokenMixer::Kda(_) => (args.kda_config.num_heads, ParameterRole::AttentionHeads),
-        TokenMixer::Mla(_) => (args.num_attention_heads, ParameterRole::AttentionHeads),
-    };
-    groups.push(partitioned_module_parameter_group::<B::Tensor, _>(
-        format!("{root}.self_attn.heads"),
-        role,
-        usize::try_from(units)
-            .map_err(|_| ParallelPlanError::InvalidGroup("Kimi head count exceeds usize".into()))?,
-        &block.mixer,
-        |metadata, shape| {
-            // Quantization companions carry their primary projection identity.
-            // They follow the same semantic head or output-column partition.
-            let name = metadata
-                .linear_companion_of
-                .as_ref()
-                .unwrap_or(&metadata.id)
-                .as_str();
-            if name.ends_with("q_proj.weight")
-                || name.ends_with("k_proj.weight")
-                || name.ends_with("v_proj.weight")
-                || name.ends_with("q_b_proj.weight")
-                || name.ends_with("kv_b_proj.weight")
-                || name.ends_with("k_b_proj.weight")
-                || name.ends_with("v_b_proj.weight")
-                || name.ends_with("f_b_proj.weight")
-                || name.ends_with("b_proj.weight")
-                || name.ends_with("g_b_proj.weight")
-                || name.ends_with("dt_bias")
-                || name.contains("conv1d.weight")
-            {
-                Ok(MemberSharding::Partitioned { axis: 0 })
-            } else if name.ends_with("A_log") && shape.len() >= 3 {
-                Ok(MemberSharding::Partitioned { axis: 2 })
-            } else if name.ends_with("o_proj.weight") && shape.len() >= 2 {
-                Ok(MemberSharding::Partitioned { axis: 1 })
-            } else {
-                Ok(MemberSharding::Replicated)
-            }
-        },
-    )?);
-    for (name, norm) in [
-        ("input_layernorm", &block.input_norm),
-        ("post_attention_layernorm", &block.post_attention_norm),
-    ] {
-        groups.push(module_parameter_group::<B::Tensor, _>(
-            format!("{root}.{name}"),
-            ParameterRole::Replicated,
-            norm,
-            |_, _| Ok(MemberSharding::Replicated),
-        )?);
-    }
-    match &block.feed_forward {
-        FeedForward::Dense(DenseSwiGlu { gate, down, up }) => {
-            let width = usize::try_from(args.intermediate_size).map_err(|_| {
-                ParallelPlanError::InvalidGroup("Kimi dense width exceeds usize".into())
-            })?;
-            groups.push(eredu_runtime::partitioned_projection_group::<
-                B::Tensor,
-                B::Linear,
-            >(
-                format!("{root}.mlp.intermediate"),
-                ParameterRole::FeedForwardIntermediate,
-                &[
-                    (gate, eredu_runtime::ProjectionSharding::Column),
-                    (up, eredu_runtime::ProjectionSharding::Column),
-                    (down, eredu_runtime::ProjectionSharding::Row),
-                ],
-                aligned_partition_units(&root, width, 1, 1)?,
-            )?);
-        }
-        FeedForward::Sparse(moe) => {
-            groups.push(module_parameter_group::<B::Tensor, _>(
-                format!("{root}.mlp.gate"),
-                ParameterRole::Replicated,
-                &moe.router,
-                |_, _| Ok(MemberSharding::Replicated),
-            )?);
-            let width = usize::try_from(args.moe_intermediate_size).map_err(|_| {
-                ParallelPlanError::InvalidGroup("Kimi expert width exceeds usize".into())
-            })?;
-            let segments = vec![0..width, width..2 * width];
-            groups.push(partitioned_module_parameter_group::<B::Tensor, _>(
-                format!("{root}.mlp.experts.intermediate"),
-                ParameterRole::ExpertIntermediate,
-                width,
-                &moe.experts,
-                |metadata, _| {
-                    if metadata.id.as_str().contains("gate_up_proj") {
-                        Ok(MemberSharding::PartitionedSegments {
-                            axis: 1,
-                            segments: segments.clone(),
-                        })
-                    } else {
-                        Ok(MemberSharding::Partitioned { axis: 2 })
-                    }
-                },
-            )?);
-            groups.push(eredu_runtime::partitioned_projection_group::<
-                B::Tensor,
-                B::Linear,
-            >(
-                format!("{root}.mlp.shared_experts.intermediate"),
-                ParameterRole::FeedForwardIntermediate,
-                &[
-                    (&moe.shared.gate, eredu_runtime::ProjectionSharding::Column),
-                    (&moe.shared.up, eredu_runtime::ProjectionSharding::Column),
-                    (&moe.shared.down, eredu_runtime::ProjectionSharding::Row),
-                ],
-                aligned_partition_units(&root, width, 1, 1)?,
-            )?);
-        }
-    }
-    Ok(groups)
 }

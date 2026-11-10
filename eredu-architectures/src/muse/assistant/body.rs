@@ -16,7 +16,35 @@ use eredu_runtime::{
 mod dflash;
 pub use dflash::{DFlashBodyDefinition, DFlashBodyUnit};
 mod dspark;
+pub(crate) use dspark::DsparkBodyParameters;
 pub use dspark::{DsparkBodyDefinition, DsparkBodyUnit};
+
+pub(super) const CONTEXT_GROUP: &str = "assistant.context";
+pub(super) const DECODER_GROUP: &str = "assistant.decoder";
+pub(super) const FINAL_NORM_GROUP: &str = "assistant.final_norm";
+
+pub(super) fn project_linear_encoding(
+    spec: &mut eredu_nn::LinearSpec,
+    format: &impl Fn(&str) -> eredu_checkpoint::LinearFormat,
+) -> Result<(), Error> {
+    spec.format = crate::linear_format::project_matrix_format(
+        &spec.weight,
+        &spec.format,
+        format(spec.weight.id.as_str()),
+    )?;
+    Ok(())
+}
+pub(super) fn project_embedding_encoding(
+    spec: &mut eredu_nn::EmbeddingSpec,
+    format: &impl Fn(&str) -> eredu_checkpoint::LinearFormat,
+) -> Result<(), Error> {
+    spec.format = crate::linear_format::project_matrix_format(
+        &spec.weight,
+        &spec.format,
+        format(spec.weight.id.as_str()),
+    )?;
+    Ok(())
+}
 
 /// A trained assistant projection consumes and returns its parameter compute dtype.
 pub(super) fn parameter_projection<B: NeuralBackend>(
@@ -83,12 +111,8 @@ impl AssistantBodyGeometry {
         {
             return Err(Error::backend("invalid assistant body geometry"));
         }
-        let graph = ExecutionGraph::chain([
-            "assistant.context",
-            "assistant.decoder",
-            "assistant.final_norm",
-        ])
-        .map_err(Error::backend)?;
+        let graph = ExecutionGraph::chain([CONTEXT_GROUP, DECODER_GROUP, FINAL_NORM_GROUP])
+            .map_err(Error::backend)?;
         let layout = ExecutionUnitLayout::new(&graph, [1, layers, 1]).map_err(Error::backend)?;
         Ok(Self {
             hidden,

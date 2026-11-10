@@ -19,7 +19,6 @@ use eredu_checkpoint::{
     },
     WeightQuantization,
 };
-use eredu_nn::AttentionValueSource;
 
 use super::{FamilyConfig, FeedForwardPolicy, ModelArgs};
 
@@ -32,22 +31,23 @@ pub fn load_time_quantization(
     quantization: WeightQuantization,
 ) -> Result<FamilyConfig, String> {
     quantization.validate().map_err(|error| error.to_string())?;
-    let mut target = config.clone();
+    let mut target = config.policy().clone();
     target.text.weight_quantization = Some(quantization);
     target.text.quantized_weights = None;
     target.text.quantized_weight_configs = None;
     if let Some(vision) = target.vision.as_mut() {
-        vision.weight_quantization = Some(quantization);
-        vision.quantized_weights = None;
-        vision.quantized_weight_configs = None;
+        *vision = vision
+            .with_formats(Some(quantization), None, None)
+            .map_err(|e| e.to_string())?;
     }
     if let Some(audio) = target.audio.as_mut() {
-        audio.weight_quantization = Some(quantization);
-        audio.quantized_weights = None;
-        audio.quantized_weight_configs = None;
+        *audio = audio
+            .with_formats(Some(quantization), None, None)
+            .map_err(|e| e.to_string())?;
     }
-    target.validate().map_err(|error| error.to_string())?;
-    Ok(target)
+    config
+        .project_storage(target)
+        .map_err(|error| error.to_string())
 }
 
 /// Applies canonical text checkpoint formats to a complete Gemma 4 family
@@ -56,7 +56,7 @@ pub fn with_checkpoint_formats(
     config: &FamilyConfig,
     formats: HashMap<String, WeightQuantization>,
 ) -> Result<FamilyConfig, String> {
-    let mut target = config.clone();
+    let mut target = config.policy().clone();
     let mut text = HashMap::new();
     let mut vision = HashMap::new();
     let mut audio = HashMap::new();
@@ -79,17 +79,22 @@ pub fn with_checkpoint_formats(
     target.text.quantized_weights = None;
     target.text.quantized_weight_configs = (!text.is_empty()).then_some(text);
     if let Some(config) = target.vision.as_mut() {
-        config.weight_quantization = None;
-        config.quantized_weights = None;
-        config.quantized_weight_configs = (!vision.is_empty()).then_some(vision);
+        *config = config
+            .with_formats(None, None, (!vision.is_empty()).then_some(vision))
+            .map_err(|e| e.to_string())?;
+    } else if !vision.is_empty() {
+        return Err("vision formats have no declared media owner".into());
     }
     if let Some(config) = target.audio.as_mut() {
-        config.weight_quantization = None;
-        config.quantized_weights = None;
-        config.quantized_weight_configs = (!audio.is_empty()).then_some(audio);
+        *config = config
+            .with_formats(None, None, (!audio.is_empty()).then_some(audio))
+            .map_err(|e| e.to_string())?;
+    } else if !audio.is_empty() {
+        return Err("audio formats have no declared media owner".into());
     }
-    target.validate().map_err(|error| error.to_string())?;
-    Ok(target)
+    config
+        .project_storage(target)
+        .map_err(|error| error.to_string())
 }
 
 fn released_layer_path(layer: usize) -> String {
@@ -176,8 +181,8 @@ impl Gemma4ArtifactConfig {
             components.push((
                 ComponentId::new("media_projector")?,
                 vec![
-                    "model.embed_vision.projection.weight".into(),
-                    "model.embed_audio.embedding_projection.weight".into(),
+                    super::media::ProjectionKind::Vision.gemma_weight().into(),
+                    super::media::ProjectionKind::Audio.gemma_weight().into(),
                 ],
             ));
         }
@@ -222,75 +227,168 @@ impl Gemma4ArtifactConfig {
 /// Native media components are appended from the same normalized family
 /// configuration, while residency remains a runtime concern.
 pub fn safetensors_plan(family: &FamilyConfig) -> Result<SafetensorsCheckpointPlan, String> {
-    shared_safetensors_plan(&family.text, family.vision.as_ref(), family.audio.as_ref())
+    shared_safetensors_plan(
+        &family.text,
+        family.vision.as_ref(),
+        "model.vision_tower",
+        family.audio.as_ref(),
+        family.pinned(),
+        family.projectors(),
+        family.blocks(),
+        family.dense_scopes(),
+        family.attention_scopes(),
+        family.routed_scopes(),
+    )
+}
+
+/// Projects matrix-shaped source geometry by resolving format identities to
+/// construction declarations. Lookup tables retain their independent semantics;
+/// floating source exceptions never require inverse packing arithmetic.
+pub(crate) fn source_linear_shapes(
+    family: &FamilyConfig,
+) -> Result<BTreeMap<String, Vec<usize>>, String> {
+    let declaration =
+        super::model::parameter_description(family).map_err(|error| error.to_string())?;
+    let pinned = family.pinned();
+    let embedding = pinned.embedding().weight.id.as_str();
+    let logical = declaration
+        .groups()
+        .iter()
+        .flat_map(|group| group.members())
+        .filter(|member| member.target() != embedding)
+        .filter_map(|member| {
+            member
+                .logical_shape()
+                .filter(|shape| shape.len() == 2)
+                .map(|shape| (member.target(), shape))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let plan = safetensors_plan(family)?;
+    let mut shapes = BTreeMap::new();
+    for source in plan.common_tensors.iter().chain(
+        plan.layout_groups
+            .iter()
+            .flat_map(|group| &group.variants)
+            .flat_map(|variant| &variant.tensors),
+    ) {
+        if let Some(shape) = source_matrix_shape(source, &logical, embedding)? {
+            shapes.insert(source.key.clone(), shape);
+        }
+    }
+    Ok(shapes)
+}
+
+fn source_matrix_shape(
+    source: &SafetensorsTensorConstraint,
+    logical: &BTreeMap<&str, &[usize]>,
+    embedding: &str,
+) -> Result<Option<Vec<usize>>, String> {
+    if source.role != eredu_checkpoint::schema::TensorRole::Tensor || source.shape.len() != 2 {
+        return Ok(None);
+    }
+    let names =
+        || std::iter::once(source.key.as_str()).chain(source.aliases.iter().map(String::as_str));
+    if names().any(|name| name == embedding) {
+        return Ok(None);
+    }
+    let mut resolved = names().filter_map(|name| logical.get(name).copied());
+    let shape = resolved.next().ok_or_else(|| {
+        format!(
+            "Gemma source matrix {:?} has no declared logical geometry",
+            source.key
+        )
+    })?;
+    if resolved.any(|other| other != shape) {
+        return Err(format!(
+            "Gemma source matrix {:?} aliases have conflicting logical geometry",
+            source.key
+        ));
+    }
+    Ok(Some(shape.to_vec()))
 }
 
 pub(crate) fn shared_safetensors_plan(
     args: &ModelArgs,
     vision: Option<&super::VisionConfig>,
+    vision_root: &str,
     audio: Option<&super::AudioConfig>,
+    declaration: &super::text::pinned::Declaration,
+    projectors: &[super::media::ProjectionSpec],
+    blocks: &[super::text::specs::BlockSpec],
+    dense_scopes: &[super::text::specs::DenseSpec],
+    attention_scopes: &[super::text::specs::AttentionSpec],
+    routed_scopes: &[Option<super::text::routed::Declaration>],
 ) -> Result<SafetensorsCheckpointPlan, String> {
-    let hidden = dimension(args.hidden_size, "hidden size")?;
+    declaration.validate_for(args).map_err(|e| e.to_string())?;
     let layers = args.num_hidden_layers();
-    let vocabulary = dimension(args.vocab_size, "vocabulary size")?;
     let mut common = Vec::new();
     let mut groups = Vec::new();
-    add_text_matrix(
-        args,
-        &mut common,
-        "model.language_model.embed_tokens.weight",
-        "model.embed_tokens.weight",
-        vec![vocabulary, hidden],
-    )?;
-    common.push(safe_alias(
-        "model.language_model.norm.weight",
-        "model.norm.weight",
-        vec![hidden],
-    ));
-    if !args.tie_word_embeddings {
-        add_text_matrix(
-            args,
-            &mut common,
-            "lm_head.weight",
-            "lm_head.weight",
-            vec![vocabulary, hidden],
-        )?;
-    }
-    if args.hidden_size_per_layer_input > 0 {
-        let per_layer = dimension(args.hidden_size_per_layer_input, "per-layer input width")?;
-        let combined = checked_mul(layers, per_layer, "combined per-layer input width")?;
-        let per_layer_vocab = dimension(
-            args.vocab_size_per_layer_input.unwrap_or(args.vocab_size),
-            "per-layer input vocabulary size",
-        )?;
-        for (source, target, shape) in [
-            (
-                "model.language_model.embed_tokens_per_layer.weight",
-                "model.embed_tokens_per_layer.weight",
-                vec![per_layer_vocab, combined],
-            ),
-            (
-                "model.language_model.per_layer_model_projection.weight",
-                "model.per_layer_model_projection.weight",
-                vec![combined, hidden],
-            ),
-        ] {
-            add_text_matrix(args, &mut common, source, target, shape)?;
+    use eredu_nn::DeclareLogicalParameters;
+    for parameter in declaration
+        .logical_parameters()
+        .map_err(|e| e.to_string())?
+    {
+        let id = parameter.parameter.id.as_str();
+        let (source, target) =
+            if let Some(local) = id.strip_prefix(&format!("{}.", declaration.root())) {
+                (
+                    format!("model.language_model.{local}"),
+                    format!("model.{local}"),
+                )
+            } else {
+                (id.to_owned(), id.to_owned())
+            };
+        if let Some(format) = parameter.linear_format {
+            common.extend(
+                matrix_for_linear_format(
+                    &source,
+                    (&source != &target).then_some(target),
+                    parameter.shape,
+                    format.encoding(),
+                    None,
+                )
+                .map_err(|e| e.to_string())?,
+            );
+        } else {
+            common.push(safe_alias(source, target, parameter.shape));
         }
-        common.push(safe_alias(
-            "model.language_model.per_layer_projection_norm.weight",
-            "model.per_layer_projection_norm.weight",
-            vec![per_layer],
-        ));
     }
     for layer in 0..layers {
-        add_safetensors_layer(args, layer, hidden, &mut common, &mut groups)?;
+        add_safetensors_layer(
+            args,
+            layer,
+            blocks.get(layer).ok_or("missing Gemma block owner")?,
+            dense_scopes.get(layer).ok_or("missing Gemma dense owner")?,
+            attention_scopes
+                .get(layer)
+                .ok_or("missing Gemma attention owner")?,
+            routed_scopes
+                .get(layer)
+                .ok_or("missing Gemma routed scope")?
+                .as_ref(),
+            &mut common,
+            &mut groups,
+        )?;
     }
     if let Some(vision) = vision {
-        add_safetensors_vision(vision, hidden, &mut common)?;
+        add_safetensors_vision(vision, vision_root, &mut common)?;
     }
     if let Some(audio) = audio {
-        add_safetensors_audio(audio, hidden, &mut common)?;
+        add_safetensors_audio(audio, &mut common)?;
+    }
+    for spec in projectors {
+        let source = spec.kind.gemma_weight();
+        for parameter in spec.logical_parameters().map_err(|e| e.to_string())? {
+            if parameter.parameter.id != spec.projection.weight.id {
+                return Err("Gemma projector storage extension does not cover bias slots".into());
+            }
+            add_matrix(
+                &mut common,
+                source,
+                parameter.shape,
+                spec.projection.format.encoding(),
+            )?;
+        }
     }
     for constraint in &mut common {
         add_mlx_vlm_aliases(constraint);
@@ -374,29 +472,9 @@ fn audio_output_projection_bias_in(
         })
 }
 
-/// Whether a name uses the `mlx-vlm` physical spelling rather than the
-/// released or backend-neutral one.
-pub(crate) fn is_mlx_vlm_physical_name(name: &str) -> bool {
-    name.starts_with("language_model.")
-        || name.starts_with("vision_tower.")
-        || name.starts_with("embed_vision.")
-        || name.starts_with("audio_tower.")
-        || name.starts_with("embed_audio.")
-}
-
-/// The backend-neutral alias of a constraint, if it has one. Alias order is
-/// normalized alphabetically by the checkpoint plan, so callers that need the
-/// neutral name must select it rather than take the first alias.
-pub(crate) fn neutral_alias(tensor: &SafetensorsTensorConstraint) -> Option<&String> {
-    tensor
-        .aliases
-        .iter()
-        .find(|alias| !is_mlx_vlm_physical_name(alias))
-}
-
 /// Adds the `mlx-vlm` physical alias of a constraint's key and existing
 /// aliases so one plan admits the released, canonical, and MLX conversions.
-fn add_mlx_vlm_aliases(constraint: &mut SafetensorsTensorConstraint) {
+pub(crate) fn add_mlx_vlm_aliases(constraint: &mut SafetensorsTensorConstraint) {
     let extra = std::iter::once(&constraint.key)
         .chain(constraint.aliases.iter())
         .filter_map(|name| mlx_vlm_physical_name(name))
@@ -468,183 +546,157 @@ fn projector_physical_name(canonical: &str) -> Option<String> {
 fn add_safetensors_layer(
     args: &ModelArgs,
     layer: usize,
-    hidden: usize,
+    block: &super::text::specs::BlockSpec,
+    dense: &super::text::specs::DenseSpec,
+    attention: &super::text::specs::AttentionSpec,
+    routed: Option<&super::text::routed::Declaration>,
     common: &mut Vec<SafetensorsTensorConstraint>,
     groups: &mut Vec<AlternativeLayoutGroup<SafetensorsTensorConstraint>>,
 ) -> Result<(), String> {
-    let policy = args
-        .layer_policy(layer)
-        .ok_or_else(|| format!("Gemma 4 layer {layer} has no normalized policy"))?;
-    let released = released_layer_path(layer);
+    let spec = super::text::specs::DecoderBlockSpec::from_scopes(
+        args,
+        layer,
+        block
+            .in_namespace(layer, "model.layers")
+            .map_err(|e| e.to_string())?,
+        dense
+            .in_namespace(layer, "model.layers")
+            .map_err(|e| e.to_string())?,
+        attention
+            .in_namespace(layer, "model.layers")
+            .map_err(|e| e.to_string())?,
+        routed
+            .map(|s| s.in_namespace(args, layer, "model.layers"))
+            .transpose()
+            .map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    add_safetensors_block(layer, &spec, &released_layer_path(layer), common, groups)
+}
+
+pub(crate) fn add_safetensors_block(
+    layer: usize,
+    spec: &super::text::specs::DecoderBlockSpec,
+    released: &str,
+    common: &mut Vec<SafetensorsTensorConstraint>,
+    groups: &mut Vec<AlternativeLayoutGroup<SafetensorsTensorConstraint>>,
+) -> Result<(), String> {
+    use eredu_nn::DeclareLogicalParameters;
     let canonical = format!("model.layers.{layer}");
-    let head = policy.head_dim.get() as usize;
-    let query = checked_mul(
-        dimension(args.num_attention_heads, "attention head count")?,
-        head,
-        "query projection width",
-    )?;
-    let key_value = checked_mul(
-        policy.num_key_value_heads.get() as usize,
-        head,
-        "key/value projection width",
-    )?;
-    for (projection, _, width) in attention_biases(args, policy, hidden, query, key_value) {
-        common.push(safe_alias(
-            format!("{released}.self_attn.{projection}.bias"),
-            format!("{canonical}.self_attn.{projection}.bias"),
-            vec![width],
-        ));
-    }
-    for local in [
-        "input_layernorm.weight",
-        "post_attention_layernorm.weight",
-        "pre_feedforward_layernorm.weight",
-        "post_feedforward_layernorm.weight",
-    ] {
-        common.push(safe_alias(
-            format!("{released}.{local}"),
-            format!("{canonical}.{local}"),
-            vec![hidden],
-        ));
-    }
-    common.push(safe_alias(
-        format!("{released}.layer_scalar"),
-        format!("{canonical}.layer_scalar"),
-        vec![1],
-    ));
-    let intermediate = policy.intermediate_size.get() as usize;
-    for (local, shape) in [
-        ("self_attn.q_proj.weight", vec![query, hidden]),
-        ("self_attn.o_proj.weight", vec![hidden, query]),
-        ("mlp.gate_proj.weight", vec![intermediate, hidden]),
-        ("mlp.up_proj.weight", vec![intermediate, hidden]),
-        ("mlp.down_proj.weight", vec![hidden, intermediate]),
-    ] {
-        add_text_matrix(
-            args,
-            common,
-            &format!("{released}.{local}"),
-            &format!("{canonical}.{local}"),
-            shape,
-        )?;
-    }
-    common.push(safe_alias(
-        format!("{released}.self_attn.q_norm.weight"),
-        format!("{canonical}.self_attn.q_norm.weight"),
-        vec![head],
-    ));
-    if policy.key_value.owns_state() {
-        add_text_matrix(
-            args,
-            common,
-            &format!("{released}.self_attn.k_proj.weight"),
-            &format!("{canonical}.self_attn.k_proj.weight"),
-            vec![key_value, hidden],
-        )?;
-        common.push(safe_alias(
-            format!("{released}.self_attn.k_norm.weight"),
-            format!("{canonical}.self_attn.k_norm.weight"),
-            vec![head],
-        ));
-        if policy.key_value.value() != Some(AttentionValueSource::ReuseKey) {
+    let attention = &spec.attention;
+    let dense = &spec.dense;
+    let block = &spec.block;
+    for parameter in attention
+        .logical_parameters()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .chain(dense.logical_parameters().map_err(|e| e.to_string())?)
+        .chain(block.logical_parameters().map_err(|e| e.to_string())?)
+    {
+        let target = parameter.parameter.id.as_str();
+        let local = target
+            .strip_prefix(&format!("{canonical}."))
+            .ok_or("Gemma ordinary extension references another invocation")?;
+        let source = format!("{released}.{local}");
+        if parameter.role == eredu_nn::LogicalParameterRole::LinearWeight {
             add_text_matrix(
-                args,
+                parameter
+                    .linear_format
+                    .ok_or("matrix slot has no declared encoding")?
+                    .encoding(),
                 common,
-                &format!("{released}.self_attn.v_proj.weight"),
-                &format!("{canonical}.self_attn.v_proj.weight"),
-                vec![key_value, hidden],
+                &source,
+                target,
+                parameter.shape,
             )?;
+        } else {
+            common.push(safe_alias(source, target, parameter.shape));
         }
     }
-    if args.hidden_size_per_layer_input > 0 {
-        let media = dimension(args.hidden_size_per_layer_input, "per-layer input width")?;
-        for (local, shape) in [
-            ("per_layer_input_gate.weight", vec![media, hidden]),
-            ("per_layer_projection.weight", vec![hidden, media]),
-        ] {
-            add_text_matrix(
-                args,
-                common,
-                &format!("{released}.{local}"),
-                &format!("{canonical}.{local}"),
-                shape,
-            )?;
-        }
-        common.push(safe_alias(
-            format!("{released}.post_per_layer_input_norm.weight"),
-            format!("{canonical}.post_per_layer_input_norm.weight"),
-            vec![hidden],
-        ));
-    }
-    if policy.feed_forward == FeedForwardPolicy::DenseWithSparseMoe {
-        add_safetensors_experts(args, &released, &canonical, hidden, common, groups)?;
+    if let Some(routed) = &spec.routed {
+        add_safetensors_experts(routed, released, &canonical, common, groups)?;
     }
     Ok(())
 }
 
 fn add_safetensors_experts(
-    args: &ModelArgs,
+    declaration: &super::text::routed::Declaration,
     released: &str,
     canonical: &str,
-    hidden: usize,
     common: &mut Vec<SafetensorsTensorConstraint>,
     groups: &mut Vec<AlternativeLayoutGroup<SafetensorsTensorConstraint>>,
 ) -> Result<(), String> {
-    let experts = dimension(
-        args.num_experts
-            .ok_or_else(|| "Gemma 4 sparse layer has no expert count".to_string())?,
-        "expert count",
-    )?;
-    let intermediate = dimension(
-        args.moe_intermediate_size
-            .ok_or_else(|| "Gemma 4 sparse layer has no expert width".to_string())?,
-        "expert intermediate size",
-    )?;
-    for (local, shape) in [
-        ("router.proj.weight", vec![experts, hidden]),
-        ("router.scale", vec![hidden]),
-        ("router.per_expert_scale", vec![experts]),
-        ("post_feedforward_layernorm_1.weight", vec![hidden]),
-        ("pre_feedforward_layernorm_2.weight", vec![hidden]),
-        ("post_feedforward_layernorm_2.weight", vec![hidden]),
-    ] {
+    use eredu_nn::DeclareLogicalParameters;
+    let source = declaration
+        .routed
+        .experts
+        .packed_parameters()
+        .map_err(|e| e.to_string())?;
+    let gate_up = source.gate_up();
+    let down = source.down();
+    let fused_shape = gate_up.shape.clone();
+    let down_shape = down.shape.clone();
+    let split_shape = source.unfused_shape();
+    for parameter in declaration
+        .router_parameters()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .chain(
+            declaration.norms[..]
+                .logical_parameters()
+                .map_err(|e| e.to_string())?,
+        )
+    {
+        let target = parameter.parameter.id.as_str();
+        let local = target
+            .strip_prefix(&format!("{canonical}."))
+            .ok_or("Gemma routed extension references another unit")?;
         let source = format!("{released}.{local}");
-        let target = format!("{canonical}.{local}");
-        if local.ends_with(".weight") && local == "router.proj.weight" {
-            add_text_matrix(args, common, &source, &target, shape)?;
+        if parameter.parameter.id == declaration.routed.selector.weight().id {
+            add_text_matrix(
+                parameter
+                    .linear_format
+                    .ok_or("matrix slot has no declared encoding")?
+                    .encoding(),
+                common,
+                &source,
+                target,
+                parameter.shape,
+            )?;
         } else {
-            common.push(safe_alias(source, target, shape));
+            common.push(safe_alias(source, target, parameter.shape));
         }
     }
     let released_root = format!("{released}.experts.switch_glu");
-    let canonical_root = format!("{canonical}.experts.switch_glu");
+    let canonical_root = gate_up
+        .parameter
+        .id
+        .as_str()
+        .strip_suffix(".gate_up_proj")
+        .ok_or("unresolved Gemma expert source root")?;
     let mut split = Vec::new();
     let split_gate = format!("{released_root}.gate_proj.weight");
     let split_up = format!("{released_root}.up_proj.weight");
-    for (source, target) in [
+    for ((source, target), format) in [
         (&split_gate, format!("{canonical_root}.gate_proj.weight")),
         (&split_up, format!("{canonical_root}.up_proj.weight")),
-    ] {
-        add_text_matrix(
-            args,
-            &mut split,
-            source,
-            &target,
-            vec![experts, intermediate, hidden],
-        )?;
+    ]
+    .into_iter()
+    .zip(declaration.split_formats)
+    {
+        add_text_matrix(format, &mut split, source, &target, split_shape.clone())?;
     }
     let fused = format!("{released_root}.gate_up_proj.weight");
     let mut packed = Vec::new();
     add_text_matrix(
-        args,
+        gate_up
+            .linear_format
+            .ok_or("expert bank has no declared encoding")?
+            .encoding(),
         &mut packed,
         &fused,
-        &format!("{canonical_root}.gate_up_proj"),
-        vec![
-            experts,
-            checked_mul(2, intermediate, "fused expert width")?,
-            hidden,
-        ],
+        gate_up.parameter.id.as_str(),
+        fused_shape,
     )?;
     groups.push(AlternativeLayoutGroup {
         id: format!("{canonical_root} gate/up storage"),
@@ -663,17 +715,19 @@ fn add_safetensors_experts(
         ],
     });
     add_text_matrix(
-        args,
+        down.linear_format
+            .ok_or("expert bank has no declared encoding")?
+            .encoding(),
         common,
         &format!("{released_root}.down_proj.weight"),
-        &format!("{canonical_root}.down_proj"),
-        vec![experts, hidden, intermediate],
+        down.parameter.id.as_str(),
+        down_shape,
     )?;
     Ok(())
 }
 
 fn add_text_matrix(
-    args: &ModelArgs,
+    format: eredu_checkpoint::LinearFormat,
     output: &mut Vec<SafetensorsTensorConstraint>,
     source: &str,
     canonical: &str,
@@ -684,7 +738,7 @@ fn add_text_matrix(
             source,
             (source != canonical).then(|| canonical.to_owned()),
             shape,
-            args.linear_format_for(canonical),
+            format,
             None,
         )
         .map_err(|error| error.to_string())?,
@@ -694,99 +748,43 @@ fn add_text_matrix(
 
 fn add_safetensors_vision(
     config: &super::VisionConfig,
-    text_hidden: usize,
+    vision_root: &str,
     output: &mut Vec<SafetensorsTensorConstraint>,
 ) -> Result<(), String> {
-    let hidden = dimension(config.hidden_size, "vision hidden size")?;
-    let intermediate = dimension(config.intermediate_size, "vision intermediate size")?;
-    let head = dimension(config.head_dim, "vision head width")?;
-    let query = checked_mul(
-        dimension(config.num_attention_heads, "vision attention head count")?,
-        head,
-        "vision query width",
-    )?;
-    let key_value = checked_mul(
-        dimension(config.num_key_value_heads, "vision KV head count")?,
-        head,
-        "vision key/value width",
-    )?;
-    let patch = dimension(config.patch_size, "vision patch size")?;
-    let patch_input = checked_mul(
-        3,
-        checked_mul(patch, patch, "vision patch area")?,
-        "vision patch input width",
-    )?;
-    let patch_name = "model.vision_tower.patch_embedder.input_proj.weight";
-    add_matrix(
+    use eredu_nn::DeclareLogicalParameters;
+    let spec = config.pinned(vision_root).map_err(|e| e.to_string())?;
+    add_vision_parameters(
         output,
-        patch_name,
-        vec![hidden, patch_input],
-        config.linear_format_for(patch_name, patch_input as i32),
+        vision_root,
+        spec.logical_parameters().map_err(|e| e.to_string())?,
     )?;
-    output.push(safe(
-        "model.vision_tower.patch_embedder.position_embedding_table",
-        vec![
-            2,
-            dimension(config.position_embedding_size, "vision position count")?,
-            hidden,
-        ],
-    ));
-    if config.standardize {
-        for local in ["std_bias", "std_scale"] {
-            output.push(safe(format!("model.vision_tower.{local}"), vec![hidden]));
-        }
-    }
     for layer in 0..dimension(config.num_hidden_layers, "vision layer count")? {
-        let root = format!("model.vision_tower.encoder.layers.{layer}");
-        for local in [
-            "input_layernorm.weight",
-            "post_attention_layernorm.weight",
-            "pre_feedforward_layernorm.weight",
-            "post_feedforward_layernorm.weight",
-        ] {
-            output.push(safe(format!("{root}.{local}"), vec![hidden]));
-        }
-        for (local, shape, input) in [
-            ("self_attn.q_proj", vec![query, hidden], hidden),
-            ("self_attn.k_proj", vec![key_value, hidden], hidden),
-            ("self_attn.v_proj", vec![key_value, hidden], hidden),
-            ("self_attn.o_proj", vec![hidden, query], query),
-            ("mlp.gate_proj", vec![intermediate, hidden], hidden),
-            ("mlp.up_proj", vec![intermediate, hidden], hidden),
-            ("mlp.down_proj", vec![hidden, intermediate], intermediate),
-        ] {
-            add_clipped_matrix(output, config, &format!("{root}.{local}"), shape, input)?;
-        }
-        for local in ["self_attn.q_norm.weight", "self_attn.k_norm.weight"] {
-            output.push(safe(format!("{root}.{local}"), vec![head]));
-        }
+        let spec = config
+            .layer(layer, vision_root)
+            .map_err(|e| e.to_string())?;
+        add_vision_parameters(
+            output,
+            vision_root,
+            spec.logical_parameters().map_err(|e| e.to_string())?,
+        )?;
     }
-    let projection = "model.embed_vision.embedding_projection.weight";
-    add_matrix(
-        output,
-        projection,
-        vec![text_hidden, hidden],
-        config.linear_format_for(projection, hidden as i32),
-    )
+    Ok(())
 }
 
-fn add_clipped_matrix(
+fn add_vision_parameters(
     output: &mut Vec<SafetensorsTensorConstraint>,
-    config: &super::VisionConfig,
-    prefix: &str,
-    shape: Vec<usize>,
-    input: usize,
+    vision_root: &str,
+    parameters: Vec<eredu_nn::LogicalParameterDeclaration<'_>>,
 ) -> Result<(), String> {
-    let weight = format!("{prefix}.linear.weight");
-    add_matrix(
-        output,
-        &weight,
-        shape,
-        config.linear_format_for(&weight, input as i32),
-    )?;
-    if config.use_clipped_linears {
-        for local in ["input_min", "input_max", "output_min", "output_max"] {
-            output.push(safe(format!("{prefix}.{local}"), Vec::new()));
+    for parameter in parameters {
+        let id = parameter.parameter.id.as_str();
+        // Published source names share the Gemma tower tree; construction keeps
+        // the actual family identity when selecting per-parameter encodings.
+        let source = id.replacen(vision_root, "model.vision_tower", 1);
+        if let Some(format) = parameter.linear_format {
+            add_matrix(output, &source, parameter.shape, format.encoding())?;
+        } else {
+            output.push(safe(source, parameter.shape));
         }
     }
     Ok(())
@@ -794,19 +792,48 @@ fn add_clipped_matrix(
 
 fn add_safetensors_audio(
     config: &super::AudioConfig,
-    text_hidden: usize,
     output: &mut Vec<SafetensorsTensorConstraint>,
 ) -> Result<(), String> {
-    for parameter in super::audio::parameters::declaration(
-        config,
-        text_hidden,
-        0..dimension(config.num_hidden_layers, "audio layer count")?,
-    )? {
-        if let Some(format) = parameter.format {
-            add_matrix(output, &parameter.name, parameter.shape, format)?;
+    use eredu_nn::DeclareLogicalParameters;
+    let pinned = config.pinned();
+    add_audio_parameters(
+        output,
+        pinned.logical_parameters().map_err(|e| e.to_string())?,
+        pinned.output.bias.as_ref().map(|p| &p.id),
+        None,
+    )?;
+    for spec in config.layers() {
+        // Released relative-position matrices remain floating source tensors;
+        // their selected materialization encoding is a separate storage concern.
+        let relative = &spec.attention.relative_key.weight.id;
+        add_audio_parameters(
+            output,
+            spec.logical_parameters().map_err(|e| e.to_string())?,
+            None,
+            Some(relative),
+        )?;
+    }
+    Ok(())
+}
+
+fn add_audio_parameters(
+    output: &mut Vec<SafetensorsTensorConstraint>,
+    parameters: Vec<eredu_nn::LogicalParameterDeclaration<'_>>,
+    optional: Option<&eredu_nn::ParameterId>,
+    floating_source: Option<&eredu_nn::ParameterId>,
+) -> Result<(), String> {
+    for parameter in parameters {
+        let name = parameter.parameter.id.as_str();
+        if let Some(format) = parameter.linear_format {
+            let encoding = if floating_source == Some(&parameter.parameter.id) {
+                eredu_checkpoint::LinearFormat::Dense
+            } else {
+                format.encoding()
+            };
+            add_matrix(output, name, parameter.shape, encoding)?;
         } else {
-            let mut tensor = safe(parameter.name, parameter.shape);
-            if parameter.optional {
+            let mut tensor = safe(name, parameter.shape);
+            if optional == Some(&parameter.parameter.id) {
                 tensor = tensor.optional();
             }
             output.push(tensor);
@@ -849,250 +876,147 @@ fn dimension(value: i32, name: &str) -> Result<usize, String> {
         .ok_or_else(|| format!("Gemma 4 {name} must be positive, got {value}"))
 }
 
-fn checked_mul(left: usize, right: usize, name: &str) -> Result<usize, String> {
-    left.checked_mul(right)
-        .ok_or_else(|| format!("Gemma 4 {name} geometry overflows"))
-}
-
 // Bias ownership follows the same projection schedule as the executable.
 // Shared-KV consumers project only Q/O; reused values have no separate V bias.
-fn attention_biases(
-    args: &ModelArgs,
-    policy: super::LayerPolicy,
-    hidden: usize,
-    query: usize,
-    key_value: usize,
-) -> Vec<(&'static str, &'static str, usize)> {
-    if !args.attention_bias {
-        return Vec::new();
-    }
-    let mut biases = vec![
-        ("q_proj", "attn_q", query),
-        ("o_proj", "attn_output", hidden),
-    ];
-    if policy.key_value.owns_state() {
-        biases.push(("k_proj", "attn_k", key_value));
-        if policy.key_value.value() != Some(AttentionValueSource::ReuseKey) {
-            biases.push(("v_proj", "attn_v", key_value));
-        }
-    }
-    biases
-}
-
 /// Builds the strict text GGUF catalog, including shared-KV omissions and
 /// split/fused routed-expert alternatives.
-pub fn gguf_plan(args: &ModelArgs) -> Result<GgufCheckpointPlan, String> {
-    let hidden = dimension(args.hidden_size, "hidden size")?;
+pub fn gguf_plan(family: &FamilyConfig) -> Result<GgufCheckpointPlan, String> {
+    shared_gguf_plan(
+        &family.text,
+        family.pinned(),
+        family.blocks(),
+        family.dense_scopes(),
+        family.attention_scopes(),
+        family.routed_scopes(),
+    )
+}
+
+pub(crate) fn shared_gguf_plan(
+    args: &ModelArgs,
+    declaration: &super::text::pinned::Declaration,
+    block_scopes: &[super::text::specs::BlockSpec],
+    dense_scopes: &[super::text::specs::DenseSpec],
+    attention_scopes: &[super::text::specs::AttentionSpec],
+    routed_scopes: &[Option<super::text::routed::Declaration>],
+) -> Result<GgufCheckpointPlan, String> {
+    declaration.validate_for(args).map_err(|e| e.to_string())?;
     let layers = args.num_hidden_layers();
-    let vocabulary = dimension(args.vocab_size, "vocabulary size")?;
-    let mut common = vec![
-        gguf(
-            "token_embd.weight",
-            vec![vocabulary, hidden],
-            TensorOperation::Matrix,
-        ),
-        gguf("output_norm.weight", vec![hidden], TensorOperation::Vector),
-    ];
-    if !args.tie_word_embeddings {
-        common.push(gguf(
-            "output.weight",
-            vec![vocabulary, hidden],
-            TensorOperation::Matrix,
-        ));
-    }
-    if args.hidden_size_per_layer_input > 0 {
-        let per_layer = dimension(args.hidden_size_per_layer_input, "per-layer input width")?;
-        let combined = checked_mul(layers, per_layer, "combined per-layer input width")?;
-        let per_layer_vocab = dimension(
-            args.vocab_size_per_layer_input.unwrap_or(args.vocab_size),
-            "per-layer input vocabulary size",
-        )?;
-        common.extend([
+    let mut common = static_gguf_slots(declaration)?
+        .into_iter()
+        .map(|(parameter, source)| {
             gguf(
-                "per_layer_token_embd.weight",
-                vec![per_layer_vocab, combined],
-                TensorOperation::Matrix,
-            ),
-            gguf(
-                "per_layer_model_proj.weight",
-                vec![combined, hidden],
-                TensorOperation::Matrix,
-            ),
-            gguf(
-                "per_layer_proj_norm.weight",
-                vec![per_layer],
-                TensorOperation::Vector,
-            ),
-        ]);
-    }
-    let attention_heads = dimension(args.num_attention_heads, "attention head count")?;
+                source,
+                parameter.shape,
+                if matches!(
+                    parameter.role,
+                    eredu_nn::LogicalParameterRole::Embedding
+                        | eredu_nn::LogicalParameterRole::LinearWeight
+                ) {
+                    TensorOperation::Matrix
+                } else {
+                    TensorOperation::Vector
+                },
+            )
+        })
+        .collect::<Vec<_>>();
     let mut groups = Vec::new();
     let mut catalog = CatalogPolicy::strict();
     catalog.allowed_prefixes.push("rope_freqs.".into());
-    for layer in 0..layers {
+    let blocks = (0..layers)
+        .map(|layer| {
+            super::text::specs::DecoderBlockSpec::from_scopes(
+                args,
+                layer,
+                block_scopes
+                    .get(layer)
+                    .ok_or_else(|| eredu_nn::Error::backend("missing Gemma block owner"))?
+                    .in_namespace(layer, "model.layers")?,
+                dense_scopes
+                    .get(layer)
+                    .ok_or_else(|| eredu_nn::Error::backend("missing Gemma dense owner"))?
+                    .in_namespace(layer, "model.layers")?,
+                attention_scopes
+                    .get(layer)
+                    .ok_or_else(|| eredu_nn::Error::backend("missing Gemma attention owner"))?
+                    .in_namespace(layer, "model.layers")?,
+                routed_scopes
+                    .get(layer)
+                    .ok_or_else(|| eredu_nn::Error::backend("missing Gemma routed scope"))?
+                    .as_ref()
+                    .map(|s| s.in_namespace(args, layer, "model.layers"))
+                    .transpose()?,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    add_gguf_blocks(&blocks, &mut common, &mut groups, &mut catalog)?;
+    GgufCheckpointPlan::new("Gemma 4 GGUF", common, groups, catalog)
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn add_gguf_blocks(
+    blocks: &[super::text::specs::DecoderBlockSpec],
+    common: &mut Vec<GgufTensorConstraint>,
+    groups: &mut Vec<AlternativeLayoutGroup<GgufTensorConstraint>>,
+    catalog: &mut CatalogPolicy,
+) -> Result<(), String> {
+    for (layer, spec) in blocks.iter().enumerate() {
         let root = format!("blk.{layer}");
-        let policy = args
-            .layer_policy(layer)
-            .ok_or_else(|| format!("Gemma 4 layer {layer} has no normalized policy"))?;
-        let head = policy.head_dim.get() as usize;
-        let query = checked_mul(attention_heads, head, "query projection width")?;
-        let key_value = checked_mul(
-            policy.num_key_value_heads.get() as usize,
-            head,
-            "key/value projection width",
-        )?;
-        for (_, projection, width) in attention_biases(args, policy, hidden, query, key_value) {
+        let attention = &spec.attention;
+        let dense = &spec.dense;
+        for (parameter, source) in ordinary_gguf_slots(attention, dense)? {
             common.push(gguf(
-                format!("{root}.{projection}.bias"),
-                vec![width],
-                TensorOperation::Vector,
+                format!("{root}.{source}"),
+                parameter.shape,
+                if parameter.role == eredu_nn::LogicalParameterRole::LinearWeight {
+                    TensorOperation::Matrix
+                } else {
+                    TensorOperation::Vector
+                },
             ));
         }
-        for local in [
-            "attn_norm.weight",
-            "post_attention_norm.weight",
-            "ffn_norm.weight",
-            "post_ffw_norm.weight",
-        ] {
+        let block = &spec.block;
+        for (parameter, source) in block_gguf_slots(block)? {
             common.push(gguf(
-                format!("{root}.{local}"),
-                vec![hidden],
-                TensorOperation::Vector,
+                format!("{root}.{source}"),
+                parameter.shape,
+                if parameter.role == eredu_nn::LogicalParameterRole::LinearWeight {
+                    TensorOperation::Matrix
+                } else {
+                    TensorOperation::Vector
+                },
             ));
         }
-        let intermediate = policy.intermediate_size.get() as usize;
-        common.extend([
-            gguf(
-                format!("{root}.layer_output_scale.weight"),
-                vec![1],
-                TensorOperation::Vector,
-            ),
-            gguf(
-                format!("{root}.attn_q.weight"),
-                vec![query, hidden],
-                TensorOperation::Matrix,
-            ),
-            gguf(
-                format!("{root}.attn_output.weight"),
-                vec![hidden, query],
-                TensorOperation::Matrix,
-            ),
-            gguf(
-                format!("{root}.attn_q_norm.weight"),
-                vec![head],
-                TensorOperation::Vector,
-            ),
-            gguf(
-                format!("{root}.ffn_gate.weight"),
-                vec![intermediate, hidden],
-                TensorOperation::Matrix,
-            ),
-            gguf(
-                format!("{root}.ffn_up.weight"),
-                vec![intermediate, hidden],
-                TensorOperation::Matrix,
-            ),
-            gguf(
-                format!("{root}.ffn_down.weight"),
-                vec![hidden, intermediate],
-                TensorOperation::Matrix,
-            ),
-        ]);
-        if policy.key_value.owns_state() {
-            common.extend([
-                gguf(
-                    format!("{root}.attn_k.weight"),
-                    vec![key_value, hidden],
-                    TensorOperation::Matrix,
-                ),
-                gguf(
-                    format!("{root}.attn_k_norm.weight"),
-                    vec![head],
-                    TensorOperation::Vector,
-                ),
-            ]);
-            if policy.key_value.value() != Some(AttentionValueSource::ReuseKey) {
-                common.push(gguf(
-                    format!("{root}.attn_v.weight"),
-                    vec![key_value, hidden],
-                    TensorOperation::Matrix,
-                ));
+        if attention.key.is_none() {
+            catalog.allowed_prefixes.extend(
+                shared_kv_gguf_exclusions(layer)
+                    .into_iter()
+                    .map(|(source, _)| format!("{source}.")),
+            );
+        }
+        if let Some(declaration) = &spec.routed {
+            let source = declaration
+                .routed
+                .experts
+                .packed_parameters()
+                .map_err(|e| e.to_string())?;
+            let fused_shape = source.gate_up().shape.clone();
+            let down_shape = source.down().shape.clone();
+            let split_shape = source.unfused_shape();
+            for (parameter, source) in routed_gguf_common(declaration)? {
+                let operation = if parameter.parameter.id == declaration.routed.selector.weight().id
+                {
+                    TensorOperation::Matrix
+                } else {
+                    TensorOperation::Vector
+                };
+                common.push(gguf(format!("{root}.{source}"), parameter.shape, operation));
             }
-        } else {
-            catalog.allowed_prefixes.extend([
-                format!("{root}.attn_k."),
-                format!("{root}.attn_v."),
-                format!("{root}.attn_k_norm."),
-            ]);
-        }
-        if args.hidden_size_per_layer_input > 0 {
-            let media = dimension(args.hidden_size_per_layer_input, "per-layer input width")?;
-            common.extend([
-                gguf(
-                    format!("{root}.inp_gate.weight"),
-                    vec![media, hidden],
-                    TensorOperation::Matrix,
-                ),
-                gguf(
-                    format!("{root}.proj.weight"),
-                    vec![hidden, media],
-                    TensorOperation::Matrix,
-                ),
-                gguf(
-                    format!("{root}.post_norm.weight"),
-                    vec![hidden],
-                    TensorOperation::Vector,
-                ),
-            ]);
-        }
-        if policy.feed_forward == FeedForwardPolicy::DenseWithSparseMoe {
-            let experts = dimension(
-                args.num_experts
-                    .ok_or_else(|| "Gemma 4 MoE has no expert count".to_string())?,
-                "expert count",
-            )?;
-            let moe = dimension(
-                args.moe_intermediate_size
-                    .ok_or_else(|| "Gemma 4 MoE has no expert width".to_string())?,
-                "expert width",
-            )?;
-            common.extend([
-                gguf(
-                    format!("{root}.ffn_gate_inp.weight"),
-                    vec![experts, hidden],
-                    TensorOperation::Matrix,
-                ),
-                gguf(
-                    format!("{root}.ffn_gate_inp.scale"),
-                    vec![hidden],
-                    TensorOperation::Vector,
-                ),
-                gguf(
-                    format!("{root}.ffn_down_exps.scale"),
-                    vec![experts],
-                    TensorOperation::Vector,
-                ),
-                gguf(
-                    format!("{root}.post_ffw_norm_1.weight"),
-                    vec![hidden],
-                    TensorOperation::Vector,
-                ),
-                gguf(
-                    format!("{root}.pre_ffw_norm_2.weight"),
-                    vec![hidden],
-                    TensorOperation::Vector,
-                ),
-                gguf(
-                    format!("{root}.post_ffw_norm_2.weight"),
-                    vec![hidden],
-                    TensorOperation::Vector,
-                ),
-                gguf(
-                    format!("{root}.ffn_down_exps.weight"),
-                    vec![experts, hidden, moe],
-                    TensorOperation::Matrix,
-                ),
-            ]);
+            common.push(gguf(
+                format!("{root}.ffn_down_exps.weight"),
+                down_shape,
+                TensorOperation::Matrix,
+            ));
             let gate = format!("{root}.ffn_gate_exps.weight");
             let up = format!("{root}.ffn_up_exps.weight");
             let fused = format!("{root}.ffn_gate_up_exps.weight");
@@ -1103,26 +1027,21 @@ pub fn gguf_plan(args: &ModelArgs) -> Result<GgufCheckpointPlan, String> {
                     LayoutVariant {
                         id: "separate gate and up".into(),
                         tensors: vec![
-                            gguf(&gate, vec![experts, moe, hidden], TensorOperation::Matrix),
-                            gguf(&up, vec![experts, moe, hidden], TensorOperation::Matrix),
+                            gguf(&gate, split_shape.clone(), TensorOperation::Matrix),
+                            gguf(&up, split_shape, TensorOperation::Matrix),
                         ],
                         discriminator_keys: vec![gate, up],
                     },
                     LayoutVariant {
                         id: "single fused gate and up".into(),
-                        tensors: vec![gguf(
-                            &fused,
-                            vec![experts, checked_mul(2, moe, "fused expert width")?, hidden],
-                            TensorOperation::Matrix,
-                        )],
+                        tensors: vec![gguf(&fused, fused_shape, TensorOperation::Matrix)],
                         discriminator_keys: vec![fused],
                     },
                 ],
             });
         }
     }
-    GgufCheckpointPlan::new("Gemma 4 GGUF", common, groups, catalog)
-        .map_err(|error| error.to_string())
+    Ok(())
 }
 
 fn gguf(
@@ -1133,79 +1052,386 @@ fn gguf(
     GgufTensorConstraint::required(name, shape, GgufTypeConstraint::OperationClass(operation))
 }
 
-/// Translates one released Gemma 4 text GGUF name to neutral parameter identity.
-pub fn translate_gguf_weight_name(name: &str) -> String {
-    for (source, target) in [
-        ("token_embd", "model.embed_tokens"),
-        ("output_norm", "model.norm"),
-        ("output", "lm_head"),
-        ("per_layer_token_embd", "model.embed_tokens_per_layer"),
-        ("per_layer_model_proj", "model.per_layer_model_projection"),
-        ("per_layer_proj_norm", "model.per_layer_projection_norm"),
-    ] {
-        if name == source || name.starts_with(&format!("{source}.")) {
-            return name.replacen(source, target, 1);
+fn static_gguf_slots(
+    declaration: &super::text::pinned::Declaration,
+) -> Result<Vec<(eredu_nn::LogicalParameterDeclaration<'_>, String)>, String> {
+    use eredu_nn::DeclareLogicalParameters;
+    let mut slots = Vec::new();
+    for parameter in declaration
+        .embedding()
+        .logical_parameters()
+        .map_err(|e| e.to_string())?
+    {
+        slots.push((parameter, "token_embd.weight".into()));
+    }
+    for parameter in declaration
+        .normalization()
+        .logical_parameters()
+        .map_err(|e| e.to_string())?
+    {
+        slots.push((parameter, "output_norm.weight".into()));
+    }
+    if let Some(head) = declaration.head() {
+        for parameter in head.logical_parameters().map_err(|e| e.to_string())? {
+            slots.push((parameter, "output.weight".into()));
         }
     }
-    let Some(rest) = name.strip_prefix("blk.") else {
-        return name.into();
-    };
-    let Some((layer, parameter)) = rest.split_once('.') else {
-        return name.into();
-    };
-    let scalar = match parameter {
-        "layer_output_scale.weight" => Some("layer_scalar"),
-        "ffn_gate_inp.scale" => Some("router.scale"),
-        "ffn_down_exps.scale" => Some("router.per_expert_scale"),
-        _ => None,
-    };
-    if let Some(scalar) = scalar {
-        return format!("model.layers.{layer}.{scalar}");
+    if let Some(spec) = &declaration.per_layer {
+        slots.extend(per_layer_gguf_slots(spec)?);
     }
-    for (source, target) in [
-        ("attn_q", "self_attn.q_proj"),
-        ("attn_k", "self_attn.k_proj"),
-        ("attn_v", "self_attn.v_proj"),
-        ("attn_output", "self_attn.o_proj"),
-        ("attn_q_norm", "self_attn.q_norm"),
-        ("attn_k_norm", "self_attn.k_norm"),
-        ("attn_norm", "input_layernorm"),
-        ("post_attention_norm", "post_attention_layernorm"),
-        ("ffn_norm", "pre_feedforward_layernorm"),
-        ("post_ffw_norm_1", "post_feedforward_layernorm_1"),
-        ("pre_ffw_norm_2", "pre_feedforward_layernorm_2"),
-        ("post_ffw_norm_2", "post_feedforward_layernorm_2"),
-        ("post_ffw_norm", "post_feedforward_layernorm"),
-        ("layer_output_scale", "layer_scalar"),
-        ("ffn_gate_inp", "router.proj"),
-        ("ffn_gate_up_exps", "experts.switch_glu.gate_up_proj"),
-        ("ffn_gate_exps", "experts.switch_glu.gate_proj"),
-        ("ffn_up_exps", "experts.switch_glu.up_proj"),
-        ("ffn_down_exps", "experts.switch_glu.down_proj"),
-        ("ffn_gate", "mlp.gate_proj"),
-        ("ffn_up", "mlp.up_proj"),
-        ("ffn_down", "mlp.down_proj"),
-        ("inp_gate", "per_layer_input_gate"),
-        ("proj", "per_layer_projection"),
-        ("post_norm", "post_per_layer_input_norm"),
-    ] {
-        if parameter == source || parameter.starts_with(&format!("{source}.")) {
-            return format!(
-                "model.layers.{layer}.{}",
-                parameter.replacen(source, target, 1)
-            );
-        }
-    }
-    name.into()
+    Ok(slots)
 }
 
-/// Translates a text GGUF parameter into the complete family's parameter tree.
-/// Standalone text and assistant construction retain `translate_gguf_weight_name`.
-pub fn translate_family_gguf_weight_name(name: &str) -> String {
-    let name = translate_gguf_weight_name(name);
-    match name.strip_prefix("model.") {
-        Some(local) => format!("model.language_model.{local}"),
-        None => name,
+pub(crate) fn per_layer_gguf_slots(
+    spec: &super::text::pinned::PerLayerSpec,
+) -> Result<Vec<(eredu_nn::LogicalParameterDeclaration<'_>, String)>, String> {
+    use eredu_nn::DeclareLogicalParameters;
+    let mut slots = Vec::new();
+    for parameter in spec
+        .embedding
+        .logical_parameters()
+        .map_err(|e| e.to_string())?
+    {
+        slots.push((parameter, "per_layer_token_embd.weight".into()));
+    }
+    for parameter in spec
+        .projection
+        .logical_parameters()
+        .map_err(|e| e.to_string())?
+    {
+        slots.push((parameter, "per_layer_model_proj.weight".into()));
+    }
+    for parameter in spec.norm.logical_parameters().map_err(|e| e.to_string())? {
+        slots.push((parameter, "per_layer_proj_norm.weight".into()));
+    }
+    Ok(slots)
+}
+
+fn block_gguf_slots(
+    block: &super::text::specs::BlockSpec,
+) -> Result<Vec<(eredu_nn::LogicalParameterDeclaration<'_>, String)>, String> {
+    use eredu_nn::DeclareLogicalParameters;
+    let mut slots = Vec::new();
+    for (spec, source) in [
+        (&block.input, "attn_norm.weight"),
+        (&block.post_attention, "post_attention_norm.weight"),
+        (&block.pre_feed_forward, "ffn_norm.weight"),
+        (&block.post_feed_forward, "post_ffw_norm.weight"),
+    ] {
+        for parameter in spec.logical_parameters().map_err(|e| e.to_string())? {
+            slots.push((parameter, source.into()));
+        }
+    }
+    for parameter in block
+        .residual_scale
+        .logical_parameters()
+        .map_err(|e| e.to_string())?
+    {
+        slots.push((parameter, "layer_output_scale.weight".into()));
+    }
+    if let Some(spec) = &block.per_layer {
+        for (slot, source) in [(&spec.gate, "inp_gate"), (&spec.projection, "proj")] {
+            for parameter in slot.logical_parameters().map_err(|e| e.to_string())? {
+                let suffix = match parameter.role {
+                    eredu_nn::LogicalParameterRole::LinearWeight => "weight",
+                    eredu_nn::LogicalParameterRole::LinearBias => "bias",
+                    _ => return Err("unresolved per-layer GGUF slot".into()),
+                };
+                slots.push((parameter, format!("{source}.{suffix}")));
+            }
+        }
+        for parameter in spec.norm.logical_parameters().map_err(|e| e.to_string())? {
+            slots.push((parameter, "post_norm.weight".into()));
+        }
+    }
+    Ok(slots)
+}
+
+// Published GGUFs may retain unused K/V tensors on shared consumers. These are
+// source exclusions, not parameter slots, aliases of the publisher, or replicas.
+fn shared_kv_gguf_exclusions(layer: usize) -> [(String, String); 3] {
+    [
+        ("attn_k", "k_proj"),
+        ("attn_v", "v_proj"),
+        ("attn_k_norm", "k_norm"),
+    ]
+    .map(|(source, target)| {
+        (
+            format!("blk.{layer}.{source}"),
+            format!("model.layers.{layer}.self_attn.{target}"),
+        )
+    })
+}
+
+fn ordinary_gguf_slots<'a>(
+    attention: &'a super::text::specs::AttentionSpec,
+    dense: &'a super::text::specs::DenseSpec,
+) -> Result<Vec<(eredu_nn::LogicalParameterDeclaration<'a>, String)>, String> {
+    use eredu_nn::DeclareLogicalParameters;
+    let mut slots = Vec::new();
+    for (spec, source) in [
+        (Some(&attention.query), "attn_q"),
+        (attention.key.as_ref(), "attn_k"),
+        (attention.value.as_ref(), "attn_v"),
+        (Some(&attention.output), "attn_output"),
+        (Some(&dense.product.gate), "ffn_gate"),
+        (Some(&dense.product.up), "ffn_up"),
+        (Some(&dense.product.down), "ffn_down"),
+    ] {
+        if let Some(spec) = spec {
+            for parameter in spec.logical_parameters().map_err(|e| e.to_string())? {
+                let suffix = match parameter.role {
+                    eredu_nn::LogicalParameterRole::LinearWeight => "weight",
+                    eredu_nn::LogicalParameterRole::LinearBias => "bias",
+                    _ => return Err("unresolved ordinary GGUF projection slot".into()),
+                };
+                slots.push((parameter, format!("{source}.{suffix}")));
+            }
+        }
+    }
+    for (spec, source) in [
+        (Some(&attention.query_norm), "attn_q_norm"),
+        (attention.key_norm.as_ref(), "attn_k_norm"),
+    ] {
+        if let Some(spec) = spec {
+            for parameter in spec.logical_parameters().map_err(|e| e.to_string())? {
+                slots.push((parameter, format!("{source}.weight")));
+            }
+        }
+    }
+    Ok(slots)
+}
+
+fn routed_gguf_common(
+    declaration: &super::text::routed::Declaration,
+) -> Result<Vec<(eredu_nn::LogicalParameterDeclaration<'_>, &'static str)>, String> {
+    use eredu_nn::DeclareLogicalParameters;
+    let mut parameters = declaration.router_parameters().map_err(|e| e.to_string())?;
+    parameters.extend(
+        declaration.norms[..]
+            .logical_parameters()
+            .map_err(|e| e.to_string())?,
+    );
+    let sources = [
+        "ffn_gate_inp.weight",
+        "ffn_gate_inp.scale",
+        "ffn_down_exps.scale",
+        "post_ffw_norm_1.weight",
+        "pre_ffw_norm_2.weight",
+        "post_ffw_norm_2.weight",
+    ];
+    if parameters.len() != sources.len() {
+        return Err("Gemma routed GGUF extension does not cover declared slots".into());
+    }
+    Ok(parameters.into_iter().zip(sources).collect())
+}
+
+fn insert_gguf_bank_bindings(
+    parameters: &mut BTreeMap<String, String>,
+    source: &str,
+    target: &str,
+) -> Result<(), String> {
+    let mut entries = vec![(format!("{source}.weight"), target.to_owned())];
+    for (suffix, role) in [
+        ("scales", eredu_nn::LinearCompanionRole::Scale),
+        ("biases", eredu_nn::LinearCompanionRole::AffineBias),
+    ] {
+        entries.push((
+            format!("{source}.{suffix}"),
+            crate::linear_format::standard_expert_companion_name(target, role),
+        ));
+    }
+    for (source, target) in entries {
+        if parameters.insert(source.clone(), target).is_some() {
+            return Err(format!("conflicting Gemma GGUF bank alias {source}"));
+        }
+    }
+    Ok(())
+}
+
+fn insert_gguf_bindings(
+    parameters: &mut BTreeMap<String, String>,
+    bindings: impl IntoIterator<Item = (String, String, bool)>,
+) -> Result<(), String> {
+    for (source, target, matrix) in bindings {
+        if parameters.insert(source.clone(), target.clone()).is_some() {
+            return Err(format!("conflicting Gemma GGUF alias {source}"));
+        }
+        if matrix {
+            let source = source
+                .strip_suffix(".weight")
+                .ok_or("matrix source has no weight suffix")?;
+            let target = target
+                .strip_suffix(".weight")
+                .ok_or("matrix source target has no weight suffix")?;
+            for suffix in ["scales", "biases"] {
+                let source = format!("{source}.{suffix}");
+                if parameters
+                    .insert(source.clone(), format!("{target}.{suffix}"))
+                    .is_some()
+                {
+                    return Err(format!("conflicting Gemma GGUF alias {source}"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Prepared source aliases referencing typed ordinary and sparse construction slots.
+#[derive(Debug, Clone)]
+pub struct TextGgufNames {
+    parameters: BTreeMap<String, String>,
+    source_exclusions: BTreeMap<String, String>,
+}
+impl TextGgufNames {
+    /// Resolves declared projection identities before source conversion or format selection.
+    pub fn new(
+        args: &ModelArgs,
+        declaration: &super::text::pinned::Declaration,
+        block_scopes: &[super::text::specs::BlockSpec],
+        dense_scopes: &[super::text::specs::DenseSpec],
+        attention_scopes: &[super::text::specs::AttentionSpec],
+        routed_scopes: &[Option<super::text::routed::Declaration>],
+    ) -> Result<Self, String> {
+        declaration.validate_for(args).map_err(|e| e.to_string())?;
+        let bindings = static_gguf_slots(declaration)?
+            .into_iter()
+            .map(|(parameter, source)| {
+                let id = parameter.parameter.id.as_str();
+                let target = id
+                    .strip_prefix(&format!("{}.", declaration.root()))
+                    .map_or_else(|| id.to_owned(), |local| format!("model.{local}"));
+                (
+                    source,
+                    target,
+                    matches!(
+                        parameter.role,
+                        eredu_nn::LogicalParameterRole::Embedding
+                            | eredu_nn::LogicalParameterRole::LinearWeight
+                    ),
+                )
+            });
+
+        let bindings = bindings.collect::<Vec<_>>();
+        let blocks = (0..args.num_hidden_layers())
+            .map(|layer| {
+                super::text::specs::DecoderBlockSpec::from_scopes(
+                    args,
+                    layer,
+                    block_scopes
+                        .get(layer)
+                        .ok_or_else(|| eredu_nn::Error::backend("missing Gemma block owner"))?
+                        .in_namespace(layer, "model.layers")?,
+                    dense_scopes
+                        .get(layer)
+                        .ok_or_else(|| eredu_nn::Error::backend("missing Gemma dense owner"))?
+                        .in_namespace(layer, "model.layers")?,
+                    attention_scopes
+                        .get(layer)
+                        .ok_or_else(|| eredu_nn::Error::backend("missing Gemma attention owner"))?
+                        .in_namespace(layer, "model.layers")?,
+                    routed_scopes
+                        .get(layer)
+                        .ok_or_else(|| eredu_nn::Error::backend("missing Gemma routed scope"))?
+                        .as_ref()
+                        .map(|s| s.in_namespace(args, layer, "model.layers"))
+                        .transpose()?,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Self::from_scopes(bindings, &blocks)
+    }
+    pub(crate) fn from_scopes(
+        bindings: impl IntoIterator<Item = (String, String, bool)>,
+        blocks: &[super::text::specs::DecoderBlockSpec],
+    ) -> Result<Self, String> {
+        let mut parameters = BTreeMap::new();
+        let mut source_exclusions = BTreeMap::new();
+        insert_gguf_bindings(&mut parameters, bindings)?;
+        for (layer, spec) in blocks.iter().enumerate() {
+            let attention = &spec.attention;
+            if attention.key.is_none() {
+                source_exclusions.extend(shared_kv_gguf_exclusions(layer));
+            }
+            let dense = &spec.dense;
+            let block = &spec.block;
+            let mut bindings = ordinary_gguf_slots(attention, dense)?
+                .into_iter()
+                .chain(block_gguf_slots(block)?)
+                .map(|(p, source)| {
+                    (
+                        format!("blk.{layer}.{source}"),
+                        p.parameter.id.as_str().to_owned(),
+                        p.role == eredu_nn::LogicalParameterRole::LinearWeight,
+                    )
+                })
+                .collect::<Vec<_>>();
+            if let Some(declaration) = &spec.routed {
+                for (parameter, source) in routed_gguf_common(declaration)? {
+                    bindings.push((
+                        format!("blk.{layer}.{source}"),
+                        parameter.parameter.id.as_str().to_owned(),
+                        parameter.parameter.id == declaration.routed.selector.weight().id,
+                    ));
+                }
+                let source = declaration
+                    .routed
+                    .experts
+                    .packed_parameters()
+                    .map_err(|e| e.to_string())?;
+                let gate_up = source.gate_up();
+                let down = source.down();
+                let root = gate_up
+                    .parameter
+                    .id
+                    .as_str()
+                    .strip_suffix(".gate_up_proj")
+                    .ok_or("unresolved Gemma expert source root")?;
+                for (source, target) in [
+                    ("ffn_gate_up_exps", gate_up.parameter.id.as_str()),
+                    ("ffn_down_exps", down.parameter.id.as_str()),
+                ] {
+                    insert_gguf_bank_bindings(
+                        &mut parameters,
+                        &format!("blk.{layer}.{source}"),
+                        target,
+                    )?;
+                }
+                for (source, target) in [
+                    ("ffn_gate_exps", format!("{root}.gate_proj.weight")),
+                    ("ffn_up_exps", format!("{root}.up_proj.weight")),
+                ] {
+                    bindings.push((format!("blk.{layer}.{source}.weight"), target, true));
+                }
+            }
+            insert_gguf_bindings(&mut parameters, bindings)?;
+        }
+        Ok(Self {
+            parameters,
+            source_exclusions,
+        })
+    }
+    /// Translates the standalone text source view used by assistant and decoder recipes.
+    pub fn translate(&self, name: &str) -> String {
+        if let Some(target) = self.parameters.get(name) {
+            return target.clone();
+        }
+        for (source, target) in &self.source_exclusions {
+            if name == source || name.starts_with(&format!("{source}.")) {
+                return name.replacen(source, target, 1);
+            }
+        }
+        name.into()
+    }
+    /// Projects source identities into the complete multimodal family's parameter tree.
+    pub fn translate_family(&self, name: &str) -> String {
+        let name = self.translate(name);
+        match name.strip_prefix("model.") {
+            Some(local) => format!("model.language_model.{local}"),
+            None => name,
+        }
     }
 }
 
@@ -1213,16 +1439,20 @@ pub fn translate_family_gguf_weight_name(name: &str) -> String {
 /// the canonical neutral expert slots used by the ordinary Gemma block.
 pub fn expert_recipes<C: RecipeCatalog + ?Sized>(
     catalog: &C,
-    args: &ModelArgs,
+    config: &FamilyConfig,
     layer: usize,
 ) -> Result<GatedProductExpertRecipes, String> {
-    let policy = args
-        .layer_policy(layer)
-        .ok_or_else(|| format!("Gemma 4 expert recipe layer {layer} is out of range"))?;
-    if policy.feed_forward != FeedForwardPolicy::DenseWithSparseMoe {
-        return Err(format!("Gemma 4 layer {layer} has no routed experts"));
-    }
-    let prefix = format!("{}.experts.switch_glu", released_layer_path(layer));
+    let declaration = config
+        .routed(layer)
+        .map_err(|e| e.to_string())?
+        .ok_or("layer has no routed source")?;
+    expert_recipes_for_declaration(catalog, declaration)
+}
+
+fn expert_recipes_for_declaration<C: RecipeCatalog + ?Sized>(
+    catalog: &C,
+    declaration: &super::text::routed::Declaration,
+) -> Result<GatedProductExpertRecipes, String> {
     let source = |base: &str| {
         if catalog.tensor_metadata(base).is_ok() {
             base.to_owned()
@@ -1230,17 +1460,37 @@ pub fn expert_recipes<C: RecipeCatalog + ?Sized>(
             format!("{base}.weight")
         }
     };
-    let names = GatedProductExpertLayoutNames {
-        target_gate_up: format!("{prefix}.gate_up_proj"),
-        target_down: format!("{prefix}.down_proj"),
-        packed_gate_up: source(&format!("{prefix}.gate_up_proj")),
-        packed_down: source(&format!("{prefix}.down_proj")),
-        separate_gate: source(&format!("{prefix}.gate_proj")),
-        separate_up: source(&format!("{prefix}.up_proj")),
-        separate_down: source(&format!("{prefix}.down_proj")),
-        independent: Vec::new(),
-    };
+    let names = expert_layout_names(declaration, source)?;
     resolve_gated_product_expert_recipes(catalog, &names).map_err(|error| error.to_string())
+}
+
+pub(super) fn expert_layout_names(
+    declaration: &super::text::routed::Declaration,
+    resolve_source: impl Fn(&str) -> String,
+) -> Result<GatedProductExpertLayoutNames, String> {
+    let source = declaration
+        .routed
+        .experts
+        .packed_parameters()
+        .map_err(|e| e.to_string())?;
+    let gate_up = source.gate_up();
+    let down = source.down();
+    let prefix = gate_up
+        .parameter
+        .id
+        .as_str()
+        .strip_suffix(".gate_up_proj")
+        .ok_or("unresolved Gemma expert root")?;
+    Ok(GatedProductExpertLayoutNames {
+        target_gate_up: gate_up.parameter.id.as_str().to_owned(),
+        target_down: down.parameter.id.as_str().to_owned(),
+        packed_gate_up: resolve_source(&format!("{prefix}.gate_up_proj")),
+        packed_down: resolve_source(&format!("{prefix}.down_proj")),
+        separate_gate: resolve_source(&format!("{prefix}.gate_proj")),
+        separate_up: resolve_source(&format!("{prefix}.up_proj")),
+        separate_down: resolve_source(&format!("{prefix}.down_proj")),
+        independent: Vec::new(),
+    })
 }
 
 /// Returns the derived-weight catalog for one canonical Gemma execution ordinal.
@@ -1280,36 +1530,29 @@ pub fn unit_recipes<C: RecipeCatalog + ?Sized>(
     {
         return Ok(BTreeMap::new());
     }
-    let resolved = expert_recipes(catalog, &family.text, layer)?;
-    Ok(BTreeMap::from([
-        (resolved.target_gate_up, resolved.gate_up),
-        (resolved.target_down, resolved.down),
-    ]))
+    let resolved = expert_recipes(catalog, family, layer)?;
+    eredu_checkpoint::expert::gated_product_materialization_recipes(catalog, &resolved)
 }
 
 /// Builds the complete architecture-owned schedule for independently resident experts.
 pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
     catalog: &C,
-    args: &ModelArgs,
+    config: &FamilyConfig,
 ) -> Result<crate::ExpertResidencyCatalog, String> {
-    let experts = usize::try_from(
-        args.num_experts
-            .ok_or_else(|| "Gemma 4 expert residency requires an expert count".to_string())?,
-    )
-    .ok()
-    .filter(|count| *count > 0)
-    .ok_or_else(|| "Gemma 4 expert count must be positive".to_string())?;
+    let experts = config
+        .routed_layers()
+        .next()
+        .map(|(_, scope)| scope)
+        .ok_or("Gemma 4 expert residency requires a sparse invocation")?
+        .routed
+        .experts
+        .group_count() as usize;
     let owner_group = eredu_runtime::ExecutionGroupId::new(super::TEXT_EXECUTION_GROUP)
         .map_err(|error| error.to_string())?;
-    let banks = (0..args.num_hidden_layers())
-        .filter(|&layer| {
-            args.layer_policy(layer)
-                .is_some_and(|policy| policy.feed_forward == FeedForwardPolicy::DenseWithSparseMoe)
-        })
-        .map(|layer| {
-            expert_recipes(catalog, args, layer)
-                .map(|recipes| (layer, released_layer_path(layer), recipes))
-        });
+    let banks = config.routed_layers().map(|(layer, declaration)| {
+        expert_recipes_for_declaration(catalog, declaration)
+            .map(|recipes| (layer, released_layer_path(layer), recipes))
+    });
     crate::expert_residency::gated_product_residency_catalog(
         catalog,
         owner_group,
