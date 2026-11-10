@@ -7,16 +7,22 @@ use super::{
 };
 use crate::lfm3::{CompleteLfm3Kernel, LayeredModel};
 use eredu_codec::liquid::{DecoderState, NeuralCodec};
-use eredu_core::{scheduler::SemanticStateTransaction, BackendFailure, Completion};
+use eredu_core::{
+    execution_control::SnapshotEstimate, scheduler::SemanticStateTransaction, BackendFailure,
+    Completion,
+};
 use eredu_media::audio::LogMelFeatures;
 use eredu_nn::{
     AttentionCache, DistributedNeuralBackend, GroupedNeuralBackend, Index, Parameterized, Tensor,
 };
 use eredu_runtime::{
+    execution_control::{
+        snapshot_value_estimate, IsolatedStateCopy, SnapshotReservation, SnapshotValue,
+    },
     DenseSamplingBackend, LayerRuntimeState, ResidentRuntime, RuntimeStateComponents,
     SamplingBackend, StateLayout, SubmissionBackend,
 };
-use std::marker::PhantomData;
+use std::{marker::PhantomData, sync::Arc};
 
 type Context<B> = <<B as eredu_nn::NeuralBackend>::Tensor as Tensor>::Context;
 
@@ -166,6 +172,7 @@ where
     language: H::State,
     hidden: B::Tensor,
     codec: Option<DecoderState<H::State, B::Tensor>>,
+    origin: Arc<()>,
     binding: PhantomData<H>,
 }
 
@@ -186,12 +193,52 @@ where
                 .as_ref()
                 .map(|state| state.try_branch(H::branch_state))
                 .transpose()?,
+            origin: self.origin.clone(),
             binding: PhantomData,
         })
     }
 
     fn commit_branch(&mut self, branch: Self) -> Result<(), Self::Error> {
         *self = branch;
+        Ok(())
+    }
+}
+
+impl<B, H> IsolatedStateCopy for ResidentAudioState<B, H>
+where
+    B: GroupedNeuralBackend + DistributedNeuralBackend<Tensor: SnapshotValue>,
+    H: ResidentAudioBinding<B, State: SnapshotValue>,
+{
+    type Error = BackendFailure;
+
+    fn estimate_isolated_copy(&self) -> Result<SnapshotEstimate, BackendFailure> {
+        snapshot_value_estimate::<Self>([
+            self.language.estimate_snapshot_value(),
+            self.hidden.estimate_snapshot_value(),
+            self.codec.estimate_snapshot_value(),
+        ])
+    }
+
+    fn copy_isolated(&self, retention: &SnapshotReservation) -> Result<Self, BackendFailure> {
+        Ok(Self {
+            language: self.language.copy_snapshot_value(retention)?,
+            hidden: self.hidden.copy_snapshot_value(retention)?,
+            codec: self.codec.copy_snapshot_value(retention)?,
+            origin: self.origin.clone(),
+            binding: PhantomData,
+        })
+    }
+
+    fn validate_isolated_restore(&self, saved: &Self) -> Result<(), BackendFailure> {
+        if !Arc::ptr_eq(&self.origin, &saved.origin) {
+            return Err(failure(super::AudioSnapshotError::ForeignSession));
+        }
+        Ok(())
+    }
+
+    fn restore_isolated(&mut self, saved: Self) -> Result<(), BackendFailure> {
+        self.validate_isolated_restore(&saved)?;
+        *self = saved;
         Ok(())
     }
 }
@@ -352,6 +399,7 @@ where
             language,
             hidden,
             codec: None,
+            origin: Arc::new(()),
             binding: PhantomData,
         };
         self.complete(&state)?;

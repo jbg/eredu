@@ -16525,6 +16525,15 @@ caller-owned neural state and shares immutable overlap roots. MLX supplies
 resident parameter bindings, device state, sampling primitives and completion.
 The architecture selects F32 widening recipes before native binding.
 
+Resident Audio composes idle snapshots through the runtime's
+`IsolatedStateSnapshot` and `RealtimeGenerationState`. The architecture
+contributes session origin, schedule, unfinished depth state and sampling
+controls. LiquidCodec contributes its neural decoder and overlap-add state.
+MLX supplies independent tensor and RNG value copies and shares immutable
+device-cache roots with independently owned cache metadata. Retention accounts
+for the roots even when their payloads are shared. The originating session's
+budget owns snapshot retention and cumulative copy work across restores.
+
 `eredu-codec::liquid` owns LiquidCodec configuration, complete neural encoder and
 decoder equations, reflective analysis, scalar-product alphabet ordering and
 polar synthesis. It consumes neutral neural/storage/runtime contracts without

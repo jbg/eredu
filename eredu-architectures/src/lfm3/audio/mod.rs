@@ -15,6 +15,7 @@ pub use encoder::{Declaration, Downsampler, Encoder, EncoderState, Projector, Un
 pub use prompt::AudioPrompt;
 pub use realtime::{
     AudioAdvance, AudioExecutionKernel, AudioSampling, AudioSession, AudioSessionError,
+    AudioSnapshot, AudioSnapshotError,
 };
 pub use resident::{
     AudioRequest, AudioResidentParameterBytes, PreparedResidentAudio, ResidentAudio,

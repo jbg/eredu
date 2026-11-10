@@ -15,10 +15,14 @@ use crate::backend::{
 };
 use crate::{MlxTensor, Stream};
 use eredu_architectures::lfm3::audio::{
-    AudioAdvance, AudioPhase, AudioRequest, AudioSession, AudioSessionError, BindingSource,
-    PreparedAudio, PreparedResidentAudio, ResidentAudio, ResidentAudioBinding, ResidentAudioError,
+    AudioAdvance, AudioPhase, AudioRequest, AudioSession, AudioSessionError, AudioSnapshot,
+    AudioSnapshotError, BindingSource, PreparedAudio, PreparedResidentAudio, ResidentAudio,
+    ResidentAudioBinding, ResidentAudioError,
 };
-use eredu_core::BackendFailure;
+use eredu_core::{
+    execution_control::{SnapshotLimits, SnapshotUsage},
+    BackendFailure,
+};
 use eredu_nn::Parameterized;
 use eredu_runtime::{RuntimeLayerState, StateLayout};
 
@@ -120,7 +124,30 @@ impl MlxAudioModel {
 /// Batch-one resident speech session exposing portable committed events.
 pub struct MlxAudioSession(AudioSession<Model>);
 
+/// Reusable saved Audio continuation, charged to the originating session.
+pub struct MlxAudioSnapshot(AudioSnapshot<Model>);
+
 impl MlxAudioSession {
+    /// Configures bounded snapshots and restores for the session.
+    pub fn enable_snapshots(&mut self, limits: SnapshotLimits) -> Result<(), AudioSnapshotError> {
+        self.0.enable_snapshots(limits)
+    }
+
+    /// Reports retention and cumulative copy work.
+    pub fn snapshot_usage(&self) -> Option<SnapshotUsage> {
+        self.0.snapshot_usage()
+    }
+
+    /// Captures the settled generation boundary, including pending depth work.
+    pub fn snapshot(&self) -> Result<MlxAudioSnapshot, AudioSnapshotError> {
+        self.0.snapshot().map(MlxAudioSnapshot)
+    }
+
+    /// Restores a boundary saved by this session.
+    pub fn restore(&mut self, saved: &MlxAudioSnapshot) -> Result<(), AudioSnapshotError> {
+        self.0.restore(&saved.0)
+    }
+
     /// Executes a single text decision or depth pass.
     pub fn advance(&mut self) -> Result<AudioAdvance, AudioSessionError> {
         self.0.advance()

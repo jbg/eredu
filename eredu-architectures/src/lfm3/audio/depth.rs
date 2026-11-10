@@ -380,6 +380,32 @@ pub struct DepthFrame {
     revealed: usize,
 }
 
+impl eredu_runtime::execution_control::SnapshotValue for DepthFrame {
+    fn estimate_snapshot_value(
+        &self,
+    ) -> Result<eredu_core::execution_control::SnapshotEstimate, eredu_core::BackendFailure> {
+        eredu_runtime::execution_control::snapshot_value_estimate::<Self>([
+            self.order.estimate_snapshot_value(),
+            self.codes.estimate_snapshot_value(),
+            self.masked.estimate_snapshot_value(),
+            self.schedule.estimate_snapshot_value(),
+        ])
+    }
+
+    fn copy_snapshot_value(
+        &self,
+        retention: &eredu_runtime::execution_control::SnapshotReservation,
+    ) -> Result<Self, eredu_core::BackendFailure> {
+        Ok(Self {
+            order: self.order.copy_snapshot_value(retention)?,
+            codes: self.codes.copy_snapshot_value(retention)?,
+            masked: self.masked.copy_snapshot_value(retention)?,
+            schedule: self.schedule.copy_snapshot_value(retention)?,
+            ..*self
+        })
+    }
+}
+
 /// Complete speech frame, with the EOS decision separated from codec input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletedSpeechFrame<'a> {

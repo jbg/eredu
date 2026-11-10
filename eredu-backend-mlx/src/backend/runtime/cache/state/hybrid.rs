@@ -1,7 +1,14 @@
 //! Mixed attention and fixed-component state realization.
 
 use super::*;
-use eredu_runtime::AppendStreamBinding;
+use eredu_core::{
+    execution_control::{ExecutionControlError, SnapshotEstimate},
+    BackendFailure,
+};
+use eredu_runtime::{
+    execution_control::{SnapshotReservation, SnapshotValue},
+    AppendStreamBinding,
+};
 mod streams;
 use streams::LayerStreams;
 pub use streams::MlxAppendStream;
@@ -653,6 +660,56 @@ pub struct MlxHybridState {
     global_layer_start: usize,
     layers: Vec<MlxHybridLayerState>,
     manager: Option<CacheResidencyManager>,
+}
+
+impl SnapshotValue for MlxHybridState {
+    fn estimate_snapshot_value(&self) -> Result<SnapshotEstimate, BackendFailure> {
+        if !self.has_immutable_roots() {
+            return Err(BackendFailure::from_error(Exception::custom(
+                "hybrid value snapshots require immutable device-local roots",
+            )));
+        }
+        let overflow = || BackendFailure::from_error(ExecutionControlError::Overflow);
+        let mut metadata = std::mem::size_of::<Self>() as u64;
+        if let Some(layout) = &self.layout {
+            metadata = metadata
+                .checked_add(layout.logical_metadata_bytes().ok_or_else(overflow)?)
+                .ok_or_else(overflow)?;
+        }
+        for layer in &self.layers {
+            metadata = metadata
+                .checked_add(std::mem::size_of::<MlxHybridLayerState>() as u64)
+                .and_then(|bytes| bytes.checked_add((layer.fixed.len() as u64).checked_mul(256)?))
+                .ok_or_else(overflow)?;
+        }
+        let retained = metadata
+            .checked_add(
+                self.isolated_snapshot_auxiliary_bytes()
+                    .ok_or_else(overflow)?,
+            )
+            .ok_or_else(overflow)?;
+        let retained_bytes =
+            self.retained_arrays()
+                .into_iter()
+                .try_fold(retained, |bytes, array| {
+                    bytes
+                        .checked_add(
+                            crate::backend::snapshot::estimate_array(array)?.retained_bytes,
+                        )
+                        .ok_or_else(overflow)
+                })?;
+        Ok(SnapshotEstimate {
+            retained_bytes,
+            copy_bytes: metadata,
+        })
+    }
+
+    fn copy_snapshot_value(&self, _: &SnapshotReservation) -> Result<Self, BackendFailure> {
+        self.estimate_snapshot_value()?;
+        // Device append caches detach reserved suffixes before a divergent write.
+        // Fixed components are replaced wholesale. No native copy is submitted.
+        self.deep_clone_state().map_err(BackendFailure::from_error)
+    }
 }
 
 impl MlxHybridState {

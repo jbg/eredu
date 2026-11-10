@@ -4,9 +4,17 @@ use super::{
     AudioPhase, AudioSchedule, AudioScheduleError, DepthDeclaration, DepthFrame, DepthProgress,
     PreparedAudio,
 };
-use eredu_core::{scheduler::SemanticStateTransaction, BackendFailure, Completion, TokenFilter};
+use eredu_core::{
+    execution_control::{SnapshotEstimate, SnapshotLimits, SnapshotUsage},
+    scheduler::SemanticStateTransaction,
+    BackendFailure, Completion, TokenFilter,
+};
 use eredu_nn::{Index, Tensor, TensorElementType};
 use eredu_runtime::{
+    execution_control::{
+        snapshot_value_estimate, IsolatedStateCopy, IsolatedStateError, IsolatedStateSnapshot,
+        SnapshotBudget, SnapshotReservation, SnapshotValue,
+    },
     DenseSamplingBackend, GenerationSampler, RealtimeFrameExecutionError, RealtimeFrameTransition,
     RealtimeGenerationBranch, RealtimeGenerationContract, RealtimeGenerationState,
     RealtimeGenerationTransactionError, Sampler, SamplingBackend,
@@ -54,6 +62,26 @@ pub enum AudioSessionError {
     Transition(#[from] RealtimeFrameExecutionError),
 }
 
+/// Portable failure when capturing or restoring a resident Audio session.
+#[derive(Debug, thiserror::Error)]
+pub enum AudioSnapshotError {
+    /// The session has no snapshot budget.
+    #[error("LFM3 Audio snapshots are not configured")]
+    NotConfigured,
+    /// Snapshot limits can only be configured once.
+    #[error("LFM3 Audio snapshots are already configured")]
+    AlreadyConfigured,
+    /// Explicit cancellation is terminal.
+    #[error("LFM3 Audio session is cancelled")]
+    Cancelled,
+    /// A saved model state originated in a different session.
+    #[error("LFM3 Audio snapshot belongs to another session")]
+    ForeignSession,
+    /// The shared state owner rejected or failed the copy.
+    #[error(transparent)]
+    State(#[from] IsolatedStateError),
+}
+
 /// Retained checkpoint sampling controls and bounded per-lane history.
 #[derive(Debug, Clone)]
 pub struct AudioSampling {
@@ -63,6 +91,23 @@ pub struct AudioSampling {
     speech_history: usize,
     text_sampler: GenerationSampler,
     speech_sampler: GenerationSampler,
+}
+
+impl SnapshotValue for AudioSampling {
+    fn estimate_snapshot_value(&self) -> Result<SnapshotEstimate, BackendFailure> {
+        snapshot_value_estimate::<Self>([
+            self.text_sampler.estimate_snapshot_value(),
+            self.speech_sampler.estimate_snapshot_value(),
+        ])
+    }
+
+    fn copy_snapshot_value(&self, retention: &SnapshotReservation) -> Result<Self, BackendFailure> {
+        Ok(Self {
+            text_sampler: self.text_sampler.copy_snapshot_value(retention)?,
+            speech_sampler: self.speech_sampler.copy_snapshot_value(retention)?,
+            ..*self
+        })
+    }
 }
 
 impl AudioSampling {
@@ -244,6 +289,59 @@ pub struct AudioSession<K: AudioExecutionKernel> {
     transition: Transition<K>,
     generation: Generation<K>,
     cancelled: bool,
+    snapshot_budget: Option<SnapshotBudget>,
+}
+
+/// Reusable idle Audio state, including unfinished refinement and codec carry.
+pub struct AudioSnapshot<K: AudioExecutionKernel>(IsolatedStateSnapshot<Generation<K>>);
+
+impl<K: AudioExecutionKernel> AudioSession<K>
+where
+    K::State: IsolatedStateCopy,
+    Random<K>: SnapshotValue,
+{
+    /// Sets this session's snapshot limits once. No state is copied.
+    pub fn enable_snapshots(&mut self, limits: SnapshotLimits) -> Result<(), AudioSnapshotError> {
+        self.check_snapshot_boundary()?;
+        if self.snapshot_budget.is_some() {
+            return Err(AudioSnapshotError::AlreadyConfigured);
+        }
+        self.snapshot_budget = Some(SnapshotBudget::new(limits));
+        Ok(())
+    }
+
+    /// Reports live retention and cumulative copy charges for this session.
+    pub fn snapshot_usage(&self) -> Option<SnapshotUsage> {
+        self.snapshot_budget.as_ref().map(SnapshotBudget::usage)
+    }
+
+    /// Saves the exact next advancement without running another model step.
+    pub fn snapshot(&self) -> Result<AudioSnapshot<K>, AudioSnapshotError> {
+        self.check_snapshot_boundary()?;
+        let budget = self
+            .snapshot_budget
+            .as_ref()
+            .ok_or(AudioSnapshotError::NotConfigured)?;
+        Ok(AudioSnapshot(IsolatedStateSnapshot::capture(
+            &self.generation,
+            budget,
+        )?))
+    }
+
+    /// Rewinds generation to a saved boundary from this session.
+    /// The caller owns any output already returned by previous advances.
+    pub fn restore(&mut self, saved: &AudioSnapshot<K>) -> Result<(), AudioSnapshotError> {
+        self.check_snapshot_boundary()?;
+        saved.0.restore(&mut self.generation)?;
+        Ok(())
+    }
+
+    fn check_snapshot_boundary(&self) -> Result<(), AudioSnapshotError> {
+        if self.cancelled {
+            return Err(AudioSnapshotError::Cancelled);
+        }
+        Ok(())
+    }
 }
 
 impl<K: AudioExecutionKernel> AudioSession<K>
@@ -274,6 +372,7 @@ where
             transition: Transition(kernel),
             generation,
             cancelled: false,
+            snapshot_budget: None,
         })
     }
 

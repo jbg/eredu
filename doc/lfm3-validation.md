@@ -256,8 +256,9 @@ processor transforms mono 16-kHz PCM to the input features.
 
 The session emits text token IDs, completed codebook frames with 24-kHz
 mono PCM, and speech EOS. Both `advance` and `events` use the same controlled
-driver. Live ingress, public snapshots and forks, distributed execution,
-and bounded residency remain unimplemented for Audio.
+driver. Idle snapshots and restore use explicit copy limits and preserve
+unfinished refinement and codec carry. Live ingress, live forks, distributed
+execution, and bounded residency remain unimplemented for Audio.
 
 A CPU loader check uses the pinned Audio checkpoint with the weight file and
 asset directory supplied separately. The selected language, encoder, depth
@@ -276,3 +277,12 @@ Each run
 commits three speech frames after six intermediate depth advances and emits
 5,760 samples, including the final codec tail. Cancelling a separate session
 after its first depth pass leaves zero committed slots.
+
+The snapshot replay check uses the same fixture. It saves the first speech
+frame after one depth pass, then saves the second after one pass with codec
+carry from the first committed frame. On CPU and precise Metal, restoring
+either boundary reproduces all three codebook frames and all 5,760 PCM
+samples exactly within each device, including the final flush. A third
+snapshot is rejected at the two-snapshot limit without charging a copy.
+Dropping both handles releases all snapshot retention while preserving
+cumulative copy usage. Explicit cancellation rejects restore.

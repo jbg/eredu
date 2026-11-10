@@ -669,6 +669,40 @@ pub struct DecoderState<S, T: Tensor> {
     config: Config,
     batch: i32,
 }
+
+impl<S, T> eredu_runtime::execution_control::SnapshotValue for DecoderState<S, T>
+where
+    S: eredu_runtime::execution_control::SnapshotValue,
+    T: Tensor + eredu_runtime::execution_control::SnapshotValue,
+{
+    fn estimate_snapshot_value(
+        &self,
+    ) -> Result<eredu_core::execution_control::SnapshotEstimate, eredu_core::BackendFailure> {
+        use eredu_core::execution_control::SnapshotEstimate;
+        let model_type_bytes = self.config.model_type.capacity() as u64;
+        eredu_runtime::execution_control::snapshot_value_estimate::<Self>([
+            self.neural.estimate_snapshot_value(),
+            self.overlap.estimate_snapshot_value(),
+            self.config.fsq_levels.estimate_snapshot_value(),
+            Ok(SnapshotEstimate {
+                retained_bytes: model_type_bytes,
+                copy_bytes: model_type_bytes,
+            }),
+        ])
+    }
+
+    fn copy_snapshot_value(
+        &self,
+        retention: &eredu_runtime::execution_control::SnapshotReservation,
+    ) -> Result<Self, eredu_core::BackendFailure> {
+        Ok(Self {
+            neural: self.neural.copy_snapshot_value(retention)?,
+            overlap: self.overlap.copy_snapshot_value(retention)?,
+            config: self.config.clone(),
+            batch: self.batch,
+        })
+    }
+}
 impl<S, T: Tensor> DecoderState<S, T> {
     /// Branches the caller-owned neural continuation and shares immutable overlap roots.
     /// The supplied operation must isolate every mutable neural cache component.

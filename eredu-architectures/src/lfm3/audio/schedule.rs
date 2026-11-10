@@ -1,7 +1,11 @@
 //! Checkpoint-owned response modes and commit boundaries for speech generation.
 
 use super::{AudioTokens, DepthDeclaration, DepthFrame, PreparedAudio};
-use eredu_runtime::RealtimeScheduleState;
+use eredu_core::{execution_control::SnapshotEstimate, BackendFailure};
+use eredu_runtime::{
+    execution_control::{snapshot_value_estimate, SnapshotReservation, SnapshotValue},
+    RealtimeScheduleState,
+};
 
 /// How a prepared prompt enters generation.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
@@ -54,6 +58,23 @@ pub struct AudioSchedulePolicy {
     audio_eos: i32,
     mode: AudioMode,
     budget: usize,
+}
+
+impl SnapshotValue for AudioSchedulePolicy {
+    fn estimate_snapshot_value(&self) -> Result<SnapshotEstimate, BackendFailure> {
+        snapshot_value_estimate::<Self>([
+            self.eos.estimate_snapshot_value(),
+            self.depth_schedule.estimate_snapshot_value(),
+        ])
+    }
+
+    fn copy_snapshot_value(&self, retention: &SnapshotReservation) -> Result<Self, BackendFailure> {
+        Ok(Self {
+            eos: self.eos.copy_snapshot_value(retention)?,
+            depth_schedule: self.depth_schedule.copy_snapshot_value(retention)?,
+            ..*self
+        })
+    }
 }
 
 impl AudioSchedulePolicy {
@@ -193,6 +214,24 @@ pub struct AudioSchedule {
     committed: usize,
     advances: usize,
     pending: Option<DepthFrame>,
+}
+
+impl SnapshotValue for AudioSchedule {
+    fn estimate_snapshot_value(&self) -> Result<SnapshotEstimate, BackendFailure> {
+        snapshot_value_estimate::<Self>([
+            self.policy.estimate_snapshot_value(),
+            self.pending.estimate_snapshot_value(),
+        ])
+    }
+
+    fn copy_snapshot_value(&self, retention: &SnapshotReservation) -> Result<Self, BackendFailure> {
+        Ok(Self {
+            policy: self.policy.copy_snapshot_value(retention)?,
+            pending: self.pending.copy_snapshot_value(retention)?,
+            mode: self.mode.clone(),
+            ..*self
+        })
+    }
 }
 
 impl AudioSchedule {
