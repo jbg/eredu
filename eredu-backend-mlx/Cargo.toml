@@ -43,6 +43,11 @@ path = "examples/personaplex_full_path_bench.rs"
 name = "personaplex_quantization_eval"
 path = "examples/personaplex_quantization_eval.rs"
 
+[[example]]
+name = "lfm3_audio_reference"
+path = "examples/lfm3_audio_reference.rs"
+required-features = ["audio"]
+
 [features]
 default = []
 accelerate = ["safemlx/accelerate"]

@@ -280,8 +280,10 @@ continuation. The encoder retains its feature overlap separately from sliding
 attention and convolution state. The standalone speech depth decoder separates
 score evaluation from committing each complete codebook group. The frame exposes
 speech or EOS only after the final group. The request owner supplies the reveal
-order, sampling policy and native completion. Public controlled speech sessions
-are still unimplemented.
+order, sampling policy and native completion. The prepared Audio artifact and
+mixed language prefill preserve ordinary decoder cache continuation. Public
+controlled speech sessions still require orchestration of all component
+submissions, including codec state and speech sampling.
 
 LiquidCodec's standalone `Tokenizer` implements finite audio-tokenizer calls and
 explicit decode-stream advancement over shared neural/spectral equations. Its

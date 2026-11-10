@@ -13,9 +13,10 @@ Ordinary and controlled text generation use the shared drivers. The existing tag
 tool dialect consumes the released template's function/parameter tags; the LFM2
 Python-call dialect does not describe this template.
 
-The public LFM3 route supports text. Vision and speech input/output have standalone
-neural components, and resident LiquidCodec has independent F32 reference
-acceptance. Public vision/video generation, audio language-model tasks, omni and
+The public LFM3 route supports text. Vision has standalone neural components.
+The Audio architecture admits the complete floating checkpoint and its codec
+companion and supports resident mixed-input traversal. Both this path and
+standalone LiquidCodec have independent F32 reference acceptance. Public vision/video generation, audio language-model tasks, omni and
 d1 decision execution remain unimplemented. The generic GGUF reader does not
 admit published NVFP4 encoding.
 
@@ -188,3 +189,52 @@ Standalone LiquidCodec neural encoding and finite/cached decoding, CPU/Metal
 F32 reference results and integration limits are documented in
 [LiquidCodec validation](liquid-codec-validation.md). Resident codec acceptance
 does not establish bounded/distributed codec or speech-model acceptance.
+
+## Mixed speech input and feedback
+
+`PreparedAudio` admits the full released Audio SafeTensors checkpoint and
+bundled LiquidCodec. It retains restricted language, speech encoder, depth
+and codec sources, as well as the tokenizer, template, generation defaults
+and processor policy. `AudioPrompt` checks the number of projected rows
+against speech placeholders and uses the shared LFM3 decoder traversal to
+replace those positions. Its readout returns normalized language states for
+depth scoring or the tied text head. A caller can also use the same input
+hook with an already configured layerwise language runtime.
+
+The independent publisher case uses the Audio revision
+`2d6c1f99c129b3ef07a8d168bc0ff08e2bdb93f1`. It compares 128,000-entry
+prefill score rows from a prompt with both input speech and replayed speech,
+eight cached language steps including EOS feedback, all three depth score
+passes, one synthesized frame and the subsequent feedback step. The fixture
+uses a fixed reveal order and greedily selects from the codec vocabulary to
+guarantee a speech frame. Source BF16 values widen exactly to F32 when bound.
+
+Both CPU and precise Metal pass the preset `5e-4` maximum absolute tolerance
+and match all 17 greedy text decisions and all twelve sampled speech codes.
+The synthetic speech frame has 1,920 PCM samples and a reference peak of
+`1.272e-6`. Artifact hashes, inputs, package versions and per-phase maxima
+are retained in
+[`audio-acceptance-results.json`](../validation/fixtures/lfm3/audio-acceptance-results.json).
+
+| Measurement | CPU maximum absolute error | Metal maximum absolute error |
+| --- | ---: | ---: |
+| Prefill scores | `1.149e-4` | `2.399e-4` |
+| Eight cached score rows | `2.694e-5` | `5.007e-5` |
+| Depth scores | `2.289e-5` | `2.575e-5` |
+| PCM samples | `2.786e-12` | `4.406e-12` |
+| Scores after generated speech feedback | `4.054e-6` | `6.170e-6` |
+
+Keep checkpoint payloads and generated traces outside the checkout. The Python
+runner verifies source and weight hashes before loading the publisher code.
+
+```sh
+python -c 'from huggingface_hub import snapshot_download; snapshot_download("LiquidAI/LFM3-Audio-2B", revision="2d6c1f99c129b3ef07a8d168bc0ff08e2bdb93f1", local_dir="/private/tmp/lfm3-audio", allow_patterns=["*.py", "*.json", "*.jinja", "model.safetensors", "audio_tokenizer/*"])'
+HF_HOME=/private/tmp/lfm3-hf HF_MODULES_CACHE=/private/tmp/lfm3-hf/modules python validation/lfm3_audio_reference.py /private/tmp/lfm3-audio /private/tmp/lfm3-audio-reference
+cargo run -p eredu-backend-mlx --features audio --example lfm3_audio_reference -- /private/tmp/lfm3-audio /private/tmp/lfm3-audio-reference /private/tmp/lfm3-audio-reference/cpu.json --device cpu
+MLX_ENABLE_TF32=0 cargo run -p eredu-backend-mlx --features audio,metal --example lfm3_audio_reference -- /private/tmp/lfm3-audio /private/tmp/lfm3-audio-reference /private/tmp/lfm3-audio-reference/metal.json --device gpu
+```
+
+The retained evidence covers resident conditional execution with a fixed
+sampler. The public realtime driver, selected audio residency and
+distribution, official audio GGUF, and native BF16 reference coverage remain
+outside this path.

@@ -51,6 +51,7 @@ pub(crate) const CHUNKED_TEXT_PREFILL: bool = true;
 /// Architecture-owned values retained for one LFM3 forward pass.
 pub struct ForwardContext<T> {
     mask: Option<T>,
+    normalized_audio_output: bool,
 }
 
 /// Complete LFM3 execution through the shared typed component adapter.
