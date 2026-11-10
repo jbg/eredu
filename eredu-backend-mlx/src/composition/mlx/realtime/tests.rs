@@ -161,7 +161,9 @@ pub(crate) fn write_tiny_native_artifact(
     let config_json = serde_json::to_string_pretty(&config_json).unwrap();
     let config = eredu_architectures::moshi::MoshiConfig::from_json(&config_json)
         .expect("tiny native Moshi config");
-    let plan = eredu_architectures::moshi::safetensors_plan(&config)
+    let contract = eredu_architectures::moshi::parameter_contract(&config)
+        .expect("tiny native parameter declaration");
+    let plan = eredu_architectures::moshi::safetensors_plan(&contract)
         .expect("tiny native SafeTensors plan");
     assert!(plan.layout_groups.is_empty());
 

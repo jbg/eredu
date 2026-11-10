@@ -32,6 +32,7 @@ pub type PartitionedLayeredModel<B> = eredu_runtime::ComponentAdapter<
 /// Selected target equations, retained prediction context and recurrent geometry.
 pub struct NemotronKernel<B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     args: ModelArgs,
+    declaration: std::sync::Arc<super::Declaration>,
     static_modules: PartitionStaticModules<B>,
     geometry: PartitionLocalGeometry,
     boundary: TargetBoundarySchema,
@@ -43,7 +44,7 @@ where
 {
     /// Constructs only the statics and target units selected by one exact partition.
     pub fn from_partition(
-        args: ModelArgs,
+        declaration: std::sync::Arc<super::Declaration>,
         definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         partition: &eredu_runtime::ArchitecturePartition<
             PartitionLocalGeometry,
@@ -51,6 +52,7 @@ where
         >,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<PartitionedLayeredModel<B>, Error> {
+        let args = declaration.args().clone();
         crate::operator_requirements::require::<B>(
             "Nemotron-H",
             crate::operator_requirements::NEMOTRON_H,
@@ -69,7 +71,7 @@ where
 
         partition
             .local_geometry()
-            .validate_for(&args)
+            .validate_for(&declaration)
             .map_err(Error::backend)?;
         let [group] = partition.groups() else {
             return Err(Error::backend(
@@ -86,7 +88,7 @@ where
         }
         let geometry = partition.local_geometry().clone();
         let definition = super::parameters::select_definition(
-            &args,
+            &declaration,
             definition,
             geometry.complete_state_layout(),
             (
@@ -98,19 +100,35 @@ where
                 .map(|index| (index, *geometry.unit(index).expect("validated local unit"))),
         )?;
         let selection = definition.select_partition(partition)?;
-        let static_modules = PartitionStaticModules::from_selected_spec(
-            super::static_spec(&args, super::FinalNormalization::Float32),
-            Some((
-                geometry.embedding_range().clone(),
-                geometry.output_range().cloned(),
-            )),
-            |role| {
-                selection.owns_storage(&eredu_runtime::ParameterStorageId::StaticRole(role.into()))
-            },
+        let statics = &declaration.statics;
+        let construction = crate::decoder::StaticModuleConstruction::new(
+            statics.embedding_spec().clone(),
+            statics.head_spec().cloned(),
+            statics.normalization_spec().clone().with_groups(1)?,
+        )?;
+        let owns = |role: &str| {
+            selection.owns_storage(&eredu_runtime::ParameterStorageId::StaticRole(role.into()))
+        };
+        use eredu_runtime::VocabularyModulePlacement as V;
+        let embedding = if owns("embedding") {
+            V::VocabularyParallel(geometry.embedding_range().clone())
+        } else {
+            V::Omitted
+        };
+        let head = match (owns("output"), geometry.output_range()) {
+            (true, Some(range)) => V::VocabularyParallel(range.clone()),
+            _ => V::Omitted,
+        };
+        let static_modules = PartitionStaticModules::from_construction(
+            construction,
+            embedding,
+            head,
+            owns("norm"),
             context,
         )?;
         let kernel = Self {
             args,
+            declaration,
             static_modules,
             geometry,
             boundary: *partition.boundary_schema(),
@@ -153,13 +171,14 @@ where
             .expert_realization()
             .and_then(|plan| plan.unit_spec(crate::decoder::TARGET_EXECUTION_GROUP, global_unit))
             .cloned();
-        super::Block::new_with_geometry_and_routed_spec(
-            &self.args,
-            global_unit,
-            *geometry,
-            routed_spec,
-            context,
-        )
+        let parameters = self
+            .declaration
+            .blocks
+            .get(global_unit)
+            .cloned()
+            .ok_or_else(|| Error::backend("retained target scope omits owned unit"))?
+            .local(*geometry, routed_spec)?;
+        super::Block::from_parameters(&self.args, global_unit, parameters, context)
     }
 
     fn local_state_ordinal(&self, global_unit: usize) -> Result<usize, Error> {

@@ -2,6 +2,9 @@
 
 /// Kimi normalization, residual, and typed block assembly.
 pub mod block;
+/// Shared typed parameter scopes and cold projections.
+pub mod declarations;
+pub use declarations::Declaration;
 /// Pure SafeTensors/GGUF catalog plans and canonical name translation.
 pub mod checkpoint;
 pub mod config;
@@ -14,33 +17,28 @@ pub mod moe;
 /// Semantic placement and rank-local Kimi geometry.
 pub mod parallel;
 mod partitioned;
+pub(crate) mod specs;
 
 pub use block::{Block, BlockGeometry, TokenMixer};
 pub use checkpoint::{
-    expert_recipes, expert_residency_catalog, gguf_plan, load_time_quantization,
-    normalize_weight_formats, safetensors_plan, translate_gguf_weight_name, unit_recipes,
-    with_checkpoint_formats,
+    expert_recipes, expert_residency_catalog, gguf_plan, load_time_quantization, safetensors_plan,
+    translate_gguf_weight_name, unit_recipes, with_checkpoint_formats,
 };
 pub use config::{
     model_args_from_config_reader, model_args_from_config_value, model_args_from_gguf_catalog,
-    prompt_cache_architecture_fingerprint, state_layout, state_layout_with_geometry, AttentionKind,
-    ConfigError, FeedForwardPolicy, KdaConfig, LayerCacheGeometry, LayerPolicy, ModelArgs,
+    prompt_cache_architecture_fingerprint, AttentionKind, ConfigError, FeedForwardPolicy,
+    KdaConfig, LayerPolicy, ModelArgs,
 };
 pub use kda::KimiDeltaAttention;
 pub use mla::KimiLatentAttention;
-pub use moe::{
-    expert_realization_plan, replicated_expert_realization_plan, DenseSwiGlu, FeedForward,
-    SparseMoe,
-};
+pub use moe::{expert_realization_plan, DenseSwiGlu, FeedForward, SparseMoe};
 pub use parallel::{
-    layer_parallel_parameter_groups, local_block_geometry, local_geometry, local_state_geometry,
-    parameter_description, partition_local_geometry, partition_local_routed_geometry,
-    partitioned_state_layout, static_parallel_parameter_groups, LocalGeometry,
+    local_block_geometry, local_geometry, partition_local_geometry,
+    partition_local_routed_geometry, partitioned_state_layout, LocalGeometry,
     PartitionExpertBankOwnership, PartitionLocalGeometry,
 };
 pub use partitioned::{
-    project_parameters, CompleteKimiGeometry, CompleteKimiKernel, KimiGeometry, KimiKernel,
-    PartitionedLayeredModel,
+    CompleteKimiGeometry, CompleteKimiKernel, KimiGeometry, KimiKernel, PartitionedLayeredModel,
 };
 
 use crate::decoder::StaticModuleSpec;
@@ -58,15 +56,6 @@ impl<T> ForwardContext<T> {
     pub const fn mask(&self) -> Option<&T> {
         self.mask.as_ref()
     }
-}
-
-/// Validates complete Kimi parameter, invocation, state and transport declarations.
-/// This operation requires no native resources.
-pub fn component_definition(args: &ModelArgs) -> Result<eredu_runtime::ComponentDefinition, Error> {
-    partitioned::component_definition(
-        parameter_description(args).map_err(Error::backend)?,
-        state_layout(args).map_err(Error::backend)?,
-    )
 }
 
 /// Complete Kimi execution through the shared typed component adapter.

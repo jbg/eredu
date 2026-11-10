@@ -38,13 +38,8 @@ impl PreparedTtsTransformerPipelineBindings {
             component: "TTS",
             reason,
         };
-        validate_transformer_partition(
-            bindings.definition(),
-            bindings.config(),
-            bindings.local_layout(),
-            &partition,
-        )
-        .map_err(ComponentPipelinePreparationError::Component)?;
+        validate_transformer_partition(bindings.declaration(), bindings.local_layout(), &partition)
+            .map_err(ComponentPipelinePreparationError::Component)?;
         let kind = if bindings.config().geometry().causal {
             ArchitectureGroupKind::Decoder
         } else {

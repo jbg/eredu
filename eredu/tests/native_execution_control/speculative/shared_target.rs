@@ -43,11 +43,12 @@ fn shared_target_prepared_modes_preserve_output_and_pending_adapter_forecasts() 
             "nvidia/Nemotron-Labs-Diffusion-3B",
         )
         .unwrap();
-    let mut schema = eredu_architectures::nemotron_labs_diffusion::adapter::safetensors_plan(
-        &family,
-        &declaration,
-    )
-    .unwrap();
+    let family = family.with_draft_adapter(declaration).unwrap();
+    let mut schema = family
+        .draft_parameters()
+        .unwrap()
+        .safetensors_plan()
+        .unwrap();
     for tensor in &mut schema.common_tensors {
         tensor.key = tensor.aliases[0].clone();
     }

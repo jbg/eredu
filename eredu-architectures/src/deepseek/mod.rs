@@ -21,12 +21,14 @@ pub mod moe;
 pub mod mtp;
 /// Semantic tensor/expert/hyper-stream placement plans.
 pub mod parallel;
-/// Shared normalized low-rank projection assembly.
-pub mod projection;
 /// Thin V3/R1 architecture policy.
 pub mod v3;
+mod v3_declarations;
+pub(crate) mod v3_specs;
 /// Thin V4 architecture policy.
 pub mod v4;
+mod v4_declarations;
+pub(crate) mod v4_specs;
 
 pub use checkpoint::{
     expert_unit_recipes, normalize_v3_weight_formats, normalize_v4_weight_formats,
@@ -48,205 +50,97 @@ pub use parallel::{
     V4PartitionLocalGeometry,
 };
 
-/// Builds the prediction-free V3 routed-expert authority from planner-local geometry.
-pub fn v3_partition_expert_realization_plan(
+/// Derives complete V3 expert ownership from declarations and optional admitted local geometry.
+pub fn v3_expert_realization_plan(
     args: &V3Args,
-    geometry: &parallel::V3LocalGeometry,
-    topology: eredu_core::ParallelRankTopology,
-) -> Result<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>, eredu_nn::Error> {
-    if args.num_nextn_predict_layers != 0 || !args.has_sparse_moe_layers() {
-        return Err(eredu_nn::Error::backend(
-            "DeepSeek-V3 partition expert planning requires sparse target units and no prediction",
-        ));
-    }
-    geometry
-        .validate_for(args)
-        .map_err(eredu_nn::Error::backend)?;
-    let global_experts =
-        usize::try_from(args.n_routed_experts).map_err(eredu_nn::Error::backend)?;
-    let local_experts = i32::try_from(
-        eredu_core::balanced_contiguous_range(
-            global_experts,
-            topology.expert_parallel_size(),
-            topology.expert_parallel_rank(),
-            false,
-        )
-        .map_err(eredu_nn::Error::backend)?
-        .len(),
-    )
-    .map_err(eredu_nn::Error::backend)?;
-    let target = usize::try_from(args.num_hidden_layers).map_err(eredu_nn::Error::backend)?;
-    let owner = eredu_runtime::ExecutionGroupId::new(crate::decoder::TARGET_EXECUTION_GROUP)
-        .map_err(eredu_nn::Error::backend)?;
-    let specs = (0..target)
-        .filter(|layer| args.layer_schedule.get(*layer) == Some(&LayerPolicy::SparseMoe))
-        .map(|layer| {
-            v3::localized_expert_bank_spec(
-                args,
-                layer,
-                local_experts,
-                geometry.args().moe_intermediate_size,
-            )
-            .map(|spec| ((owner.clone(), layer), spec))
-        })
-        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
-    crate::ExpertRealizationPlan::balanced(global_experts, topology, specs)
-        .map_err(eredu_nn::Error::backend)
-}
-
-/// Builds the prediction-free V4 routed-expert authority from planner-local geometry.
-pub fn v4_partition_expert_realization_plan(
-    args: &V4Args,
-    geometry: &parallel::V4LocalGeometry,
-    topology: eredu_core::ParallelRankTopology,
-) -> Result<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>, eredu_nn::Error> {
-    if args.num_nextn_predict_layers != 0 || args.dspark.is_some() {
-        return Err(eredu_nn::Error::backend(
-            "DeepSeek-V4 partition expert planning does not admit embedded prediction",
-        ));
-    }
-    geometry
-        .validate_for(args)
-        .map_err(eredu_nn::Error::backend)?;
-    let global_experts =
-        usize::try_from(args.n_routed_experts).map_err(eredu_nn::Error::backend)?;
-    let local_experts = i32::try_from(
-        eredu_core::balanced_contiguous_range(
-            global_experts,
-            topology.expert_parallel_size(),
-            topology.expert_parallel_rank(),
-            false,
-        )
-        .map_err(eredu_nn::Error::backend)?
-        .len(),
-    )
-    .map_err(eredu_nn::Error::backend)?;
-    let target = usize::try_from(args.num_hidden_layers).map_err(eredu_nn::Error::backend)?;
-    let owner = eredu_runtime::ExecutionGroupId::new(crate::decoder::TARGET_EXECUTION_GROUP)
-        .map_err(eredu_nn::Error::backend)?;
-    let specs = (0..target)
-        .map(|layer| {
-            v4::localized_expert_bank_spec(
-                args,
-                layer,
-                local_experts,
-                geometry.args().moe_intermediate_size,
-            )
-            .map(|spec| ((owner.clone(), layer), spec))
-        })
-        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
-    crate::ExpertRealizationPlan::balanced(global_experts, topology, specs)
-        .map_err(eredu_nn::Error::backend)
-}
-
-/// Derives complete V3 routed-expert ownership and rank-local bank geometry.
-pub fn v3_expert_realization_plan<B>(
-    architecture: &v3::V3Kernel<B>,
+    geometry: Option<&parallel::V3LocalGeometry>,
     topology: eredu_core::ParallelRankTopology,
 ) -> Result<Option<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>, eredu_nn::Error>
-where
-    B: eredu_nn::GroupedNeuralBackend
-        + eredu_nn::DistributedNeuralBackend
-        + eredu_nn::BlockwiseAttentionBackend,
 {
-    let args = architecture.args();
-    let global_experts =
-        usize::try_from(args.n_routed_experts).map_err(eredu_nn::Error::backend)?;
-    let local_experts = i32::try_from(
-        eredu_core::balanced_contiguous_range(
-            global_experts,
-            topology.expert_parallel_size(),
-            topology.expert_parallel_rank(),
-            false,
-        )
-        .map_err(eredu_nn::Error::backend)?
-        .len(),
-    )
-    .map_err(eredu_nn::Error::backend)?;
-    let local_args = architecture.shared_parallel_geometry();
-    let local_width = local_args
-        .as_ref()
-        .map_or(args.moe_intermediate_size, |geometry| {
-            geometry.args().moe_intermediate_size
-        });
-    let target = usize::try_from(args.num_hidden_layers).map_err(eredu_nn::Error::backend)?;
-    let prediction =
-        usize::try_from(args.num_nextn_predict_layers).map_err(eredu_nn::Error::backend)?;
-    let target_group =
-        eredu_runtime::ExecutionGroupId::new("target").map_err(eredu_nn::Error::backend)?;
-    let mut unit_specs = std::collections::BTreeMap::new();
-    for layer in 0..target {
-        if args.layer_schedule.get(layer) != Some(&LayerPolicy::SparseMoe) {
-            continue;
-        }
-        unit_specs.insert(
-            (target_group.clone(), layer),
-            v3::localized_expert_bank_spec(args, layer, local_experts, local_width)?,
-        );
+    args.validate().map_err(eredu_nn::Error::backend_source)?;
+    if let Some(geometry) = geometry {
+        geometry
+            .validate_for(args)
+            .map_err(eredu_nn::Error::backend_source)?;
     }
-    for depth in 0..prediction {
-        let group = eredu_runtime::ExecutionGroupId::new(format!("mtp.{depth}"))
-            .map_err(eredu_nn::Error::backend)?;
-        unit_specs.insert(
-            (group, 0),
-            v3::localized_expert_bank_spec(args, target + depth, local_experts, local_width)?,
-        );
-    }
-    if unit_specs.is_empty() {
+    let banks = v3::expert_bank_specs(args)?;
+    if banks.is_empty() {
         return Ok(None);
     }
-    crate::ExpertRealizationPlan::balanced(global_experts, topology, unit_specs)
-        .map(Some)
-        .map_err(eredu_nn::Error::backend)
+    let (_, layout) = parallel::execution_layout(
+        usize::try_from(args.num_hidden_layers).map_err(eredu_nn::Error::backend)?,
+        usize::try_from(args.num_nextn_predict_layers).map_err(eredu_nn::Error::backend)?,
+    )
+    .map_err(eredu_nn::Error::backend_source)?;
+    declared_expert_realization(
+        banks,
+        &layout,
+        geometry.map(|geometry| geometry.args().moe_intermediate_size),
+        topology,
+    )
+    .map(Some)
 }
 
-/// Derives the exact target-only replicated V3 routed realization.
-pub fn v3_replicated_expert_realization_plan(
-    args: &V3Args,
+/// Derives complete V4 expert ownership from declarations and optional admitted local geometry.
+pub fn v4_expert_realization_plan(
+    args: &V4Args,
+    geometry: Option<&parallel::V4LocalGeometry>,
+    topology: eredu_core::ParallelRankTopology,
 ) -> Result<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>, eredu_nn::Error> {
-    if args.num_nextn_predict_layers != 0 || !args.has_sparse_moe_layers() {
+    args.validate().map_err(eredu_nn::Error::backend_source)?;
+    if let Some(geometry) = geometry {
+        geometry
+            .validate_for(args)
+            .map_err(eredu_nn::Error::backend_source)?;
+    }
+    let (_, layout) = parallel::execution_layout(
+        usize::try_from(args.num_hidden_layers).map_err(eredu_nn::Error::backend)?,
+        usize::try_from(args.num_nextn_predict_layers).map_err(eredu_nn::Error::backend)?,
+    )
+    .map_err(eredu_nn::Error::backend_source)?;
+    declared_expert_realization(
+        v4::expert_bank_specs(args)?,
+        &layout,
+        geometry.map(|geometry| geometry.args().moe_intermediate_size),
+        topology,
+    )
+}
+
+/// Maps a storage-layer identity to its independent execution invocation.
+fn expert_unit_owner(
+    layout: &eredu_runtime::ExecutionUnitLayout,
+    layer: usize,
+) -> Result<(eredu_runtime::ExecutionGroupId, usize), eredu_nn::Error> {
+    let address = layout
+        .address(layer)
+        .ok_or_else(|| eredu_nn::Error::backend("unresolved DeepSeek expert invocation"))?;
+    let owner = layout
+        .group_id(address.group())
+        .ok_or_else(|| eredu_nn::Error::backend("unresolved DeepSeek expert owner"))?;
+    Ok((owner.clone(), address.index()))
+}
+
+/// Localizes construction-owned banks while retaining identities, formats and invocation owners.
+fn declared_expert_realization(
+    banks: std::collections::BTreeMap<usize, eredu_nn::GroupedGatedProductSpec>,
+    layout: &eredu_runtime::ExecutionUnitLayout,
+    intermediate: Option<i32>,
+    topology: eredu_core::ParallelRankTopology,
+) -> Result<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>, eredu_nn::Error> {
+    let global_experts = banks
+        .values()
+        .next()
+        .ok_or_else(|| eredu_nn::Error::backend("no declared routed expert banks"))?
+        .group_count();
+    if banks
+        .values()
+        .any(|bank| bank.group_count() != global_experts)
+    {
         return Err(eredu_nn::Error::backend(
-            "DeepSeek-V3 routed text requires sparse target units and no prediction units",
+            "routed expert banks have incompatible group counts",
         ));
     }
-    let global_experts =
-        usize::try_from(args.n_routed_experts).map_err(eredu_nn::Error::backend)?;
-    let local_experts = i32::try_from(global_experts).map_err(eredu_nn::Error::backend)?;
-    let target = usize::try_from(args.num_hidden_layers).map_err(eredu_nn::Error::backend)?;
-    let target_group =
-        eredu_runtime::ExecutionGroupId::new("target").map_err(eredu_nn::Error::backend)?;
-    let unit_specs = (0..target)
-        .filter(|layer| args.layer_schedule.get(*layer) == Some(&LayerPolicy::SparseMoe))
-        .map(|layer| {
-            v3::localized_expert_bank_spec(args, layer, local_experts, args.moe_intermediate_size)
-                .map(|spec| ((target_group.clone(), layer), spec))
-        })
-        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
-    crate::ExpertRealizationPlan::balanced(
-        global_experts,
-        eredu_core::ParallelRankTopology::new(
-            eredu_core::ParallelTopology::new(1, 1, 1, 1).map_err(eredu_nn::Error::backend)?,
-            0,
-        )
-        .map_err(eredu_nn::Error::backend)?,
-        unit_specs,
-    )
-    .map_err(eredu_nn::Error::backend)
-}
-
-/// Derives complete V4 routed-expert ownership and rank-local bank geometry.
-pub fn v4_expert_realization_plan<B>(
-    architecture: &v4::V4Kernel<B>,
-    topology: eredu_core::ParallelRankTopology,
-) -> Result<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>, eredu_nn::Error>
-where
-    B: eredu_nn::HyperNeuralBackend
-        + eredu_nn::DistributedNeuralBackend
-        + eredu_nn::GroupedNeuralBackend,
-{
-    let args = architecture.args();
-    let global_experts =
-        usize::try_from(args.n_routed_experts).map_err(eredu_nn::Error::backend)?;
+    let global_experts = usize::try_from(global_experts).map_err(eredu_nn::Error::backend)?;
     let local_experts = i32::try_from(
         eredu_core::balanced_contiguous_range(
             global_experts,
@@ -258,65 +152,14 @@ where
         .len(),
     )
     .map_err(eredu_nn::Error::backend)?;
-    let local_args = architecture.shared_parallel_geometry();
-    let local_width = local_args
-        .as_ref()
-        .map_or(args.moe_intermediate_size, |geometry| {
-            geometry.args().moe_intermediate_size
-        });
-    let target = usize::try_from(args.num_hidden_layers).map_err(eredu_nn::Error::backend)?;
-    let prediction =
-        usize::try_from(args.num_nextn_predict_layers).map_err(eredu_nn::Error::backend)?;
-    let target_group =
-        eredu_runtime::ExecutionGroupId::new("target").map_err(eredu_nn::Error::backend)?;
-    let mut unit_specs = std::collections::BTreeMap::new();
-    for layer in 0..target {
-        unit_specs.insert(
-            (target_group.clone(), layer),
-            v4::localized_expert_bank_spec(args, layer, local_experts, local_width)?,
-        );
-    }
-    for depth in 0..prediction {
-        let group = eredu_runtime::ExecutionGroupId::new(format!("mtp.{depth}"))
-            .map_err(eredu_nn::Error::backend)?;
-        unit_specs.insert(
-            (group, 0),
-            v4::localized_expert_bank_spec(args, target + depth, local_experts, local_width)?,
-        );
-    }
-    crate::ExpertRealizationPlan::balanced(global_experts, topology, unit_specs)
-        .map_err(eredu_nn::Error::backend)
-}
-
-/// Derives the exact target-only replicated V4 routed realization.
-pub fn v4_replicated_expert_realization_plan(
-    args: &V4Args,
-) -> Result<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>, eredu_nn::Error> {
-    if args.num_nextn_predict_layers != 0 {
-        return Err(eredu_nn::Error::backend(
-            "DeepSeek-V4 routed text does not admit prediction units",
-        ));
-    }
-    let global_experts =
-        usize::try_from(args.n_routed_experts).map_err(eredu_nn::Error::backend)?;
-    let local_experts = i32::try_from(global_experts).map_err(eredu_nn::Error::backend)?;
-    let target = usize::try_from(args.num_hidden_layers).map_err(eredu_nn::Error::backend)?;
-    let target_group =
-        eredu_runtime::ExecutionGroupId::new("target").map_err(eredu_nn::Error::backend)?;
-    let unit_specs = (0..target)
-        .map(|layer| {
-            v4::localized_expert_bank_spec(args, layer, local_experts, args.moe_intermediate_size)
-                .map(|spec| ((target_group.clone(), layer), spec))
+    let specs = banks
+        .into_iter()
+        .map(|(layer, bank)| {
+            let owner = expert_unit_owner(layout, layer)?;
+            let width = intermediate.unwrap_or(bank.intermediate_dimensions());
+            Ok((owner, bank.with_group_geometry(local_experts, width)?))
         })
-        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
-    crate::ExpertRealizationPlan::balanced(
-        global_experts,
-        eredu_core::ParallelRankTopology::new(
-            eredu_core::ParallelTopology::new(1, 1, 1, 1).map_err(eredu_nn::Error::backend)?,
-            0,
-        )
-        .map_err(eredu_nn::Error::backend)?,
-        unit_specs,
-    )
-    .map_err(eredu_nn::Error::backend)
+        .collect::<Result<_, eredu_nn::Error>>()?;
+    crate::ExpertRealizationPlan::balanced(global_experts, topology, specs)
+        .map_err(eredu_nn::Error::backend)
 }

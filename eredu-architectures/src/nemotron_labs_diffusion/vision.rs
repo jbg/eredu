@@ -2,49 +2,12 @@
 use super::{FamilyConfig, PixtralConfig};
 use crate::decoder::{ComponentInstrumentation, Config};
 use eredu_nn::{
-    Error, Index, LinearOperator, LinearSpec, NeuralBackend, NormalizationConstructionSpec,
-    NormalizationOperator, NormalizationScale, Parameter, ParameterSpec, Parameterized, Tensor,
+    Error, Index, LinearOperator, NeuralBackend, NormalizationOperator, Parameter, Parameterized,
+    Tensor,
 };
 
-fn linear<B: NeuralBackend>(
-    name: &str,
-    input: i32,
-    output: i32,
-    context: &<B::Tensor as Tensor>::Context,
-) -> Result<B::Linear, Error> {
-    B::linear(
-        LinearSpec {
-            input,
-            output,
-            weight: ParameterSpec::trainable(format!("{name}.weight")).map_err(Error::backend)?,
-            bias: None,
-            format: crate::linear_format::standard_linear_format(
-                &format!("{name}.weight"),
-                eredu_checkpoint::LinearFormat::Dense,
-            )?,
-        },
-        context,
-    )
-}
-fn norm<B: NeuralBackend>(
-    name: &str,
-    width: i32,
-    epsilon: f32,
-    context: &<B::Tensor as Tensor>::Context,
-) -> Result<B::Normalization, Error> {
-    B::normalization(
-        NormalizationConstructionSpec {
-            reduction: eredu_nn::NormalizationReduction::Native,
-            groups: None,
-            dimensions: width,
-            epsilon,
-            scale: NormalizationScale::Learned(
-                ParameterSpec::trainable(format!("{name}.weight")).map_err(Error::backend)?,
-            ),
-        },
-        context,
-    )
-}
+/// Shared typed image parameter declarations and their placement projections.
+pub mod specs;
 
 /// Packed channel-major flattened patches, with one positive grid per image.
 pub struct ImageInput<'a, T> {
@@ -156,28 +119,16 @@ impl<B: NeuralBackend> ImageEmbedding<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         config.validate_config()?;
-        let vision = config
+        let spec = config
             .vision
             .as_ref()
-            .ok_or_else(|| Error::backend("text artifact has no Pixtral tower"))?;
+            .ok_or_else(|| Error::backend("text artifact has no Pixtral tower"))?
+            .tower()
+            .embedding
+            .clone();
         Ok(Self {
-            patch_weight: Parameter::unloaded(
-                ParameterSpec::trainable("model.vision_tower.patch_conv.weight")
-                    .map_err(Error::backend)?,
-                &[
-                    vision.hidden_size,
-                    vision.num_channels,
-                    vision.patch_size,
-                    vision.patch_size,
-                ],
-                context,
-            )?,
-            ln_pre: norm::<B>(
-                "model.vision_tower.ln_pre",
-                vision.hidden_size,
-                1e-5,
-                context,
-            )?,
+            patch_weight: Parameter::unloaded(spec.weight, &spec.shape, context)?,
+            ln_pre: B::normalization(spec.norm, context)?,
             config: config.clone(),
         })
     }
@@ -244,39 +195,22 @@ impl<B: NeuralBackend> ImageProjector<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         config.validate_config()?;
-        let vision = config
-            .vision
+        let spec = config
+            .projector()
+            .ok_or_else(|| Error::backend("text artifact has no spatial projector"))?
             .as_ref()
-            .ok_or_else(|| Error::backend("text artifact has no Pixtral tower"))?;
-        let root = "model.multi_modal_projector";
-        let merge = i32::try_from(config.spatial_merge_size).map_err(Error::backend)?;
+            .clone();
         Ok(Self {
-            projector_norm: norm::<B>(
-                &format!("{root}.norm"),
-                vision.hidden_size,
-                config.rms_norm_epsilon(),
-                context,
-            )?,
-            merger: linear::<B>(
-                &format!("{root}.patch_merger.merging_layer"),
-                vision.hidden_size * merge * merge,
-                vision.hidden_size,
-                context,
-            )?,
-            linear_1: linear::<B>(
-                &format!("{root}.linear_1"),
-                vision.hidden_size,
-                config.hidden_size(),
-                context,
-            )?,
-            linear_2: linear::<B>(
-                &format!("{root}.linear_2"),
-                config.hidden_size(),
-                config.hidden_size(),
-                context,
-            )?,
-            config: vision.clone(),
-            merge,
+            projector_norm: B::normalization(spec.norm, context)?,
+            merger: B::linear(spec.merger, context)?,
+            linear_1: B::linear(spec.first, context)?,
+            linear_2: B::linear(spec.second, context)?,
+            config: config
+                .vision
+                .as_ref()
+                .expect("validated image projector")
+                .clone(),
+            merge: spec.merge,
         })
     }
     /// Applies pre-merger normalization, spatial unfold, and the exact GELU projector.
@@ -389,13 +323,7 @@ impl<B: NeuralBackend> ImageLayer<B> {
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        Self::build(
-            config,
-            index,
-            config.num_attention_heads,
-            config.intermediate_size,
-            context,
-        )
+        Self::build(config.tower().layer(index)?.clone(), index, context)
     }
 
     /// Constructs only head and intermediate-channel shards selected by the
@@ -408,46 +336,32 @@ impl<B: NeuralBackend> ImageLayer<B> {
     ) -> Result<Self, Error> {
         let (heads, intermediate) =
             super::parallel::vision_local_widths(config, index, layout).map_err(Error::backend)?;
-        Self::build(config, index, heads, intermediate, context)
+        let spec = config
+            .tower()
+            .layer(index)?
+            .project_local(heads, intermediate)?;
+        Self::build(spec, index, context)
     }
 
     fn build(
-        config: &PixtralConfig,
+        spec: specs::LayerSpec,
         index: usize,
-        heads: i32,
-        intermediate: i32,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        config.validate().map_err(Error::backend)?;
-        if index >= config.num_hidden_layers as usize
-            || heads <= 0
-            || heads > config.num_attention_heads
-            || intermediate <= 0
-            || intermediate > config.intermediate_size
-        {
-            return Err(Error::backend(
-                "Pixtral layer or local geometry outside tower",
-            ));
-        }
-        let root = format!("model.vision_tower.transformer.layers.{index}");
-        let projection = |field: &str, input, output| {
-            linear::<B>(&format!("{root}.{field}"), input, output, context)
-        };
-        let width = config.hidden_size;
         Ok(Self {
-            attention_norm: norm::<B>(&format!("{root}.attention_norm"), width, 1e-5, context)?,
-            query: projection("attention.q_proj", width, heads * config.head_dim)?,
-            key: projection("attention.k_proj", width, heads * config.head_dim)?,
-            value: projection("attention.v_proj", width, heads * config.head_dim)?,
-            output: projection("attention.o_proj", heads * config.head_dim, width)?,
-            ffn_norm: norm::<B>(&format!("{root}.ffn_norm"), width, 1e-5, context)?,
-            gate: projection("feed_forward.gate_proj", width, intermediate)?,
-            up: projection("feed_forward.up_proj", width, intermediate)?,
-            down: projection("feed_forward.down_proj", intermediate, width)?,
+            attention_norm: B::normalization(spec.attention_norm, context)?,
+            query: B::linear(spec.attention.query, context)?,
+            key: B::linear(spec.attention.key, context)?,
+            value: B::linear(spec.attention.value, context)?,
+            output: B::linear(spec.attention.output, context)?,
+            ffn_norm: B::normalization(spec.ffn_norm, context)?,
+            gate: B::linear(spec.feed_forward.gate, context)?,
+            up: B::linear(spec.feed_forward.up, context)?,
+            down: B::linear(spec.feed_forward.down, context)?,
             index,
-            heads,
-            head_dim: config.head_dim,
-            width,
+            heads: spec.attention.geometry.query_heads(),
+            head_dim: spec.attention.geometry.key_dimensions(),
+            width: spec.width,
         })
     }
 

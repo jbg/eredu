@@ -1,5 +1,6 @@
 //! Perception equations over the shared resident and bounded unit traversal.
 
+use super::perception_specs::{Declaration, PerceptionDeclaration};
 use super::{
     conformer::{ConformerBlock, ConformerLocalDimensions, ConformerState},
     perception::{PerceptionDimensions, PerceptionError, PerceptionOutput, PerceptionState},
@@ -12,7 +13,9 @@ use eredu_core::{
     },
     BackendFailure, LayerSchedule,
 };
-use eredu_nn::{Index, LinearOperator, NeuralBackend, Parameterized, Tensor};
+use eredu_nn::{
+    DeclareLogicalParameters, Index, LinearOperator, NeuralBackend, Parameterized, Tensor,
+};
 use eredu_runtime::{
     ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitectureGroupTransport,
     ArchitectureMergeDestination, ArchitectureParameterDescription, ArchitectureStatePartitionPlan,
@@ -69,30 +72,26 @@ pub trait PerceptionExecution<B: NeuralBackend> {
 pub struct PerceptionKernel<B: NeuralBackend> {
     precision: super::precision::SpeechPrecision,
     dimensions: PerceptionDimensions,
+    declaration: Declaration,
+    definition: ComponentDefinition,
+    projection_precision: super::precision::SpeechPrecisionDeclaration,
     local_blocks: Option<Vec<ConformerLocalDimensions>>,
     partition: Option<partition::PerceptionOwnership>,
     backend: PhantomData<fn() -> B>,
 }
 impl<B: NeuralBackend> PerceptionKernel<B> {
-    /// Selects storage/arithmetic policy for all independently constructed units.
-    pub fn with_precision(
-        mut self,
-        precision: super::precision::SpeechPrecision,
-    ) -> Result<Self, PerceptionError> {
-        precision
-            .validate()
-            .map_err(PerceptionError::Configuration)?;
-        self.precision = precision;
-        Ok(self)
-    }
     /// Validates component geometry before constructing any parameters.
-    pub fn new(dimensions: PerceptionDimensions) -> Result<Self, PerceptionError> {
-        dimensions.validate()?;
-        dimensions.block.validate()?;
-        dimensions.subsampling.validate()?;
+    pub fn new(declaration: PerceptionDeclaration) -> Result<Self, PerceptionError> {
+        let (dimensions, declaration, definition, precision) = declaration.into_parts();
+        let projection_precision = super::precision::SpeechPrecisionDeclaration::from_spec(
+            &declaration.pinned.projection,
+        )?;
         Ok(Self {
-            precision: Default::default(),
+            precision,
             dimensions,
+            declaration,
+            definition,
+            projection_precision,
             local_blocks: None,
             partition: None,
             backend: PhantomData,
@@ -100,11 +99,11 @@ impl<B: NeuralBackend> PerceptionKernel<B> {
     }
     /// Constructs the selected rank's projections and complete replicated caches.
     pub fn new_parallel(
-        dimensions: PerceptionDimensions,
+        declaration: PerceptionDeclaration,
         layout: &LocalModelLayout,
     ) -> Result<Self, PerceptionError> {
-        let local_blocks = perception_local_dimensions(dimensions, layout)?;
-        let mut architecture = Self::new(dimensions)?;
+        let local_blocks = declaration.local_dimensions(layout)?;
+        let mut architecture = Self::new(declaration)?;
         architecture.local_blocks = Some(local_blocks);
         Ok(architecture)
     }
@@ -112,10 +111,7 @@ impl<B: NeuralBackend> PerceptionKernel<B> {
     pub fn into_component(
         self,
     ) -> Result<ComponentAdapter<ComponentDefinition, Self>, PerceptionError> {
-        Ok(ComponentAdapter::new(
-            perception_component_definition(self.dimensions)?,
-            self,
-        )?)
+        Ok(ComponentAdapter::new(self.definition.clone(), self)?)
     }
     /// Whether execution requires the selected tensor collective.
     pub fn is_parallel(&self) -> bool {
@@ -127,11 +123,11 @@ impl<B: NeuralBackend> PerceptionKernel<B> {
     }
 }
 
-/// Canonical perception operations, independent parameter leases and Conformer cache slots.
-pub fn perception_component_definition(
+pub(super) fn declared_definition(
     dimensions: PerceptionDimensions,
+    declaration: &Declaration,
 ) -> Result<ComponentDefinition, PerceptionError> {
-    let parameters = perception_parameter_description(dimensions)?;
+    let parameters = declared_parameters(declaration)?;
     let units = (0..parameters.unit_layout().len())
         .map(|ordinal| {
             let address = parameters
@@ -357,16 +353,12 @@ pub struct PerceptionForward<T> {
     projected: bool,
 }
 
-/// Exact symbolic learned parameters and unit ownership, without backend allocation.
-pub fn perception_parameter_description(
-    dimensions: PerceptionDimensions,
+fn declared_parameters(
+    declaration: &Declaration,
 ) -> Result<ArchitectureParameterDescription, PerceptionError> {
-    use eredu_runtime::{ParameterGroupSpec, ParameterMemberSpec};
-    dimensions.validate()?;
-    dimensions.block.validate()?;
-    dimensions.subsampling.validate()?;
+    use eredu_runtime::ParameterGroupSpec;
     let graph = perception_graph()?;
-    let layout = ExecutionUnitLayout::new(&graph, [1, dimensions.layers, 1])?;
+    let layout = ExecutionUnitLayout::new(&graph, [1, declaration.blocks.len(), 1])?;
     let mut owned = Vec::new();
     let mut add =
         |group: usize, index: usize, spec: ParameterGroupSpec| -> Result<(), PerceptionError> {
@@ -379,152 +371,93 @@ pub fn perception_parameter_description(
             ));
             Ok(())
         };
-    let member = |name: String, shape: Vec<usize>| {
-        ParameterMemberSpec::new(name, shape, MemberSharding::Replicated)
-    };
-    let prefix = "stt_model.perception.encoder.pre_encode";
-    let c = dimensions.subsampling.channels as usize;
-    let width = dimensions.subsampling.width as usize;
-    let flattened = dimensions
-        .subsampling
-        .output_frames(dimensions.subsampling.features)? as usize
-        * c;
-    let mut members = Vec::new();
-    for (index, input, kernel) in [(0, 1, 3), (2, 1, 3), (3, c, 1), (5, 1, 3), (6, c, 1)] {
-        members.push(member(
-            format!("{prefix}.conv.{index}.weight"),
-            vec![c, input, kernel, kernel],
-        ));
-        members.push(member(format!("{prefix}.conv.{index}.bias"), vec![c]));
-    }
-    members.push(member(
-        format!("{prefix}.out.weight"),
-        vec![width, flattened],
-    ));
-    members.push(member(format!("{prefix}.out.bias"), vec![width]));
     add(
         0,
         0,
-        ParameterGroupSpec::new(prefix, ParameterRole::Replicated, members)?,
+        eredu_runtime::logical_parameter_group(
+            super::perception_specs::SUBSAMPLING_ROOT,
+            ParameterRole::Replicated,
+            None,
+            &declaration.pinned.subsampling,
+            |_| MemberSharding::Replicated,
+        )?,
     )?;
-    let d = dimensions.block.width as usize;
-    let f = dimensions.block.ff_hidden as usize;
-    let heads = dimensions.block.heads as usize;
-    for index in 0..dimensions.layers {
-        let prefix = format!("stt_model.perception.encoder.layers.{index}");
-        let mut members = Vec::new();
-        for norm in [
-            "norm_feed_forward1",
-            "norm_self_att",
-            "norm_conv",
-            "conv.batch_norm",
-            "norm_feed_forward2",
-            "norm_out",
-        ] {
-            members.push(member(format!("{prefix}.{norm}.weight"), vec![d]));
-            members.push(member(format!("{prefix}.{norm}.bias"), vec![d]));
-        }
-        for name in ["feed_forward1", "feed_forward2"] {
+    for (index, spec) in declaration.blocks.iter().enumerate() {
+        for ff in &spec.feed_forward {
+            let projections = ff.network.logical_parameters()?;
             add(
                 1,
                 index,
-                ParameterGroupSpec::partitioned(
-                    format!("{prefix}.{name}.projections"),
+                eredu_runtime::logical_parameter_group(
+                    format!("{}.projections", ff.root),
                     ParameterRole::FeedForwardIntermediate,
-                    f,
-                    [
-                        ParameterMemberSpec::new(
-                            format!("{prefix}.{name}.linear1.weight"),
-                            vec![f, d],
-                            MemberSharding::Partitioned { axis: 0 },
-                        ),
-                        ParameterMemberSpec::new(
-                            format!("{prefix}.{name}.linear2.weight"),
-                            vec![d, f],
-                            MemberSharding::Partitioned { axis: 1 },
-                        ),
-                    ],
+                    Some(ff.network.up.output as usize),
+                    &projections,
+                    |parameter| {
+                        let down = parameter.parameter.id == ff.network.down.weight.id
+                            || ff
+                                .network
+                                .down
+                                .bias
+                                .as_ref()
+                                .is_some_and(|bias| bias.id == parameter.parameter.id);
+                        MemberSharding::Partitioned {
+                            axis: usize::from(down),
+                        }
+                    },
                 )?,
             )?;
         }
-        let mut attention = Vec::new();
-        for name in [
-            "linear_q",
-            "linear_k",
-            "linear_v",
-            "linear_pos",
-            "linear_out",
-        ] {
-            attention.push(ParameterMemberSpec::new(
-                format!("{prefix}.self_attn.{name}.weight"),
-                vec![d, d],
-                MemberSharding::Partitioned {
-                    axis: usize::from(name == "linear_out"),
-                },
-            ));
-        }
-        for name in ["pos_bias_u", "pos_bias_v"] {
-            attention.push(ParameterMemberSpec::new(
-                format!("{prefix}.self_attn.{name}"),
-                vec![heads, d / heads],
-                MemberSharding::Partitioned { axis: 0 },
-            ));
-        }
+        let attention = spec.attention.logical_parameters()?;
         add(
             1,
             index,
-            ParameterGroupSpec::partitioned(
-                format!("{prefix}.self_attn.projections"),
+            eredu_runtime::logical_parameter_group(
+                format!("{}.projections", spec.attention.root),
                 ParameterRole::AttentionHeads,
-                heads,
-                attention,
+                Some(spec.attention.projection.geometry.query_heads() as usize),
+                &attention,
+                |parameter| {
+                    let output = parameter.parameter.id
+                        == spec.attention.projection.output.weight.id
+                        || spec
+                            .attention
+                            .projection
+                            .output
+                            .bias
+                            .as_ref()
+                            .is_some_and(|bias| bias.id == parameter.parameter.id);
+                    MemberSharding::Partitioned {
+                        axis: usize::from(output),
+                    }
+                },
             )?,
         )?;
-        members.push(member(
-            format!("{prefix}.conv.pointwise_conv1.weight"),
-            vec![
-                d.checked_mul(2).ok_or(PerceptionError::Configuration(
-                    "Conformer projection width overflow",
-                ))?,
-                d,
-                1,
-            ],
-        ));
-        members.push(member(
-            format!("{prefix}.conv.depthwise_conv.weight"),
-            vec![d, 1, dimensions.block.conv_kernel as usize],
-        ));
-        members.push(member(
-            format!("{prefix}.conv.pointwise_conv2.weight"),
-            vec![d, d, 1],
-        ));
+        let mut replicated = spec.norms[..].logical_parameters()?;
+        replicated.extend(spec.pointwise_input.logical_parameters()?);
+        replicated.extend(spec.depthwise.logical_parameters()?);
+        replicated.extend(spec.pointwise_output.logical_parameters()?);
         add(
             1,
             index,
-            ParameterGroupSpec::new(
-                format!("{prefix}.replicated"),
+            eredu_runtime::logical_parameter_group(
+                format!("{}.replicated", spec.root),
                 ParameterRole::Replicated,
-                members,
+                None,
+                &replicated,
+                |_| MemberSharding::Replicated,
             )?,
         )?;
     }
-    let prefix = "stt_model.perception.proj";
     add(
         2,
         0,
-        ParameterGroupSpec::new(
-            prefix,
+        eredu_runtime::logical_parameter_group(
+            "stt_model.perception.proj",
             ParameterRole::Replicated,
-            vec![
-                member(
-                    format!("{prefix}.weight"),
-                    vec![dimensions.output_width as usize, d],
-                ),
-                member(
-                    format!("{prefix}.bias"),
-                    vec![dimensions.output_width as usize],
-                ),
-            ],
+            None,
+            &declaration.pinned.projection,
+            |_| MemberSharding::Replicated,
         )?,
     )?;
     Ok(ArchitectureParameterDescription::from_owned(
@@ -533,17 +466,30 @@ pub fn perception_parameter_description(
 }
 
 /// Resolves physical geometry using the shared symbolic placement compiler.
-pub(super) fn perception_local_dimensions(
+pub(super) fn declared_local_dimensions(
     dimensions: PerceptionDimensions,
     layout: &LocalModelLayout,
+    declaration: &Declaration,
 ) -> Result<Vec<ConformerLocalDimensions>, PerceptionError> {
-    let description = perception_parameter_description(dimensions)?;
+    let description = declared_parameters(declaration)?;
     let query = layout
-        .tensor("stt_model.perception.encoder.layers.0.self_attn.linear_q.weight")
+        .tensor(
+            declaration.blocks[0]
+                .attention
+                .projection
+                .query
+                .weight
+                .id
+                .as_str(),
+        )
         .ok_or(PerceptionError::Configuration(
             "perception layout lacks its attention partition",
         ))?;
-    let heads = dimensions.block.heads as usize;
+    let heads = declaration.blocks[0]
+        .attention
+        .projection
+        .geometry
+        .query_heads() as usize;
     let range = query.expanded_logical_range(heads)?;
     let local_heads = range.len();
     if local_heads == 0
@@ -572,10 +518,11 @@ pub(super) fn perception_local_dimensions(
     }
     let local = ConformerLocalDimensions {
         heads: local_heads as i32,
-        ff_hidden: dimensions.block.ff_hidden / (heads / local_heads) as i32,
+        ff_hidden: declaration.blocks[0].feed_forward[0].network.up.output
+            / (heads / local_heads) as i32,
     };
     local.validate(dimensions.block)?;
-    Ok(vec![local; dimensions.layers])
+    Ok(vec![local; declaration.blocks.len()])
 }
 
 fn perception_graph() -> Result<ExecutionGraph, PerceptionError> {
@@ -637,23 +584,28 @@ impl<B: NeuralBackend> ComponentKernel<B> for PerceptionKernel<B> {
         let index = address.index();
         Ok(match group {
             0 => PerceptionUnit::Subsampling(
-                CausalSubsampling::new(self.dimensions.subsampling, context)?
+                CausalSubsampling::new(self.declaration.pinned.subsampling.clone(), context)?
                     .with_precision(self.precision)?,
             ),
-            1 => PerceptionUnit::Block(
-                match &self.local_blocks {
-                    Some(blocks) => ConformerBlock::new_parallel(
-                        self.dimensions.block,
-                        blocks[index],
-                        index,
-                        context,
-                    )?,
-                    None => ConformerBlock::new(self.dimensions.block, index, context)?,
+            1 => {
+                let mut spec = self
+                    .declaration
+                    .blocks
+                    .get(index)
+                    .ok_or(PerceptionError::Configuration(
+                        "Conformer unit exceeds declared stack",
+                    ))?
+                    .clone();
+                if let Some(blocks) = &self.local_blocks {
+                    spec = spec.local(blocks[index])?;
                 }
-                .with_precision(self.precision)?,
-            ),
+                PerceptionUnit::Block(
+                    ConformerBlock::new(spec, context)?.with_precision(self.precision)?,
+                )
+            }
             _ => {
-                let mut projection = self.dimensions.build_projection::<B>(context)?;
+                let mut projection =
+                    B::linear(self.declaration.pinned.projection.clone(), context)?;
                 projection.set_compute_element(self.precision.projection_element())?;
                 PerceptionUnit::Projection(projection)
             }
@@ -818,7 +770,7 @@ impl<B: NeuralBackend> PerceptionKernel<B> {
             }
             (2, PerceptionUnit::Projection(module)) => {
                 self.precision
-                    .require(module, hidden)
+                    .require(module, hidden, &self.projection_precision)
                     .map_err(PerceptionError::Precision)?;
                 let output = module.forward(hidden, context)?;
                 forward.projected = true;

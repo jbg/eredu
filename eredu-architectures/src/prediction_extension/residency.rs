@@ -1,81 +1,164 @@
-//! Cold physical-module ownership, independent of parallel storage placement.
+//! Cold physical-module ownership projected from retained parameter declarations.
 use super::*;
+use std::collections::BTreeMap;
 
-pub(crate) fn parameter_residency(
-    extension: &PredictionExtensionPlan,
-    name: &str,
-) -> Result<eredu_runtime::AuxiliaryModuleResidency, eredu_core::artifact::ArtifactError> {
-    let indexed = |prefix: &str| {
-        let rest = name.strip_prefix(prefix)?;
-        let (index, field) = rest.split_once('.')?;
-        Some((index.parse::<usize>().ok()?, field))
+use eredu_nn::DeclareLogicalParameters;
+use eredu_runtime::{AuxiliaryModuleResidency, ParameterGroupOwner};
+
+/// Physical identities used by cold admission and the consuming construction driver.
+#[derive(Clone, Copy)]
+pub(crate) enum PredictionModuleNamespace {
+    Embedded,
+    Qwen4Exp,
+}
+
+pub(crate) fn module_residency(
+    namespace: PredictionModuleNamespace,
+    ordinal: Option<usize>,
+) -> Result<AuxiliaryModuleResidency, eredu_core::artifact::ArtifactError> {
+    let id = match (namespace, ordinal) {
+        (PredictionModuleNamespace::Embedded, Some(ordinal)) => {
+            format!("prediction.unit.{ordinal}")
+        }
+        (PredictionModuleNamespace::Embedded, None) => "prediction.shared".into(),
+        (PredictionModuleNamespace::Qwen4Exp, Some(ordinal)) => {
+            format!("qwen4_exp.prediction.depth.{ordinal}")
+        }
+        (PredictionModuleNamespace::Qwen4Exp, None) => "qwen4_exp.prediction.shared".into(),
     };
-    let unit = |index: usize, count: usize| {
-        (index < count).then(|| (format!("prediction.unit.{index}"), false))
+    AuxiliaryModuleResidency::new(id, ordinal.is_none()).map_err(|error| invalid(error.to_string()))
+}
+
+pub(crate) fn parameter_residencies(
+    architecture: &crate::configuration::SafetensorsArchitecturePlan,
+    depth: usize,
+    definition: &eredu_runtime::ComponentDefinition,
+) -> Result<BTreeMap<String, AuxiliaryModuleResidency>, eredu_core::artifact::ArtifactError> {
+    let declared = definition.parameters().members_by_target();
+    let mut residencies = BTreeMap::new();
+    let mut assign = |member: &eredu_runtime::ParameterMemberSpec,
+                      ordinal: Option<usize>|
+     -> Result<(), eredu_core::artifact::ArtifactError> {
+        if declared.get(member.target()).copied() != Some(member) {
+            return Err(invalid(format!(
+                "prediction module parameter {:?} differs from its retained declaration",
+                member.target(),
+            )));
+        }
+        let owner = module_residency(PredictionModuleNamespace::Embedded, ordinal)?;
+        if residencies
+            .insert(member.target().to_owned(), owner)
+            .is_some()
+        {
+            return Err(invalid(format!(
+                "prediction parameter {:?} has duplicate physical module ownership",
+                member.target(),
+            )));
+        }
+        Ok(())
     };
-    let shared = || ("prediction.shared".to_owned(), true);
-    let owner = match extension.complete_architecture().model() {
-        SafetensorsModelConfig::DeepSeekV3(args) => {
-            let target = positive(args.num_hidden_layers, "target layer count")?;
-            indexed("model.layers.")
-                .and_then(|(index, _)| index.checked_sub(target))
-                .and_then(|index| unit(index, extension.depth()))
+
+    if let SafetensorsModelConfig::Inkling(args) = architecture.model() {
+        // Placement pins the complete prediction role; bounded materialization
+        // leases each typed depth independently and retains only the chain norm.
+        let parameters = args.prediction();
+        if parameters.depths.len() != depth {
+            return Err(invalid(
+                "Inkling physical depths differ from the retained extension",
+            ));
         }
-        SafetensorsModelConfig::DeepSeekV4(args) => indexed("mtp.").and_then(|(depth, field)| {
-            let (stem, _) = field.split_once('.').unwrap_or((field, ""));
-            let shared_input = depth == 0 && matches!(stem, "main_proj" | "main_norm");
-            let shared_output = depth.checked_add(1) == Some(extension.depth())
-                && matches!(
-                    stem,
-                    "norm"
-                        | "hc_head_fn"
-                        | "hc_head_base"
-                        | "hc_head_scale"
-                        | "markov_head"
-                        | "confidence_head"
-                );
-            if args.dspark.is_some() && (shared_input || shared_output) {
-                Some(shared())
-            } else {
-                unit(depth, extension.depth())
-            }
-        }),
-        SafetensorsModelConfig::Inkling(_) => {
-            if name.starts_with("model.mtp.chain_norm.") {
-                Some(shared())
-            } else {
-                indexed("model.mtp.layers.").and_then(|(depth, _)| unit(depth, extension.depth()))
+        let scope = |spec: &dyn DeclareLogicalParameters| {
+            eredu_runtime::logical_parameter_group(
+                "model.mtp",
+                eredu_runtime::ParameterRole::Replicated,
+                None,
+                spec,
+                |_| eredu_runtime::MemberSharding::Replicated,
+            )
+            .map_err(|error| invalid(error.to_string()))
+        };
+        for (ordinal, depth) in parameters.depths.iter().enumerate() {
+            for member in scope(depth)?.members() {
+                assign(member, Some(ordinal))?;
             }
         }
-        SafetensorsModelConfig::QwenHybrid(_) => {
-            if [
-                "mtp.pre_fc_norm_hidden.",
-                "mtp.pre_fc_norm_embedding.",
-                "mtp.fc.",
-                "mtp.norm.",
-            ]
-            .iter()
-            .any(|prefix| name.starts_with(prefix))
-            {
-                Some(shared())
-            } else {
-                indexed("mtp.layers.").and_then(|(depth, _)| unit(depth, extension.depth()))
+        if let Some(norm) = &parameters.chain_norm {
+            for member in scope(norm)?.members() {
+                assign(member, None)?;
             }
         }
-        SafetensorsModelConfig::NemotronH(args) => {
-            let count = args
-                .mtp_policies()
+    } else {
+        if definition.prediction_groups().len() != depth {
+            return Err(invalid(
+                "prediction groups differ from the retained extension depth",
+            ));
+        }
+        let mut units = BTreeMap::new();
+        for group in definition.prediction_groups() {
+            let index = definition
+                .parameters()
+                .graph()
+                .group_index(group)
+                .ok_or_else(|| invalid("prediction residency has no declared execution group"))?;
+            for unit in 0..definition
+                .unit_count(index)
                 .map_err(|error| invalid(error.to_string()))?
-                .len();
-            indexed("model.mtp.layers.").and_then(|(physical, _)| unit(physical, count))
+            {
+                let ordinal = units.len();
+                units.insert((group.as_str(), unit), ordinal);
+            }
         }
-        _ => None,
+        for group in definition.parameters().groups() {
+            let ordinal = match group.owner() {
+                ParameterGroupOwner::ExecutionUnit {
+                    group, global_unit, ..
+                } => {
+                    let Some(&ordinal) = units.get(&(group.as_str(), *global_unit)) else {
+                        continue;
+                    };
+                    Some(ordinal)
+                }
+                ParameterGroupOwner::StaticRole(role)
+                | ParameterGroupOwner::StaticUnitConsumers { role, .. }
+                    if role == "mtp" =>
+                {
+                    None
+                }
+                _ => continue,
+            };
+            for member in group.members() {
+                assign(member, ordinal)?;
+            }
+        }
     }
-    .ok_or_else(|| {
-        invalid(format!(
-            "prediction parameter {name:?} has no physical module owner"
-        ))
-    })?;
-    eredu_runtime::AuxiliaryModuleResidency::new(owner.0, owner.1)
-        .map_err(|error| invalid(error.to_string()))
+
+    // Every declared prediction resource is assigned once. Shared target
+    // embeddings/readout roles remain with their target storage owner.
+    for group in definition.parameters().groups() {
+        let prediction = match group.owner() {
+            ParameterGroupOwner::ExecutionUnit { group, .. } => definition
+                .prediction_groups()
+                .iter()
+                .any(|candidate| candidate == group.as_str()),
+            ParameterGroupOwner::StaticRole(role)
+            | ParameterGroupOwner::StaticUnitConsumers { role, .. } => role == "mtp",
+            _ => false,
+        };
+        if prediction {
+            for member in group.members() {
+                if !residencies.contains_key(member.target()) {
+                    return Err(invalid(format!(
+                        "prediction parameter {:?} has no physical module owner",
+                        member.target(),
+                    )));
+                }
+            }
+        }
+    }
+    if residencies.is_empty() {
+        return Err(invalid(
+            "prediction extension has no declared parameter residency",
+        ));
+    }
+    Ok(residencies)
 }

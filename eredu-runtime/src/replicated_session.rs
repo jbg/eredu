@@ -5142,7 +5142,7 @@ where
                     member.global_shape().to_vec(),
                     group.owner().clone(),
                     role,
-                    primary.to_owned(),
+                    primary.as_str().to_owned(),
                 )),
                 _ => {
                     return Err(format!(

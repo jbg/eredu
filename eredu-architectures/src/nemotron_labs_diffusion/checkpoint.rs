@@ -1,4 +1,3 @@
-use crate::decoder::Config;
 use eredu_checkpoint::schema::{
     CatalogPolicy, SafetensorsCheckpointPlan, SafetensorsTensorConstraint, StoredDtypeConstraint,
 };
@@ -39,15 +38,29 @@ pub fn canonical_parameter_name(source: &str) -> String {
     }
 }
 
-/// Exact source-only recipes normalize admitted physical names without a second
-/// base model or a copy-producing layout transformation.
+/// Projects exact source conversions through the family-owned declarations.
+/// Physical layouts and dtype constraints remain explicit format extensions.
 pub fn source_recipes(
+    config: &FamilyConfig,
     source: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
+) -> Result<std::collections::BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>, String>
+{
+    source_recipes_for(config, source, |_| true)
+}
+
+fn source_recipes_for(
+    config: &FamilyConfig,
+    source: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
+    owns: impl Fn(&str) -> bool,
 ) -> Result<std::collections::BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>, String>
 {
     let mut recipes = std::collections::BTreeMap::new();
     let mut names = std::collections::BTreeSet::new();
-    let keys = source.source_keys();
+    let keys = source
+        .source_keys()
+        .into_iter()
+        .filter(|key| owns(&canonical_parameter_name(key)))
+        .collect::<Vec<_>>();
     let mut conversion_inputs = std::collections::BTreeSet::new();
     for key in &keys {
         if source
@@ -74,8 +87,36 @@ pub fn source_recipes(
         }
         if key.starts_with("nemotron.gguf.pixtral.layers.") && canonical != key {
             use eredu_checkpoint::recipe::{DerivedWeightRecipe as Recipe, RecipeDtype};
+            use eredu_nn::DeclareLogicalParameters;
+            let vision = super::vision_gguf::companion_geometry(config)
+                .map_err(|error| error.to_string())?;
+            let (index, field) = super::vision_gguf::vision_pair(&canonical)
+                .ok_or("unresolved Pixtral GGUF projection reference")?;
+            let index = index.parse::<usize>().map_err(|error| error.to_string())?;
+            if index >= vision.num_hidden_layers as usize {
+                return Err(format!(
+                    "Pixtral GGUF projection {canonical} is outside the declared tower"
+                ));
+            }
+            let layer = vision
+                .tower()
+                .layer(index)
+                .map_err(|error| error.to_string())?;
+            let projection = match field {
+                "q_proj" => &layer.attention.query,
+                "k_proj" => &layer.attention.key,
+                _ => return Err("unresolved Pixtral GGUF projection".into()),
+            };
+            let parameter = projection
+                .logical_parameters()
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .find(|p| p.parameter.id.as_str() == canonical)
+                .ok_or("Pixtral source does not reference a declared projection")?;
             let metadata = source.source_metadata(&key).map_err(|e| e.to_string())?;
-            if metadata.stored_dtype != StoredDtype::F16 || metadata.logical_shape != [1024, 1024] {
+            if metadata.stored_dtype != StoredDtype::F16
+                || metadata.logical_shape != parameter.shape
+            {
                 return Err(
                     "Pixtral GGUF Q/K differs from admitted half-head conversion geometry".into(),
                 );
@@ -90,11 +131,16 @@ pub fn source_recipes(
                             )),
                             dtype: RecipeDtype::F32,
                         }),
-                        shape: vec![16, 32, 2, 1024],
+                        shape: vec![
+                            layer.attention.geometry.query_heads() as usize,
+                            layer.attention.geometry.key_dimensions() as usize / 2,
+                            2,
+                            projection.input as usize,
+                        ],
                     }),
                     axes: vec![0, 2, 1, 3],
                 }),
-                shape: vec![1024, 1024],
+                shape: parameter.shape,
             };
             recipe.infer(source).map_err(|e| e.to_string())?;
             recipes.insert(canonical, recipe);
@@ -133,6 +179,7 @@ pub fn source_recipes(
 }
 
 pub(crate) fn module_source_recipes<T: 'static, M: eredu_nn::Parameterized<T>>(
+    config: &FamilyConfig,
     module: &M,
     source: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<std::collections::BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>, String>
@@ -145,81 +192,37 @@ pub(crate) fn module_source_recipes<T: 'static, M: eredu_nn::Parameterized<T>>(
     }
     let mut names = Names(std::collections::BTreeSet::new());
     module.visit_parameters(&mut names);
-    Ok(source_recipes(source)?
-        .into_iter()
-        .filter(|(name, _)| names.0.contains(name))
-        .collect())
+    source_recipes_for(config, source, |name| names.0.contains(name))
 }
 
 /// Complete text tensor geometry, including independently encoded affine companions.
 pub fn safetensors_plan(config: &FamilyConfig) -> Result<SafetensorsCheckpointPlan, String> {
-    let dense =
-        crate::llama::safetensors_plan(config.dense()).map_err(|error| error.to_string())?;
+    let description = config
+        .text_declaration()
+        .parameter_description(config, crate::decoder::ParameterEncoding::Logical)
+        .map_err(|error| error.to_string())?;
+    let dense = crate::llama::checkpoint::safetensors_plan_from_parameters(
+        description.groups().iter().flat_map(|g| g.members()),
+    )
+    .map_err(|error| error.to_string())?;
     let mut tensors = dense.common_tensors;
-    if let Some(vision) = &config.vision {
-        let width = vision.hidden_size as usize;
-        let intermediate = vision.intermediate_size as usize;
-        let text = config.hidden_size() as usize;
-        let merged = width
-            .checked_mul(config.spatial_merge_size as usize)
-            .and_then(|x| x.checked_mul(config.spatial_merge_size as usize))
-            .ok_or_else(|| "Pixtral merge width overflow".to_string())?;
-        let mut add = |key: String, shape: Vec<usize>| {
+    if config.vision.is_some() {
+        use eredu_nn::DeclareLogicalParameters;
+        let declaration =
+            super::vision::specs::VisionSpec::new(config).map_err(|e| e.to_string())?;
+        for parameter in declaration
+            .logical_parameters()
+            .map_err(|e| e.to_string())?
+        {
             tensors.push(SafetensorsTensorConstraint::required(
-                key,
-                shape,
+                parameter.parameter.id.as_str(),
+                parameter.shape,
                 StoredDtypeConstraint::OneOf(vec![
                     StoredDtype::F32,
                     StoredDtype::F16,
                     StoredDtype::BF16,
                 ]),
             ));
-        };
-        for (key, shape) in [
-            (
-                "model.vision_tower.patch_conv.weight",
-                vec![
-                    width,
-                    vision.num_channels as usize,
-                    vision.patch_size as usize,
-                    vision.patch_size as usize,
-                ],
-            ),
-            ("model.vision_tower.ln_pre.weight", vec![width]),
-            (
-                "model.multi_modal_projector.patch_merger.merging_layer.weight",
-                vec![width, merged],
-            ),
-            ("model.multi_modal_projector.norm.weight", vec![width]),
-            (
-                "model.multi_modal_projector.linear_1.weight",
-                vec![text, width],
-            ),
-            (
-                "model.multi_modal_projector.linear_2.weight",
-                vec![text, text],
-            ),
-        ] {
-            add(key.into(), shape);
-        }
-        for layer in 0..vision.num_hidden_layers {
-            let prefix = format!("model.vision_tower.transformer.layers.{layer}");
-            for field in ["attention_norm", "ffn_norm"] {
-                add(format!("{prefix}.{field}.weight"), vec![width]);
-            }
-            for field in ["q_proj", "k_proj", "v_proj", "o_proj"] {
-                add(
-                    format!("{prefix}.attention.{field}.weight"),
-                    vec![width, width],
-                );
-            }
-            for (field, shape) in [
-                ("gate_proj", vec![intermediate, width]),
-                ("up_proj", vec![intermediate, width]),
-                ("down_proj", vec![width, intermediate]),
-            ] {
-                add(format!("{prefix}.feed_forward.{field}.weight"), shape);
-            }
         }
     }
     if config.tensor_fp8() {

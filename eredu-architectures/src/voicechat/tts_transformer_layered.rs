@@ -1,6 +1,7 @@
 //! Shared layered traversal for causal speech and bidirectional character stacks.
 
 use super::tts_transformer::{encoder_mask, NoTransformerCache, TransformerConfig};
+use super::tts_transformer_specs::{TransformerDeclaration, TransformerSpec};
 use crate::decoder::{self, AttentionInput, Config, PartitionedConfig, TransformerBlock};
 use eredu_core::{cache::LayerCachePolicy, BackendFailure, LayerSchedule};
 use eredu_nn::{
@@ -208,26 +209,11 @@ impl<'a, B: NeuralBackend, C: RuntimeLayerState<B>, D: DerefMut<Target = [C]>>
             ));
         }
         Ok(Self {
-            layout: architecture.state_layout.clone(),
+            layout: architecture.definition.state_layout().clone(),
             position: caches.first().map_or(0, |cache| cache.offset()),
             identity: architecture.config.architecture_fingerprint(),
             caches,
             causal: architecture.config.geometry().causal,
-            cache_base: 0,
-            backend: PhantomData,
-        })
-    }
-    /// Wraps an unpublished branch without copying native cache handles.
-    pub fn new(config: &TransformerConfig, caches: D) -> Result<Self, TransformerError>
-    where
-        C: AttentionCache<B::Tensor>,
-    {
-        Ok(Self {
-            layout: transformer_state_layout(config)?,
-            position: caches.first().map_or(0, |cache| cache.offset()),
-            identity: config.architecture_fingerprint(),
-            caches,
-            causal: config.geometry().causal,
             cache_base: 0,
             backend: PhantomData,
         })
@@ -285,17 +271,12 @@ impl<B: NeuralBackend, C: RuntimeLayerState<B>, D: DerefMut<Target = [C]>> Runti
     }
 }
 
-/// Canonical embedded-input transformer operations and cache references.
-pub fn tts_transformer_component_definition(
+pub(super) fn transformer_component_definition_with_state(
     config: &TransformerConfig,
-) -> Result<ComponentDefinition, TransformerError> {
-    transformer_component_definition_with_state(config, transformer_state_layout(config)?)
-}
-fn transformer_component_definition_with_state(
-    config: &TransformerConfig,
+    declaration: &TransformerSpec,
     state: StateLayout,
 ) -> Result<ComponentDefinition, TransformerError> {
-    let parameters = tts_transformer_parameter_description(config)?;
+    let parameters = declared_parameters(config, declaration)?;
     let units = (0..parameters.unit_layout().len())
         .map(|ordinal| {
             let address = parameters
@@ -368,49 +349,58 @@ pub struct TransformerForward<T> {
 /// Exact transformer graph with separately materializable final normalization.
 pub struct TransformerKernel<B: NeuralBackend> {
     config: TransformerConfig,
+    declaration: TransformerSpec,
+    definition: ComponentDefinition,
     local_blocks: Option<Vec<TransformerConfig>>,
-    state_layout: StateLayout,
+    local_parameters: Option<Vec<decoder::topology::BlockParameters>>,
     partition: Option<partition::TransformerOwnership>,
     backend: PhantomData<fn() -> B>,
 }
 impl<B: NeuralBackend> TransformerKernel<B> {
-    /// Validates normalized policy without allocating native parameters.
-    pub fn new(config: TransformerConfig) -> Result<Self, TransformerError> {
-        config.validate_config()?;
-        let state_layout = transformer_state_layout(&config)?;
+    /// Retains normalized policy and typed slots without allocating native parameters.
+    pub fn new(declaration: TransformerDeclaration) -> Result<Self, TransformerError> {
+        let (config, spec, definition) = declaration.into_parts();
+        let state_layout = transformer_state_layout(&config, &spec.parameters.blocks)?;
+        if definition.state_layout() != &state_layout {
+            return Err(TransformerError::Configuration(
+                "TTS retained cache layout requires matching tensor selection",
+            ));
+        }
         Ok(Self {
+            declaration: spec.with_policy(&config)?,
             config,
+            definition,
             local_blocks: None,
-            state_layout,
+            local_parameters: None,
             partition: None,
             backend: PhantomData,
         })
     }
-    /// Constructs rank-local modules from an already selected physical layout.
-    /// Global parameter identities remain unchanged; only projection widths and
-    /// cache head counts are local. No tensor or parameter payload is allocated.
+    /// Projects retained slots into the exact selected head and intermediate domains.
     pub fn new_parallel(
-        config: TransformerConfig,
+        declaration: TransformerDeclaration,
         layout: &LocalModelLayout,
     ) -> Result<Self, TransformerError> {
-        let blocks = transformer_local_configs(&config, layout)?;
-        let state_layout = transformer_local_state_layout(&config, &blocks)?;
+        let blocks = transformer_local_configs(&declaration, layout)?;
+        let local_parameters = transformer_local_parameters(&declaration, &blocks)?;
+        let state_layout = transformer_state_layout(declaration.config(), &local_parameters)?;
+        let declaration = declaration.with_state_layout(state_layout)?;
+        let (config, spec, definition) = declaration.into_parts();
         Ok(Self {
+            declaration: spec.with_policy(&config)?,
             config,
+            definition,
             local_blocks: Some(blocks),
-            state_layout,
+            local_parameters: Some(local_parameters),
             partition: None,
             backend: PhantomData,
         })
     }
-    /// Couples the selected geometry with shared typed execution contracts.
+    /// Couples retained ownership and selected state geometry with shared execution.
     pub fn into_component(
         self,
     ) -> Result<ComponentAdapter<ComponentDefinition, Self>, TransformerError> {
-        Ok(ComponentAdapter::new(
-            transformer_component_definition_with_state(&self.config, self.state_layout.clone())?,
-            self,
-        )?)
+        Ok(ComponentAdapter::new(self.definition.clone(), self)?)
     }
     /// Whether parameter construction and execution require tensor collectives.
     pub fn is_parallel(&self) -> bool {
@@ -442,13 +432,16 @@ impl<B: NeuralBackend> TransformerKernel<B> {
             Some(selected) => (
                 selected.blocks.start,
                 selected.blocks.len(),
-                selected.local_state.as_ref().unwrap_or(&self.state_layout),
+                selected
+                    .local_state
+                    .as_ref()
+                    .unwrap_or(self.definition.state_layout()),
                 !selected.blocks.is_empty(),
             ),
             None => (
                 0,
                 self.config.geometry().num_hidden_layers,
-                &self.state_layout,
+                self.definition.state_layout(),
                 true,
             ),
         };
@@ -490,7 +483,7 @@ impl<B: NeuralBackend> TransformerKernel<B> {
     ) -> Result<LayeredForwardState<B::Tensor, TransformerForward<B::Tensor>>, TransformerError>
     {
         let sequence = validate_input(&self.config, input.embedded)?;
-        if state.layout != self.state_layout.clone() {
+        if &state.layout != self.definition.state_layout() {
             return Err(TransformerError::Configuration(
                 "TTS runtime state layout mismatch",
             ));
@@ -566,10 +559,11 @@ impl<B: NeuralBackend> TransformerKernel<B> {
 
 /// Validates complete physical members before deriving rank-local block geometry.
 pub(super) fn transformer_local_configs(
-    config: &TransformerConfig,
+    declaration: &TransformerDeclaration,
     layout: &LocalModelLayout,
 ) -> Result<Vec<TransformerConfig>, TransformerError> {
-    let global = tts_transformer_parameter_description(config)?;
+    let config = declaration.config();
+    let global = declaration.definition().parameters();
     let expected = global
         .groups()
         .iter()
@@ -596,14 +590,56 @@ pub(super) fn transformer_local_configs(
             ));
         }
     }
-    let blocks = (0..config.geometry().num_hidden_layers)
-        .map(|index| config.local_block_config(index, layout))
-        .collect::<Result<Vec<_>, _>>()?;
+    let blocks = declaration
+        .spec()
+        .parameters
+        .blocks
+        .iter()
+        .map(|block| {
+            let decoder::topology::AttentionInputParameters::Split { query, key, .. } =
+                &block.attention.input
+            else {
+                return Err(eredu_nn::Error::backend(
+                    "TTS requires independent attention projections",
+                ));
+            };
+            let width = |spec: &eredu_nn::LinearSpec| -> Result<i32, eredu_nn::Error> {
+                let local = layout
+                    .tensor(spec.weight.id.as_str())
+                    .ok_or_else(|| eredu_nn::Error::backend("TTS layout omits declared affine"))?;
+                i32::try_from(local.local_shape()[0]).map_err(eredu_nn::Error::backend)
+            };
+            let Some(eredu_nn::GatedProductSpec::Split(feed)) = &block.feed_forward else {
+                return Err(eredu_nn::Error::backend(
+                    "TTS requires independent gated projections",
+                ));
+            };
+            let q = width(query)?;
+            let k = width(key)?;
+            let dimensions = block.attention.geometry.key_dimensions();
+            if q <= 0 || k <= 0 || q % dimensions != 0 || k % dimensions != 0 {
+                return Err(eredu_nn::Error::backend("invalid local TTS head geometry"));
+            }
+            let mut local = config.clone();
+            local.set_local_geometry(q / dimensions, k / dimensions, width(&feed.gate)?)?;
+            Ok(local)
+        })
+        .collect::<Result<Vec<_>, eredu_nn::Error>>()?;
     let local_descriptions = blocks
         .iter()
-        .map(decoder::embedded_parameter_description)
+        .map(|config| {
+            let config = config.clone().with_precision(Default::default());
+            let local = declaration.spec().with_geometry(&config)?;
+            Ok::<_, TransformerError>(decoder::embedded_parameter_description(
+                &config,
+                &local.parameters,
+            )?)
+        })
         .collect::<Result<Vec<_>, _>>()?;
-    let global_decoder = decoder::embedded_parameter_description(config)?;
+    let global_decoder = decoder::embedded_parameter_description(
+        &config.clone().with_precision(Default::default()),
+        &declaration.spec().parameters,
+    )?;
     for group in global.groups() {
         let local = match group.owner() {
             ParameterGroupOwner::ExecutionUnit {
@@ -637,32 +673,51 @@ pub(super) fn transformer_local_configs(
     Ok(blocks)
 }
 
-pub(super) fn transformer_local_state_layout(
-    config: &TransformerConfig,
+pub(super) fn transformer_local_parameters(
+    declaration: &TransformerDeclaration,
     blocks: &[TransformerConfig],
+) -> Result<Vec<decoder::topology::BlockParameters>, TransformerError> {
+    blocks
+        .iter()
+        .enumerate()
+        .map(|(layer, config)| {
+            let local = declaration
+                .spec()
+                .with_geometry(config)?
+                .with_policy(config)?;
+            Ok(local.parameters.blocks[layer].clone())
+        })
+        .collect()
+}
+pub(super) fn transformer_state_layout(
+    config: &TransformerConfig,
+    blocks: &[decoder::topology::BlockParameters],
 ) -> Result<StateLayout, TransformerError> {
     if config.geometry().causal {
         Ok(StateLayout::new(
-            decoder::cache_layout_with_key_value_heads(
+            decoder::cache_layout_with_attention_geometry(
                 config,
-                blocks.iter().map(Config::num_key_value_heads),
+                blocks.iter().map(|b| b.attention.geometry),
             )?,
         )?)
     } else {
-        transformer_state_layout(config)
+        Ok(StateLayout::new(LayerSchedule::new(
+            blocks.len(),
+            vec![LayerCachePolicy::NoState; blocks.len()],
+        )?)?)
     }
 }
 
 pub(super) fn validate_transformer_partition<G>(
-    definition: &ComponentDefinition,
-    config: &TransformerConfig,
+    declaration: &TransformerDeclaration,
     layout: Option<&LocalModelLayout>,
     selected: &eredu_runtime::ArchitecturePartition<G, TransformerBoundarySchema>,
 ) -> Result<(), TransformerError> {
     if let Some(layout) = layout {
-        transformer_local_configs(config, layout)?;
+        transformer_local_configs(declaration, layout)?;
     }
-    partition::validate_partition(definition, config, selected).map(|_| ())
+    partition::validate_partition(declaration.definition(), declaration.config(), selected)
+        .map(|_| ())
 }
 
 fn transformer_graph(config: &TransformerConfig) -> Result<ExecutionGraph, TransformerError> {
@@ -676,23 +731,13 @@ fn transformer_graph(config: &TransformerConfig) -> Result<ExecutionGraph, Trans
         &norm,
     )?)
 }
-fn transformer_state_layout(config: &TransformerConfig) -> Result<StateLayout, TransformerError> {
-    if config.geometry().causal {
-        Ok(decoder::state_layout(config)?)
-    } else {
-        Ok(StateLayout::new(LayerSchedule::new(
-            config.geometry().num_hidden_layers,
-            vec![LayerCachePolicy::NoState; config.geometry().num_hidden_layers],
-        )?)?)
-    }
-}
-/// Cold shared-decoder parameter shapes and format companions, with speech unit ownership.
-pub fn tts_transformer_parameter_description(
+pub(super) fn declared_parameters(
     config: &TransformerConfig,
+    declaration: &TransformerSpec,
 ) -> Result<ArchitectureParameterDescription, TransformerError> {
-    let description = decoder::embedded_parameter_description(config)?;
+    let description = decoder::embedded_parameter_description(config, &declaration.parameters)?;
     let graph = transformer_graph(config)?;
-    let layout = ExecutionUnitLayout::new(&graph, [config.geometry().num_hidden_layers, 1])?;
+    let layout = ExecutionUnitLayout::new(&graph, [declaration.parameters.blocks.len(), 1])?;
     let mut owned = Vec::new();
     for old in description.groups() {
         let (group, index) = match old.owner() {
@@ -731,7 +776,7 @@ impl<B: NeuralBackend> ComponentKernel<B> for TransformerKernel<B> {
         state: &eredu_runtime::PartitionState,
         topology: eredu_core::cache::PromptCacheTopology,
     ) -> Result<eredu_runtime::ModelStateIdentity, TransformerError> {
-        let global = self.state_layout.clone();
+        let global = self.definition.state_layout();
         let begin = state.global_layer_offset();
         let end = begin
             .checked_add(state.layout().len())
@@ -762,16 +807,26 @@ impl<B: NeuralBackend> ComponentKernel<B> for TransformerKernel<B> {
         let group = address.group();
         let index = address.index();
         Ok(if group == 0 {
-            TransformerUnit::Block(
+            TransformerUnit::Block(TransformerBlock::from_parameters(
                 self.local_blocks
                     .as_ref()
-                    .map_or(&self.config, |blocks| &blocks[index])
-                    .build_block(index, context)?,
-            )
+                    .map_or(&self.config, |blocks| &blocks[index]),
+                index,
+                self.local_parameters
+                    .as_ref()
+                    .map_or(&self.declaration.parameters.blocks[index], |blocks| {
+                        &blocks[index]
+                    }),
+                context,
+            )?)
         } else {
-            TransformerUnit::Norm(self.config.build_final_norm::<B>(context)?)
+            TransformerUnit::Norm(B::normalization(
+                self.declaration.parameters.normalization.clone(),
+                context,
+            )?)
         })
     }
+
     fn executes_group(&self, _: usize, _: &Self::ForwardContext) -> bool {
         true
     }
@@ -1068,8 +1123,10 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, TransformerError> {
         let mut empty = [];
-        let mut state =
-            TransformerRuntimeState::<B, NoTransformerCache<B>>::new(self.config(), &mut empty)?;
+        let mut state = TransformerRuntimeState::<B, NoTransformerCache<B>>::for_architecture(
+            self.architecture().kernel(),
+            &mut empty,
+        )?;
         self.forward_with_state(
             TransformerInput {
                 embedded,
@@ -1104,7 +1161,10 @@ where
         caches: &mut [C],
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, TransformerError> {
-        let mut state = TransformerRuntimeState::<B, C>::new(self.config(), caches)?;
+        let mut state = TransformerRuntimeState::<B, C>::for_architecture(
+            self.architecture().kernel(),
+            caches,
+        )?;
         self.forward_with_state(
             TransformerInput {
                 embedded,

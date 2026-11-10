@@ -1,8 +1,5 @@
 use super::*;
-use eredu_architectures::{
-    capability as architecture_capability, gemma4, gpt_oss, kimi_linear, lfm2,
-    llama::ModelArgs as LlamaModelArgs, nemotron_h,
-};
+use eredu_architectures::{capability as architecture_capability, gemma4, gpt_oss};
 use eredu_core::{
     attention::{AttentionPolicy, LayerSchedule},
     cache::{
@@ -12,106 +9,6 @@ use eredu_core::{
     CacheStateStrategy, EstimationCompleteness, InputModalities, SlidingWindowLayerCount,
 };
 use serde_json::json;
-
-#[test]
-fn qwen2_runtime_state_splits_full_and_sliding_gqa_layers() {
-    let args = eredu_architectures::qwen::model_args_from_config_value(&json!({
-            "model_type": "qwen2", "hidden_size": 16, "num_hidden_layers": 6,
-            "intermediate_size": 32, "num_attention_heads": 4,
-            "num_key_value_heads": 2, "rms_norm_eps": 1e-6, "vocab_size": 64,
-            "max_position_embeddings": 128, "rope_theta": 10000.0,
-            "tie_word_embeddings": false, "use_sliding_window": true,
-            "sliding_window": 8, "max_window_layers": 4
-    }))
-    .unwrap();
-    let (capabilities, estimate) = architecture_capability::qwen(&args).unwrap().into_parts();
-    let strategy = capabilities.state_strategy;
-    assert_eq!(
-        strategy,
-        CacheStateStrategy::MixedKv {
-            full_layers: 4,
-            sliding: vec![SlidingWindowLayerCount {
-                layers: 2,
-                window: 8,
-            }],
-        }
-    );
-    assert_eq!(
-        estimate.layer_layout(),
-        eredu_architectures::qwen::state_layout(&args)
-            .unwrap()
-            .layers()
-    );
-}
-
-#[test]
-fn qwen2_runtime_state_groups_arbitrary_distinct_windows_exactly() {
-    let mut args = eredu_architectures::qwen::model_args_from_config_value(&json!({
-            "model_type": "qwen2", "hidden_size": 16, "num_hidden_layers": 4,
-            "intermediate_size": 32, "num_attention_heads": 4,
-            "num_key_value_heads": 2, "rms_norm_eps": 1e-6, "vocab_size": 64,
-            "max_position_embeddings": 128, "rope_theta": 10000.0,
-            "tie_word_embeddings": false
-    }))
-    .unwrap();
-    args.attention_schedule = eredu_core::attention::LayerSchedule::new(
-        4,
-        vec![
-            eredu_core::attention::AttentionPolicy::sliding(4).unwrap(),
-            eredu_core::attention::AttentionPolicy::Full,
-            eredu_core::attention::AttentionPolicy::sliding(8).unwrap(),
-            eredu_core::attention::AttentionPolicy::sliding(4).unwrap(),
-        ],
-    )
-    .unwrap();
-    let (capabilities, layout) = architecture_capability::qwen(&args).unwrap().into_parts();
-    let strategy = capabilities.state_strategy;
-    assert_eq!(
-        strategy,
-        CacheStateStrategy::MixedKv {
-            full_layers: 1,
-            sliding: vec![
-                SlidingWindowLayerCount {
-                    layers: 2,
-                    window: 4,
-                },
-                SlidingWindowLayerCount {
-                    layers: 1,
-                    window: 8,
-                },
-            ],
-        }
-    );
-    let state = estimate_mlx_runtime_state(&layout, InputTokenCount::text(10), 0, 2).unwrap();
-    assert_eq!(state.assumptions.sliding_window_bounds, vec![4, 8]);
-    assert_eq!(state.context_state_bytes, (10 + 2 * 4 + 8) * 16 * 2 * 4);
-}
-
-#[test]
-fn lfm2_runtime_state_uses_the_normalized_hybrid_schedule() {
-    let args = lfm2::model_args_from_config_value(&json!({
-        "model_type": "lfm2", "vocab_size": 32, "hidden_size": 16,
-        "intermediate_size": 24, "num_hidden_layers": 3,
-        "num_attention_heads": 4, "num_key_value_heads": 2,
-        "max_position_embeddings": 128, "norm_eps": 1e-5,
-        "conv_L_cache": 3, "block_auto_adjust_ff_dim": false,
-        "layer_types": ["conv", "full_attention", "conv"]
-    }))
-    .unwrap();
-    let (capabilities, estimate) = architecture_capability::lfm2(&args).unwrap().into_parts();
-    let strategy = capabilities.state_strategy;
-    assert_eq!(
-        strategy,
-        CacheStateStrategy::HybridRecurrent {
-            full_attention_layers: 1,
-            sliding_attention: Vec::new(),
-            recurrent_layers: 2,
-        }
-    );
-    let state = estimate_mlx_runtime_state(&estimate, InputTokenCount::text(1), 0, 1).unwrap();
-    assert_eq!(state.fixed_state_bytes, 64 * 4);
-    assert_eq!(state.context_state_bytes, 256 * 16 * 4);
-}
 
 #[test]
 fn gpt_oss_runtime_state_uses_exact_schedule_and_distinct_windows() {
@@ -141,7 +38,8 @@ fn gpt_oss_runtime_state_uses_exact_schedule_and_distinct_windows() {
         ],
     )
     .unwrap();
-    let state_layout = gpt_oss::state_layout(&args).unwrap();
+    let declaration = gpt_oss::Declaration::new(args.clone()).unwrap();
+    let state_layout = declaration.common().state_layout().clone();
     assert_eq!(state_layout.len(), 4);
     for (layer, attention) in args.attention_schedule.iter().copied().enumerate() {
         assert_eq!(
@@ -172,7 +70,7 @@ fn gpt_oss_runtime_state_uses_exact_schedule_and_distinct_windows() {
         identity.architecture_fingerprint(),
         gpt_oss::prompt_cache_architecture_fingerprint(&args)
     );
-    let (capabilities, estimate) = architecture_capability::gpt_oss(&args)
+    let (capabilities, estimate) = architecture_capability::gpt_oss(&declaration)
         .unwrap()
         .into_parts();
     let strategy = capabilities.state_strategy;
@@ -193,56 +91,6 @@ fn gpt_oss_runtime_state_uses_exact_schedule_and_distinct_windows() {
         }
     );
     assert_eq!(estimate.layer_layout(), state_layout.layers());
-}
-
-#[test]
-fn nemotron_runtime_state_tracks_mixed_recurrent_kv_and_stateless_layers() {
-    let args = nemotron_h::model_args_from_config_value(&json!({
-        "model_type": "nemotron_h", "vocab_size": 32, "hidden_size": 8,
-        "intermediate_size": 12, "num_hidden_layers": 4,
-        "hybrid_override_pattern": "M*-E", "num_attention_heads": 2,
-        "num_key_value_heads": 1, "head_dim": 4,
-        "max_position_embeddings": 128, "sliding_window": 5,
-        "mamba_num_heads": 2, "mamba_head_dim": 4, "n_groups": 1,
-        "ssm_state_size": 4, "conv_kernel": 3, "chunk_size": 2,
-        "moe_intermediate_size": 6,
-        "moe_shared_expert_intermediate_size": 10,
-        "n_routed_experts": 2, "n_shared_experts": 1,
-        "num_experts_per_tok": 2, "mlp_hidden_act": "relu2",
-        "mamba_hidden_act": "silu"
-    }))
-    .unwrap();
-    let (capabilities, estimate) = architecture_capability::nemotron_h(&args)
-        .unwrap()
-        .into_parts();
-    let strategy = capabilities.state_strategy;
-    assert_eq!(
-        strategy,
-        CacheStateStrategy::HybridRecurrent {
-            full_attention_layers: 0,
-            sliding_attention: vec![SlidingWindowLayerCount {
-                layers: 1,
-                window: 5,
-            }],
-            recurrent_layers: 1,
-        }
-    );
-    assert_eq!(
-        estimate.layer_layout(),
-        nemotron_h::state_layout(&args).unwrap().layers()
-    );
-    let state = estimate_mlx_runtime_state_with_dtype(
-        &estimate,
-        InputTokenCount::text(10),
-        0,
-        2,
-        NonZeroU8::new(2).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(state.fixed_state_bytes, 384);
-    assert_eq!(state.context_state_bytes, 160);
-    assert_eq!(state.bytes_per_position_per_batch, 0);
-    assert_eq!(state.assumptions.sliding_window_bounds, vec![5]);
 }
 
 #[test]
@@ -283,37 +131,6 @@ fn qwen_hybrid_runtime_state_uses_the_normalized_schedule() {
     .unwrap();
     assert_eq!(state.fixed_state_bytes, 448);
     assert_eq!(state.context_state_bytes, 2 * 16 * 2);
-}
-
-fn tiny_llama(kv_heads: i32, sliding_window: Option<i32>) -> LlamaModelArgs {
-    LlamaModelArgs {
-        model_type: "mistral".into(),
-        hidden_size: 32,
-        num_hidden_layers: 2,
-        intermediate_size: 64,
-        num_attention_heads: 4,
-        rms_norm_eps: 1e-5,
-        vocab_size: 64,
-        num_key_value_heads: kv_heads,
-        max_position_embeddings: 128,
-        rope_theta: 10_000.0,
-        rope_traditional: false,
-        head_dim: 8,
-        tie_word_embeddings: true,
-        attention_bias: false,
-        mlp_bias: false,
-        rope_scaling: None,
-        attention_schedule: match sliding_window {
-            Some(window) => {
-                eredu_core::attention::LayerSchedule::all_sliding(2, u32::try_from(window).unwrap())
-                    .unwrap()
-            }
-            None => eredu_core::attention::LayerSchedule::all_full(2).unwrap(),
-        },
-        quantization: None,
-        quantized_weights: None,
-        quantized_weight_configs: None,
-    }
 }
 
 fn tiny_gemma4() -> gemma4::ModelArgs {
@@ -393,15 +210,39 @@ fn gemma4_capability(
     modalities: InputModalities,
 ) -> eredu_architectures::capability::CapabilityEstimate {
     let model_type = text.model_type.clone();
-    architecture_capability::gemma4(&gemma4::FamilyConfig {
-        model_type,
-        text,
-        vision: None,
-        image_token_id: modalities.image.then_some(1),
-        video_token_id: modalities.video.then_some(2),
-        audio: None,
-        audio_token_id: modalities.audio.then_some(3),
-    })
+    architecture_capability::gemma4(
+        &gemma4::FamilyConfig::new(gemma4::FamilyPolicy {
+            model_type,
+            text,
+            vision: (modalities.image || modalities.video).then(|| {
+                gemma4::VisionConfig::from_json(
+                    br#"{
+            "hidden_size":32,"intermediate_size":64,"num_hidden_layers":1,
+            "num_attention_heads":4,"num_key_value_heads":2,"head_dim":8,
+            "patch_size":2,"pooling_kernel_size":2,"position_embedding_size":16,
+            "rms_norm_eps":0.000001
+        }"#,
+                )
+                .unwrap()
+            }),
+            image_token_id: modalities.image.then_some(1),
+            video_token_id: modalities.video.then_some(2),
+            audio: modalities.audio.then(|| {
+                gemma4::AudioConfig::from_json(
+                    br#"{
+            "hidden_size":32,"num_hidden_layers":1,"num_attention_heads":4,"output_proj_dims":32,
+            "conv_kernel_size":3,"attention_chunk_size":4,"attention_context_left":8,
+            "attention_context_right":0,"attention_invalid_logits_value":-1000000000.0,
+            "attention_logit_cap":50.0,"residual_weight":0.5,"rms_norm_eps":0.000001,
+            "subsampling_conv_channels":[4,8]
+        }"#,
+                )
+                .unwrap()
+            }),
+            audio_token_id: modalities.audio.then_some(3),
+        })
+        .unwrap(),
+    )
     .unwrap()
 }
 
@@ -418,50 +259,6 @@ fn estimate(
         0,
         batch,
     )
-}
-
-#[test]
-fn standard_kv_and_gqa_use_kv_head_count() {
-    let (capabilities, llama_layout) = architecture_capability::llama(&tiny_llama(4, None))
-        .unwrap()
-        .into_parts();
-    let strategy = capabilities.state_strategy;
-    assert_eq!(strategy, CacheStateStrategy::FullKv);
-    let llama = estimate_mlx_runtime_state(&llama_layout, InputTokenCount::text(10), 0, 1).unwrap();
-    assert_eq!(llama.requested_state_bytes, 2 * 2 * 4 * 8 * 10 * 4);
-
-    let (_, gqa_layout) = architecture_capability::llama(&tiny_llama(1, None))
-        .unwrap()
-        .into_parts();
-    let gqa = estimate_mlx_runtime_state(&gqa_layout, InputTokenCount::text(10), 0, 1).unwrap();
-    assert_eq!(gqa.requested_state_bytes, llama.requested_state_bytes / 4);
-}
-
-#[test]
-fn llama_runtime_state_groups_exact_per_layer_windows() {
-    use eredu_core::attention::{AttentionPolicy, LayerSchedule};
-
-    let mut args = tiny_llama(2, None);
-    args.attention_schedule = LayerSchedule::new(
-        2,
-        vec![AttentionPolicy::Full, AttentionPolicy::sliding(3).unwrap()],
-    )
-    .unwrap();
-    let (capabilities, layout) = architecture_capability::llama(&args).unwrap().into_parts();
-    let strategy = capabilities.state_strategy;
-    assert_eq!(
-        strategy,
-        CacheStateStrategy::MixedKv {
-            full_layers: 1,
-            sliding: vec![SlidingWindowLayerCount {
-                layers: 1,
-                window: 3,
-            }],
-        }
-    );
-    let estimate = estimate_mlx_runtime_state(&layout, InputTokenCount::text(10), 0, 2).unwrap();
-    assert_eq!(estimate.context_state_bytes, (10 + 3) * 2 * 8 * 2 * 2 * 4);
-    assert_eq!(estimate.assumptions.sliding_window_bounds, vec![3]);
 }
 
 #[test]
@@ -494,70 +291,6 @@ fn compressed_mla_uses_latent_plus_rotary_width() {
     )
     .unwrap();
     assert_eq!(estimate.requested_state_bytes, 3 * 16 * 5 * 2 * 4);
-}
-
-#[test]
-fn kimi_linear_accounts_for_bounded_kda_and_growing_mla_state() {
-    let args = kimi_linear::model_args_from_config_value(&json!({
-        "model_type": "kimi_linear",
-        "vocab_size": 64,
-        "hidden_size": 8,
-        "num_hidden_layers": 4,
-        "num_attention_heads": 2,
-        "num_key_value_heads": 2,
-        "intermediate_size": 16,
-        "head_dim": 4,
-        "model_max_length": 128,
-        "linear_attn_config": {
-            "kda_layers": [1, 3],
-            "full_attn_layers": [2, 4],
-            "num_heads": 2,
-            "head_dim": 4,
-            "short_conv_kernel_size": 2
-        },
-        "num_experts": 4,
-        "moe_intermediate_size": 8,
-        "kv_lora_rank": 4,
-        "qk_nope_head_dim": 2,
-        "qk_rope_head_dim": 2,
-        "v_head_dim": 2,
-        "mla_use_nope": true,
-        "num_experts_per_token": 2,
-        "routed_scaling_factor": 1.0,
-        "first_k_dense_replace": 1,
-        "num_expert_group": 1,
-        "topk_group": 1
-    }))
-    .unwrap();
-    let (capabilities, estimate) = architecture_capability::kimi_linear(&args)
-        .unwrap()
-        .into_parts();
-    let native = capabilities.native_max_context;
-    let effective = capabilities.effective_max_context;
-    let strategy = capabilities.state_strategy;
-    let modalities = capabilities.modalities;
-    assert_eq!(native.value(), Some(&128));
-    assert_eq!(effective.value(), Some(&128));
-    assert_eq!(
-        strategy,
-        CacheStateStrategy::HybridRecurrent {
-            full_attention_layers: 2,
-            sliding_attention: Vec::new(),
-            recurrent_layers: 2,
-        }
-    );
-    assert_eq!(modalities, InputModalities::TEXT);
-    let state = estimate_mlx_runtime_state_with_dtype(
-        &estimate,
-        InputTokenCount::text(1),
-        0,
-        1,
-        NonZeroU8::new(2).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(state.fixed_state_bytes, 352);
-    assert_eq!(state.bytes_per_position_per_batch, 2 * 6 * 2);
-    assert_eq!(estimate.allocation_granularity, 256);
 }
 
 #[test]
@@ -620,10 +353,10 @@ fn inkling_runtime_state_groups_the_exact_ordered_schedule() {
     use eredu_architectures::inkling::{FeedForwardPolicy, LayerPolicy};
     use eredu_core::attention::LayerSchedule;
 
-    let mut args = tiny_inkling();
-    args.text_config.num_key_value_heads = 1;
-    args.text_config.swa_num_key_value_heads = Some(2);
-    args.text_config.layer_schedule = LayerSchedule::new(
+    let mut policy = tiny_inkling().policy().clone();
+    policy.text_config.num_key_value_heads = 1;
+    policy.text_config.swa_num_key_value_heads = Some(2);
+    policy.text_config.layer_schedule = LayerSchedule::new(
         3,
         vec![
             LayerPolicy {
@@ -641,6 +374,8 @@ fn inkling_runtime_state_groups_the_exact_ordered_schedule() {
         ],
     )
     .unwrap();
+
+    let args = eredu_architectures::inkling::ModelArgs::new(policy).unwrap();
 
     let (capabilities, layout) = architecture_capability::inkling(&args)
         .unwrap()

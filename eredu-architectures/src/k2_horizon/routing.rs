@@ -1,9 +1,9 @@
 //! Two independently specified K2 routing equations.
 use super::{ExpertBank, ModelArgs};
 use eredu_nn::{
-    Error, GatedProductGroupLayout, GatedProductPolicy, GroupedGatedProductSpec,
-    GroupedLinearActivation, GroupedLinearSpec, GroupedNeuralBackend, GroupedProjectionSpec,
-    ParameterSpec, Tensor, TopKGroupSelectorSpec,
+    DeclareLogicalParameters, Error, GatedProductGroupLayout, GatedProductPolicy,
+    GroupedGatedProductSpec, GroupedLinearActivation, GroupedLinearSpec, GroupedProjectionSpec,
+    ParameterSpec, TopKGroupSelectorSpec,
 };
 
 fn root(layer: usize, bank: ExpertBank) -> String {
@@ -13,19 +13,32 @@ fn root(layer: usize, bank: ExpertBank) -> String {
     }
 }
 
-/// Constructs a global router with a selection-only correction bias. Bias is
-/// never added to the linear logits or gathered mixture coefficients.
-pub fn new_router<B: GroupedNeuralBackend>(
+/// Declares global router parameters and selection-only correction bias.
+/// Bias never enters the projection logits or gathered mixture coefficients.
+pub(super) fn router_spec(
     args: &ModelArgs,
     layer: usize,
     bank: ExpertBank,
-    context: &<B::Tensor as Tensor>::Context,
-) -> Result<B::Selector, Error> {
+) -> Result<TopKGroupSelectorSpec, Error> {
+    args.validate().map_err(Error::backend_source)?;
+    if !(match bank {
+        ExpertBank::AttentionValue => args.is_mova_layer(layer),
+        ExpertBank::FeedForward => args.is_sparse_layer(layer),
+    }) {
+        return Err(Error::backend(
+            "router bank is absent from this K2 invocation",
+        ));
+    }
     let root = root(layer, bank);
     let name = format!("{root}.weight");
+    let parameter = |name: &str| {
+        let mut parameter = ParameterSpec::trainable(name).map_err(Error::backend)?;
+        parameter.group = Some(root.clone());
+        Ok::<_, Error>(parameter)
+    };
     let mut spec = TopKGroupSelectorSpec::new(
         args.hidden_size,
-        ParameterSpec::trainable(&name).map_err(Error::backend)?,
+        parameter(&name)?,
         crate::linear_format::standard_linear_format(&name, args.linear_format_for(&name))?,
         args.routing_spec(bank)?,
     )?;
@@ -35,16 +48,19 @@ pub fn new_router<B: GroupedNeuralBackend>(
         coefficients: eredu_nn::RoutingPrecision::Input,
     });
     if args.moe_gate_bias {
-        spec = spec.with_correction_bias(
-            ParameterSpec::trainable(format!("{root}.bias")).map_err(Error::backend)?,
-        )?;
+        spec = spec.with_correction_bias(parameter(&format!("{root}.bias"))?)?;
     }
-    B::top_k_group_selector(spec, context)
+    eredu_nn::validate_logical_parameter_topology(&spec.logical_parameters()?)
+        .map_err(Error::backend_source)?;
+    Ok(spec)
 }
 
 /// Value-bank specification with SiLU before mixture weighting. Output rows
 /// may be partitioned by KV head while every expert retains full hidden input.
-pub fn value_expert_spec(args: &ModelArgs, layer: usize) -> Result<GroupedLinearSpec, Error> {
+pub(super) fn value_expert_spec(
+    args: &ModelArgs,
+    layer: usize,
+) -> Result<GroupedLinearSpec, Error> {
     if !args.is_mova_layer(layer) {
         return Err(Error::backend("layer does not declare a value expert bank"));
     }
@@ -64,7 +80,7 @@ pub fn value_expert_spec(args: &ModelArgs, layer: usize) -> Result<GroupedLinear
 }
 
 /// Canonical packed SwiGLU bank consumed by ordinary expert providers.
-pub fn feed_forward_expert_spec(
+pub(super) fn feed_forward_expert_spec(
     args: &ModelArgs,
     layer: usize,
 ) -> Result<GroupedGatedProductSpec, Error> {
@@ -74,9 +90,14 @@ pub fn feed_forward_expert_spec(
         ));
     }
     let root = format!("model.layers.{layer}.mlp.experts");
-    let projection = |field: &str| {
+    let projection = |field: &str, row_layout| {
         let name = format!("{root}.{field}");
-        crate::linear_format::standard_expert_projection(&name, None, args.linear_format_for(&name))
+        crate::linear_format::standard_expert_projection(
+            &name,
+            None,
+            args.linear_format_for(&name),
+            row_layout,
+        )
     };
     GroupedGatedProductSpec::new(
         args.num_experts,
@@ -85,8 +106,11 @@ pub fn feed_forward_expert_spec(
         args.hidden_size,
         GatedProductPolicy::ordinary_silu(),
         GatedProductGroupLayout::Packed {
-            gate_up: projection("gate_up_proj")?,
-            down: projection("down_proj")?,
+            gate_up: projection(
+                "gate_up_proj",
+                eredu_nn::LinearRowLayout::equal_partitions(2)?,
+            )?,
+            down: projection("down_proj", eredu_nn::LinearRowLayout::Contiguous)?,
         },
     )
     .map(|spec| spec.with_reduction(eredu_nn::GroupReduction::SequentialGroupOrder))

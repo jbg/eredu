@@ -44,12 +44,32 @@ impl From<DenseDtype> for LogicalDtype {
     }
 }
 
-/// Name, shape, and dtype of one converted tensor without its payload.
+/// Meaning of one output accompanying a converted linear weight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinearCompanionKind {
+    /// Per-group or per-block multipliers.
+    Scale,
+    /// Per-group affine offsets.
+    AffineBias,
+}
+
+/// Exact primary output and encoding role of a converted companion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinearCompanion {
+    /// Identity of the primary output in this layout namespace.
+    pub primary: String,
+    /// Encoding operation performed by this companion.
+    pub kind: LinearCompanionKind,
+}
+
+/// Geometry, dtype and conversion-owned companion binding without tensor payloads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogicalTensorLayout {
     pub name: String,
     pub shape: Vec<u64>,
     pub dtype: LogicalDtype,
+    /// Conversion-owned binding; absent for ordinary or primary outputs.
+    pub linear_companion: Option<LinearCompanion>,
 }
 
 /// Explicit quantized source representation, selected without reading payloads.
@@ -743,11 +763,15 @@ impl Checkpoint {
         let mut owners = HashMap::<String, String>::new();
         let mut translated = Vec::new();
         for tensor in self.tensors() {
-            for output in tensor.outputs() {
-                let name = translate(&output.name);
+            let outputs = tensor
+                .outputs()
+                .iter()
+                .map(|output| (output, translate(&output.name)))
+                .collect::<Vec<_>>();
+            for (output, name) in &outputs {
                 if let Some(first_source) = owners.insert(name.clone(), output.name.clone()) {
                     return Err(Error::TranslatedTensorCollision {
-                        name,
+                        name: name.clone(),
                         first_source,
                         second_source: output.name.clone(),
                     });
@@ -756,9 +780,20 @@ impl Checkpoint {
                     physical_name: tensor.descriptor.name.clone(),
                     original_name: output.name.clone(),
                     layout: LogicalTensorLayout {
-                        name,
+                        name: name.clone(),
                         shape: output.shape.clone(),
                         dtype: output.dtype,
+                        linear_companion: output.linear_companion.as_ref().map(|companion| {
+                            LinearCompanion {
+                                primary: outputs
+                                    .iter()
+                                    .find(|(primary, _)| primary.name == companion.primary)
+                                    .expect("converted companion has its primary output")
+                                    .1
+                                    .clone(),
+                                kind: companion.kind,
+                            }
+                        }),
                     },
                 });
             }
@@ -1063,6 +1098,7 @@ fn catalog_tensor(
                 name: descriptor.name.clone(),
                 shape: iquant_packed_shape(&descriptor.row_major_shape(), descriptor.ggml_type)?,
                 dtype: LogicalDtype::U8,
+                linear_companion: None,
             }],
             affine: None,
             representation: Some(QuantizedTensorRepresentation::Encoded),
@@ -1075,6 +1111,7 @@ fn catalog_tensor(
                 name: descriptor.name.clone(),
                 shape: descriptor.row_major_shape(),
                 dtype: dtype.into(),
+                linear_companion: None,
             }],
             affine: None,
             representation: None,
@@ -1092,11 +1129,16 @@ fn catalog_tensor(
                     name: descriptor.name.clone(),
                     shape: weight_shape,
                     dtype: LogicalDtype::U32,
+                    linear_companion: None,
                 },
                 LogicalTensorLayout {
                     name: format!("{prefix}.scales"),
                     shape: scale_shape,
                     dtype: LogicalDtype::U8,
+                    linear_companion: Some(LinearCompanion {
+                        primary: descriptor.name.clone(),
+                        kind: LinearCompanionKind::Scale,
+                    }),
                 },
             ],
             affine: None,
@@ -1119,16 +1161,25 @@ fn catalog_tensor(
             name: descriptor.name.clone(),
             shape: weight_shape,
             dtype: LogicalDtype::U32,
+            linear_companion: None,
         },
         LogicalTensorLayout {
             name: format!("{prefix}.scales"),
             shape: scale_shape.clone(),
             dtype: LogicalDtype::F16,
+            linear_companion: Some(LinearCompanion {
+                primary: descriptor.name.clone(),
+                kind: LinearCompanionKind::Scale,
+            }),
         },
         LogicalTensorLayout {
             name: format!("{prefix}.biases"),
             shape: scale_shape,
             dtype: LogicalDtype::F16,
+            linear_companion: Some(LinearCompanion {
+                primary: descriptor.name.clone(),
+                kind: LinearCompanionKind::AffineBias,
+            }),
         },
     ];
     Ok(CatalogTensor {
@@ -1158,6 +1209,7 @@ fn explicit_quantized_tensor(
             name: descriptor.name.clone(),
             shape,
             dtype,
+            linear_companion: None,
         }],
         affine: None,
         representation: Some(representation),

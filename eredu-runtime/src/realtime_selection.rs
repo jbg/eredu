@@ -350,7 +350,10 @@ impl RealtimeExecutionRequirements {
                 .iter()
                 .filter(|member| {
                     member.target() == lowering.target().as_str()
-                        || member.linear_companion_of() == Some(lowering.target().as_str())
+                        || member
+                            .linear_companion_of()
+                            .map(eredu_nn::ParameterId::as_str)
+                            == Some(lowering.target().as_str())
                 })
                 .map(|member| member.target())
                 .collect::<BTreeSet<_>>();

@@ -38,7 +38,8 @@ struct HeaderCatalog(BTreeMap<String, TensorMetadata>);
 
 impl HeaderCatalog {
     fn for_config(config: &MoshiConfig) -> Self {
-        let plan = moshi::safetensors_plan(config).unwrap();
+        let contract = moshi::parameter_contract(config).unwrap();
+        let plan = moshi::safetensors_plan(&contract).unwrap();
         let tensors = plan
             .common_tensors
             .iter()

@@ -10,81 +10,38 @@ use eredu_core::cache::{
 };
 use eredu_nn::residual_streams::ResidualStreamGeometry;
 use eredu_nn::{
-    CausalDepthwiseConvolution, CausalDepthwiseConvolutionSpec, ConvolutionActivation, Error,
-    GroupedNeuralBackend, LinearFormatSpec, LinearOperator, LinearSpec,
-    NeuralOperatorCapabilities as C, NormalizationConstructionSpec, NormalizationOperator,
-    NormalizationScale, ParameterSpec, Tensor,
+    CausalDepthwiseConvolution, DeclareLogicalParameters, Error, GroupedNeuralBackend,
+    LinearOperator, LogicalParameterDeclaration, NeuralOperatorCapabilities as C,
+    NormalizationOperator, Tensor,
 };
 use eredu_runtime::{ParameterBankAccess, ParameterProvider, RuntimeStateComponents};
 
-/// Exact identities and geometry for the released PLE equation.
+/// Shared logical lexical parameter declarations.
+pub mod specs;
+pub use specs::LexicalParameters;
+
+/// Exact neural slots, row provider and independent history for one lexical invocation.
 #[derive(Debug, Clone)]
 pub struct LexicalInjectionSpec {
-    /// Complete residual stream geometry.
-    pub geometry: ResidualStreamGeometry,
+    /// Owned affine, normalization and convolution declarations.
+    pub parameters: LexicalParameters,
     /// Hashing, bounded table lookup and retained original token IDs.
     pub embedding: NGramEmbeddingSpec,
-    /// Concatenated n-gram feature width.
-    pub embedding_width: i32,
-    /// Shared n-gram features to one key per residual stream.
-    pub key: LinearSpec,
-    /// Shared n-gram features to the common injected value.
-    pub value: LinearSpec,
-    /// Grouped RMS normalization with explicit checkpoint scale policy.
-    pub key_norm: NormalizationConstructionSpec,
-    /// Grouped normalization of original residual streams.
-    pub query_norm: NormalizationConstructionSpec,
-    /// Grouped normalization before the local convolution.
-    pub convolution_norm: NormalizationConstructionSpec,
-    /// Bias-free dilated convolution followed by SiLU.
-    pub convolution: CausalDepthwiseConvolutionSpec,
-    /// Explicit history identity, distinct from the recurrent mixer's convolution.
+    /// History identity independent of the recurrent mixer's convolution.
     pub convolution_slot: u32,
 }
 impl LexicalInjectionSpec {
-    /// Declares the lexical equation from configuration and header-only row geometry.
-    /// Hash literals are bound separately when constructing the executable injection.
-    pub fn from_header(
+    /// Attaches header-only row geometry to the declared lexical parameters.
+    /// Hash literals bind separately when constructing the executable injection.
+    pub fn from_parameters(
         config: &Config,
-        layer: usize,
-        root: &str,
+        parameters: LexicalParameters,
         table: &eredu_runtime::RowLookupSpec,
         max_rows: usize,
-        mut format: impl FnMut(&str) -> Result<LinearFormatSpec, Error>,
     ) -> Result<Self, NGramEmbeddingError> {
         let eos = config.eos.first().ok_or(NGramError::Constants)?;
-        if !config.ngram.layers.contains(&layer) {
-            return Err(NGramError::Constants.into());
-        }
-        let geometry = ResidualStreamGeometry::new(config.residual.streams, config.hidden_size)?;
-        let root = format!("{root}.ple");
-        let parameter = |suffix: &str| {
-            ParameterSpec::trainable(format!("{root}.{suffix}.weight")).map_err(Error::backend)
-        };
-        let mut linear = |suffix: &str, output| -> Result<LinearSpec, Error> {
-            let weight = parameter(suffix)?;
-            Ok(LinearSpec {
-                input: config.ngram.embedding_dim,
-                output,
-                format: format(weight.id.as_str())?,
-                weight,
-                bias: None,
-            })
-        };
-        let norm = |suffix: &str| -> Result<NormalizationConstructionSpec, Error> {
-            Ok(NormalizationConstructionSpec {
-                reduction: eredu_nn::NormalizationReduction::Native,
-                dimensions: geometry.flattened_width(),
-                groups: Some(geometry.streams()),
-                epsilon: config.norm_epsilon,
-                scale: NormalizationScale::LearnedOffset {
-                    weight: parameter(suffix)?,
-                    offset: 1.,
-                },
-            })
-        };
         let spec = Self {
-            geometry,
+            parameters,
             embedding: NGramEmbeddingSpec::new(
                 config.vocabulary as u64,
                 *eos as u64,
@@ -94,61 +51,19 @@ impl LexicalInjectionSpec {
                 0,
                 max_rows,
             )?,
-            embedding_width: config.ngram.embedding_dim,
-            key: linear("key_proj", geometry.flattened_width())?,
-            value: linear("value_proj", geometry.hidden_size())?,
-            key_norm: norm("norm_key")?,
-            query_norm: norm("norm_query")?,
-            convolution_norm: norm("norm_conv")?,
-            convolution: CausalDepthwiseConvolutionSpec {
-                arithmetic: eredu_nn::ConvolutionArithmetic::Native,
-                channels: geometry.flattened_width(),
-                kernel_size: config.ngram.kernel,
-                dilation: config.ngram.order,
-                weight: parameter("conv1d")?,
-                bias: None,
-                activation: ConvolutionActivation::Silu,
-            },
             convolution_slot: 0,
         };
         spec.validate()?;
         Ok(spec)
     }
-    /// Rejects malformed construction before allocating any backend parameters.
+    /// Validates parameter geometry and the independent row/history contracts before allocation.
     pub fn validate(&self) -> Result<(), Error> {
-        let width = self.geometry.flattened_width();
-        if self.embedding_width != self.embedding.output_width()
-            || self.key.input != self.embedding_width
-            || self.key.output != width
-            || self.value.input != self.embedding_width
-            || self.value.output != self.geometry.hidden_size()
+        self.parameters.validate()?;
+        if self.parameters.key.input != self.embedding.output_width()
+            || self.parameters.convolution.dilation != self.embedding.order()
         {
             return Err(Error::backend(
-                "lexical projection geometry differs from declared streams and embedding",
-            ));
-        }
-        for linear in [&self.key, &self.value] {
-            if linear.bias.is_some() {
-                return Err(Error::backend("lexical projections must be bias-free"));
-            }
-            linear.format.validate_for_weight(&linear.weight)?;
-        }
-        for norm in [&self.key_norm, &self.query_norm, &self.convolution_norm] {
-            norm.validate()?;
-            if norm.dimensions != width || norm.groups != Some(self.geometry.streams()) {
-                return Err(Error::backend(
-                    "lexical normalization must reduce within each residual stream",
-                ));
-            }
-        }
-        self.convolution.validate()?;
-        if self.convolution.channels != width
-            || self.convolution.bias.is_some()
-            || self.convolution.activation != ConvolutionActivation::Silu
-            || self.convolution.dilation != self.embedding.order()
-        {
-            return Err(Error::backend(
-                "lexical convolution must use n-gram order as dilation, no bias and SiLU",
+                "lexical parameters differ from declared n-gram feature/history geometry",
             ));
         }
         Ok(())
@@ -157,7 +72,7 @@ impl LexicalInjectionSpec {
     pub fn state_policies(&self) -> Result<Vec<StateTensorPolicy>, Error> {
         self.validate()?;
         let mut result = vec![self.embedding.history_policy()];
-        let history = self.convolution.history_len()?;
+        let history = self.parameters.convolution.history_len()?;
         if history > 0 {
             result.push(
                 StateTensorPolicy::new(
@@ -167,7 +82,8 @@ impl LexicalInjectionSpec {
                     vec![
                         D::Batch,
                         D::fixed(history).map_err(Error::backend)?,
-                        D::fixed(self.geometry.flattened_width()).map_err(Error::backend)?,
+                        D::fixed(self.parameters.geometry.flattened_width())
+                            .map_err(Error::backend)?,
                     ],
                     StateTensorDtype::Floating,
                     MutableStateResidency::AlwaysDeviceMutable,
@@ -176,6 +92,12 @@ impl LexicalInjectionSpec {
             );
         }
         Ok(result)
+    }
+}
+
+impl DeclareLogicalParameters for LexicalInjectionSpec {
+    fn logical_parameters(&self) -> Result<Vec<LogicalParameterDeclaration<'_>>, Error> {
+        self.parameters.logical_parameters()
     }
 }
 
@@ -288,15 +210,15 @@ impl<B: GroupedNeuralBackend> LexicalInjection<B> {
                 .union(C::TO_F32_VEC),
         )?;
         Ok(Self {
-            geometry: spec.geometry,
+            geometry: spec.parameters.geometry,
             embedding,
             convolution_slot: spec.convolution_slot,
-            key: B::linear(spec.key, context)?,
-            value: B::linear(spec.value, context)?,
-            key_norm: B::normalization(spec.key_norm, context)?,
-            query_norm: B::normalization(spec.query_norm, context)?,
-            convolution_norm: B::normalization(spec.convolution_norm, context)?,
-            convolution: CausalDepthwiseConvolution::new(spec.convolution, context)?,
+            key: B::linear(spec.parameters.key, context)?,
+            value: B::linear(spec.parameters.value, context)?,
+            key_norm: B::normalization(spec.parameters.key_norm, context)?,
+            query_norm: B::normalization(spec.parameters.query_norm, context)?,
+            convolution_norm: B::normalization(spec.parameters.convolution_norm, context)?,
+            convolution: CausalDepthwiseConvolution::new(spec.parameters.convolution, context)?,
         })
     }
     /// Returns the additive PLE contribution as `[batch,tokens,streams,hidden]`.

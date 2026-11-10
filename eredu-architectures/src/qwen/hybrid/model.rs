@@ -165,6 +165,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DecoderStatic
 /// Typed target, prediction and partition equations over the selected resource owners.
 pub struct QwenKernel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     config: HybridConfig,
+    construction: std::collections::BTreeMap<(usize, usize), super::BlockParameters>,
     static_modules: QwenStaticModules<B>,
     definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
     target_layers: usize,
@@ -197,20 +198,30 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> QwenKernel<B>
         let definition = super::select_definition(&config, definition, geometry.as_ref())?;
         let target_layers = definition.unit_count(0)?;
         let prediction_steps = definition.prediction_groups().len();
-        let spec = super::static_module_spec(&config);
+        let construction = prepare_unit_parameters(&config, geometry.as_ref())?;
+        let prediction_shared = (prediction_steps > 0)
+            .then(|| {
+                config
+                    .prediction_shared()
+                    .cloned()
+                    .ok_or_else(|| Error::backend("undeclared prediction shared scope"))
+            })
+            .transpose()?;
+        let spec = config.statics().clone();
         let base = match &geometry {
-            Some(geometry) => StaticModules::from_parallel_spec(
+            Some(geometry) => StaticModules::from_parallel_construction(
                 spec,
                 geometry.embedding_range().clone(),
                 geometry.output_range().cloned(),
                 context,
             )?,
-            None => StaticModules::from_spec(spec, context)?,
+            None => StaticModules::from_construction(spec, context)?,
         };
-        let extension = (prediction_steps > 0)
-            .then(|| super::PredictionShared::new(&config, context))
+        let extension = prediction_shared
+            .map(|spec| super::PredictionShared::from_parameters(spec, context))
             .transpose()?;
         let kernel = Self {
+            construction,
             config,
             static_modules: QwenStaticModules {
                 embeddings: Some(base.embeddings),
@@ -297,8 +308,9 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> QwenKernel<B>
         }
         let selection = definition.select_partition(partition)?;
         let range = owned.global_units();
-        let text = crate::decoder::PartitionStaticModules::<B>::from_selected_spec(
-            super::static_module_spec(&config),
+        let construction = prepare_unit_parameters(&config, Some(geometry))?;
+        let text = crate::decoder::PartitionStaticModules::<B>::from_selected_construction(
+            config.statics().clone(),
             Some((
                 geometry.embedding_range().clone(),
                 geometry.output_range().cloned(),
@@ -318,6 +330,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> QwenKernel<B>
             })
             .transpose()?;
         let kernel = Self {
+            construction,
             target_layers: definition.unit_count(0)?,
             prediction_steps: 0,
             config,
@@ -530,11 +543,11 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> QwenKernel<B>
         self.definition.unit(group, index)?;
         if group == 0 {
             self.state_index(group, index)?;
-            let config = self
-                .parallel_geometry
-                .as_ref()
-                .and_then(|geometry| geometry.target(index))
-                .unwrap_or(&self.config);
+            let parameters = self
+                .construction
+                .get(&(group, index))
+                .ok_or_else(|| Error::backend("hybrid target has no prepared parameters"))?
+                .clone();
             let spec = self
                 .expert_realization
                 .as_ref()
@@ -544,18 +557,22 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> QwenKernel<B>
                         .ok_or_else(|| Error::backend("Qwen partition has no selected expert unit"))
                 })
                 .transpose()?;
-            Ok(Unit::Target(Block::new_with_routed_spec(
-                config, index, spec, context,
+            let parameters = match spec {
+                Some(bank) => parameters.with_experts(bank)?,
+                None => parameters,
+            };
+            Ok(Unit::Target(Block::from_parameters(
+                parameters, index, context,
             )?))
         } else {
-            let config = self
-                .parallel_geometry
-                .as_ref()
-                .and_then(|geometry| geometry.prediction(group - 1))
-                .unwrap_or(&self.config);
-            Ok(Unit::Prediction(PredictionUnit::new(
-                config,
-                group - 1,
+            let parameters = self
+                .construction
+                .get(&(group, index))
+                .ok_or_else(|| Error::backend("hybrid prediction has no prepared parameters"))?
+                .clone();
+            Ok(Unit::Prediction(PredictionUnit::from_parameters(
+                parameters,
+                self.target_layers + group - 1,
                 context,
             )?))
         }
@@ -764,8 +781,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> eredu_runtime
         std::collections::BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
         String,
     > {
-        let recipes = super::static_recipes(source)?;
-        crate::static_parameters::module_recipes(&self.static_modules, recipes)
+        super::static_recipes(source)
     }
     fn build_unit(
         &self,
@@ -1641,4 +1657,33 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
     fn text_input<'a>(tokens: &'a B::Tensor, mask: Option<&'a B::Tensor>) -> Self::Input<'a> {
         EmbeddedInput::target(tokens, mask)
     }
+}
+
+/// Prepares every invocation's typed local slots before native pinned construction.
+pub(super) fn prepare_unit_parameters(
+    config: &HybridConfig,
+    geometry: Option<&LocalGeometry>,
+) -> Result<std::collections::BTreeMap<(usize, usize), super::BlockParameters>, Error> {
+    let (schedule, _, layout) = super::parameters::execution_schedule(config)?;
+    (0..layout.group_count())
+        .map(|group| {
+            (0..schedule.unit_count(group)?)
+                .map(|index| {
+                    let local = if group == 0 {
+                        geometry.and_then(|g| g.target(index))
+                    } else {
+                        geometry.and_then(|g| g.prediction(group - 1))
+                    }
+                    .unwrap_or(config);
+                    let spec = if group == 0 {
+                        super::BlockParameters::target(local, index)?
+                    } else {
+                        super::BlockParameters::prediction(local, group - 1)?
+                    };
+                    Ok(((group, index), spec))
+                })
+                .collect::<Result<Vec<_>, Error>>()
+        })
+        .collect::<Result<Vec<_>, Error>>()
+        .map(|groups| groups.into_iter().flatten().collect())
 }

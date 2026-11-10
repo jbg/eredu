@@ -4,17 +4,6 @@ pub(in crate::discovery) mod prediction;
 mod recurrent;
 use crate::qwen::hybrid::{HybridConfig, HybridLayerPolicy};
 
-fn normalization(c: &HybridConfig, gain: String) -> ComponentNormalization {
-    ComponentNormalization {
-        kind: ComponentNormalizationKind::Rms,
-        epsilon: ComponentScalar::new(c.rms_norm_eps),
-        gain: Some(gain),
-        gain_offset: ComponentScalar::new(1.0),
-        bias: None,
-        groups: 1,
-    }
-}
-
 pub(in crate::discovery) fn unit(
     g: &mut Builder,
     c: &HybridConfig,
@@ -39,41 +28,44 @@ fn unit_with_attention(
     ffn: &str,
     attention: bool,
 ) {
-    let width = c.hidden_size as usize;
-    let heads = c.num_attention_heads as usize;
-    let kv = c.num_key_value_heads as usize;
-    let dim = c.head_dim as usize;
-    let read = |prefix: &str, field: &str, role, rows, bias, head_normalization| {
-        let weight = format!("{prefix}.{field}.weight");
-        ComponentRead {
-            source: None,
-            projection_output: None,
-            role,
-            weight: weight.clone(),
-            shared_weight: weight,
-            parameter_group: format!("parameters:{prefix}"),
-            bias: if bias {
-                Some(format!("{prefix}.{field}.bias"))
-            } else {
-                None
-            },
-            rows,
-            head_normalization,
-            input_projections: Vec::new(),
-        }
+    let policy = if attention {
+        HybridLayerPolicy::SelfAttention(eredu_core::AttentionPolicy::Full)
+    } else {
+        HybridLayerPolicy::LinearAttention
     };
+    let scope = crate::qwen::hybrid::BlockParameters::at(c, path, policy)
+        .expect("admitted hybrid component scope");
+    let width = c.hidden_size as usize;
+    let read =
+        |spec: &eredu_nn::LinearSpec, parameter_group: &str, role, rows, head_normalization| {
+            ComponentRead {
+                head_normalization,
+                ..declared_component_read(spec, parameter_group.into(), role, rows)
+            }
+        };
     if attention {
         let prefix = format!("{path}.self_attn");
-        let head_norm = |count, name| {
+        let crate::qwen::hybrid::MixerParameters::Attention(spec) = &scope.mixer else {
+            unreachable!()
+        };
+        let heads = spec.projection.geometry.query_heads() as usize;
+        let kv = spec.projection.geometry.key_value_heads() as usize;
+        let dim = spec.projection.geometry.key_dimensions() as usize;
+        let query_stride = spec
+            .projection
+            .query_layout
+            .head_width(spec.projection.geometry)
+            .expect("admitted hybrid query/gate row layout") as usize;
+        let parameter_group = format!("parameters:{prefix}");
+        let head_norm = |count, norm: &eredu_nn::NormalizationConstructionSpec| {
             Some(ComponentHeadNormalization {
                 output_scale: ComponentScalar::new(1.0),
                 heads: count,
-                head_width: dim,
+                head_width: norm.dimensions as usize,
                 independent_gains: false,
-                normalization: normalization(c, format!("{prefix}.{name}.weight")),
+                normalization: declared_normalization(norm),
             })
         };
-        let weight = format!("{prefix}.o_proj.weight");
         g.descriptor.components.push(ComponentGroup {
             routed_reads: Vec::new(),
             id: format!("{mixer}.channels"),
@@ -89,22 +81,21 @@ fn unit_with_attention(
             input: format!("{path}.attention.input"),
             reads: vec![
                 read(
-                    &prefix,
-                    "q_proj",
+                    &spec.projection.query,
+                    &parameter_group,
                     ComponentReadRole::Query,
                     ComponentRowMapping::HeadRows {
                         offset: 0,
                         component_head_width: dim,
                         read_head_width: dim,
                         component_heads_per_read_head: 1,
-                        read_head_stride: Some(2 * dim),
+                        read_head_stride: Some(query_stride),
                     },
-                    c.attention_bias,
-                    head_norm(heads, "q_norm"),
+                    head_norm(heads, &spec.query_norm),
                 ),
                 read(
-                    &prefix,
-                    "k_proj",
+                    &spec.projection.key,
+                    &parameter_group,
                     ComponentReadRole::Key,
                     ComponentRowMapping::HeadRows {
                         offset: 0,
@@ -113,39 +104,41 @@ fn unit_with_attention(
                         component_heads_per_read_head: heads / kv,
                         read_head_stride: None,
                     },
-                    c.attention_bias,
-                    head_norm(kv, "k_norm"),
+                    head_norm(kv, &spec.key_norm),
                 ),
                 read(
-                    &prefix,
-                    "v_proj",
+                    &spec.projection.value,
+                    &parameter_group,
                     ComponentReadRole::Value,
                     ComponentRowMapping::GroupedQuery {
                         offset: 0,
                         head_width: dim,
                         queries_per_kv: heads / kv,
                     },
-                    c.attention_bias,
                     None,
                 ),
                 read(
-                    &prefix,
-                    "q_proj",
+                    &spec.projection.query,
+                    &parameter_group,
                     ComponentReadRole::OutputGate,
                     ComponentRowMapping::Blocked {
                         offset: dim,
                         block_width: dim,
-                        block_stride: 2 * dim,
+                        block_stride: query_stride,
                     },
-                    c.attention_bias,
                     None,
                 ),
             ],
-            write_weight: weight.clone(),
+            write_weight: spec.projection.output.weight.id.to_string(),
             write_input_projection: None,
-            shared_write_weight: weight,
-            write_parameter_group: format!("parameters:{prefix}"),
-            write_bias: c.attention_bias.then(|| format!("{prefix}.o_proj.bias")),
+            shared_write_weight: declared_shared_weight(&spec.projection.output.weight).into(),
+            write_parameter_group: parameter_group,
+            write_bias: spec
+                .projection
+                .output
+                .bias
+                .as_ref()
+                .map(|bias| bias.id.to_string()),
             activation_equation: ComponentActivation::Attention {
                 attended_head_normalization: None,
                 query_heads: heads,
@@ -153,7 +146,7 @@ fn unit_with_attention(
                 head_width: dim,
                 output_gate: Some(ComponentNonlinearity::Sigmoid),
             },
-            input_normalization: normalization(c, format!("{path}.input_layernorm.weight")),
+            input_normalization: declared_normalization(&scope.norms[0]),
             output_gate: None,
             output_normalization: None,
             residual_scale: ComponentScalar::new(1.0),
@@ -167,7 +160,10 @@ fn unit_with_attention(
             shape,
         );
     } else {
-        recurrent::declare(g, c, layer, path, mixer);
+        let crate::qwen::hybrid::MixerParameters::Recurrent(spec) = &scope.mixer else {
+            unreachable!()
+        };
+        recurrent::declare(g, spec, &scope.norms[0], layer, path, mixer);
     }
     {
         let shared = c.is_moe();
@@ -186,13 +182,14 @@ fn unit_with_attention(
         } else {
             format!("{path}.feed_forward")
         };
-        let count = if shared {
-            c.shared_expert_intermediate_size
-        } else {
-            c.intermediate_size
-        } as usize;
+        let (projections, shared_gate) = match &scope.feed_forward {
+            crate::qwen::hybrid::FeedForwardParameters::Routed(parameters) => {
+                (&parameters.shared, Some(&parameters.shared_gate))
+            }
+            crate::qwen::hybrid::FeedForwardParameters::Dense(spec) => (spec, None),
+        };
+        let count = projections.gate.output as usize;
         let parameter_group = format!("parameters:{path}.mlp");
-        let weight = format!("{prefix}.down_proj.weight");
         g.descriptor.components.push(ComponentGroup {
             routed_reads: Vec::new(),
             id: format!("{node}.units"),
@@ -212,66 +209,48 @@ fn unit_with_attention(
             input: format!("{path}.feed_forward.input"),
             reads: vec![
                 read(
-                    &prefix,
-                    "gate_proj",
+                    &projections.gate,
+                    &parameter_group,
                     ComponentReadRole::Gate,
                     ComponentRowMapping::Direct { offset: 0 },
-                    false,
                     None,
                 ),
                 read(
-                    &prefix,
-                    "up_proj",
+                    &projections.up,
+                    &parameter_group,
                     ComponentReadRole::Value,
                     ComponentRowMapping::Direct { offset: 0 },
-                    false,
                     None,
                 ),
-            ]
-            .into_iter()
-            .map(|mut read| {
-                read.parameter_group = parameter_group.clone();
-                read
-            })
-            .collect(),
-            write_weight: weight.clone(),
+            ],
+            write_weight: projections.down.weight.id.to_string(),
             write_input_projection: None,
-            shared_write_weight: weight,
+            shared_write_weight: declared_shared_weight(&projections.down.weight).into(),
             write_parameter_group: parameter_group.clone(),
-            write_bias: None,
-            activation_equation: ComponentActivation::Gated {
-                activation: ComponentNonlinearity::Silu {
-                    multiplier: ComponentScalar::new(1.0),
-                },
-                gate_upper_bound: None,
-                value_absolute_bound: None,
-                value_offset: ComponentScalar::new(0.0),
-            },
-            input_normalization: normalization(
-                c,
-                format!("{path}.post_attention_layernorm.weight"),
-            ),
-            output_gate: shared.then(|| ComponentOutputGate {
+            write_bias: projections
+                .down
+                .bias
+                .as_ref()
+                .map(|bias| bias.id.to_string()),
+            activation_equation: declared_gated_product(projections.policy)
+                .expect("admitted hybrid gated-product policy"),
+            input_normalization: declared_normalization(&scope.norms[1]),
+            output_gate: shared_gate.map(|gate| ComponentOutputGate {
                 input: format!("{prefix}.gate.input"),
                 projection_input: format!("{prefix}.gate.projection_input"),
-                read: ComponentRead {
-                    source: None,
-                    projection_output: None,
-                    role: ComponentReadRole::OutputGate,
-                    weight: format!("{path}.mlp.shared_expert_gate.weight"),
-                    shared_weight: format!("{path}.mlp.shared_expert_gate.weight"),
-                    parameter_group,
-                    bias: None,
-                    rows: ComponentRowMapping::HeadRows {
+                read: read(
+                    &gate,
+                    &parameter_group,
+                    ComponentReadRole::OutputGate,
+                    ComponentRowMapping::HeadRows {
                         offset: 0,
                         component_head_width: count,
-                        read_head_width: 1,
+                        read_head_width: gate.output as usize,
                         component_heads_per_read_head: 1,
                         read_head_stride: None,
                     },
-                    head_normalization: None,
-                    input_projections: vec![],
-                },
+                    None,
+                ),
                 activation: ComponentNonlinearity::Sigmoid,
                 output: format!("{prefix}.gate"),
                 effective_output: format!("{prefix}.gate.effective"),
@@ -338,7 +317,14 @@ fn unit_with_attention(
 }
 
 pub(in crate::discovery) fn readout(g: &mut Builder, c: &HybridConfig) {
-    readout_observations(g, c.hidden_size as usize, c.vocab_size as usize);
+    let construction = c.statics();
+    let embedding = construction.embedding_spec();
+    let output = construction.output_projection_spec();
+    readout_observations(
+        g,
+        embedding.dimensions as usize,
+        embedding.vocabulary as usize,
+    );
     let mut other_writes = vec![];
     for layer in 0..c.layer_schedule.len() {
         for (present, boundary) in [(c.is_moe(), "feed_forward")] {
@@ -358,9 +344,9 @@ pub(in crate::discovery) fn readout(g: &mut Builder, c: &HybridConfig) {
         token_embedding_normalization: None,
         embedding_normalization: None,
         embedding: "readout.embedding".into(),
-        embedding_weight: "model.embed_tokens.weight".into(),
+        embedding_weight: embedding.weight.id.as_str().into(),
         embedding_scale: ComponentScalar::new(1.0),
-        tied_embeddings: c.tie_word_embeddings,
+        tied_embeddings: construction.head_spec().is_none(),
         equation: ComponentReadoutEquation {
             residual_cycles: vec![],
             block_transforms: vec![],
@@ -371,14 +357,9 @@ pub(in crate::discovery) fn readout(g: &mut Builder, c: &HybridConfig) {
             projection_input: Some("readout.projection_input".into()),
             linear_scores: "readout.linear".into(),
             logits: MODEL_LOGITS_OBSERVATION_PATH.into(),
-            normalization: normalization(c, "model.norm.weight".into()),
-            weight: if c.tie_word_embeddings {
-                "model.embed_tokens.weight"
-            } else {
-                "lm_head.weight"
-            }
-            .into(),
-            bias: None,
+            normalization: declared_normalization(construction.normalization_spec()),
+            weight: output.weight.id.as_str().into(),
+            bias: output.bias.as_ref().map(|bias| bias.id.as_str().into()),
             output_transform: ComponentOutputTransform::Identity,
             block_normalizations: vec![],
             other_writes,

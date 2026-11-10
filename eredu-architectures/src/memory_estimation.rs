@@ -140,11 +140,32 @@ pub fn generation_memory_geometry(
             crate::capability::nemotron_labs_diffusion(args, args.vision.is_some())?
         }
         (Some(SafetensorsModelConfig::Llama(args)), None)
-        | (None, Some(GgufModelConfig::Llama(args))) => crate::capability::llama(args)?,
+        | (None, Some(GgufModelConfig::Llama(args))) => crate::capability::llama(
+            args,
+            plan.dense_declaration()
+                .ok_or_else(|| CapabilityError::InvalidConfiguration {
+                    field: "dense_declaration",
+                    detail: "missing admitted dense scopes".into(),
+                })?,
+        )?,
         (Some(SafetensorsModelConfig::Qwen(args)), None)
-        | (None, Some(GgufModelConfig::Qwen(args))) => crate::capability::qwen(args)?,
+        | (None, Some(GgufModelConfig::Qwen(args))) => crate::capability::qwen(
+            plan.qwen_declaration(args)
+                .map_err(|detail| CapabilityError::InvalidConfiguration {
+                    field: "qwen_declaration",
+                    detail,
+                })?
+                .as_ref(),
+        )?,
         (Some(SafetensorsModelConfig::Nanbeige(args)), None)
-        | (None, Some(GgufModelConfig::Nanbeige(args))) => crate::capability::nanbeige(args)?,
+        | (None, Some(GgufModelConfig::Nanbeige(args))) => crate::capability::nanbeige(
+            args,
+            plan.dense_declaration()
+                .ok_or_else(|| CapabilityError::InvalidConfiguration {
+                    field: "dense_declaration",
+                    detail: "missing admitted dense scopes".into(),
+                })?,
+        )?,
         (Some(SafetensorsModelConfig::DeepSeekV3(args)), None)
         | (None, Some(GgufModelConfig::DeepSeekV3(args))) => crate::capability::deepseek_v3(args)?,
         (Some(SafetensorsModelConfig::DeepSeekV4(args)), None)
@@ -156,24 +177,73 @@ pub fn generation_memory_geometry(
         (Some(SafetensorsModelConfig::Gemma4(args)), None)
         | (None, Some(GgufModelConfig::Gemma4(args))) => crate::capability::gemma4(args)?,
         (Some(SafetensorsModelConfig::Gemma2(args)), None)
-        | (None, Some(GgufModelConfig::Gemma2(args))) => crate::capability::gemma2(args)?,
+        | (None, Some(GgufModelConfig::Gemma2(args))) => crate::capability::gemma2(
+            args,
+            plan.dense_declaration()
+                .ok_or_else(|| CapabilityError::InvalidConfiguration {
+                    field: "dense_declaration",
+                    detail: "missing admitted dense scopes".into(),
+                })?,
+        )?,
         (Some(SafetensorsModelConfig::GptOss(args)), None)
-        | (None, Some(GgufModelConfig::GptOss(args))) => crate::capability::gpt_oss(args)?,
+        | (None, Some(GgufModelConfig::GptOss(args))) => crate::capability::gpt_oss(
+            plan.gpt_oss_declaration(args)
+                .map_err(|detail| CapabilityError::InvalidConfiguration {
+                    field: "gpt_oss_declaration",
+                    detail,
+                })?
+                .as_ref(),
+        )?,
         (Some(SafetensorsModelConfig::Inkling(args)), None)
         | (None, Some(GgufModelConfig::Inkling(args))) => crate::capability::inkling(args)?,
         (Some(SafetensorsModelConfig::K2Horizon(args)), None)
-        | (None, Some(GgufModelConfig::K2Horizon(args))) => crate::capability::k2_horizon(args)?,
+        | (None, Some(GgufModelConfig::K2Horizon(args))) => crate::capability::k2_horizon(
+            plan.k2_declaration(args)
+                .map_err(|detail| CapabilityError::InvalidConfiguration {
+                    field: "k2_declaration",
+                    detail,
+                })?
+                .as_ref(),
+        )?,
         (Some(SafetensorsModelConfig::KimiLinear(args)), None)
-        | (None, Some(GgufModelConfig::KimiLinear(args))) => crate::capability::kimi_linear(args)?,
+        | (None, Some(GgufModelConfig::KimiLinear(args))) => crate::capability::kimi_linear(
+            plan.kimi_declaration(args)
+                .map_err(|detail| CapabilityError::InvalidConfiguration {
+                    field: "kimi_declaration",
+                    detail,
+                })?
+                .as_ref(),
+        )?,
         (Some(SafetensorsModelConfig::Muse(args)), None)
         | (None, Some(GgufModelConfig::Muse(args))) => crate::capability::muse(args)?,
         (Some(SafetensorsModelConfig::Lfm2(args)), None)
-        | (None, Some(GgufModelConfig::Lfm2(args))) => crate::capability::lfm2(args)?,
+        | (None, Some(GgufModelConfig::Lfm2(args))) => crate::capability::lfm2(
+            plan.lfm2_declaration(args)
+                .map_err(|detail| CapabilityError::InvalidConfiguration {
+                    field: "lfm2_declaration",
+                    detail,
+                })?
+                .as_ref(),
+        )?,
         (Some(SafetensorsModelConfig::NemotronH(args)), None)
-        | (None, Some(GgufModelConfig::NemotronH(args))) => crate::capability::nemotron_h(args)?,
+        | (None, Some(GgufModelConfig::NemotronH(args))) => crate::capability::nemotron_h(
+            plan.nemotron_declaration(args)
+                .map_err(|detail| CapabilityError::InvalidConfiguration {
+                    field: "nemotron_declaration",
+                    detail,
+                })?
+                .as_ref(),
+        )?,
         (Some(SafetensorsModelConfig::QwenHybrid(args)), None)
         | (None, Some(GgufModelConfig::QwenHybrid(args))) => crate::capability::qwen_hybrid(args)?,
-        (Some(SafetensorsModelConfig::QwenVl(args)), None) => crate::capability::qwen_vl(args)?,
+        (Some(SafetensorsModelConfig::QwenVl(args)), None) => crate::capability::qwen_vl(
+            plan.vl_declaration(args)
+                .map_err(|detail| CapabilityError::InvalidConfiguration {
+                    field: "vl_declaration",
+                    detail,
+                })?
+                .as_ref(),
+        )?,
         _ => {
             return Err(CapabilityError::Observation(
                 "generation state geometry is unavailable for this architecture".into(),

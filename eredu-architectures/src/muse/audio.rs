@@ -4,13 +4,13 @@ use std::collections::HashMap;
 
 use eredu_checkpoint::LinearFormat;
 use eredu_nn::{
-    CausalDepthwiseConvolution, CausalDepthwiseConvolutionSpec, ConvolutionActivation, Error,
-    LinearOperator, LinearSpec, NeuralBackend, NormalizationConstructionSpec,
-    NormalizationOperator, ParameterSpec, Parameterized, Tensor,
+    CausalDepthwiseConvolution, DeclareLogicalParameters, Error, LinearOperator, NeuralBackend,
+    NormalizationOperator, Parameterized, Tensor,
 };
 use serde::Deserialize;
 
 pub mod execution;
+pub(crate) mod specs;
 
 /// One independently materialized operation in the waveform pyramid.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -42,20 +42,11 @@ impl AudioUnitKind {
             Self::Projection => "model.audio_tower.output".into(),
         }
     }
-
-    pub(crate) fn owns_parameter(self, name: &str) -> bool {
-        match self {
-            Self::Projection => ["norm.", "proj.", "post_proj_norm."]
-                .iter()
-                .any(|suffix| name.starts_with(&format!("model.audio_tower.{suffix}"))),
-            _ => name.starts_with(&format!("{}.", self.path())),
-        }
-    }
 }
 
-/// Validated audio pyramid geometry, independent of a native runtime.
-#[derive(Debug, Clone)]
-pub struct AudioConfig {
+/// Audio pyramid policy validated when constructing an `AudioConfig`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AudioPolicy {
     /// Host-waveform precision at the first patch projection boundary.
     pub input_precision: super::config::MediaInputPrecision,
     /// Output channels at each stage.
@@ -90,9 +81,9 @@ struct AudioSource {
     hidden_act: String,
 }
 
-impl AudioConfig {
+impl AudioPolicy {
     /// Ordered patch, convolution, and projection residency units.
-    pub fn execution_units(&self) -> Result<Vec<AudioUnitKind>, Error> {
+    pub(super) fn execution_units(&self) -> Result<Vec<AudioUnitKind>, Error> {
         self.validate()?;
         let mut units = Vec::new();
         for (stage, &depth) in self.depths.iter().enumerate() {
@@ -103,7 +94,7 @@ impl AudioConfig {
         Ok(units)
     }
     /// Normalizes the released waveform companion's explicit GGUF stage geometry.
-    pub fn from_gguf_metadata(
+    pub(super) fn from_gguf_metadata(
         metadata: &HashMap<String, eredu_gguf::MetadataValue>,
         decoder_width: i32,
     ) -> Result<Self, Error> {
@@ -131,7 +122,7 @@ impl AudioConfig {
                 _ => {
                     return Err(Error::backend(format!(
                         "Muse audio GGUF {key:?} must be an integer array"
-                    )))
+                    )));
                 }
             };
             values
@@ -199,7 +190,10 @@ impl AudioConfig {
     }
 
     /// Normalizes the released encoder config and validates decoder geometry.
-    pub fn from_hf_value(value: &serde_json::Value, decoder_width: i32) -> Result<Self, Error> {
+    pub(super) fn from_hf_value(
+        value: &serde_json::Value,
+        decoder_width: i32,
+    ) -> Result<Self, Error> {
         let source: AudioSource =
             serde_json::from_value(value.clone()).map_err(Error::backend_source)?;
         if source.model_type != "muse_spark_audio"
@@ -302,59 +296,74 @@ impl AudioConfig {
     }
 }
 
-#[derive(Clone, Copy)]
-enum AffineEquation {
-    RowMajor,
-    ChannelMajor,
+/// Validated waveform policy with retained typed residency-unit declarations.
+#[derive(Debug, Clone)]
+pub struct AudioConfig {
+    policy: AudioPolicy,
+    declaration: std::sync::Arc<specs::Declarations>,
 }
-
-fn linear<B: NeuralBackend>(
-    config: &AudioConfig,
-    name: &str,
-    input: i32,
-    output: i32,
-    arithmetic: AffineEquation,
-    context: &<B::Tensor as Tensor>::Context,
-) -> Result<B::Linear, Error> {
-    let weight = format!("{name}.weight");
-    B::linear(
-        LinearSpec {
-            input,
-            output,
-            weight: ParameterSpec::trainable(&weight).map_err(Error::backend)?,
-            bias: Some(ParameterSpec::trainable(format!("{name}.bias")).map_err(Error::backend)?),
-            format: match arithmetic {
-                AffineEquation::RowMajor => crate::linear_format::standard_linear_format(
-                    &weight,
-                    config.linear_format_for(&weight),
-                )?
-                .with_arithmetic(eredu_nn::LinearArithmetic::RowMajorAffine)?,
-                AffineEquation::ChannelMajor => crate::linear_format::standard_linear_format(
-                    &weight,
-                    config.linear_format_for(&weight),
-                )?
-                .with_arithmetic(eredu_nn::LinearArithmetic::ChannelMajorAffine)?,
-            },
-        },
-        context,
-    )
+impl AudioConfig {
+    /// Declares the complete source pyramid once, without backend resources.
+    pub fn new(policy: AudioPolicy) -> Result<Self, Error> {
+        let declaration = specs::Declarations::new(&policy)?;
+        Ok(Self {
+            policy,
+            declaration: std::sync::Arc::new(declaration),
+        })
+    }
+    /// Normalized cadence, arithmetic and format policy.
+    pub fn policy(&self) -> &AudioPolicy {
+        &self.policy
+    }
+    pub(crate) fn declaration(&self) -> &specs::Declarations {
+        &self.declaration
+    }
+    /// Released GGUF normalization followed by immutable source declaration.
+    pub fn from_gguf_metadata(
+        metadata: &HashMap<String, eredu_gguf::MetadataValue>,
+        decoder_width: i32,
+    ) -> Result<Self, Error> {
+        Self::new(AudioPolicy::from_gguf_metadata(metadata, decoder_width)?)
+    }
+    /// Released SafeTensors normalization followed by immutable source declaration.
+    pub fn from_hf_value(value: &serde_json::Value, decoder_width: i32) -> Result<Self, Error> {
+        Self::new(AudioPolicy::from_hf_value(value, decoder_width)?)
+    }
+    /// Projects invocation identities from the retained parameter owners.
+    pub fn execution_units(&self) -> Result<Vec<AudioUnitKind>, Error> {
+        Ok(self
+            .declaration
+            .units
+            .iter()
+            .map(|(kind, _)| *kind)
+            .collect())
+    }
+    /// Projects encoding extensions while preserving geometry and execution policy.
+    pub fn with_formats(&self, formats: HashMap<String, LinearFormat>) -> Result<Self, Error> {
+        if formats == self.policy.linear_formats {
+            return Ok(self.clone());
+        }
+        let mut policy = self.policy.clone();
+        policy.linear_formats = formats;
+        policy.validate()?;
+        let mut declaration = self.declaration.as_ref().clone();
+        declaration.project_formats(&policy)?;
+        Ok(Self {
+            policy,
+            declaration: std::sync::Arc::new(declaration),
+        })
+    }
 }
-
-fn norm<B: NeuralBackend>(
-    config: &AudioConfig,
-    name: &str,
-    width: i32,
-    context: &<B::Tensor as Tensor>::Context,
-) -> Result<B::Normalization, Error> {
-    B::normalization(
-        NormalizationConstructionSpec::learned(
-            width,
-            config.rms_norm_eps,
-            ParameterSpec::trainable(format!("{name}.weight")).map_err(Error::backend)?,
-        )
-        .with_groups(1)?,
-        context,
-    )
+impl std::ops::Deref for AudioConfig {
+    type Target = AudioPolicy;
+    fn deref(&self) -> &Self::Target {
+        &self.policy
+    }
+}
+impl DeclareLogicalParameters for AudioConfig {
+    fn logical_parameters(&self) -> Result<Vec<eredu_nn::LogicalParameterDeclaration<'_>>, Error> {
+        self.declaration.logical_parameters()
+    }
 }
 
 /// Biased patch projection followed by direct FP32 RMS normalization.
@@ -370,6 +379,8 @@ pub struct AudioPatchEmbedding<B: NeuralBackend> {
     #[parameter(skip)]
     input_channels: i32,
     #[parameter(skip)]
+    input_width: i32,
+    #[parameter(skip)]
     input_precision: super::config::MediaInputPrecision,
 }
 
@@ -380,39 +391,28 @@ impl<B: NeuralBackend> AudioPatchEmbedding<B> {
         stage: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        config.validate()?;
-        let &patch_size = config
-            .patch_sizes
-            .get(stage)
-            .ok_or_else(|| Error::backend("missing Muse audio stage"))?;
-        let input_channels = if stage == 0 {
-            1
-        } else {
-            config.hidden_sizes[stage - 1]
+        let specs::UnitSpec::Patch(spec) = config
+            .declaration()
+            .unit(AudioUnitKind::Patch { stage })?
+            .clone()
+        else {
+            unreachable!()
         };
-        let root = format!("model.audio_tower.layers.{stage}.patch_embedder");
+        Self::from_spec(spec, context)
+    }
+
+    fn from_spec(
+        spec: specs::PatchSpec,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        eredu_nn::DeclareLogicalParameters::logical_parameters(&spec)?;
         Ok(Self {
-            projection: linear::<B>(
-                config,
-                &format!("{root}.proj"),
-                input_channels * patch_size,
-                config.hidden_sizes[stage],
-                AffineEquation::RowMajor,
-                context,
-            )?,
-            norm: norm::<B>(
-                config,
-                &format!("{root}.norm"),
-                config.hidden_sizes[stage],
-                context,
-            )?,
-            patch_size,
-            input_channels,
-            input_precision: if stage == 0 {
-                config.input_precision
-            } else {
-                super::config::MediaInputPrecision::Preserve
-            },
+            input_width: spec.projection.input,
+            projection: B::linear(spec.projection, context)?,
+            norm: B::normalization(spec.norm, context)?,
+            patch_size: spec.patch_size,
+            input_channels: spec.input_channels,
+            input_precision: spec.input_precision,
         })
     }
 
@@ -434,11 +434,7 @@ impl<B: NeuralBackend> AudioPatchEmbedding<B> {
             ));
         }
         let patches = input.reshape(
-            &[
-                shape[0],
-                shape[1] / self.patch_size,
-                self.input_channels * self.patch_size,
-            ],
+            &[shape[0], shape[1] / self.patch_size, self.input_width],
             context,
         )?;
         let patches = self
@@ -461,6 +457,8 @@ pub struct AudioConvBlock<B: NeuralBackend> {
     pub input: B::Linear,
     /// Biased output projection.
     pub output: B::Linear,
+    #[parameter(skip)]
+    activation: eredu_nn::UnaryActivation,
 }
 
 impl<B: NeuralBackend> AudioConvBlock<B> {
@@ -471,65 +469,31 @@ impl<B: NeuralBackend> AudioConvBlock<B> {
         block: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        config.validate()?;
-        let &width = config
-            .hidden_sizes
-            .get(stage)
-            .ok_or_else(|| Error::backend("missing Muse audio stage"))?;
-        if block >= config.depths[stage] {
-            return Err(Error::backend("missing Muse audio convolution block"));
-        }
-        let root = format!("model.audio_tower.layers.{stage}.conv_blocks.{block}");
+        let specs::UnitSpec::Convolution(spec) = config
+            .declaration()
+            .unit(AudioUnitKind::Convolution { stage, block })?
+            .clone()
+        else {
+            unreachable!()
+        };
+        Self::from_spec(spec, context)
+    }
+
+    fn from_spec(
+        spec: specs::ConvSpec,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        eredu_nn::DeclareLogicalParameters::logical_parameters(&spec)?;
         crate::operator_requirements::require::<B>(
             "Muse audio",
             crate::operator_requirements::MUSE_AUDIO,
         )?;
-        let intermediate = config.intermediate_size(stage)?;
         Ok(Self {
-            convolution: CausalDepthwiseConvolution::new(
-                CausalDepthwiseConvolutionSpec {
-                    arithmetic: eredu_nn::ConvolutionArithmetic::FourLaneFloat32Affine,
-                    dilation: 1,
-                    channels: width,
-                    kernel_size: config.conv_kernel_size,
-                    weight: ParameterSpec::trainable(format!("{root}.conv.weight"))
-                        .map_err(Error::backend)?,
-                    bias: Some(
-                        ParameterSpec::trainable(format!("{root}.conv.bias"))
-                            .map_err(Error::backend)?,
-                    ),
-                    activation: ConvolutionActivation::Identity,
-                },
-                context,
-            )?,
-            norm: B::normalization(
-                NormalizationConstructionSpec::learned(
-                    width,
-                    config.rms_norm_eps,
-                    ParameterSpec::trainable(format!("{root}.norm.weight"))
-                        .map_err(Error::backend)?,
-                )
-                .with_reduction(eredu_nn::NormalizationReduction::ChannelMajor)?,
-                context,
-            )?,
-            input: linear::<B>(
-                config,
-                &format!("{root}.mlp.fc1"),
-                width,
-                intermediate,
-                // The channel-major reference uses four ordered FP32 dot sums
-                // before product rounding and bias; singleton time is affine FP32.
-                AffineEquation::ChannelMajor,
-                context,
-            )?,
-            output: linear::<B>(
-                config,
-                &format!("{root}.mlp.fc2"),
-                intermediate,
-                width,
-                AffineEquation::RowMajor,
-                context,
-            )?,
+            convolution: CausalDepthwiseConvolution::new(spec.convolution, context)?,
+            norm: B::normalization(spec.norm, context)?,
+            input: B::linear(spec.network.up, context)?,
+            output: B::linear(spec.network.down, context)?,
+            activation: spec.network.activation,
         })
     }
 
@@ -542,7 +506,9 @@ impl<B: NeuralBackend> AudioConvBlock<B> {
     ) -> Result<(B::Tensor, Option<B::Tensor>), Error> {
         let convolution = self.convolution.forward(input, history, context)?;
         let hidden = self.norm.forward(&convolution.output, context)?;
-        let hidden = B::Tensor::gelu(&self.input.forward(&hidden, context)?, context)?;
+        let hidden = self
+            .activation
+            .apply::<B>(self.input.forward(&hidden, context)?, context)?;
         let output = input.add(&self.output.forward(&hidden, context)?, context)?;
         Ok((output, convolution.history))
     }
@@ -576,24 +542,24 @@ impl<B: NeuralBackend> AudioProjection<B> {
         config: &AudioConfig,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        config.validate()?;
-        let width = *config.hidden_sizes.last().expect("validated audio stages");
+        let specs::UnitSpec::Projection(spec) = config
+            .declaration()
+            .unit(AudioUnitKind::Projection)?
+            .clone()
+        else {
+            unreachable!()
+        };
+        Self::from_spec(spec, context)
+    }
+
+    fn from_spec(
+        spec: specs::ProjectionSpec,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
         Ok(Self {
-            norm: norm::<B>(config, "model.audio_tower.norm", width, context)?,
-            projection: linear::<B>(
-                config,
-                "model.audio_tower.proj",
-                width,
-                config.out_hidden_size,
-                AffineEquation::RowMajor,
-                context,
-            )?,
-            post_norm: norm::<B>(
-                config,
-                "model.audio_tower.post_proj_norm",
-                config.out_hidden_size,
-                context,
-            )?,
+            norm: B::normalization(spec.norm, context)?,
+            projection: B::linear(spec.projection, context)?,
+            post_norm: B::normalization(spec.post_norm, context)?,
         })
     }
 
@@ -628,14 +594,23 @@ impl<B: NeuralBackend> AudioUnit<B> {
         kind: AudioUnitKind,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        Ok(match kind {
-            AudioUnitKind::Patch { stage } => {
-                Self::Patch(AudioPatchEmbedding::new(config, stage, context)?)
+        Self::from_spec(config.declaration().unit(kind)?.clone(), context)
+    }
+
+    fn from_spec(
+        spec: specs::UnitSpec,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        Ok(match spec {
+            specs::UnitSpec::Patch(spec) => {
+                Self::Patch(AudioPatchEmbedding::from_spec(spec, context)?)
             }
-            AudioUnitKind::Convolution { stage, block } => {
-                Self::Convolution(AudioConvBlock::new(config, stage, block, context)?)
+            specs::UnitSpec::Convolution(spec) => {
+                Self::Convolution(AudioConvBlock::from_spec(spec, context)?)
             }
-            AudioUnitKind::Projection => Self::Projection(AudioProjection::new(config, context)?),
+            specs::UnitSpec::Projection(spec) => {
+                Self::Projection(AudioProjection::from_spec(spec, context)?)
+            }
         })
     }
 }
@@ -682,20 +657,26 @@ impl<B: NeuralBackend> AudioPyramid<B> {
         config: AudioConfig,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        config.validate()?;
-        let stages = (0..config.hidden_sizes.len())
-            .map(|stage| {
-                Ok(AudioStage {
-                    patch: AudioPatchEmbedding::new(&config, stage, context)?,
-                    blocks: (0..config.depths[stage])
-                        .map(|block| AudioConvBlock::new(&config, stage, block, context))
-                        .collect::<Result<Vec<_>, Error>>()?,
-                })
-            })
-            .collect::<Result<Vec<_>, Error>>()?;
+        let declarations = config.declaration();
+        let mut stages: Vec<AudioStage<B>> = Vec::new();
+        let mut output = None;
+        for (_, spec) in declarations.units.iter() {
+            match AudioUnit::from_spec(spec.clone(), context)? {
+                AudioUnit::Patch(patch) => stages.push(AudioStage {
+                    patch,
+                    blocks: Vec::new(),
+                }),
+                AudioUnit::Convolution(block) => stages
+                    .last_mut()
+                    .expect("declared audio stage")
+                    .blocks
+                    .push(block),
+                AudioUnit::Projection(projection) => output = Some(projection),
+            }
+        }
         Ok(Self {
             stages,
-            output: AudioProjection::new(&config, context)?,
+            output: output.expect("declared audio output"),
             config,
         })
     }

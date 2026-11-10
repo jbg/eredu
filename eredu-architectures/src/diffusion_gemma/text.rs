@@ -1,15 +1,15 @@
 //! Shared text parameters with independent context and refinement invocations.
 
 use eredu_nn::{
-    AttentionCache, EmbeddingOperator, EmbeddingSpec, Error, GroupedNeuralBackend, LinearOperator,
-    LinearSpec, NormalizationOperator, Parameter, ParameterSpec, Parameterized,
-    ReadOnlyAttentionCache, ReadOnlyCache, Tensor, TensorElementType,
+    AttentionCache, EmbeddingOperator, Error, GroupedNeuralBackend, LinearOperator,
+    NormalizationOperator, Parameter, Parameterized, ReadOnlyAttentionCache, ReadOnlyCache, Tensor,
+    TensorElementType,
 };
 use eredu_runtime::{ExpertPass, ParameterProvider, VocabularyModulePlacement};
 
 use super::FamilyConfig;
 use crate::{
-    decoder::{ComponentInstrumentation, PartitionStaticModules, StaticModuleConstruction},
+    decoder::{ComponentInstrumentation, PartitionStaticModules},
     gemma4::{BlockInput, DenseBlock, ModelArgs},
 };
 
@@ -42,56 +42,25 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Clone for Sel
 }
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SelfConditioning<B> {
-    /// Declares the released decoder-only parameters without allocating weights.
-    pub fn new(args: &ModelArgs, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
-        let width = args
-            .layer_policy(0)
-            .ok_or_else(|| Error::backend("empty diffusion stack"))?
-            .intermediate_size
-            .get() as i32;
-        Self::new_with_width(args, width, context)
-    }
-
-    fn new_with_width(
-        args: &ModelArgs,
-        width: i32,
+    /// Builds unloaded feedback modules from the retained decoder-only declaration.
+    pub fn new(
+        config: &FamilyConfig,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        if width <= 0 {
-            return Err(Error::backend(
-                "feedback construction requires nonempty local units",
-            ));
-        }
-        let prefix = "model.decoder.self_conditioning";
-        let linear = |field: &str, input, output| {
-            let key = format!("{prefix}.{field}.weight");
-            B::linear(
-                LinearSpec {
-                    input,
-                    output,
-                    weight: ParameterSpec::trainable(&key).map_err(Error::backend)?,
-                    bias: None,
-                    format: crate::linear_format::standard_linear_format(
-                        &key,
-                        args.linear_format_for(&key),
-                    )?,
-                },
-                context,
-            )
-        };
+        Self::from_declaration(config.conditioning().clone(), context)
+    }
+
+    fn from_declaration(
+        spec: super::conditioning::Declaration,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        spec.validate()?;
         Ok(Self {
-            pre_norm: B::normalization(
-                args.normalization(
-                    args.hidden_size,
-                    ParameterSpec::trainable(format!("{prefix}.pre_norm.weight"))
-                        .map_err(Error::backend)?,
-                ),
-                context,
-            )?,
-            gate: linear("gate_proj", args.hidden_size, width)?,
-            up: linear("up_proj", args.hidden_size, width)?,
-            down: linear("down_proj", width, args.hidden_size)?,
-            epsilon: args.rms_norm_eps,
+            pre_norm: B::normalization(spec.pre_norm, context)?,
+            gate: B::linear(spec.product.gate, context)?,
+            up: B::linear(spec.product.up, context)?,
+            down: B::linear(spec.product.down, context)?,
+            epsilon: spec.output_epsilon,
         })
     }
 
@@ -143,7 +112,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SelfCondition
             Some(_) => {
                 return Err(Error::backend(
                     "self-conditioning embedding geometry differs from the canvas",
-                ))
+                ));
             }
             None => {
                 zeros = embeddings.zeros_like(context)?;
@@ -179,35 +148,39 @@ pub struct TextLayer<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBacken
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TextLayer<B> {
     /// Builds one independently materializable layer unit.
     pub fn new(
-        args: &ModelArgs,
+        config: &FamilyConfig,
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        Self::new_with_experts(args, index, None, context)
+        Self::new_with_experts(
+            &config.text,
+            config.encoder_scalar(index)?,
+            config.block(index)?,
+            config.dense(index)?,
+            config.attention(index)?,
+            config.routed(index)?,
+            index,
+            None,
+            context,
+        )
     }
 
     pub(crate) fn new_with_experts(
         args: &ModelArgs,
+        encoder_scalar: &crate::gemma4::text::specs::ResidualScaleSpec,
+        block: &crate::gemma4::text::specs::BlockSpec,
+        dense: &crate::gemma4::text::specs::DenseSpec,
+        attention: &crate::gemma4::text::specs::AttentionSpec,
+        routed: Option<&crate::gemma4::text::routed::Declaration>,
         index: usize,
         experts: Option<eredu_nn::GroupedGatedProductSpec>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         Ok(Self {
-            block: DenseBlock::new_at_with_routed_spec(
-                args,
-                index,
-                "model.decoder.layers",
-                experts,
-                context,
+            block: DenseBlock::from_scopes(
+                args, index, block, dense, attention, routed, experts, context,
             )?,
-            encoder_scalar: Parameter::unloaded(
-                ParameterSpec::trainable(format!(
-                    "model.encoder.language_model.layers.{index}.layer_scalar"
-                ))
-                .map_err(Error::backend)?,
-                &[1],
-                context,
-            )?,
+            encoder_scalar: encoder_scalar.unloaded(context)?,
         })
     }
 
@@ -366,39 +339,6 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Clone for Tex
     }
 }
 
-/// Backend-neutral pinned specifications shared by cold catalogs and materialization.
-pub(super) fn static_construction_specs(
-    config: &FamilyConfig,
-) -> Result<StaticModuleConstruction, Error> {
-    let args = &config.text;
-    let key = "model.decoder.embed_tokens.weight";
-    let embedding = EmbeddingSpec {
-        vocabulary: args.vocab_size,
-        dimensions: args.hidden_size,
-        weight: ParameterSpec::trainable(key).map_err(Error::backend)?,
-        format: crate::linear_format::standard_linear_format(key, args.linear_format_for(key))?,
-    };
-    let head = (!args.tie_word_embeddings)
-        .then(|| -> Result<_, Error> {
-            Ok(LinearSpec {
-                input: args.hidden_size,
-                output: args.vocab_size,
-                weight: ParameterSpec::trainable("lm_head.weight").map_err(Error::backend)?,
-                bias: None,
-                format: crate::linear_format::standard_linear_format(
-                    "lm_head.weight",
-                    args.linear_format_for("lm_head.weight"),
-                )?,
-            })
-        })
-        .transpose()?;
-    let normalization = args.normalization(
-        args.hidden_size,
-        ParameterSpec::trainable("model.decoder.norm.weight").map_err(Error::backend)?,
-    );
-    StaticModuleConstruction::new(embedding, head, normalization)
-}
-
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TextStatic<B> {
     /// Declares pinned text parameters independently from layer residency.
     pub fn new(
@@ -438,8 +378,15 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TextStatic<B>
                 )
             }
         };
+        let conditioning = match geometry {
+            None => Some(config.conditioning().clone()),
+            Some(geometry) => geometry
+                .conditioning_width()
+                .map(|width| config.conditioning().clone().with_intermediate(width))
+                .transpose()?,
+        };
         let modules = PartitionStaticModules::<B>::from_construction(
-            static_construction_specs(config)?,
+            config.pinned().ordinary.clone(),
             placement("embedding"),
             if args.tie_word_embeddings {
                 VocabularyModulePlacement::Omitted
@@ -449,13 +396,9 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TextStatic<B>
             geometry.is_none_or(|geometry| geometry.owns_norm()),
             context,
         )?;
-        let conditioning = match geometry {
-            None => Some(SelfConditioning::new(args, context)?),
-            Some(geometry) => geometry
-                .conditioning_width()
-                .map(|width| SelfConditioning::new_with_width(args, width, context))
-                .transpose()?,
-        };
+        let conditioning = conditioning
+            .map(|spec| SelfConditioning::from_declaration(spec, context))
+            .transpose()?;
         Ok(Self {
             embeddings: modules.embeddings,
             norm: modules.norm,

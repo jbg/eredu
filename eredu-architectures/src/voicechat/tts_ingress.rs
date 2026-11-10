@@ -5,10 +5,10 @@
 //! this component. Both guidance lanes use the same projected audio feedback.
 
 use super::{
-    tts_mog::{f32_shape, parameter, TtsError},
+    tts_mog::{f32_shape, TtsError},
     tts_rvq_layered::RvqExecution,
 };
-use eredu_nn::{Index, NeuralBackend, Parameter, ParameterSpec, Parameterized, Tensor};
+use eredu_nn::{Index, NeuralBackend, Parameter, Parameterized, Tensor};
 
 /// Validated prompt audio-mask layout, including every false-to-true BOS boundary.
 #[derive(Debug, Clone)]
@@ -102,50 +102,19 @@ pub struct TtsIngress<B: NeuralBackend> {
     local_output: i32,
 }
 impl<B: NeuralBackend> TtsIngress<B> {
-    /// Declares canonical BOS/null, Aria and frozen-projection parameters.
-    /// Released geometry is hidden width 1152 and 37 speaker-prompt frames.
+    /// Constructs the declared BOS/null, Aria and frozen-projection parameters.
     pub fn new(
-        hidden: i32,
-        speaker_frames: i32,
+        spec: super::tts_conditioning_specs::IngressSpec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, TtsError> {
-        Self::new_local(hidden, speaker_frames, hidden, context)
-    }
-
-    pub(super) fn new_local(
-        hidden: i32,
-        speaker_frames: i32,
-        local_output: i32,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, TtsError> {
-        if hidden <= 0 || speaker_frames <= 0 || local_output <= 0 || local_output > hidden {
-            return Err(TtsError::Configuration("invalid TTS ingress geometry"));
-        }
-        let mut aria = ParameterSpec::trainable("tts_model.audio_prompt_latents.Aria")
-            .map_err(eredu_nn::Error::backend)?;
-        aria.trainable = false;
-        aria.group = Some("voicechat.tts.speaker.aria".into());
-        let mut projection = parameter(
-            "audio_prompt_projection_W",
-            "voicechat.tts.speaker.projection",
-        )?;
-        projection.trainable = false;
         Ok(Self {
-            bos: Parameter::unloaded(
-                parameter("bos_emb", "voicechat.tts.ingress")?,
-                &[hidden],
-                context,
-            )?,
-            null: Parameter::unloaded(
-                parameter("null_emb", "voicechat.tts.ingress")?,
-                &[hidden],
-                context,
-            )?,
-            aria: Parameter::unloaded(aria, &[1, speaker_frames, hidden], context)?,
-            projection: Parameter::unloaded(projection, &[hidden, local_output], context)?,
-            hidden,
-            speaker_frames,
-            local_output,
+            hidden: spec.bos.shape[0],
+            speaker_frames: spec.aria.shape[1],
+            local_output: spec.projection.shape[1],
+            bos: spec.bos.into_parameter(context)?,
+            null: spec.null.into_parameter(context)?,
+            aria: spec.aria.into_parameter(context)?,
+            projection: spec.projection.into_parameter(context)?,
         })
     }
 

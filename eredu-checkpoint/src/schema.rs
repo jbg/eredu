@@ -308,7 +308,8 @@ pub fn matrix_for_linear_format(
             shape,
             StoredDtypeConstraint::Floating,
         )
-        .with_aliases(aliases)]);
+        .with_aliases(aliases)
+        .with_linear_format(format)]);
     }
     if let LinearFormat::E4M3BlockFp8(fp8) = format {
         fp8.validate()
@@ -349,7 +350,8 @@ pub fn matrix_for_linear_format(
                 shape,
                 StoredDtypeConstraint::Exact(StoredDtype::F8E4M3),
             )
-            .with_aliases(aliases),
+            .with_aliases(aliases)
+            .with_linear_format(format),
             SafetensorsTensorConstraint::required(scale.key, scale_shape, scale_dtype)
                 .with_aliases(scale.aliases)
                 .linear_companion(name.clone(), LinearCompanionKind::Scale),
@@ -358,37 +360,47 @@ pub fn matrix_for_linear_format(
     let quantization = format
         .weight_quantization()
         .expect("non-dense, non-FP8 linear formats use packed quantization");
+    let mut constraints =
+        matrix_for_packed_words(name, aliases, shape, quantization, scale_companion)?;
+    constraints[0].linear_format = Some(format);
+    Ok(constraints)
+}
+
+/// Projects a source layout containing U32 packed words, per-group scales and
+/// optional affine biases. Encoding-specific global scales and byte layouts
+/// remain explicit extensions selected by the source format's owner.
+pub fn matrix_for_packed_words(
+    name: impl Into<String>,
+    aliases: impl IntoIterator<Item = impl Into<String>>,
+    shape: Vec<usize>,
+    quantization: crate::WeightQuantization,
+    scale_companion: Option<MatrixScaleNames>,
+) -> Result<Vec<SafetensorsTensorConstraint>, MatrixConstraintError> {
+    let name = name.into();
+    let aliases = aliases.into_iter().map(Into::into).collect::<Vec<String>>();
+    quantization
+        .validate()
+        .map_err(|error| MatrixConstraintError::Invalid {
+            detail: error.to_string(),
+        })?;
     let input = *shape
         .last()
         .ok_or_else(|| MatrixConstraintError::Scalar { name: name.clone() })?;
-    let bits =
-        usize::try_from(quantization.bits()).map_err(|_| MatrixConstraintError::Invalid {
-            detail: format!("quantization bit width for {name:?} exceeds usize"),
-        })?;
-    let group =
-        usize::try_from(quantization.group_size()).map_err(|_| MatrixConstraintError::Invalid {
-            detail: format!("quantization group size for {name:?} exceeds usize"),
-        })?;
-    let packed_bits = input
-        .checked_mul(bits)
-        .ok_or_else(|| MatrixConstraintError::Invalid {
-            detail: format!("quantized matrix {name:?} packing geometry overflows"),
-        })?;
-    if group == 0
-        || !input.is_multiple_of(group)
-        || !input.is_multiple_of(32)
-        || !packed_bits.is_multiple_of(32)
-    {
+    // Source layouts require whole 32-column blocks independently of word packing.
+    if !input.is_multiple_of(32) {
         return Err(MatrixConstraintError::Invalid {
-            detail: format!(
-                "quantized matrix {name:?} input dimension {input} is incompatible with group size {group} and {bits}-bit packing"
-            ),
+            detail: format!("quantized matrix {name:?} input {input} is not aligned to 32 columns"),
         });
     }
+    let geometry = quantization.packed_word_geometry(input).map_err(|error| {
+        MatrixConstraintError::Invalid {
+            detail: format!("quantized matrix {name:?}: {error}"),
+        }
+    })?;
     let mut packed = shape.clone();
-    *packed.last_mut().expect("matrix shape") = packed_bits / 32;
+    *packed.last_mut().expect("matrix shape") = geometry.word_columns();
     let mut companion = shape;
-    *companion.last_mut().expect("matrix shape") = input / group;
+    *companion.last_mut().expect("matrix shape") = geometry.group_columns();
     let prefix = name.strip_suffix(".weight").unwrap_or(&name).to_string();
     let companion_dtype = || {
         StoredDtypeConstraint::OneOf(vec![
@@ -502,7 +514,8 @@ pub fn matrix_for_nvfp4(
             packed,
             StoredDtypeConstraint::Exact(dtype),
         )
-        .with_aliases(aliases.clone()),
+        .with_aliases(aliases.clone())
+        .with_linear_format(LinearFormat::NvFp4),
         SafetensorsTensorConstraint::required(
             companion_name(scale_suffix),
             scales,
@@ -601,6 +614,9 @@ pub struct SafetensorsTensorConstraint {
     /// canonical shape used by loading recipes.
     pub element_count: Option<usize>,
     pub dtype: StoredDtypeConstraint,
+    /// Exact source encoding projected from a matrix declaration or format extension.
+    /// Raw tensors and encoding companions carry no inferred linear format.
+    pub linear_format: Option<LinearFormat>,
     pub requirement: TensorRequirement,
     pub role: TensorRole,
     /// Exact primary relationship when this is an encoded-linear companion.
@@ -620,10 +636,17 @@ impl SafetensorsTensorConstraint {
             alternate_shapes: Vec::new(),
             element_count: None,
             dtype,
+            linear_format: None,
             requirement: TensorRequirement::Required,
             role: TensorRole::Tensor,
             linear_companion: None,
         }
+    }
+
+    /// Retains the format used to derive this primary matrix's physical constraints.
+    pub fn with_linear_format(mut self, format: LinearFormat) -> Self {
+        self.linear_format = Some(format);
+        self
     }
 
     pub fn optional(mut self) -> Self {
@@ -646,11 +669,6 @@ impl SafetensorsTensorConstraint {
         shapes: impl IntoIterator<Item = impl Into<Vec<usize>>>,
     ) -> Self {
         self.alternate_shapes = shapes.into_iter().map(Into::into).collect();
-        self
-    }
-
-    pub fn companion(mut self) -> Self {
-        self.role = TensorRole::Companion;
         self
     }
 

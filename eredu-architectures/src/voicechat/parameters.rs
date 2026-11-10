@@ -1,22 +1,21 @@
 //! Exact learned-parameter units projected from retained VoiceChat artifacts.
 //!
-//! A unit projects a semantic parameter declaration or a caller-supplied module's
-//! ordinary parameter traversal. Conformer, Gemma, MoG and codec blocks can be
-//! bound independently. This contract does not select a residency schedule or
-//! construct a realtime executable.
+//! A unit projects a semantic parameter declaration. Conformer, Gemma, MoG and
+//! codec blocks can be bound independently. This contract does not select a
+//! residency schedule or construct a realtime executable.
 
 use std::collections::BTreeMap;
 
 use eredu_checkpoint::{
-    recipe::{DerivedWeightRecipe, RecipeAlias, RecipeDtype, RecipeError},
+    recipe::{DerivedWeightRecipe, RecipeDtype, RecipeError},
     store::{SharedCheckpointSource, StoreError},
 };
-use eredu_nn::{validate_parameter_topology, ParameterTopologyError, Parameterized};
+use eredu_nn::Parameterized;
 use eredu_runtime::{
-    bind_materialized_unit, materialize_selected_bindings, prepare_resource_bindings,
-    select_bindings, ArchitectureParameterDescription, ComponentPreparationError, ParameterBackend,
-    ParameterMemberSpec, ParameterOrchestrationError, ParameterResourceRecipes, PreparedComponent,
-    RecipeBindingError, SelectedBindingPlan, WeightBinding,
+    bind_materialized_unit, materialize_selected_bindings, select_bindings,
+    ArchitectureParameterDescription, ComponentPreparationError, ParameterBackend,
+    ParameterMemberSpec, ParameterOrchestrationError, PreparedComponent, RecipeBindingError,
+    SelectedBindingPlan, WeightBinding,
 };
 
 use super::{
@@ -41,7 +40,7 @@ pub enum SpeechParameterError {
         /// Module's exact stable identity.
         name: String,
     },
-    /// A declared member disagrees with its retained recipe output metadata.
+    /// A declared member disagrees with its retained identity or recipe output metadata.
     #[error("VoiceChat component {component:?} parameter {name} disagrees with admitted metadata")]
     InconsistentAdmission {
         /// Selected source component.
@@ -52,17 +51,6 @@ pub enum SpeechParameterError {
     /// Host preprocessing and integer policy buffers cannot become neural weights.
     #[error("VoiceChat parameter {0} is owned by host preparation")]
     HostParameter(String),
-    /// Module aliases must describe identical admitted recipes.
-    #[error("VoiceChat alias {alias} disagrees with its owner {owner}")]
-    AliasMismatch {
-        /// Alias destination identity.
-        alias: String,
-        /// Shared storage owner identity.
-        owner: String,
-    },
-    /// A module's parameter traversal is malformed.
-    #[error(transparent)]
-    Topology(#[from] ParameterTopologyError),
     /// Exact source projection failed.
     #[error(transparent)]
     Source(#[from] StoreError),
@@ -92,22 +80,6 @@ pub struct PreparedSpeechParameterUnit {
 }
 
 impl PreparedSpeechParameterUnit {
-    /// Selects the exact identities visited by one already constructed module.
-    /// The module may be an individual layered block or a small static component.
-    /// No payload is read and no native parameter is published here.
-    pub fn from_retained<T: 'static, M: Parameterized<T>>(
-        artifacts: &RetainedVoiceChatArtifacts,
-        component: Component,
-        module: &M,
-    ) -> Result<Self, SpeechParameterError> {
-        check_component(component)?;
-        let source = artifacts
-            .component_source(component)
-            .ok_or(SpeechParameterError::MissingComponent(component))?
-            .clone();
-        project_unit(artifacts.plan().parameters(), source, component, module)
-    }
-
     pub(super) fn from_description(
         artifacts: &RetainedVoiceChatArtifacts,
         component: Component,
@@ -189,11 +161,27 @@ fn host_parameter(name: &str) -> bool {
             .any(|buffer| buffer.key == name)
 }
 
-/// Integer scale storage belongs only to an explicitly encoded MXFP4 projection.
-pub(super) fn is_byte_scale(parameters: &BTreeMap<String, ParameterAdmission>, name: &str) -> bool {
-    name.strip_suffix(".scales")
-        .and_then(|prefix| parameters.get(&format!("{prefix}.weight")))
-        .is_some_and(|weight| weight.linear_format == eredu_checkpoint::LinearFormat::MxFp4)
+/// Integer scale storage belongs to a declared scale companion of an admitted MXFP4 primary.
+pub(super) fn is_mxfp4_scale(
+    parameters: &BTreeMap<String, ParameterAdmission>,
+    member: &ParameterMemberSpec,
+) -> bool {
+    if member.linear_companion() != Some(eredu_nn::LinearCompanionRole::Scale) {
+        return false;
+    }
+    let Some(primary_id) = member.linear_companion_of() else {
+        return false;
+    };
+    let (Some(primary), Some(companion)) = (
+        parameters.get(primary_id.as_str()),
+        parameters.get(member.target()),
+    ) else {
+        return false;
+    };
+    primary.name == primary_id.as_str()
+        && companion.name == member.target()
+        && primary.component == companion.component
+        && primary.linear_format == eredu_checkpoint::LinearFormat::MxFp4
 }
 
 pub(super) fn execution_parameter(
@@ -272,13 +260,20 @@ fn parameter_for_component<'a>(
     component: Component,
     name: &str,
 ) -> Result<&'a ParameterAdmission, SpeechParameterError> {
-    admitted
+    let parameter = admitted
         .get(name)
         .filter(|parameter| parameter.component == component)
         .ok_or_else(|| SpeechParameterError::MissingParameter {
             component,
             name: name.into(),
-        })
+        })?;
+    if parameter.name != name {
+        return Err(SpeechParameterError::InconsistentAdmission {
+            component,
+            name: name.into(),
+        });
+    }
+    Ok(parameter)
 }
 
 /// Checks retained admission before any execution conversion or accounting change.
@@ -312,60 +307,4 @@ fn admitted_parameter(
     }
     let parameter = parameter_for_component(admitted, component, name)?;
     Ok(execution_parameter(parameter, source)?)
-}
-
-fn project_unit<T: 'static, M: Parameterized<T>>(
-    admitted: &BTreeMap<String, ParameterAdmission>,
-    source: SharedCheckpointSource,
-    component: Component,
-    module: &M,
-) -> Result<PreparedSpeechParameterUnit, SpeechParameterError> {
-    check_component(component)?;
-    let topology = validate_parameter_topology(module)?;
-    let mut parameters = BTreeMap::new();
-    for metadata in &topology {
-        let name = metadata.id.as_str();
-        parameters.insert(
-            name.to_owned(),
-            admitted_parameter(admitted, &source, component, name)?,
-        );
-    }
-    let mut recipes = BTreeMap::new();
-    let mut aliases = Vec::new();
-    for metadata in &topology {
-        let name = metadata.id.as_str();
-        let parameter = &parameters[name];
-        if let Some(owner) = &metadata.alias_of {
-            let owner_parameter = &parameters[owner.as_str()];
-            if parameter.recipe != owner_parameter.recipe
-                || parameter.output != owner_parameter.output
-            {
-                return Err(SpeechParameterError::AliasMismatch {
-                    alias: name.into(),
-                    owner: owner.as_str().into(),
-                });
-            }
-            aliases.push(RecipeAlias::new(name, owner.as_str()));
-        } else {
-            recipes.insert(name.to_owned(), parameter.recipe.clone());
-        }
-    }
-    let (source, mut resources) = prepare_resource_bindings(
-        source,
-        format!("voicechat/{component:?}/module"),
-        BTreeMap::from([(
-            (),
-            ParameterResourceRecipes {
-                outputs: recipes,
-                aliases,
-            },
-        )]),
-    )?;
-    let bindings = resources.remove(&()).expect("declared module resource");
-    Ok(PreparedSpeechParameterUnit {
-        component,
-        source,
-        parameters,
-        bindings,
-    })
 }

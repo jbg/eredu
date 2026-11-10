@@ -2,21 +2,24 @@
 
 mod checkpoint;
 mod config;
+mod declarations;
+pub use declarations::Declaration;
 mod model;
 mod parallel;
 mod parameters;
 mod positions;
 
+pub(crate) use checkpoint::source_linear_shapes;
+
 pub use checkpoint::{
-    load_time_quantization, normalize_text_weight_formats, projector_gguf_plan,
-    rank_local_unit_recipes, safetensors_plan, static_recipes, translate_text_gguf_weight_name,
-    translate_vision_gguf_weight_name, unit_recipes, with_checkpoint_formats,
+    load_time_quantization, projector_gguf_plan, rank_local_unit_recipes, safetensors_plan,
+    static_recipes, translate_text_gguf_weight_name, translate_vision_gguf_weight_name,
+    unit_recipes, with_checkpoint_formats,
 };
 pub use config::{
     model_args_from_config_value, model_args_from_gguf_parts,
-    prompt_cache_architecture_fingerprint, state_identity, state_layout,
-    state_layout_with_key_value_heads, vision_config_from_gguf_catalog, GgufModelArgs, ModelArgs,
-    VlConfigError,
+    prompt_cache_architecture_fingerprint, state_identity, state_layout_with_text_state,
+    vision_config_from_gguf_catalog, GgufModelArgs, ModelArgs, VlConfigError,
 };
 pub use model::{
     prepare_input, vision_dependency_boundary_schema, vision_partition_boundary_schema,
@@ -38,47 +41,19 @@ pub use positions::{
 
 /// Derives complete expert ownership and rank-local text-bank geometry from Qwen3-VL.
 pub fn expert_realization_plan(
-    args: &ModelArgs,
+    declaration: &Declaration,
     geometry: Option<&LocalGeometry>,
     topology: eredu_core::ParallelRankTopology,
 ) -> Result<Option<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>, eredu_nn::Error>
 {
-    if !args.text.is_moe() {
-        return Ok(None);
+    if let Some(geometry) = geometry {
+        geometry
+            .validate_for(declaration)
+            .map_err(eredu_nn::Error::backend_source)?;
     }
-    let global_experts =
-        usize::try_from(args.text.num_experts).map_err(eredu_nn::Error::backend)?;
-    let local_experts = i32::try_from(
-        eredu_core::balanced_contiguous_range(
-            global_experts,
-            topology.expert_parallel_size(),
-            topology.expert_parallel_rank(),
-            false,
-        )
-        .map_err(eredu_nn::Error::backend)?
-        .len(),
+    super::expert_realization_plan(
+        declaration.text_declaration(),
+        geometry.map(LocalGeometry::text),
+        topology,
     )
-    .map_err(eredu_nn::Error::backend)?;
-    let owner_group = eredu_runtime::ExecutionGroupId::new(TEXT_EXECUTION_GROUP)
-        .map_err(eredu_nn::Error::backend)?;
-    let mut unit_specs = std::collections::BTreeMap::new();
-    for layer in
-        0..usize::try_from(args.text.num_hidden_layers).map_err(eredu_nn::Error::backend)?
-    {
-        let local = geometry
-            .and_then(|geometry| geometry.text().block(layer))
-            .unwrap_or(&args.text);
-        unit_specs.insert(
-            (owner_group.clone(), layer),
-            super::moe::localized_expert_bank_spec(
-                &args.text,
-                layer,
-                local_experts,
-                local.moe_intermediate_size,
-            )?,
-        );
-    }
-    crate::ExpertRealizationPlan::balanced(global_experts, topology, unit_specs)
-        .map(Some)
-        .map_err(eredu_nn::Error::backend)
 }

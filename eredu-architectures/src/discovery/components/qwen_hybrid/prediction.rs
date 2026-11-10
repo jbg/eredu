@@ -2,7 +2,44 @@
 use super::*;
 
 pub(in crate::discovery) fn declare(g: &mut Builder, c: &HybridConfig, target_output: &str) {
-    let width = c.hidden_size as usize;
+    let construction = c.statics();
+    let embedding_slot = &construction.embedding_spec().weight;
+    let readout = construction.output_projection_spec();
+    let embedding_weight_prefix = declared_weight_prefix(embedding_slot);
+    let output_prefix = declared_weight_prefix(&readout.weight);
+    let tied = construction.head_spec().is_none();
+    let shared = c
+        .prediction_shared()
+        .expect("admitted prediction shared declaration");
+    let hidden_normalization = super::super::declared_normalization(&shared.hidden_norm);
+    let embedding_normalization = super::super::declared_normalization(&shared.embedding_norm);
+    let final_normalization = super::super::declared_normalization(&shared.final_norm);
+    let prefix = |weight: &str| {
+        weight
+            .strip_suffix(".weight")
+            .expect("prediction shared weight")
+            .to_owned()
+    };
+    let hidden_prefix = prefix(
+        hidden_normalization
+            .gain
+            .as_deref()
+            .expect("learned hidden norm"),
+    );
+    let embedding_prefix = prefix(
+        embedding_normalization
+            .gain
+            .as_deref()
+            .expect("learned embedding norm"),
+    );
+    let final_prefix = prefix(
+        final_normalization
+            .gain
+            .as_deref()
+            .expect("learned final norm"),
+    );
+    let fusion_prefix = prefix(shared.fusion.weight.id.as_str());
+    let width = shared.fusion.output as usize;
     g.node(
         "prediction",
         ArchitectureNodeKind::Prediction,
@@ -33,28 +70,28 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &HybridConfig, target_ou
             &embedding,
             ArchitectureNodeKind::Embedding,
             Some(&root),
-            Some("model.embed_tokens"),
+            Some(embedding_weight_prefix),
             Some(width),
         );
         g.node(
             &embedding_norm,
             ArchitectureNodeKind::Normalization,
             Some(&root),
-            Some("mtp.pre_fc_norm_embedding"),
+            Some(&embedding_prefix),
             Some(width),
         );
         g.node(
             &hidden_norm,
             ArchitectureNodeKind::Normalization,
             Some(&root),
-            Some("mtp.pre_fc_norm_hidden"),
+            Some(&hidden_prefix),
             Some(width),
         );
         g.node(
             &fusion,
             ArchitectureNodeKind::Projector,
             Some(&root),
-            Some("mtp.fc"),
+            Some(&fusion_prefix),
             Some(width),
         );
         g.node(
@@ -152,18 +189,14 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &HybridConfig, target_ou
             &head_norm,
             ArchitectureNodeKind::Normalization,
             Some(&root),
-            Some("mtp.norm"),
+            Some(&final_prefix),
             Some(width),
         );
         g.node(
             &head,
             ArchitectureNodeKind::OutputHead,
             Some(&root),
-            Some(if c.tie_word_embeddings {
-                "model.embed_tokens"
-            } else {
-                "lm_head"
-            }),
+            Some(output_prefix),
             None,
         );
         g.edge(&output, &head_norm, ArchitectureEdgeKind::Data);
@@ -174,7 +207,7 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &HybridConfig, target_ou
             "Normalized prediction residual consumed by its own head",
             axes(width),
         );
-        let mut vocabulary = axes(c.vocab_size as usize);
+        let mut vocabulary = axes(readout.output as usize);
         vocabulary[2].name = "vocabulary".into();
         g.get_mut(&head).output_axes = Some(vocabulary.clone());
         g.component_observation(
@@ -184,13 +217,13 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &HybridConfig, target_ou
             vocabulary,
         );
 
-        let embedding_weight = "model.embed_tokens.weight".to_owned();
-        let fusion_weight = "mtp.fc.weight".to_owned();
+        let embedding_weight = embedding_slot.id.as_str().to_owned();
+        let fusion_weight = shared.fusion.weight.id.to_string();
         g.descriptor.component_scopes.push(ComponentExecutionScope {
             id: format!("prediction.{depth}"),
             node_id: root,
             execution_groups: vec![format!("mtp.{depth}")],
-            static_parameter_roles: if c.tie_word_embeddings {
+            static_parameter_roles: if tied {
                 vec!["embedding".into(), "mtp".into()]
             } else {
                 vec!["embedding".into(), "mtp".into(), "output".into()]
@@ -204,11 +237,11 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &HybridConfig, target_ou
                         source: ComponentFusionSource::TokenEmbedding {
                             normalization: None,
                             weight: embedding_weight.clone(),
-                            shared_weight: embedding_weight,
-                            parameter_group: "parameters:model.embed_tokens".into(),
+                            shared_weight: declared_shared_weight(embedding_slot).into(),
+                            parameter_group: format!("parameters:{embedding_weight_prefix}"),
                             scale: ComponentScalar::new(1.0),
                         },
-                        normalization: normalization(c, "mtp.pre_fc_norm_embedding.weight".into()),
+                        normalization: embedding_normalization.clone(),
                         output: format!("{path}.prediction.embedding.normalized.effective"),
                         columns: 0..width,
                     },
@@ -216,14 +249,14 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &HybridConfig, target_ou
                         source: ComponentFusionSource::Observation {
                             path: format!("{path}.prediction.hidden"),
                         },
-                        normalization: normalization(c, "mtp.pre_fc_norm_hidden.weight".into()),
+                        normalization: hidden_normalization.clone(),
                         output: format!("{path}.prediction.hidden.normalized.effective"),
                         columns: width..width * 2,
                     },
                 ],
                 weight: fusion_weight.clone(),
-                shared_weight: fusion_weight,
-                parameter_group: "parameters:mtp.fc".into(),
+                shared_weight: declared_shared_weight(&shared.fusion.weight).into(),
+                parameter_group: format!("parameters:{fusion_prefix}"),
                 bias: None,
                 projection_input: format!("{path}.prediction.fusion.input"),
                 output: format!("{path}.prediction.fusion.output"),
@@ -239,14 +272,9 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &HybridConfig, target_ou
                 projection_input: Some(format!("{path}.prediction.readout.projection_input")),
                 linear_scores: format!("{path}.prediction.readout.linear"),
                 logits: format!("{path}.prediction.readout.linear.effective"),
-                normalization: normalization(c, "mtp.norm.weight".into()),
-                weight: if c.tie_word_embeddings {
-                    "model.embed_tokens.weight"
-                } else {
-                    "lm_head.weight"
-                }
-                .into(),
-                bias: None,
+                normalization: final_normalization.clone(),
+                weight: readout.weight.id.as_str().into(),
+                bias: readout.bias.as_ref().map(|bias| bias.id.as_str().into()),
                 output_transform: ComponentOutputTransform::Identity,
                 block_normalizations: vec![],
                 other_writes: if c.is_moe() {

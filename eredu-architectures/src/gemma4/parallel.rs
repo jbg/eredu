@@ -1,16 +1,13 @@
 //! Semantic parameter placement for Gemma 4 components.
 
-use eredu_nn::{AttentionStateSource, AttentionValueSource, VocabularyParallelRange};
+use eredu_nn::VocabularyParallelRange;
 use eredu_runtime::{
-    expand_linear_format_parameter_groups, ArchitecturePartition, LocalModelLayout, MemberSharding,
-    ParallelPlanError, ParameterGroupSpec, ParameterMemberSpec, ParameterRole, PartitionOwnership,
-    StateLayout, TensorPlacement,
+    ArchitecturePartition, LocalModelLayout, MemberSharding, ParallelPlanError, ParameterGroupSpec,
+    ParameterRole, PartitionOwnership, StateLayout, TensorPlacement,
 };
 use std::ops::Range;
 
-use crate::linear_format::standard_parallel_linear_format;
-
-use super::{state_layout, FamilyConfig, FeedForwardPolicy, ModelArgs};
+use super::{FamilyConfig, FeedForwardPolicy, ModelArgs};
 
 /// Declares pinned Gemma vision modules as one atomic replicated group.
 pub fn vision_static_parameter_groups(
@@ -28,53 +25,25 @@ pub fn vision_layer_parameter_groups(
 }
 
 fn audio_parameter_groups(
-    config: &super::AudioConfig,
-    text_hidden: i32,
     logical_name: &str,
-    layers: Range<usize>,
-    include: impl Fn(&str) -> bool,
+    spec: &impl eredu_nn::DeclareLogicalParameters,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    config
-        .validate()
-        .map_err(|e| ParallelPlanError::InvalidGroup(e.to_string()))?;
-    let parameters = super::audio::parameters::declaration(config, text_hidden as usize, layers)
-        .map_err(ParallelPlanError::InvalidGroup)?;
-    let members: Vec<_> = parameters
-        .into_iter()
-        .filter(|p| include(&p.name) && (!p.optional || config.output_projection_bias))
-        .map(|p| ParameterMemberSpec::new(p.name, p.shape, MemberSharding::Replicated))
-        .collect();
-    expand_linear_format_parameter_groups(
-        vec![ParameterGroupSpec::new(
-            logical_name,
-            ParameterRole::Replicated,
-            members,
-        )?],
-        |member| {
-            let format = if member.global_shape().len() == 2 && member.target().ends_with(".weight")
-            {
-                config.linear_format_for(member.target(), member.global_shape()[1] as i32)
-            } else {
-                eredu_checkpoint::LinearFormat::Dense
-            };
-            standard_parallel_linear_format(member, format)
-        },
-    )
+    Ok(vec![eredu_runtime::logical_parameter_group(
+        logical_name,
+        ParameterRole::Replicated,
+        None,
+        spec,
+        |_| MemberSharding::Replicated,
+    )?])
 }
 
 /// Declares pinned audio subsampling and output projection storage.
 pub fn audio_static_parameter_groups(
     config: &super::AudioConfig,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    audio_parameter_groups(
-        config,
-        config.hidden_size,
-        "model.audio_tower.static",
-        0..0,
-        |name| {
-            name.starts_with("model.audio_tower.") && !name.starts_with("model.audio_tower.layers.")
-        },
-    )
+    let spec = config.pinned();
+    let selected = spec.selected();
+    audio_parameter_groups(&spec.root, &selected)
 }
 
 /// Declares one independently leased Gemma audio layer.
@@ -82,46 +51,10 @@ pub fn audio_layer_parameter_groups(
     config: &super::AudioConfig,
     index: usize,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    if index >= config.num_hidden_layers as usize {
-        return Err(ParallelPlanError::InvalidGroup(
-            "Gemma audio layer outside declared stack".into(),
-        ));
-    }
-    let prefix = format!("model.audio_tower.layers.{index}");
-    audio_parameter_groups(
-        config,
-        config.hidden_size,
-        &prefix,
-        index..index + 1,
-        |name| name.starts_with(&format!("{prefix}.")),
-    )
-}
-
-/// Declares one media-to-decoder projection with its admitted physical encoding.
-pub fn modality_projection_parameter_groups(
-    logical_name: impl Into<String>,
-    component: &str,
-    input: i32,
-    output: i32,
-    format: eredu_checkpoint::LinearFormat,
-) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    if input <= 0 || output <= 0 {
-        return Err(ParallelPlanError::InvalidGroup(
-            "Gemma projector dimensions must be positive".into(),
-        ));
-    }
-    expand_linear_format_parameter_groups(
-        vec![ParameterGroupSpec::new(
-            logical_name,
-            ParameterRole::Replicated,
-            vec![ParameterMemberSpec::new(
-                format!("model.{component}.embedding_projection.weight"),
-                vec![output as usize, input as usize],
-                MemberSharding::Replicated,
-            )],
-        )?],
-        |member| standard_parallel_linear_format(member, format),
-    )
+    let spec = config
+        .layer(index)
+        .map_err(|e| ParallelPlanError::InvalidGroup(e.to_string()))?;
+    audio_parameter_groups(&spec.root, spec)
 }
 
 /// Complete planner-derived construction and state geometry for one Gemma 4 rank.
@@ -491,9 +424,8 @@ impl LocalGeometry {
             (true, Some(_)) => return Err(invalid("tied Gemma 4 output has a separate range")),
             (false, None) => return Err(invalid("untied Gemma 4 output has no local range")),
         }
-        let local_text =
-            aggregate_local_text(&args.text, &self.text_blocks, self.per_layer_width())?;
-        let expected = state_layout(&local_text).map_err(|error| invalid(error.to_string()))?;
+        let expected = super::graph::local_state_layout(args, &self.text_blocks)
+            .map_err(|error| invalid(error.to_string()))?;
         if expected != self.state_layout {
             return Err(invalid(
                 "rank-local Gemma 4 state layout drifted from decoder geometry",
@@ -501,32 +433,6 @@ impl LocalGeometry {
         }
         Ok(())
     }
-}
-
-fn aggregate_local_text(
-    global: &ModelArgs,
-    blocks: &[ModelArgs],
-    per_layer_width: i32,
-) -> Result<ModelArgs, ParallelPlanError> {
-    let mut local = blocks
-        .first()
-        .cloned()
-        .ok_or_else(|| invalid("Gemma 4 local geometry has no text blocks"))?;
-    local.layer_schedule = eredu_core::LayerSchedule::new(
-        blocks.len(),
-        blocks
-            .iter()
-            .enumerate()
-            .map(|(layer, args)| {
-                args.layer_policy(layer)
-                    .ok_or_else(|| invalid(format!("missing local Gemma 4 layer policy {layer}")))
-            })
-            .collect::<Result<Vec<_>, _>>()?,
-    )
-    .map_err(|error| invalid(error.to_string()))?;
-    local.hidden_size_per_layer_input = per_layer_width;
-    local.vocab_size = global.vocab_size;
-    Ok(local)
 }
 
 fn local_per_layer_range(
@@ -558,7 +464,7 @@ fn local_per_layer_range(
             placement => {
                 return Err(ParallelPlanError::InvalidTensor(format!(
                     "Gemma 4 media-channel member {target} has invalid placement {placement:?}"
-                )))
+                )));
             }
         };
         if selected.as_ref().is_some_and(|current| current != &range) {
@@ -589,23 +495,38 @@ pub fn local_geometry(
     args.validate()
         .map_err(|error| invalid(error.to_string()))?;
     let text_blocks = (0..args.text.num_hidden_layers())
-        .map(|layer| local_block_args(&args.text, layer, layout))
+        .map(|layer| local_block_args(args, layer, layout))
         .collect::<Result<Vec<_>, _>>()?;
+    for (layer, local) in text_blocks.iter().enumerate() {
+        if let Some(scope) = args.routed(layer).map_err(|e| invalid(e.to_string()))? {
+            scope
+                .for_invocation(local, layer, None)
+                .map_err(|e| invalid(e.to_string()))?;
+        }
+        let width = local
+            .layer_policy(layer)
+            .ok_or_else(|| invalid("dense layer outside local schedule"))?
+            .intermediate_size
+            .get() as i32;
+        args.dense(layer)
+            .and_then(|spec| spec.clone().with_intermediate(width))
+            .map_err(|e| invalid(e.to_string()))?;
+        args.block(layer)
+            .and_then(|spec| {
+                spec.clone()
+                    .with_input_width(local.hidden_size_per_layer_input)
+            })
+            .map_err(|e| invalid(e.to_string()))?;
+    }
     let per_layer_range = local_per_layer_range(&args.text, layout, &text_blocks)?;
-    let local_text = aggregate_local_text(
-        &args.text,
-        &text_blocks,
-        per_layer_range.end - per_layer_range.start,
+    let state_layout = super::graph::local_state_layout(args, &text_blocks)
+        .map_err(|error| invalid(error.to_string()))?;
+    let (embedding_range, output_range) = args.pinned().ordinary.vocabulary_ranges(
+        layout,
+        "model.language_model.embed_tokens",
+        "model.language_model.norm",
+        "lm_head",
     )?;
-    let state_layout = state_layout(&local_text).map_err(|error| invalid(error.to_string()))?;
-    let (embedding_range, output_range) = super::static_construction_specs(&args.text)
-        .map_err(|error| invalid(error.to_string()))?
-        .vocabulary_ranges(
-            layout,
-            "model.language_model.embed_tokens",
-            "model.language_model.norm",
-            "lm_head",
-        )?;
     let geometry = LocalGeometry {
         text_blocks,
         embedding_range,
@@ -689,7 +610,7 @@ fn partition_local_geometry_impl(
             other => {
                 return Err(invalid(format!(
                     "unknown Gemma 4 partition group {other:?}"
-                )))
+                )));
             }
         };
         if slot.replace(range).is_some() {
@@ -732,11 +653,26 @@ fn partition_local_geometry_impl(
 
 /// Derives one Gemma 4 decoder block's rank-local construction geometry.
 pub fn local_block_args(
-    args: &ModelArgs,
+    config: &FamilyConfig,
     layer: usize,
     layout: &eredu_runtime::LocalModelLayout,
 ) -> Result<ModelArgs, ParallelPlanError> {
-    local_block_args_at(args, layer, layout, "model.language_model.layers")
+    let owner = config
+        .text
+        .attention_state_owner(layer)
+        .map_err(|e| invalid(e.to_string()))?;
+    local_block_args_at(
+        &config.text,
+        layer,
+        layout,
+        "model.language_model.layers",
+        config
+            .attention(layer)
+            .map_err(|e| invalid(e.to_string()))?,
+        config
+            .attention(owner)
+            .map_err(|e| invalid(e.to_string()))?,
+    )
 }
 
 /// Derives shared block geometry under the owning architecture's logical root.
@@ -745,6 +681,8 @@ pub(crate) fn local_block_args_at(
     layer: usize,
     layout: &LocalModelLayout,
     layer_root: &str,
+    attention: &super::text::specs::AttentionSpec,
+    publisher: &super::text::specs::AttentionSpec,
 ) -> Result<ModelArgs, ParallelPlanError> {
     let policy = args
         .layer_policy(layer)
@@ -761,29 +699,32 @@ pub(crate) fn local_block_args_at(
             ParallelPlanError::InvalidTensor(format!("missing local layout for {root}.{suffix}"))
         })
     };
-    let query_width = local_axis(tensor("self_attn.q_proj")?, 0, "query width")?;
-    let head_dim = i32::try_from(policy.head_dim.get()).map_err(|_| {
-        ParallelPlanError::InvalidTensor("Gemma 4 head dimension exceeds i32".into())
-    })?;
+    let query = layout
+        .tensor(attention.query.weight.id.as_str())
+        .ok_or_else(|| {
+            invalid(format!(
+                "missing selected Gemma query {}",
+                attention.query.weight.id.as_str()
+            ))
+        })?;
+    let query_width = local_axis(query, 0, "query width")?;
+    let head_dim = attention.geometry.key_dimensions();
     if query_width % head_dim != 0 {
         return Err(ParallelPlanError::InvalidTensor(format!(
             "local Gemma 4 query width {query_width} splits head dimension {head_dim}"
         )));
     }
-    let kv_tensor = if policy.key_value.owns_state() {
-        Some(tensor("self_attn.k_proj")?)
-    } else {
-        (0..layer).rev().find_map(|owner| {
-            args.layer_policy(owner)
-                .filter(|candidate| {
-                    candidate.attention == policy.attention && candidate.key_value.publishes_state()
-                })
-                .and_then(|_| tensor_at(owner, "self_attn.k_proj"))
-        })
-    }
-    .ok_or_else(|| {
+    let owner = args
+        .attention_state_owner(layer)
+        .map_err(|error| ParallelPlanError::InvalidTensor(error.to_string()))?;
+    let key = publisher.key.as_ref().ok_or_else(|| {
+        invalid(format!(
+            "Gemma shared-KV publisher {owner} has no owned key declaration"
+        ))
+    })?;
+    let kv_tensor = layout.tensor(key.weight.id.as_str()).ok_or_else(|| {
         ParallelPlanError::InvalidTensor(format!(
-            "Gemma 4 shared-KV layer {layer} has no rank-local publisher"
+            "Gemma 4 shared-KV layer {layer} has no rank-local publisher {owner}"
         ))
     })?;
     let kv_width = local_axis(kv_tensor, 0, "key/value width")?;
@@ -856,7 +797,7 @@ fn local_axis(
 
 /// Declares pinned embeddings, final normalization, and vocabulary output.
 pub fn static_parameter_groups(
-    args: &ModelArgs,
+    args: &FamilyConfig,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
     Ok(pinned_parameter_groups(args)?
         .into_iter()
@@ -866,60 +807,47 @@ pub fn static_parameter_groups(
 
 /// Declares each pinned resource together with its canonical storage role.
 pub(crate) fn pinned_parameter_groups(
-    args: &ModelArgs,
+    args: &FamilyConfig,
 ) -> Result<Vec<(&'static str, ParameterGroupSpec)>, ParallelPlanError> {
-    let root = "model.language_model";
-    let hidden = dim(args.hidden_size)?;
-    let ordinary = super::static_construction_specs(args)
-        .map_err(|error| invalid(error.to_string()))?
-        .pinned_parameter_groups(
-            "model.language_model.embed_tokens",
-            "model.language_model.norm",
-            "lm_head",
-        )?;
+    let declaration = args.pinned();
+    let root = declaration.root();
+    let ordinary = declaration.ordinary.pinned_parameter_groups(
+        crate::decoder::ParameterEncoding::Stored,
+        "model.language_model.embed_tokens",
+        "model.language_model.norm",
+        "lm_head",
+    )?;
     let mut extra = Vec::new();
-    if args.hidden_size_per_layer_input > 0 {
-        let per_layer = dim(args.hidden_size_per_layer_input)?;
-        let combined = per_layer
-            .checked_mul(args.num_hidden_layers())
-            .ok_or_else(|| invalid("Gemma per-layer embedding width overflow"))?;
-        extra.push((
-            "per_layer_embedding",
-            replicated(
+    if let Some(spec) = &declaration.per_layer {
+        for (role, name, slot) in [
+            (
+                "per_layer_embedding",
                 format!("{root}.per_layer_embedding"),
-                [(
-                    format!("{root}.embed_tokens_per_layer.weight"),
-                    vec![
-                        dim(args.vocab_size_per_layer_input.unwrap_or(args.vocab_size))?,
-                        combined,
-                    ],
-                )],
-            )?,
-        ));
-        extra.push((
-            "per_layer_projection",
-            replicated(
+                &spec.embedding as &dyn eredu_nn::DeclareLogicalParameters,
+            ),
+            (
+                "per_layer_projection",
                 format!("{root}.per_layer_projection"),
-                [(
-                    format!("{root}.per_layer_model_projection.weight"),
-                    vec![combined, hidden],
-                )],
-            )?,
-        ));
-        extra.push((
-            "per_layer_norm",
-            replicated(
+                &spec.projection,
+            ),
+            (
+                "per_layer_norm",
                 format!("{root}.per_layer_projection_norm"),
-                [(
-                    format!("{root}.per_layer_projection_norm.weight"),
-                    vec![per_layer],
-                )],
-            )?,
-        ));
+                &spec.norm,
+            ),
+        ] {
+            extra.push((
+                role,
+                eredu_runtime::logical_parameter_group(
+                    name,
+                    ParameterRole::Replicated,
+                    None,
+                    slot,
+                    |_| MemberSharding::Replicated,
+                )?,
+            ));
+        }
     }
-    let extra = eredu_runtime::expand_tagged_linear_format_parameter_groups(extra, |member| {
-        standard_parallel_linear_format(member, args.linear_format_for(member.target()))
-    })?;
     let mut extra = extra.into_iter();
     let mut groups = Vec::new();
     for (role, group) in ordinary {
@@ -933,10 +861,20 @@ pub(crate) fn pinned_parameter_groups(
 
 /// Declares one decoder layer's head, MLP, expert, media, and replicated groups.
 pub fn layer_parameter_groups(
-    args: &ModelArgs,
+    config: &FamilyConfig,
     layer: usize,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    layer_parameter_groups_at(args, layer, "model.language_model.layers")
+    layer_parameter_groups_at(
+        &config.text,
+        layer,
+        "model.language_model.layers",
+        config.block(layer).map_err(|e| invalid(e.to_string()))?,
+        config.dense(layer).map_err(|e| invalid(e.to_string()))?,
+        config
+            .attention(layer)
+            .map_err(|e| invalid(e.to_string()))?,
+        config.routed(layer).map_err(|e| invalid(e.to_string()))?,
+    )
 }
 
 /// Declares shared block placement under an architecture-owned logical root.
@@ -944,262 +882,62 @@ pub(crate) fn layer_parameter_groups_at(
     args: &ModelArgs,
     layer: usize,
     layer_root: &str,
+    block_spec: &super::text::specs::BlockSpec,
+    dense_spec: &super::text::specs::DenseSpec,
+    attention_spec: &super::text::specs::AttentionSpec,
+    routed: Option<&super::text::routed::Declaration>,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    let policy = args
-        .layer_policy(layer)
+    args.layer_policy(layer)
         .ok_or_else(|| invalid(format!("Gemma 4 layer {layer} is out of range")))?;
     let root = format!("{layer_root}.{layer}");
     let attention = format!("{root}.self_attn");
-    let hidden = dim(args.hidden_size)?;
-    let head_dim = dim(policy.head_dim.get() as i32)?;
-    let query_heads = dim(args.num_attention_heads)?;
-    let kv_heads = dim(policy.num_key_value_heads.get() as i32)?;
-    let query_width = query_heads
-        .checked_mul(head_dim)
-        .ok_or_else(|| invalid("Gemma query width overflow"))?;
-    let kv_width = kv_heads
-        .checked_mul(head_dim)
-        .ok_or_else(|| invalid("Gemma KV width overflow"))?;
-    let mut query_members = vec![
-        member(
-            format!("{attention}.q_proj.weight"),
-            vec![query_width, hidden],
-            MemberSharding::Partitioned { axis: 0 },
-        ),
-        member(
-            format!("{attention}.o_proj.weight"),
-            vec![hidden, query_width],
-            MemberSharding::Partitioned { axis: 1 },
-        ),
-    ];
-    if args.attention_bias {
-        query_members.extend([
-            member(
-                format!("{attention}.q_proj.bias"),
-                vec![query_width],
-                MemberSharding::Partitioned { axis: 0 },
-            ),
-            member(
-                format!("{attention}.o_proj.bias"),
-                vec![hidden],
-                MemberSharding::Replicated,
-            ),
-        ]);
+    let mut groups = attention_spec
+        .parameter_groups(&attention)
+        .map_err(|e| invalid(e.to_string()))?;
+    groups.push(
+        dense_spec
+            .parameter_group(&format!("{root}.mlp"))
+            .map_err(|e| invalid(e.to_string()))?,
+    );
+    if let Some(spec) = &routed {
+        groups.extend(
+            spec.parameter_groups(&root)
+                .map_err(|error| invalid(error.to_string()))?,
+        );
     }
-    let mut groups = vec![ParameterGroupSpec::partitioned(
-        format!("{attention}.query_heads"),
-        ParameterRole::AttentionHeads,
-        query_heads,
-        query_members,
-    )?];
-    if policy.key_value != AttentionStateSource::Shared {
-        let mut kv_members = vec![member(
-            format!("{attention}.k_proj.weight"),
-            vec![kv_width, hidden],
-            MemberSharding::Partitioned { axis: 0 },
-        )];
-        if policy.key_value.value() == Some(AttentionValueSource::Projected) {
-            kv_members.push(member(
-                format!("{attention}.v_proj.weight"),
-                vec![kv_width, hidden],
-                MemberSharding::Partitioned { axis: 0 },
-            ));
-        }
-        if args.attention_bias {
-            kv_members.push(member(
-                format!("{attention}.k_proj.bias"),
-                vec![kv_width],
-                MemberSharding::Partitioned { axis: 0 },
-            ));
-            if policy.key_value.value() == Some(AttentionValueSource::Projected) {
-                kv_members.push(member(
-                    format!("{attention}.v_proj.bias"),
-                    vec![kv_width],
-                    MemberSharding::Partitioned { axis: 0 },
-                ));
-            }
-        }
-        groups.push(ParameterGroupSpec::partitioned(
-            format!("{attention}.key_value_heads"),
-            ParameterRole::AttentionHeads,
-            kv_heads,
-            kv_members,
-        )?);
+    if let Some(spec) = &block_spec.per_layer {
+        groups.push(
+            spec.parameter_group(&root)
+                .map_err(|e| invalid(e.to_string()))?,
+        );
     }
-    groups.push(replicated(
-        format!("{attention}.head_norms"),
-        std::iter::once((format!("{attention}.q_norm.weight"), vec![head_dim])).chain(
-            (policy.key_value != AttentionStateSource::Shared)
-                .then(|| (format!("{attention}.k_norm.weight"), vec![head_dim])),
-        ),
-    )?);
-    let intermediate = dim(policy.intermediate_size.get() as i32)?;
-    groups.push(ParameterGroupSpec::partitioned(
-        format!("{root}.mlp.intermediate"),
-        ParameterRole::FeedForwardIntermediate,
-        intermediate,
-        [
-            member(
-                format!("{root}.mlp.gate_proj.weight"),
-                vec![intermediate, hidden],
-                MemberSharding::Partitioned { axis: 0 },
-            ),
-            member(
-                format!("{root}.mlp.up_proj.weight"),
-                vec![intermediate, hidden],
-                MemberSharding::Partitioned { axis: 0 },
-            ),
-            member(
-                format!("{root}.mlp.down_proj.weight"),
-                vec![hidden, intermediate],
-                MemberSharding::Partitioned { axis: 1 },
-            ),
-        ],
-    )?);
-    if policy.feed_forward == FeedForwardPolicy::DenseWithSparseMoe {
-        let experts = dim(args
-            .num_experts
-            .ok_or_else(|| invalid("Gemma sparse layer has no expert count"))?)?;
-        let expert_width = dim(args
-            .moe_intermediate_size
-            .ok_or_else(|| invalid("Gemma sparse layer has no expert width"))?)?;
-        let expert_root = format!("{root}.experts.switch_glu");
-        groups.push(ParameterGroupSpec::partitioned(
-            format!("{expert_root}.intermediate"),
-            ParameterRole::ExpertIntermediate,
-            expert_width,
-            [
-                member(
-                    format!("{expert_root}.gate_up_proj"),
-                    vec![experts, 2 * expert_width, hidden],
-                    MemberSharding::PartitionedSegments {
-                        axis: 1,
-                        segments: vec![0..expert_width, expert_width..2 * expert_width],
-                    },
-                ),
-                member(
-                    format!("{expert_root}.down_proj"),
-                    vec![experts, hidden, expert_width],
-                    MemberSharding::Partitioned { axis: 2 },
-                ),
-            ],
-        )?);
-        groups.push(replicated(
-            format!("{root}.router"),
-            [
-                (format!("{root}.router.proj.weight"), vec![experts, hidden]),
-                (format!("{root}.router.scale"), vec![hidden]),
-                (format!("{root}.router.per_expert_scale"), vec![experts]),
-            ],
-        )?);
+    use eredu_nn::DeclareLogicalParameters;
+    let mut replicated_members = block_spec
+        .replicated_parameters()
+        .map_err(|e| invalid(e.to_string()))?;
+    if let Some(spec) = &routed {
+        use eredu_nn::DeclareLogicalParameters;
+        replicated_members.extend(
+            spec.norms[..]
+                .logical_parameters()
+                .map_err(|error| invalid(error.to_string()))?,
+        );
     }
-    if args.hidden_size_per_layer_input > 0 {
-        let media = dim(args.hidden_size_per_layer_input)?;
-        groups.push(ParameterGroupSpec::partitioned(
-            format!("{root}.media_channels"),
-            ParameterRole::Channels,
-            media,
-            [
-                member(
-                    format!("{root}.per_layer_input_gate.weight"),
-                    vec![media, hidden],
-                    MemberSharding::Partitioned { axis: 0 },
-                ),
-                member(
-                    format!("{root}.per_layer_projection.weight"),
-                    vec![hidden, media],
-                    MemberSharding::Partitioned { axis: 1 },
-                ),
-            ],
-        )?);
+    if let Some(spec) = &block_spec.per_layer {
+        replicated_members.extend(
+            spec.norm
+                .logical_parameters()
+                .map_err(|e| invalid(e.to_string()))?,
+        );
     }
-    let mut replicated_members = vec![
-        (format!("{root}.input_layernorm.weight"), vec![hidden]),
-        (
-            format!("{root}.post_attention_layernorm.weight"),
-            vec![hidden],
-        ),
-        (
-            format!("{root}.pre_feedforward_layernorm.weight"),
-            vec![hidden],
-        ),
-        (
-            format!("{root}.post_feedforward_layernorm.weight"),
-            vec![hidden],
-        ),
-        (format!("{root}.layer_scalar"), vec![1]),
-    ];
-    if policy.feed_forward == FeedForwardPolicy::DenseWithSparseMoe {
-        replicated_members.extend([
-            (
-                format!("{root}.post_feedforward_layernorm_1.weight"),
-                vec![hidden],
-            ),
-            (
-                format!("{root}.pre_feedforward_layernorm_2.weight"),
-                vec![hidden],
-            ),
-            (
-                format!("{root}.post_feedforward_layernorm_2.weight"),
-                vec![hidden],
-            ),
-        ]);
-    }
-    if args.hidden_size_per_layer_input > 0 {
-        replicated_members.push((
-            format!("{root}.post_per_layer_input_norm.weight"),
-            vec![hidden],
-        ));
-    }
-    groups.push(replicated(
+    groups.push(eredu_runtime::logical_parameter_group(
         format!("{root}.replicated"),
-        replicated_members,
-    )?);
-    expand_linear_format_parameter_groups(groups, |member| {
-        standard_parallel_linear_format(member, args.linear_format_for(member.target()))
-    })
-}
-
-fn group(
-    name: impl Into<String>,
-    role: ParameterRole,
-    members: impl IntoIterator<Item = (String, Vec<usize>, MemberSharding)>,
-) -> Result<ParameterGroupSpec, ParallelPlanError> {
-    ParameterGroupSpec::new(
-        name,
-        role,
-        members
-            .into_iter()
-            .map(|(name, shape, sharding)| member(name, shape, sharding)),
-    )
-}
-
-fn replicated(
-    name: impl Into<String>,
-    members: impl IntoIterator<Item = (String, Vec<usize>)>,
-) -> Result<ParameterGroupSpec, ParallelPlanError> {
-    group(
-        name,
         ParameterRole::Replicated,
-        members
-            .into_iter()
-            .map(|(name, shape)| (name, shape, MemberSharding::Replicated)),
-    )
-}
-
-fn member(
-    name: impl Into<String>,
-    shape: Vec<usize>,
-    sharding: MemberSharding,
-) -> ParameterMemberSpec {
-    ParameterMemberSpec::new(name, shape, sharding)
-}
-
-fn dim(value: i32) -> Result<usize, ParallelPlanError> {
-    usize::try_from(value)
-        .ok()
-        .filter(|value| *value > 0)
-        .ok_or_else(|| invalid(format!("invalid Gemma dimension {value}")))
+        None,
+        &replicated_members,
+        |_| MemberSharding::Replicated,
+    )?);
+    Ok(groups)
 }
 
 fn invalid(message: impl Into<String>) -> ParallelPlanError {

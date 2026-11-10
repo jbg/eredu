@@ -1,9 +1,9 @@
 //! Nemotron-H dense and routed ReLU-squared feed-forward operators.
 
 use eredu_nn::{
-    Error, GroupScoring, GroupSelectionOperator, GroupedNeuralBackend, GroupedRelu2Spec,
-    LinearSpec, NeuralBackend, ParameterSpec, Parameterized, Tensor, TopKGroupSelectionSpec,
-    TopKGroupSelectorSpec,
+    DeclareLogicalParameters, Error, GroupScoring, GroupSelectionOperator, GroupedNeuralBackend,
+    GroupedRelu2Spec, LogicalParameterDeclaration, NeuralBackend, ParameterSpec, Parameterized,
+    Tensor, TopKGroupSelectionSpec, TopKGroupSelectorSpec,
 };
 use eredu_runtime::{
     ParameterProvider, ResidentExpertProvider, RoutedExpertRequest, TensorParallelParameterProvider,
@@ -13,6 +13,68 @@ use crate::linear_format::standard_expert_projection;
 
 use super::ModelArgs;
 
+/// Complete dense or shared ReLU-squared branch at global or local width.
+#[derive(Debug, Clone)]
+pub(crate) struct DenseParameters {
+    pub network: eredu_nn::UnaryFeedForwardSpec,
+}
+
+impl DenseParameters {
+    pub fn new(args: &ModelArgs, prefix: &str, intermediate: i32) -> Result<Self, Error> {
+        let up = super::attention::linear_spec(
+            args,
+            &format!("{prefix}.up_proj"),
+            args.hidden_size,
+            intermediate,
+            args.mlp_bias,
+        )?;
+        let mut down = super::attention::linear_spec(
+            args,
+            &format!("{prefix}.down_proj"),
+            intermediate,
+            args.hidden_size,
+            args.mlp_bias,
+        )?;
+        down.format = down.format.with_exact_zero_inputs();
+        let spec = Self {
+            network: eredu_nn::UnaryFeedForwardSpec::new(
+                up,
+                down,
+                eredu_nn::UnaryActivation::ReluSquared,
+            )?,
+        };
+        eredu_nn::validate_logical_parameter_topology(&spec.logical_parameters()?)
+            .map_err(Error::backend_source)?;
+        Ok(spec)
+    }
+
+    pub(crate) fn construct<B: NeuralBackend>(
+        self,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<DenseMlp<B>, Error> {
+        self.logical_parameters()?;
+        Ok(DenseMlp {
+            up_proj: B::linear(self.network.up, context)?,
+            down_proj: B::linear(self.network.down, context)?,
+            activation: self.network.activation,
+        })
+    }
+}
+
+impl DeclareLogicalParameters for DenseParameters {
+    fn logical_parameters(&self) -> Result<Vec<LogicalParameterDeclaration<'_>>, Error> {
+        if self.network.up.input != self.network.down.output
+            || self.network.activation != eredu_nn::UnaryActivation::ReluSquared
+            || !self.network.down.format.exact_zero_inputs()
+        {
+            return Err(Error::backend(
+                "incompatible Nemotron dense residual geometry or ReLU-squared policy",
+            ));
+        }
+        self.network.logical_parameters()
+    }
+}
+
 /// Dense up/ReLU²/down projection pair.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
@@ -21,49 +83,11 @@ pub struct DenseMlp<B: NeuralBackend> {
     pub up_proj: B::Linear,
     /// Down projection.
     pub down_proj: B::Linear,
+    #[parameter(skip)]
+    activation: eredu_nn::UnaryActivation,
 }
 
 impl<B: NeuralBackend> DenseMlp<B> {
-    /// Builds one unloaded dense MLP.
-    pub fn new(
-        args: &ModelArgs,
-        prefix: &str,
-        intermediate: i32,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        let linear = |field: &str, input, output| {
-            let weight = format!("{prefix}.{field}.weight");
-            B::linear(
-                LinearSpec {
-                    input,
-                    output,
-                    weight: ParameterSpec::trainable(&weight).map_err(Error::backend)?,
-                    bias: args
-                        .mlp_bias
-                        .then(|| ParameterSpec::trainable(format!("{prefix}.{field}.bias")))
-                        .transpose()
-                        .map_err(Error::backend)?,
-                    format: {
-                        let format = crate::linear_format::standard_linear_format(
-                            &weight,
-                            args.weight_quantization_for(&weight).into(),
-                        )?;
-                        if field == "down_proj" {
-                            format.with_exact_zero_inputs()
-                        } else {
-                            format
-                        }
-                    },
-                },
-                context,
-            )
-        };
-        Ok(Self {
-            up_proj: linear("up_proj", args.hidden_size, intermediate)?,
-            down_proj: linear("down_proj", intermediate, args.hidden_size)?,
-        })
-    }
-
     /// Executes replicated dense computation.
     pub fn forward(
         &mut self,
@@ -90,7 +114,7 @@ impl<B: NeuralBackend> DenseMlp<B> {
             input,
             &mut self.up_proj,
             &mut self.down_proj,
-            crate::decoder::unary::Activation::ReluSquared,
+            self.activation,
             parallel,
             context,
             instrumentation,
@@ -115,6 +139,100 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DenseMlp<B> {
     }
 }
 
+/// Complete typed sparse-unit construction scope, independent of provider residency.
+#[derive(Debug, Clone)]
+pub(crate) struct SparseMoeSpec {
+    pub(crate) selector: TopKGroupSelectorSpec,
+    pub(crate) experts: GroupedRelu2Spec,
+    pub(crate) shared: DenseParameters,
+}
+
+impl DeclareLogicalParameters for SparseMoeSpec {
+    fn logical_parameters(&self) -> Result<Vec<LogicalParameterDeclaration<'_>>, Error> {
+        let hidden = self.experts.hidden_dimensions();
+        if self.selector.input_dimensions() != hidden
+            || self.shared.network.up.input != hidden
+            || self.shared.network.down.output != hidden
+            || self.experts.group_count() > self.selector.selection().group_count()
+        {
+            return Err(Error::backend(
+                "incompatible Nemotron routed/shared geometry",
+            ));
+        }
+        let mut parameters = self.selector.logical_parameters()?;
+        parameters.extend(self.experts.logical_parameters()?);
+        parameters.extend(self.shared.logical_parameters()?);
+        eredu_nn::validate_logical_parameter_topology(&parameters)
+            .map_err(Error::backend_source)?;
+        Ok(parameters)
+    }
+}
+
+impl SparseMoeSpec {
+    /// Canonical target or appended prediction ownership, independent of invocation state.
+    pub(crate) fn for_layer(args: &ModelArgs, identity: usize) -> Result<Self, Error> {
+        args.validate().map_err(Error::backend_source)?;
+        let target = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
+        let (policy, prefix) = if identity < target {
+            let policy = args
+                .layer_schedule
+                .get(identity)
+                .copied()
+                .ok_or_else(|| Error::backend(format!("Nemotron-H has no layer {identity}")))?;
+            (policy, format!("model.layers.{identity}.moe"))
+        } else {
+            let physical = identity - target;
+            let policies = args.mtp_policies().map_err(Error::backend)?;
+            let policy = policies.get(physical).copied().ok_or_else(|| {
+                Error::backend(format!("Nemotron-H has no appended MTP layer {physical}"))
+            })?;
+            (policy, format!("model.mtp.layers.{physical}.mixer"))
+        };
+        if policy != super::LayerPolicy::SparseMoe {
+            return Err(Error::backend(format!(
+                "Nemotron-H layer {identity} is not a sparse expert unit"
+            )));
+        }
+        Self::at(args, &prefix)
+    }
+
+    /// Complete slots beneath an explicit architecture-owned source or construction root.
+    pub(crate) fn at(args: &ModelArgs, prefix: &str) -> Result<Self, Error> {
+        let spec = Self {
+            selector: selector_spec(args, prefix)?,
+            experts: expert_bank_spec_at(args, &format!("{prefix}.experts"))?,
+            shared: DenseParameters::new(
+                args,
+                &format!("{prefix}.shared_experts"),
+                args.moe_shared_expert_intermediate_size,
+            )?,
+        };
+        spec.logical_parameters()?;
+        Ok(spec)
+    }
+
+    /// Local routed and shared channels retain the global selector and exact parameter slots.
+    pub(crate) fn with_local_geometry(
+        mut self,
+        experts: GroupedRelu2Spec,
+        shared_intermediate: i32,
+    ) -> Result<Self, Error> {
+        if experts.intermediate_dimensions() > self.experts.intermediate_dimensions()
+            || shared_intermediate <= 0
+            || shared_intermediate > self.shared.network.up.output
+        {
+            return Err(Error::backend(
+                "local Nemotron expert widths exceed their declarations",
+            ));
+        }
+        self.experts = experts;
+        self.shared.network.up.output = shared_intermediate;
+        self.shared.network.down.input = shared_intermediate;
+        self.logical_parameters()?;
+        Ok(self)
+    }
+}
+
 /// Grouped sigmoid selection: routing, packed ReLU² experts, and one shared expert.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
@@ -132,64 +250,20 @@ pub struct SparseMoe<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBacken
 }
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> {
-    /// Builds one unloaded sparse unit at placement-resolved widths.
-    pub fn new(
-        args: &ModelArgs,
+    pub(crate) fn from_spec(
         layer: usize,
-        routed_intermediate: i32,
-        shared_intermediate: i32,
+        spec: SparseMoeSpec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        Self::new_at(
-            args,
-            layer,
-            &format!("model.layers.{layer}.moe"),
-            routed_intermediate,
-            shared_intermediate,
-            context,
-        )
-    }
-
-    /// Builds one sparse unit at an explicit target or MTP parameter path.
-    pub fn new_at(
-        args: &ModelArgs,
-        layer: usize,
-        prefix: &str,
-        routed_intermediate: i32,
-        shared_intermediate: i32,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        let spec = expert_bank_spec_at(
-            args,
-            &format!("{prefix}.experts"),
-            args.n_routed_experts,
-            routed_intermediate,
-        )?;
-        Self::new_at_with_spec(args, layer, prefix, spec, shared_intermediate, context)
-    }
-
-    pub(crate) fn new_at_with_spec(
-        args: &ModelArgs,
-        layer: usize,
-        prefix: &str,
-        spec: GroupedRelu2Spec,
-        shared_intermediate: i32,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        let selector = selector_spec(args, prefix)?;
-        let gate = B::top_k_group_selector(selector, context)?;
-        let experts = B::grouped_relu2(spec, context)?;
+        spec.logical_parameters()?;
+        let gate = B::top_k_group_selector(spec.selector, context)?;
+        let experts = B::grouped_relu2(spec.experts, context)?;
         Ok(Self {
             layer,
             resident_unit_coordinates: None,
             gate,
             experts,
-            shared_experts: DenseMlp::new(
-                args,
-                &format!("{prefix}.shared_experts"),
-                shared_intermediate,
-                context,
-            )?,
+            shared_experts: spec.shared.construct::<B>(context)?,
         })
     }
 
@@ -451,10 +525,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
 }
 
 /// Declares the sigmoid router and correction-bias resources at one canonical path.
-pub(crate) fn selector_spec(
-    args: &ModelArgs,
-    prefix: &str,
-) -> Result<TopKGroupSelectorSpec, Error> {
+fn selector_spec(args: &ModelArgs, prefix: &str) -> Result<TopKGroupSelectorSpec, Error> {
     let gate_weight = format!("{prefix}.gate.weight");
     let routing = TopKGroupSelectionSpec::new(
         args.n_routed_experts,
@@ -479,70 +550,24 @@ pub(crate) fn selector_spec(
     )
 }
 
-fn expert_bank_spec_at(
-    args: &ModelArgs,
-    experts_prefix: &str,
-    expert_count: i32,
-    intermediate_dimensions: i32,
-) -> Result<GroupedRelu2Spec, Error> {
+fn expert_bank_spec_at(args: &ModelArgs, experts_prefix: &str) -> Result<GroupedRelu2Spec, Error> {
     let up_name = format!("{experts_prefix}.up_proj");
     let down_name = format!("{experts_prefix}.down_proj");
     GroupedRelu2Spec::new(
-        expert_count,
+        args.n_routed_experts,
         args.hidden_size,
-        intermediate_dimensions,
+        args.moe_intermediate_size,
         standard_expert_projection(
             &up_name,
             None,
             args.weight_quantization_for(&up_name).into(),
+            eredu_nn::LinearRowLayout::Contiguous,
         )?,
         standard_expert_projection(
             &down_name,
             None,
             args.weight_quantization_for(&down_name).into(),
+            eredu_nn::LinearRowLayout::Contiguous,
         )?,
     )
-}
-
-/// Returns the architecture-owned ReLU-squared expert specification for one
-/// target or appended MTP layer.
-pub fn expert_bank_spec(args: &ModelArgs, layer: usize) -> Result<GroupedRelu2Spec, Error> {
-    localized_expert_bank_spec(
-        args,
-        layer,
-        args.n_routed_experts,
-        args.moe_intermediate_size,
-    )
-}
-
-/// Returns the architecture-owned ReLU-squared expert specification at
-/// placement-resolved local geometry.
-pub fn localized_expert_bank_spec(
-    args: &ModelArgs,
-    layer: usize,
-    expert_count: i32,
-    intermediate_dimensions: i32,
-) -> Result<GroupedRelu2Spec, Error> {
-    let target_layers = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
-    let (policy, experts_prefix) = if layer < target_layers {
-        let policy = args
-            .layer_schedule
-            .get(layer)
-            .copied()
-            .ok_or_else(|| Error::backend(format!("Nemotron-H has no layer {layer}")))?;
-        (policy, format!("model.layers.{layer}.moe.experts"))
-    } else {
-        let physical = layer - target_layers;
-        let policies = args.mtp_policies().map_err(Error::backend)?;
-        let policy = policies.get(physical).copied().ok_or_else(|| {
-            Error::backend(format!("Nemotron-H has no appended MTP layer {physical}"))
-        })?;
-        (policy, format!("model.mtp.layers.{physical}.mixer.experts"))
-    };
-    if policy != super::LayerPolicy::SparseMoe {
-        return Err(Error::backend(format!(
-            "Nemotron-H layer {layer} is not a sparse expert unit"
-        )));
-    }
-    expert_bank_spec_at(args, &experts_prefix, expert_count, intermediate_dimensions)
 }

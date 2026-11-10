@@ -17,12 +17,18 @@ pub fn mixer_spec(
 ) -> Result<GatedResidualSpec, Error> {
     let geometry = ResidualStreamGeometry::new(config.residual.streams, config.hidden_size)?;
     let width = geometry.flattened_width();
+    let parameter = |suffix: &str| -> Result<ParameterSpec, Error> {
+        let mut parameter =
+            ParameterSpec::trainable(format!("{root}.{suffix}.weight")).map_err(Error::backend)?;
+        parameter.group = Some(root.into());
+        Ok(parameter)
+    };
     let mut linear = |suffix: &str, input, output| -> Result<LinearSpec, Error> {
         let name = format!("{root}.{suffix}.weight");
         Ok(LinearSpec {
             input,
             output,
-            weight: ParameterSpec::trainable(&name).map_err(Error::backend)?,
+            weight: parameter(suffix)?,
             bias: None,
             format: format(&name)?,
         })
@@ -35,8 +41,7 @@ pub fn mixer_spec(
             groups: Some(geometry.streams()),
             epsilon: config.norm_epsilon,
             scale: NormalizationScale::LearnedOffset {
-                weight: ParameterSpec::trainable(format!("{root}.hc_norm.weight"))
-                    .map_err(Error::backend)?,
+                weight: parameter("hc_norm")?,
                 offset: 1.0,
             },
         },

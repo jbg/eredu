@@ -2,11 +2,14 @@
 
 use eredu_core::{AttentionPolicy, LayerSchedule};
 use eredu_nn::{
-    AttentionCache, AuxiliaryConvolutionState, Error, GroupedNeuralBackend, LinearSpec,
-    NormalizationConstructionSpec, NormalizationOperator, ParameterSpec, Parameterized, Tensor,
+    AttentionCache, AuxiliaryConvolutionState, Error, GroupedNeuralBackend, NormalizationOperator,
+    Parameterized, Tensor,
 };
 
 use super::{DecoderLayer, FeedForwardPolicy, LayerPolicy, ModelArgs, MtpConfig, TextArgs};
+
+mod specs;
+pub(crate) use specs::Parameters as PredictionParameters;
 
 /// One prediction depth's hidden/token fusion and ordinary decoder block.
 #[derive(Debug, Clone, Parameterized)]
@@ -58,90 +61,24 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> MtpModel<B> {
         args: &ModelArgs,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Option<Self>, Error> {
-        let Some(config) = args.mtp_config.as_ref() else {
-            return Ok(None);
-        };
-        let count = usize::try_from(config.num_nextn_predict_layers)
-            .map_err(|_| Error::backend("Inkling MTP layer count is negative"))?;
+        let parameters = args.prediction();
+        let count = parameters.depths.len();
         if count == 0 {
             return Ok(None);
         }
-        let sliding = args
-            .text_config
-            .layer_schedule
+        let policies = parameters
+            .depths
             .iter()
-            .find_map(|policy| policy.attention.window())
-            .map(|window| AttentionPolicy::Sliding { window });
-        if !config.local_layer_ids.is_empty() && sliding.is_none() {
-            return Err(Error::backend(
-                "Inkling MTP local layers require a backbone sliding window",
-            ));
-        }
-        let policies = (0..count)
-            .map(|depth| {
-                if config.local_layer_ids.contains(&depth) {
-                    sliding.expect("validated local MTP policy")
-                } else {
-                    AttentionPolicy::Full
-                }
-            })
-            .collect::<Vec<_>>();
+            .map(|depth| depth.common.attention.policy)
+            .collect();
         let mut layers = Vec::with_capacity(count);
-        for (depth, attention) in policies.iter().copied().enumerate() {
-            let text = mtp_text_args(&args.text_config, config, attention)?;
-            let root = format!("model.mtp.layers.{depth}");
-            let norm = |field: &str| {
-                B::normalization(
-                    NormalizationConstructionSpec::learned(
-                        text.hidden_size,
-                        text.rms_norm_eps,
-                        ParameterSpec::trainable(format!("{root}.{field}.weight"))
-                            .map_err(Error::backend)?,
-                    ),
-                    context,
-                )
-            };
-            let input_weight = format!("{root}.input_proj.weight");
-            layers.push(MtpDepth {
-                hidden_norm: norm("hidden_norm")?,
-                embedding_norm: norm("embed_norm")?,
-                input_projection: B::linear(
-                    LinearSpec {
-                        input: text.hidden_size * 2,
-                        output: text.hidden_size,
-                        weight: ParameterSpec::trainable(&input_weight).map_err(Error::backend)?,
-                        bias: None,
-                        format: crate::linear_format::standard_linear_format(
-                            &input_weight,
-                            text.linear_format_for(&input_weight),
-                        )?,
-                    },
-                    context,
-                )?,
-                transformer_block: DecoderLayer::new_at(
-                    &text,
-                    LayerPolicy {
-                        attention,
-                        feed_forward: FeedForwardPolicy::Dense,
-                    },
-                    &format!("{root}.transformer_block"),
-                    context,
-                )?,
-            });
+        for parameters in parameters.depths.iter().cloned() {
+            layers.push(MtpDepth::from_parameters(parameters, context)?);
         }
-        let chain_norm = config
-            .chain_hidden_post_norm
-            .then(|| {
-                B::normalization(
-                    NormalizationConstructionSpec::learned(
-                        args.text_config.hidden_size,
-                        args.text_config.rms_norm_eps,
-                        ParameterSpec::trainable("model.mtp.chain_norm.weight")
-                            .map_err(Error::backend)?,
-                    ),
-                    context,
-                )
-            })
+        let chain_norm = parameters
+            .chain_norm
+            .clone()
+            .map(|norm| B::normalization(norm, context))
             .transpose()?;
         Ok(Some(Self {
             layers,
@@ -225,6 +162,29 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> MtpModel<B> {
 }
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> MtpDepth<B> {
+    fn from_parameters(
+        parameters: specs::DepthParameters,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let fusion = parameters.fusion;
+        Ok(Self {
+            hidden_norm: B::normalization(fusion.hidden_norm, context)?,
+            embedding_norm: B::normalization(fusion.embedding_norm, context)?,
+            input_projection: B::linear(fusion.input_projection, context)?,
+            transformer_block: DecoderLayer::from_parameters(
+                parameters.common,
+                0,
+                0,
+                context,
+                |context| {
+                    Ok(super::text::FeedForward::Dense(
+                        super::text::DenseMlp::from_parameters(parameters.dense, context)?,
+                    ))
+                },
+            )?,
+        })
+    }
+
     /// Executes one physical depth using its own causal state and the optional
     /// shared chain norm. The whole-chain and prepared drivers use this equation.
     pub fn forward_step_instrumented<S>(
@@ -280,7 +240,30 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> MtpDepth<B> {
     }
 }
 
-pub(crate) fn mtp_text_args(
+fn depth_policy(args: &super::ModelPolicy, depth: usize) -> Result<AttentionPolicy, Error> {
+    let config = args
+        .mtp_config
+        .as_ref()
+        .ok_or_else(|| Error::backend("Inkling has no prediction declaration"))?;
+    let count = usize::try_from(config.num_nextn_predict_layers).map_err(Error::backend)?;
+    if depth >= count {
+        return Err(Error::backend("Inkling prediction depth is out of range"));
+    }
+    if config.local_layer_ids.contains(&depth) {
+        args.text_config
+            .layer_schedule
+            .iter()
+            .find_map(|policy| policy.attention.window())
+            .map(|window| AttentionPolicy::Sliding { window })
+            .ok_or_else(|| {
+                Error::backend("Inkling MTP local layers require a backbone sliding window")
+            })
+    } else {
+        Ok(AttentionPolicy::Full)
+    }
+}
+
+fn mtp_text_args(
     backbone: &TextArgs,
     config: &MtpConfig,
     attention: AttentionPolicy,

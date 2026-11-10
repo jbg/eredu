@@ -2,7 +2,8 @@
 use super::*;
 
 pub(in crate::discovery) fn declare(g: &mut Builder, c: &V3Args, target_output: &str) {
-    let width = c.hidden_size as usize;
+    let statics = &c.parameters().statics;
+    let embedding_slot = &statics.embedding_spec().weight;
     g.node(
         "prediction",
         ArchitectureNodeKind::Prediction,
@@ -14,6 +15,12 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &V3Args, target_output: 
     for depth in 0..c.num_nextn_predict_layers as usize {
         let layer = c.num_hidden_layers as usize + depth;
         let path = format!("model.layers.{layer}");
+        let spec = crate::deepseek::v3_specs::prediction_spec(c, &path)
+            .expect("admitted V3 prediction declaration");
+        let width = spec.fusion.output as usize;
+        let embedding_width = spec.embedding_norm.dimensions as usize;
+        let embedding_prefix = declared_weight_prefix(embedding_slot);
+        let fusion_prefix = declared_weight_prefix(&spec.fusion.weight);
         let root = format!("prediction.layers.{depth}");
         let block = format!("{root}.decoder");
         let embedding = format!("{root}.embedding");
@@ -33,28 +40,28 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &V3Args, target_output: 
             &embedding,
             ArchitectureNodeKind::Embedding,
             Some(&root),
-            Some("model.embed_tokens"),
+            Some(embedding_prefix),
             Some(width),
         );
         g.node(
             &embedding_norm,
             ArchitectureNodeKind::Normalization,
             Some(&root),
-            Some(&format!("{path}.enorm")),
+            declared_normalization_prefix(&spec.embedding_norm),
             Some(width),
         );
         g.node(
             &hidden_norm,
             ArchitectureNodeKind::Normalization,
             Some(&root),
-            Some(&format!("{path}.hnorm")),
+            declared_normalization_prefix(&spec.hidden_norm),
             Some(width),
         );
         g.node(
             &fusion,
             ArchitectureNodeKind::Projector,
             Some(&root),
-            Some(&format!("{path}.eh_proj")),
+            Some(fusion_prefix),
             Some(width),
         );
         g.node(
@@ -158,14 +165,14 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &V3Args, target_output: 
             &head_norm,
             ArchitectureNodeKind::Normalization,
             Some(&root),
-            Some(&format!("{path}.shared_head.norm")),
+            declared_normalization_prefix(&spec.output_norm),
             Some(width),
         );
         g.node(
             &head,
             ArchitectureNodeKind::OutputHead,
             Some(&root),
-            Some(&format!("{path}.shared_head.head")),
+            Some(declared_weight_prefix(&spec.output.weight)),
             None,
         );
         g.edge(&output, &head_norm, ArchitectureEdgeKind::Data);
@@ -176,7 +183,7 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &V3Args, target_output: 
             "Normalized prediction residual consumed by its own head",
             axes(width),
         );
-        let mut vocabulary = axes(c.vocab_size as usize);
+        let mut vocabulary = axes(spec.output.output as usize);
         vocabulary[2].name = "vocabulary".into();
         g.get_mut(&head).output_axes = Some(vocabulary.clone());
         g.component_observation(
@@ -186,8 +193,8 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &V3Args, target_output: 
             vocabulary,
         );
 
-        let embedding_weight = "model.embed_tokens.weight".to_owned();
-        let fusion_weight = format!("{path}.eh_proj.weight");
+        let embedding_weight = embedding_slot.id.as_str().to_owned();
+        let fusion_weight = spec.fusion.weight.id.as_str().to_owned();
         g.descriptor.component_scopes.push(ComponentExecutionScope {
             id: format!("prediction.{depth}"),
             node_id: root,
@@ -202,27 +209,27 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &V3Args, target_output: 
                         source: ComponentFusionSource::TokenEmbedding {
                             normalization: None,
                             weight: embedding_weight.clone(),
-                            shared_weight: embedding_weight,
-                            parameter_group: "parameters:model.embed_tokens".into(),
+                            shared_weight: declared_shared_weight(embedding_slot).into(),
+                            parameter_group: format!("parameters:{embedding_prefix}"),
                             scale: ComponentScalar::new(1.0),
                         },
-                        normalization: norm(c, format!("{path}.enorm.weight")),
+                        normalization: declared_normalization(&spec.embedding_norm),
                         output: format!("{path}.prediction.embedding.normalized.effective"),
-                        columns: 0..width,
+                        columns: 0..embedding_width,
                     },
                     ComponentFusionInput {
                         source: ComponentFusionSource::Observation {
                             path: format!("mtp.{depth}.capture"),
                         },
-                        normalization: norm(c, format!("{path}.hnorm.weight")),
+                        normalization: declared_normalization(&spec.hidden_norm),
                         output: format!("{path}.prediction.hidden.normalized.effective"),
-                        columns: width..width * 2,
+                        columns: embedding_width..spec.fusion.input as usize,
                     },
                 ],
                 weight: fusion_weight.clone(),
-                shared_weight: fusion_weight,
-                parameter_group: format!("parameters:{path}.eh_proj"),
-                bias: None,
+                shared_weight: declared_shared_weight(&spec.fusion.weight).into(),
+                parameter_group: format!("parameters:{fusion_prefix}"),
+                bias: spec.fusion.bias.as_ref().map(|bias| bias.id.to_string()),
                 projection_input: format!("{path}.prediction.fusion.input"),
                 output: format!("{path}.prediction.fusion.output"),
                 effective_output: format!("{path}.prediction.fusion.output.effective"),
@@ -237,9 +244,9 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &V3Args, target_output: 
                 projection_input: Some(format!("{path}.prediction.readout.projection_input")),
                 linear_scores: format!("{path}.prediction.readout.linear"),
                 logits: format!("{path}.prediction.readout.linear.effective"),
-                normalization: norm(c, format!("{path}.shared_head.norm.weight")),
-                weight: format!("{path}.shared_head.head.weight"),
-                bias: None,
+                normalization: declared_normalization(&spec.output_norm),
+                weight: spec.output.weight.id.as_str().into(),
+                bias: spec.output.bias.as_ref().map(|bias| bias.id.to_string()),
                 output_transform: ComponentOutputTransform::Identity,
                 block_normalizations: vec![],
                 other_writes: vec![ComponentResidualWrite {

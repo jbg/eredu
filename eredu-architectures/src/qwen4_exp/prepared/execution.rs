@@ -306,7 +306,7 @@ impl PreparedTarget {
         &self,
         selected: &SelectedRoutedTextRealization,
     ) -> Result<TargetSpec, Error> {
-        target_spec_from_formats(
+        target_spec_from_parameters(
             self.spec.config.clone(),
             &self
                 .tables
@@ -314,18 +314,18 @@ impl PreparedTarget {
                 .map(|(&layer, table)| (layer, table.lookup.clone()))
                 .collect(),
             self.spec.limits,
-            &self.formats,
+            &self.parameters,
             Some(selected),
         )
     }
 }
 
 /// One format projection for cold inspection and source-bound construction.
-pub(super) fn target_spec_from_formats(
+pub(super) fn target_spec_from_parameters(
     config: Config,
     rows: &BTreeMap<usize, eredu_runtime::RowLookupSpec>,
     limits: TargetLimits,
-    source: &ParameterFormats,
+    source: &TargetParameters,
     selected: Option<&SelectedRoutedTextRealization>,
 ) -> Result<TargetSpec, Error> {
     use crate::routed_text::RoutedGroupedPlan;
@@ -346,33 +346,61 @@ pub(super) fn target_spec_from_formats(
             Ok(experts)
         })
         .transpose()?;
-    TargetSpec::from_headers(
-        config.clone(),
-        rows,
-        limits,
-        |layer, ordinal| match experts {
-            Some(experts) => experts
-                .unit_spec(crate::decoder::TARGET_EXECUTION_GROUP, ordinal)
-                .cloned()
-                .ok_or_else(|| Error::backend("selected target expert owner is missing")),
-            None => expert_spec(
-                &config,
-                source,
-                &format!("model.layers.{layer}.mlp.experts"),
-            ),
-        },
-        |name| {
-            let Some(formats) = &formats else {
-                return source.ordinary(name);
-            };
-            let format = formats.get(name).copied().ok_or_else(|| {
-                Error::backend(format!("target projection {name} has no selected format"))
-            })?;
-            if format == source.get(name)? {
-                source.ordinary(name)
-            } else {
-                crate::linear_format::standard_linear_format(name, format)
-            }
-        },
+    let parameters = if let Some(formats) = formats {
+        source.with_formats(
+            |weight, original| {
+                let name = weight.id.as_str();
+                let format = formats.get(name).copied().ok_or_else(|| {
+                    Error::backend(format!("target projection {name} has no selected format"))
+                })?;
+                if format == original.encoding() {
+                    Ok(original.clone())
+                } else {
+                    crate::linear_format::standard_linear_format(name, format)
+                }
+            },
+            |ordinal, _| {
+                experts
+                    .ok_or_else(|| Error::backend("selected target is missing its expert bank"))?
+                    .unit_spec(crate::decoder::TARGET_EXECUTION_GROUP, ordinal)
+                    .cloned()
+                    .ok_or_else(|| Error::backend("selected target expert owner is missing"))
+            },
+        )?
+    } else {
+        source.clone()
+    };
+    TargetSpec::from_parameters(config, rows, limits, parameters)
+}
+
+/// Applies admitted storage extensions without rebuilding the source declaration's geometry.
+pub(super) fn target_parameters_from_formats(
+    source: &TargetParameters,
+    formats: &ParameterFormats,
+) -> Result<TargetParameters, Error> {
+    source.with_formats(
+        |weight, _| formats.ordinary(weight.id.as_str()),
+        |_, bank| packed_bank_from_formats(bank, formats),
     )
+}
+
+pub(super) fn packed_bank_from_formats(
+    bank: &eredu_nn::GroupedGatedProductSpec,
+    formats: &ParameterFormats,
+) -> Result<eredu_nn::GroupedGatedProductSpec, Error> {
+    if !matches!(
+        bank.layout(),
+        eredu_nn::GatedProductGroupLayout::Packed { .. }
+    ) {
+        return Err(Error::backend(
+            "Qwen4 source requires a packed logical expert bank",
+        ));
+    }
+    bank.map_projections(|spec| {
+        spec.clone()
+            .with_format(crate::qwen4_exp::target::declarations::storage_format(
+                spec.format(),
+                formats.expert(spec.weight().id.as_str())?,
+            )?)
+    })
 }

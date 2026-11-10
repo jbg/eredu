@@ -262,24 +262,41 @@ fn admit_recipes(
     formats: &BTreeMap<String, eredu_checkpoint::LinearFormat>,
 ) -> Result<BTreeMap<String, ParameterAdmission>, AdmissionError> {
     let mut recipes =
-        checkpoint::canonical_recipes(config, layout).map_err(AdmissionError::InvalidArtifact)?;
+        checkpoint::parameter_sources(config, layout).map_err(AdmissionError::InvalidArtifact)?;
     for (name, format) in formats {
         if let eredu_checkpoint::LinearFormat::Affine(_) = format {
+            let component = recipes
+                .get(name)
+                .ok_or_else(|| {
+                    AdmissionError::InvalidArtifact(format!(
+                        "encoding references undeclared VoiceChat parameter {name}"
+                    ))
+                })?
+                .component;
             let prefix = name
                 .strip_suffix(".weight")
                 .expect("declared projection matrix");
             for suffix in ["scales", "biases"] {
                 let companion = format!("{prefix}.{suffix}");
+                if recipes.contains_key(&companion) {
+                    return Err(AdmissionError::InvalidArtifact(format!(
+                        "encoding companion duplicates declared VoiceChat output {companion}"
+                    )));
+                }
                 recipes.insert(
                     companion.clone(),
-                    DerivedWeightRecipe::source(companion, TensorSelection::Full),
+                    checkpoint::ParameterSourceDeclaration {
+                        component,
+                        recipe: DerivedWeightRecipe::source(companion, TensorSelection::Full),
+                    },
                 );
             }
         }
     }
     recipes
         .into_iter()
-        .map(|(name, recipe)| {
+        .map(|(name, declaration)| {
+            let checkpoint::ParameterSourceDeclaration { component, recipe } = declaration;
             let output = recipe.infer(catalog)?;
             let stored_bytes = recipe
                 .source_keys()
@@ -314,9 +331,6 @@ fn admit_recipes(
                 })?;
             let materialization_peak_bytes = peak.checked_add(stored_bytes).ok_or_else(|| {
                 AdmissionError::InvalidArtifact("parameter conversion byte count overflow".into())
-            })?;
-            let component = checkpoint::component_for_key(&name).ok_or_else(|| {
-                AdmissionError::InvalidArtifact(format!("unknown component for {name}"))
             })?;
             Ok((
                 name.clone(),
@@ -404,15 +418,14 @@ impl VoiceChatArtifactPlan {
             )?;
         }
         let expected =
-            checkpoint::canonical_recipes(config, None).map_err(AdmissionError::InvalidArtifact)?;
+            checkpoint::parameter_sources(config, None).map_err(AdmissionError::InvalidArtifact)?;
         for component in required {
             let keys = expected
-                .keys()
-                .filter(|k| {
-                    checkpoint::component_for_key(k) == Some(component)
-                        && !parameters.contains_key(*k)
+                .iter()
+                .filter(|(name, declaration)| {
+                    declaration.component == component && !parameters.contains_key(*name)
                 })
-                .cloned()
+                .map(|(name, _)| name.clone())
                 .collect::<Vec<_>>();
             if !keys.is_empty() {
                 return Err(AdmissionError::MissingComponent { component, keys });

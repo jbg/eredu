@@ -5,14 +5,12 @@
 //! remain outside these neural operations.
 
 use super::config::ChannelPolicy;
+use super::function_head_layered::FunctionHeadSpec;
 use crate::decoder::StaticModules;
 use eredu_nn::{
     DistributedNeuralBackend, EmbeddingLookupPolicy, EmbeddingOperator, LinearFormatSpec,
-    LinearOperator, LinearSpec, NeuralBackend, ParameterSpec, Parameterized, Tensor,
-    TensorElementType, VocabularyParallelRange,
-};
-use eredu_runtime::{
-    module_parameter_group, MemberSharding, ParallelPlanError, ParameterGroupSpec, ParameterRole,
+    LinearOperator, NeuralBackend, Parameterized, Tensor, TensorElementType,
+    VocabularyParallelRange,
 };
 
 /// Released `<s>` ID used to frame system-prompt tokens.
@@ -584,41 +582,29 @@ fn prompt_tensors<T: Tensor>(
 pub struct FunctionHead<B: NeuralBackend> {
     head: B::Linear,
     #[parameter(skip)]
-    width: i32,
-    #[parameter(skip)]
-    vocabulary: i32,
+    declaration: FunctionHeadSpec,
     #[parameter(skip)]
     parallel: Option<VocabularyParallelRange>,
-    #[parameter(skip)]
-    format: LinearFormatSpec,
 }
 impl<B: NeuralBackend> FunctionHead<B> {
-    /// Declares the independently materializable canonical function head.
+    /// Constructs the validated independently materializable function-head declaration.
     pub fn new(
-        width: i32,
-        vocabulary: i32,
-        format: LinearFormatSpec,
+        declaration: FunctionHeadSpec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, ChannelError> {
-        let spec = head_spec(width, vocabulary, format.clone())?;
         Ok(Self {
-            head: B::linear(spec, context)?,
-            width,
-            vocabulary,
+            head: B::linear(declaration.projection.clone(), context)?,
+            declaration,
             parallel: None,
-            format,
         })
     }
     /// Logical vocabulary projection geometry, independent of storage format.
     pub fn dimensions(&self) -> super::function_head_layered::FunctionHeadDimensions {
-        super::function_head_layered::FunctionHeadDimensions {
-            width: self.width,
-            vocabulary: self.vocabulary,
-        }
+        self.declaration.dimensions()
     }
     /// Exact physical matrix and companion format selected at construction.
     pub fn format(&self) -> &LinearFormatSpec {
-        &self.format
+        self.declaration.format()
     }
     /// Exact selected vocabulary rows, when this unit requires collective projection.
     pub fn parallel_range(&self) -> Option<&VocabularyParallelRange> {
@@ -639,23 +625,6 @@ impl<B: NeuralBackend> FunctionHead<B> {
         }
         Ok(self.head.forward(normalized, context)?)
     }
-    /// Declares vocabulary-axis sharding, including physical encoding companions.
-    pub fn parallel_parameter_group(&self) -> Result<ParameterGroupSpec, ParallelPlanError> {
-        module_parameter_group::<B::Tensor, _>(
-            "voicechat.function_head",
-            ParameterRole::Vocabulary,
-            &self.head,
-            |_, shape| {
-                if shape.is_empty() {
-                    Err(ParallelPlanError::InvalidTensor(
-                        "VoiceChat function-head parameter is scalar".into(),
-                    ))
-                } else {
-                    Ok(MemberSharding::Balanced { axis: 0 })
-                }
-            },
-        )
-    }
     pub(super) fn validate_replicated_projection(
         &self,
         hidden: &B::Tensor,
@@ -673,22 +642,21 @@ impl<B: NeuralBackend> FunctionHead<B> {
     }
 }
 impl<B: DistributedNeuralBackend> FunctionHead<B> {
-    /// Constructs this rank's declared vocabulary rows using the shared projection mechanism.
+    /// Constructs this rank's declared vocabulary rows using the retained neural spec.
     pub fn new_parallel(
-        width: i32,
-        vocabulary: i32,
-        format: LinearFormatSpec,
+        declaration: FunctionHeadSpec,
         range: VocabularyParallelRange,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, ChannelError> {
-        range.validate_global_rows(vocabulary)?;
-        let spec = head_spec(width, vocabulary, format.clone())?;
+        range.validate_global_rows(declaration.dimensions().vocabulary)?;
         Ok(Self {
-            head: B::vocabulary_parallel_linear(spec, range.clone(), context)?,
-            width,
-            vocabulary,
+            head: B::vocabulary_parallel_linear(
+                declaration.projection.clone(),
+                range.clone(),
+                context,
+            )?,
+            declaration,
             parallel: Some(range),
-            format,
         })
     }
     pub(super) fn validate_parallel_projection(
@@ -801,28 +769,6 @@ where
     Ok(())
 }
 
-pub(super) fn head_spec(
-    width: i32,
-    vocabulary: i32,
-    format: LinearFormatSpec,
-) -> Result<LinearSpec, ChannelError> {
-    if width <= 0 || vocabulary <= 0 {
-        return Err(ChannelError::Configuration(
-            "function-head dimensions must be positive",
-        ));
-    }
-    let mut weight = ParameterSpec::trainable("stt_model.function_head.weight")
-        .map_err(eredu_nn::Error::backend)?;
-    weight.group = Some("voicechat.function_head".into());
-    format.validate_for_weight(&weight)?;
-    Ok(LinearSpec {
-        input: width,
-        output: vocabulary,
-        weight,
-        bias: None,
-        format,
-    })
-}
 pub(super) fn validate_logits<T: Tensor>(
     agent: &T,
     function: &T,

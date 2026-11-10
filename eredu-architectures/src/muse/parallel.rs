@@ -1,17 +1,14 @@
 //! Semantic tensor-parallel placement for Muse-Glimmer text and vision components.
 
-use eredu_core::{cache::LayerCachePolicy, LayerSchedule};
+use eredu_core::LayerSchedule;
 use eredu_nn::VocabularyParallelRange;
 use eredu_runtime::{
-    expand_linear_format_parameter_groups, ArchitecturePartition, LocalModelLayout, MemberSharding,
-    ParallelPlanError, ParameterGroupSpec, ParameterMemberSpec, ParameterRole, PartitionOwnership,
-    StateLayout,
+    ArchitecturePartition, LocalModelLayout, MemberSharding, ParallelPlanError, ParameterGroupSpec,
+    ParameterRole, PartitionOwnership, StateLayout,
 };
 use std::ops::Range;
 
-use crate::linear_format::standard_parallel_linear_format;
-
-use super::{BlockNormalization, DecoderConfig, RoutedFeedForwardEquation};
+use super::DecoderConfig;
 
 /// Exact sums surrounding a routed Muse unit, including inactive PP participants.
 pub fn routed_tensor_reductions(
@@ -21,20 +18,21 @@ pub fn routed_tensor_reductions(
     use eredu_runtime::{
         RoutedTensorDimension as Axis, RoutedTensorReduction as Sum, RoutedTensorReductions,
     };
-    match (routed, args.routed_feed_forward) {
-        (true, RoutedFeedForwardEquation::CompressedSigmoid { expert_width, .. }) => {
-            RoutedTensorReductions {
-                before: vec![Sum::Hidden],
-                after: vec![Sum::Activation {
-                    shape: vec![
-                        Axis::Tokens(1),
-                        Axis::Fixed(args.num_experts_per_tok),
-                        Axis::Fixed(expert_width),
-                    ],
-                }],
-            }
-        }
-        _ => RoutedTensorReductions::hidden(1, 1),
+    let declaration = routed
+        .then(|| args.routed_layers().values().next())
+        .flatten();
+    match declaration.filter(|declaration| declaration.compression().is_some()) {
+        Some(declaration) => RoutedTensorReductions {
+            before: vec![Sum::Hidden],
+            after: vec![Sum::Activation {
+                shape: vec![
+                    Axis::Tokens(1),
+                    Axis::Fixed(declaration.selector().selection().top_k()),
+                    Axis::Fixed(declaration.bank().output_dimensions()),
+                ],
+            }],
+        },
+        None => RoutedTensorReductions::hidden(1, 1),
     }
 }
 
@@ -377,12 +375,12 @@ impl LocalGeometry {
             (true, Some(_)) => {
                 return Err(invalid(
                     "tied Muse-Glimmer output has a separate vocabulary range",
-                ))
+                ));
             }
             (false, None) => {
                 return Err(invalid(
                     "untied Muse-Glimmer output has no vocabulary range",
-                ))
+                ));
             }
         }
         let expected = local_state_layout(&self.text_blocks)?;
@@ -404,12 +402,9 @@ pub fn local_geometry(
         .map(|layer| local_decoder_config(args, layer, layout))
         .collect::<Result<Vec<_>, _>>()?;
     let state_layout = local_state_layout(&text_blocks)?;
-    let (embedding_range, output_range) = super::text::static_spec(args).vocabulary_ranges(
-        layout,
-        "model.embed_tokens",
-        "model.norm",
-        "lm_head",
-    )?;
+    let (embedding_range, output_range) =
+        args.pinned()
+            .vocabulary_ranges(layout, "model.embed_tokens", "model.norm", "lm_head")?;
     let geometry = LocalGeometry {
         text_blocks,
         embedding_range,
@@ -479,7 +474,7 @@ fn partition_local_geometry_impl(
             other => {
                 return Err(invalid(format!(
                     "unknown Muse-Glimmer partition group {other:?}"
-                )))
+                )));
             }
         };
         if slot.replace(range).is_some() {
@@ -518,12 +513,9 @@ fn local_state_layout(blocks: &[DecoderConfig]) -> Result<StateLayout, ParallelP
         .iter()
         .enumerate()
         .map(|(layer, block)| {
-            let policy = block.attention_schedule.get(layer).ok_or_else(|| {
-                invalid(format!(
-                    "rank-local Muse-Glimmer block {layer} has no attention policy"
-                ))
-            })?;
-            LayerCachePolicy::key_value(*policy, block.num_key_value_heads, block.head_dim)
+            block
+                .selected_attention(layer)
+                .and_then(|spec| spec.state_policy())
                 .map_err(|error| invalid(error.to_string()))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -568,9 +560,8 @@ pub fn local_decoder_config(
             args.head_dim
         )));
     }
-    let mut local = args.clone();
-    local.num_attention_heads = query_width / args.head_dim;
-    local.num_key_value_heads = key_width / args.head_dim;
+    let mut dense = args.intermediate_size;
+    let mut experts = args.moe_intermediate_size;
     if args.is_moe() {
         let fused = local_axis(
             tensor("mlp.experts.gate_up_proj")?,
@@ -582,12 +573,17 @@ pub fn local_decoder_config(
                 "local Muse-Glimmer expert gate/up width {fused} is not even"
             )));
         }
-        local.moe_intermediate_size = fused / 2;
+        experts = fused / 2;
     } else {
-        local.intermediate_size =
-            local_axis(tensor("mlp.gate_proj")?, 0, "dense intermediate width")?;
+        dense = local_axis(tensor("mlp.gate_proj")?, 0, "dense intermediate width")?;
     }
-    Ok(local)
+    args.with_local_dimensions(
+        query_width / args.head_dim,
+        key_width / args.head_dim,
+        dense,
+        experts,
+    )
+    .map_err(|e| invalid(e.to_string()))
 }
 
 fn local_axis(
@@ -623,7 +619,8 @@ pub fn static_parameter_groups(
 pub(crate) fn static_resource_parameter_groups(
     args: &DecoderConfig,
 ) -> Result<Vec<(&'static str, ParameterGroupSpec)>, ParallelPlanError> {
-    super::text::static_spec(args).pinned_parameter_groups(
+    args.pinned().pinned_parameter_groups(
+        crate::decoder::ParameterEncoding::Stored,
         "model.embed_tokens",
         "model.norm",
         "lm_head",
@@ -640,185 +637,60 @@ pub fn layer_parameter_groups(
             "Muse-Glimmer layer {layer} is out of range"
         )));
     }
-    let hidden = dim(args.hidden_size)?;
-    let query_heads = dim(args.num_attention_heads)?;
-    let key_value_heads = dim(args.num_key_value_heads)?;
-    let head = dim(args.head_dim)?;
-    let query_width = query_heads
-        .checked_mul(head)
-        .ok_or_else(|| invalid("Muse-Glimmer query width overflow"))?;
-    let key_value_width = key_value_heads
-        .checked_mul(head)
-        .ok_or_else(|| invalid("Muse-Glimmer key/value width overflow"))?;
     let root = format!("model.layers.{layer}");
-    let attention = format!("{root}.self_attn");
-    let mut groups = vec![ParameterGroupSpec::partitioned(
-        format!("{attention}.query_heads"),
-        ParameterRole::AttentionHeads,
-        query_heads,
-        [
-            member(
-                format!("{attention}.q_proj.weight"),
-                vec![query_width, hidden],
-                partitioned(0),
-            ),
-            member(
-                format!("{attention}.gate_proj.weight"),
-                vec![query_width, hidden],
-                partitioned(0),
-            ),
-            member(
-                format!("{attention}.o_proj.weight"),
-                vec![hidden, query_width],
-                partitioned(1),
-            ),
-        ],
-    )?
-    .with_partition_unit_assignment(eredu_runtime::PartitionUnitAssignment::Even)?];
-    groups.push(
-        ParameterGroupSpec::partitioned(
-            format!("{attention}.key_value_heads"),
-            ParameterRole::AttentionHeads,
-            key_value_heads,
-            [
-                member(
-                    format!("{attention}.k_proj.weight"),
-                    vec![key_value_width, hidden],
-                    partitioned(0),
-                ),
-                member(
-                    format!("{attention}.v_proj.weight"),
-                    vec![key_value_width, hidden],
-                    partitioned(0),
-                ),
-            ],
-        )?
-        .with_partition_unit_assignment(
-            eredu_runtime::PartitionUnitAssignment::Repeat {
-                semantic_units: key_value_heads,
-            },
-        )?,
-    );
-    if args.weight_convention == super::WeightConvention::Gguf {
-        groups.push(replicated(
-            format!("{attention}.qk_norm"),
-            [
-                (format!("{attention}.q_norm.weight"), vec![head]),
-                (format!("{attention}.k_norm.weight"), vec![head]),
-            ],
-        )?);
-    }
+    let parameters = args
+        .attention(layer)
+        .map(|spec| &spec.parameters)
+        .map_err(|error| invalid(error.to_string()))?;
+    let mut groups = parameters
+        .parameter_groups(true)
+        .map_err(|error| invalid(error.to_string()))?;
     if args.is_moe() {
-        let experts = dim(args.num_experts)?;
-        let expert_width = match args.routed_feed_forward {
-            RoutedFeedForwardEquation::DirectSoftmax => hidden,
-            RoutedFeedForwardEquation::CompressedSigmoid { expert_width, .. } => dim(expert_width)?,
-        };
-        let intermediate = dim(args.moe_intermediate_size)?;
-        groups.push(ParameterGroupSpec::partitioned(
-            format!("{root}.mlp.experts.intermediate"),
-            ParameterRole::ExpertIntermediate,
-            intermediate,
-            [
-                member(
-                    format!("{root}.mlp.experts.gate_up_proj"),
-                    vec![experts, 2 * intermediate, expert_width],
-                    MemberSharding::PartitionedSegments {
-                        axis: 1,
-                        segments: vec![0..intermediate, intermediate..2 * intermediate],
-                    },
-                ),
-                member(
-                    format!("{root}.mlp.experts.down_proj"),
-                    vec![experts, expert_width, intermediate],
-                    partitioned(2),
-                ),
-            ],
-        )?);
-        let mut router = vec![(format!("{root}.mlp.gate.weight"), vec![experts, hidden])];
-        if let RoutedFeedForwardEquation::CompressedSigmoid { .. } = args.routed_feed_forward {
-            router.push((
-                format!("{root}.mlp.gate.e_score_correction_bias"),
-                vec![experts],
-            ));
-            groups.push(replicated(
-                format!("{root}.mlp.compression"),
-                [
-                    (
-                        format!("{root}.mlp.pre_expert_proj.weight"),
-                        vec![expert_width, hidden],
-                    ),
-                    (
-                        format!("{root}.mlp.pre_expert_norm.weight"),
-                        vec![expert_width],
-                    ),
-                    (
-                        format!("{root}.mlp.experts.post_expert_norm.weight"),
-                        vec![expert_width],
-                    ),
-                    (
-                        format!("{root}.mlp.post_expert_proj.weight"),
-                        vec![hidden, expert_width],
-                    ),
-                ],
-            )?);
-        }
-        groups.push(replicated(format!("{root}.mlp.router"), router)?);
+        let declaration = args
+            .routed(layer)
+            .map_err(|error| invalid(error.to_string()))?;
+        groups.extend(
+            declaration
+                .parameter_groups(&format!("{root}.mlp"))
+                .map_err(|error| invalid(error.to_string()))?,
+        );
     } else {
-        let intermediate = dim(args.intermediate_size)?;
-        groups.push(ParameterGroupSpec::partitioned(
-            format!("{root}.mlp.intermediate"),
-            ParameterRole::FeedForwardIntermediate,
-            intermediate,
-            [
-                member(
-                    format!("{root}.mlp.gate_proj.weight"),
-                    vec![intermediate, hidden],
-                    partitioned(0),
-                ),
-                member(
-                    format!("{root}.mlp.up_proj.weight"),
-                    vec![intermediate, hidden],
-                    partitioned(0),
-                ),
-                member(
-                    format!("{root}.mlp.down_proj.weight"),
-                    vec![hidden, intermediate],
-                    partitioned(1),
-                ),
-            ],
-        )?);
+        let prefix = format!("{root}.mlp");
+        let projections = args
+            .dense(layer)
+            .map_err(|error| invalid(error.to_string()))?;
+        groups.push(
+            super::text::specs::dense_parameter_group(&prefix, &projections)
+                .map_err(|error| invalid(error.to_string()))?,
+        );
     }
-    let mut norms = vec![
-        (format!("{root}.input_layernorm.weight"), vec![hidden]),
-        (
-            format!("{root}.pre_feedforward_layernorm.weight"),
-            vec![hidden],
-        ),
-        (
-            format!("{root}.post_feedforward_layernorm.weight"),
-            vec![hidden],
-        ),
-    ];
-    if args.block_normalization == BlockNormalization::OutputScaled {
-        norms.push((
-            format!("{root}.post_attention_layernorm.weight"),
-            vec![hidden],
-        ));
-    }
-    groups.push(replicated(format!("{root}.norms"), norms)?);
-    let residual_names = super::checkpoint::residual_parameter_names(args);
-    if !residual_names.is_empty() {
-        groups.push(replicated(
+    use eredu_nn::DeclareLogicalParameters;
+    let scalar = args
+        .scalar(layer)
+        .map_err(|error| invalid(error.to_string()))?;
+    let norms = scalar
+        .norm_parameters()
+        .map_err(|error| invalid(error.to_string()))?;
+    groups.push(eredu_runtime::logical_parameter_group(
+        format!("{root}.norms"),
+        ParameterRole::Replicated,
+        None,
+        &norms,
+        |_| MemberSharding::Replicated,
+    )?);
+    let residuals = scalar.residuals[..]
+        .logical_parameters()
+        .map_err(|error| invalid(error.to_string()))?;
+    if !residuals.is_empty() {
+        groups.push(eredu_runtime::logical_parameter_group(
             format!("{root}.residual_gates"),
-            residual_names
-                .into_iter()
-                .map(|name| (format!("{root}.{name}"), vec![hidden])),
+            ParameterRole::Replicated,
+            None,
+            &residuals,
+            |_| MemberSharding::Replicated,
         )?);
     }
-    expand_linear_format_parameter_groups(groups, |member| {
-        standard_parallel_linear_format(member, args.linear_format_for(member.target()))
-    })
+    Ok(groups)
 }
 
 /// Independently materialized pinned vision resources.
@@ -837,17 +709,6 @@ impl VisionStaticResource {
             Self::Norms => "model.vision_tower.static_norms",
             Self::Adapter => "model.vision_adapter.intermediate",
             Self::Projection => "model.vision_projection",
-        }
-    }
-    fn owns_target(self, target: &str) -> bool {
-        match self {
-            Self::Patch => target.starts_with("model.vision_tower.patch_embedder."),
-            Self::Norms => {
-                target.starts_with("model.vision_tower.ln_pre.")
-                    || target.starts_with("model.vision_tower.ln_post.")
-            }
-            Self::Adapter => target.starts_with("model.vision_adapter."),
-            Self::Projection => target.starts_with("model.vision_projection."),
         }
     }
     /// Request preparation uses patch/position and norms on each vision owner;
@@ -881,191 +742,88 @@ fn declared_vision_groups(
     let Some(config) = &args.vision_config else {
         return Ok(Vec::new());
     };
-    let hidden = dim(config.hidden_size)?;
-    let _ = dim(config.num_heads)?;
-    let patch_input = dim(config.temporal_patch_size * 3 * config.patch_size * config.patch_size)?;
-    let positions = dim(config.position_height * config.position_width)?;
+    use eredu_nn::DeclareLogicalParameters;
+    let declarations = config.declaration();
+    let group = |name, role, parameters: Vec<eredu_nn::LogicalParameterDeclaration<'_>>| {
+        eredu_runtime::logical_parameter_group(name, role, None, &parameters, |_| {
+            MemberSharding::Replicated
+        })
+    };
+    let mut patch = declarations
+        .statics
+        .patch
+        .logical_parameters()
+        .map_err(|error| invalid(error.to_string()))?;
+    patch.extend(
+        declarations
+            .statics
+            .position
+            .logical_parameters()
+            .map_err(|error| invalid(error.to_string()))?,
+    );
     let mut groups = vec![(
         VisionParameterOwner::Static(VisionStaticResource::Patch),
-        ParameterGroupSpec::new(
-            VisionStaticResource::Patch.logical_name(),
+        group(
+            VisionStaticResource::Patch.logical_name().to_owned(),
             ParameterRole::Channels,
-            [
-                member(
-                    "model.vision_tower.patch_embedder.patch_embedding.weight",
-                    vec![hidden, patch_input],
-                    MemberSharding::Replicated,
-                ),
-                member(
-                    "model.vision_tower.patch_embedder.position_embedding_table.weight",
-                    vec![positions, hidden],
-                    MemberSharding::Replicated,
-                ),
-            ],
+            patch,
         )?,
     )];
-    for layer in 0..config.layer_count() {
-        let root = format!("model.vision_tower.layers.{layer}");
-        groups.push((
-            VisionParameterOwner::Layer(layer),
-            ParameterGroupSpec::new(
-                format!("{root}.attention_heads"),
+    for (layer, spec) in declarations.blocks.iter().enumerate() {
+        for (name, role, parameters) in [
+            (
+                format!("{}.attention_heads", spec.root),
                 ParameterRole::AttentionHeads,
-                [
-                    member(
-                        format!("{root}.attn.q_proj.weight"),
-                        vec![hidden, hidden],
-                        MemberSharding::Replicated,
-                    ),
-                    member(
-                        format!("{root}.attn.q_proj.bias"),
-                        vec![hidden],
-                        MemberSharding::Replicated,
-                    ),
-                    member(
-                        format!("{root}.attn.k_proj.weight"),
-                        vec![hidden, hidden],
-                        MemberSharding::Replicated,
-                    ),
-                    member(
-                        format!("{root}.attn.k_proj.bias"),
-                        vec![hidden],
-                        MemberSharding::Replicated,
-                    ),
-                    member(
-                        format!("{root}.attn.v_proj.weight"),
-                        vec![hidden, hidden],
-                        MemberSharding::Replicated,
-                    ),
-                    member(
-                        format!("{root}.attn.v_proj.bias"),
-                        vec![hidden],
-                        MemberSharding::Replicated,
-                    ),
-                    member(
-                        format!("{root}.attn.proj.weight"),
-                        vec![hidden, hidden],
-                        MemberSharding::Replicated,
-                    ),
-                    member(
-                        format!("{root}.attn.proj.bias"),
-                        vec![hidden],
-                        MemberSharding::Replicated,
-                    ),
-                ],
-            )?,
-        ));
-        let intermediate = dim(config.intermediate_size)?;
-        groups.push((
-            VisionParameterOwner::Layer(layer),
-            ParameterGroupSpec::new(
-                format!("{root}.mlp.intermediate"),
+                spec.attention.logical_parameters(),
+            ),
+            (
+                format!("{}.mlp.intermediate", spec.root),
                 ParameterRole::FeedForwardIntermediate,
-                [
-                    member(
-                        format!("{root}.mlp.fc1.weight"),
-                        vec![intermediate, hidden],
-                        MemberSharding::Replicated,
-                    ),
-                    member(
-                        format!("{root}.mlp.fc1.bias"),
-                        vec![intermediate],
-                        MemberSharding::Replicated,
-                    ),
-                    member(
-                        format!("{root}.mlp.fc2.weight"),
-                        vec![hidden, intermediate],
-                        MemberSharding::Replicated,
-                    ),
-                    member(
-                        format!("{root}.mlp.fc2.bias"),
-                        vec![hidden],
-                        MemberSharding::Replicated,
-                    ),
-                ],
-            )?,
-        ));
-        groups.push((
-            VisionParameterOwner::Layer(layer),
-            replicated(
-                format!("{root}.norms"),
-                [
-                    (format!("{root}.norm1.weight"), vec![hidden]),
-                    (format!("{root}.norm1.bias"), vec![hidden]),
-                    (format!("{root}.norm2.weight"), vec![hidden]),
-                    (format!("{root}.norm2.bias"), vec![hidden]),
-                ],
-            )?,
-        ));
+                spec.mlp.logical_parameters(),
+            ),
+            (
+                format!("{}.norms", spec.root),
+                ParameterRole::Replicated,
+                spec.norms[..].logical_parameters(),
+            ),
+        ] {
+            groups.push((
+                VisionParameterOwner::Layer(layer),
+                group(
+                    name,
+                    role,
+                    parameters.map_err(|error| invalid(error.to_string()))?,
+                )?,
+            ));
+        }
     }
-    let projector = dim(config.projector_hidden_size)?;
-    let shuffled = hidden
-        .checked_mul(dim(config.merge_size * config.merge_size)?)
-        .ok_or_else(|| invalid("Muse-Glimmer shuffled width overflow"))?;
-    groups.push((
-        VisionParameterOwner::Static(VisionStaticResource::Adapter),
-        ParameterGroupSpec::new(
-            VisionStaticResource::Adapter.logical_name(),
+    for (resource, role, parameters) in [
+        (
+            VisionStaticResource::Adapter,
             ParameterRole::FeedForwardIntermediate,
-            [
-                member(
-                    "model.vision_adapter.fc1.weight",
-                    vec![projector, shuffled],
-                    MemberSharding::Replicated,
-                ),
-                member(
-                    "model.vision_adapter.fc2.weight",
-                    vec![projector, projector],
-                    MemberSharding::Replicated,
-                ),
-            ],
-        )?,
-    ));
-    groups.push((
-        VisionParameterOwner::Static(VisionStaticResource::Projection),
-        ParameterGroupSpec::new(
-            VisionStaticResource::Projection.logical_name(),
+            declarations.statics.adapter.logical_parameters(),
+        ),
+        (
+            VisionStaticResource::Projection,
             ParameterRole::ColumnProjection,
-            [member(
-                "model.vision_projection.weight",
-                vec![dim(config.language_hidden_size)?, projector],
-                MemberSharding::Replicated,
-            )],
-        )?,
-    ));
-    groups.push((
-        VisionParameterOwner::Static(VisionStaticResource::Norms),
-        replicated(
-            VisionStaticResource::Norms.logical_name(),
-            [
-                ("model.vision_tower.ln_pre.weight", vec![hidden]),
-                ("model.vision_tower.ln_pre.bias", vec![hidden]),
-                ("model.vision_tower.ln_post.weight", vec![hidden]),
-                ("model.vision_tower.ln_post.bias", vec![hidden]),
-            ],
-        )?,
-    ));
-    eredu_runtime::expand_tagged_linear_format_parameter_groups(groups, |member| {
-        standard_parallel_linear_format(member, config.linear_format_for(member.target()))
-    })
-}
-
-/// Vision units whose owners need each pinned static module. Every vision
-/// partition prepares request geometry through the pinned ingress in `begin`;
-/// patch/position and static norm groups therefore remain available on those
-/// owners. The large merge adapter and projection are needed only at the end.
-pub(crate) fn vision_static_consumer_units(
-    args: &DecoderConfig,
-    target: &str,
-) -> Option<std::ops::Range<usize>> {
-    let layers = args.vision_config.as_ref()?.layer_count();
-    if layers == 0 {
-        return None;
+            declarations.statics.projection.logical_parameters(),
+        ),
+        (
+            VisionStaticResource::Norms,
+            ParameterRole::Replicated,
+            declarations.statics.norms[..].logical_parameters(),
+        ),
+    ] {
+        groups.push((
+            VisionParameterOwner::Static(resource),
+            group(
+                resource.logical_name().to_owned(),
+                role,
+                parameters.map_err(|error| invalid(error.to_string()))?,
+            )?,
+        ));
     }
-    VisionStaticResource::ALL
-        .into_iter()
-        .find(|resource| resource.owns_target(target))
-        .map(|resource| resource.consumers(layers))
+    Ok(groups)
 }
 
 /// Declares only the pinned patch/position, merge, projection, and norm groups.
@@ -1111,52 +869,6 @@ pub fn vision_layer_parameter_groups(
             _ => None,
         })
         .collect())
-}
-
-fn group(
-    name: impl Into<String>,
-    role: ParameterRole,
-    members: impl IntoIterator<Item = (impl Into<String>, Vec<usize>, MemberSharding)>,
-) -> Result<ParameterGroupSpec, ParallelPlanError> {
-    ParameterGroupSpec::new(
-        name,
-        role,
-        members
-            .into_iter()
-            .map(|(name, shape, sharding)| member(name, shape, sharding)),
-    )
-}
-
-fn replicated(
-    name: impl Into<String>,
-    members: impl IntoIterator<Item = (impl Into<String>, Vec<usize>)>,
-) -> Result<ParameterGroupSpec, ParallelPlanError> {
-    group(
-        name,
-        ParameterRole::Replicated,
-        members
-            .into_iter()
-            .map(|(name, shape)| (name, shape, MemberSharding::Replicated)),
-    )
-}
-
-fn member(
-    name: impl Into<String>,
-    shape: Vec<usize>,
-    sharding: MemberSharding,
-) -> ParameterMemberSpec {
-    ParameterMemberSpec::new(name, shape, sharding)
-}
-
-const fn partitioned(axis: usize) -> MemberSharding {
-    MemberSharding::Partitioned { axis }
-}
-
-fn dim(value: i32) -> Result<usize, ParallelPlanError> {
-    usize::try_from(value)
-        .ok()
-        .filter(|value| *value > 0)
-        .ok_or_else(|| invalid(format!("invalid Muse-Glimmer dimension {value}")))
 }
 
 fn invalid(message: impl Into<String>) -> ParallelPlanError {

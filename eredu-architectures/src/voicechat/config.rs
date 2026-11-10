@@ -492,13 +492,7 @@ fn source_document(source: &Value) -> Result<Value, ConfigError> {
     equals(source, "/mlx_runtime_config_version", json!(2))?;
     // These are the complete published Nemotron-H inference fields. Unknown
     // equation overrides must not disappear during document projection.
-    let text = json!({"model_type":"nemotron_h", "vocab_size":131072, "hidden_size":4480,
-        "intermediate_size":15680, "num_hidden_layers":56, "max_position_embeddings":131072,
-        "num_attention_heads":40, "num_key_value_heads":8, "attention_bias":false,
-        "mamba_num_heads":128, "mamba_head_dim":80, "mamba_proj_bias":false,
-        "ssm_state_size":128, "conv_kernel":4, "n_groups":8, "mlp_bias":false,
-        "layer_norm_epsilon":1e-5, "use_bias":false, "use_conv_bias":true,
-        "hybrid_override_pattern":"M-M-M-MM-M-M-M*-M-M-M*-M-M-M-M*-M-M-M-M*-M-MM-M-M-M-M-M-", "head_dim":128});
+    let text = released_backbone_configuration();
     compare("/text_config", &text, at(source, "/text_config")?)?;
     known_fields(
         source,
@@ -1246,4 +1240,20 @@ fn normalize(source: &Value) -> Result<VoiceChatConfig, ConfigError> {
         speaker_name: read(source, "/model/inference_speaker_name")?,
         linear_formats: std::collections::BTreeMap::new(),
     })
+}
+
+/// Normalizes the pinned configuration without re-entering checkpoint format admission.
+pub(super) fn released_configuration() -> Result<VoiceChatConfig, ConfigError> {
+    normalize(&serde_json::from_str(RELEASED)?)
+}
+
+/// Published backbone inference fields shared by document validation and parameter projection.
+pub(crate) fn released_backbone_configuration() -> Value {
+    json!({"model_type":"nemotron_h", "vocab_size":131072, "hidden_size":4480,
+        "intermediate_size":15680, "num_hidden_layers":56, "max_position_embeddings":131072,
+        "num_attention_heads":40, "num_key_value_heads":8, "attention_bias":false,
+        "mamba_num_heads":128, "mamba_head_dim":80, "mamba_proj_bias":false,
+        "ssm_state_size":128, "conv_kernel":4, "n_groups":8, "mlp_bias":false,
+        "layer_norm_epsilon":1e-5, "use_bias":false, "use_conv_bias":true,
+        "hybrid_override_pattern":"M-M-M-MM-M-M-M*-M-M-M*-M-M-M-M*-M-M-M-M*-M-MM-M-M-M-M-M-", "head_dim":128})
 }

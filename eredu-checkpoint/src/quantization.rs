@@ -308,18 +308,15 @@ impl BoundedQuantizationTarget {
             ));
         }
         let columns = input_shape.last().copied().unwrap_or(0);
-        let group = quantization.group_size() as usize;
-        if input_shape.len() < 2
-            || columns == 0
-            || columns % group != 0
-            || columns % 32 != 0
-            || input_shape.contains(&0)
-        {
+        if input_shape.len() < 2 || columns == 0 || columns % 32 != 0 || input_shape.contains(&0) {
             return Err(quantization_error(format!(
                 "quantization input geometry is incompatible: {}",
                 self.weight_name
             )));
         }
+        let geometry = quantization
+            .packed_word_geometry(columns)
+            .map_err(|error| quantization_error(format!("{}: {error}", self.weight_name)))?;
         let dtype = match self.affine_companion_dtype {
             RecipeDtype::F16 => StoredDtype::F16,
             RecipeDtype::BF16 => StoredDtype::BF16,
@@ -353,17 +350,14 @@ impl BoundedQuantizationTarget {
         };
         insert(
             &self.weight_name,
-            columns
-                .checked_mul(quantization.bits() as usize)
-                .ok_or_else(|| quantization_error("packed width overflow"))?
-                / 32,
+            geometry.word_columns(),
             StoredDtype::U32,
             4,
         )?;
         let mxfp = matches!(quantization, WeightQuantization::MxFp4);
         insert(
             &self.scales_name,
-            columns / group,
+            geometry.group_columns(),
             if mxfp { StoredDtype::U8 } else { dtype.clone() },
             if mxfp {
                 1
@@ -376,7 +370,7 @@ impl BoundedQuantizationTarget {
                 self.biases_name
                     .as_deref()
                     .ok_or_else(|| quantization_error("affine target has no biases identity"))?,
-                columns / group,
+                geometry.group_columns(),
                 dtype,
                 self.affine_companion_bytes(),
             )?;

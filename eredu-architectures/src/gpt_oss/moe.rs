@@ -95,13 +95,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedMlp<B> 
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let router = B::top_k_group_selector(selector_spec(args, layer)?, context)?;
-        let experts = B::grouped_gated_product(expert_bank_spec(args, layer)?, context)?;
-        Ok(Self {
-            layer,
-            router,
-            experts,
-        })
+        Self::from_spec(layer, routed_spec(args, layer)?, context)
     }
 
     /// Builds a partition-local bank while retaining global SelectedSoftmax routing.
@@ -111,20 +105,23 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedMlp<B> 
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let router = B::top_k_group_selector(selector_spec(global, layer)?, context)?;
-        let experts = B::grouped_gated_product(
-            localized_expert_bank_spec(
-                global,
-                layer,
-                local.num_local_experts,
-                local.intermediate_size,
-            )?,
+        Self::from_spec(
+            layer,
+            local_spec(local, &routed_spec(global, layer)?)?,
             context,
-        )?;
+        )
+    }
+
+    pub(crate) fn from_spec(
+        layer: usize,
+        spec: eredu_nn::RoutedGatedProductSpec,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        spec.validate()?;
         Ok(Self {
             layer,
-            router,
-            experts,
+            router: B::top_k_group_selector(spec.selector, context)?,
+            experts: B::grouped_gated_product(spec.experts, context)?,
         })
     }
 
@@ -190,11 +187,18 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedMlp<B> 
     }
 }
 
-/// Declares global biased routing independently of native materialization.
-pub(crate) fn selector_spec(
+/// Declares global biased routing and native MXFP4 experts as one validated scope.
+pub(crate) fn routed_spec(
     args: &ModelArgs,
     layer: usize,
-) -> Result<TopKGroupSelectorSpec, Error> {
+) -> Result<eredu_nn::RoutedGatedProductSpec, Error> {
+    args.validate().map_err(Error::backend_source)?;
+    let layers = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
+    if layer >= layers {
+        return Err(Error::backend(format!(
+            "GPT-OSS expert layer {layer} is outside {layers} declared layers"
+        )));
+    }
     let prefix = format!("{}.layers.{layer}.mlp", args.parameter_root);
     let router_weight = format!("{prefix}.router.weight");
     let router_bias = format!("{prefix}.router.bias");
@@ -204,7 +208,7 @@ pub(crate) fn selector_spec(
         GroupScoring::SelectedSoftmax,
         false,
     )?;
-    TopKGroupSelectorSpec::new(
+    let selector = TopKGroupSelectorSpec::new(
         args.hidden_size,
         ParameterSpec::trainable(&router_weight).map_err(Error::backend)?,
         crate::linear_format::standard_linear_format(
@@ -214,17 +218,13 @@ pub(crate) fn selector_spec(
         )?,
         routing,
     )?
-    .with_bias(ParameterSpec::trainable(&router_bias).map_err(Error::backend)?)
-}
-
-/// Returns the architecture-owned routed expert specification for one layer.
-pub fn expert_bank_spec(args: &ModelArgs, layer: usize) -> Result<GroupedGatedProductSpec, Error> {
+    .with_bias(ParameterSpec::trainable(&router_bias).map_err(Error::backend)?)?;
     let expert_prefix = format!("{}.layers.{layer}.mlp.experts", args.parameter_root);
     let gate_up_weight = format!("{expert_prefix}.gate_up_proj");
     let gate_up_bias = format!("{expert_prefix}.gate_up_proj_bias");
     let down_weight = format!("{expert_prefix}.down_proj");
     let down_bias = format!("{expert_prefix}.down_proj_bias");
-    GroupedGatedProductSpec::new(
+    let experts = GroupedGatedProductSpec::new(
         args.num_local_experts,
         args.hidden_size,
         args.intermediate_size,
@@ -235,97 +235,39 @@ pub fn expert_bank_spec(args: &ModelArgs, layer: usize) -> Result<GroupedGatedPr
                 &gate_up_weight,
                 Some(&gate_up_bias),
                 WeightQuantization::MxFp4.into(),
+                eredu_nn::LinearRowLayout::equal_partitions(2)?,
             )?,
             down: standard_expert_projection(
                 &down_weight,
                 Some(&down_bias),
                 WeightQuantization::MxFp4.into(),
+                eredu_nn::LinearRowLayout::Contiguous,
             )?,
         },
-    )
+    )?;
+    eredu_nn::RoutedGatedProductSpec::new(selector, experts)
 }
 
-/// Returns the architecture-owned routed expert specification at rank-local geometry.
-///
-/// Parameter identities, native MXFP4 formats, biases, and gating policy remain
-/// identical to the global bank; only placement-resolved geometry is localized.
-pub(crate) fn localized_expert_bank_spec(
-    args: &ModelArgs,
-    layer: usize,
-    expert_count: i32,
-    intermediate_dimensions: i32,
-) -> Result<GroupedGatedProductSpec, Error> {
-    expert_bank_spec(args, layer)?.with_group_geometry(expert_count, intermediate_dimensions)
-}
-
-/// Derives the complete replicated expert plan directly from normalized geometry.
-pub fn replicated_expert_realization_plan(
-    args: &ModelArgs,
-) -> Result<crate::ExpertRealizationPlan<GroupedGatedProductSpec>, Error> {
-    let global_experts = usize::try_from(args.num_local_experts).map_err(Error::backend)?;
-    let layers = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
-    let owner_group =
-        eredu_runtime::ExecutionGroupId::new("text_decoder").map_err(Error::backend)?;
-    let unit_specs = (0..layers)
-        .map(|layer| expert_bank_spec(args, layer).map(|spec| ((owner_group.clone(), layer), spec)))
-        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
-    crate::ExpertRealizationPlan::balanced(
-        global_experts,
-        eredu_core::ParallelRankTopology::new(
-            eredu_core::ParallelTopology::new(1, 1, 1, 1).map_err(Error::backend)?,
-            0,
-        )
-        .map_err(Error::backend)?,
-        unit_specs,
-    )
-    .map_err(Error::backend)
-}
-
-/// Derives complete expert ownership and rank-local bank geometry from GPT-OSS.
-pub fn expert_realization_plan<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>(
-    architecture: &super::LayeredModel<B>,
+/// Derives complete expert authority from normalized configuration and retained placement.
+/// No native model, tensor or context participates in this projection.
+pub fn expert_realization_plan(
+    declaration: &super::Declaration,
+    geometry: Option<&super::LocalGeometry>,
     topology: eredu_core::ParallelRankTopology,
-) -> Result<Option<crate::ExpertRealizationPlan<GroupedGatedProductSpec>>, Error> {
-    let args = architecture.kernel().args();
-    let global_experts = usize::try_from(args.num_local_experts).map_err(Error::backend)?;
-    let local_experts = i32::try_from(
-        eredu_core::balanced_contiguous_range(
-            global_experts,
-            topology.expert_parallel_size(),
-            topology.expert_parallel_rank(),
-            false,
-        )
-        .map_err(Error::backend)?
-        .len(),
-    )
-    .map_err(Error::backend)?;
-    let layers = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
-    let owner_group =
-        eredu_runtime::ExecutionGroupId::new("text_decoder").map_err(Error::backend)?;
-    let mut unit_specs = std::collections::BTreeMap::new();
-    for layer in 0..layers {
-        let width = architecture
-            .kernel()
-            .parallel_geometry()
-            .and_then(|geometry| geometry.block(layer))
-            .map_or(args.intermediate_size, |local| local.intermediate_size);
-        unit_specs.insert(
-            (owner_group.clone(), layer),
-            localized_expert_bank_spec(args, layer, local_experts, width)?,
-        );
+) -> Result<crate::ExpertRealizationPlan<GroupedGatedProductSpec>, Error> {
+    let args = declaration.args();
+    args.validate().map_err(Error::backend_source)?;
+    if let Some(geometry) = geometry {
+        geometry
+            .validate_with_declaration(args, declaration.common())
+            .map_err(Error::backend_source)?;
     }
-    crate::ExpertRealizationPlan::balanced(global_experts, topology, unit_specs)
-        .map(Some)
-        .map_err(Error::backend)
-}
-
-/// Derives exact TP×EP-local expert geometry before native construction.
-pub fn partition_expert_realization_plan(
-    args: &ModelArgs,
-    layout: &eredu_runtime::LocalModelLayout,
-    topology: eredu_core::ParallelRankTopology,
-) -> Result<crate::ExpertRealizationPlan<GroupedGatedProductSpec>, Error> {
-    let global_experts = usize::try_from(args.num_local_experts).map_err(Error::backend)?;
+    let banks = declaration.expert_banks()?;
+    let global_experts = banks
+        .values()
+        .next()
+        .ok_or_else(|| Error::backend("GPT-OSS has no declared expert banks"))?
+        .group_count() as usize;
     let local_experts = i32::try_from(
         eredu_core::balanced_contiguous_range(
             global_experts,
@@ -337,17 +279,21 @@ pub fn partition_expert_realization_plan(
         .len(),
     )
     .map_err(Error::backend)?;
-    let layers = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
     let owner_group =
-        eredu_runtime::ExecutionGroupId::new("text_decoder").map_err(Error::backend)?;
-    let unit_specs = (0..layers)
-        .map(|layer| {
-            let local =
-                super::parallel::local_block_args(args, layer, layout).map_err(Error::backend)?;
-            localized_expert_bank_spec(args, layer, local_experts, local.intermediate_size)
+        eredu_runtime::ExecutionGroupId::new(crate::decoder::TEXT_DECODER_EXECUTION_GROUP)
+            .map_err(Error::backend)?;
+    let unit_specs = banks
+        .into_iter()
+        .map(|(layer, bank)| {
+            let width = geometry
+                .and_then(|geometry| geometry.block(layer))
+                .map_or(bank.intermediate_dimensions(), |local| {
+                    local.intermediate_size
+                });
+            bank.with_group_geometry(local_experts, width)
                 .map(|spec| ((owner_group.clone(), layer), spec))
         })
-        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
+        .collect::<Result<_, Error>>()?;
     crate::ExpertRealizationPlan::balanced(global_experts, topology, unit_specs)
         .map_err(Error::backend)
 }
@@ -390,4 +336,14 @@ impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeur
             context,
         )
     }
+}
+
+/// Declares global routing with the selected local bank geometry.
+pub(crate) fn local_spec(
+    local: &ModelArgs,
+    parameters: &eredu_nn::RoutedGatedProductSpec,
+) -> Result<eredu_nn::RoutedGatedProductSpec, Error> {
+    parameters
+        .clone()
+        .with_group_geometry(local.num_local_experts, local.intermediate_size)
 }

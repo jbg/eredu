@@ -1,26 +1,22 @@
 //! Each prediction depth owns an ordered physical schedule and fused residual base.
 use super::*;
 use crate::discovery::routed_components::{self as routed_units, Site as RoutedUnitSite};
-use crate::nemotron_h::{LayerPolicy, ModelArgs};
+use crate::nemotron_h::{declarations::TargetOperatorParameters as P, LayerPolicy};
 
-fn normalization(c: &ModelArgs, gain: String) -> ComponentNormalization {
-    ComponentNormalization {
-        kind: ComponentNormalizationKind::Rms,
-        epsilon: ComponentScalar::new(c.layer_norm_epsilon),
-        gain: Some(gain),
-        gain_offset: ComponentScalar::new(0.0),
-        bias: None,
-        groups: 1,
-    }
-}
-
-pub(in crate::discovery) fn declare(g: &mut Builder, c: &ModelArgs, target_output: &str) {
-    let policies = c
-        .mtp_policies()
-        .expect("admitted Nemotron prediction schedule");
+pub(in crate::discovery) fn declare(
+    g: &mut Builder,
+    declaration: &crate::nemotron_h::Declaration,
+    target_output: &str,
+) {
+    let c = declaration.args();
+    let statics = &declaration.statics;
+    let embedding_weight = &statics.embedding_spec().weight;
+    let output_weight = statics
+        .head_spec()
+        .map(|p| &p.weight)
+        .unwrap_or(embedding_weight);
     let depth_count = c.num_nextn_predict_layers as usize;
-    let pattern = policies.len() / depth_count;
-    let width = c.hidden_size as usize;
+    let pattern = declaration.predictions.len() / depth_count;
     g.node(
         "prediction",
         ArchitectureNodeKind::Prediction,
@@ -30,8 +26,40 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &ModelArgs, target_outpu
     );
     g.edge(target_output, "prediction", ArchitectureEdgeKind::Data);
     for depth in 0..depth_count {
-        let first = format!("model.mtp.layers.{}", depth * pattern);
-        let last = format!("model.mtp.layers.{}", (depth + 1) * pattern - 1);
+        let first_parameters = &declaration.predictions[depth * pattern];
+        let last_parameters = &declaration.predictions[(depth + 1) * pattern - 1];
+        let first = format!("model.mtp.layers.{}", first_parameters.physical);
+        let last = format!("model.mtp.layers.{}", last_parameters.physical);
+        let fusion_spec = first_parameters
+            .fusion
+            .as_ref()
+            .expect("first prediction unit fusion");
+        let embedding_norm_spec = first_parameters
+            .embedding_norm
+            .as_ref()
+            .expect("first prediction embedding norm");
+        let hidden_norm_spec = first_parameters
+            .hidden_norm
+            .as_ref()
+            .expect("first prediction hidden norm");
+        let final_norm_spec = last_parameters
+            .final_norm
+            .as_ref()
+            .expect("last prediction final norm");
+        let embedding_normalization = super::super::declared_normalization(embedding_norm_spec);
+        let hidden_normalization = super::super::declared_normalization(hidden_norm_spec);
+        let final_normalization = super::super::declared_normalization(final_norm_spec);
+        let prefix = |normalization: &ComponentNormalization| {
+            normalization
+                .gain
+                .as_ref()
+                .expect("declared prediction normalization")
+                .trim_end_matches(".weight")
+                .to_owned()
+        };
+        let embedding_prefix = embedding_weight.id.as_str().trim_end_matches(".weight");
+        let fusion_prefix = fusion_spec.weight.id.as_str().trim_end_matches(".weight");
+        let width = fusion_spec.output as usize;
         let root = format!("prediction.layers.{depth}");
         let embedding = format!("{root}.embedding");
         let embedding_norm = format!("{embedding}.norm");
@@ -48,22 +76,22 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &ModelArgs, target_outpu
             (
                 &embedding,
                 ArchitectureNodeKind::Embedding,
-                "model.embeddings".to_owned(),
+                embedding_prefix.to_owned(),
             ),
             (
                 &embedding_norm,
                 ArchitectureNodeKind::Normalization,
-                format!("{first}.enorm"),
+                prefix(&embedding_normalization),
             ),
             (
                 &hidden_norm,
                 ArchitectureNodeKind::Normalization,
-                format!("{first}.hnorm"),
+                prefix(&hidden_normalization),
             ),
             (
                 &fusion,
                 ArchitectureNodeKind::Projector,
-                format!("{first}.eh_proj"),
+                fusion_prefix.to_owned(),
             ),
         ] {
             g.node(node, kind, Some(&root), Some(&parameter), Some(width));
@@ -124,7 +152,8 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &ModelArgs, target_outpu
                 node_id: block.clone(),
                 physical_layer_index: relative,
             });
-            let policy = policies[physical];
+            let unit = &declaration.predictions[physical];
+            let policy = unit.policy;
             let kind = match policy {
                 LayerPolicy::SelfAttention(_) => ArchitectureNodeKind::Attention,
                 LayerPolicy::SparseMoe => ArchitectureNodeKind::MixtureOfExperts,
@@ -139,37 +168,25 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &ModelArgs, target_outpu
                 width,
                 kind,
             );
-            match policy {
-                LayerPolicy::SelfAttention(policy) => {
+            match (&unit.block.operator, policy) {
+                (P::Attention(spec), LayerPolicy::SelfAttention(policy)) => {
+                    let geometry = spec.projection.geometry;
                     let mut attributes = attention(
-                        c.num_attention_heads,
-                        c.num_key_value_heads,
-                        c.head_dim,
+                        geometry.query_heads(),
+                        geometry.key_value_heads(),
+                        geometry.key_dimensions(),
                         policy,
                     );
                     attributes.positional_encoding = Some(PositionalEncoding::None);
                     g.get_mut(&operator).attention = Some(attributes);
-                    super::super::nemotron_unit_at(
-                        g,
-                        c,
-                        layer,
-                        &path,
-                        &operator,
-                        true,
-                        &parameters,
-                    );
+                    super::super::nemotron_unit(g, &unit.block, layer, &path, &operator);
                 }
-                LayerPolicy::SparseMoe => {
+                (P::Sparse(spec), LayerPolicy::SparseMoe) => {
                     super::super::nemotron_other_unit(g, width, &path, &operator, "feed_forward");
-                    let mut attributes = moe(
-                        c.n_routed_experts,
-                        c.num_experts_per_tok,
-                        c.n_shared_experts,
-                        c.norm_topk_prob,
-                        RoutingScoreTransform::Sigmoid,
-                    );
-                    attributes.shared_expert_width =
-                        Some(c.moe_shared_expert_intermediate_size as usize);
+                    let mut attributes =
+                        declared_routing(spec.selector.selection(), c.n_shared_experts)
+                            .expect("admitted prediction routing equation");
+                    attributes.shared_expert_width = Some(spec.shared.network.up.output as usize);
                     g.moe(
                         &operator,
                         &parameters,
@@ -177,7 +194,15 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &ModelArgs, target_outpu
                         Some(&format!("{path}.routing")),
                         width,
                     );
-                    super::shared_units_at(g, c, layer, &path, &operator, &parameters);
+                    super::shared_units(
+                        g,
+                        spec,
+                        &unit.block.norm,
+                        layer,
+                        &path,
+                        &operator,
+                        &parameters,
+                    );
                     routed_units::relu2(
                         g,
                         RoutedUnitSite {
@@ -185,14 +210,12 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &ModelArgs, target_outpu
                             layer,
                             routing: &format!("{path}.routing"),
                             input: Some(format!("{path}.feed_forward.input")),
-                            normalization: Some(routed_units::rms(
-                                format!("{path}.norm.weight"),
-                                c.layer_norm_epsilon,
-                                0.0,
+                            normalization: Some(super::super::declared_normalization(
+                                &unit.block.norm,
                             )),
                             residual_scale: Some(ComponentScalar::new(1.0)),
                         },
-                        crate::nemotron_h::expert_bank_spec(c, layer),
+                        Ok(spec.experts.clone()),
                     );
                     other_writes.push(ComponentResidualWrite {
                         input: Some(format!("{path}.feed_forward.input")),
@@ -221,16 +244,16 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &ModelArgs, target_outpu
         let routed_components = g.descriptor.routed_components.split_off(routed_start);
         let head_norm = format!("{root}.head.norm");
         let head = format!("{root}.head");
-        let output_parameter = if c.tie_word_embeddings {
-            "model.embeddings"
-        } else {
-            "lm_head"
-        };
+        let output_parameter = output_weight
+            .id
+            .as_str()
+            .strip_suffix(".weight")
+            .expect("declared vocabulary weight");
         g.node(
             &head_norm,
             ArchitectureNodeKind::Normalization,
             Some(&root),
-            Some(&format!("{last}.final_layernorm")),
+            Some(&prefix(&final_normalization)),
             Some(width),
         );
         g.node(
@@ -254,7 +277,7 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &ModelArgs, target_outpu
             "Normalized prediction residual consumed by the shared head",
             axes(width),
         );
-        let mut vocabulary = axes(c.vocab_size as usize);
+        let mut vocabulary = axes(statics.embedding_spec().vocabulary as usize);
         vocabulary[2].name = "vocabulary".into();
         g.get_mut(&head).output_axes = Some(vocabulary.clone());
         g.component_observation(
@@ -267,7 +290,7 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &ModelArgs, target_outpu
             id: format!("prediction.{depth}"),
             node_id: root,
             execution_groups: vec![format!("mtp.{depth}")],
-            static_parameter_roles: if c.tie_word_embeddings {
+            static_parameter_roles: if statics.head_spec().is_none() {
                 vec!["embedding".into()]
             } else {
                 vec!["embedding".into(), "output".into()]
@@ -280,28 +303,35 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &ModelArgs, target_outpu
                     ComponentFusionInput {
                         source: ComponentFusionSource::TokenEmbedding {
                             normalization: None,
-                            weight: "model.embeddings.weight".into(),
-                            shared_weight: "model.embeddings.weight".into(),
-                            parameter_group: "parameters:model.embeddings".into(),
+                            weight: embedding_weight.id.as_str().into(),
+                            shared_weight: embedding_weight.id.as_str().into(),
+                            parameter_group: format!("parameters:{embedding_prefix}"),
                             scale: ComponentScalar::new(1.0),
                         },
-                        normalization: normalization(c, format!("{first}.enorm.weight")),
+                        normalization: embedding_normalization,
                         output: format!("{first}.prediction.embedding.normalized.effective"),
-                        columns: 0..width,
+                        columns: 0..embedding_norm_spec.dimensions as usize,
                     },
                     ComponentFusionInput {
                         source: ComponentFusionSource::Observation {
                             path: format!("{first}.prediction.hidden"),
                         },
-                        normalization: normalization(c, format!("{first}.hnorm.weight")),
+                        normalization: hidden_normalization,
                         output: format!("{first}.prediction.hidden.normalized.effective"),
-                        columns: width..width * 2,
+                        columns: embedding_norm_spec.dimensions as usize
+                            ..fusion_spec.input as usize,
                     },
                 ],
-                weight: format!("{first}.eh_proj.weight"),
-                shared_weight: format!("{first}.eh_proj.weight"),
-                parameter_group: format!("parameters:{first}.eh_proj"),
-                bias: None,
+                weight: fusion_spec.weight.id.as_str().into(),
+                shared_weight: fusion_spec
+                    .weight
+                    .alias_of
+                    .as_ref()
+                    .unwrap_or(&fusion_spec.weight.id)
+                    .as_str()
+                    .into(),
+                parameter_group: format!("parameters:{fusion_prefix}"),
+                bias: fusion_spec.bias.as_ref().map(|bias| bias.id.to_string()),
                 projection_input: format!("{first}.prediction.fusion.input"),
                 output: format!("{first}.prediction.fusion.output"),
                 effective_output: format!("{first}.prediction.fusion.output.effective"),
@@ -316,8 +346,8 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &ModelArgs, target_outpu
                 projection_input: Some(format!("{last}.prediction.readout.projection_input")),
                 linear_scores: format!("{last}.prediction.readout.linear"),
                 logits: format!("{last}.prediction.readout.linear.effective"),
-                normalization: normalization(c, format!("{last}.final_layernorm.weight")),
-                weight: format!("{output_parameter}.weight"),
+                normalization: final_normalization,
+                weight: output_weight.id.as_str().into(),
                 bias: None,
                 output_transform: ComponentOutputTransform::Identity,
                 block_normalizations: vec![],

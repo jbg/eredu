@@ -8,8 +8,8 @@ use eredu_runtime::{
 };
 
 use super::{
-    prompt_cache_architecture_fingerprint, state_layout_with_geometry, HybridConfig,
-    HybridLayerPolicy, HybridStateGeometry, ParsedHybridConfig,
+    prompt_cache_architecture_fingerprint, state_layout_with_block_configs, HybridConfig,
+    HybridLayerPolicy, ParsedHybridConfig,
 };
 
 use crate::qwen::vision;
@@ -22,6 +22,7 @@ pub struct LocalGeometry {
     embedding_range: VocabularyParallelRange,
     output_range: Option<VocabularyParallelRange>,
     state_layout: StateLayout,
+    parameters: std::sync::Arc<eredu_runtime::ArchitectureParameterDescription>,
     architecture_fingerprint: String,
 }
 
@@ -56,7 +57,10 @@ impl LocalGeometry {
             .map_err(|_| invalid("Qwen hybrid target layer count is negative"))?;
         let predictions = usize::try_from(config.mtp_num_hidden_layers)
             .map_err(|_| invalid("Qwen hybrid MTP layer count is negative"))?;
-        if self.architecture_fingerprint != prompt_cache_architecture_fingerprint(config)
+        let parameters =
+            super::parameter_description(config, crate::decoder::ParameterEncoding::Stored)?;
+        if self.parameters.as_ref() != &parameters
+            || self.architecture_fingerprint != prompt_cache_architecture_fingerprint(config)
             || self.target.len() != targets
             || self.prediction.len() != predictions
         {
@@ -98,7 +102,7 @@ pub fn local_geometry(
     let prediction = (0..predictions)
         .map(|depth| local_unit_config(config, depth + 1, 0, layout))
         .collect::<Result<Vec<_>, _>>()?;
-    let (embedding_range, output_range) = super::static_module_spec(config).vocabulary_ranges(
+    let (embedding_range, output_range) = config.statics().vocabulary_ranges(
         layout,
         "model.embed_tokens",
         "model.norm",
@@ -111,6 +115,10 @@ pub fn local_geometry(
         embedding_range,
         output_range,
         state_layout,
+        parameters: std::sync::Arc::new(super::parameter_description(
+            config,
+            crate::decoder::ParameterEncoding::Stored,
+        )?),
         architecture_fingerprint: prompt_cache_architecture_fingerprint(config),
     };
     geometry.validate_for(config)?;
@@ -122,28 +130,8 @@ fn local_state_layout(
     target: &[HybridConfig],
     prediction: &[HybridConfig],
 ) -> Result<StateLayout, ParallelPlanError> {
-    let mut geometry = target
-        .iter()
-        .enumerate()
-        .map(|(layer, local)| match config.layer_schedule.get(layer) {
-            Some(HybridLayerPolicy::SelfAttention(_)) => HybridStateGeometry::FullAttention {
-                key_value_heads: local.num_key_value_heads,
-            },
-            Some(HybridLayerPolicy::LinearAttention) => HybridStateGeometry::LinearAttention {
-                key_heads: local.linear_num_key_heads,
-                value_heads: local.linear_num_value_heads,
-            },
-            None => HybridStateGeometry::FullAttention { key_value_heads: 0 },
-        })
-        .collect::<Vec<_>>();
-    geometry.extend(
-        prediction
-            .iter()
-            .map(|local| HybridStateGeometry::FullAttention {
-                key_value_heads: local.num_key_value_heads,
-            }),
-    );
-    state_layout_with_geometry(config, &geometry).map_err(|error| invalid(error.to_string()))
+    state_layout_with_block_configs(config, target.iter(), prediction.iter())
+        .map_err(|error| invalid(error.to_string()))
 }
 
 fn invalid(message: impl Into<String>) -> ParallelPlanError {
@@ -511,9 +499,9 @@ pub fn conditional_local_geometry(
         .ok_or_else(|| invalid("conditional Qwen requires vision geometry"))?;
     let text = local_geometry(&parsed.text, layout)?;
     let vision_blocks = (0..vision_config.layer_count())
-        .map(|layer| vision::local_block_geometry(vision_config, "model.visual", layer, layout))
+        .map(|layer| vision::local_block_geometry(vision_config, layer, layout))
         .collect::<Result<Vec<_>, _>>()?;
-    let merger_widths = vision::local_merger_widths(vision_config, "model.visual", layout)?;
+    let merger_widths = vision::local_merger_widths(vision_config, layout)?;
     let geometry = ConditionalLocalGeometry {
         text,
         vision_blocks,
@@ -717,7 +705,7 @@ fn local_config_at(
     policy: HybridLayerPolicy,
     layout: &eredu_runtime::LocalModelLayout,
 ) -> Result<HybridConfig, ParallelPlanError> {
-    let mut local = config.clone();
+    let mut local = config.policy().clone();
     match policy {
         HybridLayerPolicy::LinearAttention => {
             let key = local_width(layout, &format!("{root}.linear_attn.in_proj_qkv.weight"), 0)?;
@@ -743,20 +731,30 @@ fn local_config_at(
             local.linear_num_value_heads = value / config.linear_value_head_dim;
         }
         HybridLayerPolicy::SelfAttention(_) => {
-            let query = local_width(layout, &format!("{root}.self_attn.q_proj.weight"), 0)?;
-            let key = local_width(layout, &format!("{root}.self_attn.k_proj.weight"), 0)?;
+            let scope = super::BlockParameters::at(config, root, policy)
+                .map_err(|e| invalid(e.to_string()))?;
+            let super::specs::MixerParameters::Attention(parameters) = &scope.mixer else {
+                unreachable!()
+            };
+            let heads = parameters.projection.geometry;
+            let query_head_width = parameters
+                .projection
+                .query_layout
+                .head_width(heads)
+                .map_err(|error| invalid(error.to_string()))?;
+            let query = local_width(layout, parameters.projection.query.weight.id.as_str(), 0)?;
+            let key = local_width(layout, parameters.projection.key.weight.id.as_str(), 0)?;
             if query <= 0
                 || key <= 0
-                || config.head_dim <= 0
-                || query % (2 * config.head_dim) != 0
-                || key % config.head_dim != 0
+                || query % query_head_width != 0
+                || key % heads.key_dimensions() != 0
             {
                 return Err(ParallelPlanError::InvalidTensor(
                     "rank-local attention projection splits heads".into(),
                 ));
             }
-            local.num_attention_heads = query / (2 * config.head_dim);
-            local.num_key_value_heads = key / config.head_dim;
+            local.num_attention_heads = query / query_head_width;
+            local.num_key_value_heads = key / heads.key_dimensions();
         }
     }
     if config.is_moe() {
@@ -790,5 +788,7 @@ fn local_config_at(
             ));
         }
     }
-    Ok(local)
+    config
+        .with_local_policy(local)
+        .map_err(|e| invalid(e.to_string()))
 }

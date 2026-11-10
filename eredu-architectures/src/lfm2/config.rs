@@ -8,14 +8,9 @@ use std::{
 use crate::{rotary::RopeValue, GgufTensorCatalog};
 use eredu_checkpoint::WeightQuantization;
 use eredu_core::{
-    cache::{
-        derive_prompt_cache_architecture_fingerprint, LayerCachePolicy, MutableStateResidency,
-        StateTensorDimension, StateTensorDtype, StateTensorPolicy, StateTensorRole,
-    },
-    AttentionPolicy, LayerSchedule,
+    cache::derive_prompt_cache_architecture_fingerprint, AttentionPolicy, LayerSchedule,
 };
 use eredu_gguf::MetadataValue;
-use eredu_runtime::StateLayout;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -98,14 +93,14 @@ pub struct LayerPolicy {
 }
 
 /// Canonical rotary-position configuration used by LFM2 attention layers.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RopeConfig {
     /// RoPE frequency base.
     pub theta: f32,
 }
 
 /// Validated LFM2/LFM2-MoE decoder configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModelArgs {
     /// Hugging Face model type (`lfm2` or `lfm2_moe`).
     pub model_type: String,
@@ -436,21 +431,6 @@ impl ModelArgs {
         self.layer_schedule.get(layer)
     }
 
-    /// Returns the canonical routed observation point for one sparse layer.
-    pub fn routed_observation_points(
-        &self,
-        unit_path: &str,
-        layer: usize,
-    ) -> Option<eredu_runtime::RoutedObservationPoints> {
-        (self.layer_policy(layer)?.feed_forward == FeedForwardPolicy::SparseMoe).then(|| {
-            eredu_runtime::RoutedObservationPoints::new(
-                eredu_runtime::RoutedBankId::new(0),
-                format!("{unit_path}.feed_forward"),
-                self.num_experts,
-            )
-        })
-    }
-
     /// Returns whether any layer contains routed experts.
     pub fn has_sparse_moe_layers(&self) -> bool {
         self.layer_schedule
@@ -480,8 +460,16 @@ impl ModelArgs {
             .join(",")
     }
 
+    /// The declared router retains floating storage under family-wide conversions.
+    pub(crate) fn preserves_linear_source(&self, weight_name: &str) -> bool {
+        weight_name.ends_with(".feed_forward.gate.weight")
+    }
+
     /// Returns the physical encoding for one canonical parameter identity.
     pub fn weight_quantization_for(&self, weight_name: &str) -> Option<WeightQuantization> {
+        if self.preserves_linear_source(weight_name) {
+            return None;
+        }
         if let Some(config) = self
             .quantized_weight_configs
             .as_ref()
@@ -616,101 +604,6 @@ pub fn model_args_from_gguf_catalog(
     };
     args.validate()?;
     Ok(args)
-}
-
-/// Rank-local state geometry for one heterogeneous LFM2 layer.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub struct LayerCacheGeometry {
-    /// Rank-local key/value heads for an attention layer.
-    pub kv_heads: Option<i32>,
-    /// Rank-local convolution channels for a short-convolution layer.
-    pub convolution_channels: Option<i32>,
-}
-
-/// Declares state geometry using the global replicated parameter layout.
-pub fn state_layout(args: &ModelArgs) -> Result<StateLayout, ConfigError> {
-    let geometry = args
-        .layer_schedule
-        .iter()
-        .map(|policy| match policy.operator {
-            OperatorPolicy::CausalConvolution => LayerCacheGeometry {
-                kv_heads: None,
-                convolution_channels: Some(args.hidden_size),
-            },
-            OperatorPolicy::SelfAttention(_) => LayerCacheGeometry {
-                kv_heads: Some(args.num_key_value_heads),
-                convolution_channels: None,
-            },
-        })
-        .collect::<Vec<_>>();
-    state_layout_with_geometry(args, &geometry)
-}
-
-/// Declares exact state geometry from a resolved rank-local parameter layout.
-pub fn state_layout_with_geometry(
-    args: &ModelArgs,
-    geometry: &[LayerCacheGeometry],
-) -> Result<StateLayout, ConfigError> {
-    if geometry.len() != args.layer_schedule.len() {
-        return Err(invalid(format!(
-            "LFM2 cache geometry has {} layers, expected {}",
-            geometry.len(),
-            args.layer_schedule.len()
-        )));
-    }
-    let history = args
-        .conv_l_cache
-        .checked_sub(1)
-        .ok_or_else(|| invalid("invalid LFM2 convolution width"))?;
-    let fixed =
-        |value| StateTensorDimension::fixed(value).map_err(|error| invalid(error.to_string()));
-    let policies = args
-        .layer_schedule
-        .iter()
-        .zip(geometry)
-        .map(|(policy, geometry)| {
-            match (
-                policy.operator,
-                geometry.kv_heads,
-                geometry.convolution_channels,
-            ) {
-                (OperatorPolicy::CausalConvolution, None, Some(_)) if history == 0 => {
-                    Ok(LayerCachePolicy::NoState)
-                }
-                (OperatorPolicy::CausalConvolution, None, Some(channels)) => {
-                    LayerCachePolicy::fixed_only(vec![StateTensorPolicy::new(
-                        StateTensorRole::Convolution { slot: 0 },
-                        vec![
-                            StateTensorDimension::Batch,
-                            fixed(history)?,
-                            fixed(channels)?,
-                        ],
-                        StateTensorDtype::Floating,
-                        MutableStateResidency::AlwaysDeviceMutable,
-                    )
-                    .map_err(|error| invalid(error.to_string()))?])
-                    .map_err(|error| invalid(error.to_string()))
-                }
-                (OperatorPolicy::SelfAttention(attention), Some(kv_heads), None) => {
-                    LayerCachePolicy::key_value(
-                        attention,
-                        kv_heads,
-                        args.hidden_size / args.num_attention_heads,
-                    )
-                    .map_err(|error| invalid(error.to_string()))
-                }
-                (OperatorPolicy::CausalConvolution, _, _) => Err(invalid(
-                    "LFM2 convolution layer requires only convolution-channel cache geometry",
-                )),
-                (OperatorPolicy::SelfAttention(_), _, _) => Err(invalid(
-                    "LFM2 attention layer requires only KV-head cache geometry",
-                )),
-            }
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let schedule = LayerSchedule::new(args.layer_schedule.len(), policies)
-        .map_err(|error| invalid(error.to_string()))?;
-    StateLayout::new(schedule).map_err(|error| invalid(error.to_string()))
 }
 
 /// Derives the canonical cache-relevant architecture fingerprint.

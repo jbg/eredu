@@ -2,8 +2,9 @@
 //! SGLang equation reference: 7bdd8fe6ec2a94d6a0d11b885ca9fe6a9f610d53.
 use eredu_nn::residual_streams::ResidualStreamGeometry;
 use eredu_nn::{
-    Error, LinearOperator, LinearSpec, NeuralBackend, NormalizationConstructionSpec,
-    NormalizationOperator, Tensor,
+    DeclareLogicalParameters, Error, LinearFormatSpec, LinearOperator, LinearSpec,
+    LogicalParameterDeclaration, NeuralBackend, NormalizationConstructionSpec,
+    NormalizationOperator, NormalizationScale, ParameterSpec, Tensor,
 };
 
 /// Exact checkpoint parameters for residual-linear-shared prediction fusion.
@@ -22,6 +23,48 @@ pub struct PredictionFusionSpec {
     pub hidden_projection: LinearSpec,
 }
 impl PredictionFusionSpec {
+    /// Declares prediction-only fusion geometry without decoder state or invocation limits.
+    pub fn from_config(
+        config: &super::config::Config,
+        mut format: impl FnMut(&str) -> Result<LinearFormatSpec, Error>,
+    ) -> Result<Self, Error> {
+        let geometry = ResidualStreamGeometry::new(config.residual.streams, config.hidden_size)?;
+        let parameter = |name: &str| {
+            let mut weight = ParameterSpec::trainable(name).map_err(Error::backend)?;
+            weight.group = Some("mtp.fusion".into());
+            Ok::<_, Error>(weight)
+        };
+        let norm = |name: &str, dimensions| -> Result<_, Error> {
+            Ok(NormalizationConstructionSpec {
+                reduction: eredu_nn::NormalizationReduction::Native,
+                dimensions,
+                groups: None,
+                epsilon: config.norm_epsilon,
+                scale: NormalizationScale::LearnedOffset {
+                    weight: parameter(name)?,
+                    offset: 1.,
+                },
+            })
+        };
+        let mut projection = |name: &str| -> Result<_, Error> {
+            Ok(LinearSpec {
+                input: geometry.hidden_size(),
+                output: geometry.hidden_size(),
+                weight: parameter(name)?,
+                bias: None,
+                format: format(name)?,
+            })
+        };
+        let spec = Self {
+            geometry,
+            embedding_norm: norm("mtp.pre_fc_norm_embedding.weight", geometry.hidden_size())?,
+            hidden_norm: norm("mtp.pre_fc_norm_hidden.weight", geometry.flattened_width())?,
+            embedding_projection: projection("mtp.fc_embedding.weight")?,
+            hidden_projection: projection("mtp.fc_hidden.weight")?,
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
     /// Checks the distinct full-residual and per-stream arithmetic geometry.
     pub fn validate(&self) -> Result<(), Error> {
         self.embedding_norm.validate()?;
@@ -33,7 +76,9 @@ impl PredictionFusionSpec {
             || self.hidden_norm.dimensions != self.geometry.flattened_width()
             || self.hidden_norm.groups.is_some()
         {
-            return Err(Error::backend("prediction fusion requires full residual normalization before per-stream projection"));
+            return Err(Error::backend(
+                "prediction fusion requires full residual normalization before per-stream projection",
+            ));
         }
         for linear in [&self.embedding_projection, &self.hidden_projection] {
             if linear.input != hidden || linear.output != hidden || linear.bias.is_some() {
@@ -43,9 +88,20 @@ impl PredictionFusionSpec {
             }
             linear.format.validate_for_weight(&linear.weight)?;
         }
-        Ok(())
+        eredu_nn::validate_logical_parameter_topology(&self.logical_parameters()?)
+            .map_err(Error::backend_source)
     }
 }
+impl DeclareLogicalParameters for PredictionFusionSpec {
+    fn logical_parameters(&self) -> Result<Vec<LogicalParameterDeclaration<'_>>, Error> {
+        let mut p = self.embedding_norm.logical_parameters()?;
+        p.extend(self.hidden_norm.logical_parameters()?);
+        p.extend(self.embedding_projection.logical_parameters()?);
+        p.extend(self.hidden_projection.logical_parameters()?);
+        Ok(p)
+    }
+}
+
 /// Stateless learned fusion; prediction decoder state remains separately owned.
 #[derive(Debug, Clone, eredu_nn::Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
@@ -105,10 +161,15 @@ impl<B: NeuralBackend> PredictionFusion<B> {
     }
 }
 
+pub(crate) mod declarations;
 mod decoder;
 mod parallel;
+mod parameters;
+
+/// Execution-group identity for independent prediction decoder depths.
+pub(crate) const PREDICTION_EXECUTION_GROUP: &str = "prediction";
 pub use decoder::{
-    PredictionForward, PredictionInput, PredictionLimits, PredictionShared, PredictionSpec,
-    PredictionUnit, PredictionUnitSpec,
+    PredictionForward, PredictionInput, PredictionLimits, PredictionShared, PredictionSharedSpec,
+    PredictionSpec, PredictionUnit, PredictionUnitSpec,
 };
 pub use parallel::PredictionTensorPartition;

@@ -10,8 +10,7 @@ use super::config::TtsConfig;
 pub const GUMBEL_EPSILON: f32 = 1e-8;
 use eredu_nn::{
     DistributedNeuralBackend, Index, LinearOperator, LinearSpec, NeuralBackend,
-    NormalizationConstructionSpec, NormalizationOperator, NormalizationScale, Parameter,
-    ParameterSpec, Parameterized, Tensor, TensorElementType,
+    NormalizationOperator, Parameter, ParameterSpec, Parameterized, Tensor, TensorElementType,
 };
 
 /// Invalid geometry, draw payload or neural execution.
@@ -140,43 +139,19 @@ pub(crate) fn parameter(name: &str, group: &str) -> Result<ParameterSpec, eredu_
     spec.group = Some(group.into());
     Ok(spec)
 }
-pub(crate) fn linear<B: NeuralBackend>(
+pub(crate) fn linear_spec(
     name: &str,
     group: &str,
     input: i32,
     output: i32,
-    context: &<B::Tensor as Tensor>::Context,
-) -> Result<B::Linear, eredu_nn::Error> {
-    B::linear(
-        LinearSpec {
-            input,
-            output,
-            weight: parameter(&format!("{name}.weight"), group)?,
-            bias: None,
-            format: eredu_nn::LinearFormatSpec::unscaled(eredu_checkpoint::LinearFormat::Dense)?,
-        },
-        context,
-    )
-}
-fn norm<B: NeuralBackend>(
-    name: &str,
-    group: &str,
-    dimensions: MogDimensions,
-    context: &<B::Tensor as Tensor>::Context,
-) -> Result<B::Normalization, eredu_nn::Error> {
-    B::normalization(
-        NormalizationConstructionSpec {
-            reduction: eredu_nn::NormalizationReduction::Native,
-            dimensions: dimensions.hidden,
-            epsilon: dimensions.epsilon,
-            groups: Some(1),
-            scale: NormalizationScale::LearnedOffset {
-                weight: parameter(&format!("{name}.weight"), group)?,
-                offset: 1.0,
-            },
-        },
-        context,
-    )
+) -> Result<LinearSpec, eredu_nn::Error> {
+    Ok(LinearSpec {
+        input,
+        output,
+        weight: parameter(&format!("{name}.weight"), group)?,
+        bias: None,
+        format: eredu_nn::LinearFormatSpec::unscaled(eredu_checkpoint::LinearFormat::Dense)?,
+    })
 }
 pub(crate) fn f32_shape<T: Tensor>(input: &T, width: i32) -> Result<(), TtsError> {
     if input.shape().len() != 3
@@ -197,6 +172,8 @@ pub(crate) fn f32_shape<T: Tensor>(input: &T, width: i32) -> Result<(), TtsError
 pub struct MogBlock<B: NeuralBackend> {
     #[parameter(skip)]
     precision: super::precision::SpeechPrecision,
+    #[parameter(skip)]
+    precision_declaration: super::precision::SpeechPrecisionDeclaration,
     pre: B::Normalization,
     gate: B::Linear,
     up: B::Linear,
@@ -224,56 +201,23 @@ impl<B: NeuralBackend> MogBlock<B> {
         Ok(self)
     }
 
-    /// Declares one canonical residual stage, independently of the large heads.
+    /// Constructs the validated global or rank-local block declaration.
     pub fn new(
-        dimensions: MogDimensions,
-        index: usize,
+        spec: super::tts_mog_specs::BlockSpec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, TtsError> {
-        Self::new_local(dimensions, dimensions.intermediate, index, context)
-    }
-    /// Constructs one complete or rank-local intermediate projection.
-    pub fn new_local(
-        dimensions: MogDimensions,
-        intermediate: i32,
-        index: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, TtsError> {
-        dimensions.validate()?;
-        if intermediate <= 0 || intermediate > dimensions.intermediate {
-            return Err(TtsError::Configuration("invalid MoG intermediate shard"));
-        }
-        if index >= dimensions.layers {
-            return Err(TtsError::Configuration("MoG layer index exceeds stack"));
-        }
-        let name = format!("mog_head.mlp_stack.{index}");
-        let group = format!("voicechat.tts.mog.layer.{index}");
+        let precision_declaration = super::precision::SpeechPrecisionDeclaration::from_spec(&spec)?;
+        spec.validate()?;
+        let intermediate = spec.product.gate.output;
         Ok(Self {
             precision: Default::default(),
-            pre: norm::<B>(&format!("{name}.pre_norm"), &group, dimensions, context)?,
-            gate: linear::<B>(
-                &format!("{name}.mlp.gate_proj"),
-                &group,
-                dimensions.hidden,
-                intermediate,
-                context,
-            )?,
-            up: linear::<B>(
-                &format!("{name}.mlp.up_proj"),
-                &group,
-                dimensions.hidden,
-                intermediate,
-                context,
-            )?,
-            down: linear::<B>(
-                &format!("{name}.mlp.down_proj"),
-                &group,
-                intermediate,
-                dimensions.hidden,
-                context,
-            )?,
-            post: norm::<B>(&format!("{name}.post_norm"), &group, dimensions, context)?,
-            dimensions,
+            precision_declaration,
+            pre: B::normalization(spec.pre, context)?,
+            gate: B::linear(spec.product.gate, context)?,
+            up: B::linear(spec.product.up, context)?,
+            down: B::linear(spec.product.down, context)?,
+            post: B::normalization(spec.post, context)?,
+            dimensions: spec.dimensions,
             intermediate,
         })
     }
@@ -324,7 +268,7 @@ impl<B: NeuralBackend> MogBlock<B> {
     fn validate_hidden(&self, hidden: &B::Tensor) -> Result<(), TtsError> {
         f32_shape(hidden, self.dimensions.hidden)?;
         self.precision
-            .require(self, hidden)
+            .require(self, hidden, &self.precision_declaration)
             .map_err(TtsError::Shape)
     }
     fn project(
@@ -392,28 +336,15 @@ impl<B: NeuralBackend> MogPredictionHead<B> {
     pub(super) fn dimensions(&self) -> MogDimensions {
         self.dimensions
     }
-    /// Declares only the weights required to choose a mixture.
+    /// Constructs the typed final-normalization and mixture-projection declaration.
     pub fn new(
-        dimensions: MogDimensions,
+        spec: super::tts_mog_specs::PredictionSpec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, TtsError> {
-        dimensions.validate()?;
-        let group = "voicechat.tts.mog.prediction";
         Ok(Self {
-            norm: norm::<B>(
-                &format!("mog_head.mlp_stack.{}", dimensions.layers),
-                group,
-                dimensions,
-                context,
-            )?,
-            logits: linear::<B>(
-                "mog_head.proj_logits",
-                group,
-                dimensions.hidden,
-                dimensions.mixtures,
-                context,
-            )?,
-            dimensions,
+            norm: B::normalization(spec.norm, context)?,
+            logits: B::linear(spec.logits, context)?,
+            dimensions: spec.dimensions,
         })
     }
     /// Final normalization followed by guidance; the conditional batch lane is first.
@@ -465,45 +396,23 @@ pub struct MogComponentBank<B: NeuralBackend> {
     rank: i32,
 }
 impl<B: NeuralBackend> MogComponentBank<B> {
-    /// Declares the residual, scale, means and low-rank component parameters.
+    /// Constructs the global or rank-local selected-component declaration.
     pub fn new(
-        dimensions: MogDimensions,
+        spec: super::tts_mog_specs::ComponentSpec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, TtsError> {
-        Self::new_local(dimensions, dimensions.rank, context)
-    }
-    /// Constructs one coherent low-rank slice for every mixture.
-    pub fn new_local(
-        dimensions: MogDimensions,
-        rank: i32,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, TtsError> {
-        dimensions.validate()?;
-        if rank <= 0 || rank > dimensions.rank {
-            return Err(TtsError::Configuration("invalid MoG component rank shard"));
-        }
-        let group = "voicechat.tts.mog.components";
+        let low_shape = spec.low.shape();
         Ok(Self {
-            residual: linear::<B>(
-                "mog_head.proj_else",
-                group,
-                dimensions.hidden,
-                dimensions.latent,
-                context,
-            )?,
-            logs: linear::<B>("mog_head.proj_logs", group, dimensions.hidden, 1, context)?,
+            residual: B::linear(spec.residual, context)?,
+            logs: B::linear(spec.logs, context)?,
             mus: Parameter::unloaded(
-                parameter("mog_head.proj_mus.weight", "voicechat.tts.mog.means")?,
-                &[dimensions.mixtures * rank, dimensions.hidden],
+                spec.means.weight,
+                &[spec.means.output, spec.means.input],
                 context,
             )?,
-            low: Parameter::unloaded(
-                parameter("mog_head.low_mat", "voicechat.tts.mog.low_rank")?,
-                &[dimensions.mixtures, dimensions.latent, rank],
-                context,
-            )?,
-            dimensions,
-            rank,
+            low: Parameter::unloaded(spec.low.weight, &low_shape, context)?,
+            dimensions: spec.dimensions,
+            rank: spec.low.rank,
         })
     }
     /// Evaluates only the supplied mixture IDs and applies explicit Gaussian noise.
@@ -725,9 +634,11 @@ impl<B: NeuralBackend> MogHead<B> {
     ) -> Result<Self, TtsError> {
         Ok(Self {
             runtime: eredu_runtime::ResidentRuntime::new(
-                super::tts_mog_layered::MogKernel::new(dimensions)?
-                    .with_precision(precision)?
-                    .into_component()?,
+                super::tts_mog_layered::MogKernel::new(super::tts_mog_specs::MogDeclaration::new(
+                    dimensions,
+                )?)?
+                .with_precision(precision)?
+                .into_component()?,
                 context,
             )
             .map_err(eredu_runtime::ResidentUnitsError::into_architecture)?,
@@ -735,7 +646,7 @@ impl<B: NeuralBackend> MogHead<B> {
     }
     /// Adopts separately bound layers, prediction and selected-component units.
     pub(super) fn from_parts(
-        dimensions: MogDimensions,
+        declaration: super::tts_mog_specs::MogDeclaration,
         blocks: Vec<MogBlock<B>>,
         prediction: MogPredictionHead<B>,
         components: MogComponentBank<B>,
@@ -748,7 +659,7 @@ impl<B: NeuralBackend> MogHead<B> {
         ];
         Ok(Self {
             runtime: eredu_runtime::ResidentRuntime::from_units(
-                MogKernel::new(dimensions)?.into_component()?,
+                MogKernel::new(declaration)?.into_component()?,
                 units,
             )
             .map_err(eredu_runtime::ResidentUnitsError::into_architecture)?,

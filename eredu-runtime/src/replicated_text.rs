@@ -514,8 +514,11 @@ pub enum ParameterTransformConstraint {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ReplicatedTextParameterRole {
-    /// Token lookup table.
+    /// Primary token-vocabulary lookup table.
     Embedding,
+    /// Component-owned token, position or feature lookup table, independent of
+    /// the primary vocabulary embedding and its static ownership role.
+    LookupTable,
     /// Executable affine projection weight.
     LinearWeight,
     /// Learned affine projection bias.
@@ -552,6 +555,40 @@ pub enum ReplicatedTextParameterOwner {
 }
 
 impl ReplicatedTextParameterOwner {
+    /// Projects canonical physical storage from an architecture-owned group.
+    /// Logical invocation consumers remain in the architecture description.
+    pub fn from_parameter_group_owner(
+        owner: &ParameterGroupOwner,
+    ) -> Result<Self, ReplicatedTextContractError> {
+        Ok(match owner {
+            ParameterGroupOwner::StaticRole(_) | ParameterGroupOwner::StaticAnyOf(_) => {
+                Self::StaticRole(
+                    owner
+                        .static_storage_role()
+                        .ok_or_else(|| {
+                            ReplicatedTextContractError::invalid("static owner has no storage role")
+                        })?
+                        .to_owned(),
+                )
+            }
+            ParameterGroupOwner::StaticUnitConsumers { role, consumers } => {
+                Self::StaticUnitConsumers {
+                    role: role.clone(),
+                    consumers: consumers
+                        .iter()
+                        .map(|(group, unit)| (group.as_str().to_owned(), *unit))
+                        .collect(),
+                }
+            }
+            ParameterGroupOwner::ExecutionUnit {
+                group, global_unit, ..
+            } => Self::ExecutionUnit {
+                group: group.as_str().to_owned(),
+                unit: *global_unit,
+            },
+        })
+    }
+
     /// Resolves the portable parameter-topology owner without allocating tensors.
     pub fn parameter_group_owner(
         &self,
@@ -1118,6 +1155,7 @@ impl ReplicatedTextParameterRequirement {
                 (matches!(
                     self.role,
                     ReplicatedTextParameterRole::Embedding
+                        | ReplicatedTextParameterRole::LookupTable
                         | ReplicatedTextParameterRole::LinearWeight
                 ) && executable != LinearFormat::Dense)
                     .then(|| self.logical_shape.len().checked_sub(1))
@@ -1748,7 +1786,7 @@ impl ReplicatedTextRequirements {
             .collect()
     }
 
-    /// Admitted linear and embedding formats, including dense matrices.
+    /// Admitted storage formats for linear weights and lookup tables, including dense storage.
     pub fn native_matrix_formats(&self) -> HashMap<String, LinearFormat> {
         self.matrix_parameters()
             .map(|parameter| (parameter.name().to_owned(), parameter.native_executable()))
@@ -1759,7 +1797,9 @@ impl ReplicatedTextRequirements {
         self.parameters().iter().filter(|parameter| {
             matches!(
                 parameter.role(),
-                ReplicatedTextParameterRole::LinearWeight | ReplicatedTextParameterRole::Embedding
+                ReplicatedTextParameterRole::LinearWeight
+                    | ReplicatedTextParameterRole::Embedding
+                    | ReplicatedTextParameterRole::LookupTable
             )
         })
     }
@@ -2421,14 +2461,23 @@ pub struct ReplicatedTextOutputCompanion {
     role: eredu_nn::LinearCompanionRole,
     logical_shape: Vec<usize>,
     owner: ParameterGroupOwner,
-    materialization_task: Option<Box<ReplicatedTextMaterializationTask>>,
-    catalog_source: Option<ReplicatedTextPhysicalSource>,
-    derived_recipe: Option<eredu_checkpoint::recipe::DerivedWeightRecipe>,
-    derived_output: Option<eredu_checkpoint::recipe::RecipeMetadata>,
+    source: CompanionSource,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum CompanionSource {
+    Generated,
+    Catalog(ReplicatedTextPhysicalSource),
+    Recipe {
+        recipe: eredu_checkpoint::recipe::DerivedWeightRecipe,
+        output: eredu_checkpoint::recipe::RecipeMetadata,
+    },
+    Task(Box<ReplicatedTextMaterializationTask>),
 }
 
 impl ReplicatedTextOutputCompanion {
     /// Creates one exact output companion identity and semantic role.
+    /// An empty shape denotes a scalar, including an ungrouped NVFP4 global scale.
     pub fn new(
         name: impl Into<String>,
         role: eredu_nn::LinearCompanionRole,
@@ -2436,7 +2485,7 @@ impl ReplicatedTextOutputCompanion {
         owner: ParameterGroupOwner,
     ) -> Result<Self, ReplicatedTextContractError> {
         let name = name.into();
-        if name.trim().is_empty() || logical_shape.is_empty() || logical_shape.contains(&0) {
+        if name.trim().is_empty() || logical_shape.contains(&0) {
             return Err(ReplicatedTextContractError::invalid(
                 "materialization output companion identity or geometry is invalid",
             ));
@@ -2446,10 +2495,7 @@ impl ReplicatedTextOutputCompanion {
             role,
             logical_shape,
             owner,
-            materialization_task: None,
-            catalog_source: None,
-            derived_recipe: None,
-            derived_output: None,
+            source: CompanionSource::Generated,
         })
     }
 
@@ -2458,8 +2504,7 @@ impl ReplicatedTextOutputCompanion {
         recipe: eredu_checkpoint::recipe::DerivedWeightRecipe,
         output: eredu_checkpoint::recipe::RecipeMetadata,
     ) -> Self {
-        self.derived_recipe = Some(recipe);
-        self.derived_output = Some(output);
+        self.source = CompanionSource::Recipe { recipe, output };
         self
     }
 
@@ -2483,25 +2528,31 @@ impl ReplicatedTextOutputCompanion {
         &self.owner
     }
 
-    pub(crate) fn with_materialization_task(
+    /// Retains an independently validated recipe task for this exact companion.
+    pub fn with_materialization_task(
         mut self,
         task: ReplicatedTextMaterializationTask,
     ) -> Result<Self, ReplicatedTextContractError> {
         let names_output =
             task.name() == self.name || task.aliases().iter().any(|alias| alias == &self.name);
-        if !names_output || !task.output_companions().is_empty() {
+        if !names_output
+            || task.role() != ReplicatedTextParameterRole::FormatCompanion
+            || !task.output_companions().is_empty()
+            || task.logical_shape() != self.logical_shape
+            || parameter_group_owner(task.owner())? != self.owner
+        {
             return Err(ReplicatedTextContractError::invalid(format!(
                 "companion {:?} has an inconsistent standalone materialization task",
                 self.name
             )));
         }
-        self.materialization_task = Some(Box::new(task));
+        self.source = CompanionSource::Task(Box::new(task));
         Ok(self)
     }
 
     /// Retains exact translated-catalog provenance for a directly loaded companion.
     pub fn with_catalog_source(mut self, source: ReplicatedTextPhysicalSource) -> Self {
-        self.catalog_source = Some(source);
+        self.source = CompanionSource::Catalog(source);
         self
     }
 
@@ -2510,22 +2561,39 @@ impl ReplicatedTextOutputCompanion {
     /// Generated transform outputs and translated checkpoint catalog outputs
     /// instead retain their causal source on the primary task or companion.
     pub fn materialization_task(&self) -> Option<&ReplicatedTextMaterializationTask> {
-        self.materialization_task.as_deref()
+        match &self.source {
+            CompanionSource::Task(task) => Some(task),
+            _ => None,
+        }
     }
 
-    /// Returns exact translated-catalog provenance for this companion.
-    pub const fn catalog_source(&self) -> Option<&ReplicatedTextPhysicalSource> {
-        self.catalog_source.as_ref()
+    /// Returns exact translated-catalog provenance, including a retained direct task.
+    pub fn catalog_source(&self) -> Option<&ReplicatedTextPhysicalSource> {
+        match &self.source {
+            CompanionSource::Catalog(source) => Some(source),
+            CompanionSource::Task(task) if task.lowering() == WeightLoweringKind::Direct => {
+                task.physical_sources().first()
+            }
+            _ => None,
+        }
     }
 
-    /// Returns the architecture-owned companion derivation, when required.
-    pub const fn derived_recipe(&self) -> Option<&eredu_checkpoint::recipe::DerivedWeightRecipe> {
-        self.derived_recipe.as_ref()
+    /// Projects the architecture-owned derivation from the retained source authority.
+    pub fn derived_recipe(&self) -> Option<&eredu_checkpoint::recipe::DerivedWeightRecipe> {
+        match &self.source {
+            CompanionSource::Recipe { recipe, .. } => Some(recipe),
+            CompanionSource::Task(task) => task.derived_recipe(),
+            _ => None,
+        }
     }
 
-    /// Returns admission-time metadata for the derived companion output.
-    pub const fn derived_output(&self) -> Option<&eredu_checkpoint::recipe::RecipeMetadata> {
-        self.derived_output.as_ref()
+    /// Projects exact inferred output metadata from the retained source authority.
+    pub fn derived_output(&self) -> Option<&eredu_checkpoint::recipe::RecipeMetadata> {
+        match &self.source {
+            CompanionSource::Recipe { output, .. } => Some(output),
+            CompanionSource::Task(task) => task.derived_output(),
+            _ => None,
+        }
     }
 }
 
@@ -2542,15 +2610,13 @@ impl ReplicatedTextMaterializationTask {
         self.auxiliary_residency.as_ref()
     }
 
-    /// Creates one exact, source-backed materialization task selected outside
-    /// the ordinary replicated-text session lifecycle.
-    ///
-    /// This is used by architecture-owned auxiliary modules which share the
-    /// same physical lowering contract but do not own a text session.
+    /// Creates exact physical or recipe-backed work for a separately invoked module.
+    /// Inferred recipe output is paired with every admitted physical input; no input
+    /// is represented as a synthetic physical tensor. Scalars retain empty shapes.
     #[allow(clippy::too_many_arguments)]
-    pub fn from_exact_source(
+    pub fn from_exact_sources(
         name: impl Into<String>,
-        physical_source: ReplicatedTextPhysicalSource,
+        physical_sources: Vec<ReplicatedTextPhysicalSource>,
         aliases: Vec<String>,
         physical_shape: Vec<usize>,
         logical_shape: Vec<usize>,
@@ -2559,14 +2625,22 @@ impl ReplicatedTextMaterializationTask {
         executable: LinearFormat,
         lowering: WeightLoweringKind,
         lowering_descriptor: WeightLoweringDescriptor,
+        derived: Option<(
+            eredu_checkpoint::recipe::DerivedWeightRecipe,
+            eredu_checkpoint::recipe::RecipeMetadata,
+        )>,
     ) -> Result<Self, ReplicatedTextContractError> {
         let name = name.into();
+        let sources = physical_sources
+            .iter()
+            .map(|source| source.catalog_key().to_owned())
+            .collect::<Vec<_>>();
+        let source_keys = sources.iter().map(String::as_str).collect::<BTreeSet<_>>();
         if name.trim().is_empty()
-            || physical_shape.is_empty()
-            || logical_shape.is_empty()
+            || sources.is_empty()
+            || source_keys.len() != sources.len()
             || physical_shape.contains(&0)
             || logical_shape.contains(&0)
-            || lowering_descriptor.source() != physical_source.source_encoding()
             || lowering_descriptor.executable() != executable
             || lowering_descriptor.physical_shape() != physical_shape
             || lowering_descriptor.logical_shape() != logical_shape
@@ -2575,11 +2649,66 @@ impl ReplicatedTextMaterializationTask {
                 "exact auxiliary materialization task is internally inconsistent",
             ));
         }
-        let source = physical_source.catalog_key().to_owned();
+        let (presence, derived_recipe, derived_output) = match derived {
+            Some((recipe, output)) => {
+                let SourceTensorEncoding::RecipeOutput(dtype) = lowering_descriptor.source() else {
+                    return Err(ReplicatedTextContractError::invalid(
+                        "recipe task has no inferred output encoding",
+                    ));
+                };
+                let bits = output
+                    .dtype
+                    .bit_width()
+                    .map_err(|error| ReplicatedTextContractError::invalid(error.to_string()))?;
+                let bytes = output
+                    .shape
+                    .iter()
+                    .try_fold(bits, |bits, size| bits.checked_mul(*size as u64))
+                    .and_then(|bits| bits.checked_add(7))
+                    .map(|bits| bits / 8);
+                if bytes != Some(output.byte_len) {
+                    return Err(ReplicatedTextContractError::invalid(
+                        "recipe task has inconsistent inferred output byte extent",
+                    ));
+                }
+                if !matches!(
+                    lowering,
+                    WeightLoweringKind::Derived | WeightLoweringKind::DerivedTransform
+                ) || recipe.source_keys().into_iter().collect::<BTreeSet<_>>() != source_keys
+                    || output.shape != physical_shape
+                    || output.dtype != dtype.clone().into()
+                {
+                    return Err(ReplicatedTextContractError::invalid(
+                        "recipe task differs from its inferred geometry or exact physical inputs",
+                    ));
+                }
+                (
+                    ReplicatedTextParameterPresence::Derived {
+                        recipe: "architecture.recipe".into(),
+                    },
+                    Some(recipe),
+                    Some(output),
+                )
+            }
+            None => {
+                if physical_sources.len() != 1
+                    || lowering_descriptor.source() != physical_sources[0].source_encoding()
+                    || matches!(
+                        lowering,
+                        WeightLoweringKind::Derived | WeightLoweringKind::DerivedTransform
+                    )
+                {
+                    return Err(ReplicatedTextContractError::invalid(
+                        "direct task must retain one exact physical source and direct lowering",
+                    ));
+                }
+                (ReplicatedTextParameterPresence::Required, None, None)
+            }
+        };
         Ok(Self {
             name,
-            sources: vec![source],
-            physical_sources: vec![physical_source],
+            sources,
+            physical_sources,
             aliases,
             source_encoding: lowering_descriptor.source().clone(),
             physical_shape,
@@ -2587,12 +2716,12 @@ impl ReplicatedTextMaterializationTask {
             role,
             owner,
             auxiliary_residency: None,
-            presence: ReplicatedTextParameterPresence::Required,
+            presence,
             executable,
             lowering,
             lowering_descriptor,
-            derived_recipe: None,
-            derived_output: None,
+            derived_recipe,
+            derived_output,
             shared_source_keys: BTreeSet::new(),
             permitted_native_source_dtypes: Vec::new(),
             output_companions: Vec::new(),
@@ -3335,11 +3464,6 @@ pub fn partition_selected_replicated_text_materialization_tasks<G, A>(
             binding.owner() == tagged.owner()
                 && parameter_groups_have_same_members(binding.group(), tagged.group())
         });
-        let group_targets = tagged
-            .members()
-            .iter()
-            .map(|member| member.target())
-            .collect::<BTreeSet<_>>();
         for member in tagged.members() {
             if !all_targets.insert(member.target().to_owned()) {
                 return Err(ReplicatedTextContractError::invalid(format!(
@@ -3350,30 +3474,19 @@ pub fn partition_selected_replicated_text_materialization_tasks<G, A>(
             if local {
                 owned_targets.insert(member.target().to_owned());
             }
-            match (member.linear_companion(), member.linear_companion_of()) {
-                (None, None) => {}
-                (Some(role), Some(primary)) if group_targets.contains(primary) && local => {
-                    companions.entry(primary.to_owned()).or_default().push(
-                        ReplicatedTextOutputCompanion::new(
+            if let (Some(role), Some(primary)) =
+                (member.linear_companion(), member.linear_companion_of())
+            {
+                if local {
+                    companions
+                        .entry(primary.as_str().to_owned())
+                        .or_default()
+                        .push(ReplicatedTextOutputCompanion::new(
                             member.target(),
                             role,
                             member.global_shape().to_vec(),
                             tagged.owner().clone(),
-                        )?,
-                    );
-                }
-                (Some(_), Some(primary)) if group_targets.contains(primary) => {}
-                (Some(_), Some(primary)) => {
-                    return Err(ReplicatedTextContractError::invalid(format!(
-                        "physical companion {:?} names primary {primary:?} outside its atomic parameter group",
-                        member.target()
-                    )));
-                }
-                _ => {
-                    return Err(ReplicatedTextContractError::invalid(format!(
-                        "physical parameter {:?} has incomplete companion metadata",
-                        member.target()
-                    )));
+                        )?);
                 }
             }
         }
@@ -3427,7 +3540,9 @@ pub fn partition_selected_replicated_text_materialization_tasks<G, A>(
         {
             return Err(ReplicatedTextContractError::invalid(format!(
                 "partition parameter companions for {:?} differ from authoritative selection: constructed={:?}, selected={:?}",
-                task.name(), declared, selected,
+                task.name(),
+                declared,
+                selected,
             )));
         }
     }
@@ -3482,13 +3597,10 @@ fn parameter_groups_have_same_members(
         && left.partition_unit_assignment() == right.partition_unit_assignment()
         && left.members().len() == right.members().len()
         && left.members().iter().all(|left_member| {
-            right.members().iter().any(|right_member| {
-                left_member.target() == right_member.target()
-                    && left_member.global_shape() == right_member.global_shape()
-                    && left_member.sharding() == right_member.sharding()
-                    && left_member.linear_companion() == right_member.linear_companion()
-                    && left_member.linear_companion_of() == right_member.linear_companion_of()
-            })
+            right
+                .members()
+                .iter()
+                .any(|right_member| left_member == right_member)
         })
 }
 
@@ -3956,6 +4068,36 @@ impl SelectedStateRealization {
         &self.components
     }
 
+    /// Ordinary attention K/V payload bytes for one cached position and batch element.
+    /// Compressed, fixed and append-stream state have separate resource contracts.
+    /// This is a payload coefficient, not allocation capacity or allocator overhead.
+    pub fn attention_cache_bytes_per_position(&self) -> Result<u64, ReplicatedTextContractError> {
+        use eredu_core::cache::StateComponentRole;
+        self.components
+            .iter()
+            .filter(|selected| {
+                matches!(
+                    selected.component().role(),
+                    StateComponentRole::AttentionKeys | StateComponentRole::AttentionValues,
+                )
+            })
+            .try_fold(0u64, |total, selected| {
+                let elements = selected
+                    .component()
+                    .element_bounds(1, 1)
+                    .map_err(|error| ReplicatedTextContractError::invalid(error.to_string()))?
+                    .maximum;
+                let bytes = elements
+                    .checked_mul(u64::from(selected.storage_dtype().bytes().get()))
+                    .ok_or_else(|| {
+                        ReplicatedTextContractError::invalid("attention cache byte count overflow")
+                    })?;
+                total.checked_add(bytes).ok_or_else(|| {
+                    ReplicatedTextContractError::invalid("attention cache byte count overflow")
+                })
+            })
+    }
+
     /// Returns whether state checkpoints are selected.
     pub const fn checkpoint(&self) -> bool {
         self.checkpoint
@@ -3982,6 +4124,100 @@ impl SelectedStateRealization {
     }
 }
 
+/// Validates a selected physical projection against its source declaration and tasks.
+/// Equation, invocation, logical ownership and state identities remain authoritative.
+pub fn validate_executable_component_projection(
+    source: &std::sync::Arc<crate::ComponentDefinition>,
+    definition: &std::sync::Arc<crate::ComponentDefinition>,
+    tasks: &[ReplicatedTextMaterializationTask],
+) -> Result<(), ReplicatedTextContractError> {
+    let parameters = definition.parameters();
+    let exact = source.project_parameters(parameters.clone());
+    if !exact.as_ref().is_ok_and(|expected| expected == definition) {
+        let paths = source.project_parameters_with_unit_paths(parameters.clone());
+        if !paths.as_ref().is_ok_and(|expected| expected == definition) {
+            return Err(ReplicatedTextContractError::invalid(
+                "executable component changes retained equation, ownership or state",
+            ));
+        }
+    }
+    let members = parameters.members_by_target();
+    let original = source.parameters().members_by_target();
+    for member in members
+        .values()
+        .filter(|member| member.linear_companion().is_none())
+    {
+        let declared = original.get(member.target()).ok_or_else(|| {
+            ReplicatedTextContractError::invalid("executable declaration adds a primary")
+        })?;
+        if member.logical_shape() != declared.logical_shape()
+            || member.logical_role() != declared.logical_role()
+            || member.alias_of() != declared.alias_of()
+            || member.logical_linear_format().is_some()
+                != declared.logical_linear_format().is_some()
+            || (member.logical_shape().is_none()
+                && member.global_shape() != declared.global_shape())
+        {
+            return Err(ReplicatedTextContractError::invalid(format!(
+                "executable projection changes logical declaration {}",
+                member.target(),
+            )));
+        }
+    }
+    for task in tasks {
+        let member = members.get(task.name()).ok_or_else(|| {
+            ReplicatedTextContractError::invalid(format!(
+                "executable declaration omits selected task {}",
+                task.name(),
+            ))
+        })?;
+        if member
+            .logical_shape()
+            .is_some_and(|shape| shape != task.logical_shape())
+        {
+            return Err(ReplicatedTextContractError::invalid(format!(
+                "executable geometry differs from selected task {}",
+                task.name(),
+            )));
+        }
+        if let Some(format) = member.logical_linear_format() {
+            if format.encoding() != task.executable() {
+                return Err(ReplicatedTextContractError::invalid(format!(
+                    "executable declaration differs from selected task {}",
+                    task.name(),
+                )));
+            }
+            let companion_count = usize::from(format.scale().is_some())
+                + usize::from(format.affine_bias().is_some())
+                + usize::from(format.global_scale().is_some());
+            if companion_count != task.output_companions().len() {
+                return Err(ReplicatedTextContractError::invalid(format!(
+                    "executable declaration has different companions for {}",
+                    task.name(),
+                )));
+            }
+            for companion in task.output_companions() {
+                let declared = members.get(companion.name()).ok_or_else(|| {
+                    ReplicatedTextContractError::invalid(format!(
+                        "executable declaration omits companion {}",
+                        companion.name(),
+                    ))
+                })?;
+                if declared.global_shape() != companion.logical_shape()
+                    || declared.linear_companion() != Some(companion.role())
+                    || declared.linear_companion_of().map(|id| id.as_str()) != Some(task.name())
+                {
+                    return Err(ReplicatedTextContractError::invalid(format!(
+                        "executable companion differs from selected task {}",
+                        companion.name(),
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Authoritative realization selected before architecture or payload construction.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct SelectedReplicatedTextRealization {
@@ -3990,6 +4226,8 @@ pub struct SelectedReplicatedTextRealization {
     backend_chunked_prefill: bool,
     max_cached_shards: usize,
     requirements: ReplicatedTextRequirements,
+    /// Architecture-authored executable projection, distinct from source requirements.
+    executable_component: Option<std::sync::Arc<crate::ComponentDefinition>>,
     /// Exact selected execution topology.
     topology: ParallelTopology,
     /// Selected ordinary parameter residency.
@@ -4048,6 +4286,35 @@ impl SelectedReplicatedTextRealization {
     pub const fn requirements(&self) -> &ReplicatedTextRequirements {
         &self.requirements
     }
+    /// Retains an architecture-authored target projection before native allocation.
+    /// The source declaration remains available for conversion and source binding.
+    /// Only the existing exact parameter and unit-path projections are accepted.
+    pub fn with_executable_component(
+        mut self,
+        definition: std::sync::Arc<crate::ComponentDefinition>,
+    ) -> Result<Self, ReplicatedTextContractError> {
+        let source = self
+            .requirements
+            .shared_component_definition()
+            .ok_or_else(|| {
+                ReplicatedTextContractError::invalid(
+                    "executable projection has no source definition",
+                )
+            })?;
+        validate_executable_component_projection(
+            &source,
+            &definition,
+            &self.materialization_tasks,
+        )?;
+        self.executable_component = Some(definition);
+        Ok(self)
+    }
+
+    /// Exact retained target declaration; source geometry remains in requirements.
+    pub fn executable_component(&self) -> Option<&std::sync::Arc<crate::ComponentDefinition>> {
+        self.executable_component.as_ref()
+    }
+
     /// Returns the exact selected topology.
     pub const fn topology(&self) -> ParallelTopology {
         self.topology
@@ -4312,6 +4579,7 @@ pub fn select_replicated_text_realization(
         backend_chunked_prefill: capabilities.chunked_prefill,
         max_cached_shards: request.max_cached_shards,
         requirements: requirements.clone(),
+        executable_component: None,
         topology: request
             .topology
             .unwrap_or_else(|| ParallelTopology::new(1, 1, 1, 1).expect("replicated topology")),
@@ -5042,49 +5310,13 @@ mod tests {
             64 * 32 + 2 * 64 * 2
         );
 
-        let members = physical.members();
-        let primary = ParameterGroupSpec::new(
-            "primary",
-            ParameterRole::FeedForwardIntermediate,
-            [members[0].clone()],
-        )
-        .unwrap();
-        let companions = ParameterGroupSpec::new(
+        // A companion group without its primary is invalid before partitioning.
+        assert!(ParameterGroupSpec::new(
             "companions",
             ParameterRole::FeedForwardIntermediate,
-            members[1..].to_vec(),
+            physical.members()[1..].to_vec(),
         )
-        .unwrap();
-        let malformed = ArchitectureParameterDescription::new(
-            &graph,
-            &layout,
-            [primary.clone(), companions.clone(), norm.clone()],
-            [
-                OwnedParameterGroupSpec::new(owner.clone(), primary),
-                OwnedParameterGroupSpec::new(owner.clone(), companions),
-                OwnedParameterGroupSpec::new(owner, norm),
-            ],
-        )
-        .unwrap();
-        let malformed_partition = ArchitecturePartition::from_description(
-            &malformed,
-            [(layout.group_id(0).unwrap().as_str(), 0..1)],
-            ownership,
-            state,
-            &state_plan,
-            (),
-            NoAuxiliaryBoundarySchema::new(64),
-        )
-        .unwrap();
-        let error = partitioned_replicated_text_materialization_tasks(
-            &selected,
-            &malformed,
-            &malformed_partition,
-        )
-        .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("outside its atomic parameter group"));
+        .is_err());
     }
 
     #[test]

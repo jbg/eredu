@@ -6,6 +6,37 @@ use eredu_checkpoint::schema::{
 };
 use eredu_gguf::{Checkpoint, GgmlType, MetadataValue};
 
+/// Resolves the published companion geometry for admission and source conversion.
+pub(crate) fn companion_geometry(
+    config: &FamilyConfig,
+) -> Result<&super::PixtralConfig, ConfigError> {
+    let invalid = |message: String| ConfigError::Invalid(message);
+    config
+        .validate_config()
+        .map_err(|e| invalid(e.to_string()))?;
+    let vision = config
+        .vision
+        .as_ref()
+        .ok_or_else(|| invalid("vision companion requires a Pixtral configuration".into()))?;
+    if config.hidden_size() != 4096
+        || config.spatial_merge_size != 2
+        || vision.hidden_size != 1024
+        || vision.intermediate_size != 4096
+        || vision.num_hidden_layers != 24
+        || vision.num_attention_heads != 16
+        || vision.head_dim != 64
+        || vision.num_channels != 3
+        || vision.patch_size != 14
+        || vision.image_size != 1540
+        || vision.rope_parameters["rope_theta"].as_f64() != Some(10000.0)
+    {
+        return Err(invalid(
+            "vision companion differs from pinned Pixtral geometry".into(),
+        ));
+    }
+    Ok(vision)
+}
+
 /// Exact separately addressable vision source; no generic `clip` alias authority.
 #[derive(Debug, Clone)]
 pub struct VisionGgufPlan {
@@ -86,29 +117,7 @@ impl VisionGgufPlan {
         fingerprints: std::sync::Arc<eredu_checkpoint::artifact::ArtifactFingerprintSource>,
     ) -> Result<Self, ConfigError> {
         let invalid = |message: String| ConfigError::Invalid(message);
-        config
-            .validate_config()
-            .map_err(|e| invalid(e.to_string()))?;
-        let vision = config
-            .vision
-            .as_ref()
-            .ok_or_else(|| invalid("vision companion requires a Pixtral configuration".into()))?;
-        if config.hidden_size() != 4096
-            || config.spatial_merge_size != 2
-            || vision.hidden_size != 1024
-            || vision.intermediate_size != 4096
-            || vision.num_hidden_layers != 24
-            || vision.num_attention_heads != 16
-            || vision.head_dim != 64
-            || vision.num_channels != 3
-            || vision.patch_size != 14
-            || vision.image_size != 1540
-            || vision.rope_parameters["rope_theta"].as_f64() != Some(10000.0)
-        {
-            return Err(invalid(
-                "vision companion differs from pinned Pixtral geometry".into(),
-            ));
-        }
+        let vision = companion_geometry(config)?;
         let metadata = checkpoint.metadata();
         for (key, expected) in [
             ("general.architecture", "clip"),
@@ -129,14 +138,32 @@ impl VisionGgufPlan {
             }
         }
         for (key, expected) in [
-            ("clip.vision.projection_dim", 4096),
-            ("clip.vision.image_size", 1540),
-            ("clip.vision.patch_size", 14),
-            ("clip.vision.embedding_length", 1024),
-            ("clip.vision.feed_forward_length", 4096),
-            ("clip.vision.block_count", 24),
-            ("clip.vision.attention.head_count", 16),
-            ("clip.vision.spatial_merge_size", 2),
+            (
+                "clip.vision.projection_dim",
+                i64::from(config.hidden_size()),
+            ),
+            ("clip.vision.image_size", i64::from(vision.image_size)),
+            ("clip.vision.patch_size", i64::from(vision.patch_size)),
+            (
+                "clip.vision.embedding_length",
+                i64::from(vision.hidden_size),
+            ),
+            (
+                "clip.vision.feed_forward_length",
+                i64::from(vision.intermediate_size),
+            ),
+            (
+                "clip.vision.block_count",
+                i64::from(vision.num_hidden_layers),
+            ),
+            (
+                "clip.vision.attention.head_count",
+                i64::from(vision.num_attention_heads),
+            ),
+            (
+                "clip.vision.spatial_merge_size",
+                i64::from(config.spatial_merge_size),
+            ),
         ] {
             if metadata.get(key).and_then(MetadataValue::as_i64) != Some(expected) {
                 return Err(invalid(format!(

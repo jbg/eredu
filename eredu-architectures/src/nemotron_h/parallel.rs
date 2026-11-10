@@ -1,18 +1,10 @@
 //! Semantic placement and rank-local geometry for Nemotron-H physical units.
 
-use eredu_nn::{GroupedNeuralBackend, VocabularyParallelRange};
-use eredu_runtime::{
-    aligned_partition_units, module_parameter_group, partitioned_module_parameter_group,
-    partitioned_projection_group, LocalModelLayout, MemberSharding, ParallelPlanError,
-    ParameterGroupSpec, ParameterRole, ProjectionSharding, StateLayout,
-};
+use eredu_nn::VocabularyParallelRange;
+use eredu_runtime::{LocalModelLayout, ParallelPlanError, StateLayout};
 use std::ops::Range;
 
-use super::{
-    prompt_cache_architecture_fingerprint, state_layout_with_geometry, Block, DenseMlp,
-    LayerGeometry, LayerPolicy, ModelArgs, Operator, PredictionUnit, Unit,
-};
-use crate::decoder::StaticModules;
+use super::{prompt_cache_architecture_fingerprint, LayerGeometry};
 
 /// Complete planner-derived construction and state geometry for one Nemotron-H rank.
 #[derive(Debug, Clone)]
@@ -23,10 +15,7 @@ pub struct LocalGeometry {
     output_range: Option<VocabularyParallelRange>,
     state_layout: StateLayout,
     architecture_fingerprint: String,
-    global_target: Vec<LayerGeometry>,
-    global_prediction: Vec<LayerGeometry>,
-    prediction_steps: usize,
-    prediction_pattern: usize,
+    parameters: std::sync::Arc<eredu_runtime::ArchitectureParameterDescription>,
     tied_head: bool,
 }
 
@@ -39,6 +28,7 @@ pub struct PartitionLocalGeometry {
     output_range: Option<VocabularyParallelRange>,
     complete_state_layout: StateLayout,
     architecture_fingerprint: String,
+    parameters: std::sync::Arc<eredu_runtime::ArchitectureParameterDescription>,
     tied_head: bool,
     static_roles: Vec<String>,
     boundary_schema: super::TargetBoundarySchema,
@@ -181,9 +171,11 @@ impl PartitionLocalGeometry {
         &self.expert_banks
     }
 
-    pub(super) fn validate_for(&self, args: &ModelArgs) -> Result<(), ParallelPlanError> {
-        args.validate()
-            .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+    pub(super) fn validate_for(
+        &self,
+        declaration: &super::Declaration,
+    ) -> Result<(), ParallelPlanError> {
+        let args = declaration.args();
         if args.has_sparse_moe_layers() != self.expert_realization.is_some() {
             return Err(ParallelPlanError::InvalidGroup(
                 "partition-local Nemotron-H routed authority differs from its schedule".into(),
@@ -202,9 +194,10 @@ impl PartitionLocalGeometry {
             || self.units.len() != self.owned_units.len()
             || self.complete_state_layout.len() != count
             || self.architecture_fingerprint != prompt_cache_architecture_fingerprint(args)
+            || self.parameters.as_ref() != declaration.definition().parameters()
             || self.tied_head != args.tie_word_embeddings
             || self.static_roles != expected_static_roles(&self.owned_units, count)
-            || self.boundary_schema != super::TargetBoundarySchema::from_args(args)
+            || self.boundary_schema != super::TargetBoundarySchema::from_declaration(declaration)
         {
             return Err(ParallelPlanError::InvalidGroup(
                 "partition-local Nemotron-H geometry belongs to a different model or range".into(),
@@ -221,7 +214,7 @@ impl PartitionLocalGeometry {
             _ => {
                 return Err(ParallelPlanError::InvalidGroup(
                     "partition-local Nemotron-H output vocabulary ownership is inconsistent".into(),
-                ))
+                ));
             }
         }
         for global in self.owned_units.clone() {
@@ -232,71 +225,25 @@ impl PartitionLocalGeometry {
             let state = self.complete_state_layout.layer(global).ok_or_else(|| {
                 ParallelPlanError::InvalidGroup("missing complete Nemotron-H state layer".into())
             })?;
-            let matches = match (policy, geometry, state) {
+            let scope = declaration.block(global).ok_or_else(|| {
+                ParallelPlanError::InvalidGroup("owned invocation has no declared scope".into())
+            })?;
+            let expected = match (&scope.operator, geometry) {
                 (
-                    LayerPolicy::Mamba,
-                    LayerGeometry::Mamba { heads, groups },
-                    eredu_core::cache::LayerCachePolicy::FixedState { tensors },
-                ) => {
-                    let history = args.conv_kernel - 1;
-                    let convolution_width =
-                        heads.checked_mul(args.mamba_head_dim).and_then(|width| {
-                            groups
-                                .checked_mul(args.ssm_state_size)
-                                .and_then(|state| state.checked_mul(2))
-                                .and_then(|state| width.checked_add(state))
-                        });
-                    let convolution_count = usize::from(history > 0);
-                    tensors.len() == convolution_count + 1
-                        && (history == 0
-                            || tensors.first().is_some_and(|tensor| {
-                                tensor.role
-                                    == eredu_core::cache::StateTensorRole::Convolution { slot: 0 }
-                                    && tensor.dtype == eredu_core::cache::StateTensorDtype::Floating
-                                    && fixed_shape(
-                                        &tensor.shape,
-                                        &[None, Some(history), convolution_width],
-                                    )
-                            }))
-                        && tensors.last().is_some_and(|tensor| {
-                            tensor.role == eredu_core::cache::StateTensorRole::Recurrent
-                                && tensor.dtype == eredu_core::cache::StateTensorDtype::Float32
-                                && fixed_shape(
-                                    &tensor.shape,
-                                    &[
-                                        None,
-                                        Some(heads),
-                                        Some(args.mamba_head_dim),
-                                        Some(args.ssm_state_size),
-                                    ],
-                                )
-                        })
-                }
-                (
-                    LayerPolicy::SelfAttention(expected_attention),
-                    LayerGeometry::Attention { kv_heads, .. },
-                    eredu_core::cache::LayerCachePolicy::KeyValue {
-                        attention,
-                        num_key_value_heads,
-                        head_dim,
-                    },
-                ) => {
-                    *attention == expected_attention
-                        && i32::try_from(num_key_value_heads.get()) == Ok(kv_heads)
-                        && i32::try_from(head_dim.get()) == Ok(args.head_dim)
-                }
-                (
-                    LayerPolicy::DenseMlp,
+                    super::declarations::TargetOperatorParameters::Dense(_),
                     LayerGeometry::DenseMlp { .. },
-                    eredu_core::cache::LayerCachePolicy::NoState,
-                ) => true,
-                (
-                    LayerPolicy::SparseMoe,
+                )
+                | (
+                    super::declarations::TargetOperatorParameters::Sparse(_),
                     LayerGeometry::SparseMoe { .. },
-                    eredu_core::cache::LayerCachePolicy::NoState,
-                ) => true,
-                _ => false,
-            };
+                ) => scope.state_policy(policy),
+                _ => scope
+                    .clone()
+                    .local(geometry, None)
+                    .and_then(|scope| scope.state_policy(policy)),
+            }
+            .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+            let matches = *state == expected;
             if !matches {
                 return Err(ParallelPlanError::InvalidGroup(format!(
                     "owned Nemotron-H unit {global} differs from complete TP-local state geometry"
@@ -305,23 +252,6 @@ impl PartitionLocalGeometry {
         }
         Ok(())
     }
-}
-
-fn fixed_shape(
-    actual: &[eredu_core::cache::StateTensorDimension],
-    expected: &[Option<i32>],
-) -> bool {
-    actual.len() == expected.len()
-        && actual
-            .iter()
-            .zip(expected)
-            .all(|(actual, expected)| match (actual, expected) {
-                (eredu_core::cache::StateTensorDimension::Batch, None) => true,
-                (eredu_core::cache::StateTensorDimension::Fixed(value), Some(expected)) => {
-                    i32::try_from(value.get()) == Ok(*expected)
-                }
-                _ => false,
-            })
 }
 
 impl LocalGeometry {
@@ -360,38 +290,17 @@ impl LocalGeometry {
         &self.state_layout
     }
 
-    pub(super) fn validate_for(&self, args: &ModelArgs) -> Result<(), ParallelPlanError> {
-        args.validate()
-            .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-        let expected_target = global_target_geometry(args)?;
-        let expected_prediction = global_prediction_geometry(args)?;
-        let prediction_steps = usize::try_from(args.num_nextn_predict_layers).map_err(|_| {
-            ParallelPlanError::InvalidGroup("Nemotron-H prediction-step count exceeds usize".into())
-        })?;
-        let prediction_pattern = if prediction_steps == 0 {
-            0
-        } else {
-            if expected_prediction.len() % prediction_steps != 0 {
-                return Err(ParallelPlanError::InvalidGroup(
-                    "Nemotron-H MTP geometry does not divide into prediction steps".into(),
-                ));
-            }
-            expected_prediction
-                .len()
-                .checked_div(prediction_steps)
-                .filter(|pattern| *pattern > 0)
-                .ok_or_else(|| {
-                    ParallelPlanError::InvalidGroup(
-                        "Nemotron-H MTP geometry has an empty prediction pattern".into(),
-                    )
-                })?
-        };
-        if self.target.len() != expected_target.len()
-            || self.prediction.len() != expected_prediction.len()
-            || self.global_target != expected_target
-            || self.global_prediction != expected_prediction
-            || self.prediction_steps != prediction_steps
-            || self.prediction_pattern != prediction_pattern
+    pub(super) fn validate_for(
+        &self,
+        declaration: &super::Declaration,
+    ) -> Result<(), ParallelPlanError> {
+        let args = declaration.args();
+        let parameters = declaration.definition().parameters();
+        let layout = parameters.unit_layout();
+        let target_count = layout.group_range(0).expect("declared target group").len();
+        if self.parameters.as_ref() != parameters
+            || self.target.len() != target_count
+            || self.prediction.len() != layout.len() - target_count
             || self.architecture_fingerprint != prompt_cache_architecture_fingerprint(args)
             || self.tied_head != args.tie_word_embeddings
         {
@@ -410,12 +319,12 @@ impl LocalGeometry {
             (true, Some(_)) => {
                 return Err(ParallelPlanError::InvalidGroup(
                     "tied Nemotron-H output unexpectedly owns a separate vocabulary range".into(),
-                ))
+                ));
             }
             (false, None) => {
                 return Err(ParallelPlanError::InvalidGroup(
                     "untied Nemotron-H output is missing vocabulary ownership".into(),
-                ))
+                ));
             }
         }
         let geometry = self
@@ -424,7 +333,8 @@ impl LocalGeometry {
             .chain(&self.prediction)
             .copied()
             .collect::<Vec<_>>();
-        let expected = state_layout_with_geometry(args, &geometry)
+        let expected = declaration
+            .state_layout_for(&geometry)
             .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
         if expected != self.state_layout {
             return Err(ParallelPlanError::InvalidGroup(
@@ -461,196 +371,112 @@ fn local_width(
     })
 }
 
-/// Derives one target block's local geometry from the resolved parameter layout.
-pub fn local_block_geometry(
-    args: &ModelArgs,
-    layer: usize,
+fn scope_local_geometry(
+    scope: &super::declarations::TargetBlockParameters,
     layout: &LocalModelLayout,
 ) -> Result<LayerGeometry, ParallelPlanError> {
-    let root = format!("model.layers.{layer}");
-    match args.layer_schedule.get(layer).copied().ok_or_else(|| {
-        ParallelPlanError::InvalidGroup(format!("Nemotron-H has no layer {layer}"))
-    })? {
-        LayerPolicy::Mamba => {
-            let heads = local_width(layout, &format!("{root}.mamba.dt_bias"), 0)?;
-            if args.n_groups <= 0 || args.mamba_num_heads % args.n_groups != 0 {
-                return Err(ParallelPlanError::InvalidGroup(
-                    "Nemotron-H Mamba heads do not divide into state groups".into(),
-                ));
-            }
-            let heads_per_group = args.mamba_num_heads / args.n_groups;
-            if heads_per_group <= 0 || heads % heads_per_group != 0 {
+    use super::declarations::TargetOperatorParameters as P;
+    Ok(match &scope.operator {
+        P::Mamba(spec) => {
+            let heads = local_width(layout, spec.dt_bias.id.as_str(), 0)?;
+            let per_group = spec.geometry.heads() / spec.geometry.groups();
+            if heads % per_group != 0 {
                 return Err(ParallelPlanError::InvalidTensor(
                     "local Mamba heads do not contain complete state groups".into(),
                 ));
             }
-            Ok(LayerGeometry::Mamba {
+            LayerGeometry::Mamba {
                 heads,
-                groups: heads / heads_per_group,
-            })
+                groups: heads / per_group,
+            }
         }
-        LayerPolicy::SelfAttention(_) => {
-            let query = local_width(layout, &format!("{root}.attention.q_proj.weight"), 0)?;
-            let key = local_width(layout, &format!("{root}.attention.k_proj.weight"), 0)?;
-            if args.head_dim <= 0 || query % args.head_dim != 0 || key % args.head_dim != 0 {
+        P::Attention(spec) => {
+            let query = local_width(layout, spec.projection.query.weight.id.as_str(), 0)?;
+            let key = local_width(layout, spec.projection.key.weight.id.as_str(), 0)?;
+            let qdim = spec.projection.geometry.key_dimensions();
+            if query % qdim != 0 || key % qdim != 0 {
                 return Err(ParallelPlanError::InvalidTensor(
                     "local attention widths do not contain complete heads".into(),
                 ));
             }
-            Ok(LayerGeometry::Attention {
-                query_heads: query / args.head_dim,
-                kv_heads: key / args.head_dim,
-            })
+            LayerGeometry::Attention {
+                query_heads: query / qdim,
+                kv_heads: key / qdim,
+            }
         }
-        LayerPolicy::DenseMlp => Ok(LayerGeometry::DenseMlp {
-            intermediate: local_width(layout, &format!("{root}.mlp.up_proj.weight"), 0)?,
-        }),
-        LayerPolicy::SparseMoe => Ok(LayerGeometry::SparseMoe {
-            routed: local_width(layout, &format!("{root}.moe.experts.up_proj"), 1)?,
-            shared: local_width(
-                layout,
-                &format!("{root}.moe.shared_experts.up_proj.weight"),
-                0,
-            )?,
-        }),
-    }
+        P::Dense(spec) => LayerGeometry::DenseMlp {
+            intermediate: local_width(layout, spec.network.up.weight.id.as_str(), 0)?,
+        },
+        P::Sparse(spec) => LayerGeometry::SparseMoe {
+            routed: local_width(layout, spec.experts.up().weight().id.as_str(), 1)?,
+            shared: local_width(layout, spec.shared.network.up.weight.id.as_str(), 0)?,
+        },
+    })
 }
 
-/// Returns resolved state geometry for target and appended MTP units.
+/// Derives one declared target block's geometry from selected parameter placement.
+pub fn local_block_geometry(
+    declaration: &super::Declaration,
+    layer: usize,
+    layout: &LocalModelLayout,
+) -> Result<LayerGeometry, ParallelPlanError> {
+    scope_local_geometry(
+        declaration.blocks.get(layer).ok_or_else(|| {
+            ParallelPlanError::InvalidGroup("target unit is outside its declaration".into())
+        })?,
+        layout,
+    )
+}
+
+/// Resolves target and independent prediction invocations from their declared slots.
 pub fn local_state_geometry(
-    args: &ModelArgs,
+    declaration: &super::Declaration,
     layout: &LocalModelLayout,
 ) -> Result<Vec<LayerGeometry>, ParallelPlanError> {
-    let mut geometry = (0..args.num_hidden_layers as usize)
-        .map(|layer| local_block_geometry(args, layer, layout))
-        .collect::<Result<Vec<_>, _>>()?;
-    let target = args.num_hidden_layers as usize;
-    for (physical, policy) in args
-        .mtp_policies()
-        .map_err(|e| ParallelPlanError::InvalidGroup(e.to_string()))?
-        .into_iter()
-        .enumerate()
-    {
-        let root = format!("model.mtp.layers.{physical}.mixer");
-        geometry.push(match policy {
-            LayerPolicy::SelfAttention(_) => {
-                let query = local_width(layout, &format!("{root}.q_proj.weight"), 0)?;
-                let key = local_width(layout, &format!("{root}.k_proj.weight"), 0)?;
-                if args.head_dim <= 0
-                    || query % args.head_dim != 0
-                    || key % args.head_dim != 0
-                {
-                    return Err(ParallelPlanError::InvalidTensor(format!(
-                        "local Nemotron-H MTP attention widths at physical layer {physical} do not contain complete heads"
-                    )));
-                }
-                LayerGeometry::Attention {
-                    query_heads: query / args.head_dim,
-                    kv_heads: key / args.head_dim,
-                }
-            }
-            LayerPolicy::SparseMoe => LayerGeometry::SparseMoe {
-                routed: local_width(layout, &format!("{root}.experts.up_proj"), 1)?,
-                shared: local_width(layout, &format!("{root}.shared_experts.up_proj.weight"), 0)?,
-            },
-            _ => {
-                return Err(ParallelPlanError::InvalidGroup(format!(
-                    "unsupported MTP policy at global state layer {}",
-                    target + physical
-                )))
-            }
-        });
-    }
-    Ok(geometry)
-}
-
-pub(super) fn global_target_geometry(
-    args: &ModelArgs,
-) -> Result<Vec<LayerGeometry>, ParallelPlanError> {
-    Ok(args
-        .layer_schedule
+    declaration
+        .blocks
         .iter()
-        .map(|policy| match policy {
-            LayerPolicy::Mamba => LayerGeometry::Mamba {
-                heads: args.mamba_num_heads,
-                groups: args.n_groups,
-            },
-            LayerPolicy::SelfAttention(_) => LayerGeometry::Attention {
-                query_heads: args.num_attention_heads,
-                kv_heads: args.num_key_value_heads,
-            },
-            LayerPolicy::DenseMlp => LayerGeometry::DenseMlp {
-                intermediate: args.intermediate_size,
-            },
-            LayerPolicy::SparseMoe => LayerGeometry::SparseMoe {
-                routed: args.moe_intermediate_size,
-                shared: args.moe_shared_expert_intermediate_size,
-            },
-        })
-        .collect())
+        .chain(declaration.predictions.iter().map(|unit| &unit.block))
+        .map(|scope| scope_local_geometry(scope, layout))
+        .collect()
 }
-
-pub(super) fn global_prediction_geometry(
-    args: &ModelArgs,
-) -> Result<Vec<LayerGeometry>, ParallelPlanError> {
-    Ok(args
-        .mtp_policies()
-        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?
-        .into_iter()
-        .map(|policy| match policy {
-            LayerPolicy::SelfAttention(_) => LayerGeometry::Attention {
-                query_heads: args.num_attention_heads,
-                kv_heads: args.num_key_value_heads,
-            },
-            LayerPolicy::SparseMoe => LayerGeometry::SparseMoe {
-                routed: args.moe_intermediate_size,
-                shared: args.moe_shared_expert_intermediate_size,
-            },
-            _ => unreachable!("validated Nemotron-H MTP schedules contain attention and MoE"),
-        })
-        .collect())
+pub(super) fn global_target_geometry(declaration: &super::Declaration) -> Vec<LayerGeometry> {
+    declaration
+        .blocks
+        .iter()
+        .map(|block| block.geometry())
+        .collect()
+}
+pub(super) fn global_prediction_geometry(declaration: &super::Declaration) -> Vec<LayerGeometry> {
+    declaration
+        .predictions
+        .iter()
+        .map(|unit| unit.block.geometry())
+        .collect()
 }
 
 /// Derives complete rank-local target, MTP, vocabulary, and state geometry.
 pub fn local_geometry(
-    args: &ModelArgs,
+    declaration: &super::Declaration,
     layout: &LocalModelLayout,
 ) -> Result<LocalGeometry, ParallelPlanError> {
+    let args = declaration.args();
     args.validate()
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    let geometry = local_state_geometry(args, layout)?;
+    let geometry = local_state_geometry(declaration, layout)?;
     let target_count = usize::try_from(args.num_hidden_layers).map_err(|_| {
         ParallelPlanError::InvalidGroup("Nemotron-H target layer count exceeds usize".into())
     })?;
     let (target, prediction) = geometry.split_at(target_count);
-    let state_layout = state_layout_with_geometry(args, &geometry)
+    let state_layout = declaration
+        .state_layout_for(&geometry)
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    let (embedding_range, output_range) = super::static_spec(
-        args,
-        super::FinalNormalization::Native,
-    )
-    .vocabulary_ranges(layout, "model.embeddings", "model.norm_f", "lm_head")?;
-    let prediction_steps = usize::try_from(args.num_nextn_predict_layers).map_err(|_| {
-        ParallelPlanError::InvalidGroup("Nemotron-H prediction-step count exceeds usize".into())
-    })?;
-    let prediction_pattern = if prediction_steps == 0 {
-        0
-    } else {
-        if prediction.len() % prediction_steps != 0 {
-            return Err(ParallelPlanError::InvalidGroup(
-                "Nemotron-H MTP geometry does not divide into prediction steps".into(),
-            ));
-        }
-        prediction
-            .len()
-            .checked_div(prediction_steps)
-            .filter(|n| *n > 0)
-            .ok_or_else(|| {
-                ParallelPlanError::InvalidGroup(
-                    "Nemotron-H MTP geometry has an empty prediction pattern".into(),
-                )
-            })?
-    };
+    let (embedding_range, output_range) = declaration.statics.vocabulary_ranges(
+        layout,
+        "model.embeddings",
+        "model.norm_f",
+        "lm_head",
+    )?;
     let local = LocalGeometry {
         target: target.to_vec(),
         prediction: prediction.to_vec(),
@@ -658,22 +484,20 @@ pub fn local_geometry(
         output_range,
         state_layout,
         architecture_fingerprint: prompt_cache_architecture_fingerprint(args),
-        global_target: global_target_geometry(args)?,
-        global_prediction: global_prediction_geometry(args)?,
-        prediction_steps,
-        prediction_pattern,
+        parameters: std::sync::Arc::new(declaration.definition().parameters().clone()),
         tied_head: args.tie_word_embeddings,
     };
-    local.validate_for(args)?;
+    local.validate_for(declaration)?;
     Ok(local)
 }
 
 /// Derives dense target construction geometry for one exact TP/PP partition.
 pub fn partition_local_geometry(
-    args: &ModelArgs,
+    declaration: &super::Declaration,
     layout: &LocalModelLayout,
     owned_units: Range<usize>,
 ) -> Result<PartitionLocalGeometry, ParallelPlanError> {
+    let args = declaration.args();
     if args.has_sparse_moe_layers() {
         return Err(ParallelPlanError::InvalidGroup(
             "partitioned resident Nemotron-H does not accept routed units".into(),
@@ -692,7 +516,7 @@ pub fn partition_local_geometry(
             "Nemotron-H local unit range {owned_units:?} is outside {count} target layers"
         )));
     }
-    let complete = local_geometry(args, layout)?;
+    let complete = local_geometry(declaration, layout)?;
     let units = owned_units
         .clone()
         .map(|unit| {
@@ -710,26 +534,28 @@ pub fn partition_local_geometry(
         output_range: complete.output_range.clone(),
         complete_state_layout: complete.state_layout.clone(),
         architecture_fingerprint: complete.architecture_fingerprint.clone(),
+        parameters: std::sync::Arc::clone(&complete.parameters),
         tied_head: complete.tied_head,
         static_roles: expected_static_roles(&owned_units, count),
-        boundary_schema: super::TargetBoundarySchema::from_args(args),
+        boundary_schema: super::TargetBoundarySchema::from_declaration(declaration),
         expert_realization: None,
         routed_expert_intermediate_range: None,
         shared_expert_intermediate_range: None,
         expert_banks: Vec::new(),
     };
-    geometry.validate_for(args)?;
+    geometry.validate_for(declaration)?;
     Ok(geometry)
 }
 
 /// Derives prediction-free routed Nemotron-H geometry from the selected expert plan.
 pub fn partition_local_routed_geometry(
-    args: &ModelArgs,
+    declaration: &super::Declaration,
     layout: &LocalModelLayout,
     owned_units: Range<usize>,
     topology: eredu_core::ParallelRankTopology,
     realization: &crate::ExpertRealizationPlan<eredu_nn::GroupedRelu2Spec>,
 ) -> Result<PartitionLocalGeometry, ParallelPlanError> {
+    let args = declaration.args();
     if args.num_nextn_predict_layers != 0 {
         return Err(ParallelPlanError::InvalidGroup(
             "partition-local Nemotron-H rejects embedded prediction".into(),
@@ -756,22 +582,24 @@ pub fn partition_local_routed_geometry(
         ));
     }
 
-    let complete = local_geometry(args, layout)?;
-    let global_experts = usize::try_from(args.n_routed_experts).map_err(|_| {
-        ParallelPlanError::InvalidGroup("Nemotron-H expert count exceeds usize".into())
-    })?;
+    let complete = local_geometry(declaration, layout)?;
+    let banks = declaration.expert_banks();
+    let global_experts = banks
+        .values()
+        .next()
+        .ok_or_else(|| {
+            ParallelPlanError::InvalidGroup(
+                "Nemotron-H sparse schedule has no declared bank".into(),
+            )
+        })?
+        .group_count() as usize;
     let local_experts = validate_realization(topology, global_experts, realization)?;
     let local_count = i32::try_from(local_experts.len()).map_err(|_| {
         ParallelPlanError::InvalidGroup("Nemotron-H local expert count exceeds i32".into())
     })?;
     let mut routed_range = None;
     let mut shared_range = None;
-    let mut expected_sparse_units = 0;
-    for (unit, policy) in args.layer_schedule.iter().copied().enumerate() {
-        if policy != LayerPolicy::SparseMoe {
-            continue;
-        }
-        expected_sparse_units += 1;
+    for (&unit, bank) in &banks {
         let geometry = complete.target_unit(unit).copied().ok_or_else(|| {
             ParallelPlanError::InvalidGroup("missing local Nemotron-H sparse unit".into())
         })?;
@@ -780,7 +608,9 @@ pub fn partition_local_routed_geometry(
                 "Nemotron-H sparse schedule has non-sparse local geometry".into(),
             ));
         };
-        let expected = super::localized_expert_bank_spec(args, unit, local_count, routed)
+        let expected = (**bank)
+            .clone()
+            .with_group_geometry(local_count, routed)
             .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
         if realization.unit_spec("target", unit) != Some(&expected) {
             return Err(ParallelPlanError::InvalidGroup(format!(
@@ -789,14 +619,19 @@ pub fn partition_local_routed_geometry(
         }
         let current_routed = exact_logical_range(
             layout,
-            &format!("model.layers.{unit}.moe.experts.up_proj"),
-            args.moe_intermediate_size,
+            bank.up().weight().id.as_str(),
+            bank.intermediate_dimensions(),
         )?;
-        let current_shared = exact_logical_range(
-            layout,
-            &format!("model.layers.{unit}.moe.shared_experts.up_proj.weight"),
-            args.moe_shared_expert_intermediate_size,
-        )?;
+        let Some(super::declarations::TargetOperatorParameters::Sparse(declared)) =
+            declaration.block(unit).map(|scope| &scope.operator)
+        else {
+            return Err(ParallelPlanError::InvalidGroup(
+                "retained sparse invocation has no scope".into(),
+            ));
+        };
+        let shared_up = &declared.shared.network.up;
+        let current_shared =
+            exact_logical_range(layout, shared_up.weight.id.as_str(), shared_up.output)?;
         merge_exact_range(&mut routed_range, current_routed, "routed expert")?;
         merge_exact_range(&mut shared_range, current_shared, "shared expert")?;
         if i32::try_from(
@@ -817,7 +652,7 @@ pub fn partition_local_routed_geometry(
             ));
         }
     }
-    if realization.unit_specs().len() != expected_sparse_units {
+    if realization.unit_specs().len() != banks.len() {
         return Err(ParallelPlanError::InvalidGroup(
             "Nemotron-H expert unit schedule drifted".into(),
         ));
@@ -838,7 +673,7 @@ pub fn partition_local_routed_geometry(
         .collect::<Result<Vec<_>, _>>()?;
     let expert_banks = owned_units
         .clone()
-        .filter(|unit| args.layer_schedule.get(*unit) == Some(&LayerPolicy::SparseMoe))
+        .filter(|unit| banks.contains_key(unit))
         .flat_map(|global_unit| {
             local_experts.iter().copied().enumerate().map({
                 let range = routed_range.clone();
@@ -858,15 +693,16 @@ pub fn partition_local_routed_geometry(
         output_range: complete.output_range.clone(),
         complete_state_layout: complete.state_layout.clone(),
         architecture_fingerprint: complete.architecture_fingerprint.clone(),
+        parameters: std::sync::Arc::clone(&complete.parameters),
         tied_head: complete.tied_head,
         static_roles: expected_static_roles(&owned_units, count),
-        boundary_schema: super::TargetBoundarySchema::from_args(args),
+        boundary_schema: super::TargetBoundarySchema::from_declaration(declaration),
         expert_realization: Some(realization.clone()),
         routed_expert_intermediate_range: Some(routed_range),
         shared_expert_intermediate_range: Some(shared_range),
         expert_banks,
     };
-    geometry.validate_for(args)?;
+    geometry.validate_for(declaration)?;
     Ok(geometry)
 }
 
@@ -943,10 +779,11 @@ fn validate_realization(
 
 /// Derives exact TP-local target state before pipeline ownership is sliced.
 pub fn partitioned_state_layout(
-    args: &ModelArgs,
+    declaration: &super::Declaration,
     tensor_rank: usize,
     tensor_size: usize,
 ) -> Result<StateLayout, ParallelPlanError> {
+    let args = declaration.args();
     args.validate()
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
     if args.num_nextn_predict_layers != 0 {
@@ -970,335 +807,32 @@ pub fn partitioned_state_layout(
             ParallelPlanError::InvalidGroup(format!("Nemotron-H local {role} count exceeds i32"))
         })
     };
-    let geometry = args
-        .layer_schedule
-        .iter()
-        .map(|policy| match policy {
-            LayerPolicy::Mamba => {
-                if args.n_groups <= 0 || args.mamba_num_heads % args.n_groups != 0 {
-                    return Err(ParallelPlanError::InvalidGroup(
-                        "Nemotron-H Mamba heads do not divide into state groups".into(),
-                    ));
+    let geometry = global_target_geometry(declaration)
+        .into_iter()
+        .map(|geometry| {
+            Ok(match geometry {
+                LayerGeometry::Mamba { heads, groups } => {
+                    let local = select(groups, "Mamba groups")?;
+                    LayerGeometry::Mamba {
+                        heads: local * (heads / groups),
+                        groups: local,
+                    }
                 }
-                let groups = select(args.n_groups, "Mamba groups")?;
-                Ok(LayerGeometry::Mamba {
-                    heads: groups * (args.mamba_num_heads / args.n_groups),
-                    groups,
-                })
-            }
-            LayerPolicy::SelfAttention(_) => Ok(LayerGeometry::Attention {
-                query_heads: select(args.num_attention_heads, "query heads")?,
-                kv_heads: select(args.num_key_value_heads, "key/value heads")?,
-            }),
-            LayerPolicy::DenseMlp => Ok(LayerGeometry::DenseMlp {
-                intermediate: select(args.intermediate_size, "MLP width")?,
-            }),
-            LayerPolicy::SparseMoe => Ok(LayerGeometry::SparseMoe {
-                routed: args.moe_intermediate_size,
-                shared: args.moe_shared_expert_intermediate_size,
-            }),
+                LayerGeometry::Attention {
+                    query_heads,
+                    kv_heads,
+                } => LayerGeometry::Attention {
+                    query_heads: select(query_heads, "query heads")?,
+                    kv_heads: select(kv_heads, "key/value heads")?,
+                },
+                LayerGeometry::DenseMlp { intermediate } => LayerGeometry::DenseMlp {
+                    intermediate: select(intermediate, "MLP width")?,
+                },
+                geometry @ LayerGeometry::SparseMoe { .. } => geometry,
+            })
         })
         .collect::<Result<Vec<_>, ParallelPlanError>>()?;
-    state_layout_with_geometry(args, &geometry)
+    declaration
+        .state_layout_for(&geometry)
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))
-}
-
-/// Declares vocabulary and replicated final-normalization groups.
-pub fn static_parallel_parameter_groups<
-    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
->(
-    modules: &StaticModules<B>,
-) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    let mut groups = vec![
-        module_parameter_group::<B::Tensor, _>(
-            "model.embeddings",
-            ParameterRole::Vocabulary,
-            &modules.embeddings,
-            |_, shape| {
-                if shape.is_empty() {
-                    Err(ParallelPlanError::InvalidTensor(
-                        "Nemotron-H embedding is scalar".into(),
-                    ))
-                } else {
-                    Ok(MemberSharding::Balanced { axis: 0 })
-                }
-            },
-        )?,
-        module_parameter_group::<B::Tensor, _>(
-            "model.norm_f",
-            ParameterRole::Replicated,
-            &modules.boundary.norm,
-            |_, _| Ok(MemberSharding::Replicated),
-        )?,
-    ];
-    if let Some(head) = &modules.lm_head {
-        groups.push(module_parameter_group::<B::Tensor, _>(
-            "lm_head",
-            ParameterRole::Vocabulary,
-            head,
-            |_, shape| {
-                if shape.is_empty() {
-                    Err(ParallelPlanError::InvalidTensor(
-                        "Nemotron-H output is scalar".into(),
-                    ))
-                } else {
-                    Ok(MemberSharding::Balanced { axis: 0 })
-                }
-            },
-        )?);
-    }
-    Ok(groups)
-}
-
-fn dense_groups<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>(
-    root: &str,
-    mlp: &DenseMlp<B>,
-    width: i32,
-    role: ParameterRole,
-) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    Ok(vec![partitioned_projection_group::<B::Tensor, B::Linear>(
-        format!("{root}.intermediate"),
-        role,
-        &[
-            (&mlp.up_proj, ProjectionSharding::Column),
-            (&mlp.down_proj, ProjectionSharding::Row),
-        ],
-        aligned_partition_units(
-            root,
-            usize::try_from(width).map_err(|_| {
-                ParallelPlanError::InvalidGroup(
-                    "Nemotron-H intermediate width exceeds usize".into(),
-                )
-            })?,
-            1,
-            1,
-        )?,
-    )?])
-}
-
-/// Declares semantic groups for one target physical block.
-pub fn layer_parallel_parameter_groups<
-    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
->(
-    block: &Block<B>,
-    args: &ModelArgs,
-    layer: usize,
-) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    let root = format!("model.layers.{layer}");
-    block_parallel_parameter_groups(block, args, &root)
-}
-
-fn block_parallel_parameter_groups<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>(
-    block: &Block<B>,
-    args: &ModelArgs,
-    root: &str,
-) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    let mut groups = vec![module_parameter_group::<B::Tensor, _>(
-        format!("{root}.norm"),
-        ParameterRole::Replicated,
-        &block.norm,
-        |_, _| Ok(MemberSharding::Replicated),
-    )?];
-    match &block.operator {
-        Operator::Mamba(mamba) => {
-            let heads = usize::try_from(args.mamba_num_heads)
-                .map_err(|_| ParallelPlanError::InvalidGroup("Mamba heads exceed usize".into()))?;
-            let intermediate = usize::try_from(args.mamba_num_heads * args.mamba_head_dim)
-                .map_err(|_| ParallelPlanError::InvalidGroup("Mamba width exceeds usize".into()))?;
-            let grouped = usize::try_from(args.n_groups * args.ssm_state_size).map_err(|_| {
-                ParallelPlanError::InvalidGroup("Mamba state width exceeds usize".into())
-            })?;
-            let segments = vec![
-                0..intermediate,
-                intermediate..2 * intermediate,
-                2 * intermediate..2 * intermediate + grouped,
-                2 * intermediate + grouped..2 * intermediate + 2 * grouped,
-                2 * intermediate + 2 * grouped..2 * intermediate + 2 * grouped + heads,
-            ];
-            groups.push(partitioned_module_parameter_group::<B::Tensor, _>(
-                format!("{root}.mamba.heads"),
-                ParameterRole::Channels,
-                usize::try_from(args.n_groups).map_err(|_| {
-                    ParallelPlanError::InvalidGroup("Mamba group count exceeds usize".into())
-                })?,
-                mamba,
-                |metadata, shape| {
-                    let name = metadata
-                        .linear_companion_of
-                        .as_ref()
-                        .unwrap_or(&metadata.id)
-                        .as_str();
-                    if name.ends_with("in_proj.weight") || name.ends_with("in_proj.bias") {
-                        Ok(MemberSharding::PartitionedSegments {
-                            axis: 0,
-                            segments: segments.clone(),
-                        })
-                    } else if name.ends_with("conv1d.weight") || name.ends_with("conv1d.bias") {
-                        // Convolution channels concatenate values, input-state
-                        // and output-state projections. Each TP owner must take
-                        // its group interval from every semantic segment.
-                        Ok(MemberSharding::PartitionedSegments {
-                            axis: 0,
-                            segments: vec![
-                                0..intermediate,
-                                intermediate..intermediate + grouped,
-                                intermediate + grouped..intermediate + 2 * grouped,
-                            ],
-                        })
-                    } else if name.ends_with("dt_bias")
-                        || name.ends_with("A_log")
-                        || name.ends_with("D")
-                        || name.ends_with("norm.weight")
-                    {
-                        Ok(MemberSharding::Partitioned { axis: 0 })
-                    } else if name.ends_with("out_proj.weight") && shape.len() >= 2 {
-                        Ok(MemberSharding::Partitioned { axis: 1 })
-                    } else {
-                        Ok(MemberSharding::Replicated)
-                    }
-                },
-            )?);
-        }
-        Operator::Attention(attention) => {
-            groups.push(partitioned_module_parameter_group::<B::Tensor, _>(
-                format!("{root}.attention.heads"),
-                ParameterRole::AttentionHeads,
-                usize::try_from(args.num_key_value_heads).map_err(|_| {
-                    ParallelPlanError::InvalidGroup("attention head count exceeds usize".into())
-                })?,
-                attention,
-                |metadata, shape| {
-                    let name = metadata
-                        .linear_companion_of
-                        .as_ref()
-                        .unwrap_or(&metadata.id)
-                        .as_str();
-                    if name.ends_with("q_proj.weight")
-                        || name.ends_with("k_proj.weight")
-                        || name.ends_with("v_proj.weight")
-                        || name.ends_with("q_proj.bias")
-                        || name.ends_with("k_proj.bias")
-                        || name.ends_with("v_proj.bias")
-                    {
-                        Ok(MemberSharding::Partitioned { axis: 0 })
-                    } else if name.ends_with("o_proj.weight") && shape.len() >= 2 {
-                        Ok(MemberSharding::Partitioned { axis: 1 })
-                    } else {
-                        Ok(MemberSharding::Replicated)
-                    }
-                },
-            )?)
-        }
-        Operator::Dense(mlp) => groups.extend(dense_groups(
-            &format!("{root}.mlp"),
-            mlp,
-            args.intermediate_size,
-            ParameterRole::FeedForwardIntermediate,
-        )?),
-        Operator::Sparse(moe) => {
-            groups.push(module_parameter_group::<B::Tensor, _>(
-                format!("{root}.moe.gate"),
-                ParameterRole::Replicated,
-                &moe.gate,
-                |_, _| Ok(MemberSharding::Replicated),
-            )?);
-            groups.push(partitioned_module_parameter_group::<B::Tensor, _>(
-                format!("{root}.moe.experts.intermediate"),
-                ParameterRole::ExpertIntermediate,
-                usize::try_from(args.moe_intermediate_size).map_err(|_| {
-                    ParallelPlanError::InvalidGroup("expert width exceeds usize".into())
-                })?,
-                &moe.experts,
-                |metadata, _| {
-                    let name = metadata
-                        .linear_companion_of
-                        .as_ref()
-                        .unwrap_or(&metadata.id)
-                        .as_str();
-                    if name.contains("up_proj") {
-                        Ok(MemberSharding::Partitioned { axis: 1 })
-                    } else {
-                        Ok(MemberSharding::Partitioned { axis: 2 })
-                    }
-                },
-            )?);
-            groups.extend(dense_groups(
-                &format!("{root}.moe.shared_experts"),
-                &moe.shared_experts,
-                args.moe_shared_expert_intermediate_size,
-                ParameterRole::ExpertIntermediate,
-            )?);
-        }
-    }
-    Ok(groups)
-}
-
-/// Declares semantic placement for one target or appended prediction unit.
-pub fn unit_parallel_parameter_groups<
-    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
->(
-    unit: &Unit<B>,
-    args: &ModelArgs,
-    flat: usize,
-) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    let target = usize::try_from(args.num_hidden_layers)
-        .map_err(|_| ParallelPlanError::InvalidGroup("layer count exceeds usize".into()))?;
-    match unit {
-        Unit::Target(block) if flat < target => layer_parallel_parameter_groups(block, args, flat),
-        Unit::Prediction(prediction) if flat >= target => {
-            prediction_parallel_parameter_groups(prediction, args, flat - target)
-        }
-        _ => Err(ParallelPlanError::InvalidGroup(format!(
-            "Nemotron-H unit kind does not match flat position {flat}"
-        ))),
-    }
-}
-
-fn prediction_parallel_parameter_groups<
-    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
->(
-    unit: &PredictionUnit<B>,
-    args: &ModelArgs,
-    physical: usize,
-) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    let root = format!("model.mtp.layers.{physical}");
-    let mut groups = Vec::new();
-    if let Some(norm) = &unit.embedding_norm {
-        groups.push(module_parameter_group::<B::Tensor, _>(
-            format!("{root}.enorm"),
-            ParameterRole::Replicated,
-            norm,
-            |_, _| Ok(MemberSharding::Replicated),
-        )?);
-    }
-    if let Some(norm) = &unit.hidden_norm {
-        groups.push(module_parameter_group::<B::Tensor, _>(
-            format!("{root}.hnorm"),
-            ParameterRole::Replicated,
-            norm,
-            |_, _| Ok(MemberSharding::Replicated),
-        )?);
-    }
-    if let Some(fusion) = &unit.fusion {
-        groups.push(module_parameter_group::<B::Tensor, _>(
-            format!("{root}.eh_proj"),
-            ParameterRole::Replicated,
-            fusion,
-            |_, _| Ok(MemberSharding::Replicated),
-        )?);
-    }
-    groups.extend(block_parallel_parameter_groups(
-        &unit.block,
-        args,
-        &format!("{root}.mixer"),
-    )?);
-    if let Some(norm) = &unit.final_norm {
-        groups.push(module_parameter_group::<B::Tensor, _>(
-            format!("{root}.final_layernorm"),
-            ParameterRole::Replicated,
-            norm,
-            |_, _| Ok(MemberSharding::Replicated),
-        )?);
-    }
-    Ok(groups)
 }

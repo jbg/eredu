@@ -133,6 +133,8 @@ fn default_activation() -> String {
 #[derive(Debug, Clone)]
 pub struct ModelArgs {
     pub(crate) value_output_start: i32,
+    // Empty local ownership does not remove the global routed-value invocation.
+    pub(crate) local_value_experts: Option<i32>,
     // Shared and routed projections can have different encoding alignments and
     // therefore different local widths, even when their global widths agree.
     pub(crate) local_shared_intermediate_size: Option<i32>,
@@ -142,6 +144,9 @@ pub struct ModelArgs {
     pub(crate) rotary: eredu_nn::RotaryAlgorithm,
     pub(crate) formats: BTreeMap<String, LinearFormat>,
     pub(crate) fp8: Option<eredu_checkpoint::fp8::BlockFp8Metadata>,
+    // Initial source construction and transient local policies may omit this authority.
+    // Parsed sources and format projections retain it; scopes contain no ModelArgs cycle.
+    pub(crate) retained_scopes: Option<std::sync::Arc<super::declarations::ParameterScopes>>,
 }
 
 impl Deref for ModelArgs {
@@ -367,6 +372,7 @@ pub fn model_args_from_config_value(value: &serde_json::Value) -> Result<ModelAr
     .map_err(|e| ConfigError::Invalid(e.to_string()))?;
     let mut args = ModelArgs {
         value_output_start: 0,
+        local_value_experts: None,
         local_shared_intermediate_size: None,
         dense_layers: fields
             .mlp_only_layers
@@ -379,6 +385,7 @@ pub fn model_args_from_config_value(value: &serde_json::Value) -> Result<ModelAr
         schedule,
         rotary,
         formats: BTreeMap::new(),
+        retained_scopes: None,
         fp8: value
             .get("quantization_config")
             .filter(|v| !v.is_null())

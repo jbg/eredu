@@ -16,7 +16,7 @@ use super::{
     parameters::{admitted_member, execution_parameter, SpeechParameterError},
     tts_mog::TtsError,
     tts_rvq::RvqDimensions,
-    tts_rvq_layered::rvq_component_definition,
+    tts_rvq_specs::{released_declaration, RvqDeclaration},
 };
 
 /// Invalid component geometry or exact retained parameter contract.
@@ -55,8 +55,7 @@ pub enum RvqPreparationError {
 /// conversion bounds use the shared speech recipe projection. This component
 /// contract declares no full VoiceChat execution capability.
 pub struct PreparedRvqBindings {
-    dimensions: RvqDimensions,
-    prepared: PreparedComponent<eredu_runtime::ComponentDefinition>,
+    prepared: PreparedComponent<RvqDeclaration>,
 }
 
 impl PreparedRvqBindings {
@@ -68,7 +67,7 @@ impl PreparedRvqBindings {
             .component_source(Component::Tts)
             .ok_or(SpeechParameterError::MissingComponent(Component::Tts))?;
         Self::from_parameters(
-            RvqDimensions::from_config(&artifacts.plan().config().tts)?,
+            released_declaration()?.clone(),
             source.clone(),
             artifacts.plan().parameters(),
         )
@@ -78,14 +77,13 @@ impl PreparedRvqBindings {
     /// discovery or native allocation. Shapes follow the symbolic architecture;
     /// neighboring TTS component payloads are excluded.
     pub fn from_parameters(
-        dimensions: RvqDimensions,
+        declaration: RvqDeclaration,
         source: SharedCheckpointSource,
         parameters: &BTreeMap<String, ParameterAdmission>,
     ) -> Result<Self, RvqPreparationError> {
-        let definition = rvq_component_definition(dimensions)?;
         let prepared = PreparedComponent::prepare(
             "voicechat/tts_rvq/leased-units",
-            definition,
+            declaration,
             source.clone(),
             |member| {
                 let name = member.target();
@@ -97,10 +95,7 @@ impl PreparedRvqBindings {
                 Ok(parameter.recipe)
             },
         )?;
-        Ok(Self {
-            dimensions,
-            prepared,
-        })
+        Ok(Self { prepared })
     }
 
     /// Selects exact tensor placement or validates a retained selection without
@@ -115,7 +110,7 @@ impl PreparedRvqBindings {
 
     /// Lowers each canonical binding through the selected shared physical layout.
     pub fn into_parallel(mut self, layout: &LocalModelLayout) -> Result<Self, RvqPreparationError> {
-        super::tts_rvq_layered::rvq_local_dimensions(self.dimensions, layout)?;
+        self.prepared.declaration().local_dimensions(layout)?;
         self.prepared = self.prepared.select(layout)?;
         Ok(self)
     }
@@ -127,7 +122,7 @@ impl PreparedRvqBindings {
 
     /// Validated RVQ geometry; no other speech stack is selected.
     pub fn dimensions(&self) -> RvqDimensions {
-        self.dimensions
+        self.prepared.declaration().dimensions()
     }
 
     /// Exact prepared unit bindings for cold resource accounting.
@@ -142,25 +137,24 @@ impl PreparedRvqBindings {
 
     /// Validated semantic declaration retained by this exact preparation.
     pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
-        self.prepared.declaration()
+        self.prepared.declaration().definition()
     }
 
     /// Consumes exact source authority and the canonical ordered binding plan.
     pub fn into_parts(
         self,
     ) -> (
-        RvqDimensions,
-        eredu_runtime::ComponentDefinition,
+        RvqDeclaration,
         Option<LocalModelLayout>,
         eredu_runtime::ExecutionUnitAddressMap,
         SharedCheckpointSource,
         Vec<Vec<WeightBinding>>,
     ) {
-        let (definition, local, layout, source, units) = self
+        let (declaration, local, layout, source, units) = self
             .prepared
             .into_declared_unit_parts()
             .expect("RVQ declares only independently leased units");
-        (self.dimensions, definition, local, layout, source, units)
+        (declaration, local, layout, source, units)
     }
 }
 

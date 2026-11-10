@@ -1,5 +1,7 @@
 //! Architecture-owned inspection and preparation of external draft assistants.
 
+mod parameters;
+pub use parameters::AssistantParameterDeclarations;
 mod capture_placement;
 mod construction;
 use construction::NormalizedExternalAssistant;
@@ -25,7 +27,7 @@ use std::{
 
 use eredu_checkpoint::{
     recipe::RecipeCatalog,
-    schema::{SafetensorsCheckpointPlan, TensorRequirement, TensorRole},
+    schema::{SafetensorsCheckpointPlan, TensorRequirement},
     store::{CheckpointSource, StoreError, TensorMetadata, TensorSourceProvenance},
     validation::{resolve_gguf_plan, resolve_safetensors_plan, ResolvedCheckpointPlan},
     LinearFormat, WeightQuantization,
@@ -42,16 +44,16 @@ use serde_json::Value;
 use crate::{gemma4, muse};
 use muse::assistant::integration::{
     MuseAssistantConfig, MuseAssistantConstruction, MuseAssistantModule,
+    MuseAssistantParameterDefinition,
 };
 
 use eredu_runtime::{
     local_parameter_acquisition_units, order_parameter_acquisition_units,
     parameter_acquisition_units, ParameterAcquisitionUnit, ReplicatedTextMaterializationTask,
-    ReplicatedTextOutputCompanion, ReplicatedTextParameterOwner, ReplicatedTextParameterRole,
-    ReplicatedTextPhysicalSource, SpeculativeArchitectureCompatibilityProof,
-    SpeculativeCaptureEntry, SpeculativeCaptureEnvelope, SpeculativeCaptureMetadata,
-    SpeculativeCaptureSchema, SpeculativeIdentity, SpeculativeMechanism,
-    SpeculativeMechanismRequirements, SpeculativePlacementRequest,
+    ReplicatedTextOutputCompanion, ReplicatedTextParameterRole, ReplicatedTextPhysicalSource,
+    SpeculativeArchitectureCompatibilityProof, SpeculativeCaptureEntry, SpeculativeCaptureEnvelope,
+    SpeculativeCaptureMetadata, SpeculativeCaptureSchema, SpeculativeIdentity,
+    SpeculativeMechanism, SpeculativeMechanismRequirements, SpeculativePlacementRequest,
     SpeculativeRealizationRequirements, SpeculativeSelectionRequest,
     SpeculativeStateCacheIdentityIngredients, SpeculativeStrategyRequirements,
     WeightLoweringDescriptor, WeightLoweringKind,
@@ -414,6 +416,8 @@ mod sealed {
 pub trait ExternalAssistantArchitecture: sealed::Sealed + Sized + 'static {
     /// Exact normalized architecture configuration.
     type Config: Clone + std::fmt::Debug;
+    /// Retained family construction authority, independent of target invocation state.
+    type ParameterDefinition: Clone + std::fmt::Debug;
     /// Complete neural construction geometry after target compatibility is proven.
     type ModuleConfig: Clone + std::fmt::Debug;
 
@@ -430,6 +434,7 @@ pub trait ExternalAssistantArchitecture: sealed::Sealed + Sized + 'static {
     /// Normalizes construction without opening payloads or binding native resources.
     fn module_config(
         config: &Self::Config,
+        definition: &Self::ParameterDefinition,
         target: Option<&ExternalAssistantTargetProfile>,
     ) -> Result<Self::ModuleConfig, String>;
 
@@ -456,7 +461,7 @@ pub trait ExternalAssistantArchitecture: sealed::Sealed + Sized + 'static {
 
     /// Constructs one unloaded unit from retained target-proven geometry.
     fn build_execution_unit<B>(
-        config: &Self::ModuleConfig,
+        construction: &PreparedAssistantModule<Self>,
         ordinal: usize,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<Self::Unit<B>, eredu_nn::Error>
@@ -508,7 +513,7 @@ pub trait ExternalAssistantArchitecture: sealed::Sealed + Sized + 'static {
 
     /// Builds the unloaded neutral assistant module.
     fn module<B>(
-        config: Self::ModuleConfig,
+        construction: PreparedAssistantModule<Self>,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<Self::Module<B>, eredu_nn::Error>
     where
@@ -521,27 +526,37 @@ pub trait ExternalAssistantArchitecture: sealed::Sealed + Sized + 'static {
     /// Derives the module configuration for explicit load-time quantization.
     fn load_time_quantization(
         config: &Self::Config,
+        definition: &Self::ParameterDefinition,
         quantization: eredu_checkpoint::WeightQuantization,
     ) -> Result<Self::Config, String>;
 
     /// Applies exact per-parameter formats discovered in a GGUF container.
     fn with_checkpoint_formats(
         config: &Self::Config,
+        definition: &Self::ParameterDefinition,
         formats: HashMap<String, eredu_checkpoint::WeightQuantization>,
     ) -> Result<Self::Config, String>;
 
-    /// Describes the exact parameter topology constructed for this configuration.
-    fn materialization_plan(config: &Self::Config) -> Result<SafetensorsCheckpointPlan, String>;
-
-    /// Returns the executable format selected for one primary matrix parameter.
-    fn linear_format(config: &Self::Config, name: &str) -> LinearFormat;
-
-    /// Declares the independently acquired owner of one canonical primary parameter.
-    /// Quantization companions inherit this owner rather than creating another unit.
-    fn parameter_owner(
+    /// Retains the family's typed neural construction scopes before payload access.
+    fn parameter_definition(config: &Self::Config) -> Result<Self::ParameterDefinition, String>;
+    /// Prepares selected construction authority from the admitted source definition.
+    fn selected_parameter_definition(
+        source: &Self::ParameterDefinition,
         config: &Self::Config,
-        name: &str,
-    ) -> Result<ReplicatedTextParameterOwner, String>;
+    ) -> Result<Self::ParameterDefinition, String>;
+
+    /// Borrows logical slots and acquisition owners projected from that definition.
+    fn parameter_declarations(
+        definition: &Self::ParameterDefinition,
+    ) -> &AssistantParameterDeclarations;
+
+    /// Physical layout extensions reference retained logical identities.
+    fn source_recipes(
+        _definition: &Self::ParameterDefinition,
+        _catalog: &dyn RecipeCatalog,
+    ) -> Result<BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>, String> {
+        Ok(BTreeMap::new())
+    }
 
     /// Binds a typed assistant to the architecture-owned speculative lifecycle.
     fn executor<'a, M>(
@@ -935,9 +950,11 @@ impl sealed::Sealed for Gemma4AssistantArchitecture {}
 
 impl ExternalAssistantArchitecture for Gemma4AssistantArchitecture {
     type Config = gemma4::AssistantConfig;
+    type ParameterDefinition = gemma4::AssistantDefinition;
     type ModuleConfig = gemma4::AssistantConfig;
     fn module_config(
         config: &Self::Config,
+        _definition: &Self::ParameterDefinition,
         _target: Option<&ExternalAssistantTargetProfile>,
     ) -> Result<Self::ModuleConfig, String> {
         Ok(config.clone())
@@ -960,17 +977,14 @@ impl ExternalAssistantArchitecture for Gemma4AssistantArchitecture {
         Ok(None)
     }
     fn build_execution_unit<B>(
-        config: &Self::ModuleConfig,
+        construction: &PreparedAssistantModule<Self>,
         ordinal: usize,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<Self::Unit<B>, eredu_nn::Error>
     where
         B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone,
     {
-        if ordinal >= config.text_config.num_hidden_layers() {
-            return Err(eredu_nn::Error::backend("invalid assistant decoder unit"));
-        }
-        gemma4::DenseBlock::new_at(&config.text_config, ordinal, "model.layers", context)
+        construction.definition.build_unit::<B>(ordinal, context)
     }
     fn into_execution<B, P>(
         module: Self::Module<B>,
@@ -1004,13 +1018,13 @@ impl ExternalAssistantArchitecture for Gemma4AssistantArchitecture {
     }
 
     fn module<B>(
-        config: Self::ModuleConfig,
+        construction: PreparedAssistantModule<Self>,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<Self::Module<B>, eredu_nn::Error>
     where
         B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone,
     {
-        gemma4::Assistant::new(config, context)
+        gemma4::Assistant::new(&construction.definition, context)
     }
 
     fn quantization(config: &Self::Config) -> Option<eredu_checkpoint::WeightQuantization> {
@@ -1019,6 +1033,7 @@ impl ExternalAssistantArchitecture for Gemma4AssistantArchitecture {
 
     fn load_time_quantization(
         config: &Self::Config,
+        _definition: &Self::ParameterDefinition,
         quantization: eredu_checkpoint::WeightQuantization,
     ) -> Result<Self::Config, String> {
         config
@@ -1027,45 +1042,39 @@ impl ExternalAssistantArchitecture for Gemma4AssistantArchitecture {
     }
 
     fn with_checkpoint_formats(
-        config: &Self::Config,
+        _config: &Self::Config,
+        definition: &Self::ParameterDefinition,
         formats: HashMap<String, eredu_checkpoint::WeightQuantization>,
     ) -> Result<Self::Config, String> {
-        config
+        definition
             .with_checkpoint_formats(formats)
             .map_err(|error| error.to_string())
     }
 
-    fn materialization_plan(config: &Self::Config) -> Result<SafetensorsCheckpointPlan, String> {
-        gemma4::assistant_safetensors_plan(config)
+    fn parameter_definition(config: &Self::Config) -> Result<Self::ParameterDefinition, String> {
+        gemma4::AssistantDefinition::new(config.clone()).map_err(|error| error.to_string())
     }
 
-    fn linear_format(config: &Self::Config, name: &str) -> LinearFormat {
-        config
-            .quantization
-            .map(LinearFormat::from)
-            .unwrap_or_else(|| config.text_config.linear_format_for(name))
-    }
-
-    fn parameter_owner(
+    fn selected_parameter_definition(
+        source: &Self::ParameterDefinition,
         config: &Self::Config,
-        name: &str,
-    ) -> Result<ReplicatedTextParameterOwner, String> {
-        if let Some(rest) = name.strip_prefix("model.layers.") {
-            let (index, suffix) = rest
-                .split_once('.')
-                .ok_or("invalid assistant block parameter")?;
-            let unit = index.parse::<usize>().map_err(|e| e.to_string())?;
-            if unit >= config.text_config.num_hidden_layers() || suffix.is_empty() {
-                return Err(format!("assistant parameter {name:?} has no decoder block"));
-            }
-            return Ok(ReplicatedTextParameterOwner::ExecutionUnit {
-                group: "assistant.decoder".into(),
-                unit,
-            });
-        }
-        Ok(ReplicatedTextParameterOwner::StaticRole(
-            "external_assistant".into(),
-        ))
+    ) -> Result<Self::ParameterDefinition, String> {
+        source
+            .project_formats(config.clone())
+            .map_err(|error| error.to_string())
+    }
+
+    fn parameter_declarations(
+        definition: &Self::ParameterDefinition,
+    ) -> &AssistantParameterDeclarations {
+        definition.parameter_declarations()
+    }
+
+    fn source_recipes(
+        definition: &Self::ParameterDefinition,
+        catalog: &dyn RecipeCatalog,
+    ) -> Result<BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>, String> {
+        definition.source_recipes(catalog)
     }
 
     fn executor<'a, M>(
@@ -1112,12 +1121,14 @@ impl ExternalAssistantArchitecture for MuseAssistantArchitecture {
         config.execution_definition().memory_topology().map(Some)
     }
     type Config = MuseAssistantConfig;
+    type ParameterDefinition = MuseAssistantParameterDefinition;
     type ModuleConfig = MuseAssistantConstruction;
     fn module_config(
-        config: &Self::Config,
+        _config: &Self::Config,
+        definition: &Self::ParameterDefinition,
         target: Option<&ExternalAssistantTargetProfile>,
     ) -> Result<Self::ModuleConfig, String> {
-        config.construction(match target {
+        definition.construction(match target {
             Some(ExternalAssistantTargetProfile::Muse(target)) => Some(target),
             _ => None,
         })
@@ -1140,14 +1151,15 @@ impl ExternalAssistantArchitecture for MuseAssistantArchitecture {
         Ok(Some(config.execution_definition().unit_layout().clone()))
     }
     fn build_execution_unit<B>(
-        config: &Self::ModuleConfig,
+        construction: &PreparedAssistantModule<Self>,
         ordinal: usize,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<Self::Unit<B>, eredu_nn::Error>
     where
         B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone,
     {
-        config
+        construction
+            .config()
             .execution_definition()
             .build_unit::<B>(ordinal, context)
     }
@@ -1203,13 +1215,14 @@ impl ExternalAssistantArchitecture for MuseAssistantArchitecture {
     }
 
     fn module<B>(
-        config: Self::ModuleConfig,
+        construction: PreparedAssistantModule<Self>,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<Self::Module<B>, eredu_nn::Error>
     where
         B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone,
     {
-        config.module(context)
+        construction.parameter_declarations().validate()?;
+        construction.config.module(context)
     }
 
     fn quantization(config: &Self::Config) -> Option<eredu_checkpoint::WeightQuantization> {
@@ -1220,36 +1233,40 @@ impl ExternalAssistantArchitecture for MuseAssistantArchitecture {
     }
 
     fn load_time_quantization(
-        config: &Self::Config,
+        _config: &Self::Config,
+        definition: &Self::ParameterDefinition,
         quantization: eredu_checkpoint::WeightQuantization,
     ) -> Result<Self::Config, String> {
-        config
+        definition
             .load_time_quantization(quantization)
             .map_err(|error| error.to_string())
     }
 
     fn with_checkpoint_formats(
-        config: &Self::Config,
+        _config: &Self::Config,
+        definition: &Self::ParameterDefinition,
         formats: HashMap<String, eredu_checkpoint::WeightQuantization>,
     ) -> Result<Self::Config, String> {
-        config
+        definition
             .with_checkpoint_formats(formats)
             .map_err(|error| error.to_string())
     }
 
-    fn materialization_plan(config: &Self::Config) -> Result<SafetensorsCheckpointPlan, String> {
-        config.safetensors_plan()
+    fn parameter_definition(config: &Self::Config) -> Result<Self::ParameterDefinition, String> {
+        MuseAssistantParameterDefinition::new(config)
     }
 
-    fn linear_format(config: &Self::Config, name: &str) -> LinearFormat {
-        config.linear_format(name)
-    }
-
-    fn parameter_owner(
+    fn selected_parameter_definition(
+        source: &Self::ParameterDefinition,
         config: &Self::Config,
-        name: &str,
-    ) -> Result<ReplicatedTextParameterOwner, String> {
-        config.parameter_owner(name)
+    ) -> Result<Self::ParameterDefinition, String> {
+        source.project_formats(config)
+    }
+
+    fn parameter_declarations(
+        definition: &Self::ParameterDefinition,
+    ) -> &AssistantParameterDeclarations {
+        definition.parameter_declarations()
     }
 
     fn executor<'a, M>(
@@ -1285,6 +1302,7 @@ impl ExternalAssistantArchitecture for MuseAssistantArchitecture {
 pub(crate) struct PreparedExternalAssistant<A: ExternalAssistantArchitecture> {
     checkpoint: ExternalAssistantCheckpoint,
     config: A::Config,
+    definition: Arc<A::ParameterDefinition>,
     _architecture: PhantomData<fn() -> A>,
 }
 
@@ -1296,7 +1314,38 @@ pub(crate) struct SelectedExternalAssistant<A: ExternalAssistantArchitecture> {
     source_config: A::Config,
     config: A::Config,
     tasks: Vec<ReplicatedTextMaterializationTask>,
+    source_definition: Arc<A::ParameterDefinition>,
+    definition: Arc<A::ParameterDefinition>,
     _architecture: PhantomData<fn() -> A>,
+}
+
+/// Cold-validated construction geometry and its retained logical parameter declaration.
+/// Backend callers cannot substitute an independently reconstructed configuration.
+pub struct PreparedAssistantModule<A: ExternalAssistantArchitecture> {
+    config: A::ModuleConfig,
+    definition: Arc<A::ParameterDefinition>,
+}
+impl<A: ExternalAssistantArchitecture> Clone for PreparedAssistantModule<A> {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            definition: Arc::clone(&self.definition),
+        }
+    }
+}
+impl<A: ExternalAssistantArchitecture> PreparedAssistantModule<A> {
+    /// Target-proven construction and execution geometry.
+    pub fn config(&self) -> &A::ModuleConfig {
+        &self.config
+    }
+    /// Global logical geometry, sharing, formats and physical parameter owners.
+    pub fn parameter_declarations(&self) -> &AssistantParameterDeclarations {
+        A::parameter_declarations(&self.definition)
+    }
+    /// Shared typed construction authority retained by cold selection.
+    pub fn parameter_definition(&self) -> &Arc<A::ParameterDefinition> {
+        &self.definition
+    }
 }
 
 /// Exact neutral source role paired with one selected external assistant.
@@ -1304,8 +1353,8 @@ pub struct PreparedExternalAssistantSource<A: ExternalAssistantArchitecture> {
     checkpoint: ExternalAssistantCheckpoint,
     artifact_identity: DeferredArtifactIdentity,
     source: eredu_checkpoint::store::SharedCheckpointSource,
-    source_module_config: A::ModuleConfig,
-    module_config: A::ModuleConfig,
+    source_module_config: PreparedAssistantModule<A>,
+    module_config: PreparedAssistantModule<A>,
     config: A::Config,
     tasks: Vec<ReplicatedTextMaterializationTask>,
     parameter_units: Vec<ParameterAcquisitionUnit>,
@@ -1428,8 +1477,13 @@ impl<A: ExternalAssistantArchitecture> PreparedExternalAssistantSource<A> {
     }
 
     /// Selected, target-bound neural geometry; no artifact needs reopening.
-    pub const fn module_config(&self) -> &A::ModuleConfig {
-        &self.module_config
+    pub fn module_config(&self) -> &A::ModuleConfig {
+        self.module_config.config()
+    }
+
+    /// Selected global parameter facts retained through source and native preparation.
+    pub fn parameter_declarations(&self) -> &AssistantParameterDeclarations {
+        self.module_config.parameter_declarations()
     }
 
     /// Consumes the exact source, source/selected neural geometry, selected config and tasks.
@@ -1439,9 +1493,9 @@ impl<A: ExternalAssistantArchitecture> PreparedExternalAssistantSource<A> {
         eredu_checkpoint::store::SharedCheckpointSource,
         ExternalAssistantCheckpoint,
         DeferredArtifactIdentity,
-        A::ModuleConfig,
+        PreparedAssistantModule<A>,
         A::Config,
-        A::ModuleConfig,
+        PreparedAssistantModule<A>,
         Vec<ReplicatedTextMaterializationTask>,
     ) {
         (
@@ -1464,8 +1518,8 @@ impl PreparedExternalAssistantSource<MuseAssistantArchitecture> {
         rank: ParallelRankTopology,
     ) -> Result<Self, ArtifactError> {
         let (source, selected, layout) = construction::partition_muse_construction(
-            &self.source_module_config,
-            &self.module_config,
+            self.source_module_config.config(),
+            self.module_config.config(),
             &self.tasks,
             rank,
         )?;
@@ -1475,8 +1529,8 @@ impl PreparedExternalAssistantSource<MuseAssistantArchitecture> {
             selected.execution_definition().unit_layout(),
         )?;
         self.execution_layout = Some(selected.execution_definition().unit_layout().clone());
-        self.source_module_config = source;
-        self.module_config = selected;
+        self.source_module_config.config = source;
+        self.module_config.config = selected;
         self.parameter_layout = Some(layout);
         Ok(self)
     }
@@ -1497,6 +1551,8 @@ impl<A: ExternalAssistantArchitecture> SelectedExternalAssistant<A> {
             source_config: _,
             config,
             tasks,
+            source_definition,
+            definition,
             _architecture: _,
         } = self;
         let execution_layout =
@@ -1549,8 +1605,14 @@ impl<A: ExternalAssistantArchitecture> SelectedExternalAssistant<A> {
             source,
             checkpoint: retained_checkpoint,
             artifact_identity,
-            source_module_config,
-            module_config,
+            source_module_config: PreparedAssistantModule {
+                config: source_module_config,
+                definition: source_definition,
+            },
+            module_config: PreparedAssistantModule {
+                config: module_config,
+                definition,
+            },
             config,
             tasks,
             parameter_units,
@@ -1573,9 +1635,15 @@ impl<A: ExternalAssistantArchitecture> SelectedExternalAssistant<A> {
 }
 
 impl<A: ExternalAssistantArchitecture> PreparedExternalAssistant<A> {
-    /// Consumes the plan into its admitted checkpoint and normalized configuration.
-    fn into_parts(self) -> (ExternalAssistantCheckpoint, A::Config) {
-        (self.checkpoint, self.config)
+    /// Consumes admission into its checkpoint, normalized policy and retained definition.
+    fn into_parts(
+        self,
+    ) -> (
+        ExternalAssistantCheckpoint,
+        A::Config,
+        Arc<A::ParameterDefinition>,
+    ) {
+        (self.checkpoint, self.config, self.definition)
     }
 }
 
@@ -1877,7 +1945,7 @@ impl PreparedCompatibleExternalAssistant {
             DispatchedPreparedExternalAssistant::Gemma4(_) => {
                 return Err(invalid_assistant(
                     "tensor-parallel assistant source construction is implemented for Muse DSpark",
-                ))
+                ));
             }
         };
         self.placement = Some(ExternalAssistantSourcePlacement::TensorParallel(rank));
@@ -2227,45 +2295,126 @@ fn gguf_checkpoint_formats(
     Ok(formats)
 }
 
-fn selected_plan_constraints<'a>(
-    plan: &'a SafetensorsCheckpointPlan,
-    store: &(impl SelectedCatalogMetadata + ?Sized),
-) -> Result<Vec<&'a eredu_checkpoint::schema::SafetensorsTensorConstraint>, String> {
+fn selected_source_constraints(
+    checkpoint: &ExternalAssistantCheckpoint,
+) -> Result<BTreeMap<String, &eredu_checkpoint::schema::SafetensorsTensorConstraint>, String> {
+    let ExternalAssistantCheckpoint::SafeTensors {
+        plan, resolution, ..
+    } = checkpoint
+    else {
+        return Ok(BTreeMap::new());
+    };
     let mut selected = plan.common_tensors.iter().collect::<Vec<_>>();
     for group in &plan.layout_groups {
-        let candidates = group
-            .variants
-            .iter()
-            .filter(|variant| {
-                variant.tensors.iter().all(|constraint| {
-                    constraint.requirement == TensorRequirement::Optional
-                        || constraint.role == TensorRole::Companion
-                        || store.source_metadata(&constraint.key).is_ok()
-                        || constraint
-                            .aliases
-                            .iter()
-                            .any(|alias| store.source_metadata(alias).is_ok())
-                })
-            })
-            .collect::<Vec<_>>();
-        match candidates.as_slice() {
-            [variant] => selected.extend(variant.tensors.iter()),
-            [] if !group.required => {}
-            [] => {
-                return Err(format!(
-                    "external assistant materialization cannot resolve layout group {:?}",
-                    group.id
-                ));
+        match resolution.layout_variant(&group.id) {
+            Some(id) => {
+                let variant = group
+                    .variants
+                    .iter()
+                    .find(|variant| variant.id == id)
+                    .ok_or_else(|| format!("admitted assistant layout {id:?} is unresolved"))?;
+                selected.extend(variant.tensors.iter());
             }
-            _ => {
+            None if !group.required => {}
+            None => {
                 return Err(format!(
-                    "external assistant materialization ambiguously resolves layout group {:?}",
+                    "admitted assistant layout {:?} is missing",
                     group.id
                 ));
             }
         }
     }
-    Ok(selected)
+    Ok(selected
+        .into_iter()
+        .map(|constraint| (constraint.key.clone(), constraint))
+        .collect())
+}
+
+struct AdmittedAssistantCatalog<'a> {
+    store: &'a SelectedCheckpointCatalog<'a>,
+    aliases: Option<BTreeMap<String, String>>,
+    extensions: BTreeMap<String, &'a eredu_checkpoint::schema::SafetensorsTensorConstraint>,
+}
+impl<'a> AdmittedAssistantCatalog<'a> {
+    fn new(
+        store: &'a SelectedCheckpointCatalog<'a>,
+        checkpoint: &'a ExternalAssistantCheckpoint,
+    ) -> Result<Self, String> {
+        let selected = selected_source_constraints(checkpoint)?;
+        let mut aliases = BTreeMap::new();
+        let mut extensions = BTreeMap::new();
+        for constraint in selected.values() {
+            let names = std::iter::once(&constraint.key)
+                .chain(constraint.aliases.iter())
+                .collect::<std::collections::BTreeSet<_>>();
+            for name in &names {
+                if extensions
+                    .insert((*name).clone(), *constraint)
+                    .is_some_and(|previous| previous.key != constraint.key)
+                {
+                    return Err(format!(
+                        "assistant source alias {name:?} references conflicting extensions"
+                    ));
+                }
+            }
+            let present = names
+                .iter()
+                .filter(|key| store.source_metadata(key).is_ok())
+                .collect::<Vec<_>>();
+            let actual = match present.as_slice() {
+                [key] => (*key).to_string(),
+                [] if constraint.requirement == TensorRequirement::Optional => continue,
+                [] => {
+                    return Err(format!(
+                        "admitted assistant source {:?} disappeared",
+                        constraint.key
+                    ));
+                }
+                _ => {
+                    return Err(format!(
+                        "admitted assistant source {:?} has conflicting aliases",
+                        constraint.key
+                    ));
+                }
+            };
+            for name in names {
+                if aliases
+                    .insert(name.clone(), actual.clone())
+                    .is_some_and(|previous| previous != actual)
+                {
+                    return Err(format!(
+                        "assistant source alias {name:?} has conflicting identities"
+                    ));
+                }
+            }
+        }
+        Ok(Self {
+            store,
+            aliases: matches!(checkpoint, ExternalAssistantCheckpoint::SafeTensors { .. })
+                .then_some(aliases),
+            extensions,
+        })
+    }
+    fn resolve(&self, name: &str) -> Option<String> {
+        match &self.aliases {
+            Some(aliases) => aliases.get(name).cloned(),
+            None => self
+                .store
+                .source_metadata(name)
+                .ok()
+                .map(|_| name.to_owned()),
+        }
+    }
+}
+impl RecipeCatalog for AdmittedAssistantCatalog<'_> {
+    fn tensor_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
+        let key = self
+            .resolve(key)
+            .ok_or_else(|| StoreError::UnknownTensor { key: key.into() })?;
+        let mut metadata = self.store.source_metadata(&key)?;
+        metadata.name = key;
+        Ok(metadata)
+    }
 }
 
 fn exact_physical_source(
@@ -2301,16 +2450,32 @@ where
     A: ExternalAssistantArchitecture,
     F: Fn(&WeightLoweringDescriptor, bool) -> Option<WeightLoweringKind>,
 {
-    let (checkpoint, source_config) = prepared.into_parts();
+    let (checkpoint, source_config, admitted_definition) = prepared.into_parts();
     let store = selected_checkpoint_catalog(&checkpoint, max_cached_sources)?;
     let prepared_source = match &store {
         SelectedCheckpointCatalog::Source(source) => Some(Arc::clone(source)),
         SelectedCheckpointCatalog::SafeTensors(_) => None,
     };
     let source_config = if matches!(checkpoint, ExternalAssistantCheckpoint::Gguf { .. }) {
-        A::with_checkpoint_formats(&source_config, gguf_checkpoint_formats(&checkpoint)?)?
+        A::with_checkpoint_formats(
+            &source_config,
+            &admitted_definition,
+            gguf_checkpoint_formats(&checkpoint)?,
+        )?
     } else {
         source_config
+    };
+    let source_definition = if matches!(checkpoint, ExternalAssistantCheckpoint::Gguf { .. }) {
+        let projected = Arc::new(A::selected_parameter_definition(
+            &admitted_definition,
+            &source_config,
+        )?);
+        A::parameter_declarations(&admitted_definition)
+            .validate_projection(A::parameter_declarations(&projected))
+            .map_err(|e| e.to_string())?;
+        projected
+    } else {
+        admitted_definition
     };
     let target_config = match quantization {
         Some(eredu_core::QuantizationRequest::Affine { group_size, bits }) => {
@@ -2318,118 +2483,224 @@ where
                 .map_err(|_| "assistant affine group size exceeds i32".to_owned())?;
             A::load_time_quantization(
                 &source_config,
+                &source_definition,
                 WeightQuantization::Affine(
                     eredu_checkpoint::AffineQuantization::new(group_size, i32::from(bits))
                         .map_err(|error| error.to_string())?,
                 ),
             )?
         }
-        Some(eredu_core::QuantizationRequest::MxFp4) => {
-            A::load_time_quantization(&source_config, WeightQuantization::MxFp4)?
-        }
+        Some(eredu_core::QuantizationRequest::MxFp4) => A::load_time_quantization(
+            &source_config,
+            &source_definition,
+            WeightQuantization::MxFp4,
+        )?,
         Some(_) => return Err("unsupported external assistant transform request".into()),
         None => source_config.clone(),
     };
-    let target_plan = A::materialization_plan(&target_config)?;
-    let constraints = selected_plan_constraints(&target_plan, &store)?;
-    let companions = constraints
-        .iter()
-        .filter_map(|constraint| {
-            constraint.linear_companion.as_ref().map(|companion| {
-                let role = match companion.kind {
-                    eredu_checkpoint::schema::LinearCompanionKind::GlobalScale => {
-                        eredu_nn::LinearCompanionRole::GlobalScale
-                    }
-                    eredu_checkpoint::schema::LinearCompanionKind::Scale => {
-                        eredu_nn::LinearCompanionRole::Scale
-                    }
-                    eredu_checkpoint::schema::LinearCompanionKind::AffineBias => {
-                        eredu_nn::LinearCompanionRole::AffineBias
-                    }
-                };
-                (companion.primary.clone(), *constraint, role)
-            })
-        })
-        .fold(
-            BTreeMap::<String, Vec<_>>::new(),
-            |mut groups, (primary, value, role)| {
-                groups.entry(primary).or_default().push((value, role));
-                groups
-            },
-        );
-    let mut tasks = Vec::new();
-    for constraint in constraints {
-        if constraint.linear_companion.is_some() {
-            continue;
+    let definition = if quantization.is_none() {
+        Arc::clone(&source_definition)
+    } else {
+        Arc::new(A::selected_parameter_definition(
+            &source_definition,
+            &target_config,
+        )?)
+    };
+    let source_declarations = A::parameter_declarations(&source_definition);
+    let declarationss = A::parameter_declarations(&definition);
+    source_declarations
+        .validate_projection(declarationss)
+        .map_err(|e| e.to_string())?;
+    let source_physical = source_declarations
+        .physical_parameters()
+        .map_err(|error| error.to_string())?;
+    let physical = declarationss
+        .physical_parameters()
+        .map_err(|e| e.to_string())?;
+    let admitted = AdmittedAssistantCatalog::new(&store, &checkpoint)?;
+    let recipes = A::source_recipes(&source_definition, &admitted)?;
+    for target in recipes.keys() {
+        if !source_physical.contains_key(target) {
+            return Err(format!(
+                "assistant recipe references undeclared parameter {target:?}"
+            ));
         }
-        let source = match store.source_metadata(&constraint.key) {
-            Ok(metadata) => metadata,
-            Err(_) if constraint.requirement == TensorRequirement::Optional => continue,
-            Err(error) => return Err(error.to_string()),
-        };
-        let is_matrix = source.logical_shape.len() == 2
-            || (constraint.key.ends_with(".weight") && source.logical_shape.len() > 2);
-        let packed_output = companions.contains_key(&constraint.key);
-        let executable = if quantization.is_some() && !packed_output {
-            LinearFormat::Dense
-        } else {
-            A::linear_format(&target_config, &constraint.key)
-        };
-        let transforms = quantization.is_some() && packed_output;
-        let descriptor = WeightLoweringDescriptor::new(
-            store
-                .source_provenance(&constraint.key)
+    }
+    let mut tasks = Vec::new();
+    for (name, declared) in &declarationss.parameters {
+        let source_extension = admitted.extensions.get(name);
+        let (sources, source_shape, encoding, derived) = if let Some(key) = admitted.resolve(name) {
+            let source = store
+                .source_metadata(&key)
+                .map_err(|error| error.to_string())?;
+            let physical = exact_physical_source(&store, &key)?;
+            let encoding = physical.source_encoding().clone();
+            (vec![physical], source.physical_shape, encoding, None)
+        } else if let Some(recipe) = recipes.get(name) {
+            let output = recipe.infer(&admitted).map_err(|error| error.to_string())?;
+            if output.shape != source_physical[name].global_shape() {
+                return Err(format!(
+                    "assistant recipe output geometry differs from declaration {name:?}"
+                ));
+            }
+            let sources = recipe
+                .source_keys()
+                .into_iter()
+                .map(|key| exact_physical_source(&store, key))
+                .collect::<Result<Vec<_>, _>>()?;
+            let dtype = admitted
+                .tensor_metadata(recipe.source_keys()[0])
                 .map_err(|error| error.to_string())?
-                .source_encoding,
+                .stored_dtype;
+            if output.dtype != dtype.clone().into() {
+                return Err(format!(
+                    "assistant recipe {name:?} changes source scalar representation"
+                ));
+            }
+            (
+                sources,
+                output.shape.clone(),
+                eredu_checkpoint::SourceTensorEncoding::RecipeOutput(dtype),
+                Some((recipe.clone(), output)),
+            )
+        } else if source_extension
+            .is_some_and(|extension| extension.requirement == TensorRequirement::Optional)
+        {
+            continue;
+        } else {
+            return Err(format!(
+                "assistant source {name:?} has no admitted physical tensor or recipe"
+            ));
+        };
+        let role = match declared.role {
+            eredu_nn::LogicalParameterRole::LinearWeight => {
+                ReplicatedTextParameterRole::LinearWeight
+            }
+            eredu_nn::LogicalParameterRole::LinearBias => ReplicatedTextParameterRole::LinearBias,
+            eredu_nn::LogicalParameterRole::Embedding
+            | eredu_nn::LogicalParameterRole::PositionEmbedding => {
+                ReplicatedTextParameterRole::LookupTable
+            }
+            eredu_nn::LogicalParameterRole::Normalization
+            | eredu_nn::LogicalParameterRole::NormalizationBias => {
+                ReplicatedTextParameterRole::Normalization
+            }
+            _ => ReplicatedTextParameterRole::Other,
+        };
+        let companions = physical
+            .values()
+            .filter(|member| {
+                member
+                    .linear_companion_of()
+                    .is_some_and(|primary| primary.as_str() == name)
+            })
+            .collect::<Vec<_>>();
+        let executable = declared
+            .format
+            .as_ref()
+            .map_or(LinearFormat::Dense, |format| format.encoding());
+        let transforms = quantization.is_some() && !companions.is_empty();
+        let descriptor = WeightLoweringDescriptor::new(
+            encoding,
             executable,
-            source.physical_shape.clone(),
-            source.logical_shape.clone(),
-            (is_matrix && executable != LinearFormat::Dense)
-                .then(|| source.logical_shape.len() - 1),
+            source_shape.clone(),
+            declared.shape.clone(),
+            (declared.format.is_some() && executable != LinearFormat::Dense)
+                .then(|| declared.shape.len() - 1),
         )
         .map_err(|error| error.to_string())?;
         let kind = lowering(&descriptor, transforms).ok_or_else(|| {
-            format!(
-                "backend has no exact external assistant lowering for {:?}",
-                constraint.key
-            )
+            format!("backend has no exact external assistant lowering for {name:?}")
         })?;
-        let owner = A::parameter_owner(&target_config, &constraint.key)?;
+        let kind = if derived.is_some() {
+            if kind.transforms_payload() {
+                WeightLoweringKind::DerivedTransform
+            } else {
+                WeightLoweringKind::Derived
+            }
+        } else {
+            kind
+        };
+        let owner = declared.owner.clone();
         let companion_owner = owner
             .parameter_group_owner()
             .map_err(|error| error.to_string())?;
-        let mut task = ReplicatedTextMaterializationTask::from_exact_source(
-            constraint.key.clone(),
-            exact_physical_source(&store, &constraint.key)?,
-            constraint.aliases.clone(),
-            source.physical_shape,
-            source.logical_shape,
-            if is_matrix {
-                ReplicatedTextParameterRole::LinearWeight
-            } else {
-                ReplicatedTextParameterRole::Other
-            },
+        let mut task = ReplicatedTextMaterializationTask::from_exact_sources(
+            name.clone(),
+            sources,
+            source_extension.map_or_else(Vec::new, |extension| extension.aliases.clone()),
+            source_shape,
+            declared.shape.clone(),
+            role,
             owner,
             executable,
             kind,
             descriptor,
+            derived,
         )
         .map_err(|error| error.to_string())?;
         let outputs = companions
-            .get(&constraint.key)
             .into_iter()
-            .flatten()
-            .map(|(companion, role)| {
+            .map(|companion| {
                 let mut output = ReplicatedTextOutputCompanion::new(
-                    companion.key.clone(),
-                    *role,
-                    companion.shape.clone(),
+                    companion.target(),
+                    companion
+                        .linear_companion()
+                        .expect("expanded companion has a role"),
+                    companion.global_shape().to_vec(),
                     companion_owner.clone(),
                 )
                 .map_err(|error| error.to_string())?;
-                if store.source_metadata(&companion.key).is_ok() {
-                    output =
-                        output.with_catalog_source(exact_physical_source(&store, &companion.key)?);
+                if let Some(key) = admitted.resolve(companion.target()) {
+                    output = output.with_catalog_source(exact_physical_source(&store, &key)?);
+                } else if let Some(recipe) = recipes.get(companion.target()) {
+                    let inferred = recipe.infer(&admitted).map_err(|error| error.to_string())?;
+                    if inferred.shape != source_physical[companion.target()].global_shape() {
+                        return Err(format!(
+                            "assistant companion recipe geometry differs for {:?}",
+                            companion.target()
+                        ));
+                    }
+                    let dtype = admitted
+                        .tensor_metadata(recipe.source_keys()[0])
+                        .map_err(|error| error.to_string())?
+                        .stored_dtype;
+                    if inferred.dtype != dtype.clone().into() {
+                        return Err(
+                            "assistant companion recipe changes source scalar representation"
+                                .into(),
+                        );
+                    }
+                    let descriptor = WeightLoweringDescriptor::new(
+                        eredu_checkpoint::SourceTensorEncoding::RecipeOutput(dtype),
+                        LinearFormat::Dense,
+                        inferred.shape.clone(),
+                        inferred.shape.clone(),
+                        None,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    let sources = recipe
+                        .source_keys()
+                        .into_iter()
+                        .map(|key| exact_physical_source(&store, key))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let task = ReplicatedTextMaterializationTask::from_exact_sources(
+                        companion.target(),
+                        sources,
+                        Vec::new(),
+                        inferred.shape.clone(),
+                        inferred.shape.clone(),
+                        ReplicatedTextParameterRole::FormatCompanion,
+                        declared.owner.clone(),
+                        LinearFormat::Dense,
+                        WeightLoweringKind::Derived,
+                        descriptor,
+                        Some((recipe.clone(), inferred)),
+                    )
+                    .map_err(|error| error.to_string())?;
+                    output = output
+                        .with_materialization_task(task)
+                        .map_err(|error| error.to_string())?;
                 }
                 Ok(output)
             })
@@ -2448,6 +2719,8 @@ where
         source_config,
         config: target_config,
         tasks,
+        source_definition,
+        definition,
         _architecture: PhantomData,
     })
 }
@@ -2837,17 +3110,21 @@ pub fn prepare_external_assistant(
                     ));
                 }
             };
+            let definition =
+                gemma4::AssistantDefinition::new(config.clone()).map_err(invalid_assistant)?;
+            let names = definition.gguf_names().map_err(invalid_assistant)?;
             let checkpoint = prepared_checkpoint(
                 &inspection,
-                || gemma4::assistant_safetensors_plan(&config),
-                || gemma4::assistant_gguf_plan(&config),
-                gemma4::translate_assistant_gguf_weight_name,
+                || gemma4::assistant_safetensors_plan(&definition),
+                || gemma4::assistant_gguf_plan(&definition),
+                |name| names.translate(name),
             )?;
             Ok(ExternalAssistantPreparation {
                 dispatched: DispatchedExternalAssistantPreparation::Gemma4(
                     PreparedExternalAssistant {
                         checkpoint,
                         config,
+                        definition: Arc::new(definition),
                         _architecture: PhantomData,
                     },
                 ),
@@ -2869,17 +3146,21 @@ pub fn prepare_external_assistant(
                     ));
                 }
             };
+            let config = MuseAssistantConfig::Glimmer(config);
+            let definition = MuseAssistantArchitecture::parameter_definition(&config)
+                .map_err(invalid_assistant)?;
             let checkpoint = prepared_checkpoint(
                 &inspection,
-                || muse::dflash_safetensors_plan(&config),
-                || muse::dflash_gguf_plan(&config),
+                || definition.safetensors_plan(),
+                || definition.gguf_plan(),
                 muse::translate_dflash_gguf_weight_name,
             )?;
             Ok(ExternalAssistantPreparation {
                 dispatched: DispatchedExternalAssistantPreparation::Muse(
                     PreparedExternalAssistant {
                         checkpoint,
-                        config: MuseAssistantConfig::Glimmer(config),
+                        definition: Arc::new(definition),
+                        config,
                         _architecture: PhantomData,
                     },
                 ),
@@ -2897,16 +3178,19 @@ pub fn prepare_external_assistant(
             let config = MuseAssistantConfig::Spark(
                 muse::assistant::spark::SparkAssistantLoadConfig::new(released),
             );
+            let definition = MuseAssistantArchitecture::parameter_definition(&config)
+                .map_err(invalid_assistant)?;
             let checkpoint = prepared_checkpoint(
                 &inspection,
-                || config.safetensors_plan(),
-                || Err("no released Spark assistant GGUF format is declared".into()),
+                || definition.safetensors_plan(),
+                || definition.gguf_plan(),
                 str::to_owned,
             )?;
             Ok(ExternalAssistantPreparation {
                 dispatched: DispatchedExternalAssistantPreparation::Muse(
                     PreparedExternalAssistant {
                         checkpoint,
+                        definition: Arc::new(definition),
                         config,
                         _architecture: PhantomData,
                     },

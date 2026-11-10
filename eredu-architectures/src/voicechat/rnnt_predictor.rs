@@ -1,12 +1,11 @@
 //! RNNT recurrent layers over the shared stateful pipeline traversal.
 use super::{
-    rnnt::{
-        build_predictor_layer, step_predictor_layer, RnntDimensions, RnntError, RnntPredictionState,
-    },
-    rnnt_layered::{rnnt_parameter_description_for_phases, RnntPhase},
+    rnnt::{step_predictor_layer, RnntDimensions, RnntError, RnntPredictionState},
+    rnnt_layered::{declared_parameter_description, RnntPhase},
     rnnt_predictor_partition::{
         validate_rnnt_predictor_partition, RnntPredictorBoundarySchema, RnntPredictorPipelineCuts,
     },
+    rnnt_specs::{Declaration, RnntPredictorDeclaration, UnitSpec},
 };
 use eredu_core::{
     cache::{
@@ -27,19 +26,13 @@ pub(crate) const GROUP: &str = RnntPhase::Predictor.id();
 pub(crate) fn invalid(message: &'static str) -> RnntError {
     RnntError::InvalidState(message)
 }
-/// Exact recurrent parameter ownership, with no embedding or joint parameters.
-pub fn rnnt_predictor_parameter_description(
+pub(super) fn declared_definition(
     dimensions: RnntDimensions,
-) -> Result<ArchitectureParameterDescription, RnntError> {
-    rnnt_parameter_description_for_phases(dimensions, &[RnntPhase::Predictor])
-}
-/// Global recurrent operations, independently leased layers and carry identities.
-pub fn rnnt_predictor_component_definition(
-    dimensions: RnntDimensions,
+    declaration: &Declaration,
 ) -> Result<ComponentDefinition, RnntError> {
     Ok(ComponentDefinition::new(
         "voicechat.rnnt.predictor",
-        rnnt_predictor_parameter_description(dimensions)?,
+        declared_parameter_description(&[RnntPhase::Predictor], declaration)?,
         (0..dimensions.predictor_layers)
             .map(|index| ComponentUnit {
                 path: RnntPhase::Predictor.path(index),
@@ -280,15 +273,16 @@ pub struct RnntPredictorForward<T> {
 /// Model-family equations and exact state ownership for a predictor stage.
 pub struct RnntPredictorKernel<B: NeuralBackend> {
     pub(crate) dimensions: RnntDimensions,
+    declaration: RnntPredictorDeclaration,
     pub(crate) partition: Option<(Range<usize>, RnntPredictorPipelineCuts)>,
     backend: PhantomData<fn() -> B>,
 }
 impl<B: NeuralBackend> RnntPredictorKernel<B> {
     /// Declares a complete predictor without native allocations.
-    pub fn new(dimensions: RnntDimensions) -> Result<Self, RnntError> {
-        dimensions.validate()?;
+    pub fn new(declaration: RnntPredictorDeclaration) -> Result<Self, RnntError> {
         Ok(Self {
-            dimensions,
+            dimensions: declaration.dimensions(),
+            declaration,
             partition: None,
             backend: PhantomData,
         })
@@ -296,22 +290,23 @@ impl<B: NeuralBackend> RnntPredictorKernel<B> {
     /// Couples the recurrent equations to their validated global declaration.
     pub fn into_component(self) -> Result<ComponentAdapter<ComponentDefinition, Self>, RnntError> {
         Ok(ComponentAdapter::new(
-            rnnt_predictor_component_definition(self.dimensions)?,
+            self.declaration.definition().clone(),
             self,
         )?)
     }
     /// Retains exactly one contiguous predictor stage.
     pub fn new_partition<G>(
-        definition: ComponentDefinition,
-        dimensions: RnntDimensions,
+        declaration: RnntPredictorDeclaration,
         partition: &ArchitecturePartition<G, RnntPredictorBoundarySchema>,
         cuts: &RnntPredictorPipelineCuts,
     ) -> Result<ComponentAdapter<ComponentDefinition, Self>, RnntError> {
-        let range = validate_rnnt_predictor_partition(&definition, dimensions, partition)?;
+        let dimensions = declaration.dimensions();
+        let range = validate_rnnt_predictor_partition(&declaration, partition)?;
         if cuts.dimensions() != dimensions {
             return Err(invalid("RNNT predictor cuts belong to another geometry"));
         }
-        let mut value = Self::new(dimensions)?;
+        let definition = declaration.definition().clone();
+        let mut value = Self::new(declaration)?;
         value.partition = Some((range, cuts.clone()));
         Ok(ComponentAdapter::new(definition, value)?.select_partition(partition)?)
     }
@@ -431,10 +426,15 @@ impl<B: NeuralBackend> ComponentKernel<B> for RnntPredictorKernel<B> {
         if !self.range().contains(&index) {
             return Err(invalid("RNNT predictor unit exceeds selected stage"));
         }
+        let UnitSpec::Predictor(spec) =
+            self.declaration.spec().unit(RnntPhase::Predictor, index)?
+        else {
+            return Err(invalid("RNNT predictor scope contains a nonrecurrent unit"));
+        };
         Ok(RnntPredictorUnit {
             dimensions: self.dimensions,
             index,
-            layer: build_predictor_layer::<B>(self.dimensions, index, context)?,
+            layer: Lstm::new(vec![spec.clone()], context)?,
         })
     }
 

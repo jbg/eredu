@@ -178,7 +178,7 @@ struct TextSource {
 }
 
 /// Validated Inkling text-decoder geometry.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TextArgs {
     /// Released dense scalar type metadata.
     pub torch_dtype: Option<String>,
@@ -379,8 +379,8 @@ pub struct MtpConfig {
 }
 
 /// Native dMel audio projector configuration.
-#[derive(Debug, Clone, Deserialize)]
-pub struct AudioConfig {
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct AudioPolicy {
     /// Decoder hidden width.
     #[serde(alias = "decoder_dmodel")]
     pub text_hidden_size: i32,
@@ -407,7 +407,69 @@ pub struct AudioConfig {
     pub quantized_weight_configs: Option<HashMap<String, WeightQuantization>>,
 }
 
+/// Validated audio policy with retained typed parameter scopes.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(try_from = "AudioPolicy")]
+pub struct AudioConfig {
+    policy: AudioPolicy,
+    parameters: std::sync::Arc<super::audio::Parameters>,
+}
 impl AudioConfig {
+    /// Validates normalized source policy and declares parameters once.
+    pub fn new(policy: AudioPolicy) -> Result<Self, eredu_nn::Error> {
+        let parameters = super::audio::Parameters::new(&policy)?;
+        Ok(Self {
+            policy,
+            parameters: std::sync::Arc::new(parameters),
+        })
+    }
+    /// Normalized source geometry and encoding policy.
+    pub fn policy(&self) -> &AudioPolicy {
+        &self.policy
+    }
+    pub(crate) fn parameters(&self) -> &super::audio::Parameters {
+        &self.parameters
+    }
+    /// Projects encoding extensions without changing geometry or execution policy.
+    pub fn with_formats(
+        &self,
+        formats: HashMap<String, WeightQuantization>,
+    ) -> Result<Self, eredu_nn::Error> {
+        let formats = (!formats.is_empty()).then_some(formats);
+        if formats == self.policy.quantized_weight_configs {
+            return Ok(self.clone());
+        }
+        let mut policy = self.policy.clone();
+        policy.quantized_weight_configs = formats;
+        let mut parameters = self.parameters.as_ref().clone();
+        parameters.project_formats(&policy)?;
+        Ok(Self {
+            policy,
+            parameters: std::sync::Arc::new(parameters),
+        })
+    }
+}
+impl TryFrom<AudioPolicy> for AudioConfig {
+    type Error = eredu_nn::Error;
+    fn try_from(policy: AudioPolicy) -> Result<Self, Self::Error> {
+        Self::new(policy)
+    }
+}
+impl std::ops::Deref for AudioConfig {
+    type Target = AudioPolicy;
+    fn deref(&self) -> &Self::Target {
+        &self.policy
+    }
+}
+impl eredu_nn::DeclareLogicalParameters for AudioConfig {
+    fn logical_parameters(
+        &self,
+    ) -> Result<Vec<eredu_nn::LogicalParameterDeclaration<'_>>, eredu_nn::Error> {
+        self.parameters.logical_parameters()
+    }
+}
+
+impl AudioPolicy {
     /// Returns the exact physical format for one dMel weight.
     pub fn linear_format_for(&self, name: &str) -> LinearFormat {
         self.quantized_weight_configs
@@ -420,8 +482,8 @@ impl AudioConfig {
 }
 
 /// Native folded hMLP vision projector configuration.
-#[derive(Debug, Clone, Deserialize)]
-pub struct VisionConfig {
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct VisionPolicy {
     /// Exact native encoder type.
     #[serde(default = "default_vision_encoder_type")]
     pub vision_encoder_type: String,
@@ -449,22 +511,69 @@ pub struct VisionConfig {
     pub quantized_weight_configs: Option<HashMap<String, WeightQuantization>>,
 }
 
+/// Validated vision policy with retained typed parameter scopes.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(try_from = "VisionPolicy")]
+pub struct VisionConfig {
+    policy: VisionPolicy,
+    parameters: std::sync::Arc<super::vision::Parameters>,
+}
 impl VisionConfig {
-    /// Returns the fixed released hMLP fold and projection schedule.
-    pub fn layer_specs(&self) -> [(i32, i32, i32, i32); 4] {
-        let second_stage_width = if self.text_hidden_size == 4096 {
-            320
-        } else {
-            512
-        };
-        [
-            (75, 128, 1, 5),
-            (512, second_stage_width, 1, 2),
-            (second_stage_width * 16, 4800, 1, 4),
-            (9600, self.text_hidden_size, 2, 1),
-        ]
+    /// Validates normalized source policy and declares parameters once.
+    pub fn new(policy: VisionPolicy) -> Result<Self, eredu_nn::Error> {
+        let parameters = super::vision::Parameters::new(&policy)?;
+        Ok(Self {
+            policy,
+            parameters: std::sync::Arc::new(parameters),
+        })
     }
+    /// Normalized source geometry and encoding policy.
+    pub fn policy(&self) -> &VisionPolicy {
+        &self.policy
+    }
+    pub(crate) fn parameters(&self) -> &super::vision::Parameters {
+        &self.parameters
+    }
+    /// Projects encoding extensions without changing geometry or execution policy.
+    pub fn with_formats(
+        &self,
+        formats: HashMap<String, WeightQuantization>,
+    ) -> Result<Self, eredu_nn::Error> {
+        let formats = (!formats.is_empty()).then_some(formats);
+        if formats == self.policy.quantized_weight_configs {
+            return Ok(self.clone());
+        }
+        let mut policy = self.policy.clone();
+        policy.quantized_weight_configs = formats;
+        let mut parameters = self.parameters.as_ref().clone();
+        parameters.project_formats(&policy)?;
+        Ok(Self {
+            policy,
+            parameters: std::sync::Arc::new(parameters),
+        })
+    }
+}
+impl TryFrom<VisionPolicy> for VisionConfig {
+    type Error = eredu_nn::Error;
+    fn try_from(policy: VisionPolicy) -> Result<Self, Self::Error> {
+        Self::new(policy)
+    }
+}
+impl std::ops::Deref for VisionConfig {
+    type Target = VisionPolicy;
+    fn deref(&self) -> &Self::Target {
+        &self.policy
+    }
+}
+impl eredu_nn::DeclareLogicalParameters for VisionConfig {
+    fn logical_parameters(
+        &self,
+    ) -> Result<Vec<eredu_nn::LogicalParameterDeclaration<'_>>, eredu_nn::Error> {
+        self.parameters.logical_parameters()
+    }
+}
 
+impl VisionPolicy {
     /// Returns the exact physical format for one hMLP weight.
     pub fn linear_format_for(&self, name: &str) -> LinearFormat {
         self.quantized_weight_configs
@@ -493,9 +602,9 @@ struct ModelSource {
     audio_token_id: u32,
 }
 
-/// Released top-level Inkling configuration.
+/// Normalized top-level Inkling source and execution policy.
 #[derive(Debug, Clone)]
-pub struct ModelArgs {
+pub struct ModelPolicy {
     /// Exact family identity.
     pub model_type: String,
     /// Text decoder policy.
@@ -512,7 +621,331 @@ pub struct ModelArgs {
     pub audio_token_id: u32,
 }
 
+/// Immutable source with complete retained text, media and prediction parameter declarations.
+#[derive(Debug, Clone)]
+pub struct ModelArgs {
+    policy: ModelPolicy,
+    prediction: std::sync::Arc<super::mtp::PredictionParameters>,
+    pinned: std::sync::Arc<super::text::PinnedParameters>,
+    common: std::sync::Arc<Vec<super::text::CommonParameters>>,
+    feed_forward: std::sync::Arc<Vec<super::text::FeedForwardParameters>>,
+}
 impl ModelArgs {
+    /// Validates normalized policy and declares every text and prediction parameter once.
+    pub fn new(policy: ModelPolicy) -> Result<Self, ConfigError> {
+        policy.validate()?;
+        let prediction =
+            super::mtp::PredictionParameters::new(&policy).map_err(|e| invalid(e.to_string()))?;
+        let pinned = super::text::PinnedParameters::new(&policy.text_config)
+            .map_err(|e| invalid(e.to_string()))?;
+        let common = policy
+            .text_config
+            .layer_schedule
+            .iter()
+            .enumerate()
+            .map(|(layer, layer_policy)| {
+                super::text::CommonParameters::new_at(
+                    &policy.text_config,
+                    layer_policy.attention,
+                    &format!("model.layers.{layer}"),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| invalid(e.to_string()))?;
+        let feed_forward = (0..policy.text_config.layer_schedule.len())
+            .map(|layer| super::text::FeedForwardParameters::new(&policy.text_config, layer))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| invalid(e.to_string()))?;
+        let configuration = Self {
+            policy,
+            prediction: std::sync::Arc::new(prediction),
+            pinned: std::sync::Arc::new(pinned),
+            common: std::sync::Arc::new(common),
+            feed_forward: std::sync::Arc::new(feed_forward),
+        };
+        configuration.validate_parameters()?;
+        Ok(configuration)
+    }
+    /// Normalized source geometry, media, and format policy.
+    pub fn policy(&self) -> &ModelPolicy {
+        &self.policy
+    }
+    pub(crate) fn prediction(&self) -> &super::mtp::PredictionParameters {
+        &self.prediction
+    }
+    pub(crate) fn pinned(&self) -> &super::text::PinnedParameters {
+        &self.pinned
+    }
+    pub(crate) fn common_layers(&self) -> &[super::text::CommonParameters] {
+        &self.common
+    }
+    pub(crate) fn common(
+        &self,
+        layer: usize,
+    ) -> Result<&super::text::CommonParameters, eredu_nn::Error> {
+        self.common.get(layer).ok_or_else(|| {
+            eredu_nn::Error::backend("Inkling common invocation is outside its declared source")
+        })
+    }
+    pub(crate) fn local_common(
+        &self,
+        layer: usize,
+        local: &TextArgs,
+    ) -> Result<super::text::CommonParameters, eredu_nn::Error> {
+        let source = self.common(layer)?;
+        if local == &self.text_config {
+            return Ok(source.clone());
+        }
+        self.validate_local_text(local)?;
+        let windowed = source.attention.policy.window().is_some();
+        source.localized(local.query_heads(windowed), local.key_value_heads(windowed))
+    }
+    fn validate_local_text(&self, local: &TextArgs) -> Result<(), eredu_nn::Error> {
+        if local == &self.text_config {
+            return Ok(());
+        }
+        let mut expected = self.text_config.clone();
+        expected.num_attention_heads = local.num_attention_heads;
+        expected.num_key_value_heads = local.num_key_value_heads;
+        expected.swa_num_attention_heads = local.swa_num_attention_heads;
+        expected.swa_num_key_value_heads = local.swa_num_key_value_heads;
+        expected.dense_intermediate_size = local.dense_intermediate_size;
+        expected.moe_intermediate_size = local.moe_intermediate_size;
+        if expected != *local
+            || local.dense_intermediate_size() <= 0
+            || local.dense_intermediate_size() > self.text_config.dense_intermediate_size()
+            || local.moe_intermediate_size() <= 0
+            || local.moe_intermediate_size() > self.text_config.moe_intermediate_size()
+        {
+            return Err(eredu_nn::Error::backend("Inkling local common projection changes non-placement policy or exceeds source widths"));
+        }
+        Ok(())
+    }
+    pub(crate) fn feed_forward(
+        &self,
+        layer: usize,
+    ) -> Result<&super::text::FeedForwardParameters, eredu_nn::Error> {
+        self.feed_forward.get(layer).ok_or_else(|| {
+            eredu_nn::Error::backend(
+                "Inkling feed-forward invocation is outside its declared source",
+            )
+        })
+    }
+    pub(crate) fn dense(
+        &self,
+        layer: usize,
+    ) -> Result<&super::text::DenseParameters, eredu_nn::Error> {
+        match self.feed_forward(layer)? {
+            super::text::FeedForwardParameters::Dense(p) => Ok(p),
+            _ => Err(eredu_nn::Error::backend(
+                "Inkling invocation does not own a dense branch",
+            )),
+        }
+    }
+    pub(crate) fn sparse(
+        &self,
+        layer: usize,
+    ) -> Result<&super::text::SparseParameters, eredu_nn::Error> {
+        match self.feed_forward(layer)? {
+            super::text::FeedForwardParameters::Sparse(p) => Ok(p),
+            _ => Err(eredu_nn::Error::backend(
+                "Inkling invocation does not own a sparse branch",
+            )),
+        }
+    }
+    pub(crate) fn sparse_layers(
+        &self,
+    ) -> impl Iterator<Item = (usize, &super::text::SparseParameters)> {
+        self.feed_forward
+            .iter()
+            .enumerate()
+            .filter_map(|(layer, p)| match p {
+                super::text::FeedForwardParameters::Sparse(p) => Some((layer, p)),
+                _ => None,
+            })
+    }
+    pub(crate) fn local_feed_forward(
+        &self,
+        layer: usize,
+        local: &TextArgs,
+    ) -> Result<super::text::FeedForwardParameters, eredu_nn::Error> {
+        self.validate_local_text(local)?;
+        self.feed_forward(layer)?.localized(local)
+    }
+    fn text_parameters(
+        &self,
+    ) -> Result<Vec<eredu_nn::LogicalParameterDeclaration<'_>>, eredu_nn::Error> {
+        use eredu_nn::DeclareLogicalParameters;
+        let mut parameters = self.pinned.logical_parameters()?;
+        parameters.extend(self.common.logical_parameters()?);
+        parameters.extend(self.feed_forward.logical_parameters()?);
+        parameters.extend(self.prediction.logical_parameters()?);
+        Ok(parameters)
+    }
+    fn validate_parameters(&self) -> Result<(), ConfigError> {
+        use eredu_nn::DeclareLogicalParameters;
+        let declarations = self
+            .logical_parameters()
+            .map_err(|e| invalid(e.to_string()))?;
+        eredu_nn::validate_logical_parameter_topology(&declarations)
+            .map_err(|e| invalid(e.to_string()))?;
+        let text_parameters = self.text_parameters().map_err(|e| invalid(e.to_string()))?;
+        crate::format_references::validate_matrices(
+            text_parameters,
+            self.text_config
+                .quantized_weight_configs
+                .iter()
+                .flat_map(|formats| formats.iter())
+                .map(|(name, format)| (name.as_str(), Some((*format).into()))),
+        )
+        .map_err(|e| invalid(e.to_string()))?;
+        Ok(())
+    }
+    /// Parses external HF policy before declaration construction.
+    pub fn from_hf_json(bytes: &[u8]) -> Result<Self, ConfigError> {
+        Self::new(ModelPolicy::from_hf_json(bytes)?)
+    }
+    /// Parses text-only GGUF policy before declaration construction.
+    pub fn from_gguf_metadata(
+        metadata: &HashMap<String, MetadataValue>,
+    ) -> Result<Self, ConfigError> {
+        Self::new(ModelPolicy::from_gguf_metadata(metadata)?)
+    }
+    /// Attaches validated media while retaining the unchanged predictor scopes.
+    pub fn with_gguf_projector_metadata(
+        &self,
+        model_metadata: &HashMap<String, MetadataValue>,
+        projector_metadata: &HashMap<String, MetadataValue>,
+        formats: HashMap<String, WeightQuantization>,
+    ) -> Result<Self, ConfigError> {
+        let policy = self.policy.clone().with_gguf_projector_metadata(
+            model_metadata,
+            projector_metadata,
+            formats,
+        )?;
+        Ok(Self {
+            policy,
+            prediction: self.prediction.clone(),
+            pinned: self.pinned.clone(),
+            common: self.common.clone(),
+            feed_forward: self.feed_forward.clone(),
+        })
+    }
+    /// Projects selected text encodings while preserving all equation and invocation policy.
+    pub(crate) fn with_text_formats(
+        &self,
+        uniform: Option<WeightQuantization>,
+        formats: Option<HashMap<String, WeightQuantization>>,
+    ) -> Result<Self, ConfigError> {
+        if uniform == self.text_config.weight_quantization
+            && formats == self.text_config.quantized_weight_configs
+        {
+            return Ok(self.clone());
+        }
+        let mut policy = self.policy.clone();
+        policy.text_config.weight_quantization = uniform;
+        policy.text_config.quantized_weight_configs = formats;
+        policy.validate()?;
+        let mut feed_forward = self.feed_forward.as_ref().clone();
+        for parameters in &mut feed_forward {
+            parameters
+                .project_formats(&policy.text_config)
+                .map_err(|e| invalid(e.to_string()))?;
+        }
+        let mut common = self.common.as_ref().clone();
+        for parameters in &mut common {
+            parameters
+                .project_formats(&policy.text_config)
+                .map_err(|e| invalid(e.to_string()))?;
+        }
+        let mut pinned = self.pinned.as_ref().clone();
+        pinned
+            .project_formats(&policy.text_config)
+            .map_err(|e| invalid(e.to_string()))?;
+        let mut prediction = self.prediction.as_ref().clone();
+        prediction
+            .project_formats(&policy.text_config)
+            .map_err(|e| invalid(e.to_string()))?;
+        let configuration = Self {
+            policy,
+            prediction: std::sync::Arc::new(prediction),
+            pinned: std::sync::Arc::new(pinned),
+            common: std::sync::Arc::new(common),
+            feed_forward: std::sync::Arc::new(feed_forward),
+        };
+        configuration.validate_parameters()?;
+        Ok(configuration)
+    }
+    /// Projects selected media encodings without rebuilding text or prediction geometry.
+    pub(crate) fn with_media_formats(
+        &self,
+        audio: HashMap<String, WeightQuantization>,
+        vision: HashMap<String, WeightQuantization>,
+    ) -> Result<Self, ConfigError> {
+        let mut policy = self.policy.clone();
+        if let Some(config) = policy.audio_config.as_mut() {
+            *config = config
+                .with_formats(audio)
+                .map_err(|e| invalid(e.to_string()))?;
+        } else if !audio.is_empty() {
+            return Err(invalid("Inkling audio formats have no declared dMel tower"));
+        }
+        if let Some(config) = policy.vision_config.as_mut() {
+            *config = config
+                .with_formats(vision)
+                .map_err(|e| invalid(e.to_string()))?;
+        } else if !vision.is_empty() {
+            return Err(invalid(
+                "Inkling vision formats have no declared hMLP tower",
+            ));
+        }
+        policy.validate()?;
+        Ok(Self {
+            policy,
+            prediction: self.prediction.clone(),
+            pinned: self.pinned.clone(),
+            common: self.common.clone(),
+            feed_forward: self.feed_forward.clone(),
+        })
+    }
+    /// Selects the target-only configuration and removes predictor format references.
+    pub fn without_prediction(&self) -> Self {
+        let mut policy = self.policy.clone();
+        policy.mtp_config = None;
+        if let Some(formats) = &mut policy.text_config.quantized_weight_configs {
+            formats.retain(|name, _| !name.starts_with("model.mtp."));
+        }
+        Self {
+            policy,
+            prediction: std::sync::Arc::new(super::mtp::PredictionParameters::empty()),
+            pinned: self.pinned.clone(),
+            common: self.common.clone(),
+            feed_forward: self.feed_forward.clone(),
+        }
+    }
+}
+impl eredu_nn::DeclareLogicalParameters for ModelArgs {
+    fn logical_parameters(
+        &self,
+    ) -> Result<Vec<eredu_nn::LogicalParameterDeclaration<'_>>, eredu_nn::Error> {
+        let mut parameters = self.text_parameters()?;
+        if let Some(audio) = &self.audio_config {
+            parameters.extend(audio.logical_parameters()?);
+        }
+        if let Some(vision) = &self.vision_config {
+            parameters.extend(vision.logical_parameters()?);
+        }
+        Ok(parameters)
+    }
+}
+impl std::ops::Deref for ModelArgs {
+    type Target = ModelPolicy;
+    fn deref(&self) -> &Self::Target {
+        &self.policy
+    }
+}
+
+impl ModelPolicy {
     /// Returns the input modalities admitted by this exact family variant.
     pub const fn input_modalities(&self) -> InputModalities {
         let admits_media = self.vision_config.is_some() || self.audio_config.is_some();
@@ -525,7 +958,7 @@ impl ModelArgs {
     }
 
     /// Parses and validates one Hugging Face configuration document.
-    pub fn from_hf_json(bytes: &[u8]) -> Result<Self, ConfigError> {
+    fn from_hf_json(bytes: &[u8]) -> Result<Self, ConfigError> {
         let source: ModelSource = serde_json::from_slice(bytes)?;
         let schedule = layer_schedule(&source.text_config)?;
         let text_config = source.text_config.into_args(schedule);
@@ -538,16 +971,13 @@ impl ModelArgs {
             image_token_id: source.image_token_id,
             audio_token_id: source.audio_token_id,
         };
-        args.validate()?;
         Ok(args)
     }
 
     /// Parses the released Inkling GGUF metadata without a concrete-backend
     /// checkpoint or tensor type. Sibling projector geometry is applied
     /// separately after its own artifact has been admitted.
-    pub fn from_gguf_metadata(
-        metadata: &HashMap<String, MetadataValue>,
-    ) -> Result<Self, ConfigError> {
+    fn from_gguf_metadata(metadata: &HashMap<String, MetadataValue>) -> Result<Self, ConfigError> {
         let key = |suffix: &str| format!("inkling.{suffix}");
         let layers = gguf_i32(metadata, &key("block_count"))?;
         if layers <= 0 {
@@ -693,14 +1123,13 @@ impl ModelArgs {
             image_token_id: default_image_token_id(),
             audio_token_id: default_audio_token_id(),
         };
-        args.validate()?;
         Ok(args)
     }
 
     /// Applies an admitted sibling Inkling hMLP/dMel projector catalog to a
     /// text-only GGUF configuration. Physical per-weight formats are supplied
     /// by the binder after header inspection.
-    pub fn with_gguf_projector_metadata(
+    fn with_gguf_projector_metadata(
         mut self,
         model_metadata: &HashMap<String, MetadataValue>,
         projector_metadata: &HashMap<String, MetadataValue>,
@@ -750,35 +1179,41 @@ impl ModelArgs {
                 "Inkling mmproj image_size {image_size} does not match patch_size {patch_size}"
             )));
         }
-        self.vision_config = Some(VisionConfig {
-            vision_encoder_type: "hmlp".into(),
-            text_hidden_size: vision_hidden,
-            patch_size,
-            temporal_patch_size: 2,
-            num_channels: gguf_i32(projector_metadata, "clip.vision.embedding_length")?,
-            num_hidden_layers: gguf_i32(projector_metadata, "clip.vision.block_count")?,
-            use_vision_norm: true,
-            rms_norm_eps: gguf_optional_f32(
-                projector_metadata,
-                "clip.vision.attention.layer_norm_epsilon",
-            )?
-            .unwrap_or(default_rms_norm_eps()),
-            quantized_weight_configs: (!vision_formats.is_empty()).then_some(vision_formats),
-        });
-        self.audio_config = Some(AudioConfig {
-            text_hidden_size: audio_hidden,
-            num_codebooks: gguf_i32(projector_metadata, "clip.audio.num_mel_bins")?,
-            codebook_size: 16,
-            bias: false,
-            use_audio_norm: true,
-            audio_mode: "dmel".into(),
-            rms_norm_eps: gguf_optional_f32(
-                projector_metadata,
-                "clip.audio.attention.layer_norm_epsilon",
-            )?
-            .unwrap_or(default_rms_norm_eps()),
-            quantized_weight_configs: (!audio_formats.is_empty()).then_some(audio_formats),
-        });
+        self.vision_config = Some(
+            VisionConfig::new(VisionPolicy {
+                vision_encoder_type: "hmlp".into(),
+                text_hidden_size: vision_hidden,
+                patch_size,
+                temporal_patch_size: 2,
+                num_channels: gguf_i32(projector_metadata, "clip.vision.embedding_length")?,
+                num_hidden_layers: gguf_i32(projector_metadata, "clip.vision.block_count")?,
+                use_vision_norm: true,
+                rms_norm_eps: gguf_optional_f32(
+                    projector_metadata,
+                    "clip.vision.attention.layer_norm_epsilon",
+                )?
+                .unwrap_or(default_rms_norm_eps()),
+                quantized_weight_configs: (!vision_formats.is_empty()).then_some(vision_formats),
+            })
+            .map_err(|e| invalid(e.to_string()))?,
+        );
+        self.audio_config = Some(
+            AudioConfig::new(AudioPolicy {
+                text_hidden_size: audio_hidden,
+                num_codebooks: gguf_i32(projector_metadata, "clip.audio.num_mel_bins")?,
+                codebook_size: 16,
+                bias: false,
+                use_audio_norm: true,
+                audio_mode: "dmel".into(),
+                rms_norm_eps: gguf_optional_f32(
+                    projector_metadata,
+                    "clip.audio.attention.layer_norm_epsilon",
+                )?
+                .unwrap_or(default_rms_norm_eps()),
+                quantized_weight_configs: (!audio_formats.is_empty()).then_some(audio_formats),
+            })
+            .map_err(|e| invalid(e.to_string()))?,
+        );
         if let Some(id) = gguf_optional_i32(model_metadata, "inkling.audio_token_id")? {
             self.audio_token_id = u32::try_from(id)
                 .map_err(|_| invalid("Inkling audio placeholder id is negative"))?;
@@ -886,6 +1321,11 @@ impl ModelArgs {
                 return Err(invalid(format!("Inkling {name} must be positive")));
             }
         }
+        if usize::try_from(text.num_hidden_layers).ok() != Some(text.layer_schedule.len()) {
+            return Err(invalid(
+                "Inkling layer schedule differs from declared target depth",
+            ));
+        }
         if !text.rms_norm_eps.is_finite()
             || text.rms_norm_eps <= 0.0
             || !text.route_scale.is_finite()
@@ -960,36 +1400,21 @@ impl ModelArgs {
                 ));
             }
         }
-        if let Some(audio) = &self.audio_config {
-            if audio.text_hidden_size != text.hidden_size
-                || audio.num_codebooks <= 0
-                || audio.codebook_size <= 0
-                || audio.bias
-                || !audio.use_audio_norm
-                || audio.audio_mode != "dmel"
-                || audio
-                    .num_codebooks
-                    .checked_mul(audio.codebook_size)
-                    .is_none()
-            {
-                return Err(invalid("Inkling audio configuration is inconsistent"));
-            }
+        if self
+            .audio_config
+            .as_ref()
+            .is_some_and(|audio| audio.text_hidden_size != text.hidden_size)
+        {
+            return Err(invalid("Inkling audio width differs from decoder geometry"));
         }
-        if let Some(vision) = &self.vision_config {
-            if vision.text_hidden_size != text.hidden_size
-                || vision.vision_encoder_type != "hmlp"
-                || !vision.use_vision_norm
-                || (
-                    vision.temporal_patch_size,
-                    vision.patch_size,
-                    vision.num_hidden_layers,
-                    vision.num_channels,
-                ) != (2, 40, 4, 3)
-            {
-                return Err(invalid(
-                    "Inkling vision configuration is not the released hMLP tower",
-                ));
-            }
+        if self
+            .vision_config
+            .as_ref()
+            .is_some_and(|vision| vision.text_hidden_size != text.hidden_size)
+        {
+            return Err(invalid(
+                "Inkling vision width differs from decoder geometry",
+            ));
         }
         Ok(())
     }

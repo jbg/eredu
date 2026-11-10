@@ -259,7 +259,8 @@ fn shared_vision_report_uses_selected_segment_facts_without_a_physical_fit_claim
     .unwrap();
     let config = source.normalize_qwen3_vl().unwrap();
     let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
-    let report = config
+    let declaration = eredu_architectures::qwen::vision::Declaration::new(config, "").unwrap();
+    let report = declaration
         .memory_report(
             &[(2, 4, 4)],
             TensorElementType::F32,

@@ -6,9 +6,10 @@ use eredu_nn::{
 };
 use eredu_runtime::{LayerRuntimeState, VocabularyModulePlacement};
 
-use super::{block, MoshiConfig, MoshiTransformerConfig};
+use super::{block, MoshiPolicy, MoshiTransformerConfig};
 
 /// One slice's neutral edge resources and shared-block geometry.
+#[derive(Debug, Clone)]
 pub(super) struct DepthConstruction {
     pub(super) transformer: MoshiTransformerConfig,
     pub(super) embedding: EmbeddingSpec,
@@ -16,8 +17,24 @@ pub(super) struct DepthConstruction {
     pub(super) output: LinearSpec,
 }
 
+impl eredu_nn::DeclareLogicalParameters for DepthConstruction {
+    fn logical_parameters(&self) -> Result<Vec<eredu_nn::LogicalParameterDeclaration<'_>>, Error> {
+        let mut parameters =
+            eredu_nn::DeclareLogicalParameters::logical_parameters(&self.embedding)?;
+        parameters.extend(eredu_nn::DeclareLogicalParameters::logical_parameters(
+            &self.input,
+        )?);
+        parameters.extend(eredu_nn::DeclareLogicalParameters::logical_parameters(
+            &self.output,
+        )?);
+        eredu_nn::validate_logical_parameter_topology(&parameters)
+            .map_err(Error::backend_source)?;
+        Ok(parameters)
+    }
+}
+
 impl DepthConstruction {
-    pub(super) fn new(config: &MoshiConfig, index: usize) -> Result<Self, Error> {
+    pub(super) fn new(config: &MoshiPolicy, index: usize) -> Result<Self, Error> {
         let transformer = config.depth_transformer(index).map_err(Error::backend)?;
         let prefix = format!("depformer.slices.{index}");
         let input_vocabulary = if index == 0 {
@@ -59,12 +76,14 @@ impl DepthConstruction {
                 config.native_quantization().into(),
             )?,
         };
-        Ok(Self {
+        let spec = Self {
             transformer,
             embedding,
             input,
             output,
-        })
+        };
+        eredu_nn::DeclareLogicalParameters::logical_parameters(&spec)?;
+        Ok(spec)
     }
 }
 
@@ -87,25 +106,25 @@ pub struct DepthSlice<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DepthSlice<B> {
     /// Builds one canonical depth slice.
     pub fn new(
-        config: &MoshiConfig,
+        parameters: &super::MoshiParameterContract,
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        Self::from_geometry(config, index, None, context)
+        Self::from_geometry(parameters, index, None, context)
     }
 
     /// Builds one rank-local depth slice with vocabulary-parallel edge modules.
     pub fn new_parallel(
-        config: &MoshiConfig,
+        parameters: &super::MoshiParameterContract,
         index: usize,
         geometry: &super::LocalGeometry,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        Self::from_geometry(config, index, Some(geometry), context)
+        Self::from_geometry(parameters, index, Some(geometry), context)
     }
 
     fn from_geometry(
-        config: &MoshiConfig,
+        parameters: &super::MoshiParameterContract,
         index: usize,
         geometry: Option<&super::LocalGeometry>,
         context: &<B::Tensor as Tensor>::Context,
@@ -115,7 +134,14 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DepthSlice<B> {
             embedding: embedding_spec,
             input: input_spec,
             output: output_spec,
-        } = DepthConstruction::new(config, index)?;
+        } = parameters
+            .declarations()
+            .depth
+            .get(index)
+            .ok_or_else(|| Error::backend("missing depth parameter owner"))?
+            .edge
+            .clone();
+        let declared = &parameters.declarations().depth[index].blocks;
         let placement = |name: &str, vocabulary, missing| -> Result<_, Error> {
             Ok(match geometry {
                 None => VocabularyModulePlacement::Local,
@@ -151,12 +177,12 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DepthSlice<B> {
             .expect("depth slice owns its output");
         let blocks = (0..transformer.num_hidden_layers() as usize)
             .map(|layer| match geometry {
-                None => block::build::<B>(&transformer, layer, context),
+                None => block::build::<B>(&transformer, layer, &declared[layer], context),
                 Some(geometry) => {
                     let local = geometry
                         .depth_config(&transformer, index, layer)
                         .map_err(Error::backend)?;
-                    block::build::<B>(&local, layer, context)
+                    block::build::<B>(&local, layer, &declared[layer], context)
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;

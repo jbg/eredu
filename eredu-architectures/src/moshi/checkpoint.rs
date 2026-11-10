@@ -15,12 +15,38 @@ use eredu_checkpoint::{
 use super::{CheckpointLayout, MoshiConfig};
 
 /// Builds the strict physical SafeTensors catalog selected by normalized metadata.
-pub fn safetensors_plan(config: &MoshiConfig) -> Result<SafetensorsCheckpointPlan, String> {
-    let g = Geometry::new(config)?;
+pub fn safetensors_plan(
+    contract: &super::MoshiParameterContract,
+) -> Result<SafetensorsCheckpointPlan, String> {
+    let config = contract.configuration();
+    let declarations = contract.declarations();
+    let mut physical = std::collections::BTreeMap::new();
+    for extension in storage_extensions(config, declarations)? {
+        if let Some(source) = extension.source {
+            if let Some(previous) = physical.insert(source.key.clone(), source.clone()) {
+                if previous != source {
+                    return Err(format!(
+                        "conflicting Moshi physical declarations for {}",
+                        source.key
+                    ));
+                }
+            }
+        }
+    }
     let mut tensors = Vec::new();
-    match config.checkpoint_layout() {
-        CheckpointLayout::MoshiSafetensors => native_catalog(config, g, &mut tensors)?,
-        CheckpointLayout::PersonaPlexPytorch => personaplex_catalog(config, g, &mut tensors)?,
+    for source in physical.into_values() {
+        if source.matrix {
+            matrix_constraint(
+                config,
+                &mut tensors,
+                &source.key,
+                source.aliases,
+                &source.companion_prefix,
+                source.shape,
+            )?;
+        } else {
+            tensors.push(vector(source.key, source.shape[0], source.flattened));
+        }
     }
     SafetensorsCheckpointPlan::new(
         match config.checkpoint_layout() {
@@ -31,335 +57,167 @@ pub fn safetensors_plan(config: &MoshiConfig) -> Result<SafetensorsCheckpointPla
         Vec::new(),
         CatalogPolicy::strict(),
     )
-    .map_err(|error| error.to_string())
+    .map_err(|e| e.to_string())
 }
 
 /// Maps either physical layout to one canonical Moshi parameter publication.
 /// No output or alias escapes until every source and companion has validated.
 pub fn canonical_recipes<C: RecipeCatalog + ?Sized>(
-    config: &MoshiConfig,
+    contract: &super::MoshiParameterContract,
     catalog: &C,
 ) -> Result<AtomicRecipeSet, String> {
-    let g = Geometry::new(config)?;
+    let config = contract.configuration();
+    let declarations = contract.declarations();
     let mut builder = RecipeBuilder::new(config, catalog);
-    match config.checkpoint_layout() {
-        CheckpointLayout::MoshiSafetensors => native_recipes(g, &mut builder)?,
-        CheckpointLayout::PersonaPlexPytorch => personaplex_recipes(g, &mut builder)?,
+    for extension in storage_extensions(config, declarations)? {
+        let target = extension.parameter.id.as_str();
+        if let Some(owner) = &extension.parameter.alias_of {
+            builder.alias(target, owner.as_str());
+            continue;
+        }
+        let source = extension
+            .source
+            .expect("owned Moshi parameter has a source");
+        let names = std::iter::once(source.key.clone()).chain(source.aliases.clone());
+        if source.matrix {
+            builder.matrix(target, names, &source.companion_prefix, extension.rows)?;
+        } else {
+            builder.vector(target, names, source.shape[0])?;
+        }
     }
     builder.publish()
 }
-
-#[derive(Clone, Copy)]
-struct Geometry {
-    temporal_dim: usize,
-    temporal_hidden: usize,
-    temporal_layers: usize,
-    depth_dim: usize,
-    depth_hidden: usize,
-    depth_layers: usize,
-    text_vocab: usize,
-    audio_vocab: usize,
-    audio_codebooks: usize,
-    depth_slices: usize,
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PhysicalSource {
+    key: String,
+    aliases: Vec<String>,
+    companion_prefix: String,
+    shape: Vec<usize>,
+    matrix: bool,
+    flattened: bool,
+}
+struct StorageExtension<'a> {
+    parameter: &'a eredu_nn::ParameterSpec,
+    source: Option<PhysicalSource>,
+    rows: Option<std::ops::Range<usize>>,
 }
 
-impl Geometry {
-    fn new(config: &MoshiConfig) -> Result<Self, String> {
-        Ok(Self {
-            temporal_dim: dim(config.temporal().hidden_size(), "temporal hidden size")?,
-            temporal_hidden: dim(
-                config.temporal().gated_hidden_size(),
-                "temporal gated width",
-            )?,
-            temporal_layers: dim(
-                config.temporal().num_hidden_layers(),
-                "temporal layer count",
-            )?,
-            depth_dim: dim(config.depth_template().hidden_size(), "depth hidden size")?,
-            depth_hidden: dim(
-                config.depth_template().gated_hidden_size(),
-                "depth gated width",
-            )?,
-            depth_layers: dim(
-                config.depth_template().num_hidden_layers(),
-                "depth layer count",
-            )?,
-            text_vocab: dim(config.text_vocabulary_size(), "text vocabulary size")?,
-            audio_vocab: dim(config.audio_vocabulary_size(), "audio vocabulary size")?,
-            audio_codebooks: config.frame_schedule().total_audio_codebooks(),
-            depth_slices: config.frame_schedule().depth_audio_codebooks(),
-        })
-    }
-    fn text_input(self) -> Result<usize, String> {
-        add(self.text_vocab, 1, "text input vocabulary")
-    }
-    fn audio_input(self) -> Result<usize, String> {
-        add(self.audio_vocab, 1, "audio input vocabulary")
-    }
-}
-
-fn native_catalog(
+fn storage_extensions<'a>(
     config: &MoshiConfig,
-    g: Geometry,
-    out: &mut Vec<SafetensorsTensorConstraint>,
-) -> Result<(), String> {
-    matrix_constraint(
-        config,
-        out,
-        "text_emb.weight",
-        [],
-        "text_emb",
-        vec![g.text_input()?, g.temporal_dim],
-    )?;
-    matrix_constraint(
-        config,
-        out,
-        "text_linear.weight",
-        [],
-        "text_linear",
-        vec![g.text_vocab, g.temporal_dim],
-    )?;
-    out.push(vector("out_norm.weight", g.temporal_dim, false));
-    for codebook in 0..g.audio_codebooks {
-        let name = format!("audio_embs.{codebook}.weight");
-        matrix_constraint(
-            config,
-            out,
-            &name,
-            [],
-            name.trim_end_matches(".weight"),
-            vec![g.audio_input()?, g.temporal_dim],
-        )?;
-    }
-    for layer in 0..g.temporal_layers {
-        block_catalog(
-            config,
-            out,
-            &format!("transformer.layers.{layer}"),
-            g.temporal_dim,
-            g.temporal_hidden,
-            false,
-        )?;
-    }
-    for slice in 0..g.depth_slices {
-        let root = format!("depformer.slices.{slice}");
-        for (local, shape) in [
-            (
-                "emb",
-                vec![
-                    if slice == 0 {
-                        g.text_input()?
-                    } else {
-                        g.audio_input()?
-                    },
-                    g.depth_dim,
-                ],
-            ),
-            ("linear_in", vec![g.depth_dim, g.temporal_dim]),
-            ("linear_out", vec![g.audio_vocab, g.depth_dim]),
-        ] {
-            let name = format!("{root}.{local}.weight");
-            matrix_constraint(
-                config,
-                out,
-                &name,
-                [],
-                name.trim_end_matches(".weight"),
-                shape,
-            )?;
-        }
-        for layer in 0..g.depth_layers {
-            block_catalog(
-                config,
-                out,
-                &format!("{root}.transformer.layers.{layer}"),
-                g.depth_dim,
-                g.depth_hidden,
-                false,
-            )?;
-        }
-    }
-    Ok(())
-}
-
-fn personaplex_catalog(
-    config: &MoshiConfig,
-    g: Geometry,
-    out: &mut Vec<SafetensorsTensorConstraint>,
-) -> Result<(), String> {
-    matrix_constraint(
-        config,
-        out,
-        "text_emb.weight",
-        [],
-        "text_emb",
-        vec![g.text_input()?, g.temporal_dim],
-    )?;
-    matrix_constraint(
-        config,
-        out,
-        "text_linear.weight",
-        [],
-        "text_linear",
-        vec![g.text_vocab, g.temporal_dim],
-    )?;
-    out.push(vector("out_norm.alpha", g.temporal_dim, true));
-    for codebook in 0..g.audio_codebooks {
-        let name = format!("emb.{codebook}.weight");
-        matrix_constraint(
-            config,
-            out,
-            &name,
-            [],
-            name.trim_end_matches(".weight"),
-            vec![g.audio_input()?, g.temporal_dim],
-        )?;
-    }
-    for layer in 0..g.temporal_layers {
-        block_catalog(
-            config,
-            out,
-            &format!("transformer.layers.{layer}"),
-            g.temporal_dim,
-            g.temporal_hidden,
-            true,
-        )?;
-    }
-    for slice in 0..g.depth_slices {
-        let embedding = if slice == 0 {
-            "depformer_text_emb.weight".into()
-        } else {
-            format!("depformer_emb.{}.weight", slice - 1)
-        };
-        for (name, shape) in [
-            (
-                embedding,
-                vec![
-                    if slice == 0 {
-                        g.text_input()?
-                    } else {
-                        g.audio_input()?
-                    },
-                    g.depth_dim,
-                ],
-            ),
-            (
-                format!("depformer_in.{slice}.weight"),
-                vec![g.depth_dim, g.temporal_dim],
-            ),
-            (
-                format!("linears.{slice}.weight"),
-                vec![g.audio_vocab, g.depth_dim],
-            ),
-        ] {
-            matrix_constraint(
-                config,
-                out,
-                &name,
-                [],
-                name.trim_end_matches(".weight"),
-                shape,
-            )?;
-        }
-    }
-    for layer in 0..g.depth_layers {
-        let root = format!("depformer.layers.{layer}");
-        out.push(vector(format!("{root}.norm1.alpha"), g.depth_dim, true));
-        out.push(vector(format!("{root}.norm2.alpha"), g.depth_dim, true));
-        matrix_constraint(
-            config,
-            out,
-            &format!("{root}.self_attn.in_proj_weight"),
-            [format!("{root}.self_attn.in_proj.weight")],
-            &format!("{root}.self_attn.in_proj"),
-            vec![
-                mul(
-                    mul(g.depth_slices, 3, "depth QKV count")?,
-                    g.depth_dim,
-                    "packed depth QKV rows",
-                )?,
-                g.depth_dim,
-            ],
-        )?;
-        let output = format!("{root}.self_attn.out_proj.weight");
-        matrix_constraint(
-            config,
-            out,
-            &output,
-            [],
-            output.trim_end_matches(".weight"),
-            vec![
-                mul(g.depth_slices, g.depth_dim, "packed depth output rows")?,
-                g.depth_dim,
-            ],
-        )?;
-        for slice in 0..g.depth_slices {
-            for (local, shape) in [
-                (
-                    "linear_in",
-                    vec![mul(2, g.depth_hidden, "depth gated rows")?, g.depth_dim],
-                ),
-                ("linear_out", vec![g.depth_dim, g.depth_hidden]),
-            ] {
-                let name = format!("{root}.gating.{slice}.{local}.weight");
-                matrix_constraint(
-                    config,
-                    out,
-                    &name,
-                    [],
-                    name.trim_end_matches(".weight"),
-                    shape,
-                )?;
+    declarations: &'a super::declarations::Declarations,
+) -> Result<Vec<StorageExtension<'a>>, String> {
+    use eredu_nn::{DeclareLogicalParameters, LogicalParameterRole};
+    declarations
+        .logical_parameters()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|declaration| {
+            let parameter = declaration.parameter;
+            if parameter.alias_of.is_some() {
+                return Ok(StorageExtension {
+                    parameter,
+                    source: None,
+                    rows: None,
+                });
             }
-        }
-    }
-    Ok(())
-}
-
-fn block_catalog(
-    config: &MoshiConfig,
-    out: &mut Vec<SafetensorsTensorConstraint>,
-    root: &str,
-    hidden: usize,
-    gated: usize,
-    pytorch: bool,
-) -> Result<(), String> {
-    let suffix = if pytorch { "alpha" } else { "weight" };
-    out.push(vector(format!("{root}.norm1.{suffix}"), hidden, pytorch));
-    out.push(vector(format!("{root}.norm2.{suffix}"), hidden, pytorch));
-    let input = if pytorch {
-        format!("{root}.self_attn.in_proj_weight")
-    } else {
-        format!("{root}.self_attn.in_proj.weight")
-    };
-    let aliases = pytorch.then(|| format!("{root}.self_attn.in_proj.weight"));
-    matrix_constraint(
-        config,
-        out,
-        &input,
-        aliases,
-        &format!("{root}.self_attn.in_proj"),
-        vec![mul(3, hidden, "QKV rows")?, hidden],
-    )?;
-    for (local, shape) in [
-        ("self_attn.out_proj", vec![hidden, hidden]),
-        (
-            "gating.linear_in",
-            vec![mul(2, gated, "gated rows")?, hidden],
-        ),
-        ("gating.linear_out", vec![hidden, gated]),
-    ] {
-        let name = format!("{root}.{local}.weight");
-        matrix_constraint(
-            config,
-            out,
-            &name,
-            [],
-            name.trim_end_matches(".weight"),
-            shape,
-        )?;
-    }
-    Ok(())
+            let canonical = parameter.id.as_str();
+            let matrix = matches!(
+                declaration.role,
+                LogicalParameterRole::LinearWeight | LogicalParameterRole::Embedding
+            );
+            if !matrix && declaration.role != LogicalParameterRole::Normalization {
+                return Err(format!("unsupported Moshi parameter role for {canonical}"));
+            }
+            let mut source = PhysicalSource {
+                key: canonical.into(),
+                aliases: Vec::new(),
+                companion_prefix: canonical.trim_end_matches(".weight").into(),
+                shape: declaration.shape,
+                matrix,
+                flattened: false,
+            };
+            let mut rows = None;
+            if config.checkpoint_layout() == CheckpointLayout::PersonaPlexPytorch {
+                if canonical == "out_norm.weight" {
+                    source.key = "out_norm.alpha".into();
+                    source.flattened = true;
+                } else if let Some(local) = canonical.strip_prefix("audio_embs.") {
+                    source.key = format!("emb.{local}");
+                } else if let Some(local) = canonical.strip_prefix("depformer.slices.") {
+                    let (slice, local) = local
+                        .split_once('.')
+                        .ok_or_else(|| format!("invalid Moshi depth identity {canonical}"))?;
+                    let slice: usize = slice
+                        .parse()
+                        .map_err(|_| format!("invalid Moshi depth slice {canonical}"))?;
+                    source.key = match local {
+                        "emb.weight" if slice == 0 => "depformer_text_emb.weight".into(),
+                        "emb.weight" => format!("depformer_emb.{}.weight", slice - 1),
+                        "linear_in.weight" => format!("depformer_in.{slice}.weight"),
+                        "linear_out.weight" => format!("linears.{slice}.weight"),
+                        _ => {
+                            let local =
+                                local.strip_prefix("transformer.layers.").ok_or_else(|| {
+                                    format!("unknown Moshi depth parameter {canonical}")
+                                })?;
+                            let (layer, local) = local
+                                .split_once('.')
+                                .ok_or_else(|| format!("invalid Moshi depth block {canonical}"))?;
+                            let root = format!("depformer.layers.{layer}");
+                            match local {
+                                "norm1.weight" | "norm2.weight" => {
+                                    source.flattened = true;
+                                    format!("{root}.{}.alpha", local.trim_end_matches(".weight"))
+                                }
+                                "self_attn.in_proj.weight" | "self_attn.out_proj.weight" => {
+                                    let width = source.shape[0];
+                                    let start = mul(slice, width, "depth projection row offset")?;
+                                    rows =
+                                        Some(start..add(start, width, "depth projection row end")?);
+                                    source.shape[0] = mul(
+                                        declarations.depth.len(),
+                                        width,
+                                        "packed depth projection rows",
+                                    )?;
+                                    format!("{root}.{local}")
+                                }
+                                "gating.linear_in.weight" | "gating.linear_out.weight" => format!(
+                                    "{root}.gating.{slice}.{}",
+                                    local.strip_prefix("gating.").unwrap()
+                                ),
+                                _ => {
+                                    return Err(format!(
+                                        "unknown Moshi depth parameter {canonical}"
+                                    ));
+                                }
+                            }
+                        }
+                    };
+                }
+                // Physical alpha tensors and packed QKV spellings are source-format rules.
+                if source.key.starts_with("transformer.layers.") && !matrix {
+                    source.key = format!("{}.alpha", source.key.trim_end_matches(".weight"));
+                    source.flattened = true;
+                }
+                if source.key.ends_with(".self_attn.in_proj.weight") {
+                    let dotted = source.key.clone();
+                    source.key = format!("{}_weight", dotted.trim_end_matches(".weight"));
+                    source.aliases.push(dotted);
+                }
+                source.companion_prefix = source
+                    .key
+                    .strip_suffix("_weight")
+                    .filter(|_| source.key.ends_with(".in_proj_weight"))
+                    .unwrap_or_else(|| source.key.trim_end_matches(".weight"))
+                    .into();
+            }
+            Ok(StorageExtension {
+                parameter,
+                source: Some(source),
+                rows,
+            })
+        })
+        .collect()
 }
 
 fn matrix_constraint(
@@ -374,35 +232,14 @@ fn matrix_constraint(
     let Some(quantization) = config.native_quantization() else {
         out.push(
             SafetensorsTensorConstraint::required(name, shape, StoredDtypeConstraint::Floating)
-                .with_aliases(aliases),
+                .with_aliases(aliases)
+                .with_linear_format(eredu_checkpoint::LinearFormat::Dense),
         );
         return Ok(());
     };
     if matches!(quantization, WeightQuantization::GgufIQuant { .. }) {
         return Err("Moshi SafeTensors cannot use GGUF quantization".into());
     }
-    let input = *shape
-        .last()
-        .ok_or_else(|| format!("matrix {name:?} is scalar"))?;
-    let group = dim(quantization.group_size(), "quantization group size")?;
-    let bits = dim(quantization.bits(), "quantization bit width")?;
-    let packed_bits = mul(input, bits, "packed input")?;
-    if !input.is_multiple_of(group) || !input.is_multiple_of(32) || !packed_bits.is_multiple_of(32)
-    {
-        return Err(format!("quantized Moshi tensor {name:?} input dimension {input} is incompatible with group size {group} and {bits}-bit packing"));
-    }
-    let mut packed = shape.clone();
-    *packed.last_mut().unwrap() = packed_bits / 32;
-    let mut companion = shape;
-    *companion.last_mut().unwrap() = input / group;
-    out.push(
-        SafetensorsTensorConstraint::required(
-            name,
-            packed,
-            StoredDtypeConstraint::Exact(StoredDtype::U32),
-        )
-        .with_aliases(aliases),
-    );
     let dtype = match config.checkpoint_layout() {
         CheckpointLayout::PersonaPlexPytorch => StoredDtypeConstraint::OneOf(vec![
             StoredDtype::F16,
@@ -417,24 +254,30 @@ fn matrix_constraint(
             WeightQuantization::GgufIQuant { .. } => unreachable!(),
         },
     };
-    out.push(
-        SafetensorsTensorConstraint::required(
-            format!("{companion_prefix}.scales"),
-            companion.clone(),
-            dtype.clone(),
-        )
-        .companion(),
-    );
-    if quantization.has_biases() {
-        out.push(
-            SafetensorsTensorConstraint::required(
-                format!("{companion_prefix}.biases"),
-                companion,
-                dtype,
-            )
-            .companion(),
-        );
+    let mut constraints =
+        eredu_checkpoint::schema::matrix_for_packed_words(name, aliases, shape, quantization, None)
+            .map_err(|error| error.to_string())?;
+    for constraint in &mut constraints {
+        match &constraint.linear_companion {
+            None => constraint.linear_format = Some(quantization.into()),
+            Some(companion) => {
+                use eredu_checkpoint::schema::LinearCompanionKind;
+                let suffix = match companion.kind {
+                    LinearCompanionKind::Scale => "scales",
+                    LinearCompanionKind::AffineBias => "biases",
+                    LinearCompanionKind::GlobalScale => {
+                        return Err("Moshi packed source has no global scale companion".into());
+                    }
+                };
+                // Published companion names and dtypes are source-layout rules.
+                // Weight aliases do not grant additional companion spellings.
+                constraint.key = format!("{companion_prefix}.{suffix}");
+                constraint.aliases.clear();
+                constraint.dtype = dtype.clone();
+            }
+        }
     }
+    out.extend(constraints);
     Ok(())
 }
 
@@ -453,178 +296,6 @@ fn vector(
     } else {
         value
     }
-}
-
-fn native_recipes<C: RecipeCatalog + ?Sized>(
-    g: Geometry,
-    b: &mut RecipeBuilder<'_, C>,
-) -> Result<(), String> {
-    b.matrix("text_emb.weight", ["text_emb.weight"], "text_emb", None)?;
-    b.matrix(
-        "text_linear.weight",
-        ["text_linear.weight"],
-        "text_linear",
-        None,
-    )?;
-    b.vector("out_norm.weight", ["out_norm.weight"], g.temporal_dim)?;
-    for codebook in 0..g.audio_codebooks {
-        let name = format!("audio_embs.{codebook}.weight");
-        b.matrix(&name, [&name], name.trim_end_matches(".weight"), None)?;
-    }
-    for layer in 0..g.temporal_layers {
-        let root = format!("transformer.layers.{layer}");
-        direct_block(g.temporal_dim, &root, b)?;
-    }
-    for slice in 0..g.depth_slices {
-        let root = format!("depformer.slices.{slice}");
-        for local in ["emb", "linear_in", "linear_out"] {
-            let name = format!("{root}.{local}.weight");
-            b.matrix(&name, [&name], name.trim_end_matches(".weight"), None)?;
-        }
-        for layer in 0..g.depth_layers {
-            direct_block(
-                g.depth_dim,
-                &format!("{root}.transformer.layers.{layer}"),
-                b,
-            )?;
-        }
-    }
-    Ok(())
-}
-
-fn personaplex_recipes<C: RecipeCatalog + ?Sized>(
-    g: Geometry,
-    b: &mut RecipeBuilder<'_, C>,
-) -> Result<(), String> {
-    b.matrix("text_emb.weight", ["text_emb.weight"], "text_emb", None)?;
-    b.matrix(
-        "text_linear.weight",
-        ["text_linear.weight"],
-        "text_linear",
-        None,
-    )?;
-    b.vector("out_norm.weight", ["out_norm.alpha"], g.temporal_dim)?;
-    for codebook in 0..g.audio_codebooks {
-        b.matrix(
-            &format!("audio_embs.{codebook}.weight"),
-            [format!("emb.{codebook}.weight")],
-            &format!("emb.{codebook}"),
-            None,
-        )?;
-    }
-    for layer in 0..g.temporal_layers {
-        let root = format!("transformer.layers.{layer}");
-        for norm in ["norm1", "norm2"] {
-            b.vector(
-                &format!("{root}.{norm}.weight"),
-                [format!("{root}.{norm}.alpha")],
-                g.temporal_dim,
-            )?;
-        }
-        let canonical = format!("{root}.self_attn.in_proj.weight");
-        let underscored = format!("{root}.self_attn.in_proj_weight");
-        b.matrix(
-            &canonical,
-            [underscored.clone(), canonical.clone()],
-            &format!("{root}.self_attn.in_proj"),
-            None,
-        )?;
-        for local in [
-            "self_attn.out_proj",
-            "gating.linear_in",
-            "gating.linear_out",
-        ] {
-            let name = format!("{root}.{local}.weight");
-            b.matrix(&name, [&name], name.trim_end_matches(".weight"), None)?;
-        }
-    }
-    for slice in 0..g.depth_slices {
-        let root = format!("depformer.slices.{slice}");
-        let embedding = if slice == 0 {
-            "depformer_text_emb.weight".into()
-        } else {
-            format!("depformer_emb.{}.weight", slice - 1)
-        };
-        for (local, source) in [
-            ("emb", embedding),
-            ("linear_in", format!("depformer_in.{slice}.weight")),
-            ("linear_out", format!("linears.{slice}.weight")),
-        ] {
-            b.matrix(
-                &format!("{root}.{local}.weight"),
-                [source.clone()],
-                source.trim_end_matches(".weight"),
-                None,
-            )?;
-        }
-    }
-    for layer in 0..g.depth_layers {
-        let physical = format!("depformer.layers.{layer}");
-        for norm in ["norm1", "norm2"] {
-            let owner = format!("depformer.slices.0.transformer.layers.{layer}.{norm}.weight");
-            b.vector(&owner, [format!("{physical}.{norm}.alpha")], g.depth_dim)?;
-            for slice in 1..g.depth_slices {
-                b.alias(
-                    format!("depformer.slices.{slice}.transformer.layers.{layer}.{norm}.weight"),
-                    owner.clone(),
-                );
-            }
-        }
-        for slice in 0..g.depth_slices {
-            let canonical = format!("depformer.slices.{slice}.transformer.layers.{layer}");
-            b.matrix(
-                &format!("{canonical}.self_attn.in_proj.weight"),
-                [
-                    format!("{physical}.self_attn.in_proj_weight"),
-                    format!("{physical}.self_attn.in_proj.weight"),
-                ],
-                &format!("{physical}.self_attn.in_proj"),
-                Some(slice * 3 * g.depth_dim..(slice + 1) * 3 * g.depth_dim),
-            )?;
-            b.matrix(
-                &format!("{canonical}.self_attn.out_proj.weight"),
-                [format!("{physical}.self_attn.out_proj.weight")],
-                &format!("{physical}.self_attn.out_proj"),
-                Some(slice * g.depth_dim..(slice + 1) * g.depth_dim),
-            )?;
-            for local in ["linear_in", "linear_out"] {
-                let source = format!("{physical}.gating.{slice}.{local}.weight");
-                b.matrix(
-                    &format!("{canonical}.gating.{local}.weight"),
-                    [source.clone()],
-                    source.trim_end_matches(".weight"),
-                    None,
-                )?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn direct_block<C: RecipeCatalog + ?Sized>(
-    hidden: usize,
-    root: &str,
-    b: &mut RecipeBuilder<'_, C>,
-) -> Result<(), String> {
-    for norm in ["norm1", "norm2"] {
-        let name = format!("{root}.{norm}.weight");
-        b.vector(&name, [name.clone()], hidden)?;
-    }
-    for local in [
-        "self_attn.in_proj",
-        "self_attn.out_proj",
-        "gating.linear_in",
-        "gating.linear_out",
-    ] {
-        let name = format!("{root}.{local}.weight");
-        b.matrix(
-            &name,
-            [name.clone()],
-            name.trim_end_matches(".weight"),
-            None,
-        )?;
-    }
-    Ok(())
 }
 
 struct RecipeBuilder<'a, C: ?Sized> {
@@ -748,12 +419,6 @@ fn resolve_source<C: RecipeCatalog + ?Sized>(
     }
 }
 
-fn dim(value: i32, name: &str) -> Result<usize, String> {
-    usize::try_from(value)
-        .ok()
-        .filter(|value| *value > 0)
-        .ok_or_else(|| format!("Moshi {name} must be positive, got {value}"))
-}
 fn add(left: usize, right: usize, name: &str) -> Result<usize, String> {
     left.checked_add(right)
         .ok_or_else(|| format!("Moshi {name} geometry overflows"))

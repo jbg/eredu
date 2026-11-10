@@ -40,7 +40,7 @@ result to any intervening `component_transforms`, including causal convolutions
 and shared relative-position projections. Logical repeated
 invocations have distinct component IDs and the same `shared_weight` identities.
 
-Architecture descriptor schema 14 carries component schema 13, including
+Architecture descriptor schema 15 carries component schema 13, including
 `ComponentRead::input_projections` and explicit shared-state read sources. Check
 the descriptor version before interpreting these relationships. An empty chain
 reads the source group's normalized input directly; the default source is the

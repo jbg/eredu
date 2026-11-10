@@ -1,9 +1,9 @@
 //! Backend-neutral Llama/Mistral/Phi-4 decoder implementation.
 
-mod checkpoint;
+pub(crate) mod checkpoint;
 mod config;
 
-pub(crate) use checkpoint::translate_gguf_weight_name_for_model;
+pub(crate) use checkpoint::{gguf_parameter_name, translate_gguf_weight_name_for_model};
 pub use checkpoint::{
     gguf_plan, load_time_quantization, safetensors_plan, translate_gguf_weight_name,
     with_checkpoint_formats, SafetensorsPlanError,
@@ -14,9 +14,8 @@ pub use config::{
 };
 
 pub use crate::decoder::{
-    cache_layout, cache_layout_with_key_value_heads, create_caches, dense_parameter_description,
-    layer_parallel_parameter_groups, partition_local_geometry, state_layout,
-    static_parallel_parameter_groups, validate_caches, Attention, AttentionInput,
+    cache_layout, cache_layout_with_attention_geometry, create_caches, dense_parameter_description,
+    partition_local_geometry, state_layout, validate_caches, Attention, AttentionInput,
     AttentionProjection, Config, ForwardContext, LayeredInput, Mlp, PartitionLocalGeometry,
     PartitionStaticModules, StaticModules, TransformerBlock,
 };
@@ -52,81 +51,19 @@ pub fn state_identity(
     .map_err(Error::backend)
 }
 
-/// Derives rank-local construction geometry for one tensor-parallel block.
-pub fn local_block_args(
-    args: &ModelArgs,
-    layer: usize,
-    layout: &eredu_runtime::LocalModelLayout,
-) -> Result<ModelArgs, ParallelPlanError> {
-    if args.model_type == "phi3" {
-        return crate::decoder::PartitionedConfig::local_block_config(args, layer, layout)
-            .map_err(|error| ParallelPlanError::InvalidTensor(error.to_string()));
-    }
-    let prefix = format!("model.layers.{layer}");
-    let tensor = |suffix: &str| {
-        layout
-            .tensor(&format!("{prefix}.{suffix}.weight"))
-            .ok_or_else(|| {
-                ParallelPlanError::InvalidTensor(format!(
-                    "missing local layout for {prefix}.{suffix}.weight"
-                ))
-            })
-    };
-    let query = tensor("self_attn.q_proj")?;
-    let key = tensor("self_attn.k_proj")?;
-    let gate = tensor("mlp.gate_proj")?;
-    let query_width = i32::try_from(*query.local_shape().first().ok_or_else(|| {
-        ParallelPlanError::InvalidTensor("local Llama query projection is scalar".into())
-    })?)
-    .map_err(|_| ParallelPlanError::InvalidTensor("local Llama query width exceeds i32".into()))?;
-    let key_width = i32::try_from(*key.local_shape().first().ok_or_else(|| {
-        ParallelPlanError::InvalidTensor("local Llama key projection is scalar".into())
-    })?)
-    .map_err(|_| ParallelPlanError::InvalidTensor("local Llama key width exceeds i32".into()))?;
-    if query_width <= 0
-        || key_width <= 0
-        || query_width % args.head_dim != 0
-        || key_width % args.head_dim != 0
-    {
-        return Err(ParallelPlanError::InvalidTensor(format!(
-            "local Llama attention widths q={query_width}, k={key_width} split head dimension {}",
-            args.head_dim
-        )));
-    }
-    let mut local = args.clone();
-    local.num_attention_heads = query_width / args.head_dim;
-    local.num_key_value_heads = key_width / args.head_dim;
-    local.intermediate_size = i32::try_from(*gate.local_shape().first().ok_or_else(|| {
-        ParallelPlanError::InvalidTensor("local Llama gate projection is scalar".into())
-    })?)
-    .map_err(|_| ParallelPlanError::InvalidTensor("local Llama MLP width exceeds i32".into()))?;
-    if local.intermediate_size <= 0 {
-        return Err(ParallelPlanError::InvalidTensor(
-            "local Llama MLP width must be positive".into(),
-        ));
-    }
-    Ok(local)
-}
-
-/// Returns the rank-local key/value head count for every decoder layer.
-pub fn local_key_value_heads(
-    args: &ModelArgs,
-    layout: &eredu_runtime::LocalModelLayout,
-) -> Result<Vec<i32>, ParallelPlanError> {
-    (0..args.num_hidden_layers as usize)
-        .map(|layer| Ok(local_block_args(args, layer, layout)?.num_key_value_heads))
-        .collect()
-}
-
 /// Complete rank-local geometry for the canonical neutral Llama model.
 pub type LocalGeometry = crate::decoder::LocalGeometry<ModelArgs>;
 
 /// Derives Llama unit, vocabulary, and state geometry from one typed plan.
 pub fn local_geometry(
     args: &ModelArgs,
+    declaration: &crate::decoder::DecoderDeclaration,
     layout: &eredu_runtime::LocalModelLayout,
 ) -> Result<LocalGeometry, ParallelPlanError> {
-    crate::decoder::local_geometry(args, layout, local_block_args)
+    crate::decoder::local_geometry(args, declaration, layout, |config, layer, layout| {
+        crate::decoder::PartitionedConfig::local_block_config(config, layer, layout)
+            .map_err(|error| ParallelPlanError::InvalidTensor(error.to_string()))
+    })
 }
 
 /// Shared dense-decoder lifecycle specialized to Llama configuration policy.
@@ -152,4 +89,23 @@ impl crate::decoder::PartitionedConfig for ModelArgs {
         self.intermediate_size = intermediate;
         Ok(())
     }
+}
+
+/// Projects formats only after proving that geometry, sharing and equations are unchanged.
+pub(crate) fn project_declaration_formats(
+    declaration: &crate::decoder::DecoderDeclaration,
+    source: &ModelArgs,
+    selected: &ModelArgs,
+) -> Result<crate::decoder::DecoderDeclaration, Error> {
+    declaration.validate_for(source)?;
+    let mut policy = selected.clone();
+    policy.quantization = source.quantization;
+    policy.quantized_weights = source.quantized_weights.clone();
+    policy.quantized_weight_configs = source.quantized_weight_configs.clone();
+    if policy.architecture_fingerprint() != source.architecture_fingerprint() {
+        return Err(Error::backend(
+            "Llama format projection changes architecture policy",
+        ));
+    }
+    declaration.with_formats(selected)
 }

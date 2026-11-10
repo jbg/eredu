@@ -201,15 +201,21 @@ fn materialize(
     weights_stream: &Stream,
     execution_stream: &Stream,
 ) -> Result<(MlxTtsTransformer, LayerwiseModelMetadata), BackendFailure> {
+    if prepared.local_layout() != parallel.map(|(layout, _)| layout) {
+        return Err(BackendFailure::from_error(TransformerError::Configuration(
+            "TTS parameter placement differs from selected execution",
+        )));
+    }
     detached_preparation(
         Vec::<Array>::new(),
         || {
-            let (config, definition, layout, source, units) = prepared.into_parts();
-            let kernel = match parallel {
-                Some((local, _)) => {
-                    TransformerKernel::<MlxNeuralBackend>::new_parallel(config, local)
+            let (declaration, selected, layout, source, units) = prepared.into_parts();
+            let definition = declaration.definition().clone();
+            let kernel = match selected.as_ref() {
+                Some(local) => {
+                    TransformerKernel::<MlxNeuralBackend>::new_parallel(declaration, local)
                 }
-                None => TransformerKernel::<MlxNeuralBackend>::new(config),
+                None => TransformerKernel::<MlxNeuralBackend>::new(declaration),
             }
             .map_err(BackendFailure::from_error)?;
             let mut architecture = eredu_runtime::ComponentAdapter::new(definition, kernel)

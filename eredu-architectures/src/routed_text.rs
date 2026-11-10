@@ -616,11 +616,9 @@ where
     )
     .map_err(|error| error.to_string())?;
     let config = diffusion_args(inspection).ok_or("missing admitted diffusion geometry")?;
-    let mut target = config.clone();
-    target.text.weight_quantization = None;
-    target.text.quantized_weights = None;
-    let formats = selected.text().quantized_formats();
-    target.text.quantized_weight_configs = (!formats.is_empty()).then_some(formats);
+    let target = config
+        .with_text_formats(selected.text().quantized_formats())
+        .map_err(|e| e.to_string())?;
     let identity = target.architecture_fingerprint();
     let capability =
         crate::capability::diffusion_gemma(&target).map_err(|error| error.to_string())?;
@@ -641,8 +639,7 @@ where
         })
         .transpose()
         .map_err(|error| error.to_string())?;
-    let definition = crate::diffusion_gemma::model::project_parameters(&target, &retained)
-        .map_err(|error| error.to_string())?;
+    let definition = crate::replicated_text::executable_component(selected.text())?;
     let architecture = crate::diffusion_gemma::model::TextKernel::<B>::from_definition(
         target, definition, context,
     )
@@ -689,13 +686,30 @@ where
     let args = k2_horizon_args(inspection).ok_or("expected K2 Horizon configuration")?;
     let selected_args = crate::replicated_text::selected_k2_horizon_args(args, selected.text())?;
     let identity = crate::k2_horizon::prompt_cache_architecture_fingerprint(&selected_args);
+    let source_declaration = inspection.architecture_plan().k2_declaration(args)?;
+    let target_declaration = inspection
+        .architecture_plan()
+        .k2_declaration(&selected_args)?;
     let capability =
-        crate::capability::k2_horizon(&selected_args).map_err(|error| error.to_string())?;
+        crate::capability::k2_horizon(&target_declaration).map_err(|error| error.to_string())?;
     let (architecture, source_architecture) = crate::replicated_text::materialize_decoder::<
         B,
         crate::k2_horizon::ModelArgs,
         crate::k2_horizon::BlockFactory,
-    >(args, selected_args, selected.text(), context)
+    >(
+        args,
+        selected_args,
+        &crate::replicated_text::DecoderConstructionScopes {
+            source: source_declaration.common().clone(),
+            selected: target_declaration.common().clone(),
+        },
+        Some((
+            source_declaration.projections().expect("routed K2 source"),
+            target_declaration.projections().expect("routed K2 target"),
+        )),
+        selected.text(),
+        context,
+    )
     .map_err(|error| error.to_string())?;
     prepare_routed_architecture_handoff::<B, S, _>(
         architecture,
@@ -761,13 +775,38 @@ where
         .map_err(RoutedTextPreparationError::Invalid)?;
     let prompt_cache_architecture_identity =
         crate::qwen::prompt_cache_architecture_fingerprint(&selected_args);
+    let source_declaration = inspection
+        .architecture_plan()
+        .qwen_declaration(args)
+        .map_err(RoutedTextPreparationError::Invalid)?;
+    let target_declaration = inspection
+        .architecture_plan()
+        .qwen_declaration(&selected_args)
+        .map_err(RoutedTextPreparationError::Invalid)?;
     let (architecture, source_architecture) = crate::replicated_text::materialize_decoder::<
         B,
         crate::qwen::ModelArgs,
         crate::qwen::RoutedQwenBlockFactory,
-    >(args, selected_args, &text, context)
+    >(
+        args,
+        selected_args,
+        &crate::replicated_text::DecoderConstructionScopes {
+            source: source_declaration.common().clone(),
+            selected: target_declaration.common().clone(),
+        },
+        Some((
+            source_declaration
+                .projections()
+                .expect("routed Qwen source"),
+            target_declaration
+                .projections()
+                .expect("routed Qwen selected"),
+        )),
+        &text,
+        context,
+    )
     .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
-    let capability_estimate = crate::capability::qwen(args)
+    let capability_estimate = crate::capability::qwen(&source_declaration)
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let targets =
         addressable_parameter_targets::<GatedProductOperation>(bank_residency, &plan, &catalog);
@@ -843,13 +882,34 @@ where
         .map_err(RoutedTextPreparationError::Invalid)?;
     let prompt_cache_architecture_identity =
         crate::gpt_oss::prompt_cache_architecture_fingerprint(&selected_args);
+    let source_declaration = inspection
+        .architecture_plan()
+        .gpt_oss_declaration(args)
+        .map_err(RoutedTextPreparationError::Invalid)?;
+    let target_declaration = inspection
+        .architecture_plan()
+        .gpt_oss_declaration(&selected_args)
+        .map_err(RoutedTextPreparationError::Invalid)?;
     let (architecture, source_architecture) = crate::replicated_text::materialize_decoder::<
         B,
         crate::gpt_oss::ModelArgs,
         crate::gpt_oss::GptOssBlockFactory,
-    >(args, selected_args, &text, context)
+    >(
+        args,
+        selected_args,
+        &crate::replicated_text::DecoderConstructionScopes {
+            source: source_declaration.common().clone(),
+            selected: target_declaration.common().clone(),
+        },
+        Some((
+            source_declaration.projections(),
+            target_declaration.projections(),
+        )),
+        &text,
+        context,
+    )
     .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
-    let capability_estimate = crate::capability::gpt_oss(args)
+    let capability_estimate = crate::capability::gpt_oss(&source_declaration)
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let targets =
         addressable_parameter_targets::<GatedProductOperation>(bank_residency, &plan, &catalog);
@@ -933,8 +993,18 @@ where
     let source_architecture = text
         .uses_weight_transform()
         .then(|| {
-            let definition = crate::lfm2::project_parameters(args, &retained)?;
-            crate::lfm2::CompleteLfm2Kernel::<B>::from_definition(args.clone(), definition, context)
+            let declaration = inspection
+                .architecture_plan()
+                .lfm2_declaration(args)
+                .map_err(eredu_nn::Error::backend)?;
+            let definition =
+                retained.project_parameters(declaration.definition().parameters().clone())?;
+            crate::lfm2::CompleteLfm2Kernel::<B>::from_selected_declaration(
+                declaration,
+                definition,
+                None,
+                context,
+            )
         })
         .transpose()
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
@@ -942,13 +1012,26 @@ where
         .map_err(RoutedTextPreparationError::Invalid)?;
     let prompt_cache_architecture_identity =
         crate::lfm2::prompt_cache_architecture_fingerprint(&selected_args);
-    let definition = crate::lfm2::project_parameters(&selected_args, &retained)
-        .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
-    let architecture =
-        crate::lfm2::CompleteLfm2Kernel::<B>::from_definition(selected_args, definition, context)
-            .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
-    let capability_estimate = crate::capability::lfm2(args)
-        .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
+    let definition = crate::replicated_text::executable_component(&text)
+        .map_err(RoutedTextPreparationError::Invalid)?;
+    let architecture = crate::lfm2::CompleteLfm2Kernel::<B>::from_selected_declaration(
+        inspection
+            .architecture_plan()
+            .lfm2_declaration(&selected_args)
+            .map_err(RoutedTextPreparationError::Invalid)?,
+        definition,
+        None,
+        context,
+    )
+    .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
+    let capability_estimate = crate::capability::lfm2(
+        inspection
+            .architecture_plan()
+            .lfm2_declaration(args)
+            .map_err(RoutedTextPreparationError::Invalid)?
+            .as_ref(),
+    )
+    .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let targets =
         addressable_parameter_targets::<GatedProductOperation>(bank_residency, &plan, &catalog);
     let prepared =
@@ -1041,10 +1124,16 @@ where
     let source_architecture = text
         .uses_weight_transform()
         .then(|| {
-            let definition = crate::kimi_linear::project_parameters(args, &retained)?;
-            crate::kimi_linear::CompleteKimiKernel::<B>::from_definition(
-                args.clone(),
+            let declaration = inspection
+                .architecture_plan()
+                .kimi_declaration(args)
+                .map_err(eredu_nn::Error::backend)?;
+            let definition =
+                retained.project_parameters(declaration.definition().parameters().clone())?;
+            crate::kimi_linear::CompleteKimiKernel::<B>::from_selected_declaration(
+                declaration,
                 definition,
+                None,
                 context,
             )
         })
@@ -1054,16 +1143,26 @@ where
         .map_err(RoutedTextPreparationError::Invalid)?;
     let prompt_cache_architecture_identity =
         crate::kimi_linear::prompt_cache_architecture_fingerprint(&selected_args);
-    let definition = crate::kimi_linear::project_parameters(&selected_args, &retained)
-        .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
-    let architecture = crate::kimi_linear::CompleteKimiKernel::<B>::from_definition(
-        selected_args,
+    let definition = crate::replicated_text::executable_component(&text)
+        .map_err(RoutedTextPreparationError::Invalid)?;
+    let architecture = crate::kimi_linear::CompleteKimiKernel::<B>::from_selected_declaration(
+        inspection
+            .architecture_plan()
+            .kimi_declaration(&selected_args)
+            .map_err(RoutedTextPreparationError::Invalid)?,
         definition,
+        None,
         context,
     )
     .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
-    let capability_estimate = crate::capability::kimi_linear(args)
-        .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
+    let capability_estimate = crate::capability::kimi_linear(
+        inspection
+            .architecture_plan()
+            .kimi_declaration(args)
+            .map_err(RoutedTextPreparationError::Invalid)?
+            .as_ref(),
+    )
+    .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let targets =
         addressable_parameter_targets::<GatedProductOperation>(bank_residency, &plan, &catalog);
     let prepared =
@@ -1166,8 +1265,8 @@ where
         .map_err(RoutedTextPreparationError::Invalid)?;
     let prompt_cache_architecture_identity =
         crate::qwen::hybrid::prompt_cache_architecture_fingerprint(&selected_args);
-    let definition = crate::qwen::hybrid::project_parameters(&selected_args, &retained)
-        .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
+    let definition = crate::replicated_text::executable_component(&text)
+        .map_err(RoutedTextPreparationError::Invalid)?;
     let architecture =
         crate::qwen::hybrid::QwenKernel::<B>::from_definition(selected_args, definition, context)
             .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
@@ -1269,8 +1368,8 @@ where
         .map_err(RoutedTextPreparationError::Invalid)?;
     let prompt_cache_architecture_identity =
         crate::deepseek::v3_architecture_fingerprint(&selected_args);
-    let definition = crate::deepseek::v3::project_parameters(&selected_args, &retained)
-        .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
+    let definition = crate::replicated_text::executable_component(&text)
+        .map_err(RoutedTextPreparationError::Invalid)?;
     let architecture =
         crate::deepseek::v3::V3Kernel::<B>::from_definition(selected_args, definition, context)
             .and_then(|kernel| kernel.into_model())
@@ -1373,8 +1472,8 @@ where
         .map_err(RoutedTextPreparationError::Invalid)?;
     let prompt_cache_architecture_identity =
         crate::deepseek::v4_architecture_fingerprint(&selected_args);
-    let definition = crate::deepseek::v4::project_parameters(&selected_args, &retained)
-        .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
+    let definition = crate::replicated_text::executable_component(&text)
+        .map_err(RoutedTextPreparationError::Invalid)?;
     let architecture =
         crate::deepseek::v4::V4Kernel::<B>::from_definition(selected_args, definition, context)
             .and_then(|kernel| kernel.into_model())
@@ -1470,10 +1569,16 @@ where
     let source_architecture = text
         .uses_weight_transform()
         .then(|| {
-            let definition = crate::nemotron_h::project_parameters(args, &retained)?;
-            crate::nemotron_h::CompleteNemotronKernel::<B>::from_definition(
-                args.clone(),
+            let declaration = inspection
+                .architecture_plan()
+                .nemotron_declaration(args)
+                .map_err(eredu_nn::Error::backend)?;
+            let definition =
+                retained.project_parameters(declaration.definition().parameters().clone())?;
+            crate::nemotron_h::CompleteNemotronKernel::<B>::from_selected_declaration(
+                declaration,
                 definition,
+                None,
                 context,
             )
         })
@@ -1483,16 +1588,26 @@ where
         .map_err(RoutedTextPreparationError::Invalid)?;
     let prompt_cache_architecture_identity =
         crate::nemotron_h::prompt_cache_architecture_fingerprint(&selected_args);
-    let definition = crate::nemotron_h::project_parameters(&selected_args, &retained)
-        .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
-    let architecture = crate::nemotron_h::CompleteNemotronKernel::<B>::from_definition(
-        selected_args,
+    let definition = crate::replicated_text::executable_component(&text)
+        .map_err(RoutedTextPreparationError::Invalid)?;
+    let architecture = crate::nemotron_h::CompleteNemotronKernel::<B>::from_selected_declaration(
+        inspection
+            .architecture_plan()
+            .nemotron_declaration(&selected_args)
+            .map_err(RoutedTextPreparationError::Invalid)?,
         definition,
+        None,
         context,
     )
     .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
-    let capability_estimate = crate::capability::nemotron_h(args)
-        .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
+    let capability_estimate = crate::capability::nemotron_h(
+        inspection
+            .architecture_plan()
+            .nemotron_declaration(args)
+            .map_err(RoutedTextPreparationError::Invalid)?
+            .as_ref(),
+    )
+    .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let targets = addressable_parameter_targets::<Relu2Operation>(bank_residency, &plan, &catalog);
     let prepared =
         crate::replicated_text::prepare_architecture_handoff_with_addressable::<B, S, _>(
@@ -2588,7 +2703,7 @@ impl SelectedRoutedBank {
 /// Authoritative routed realization selected before architecture construction.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectedRoutedTextRealization {
-    text: eredu_runtime::SelectedReplicatedTextRealization,
+    pub(crate) text: eredu_runtime::SelectedReplicatedTextRealization,
     bank_residency: eredu_runtime::ParameterBankResidency,
     banks: BTreeMap<RoutedBankId, SelectedRoutedBank>,
     rows: Option<eredu_runtime::SelectedRowLookupPlans>,
@@ -2822,7 +2937,11 @@ fn select_grouped_formats(
     match plan {
         RoutedGroupedPlan::Linear(plan) => plan
             .try_map_unit_specs(|spec| {
-                let projection = select_projection_format(spec.projection(), text)?;
+                let projection = select_projection_format(
+                    spec.projection(),
+                    text,
+                    eredu_nn::LinearRowLayout::Contiguous,
+                )?;
                 eredu_nn::GroupedLinearSpec::new(
                     spec.group_count(),
                     spec.input_dimensions(),
@@ -2847,27 +2966,25 @@ fn select_grouped_formats(
 fn select_projection_format(
     projection: &eredu_nn::GroupedProjectionSpec,
     text: &eredu_runtime::SelectedReplicatedTextRealization,
+    row_layout: eredu_nn::LinearRowLayout,
 ) -> Result<eredu_nn::GroupedProjectionSpec, String> {
-    let weight = projection.weight().id.to_string();
-    let executable = text
-        .parameters()
+    let weight = projection.weight().id.as_str();
+    let task = text
+        .materialization_tasks()
         .iter()
-        .chain(text.auxiliary_parameters())
-        .find(|parameter| parameter.name() == weight)
-        .map(eredu_runtime::SelectedParameterRealization::executable)
-        .ok_or_else(|| format!("grouped projection {weight:?} has no selected realization"))?;
-    if executable == projection.format().encoding() {
+        .chain(text.auxiliary_materialization_tasks())
+        .find(|task| task.name() == weight)
+        .ok_or_else(|| {
+            format!("grouped projection {weight:?} has no selected materialization task")
+        })?;
+    if task.executable() == projection.format().encoding() {
         return Ok(projection.clone());
     }
     eredu_nn::GroupedProjectionSpec::new(
         projection.weight().clone(),
         projection.bias().cloned(),
-        if weight.ends_with(".weight") {
-            crate::linear_format::standard_linear_format(&weight, executable)
-        } else {
-            crate::linear_format::standard_expert_format(&weight, executable)
-        }
-        .map_err(|error| error.to_string())?,
+        crate::linear_format::selected_linear_format(projection.weight(), task, row_layout)
+            .map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())
 }
@@ -2879,8 +2996,13 @@ fn select_gated_formats(
     let layout = match spec.layout() {
         eredu_nn::GatedProductGroupLayout::Packed { gate_up, down } => {
             eredu_nn::GatedProductGroupLayout::Packed {
-                gate_up: select_projection_format(gate_up, text)?,
-                down: select_projection_format(down, text)?,
+                gate_up: select_projection_format(
+                    gate_up,
+                    text,
+                    eredu_nn::LinearRowLayout::equal_partitions(2)
+                        .map_err(|error| error.to_string())?,
+                )?,
+                down: select_projection_format(down, text, eredu_nn::LinearRowLayout::Contiguous)?,
             }
         }
         eredu_nn::GatedProductGroupLayout::Independent(groups) => {
@@ -2889,9 +3011,21 @@ fn select_gated_formats(
                     .iter()
                     .map(|group| {
                         Ok(eredu_nn::GatedProductGroupParameters::new(
-                            select_projection_format(group.gate(), text)?,
-                            select_projection_format(group.up(), text)?,
-                            select_projection_format(group.down(), text)?,
+                            select_projection_format(
+                                group.gate(),
+                                text,
+                                eredu_nn::LinearRowLayout::Contiguous,
+                            )?,
+                            select_projection_format(
+                                group.up(),
+                                text,
+                                eredu_nn::LinearRowLayout::Contiguous,
+                            )?,
+                            select_projection_format(
+                                group.down(),
+                                text,
+                                eredu_nn::LinearRowLayout::Contiguous,
+                            )?,
                         ))
                     })
                     .collect::<Result<Vec<_>, String>>()?,
@@ -2919,8 +3053,8 @@ fn select_relu2_formats(
         spec.group_count(),
         spec.hidden_dimensions(),
         spec.intermediate_dimensions(),
-        select_projection_format(spec.up(), text)?,
-        select_projection_format(spec.down(), text)?,
+        select_projection_format(spec.up(), text, eredu_nn::LinearRowLayout::Contiguous)?,
+        select_projection_format(spec.down(), text, eredu_nn::LinearRowLayout::Contiguous)?,
     )
     .map_err(|error| error.to_string())
 }
@@ -2983,7 +3117,11 @@ fn derive_routed_text_requirements(
             0,
         )
         .map_err(|e| invalid(e.to_string()))?;
-        let plans = crate::k2_horizon::expert_realization_plans(args, rank, None)
+        let declaration = inspection
+            .architecture_plan()
+            .k2_declaration(args)
+            .map_err(invalid)?;
+        let plans = crate::k2_horizon::expert_realization_plans(&declaration, rank, None)
             .map_err(|e| invalid(e.to_string()))?;
         let owner =
             eredu_runtime::ExecutionGroupId::new(crate::decoder::TEXT_DECODER_EXECUTION_GROUP)
@@ -3005,8 +3143,9 @@ fn derive_routed_text_requirements(
                 RoutedGroupedPlan::Linear(plan) => uniform_routes_by_unit(plan, routes),
                 RoutedGroupedPlan::Relu2(_) => unreachable!("K2 has SwiGLU feed-forward banks"),
             };
-            let catalog = crate::k2_horizon::expert_residency_catalog(source.as_ref(), args, bank)
-                .map_err(invalid)?;
+            let catalog =
+                crate::k2_horizon::expert_residency_catalog(source.as_ref(), &declaration, bank)
+                    .map_err(invalid)?;
             banks.push((
                 bank.id(),
                 RoutedBankRequirements::new(owner.clone(), plan.clone(), catalog, routes_by_unit)?,
@@ -3123,73 +3262,73 @@ fn derive_routed_text_requirements(
             "routed architecture has no positive routes-per-token cardinality".into(),
         )
     })?;
-    let expected_routed_units = match &family {
-        Family::Qwen(args) => (0..usize::try_from(args.num_hidden_layers).unwrap_or(0))
-            .map(|unit| {
-                (
-                    ("text_decoder".to_owned(), unit),
-                    format!("{}.layers.{unit}", args.parameter_root),
-                )
-            })
-            .collect(),
-        Family::GptOss(args) => (0..usize::try_from(args.num_hidden_layers).unwrap_or(0))
-            .map(|unit| {
-                (
-                    ("text_decoder".to_owned(), unit),
-                    format!("{}.layers.{unit}", args.parameter_root),
-                )
-            })
-            .collect(),
-        Family::NemotronH(args) => args
-            .layer_schedule
-            .iter()
-            .enumerate()
-            .filter(|(_, policy)| **policy == crate::nemotron_h::LayerPolicy::SparseMoe)
-            .map(|(unit, _)| (("target".to_owned(), unit), format!("model.layers.{unit}")))
-            .collect(),
-        Family::Lfm2(args) => args
-            .layer_schedule
-            .iter()
-            .enumerate()
-            .filter(|(_, policy)| policy.feed_forward == crate::lfm2::FeedForwardPolicy::SparseMoe)
-            .map(|(unit, _)| (("target".to_owned(), unit), format!("model.layers.{unit}")))
-            .collect(),
-        Family::KimiLinear(args) => args
-            .layer_schedule
-            .iter()
-            .enumerate()
-            .filter(|(_, policy)| {
-                policy.feed_forward == crate::kimi_linear::FeedForwardPolicy::SparseMoe
-            })
-            .map(|(unit, _)| (("target".to_owned(), unit), format!("model.layers.{unit}")))
-            .collect(),
-        Family::QwenHybrid(args) => (0..usize::try_from(args.num_hidden_layers).unwrap_or(0))
-            .map(|unit| (("target".to_owned(), unit), format!("model.layers.{unit}")))
-            .collect(),
-        Family::DeepSeekV3(args) => args
-            .layer_schedule
-            .iter()
-            .enumerate()
-            .filter(|(_, policy)| **policy == crate::deepseek::LayerPolicy::SparseMoe)
-            .map(|(unit, _)| (("target".to_owned(), unit), format!("model.layers.{unit}")))
-            .collect(),
-        Family::DeepSeekV4(args) => (0..usize::try_from(args.num_hidden_layers).unwrap_or(0))
-            .map(|unit| (("target".to_owned(), unit), format!("layers.{unit}")))
-            .collect(),
-    };
+    let declared_routed_units = match &family {
+        Family::Qwen(args) => inspection
+            .architecture_plan()
+            .qwen_declaration(args)
+            .map_err(RoutedTextRequirementsError::Invalid)?
+            .expert_banks()
+            .map(|banks| banks.into_keys().collect::<Vec<_>>()),
+        Family::GptOss(args) => inspection
+            .architecture_plan()
+            .gpt_oss_declaration(args)
+            .map_err(RoutedTextRequirementsError::Invalid)?
+            .expert_banks()
+            .map(|banks| banks.into_keys().collect::<Vec<_>>()),
+        Family::NemotronH(args) => Ok(inspection
+            .architecture_plan()
+            .nemotron_declaration(args)
+            .map_err(RoutedTextRequirementsError::Invalid)?
+            .expert_banks()
+            .into_keys()
+            .collect::<Vec<_>>()),
+        Family::Lfm2(args) => inspection
+            .architecture_plan()
+            .lfm2_declaration(args)
+            .map(|declaration| declaration.expert_banks().into_keys().collect::<Vec<_>>())
+            .map_err(eredu_nn::Error::backend),
+        Family::KimiLinear(args) => inspection
+            .architecture_plan()
+            .kimi_declaration(args)
+            .map(|declaration| declaration.expert_banks().into_keys().collect::<Vec<_>>())
+            .map_err(eredu_nn::Error::backend),
+        Family::QwenHybrid(args) => crate::qwen::hybrid::block::expert_bank_specs(args)
+            .map(|banks| banks.into_keys().collect::<Vec<_>>()),
+        Family::DeepSeekV3(args) => crate::deepseek::v3::expert_bank_specs(args)
+            .map(|banks| banks.into_keys().collect::<Vec<_>>()),
+        Family::DeepSeekV4(args) => crate::deepseek::v4::expert_bank_specs(args)
+            .map(|banks| banks.into_keys().collect::<Vec<_>>()),
+    }
+    .map_err(|error| RoutedTextRequirementsError::Invalid(error.to_string()))?;
     let recipe_source = crate::replicated_text::artifact::target_catalog(inspection)
         .map_err(|error| RoutedTextRequirementsError::Invalid(error.to_string()))?;
+    let replicated_rank = eredu_core::ParallelRankTopology::new(
+        eredu_core::ParallelTopology::new(1, 1, 1, 1)
+            .map_err(|error| RoutedTextRequirementsError::Invalid(error.to_string()))?,
+        0,
+    )
+    .map_err(|error| RoutedTextRequirementsError::Invalid(error.to_string()))?;
     if let Family::NemotronH(args) = family {
         let text =
             crate::replicated_text::nemotron_h_replicated_text_requirements(inspection, args)
                 .map_err(|error| RoutedTextRequirementsError::Invalid(error.to_string()))?
                 .with_grouped_operations([eredu_runtime::GroupedOperationRequirement::Relu2]);
-        let plan = crate::nemotron_h::replicated_expert_realization_plan(args)
-            .map_err(|error| RoutedTextRequirementsError::Invalid(error.to_string()))?;
-        let catalog = crate::nemotron_h::expert_residency_catalog(recipe_source.as_ref(), args)
+        let declaration = inspection
+            .architecture_plan()
+            .nemotron_declaration(args)
             .map_err(RoutedTextRequirementsError::Invalid)?;
-        let owner_group = eredu_runtime::ExecutionGroupId::new("target")
-            .map_err(|error| RoutedTextRequirementsError::Invalid(error.to_string()))?;
+        let plan = crate::nemotron_h::expert_realization_plan(&declaration, None, replicated_rank)
+            .map_err(|error| RoutedTextRequirementsError::Invalid(error.to_string()))?
+            .ok_or_else(|| {
+                RoutedTextRequirementsError::Invalid(
+                    "Nemotron-H routed parameters have no declared bank".into(),
+                )
+            })?;
+        let catalog =
+            crate::nemotron_h::expert_residency_catalog(recipe_source.as_ref(), &declaration)
+                .map_err(RoutedTextRequirementsError::Invalid)?;
+        let (owner_group, expected_routed_units) =
+            declared_routed_schedule(&text, &declared_routed_units)?;
         validate_expected_routed_schedule(&expected_routed_units, &plan, &catalog)?;
         validate_plan_catalog::<Relu2Operation>(&owner_group, &plan, &catalog)?;
         validate_catalog_parameter_topology::<Relu2Operation>(
@@ -3213,62 +3352,127 @@ fn derive_routed_text_requirements(
             recipe_source.as_ref(),
         );
     }
-    let (text, plan, catalog, owner_group_name) = match family {
-        Family::Qwen(args) => (
-            crate::replicated_text::qwen_replicated_text_requirements(inspection, args),
-            crate::qwen::replicated_expert_realization_plan(args)
-                .map_err(|error| RoutedTextRequirementsError::Invalid(error.to_string())),
-            crate::qwen::expert_residency_catalog(recipe_source.as_ref(), args)
-                .map_err(RoutedTextRequirementsError::Invalid),
-            "text_decoder",
-        ),
-        Family::GptOss(args) => (
-            crate::replicated_text::gpt_oss_replicated_text_requirements(inspection, args),
-            crate::gpt_oss::replicated_expert_realization_plan(args)
-                .map_err(|error| RoutedTextRequirementsError::Invalid(error.to_string())),
-            crate::gpt_oss::expert_residency_catalog(recipe_source.as_ref(), args)
-                .map_err(RoutedTextRequirementsError::Invalid),
-            "text_decoder",
-        ),
+    let (text, plan, catalog) = match family {
+        Family::Qwen(args) => {
+            let declaration = inspection
+                .architecture_plan()
+                .qwen_declaration(args)
+                .map_err(RoutedTextRequirementsError::Invalid)?;
+            (
+                crate::replicated_text::qwen_replicated_text_requirements(inspection, args),
+                crate::qwen::expert_realization_plan(&declaration, None, replicated_rank)
+                    .map_err(|error| RoutedTextRequirementsError::Invalid(error.to_string()))
+                    .and_then(|plan| {
+                        plan.ok_or_else(|| {
+                            RoutedTextRequirementsError::Invalid(
+                                "routed Qwen has no declared bank".into(),
+                            )
+                        })
+                    }),
+                crate::qwen::expert_residency_catalog(recipe_source.as_ref(), &declaration)
+                    .map_err(RoutedTextRequirementsError::Invalid),
+            )
+        }
+        Family::GptOss(args) => {
+            let declaration = inspection
+                .architecture_plan()
+                .gpt_oss_declaration(args)
+                .map_err(RoutedTextRequirementsError::Invalid)?;
+            (
+                crate::replicated_text::gpt_oss_replicated_text_requirements(inspection, args),
+                crate::gpt_oss::expert_realization_plan(&declaration, None, replicated_rank)
+                    .map_err(|error| RoutedTextRequirementsError::Invalid(error.to_string())),
+                crate::gpt_oss::expert_residency_catalog(recipe_source.as_ref(), &declaration)
+                    .map_err(RoutedTextRequirementsError::Invalid),
+            )
+        }
         Family::Lfm2(args) => (
             crate::replicated_text::lfm2_replicated_text_requirements(inspection, args),
-            crate::lfm2::replicated_expert_realization_plan(args)
-                .map_err(|error| RoutedTextRequirementsError::Invalid(error.to_string())),
-            crate::lfm2::expert_residency_catalog(recipe_source.as_ref(), args)
+            inspection
+                .architecture_plan()
+                .lfm2_declaration(args)
+                .map_err(RoutedTextRequirementsError::Invalid)
+                .and_then(|declaration| {
+                    crate::lfm2::expert_realization_plan(&declaration, None, replicated_rank)
+                        .map_err(|error| RoutedTextRequirementsError::Invalid(error.to_string()))
+                })
+                .and_then(|plan| {
+                    plan.ok_or_else(|| {
+                        RoutedTextRequirementsError::Invalid(
+                            "LFM2 routed parameters have no declared bank".into(),
+                        )
+                    })
+                }),
+            inspection
+                .architecture_plan()
+                .lfm2_declaration(args)
+                .and_then(|declaration| {
+                    crate::lfm2::expert_residency_catalog(recipe_source.as_ref(), &declaration)
+                })
                 .map_err(RoutedTextRequirementsError::Invalid),
-            "target",
         ),
         Family::KimiLinear(args) => (
             crate::replicated_text::kimi_linear_replicated_text_requirements(inspection, args),
-            crate::kimi_linear::replicated_expert_realization_plan(args)
-                .map_err(|error| RoutedTextRequirementsError::Invalid(error.to_string())),
-            crate::kimi_linear::expert_residency_catalog(recipe_source.as_ref(), args)
+            inspection
+                .architecture_plan()
+                .kimi_declaration(args)
+                .map_err(RoutedTextRequirementsError::Invalid)
+                .and_then(|declaration| {
+                    crate::kimi_linear::expert_realization_plan(&declaration, None, replicated_rank)
+                        .map_err(|error| RoutedTextRequirementsError::Invalid(error.to_string()))
+                })
+                .and_then(|plan| {
+                    plan.ok_or_else(|| {
+                        RoutedTextRequirementsError::Invalid(
+                            "Kimi Linear routed parameters have no declared bank".into(),
+                        )
+                    })
+                }),
+            inspection
+                .architecture_plan()
+                .kimi_declaration(args)
+                .and_then(|declaration| {
+                    crate::kimi_linear::expert_residency_catalog(
+                        recipe_source.as_ref(),
+                        &declaration,
+                    )
+                })
                 .map_err(RoutedTextRequirementsError::Invalid),
-            "target",
         ),
         Family::QwenHybrid(args) => (
             crate::replicated_text::qwen_hybrid_replicated_text_requirements(inspection, args),
-            crate::qwen::hybrid::replicated_expert_realization_plan(args)
-                .map_err(|error| RoutedTextRequirementsError::Invalid(error.to_string())),
+            crate::qwen::hybrid::expert_realization_plan(args, None, replicated_rank)
+                .map_err(|error| RoutedTextRequirementsError::Invalid(error.to_string()))
+                .and_then(|plan| {
+                    plan.ok_or_else(|| {
+                        RoutedTextRequirementsError::Invalid(
+                            "routed Qwen hybrid has no declared bank".into(),
+                        )
+                    })
+                }),
             crate::qwen::hybrid::expert_residency_catalog(recipe_source.as_ref(), args)
                 .map_err(RoutedTextRequirementsError::Invalid),
-            "target",
         ),
         Family::DeepSeekV3(args) => (
             crate::replicated_text::deepseek_v3_replicated_text_requirements(inspection, args),
-            crate::deepseek::v3_replicated_expert_realization_plan(args)
-                .map_err(|error| RoutedTextRequirementsError::Invalid(error.to_string())),
+            crate::deepseek::v3_expert_realization_plan(args, None, replicated_rank)
+                .map_err(|error| RoutedTextRequirementsError::Invalid(error.to_string()))
+                .and_then(|plan| {
+                    plan.ok_or_else(|| {
+                        RoutedTextRequirementsError::Invalid(
+                            "V3 routed text has no declared bank".into(),
+                        )
+                    })
+                }),
             crate::deepseek::v3_expert_residency_catalog(recipe_source.as_ref(), args, None)
                 .map_err(RoutedTextRequirementsError::Invalid),
-            "target",
         ),
         Family::DeepSeekV4(args) => (
             crate::replicated_text::deepseek_v4_replicated_text_requirements(inspection, args),
-            crate::deepseek::v4_replicated_expert_realization_plan(args)
+            crate::deepseek::v4_expert_realization_plan(args, None, replicated_rank)
                 .map_err(|error| RoutedTextRequirementsError::Invalid(error.to_string())),
             crate::deepseek::v4_expert_residency_catalog(recipe_source.as_ref(), args, None)
                 .map_err(RoutedTextRequirementsError::Invalid),
-            "target",
         ),
         Family::NemotronH(_) => {
             unreachable!("Nemotron-H returned through ReLU-squared requirements")
@@ -3279,8 +3483,8 @@ fn derive_routed_text_requirements(
         .with_grouped_operations([eredu_runtime::GroupedOperationRequirement::GatedProduct]);
     let plan = plan?;
     let catalog = catalog?;
-    let owner_group = eredu_runtime::ExecutionGroupId::new(owner_group_name)
-        .map_err(|error| RoutedTextRequirementsError::Invalid(error.to_string()))?;
+    let (owner_group, expected_routed_units) =
+        declared_routed_schedule(&text, &declared_routed_units)?;
     validate_expected_routed_schedule(&expected_routed_units, &plan, &catalog)?;
     validate_plan_catalog::<GatedProductOperation>(&owner_group, &plan, &catalog)?;
     validate_catalog_parameter_topology::<GatedProductOperation>(
@@ -3303,6 +3507,58 @@ fn derive_routed_text_requirements(
         )],
         recipe_source.as_ref(),
     )
+}
+
+/// Projects bank membership into the retained execution addresses and operation paths.
+fn declared_routed_schedule(
+    text: &eredu_runtime::ReplicatedTextRequirements,
+    ordinals: &[usize],
+) -> Result<
+    (
+        eredu_runtime::ExecutionGroupId,
+        BTreeMap<(String, usize), String>,
+    ),
+    RoutedTextRequirementsError,
+> {
+    let invalid = |detail: String| RoutedTextRequirementsError::Invalid(detail);
+    let definition = text
+        .component_definition()
+        .ok_or_else(|| invalid("routed schedule has no retained component declaration".into()))?;
+    let layout = definition.parameters().unit_layout();
+    let mut expected = BTreeMap::new();
+    for &ordinal in ordinals {
+        let address = layout.address(ordinal).ok_or_else(|| {
+            invalid(format!(
+                "routed bank refers to undeclared invocation ordinal {ordinal}"
+            ))
+        })?;
+        let group = layout.group_id(address.group()).ok_or_else(|| {
+            invalid(format!(
+                "routed bank refers to undeclared execution group {}",
+                address.group()
+            ))
+        })?;
+        let unit = definition
+            .unit(address.group(), address.index())
+            .map_err(|error| invalid(error.to_string()))?;
+        let key = (group.as_str().to_owned(), address.index());
+        if expected.insert(key.clone(), unit.path.clone()).is_some() {
+            return Err(invalid(format!("duplicate routed invocation {key:?}")));
+        }
+    }
+    let group = expected
+        .keys()
+        .next()
+        .map(|(group, _)| group)
+        .ok_or_else(|| invalid("routed parameters have no declared invocation".into()))?;
+    if expected.keys().any(|(other, _)| other != group) {
+        return Err(invalid(
+            "routed bank spans multiple execution groups".into(),
+        ));
+    }
+    let owner = eredu_runtime::ExecutionGroupId::new(group.clone())
+        .map_err(|error| invalid(error.to_string()))?;
+    Ok((owner, expected))
 }
 
 fn validate_expected_routed_schedule<S>(
@@ -3365,6 +3621,16 @@ fn validate_catalog_parameter_topology<O: RoutedGroupedOperationValidation>(
     let mut allowed_sources = BTreeMap::new();
     let mut member_recipes = BTreeMap::new();
     for unit in catalog.units() {
+        let spec = plan
+            .unit_spec(unit.owner_group().as_str(), unit.identity().unit())
+            .ok_or_else(|| {
+                RoutedTextRequirementsError::Invalid(format!(
+                    "bank member {:?} has no routed unit specification",
+                    unit.identity()
+                ))
+            })?;
+        let expected_shapes = O::member_parameter_shapes(spec, unit.identity().member())
+            .map_err(|error| RoutedTextRequirementsError::Invalid(error.to_string()))?;
         for parameter in unit.parameters() {
             let requirement = requirements
                 .get(parameter.logical_target())
@@ -3374,17 +3640,15 @@ fn validate_catalog_parameter_topology<O: RoutedGroupedOperationValidation>(
                         parameter.logical_target()
                     ))
                 })?;
-            let spec = plan
-                .unit_spec(unit.owner_group().as_str(), unit.identity().unit())
-                .ok_or_else(|| {
-                    RoutedTextRequirementsError::Invalid(format!(
-                        "bank target {:?} has no routed unit specification",
-                        parameter.logical_target()
-                    ))
-                })?;
-            let expected_shapes = O::member_parameter_shapes(spec, unit.identity().member())
-                .map_err(|error| RoutedTextRequirementsError::Invalid(error.to_string()))?;
-            if let Some(expected_member_shape) = expected_shapes.get(parameter.logical_target()) {
+            {
+                let expected_member_shape = expected_shapes
+                    .get(parameter.logical_target())
+                    .ok_or_else(|| {
+                        RoutedTextRequirementsError::Invalid(format!(
+                            "bank target {:?} is absent from grouped member declarations",
+                            parameter.logical_target()
+                        ))
+                    })?;
                 let occurrences = occurrences[parameter.logical_target()];
                 let mut expected_logical = expected_member_shape.clone();
                 if occurrences > 1 {
@@ -3444,7 +3708,8 @@ fn validate_catalog_parameter_topology<O: RoutedGroupedOperationValidation>(
                     if *first != occurrences {
                         return Err(RoutedTextRequirementsError::Invalid(format!(
                             "bank target {:?} physical expert axis {} differs from catalog cardinality {occurrences}",
-                            parameter.logical_target(), *first
+                            parameter.logical_target(),
+                            *first
                         )));
                     }
                     *first = 1;
@@ -3458,7 +3723,8 @@ fn validate_catalog_parameter_topology<O: RoutedGroupedOperationValidation>(
                 if metadata.shape() != expected_physical {
                     return Err(RoutedTextRequirementsError::Invalid(format!(
                         "bank target {:?} recipe shape {:?} differs from admitted member shape {expected_physical:?}",
-                        parameter.logical_target(), metadata.shape()
+                        parameter.logical_target(),
+                        metadata.shape()
                     )));
                 }
             }
@@ -4430,7 +4696,7 @@ pub struct Relu2Operation;
 /// Architecture-level geometry shared by resident and addressable grouped execution.
 pub trait RoutedGroupedOperationValidation {
     /// Architecture-owned grouped specification.
-    type Spec: Clone + PartialEq;
+    type Spec: Clone + PartialEq + eredu_nn::DeclareGroupedParameters;
 
     /// Returns the number of groups described by a specification.
     fn group_count(spec: &Self::Spec) -> i32;
@@ -4438,17 +4704,38 @@ pub trait RoutedGroupedOperationValidation {
     /// Returns the output width after the selected grouped equation.
     fn output_dimensions(spec: &Self::Spec) -> i32;
 
-    /// Returns every exact parameter target needed by one global member.
-    fn member_parameter_targets(
-        spec: &Self::Spec,
-        member: usize,
-    ) -> Result<Vec<String>, eredu_nn::Error>;
-
-    /// Returns exact per-member logical shapes for primary projections and biases.
+    /// Returns every exact primary, bias and encoding companion of one member.
     fn member_parameter_shapes(
         spec: &Self::Spec,
         member: usize,
-    ) -> Result<BTreeMap<String, Vec<usize>>, eredu_nn::Error>;
+    ) -> Result<BTreeMap<String, Vec<usize>>, eredu_nn::Error> {
+        let declarations =
+            eredu_nn::DeclareGroupedParameters::logical_member_parameters(spec, member)?;
+        let group = eredu_runtime::logical_parameter_group(
+            "routed.member",
+            eredu_runtime::ParameterRole::Replicated,
+            None,
+            &declarations,
+            |_| eredu_runtime::MemberSharding::Replicated,
+        )
+        .map_err(eredu_nn::Error::backend_source)?;
+        let mut shapes = group
+            .members()
+            .iter()
+            .map(|parameter| {
+                (
+                    parameter.target().to_owned(),
+                    parameter.global_shape().to_vec(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        // Storage expansion packs primary columns; admission compares their
+        // logical geometry and the exact stored geometry of companions.
+        for declaration in declarations {
+            shapes.insert(declaration.parameter.id.to_string(), declaration.shape);
+        }
+        Ok(shapes)
+    }
 
     /// Projects an architecture-global specification to one compact bank.
     fn compact_spec(spec: &Self::Spec, group_count: i32) -> Result<Self::Spec, eredu_nn::Error>;
@@ -4543,82 +4830,6 @@ impl RoutedGroupedOperationValidation for GatedProductOperation {
 
     fn output_dimensions(spec: &Self::Spec) -> i32 {
         spec.output_dimensions()
-    }
-
-    fn member_parameter_targets(
-        spec: &Self::Spec,
-        member: usize,
-    ) -> Result<Vec<String>, eredu_nn::Error> {
-        let projections = match spec.layout() {
-            eredu_nn::GatedProductGroupLayout::Packed { gate_up, down } => {
-                vec![gate_up, down]
-            }
-            eredu_nn::GatedProductGroupLayout::Independent(groups) => {
-                let group = groups.get(member).ok_or_else(|| {
-                    eredu_nn::Error::backend(format!(
-                        "gated-product member {member} has no parameter group"
-                    ))
-                })?;
-                vec![group.gate(), group.up(), group.down()]
-            }
-            _ => return Err(eredu_nn::Error::backend("unknown gated-product layout")),
-        };
-        Ok(projections
-            .into_iter()
-            .flat_map(eredu_nn::GroupedProjectionSpec::parameters)
-            .map(|parameter| parameter.id.to_string())
-            .collect())
-    }
-
-    fn member_parameter_shapes(
-        spec: &Self::Spec,
-        member: usize,
-    ) -> Result<BTreeMap<String, Vec<usize>>, eredu_nn::Error> {
-        let input = usize::try_from(spec.input_dimensions()).map_err(eredu_nn::Error::backend)?;
-        let intermediate =
-            usize::try_from(spec.intermediate_dimensions()).map_err(eredu_nn::Error::backend)?;
-        let output = usize::try_from(spec.output_dimensions()).map_err(eredu_nn::Error::backend)?;
-        let mut shapes = BTreeMap::new();
-        let mut add = |projection: &eredu_nn::GroupedProjectionSpec, shape: Vec<usize>| {
-            shapes.insert(projection.weight().id.to_string(), shape.clone());
-            if let Some(bias) = projection.bias() {
-                shapes.insert(bias.id.to_string(), shape[..shape.len() - 1].to_vec());
-            }
-            if let Some(global) = projection.format().global_scale() {
-                let mut global_shape = shape[..shape.len() - 2].to_vec();
-                let parts = projection.format().row_layout().partitions();
-                if parts > 1 {
-                    global_shape.push(parts);
-                }
-                shapes.insert(global.id.to_string(), global_shape);
-            }
-            if let Some(companion_shape) = grouped_companion_shape(projection.format(), &shape) {
-                if let Some(scale) = projection.format().scale() {
-                    shapes.insert(scale.id.to_string(), companion_shape.clone());
-                }
-                if let Some(bias) = projection.format().affine_bias() {
-                    shapes.insert(bias.id.to_string(), companion_shape);
-                }
-            }
-        };
-        match spec.layout() {
-            eredu_nn::GatedProductGroupLayout::Packed { gate_up, down } => {
-                add(gate_up, vec![1, intermediate * 2, input]);
-                add(down, vec![1, output, intermediate]);
-            }
-            eredu_nn::GatedProductGroupLayout::Independent(groups) => {
-                let group = groups.get(member).ok_or_else(|| {
-                    eredu_nn::Error::backend(format!(
-                        "gated-product member {member} has no parameter group"
-                    ))
-                })?;
-                add(group.gate(), vec![intermediate, input]);
-                add(group.up(), vec![intermediate, input]);
-                add(group.down(), vec![output, intermediate]);
-            }
-            _ => return Err(eredu_nn::Error::backend("unknown gated-product layout")),
-        }
-        Ok(shapes)
     }
 
     fn compact_spec(spec: &Self::Spec, group_count: i32) -> Result<Self::Spec, eredu_nn::Error> {
@@ -4742,84 +4953,10 @@ impl RoutedGroupedOperationValidation for Relu2Operation {
         spec.hidden_dimensions()
     }
 
-    fn member_parameter_targets(
-        spec: &Self::Spec,
-        _: usize,
-    ) -> Result<Vec<String>, eredu_nn::Error> {
-        Ok([spec.up(), spec.down()]
-            .into_iter()
-            .flat_map(eredu_nn::GroupedProjectionSpec::parameters)
-            .map(|parameter| parameter.id.to_string())
-            .collect())
-    }
-
-    fn member_parameter_shapes(
-        spec: &Self::Spec,
-        _: usize,
-    ) -> Result<BTreeMap<String, Vec<usize>>, eredu_nn::Error> {
-        let hidden = usize::try_from(spec.hidden_dimensions()).map_err(eredu_nn::Error::backend)?;
-        let intermediate =
-            usize::try_from(spec.intermediate_dimensions()).map_err(eredu_nn::Error::backend)?;
-        let mut shapes = BTreeMap::new();
-        for (projection, shape) in [
-            (spec.up(), vec![1, intermediate, hidden]),
-            (spec.down(), vec![1, hidden, intermediate]),
-        ] {
-            shapes.insert(projection.weight().id.to_string(), shape.clone());
-            if let Some(bias) = projection.bias() {
-                shapes.insert(bias.id.to_string(), shape[..shape.len() - 1].to_vec());
-            }
-            if let Some(global) = projection.format().global_scale() {
-                let mut global_shape = shape[..shape.len() - 2].to_vec();
-                let parts = projection.format().row_layout().partitions();
-                if parts > 1 {
-                    global_shape.push(parts);
-                }
-                shapes.insert(global.id.to_string(), global_shape);
-            }
-            if let Some(companion_shape) = grouped_companion_shape(projection.format(), &shape) {
-                if let Some(scale) = projection.format().scale() {
-                    shapes.insert(scale.id.to_string(), companion_shape.clone());
-                }
-                if let Some(bias) = projection.format().affine_bias() {
-                    shapes.insert(bias.id.to_string(), companion_shape);
-                }
-            }
-        }
-        Ok(shapes)
-    }
-
     fn compact_spec(spec: &Self::Spec, group_count: i32) -> Result<Self::Spec, eredu_nn::Error> {
-        spec.clone().with_group_count(group_count)
+        spec.clone()
+            .with_group_geometry(group_count, spec.intermediate_dimensions())
     }
-}
-
-fn grouped_companion_shape(
-    format: &eredu_nn::LinearFormatSpec,
-    weight_shape: &[usize],
-) -> Option<Vec<usize>> {
-    let rows = *weight_shape.get(weight_shape.len().checked_sub(2)?)?;
-    let columns = *weight_shape.last()?;
-    let (row_groups, column_groups) = match format.encoding() {
-        eredu_checkpoint::LinearFormat::Affine(config) => (
-            rows,
-            columns.div_ceil(usize::try_from(config.group_size).ok()?),
-        ),
-        eredu_checkpoint::LinearFormat::MxFp4 => (rows, columns.div_ceil(32)),
-        eredu_checkpoint::LinearFormat::NvFp4 => (rows, columns.div_ceil(16)),
-        eredu_checkpoint::LinearFormat::E4M3BlockFp8(config) => (
-            format
-                .row_layout()
-                .scale_rows(rows, usize::try_from(config.block_rows).ok()?)
-                .ok()?,
-            columns.div_ceil(usize::try_from(config.block_columns).ok()?),
-        ),
-        eredu_checkpoint::LinearFormat::Dense
-        | eredu_checkpoint::LinearFormat::GgufIQuant { .. } => return None,
-    };
-    let mut shape = weight_shape[..weight_shape.len() - 2].to_vec();
-    shape.extend([row_groups, column_groups]);
-    Some(shape)
 }
 
 impl<B> RoutedGroupedOperation<B> for Relu2Operation
@@ -6209,9 +6346,9 @@ where
                     unit.identity()
                 )));
             }
-            let expected = O::member_parameter_targets(spec, member)
+            let expected = O::member_parameter_shapes(spec, member)
                 .map_err(|error| RoutedTextRequirementsError::Invalid(error.to_string()))?
-                .into_iter()
+                .into_keys()
                 .collect::<std::collections::BTreeSet<_>>();
             let mut actual = std::collections::BTreeSet::new();
             for parameter in unit.parameters() {
@@ -6292,44 +6429,6 @@ impl RoutedGroupedOperationValidation for LinearOperation {
     }
     fn output_dimensions(spec: &Self::Spec) -> i32 {
         spec.output_dimensions()
-    }
-    fn member_parameter_targets(
-        spec: &Self::Spec,
-        _: usize,
-    ) -> Result<Vec<String>, eredu_nn::Error> {
-        Ok(spec
-            .projection()
-            .parameters()
-            .iter()
-            .map(|p| p.id.to_string())
-            .collect())
-    }
-    fn member_parameter_shapes(
-        spec: &Self::Spec,
-        _: usize,
-    ) -> Result<BTreeMap<String, Vec<usize>>, eredu_nn::Error> {
-        let projection = spec.projection();
-        let shape = vec![
-            1,
-            spec.output_dimensions() as usize,
-            spec.input_dimensions() as usize,
-        ];
-        let mut shapes = BTreeMap::from([(projection.weight().id.to_string(), shape.clone())]);
-        if let Some(bias) = projection.bias() {
-            shapes.insert(bias.id.to_string(), shape[..2].to_vec());
-        }
-        if let Some(companion) = grouped_companion_shape(projection.format(), &shape) {
-            for parameter in [
-                projection.format().scale(),
-                projection.format().affine_bias(),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                shapes.insert(parameter.id.to_string(), companion.clone());
-            }
-        }
-        Ok(shapes)
     }
     fn compact_spec(spec: &Self::Spec, groups: i32) -> Result<Self::Spec, eredu_nn::Error> {
         spec.clone().with_group_count(groups)

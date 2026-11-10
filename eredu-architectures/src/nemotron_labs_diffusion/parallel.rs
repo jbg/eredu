@@ -79,63 +79,43 @@ pub fn composite_parameter_description(
     config: &FamilyConfig,
 ) -> Result<ArchitectureParameterDescription, ParallelPlanError> {
     let (graph, layout) = composite_graph(config)?;
-    let vision = config.vision.as_ref().expect("validated composite graph");
-    let width = vision.hidden_size as usize;
-    let text = config.hidden_size() as usize;
-    let merge = config.spatial_merge_size as usize;
+    use eredu_nn::DeclareLogicalParameters;
+    let declaration = super::vision::specs::VisionSpec::new(config)
+        .map_err(|e| ParallelPlanError::InvalidGroup(e.to_string()))?;
     let mut owned = parameter_description(config)?.groups().to_vec();
-    for (role, name, shape) in [
+    for (spec, owner) in [
         (
-            "vision_embedding",
-            "model.vision_tower.patch_conv",
-            vec![
-                width,
-                vision.num_channels as usize,
-                vision.patch_size as usize,
-                vision.patch_size as usize,
-            ],
-        ),
-        ("vision_embedding", "model.vision_tower.ln_pre", vec![width]),
-        (
-            "vision_projection",
-            "model.multi_modal_projector.norm",
-            vec![width],
+            &declaration.embedding as &dyn DeclareLogicalParameters,
+            ParameterGroupOwner::static_role("vision_embedding"),
         ),
         (
-            "vision_projection",
-            "model.multi_modal_projector.patch_merger.merging_layer",
-            vec![width, width * merge * merge],
-        ),
-        (
-            "vision_projection",
-            "model.multi_modal_projector.linear_1",
-            vec![text, width],
-        ),
-        (
-            "vision_projection",
-            "model.multi_modal_projector.linear_2",
-            vec![text, text],
+            &declaration.projector as &dyn DeclareLogicalParameters,
+            ParameterGroupOwner::execution_unit(layout.group_id(1).unwrap().clone(), 0),
         ),
     ] {
-        owned.push(OwnedParameterGroupSpec::new(
-            if role == "vision_projection" {
-                ParameterGroupOwner::execution_unit(layout.group_id(1).unwrap().clone(), 0)
-            } else {
-                ParameterGroupOwner::static_role(role)
-            },
-            ParameterGroupSpec::new(
-                name,
-                ParameterRole::Replicated,
-                [ParameterMemberSpec::new(
-                    format!("{name}.weight"),
-                    shape,
-                    MemberSharding::Replicated,
-                )],
-            )?,
-        ));
+        for parameter in spec
+            .logical_parameters()
+            .map_err(|e| ParallelPlanError::InvalidGroup(e.to_string()))?
+        {
+            owned.push(OwnedParameterGroupSpec::new(
+                owner.clone(),
+                ParameterGroupSpec::new(
+                    parameter
+                        .parameter
+                        .group
+                        .as_ref()
+                        .expect("declared image parameter owner"),
+                    ParameterRole::Replicated,
+                    [ParameterMemberSpec::from_logical_declaration(
+                        &parameter,
+                        MemberSharding::Replicated,
+                    )],
+                )?,
+            ));
+        }
     }
-    for index in 0..vision.num_hidden_layers as usize {
-        for group in vision_layer_groups(vision, index)? {
+    for (index, layer) in declaration.layers.iter().enumerate() {
+        for group in layer.parameter_groups()? {
             owned.push(OwnedParameterGroupSpec::new(
                 ParameterGroupOwner::execution_unit(layout.group_id(0).unwrap().clone(), index),
                 group,
@@ -150,8 +130,17 @@ pub fn composite_parameter_description(
 pub fn parameter_description(
     config: &FamilyConfig,
 ) -> Result<ArchitectureParameterDescription, ParallelPlanError> {
-    let base = decoder::dense_parameter_description(config)?;
-    let Some(adapter) = config.draft_adapter() else {
+    let base = config
+        .text_declaration()
+        .parameter_description(config, decoder::ParameterEncoding::Stored)?;
+    config.extend_common_parameters(base)
+}
+
+pub(crate) fn with_draft_parameters(
+    base: ArchitectureParameterDescription,
+    adapter: Option<&super::adapter::DraftAdapterDeclaration>,
+) -> Result<ArchitectureParameterDescription, ParallelPlanError> {
+    let Some(adapter) = adapter else {
         return Ok(base);
     };
     let mut owned = base.groups().to_vec();
@@ -160,28 +149,8 @@ pub fn parameter_description(
         .group_id(0)
         .expect("validated text graph")
         .clone();
-    for index in 0..config.num_hidden_layers() as usize {
-        let name = format!("draft_adapter.layers.{index}.o_proj");
-        let parameters = ParameterGroupSpec::partitioned(
-            &name,
-            ParameterRole::AttentionHeads,
-            config.num_attention_heads() as usize,
-            [
-                ParameterMemberSpec::new(
-                    format!("{name}.lora_A.weight"),
-                    vec![
-                        adapter.rank() as usize,
-                        (config.num_attention_heads() * config.head_dim()) as usize,
-                    ],
-                    MemberSharding::Partitioned { axis: 1 },
-                ),
-                ParameterMemberSpec::new(
-                    format!("{name}.lora_B.weight"),
-                    vec![config.hidden_size() as usize, adapter.rank() as usize],
-                    MemberSharding::Replicated,
-                ),
-            ],
-        )?;
+    for (index, layer) in adapter.layers().iter().enumerate() {
+        let parameters = layer.parameter_group()?;
         owned.push(OwnedParameterGroupSpec::new(
             ParameterGroupOwner::execution_unit(group.clone(), index),
             parameters,
@@ -197,60 +166,11 @@ pub fn vision_layer_groups(
     config: &super::PixtralConfig,
     index: usize,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    config.validate().map_err(ParallelPlanError::InvalidGroup)?;
-    if index >= config.num_hidden_layers as usize {
-        return Err(ParallelPlanError::InvalidGroup(
-            "Pixtral layer outside tower".into(),
-        ));
-    }
-    let root = format!("model.vision_tower.transformer.layers.{index}");
-    let width = config.hidden_size as usize;
-    let intermediate = config.intermediate_size as usize;
-    let mut groups = Vec::new();
-    for field in ["attention_norm", "ffn_norm"] {
-        groups.push(ParameterGroupSpec::new(
-            format!("{root}.{field}"),
-            ParameterRole::Replicated,
-            [ParameterMemberSpec::new(
-                format!("{root}.{field}.weight"),
-                vec![width],
-                MemberSharding::Replicated,
-            )],
-        )?);
-    }
-    groups.push(ParameterGroupSpec::partitioned(
-        format!("{root}.attention"),
-        ParameterRole::AttentionHeads,
-        config.num_attention_heads as usize,
-        ["q_proj", "k_proj", "v_proj", "o_proj"].map(|field| {
-            ParameterMemberSpec::new(
-                format!("{root}.attention.{field}.weight"),
-                vec![width, width],
-                MemberSharding::Partitioned {
-                    axis: if field == "o_proj" { 1 } else { 0 },
-                },
-            )
-        }),
-    )?);
-    groups.push(ParameterGroupSpec::partitioned(
-        format!("{root}.feed_forward"),
-        ParameterRole::FeedForwardIntermediate,
-        intermediate,
-        ["gate_proj", "up_proj", "down_proj"].map(|field| {
-            ParameterMemberSpec::new(
-                format!("{root}.feed_forward.{field}.weight"),
-                if field == "down_proj" {
-                    vec![width, intermediate]
-                } else {
-                    vec![intermediate, width]
-                },
-                MemberSharding::Partitioned {
-                    axis: if field == "down_proj" { 1 } else { 0 },
-                },
-            )
-        }),
-    )?);
-    Ok(groups)
+    config
+        .tower()
+        .layer(index)
+        .map_err(|e| ParallelPlanError::InvalidGroup(e.to_string()))?
+        .parameter_groups()
 }
 
 /// Proves aligned head/channel selections before any native layer is declared.
@@ -374,8 +294,13 @@ pub fn partition(
         .validate_parameter_topology(&parameter_description(config)?)
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
     let parameters = definition.parameters();
-    let geometry =
-        decoder::partition_local_geometry(config, parameters.invocations(), layout, units.clone())?;
+    let geometry = decoder::partition_local_geometry(
+        config,
+        config.text_declaration().as_ref(),
+        parameters.invocations(),
+        layout,
+        units.clone(),
+    )?;
     let definition = definition
         .clone()
         .with_state_layout(geometry.complete_state_layout().clone())

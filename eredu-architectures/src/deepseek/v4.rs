@@ -10,10 +10,9 @@ use eredu_core::{
     AttentionPolicy, LayerSchedule,
 };
 use eredu_nn::{
-    EmbeddingLookupPolicy, EmbeddingOperator, EmbeddingSpec, Error, GroupedGatedProductOperator,
-    GroupedNeuralBackend, HyperHead, HyperHeadSpec, HyperNeuralBackend, Index, LinearOperator,
-    LinearSpec, NormalizationConstructionSpec, NormalizationOperator, ParameterSpec, Parameterized,
-    PoolingAttentionCache, Tensor,
+    EmbeddingLookupPolicy, EmbeddingOperator, Error, GroupedGatedProductOperator,
+    GroupedNeuralBackend, HyperHead, HyperNeuralBackend, Index, LinearOperator,
+    NormalizationOperator, Parameterized, PoolingAttentionCache, Tensor,
 };
 use eredu_runtime::{
     ComponentAdapter, ComponentEquations, ComponentKernel, ComponentPartitionContext,
@@ -31,9 +30,9 @@ use crate::decoder::{DecoderStaticResources, PartitionStaticModules, StaticModul
 use super::{
     block::V4Block,
     config::V4TargetCapturePolicy,
-    moe::MoePolicy,
+    moe::RoutedSpec,
     mtp::{EmbeddedInput, ForwardMode, RetainedValues, V4PredictionLayer},
-    DsparkConfig, V4Args, V4AttentionPolicy,
+    DsparkConfig, V4Args,
 };
 
 /// Shared execution adapter over V4 equations and the validated component definition.
@@ -479,7 +478,7 @@ impl V4UnitFactory {
         self.args
             .dspark
             .as_ref()
-            .map(|config| DsparkStatic::new(&self.args, config, context))
+            .map(|_| DsparkStatic::new(&self.args, context))
             .transpose()
     }
     /// Constructs only the addressed target, sequential MTP or DSpark resource.
@@ -2865,7 +2864,7 @@ where
     }
 }
 
-pub(super) fn text_static_spec(args: &V4Args) -> StaticModuleSpec {
+pub(super) fn declare_text_static_spec(args: &V4Args) -> StaticModuleSpec {
     StaticModuleSpec {
         normalization_groups: None,
         embedding_weight: "embed.weight".into(),
@@ -2875,7 +2874,7 @@ pub(super) fn text_static_spec(args: &V4Args) -> StaticModuleSpec {
         hidden_size: args.hidden_size,
         normalization_epsilon: args.rms_norm_eps,
         normalization_offset: 0.0,
-        embedding_format: LinearFormat::Dense,
+        embedding_format: args.linear_format_for("embed.weight"),
         head_format: args.linear_format_for("head.weight"),
         tied_head: false,
     }
@@ -2895,8 +2894,11 @@ where
             selection.owns_storage(&eredu_runtime::ParameterStorageId::StaticRole(role.into()))
         })
     };
-    let text = PartitionStaticModules::from_selected_spec(
-        text_static_spec(args),
+    let hyper_spec = owns("hyper_head")
+        .then(|| super::v4_specs::hyper_head_spec(args, "hc_head"))
+        .transpose()?;
+    let text = PartitionStaticModules::from_selected_construction(
+        args.parameters().statics.clone(),
         construction.parallel_geometry.as_ref().map(|geometry| {
             (
                 geometry.embedding_range().clone(),
@@ -2906,21 +2908,8 @@ where
         owns,
         context,
     )?;
-    let hyper_head = owns("hyper_head")
-        .then(|| {
-            HyperHead::new(
-                HyperHeadSpec {
-                    streams: args.hc_mult,
-                    hidden_size: args.hidden_size,
-                    norm_epsilon: args.rms_norm_eps,
-                    epsilon: args.hc_eps,
-                    function: parameter("hc_head_fn")?,
-                    base: parameter("hc_head_base")?,
-                    scale: parameter("hc_head_scale")?,
-                },
-                context,
-            )
-        })
+    let hyper_head = hyper_spec
+        .map(|spec| HyperHead::new(spec, context))
         .transpose()?;
     let dspark = if owns("mtp") {
         construction.construct_dspark::<B>(context)?
@@ -2935,77 +2924,16 @@ where
 }
 
 impl<B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend> DsparkStatic<B> {
-    fn new(
-        args: &V4Args,
-        config: &DsparkConfig,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        let last = usize::try_from(args.num_nextn_predict_layers).map_err(Error::backend)? - 1;
-        let norm = |name: String| {
-            B::normalization(
-                NormalizationConstructionSpec::learned(
-                    args.hidden_size,
-                    args.rms_norm_eps,
-                    parameter(name)?,
-                ),
-                context,
-            )
-        };
+    fn new(args: &V4Args, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
+        let spec = super::v4_specs::dspark_spec(args)?;
         Ok(Self {
-            main_projection: projection::<B>(
-                "mtp.0.main_proj.weight",
-                args.hidden_size
-                    * i32::try_from(
-                        args.target_capture_policy
-                            .as_ref()
-                            .expect("validated DSpark target capture policy")
-                            .len(),
-                    )
-                    .map_err(Error::backend)?,
-                args.hidden_size,
-                args.linear_format_for("mtp.0.main_proj.weight"),
-                context,
-            )?,
-            main_norm: norm("mtp.0.main_norm.weight".into())?,
-            output_norm: norm(format!("mtp.{last}.norm.weight"))?,
-            hyper_head: HyperHead::new(
-                HyperHeadSpec {
-                    streams: args.hc_mult,
-                    hidden_size: args.hidden_size,
-                    norm_epsilon: args.rms_norm_eps,
-                    epsilon: args.hc_eps,
-                    function: parameter(format!("mtp.{last}.hc_head_fn"))?,
-                    base: parameter(format!("mtp.{last}.hc_head_base"))?,
-                    scale: parameter(format!("mtp.{last}.hc_head_scale"))?,
-                },
-                context,
-            )?,
-            markov_embedding: B::embedding(
-                EmbeddingSpec {
-                    vocabulary: args.vocab_size,
-                    dimensions: config.markov_rank,
-                    weight: parameter(format!("mtp.{last}.markov_head.markov_w1.weight"))?,
-                    format: crate::linear_format::standard_linear_format(
-                        &format!("mtp.{last}.markov_head.markov_w1.weight"),
-                        LinearFormat::Dense,
-                    )?,
-                },
-                context,
-            )?,
-            markov_output: projection::<B>(
-                format!("mtp.{last}.markov_head.markov_w2.weight"),
-                config.markov_rank,
-                args.vocab_size,
-                args.linear_format_for(&format!("mtp.{last}.markov_head.markov_w2.weight")),
-                context,
-            )?,
-            confidence_head: projection::<B>(
-                format!("mtp.{last}.confidence_head.proj.weight"),
-                args.hidden_size + config.markov_rank,
-                1,
-                args.linear_format_for(&format!("mtp.{last}.confidence_head.proj.weight")),
-                context,
-            )?,
+            main_projection: B::linear(spec.main_projection, context)?,
+            main_norm: B::normalization(spec.main_norm, context)?,
+            output_norm: B::normalization(spec.output_norm, context)?,
+            hyper_head: HyperHead::new(spec.hyper_head, context)?,
+            markov_embedding: B::embedding(spec.markov_embedding, context)?,
+            markov_output: B::linear(spec.markov_output, context)?,
+            confidence_head: B::linear(spec.confidence_head, context)?,
         })
     }
 }
@@ -3014,13 +2942,6 @@ pub(crate) fn target_group_transport() -> eredu_runtime::ArchitectureGroupTransp
     let mut transport = crate::transport::decoder();
     transport.last_owner_static_roles.push("hyper_head".into());
     transport
-}
-
-/// Builds the shared learned or token-selected MoE policy for one target
-/// layer. The caller supplies token-table IDs to `RouteSource::Selected` for
-/// hash layers.
-pub fn moe_policy(args: &V4Args, layer: usize) -> Result<MoePolicy, Error> {
-    moe_policy_at(args, layer, &format!("layers.{layer}.ffn"))
 }
 
 /// Returns the architecture-owned routed expert specification for a target or MTP layer.
@@ -3033,64 +2954,124 @@ pub fn expert_bank_spec(
     } else {
         format!("mtp.{}.ffn", layer - args.num_hidden_layers as usize)
     };
-    crate::deepseek::moe::expert_bank_spec(&moe_policy_at(args, layer, &root)?)
+    Ok(super::v4_specs::moe_spec(args, layer, &root, None)?
+        .routed
+        .parameters
+        .experts)
 }
 
-pub(crate) fn localized_expert_bank_spec(
+/// Traverses the validated target and prediction schedule into construction-owned banks.
+pub(crate) fn expert_bank_specs(
+    args: &V4Args,
+) -> Result<std::collections::BTreeMap<usize, eredu_nn::GroupedGatedProductSpec>, Error> {
+    args.validate().map_err(Error::backend)?;
+    let target = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
+    let prediction = usize::try_from(args.num_nextn_predict_layers).map_err(Error::backend)?;
+    let total = target
+        .checked_add(prediction)
+        .ok_or_else(|| Error::backend("DeepSeek expert layer count overflowed"))?;
+    (0..total)
+        .map(|layer| expert_bank_spec(args, layer).map(|bank| (layer, bank)))
+        .collect()
+}
+
+/// Complete routed/shared declaration; token-table ownership is supplied by `v4_specs`.
+pub(super) fn declare_routed_spec_at(
     args: &V4Args,
     layer: usize,
-    expert_count: i32,
-    intermediate_dimensions: i32,
-) -> Result<eredu_nn::GroupedGatedProductSpec, Error> {
-    expert_bank_spec(args, layer)?.with_group_geometry(expert_count, intermediate_dimensions)
-}
-
-pub(crate) fn moe_policy_at(args: &V4Args, layer: usize, root: &str) -> Result<MoePolicy, Error> {
-    if layer
-        >= usize::try_from(args.num_hidden_layers + args.num_nextn_predict_layers)
-            .map_err(Error::backend)?
-    {
+    root: &str,
+) -> Result<RoutedSpec, Error> {
+    use eredu_nn::{
+        DeclareLogicalParameters, GatedProductPolicy, GroupScoring, LinearSpec, ParameterSpec,
+        TopKGroupSelectionSpec, TopKGroupSelectorSpec,
+    };
+    let end = usize::try_from(
+        args.num_hidden_layers
+            .checked_add(args.num_nextn_predict_layers)
+            .ok_or_else(|| Error::backend("V4 total layer count overflowed"))?,
+    )
+    .map_err(Error::backend)?;
+    if layer >= end {
         return Err(Error::backend(format!(
             "V4 target or prediction layer {layer} is out of range"
         )));
     }
-    Ok(MoePolicy {
-        layer,
-        hidden: args.hidden_size,
-        expert_count: args.n_routed_experts,
-        routes_per_token: args.num_experts_per_tok,
-        expert_width: args.moe_intermediate_size,
-        shared_width: args
-            .moe_intermediate_size
-            .checked_mul(args.n_shared_experts)
-            .ok_or_else(|| Error::backend("V4 shared expert width overflowed"))?,
-        scoring: eredu_nn::GroupScoring::SqrtSoftplus,
-        normalize_routes: args.norm_topk_prob,
-        normalization_epsilon: 1e-20,
-        routed_scaling: args.routed_scaling_factor,
-        expert_groups: 1,
-        selected_groups: 1,
-        router_weight: format!("{root}.gate.weight"),
-        router_format: args
-            .linear_formats
-            .get(&format!("{root}.gate.weight"))
-            .copied()
-            .unwrap_or(LinearFormat::Dense),
-        correction_bias: (layer >= args.num_hash_layers as usize)
-            .then(|| format!("{root}.gate.bias")),
-        expert_gate_up: format!("{root}.switch_mlp.gate_up_proj"),
-        expert_down: format!("{root}.switch_mlp.down_proj"),
-        shared_gate: format!("{root}.shared_experts.w1.weight"),
-        shared_up: format!("{root}.shared_experts.w3.weight"),
-        shared_down: format!("{root}.shared_experts.w2.weight"),
-        shared_gate_format: args.linear_format_for(&format!("{root}.shared_experts.w1.weight")),
-        shared_up_format: args.linear_format_for(&format!("{root}.shared_experts.w3.weight")),
-        shared_down_format: args.linear_format_for(&format!("{root}.shared_experts.w2.weight")),
-        expert_gate_up_format: args.linear_format_for(&format!("{root}.switch_mlp.gate_up_proj")),
-        expert_down_format: args.linear_format_for(&format!("{root}.switch_mlp.down_proj")),
-        shared_limit: None,
-        limit: args.swiglu_limit,
-    })
+    let parameter = |name: String| ParameterSpec::trainable(name).map_err(Error::backend);
+    let router_name = format!("{root}.gate.weight");
+    let router_format = args
+        .linear_formats
+        .get(&router_name)
+        .copied()
+        .unwrap_or(LinearFormat::Dense);
+    let mut selector = TopKGroupSelectorSpec::new(
+        args.hidden_size,
+        parameter(router_name.clone())?,
+        crate::linear_format::standard_linear_format(&router_name, router_format)?,
+        TopKGroupSelectionSpec::new(
+            args.n_routed_experts,
+            args.num_experts_per_tok,
+            GroupScoring::SqrtSoftplus,
+            args.norm_topk_prob,
+        )?
+        .with_groups(1, 1)?
+        .with_weight_policy(1e-20, args.routed_scaling_factor)?,
+    )?;
+    if layer >= args.num_hash_layers as usize {
+        selector = selector.with_correction_bias(parameter(format!("{root}.gate.bias"))?)?;
+    }
+    let experts = {
+        let projection = |field: &str, row_layout| {
+            let name = format!("{root}.switch_mlp.{field}");
+            crate::linear_format::standard_expert_projection(
+                &name,
+                None,
+                args.linear_format_for(&name),
+                row_layout,
+            )
+        };
+        eredu_nn::GroupedGatedProductSpec::new(
+            args.n_routed_experts,
+            args.hidden_size,
+            args.moe_intermediate_size,
+            args.hidden_size,
+            args.swiglu_limit.unwrap_or_default(),
+            eredu_nn::GatedProductGroupLayout::Packed {
+                gate_up: projection(
+                    "gate_up_proj",
+                    eredu_nn::LinearRowLayout::equal_partitions(2)?,
+                )?,
+                down: projection("down_proj", eredu_nn::LinearRowLayout::Contiguous)?,
+            },
+        )?
+    };
+    let width = args
+        .moe_intermediate_size
+        .checked_mul(args.n_shared_experts)
+        .ok_or_else(|| Error::backend("V4 shared expert width overflowed"))?;
+    let linear = |field: &str, input, output| {
+        let name = format!("{root}.shared_experts.{field}.weight");
+        Ok::<_, Error>(LinearSpec {
+            input,
+            output,
+            format: crate::linear_format::standard_linear_format(
+                &name,
+                args.linear_format_for(&name),
+            )?,
+            weight: parameter(name)?,
+            bias: None,
+        })
+    };
+    let spec = RoutedSpec {
+        parameters: eredu_nn::RoutedGatedProductSpec { selector, experts },
+        shared: eredu_nn::SplitGatedProductSpec::new(
+            linear("w1", args.hidden_size, width)?,
+            linear("w3", args.hidden_size, width)?,
+            linear("w2", width, args.hidden_size)?,
+            GatedProductPolicy::ordinary_silu(),
+        )?,
+    };
+    spec.logical_parameters()?;
+    Ok(spec)
 }
 
 /// Declares bounded local keys and every append-only pooling component for V4
@@ -3108,24 +3089,27 @@ pub fn state_layout(args: &V4Args) -> Result<StateLayout, Error> {
             .map_err(Error::backend)?;
     let policies = (0..layers)
         .map(|layer| {
-            let fixed = match args.attention_policy(layer) {
-                Some(V4AttentionPolicy::Local) => Vec::new(),
-                Some(V4AttentionPolicy::Compressed { ratio }) => {
-                    let mut tensors = pooling_stream(0, ratio, args.head_dim, ratio == 4)?;
-                    if ratio == 4 {
-                        tensors.extend(pooling_stream(1, ratio, args.index_head_dim, true)?);
-                    }
-                    tensors
-                }
-                None => return Err(Error::backend(format!("missing V4 layer policy {layer}"))),
+            let root = if layer < args.num_hidden_layers as usize {
+                format!("layers.{layer}.attn")
+            } else {
+                format!("mtp.{}.attn", layer - args.num_hidden_layers as usize)
             };
+            let spec = super::v4_specs::attention_spec(args, layer, &root)?;
+            let mut fixed = Vec::new();
+            if let Some(compressor) = &spec.compressor {
+                fixed.extend(pooling_stream(0, compressor)?);
+            }
+            if let Some(indexer) = &spec.indexer {
+                let compressor = &indexer.compressor;
+                fixed.extend(pooling_stream(1, compressor)?);
+            }
             if fixed.is_empty() {
-                LayerCachePolicy::key_only(attention, 1, args.head_dim).map_err(Error::backend)
+                LayerCachePolicy::key_only(attention, 1, spec.kv.output).map_err(Error::backend)
             } else {
                 LayerCachePolicy::key_only_with_state(
                     attention,
                     1,
-                    args.head_dim,
+                    spec.kv.output,
                     fixed,
                     Vec::new(),
                 )
@@ -3161,19 +3145,13 @@ pub fn state_layout(args: &V4Args) -> Result<StateLayout, Error> {
 
 fn pooling_stream(
     stream: u32,
-    ratio: i32,
-    pooled_width: i32,
-    overlapping: bool,
+    spec: &super::v4_specs::CompressorSpec,
 ) -> Result<Vec<StateTensorPolicy>, Error> {
-    let ratio = NonZeroU32::new(u32::try_from(ratio).map_err(Error::backend)?)
+    let ratio = NonZeroU32::new(u32::try_from(spec.ratio).map_err(Error::backend)?)
         .ok_or_else(|| Error::backend("V4 pooling ratio must be positive"))?;
-    let source_width = if overlapping {
-        pooled_width
-            .checked_mul(2)
-            .ok_or_else(|| Error::backend("V4 pooling source width overflowed"))?
-    } else {
-        pooled_width
-    };
+    let pooled_width = spec.head_dimensions();
+    let source_width = spec.wkv.output;
+    let overlapping = spec.overlapping();
     let role = |component| StateTensorRole::Pooling { stream, component };
     let pending = |component| {
         StateTensorPolicy::new(
@@ -3227,30 +3205,6 @@ fn pooling_stream(
         }
     }
     Ok(tensors)
-}
-
-fn parameter(name: impl Into<String>) -> Result<ParameterSpec, Error> {
-    ParameterSpec::trainable(name).map_err(Error::backend)
-}
-
-fn projection<B: eredu_nn::NeuralBackend>(
-    name: impl Into<String>,
-    input: i32,
-    output: i32,
-    format: LinearFormat,
-    context: &<B::Tensor as Tensor>::Context,
-) -> Result<B::Linear, Error> {
-    let name = name.into();
-    B::linear(
-        LinearSpec {
-            input,
-            output,
-            weight: parameter(&name)?,
-            bias: None,
-            format: crate::linear_format::standard_linear_format(&name, format)?,
-        },
-        context,
-    )
 }
 
 fn broadcast_streams<B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend>(
@@ -4459,7 +4413,7 @@ where
             _ => {
                 return Err(eredu_nn::Error::backend(
                     "target partition received prediction input",
-                ))
+                ));
             }
         };
         let input = match incoming {

@@ -9,28 +9,37 @@ use super::{
 };
 use crate::{
     decoder::ComponentInstrumentation,
-    muse::{
-        AttentionEquation, DecoderConfig, LearnedRmsNorm, RmsGain, RmsNormEquation,
-        TransformerBlock, WeightConvention,
-    },
+    muse::{AttentionEquation, DecoderPolicy, LearnedRmsNorm, TransformerBlock, WeightConvention},
 };
 use eredu_nn::{
-    DistributedNeuralBackend, Error, GroupedNeuralBackend, LinearSpec, ParameterSpec,
-    Parameterized, Tensor, TensorElementType,
+    DistributedNeuralBackend, Error, GroupedNeuralBackend, Parameterized, Tensor, TensorElementType,
 };
 
 mod parallel;
+mod parameters;
+pub(crate) use parameters::DsparkBodyParameters;
 
 /// Validated causal dense body geometry, separate from acquired parameters.
 #[derive(Debug, Clone)]
 pub struct DsparkBodyDefinition {
-    args: DecoderConfig,
-    blocks: Vec<DecoderConfig>,
+    args: DecoderPolicy,
+    parameters: std::sync::Arc<DsparkBodyParameters>,
+    local_parameters: Option<DsparkBodyParameters>,
     geometry: AssistantBodyGeometry,
 }
 impl DsparkBodyDefinition {
     /// Validates the normalized DSpark equations before any neural construction.
-    pub fn new(args: DecoderConfig, captures: usize, block: usize) -> Result<Self, Error> {
+    pub fn new(args: DecoderPolicy, captures: usize, block: usize) -> Result<Self, Error> {
+        args.validate().map_err(Error::backend)?;
+        let parameters = DsparkBodyParameters::from_args(&args, captures)?;
+        Self::from_parameters(args, std::sync::Arc::new(parameters), block)
+    }
+
+    pub(in crate::muse::assistant) fn from_parameters(
+        args: DecoderPolicy,
+        parameters: std::sync::Arc<DsparkBodyParameters>,
+        block: usize,
+    ) -> Result<Self, Error> {
         args.validate().map_err(Error::backend)?;
         if args.is_moe()
             || args.attention_equation != AttentionEquation::NormalizedHeadsScoreScaled
@@ -48,6 +57,7 @@ impl DsparkBodyDefinition {
         {
             return Err(Error::backend("invalid normalized DSpark decoder equation"));
         }
+        let captures = parameters.validate_binding(&args)?;
         let window = args
             .attention_schedule
             .iter()
@@ -66,13 +76,17 @@ impl DsparkBodyDefinition {
             window,
             ProposalLayout::SampleFromAnchor,
         )?;
-        let blocks = vec![args.clone(); geometry.layers];
         Ok(Self {
             args,
-            blocks,
+            parameters,
+            local_parameters: None,
             geometry,
         })
     }
+    fn selected_parameters(&self) -> &DsparkBodyParameters {
+        self.local_parameters.as_ref().unwrap_or(&self.parameters)
+    }
+
     /// Cold unit layout and context geometry, without a backend specialization.
     pub const fn geometry(&self) -> &AssistantBodyGeometry {
         &self.geometry
@@ -83,7 +97,7 @@ impl DsparkBodyDefinition {
         &self,
         selected: &Self,
     ) -> Result<Self, Error> {
-        let global = |a: &DecoderConfig| {
+        let global = |a: &DecoderPolicy| {
             (
                 a.hidden_size,
                 a.num_hidden_layers,
@@ -103,12 +117,21 @@ impl DsparkBodyDefinition {
             ));
         }
         let mut source = self.clone();
-        for (source, selected) in source.blocks.iter_mut().zip(&selected.blocks) {
-            source.num_attention_heads = selected.num_attention_heads;
-            source.num_key_value_heads = selected.num_key_value_heads;
-            source.intermediate_size = selected.intermediate_size;
-            source.validate().map_err(Error::backend)?;
+        let mut parameters = self.parameters.as_ref().clone();
+        for (source, selected) in parameters
+            .blocks
+            .iter_mut()
+            .zip(&selected.selected_parameters().blocks)
+        {
+            let heads = selected.attention.projection.geometry;
+            *source = source.select_dimensions(
+                heads.query_heads(),
+                heads.key_value_heads(),
+                selected.dense.gate.output,
+            )?;
         }
+        parameters.validate()?;
+        source.local_parameters = Some(parameters);
         source.geometry.key_value_heads = selected.geometry.key_value_heads;
         Ok(source)
     }
@@ -116,24 +139,23 @@ impl DsparkBodyDefinition {
     pub(in crate::muse::assistant) fn memory_body(
         &self,
     ) -> eredu_runtime::memory_forecast::ConditionedPredictionBody {
-        let a = &self.blocks[0];
         let g = &self.geometry;
+        let blocks = &self.selected_parameters().blocks;
+        let heads = blocks[0].attention.projection.geometry;
         eredu_runtime::memory_forecast::ConditionedPredictionBody {
             hidden: g.hidden as u64,
             captures: g.captures as u64,
             layers: g.layers as u64,
-            query_heads: self
-                .blocks
+            query_heads: blocks
                 .iter()
-                .map(|a| a.num_attention_heads as u64)
+                .map(|b| b.attention.projection.geometry.query_heads() as u64)
                 .max()
                 .unwrap(),
-            head_width: a.head_dim as u64,
-            key_value_width: a.num_key_value_heads as u64 * a.head_dim as u64,
-            intermediate: self
-                .blocks
+            head_width: heads.key_dimensions() as u64,
+            key_value_width: heads.key_width() as u64,
+            intermediate: blocks
                 .iter()
-                .map(|a| a.intermediate_size as u64)
+                .map(|b| b.dense.gate.output as u64)
                 .max()
                 .unwrap(),
             context_window: g.window as u64,
@@ -175,41 +197,22 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> AssistantBodyDefinition
         ordinal: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Unit, Error> {
-        let args = &self.args;
-        let norm = |name: &str, gain| {
-            LearnedRmsNorm::new(
-                args.hidden_size,
-                args.rms_norm_eps,
-                RmsNormEquation::OutputScaledComputeFp32(gain),
-                name,
-                context,
-            )
-        };
+        let edge = self.selected_parameters().edge.clone();
+        let [context_norm, final_norm] = edge.norms;
         let module = if ordinal == 0 {
             Module::Context(ContextEncoder {
-                projection: B::linear(
-                    LinearSpec {
-                        input: self.geometry.hidden * self.geometry.captures,
-                        output: args.hidden_size,
-                        weight: ParameterSpec::trainable("fc.weight").map_err(Error::backend)?,
-                        bias: None,
-                        format: crate::linear_format::standard_linear_format(
-                            "fc.weight",
-                            args.linear_format_for("fc.weight"),
-                        )?,
-                    },
-                    context,
-                )?,
-                normalization: norm("hidden_norm.weight", RmsGain::Centered)?,
+                projection: B::linear(edge.projection, context)?,
+                normalization: LearnedRmsNorm::new(context_norm, context)?,
             })
         } else if ordinal <= self.geometry.layers {
-            Module::Decoder(TransformerBlock::new_dspark(
-                &self.blocks[ordinal - 1],
+            Module::Decoder(TransformerBlock::from_dspark_parameters(
+                &self.args,
+                self.selected_parameters().blocks[ordinal - 1].clone(),
                 ordinal - 1,
                 context,
             )?)
         } else if ordinal == self.geometry.layers + 1 {
-            Module::Final(norm("norm.weight", RmsGain::Direct)?)
+            Module::Final(LearnedRmsNorm::new(final_norm, context)?)
         } else {
             return Err(Error::backend("unknown DSpark parameter unit"));
         };

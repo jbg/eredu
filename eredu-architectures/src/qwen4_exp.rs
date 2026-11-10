@@ -3,6 +3,8 @@
 //! Family admission is enabled only after complete prepared execution is wired.
 /// Distinct released-family configuration and schedule normalization.
 pub mod config;
+mod declarations;
+pub use declarations::Declaration;
 pub mod ngram;
 
 /// Exact released n-gram aliases, integer buffers and compact table recipes.
@@ -32,5 +34,7 @@ pub mod media;
 pub mod position;
 /// Retained SafeTensors target owners and generic row-bank binding contracts.
 pub mod prepared;
+/// Shared pinned vocabulary and final residual-collapse declarations.
+pub mod static_parameters;
 /// Layer-sized target units and shared layered execution.
 pub mod target;

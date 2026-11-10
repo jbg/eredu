@@ -22,6 +22,39 @@ mod read_only_attention;
 pub use indexed_attention::{IndexedAttentionInput, LocalAttentionInput};
 pub use read_only_attention::{ReadOnlyAttentionCache, ReadOnlyCache};
 
+mod clipped_linear;
+pub use clipped_linear::{ClippedLinearSpec, LinearClippingSpec};
+
+mod gated;
+pub use gated::{FusedGatedProductSpec, GatedProductSpec};
+mod gated_delta_geometry;
+pub use gated_delta_geometry::GatedDeltaHeadGeometry;
+mod latent_attention;
+pub use latent_attention::LatentAttentionGeometry;
+mod attention_projection;
+pub use attention_projection::{
+    AttentionHeadGeometry, AttentionQueryLayout, ClippedSelfAttentionProjectionSpec,
+    SelfAttentionProjectionSpec,
+};
+mod joint_selector;
+pub use joint_selector::JointGroupSelectorSpec;
+mod routed_gated;
+pub use routed_gated::RoutedGatedProductSpec;
+mod unary_feed_forward;
+pub use unary_feed_forward::{UnaryActivation, UnaryFeedForwardSpec};
+mod split_gated;
+pub use split_gated::SplitGatedProductSpec;
+
+mod layer_normalization;
+pub use layer_normalization::LayerNormalizationConstructionSpec;
+
+mod parameter_declarations;
+pub use parameter_declarations::{
+    validate_logical_parameter_scope, validate_logical_parameter_topology,
+    DeclareGroupedParameters, DeclareLogicalParameters, LogicalParameterDeclaration,
+    LogicalParameterRole, LogicalParameterTopologyError, PackedGatedProductParameters,
+};
+
 mod grouped_linear;
 mod grouped_units;
 mod linear_rows;
@@ -781,30 +814,47 @@ where
 
     let mut collector = Collector(Vec::new());
     module.visit_parameters(&mut collector);
+    validate_parameter_identities(
+        collector
+            .0
+            .iter()
+            .map(|metadata| (&metadata.id, metadata.alias_of.as_ref())),
+        true,
+    )?;
+    Ok(collector.0)
+}
+
+fn validate_parameter_identities<'a>(
+    entries: impl IntoIterator<Item = (&'a ParameterId, Option<&'a ParameterId>)>,
+    require_destinations: bool,
+) -> Result<(), ParameterTopologyError> {
     let mut topology = std::collections::BTreeMap::new();
-    for metadata in &collector.0 {
-        if topology.insert(metadata.id.clone(), metadata).is_some() {
-            return Err(ParameterTopologyError::DuplicateId(metadata.id.clone()));
+    for (id, alias) in entries {
+        if topology.insert(id, alias).is_some() {
+            return Err(ParameterTopologyError::DuplicateId(id.clone()));
         }
     }
-    for metadata in &collector.0 {
-        let Some(destination) = &metadata.alias_of else {
+    for (&id, &alias) in &topology {
+        let Some(destination) = alias else {
             continue;
         };
         let Some(target) = topology.get(destination) else {
+            if !require_destinations {
+                continue;
+            }
             return Err(ParameterTopologyError::MissingAliasDestination {
-                alias: metadata.id.clone(),
+                alias: id.clone(),
                 destination: destination.clone(),
             });
         };
-        if target.alias_of.is_some() {
+        if target.is_some() {
             return Err(ParameterTopologyError::AliasTargetsAlias {
-                alias: metadata.id.clone(),
+                alias: id.clone(),
                 destination: destination.clone(),
             });
         }
     }
-    Ok(collector.0)
+    Ok(())
 }
 
 /// Shape and checkpoint identity for an affine projection.
@@ -833,6 +883,20 @@ pub struct EmbeddingSpec {
     pub weight: ParameterSpec,
     /// Complete physical checkpoint encoding and exact companion identities.
     pub format: LinearFormatSpec,
+}
+
+impl EmbeddingSpec {
+    /// References this table as a bias-free output projection with its exact identity and encoding.
+    /// This projection adds no logical identity; callers retain placement and materialization authority.
+    pub fn output_projection(&self) -> LinearSpec {
+        LinearSpec {
+            input: self.dimensions,
+            output: self.vocabulary,
+            weight: self.weight.clone(),
+            bias: None,
+            format: self.format.clone(),
+        }
+    }
 }
 
 /// Architecture-owned physical encoding and exact companion parameters.
@@ -881,6 +945,19 @@ impl LinearArithmetic {
 }
 
 impl LinearFormatSpec {
+    /// Projects companion identities while retaining encoding, row layout and arithmetic.
+    pub fn map_parameters(
+        &self,
+        mut map: impl FnMut(&ParameterSpec) -> Result<ParameterSpec, Error>,
+    ) -> Result<Self, Error> {
+        let mut projected = self.clone();
+        projected.scale = self.scale.as_ref().map(&mut map).transpose()?;
+        projected.affine_bias = self.affine_bias.as_ref().map(&mut map).transpose()?;
+        projected.global_scale = self.global_scale.as_ref().map(&mut map).transpose()?;
+        projected.validate()?;
+        Ok(projected)
+    }
+
     /// Selects one complete affine arithmetic policy without changing storage.
     pub fn with_arithmetic(mut self, arithmetic: LinearArithmetic) -> Result<Self, Error> {
         if arithmetic.compute_element().is_some_and(|e| {
@@ -1316,6 +1393,16 @@ impl FusedProjectionLayout {
         self.output_width
     }
 
+    /// Checked final-axis component ranges in declaration order.
+    pub fn ranges(&self) -> impl Iterator<Item = std::ops::Range<i32>> + '_ {
+        self.segments.iter().scan(0, |start, segment| {
+            let end = *start + segment.width;
+            let range = *start..end;
+            *start = end;
+            Some(range)
+        })
+    }
+
     /// Splits one fused result into component-major final-axis views.
     pub fn split<T: Tensor>(&self, output: &T, context: &T::Context) -> Result<Vec<T>, Error> {
         let actual = output
@@ -1329,17 +1416,12 @@ impl FusedProjectionLayout {
                 self.output_width
             )));
         }
-        let mut start = 0i32;
         let mut indexes = vec![Index::Full; output.shape().len()];
-        self.segments
-            .iter()
-            .map(|segment| {
-                let end = start + segment.width;
+        self.ranges()
+            .map(|range| {
                 let last = indexes.len() - 1;
-                indexes[last] = Index::Range(start, end);
-                let selected = output.index(&indexes, context);
-                start = end;
-                selected
+                indexes[last] = Index::Range(range.start, range.end);
+                output.index(&indexes, context)
             })
             .collect()
     }
@@ -1409,6 +1491,16 @@ pub enum LayerNormalizationArithmetic {
     /// scalar moment merges use fused multiply-add; vector chains round their
     /// products and sums separately.
     CascadedMoments,
+}
+
+impl LayerNormalizationArithmetic {
+    /// Optional backend mechanism required by this exact normalization equation.
+    pub const fn required_operator_capabilities(self) -> NeuralOperatorCapabilities {
+        match self {
+            Self::Native => NeuralOperatorCapabilities::NONE,
+            Self::CascadedMoments => NeuralOperatorCapabilities::CASCADED_LAYER_NORM,
+        }
+    }
 }
 
 impl NormalizationConstructionSpec {
@@ -1770,6 +1862,10 @@ pub struct LowRankProjectionSpec {
 impl LowRankProjectionSpec {
     /// Validates that both projections and normalization agree on rank width.
     pub fn validate(&self) -> Result<(), Error> {
+        self.logical_parameters().map(|_| ())
+    }
+
+    pub(crate) fn validate_geometry(&self) -> Result<(), Error> {
         let rank = self.normalization.dimensions;
         if rank <= 0 {
             return Err(Error::backend(format!(
@@ -2103,6 +2199,24 @@ impl SelectorInputTransformSpec {
 }
 
 impl TopKGroupSelectorSpec {
+    /// Projects exact parameter references without changing selector geometry or equations.
+    pub fn map_parameters(
+        &self,
+        mut map: impl FnMut(&ParameterSpec) -> Result<ParameterSpec, Error>,
+    ) -> Result<Self, Error> {
+        let mut projected = self.clone();
+        projected.weight = map(&self.weight)?;
+        projected.bias = self.bias.as_ref().map(&mut map).transpose()?;
+        projected.correction_bias = self.correction_bias.as_ref().map(&mut map).transpose()?;
+        projected.coefficient_scale = self.coefficient_scale.as_ref().map(&mut map).transpose()?;
+        if let Some(transform) = &mut projected.input_transform {
+            transform.scale = map(&transform.scale)?;
+        }
+        projected.format = self.format.map_parameters(&mut map)?;
+        projected.validate()?;
+        Ok(projected)
+    }
+
     /// Creates a selector projection with no optional parameters.
     pub fn new(
         input_dimensions: i32,
@@ -2206,6 +2320,12 @@ impl TopKGroupSelectorSpec {
     /// Returns the physical projection format.
     pub const fn format(&self) -> &LinearFormatSpec {
         &self.format
+    }
+    /// Replaces only the selector's physical encoding and companion identities.
+    pub fn with_format(mut self, format: LinearFormatSpec) -> Result<Self, Error> {
+        self.format = format;
+        self.validate()?;
+        Ok(self)
     }
     /// Returns the group-selection semantics.
     pub const fn selection(&self) -> TopKGroupSelectionSpec {
@@ -2426,6 +2546,7 @@ impl JointGroupSelectionSpec {
     ) -> Result<Self, Error> {
         if selectable_groups <= 0
             || always_on_groups <= 0
+            || selectable_groups.checked_add(always_on_groups).is_none()
             || top_k <= 0
             || top_k > selectable_groups
             || !coefficient_scale.is_finite()
@@ -2451,6 +2572,11 @@ impl JointGroupSelectionSpec {
     /// Returns the number of always-on groups.
     pub const fn always_on_groups(self) -> i32 {
         self.always_on_groups
+    }
+
+    /// Complete projection axis, including selectable and always-on groups.
+    pub const fn projected_groups(self) -> i32 {
+        self.selectable_groups + self.always_on_groups
     }
 
     /// Returns the selected group count per row.
@@ -2542,11 +2668,7 @@ impl<T: Tensor> JointGroupSelectionInput<'_, T> {
         let scale = self.global_scale.shape();
         let hidden_width = hidden.last().copied().unwrap_or(0);
         if hidden.len() < 2
-            || weight
-                != [
-                    self.selectable_groups() + self.always_on_groups(),
-                    hidden_width,
-                ]
+            || weight != [self.selection.projected_groups(), hidden_width]
             || bias != [self.selectable_groups()]
             || scale != [1]
         {
@@ -2596,17 +2718,19 @@ impl<T> JointGroupSelection<T> {
     }
 }
 
-/// Activation applied to the gate branch of a grouped gated product.
+/// Activation applied to the gate branch of a gated product.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum GatedProductActivation {
     /// `gate * sigmoid(sigmoid_multiplier * gate)`.
     Silu,
+    /// Exact Gaussian error linear unit.
+    Gelu,
     /// Approximate Gaussian error linear unit.
     GeluApproximate,
 }
 
-/// Validated equation policy for a gated product group.
+/// Validated equation policy for a gated product.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GatedProductPolicy {
     activation: GatedProductActivation,
@@ -2644,6 +2768,14 @@ impl GatedProductPolicy {
             up_absolute_bound: None,
             sigmoid_multiplier: 1.0,
             up_offset: 0.0,
+        }
+    }
+
+    /// Ordinary unbounded exact-GELU gating.
+    pub const fn ordinary_gelu() -> Self {
+        Self {
+            activation: GatedProductActivation::Gelu,
+            ..Self::ordinary_silu()
         }
     }
 
@@ -2791,6 +2923,26 @@ pub struct GroupedProjectionSpec {
 }
 
 impl GroupedProjectionSpec {
+    /// Projects exact primary, bias and companion references without changing storage policy.
+    pub fn map_parameters(
+        &self,
+        mut map: impl FnMut(&ParameterSpec) -> Result<ParameterSpec, Error>,
+    ) -> Result<Self, Error> {
+        let mut projected = self.clone();
+        projected.weight = map(&self.weight)?;
+        projected.bias = self.bias.as_ref().map(&mut map).transpose()?;
+        projected.format = self.format.map_parameters(&mut map)?;
+        projected.validate()?;
+        Ok(projected)
+    }
+    /// Selects storage and its row origins while preserving primary and bias ownership.
+    pub fn with_format(mut self, format: LinearFormatSpec) -> Result<Self, Error> {
+        self.weight.linear_row_layout = format.row_layout();
+        self.format = format;
+        self.validate()?;
+        Ok(self)
+    }
+
     /// Creates one validated grouped projection description.
     pub fn new(
         mut weight: ParameterSpec,
@@ -2893,6 +3045,29 @@ pub struct GroupedGatedProductSpec {
 }
 
 impl GroupedGatedProductSpec {
+    /// Projects every retained projection while preserving bank geometry and equations.
+    pub fn map_projections(
+        &self,
+        mut map: impl FnMut(&GroupedProjectionSpec) -> Result<GroupedProjectionSpec, Error>,
+    ) -> Result<Self, Error> {
+        let mut projected = self.clone();
+        match &mut projected.layout {
+            GatedProductGroupLayout::Packed { gate_up, down } => {
+                *gate_up = map(gate_up)?;
+                *down = map(down)?;
+            }
+            GatedProductGroupLayout::Independent(groups) => {
+                for group in groups {
+                    group.gate = map(&group.gate)?;
+                    group.up = map(&group.up)?;
+                    group.down = map(&group.down)?;
+                }
+            }
+        }
+        projected.validate()?;
+        Ok(projected)
+    }
+
     /// Creates one validated grouped gated-product mechanism request.
     pub fn new(
         group_count: i32,
@@ -3174,6 +3349,18 @@ pub struct GroupedRelu2Spec {
 }
 
 impl GroupedRelu2Spec {
+    /// Projects retained up/down slots while preserving bank geometry and equations.
+    pub fn map_projections(
+        &self,
+        mut map: impl FnMut(&GroupedProjectionSpec) -> Result<GroupedProjectionSpec, Error>,
+    ) -> Result<Self, Error> {
+        let mut projected = self.clone();
+        projected.up = map(&self.up)?;
+        projected.down = map(&self.down)?;
+        projected.validate()?;
+        Ok(projected)
+    }
+
     /// Creates one validated grouped ReLU-squared mechanism request.
     pub fn new(
         group_count: i32,
@@ -3193,8 +3380,13 @@ impl GroupedRelu2Spec {
         Ok(spec)
     }
     /// Returns a copy with placement-resolved group geometry.
-    pub fn with_group_count(mut self, group_count: i32) -> Result<Self, Error> {
+    pub fn with_group_geometry(
+        mut self,
+        group_count: i32,
+        intermediate_dimensions: i32,
+    ) -> Result<Self, Error> {
         self.group_count = group_count;
+        self.intermediate_dimensions = intermediate_dimensions;
         self.validate()?;
         Ok(self)
     }
@@ -3529,8 +3721,12 @@ pub struct HyperConnectionSpec {
 }
 
 impl HyperConnectionSpec {
-    /// Validates geometry and numerical policy without inspecting parameters.
+    /// Validates geometry, numerical policy, and the complete parameter scope.
     pub fn validate(&self) -> Result<(), Error> {
+        self.logical_parameters().map(|_| ())
+    }
+
+    pub(crate) fn validate_geometry(&self) -> Result<(), Error> {
         if self.streams <= 0 || self.hidden_size <= 0 {
             return Err(Error::backend(
                 "hyper-connection streams and hidden size must be positive",
@@ -3570,8 +3766,12 @@ pub struct HyperHeadSpec {
 }
 
 impl HyperHeadSpec {
-    /// Validates geometry and numerical policy without inspecting parameters.
+    /// Validates geometry, numerical policy, and the complete parameter scope.
     pub fn validate(&self) -> Result<(), Error> {
+        self.logical_parameters().map(|_| ())
+    }
+
+    pub(crate) fn validate_geometry(&self) -> Result<(), Error> {
         if self.streams <= 0 || self.hidden_size <= 0 {
             return Err(Error::backend(
                 "hyper-head streams and hidden size must be positive",
@@ -6317,13 +6517,23 @@ pub struct GatedShortConvolutionSpec {
 }
 
 impl GatedShortConvolutionSpec {
+    /// Declares the component-major B, C and x rows for one channel domain.
+    pub fn input_layout(channels: i32) -> Result<FusedProjectionLayout, Error> {
+        FusedProjectionLayout::new([
+            FusedProjectionSegment::new("B", channels)?,
+            FusedProjectionSegment::new("C", channels)?,
+            FusedProjectionSegment::new("x", channels)?,
+        ])
+    }
+
     /// Validates the fused segment and convolution geometry.
     pub fn validate(&self) -> Result<(), Error> {
+        self.logical_parameters().map(|_| ())
+    }
+
+    pub(crate) fn validate_geometry(&self) -> Result<(), Error> {
         self.convolution.validate()?;
-        let fused = self
-            .channels
-            .checked_mul(3)
-            .ok_or_else(|| Error::backend("gated short-convolution width overflowed"))?;
+        let fused = Self::input_layout(self.channels)?.output_width();
         if self.input_dimensions <= 0
             || self.channels <= 0
             || self.output_dimensions <= 0
@@ -6369,7 +6579,7 @@ pub struct GatedShortConvolution<B: NeuralBackend> {
     /// Output projection.
     pub output_projection: B::Linear,
     #[parameter(skip)]
-    channels: i32,
+    input_layout: FusedProjectionLayout,
 }
 
 impl<B: NeuralBackend> GatedShortConvolution<B> {
@@ -6379,11 +6589,12 @@ impl<B: NeuralBackend> GatedShortConvolution<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         spec.validate()?;
+        let input_layout = GatedShortConvolutionSpec::input_layout(spec.channels)?;
         Ok(Self {
             input_projection: B::linear(spec.input_projection, context)?,
             convolution: CausalDepthwiseConvolution::new(spec.convolution, context)?,
             output_projection: B::linear(spec.output_projection, context)?,
-            channels: spec.channels,
+            input_layout,
         })
     }
 
@@ -6394,21 +6605,11 @@ impl<B: NeuralBackend> GatedShortConvolution<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<(B::Tensor, Option<B::Tensor>), Error> {
         let projected = self.input_projection.forward(input, context)?;
-        let rank = projected.shape().len();
-        if rank == 0 || projected.shape()[rank - 1] != 3 * self.channels {
-            return Err(Error::backend(format!(
-                "gated short-convolution projection returned shape {:?}, expected final width {}",
-                projected.shape(),
-                3 * self.channels
-            )));
-        }
-        let mut segment = vec![Index::Full; rank];
-        segment[rank - 1] = Index::Range(0, self.channels);
-        let b = projected.index(&segment, context)?;
-        segment[rank - 1] = Index::Range(self.channels, 2 * self.channels);
-        let c = projected.index(&segment, context)?;
-        segment[rank - 1] = Index::Range(2 * self.channels, 3 * self.channels);
-        let x = projected.index(&segment, context)?;
+        let [b, c, x]: [B::Tensor; 3] = self
+            .input_layout
+            .split(&projected, context)?
+            .try_into()
+            .map_err(|_| Error::backend("short-convolution requires three declared components"))?;
         let convolution = self
             .convolution
             .forward(&b.multiply(&x, context)?, history, context)?;
@@ -6646,6 +6847,8 @@ impl<T: 'static> Parameterized<T> for Linear<T> {
 pub struct LayerNorm<T> {
     /// Numerical stability epsilon.
     pub epsilon: f32,
+    /// Moment and affine arithmetic required by the construction declaration.
+    pub arithmetic: LayerNormalizationArithmetic,
     /// Optional trainable scale.
     pub weight: Option<Parameter<T>>,
     /// Optional trainable bias.
@@ -6653,21 +6856,22 @@ pub struct LayerNorm<T> {
 }
 
 impl<T: Tensor> LayerNorm<T> {
-    /// Creates an unloaded affine layer normalization.
-    pub fn unloaded(
-        dimensions: i32,
-        epsilon: f32,
-        weight: Option<ParameterSpec>,
-        bias: Option<ParameterSpec>,
+    /// Constructs an unloaded affine normalization from its typed declaration.
+    pub fn new(
+        spec: LayerNormalizationConstructionSpec,
         context: &T::Context,
     ) -> Result<Self, Error> {
+        spec.validate()?;
         Ok(Self {
-            epsilon,
-            weight: weight
-                .map(|weight| Parameter::unloaded(weight, &[dimensions], context))
+            epsilon: spec.epsilon,
+            arithmetic: spec.arithmetic,
+            weight: spec
+                .weight
+                .map(|weight| Parameter::unloaded(weight, &[spec.dimensions], context))
                 .transpose()?,
-            bias: bias
-                .map(|bias| Parameter::unloaded(bias, &[dimensions], context))
+            bias: spec
+                .bias
+                .map(|bias| Parameter::unloaded(bias, &[spec.dimensions], context))
                 .transpose()?,
         })
     }
@@ -6679,7 +6883,7 @@ impl<T: Tensor> LayerNorm<T> {
             self.weight.as_ref().map(Parameter::as_ref),
             self.bias.as_ref().map(Parameter::as_ref),
             self.epsilon,
-            LayerNormalizationArithmetic::Native,
+            self.arithmetic,
             context,
         )
     }

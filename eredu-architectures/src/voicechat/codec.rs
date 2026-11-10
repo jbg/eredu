@@ -78,3 +78,42 @@ pub fn waveform_decoder_config(config: &CodecConfig) -> Result<AudioDecoderConfi
     }
     Ok(decoder)
 }
+
+/// Source-free neural codec scopes for the validated published VoiceChat profile.
+#[derive(Debug)]
+pub(crate) struct CodecDeclarations {
+    pub encoder: eredu_codec::declarations::EncoderDeclaration,
+    pub decoder: eredu_codec::declarations::DecoderDeclaration,
+    pub quantizer: eredu_codec::declarations::QuantizerDeclaration,
+}
+/// Every admitted VoiceChat configuration validates against this exact released profile.
+/// These immutable scopes carry no artifact values, invocation state or backend resources.
+pub(crate) fn released_declarations() -> Result<&'static CodecDeclarations, Error> {
+    static DECLARATIONS: std::sync::OnceLock<Result<CodecDeclarations, String>> =
+        std::sync::OnceLock::new();
+    DECLARATIONS
+        .get_or_init(|| {
+            let config = super::config::released_configuration().map_err(|e| e.to_string())?;
+            let encoder = waveform_encoder_config(&config.codec).map_err(|e| e.to_string())?;
+            let decoder = waveform_decoder_config(&config.codec).map_err(|e| e.to_string())?;
+            Ok(CodecDeclarations {
+                encoder: eredu_codec::declarations::EncoderDeclaration::new(
+                    encoder.neural,
+                    "tts_model.audio_codec.encoder",
+                )
+                .map_err(|e| e.to_string())?,
+                decoder: eredu_codec::declarations::DecoderDeclaration::new(
+                    decoder.neural,
+                    "tts_model.audio_codec.decoder",
+                )
+                .map_err(|e| e.to_string())?,
+                quantizer: eredu_codec::declarations::QuantizerDeclaration::new(
+                    decoder.quantizer,
+                    "tts_model.audio_codec.prvq",
+                )
+                .map_err(|e| e.to_string())?,
+            })
+        })
+        .as_ref()
+        .map_err(|reason| Error::InvalidShape(reason.clone()))
+}

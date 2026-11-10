@@ -86,6 +86,88 @@ fn native_control_recurrent_moe_continuations_preserve_routing_interventions() {
     sampled_conformance(root.path(), true);
 }
 
+#[test]
+fn native_control_mamba_continuations_preserve_state() {
+    let root = tempfile::tempdir().unwrap();
+    let config = serde_json::json!({
+        "model_type": "nemotron_h", "vocab_size": 64, "hidden_size": 32,
+        "intermediate_size": 48, "num_hidden_layers": 4,
+        "hybrid_override_pattern": "M*-E", "num_attention_heads": 4,
+        "num_key_value_heads": 2, "head_dim": 8, "max_position_embeddings": 128,
+        "mamba_num_heads": 4, "mamba_head_dim": 8, "n_groups": 2,
+        "ssm_state_size": 4, "conv_kernel": 3, "chunk_size": 2,
+        "moe_intermediate_size": 16, "moe_shared_expert_intermediate_size": 24,
+        "n_routed_experts": 2, "n_shared_experts": 1, "num_experts_per_tok": 1,
+        "mlp_hidden_act": "relu2", "mamba_hidden_act": "silu"
+    });
+    write_configured_safetensors_fixture(root.path(), &config, |key, index| {
+        if key.ends_with(".A_log") {
+            -1.0
+        } else {
+            fixture_value(key, index)
+        }
+    });
+    sampled_conformance(root.path(), false);
+}
+
+#[test]
+fn native_control_recurrent_latent_continuations_preserve_state() {
+    let root = tempfile::tempdir().unwrap();
+    let config = serde_json::json!({
+        "model_type": "kimi_linear", "vocab_size": 64, "hidden_size": 16,
+        "num_hidden_layers": 2, "num_attention_heads": 2, "num_key_value_heads": 2,
+        "intermediate_size": 32, "head_dim": 8, "model_max_length": 128,
+        "linear_attn_config": {"kda_layers": [1], "full_attn_layers": [2],
+            "num_heads": 2, "head_dim": 8, "short_conv_kernel_size": 3},
+        "num_experts": 2, "moe_intermediate_size": 16, "kv_lora_rank": 8,
+        "q_lora_rank": 8, "qk_nope_head_dim": 4, "qk_rope_head_dim": 4,
+        "v_head_dim": 8, "mla_use_nope": true, "num_experts_per_token": 1,
+        "routed_scaling_factor": 1.0, "first_k_dense_replace": 1,
+        "num_expert_group": 1, "topk_group": 1
+    });
+    write_configured_safetensors_fixture(root.path(), &config, fixture_value);
+    sampled_conformance(root.path(), false);
+}
+
+#[test]
+fn native_control_rotary_latent_continuations_preserve_state() {
+    let root = tempfile::tempdir().unwrap();
+    let config = serde_json::json!({
+        "model_type": "deepseek_v3", "vocab_size": 64, "hidden_size": 16,
+        "num_hidden_layers": 2, "num_attention_heads": 2, "intermediate_size": 32,
+        "moe_intermediate_size": 16, "max_position_embeddings": 128,
+        "q_lora_rank": 8, "kv_lora_rank": 8, "qk_nope_head_dim": 4,
+        "qk_rope_head_dim": 4, "v_head_dim": 8, "first_k_dense_replace": 1,
+        "n_routed_experts": 2, "n_shared_experts": 1, "num_experts_per_tok": 1,
+        "n_group": 1, "topk_group": 1
+    });
+    write_configured_safetensors_fixture(root.path(), &config, fixture_value);
+    sampled_conformance(root.path(), false);
+}
+
+#[test]
+fn native_control_compressed_hyper_stream_continuations_preserve_state() {
+    let root = tempfile::tempdir().unwrap();
+    let config = serde_json::json!({
+        "model_type": "deepseek_v4", "vocab_size": 64, "hidden_size": 16,
+        "num_hidden_layers": 3, "num_attention_heads": 2, "head_dim": 8,
+        "qk_rope_head_dim": 4, "q_lora_rank": 8, "o_lora_rank": 8, "o_groups": 1,
+        "moe_intermediate_size": 16, "max_position_embeddings": 128,
+        "sliding_window": 4, "compress_ratios": [0, 4, 128],
+        "index_n_heads": 2, "index_head_dim": 8, "index_topk": 2,
+        "hc_mult": 2, "hc_sinkhorn_iters": 2, "num_hash_layers": 1,
+        "n_routed_experts": 2, "n_shared_experts": 1, "num_experts_per_tok": 1
+    });
+    write_configured_safetensors_fixture(root.path(), &config, |key, index| {
+        if key.ends_with(".tid2eid") {
+            (index % 2) as f32
+        } else {
+            fixture_value(key, index)
+        }
+    });
+    sampled_conformance(root.path(), false);
+}
+
 fn fixture_value(key: &str, index: usize) -> f32 {
     if key.contains("norm") {
         1.0

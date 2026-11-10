@@ -2,12 +2,14 @@
 use super::{config::Config, residual::mixer_spec};
 use crate::{
     decoder::ComponentInstrumentation,
-    shared_routed::{SharedRoutedGatedProduct, SharedRoutedGatedProductSpec},
+    shared_routed::{
+        SharedRoutedGatedProduct, SharedRoutedGatedProductParameters, SharedRoutedGatedProductSpec,
+    },
 };
 use eredu_nn::{
     residual_streams::{GatedResidual, GatedResidualSpec},
-    DistributedNeuralBackend, Error, GatedProductPolicy, GroupReduction, GroupScoring,
-    GroupedGatedProductSpec, GroupedNeuralBackend, LinearFormatSpec, LinearSpec,
+    DeclareLogicalParameters, DistributedNeuralBackend, Error, GatedProductPolicy, GroupReduction,
+    GroupScoring, GroupedGatedProductSpec, GroupedNeuralBackend, LinearFormatSpec, LinearSpec,
     OutputGateActivation, ParameterSpec, RoutingArithmetic, RoutingPrecision, Tensor,
     TopKGroupSelectionSpec, TopKGroupSelectorSpec,
 };
@@ -15,15 +17,44 @@ use eredu_runtime::{
     ParameterProvider, RoutedBankId, RoutedObservationPoints, TensorParallelParameterProvider,
 };
 
-/// Formats and independent expert layouts are retained from checkpoint preparation.
-/// `layer` identifies the physical parameter-bank owner, independently of its name.
-pub fn feed_forward_spec(
+/// Canonical packed bank; physical layouts and encodings are explicit source extensions.
+/// The format callback receives the projection's component row origins; source
+/// adapters retain the actual stored layout independently of the logical fusion.
+pub fn expert_spec(
     config: &Config,
-    layer: usize,
+    root: &str,
+    mut format: impl FnMut(&str, eredu_nn::LinearRowLayout) -> Result<LinearFormatSpec, Error>,
+) -> Result<GroupedGatedProductSpec, Error> {
+    let mut projection = |suffix: &str, row_layout| {
+        let name = format!("{root}.{suffix}");
+        let mut parameter = ParameterSpec::trainable(&name).map_err(Error::backend)?;
+        parameter.group = Some(root.into());
+        eredu_nn::GroupedProjectionSpec::new(parameter, None, format(&name, row_layout)?)
+    };
+    GroupedGatedProductSpec::new(
+        config.experts.count,
+        config.hidden_size,
+        config.experts.intermediate,
+        config.hidden_size,
+        GatedProductPolicy::ordinary_silu(),
+        eredu_nn::GatedProductGroupLayout::Packed {
+            gate_up: projection(
+                "gate_up_proj",
+                eredu_nn::LinearRowLayout::equal_partitions(2)?,
+            )?,
+            down: projection("down_proj", eredu_nn::LinearRowLayout::Contiguous)?,
+        },
+    )
+}
+
+/// Formats and independent expert layouts are retained from checkpoint preparation.
+/// Invocation layer and bank ownership are supplied separately by construction.
+pub fn feed_forward_parameters(
+    config: &Config,
     root: &str,
     experts: GroupedGatedProductSpec,
     mut format: impl FnMut(&str) -> Result<LinearFormatSpec, Error>,
-) -> Result<SharedRoutedGatedProductSpec, Error> {
+) -> Result<SharedRoutedGatedProductParameters, Error> {
     if experts.group_count() != config.experts.count
         || experts.input_dimensions() != config.hidden_size
         || experts.output_dimensions() != config.hidden_size
@@ -34,10 +65,15 @@ pub fn feed_forward_spec(
             "qwen4_exp prepared expert geometry or equation mismatch",
         ));
     }
+    let parameter = |name: &str| -> Result<ParameterSpec, Error> {
+        let mut parameter = ParameterSpec::trainable(name).map_err(Error::backend)?;
+        parameter.group = Some(root.into());
+        Ok(parameter)
+    };
     let router_name = format!("{root}.gate.weight");
     let router = TopKGroupSelectorSpec::new(
         config.hidden_size,
-        ParameterSpec::trainable(&router_name).map_err(Error::backend)?,
+        parameter(&router_name)?,
         format(&router_name)?,
         TopKGroupSelectionSpec::new(
             config.experts.count,
@@ -56,18 +92,18 @@ pub fn feed_forward_spec(
         Ok::<_, Error>(LinearSpec {
             input,
             output,
-            weight: ParameterSpec::trainable(&name).map_err(Error::backend)?,
+            weight: parameter(&name)?,
             bias: None,
             format: format(&name)?,
         })
     };
-    let spec = SharedRoutedGatedProductSpec {
-        layer,
-        bank: RoutedBankId::new(0),
-        router,
-        // The reference accumulates expert writes in increasing expert-ID order.
-        experts: experts.with_reduction(GroupReduction::SequentialGroupOrder),
-        shared: [
+    let spec = SharedRoutedGatedProductParameters {
+        routed: eredu_nn::RoutedGatedProductSpec {
+            selector: router,
+            // The reference accumulates expert writes in increasing expert-ID order.
+            experts: experts.with_reduction(GroupReduction::SequentialGroupOrder),
+        },
+        shared: eredu_nn::SplitGatedProductSpec::new(
             linear(
                 "shared_expert.gate_proj",
                 config.hidden_size,
@@ -83,8 +119,8 @@ pub fn feed_forward_spec(
                 config.experts.shared_intermediate,
                 config.hidden_size,
             )?,
-        ],
-        shared_policy: GatedProductPolicy::ordinary_silu(),
+            GatedProductPolicy::ordinary_silu(),
+        )?,
         shared_gate: linear("shared_expert_gate", config.hidden_size, 1)?,
         gate_activation: OutputGateActivation::Sigmoid,
     };
@@ -116,30 +152,59 @@ impl FeedForwardSublayerSpec {
                 true,
                 &mut format,
             )?,
-            feed_forward: feed_forward_spec(
-                config,
+            feed_forward: SharedRoutedGatedProductSpec {
                 layer,
-                &format!("{root}.mlp"),
-                experts,
-                format,
-            )?,
+                bank: RoutedBankId::new(0),
+                parameters: feed_forward_parameters(
+                    config,
+                    &format!("{root}.mlp"),
+                    experts,
+                    format,
+                )?,
+            },
         };
         spec.validate()?;
         Ok(spec)
     }
     /// Checks both sides of the residual boundary before constructing operators.
     pub fn validate(&self) -> Result<(), Error> {
+        self.logical_parameters().map(|_| ())
+    }
+    fn validate_geometry(&self) -> Result<(), Error> {
         self.residual.validate()?;
         self.feed_forward.validate()?;
         if self.residual.injection.is_none()
-            || self.residual.geometry.hidden_size() != self.feed_forward.experts.input_dimensions()
-            || self.residual.geometry.hidden_size() != self.feed_forward.experts.output_dimensions()
+            || self.residual.geometry.hidden_size()
+                != self
+                    .feed_forward
+                    .parameters
+                    .routed
+                    .experts
+                    .input_dimensions()
+            || self.residual.geometry.hidden_size()
+                != self
+                    .feed_forward
+                    .parameters
+                    .routed
+                    .experts
+                    .output_dimensions()
         {
             return Err(Error::backend(
                 "qwen4_exp feed-forward residual geometry mismatch",
             ));
         }
         Ok(())
+    }
+}
+
+impl DeclareLogicalParameters for FeedForwardSublayerSpec {
+    fn logical_parameters(&self) -> Result<Vec<eredu_nn::LogicalParameterDeclaration<'_>>, Error> {
+        self.validate_geometry()?;
+        let mut parameters = self.residual.logical_parameters()?;
+        parameters.extend(self.feed_forward.logical_parameters()?);
+        eredu_nn::validate_logical_parameter_topology(&parameters)
+            .map_err(Error::backend_source)?;
+        Ok(parameters)
     }
 }
 

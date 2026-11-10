@@ -45,60 +45,35 @@ pub fn source_name(root: &str, physical_layers: usize, name: &str) -> String {
 /// Self aliases keep shared originals in the executable catalog when another
 /// invocation consumes them through a recipe.
 pub fn recipes(
-    source: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
-    root: &str,
-    physical_layers: usize,
-    repetitions: usize,
-    normalize_between: bool,
-    parameter_owner: impl Fn(usize) -> usize,
-) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
-    physical_layers
-        .checked_mul(repetitions)
-        .filter(|&count| physical_layers > 0 && repetitions > 0 && count <= i32::MAX as usize)
-        .ok_or("invalid repeated decoder depth")?;
-    if repetitions == 1 {
-        return Ok(BTreeMap::new());
-    }
-    let prefix = format!("{root}.layers.");
+    parameters: &eredu_runtime::ArchitectureParameterDescription,
+) -> BTreeMap<String, DerivedWeightRecipe> {
     let mut result = BTreeMap::new();
-    for key in source.source_keys() {
-        let Some((layer, suffix)) = key.strip_prefix(&prefix).and_then(|s| s.split_once('.'))
-        else {
+    if parameters.invocations().logical_addresses().len()
+        == parameters.invocations().storage_layout().len()
+    {
+        return result;
+    }
+    for group in parameters.groups() {
+        if !matches!(
+            group.owner(),
+            eredu_runtime::ParameterGroupOwner::ExecutionUnit { .. }
+        ) {
             continue;
-        };
-        let Ok(layer) = layer.parse::<usize>() else {
-            continue;
-        };
-        if layer >= physical_layers {
-            return Err(format!("physical block {layer} exceeds {physical_layers}"));
         }
-        for pass in 0..repetitions {
-            let invocation = pass * physical_layers + layer;
-            if parameter_owner(invocation) != invocation {
-                continue;
-            }
+        for member in group.members() {
+            let source = member.alias_of().map_or(member.target(), |id| id.as_str());
             result.insert(
-                format!("{prefix}{invocation}.{suffix}"),
-                DerivedWeightRecipe::source(&key, TensorSelection::Full),
+                member.target().to_owned(),
+                DerivedWeightRecipe::source(source, TensorSelection::Full),
             );
+            // Keep each shared original visible when an inter-pass normalization aliases it.
+            if member.alias_of().is_some() {
+                result.insert(
+                    source.to_owned(),
+                    DerivedWeightRecipe::source(source, TensorSelection::Full),
+                );
+            }
         }
     }
-    if normalize_between && repetitions > 1 {
-        let norm = format!("{root}.norm.weight");
-        result.insert(
-            norm.clone(),
-            DerivedWeightRecipe::source(&norm, TensorSelection::Full),
-        );
-        for pass in 1..repetitions {
-            let invocation = pass * physical_layers - 1;
-            if parameter_owner(invocation) != invocation {
-                continue;
-            }
-            result.insert(
-                format!("{prefix}{invocation}.output_norm.weight"),
-                DerivedWeightRecipe::source(&norm, TensorSelection::Full),
-            );
-        }
-    }
-    Ok(result)
+    result
 }

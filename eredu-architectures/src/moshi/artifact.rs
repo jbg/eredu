@@ -29,6 +29,7 @@ pub struct MoshiPreparationPlan {
     artifact_root: PathBuf,
     checkpoint_source: PathBuf,
     config: MoshiConfig,
+    parameters: super::MoshiParameterContract,
     checkpoint_plan: SafetensorsCheckpointPlan,
     resolved_checkpoint_plan: ResolvedCheckpointPlan,
     source_metadata: BTreeMap<String, TensorMetadata>,
@@ -39,6 +40,11 @@ pub struct MoshiPreparationPlan {
 }
 
 impl MoshiPreparationPlan {
+    /// Exact parameter scopes and executable-format projection retained by admission.
+    pub fn parameter_contract(&self) -> &super::MoshiParameterContract {
+        &self.parameters
+    }
+
     /// Submitted artifact directory used to name and identify source files.
     pub fn artifact_root(&self) -> &Path {
         &self.artifact_root
@@ -105,6 +111,7 @@ impl MoshiPreparationPlan {
             artifact_root: Some(self.artifact_root),
             checkpoint_source: Some(self.checkpoint_source),
             config: Some(self.config),
+            parameters: Some(self.parameters),
             checkpoint_plan: Some(self.checkpoint_plan),
             resolved_checkpoint_plan: Some(self.resolved_checkpoint_plan),
             source_metadata: Some(self.source_metadata),
@@ -121,6 +128,7 @@ pub struct MoshiPreparationArtifact {
     artifact_root: Option<PathBuf>,
     checkpoint_source: Option<PathBuf>,
     config: Option<MoshiConfig>,
+    parameters: Option<super::MoshiParameterContract>,
     checkpoint_plan: Option<SafetensorsCheckpointPlan>,
     resolved_checkpoint_plan: Option<ResolvedCheckpointPlan>,
     source_metadata: Option<BTreeMap<String, TensorMetadata>>,
@@ -131,6 +139,13 @@ pub struct MoshiPreparationArtifact {
 }
 
 impl MoshiPreparationArtifact {
+    /// Takes the declaration retained by checkpoint admission exactly once.
+    pub fn take_parameter_contract(&mut self) -> super::MoshiParameterContract {
+        self.parameters
+            .take()
+            .expect("parameter contract already taken")
+    }
+
     /// Takes the submitted artifact root exactly once.
     pub fn take_artifact_root(&mut self) -> PathBuf {
         self.artifact_root
@@ -235,10 +250,12 @@ pub fn prepare_moshi_from_catalog<C>(
 where
     C: SafetensorsCatalog + RecipeCatalog + ?Sized,
 {
+    let parameters = super::parameter_contract(&config)
+        .map_err(|error| MoshiPreparationError::InvalidArchitecture(error.to_string()))?;
     let checkpoint_plan =
-        safetensors_plan(&config).map_err(MoshiPreparationError::InvalidArchitecture)?;
+        safetensors_plan(&parameters).map_err(MoshiPreparationError::InvalidArchitecture)?;
     let admitted =
-        admit_checkpoint(&config, &checkpoint_plan, catalog).map_err(|error| match error {
+        admit_checkpoint(&parameters, &checkpoint_plan, catalog).map_err(|error| match error {
             CheckpointPreparationError::Schema(validation) => {
                 MoshiPreparationError::InvalidCheckpoint(format!("{validation:?}"))
             }
@@ -255,6 +272,7 @@ where
         checkpoint_source: checkpoint_source.as_ref().to_owned(),
         config,
         checkpoint_plan,
+        parameters,
         resolved_checkpoint_plan: admitted.resolved_checkpoint_plan,
         source_metadata: admitted.source_metadata,
         recipes: admitted.recipes,
@@ -328,7 +346,7 @@ fn metadata_contract_identity(config: &MoshiConfig, admitted: &AdmittedCheckpoin
 /// Proves the strict physical schema and canonical recipe publication as one
 /// architecture-owned checkpoint admission.
 fn admit_checkpoint<C>(
-    config: &MoshiConfig,
+    parameters: &super::MoshiParameterContract,
     checkpoint_plan: &SafetensorsCheckpointPlan,
     catalog: &C,
 ) -> Result<AdmittedCheckpoint, CheckpointPreparationError>
@@ -365,7 +383,7 @@ where
         })
         .collect::<Result<_, _>>()?;
     let recipes =
-        canonical_recipes(config, catalog).map_err(CheckpointPreparationError::Recipes)?;
+        canonical_recipes(parameters, catalog).map_err(CheckpointPreparationError::Recipes)?;
     let recipe_outputs = recipes
         .iter()
         .map(|(target, recipe)| {

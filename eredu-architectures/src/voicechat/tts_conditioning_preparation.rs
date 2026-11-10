@@ -14,7 +14,8 @@ use super::{
     artifact::{ParameterAdmission, RetainedVoiceChatArtifacts},
     checkpoint::Component,
     parameters::{admitted_member, execution_parameter, SpeechParameterError},
-    tts_conditioning_layered::{tts_conditioning_component_definition, ConditioningDimensions},
+    tts_conditioning_layered::ConditioningDimensions,
+    tts_conditioning_specs::{released_declaration, ConditioningDeclaration},
     tts_mog::TtsError,
 };
 
@@ -45,8 +46,7 @@ pub enum ConditioningPreparationError {
 /// conversion bounds use the shared speech recipe projection. This component
 /// contract declares no full VoiceChat execution capability.
 pub struct PreparedConditioningBindings {
-    dimensions: ConditioningDimensions,
-    prepared: PreparedComponent<eredu_runtime::ComponentDefinition>,
+    prepared: PreparedComponent<ConditioningDeclaration>,
 }
 
 impl PreparedConditioningBindings {
@@ -57,34 +57,8 @@ impl PreparedConditioningBindings {
         let source = artifacts
             .component_source(Component::Tts)
             .ok_or(SpeechParameterError::MissingComponent(Component::Tts))?;
-        let dimension = |name: &str, axis: usize| -> Result<i32, ConditioningPreparationError> {
-            let parameter = artifacts.plan().parameters().get(name).ok_or_else(|| {
-                SpeechParameterError::MissingParameter {
-                    component: Component::Tts,
-                    name: name.into(),
-                }
-            })?;
-            let value = parameter
-                .output
-                .shape
-                .get(axis)
-                .copied()
-                .and_then(|n| i32::try_from(n).ok())
-                .ok_or_else(|| ConditioningPreparationError::Geometry(name.into()))?;
-            Ok(value)
-        };
-        let characters = dimension("tts_model.tts_model.embed_subword.embed_tokens.weight", 0)?
-            .checked_sub(1)
-            .ok_or_else(|| {
-                ConditioningPreparationError::Geometry("character padding row".into())
-            })?;
-        let speaker_frames = dimension("tts_model.audio_prompt_latents.Aria", 1)?;
         Self::from_parameters(
-            ConditioningDimensions::from_config(
-                &artifacts.plan().config().tts,
-                characters,
-                speaker_frames,
-            )?,
+            released_declaration()?.clone(),
             source.clone(),
             artifacts.plan().parameters(),
         )
@@ -94,14 +68,13 @@ impl PreparedConditioningBindings {
     /// discovery or native allocation. Shapes follow the symbolic architecture;
     /// neighboring TTS component payloads are excluded.
     pub fn from_parameters(
-        dimensions: ConditioningDimensions,
+        declaration: ConditioningDeclaration,
         source: SharedCheckpointSource,
         parameters: &BTreeMap<String, ParameterAdmission>,
     ) -> Result<Self, ConditioningPreparationError> {
-        let definition = tts_conditioning_component_definition(dimensions)?;
         let prepared = PreparedComponent::prepare(
             "voicechat/tts_conditioning/leased-units",
-            definition,
+            declaration,
             source.clone(),
             |member| {
                 let name = member.target();
@@ -113,10 +86,7 @@ impl PreparedConditioningBindings {
                 Ok::<_, ConditioningPreparationError>(parameter.recipe)
             },
         )?;
-        Ok(Self {
-            dimensions,
-            prepared,
-        })
+        Ok(Self { prepared })
     }
 
     /// Selects exact tensor placement or validates a retained selection without
@@ -134,7 +104,7 @@ impl PreparedConditioningBindings {
         mut self,
         layout: &LocalModelLayout,
     ) -> Result<Self, ConditioningPreparationError> {
-        super::tts_conditioning_layered::conditioning_local_dimensions(self.dimensions, layout)?;
+        self.prepared.declaration().local_dimensions(layout)?;
         self.prepared = self.prepared.select(layout)?;
         Ok(self)
     }
@@ -146,7 +116,7 @@ impl PreparedConditioningBindings {
 
     /// Validated conditioning geometry; no other speech stack is selected.
     pub fn dimensions(&self) -> ConditioningDimensions {
-        self.dimensions
+        self.prepared.declaration().dimensions()
     }
 
     /// Exact prepared unit bindings for cold resource accounting.
@@ -161,24 +131,23 @@ impl PreparedConditioningBindings {
 
     /// Complete semantic declaration retained through precision and placement selection.
     pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
-        self.prepared.declaration()
+        self.prepared.declaration().definition()
     }
 
     /// Consumes exact source authority and the canonical ordered binding plan.
     pub fn into_parts(
         self,
     ) -> (
-        ConditioningDimensions,
-        eredu_runtime::ComponentDefinition,
+        ConditioningDeclaration,
         Option<LocalModelLayout>,
         eredu_runtime::ExecutionUnitAddressMap,
         SharedCheckpointSource,
         Vec<Vec<WeightBinding>>,
     ) {
-        let (definition, local, layout, source, units) = self
+        let (declaration, local, layout, source, units) = self
             .prepared
             .into_declared_unit_parts()
             .expect("component declares only independently leased units");
-        (self.dimensions, definition, local, layout, source, units)
+        (declaration, local, layout, source, units)
     }
 }

@@ -97,8 +97,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> StaticModules
         owns: impl Fn(&str) -> bool,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let common = crate::decoder::PartitionStaticModules::<B>::from_selected_spec(
-            super::static_spec(&args.text_config),
+        let common = crate::decoder::PartitionStaticModules::<B>::from_selected_construction(
+            args.pinned().ordinary.clone(),
             geometry.map(|geometry| {
                 (
                     geometry.embedding_range().clone(),
@@ -111,12 +111,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> StaticModules
         Ok(Self {
             embeddings: common.embeddings,
             embedding_norm: owns("embedding_norm")
-                .then(|| {
-                    B::normalization(
-                        super::text::embedding_norm_spec(&args.text_config)?,
-                        context,
-                    )
-                })
+                .then(|| B::normalization(args.pinned().embedding_norm.clone(), context))
                 .transpose()?,
             final_norm: common.norm,
             output: common.lm_head,
@@ -1756,10 +1751,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ComponentKern
         std::collections::BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
         String,
     > {
-        crate::static_parameters::module_recipes(
-            &self.static_modules,
-            super::static_safetensors_recipes(&self.args, source)?,
-        )
+        super::static_safetensors_recipes(&self.args, source)
     }
     fn build_unit(
         &self,
@@ -1775,12 +1767,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ComponentKern
                     .vision_config
                     .as_ref()
                     .ok_or_else(|| Error::backend("Inkling has no vision config"))?;
-                Ok(Unit::Vision(VisionLayer::new(
-                    vision,
-                    index,
-                    vision.layer_specs()[index],
-                    context,
-                )?))
+                Ok(Unit::Vision(VisionLayer::new(vision, index, context)?))
             }
             2 => {
                 let text = match &self.parallel_geometry {
@@ -1808,15 +1795,13 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ComponentKern
                         "Inkling expert realization omits text unit {index}"
                     )));
                 }
-                Ok(Unit::Text(match realization {
-                    Some(realization) => DecoderLayer::new_with_expert_realization(
-                        text,
-                        index,
-                        realization,
-                        context,
-                    )?,
-                    None => DecoderLayer::new(text, index, context)?,
-                }))
+                Ok(Unit::Text(DecoderLayer::from_selection(
+                    &self.args,
+                    text,
+                    index,
+                    realization,
+                    context,
+                )?))
             }
             _ => Err(Error::backend("Inkling has three execution groups")),
         }

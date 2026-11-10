@@ -2,7 +2,7 @@
 
 use eredu_checkpoint::LinearFormat;
 use eredu_nn::{Error, GroupedProjectionSpec, LinearFormatSpec, ParameterSpec};
-use eredu_runtime::{ParallelPlanError, ParameterMemberSpec};
+use eredu_runtime::ParallelPlanError;
 
 /// Packed formats do not establish activation precision from integer storage.
 /// Retain the portable floating fallback envelope until a compute contract
@@ -87,6 +87,57 @@ fn companion(
     Ok(companion)
 }
 
+/// Projects ordinary matrix storage while preserving retained operator arithmetic.
+pub(crate) fn project_matrix_format(
+    weight: &ParameterSpec,
+    old: &LinearFormatSpec,
+    encoding: LinearFormat,
+) -> Result<LinearFormatSpec, Error> {
+    let name = weight.id.as_str();
+    let mut format =
+        matrix_linear_format(name, name.strip_suffix(".weight").unwrap_or(name), encoding)?
+            .with_arithmetic(old.arithmetic())?;
+    if old.exact_zero_inputs() {
+        format = format.with_exact_zero_inputs();
+    }
+    Ok(format)
+}
+
+/// Projects storage from packed gate/up semantics while retaining geometry and arithmetic.
+pub(crate) fn project_packed_gated_formats(
+    bank: &eredu_nn::GroupedGatedProductSpec,
+    encoding: impl Fn(&str) -> LinearFormat,
+) -> Result<eredu_nn::GroupedGatedProductSpec, Error> {
+    let eredu_nn::GatedProductGroupLayout::Packed { gate_up, .. } = bank.layout() else {
+        return Err(Error::backend(
+            "storage projection requires retained packed gate/up slots",
+        ));
+    };
+    let fused = &gate_up.weight().id;
+    bank.map_projections(|p| {
+        let row_layout = if &p.weight().id == fused {
+            eredu_nn::LinearRowLayout::equal_partitions(2)?
+        } else {
+            eredu_nn::LinearRowLayout::Contiguous
+        };
+        project_expert_format(p, encoding(p.weight().id.as_str()), row_layout)
+    })
+}
+
+/// Projects expert storage while retaining primary/bias ownership and arithmetic.
+pub(crate) fn project_expert_format(
+    projection: &GroupedProjectionSpec,
+    encoding: LinearFormat,
+    row_layout: eredu_nn::LinearRowLayout,
+) -> Result<GroupedProjectionSpec, Error> {
+    let mut format = standard_expert_format(projection.weight().id.as_str(), encoding, row_layout)?
+        .with_arithmetic(projection.format().arithmetic())?;
+    if projection.format().exact_zero_inputs() {
+        format = format.with_exact_zero_inputs();
+    }
+    projection.clone().with_format(format)
+}
+
 /// Declares one ordinary matrix's encoding and exact physical companions.
 pub(crate) fn standard_linear_format(
     weight_name: &str,
@@ -139,78 +190,171 @@ pub(crate) fn matrix_linear_format(
     }
 }
 
+pub(crate) fn standard_expert_companion_name(
+    weight: &str,
+    role: eredu_nn::LinearCompanionRole,
+) -> String {
+    let suffix = match role {
+        eredu_nn::LinearCompanionRole::Scale => "scales",
+        eredu_nn::LinearCompanionRole::AffineBias => "biases",
+        eredu_nn::LinearCompanionRole::GlobalScale => "global_scale",
+    };
+    format!("{weight}_{suffix}")
+}
+
+/// Declares bank companion identities with explicit block-scaled row origins.
+/// Other encodings retain contiguous rows.
 pub(crate) fn standard_expert_format(
     weight_name: &str,
     format: LinearFormat,
+    row_layout: eredu_nn::LinearRowLayout,
 ) -> Result<LinearFormatSpec, Error> {
     let declaration = match format {
         LinearFormat::Dense | LinearFormat::GgufIQuant { .. } => LinearFormatSpec::unscaled(format),
         LinearFormat::MxFp4 | LinearFormat::E4M3BlockFp8(_) => LinearFormatSpec::scaled(
             format,
-            companion(weight_name, format!("{weight_name}_scales"), "scale")?,
-        ),
-        LinearFormat::NvFp4 => LinearFormatSpec::nvfp4(
-            companion(weight_name, format!("{weight_name}_scales"), "scale")?,
             companion(
                 weight_name,
-                format!("{weight_name}_global_scale"),
+                standard_expert_companion_name(weight_name, eredu_nn::LinearCompanionRole::Scale),
+                "scale",
+            )?,
+        ),
+        LinearFormat::NvFp4 => LinearFormatSpec::nvfp4(
+            companion(
+                weight_name,
+                standard_expert_companion_name(weight_name, eredu_nn::LinearCompanionRole::Scale),
+                "scale",
+            )?,
+            companion(
+                weight_name,
+                standard_expert_companion_name(
+                    weight_name,
+                    eredu_nn::LinearCompanionRole::GlobalScale,
+                ),
                 "global-scale",
             )?,
         ),
         LinearFormat::Affine(_) => LinearFormatSpec::affine(
             format,
-            companion(weight_name, format!("{weight_name}_scales"), "scale")?,
-            companion(weight_name, format!("{weight_name}_biases"), "affine-bias")?,
+            companion(
+                weight_name,
+                standard_expert_companion_name(weight_name, eredu_nn::LinearCompanionRole::Scale),
+                "scale",
+            )?,
+            companion(
+                weight_name,
+                standard_expert_companion_name(
+                    weight_name,
+                    eredu_nn::LinearCompanionRole::AffineBias,
+                ),
+                "affine-bias",
+            )?,
         ),
     }?;
-    if matches!(format, LinearFormat::E4M3BlockFp8(_) | LinearFormat::NvFp4)
-        && weight_name.ends_with(".gate_up_proj")
-    {
-        declaration.with_row_layout(eredu_nn::LinearRowLayout::equal_partitions(2)?)
+    if matches!(format, LinearFormat::E4M3BlockFp8(_) | LinearFormat::NvFp4) {
+        declaration.with_row_layout(row_layout)
     } else {
         Ok(declaration)
     }
+}
+
+/// Binds a selected encoding to its retained output identities, without naming policy.
+pub(crate) fn selected_linear_format(
+    weight: &ParameterSpec,
+    task: &eredu_runtime::ReplicatedTextMaterializationTask,
+    row_layout: eredu_nn::LinearRowLayout,
+) -> Result<LinearFormatSpec, Error> {
+    if task.name() != weight.id.as_str() {
+        return Err(Error::backend(
+            "selected format references another primary parameter",
+        ));
+    }
+    let mut scale = None;
+    let mut bias = None;
+    let mut global = None;
+    for output in task.output_companions() {
+        let slot = match output.role() {
+            eredu_nn::LinearCompanionRole::Scale => &mut scale,
+            eredu_nn::LinearCompanionRole::AffineBias => &mut bias,
+            eredu_nn::LinearCompanionRole::GlobalScale => &mut global,
+        };
+        if slot
+            .replace(companion(
+                task.name(),
+                output.name().to_owned(),
+                "selected output",
+            )?)
+            .is_some()
+        {
+            return Err(Error::backend("selected format repeats a companion role"));
+        }
+    }
+    let required = |slot: Option<ParameterSpec>| {
+        slot.ok_or_else(|| Error::backend("selected format omits a required companion"))
+    };
+    let encoding = task.executable();
+    let format = match encoding {
+        LinearFormat::Dense | LinearFormat::GgufIQuant { .. } => {
+            if scale.is_some() || bias.is_some() || global.is_some() {
+                return Err(Error::backend(
+                    "unscaled selected format declares companions",
+                ));
+            }
+            LinearFormatSpec::unscaled(encoding)
+        }
+        LinearFormat::Affine(_) => {
+            if global.is_some() {
+                return Err(Error::backend(
+                    "affine selected format declares a global scale",
+                ));
+            }
+            LinearFormatSpec::affine(encoding, required(scale)?, required(bias)?)
+        }
+        LinearFormat::MxFp4 | LinearFormat::E4M3BlockFp8(_) => {
+            if bias.is_some() || global.is_some() {
+                return Err(Error::backend(
+                    "scaled selected format declares unexpected companions",
+                ));
+            }
+            LinearFormatSpec::scaled(encoding, required(scale)?)
+        }
+        LinearFormat::NvFp4 => {
+            if bias.is_some() {
+                return Err(Error::backend(
+                    "NVFP4 selected format declares an affine bias",
+                ));
+            }
+            LinearFormatSpec::nvfp4(required(scale)?, required(global)?)
+        }
+    }?;
+    let format = if matches!(
+        encoding,
+        LinearFormat::E4M3BlockFp8(_) | LinearFormat::NvFp4
+    ) {
+        format.with_row_layout(row_layout)?
+    } else {
+        format
+    };
+    format.validate_for_weight(weight)?;
+    Ok(format)
 }
 
 /// Declares one expert projection using the repository's checkpoint convention.
 ///
 /// The returned neutral specification contains the complete topology. Backends
 /// consume these identities literally and never reconstruct this convention.
+/// The typed projection supplies independent row origins for block-scaled formats.
 pub(crate) fn standard_expert_projection(
     weight_name: &str,
     bias_name: Option<&str>,
     format: LinearFormat,
+    row_layout: eredu_nn::LinearRowLayout,
 ) -> Result<GroupedProjectionSpec, Error> {
     GroupedProjectionSpec::new(
         expert_parameter(weight_name)?,
         bias_name.map(expert_parameter).transpose()?,
-        standard_expert_format(weight_name, format)?,
+        standard_expert_format(weight_name, format, row_layout)?,
     )
-}
-
-/// Declares the canonical dense-matrix and packed-expert companion convention.
-pub(crate) fn standard_parallel_linear_format(
-    member: &ParameterMemberSpec,
-    format: LinearFormat,
-) -> Result<Option<LinearFormatSpec>, ParallelPlanError> {
-    if format == LinearFormat::Dense || member.global_shape().len() < 2 {
-        return Ok(None);
-    }
-    let name = member.target();
-    let (prefix, expert_bank) = if let Some(prefix) = name.strip_suffix(".weight") {
-        (prefix, false)
-    } else if name.ends_with(".gate_up_proj") || name.ends_with(".down_proj") {
-        (name, true)
-    } else {
-        return Ok(None);
-    };
-    let declaration = if expert_bank {
-        standard_expert_format(prefix, format)
-    } else {
-        standard_linear_format(name, format)
-    }
-    .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    Ok(Some(declaration))
 }
 
 /// Input-axis block granularity required to retain encoded projection slices.
@@ -275,7 +419,7 @@ pub(crate) fn dense_ffn_partition_tail(
         let Some(owner) = member.linear_companion_of() else {
             return Ok(chunk);
         };
-        let LinearFormat::E4M3BlockFp8(format) = format_of(owner) else {
+        let LinearFormat::E4M3BlockFp8(format) = format_of(owner.as_str()) else {
             // Dense FFN read projections shard output rows. Affine and MXFP4
             // companions retain these rows; only their input axis is packed.
             return Ok(chunk);
@@ -289,7 +433,7 @@ pub(crate) fn dense_ffn_partition_tail(
             _ => {
                 return Err(ParallelPlanError::InvalidTensor(
                     "dense FFN companion has no partition axis".into(),
-                ))
+                ));
             }
         };
         let divisor = match member.global_shape().len().checked_sub(axis) {
@@ -298,7 +442,7 @@ pub(crate) fn dense_ffn_partition_tail(
             _ => {
                 return Err(ParallelPlanError::InvalidTensor(
                     "dense FFN companion axis is not a matrix axis".into(),
-                ))
+                ));
             }
         };
         if !chunk.is_multiple_of(divisor) {

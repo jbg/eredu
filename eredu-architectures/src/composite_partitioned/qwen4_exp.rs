@@ -19,7 +19,7 @@ fn invalid<E>(error: impl std::fmt::Display) -> CompositePartitionPreparationErr
 fn local_geometry(
     bound: &BoundTargetSpec,
     ingress: &MediaIngress,
-    vision: &crate::qwen::vision::VisionConfig,
+    vision: &crate::qwen::vision::Declaration,
     rank: eredu_core::ParallelRankTopology,
 ) -> Result<
     (
@@ -129,6 +129,13 @@ impl PreparedConditionalPartition {
                 vision.linear_formats.insert(name, format);
             }
         }
+        let vision = std::sync::Arc::new(
+            ingress
+                .vision()
+                .scopes()
+                .with_formats(vision)
+                .map_err(invalid)?,
+        );
         let (tensor, parameters, layout, experts) =
             local_geometry(&bound, &ingress, &vision, rank).map_err(invalid)?;
         let state = selected
@@ -170,7 +177,7 @@ impl PreparedConditionalPartition {
             ));
         }
         let source_architecture = if execution.text().uses_weight_transform() {
-            let source_vision = ingress.vision().config().clone();
+            let source_vision = ingress.vision().scopes().clone();
             let (source_tensor, source_parameters, source_layout, source_experts) =
                 local_geometry(&source_bound, &ingress, &source_vision, rank).map_err(invalid)?;
             if eredu_runtime::derive_partitioned_transform_source_layout(

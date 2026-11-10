@@ -1,10 +1,7 @@
 //! Retained physical names and bounded ownership for target, prediction and vision.
-use super::schema::{aliases, canonical_name};
+use super::schema::canonical_name;
 use crate::qwen4_exp::config::Config;
-use eredu_checkpoint::{
-    recipe::{DerivedWeightRecipe, RecipeCatalog},
-    store::TensorSelection,
-};
+use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::TensorSelection};
 use std::collections::BTreeMap;
 
 /// Static parameters and layer-sized execution units have separate source views.
@@ -90,34 +87,4 @@ pub fn parameter_recipes(
         }
     }
     Ok(recipes)
-}
-/// Shared packed/split-bank recipes restricted to one target or prediction expert.
-pub fn expert_recipes<C: RecipeCatalog + ?Sized>(
-    catalog: &C,
-    config: &Config,
-    scope: ParameterScope,
-    expert: usize,
-) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
-    if !matches!(
-        scope,
-        ParameterScope::Target(_) | ParameterScope::Prediction(_)
-    ) || expert >= config.experts.count as usize
-    {
-        return Err("expert is outside the declared routed unit".into());
-    }
-    let root = format!(
-        "{}.mlp.experts",
-        root(config, scope)?.ok_or("expert requires a layer owner")?
-    );
-    crate::shared_routed::checkpoint::gated_expert_recipes(
-        catalog,
-        &root,
-        expert..expert + 1,
-        TensorSelection::Range {
-            axis: 0,
-            start: expert,
-            end: expert + 1,
-        },
-        aliases,
-    )
 }

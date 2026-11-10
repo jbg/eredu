@@ -2,15 +2,11 @@
 
 use eredu_nn::{
     AttentionMask, BlockwiseAttentionBackend, BlockwiseAttentionSpec, CompressedAttentionCache,
-    CompressedAttentionState, Error, Index, LinearOperator, LinearSpec, LowRankProjection,
-    NormalizationConstructionSpec, NormalizationOperator, ParameterSpec, Parameterized,
-    RotaryOperator, RotaryPosition, RotarySpec, Tensor,
+    CompressedAttentionState, Error, Index, LinearOperator, LowRankProjection,
+    NormalizationOperator, Parameterized, RotaryOperator, RotaryPosition, Tensor,
 };
 
-use crate::{
-    decoder::ComponentInstrumentation,
-    deepseek::{projection::ProjectionPolicy, V3Args},
-};
+use crate::{decoder::ComponentInstrumentation, deepseek::V3Args};
 
 /// Direct or normalized low-rank query projection.
 #[derive(Debug, Clone, Parameterized)]
@@ -74,100 +70,32 @@ impl<B: BlockwiseAttentionBackend> Attention<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         args.validate().map_err(Error::backend)?;
-        let root = format!("model.layers.{layer}.self_attn");
-        let query_width = args
-            .num_attention_heads
-            .checked_mul(args.qk_nope_head_dim + args.qk_rope_head_dim)
-            .ok_or_else(|| Error::backend("V3 query width overflowed"))?;
-        let linear = |name: String, input, output| {
-            let format = args.linear_format_for(&name);
-            B::linear(
-                LinearSpec {
-                    input,
-                    output,
-                    weight: parameter(&name)?,
-                    bias: None,
-                    format: crate::linear_format::standard_linear_format(&name, format)?,
-                },
-                context,
-            )
+        let spec = super::super::v3_specs::attention_spec(
+            args,
+            &format!("model.layers.{layer}.self_attn"),
+        )?;
+        let geometry = spec.geometry;
+        let query = match spec.query {
+            super::super::v3_specs::QuerySpec::Direct(projection) => {
+                QueryProjection::Direct(B::linear(projection, context)?)
+            }
+            super::super::v3_specs::QuerySpec::LowRank(projection) => {
+                QueryProjection::LowRank(LowRankProjection::new(projection, context)?)
+            }
         };
-        let query = if let Some(rank) = args.q_lora_rank {
-            QueryProjection::LowRank(
-                ProjectionPolicy {
-                    first_weight: Some(format!("{root}.q_a_proj.weight")),
-                    normalization_weight: format!("{root}.q_a_layernorm.weight"),
-                    second_weight: format!("{root}.q_b_proj.weight"),
-                    input_dimensions: args.hidden_size,
-                    rank,
-                    output_dimensions: query_width,
-                    epsilon: args.rms_norm_eps,
-                    first_format: args.linear_format_for(&format!("{root}.q_a_proj.weight")),
-                    second_format: args.linear_format_for(&format!("{root}.q_b_proj.weight")),
-                }
-                .build(context)?,
-            )
-        } else {
-            QueryProjection::Direct(linear(
-                format!("{root}.q_proj.weight"),
-                args.hidden_size,
-                query_width,
-            )?)
-        };
-        let rotary_algorithm = args
-            .rope_scaling
-            .as_ref()
-            .map_or(eredu_nn::RotaryAlgorithm::Default, |yarn| {
-                yarn.rotary_algorithm()
-            });
-        let scale = ((args.qk_nope_head_dim + args.qk_rope_head_dim) as f32)
-            .sqrt()
-            .recip()
-            * args
-                .rope_scaling
-                .as_ref()
-                .map_or(1.0, |yarn| yarn.attention_multiplier());
         Ok(Self {
-            heads: args.num_attention_heads,
-            nope: args.qk_nope_head_dim,
-            rope_dimensions: args.qk_rope_head_dim,
-            value_dimensions: args.v_head_dim,
-            latent_dimensions: args.kv_lora_rank,
-            scale,
+            heads: geometry.heads(),
+            nope: geometry.non_positional_dimensions(),
+            rope_dimensions: geometry.positional_dimensions(),
+            value_dimensions: geometry.value_dimensions(),
+            latent_dimensions: geometry.latent_dimensions(),
+            scale: spec.scale,
             query,
-            kv_a: linear(
-                format!("{root}.kv_a_proj_with_mqa.weight"),
-                args.hidden_size,
-                args.kv_lora_rank + args.qk_rope_head_dim,
-            )?,
-            kv_norm: B::normalization(
-                NormalizationConstructionSpec::learned(
-                    args.kv_lora_rank,
-                    args.rms_norm_eps,
-                    parameter(format!("{root}.kv_a_layernorm.weight"))?,
-                ),
-                context,
-            )?,
-            kv_b: linear(
-                format!("{root}.kv_b_proj.weight"),
-                args.kv_lora_rank,
-                args.num_attention_heads * (args.qk_nope_head_dim + args.v_head_dim),
-            )?,
-            output: linear(
-                format!("{root}.o_proj.weight"),
-                args.num_attention_heads * args.v_head_dim,
-                args.hidden_size,
-            )?,
-            rotary: B::rotary(
-                RotarySpec {
-                    arithmetic: eredu_nn::RotaryArithmetic::Native,
-                    dimensions: args.qk_rope_head_dim,
-                    base: args.rope_theta,
-                    traditional: false,
-                    algorithm: rotary_algorithm,
-                },
-                context,
-            )?,
+            kv_a: B::linear(spec.kv_a, context)?,
+            kv_norm: B::normalization(spec.kv_norm, context)?,
+            kv_b: B::linear(spec.kv_b, context)?,
+            output: B::linear(spec.output, context)?,
+            rotary: B::rotary(spec.rotary, context)?,
         })
     }
 
@@ -379,8 +307,4 @@ fn slice_last<T: Tensor>(
     let last = indexes.len() - 1;
     indexes[last] = Index::Range(start, end);
     value.index(&indexes, context)
-}
-
-fn parameter(name: impl Into<String>) -> Result<ParameterSpec, Error> {
-    ParameterSpec::trainable(name).map_err(Error::backend)
 }

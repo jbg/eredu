@@ -16,7 +16,7 @@ pub(super) fn register(
         )
         .into());
     }
-    let hidden = spec.fusion.geometry.hidden_size() as usize;
+    let hidden = spec.shared.fusion.geometry.hidden_size() as usize;
     for unit in &spec.units {
         let scope = SpeculativeCaptureScope::Prediction { depth: unit.depth };
         execution.validate_scope(scope)?;
@@ -64,11 +64,11 @@ pub(super) fn register(
                     registrar.matrix_axis(
                         &format!("{root}.attention.{suffix}"),
                         "attention_channel",
-                        &indexed.projections[3],
+                        &indexed.parameters.projection.output,
                         1,
                     )?;
                 }
-                let selection = indexed.indexer.selection;
+                let selection = indexed.selection;
                 registrar.replicated(
                     &format!("{root}.attention.selected_positions"),
                     "selected_position",

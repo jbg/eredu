@@ -12,31 +12,39 @@ use eredu_checkpoint::{
 use super::ModelArgs;
 use crate::qwen::{self, vision};
 
-/// Derives a Qwen3-VL configuration whose text and aligned vision matrix
-/// formats reflect load-time quantization.
+/// Projects text and aligned vision storage through retained composite declarations.
 pub fn load_time_quantization(
-    args: &ModelArgs,
+    declaration: &super::Declaration,
     quantization: WeightQuantization,
-) -> Result<ModelArgs, String> {
-    let mut target = args.clone();
-    target.text = qwen::load_time_quantization(&args.text, quantization)?;
-    target.vision.apply_load_time_quantization(quantization);
-    target
-        .vision
-        .validate_for(vision::VisionMode::DeepStack)
+) -> Result<super::Declaration, String> {
+    let mut target = declaration.args().clone();
+    target.text = qwen::load_time_quantization(&target.text, quantization)?;
+    let vision = declaration
+        .vision_declaration()
+        .with_quantization(quantization)
         .map_err(|error| error.to_string())?;
-    Ok(target)
+    target.vision = vision.config().clone();
+    super::Declaration::from_components(
+        target.clone(),
+        std::sync::Arc::new(
+            declaration
+                .text_declaration()
+                .with_formats(target.text)
+                .map_err(|error| error.to_string())?,
+        ),
+        std::sync::Arc::new(vision),
+    )
+    .map_err(|error| error.to_string())
 }
 
 /// Applies canonical text and projector checkpoint formats to a complete
 /// Qwen3-VL configuration.
 pub fn with_checkpoint_formats(
     args: &ModelArgs,
-    mut text_formats: HashMap<String, WeightQuantization>,
+    text_formats: HashMap<String, WeightQuantization>,
     vision_formats: HashMap<String, WeightQuantization>,
 ) -> Result<ModelArgs, String> {
     let mut target = args.clone();
-    normalize_text_weight_formats(&args.text, &mut text_formats);
     target.text = qwen::with_checkpoint_formats(&args.text, text_formats)?;
     target.vision.linear_formats = vision_formats
         .into_iter()
@@ -53,7 +61,8 @@ pub fn with_checkpoint_formats(
 ///
 /// Family mode and decoder/projector width compatibility are revalidated here
 /// so a backend cannot construct a projector plan from unrelated parts.
-pub fn projector_gguf_plan(args: &ModelArgs) -> Result<GgufCheckpointPlan, String> {
+pub fn projector_gguf_plan(declaration: &super::Declaration) -> Result<GgufCheckpointPlan, String> {
+    let args = declaration.args();
     args.vision
         .validate_for(vision::VisionMode::DeepStack)
         .map_err(|error| error.to_string())?;
@@ -63,16 +72,19 @@ pub fn projector_gguf_plan(args: &ModelArgs) -> Result<GgufCheckpointPlan, Strin
             args.vision.out_hidden_size, args.text.hidden_size
         ));
     }
-    vision::gguf_plan(&args.vision, args.text.hidden_size)
+    vision::gguf_plan(declaration.vision_declaration())
 }
 
 /// Builds one strict catalog for the ordinary Qwen decoder plus shared vision tower.
-pub fn safetensors_plan(args: &ModelArgs) -> Result<SafetensorsCheckpointPlan, String> {
+pub fn safetensors_plan(
+    declaration: &super::Declaration,
+) -> Result<SafetensorsCheckpointPlan, String> {
+    let args = declaration.args();
     args.vision
         .validate_for(vision::VisionMode::DeepStack)
         .map_err(|error| error.to_string())?;
-    let mut text = qwen::safetensors_plan_with_root(&args.text, &args.text.parameter_root, true)?;
-    let vision = vision::safetensors_plan(&args.vision, "model.visual")?;
+    let mut text = qwen::safetensors_plan(declaration.text_declaration(), true)?;
+    let vision = vision::safetensors_plan(declaration.vision_declaration())?;
     text.common_tensors.extend(vision.common_tensors);
     text.layout_groups.extend(vision.layout_groups);
     let policy = text.catalog_policy;
@@ -83,6 +95,23 @@ pub fn safetensors_plan(args: &ModelArgs) -> Result<SafetensorsCheckpointPlan, S
         policy,
     )
     .map_err(|error| error.to_string())
+}
+
+/// Projects text and vision source matrix geometry from the corresponding
+/// construction declarations and their explicit source-layout extensions.
+pub(crate) fn source_linear_shapes(
+    declaration: &super::Declaration,
+) -> Result<BTreeMap<String, Vec<usize>>, String> {
+    let args = declaration.args();
+    args.vision
+        .validate_for(vision::VisionMode::DeepStack)
+        .map_err(|error| error.to_string())?;
+    let mut shapes =
+        super::super::checkpoint::source_linear_shapes(declaration.text_declaration())?;
+    shapes.extend(vision::source_linear_shapes(
+        declaration.vision_declaration(),
+    )?);
+    Ok(shapes)
 }
 
 /// Translates one Qwen3-VL text GGUF name into the composite runtime namespace.
@@ -99,20 +128,6 @@ pub fn translate_vision_gguf_weight_name(name: &str, deepstack: &[i32]) -> Strin
         "v.patch_embd.weight" => "model.visual.patch_embed.proj.weight.0".into(),
         "v.patch_embd.weight.1" => "model.visual.patch_embed.proj.weight.1".into(),
         _ => vision::translate_gguf_weight_name(name, deepstack),
-    }
-}
-
-/// Rehomes split expert GGUF formats onto their canonical fused runtime weights.
-pub fn normalize_text_weight_formats<V>(args: &qwen::ModelArgs, formats: &mut HashMap<String, V>) {
-    if !args.is_moe() {
-        return;
-    }
-    for layer in 0..args.num_hidden_layers {
-        let root = format!("model.language_model.layers.{layer}.mlp.experts");
-        if let Some(format) = formats.remove(&format!("{root}.gate_proj.weight")) {
-            formats.remove(&format!("{root}.up_proj.weight"));
-            formats.insert(format!("{root}.gate_up_proj"), format);
-        }
     }
 }
 
@@ -137,14 +152,19 @@ pub fn static_recipes<C: RecipeCatalog + ?Sized>(
 /// Returns all derived recipes for one flat vision/text execution unit.
 pub fn unit_recipes<C: RecipeCatalog + ?Sized>(
     catalog: &C,
-    args: &ModelArgs,
+    declaration: &super::Declaration,
     flat: usize,
 ) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
+    let args = declaration.args();
     let vision_layers = args.vision.layer_count();
     if flat < vision_layers || !args.text.is_moe() {
         return Ok(BTreeMap::new());
     }
-    let resolved = qwen::expert_recipes(catalog, &args.text, flat - vision_layers)?;
+    let resolved = qwen::expert_recipes(
+        catalog,
+        declaration.text_declaration(),
+        flat - vision_layers,
+    )?;
     Ok(BTreeMap::from([
         (resolved.target_gate_up, resolved.gate_up),
         (resolved.target_down, resolved.down),
@@ -154,15 +174,21 @@ pub fn unit_recipes<C: RecipeCatalog + ?Sized>(
 /// Returns rank-local recipes for one flat Qwen3-VL text execution unit.
 pub fn rank_local_unit_recipes<C: RecipeCatalog + ?Sized>(
     catalog: &C,
-    args: &ModelArgs,
+    declaration: &super::Declaration,
     flat: usize,
     group_indices: &[usize],
 ) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
+    let args = declaration.args();
     let vision_layers = args.vision.layer_count();
     if flat < vision_layers {
         return Err(format!(
             "Qwen3-VL unit {flat} is a vision unit and has no expert bank"
         ));
     }
-    qwen::rank_local_expert_recipes(catalog, &args.text, flat - vision_layers, group_indices)
+    qwen::rank_local_expert_recipes(
+        catalog,
+        declaration.text_declaration(),
+        flat - vision_layers,
+        group_indices,
+    )
 }

@@ -49,12 +49,11 @@ pub(crate) struct QwenHybridReplicated;
 
 impl<B: NeuralBackend> FixedReplicatedFamily<B> for Lfm2Replicated {
     const CHUNKED_PREFILL: bool = crate::lfm2::CHUNKED_TEXT_PREFILL;
-    type Config = crate::lfm2::ModelArgs;
+    type Config = Arc<crate::lfm2::Declaration>;
     type Unit = crate::lfm2::block::ReplicatedBlock<B>;
 
     fn validate(config: &Self::Config) -> Result<(), eredu_nn::Error> {
-        config.validate().map_err(eredu_nn::Error::backend)?;
-        if config.has_sparse_moe_layers() {
+        if config.args().has_sparse_moe_layers() {
             return Err(eredu_nn::Error::backend(
                 "replicated LFM2 configuration contains routed layers",
             ));
@@ -64,10 +63,22 @@ impl<B: NeuralBackend> FixedReplicatedFamily<B> for Lfm2Replicated {
     fn definition(
         config: &Self::Config,
     ) -> Result<eredu_runtime::ComponentDefinition, eredu_nn::Error> {
-        crate::lfm2::component_definition(config)
+        Ok(config.definition().as_ref().clone())
     }
-    fn static_spec(config: &Self::Config) -> crate::decoder::StaticModuleSpec {
-        crate::lfm2::static_spec(config)
+
+    fn construct_statics(
+        config: &Self::Config,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<crate::decoder::StaticModules<B>, eredu_nn::Error> {
+        let s = &config.statics;
+        let boundary =
+            crate::decoder::NormalizedBoundary::new(s.normalization_spec().clone(), context)?;
+        crate::decoder::StaticModules::from_boundary(
+            s.embedding_spec().clone(),
+            s.head_spec().cloned(),
+            boundary,
+            context,
+        )
     }
 
     fn state_identity(
@@ -76,17 +87,22 @@ impl<B: NeuralBackend> FixedReplicatedFamily<B> for Lfm2Replicated {
         global_layer_start: usize,
         topology: eredu_core::cache::PromptCacheTopology,
     ) -> Result<eredu_runtime::ModelStateIdentity, eredu_nn::Error> {
-        crate::lfm2::state_identity(config, layout, global_layer_start, topology)
+        crate::lfm2::state_identity(config.args(), layout, global_layer_start, topology)
     }
     fn build_unit(
         config: &Self::Config,
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Unit, eredu_nn::Error> {
-        crate::lfm2::block::ReplicatedBlock::new(config, index, context)
+        let parameters = config
+            .blocks
+            .get(index)
+            .cloned()
+            .ok_or_else(|| eredu_nn::Error::backend("retained LFM2 scope omits target unit"))?;
+        crate::lfm2::block::ReplicatedBlock::from_parameters(parameters, context)
     }
     fn mask_layer(config: &Self::Config) -> Option<usize> {
-        config.layer_schedule.iter().position(|policy| {
+        config.args().layer_schedule.iter().position(|policy| {
             matches!(
                 policy.operator,
                 crate::lfm2::OperatorPolicy::SelfAttention(_)
@@ -132,10 +148,11 @@ impl<B: NeuralBackend> FixedReplicatedFamily<B> for Lfm2Replicated {
 impl<B: eredu_nn::BlockwiseAttentionBackend> CompressedReplicatedFamily<B>
     for KimiLinearReplicated
 {
-    type Config = crate::kimi_linear::ModelArgs;
+    type Config = Arc<crate::kimi_linear::Declaration>;
     type Unit = crate::kimi_linear::block::ReplicatedBlock<B>;
 
     fn validate(config: &Self::Config) -> Result<(), eredu_nn::Error> {
+        let config = config.args();
         config.validate().map_err(eredu_nn::Error::backend)?;
         if config
             .layer_schedule
@@ -151,10 +168,21 @@ impl<B: eredu_nn::BlockwiseAttentionBackend> CompressedReplicatedFamily<B>
     fn definition(
         config: &Self::Config,
     ) -> Result<eredu_runtime::ComponentDefinition, eredu_nn::Error> {
-        crate::kimi_linear::component_definition(config)
+        Ok(config.definition().as_ref().clone())
     }
-    fn static_spec(config: &Self::Config) -> crate::decoder::StaticModuleSpec {
-        crate::kimi_linear::static_spec(config)
+    fn construct_statics(
+        config: &Self::Config,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<crate::decoder::StaticModules<B>, eredu_nn::Error> {
+        let s = &config.statics;
+        let boundary =
+            crate::decoder::NormalizedBoundary::new(s.normalization_spec().clone(), context)?;
+        crate::decoder::StaticModules::from_boundary(
+            s.embedding_spec().clone(),
+            s.head_spec().cloned(),
+            boundary,
+            context,
+        )
     }
 
     fn state_identity(
@@ -163,17 +191,25 @@ impl<B: eredu_nn::BlockwiseAttentionBackend> CompressedReplicatedFamily<B>
         global_layer_start: usize,
         topology: eredu_core::cache::PromptCacheTopology,
     ) -> Result<eredu_runtime::ModelStateIdentity, eredu_nn::Error> {
-        crate::kimi_linear::state_identity(config, layout, global_layer_start, topology)
+        crate::kimi_linear::state_identity(config.args(), layout, global_layer_start, topology)
     }
     fn build_unit(
         config: &Self::Config,
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Unit, eredu_nn::Error> {
-        crate::kimi_linear::block::ReplicatedBlock::new(config, index, context)
+        crate::kimi_linear::block::ReplicatedBlock::from_parameters(
+            config
+                .blocks
+                .get(index)
+                .cloned()
+                .ok_or_else(|| eredu_nn::Error::backend("Kimi scope omits unit"))?,
+            context,
+        )
     }
     fn mask_layer(config: &Self::Config) -> Option<usize> {
         config
+            .args()
             .layer_schedule
             .iter()
             .position(|policy| policy.attention == crate::kimi_linear::AttentionKind::Mla)
@@ -239,8 +275,14 @@ impl<B: eredu_nn::BlockwiseAttentionBackend> CompressedReplicatedFamily<B>
     ) -> Result<eredu_runtime::ComponentDefinition, eredu_nn::Error> {
         crate::deepseek::v3::component_definition(config, None)
     }
-    fn static_spec(config: &Self::Config) -> crate::decoder::StaticModuleSpec {
-        crate::deepseek::v3::static_spec(config)
+    fn construct_statics(
+        config: &Self::Config,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<crate::decoder::StaticModules<B>, eredu_nn::Error> {
+        crate::decoder::StaticModules::from_construction(
+            config.parameters().statics.clone(),
+            context,
+        )
     }
 
     fn state_identity(
@@ -299,10 +341,11 @@ impl<B: eredu_nn::BlockwiseAttentionBackend> CompressedReplicatedFamily<B>
 }
 
 impl<B: NeuralBackend> FixedReplicatedFamily<B> for KimiLinearReplicated {
-    type Config = crate::kimi_linear::ModelArgs;
+    type Config = Arc<crate::kimi_linear::Declaration>;
     type Unit = crate::kimi_linear::block::KdaReplicatedBlock<B>;
 
     fn validate(config: &Self::Config) -> Result<(), eredu_nn::Error> {
+        let config = config.args();
         config.validate().map_err(eredu_nn::Error::backend)?;
         if config.layer_schedule.iter().any(|policy| {
             policy.feed_forward != crate::kimi_linear::FeedForwardPolicy::Dense
@@ -317,10 +360,21 @@ impl<B: NeuralBackend> FixedReplicatedFamily<B> for KimiLinearReplicated {
     fn definition(
         config: &Self::Config,
     ) -> Result<eredu_runtime::ComponentDefinition, eredu_nn::Error> {
-        crate::kimi_linear::component_definition(config)
+        Ok(config.definition().as_ref().clone())
     }
-    fn static_spec(config: &Self::Config) -> crate::decoder::StaticModuleSpec {
-        crate::kimi_linear::static_spec(config)
+    fn construct_statics(
+        config: &Self::Config,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<crate::decoder::StaticModules<B>, eredu_nn::Error> {
+        let s = &config.statics;
+        let boundary =
+            crate::decoder::NormalizedBoundary::new(s.normalization_spec().clone(), context)?;
+        crate::decoder::StaticModules::from_boundary(
+            s.embedding_spec().clone(),
+            s.head_spec().cloned(),
+            boundary,
+            context,
+        )
     }
 
     fn state_identity(
@@ -329,14 +383,21 @@ impl<B: NeuralBackend> FixedReplicatedFamily<B> for KimiLinearReplicated {
         global_layer_start: usize,
         topology: eredu_core::cache::PromptCacheTopology,
     ) -> Result<eredu_runtime::ModelStateIdentity, eredu_nn::Error> {
-        crate::kimi_linear::state_identity(config, layout, global_layer_start, topology)
+        crate::kimi_linear::state_identity(config.args(), layout, global_layer_start, topology)
     }
     fn build_unit(
         config: &Self::Config,
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Unit, eredu_nn::Error> {
-        crate::kimi_linear::block::KdaReplicatedBlock::new(config, index, context)
+        crate::kimi_linear::block::KdaReplicatedBlock::from_parameters(
+            config
+                .blocks
+                .get(index)
+                .cloned()
+                .ok_or_else(|| eredu_nn::Error::backend("Kimi scope omits unit"))?,
+            context,
+        )
     }
     fn mask_layer(_config: &Self::Config) -> Option<usize> {
         None
@@ -377,11 +438,11 @@ impl<B: NeuralBackend> FixedReplicatedFamily<B> for KimiLinearReplicated {
 }
 
 impl<B: NeuralBackend> FixedReplicatedFamily<B> for NemotronHReplicated {
-    type Config = crate::nemotron_h::ModelArgs;
+    type Config = Arc<crate::nemotron_h::Declaration>;
     type Unit = crate::nemotron_h::block::ReplicatedBlock<B>;
 
     fn validate(config: &Self::Config) -> Result<(), eredu_nn::Error> {
-        config.validate().map_err(eredu_nn::Error::backend)?;
+        let config = config.args();
         if config.num_nextn_predict_layers != 0
             || config
                 .layer_schedule
@@ -397,10 +458,22 @@ impl<B: NeuralBackend> FixedReplicatedFamily<B> for NemotronHReplicated {
     fn definition(
         config: &Self::Config,
     ) -> Result<eredu_runtime::ComponentDefinition, eredu_nn::Error> {
-        crate::nemotron_h::component_definition(config, None)
+        Ok(config.definition().as_ref().clone())
     }
-    fn static_spec(config: &Self::Config) -> crate::decoder::StaticModuleSpec {
-        crate::nemotron_h::static_spec(config, crate::nemotron_h::FinalNormalization::Native)
+
+    fn construct_statics(
+        config: &Self::Config,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<crate::decoder::StaticModules<B>, eredu_nn::Error> {
+        let scopes = &config.statics;
+        let boundary =
+            crate::decoder::NormalizedBoundary::new(scopes.normalization_spec().clone(), context)?;
+        crate::decoder::StaticModules::from_boundary(
+            scopes.embedding_spec().clone(),
+            scopes.head_spec().cloned(),
+            boundary,
+            context,
+        )
     }
 
     fn state_identity(
@@ -409,17 +482,27 @@ impl<B: NeuralBackend> FixedReplicatedFamily<B> for NemotronHReplicated {
         global_layer_start: usize,
         topology: eredu_core::cache::PromptCacheTopology,
     ) -> Result<eredu_runtime::ModelStateIdentity, eredu_nn::Error> {
-        crate::nemotron_h::state_identity(config, layout, global_layer_start, topology)
+        crate::nemotron_h::state_identity(config.args(), layout, global_layer_start, topology)
     }
     fn build_unit(
         config: &Self::Config,
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Unit, eredu_nn::Error> {
-        crate::nemotron_h::block::ReplicatedBlock::new(config, index, context)
+        let parameters =
+            config.blocks.get(index).cloned().ok_or_else(|| {
+                eredu_nn::Error::backend("retained Nemotron scope omits target unit")
+            })?;
+        crate::nemotron_h::block::ReplicatedBlock::from_parameters(
+            config.args(),
+            index,
+            parameters,
+            context,
+        )
     }
     fn mask_layer(config: &Self::Config) -> Option<usize> {
         config
+            .args()
             .layer_schedule
             .iter()
             .position(|policy| matches!(policy, crate::nemotron_h::LayerPolicy::SelfAttention(_)))
@@ -479,8 +562,11 @@ impl<B: NeuralBackend> FixedReplicatedFamily<B> for QwenHybridReplicated {
     ) -> Result<eredu_runtime::ComponentDefinition, eredu_nn::Error> {
         crate::qwen::hybrid::component_definition(config, None)
     }
-    fn static_spec(config: &Self::Config) -> crate::decoder::StaticModuleSpec {
-        crate::qwen::hybrid::static_module_spec(config)
+    fn construct_statics(
+        config: &Self::Config,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<crate::decoder::StaticModules<B>, eredu_nn::Error> {
+        crate::decoder::StaticModules::from_construction(config.statics().clone(), context)
     }
 
     fn state_identity(
@@ -496,7 +582,10 @@ impl<B: NeuralBackend> FixedReplicatedFamily<B> for QwenHybridReplicated {
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Unit, eredu_nn::Error> {
-        crate::qwen::hybrid::block::ReplicatedBlock::new(config, index, context)
+        crate::qwen::hybrid::block::ReplicatedBlock::from_parameters(
+            crate::qwen::hybrid::BlockParameters::target(config, index)?,
+            context,
+        )
     }
     fn mask_layer(config: &Self::Config) -> Option<usize> {
         config.layer_schedule.iter().position(|policy| {
@@ -891,17 +980,27 @@ where
     .map_err(|handoff| ReplicatedTextDispatchError::Architecture(handoff.to_string()))?;
     visitor.construction_started();
     match eligible {
-        EligibleConfig::Gemma2(args) => {
-            let capability_estimate = crate::capability::gemma2(args)
+        EligibleConfig::Gemma2(args, declaration) => {
+            let capability_estimate = crate::capability::gemma2(args, &declaration)
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let effective_model_type = "gemma2".to_owned();
             let selected_args = selected_gemma2_args(args, &selected)
                 .map_err(ReplicatedTextDispatchError::Architecture)?;
+            let decoder_scopes = DecoderConstructionScopes {
+                selected: Arc::new(
+                    crate::gemma2::project_declaration_formats(&declaration, args, &selected_args)
+                        .map_err(|error| {
+                            ReplicatedTextDispatchError::Architecture(error.to_string())
+                        })?,
+                ),
+                source: declaration,
+            };
             let prompt_cache_architecture_identity =
                 crate::gemma2::prompt_cache_architecture_fingerprint(&selected_args);
             visit_prepared_decoder::<B, S, _, crate::decoder::DenseBlockFactory, _>(
                 args,
                 selected_args,
+                decoder_scopes,
                 requirements,
                 selected,
                 capability_estimate,
@@ -912,17 +1011,27 @@ where
                 store,
             )
         }
-        EligibleConfig::Llama(args) => {
-            let capability_estimate = crate::capability::llama(args)
+        EligibleConfig::Llama(args, declaration) => {
+            let capability_estimate = crate::capability::llama(args, &declaration)
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let effective_model_type = args.model_type.clone();
             let selected_args = selected_llama_args(args, &selected)
                 .map_err(ReplicatedTextDispatchError::Architecture)?;
+            let decoder_scopes = DecoderConstructionScopes {
+                selected: Arc::new(
+                    crate::llama::project_declaration_formats(&declaration, args, &selected_args)
+                        .map_err(|error| {
+                        ReplicatedTextDispatchError::Architecture(error.to_string())
+                    })?,
+                ),
+                source: declaration,
+            };
             let prompt_cache_architecture_identity =
                 crate::llama::prompt_cache_architecture_fingerprint(&selected_args);
             visit_prepared_decoder::<B, S, _, crate::decoder::DenseBlockFactory, _>(
                 args,
                 selected_args,
+                decoder_scopes,
                 requirements,
                 selected,
                 capability_estimate,
@@ -933,17 +1042,31 @@ where
                 store,
             )
         }
-        EligibleConfig::Nanbeige(args) => {
-            let capability_estimate = crate::capability::nanbeige(args)
+        EligibleConfig::Nanbeige(args, declaration) => {
+            let capability_estimate = crate::capability::nanbeige(args, &declaration)
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let effective_model_type = "nanbeige".to_owned();
             let selected_args = selected_nanbeige_args(args, &selected)
                 .map_err(ReplicatedTextDispatchError::Architecture)?;
+            let decoder_scopes = DecoderConstructionScopes {
+                selected: Arc::new(
+                    crate::nanbeige::project_declaration_formats(
+                        &declaration,
+                        args,
+                        &selected_args,
+                    )
+                    .map_err(|error| {
+                        ReplicatedTextDispatchError::Architecture(error.to_string())
+                    })?,
+                ),
+                source: declaration,
+            };
             let prompt_cache_architecture_identity =
                 crate::nanbeige::prompt_cache_architecture_fingerprint(&selected_args);
             visit_prepared_decoder::<B, S, _, crate::decoder::DenseBlockFactory, _>(
                 args,
                 selected_args,
+                decoder_scopes,
                 requirements,
                 selected,
                 capability_estimate,
@@ -954,17 +1077,25 @@ where
                 store,
             )
         }
-        EligibleConfig::K2Horizon(args) => {
-            let capability_estimate = crate::capability::k2_horizon(args)
+        EligibleConfig::K2Horizon(args, declaration) => {
+            let capability_estimate = crate::capability::k2_horizon(&declaration)
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let effective_model_type = args.model_type.clone();
             let selected_args = selected_k2_horizon_args(args, &selected)
                 .map_err(ReplicatedTextDispatchError::Architecture)?;
+            let target = declaration
+                .with_formats(selected_args.clone())
+                .map_err(|e| ReplicatedTextDispatchError::Architecture(e.to_string()))?;
+            let decoder_scopes = DecoderConstructionScopes {
+                source: declaration.common().clone(),
+                selected: target.common().clone(),
+            };
             let prompt_cache_architecture_identity =
                 crate::k2_horizon::prompt_cache_architecture_fingerprint(&selected_args);
             visit_prepared_decoder::<B, S, _, crate::k2_horizon::DenseBlockFactory, _>(
                 args,
                 selected_args,
+                decoder_scopes,
                 requirements,
                 selected,
                 capability_estimate,
@@ -975,17 +1106,25 @@ where
                 store,
             )
         }
-        EligibleConfig::Qwen(args) => {
-            let capability_estimate = crate::capability::qwen(args)
+        EligibleConfig::Qwen(args, declaration) => {
+            let capability_estimate = crate::capability::qwen(&declaration)
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let effective_model_type = args.model_type.clone();
             let selected_args = selected_qwen_args(args, &selected)
                 .map_err(ReplicatedTextDispatchError::Architecture)?;
+            let selected_declaration = declaration
+                .with_formats(selected_args.clone())
+                .map_err(|e| ReplicatedTextDispatchError::Architecture(e.to_string()))?;
+            let decoder_scopes = DecoderConstructionScopes {
+                source: declaration.common().clone(),
+                selected: selected_declaration.common().clone(),
+            };
             let prompt_cache_architecture_identity =
                 crate::qwen::prompt_cache_architecture_fingerprint(&selected_args);
             visit_prepared_decoder::<B, S, _, crate::qwen::QwenBlockFactory, _>(
                 args,
                 selected_args,
+                decoder_scopes,
                 requirements,
                 selected,
                 capability_estimate,
@@ -1000,7 +1139,7 @@ where
         | EligibleConfig::KimiLinear(_)
         | EligibleConfig::NemotronH(_)
         | EligibleConfig::QwenHybrid(_)
-        | EligibleConfig::GptOss(_)
+        | EligibleConfig::GptOss(_, _)
         | EligibleConfig::DeepSeekV3(_)
         | EligibleConfig::DeepSeekV4(_)
         | EligibleConfig::DiffusionGemma(_)
@@ -1015,9 +1154,15 @@ where
     }
 }
 
+pub(crate) struct DecoderConstructionScopes {
+    pub(crate) source: Arc<crate::decoder::DecoderDeclaration>,
+    pub(crate) selected: Arc<crate::decoder::DecoderDeclaration>,
+}
+
 fn visit_prepared_decoder<B, S, C, P, V>(
     source_args: &C,
     args: C,
+    decoder_scopes: DecoderConstructionScopes,
     requirements: ReplicatedTextRequirements,
     selected: SelectedReplicatedTextRealization,
     capability: crate::capability::CapabilityEstimate,
@@ -1035,9 +1180,15 @@ where
     S::LayerState: AttentionCache<B::Tensor>,
     V: ReplicatedTextArchitectureVisitor<B, S>,
 {
-    let (architecture, source) =
-        materialize_decoder::<B, C, P>(source_args, args, &selected, context)
-            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+    let (architecture, source) = materialize_decoder::<B, C, P>(
+        source_args,
+        args,
+        &decoder_scopes,
+        None,
+        &selected,
+        context,
+    )
+    .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
     let prepared = prepare_architecture_handoff::<B, S, _>(
         architecture,
         source,
@@ -1058,6 +1209,11 @@ where
 pub(crate) fn materialize_decoder<B, C, P>(
     source_args: &C,
     args: C,
+    decoder_scopes: &DecoderConstructionScopes,
+    projections: Option<(
+        &crate::decoder::ProjectionDeclarations<P::Parameters>,
+        &crate::decoder::ProjectionDeclarations<P::Parameters>,
+    )>,
     selected: &SelectedReplicatedTextRealization,
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<
@@ -1082,48 +1238,260 @@ where
             crate::decoder::CompleteDecoderKernel::<B, C, P>::from_definition(
                 source_args.clone(),
                 retained,
+                decoder_scopes.source.as_ref(),
+                projections.map(|scopes| scopes.0),
                 context,
             )
         })
         .transpose()?;
-    let definition = selected_decoder_definition::<B, C, P>(&args, selected)?;
+    let definition = executable_component(selected).map_err(eredu_nn::Error::backend)?;
     let architecture = crate::decoder::CompleteDecoderKernel::<B, C, P>::from_definition(
-        args, definition, context,
+        args,
+        definition,
+        decoder_scopes.selected.as_ref(),
+        projections.map(|scopes| scopes.1),
+        context,
     )?;
     Ok((architecture, source))
 }
 
-pub(crate) fn selected_decoder_definition<B, C, P>(
-    args: &C,
-    selected: &SelectedReplicatedTextRealization,
-) -> Result<Arc<eredu_runtime::ComponentDefinition>, eredu_nn::Error>
-where
-    B: NeuralBackend,
-    C: crate::decoder::Config,
-    P: crate::decoder::BlockFactory<B, C>,
-{
+/// Retains executable component projections for cold rank reporting and construction.
+pub(crate) fn retain_executable_component(
+    inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
+    selected: SelectedReplicatedTextRealization,
+) -> Result<SelectedReplicatedTextRealization, String> {
+    let plan = inspection.architecture_plan();
     let retained = selected
         .requirements()
         .shared_component_definition()
-        .ok_or_else(|| eredu_nn::Error::backend("decoder selection has no retained definition"))?;
-    let original = selected
-        .requirements()
-        .parameters()
-        .iter()
-        .map(|parameter| (parameter.name(), parameter.native_executable()))
-        .collect::<HashMap<_, _>>();
-    let changed = selected
-        .parameters()
-        .iter()
-        .any(|parameter| original.get(parameter.name()).copied() != Some(parameter.executable()));
-    if !changed {
-        return Ok(retained);
-    }
-    retained
-        .project_parameters_with_unit_paths(
-            P::parameter_description(args).map_err(eredu_nn::Error::backend_source)?,
-        )
-        .map_err(eredu_nn::Error::from)
+        .ok_or("selected execution has no retained source definition")?;
+    let definition = match composite_config(plan).map_err(|error| error.to_string())? {
+        Some(CompositeConfig::Inkling(config)) => {
+            let target =
+                crate::inkling::with_checkpoint_formats(config, selected.quantized_formats())?;
+            crate::inkling::model::project_parameters(&target, &retained)
+                .map_err(|error| error.to_string())?
+        }
+        Some(CompositeConfig::QwenHybrid(config)) => {
+            let target = qwen_hybrid_composite_with_formats(
+                config,
+                selected.matrix_formats_for(selected.requirements()),
+            )?;
+            crate::qwen::hybrid::project_conditional_parameters(&target, &retained)
+                .map_err(|error| error.to_string())?
+        }
+        Some(CompositeConfig::QwenVl(config)) => {
+            let target = qwen_vl_with_formats(
+                &config,
+                selected.matrix_formats_for(selected.requirements()),
+            )?;
+            crate::qwen::vl::project_parameters(&target, &retained)
+                .map_err(|error| error.to_string())?
+        }
+        Some(CompositeConfig::Gemma4(config)) => {
+            let exact = config.with_audio_output_projection_bias(
+                crate::gemma4::checkpoint::audio_output_projection_bias(inspection),
+            );
+            let target =
+                crate::gemma4::with_checkpoint_formats(&exact, selected.quantized_formats())?;
+            crate::gemma4::model::project_parameters(&target, &retained)
+                .map_err(|error| error.to_string())?
+        }
+        Some(CompositeConfig::Diffusion(config)) => {
+            let target = config
+                .with_checkpoint_formats(selected.quantized_formats())
+                .map_err(|e| e.to_string())?;
+            crate::diffusion_gemma::composite::project_parameters(&target, &retained)
+                .map_err(|error| error.to_string())?
+        }
+        Some(CompositeConfig::Muse(config)) => {
+            let target =
+                crate::muse::with_checkpoint_formats(config, selected.quantized_formats())?;
+            crate::muse::model::project_parameters(&target, &retained)
+                .map_err(|error| error.to_string())?
+        }
+        Some(CompositeConfig::NemotronLabsDiffusion(config)) => {
+            let target = config
+                .with_checkpoint_formats(selected.quantized_formats())
+                .map_err(|error| error.to_string())?;
+            crate::nemotron_labs_diffusion::definition::project_composite_parameters(
+                &target, &retained,
+            )
+            .map_err(|error| error.to_string())?
+        }
+        None => match (
+            plan.safetensors_architecture().map(|p| p.model()),
+            plan.gguf_plan().map(|p| p.model()),
+        ) {
+            (Some(SafetensorsModelConfig::QwenHybrid(config)), None)
+            | (None, Some(GgufModelConfig::QwenHybrid(config)))
+                if config.vision.is_none() =>
+            {
+                let target = selected_qwen_hybrid_args(&config.text, &selected)?;
+                crate::qwen::hybrid::project_parameters(&target, &retained)
+                    .map_err(|error| error.to_string())?
+            }
+            (Some(SafetensorsModelConfig::DiffusionGemma(config)), None)
+            | (None, Some(GgufModelConfig::DiffusionGemma(config))) => {
+                let target = config
+                    .with_checkpoint_formats(selected.quantized_formats())
+                    .map_err(|e| e.to_string())?;
+                crate::diffusion_gemma::model::project_parameters(&target, &retained)
+                    .map_err(|error| error.to_string())?
+            }
+            (Some(SafetensorsModelConfig::DeepSeekV4(args)), None)
+            | (None, Some(GgufModelConfig::DeepSeekV4(args))) => {
+                let target = selected_deepseek_v4_args(args, &selected)?;
+                crate::deepseek::v4::project_parameters(&target, &retained)
+                    .map_err(|error| error.to_string())?
+            }
+            (Some(SafetensorsModelConfig::DeepSeekV3(args)), None)
+            | (None, Some(GgufModelConfig::DeepSeekV3(args))) => {
+                let target = selected_deepseek_v3_args(args, &selected)?;
+                crate::deepseek::v3::project_parameters(&target, &retained)
+                    .map_err(|error| error.to_string())?
+            }
+            (Some(SafetensorsModelConfig::Lfm2(args)), None)
+            | (None, Some(GgufModelConfig::Lfm2(args))) => {
+                let target = selected_lfm2_args(args, &selected)?;
+                let declaration = plan.lfm2_declaration(&target)?;
+                retained
+                    .project_parameters(declaration.definition().parameters().clone())
+                    .map_err(|error| error.to_string())?
+            }
+            (Some(SafetensorsModelConfig::KimiLinear(args)), None)
+            | (None, Some(GgufModelConfig::KimiLinear(args))) => {
+                let target = selected_kimi_linear_args(args, &selected)?;
+                let declaration = plan.kimi_declaration(&target)?;
+                retained
+                    .project_parameters(declaration.definition().parameters().clone())
+                    .map_err(|error| error.to_string())?
+            }
+            (Some(SafetensorsModelConfig::NemotronH(args)), None)
+            | (None, Some(GgufModelConfig::NemotronH(args))) => {
+                let target = selected_nemotron_h_args(args, &selected)?;
+                let declaration = plan.nemotron_declaration(&target)?;
+                retained
+                    .project_parameters(declaration.definition().parameters().clone())
+                    .map_err(|error| error.to_string())?
+            }
+            (Some(SafetensorsModelConfig::Llama(args)), None)
+            | (None, Some(GgufModelConfig::Llama(args))) => {
+                let target = selected_llama_args(args, &selected)?;
+                let source = plan
+                    .dense_declaration()
+                    .ok_or_else(|| "missing admitted dense scopes".to_string())?;
+                let declaration = crate::llama::project_declaration_formats(source, args, &target)
+                    .map_err(|error| error.to_string())?;
+                let parameters = declaration
+                    .parameter_description(&target, crate::decoder::ParameterEncoding::Stored)
+                    .map_err(|error| error.to_string())?;
+                retained
+                    .project_parameters_with_unit_paths(parameters)
+                    .map_err(|error| error.to_string())?
+            }
+            (Some(SafetensorsModelConfig::Gemma2(args)), None)
+            | (None, Some(GgufModelConfig::Gemma2(args))) => {
+                let target = selected_gemma2_args(args, &selected)?;
+                let source = plan
+                    .dense_declaration()
+                    .ok_or_else(|| "missing admitted dense scopes".to_string())?;
+                let declaration = crate::gemma2::project_declaration_formats(source, args, &target)
+                    .map_err(|error| error.to_string())?;
+                let parameters = declaration
+                    .parameter_description(&target, crate::decoder::ParameterEncoding::Stored)
+                    .map_err(|error| error.to_string())?;
+                retained
+                    .project_parameters_with_unit_paths(parameters)
+                    .map_err(|error| error.to_string())?
+            }
+            (Some(SafetensorsModelConfig::Nanbeige(args)), None)
+            | (None, Some(GgufModelConfig::Nanbeige(args))) => {
+                let target = selected_nanbeige_args(args, &selected)?;
+                let source = plan
+                    .dense_declaration()
+                    .ok_or_else(|| "missing admitted dense scopes".to_string())?;
+                let declaration =
+                    crate::nanbeige::project_declaration_formats(source, args, &target)
+                        .map_err(|error| error.to_string())?;
+                let parameters = declaration
+                    .parameter_description(&target, crate::decoder::ParameterEncoding::Stored)
+                    .map_err(|error| error.to_string())?;
+                retained
+                    .project_parameters_with_unit_paths(parameters)
+                    .map_err(|error| error.to_string())?
+            }
+            (Some(SafetensorsModelConfig::Qwen(args)), None)
+            | (None, Some(GgufModelConfig::Qwen(args))) => {
+                let target = selected_qwen_args(args, &selected)?;
+                let declaration = plan.qwen_declaration(&target)?;
+                let parameters = crate::qwen::parameter_description(
+                    &declaration,
+                    crate::decoder::ParameterEncoding::Stored,
+                )
+                .map_err(|e| e.to_string())?;
+                retained
+                    .project_parameters_with_unit_paths(parameters)
+                    .map_err(|error| error.to_string())?
+            }
+            (Some(SafetensorsModelConfig::GptOss(args)), None)
+            | (None, Some(GgufModelConfig::GptOss(args))) => {
+                let target = selected_gpt_oss_args(args, &selected)?;
+                let parameters = crate::gpt_oss::parameter_description(
+                    plan.gpt_oss_declaration(&target)?.as_ref(),
+                    crate::decoder::ParameterEncoding::Stored,
+                )
+                .map_err(|error| error.to_string())?;
+                retained
+                    .project_parameters_with_unit_paths(parameters)
+                    .map_err(|error| error.to_string())?
+            }
+            (Some(SafetensorsModelConfig::K2Horizon(args)), None)
+            | (None, Some(GgufModelConfig::K2Horizon(args))) => {
+                let target = selected_k2_horizon_args(args, &selected)?;
+                let declaration = plan.k2_declaration(&target)?;
+                let parameters = crate::k2_horizon::parameter_description(&declaration)
+                    .map_err(|e| e.to_string())?;
+                retained
+                    .project_parameters_with_unit_paths(parameters)
+                    .map_err(|error| error.to_string())?
+            }
+            (Some(SafetensorsModelConfig::NemotronLabsDiffusion(config)), None) => {
+                let target = config
+                    .with_checkpoint_formats(selected.quantized_formats())
+                    .map_err(|error| error.to_string())?;
+                crate::nemotron_labs_diffusion::definition::project_text_parameters(
+                    &target, &retained,
+                )
+                .map_err(|error| error.to_string())?
+            }
+            (None, Some(GgufModelConfig::NemotronLabsDiffusion(plan))) => {
+                let target = plan
+                    .text_config()
+                    .with_checkpoint_formats(selected.quantized_formats())
+                    .map_err(|error| error.to_string())?;
+                crate::nemotron_labs_diffusion::definition::project_text_parameters(
+                    &target, &retained,
+                )
+                .map_err(|error| error.to_string())?
+            }
+            _ => {
+                return Err("selected architecture has no executable component projection".into());
+            }
+        },
+    };
+    selected
+        .with_executable_component(definition)
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn executable_component(
+    selected: &SelectedReplicatedTextRealization,
+) -> Result<Arc<eredu_runtime::ComponentDefinition>, String> {
+    selected
+        .executable_component()
+        .cloned()
+        .ok_or_else(|| "selected execution has no retained executable definition".into())
 }
 
 fn validate_plan_identity(
@@ -1326,7 +1694,7 @@ pub(crate) fn selected_qwen_hybrid_args(
     selected: &SelectedReplicatedTextRealization,
 ) -> Result<crate::qwen::hybrid::HybridConfig, String> {
     let formats = selected.quantized_formats();
-    let mut target = args.clone();
+    let mut target = args.policy().clone();
     if !formats.is_empty() {
         target.linear_formats = formats
             .into_iter()
@@ -1334,7 +1702,7 @@ pub(crate) fn selected_qwen_hybrid_args(
             .collect();
     }
     target.validate().map_err(|error| error.to_string())?;
-    Ok(target)
+    args.with_formats(target).map_err(|e| e.to_string())
 }
 
 pub(crate) fn selected_deepseek_v3_args(
@@ -1518,16 +1886,17 @@ where
     )
     .map_err(|handoff| ReplicatedTextDispatchError::Architecture(handoff.to_string()))?;
     match eligible {
-        EligibleConfig::Lfm2(args) => {
+        EligibleConfig::Lfm2(declaration) => {
+            let args = declaration.args();
             visitor.construction_started();
-            let capability_estimate = crate::capability::lfm2(args)
+            let capability_estimate = crate::capability::lfm2(&declaration)
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let effective_model_type = args.model_type.clone();
             let source_architecture = selected
                 .uses_weight_transform()
                 .then(|| {
                     <P as FixedProfile<B, S, Lfm2Replicated>>::from_definition(
-                        args.clone(),
+                        Arc::clone(&declaration),
                         retained.clone(),
                         context,
                     )
@@ -1538,9 +1907,12 @@ where
                 .map_err(ReplicatedTextDispatchError::Architecture)?;
             let prompt_cache_architecture_identity =
                 crate::lfm2::prompt_cache_architecture_fingerprint(&args);
+            let definition = executable_component(&selected)
+                .map_err(ReplicatedTextDispatchError::Architecture)?;
             let architecture = <P as FixedProfile<B, S, Lfm2Replicated>>::from_definition(
-                args,
-                retained.clone(),
+                plan.lfm2_declaration(&args)
+                    .map_err(ReplicatedTextDispatchError::Architecture)?,
+                definition,
                 context,
             )
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
@@ -1559,16 +1931,18 @@ where
                 .visit(prepared, store)
                 .map_err(ReplicatedTextDispatchError::Backend)
         }
-        EligibleConfig::NemotronH(args) => {
+        EligibleConfig::NemotronH(declaration) => {
+            let args = declaration.args();
             visitor.construction_started();
-            let capability_estimate = crate::capability::nemotron_h(args)
+            let capability_estimate = crate::capability::nemotron_h(&declaration)
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let effective_model_type = args.model_type.clone();
             let source_architecture = selected
                 .uses_weight_transform()
                 .then(|| {
                     <P as FixedProfile<B, S, NemotronHReplicated>>::from_definition(
-                        args.clone(),
+                        plan.nemotron_declaration(args)
+                            .map_err(eredu_nn::Error::backend)?,
                         retained.clone(),
                         context,
                     )
@@ -1579,9 +1953,12 @@ where
                 .map_err(ReplicatedTextDispatchError::Architecture)?;
             let prompt_cache_architecture_identity =
                 crate::nemotron_h::prompt_cache_architecture_fingerprint(&args);
+            let definition = executable_component(&selected)
+                .map_err(ReplicatedTextDispatchError::Architecture)?;
             let architecture = <P as FixedProfile<B, S, NemotronHReplicated>>::from_definition(
-                args,
-                retained.clone(),
+                plan.nemotron_declaration(&args)
+                    .map_err(ReplicatedTextDispatchError::Architecture)?,
+                definition,
                 context,
             )
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
@@ -1620,10 +1997,10 @@ where
                 .map_err(ReplicatedTextDispatchError::Architecture)?;
             let prompt_cache_architecture_identity =
                 crate::qwen::hybrid::prompt_cache_architecture_fingerprint(&args);
+            let definition = executable_component(&selected)
+                .map_err(ReplicatedTextDispatchError::Architecture)?;
             let architecture = <P as FixedProfile<B, S, QwenHybridReplicated>>::from_definition(
-                args,
-                retained.clone(),
-                context,
+                args, definition, context,
             )
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let prepared = prepare_architecture_handoff::<B, S, _>(
@@ -1641,16 +2018,22 @@ where
                 .visit(prepared, store)
                 .map_err(ReplicatedTextDispatchError::Backend)
         }
-        EligibleConfig::KimiLinear(args) => {
+        EligibleConfig::KimiLinear(declaration) => {
+            let args = declaration.args();
             visitor.construction_started();
-            let capability_estimate = crate::capability::kimi_linear(args)
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+            let capability_estimate = crate::capability::kimi_linear(
+                plan.kimi_declaration(args)
+                    .map_err(ReplicatedTextDispatchError::Architecture)?
+                    .as_ref(),
+            )
+            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let effective_model_type = args.model_type.clone();
             let source_architecture = selected
                 .uses_weight_transform()
                 .then(|| {
                     <P as FixedProfile<B, S, KimiLinearReplicated>>::from_definition(
-                        args.clone(),
+                        plan.kimi_declaration(args)
+                            .map_err(eredu_nn::Error::backend)?,
                         retained.clone(),
                         context,
                     )
@@ -1661,9 +2044,12 @@ where
                 .map_err(ReplicatedTextDispatchError::Architecture)?;
             let prompt_cache_architecture_identity =
                 crate::kimi_linear::prompt_cache_architecture_fingerprint(&args);
+            let definition = executable_component(&selected)
+                .map_err(ReplicatedTextDispatchError::Architecture)?;
             let architecture = <P as FixedProfile<B, S, KimiLinearReplicated>>::from_definition(
-                args,
-                retained.clone(),
+                plan.kimi_declaration(&args)
+                    .map_err(ReplicatedTextDispatchError::Architecture)?,
+                definition,
                 context,
             )
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
@@ -1682,12 +2068,12 @@ where
                 .visit(prepared, store)
                 .map_err(ReplicatedTextDispatchError::Backend)
         }
-        EligibleConfig::Gemma2(_)
-        | EligibleConfig::Llama(_)
-        | EligibleConfig::Nanbeige(_)
-        | EligibleConfig::K2Horizon(_)
-        | EligibleConfig::Qwen(_)
-        | EligibleConfig::GptOss(_)
+        EligibleConfig::Gemma2(_, _)
+        | EligibleConfig::Llama(_, _)
+        | EligibleConfig::Nanbeige(_, _)
+        | EligibleConfig::K2Horizon(_, _)
+        | EligibleConfig::Qwen(_, _)
+        | EligibleConfig::GptOss(_, _)
         | EligibleConfig::DeepSeekV3(_)
         | EligibleConfig::DeepSeekV4(_)
         | EligibleConfig::DiffusionGemma(_)
@@ -1853,17 +2239,18 @@ where
     )
     .map_err(|handoff| ReplicatedTextDispatchError::Architecture(handoff.to_string()))?;
     macro_rules! visit_family {
-        ($family:ty, $args:expr, $capability:path, $select:path, $identity:path) => {{
+        ($family:ty, $args:expr, $capability:expr, $select:path, $identity:path, $prepare:expr) => {{
             visitor.construction_started();
             let args = $args;
-            let capability_estimate = $capability(args)
+            let prepare = $prepare;
+            let capability_estimate = ($capability)(args)
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let effective_model_type = args.model_type.clone();
             let source_architecture = selected
                 .uses_weight_transform()
                 .then(|| {
                     <P as CompressedProfile<B, S, $family>>::from_definition(
-                        args.clone(),
+                        prepare(args).map_err(eredu_nn::Error::backend)?,
                         retained.clone(),
                         context,
                     )
@@ -1873,9 +2260,11 @@ where
             let args =
                 $select(args, &selected).map_err(ReplicatedTextDispatchError::Architecture)?;
             let prompt_cache_architecture_identity = $identity(&args);
+            let definition = executable_component(&selected)
+                .map_err(ReplicatedTextDispatchError::Architecture)?;
             let architecture = <P as CompressedProfile<B, S, $family>>::from_definition(
-                args,
-                retained.clone(),
+                prepare(&args).map_err(ReplicatedTextDispatchError::Architecture)?,
+                definition,
                 context,
             )
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
@@ -1896,19 +2285,26 @@ where
         }};
     }
     match eligible {
-        EligibleConfig::KimiLinear(args) => visit_family!(
-            KimiLinearReplicated,
-            args,
-            crate::capability::kimi_linear,
-            selected_kimi_linear_args,
-            crate::kimi_linear::prompt_cache_architecture_fingerprint
-        ),
+        EligibleConfig::KimiLinear(declaration) => {
+            let args = declaration.args();
+            visit_family!(
+                KimiLinearReplicated,
+                args,
+                |_args: &crate::kimi_linear::ModelArgs| crate::capability::kimi_linear(
+                    &declaration
+                ),
+                selected_kimi_linear_args,
+                crate::kimi_linear::prompt_cache_architecture_fingerprint,
+                |args: &crate::kimi_linear::ModelArgs| plan.kimi_declaration(args)
+            )
+        }
         EligibleConfig::DeepSeekV3(args) => visit_family!(
             DeepSeekV3DenseReplicated,
             args,
             crate::capability::deepseek_v3,
             selected_deepseek_v3_args,
-            crate::deepseek::v3_architecture_fingerprint
+            crate::deepseek::v3_architecture_fingerprint,
+            |args: &crate::deepseek::V3Args| Ok::<_, String>(args.clone())
         ),
         _ => Err(ReplicatedTextIneligibility::Unrelated.into()),
     }
@@ -2077,11 +2473,11 @@ where
     let eligible = eligible_config(plan)?;
     if matches!(
         eligible,
-        EligibleConfig::Gemma2(_)
-            | EligibleConfig::Llama(_)
-            | EligibleConfig::Nanbeige(_)
-            | EligibleConfig::K2Horizon(_)
-            | EligibleConfig::Qwen(_)
+        EligibleConfig::Gemma2(_, _)
+            | EligibleConfig::Llama(_, _)
+            | EligibleConfig::Nanbeige(_, _)
+            | EligibleConfig::K2Horizon(_, _)
+            | EligibleConfig::Qwen(_, _)
     ) {
         visit_replicated_text_architecture(plan, selected, store, context, visitor)
     } else {
@@ -2154,8 +2550,7 @@ where
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
         let effective_model_type = target.model_identity().to_owned();
         let definition =
-            crate::nemotron_labs_diffusion::definition::project_text_parameters(&target, &retained)
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+            executable_component(&selected).map_err(ReplicatedTextDispatchError::Architecture)?;
         let architecture = crate::nemotron_labs_diffusion::model::TextKernel::<B>::from_definition(
             target, definition, context,
         )
@@ -2212,16 +2607,14 @@ where
         })
         .transpose()
         .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-    let mut target = config.clone();
-    target.text.weight_quantization = None;
-    target.text.quantized_weights = None;
-    let formats = selected.quantized_formats();
-    target.text.quantized_weight_configs = (!formats.is_empty()).then_some(formats);
+    let target = config
+        .with_text_formats(selected.quantized_formats())
+        .map_err(|e| ReplicatedTextDispatchError::Architecture(e.to_string()))?;
     let identity = target.architecture_fingerprint();
     let capability = crate::capability::diffusion_gemma(&target)
         .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-    let definition = crate::diffusion_gemma::model::project_parameters(&target, &retained)
-        .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+    let definition =
+        executable_component(&selected).map_err(ReplicatedTextDispatchError::Architecture)?;
     let architecture = crate::diffusion_gemma::model::TextKernel::<B>::from_definition(
         target, definition, context,
     )
@@ -2282,11 +2675,11 @@ where
     let eligible = eligible_config(plan)?;
     let ordinary = matches!(
         eligible,
-        EligibleConfig::Gemma2(_)
-            | EligibleConfig::Llama(_)
-            | EligibleConfig::Nanbeige(_)
-            | EligibleConfig::K2Horizon(_)
-            | EligibleConfig::Qwen(_)
+        EligibleConfig::Gemma2(_, _)
+            | EligibleConfig::Llama(_, _)
+            | EligibleConfig::Nanbeige(_, _)
+            | EligibleConfig::K2Horizon(_, _)
+            | EligibleConfig::Qwen(_, _)
     );
     match (ordinary, selected.state().access()) {
         (true, ReplicatedTextStateAccess::KeyValue) => visit_replicated_text_architecture(
@@ -2418,7 +2811,7 @@ where
         eredu_runtime::SourceHandoffScope::Primary,
     )
     .map_err(|handoff| ReplicatedTextDispatchError::Architecture(handoff.to_string()))?;
-    let args = match eligible {
+    let declaration = match eligible {
         EligibleConfig::QwenHybrid(args) => {
             let capability_estimate = crate::capability::qwen_hybrid_text(args)
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
@@ -2437,12 +2830,13 @@ where
                 .map_err(ReplicatedTextDispatchError::Architecture)?;
             let prompt_cache_architecture_identity =
                 crate::qwen::hybrid::prompt_cache_architecture_fingerprint(&args);
-            let mut architecture = <MixedState as FixedProfile<
-                B,
-                D::State,
-                QwenHybridReplicated,
-            >>::from_definition(args, retained.clone(), context)
-            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+            let definition = executable_component(&selected)
+                .map_err(ReplicatedTextDispatchError::Architecture)?;
+            let mut architecture =
+                <MixedState as FixedProfile<B, D::State, QwenHybridReplicated>>::from_definition(
+                    args, definition, context,
+                )
+                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             architecture.kernel_mut().enable_prediction_capture();
             let prepared = prepare_architecture_handoff::<B, D::State, _>(
                 architecture,
@@ -2462,17 +2856,19 @@ where
                 dispatcher.into_visitor(),
             );
         }
-        EligibleConfig::NemotronH(args) => args,
+        EligibleConfig::NemotronH(declaration) => declaration,
         _ => return Err(ReplicatedTextIneligibility::Unrelated.into()),
     };
-    let capability_estimate = crate::capability::nemotron_h(args)
+    let args = declaration.args();
+    let capability_estimate = crate::capability::nemotron_h(&declaration)
         .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
     let effective_model_type = args.model_type.clone();
     let source_architecture = selected
         .uses_weight_transform()
         .then(|| {
             <MixedState as FixedProfile<B, D::State, NemotronHReplicated>>::from_definition(
-                args.clone(),
+                plan.nemotron_declaration(args)
+                    .map_err(eredu_nn::Error::backend)?,
                 retained.clone(),
                 context,
             )
@@ -2483,10 +2879,13 @@ where
         .map_err(ReplicatedTextDispatchError::Architecture)?;
     let prompt_cache_architecture_identity =
         crate::nemotron_h::prompt_cache_architecture_fingerprint(&args);
+    let definition =
+        executable_component(&selected).map_err(ReplicatedTextDispatchError::Architecture)?;
     let mut architecture =
         <MixedState as FixedProfile<B, D::State, NemotronHReplicated>>::from_definition(
-            args,
-            retained.clone(),
+            plan.nemotron_declaration(&args)
+                .map_err(ReplicatedTextDispatchError::Architecture)?,
+            definition,
             context,
         )
         .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
@@ -2512,23 +2911,38 @@ where
 
 enum EligibleConfig<'a> {
     NemotronLabsDiffusion(&'a crate::nemotron_labs_diffusion::FamilyConfig),
-    K2Horizon(&'a crate::k2_horizon::ModelArgs),
-    Llama(&'a crate::llama::ModelArgs),
-    Gemma2(&'a crate::gemma2::ModelArgs),
-    Nanbeige(&'a crate::nanbeige::ModelArgs),
-    Qwen(&'a crate::qwen::ModelArgs),
-    Lfm2(&'a crate::lfm2::ModelArgs),
-    KimiLinear(&'a crate::kimi_linear::ModelArgs),
-    NemotronH(&'a crate::nemotron_h::ModelArgs),
+    K2Horizon(
+        &'a crate::k2_horizon::ModelArgs,
+        Arc<crate::k2_horizon::Declaration>,
+    ),
+    Llama(
+        &'a crate::llama::ModelArgs,
+        Arc<crate::decoder::DecoderDeclaration>,
+    ),
+    Gemma2(
+        &'a crate::gemma2::ModelArgs,
+        Arc<crate::decoder::DecoderDeclaration>,
+    ),
+    Nanbeige(
+        &'a crate::nanbeige::ModelArgs,
+        Arc<crate::decoder::DecoderDeclaration>,
+    ),
+    Qwen(&'a crate::qwen::ModelArgs, Arc<crate::qwen::Declaration>),
+    Lfm2(Arc<crate::lfm2::Declaration>),
+    KimiLinear(Arc<crate::kimi_linear::Declaration>),
+    NemotronH(Arc<crate::nemotron_h::Declaration>),
     QwenHybrid(&'a crate::qwen::hybrid::HybridConfig),
-    GptOss(&'a crate::gpt_oss::ModelArgs),
+    GptOss(
+        &'a crate::gpt_oss::ModelArgs,
+        Arc<crate::gpt_oss::Declaration>,
+    ),
     DeepSeekV3(&'a crate::deepseek::V3Args),
     DeepSeekV4(&'a crate::deepseek::V4Args),
     DiffusionGemma(&'a crate::diffusion_gemma::FamilyConfig),
     Gemma4(&'a crate::gemma4::FamilyConfig),
     Inkling(&'a crate::inkling::ModelArgs),
     Muse(&'a crate::muse::DecoderConfig),
-    QwenVl(&'a crate::qwen::vl::ModelArgs),
+    QwenVl(Arc<crate::qwen::vl::Declaration>),
     QwenCompositeHybrid(&'a crate::qwen::hybrid::ParsedHybridConfig),
 }
 
@@ -2538,14 +2952,22 @@ impl EligibleConfig<'_> {
     ) -> Result<Option<eredu_runtime::execution_topology::TextExecutionTopology>, eredu_nn::Error>
     {
         let topology = match self {
-            Self::NemotronLabsDiffusion(args) => crate::decoder::topology::text(*args)?,
+            Self::NemotronLabsDiffusion(args) => {
+                args.text_declaration().execution_topology(*args)?
+            }
             Self::DiffusionGemma(args) => crate::diffusion_gemma::topology::text(args)?,
-            Self::Llama(args) => crate::decoder::topology::text(*args)?,
-            Self::Nanbeige(args) => crate::decoder::topology::text(*args)?,
-            Self::Gemma2(args) => crate::decoder::topology::text(*args)?,
-            Self::K2Horizon(args) => crate::decoder::topology::text(*args)?,
-            Self::Qwen(args) => crate::qwen::execution_topology(args)?,
-            Self::Lfm2(args) => crate::lfm2::execution_topology(args)?,
+            Self::Llama(args, declaration) => declaration.execution_topology(*args)?,
+            Self::Nanbeige(args, declaration) => declaration.execution_topology(*args)?,
+            Self::Gemma2(args, declaration) => declaration.execution_topology(*args)?,
+            Self::K2Horizon(_, declaration) => declaration.execution_topology()?,
+            Self::Qwen(args, declaration) => {
+                if args.is_moe() {
+                    crate::qwen::execution_topology(&declaration)?
+                } else {
+                    declaration.common().execution_topology(*args)?
+                }
+            }
+            Self::Lfm2(declaration) => crate::lfm2::execution_topology(declaration)?,
             Self::QwenHybrid(args) => crate::qwen::hybrid::topology::target(args)?,
             Self::QwenCompositeHybrid(args) => crate::qwen::hybrid::topology::target(&args.text)?,
             _ => return Ok(None),
@@ -2567,13 +2989,13 @@ impl EligibleConfig<'_> {
                 args.encoder_attention
                     == crate::diffusion_gemma::EncoderAttention::CausalWithVisionSpans
             }
-            Self::Llama(_)
+            Self::Llama(_, _)
             | Self::NemotronLabsDiffusion(_)
-            | Self::Nanbeige(_)
-            | Self::Qwen(_)
-            | Self::Gemma2(_)
-            | Self::K2Horizon(_)
-            | Self::GptOss(_) => crate::decoder::CHUNKED_TEXT_PREFILL,
+            | Self::Nanbeige(_, _)
+            | Self::Qwen(_, _)
+            | Self::Gemma2(_, _)
+            | Self::K2Horizon(_, _)
+            | Self::GptOss(_, _) => crate::decoder::CHUNKED_TEXT_PREFILL,
             Self::Muse(_) => crate::muse::model::RETAINED_PREFILL,
             Self::Lfm2(_) => crate::lfm2::CHUNKED_TEXT_PREFILL,
             Self::QwenHybrid(_) | Self::QwenCompositeHybrid(_) => {
@@ -2602,20 +3024,51 @@ impl EligibleConfig<'_> {
                 .wire_schema()
                 .map_err(|error| error.to_string())
             }
-            Self::Nanbeige(args) => standard(args.dense_config().hidden_size),
-            Self::Gemma2(args) => standard(args.dense_config().hidden_size),
-            Self::Llama(args) => standard(args.hidden_size),
-            Self::K2Horizon(args) => standard(args.hidden_size),
-            Self::Qwen(args) => standard(args.hidden_size),
-            Self::Lfm2(args) => standard(args.hidden_size),
-            Self::KimiLinear(args) => standard(args.hidden_size),
+            Self::Nanbeige(_, declaration) => standard(
+                declaration
+                    .static_construction()
+                    .embedding_spec()
+                    .dimensions,
+            ),
+            Self::Gemma2(_, declaration) | Self::Llama(_, declaration) => standard(
+                declaration
+                    .static_construction()
+                    .embedding_spec()
+                    .dimensions,
+            ),
+            Self::K2Horizon(_, declaration) => standard(
+                declaration
+                    .common()
+                    .static_construction()
+                    .embedding_spec()
+                    .dimensions,
+            ),
+            Self::Qwen(_, declaration) => standard(
+                declaration
+                    .common()
+                    .static_construction()
+                    .embedding_spec()
+                    .dimensions,
+            ),
+            Self::Lfm2(declaration) => standard(declaration.statics.embedding_spec().dimensions),
+            Self::KimiLinear(declaration) => {
+                standard(declaration.statics.embedding_spec().dimensions)
+            }
             Self::QwenHybrid(args) => standard(args.hidden_size),
-            Self::GptOss(args) => standard(args.hidden_size),
+            Self::GptOss(_, declaration) => standard(
+                declaration
+                    .common()
+                    .static_construction()
+                    .embedding_spec()
+                    .dimensions,
+            ),
             Self::Inkling(args) => standard(args.text_config.hidden_size),
             Self::Muse(args) => standard(args.hidden_size),
-            Self::NemotronH(args) => crate::nemotron_h::TargetBoundarySchema::from_args(args)
-                .wire_schema()
-                .map_err(|error| error.to_string()),
+            Self::NemotronH(declaration) => {
+                crate::nemotron_h::TargetBoundarySchema::from_declaration(declaration)
+                    .wire_schema()
+                    .map_err(|error| error.to_string())
+            }
             Self::DeepSeekV3(args) => crate::deepseek::v3::TargetBoundarySchema::from_args(args)
                 .wire_schema()
                 .map_err(|error| error.to_string()),
@@ -2647,7 +3100,8 @@ impl EligibleConfig<'_> {
                 } else {
                     0
                 };
-                let state = crate::gemma4::pipeline::tensor_state_layout(&args.text, topology)?;
+                let state = crate::gemma4::graph::tensor_state_layout(args, topology)
+                    .map_err(|error| error.to_string())?;
                 crate::gemma4::TextBoundarySchema::from_state_layout(&args.text, width, &state)
                     .wire_schema()
                     .map_err(|error| error.to_string())
@@ -2692,20 +3146,20 @@ impl EligibleConfig<'_> {
             Ok(())
         };
         match self {
-            Self::NemotronLabsDiffusion(_) => {
-                extend(crate::nemotron_labs_diffusion::source_recipes(source)?)?
-            }
-            Self::Gemma2(_) | Self::Llama(_) => {}
-            Self::Nanbeige(args) => extend(crate::decoder::repeated::recipes(
-                source,
-                "model",
-                args.physical_layer_count(),
-                args.num_loops(),
-                !args.skip_loop_final_norm(),
-                |layer| crate::decoder::Config::block_parameter_owner(*args, layer),
-            )?)?,
-            Self::K2Horizon(args) => {
-                extend(crate::k2_horizon::linear_companion_recipes(source, args)?)?;
+            Self::NemotronLabsDiffusion(config) => extend(
+                crate::nemotron_labs_diffusion::source_recipes(config, source)?,
+            )?,
+            Self::Gemma2(_, _) | Self::Llama(_, _) => {}
+            Self::Nanbeige(args, declaration) => extend(crate::decoder::repeated::recipes(
+                &declaration
+                    .parameter_description(*args, crate::decoder::ParameterEncoding::Stored)
+                    .map_err(|error| error.to_string())?,
+            ))?,
+            Self::K2Horizon(args, declaration) => {
+                extend(crate::k2_horizon::linear_companion_recipes(
+                    source,
+                    declaration,
+                )?)?;
                 for layer in 0..self.unit_count()? {
                     for (bank, count, enabled) in [
                         (
@@ -2722,7 +3176,7 @@ impl EligibleConfig<'_> {
                         if enabled {
                             extend(crate::k2_horizon::expert_recipes(
                                 source,
-                                args,
+                                declaration,
                                 layer,
                                 bank,
                                 &(0..count as usize).collect::<Vec<_>>(),
@@ -2731,57 +3185,73 @@ impl EligibleConfig<'_> {
                     }
                 }
             }
-            Self::Qwen(args) if args.is_moe() => {
+            Self::Qwen(args, declaration) if args.is_moe() => {
                 for layer in 0..self.unit_count()? {
-                    let expert = crate::qwen::expert_recipes(source, args, layer)?;
-                    extend(BTreeMap::from([
-                        (expert.target_gate_up, expert.gate_up),
-                        (expert.target_down, expert.down),
-                    ]))?;
+                    let expert = crate::qwen::expert_recipes(source, declaration, layer)?;
+                    extend(
+                        eredu_checkpoint::expert::gated_product_materialization_recipes(
+                            source, &expert,
+                        )?,
+                    )?;
                 }
             }
-            Self::Qwen(_) => {}
-            Self::Lfm2(args) => {
-                for layer in 0..self.unit_count()? {
-                    extend(crate::lfm2::unit_recipes(source, args, layer)?)?;
+            Self::Qwen(_, _) => {}
+            Self::Lfm2(declaration) => {
+                for layer in 0..declaration.definition().parameters().unit_layout().len() {
+                    extend(crate::lfm2::unit_recipes(source, &declaration, layer)?)?;
                 }
             }
-            Self::KimiLinear(args) => {
-                for layer in 0..self.unit_count()? {
-                    extend(crate::kimi_linear::unit_recipes(source, args, layer, true)?)?;
+            Self::KimiLinear(declaration) => {
+                for layer in 0..declaration.definition().parameters().unit_layout().len() {
+                    extend(crate::kimi_linear::unit_recipes(
+                        source,
+                        &declaration,
+                        layer,
+                        true,
+                    )?)?;
                 }
             }
-            Self::NemotronH(args) => {
+            Self::NemotronH(declaration) => {
+                let args = declaration.args();
                 extend(crate::nemotron_h::static_recipes(source, args, None)?)?;
-                for layer in 0..self.unit_count()? {
-                    extend(crate::nemotron_h::unit_recipes(
-                        source, args, 0, layer, true,
+                let parameters = declaration.definition().parameters();
+                for ordinal in 0..parameters.unit_layout().len() {
+                    extend(crate::nemotron_h::unit_recipes_flat(
+                        source,
+                        &declaration,
+                        ordinal,
+                        true,
                     )?)?;
                 }
             }
             Self::QwenHybrid(args) => {
                 extend(crate::qwen::hybrid::static_recipes(source)?)?;
-                for layer in 0..self.unit_count()? {
-                    extend(crate::qwen::hybrid::unit_recipes(source, args, layer)?)?;
+                let parameters = self.parameter_description()?;
+                for ordinal in 0..parameters.unit_layout().len() {
+                    extend(crate::qwen::hybrid::unit_recipes(source, args, ordinal)?)?;
                 }
             }
-            Self::GptOss(args) => {
-                for layer in 0..self.unit_count()? {
+            Self::GptOss(_, declaration) => {
+                for layer in declaration.projections().owner_layers() {
                     extend(
-                        crate::gpt_oss::expert_recipes(source, args, layer)?
+                        crate::gpt_oss::expert_recipes(source, declaration, layer)?
                             .into_outputs()
                             .into_outputs(),
                     )?;
                 }
             }
             Self::DeepSeekV3(args) => {
-                for layer in 0..self.unit_count()? {
-                    extend(crate::deepseek::v3_unit_recipes(source, args, layer, true)?)?;
+                let parameters = self.parameter_description()?;
+                for ordinal in 0..parameters.unit_layout().len() {
+                    extend(crate::deepseek::v3_unit_recipes(
+                        source, args, ordinal, true,
+                    )?)?;
                 }
             }
             Self::DeepSeekV4(args) => {
-                for layer in 0..self.unit_count()? {
-                    let expert = crate::deepseek::v4_expert_recipes(source, args, layer)?;
+                let parameters = self.parameter_description()?;
+                for ordinal in 0..parameters.unit_layout().len() {
+                    let expert = crate::deepseek::v4_expert_recipes(source, args, ordinal)?;
                     extend(
                         eredu_checkpoint::expert::gated_product_materialization_recipes(
                             source, &expert,
@@ -2801,6 +3271,7 @@ impl EligibleConfig<'_> {
             }
             Self::Inkling(args) => {
                 extend(crate::inkling::static_safetensors_recipes(args, source)?)?;
+                extend(crate::inkling::mtp_safetensors_recipes(args, source)?)?;
                 let counts = [
                     args.vision_config
                         .as_ref()
@@ -2835,7 +3306,7 @@ impl EligibleConfig<'_> {
                         let text_layers = usize::try_from(args.num_hidden_layers)
                             .map_err(|_| "invalid Muse-Glimmer text layer count".to_owned())?;
                         for layer in 0..text_layers {
-                            let expert = crate::muse::expert_recipes(source, layer)?;
+                            let expert = crate::muse::expert_recipes(source, args, layer)?;
                             extend(BTreeMap::from([
                                 (expert.target_gate_up, expert.gate_up),
                                 (expert.target_down, expert.down),
@@ -2876,7 +3347,8 @@ impl EligibleConfig<'_> {
             }
             Self::QwenCompositeHybrid(args) => {
                 extend(crate::qwen::hybrid::static_recipes(source)?)?;
-                for ordinal in 0..self.unit_count()? {
+                let parameters = self.parameter_description()?;
+                for ordinal in 0..parameters.unit_layout().len() {
                     extend(crate::qwen::hybrid::conditional_unit_recipes(
                         source, args, ordinal,
                     )?)?;
@@ -2911,20 +3383,26 @@ impl EligibleConfig<'_> {
     fn architecture_identity(&self) -> String {
         match self {
             Self::NemotronLabsDiffusion(args) => args.architecture_fingerprint(),
-            Self::Nanbeige(args) => crate::nanbeige::prompt_cache_architecture_fingerprint(args),
-            Self::Gemma2(args) => crate::gemma2::prompt_cache_architecture_fingerprint(args),
-            Self::Llama(args) => crate::llama::prompt_cache_architecture_fingerprint(args),
-            Self::K2Horizon(args) => crate::k2_horizon::prompt_cache_architecture_fingerprint(args),
-            Self::Qwen(args) => crate::qwen::prompt_cache_architecture_fingerprint(args),
-            Self::Lfm2(args) => crate::lfm2::prompt_cache_architecture_fingerprint(args),
-            Self::KimiLinear(args) => {
-                crate::kimi_linear::prompt_cache_architecture_fingerprint(args)
+            Self::Nanbeige(args, _) => crate::nanbeige::prompt_cache_architecture_fingerprint(args),
+            Self::Gemma2(args, _) => crate::gemma2::prompt_cache_architecture_fingerprint(args),
+            Self::Llama(args, _) => crate::llama::prompt_cache_architecture_fingerprint(args),
+            Self::K2Horizon(args, _) => {
+                crate::k2_horizon::prompt_cache_architecture_fingerprint(args)
             }
-            Self::NemotronH(args) => crate::nemotron_h::prompt_cache_architecture_fingerprint(args),
+            Self::Qwen(args, _) => crate::qwen::prompt_cache_architecture_fingerprint(args),
+            Self::Lfm2(declaration) => {
+                crate::lfm2::prompt_cache_architecture_fingerprint(declaration.args())
+            }
+            Self::KimiLinear(declaration) => {
+                crate::kimi_linear::prompt_cache_architecture_fingerprint(declaration.args())
+            }
+            Self::NemotronH(declaration) => {
+                crate::nemotron_h::prompt_cache_architecture_fingerprint(declaration.args())
+            }
             Self::QwenHybrid(args) => {
                 crate::qwen::hybrid::prompt_cache_architecture_fingerprint(args)
             }
-            Self::GptOss(args) => crate::gpt_oss::prompt_cache_architecture_fingerprint(args),
+            Self::GptOss(args, _) => crate::gpt_oss::prompt_cache_architecture_fingerprint(args),
             Self::DeepSeekV3(args) => crate::deepseek::v3_architecture_fingerprint(args),
             Self::DeepSeekV4(args) => crate::deepseek::v4_architecture_fingerprint(args),
             Self::DiffusionGemma(args) => args.architecture_fingerprint(),
@@ -2948,6 +3426,20 @@ impl EligibleConfig<'_> {
         if matches!(self, Self::Muse(_)) {
             return crate::muse::checkpoint::canonical_safetensors_target(name);
         }
+        if matches!(self, Self::NemotronH(_)) {
+            let canonical = aliases
+                .iter()
+                .find(|alias| alias.starts_with("model.") || alias.starts_with("lm_head."))
+                .map_or(name, String::as_str);
+            if canonical.contains(".experts.") {
+                for suffix in ["scales", "biases"] {
+                    if let Some(prefix) = canonical.strip_suffix(&format!(".{suffix}")) {
+                        return format!("{prefix}_{suffix}");
+                    }
+                }
+            }
+            return canonical.to_owned();
+        }
         if name.contains(".experts.") {
             if let Some(prefix) = name.strip_suffix(".scales") {
                 return format!("{prefix}_scales");
@@ -2958,92 +3450,10 @@ impl EligibleConfig<'_> {
         }
         match self {
             Self::Inkling(_) => aliases.first().cloned().unwrap_or_else(|| name.to_owned()),
-            Self::NemotronH(_) => aliases
-                .iter()
-                .find(|alias| alias.starts_with("model.") || alias.starts_with("lm_head."))
-                .cloned()
-                .unwrap_or_else(|| name.to_owned()),
-            Self::GptOss(_) => name
+            Self::GptOss(_, _) => name
                 .strip_suffix("_blocks")
                 .map_or_else(|| name.to_owned(), str::to_owned),
             _ => name.to_owned(),
-        }
-    }
-
-    fn logical_parameter_shape(&self, name: &str, discovered: Vec<usize>) -> Vec<usize> {
-        if let Self::KimiLinear(args) = self {
-            if name.ends_with(".self_attn.A_log") {
-                return vec![
-                    1,
-                    1,
-                    usize::try_from(args.kda_config.num_heads).unwrap_or_default(),
-                    1,
-                ];
-            }
-        }
-        if discovered.len() != 2 {
-            return discovered;
-        }
-        match self {
-            Self::Lfm2(args) if name.ends_with(".conv.conv.weight") => vec![
-                usize::try_from(args.hidden_size).unwrap_or_default(),
-                1,
-                usize::try_from(args.conv_l_cache).unwrap_or_default(),
-            ],
-            Self::KimiLinear(args)
-                if name.ends_with(".q_conv1d.weight")
-                    || name.ends_with(".k_conv1d.weight")
-                    || name.ends_with(".v_conv1d.weight") =>
-            {
-                vec![
-                    usize::try_from(args.kda_config.num_heads * args.kda_config.head_dim)
-                        .unwrap_or_default(),
-                    1,
-                    usize::try_from(args.kda_config.short_conv_kernel_size).unwrap_or_default(),
-                ]
-            }
-            Self::NemotronH(args) if name.ends_with(".mamba.conv1d.weight") => vec![
-                usize::try_from(
-                    args.mamba_num_heads * args.mamba_head_dim
-                        + 2 * args.n_groups * args.ssm_state_size,
-                )
-                .unwrap_or_default(),
-                1,
-                usize::try_from(args.conv_kernel).unwrap_or_default(),
-            ],
-            Self::QwenHybrid(_) if name.ends_with(".linear_attn.conv1d.weight") => {
-                vec![discovered[0], 1, discovered[1]]
-            }
-            _ => discovered,
-        }
-    }
-
-    fn parameter_requires_shape_recipe(&self, name: &str) -> bool {
-        match self {
-            Self::NemotronLabsDiffusion(_) => false,
-            Self::Lfm2(_) => name.ends_with(".conv.conv.weight"),
-            Self::KimiLinear(_) => {
-                name.ends_with(".self_attn.A_log")
-                    || name.ends_with(".q_conv1d.weight")
-                    || name.ends_with(".k_conv1d.weight")
-                    || name.ends_with(".v_conv1d.weight")
-            }
-            Self::NemotronH(_) => name.ends_with(".mamba.conv1d.weight"),
-            Self::QwenHybrid(_) => name.ends_with(".linear_attn.conv1d.weight"),
-            Self::QwenCompositeHybrid(_) => name.ends_with(".linear_attn.conv1d.weight"),
-            Self::Gemma2(_)
-            | Self::Llama(_)
-            | Self::Nanbeige(_)
-            | Self::K2Horizon(_)
-            | Self::Qwen(_)
-            | Self::GptOss(_)
-            | Self::DeepSeekV3(_)
-            | Self::DeepSeekV4(_)
-            | Self::DiffusionGemma(_)
-            | Self::Gemma4(_)
-            | Self::Inkling(_)
-            | Self::Muse(_)
-            | Self::QwenVl(_) => false,
         }
     }
 
@@ -3058,26 +3468,30 @@ impl EligibleConfig<'_> {
         match self {
             Self::NemotronLabsDiffusion(args) => crate::decoder::operator_requirements(*args)
                 .union(NeuralOperatorCapabilities::CAST_FLOAT),
-            Self::K2Horizon(args) => crate::decoder::operator_requirements(*args),
-            Self::Gemma2(args) => crate::decoder::operator_requirements(*args),
-            Self::Llama(_)
-            | Self::Nanbeige(_)
-            | Self::Qwen(_)
+            Self::K2Horizon(args, _) => crate::decoder::operator_requirements(*args),
+            Self::Gemma2(args, _) => crate::decoder::operator_requirements(*args),
+            Self::Llama(_, _)
+            | Self::Nanbeige(_, _)
+            | Self::Qwen(_, _)
             | Self::Lfm2(_)
-            | Self::GptOss(_) => NeuralOperatorCapabilities::NONE,
-            Self::KimiLinear(args)
-                if args
-                    .layer_schedule
-                    .iter()
-                    .any(|policy| policy.attention == crate::kimi_linear::AttentionKind::Kda) =>
+            | Self::GptOss(_, _) => NeuralOperatorCapabilities::NONE,
+            Self::KimiLinear(declaration)
+                if declaration.blocks.iter().any(|scope| {
+                    matches!(
+                        scope.mixer,
+                        crate::kimi_linear::declarations::MixerParameters::Kda(_)
+                    )
+                }) =>
             {
                 crate::operator_requirements::KIMI_LINEAR
             }
-            Self::NemotronH(args)
-                if args
-                    .layer_schedule
-                    .iter()
-                    .any(|policy| *policy == crate::nemotron_h::LayerPolicy::Mamba) =>
+            Self::NemotronH(declaration)
+                if declaration.blocks.iter().any(|scope| {
+                    matches!(
+                        scope.operator,
+                        crate::nemotron_h::declarations::TargetOperatorParameters::Mamba(_)
+                    )
+                }) =>
             {
                 crate::operator_requirements::NEMOTRON_H
             }
@@ -3104,60 +3518,20 @@ impl EligibleConfig<'_> {
         }
     }
 
-    fn execution_group(&self) -> &'static str {
-        match self {
-            Self::NemotronLabsDiffusion(_) => crate::decoder::TEXT_DECODER_EXECUTION_GROUP,
-            Self::Gemma2(_)
-            | Self::Llama(_)
-            | Self::Nanbeige(_)
-            | Self::K2Horizon(_)
-            | Self::Qwen(_)
-            | Self::GptOss(_) => crate::decoder::TEXT_DECODER_EXECUTION_GROUP,
-            Self::Lfm2(_) | Self::KimiLinear(_) | Self::NemotronH(_) | Self::QwenHybrid(_) => {
-                crate::decoder::TARGET_EXECUTION_GROUP
-            }
-            Self::DeepSeekV3(_) => crate::decoder::TARGET_EXECUTION_GROUP,
-            Self::DeepSeekV4(_) => crate::decoder::TARGET_EXECUTION_GROUP,
-            Self::DiffusionGemma(_) => crate::diffusion_gemma::model::TEXT_EXECUTION_GROUP,
-            Self::Gemma4(_) => crate::gemma4::model::TEXT_EXECUTION_GROUP,
-            Self::Inkling(_) => crate::inkling::model::TEXT_EXECUTION_GROUP,
-            Self::Muse(_) => crate::muse::model::TEXT_EXECUTION_GROUP,
-            Self::QwenVl(_) => crate::qwen::vl::TEXT_EXECUTION_GROUP,
-            Self::QwenCompositeHybrid(_) => crate::qwen::hybrid::VISION_EXECUTION_GROUP,
-        }
-    }
-
     fn component_definition(&self) -> Result<eredu_runtime::ComponentDefinition, eredu_nn::Error> {
-        fn decoder<C: crate::decoder::Config>(
-            args: &C,
-            parameters: Result<
-                eredu_runtime::ArchitectureParameterDescription,
-                eredu_runtime::ParallelPlanError,
-            >,
-        ) -> Result<eredu_runtime::ComponentDefinition, eredu_nn::Error> {
-            crate::decoder::component_definition(
-                args,
-                parameters.map_err(eredu_nn::Error::backend_source)?,
-                crate::decoder::state_layout(args)?,
-            )
-        }
         match self {
             Self::NemotronLabsDiffusion(args) => {
                 crate::nemotron_labs_diffusion::definition::text(args, None)
             }
-            Self::Llama(args) => decoder(*args, crate::decoder::dense_parameter_description(*args)),
-            Self::Nanbeige(args) => {
-                decoder(*args, crate::decoder::dense_parameter_description(*args))
-            }
-            Self::Gemma2(args) => {
-                decoder(*args, crate::decoder::dense_parameter_description(*args))
-            }
-            Self::K2Horizon(args) => decoder(*args, crate::k2_horizon::parameter_description(args)),
-            Self::Qwen(args) => decoder(*args, crate::qwen::parameter_description(args)),
-            Self::GptOss(args) => decoder(*args, crate::gpt_oss::parameter_description(args)),
-            Self::Lfm2(args) => crate::lfm2::component_definition(args),
-            Self::KimiLinear(args) => crate::kimi_linear::component_definition(args),
-            Self::NemotronH(args) => crate::nemotron_h::component_definition(args, None),
+            Self::Llama(args, declaration) => declaration.component_definition(*args),
+            Self::Nanbeige(args, declaration) => declaration.component_definition(*args),
+            Self::Gemma2(args, declaration) => declaration.component_definition(*args),
+            Self::K2Horizon(_, declaration) => declaration.component_definition(),
+            Self::Qwen(_, declaration) => declaration.component_definition(),
+            Self::GptOss(_, declaration) => declaration.component_definition(),
+            Self::Lfm2(declaration) => Ok(declaration.definition().as_ref().clone()),
+            Self::KimiLinear(declaration) => Ok(declaration.definition().as_ref().clone()),
+            Self::NemotronH(declaration) => Ok(declaration.definition().as_ref().clone()),
             Self::QwenHybrid(args) => crate::qwen::hybrid::component_definition(args, None),
             Self::DeepSeekV3(args) => crate::deepseek::v3::component_definition(args, None),
             Self::DeepSeekV4(args) => crate::deepseek::v4::component_definition(args, None),
@@ -3177,20 +3551,24 @@ impl EligibleConfig<'_> {
     fn unit_count(&self) -> Result<usize, String> {
         let count = match self {
             Self::NemotronLabsDiffusion(args) => args.num_hidden_layers(),
-            Self::Nanbeige(args) => {
-                return crate::decoder::DecoderSchedule::new(*args)
-                    .map(|schedule| schedule.len())
-                    .map_err(|error| error.to_string())
+            Self::Nanbeige(args, declaration) => {
+                return declaration
+                    .component_definition(*args)
+                    .map(|definition| definition.parameters().unit_layout().len())
+                    .map_err(|error| error.to_string());
             }
-            Self::Gemma2(args) => args.dense_config().num_hidden_layers,
-            Self::Llama(args) => args.num_hidden_layers,
-            Self::K2Horizon(args) => args.num_hidden_layers,
-            Self::Qwen(args) => args.num_hidden_layers,
-            Self::Lfm2(args) => args.num_hidden_layers,
-            Self::KimiLinear(args) => args.num_hidden_layers,
-            Self::NemotronH(args) => args.num_hidden_layers,
+            Self::Gemma2(_, declaration) | Self::Llama(_, declaration) => {
+                return Ok(declaration.state_layout().len());
+            }
+            Self::K2Horizon(_, declaration) => {
+                return Ok(declaration.common().state_layout().len());
+            }
+            Self::Qwen(_, declaration) => return Ok(declaration.common().state_layout().len()),
+            Self::Lfm2(declaration) => return Ok(declaration.blocks.len()),
+            Self::KimiLinear(declaration) => return Ok(declaration.blocks.len()),
+            Self::NemotronH(declaration) => return Ok(declaration.blocks.len()),
             Self::QwenHybrid(args) => args.num_hidden_layers,
-            Self::GptOss(args) => args.num_hidden_layers,
+            Self::GptOss(args, _) => args.num_hidden_layers,
             Self::DeepSeekV3(args) => args.num_hidden_layers,
             Self::DeepSeekV4(args) => args.num_hidden_layers,
             Self::DiffusionGemma(args) => return Ok(args.text.num_hidden_layers()),
@@ -3251,35 +3629,20 @@ impl EligibleConfig<'_> {
 
     fn state_layout(&self) -> Result<eredu_runtime::StateLayout, String> {
         match self {
-            Self::NemotronLabsDiffusion(args) => {
-                crate::decoder::state_layout(*args).map_err(|error| error.to_string())
+            Self::NemotronLabsDiffusion(args) => Ok(args.text_declaration().state_layout().clone()),
+            Self::Nanbeige(_, declaration) => Ok(declaration.state_layout().clone()),
+            Self::Gemma2(_, declaration) | Self::Llama(_, declaration) => {
+                Ok(declaration.state_layout().clone())
             }
-            Self::Nanbeige(args) => {
-                crate::nanbeige::state_layout(args).map_err(|error| error.to_string())
-            }
-            Self::Gemma2(args) => {
-                crate::gemma2::state_layout(*args).map_err(|error| error.to_string())
-            }
-            Self::Llama(args) => {
-                crate::llama::state_layout(*args).map_err(|error| error.to_string())
-            }
-            Self::K2Horizon(args) => {
-                crate::decoder::state_layout(*args).map_err(|error| error.to_string())
-            }
-            Self::Qwen(args) => crate::qwen::state_layout(*args).map_err(|error| error.to_string()),
-            Self::Lfm2(args) => crate::lfm2::state_layout(args).map_err(|error| error.to_string()),
-            Self::KimiLinear(args) => {
-                crate::kimi_linear::state_layout(args).map_err(|error| error.to_string())
-            }
-            Self::NemotronH(args) => {
-                crate::nemotron_h::state_layout(args).map_err(|error| error.to_string())
-            }
+            Self::K2Horizon(_, declaration) => Ok(declaration.common().state_layout().clone()),
+            Self::Qwen(_, declaration) => Ok(declaration.common().state_layout().clone()),
+            Self::Lfm2(declaration) => Ok(declaration.definition().state_layout().clone()),
+            Self::KimiLinear(declaration) => Ok(declaration.definition().state_layout().clone()),
+            Self::NemotronH(declaration) => Ok(declaration.definition().state_layout().clone()),
             Self::QwenHybrid(args) => {
                 crate::qwen::hybrid::state_layout(args).map_err(|error| error.to_string())
             }
-            Self::GptOss(args) => {
-                crate::gpt_oss::state_layout(args).map_err(|error| error.to_string())
-            }
+            Self::GptOss(_, declaration) => Ok(declaration.common().state_layout().clone()),
             Self::DeepSeekV3(args) => {
                 crate::deepseek::v3::state_layout(args).map_err(|error| error.to_string())
             }
@@ -3290,7 +3653,7 @@ impl EligibleConfig<'_> {
                 crate::diffusion_gemma::state_layout(args).map_err(|error| error.to_string())
             }
             Self::Gemma4(args) => {
-                crate::gemma4::state_layout(&args.text).map_err(|error| error.to_string())
+                crate::gemma4::state_layout(args).map_err(|error| error.to_string())
             }
             Self::Inkling(args) => {
                 let target =
@@ -3301,166 +3664,68 @@ impl EligibleConfig<'_> {
                     .map_err(|error| error.to_string())
             }
             Self::Muse(args) => crate::muse::state_layout(args).map_err(|error| error.to_string()),
-            Self::QwenVl(args) => {
-                crate::qwen::vl::state_layout(args).map_err(|error| error.to_string())
-            }
+            Self::QwenVl(args) => Ok(args.state_layout().clone()),
             Self::QwenCompositeHybrid(args) => {
                 crate::qwen::hybrid::state_layout(&args.text).map_err(|error| error.to_string())
             }
         }
     }
 
-    fn native_format_for_shape(&self, name: &str, shape: &[usize]) -> LinearFormat {
-        if let Self::Gemma4(args) = self {
-            let input = shape
-                .last()
-                .and_then(|&size| i32::try_from(size).ok())
-                .unwrap_or(0);
-            if name.starts_with("model.vision_") || name.starts_with("model.embed_vision.") {
-                return args.vision.as_ref().map_or(LinearFormat::Dense, |config| {
-                    config.linear_format_for(name, input)
-                });
-            }
-            if name.starts_with("model.audio_") || name.starts_with("model.embed_audio.") {
-                return args.audio.as_ref().map_or(LinearFormat::Dense, |config| {
-                    config.linear_format_for(name, input)
-                });
-            }
-        }
-        self.native_format(name)
-    }
-
-    fn native_format(&self, name: &str) -> LinearFormat {
-        match self {
+    fn linear_parameter_declarations(&self) -> Result<LinearParameterDeclarations, String> {
+        let mut bank_companions = BTreeMap::new();
+        let shapes = match self {
             Self::NemotronLabsDiffusion(args) => {
-                return crate::decoder::Config::linear_format(*args, name)
+                let mut shapes = BTreeMap::new();
+                insert_declared_linear_shapes(&mut shapes, args.text_declaration().as_ref())?;
+                Ok::<_, String>(shapes)
             }
-            Self::Nanbeige(args) => args.weight_quantization_for(name),
-            Self::Gemma2(args) => args.weight_quantization_for(name),
-            Self::Llama(args) => args.weight_quantization_for(name),
-            Self::K2Horizon(args) => return args.linear_format_for(name),
-            Self::Qwen(args) => args.weight_quantization_for(name),
-            Self::Lfm2(args) => args.weight_quantization_for(name),
-            Self::KimiLinear(args) => args.weight_quantization_for(name),
-            Self::NemotronH(args) => args.weight_quantization_for(name),
-            Self::QwenHybrid(args) => return args.linear_format(name),
-            Self::GptOss(_)
-                if name.contains(".mlp.experts.")
-                    && (name.ends_with("gate_up_proj") || name.ends_with("down_proj")) =>
-            {
-                Some(eredu_checkpoint::WeightQuantization::MxFp4)
+            Self::Nanbeige(_, declaration) => {
+                let sources =
+                    eredu_nn::DeclareLogicalParameters::logical_parameters(declaration.as_ref())
+                        .map_err(|error| error.to_string())?
+                        .into_iter()
+                        .filter(|slot| slot.parameter.alias_of.is_none())
+                        .collect::<Vec<_>>();
+                let mut shapes = BTreeMap::new();
+                insert_declared_linear_shapes(&mut shapes, &sources)?;
+                Ok(shapes)
             }
-            Self::GptOss(args) => args.weight_quantization_for(name),
-            Self::DeepSeekV3(args) => return args.linear_format_for(name),
-            Self::DeepSeekV4(args) => return args.linear_format_for(name),
-            Self::DiffusionGemma(args) => return args.text.linear_format_for(name),
-            Self::Gemma4(args) => {
-                if name.starts_with("model.vision_") {
-                    return args.vision.as_ref().map_or(LinearFormat::Dense, |config| {
-                        configured_linear_format(
-                            config.weight_quantization,
-                            config.quantized_weights.as_ref(),
-                            config.quantized_weight_configs.as_ref(),
-                            name,
-                        )
-                    });
-                }
-                if name.starts_with("model.audio_") {
-                    return args.audio.as_ref().map_or(LinearFormat::Dense, |config| {
-                        configured_linear_format(
-                            config.weight_quantization,
-                            config.quantized_weights.as_ref(),
-                            config.quantized_weight_configs.as_ref(),
-                            name,
-                        )
-                    });
-                }
-                return args.text.linear_format_for(name);
+            Self::Gemma2(_, declaration) | Self::Llama(_, declaration) => {
+                let mut shapes = BTreeMap::new();
+                insert_declared_linear_shapes(&mut shapes, declaration.as_ref())?;
+                Ok(shapes)
             }
-            Self::Inkling(args) => {
-                if name.starts_with("visual.") {
-                    return args
-                        .vision_config
-                        .as_ref()
-                        .map_or(LinearFormat::Dense, |config| config.linear_format_for(name));
-                }
-                if name.starts_with("audio.") {
-                    return args
-                        .audio_config
-                        .as_ref()
-                        .map_or(LinearFormat::Dense, |config| config.linear_format_for(name));
-                }
-                return args.text_config.linear_format_for(name);
-            }
-            Self::Muse(args) => {
-                if name.starts_with("model.vision_") {
-                    return args
-                        .vision_config
-                        .as_ref()
-                        .map_or(LinearFormat::Dense, |vision| vision.linear_format_for(name));
-                }
-                if name.starts_with("model.audio_tower.") {
-                    return args
-                        .audio_config
-                        .as_ref()
-                        .map_or(LinearFormat::Dense, |audio| audio.linear_format_for(name));
-                }
-                return args.linear_format_for(name);
-            }
-            Self::QwenVl(args) => {
-                if name.starts_with("model.visual.") {
-                    return args.vision.linear_format(name);
-                }
-                return args.text.weight_quantization_for(name).into();
-            }
-            Self::QwenCompositeHybrid(args) => {
-                if name.starts_with("model.visual.") {
-                    return args
-                        .vision
-                        .as_ref()
-                        .map_or(LinearFormat::Dense, |vision| vision.linear_format(name));
-                }
-                return args.text.linear_format(name);
-            }
-        }
-        .map_or(LinearFormat::Dense, LinearFormat::from)
-    }
-
-    fn linear_parameter_shapes(&self) -> Result<BTreeMap<String, Vec<usize>>, String> {
-        match self {
-            Self::NemotronLabsDiffusion(args) => decoder_linear_parameter_shapes(*args),
-            Self::Nanbeige(args) => decoder_linear_parameter_shapes(*args),
-            Self::Gemma2(args) => decoder_linear_parameter_shapes(*args),
-            Self::Llama(args) => decoder_linear_parameter_shapes(*args),
-            Self::K2Horizon(args) => {
-                let mut shapes = family_linear_parameter_shapes(
-                    crate::k2_horizon::safetensors_plan(args)?,
-                    |name| Some(args.linear_format_for(name)),
-                    "model.embed_tokens.weight",
-                )?;
+            Self::K2Horizon(_, declaration) => {
+                let mut shapes = crate::k2_horizon::source_parameters(
+                    declaration,
+                    crate::k2_horizon::SourceLayout::Safetensors,
+                )?
+                .into_iter()
+                .filter(|p| {
+                    p.role == eredu_nn::LogicalParameterRole::LinearWeight && p.shape.len() == 2
+                })
+                .map(|p| (p.name, p.shape))
+                .collect::<BTreeMap<_, _>>();
                 let rank = eredu_core::ParallelRankTopology::new(
                     eredu_core::ParallelTopology::new(1, 1, 1, 1).map_err(|e| e.to_string())?,
                     0,
                 )
                 .map_err(|e| e.to_string())?;
-                for bank in crate::k2_horizon::expert_realization_plans(args, rank, None)
+                for bank in crate::k2_horizon::expert_realization_plans(declaration, rank, None)
                     .map_err(|e| e.to_string())?
                     .values()
                 {
                     match bank {
                         crate::RoutedGroupedPlan::Gated(plan) => {
-                            insert_grouped_gated_linear_shapes(&mut shapes, plan)?
+                            insert_grouped_gated_linear_shapes(
+                                &mut shapes,
+                                &mut bank_companions,
+                                plan,
+                            )?
                         }
                         crate::RoutedGroupedPlan::Linear(plan) => {
                             for spec in plan.unit_specs().values() {
-                                shapes.insert(
-                                    spec.projection().weight().id.to_string(),
-                                    vec![
-                                        spec.group_count() as usize,
-                                        spec.output_dimensions() as usize,
-                                        spec.input_dimensions() as usize,
-                                    ],
-                                );
+                                insert_declared_linear_shapes(&mut shapes, spec)?;
                             }
                         }
                         crate::RoutedGroupedPlan::Relu2(_) => {
@@ -3470,311 +3735,249 @@ impl EligibleConfig<'_> {
                 }
                 Ok(shapes)
             }
-            Self::Qwen(args) => {
-                let mut shapes = decoder_linear_parameter_shapes(*args)?;
-                if args.num_experts > 0 {
-                    let experts = positive(args.num_experts, "Qwen expert count")?;
-                    let hidden = positive(args.hidden_size, "Qwen hidden size")?;
-                    let intermediate =
-                        positive(args.moe_intermediate_size, "Qwen expert intermediate size")?;
-                    let fused = intermediate
-                        .checked_mul(2)
-                        .ok_or_else(|| "Qwen fused expert width overflowed".to_string())?;
-                    for layer in 0..self.unit_count()? {
-                        let root = format!("{}.layers.{layer}.mlp.experts", args.parameter_root);
-                        shapes.insert(format!("{root}.gate_up_proj"), vec![experts, fused, hidden]);
-                        shapes.insert(
-                            format!("{root}.down_proj"),
-                            vec![experts, hidden, intermediate],
-                        );
+            Self::Qwen(_, declaration) => {
+                let mut shapes = BTreeMap::new();
+                insert_declared_linear_shapes(&mut shapes, declaration.common().as_ref())?;
+                for bank in declaration
+                    .expert_banks()
+                    .map_err(|e| e.to_string())?
+                    .values()
+                {
+                    insert_gated_bank_linear_shapes(&mut shapes, &mut bank_companions, bank)?;
+                }
+                Ok(shapes)
+            }
+            Self::GptOss(_, declaration) => {
+                let mut shapes = BTreeMap::new();
+                insert_declared_linear_shapes(&mut shapes, declaration.common().as_ref())?;
+                for layer in 0..self.unit_count()? {
+                    let bank = declaration
+                        .expert_bank(layer)
+                        .map_err(|error| error.to_string())?;
+                    insert_declared_linear_shapes(&mut shapes, bank)?;
+                    // Published expert storage remains native MXFP4, independently
+                    // of the ordinary matrix conversion selected for this family.
+                    use eredu_nn::DeclareLogicalParameters;
+                    for parameter in bank
+                        .logical_parameters()
+                        .map_err(|error| error.to_string())?
+                    {
+                        if parameter.role == eredu_nn::LogicalParameterRole::LinearWeight {
+                            register_linear_conversion_policy(
+                                &mut bank_companions,
+                                parameter.parameter.id.to_string(),
+                                LinearConversionPolicy::NativeOnly,
+                            )?;
+                        }
                     }
                 }
                 Ok(shapes)
             }
-            Self::GptOss(args) => {
-                let mut shapes = decoder_linear_parameter_shapes(*args)?;
-                let experts = positive(args.num_local_experts, "GPT-OSS expert count")?;
-                let hidden = positive(args.hidden_size, "GPT-OSS hidden size")?;
-                let intermediate = positive(args.intermediate_size, "GPT-OSS intermediate size")?;
-                let fused = intermediate
-                    .checked_mul(2)
-                    .ok_or_else(|| "GPT-OSS fused expert width overflowed".to_string())?;
-                for layer in 0..self.unit_count()? {
-                    let root = format!("{}.layers.{layer}.mlp.experts", args.parameter_root);
-                    shapes.insert(format!("{root}.gate_up_proj"), vec![experts, fused, hidden]);
-                    shapes.insert(
-                        format!("{root}.down_proj"),
-                        vec![experts, hidden, intermediate],
-                    );
-                }
-                Ok(shapes)
-            }
-            Self::Lfm2(args) => {
-                let mut shapes = family_linear_parameter_shapes(
-                    crate::lfm2::safetensors_plan(args, true).map_err(|error| error.to_string())?,
-                    |name| args.weight_quantization_for(name).map(LinearFormat::from),
-                    "model.embed_tokens.weight",
-                )?;
+            Self::Lfm2(declaration) => {
+                let args = declaration.args();
+                let mut shapes = crate::lfm2::checkpoint::source_linear_shapes(&declaration)?;
                 if args.has_sparse_moe_layers() {
                     insert_grouped_gated_linear_shapes(
                         &mut shapes,
-                        &crate::lfm2::replicated_expert_realization_plan(args)
-                            .map_err(|error| error.to_string())?,
+                        &mut bank_companions,
+                        &crate::lfm2::expert_realization_plan(
+                            &declaration,
+                            None,
+                            replicated_expert_topology()?,
+                        )
+                        .map_err(|error| error.to_string())?
+                        .ok_or("LFM2 routed parameters have no declared bank")?,
+                    )?;
+                }
+                for name in shapes
+                    .keys()
+                    .filter(|name| args.preserves_linear_source(name))
+                {
+                    register_linear_conversion_policy(
+                        &mut bank_companions,
+                        name.clone(),
+                        LinearConversionPolicy::NativeOnly,
                     )?;
                 }
                 Ok(shapes)
             }
-            Self::KimiLinear(args) => {
-                let mut shapes = family_linear_parameter_shapes(
-                    crate::kimi_linear::safetensors_plan(args)
-                        .map_err(|error| error.to_string())?,
-                    |name| args.weight_quantization_for(name).map(LinearFormat::from),
-                    "model.embed_tokens.weight",
-                )?;
+            Self::KimiLinear(declaration) => {
+                let args = declaration.args();
+                let mut shapes =
+                    crate::kimi_linear::checkpoint::source_linear_shapes(&declaration)?;
                 if args.has_sparse_moe_layers() {
                     insert_grouped_gated_linear_shapes(
                         &mut shapes,
-                        &crate::kimi_linear::replicated_expert_realization_plan(args)
-                            .map_err(|error| error.to_string())?,
+                        &mut bank_companions,
+                        &crate::kimi_linear::expert_realization_plan(
+                            &declaration,
+                            None,
+                            replicated_expert_topology()?,
+                        )
+                        .map_err(|error| error.to_string())?
+                        .ok_or("Kimi Linear routed parameters have no declared bank")?,
                     )?;
                 }
                 Ok(shapes)
             }
-            Self::NemotronH(args) => {
-                let mut shapes = family_linear_parameter_shapes(
-                    crate::nemotron_h::safetensors_plan(args).map_err(|error| error.to_string())?,
-                    |name| args.weight_quantization_for(name).map(LinearFormat::from),
-                    "model.embeddings.weight",
-                )?;
+            Self::NemotronH(declaration) => {
+                let args = declaration.args();
+                let mut shapes = crate::nemotron_h::checkpoint::source_linear_shapes(&declaration)?;
                 if args.has_sparse_moe_layers() && args.num_nextn_predict_layers == 0 {
                     insert_grouped_relu2_linear_shapes(
                         &mut shapes,
-                        &crate::nemotron_h::replicated_expert_realization_plan(args)
-                            .map_err(|error| error.to_string())?,
+                        &mut bank_companions,
+                        &crate::nemotron_h::expert_realization_plan(
+                            &declaration,
+                            None,
+                            replicated_expert_topology()?,
+                        )
+                        .map_err(|error| error.to_string())?
+                        .ok_or("Nemotron-H routed parameters have no declared bank")?,
                     )?;
+                }
+                if args.num_nextn_predict_layers > 0 {
+                    for spec in declaration.expert_banks().values() {
+                        register_relu2_conversion_companions(&mut bank_companions, spec)?;
+                    }
+                }
+                for name in shapes.keys() {
+                    let canonical =
+                        crate::nemotron_h::checkpoint::normalized_parameter_key(name, args)?;
+                    if args.preserves_linear_source(&canonical) {
+                        for identity in [name, &canonical] {
+                            register_linear_conversion_policy(
+                                &mut bank_companions,
+                                identity.clone(),
+                                LinearConversionPolicy::NativeOnly,
+                            )?;
+                        }
+                    }
                 }
                 Ok(shapes)
             }
             Self::QwenHybrid(args) => {
-                let mut shapes = family_linear_parameter_shapes(
-                    crate::qwen::hybrid::safetensors_plan(args)
-                        .map_err(|error| error.to_string())?,
-                    |name| Some(args.linear_format(name)),
-                    "model.embed_tokens.weight",
-                )?;
+                let mut shapes = crate::qwen::hybrid::source_linear_shapes(args)?;
                 if args.num_experts > 0 && args.num_experts_per_tok > 0 {
                     insert_grouped_gated_linear_shapes(
                         &mut shapes,
-                        &crate::qwen::hybrid::replicated_expert_realization_plan(args)
-                            .map_err(|error| error.to_string())?,
+                        &mut bank_companions,
+                        &crate::qwen::hybrid::expert_realization_plan(
+                            args,
+                            None,
+                            replicated_expert_topology()?,
+                        )
+                        .map_err(|error| error.to_string())?
+                        .ok_or("routed Qwen hybrid has no declared bank")?,
                     )?;
                 }
                 Ok(shapes)
             }
             Self::DeepSeekV3(args) => {
-                let mut shapes = family_linear_parameter_shapes(
-                    crate::deepseek::v3_safetensors_plan(args, true)
-                        .map_err(|error| error.to_string())?,
-                    |name| Some(args.linear_format_for(name)),
-                    "model.embed_tokens.weight",
-                )?;
+                let mut shapes = crate::deepseek::checkpoint::v3_source_linear_shapes(args)?;
                 if args.num_nextn_predict_layers == 0 && args.has_sparse_moe_layers() {
                     insert_grouped_gated_linear_shapes(
                         &mut shapes,
-                        &crate::deepseek::v3_replicated_expert_realization_plan(args)
-                            .map_err(|error| error.to_string())?,
+                        &mut bank_companions,
+                        &crate::deepseek::v3_expert_realization_plan(
+                            args,
+                            None,
+                            replicated_expert_topology()?,
+                        )
+                        .map_err(|error| error.to_string())?
+                        .ok_or("V3 routed parameters have no expert realization")?,
                     )?;
+                }
+                if args.num_nextn_predict_layers > 0 {
+                    for spec in crate::deepseek::v3::expert_bank_specs(args)
+                        .map_err(|error| error.to_string())?
+                        .values()
+                    {
+                        register_gated_conversion_companions(&mut bank_companions, spec)?;
+                    }
                 }
                 Ok(shapes)
             }
             Self::DeepSeekV4(args) => {
-                let mut shapes = crate::deepseek::checkpoint::v4_linear_parameter_shapes(args)?;
+                let mut shapes = crate::deepseek::checkpoint::v4_source_linear_shapes(args)?;
                 if args.num_nextn_predict_layers == 0 {
                     insert_grouped_gated_linear_shapes(
                         &mut shapes,
-                        &crate::deepseek::v4_replicated_expert_realization_plan(args)
-                            .map_err(|error| error.to_string())?,
+                        &mut bank_companions,
+                        &crate::deepseek::v4_expert_realization_plan(
+                            args,
+                            None,
+                            replicated_expert_topology()?,
+                        )
+                        .map_err(|error| error.to_string())?,
                     )?;
+                }
+                if args.num_nextn_predict_layers > 0 {
+                    for spec in crate::deepseek::v4::expert_bank_specs(args)
+                        .map_err(|error| error.to_string())?
+                        .values()
+                    {
+                        register_gated_conversion_companions(&mut bank_companions, spec)?;
+                    }
                 }
                 Ok(shapes)
             }
             Self::DiffusionGemma(args) => {
-                // Logical matrix geometry is independent of its packed storage.
-                let dense = args.with_checkpoint_formats(HashMap::new());
-                let mut groups = crate::diffusion_gemma::parallel::static_parameter_groups(&dense)
+                let declaration = crate::diffusion_gemma::parallel::parameter_description(args)
                     .map_err(|error| error.to_string())?;
-                for layer in 0..args.text.num_hidden_layers() {
-                    groups.extend(
-                        crate::diffusion_gemma::parallel::layer_parameter_groups(&dense, layer)
-                            .map_err(|error| error.to_string())?,
-                    );
+                for (_, declaration) in args.routed_layers() {
+                    register_gated_conversion_companions(
+                        &mut bank_companions,
+                        &declaration.routed.experts,
+                    )?;
                 }
-                Ok(groups
-                    .into_iter()
-                    .flat_map(|group| group.members().to_vec())
+                Ok(declaration
+                    .groups()
+                    .iter()
+                    .flat_map(|group| group.members())
                     .filter(|member| {
-                        let name = member.target();
-                        member.global_shape().len() >= 2
-                            && name != "model.decoder.embed_tokens.weight"
-                            && (name.ends_with(".weight")
-                                || name.ends_with(".gate_up_proj")
-                                || name.ends_with(".down_proj"))
+                        member.logical_role() == Some(eredu_nn::LogicalParameterRole::LinearWeight)
                     })
-                    .map(|member| (member.target().to_owned(), member.global_shape().to_vec()))
+                    .map(|member| {
+                        (
+                            member.target().to_owned(),
+                            member
+                                .logical_shape()
+                                .expect("logical role retains declared geometry")
+                                .to_vec(),
+                        )
+                    })
                     .collect())
             }
             Self::Gemma4(args) => {
-                let mut shapes = family_linear_parameter_shapes(
-                    crate::gemma4::safetensors_plan(args).map_err(|error| error.to_string())?,
-                    |name| Some(self.native_format(name)),
-                    "model.language_model.embed_tokens.weight",
-                )?;
+                let mut shapes = crate::gemma4::checkpoint::source_linear_shapes(args)?;
                 if args.text.num_experts.unwrap_or_default() > 0 {
-                    insert_grouped_gated_linear_shapes(
-                        &mut shapes,
-                        &gemma4_replicated_expert_realization_plan(args)?,
-                    )?;
+                    let plan = crate::gemma4::expert_realization_plan(
+                        args,
+                        None,
+                        replicated_expert_topology()?,
+                    )
+                    .map_err(|error| error.to_string())?
+                    .ok_or("Gemma 4 expert realization requires a sparse invocation")?;
+                    insert_grouped_gated_linear_shapes(&mut shapes, &mut bank_companions, &plan)?;
                 }
                 Ok(shapes)
             }
             Self::Inkling(args) => {
-                let plan =
-                    crate::inkling::safetensors_plan(args).map_err(|error| error.to_string())?;
-                let canonical = plan
-                    .common_tensors
-                    .iter()
-                    .chain(
-                        plan.layout_groups
-                            .iter()
-                            .flat_map(|group| &group.variants)
-                            .flat_map(|variant| &variant.tensors),
-                    )
-                    .map(|tensor| {
-                        (
-                            tensor.key.clone(),
-                            self.canonical_parameter_name(&tensor.key, &tensor.aliases),
-                        )
-                    })
-                    .collect::<BTreeMap<_, _>>();
-                // Recipe finalization uses canonical targets, so released aliases
-                // must retain the same semantic role and format at both stages.
-                let mut shapes = family_linear_parameter_shapes(
-                    plan,
-                    |name| {
-                        Some(self.native_format(canonical.get(name).map_or(name, String::as_str)))
-                    },
-                    "model.llm.embed.weight",
-                )?
-                .into_iter()
-                .map(|(name, shape)| (canonical.get(&name).cloned().unwrap_or(name), shape))
-                .collect::<BTreeMap<_, _>>();
-                // The relative table and joint-selection router are raw tensor
-                // operators, not backend Linear modules. Their rank alone does
-                // not authorize conversion; both remain floating parameters.
-                shapes.retain(|name, _| {
-                    name != "model.embed_tokens.weight"
-                        && !name.ends_with(".self_attn.rel_proj")
-                        && !name.ends_with(".moe.router.weight")
-                });
+                let mut shapes = crate::inkling::checkpoint::source_linear_shapes(args)?;
                 if args.text_config.has_sparse_moe_layers() {
-                    let (plan, _) = inkling_replicated_expert_realization_plan(args)?;
-                    insert_grouped_gated_linear_shapes(&mut shapes, &plan)?;
+                    let (plan, _) = crate::inkling::replicated_expert_realization_plan(args)
+                        .map_err(|error| error.to_string())?;
+                    insert_grouped_gated_linear_shapes(&mut shapes, &mut bank_companions, &plan)?;
                 }
                 Ok(shapes)
             }
             Self::Muse(args) => {
-                let mut shapes = match args.weight_convention {
-                    crate::muse::WeightConvention::HuggingFace => {
-                        let plan = crate::muse::safetensors_plan(args)?;
-                        let canonical = plan
-                            .common_tensors
-                            .iter()
-                            .chain(
-                                plan.layout_groups
-                                    .iter()
-                                    .flat_map(|group| &group.variants)
-                                    .flat_map(|variant| &variant.tensors),
-                            )
-                            .map(|tensor| {
-                                (
-                                    tensor.key.clone(),
-                                    self.canonical_parameter_name(&tensor.key, &tensor.aliases),
-                                )
-                            })
-                            .collect::<BTreeMap<_, _>>();
-                        family_linear_parameter_shapes(
-                            plan,
-                            |name| {
-                                Some(self.native_format(
-                                    canonical.get(name).map_or(name, String::as_str),
-                                ))
-                            },
-                            "model.language_model.embed_tokens.weight",
-                        )?
-                        .into_iter()
-                        .map(|(name, shape)| (canonical.get(&name).cloned().unwrap_or(name), shape))
-                        .collect()
-                    }
-                    crate::muse::WeightConvention::Gguf => {
-                        // GGUF text admission has no required vision tower. Its
-                        // declared shapes are logical, independent of encoded
-                        // source blocks, and its names have their own translation.
-                        let mut shapes = crate::muse::gguf_plan(args)?
-                            .common_tensors
-                            .into_iter()
-                            .filter(|tensor| {
-                                tensor.shape.len() == 2 && tensor.key != "token_embd.weight"
-                            })
-                            .map(|tensor| {
-                                (
-                                    crate::muse::translate_text_gguf_name(&tensor.key),
-                                    tensor.shape,
-                                )
-                            })
-                            .collect::<BTreeMap<_, _>>();
-                        if args.vision_config.is_some() {
-                            shapes.extend(
-                                crate::muse::projector_gguf_plan(args)?
-                                    .common_tensors
-                                    .into_iter()
-                                    .filter(|tensor| tensor.shape.len() == 2)
-                                    .map(|tensor| {
-                                        (
-                                            crate::muse::translate_projector_gguf_name(
-                                                &tensor.key,
-                                                args.audio_config.as_ref(),
-                                            ),
-                                            tensor.shape,
-                                        )
-                                    }),
-                            );
-                            let patch = crate::muse::projector_gguf_plan(args)?
-                                .common_tensors
-                                .into_iter()
-                                .find(|tensor| tensor.key == "v.patch_embd.weight")
-                                .expect("projector schema declares its patch kernel");
-                            let width =
-                                patch.shape[1..]
-                                    .iter()
-                                    .try_fold(1usize, |total, dimension| {
-                                        total.checked_mul(*dimension).ok_or_else(|| {
-                                            "Muse-Glimmer patch width overflowed".to_owned()
-                                        })
-                                    })?;
-                            shapes.insert(
-                                crate::muse::translate_projector_gguf_name(
-                                    &patch.key,
-                                    args.audio_config.as_ref(),
-                                ),
-                                vec![patch.shape[0], width],
-                            );
-                        }
-                        shapes
-                    }
-                };
+                let mut shapes = crate::muse::checkpoint::source_linear_shapes(args)?;
                 if args.is_moe() {
                     insert_grouped_gated_linear_shapes(
                         &mut shapes,
+                        &mut bank_companions,
                         &crate::muse::expert_realization_plan(
                             args,
                             None,
@@ -3789,502 +3992,613 @@ impl EligibleConfig<'_> {
                 Ok(shapes)
             }
             Self::QwenVl(args) => {
-                let mut shapes = family_linear_parameter_shapes(
-                    crate::qwen::vl::safetensors_plan(args).map_err(|error| error.to_string())?,
-                    |name| Some(self.native_format(name)),
-                    "model.language_model.embed_tokens.weight",
-                )?;
-                // The static position table uses a fixed dense embedding lookup.
-                shapes.remove("model.visual.pos_embed.weight");
+                let mut shapes = crate::qwen::vl::source_linear_shapes(args)?;
                 if args.text.is_moe() {
                     insert_grouped_gated_linear_shapes(
                         &mut shapes,
-                        &crate::qwen::replicated_expert_realization_plan(&args.text)
-                            .map_err(|error| error.to_string())?,
+                        &mut bank_companions,
+                        &crate::qwen::vl::expert_realization_plan(
+                            args,
+                            None,
+                            replicated_expert_topology()?,
+                        )
+                        .map_err(|error| error.to_string())?
+                        .ok_or("Qwen3-VL routed parameters have no declared bank")?,
                     )?;
                 }
                 Ok(shapes)
             }
             Self::QwenCompositeHybrid(args) => {
-                let mut shapes = family_linear_parameter_shapes(
-                    crate::qwen::hybrid::composite_safetensors_plan(args)
-                        .map_err(|error| error.to_string())?,
-                    |name| Some(self.native_format(name)),
-                    "model.embed_tokens.weight",
-                )?;
-                // The static position table uses a fixed dense embedding lookup.
-                shapes.remove("model.visual.pos_embed.weight");
+                let mut shapes = crate::qwen::hybrid::conditional_source_linear_shapes(args)?;
                 if args.text.is_moe() {
                     insert_grouped_gated_linear_shapes(
                         &mut shapes,
-                        &crate::qwen::hybrid::replicated_expert_realization_plan(&args.text)
-                            .map_err(|error| error.to_string())?,
+                        &mut bank_companions,
+                        &crate::qwen::hybrid::conditional_expert_realization_plan(
+                            args,
+                            None,
+                            replicated_expert_topology()?,
+                        )
+                        .map_err(|error| error.to_string())?
+                        .ok_or("conditional routed Qwen has no declared bank")?,
                     )?;
                 }
                 Ok(shapes)
             }
-        }
+        }?;
+        let mut companions = shapes
+            .keys()
+            .map(|name| (name.clone(), LinearConversionPolicy::Ordinary))
+            .collect::<BTreeMap<_, _>>();
+        companions.extend(bank_companions);
+        Ok(LinearParameterDeclarations { shapes, companions })
     }
 
-    fn parameter_root(&self) -> &str {
-        match self {
-            Self::NemotronLabsDiffusion(args) => crate::decoder::Config::parameter_root(*args),
-            Self::Nanbeige(args) => crate::decoder::Config::parameter_root(*args),
-            Self::Gemma2(args) => crate::decoder::Config::parameter_root(*args),
-            Self::Llama(args) => crate::decoder::Config::parameter_root(*args),
-            Self::K2Horizon(args) => crate::decoder::Config::parameter_root(*args),
-            Self::Qwen(args) => crate::decoder::Config::parameter_root(*args),
-            Self::Lfm2(_) | Self::KimiLinear(_) | Self::QwenHybrid(_) => "model",
-            Self::NemotronH(_) => "model",
-            Self::GptOss(args) => crate::decoder::Config::parameter_root(*args),
-            Self::DeepSeekV3(_) => "model",
-            Self::DeepSeekV4(_) => "",
-            Self::DiffusionGemma(_) => "model.decoder",
-            Self::Gemma4(_) => "model.language_model",
-            Self::Inkling(_) | Self::Muse(_) | Self::QwenCompositeHybrid(_) => "model",
-            Self::QwenVl(args) => &args.text.parameter_root,
-        }
-    }
-
-    fn tied_embeddings(&self) -> bool {
-        match self {
-            Self::NemotronLabsDiffusion(_) => false,
-            Self::Nanbeige(args) => crate::decoder::Config::tie_word_embeddings(*args),
-            Self::Gemma2(args) => crate::decoder::Config::tie_word_embeddings(*args),
-            Self::Llama(args) => crate::decoder::Config::tie_word_embeddings(*args),
-            Self::K2Horizon(args) => crate::decoder::Config::tie_word_embeddings(*args),
-            Self::Qwen(args) => crate::decoder::Config::tie_word_embeddings(*args),
-            Self::Lfm2(args) => args.tie_word_embeddings,
-            Self::KimiLinear(args) => args.tie_word_embeddings,
-            Self::NemotronH(args) => args.tie_word_embeddings,
-            Self::QwenHybrid(args) => args.tie_word_embeddings,
-            Self::GptOss(args) => crate::decoder::Config::tie_word_embeddings(*args),
-            Self::DeepSeekV3(args) => args.tie_word_embeddings,
-            Self::DeepSeekV4(args) => args.tie_word_embeddings,
-            Self::DiffusionGemma(args) => args.text.tie_word_embeddings,
-            Self::Gemma4(args) => args.text.tie_word_embeddings,
-            Self::Inkling(_) => false,
-            Self::Muse(args) => args.tie_word_embeddings,
-            Self::QwenVl(args) => args.text.tie_word_embeddings,
-            Self::QwenCompositeHybrid(args) => args.text.tie_word_embeddings,
-        }
-    }
-
-    fn embedding_shape(&self) -> Result<Vec<usize>, String> {
-        let (vocabulary, hidden) = match self {
-            Self::NemotronLabsDiffusion(args) => (args.vocabulary_size(), args.hidden_size()),
-            Self::Nanbeige(args) => (
-                args.dense_config().vocab_size,
-                args.dense_config().hidden_size,
+    /// Source conversion policy references declared component owners, independently
+    /// of physical checkpoint spelling and parameter geometry.
+    fn optional_transform_alignment(&self, owner: &ReplicatedTextParameterOwner) -> Option<usize> {
+        let (statics, groups): (&[&str], &[&str]) = match self {
+            Self::Gemma4(_) => (
+                &["vision", "vision_projection", "audio", "audio_projection"],
+                &[
+                    crate::gemma4::VISION_EXECUTION_GROUP,
+                    crate::gemma4::AUDIO_EXECUTION_GROUP,
+                ],
             ),
-            Self::Gemma2(args) => (
-                args.dense_config().vocab_size,
-                args.dense_config().hidden_size,
+            Self::Muse(_) => (
+                &["vision"],
+                &[
+                    crate::muse::VISION_EXECUTION_GROUP,
+                    crate::muse::audio::execution::AUDIO_EXECUTION_GROUP,
+                ],
             ),
-            Self::Llama(args) => (args.vocab_size, args.hidden_size),
-            Self::K2Horizon(args) => (args.vocab_size, args.hidden_size),
-            Self::Qwen(args) => (args.vocab_size, args.hidden_size),
-            Self::Lfm2(args) => (args.vocab_size, args.hidden_size),
-            Self::KimiLinear(args) => (args.vocab_size, args.hidden_size),
-            Self::NemotronH(args) => (args.vocab_size, args.hidden_size),
-            Self::QwenHybrid(args) => (args.vocab_size, args.hidden_size),
-            Self::GptOss(args) => (args.vocab_size, args.hidden_size),
-            Self::DeepSeekV3(args) => (args.vocab_size, args.hidden_size),
-            Self::DeepSeekV4(args) => (args.vocab_size, args.hidden_size),
-            Self::DiffusionGemma(args) => (args.text.vocab_size, args.text.hidden_size),
-            Self::Gemma4(args) => (args.text.vocab_size, args.text.hidden_size),
-            Self::Inkling(args) => (args.text_config.vocab_size, args.text_config.hidden_size),
-            Self::Muse(args) => (args.vocab_size, args.hidden_size),
-            Self::QwenVl(args) => (args.text.vocab_size, args.text.hidden_size),
-            Self::QwenCompositeHybrid(args) => (args.text.vocab_size, args.text.hidden_size),
+            Self::QwenVl(_) => (&["vision"], &[crate::qwen::vl::VISION_EXECUTION_GROUP]),
+            _ => return None,
         };
-        Ok(vec![
-            positive(vocabulary, "vocabulary size")?,
-            positive(hidden, "hidden size")?,
-        ])
+        let media = match owner {
+            ReplicatedTextParameterOwner::StaticRole(role)
+            | ReplicatedTextParameterOwner::StaticUnitConsumers { role, .. } => {
+                statics.contains(&role.as_str())
+            }
+            ReplicatedTextParameterOwner::ExecutionUnit { group, .. } => {
+                groups.contains(&group.as_str())
+            }
+            _ => false,
+        };
+        media.then_some(32)
     }
 
-    fn parameter_role(
+    /// Borrows family facts through the same validated pinned construction used
+    /// by materialization. Source aliases remain checkpoint extensions.
+    fn static_construction(&self) -> Result<crate::decoder::StaticModuleConstruction, String> {
+        let construction = match self {
+            Self::NemotronLabsDiffusion(args) => {
+                return Ok(args.text_declaration().static_construction().clone());
+            }
+            Self::Nanbeige(_, declaration) => return Ok(declaration.static_construction().clone()),
+            Self::Gemma2(_, declaration) | Self::Llama(_, declaration) => {
+                return Ok(declaration.static_construction().clone());
+            }
+            Self::K2Horizon(_, declaration) => {
+                return Ok(declaration.common().static_construction().clone());
+            }
+            Self::Qwen(_, declaration) => {
+                return Ok(declaration.common().static_construction().clone());
+            }
+            Self::GptOss(_, declaration) => {
+                return Ok(declaration.common().static_construction().clone());
+            }
+            Self::Lfm2(declaration) => return Ok(declaration.statics.clone()),
+            Self::KimiLinear(declaration) => return Ok(declaration.statics.clone()),
+            Self::NemotronH(declaration) => return Ok(declaration.statics.clone()),
+            Self::QwenHybrid(args) => return Ok(args.statics().clone()),
+            Self::DeepSeekV3(args) => args.parameters().statics.clone(),
+            Self::DeepSeekV4(args) => args.parameters().statics.clone(),
+            Self::DiffusionGemma(args) => {
+                return Ok(args.pinned().ordinary.clone());
+            }
+            Self::Gemma4(args) => {
+                return Ok(args.pinned().ordinary.clone());
+            }
+            Self::Inkling(args) => return Ok(args.pinned().ordinary.clone()),
+            Self::Muse(args) => return Ok(args.pinned().clone()),
+            Self::QwenVl(args) => {
+                return Ok(args
+                    .text_declaration()
+                    .common()
+                    .static_construction()
+                    .clone());
+            }
+            Self::QwenCompositeHybrid(args) => return Ok(args.text.statics().clone()),
+        };
+        Ok(construction)
+    }
+
+    fn parameter_description(
         &self,
-        name: &str,
-        companion: bool,
-        linear_shapes: &BTreeMap<String, Vec<usize>>,
-    ) -> ReplicatedTextParameterRole {
+    ) -> Result<eredu_runtime::ArchitectureParameterDescription, String> {
+        use crate::decoder::ParameterEncoding;
         match self {
             Self::NemotronLabsDiffusion(args) => {
-                decoder_parameter_role(*args, name, companion, linear_shapes)
-            }
-            Self::Nanbeige(args) => decoder_parameter_role(*args, name, companion, linear_shapes),
-            Self::Gemma2(args) => decoder_parameter_role(*args, name, companion, linear_shapes),
-            Self::Llama(args) => decoder_parameter_role(*args, name, companion, linear_shapes),
-            Self::K2Horizon(args) => decoder_parameter_role(*args, name, companion, linear_shapes),
-            Self::Qwen(args) => decoder_parameter_role(*args, name, companion, linear_shapes),
-            Self::GptOss(args) => decoder_parameter_role(*args, name, companion, linear_shapes),
-            Self::Lfm2(_)
-            | Self::KimiLinear(_)
-            | Self::NemotronH(_)
-            | Self::QwenHybrid(_)
-            | Self::DeepSeekV3(_)
-            | Self::DeepSeekV4(_)
-            | Self::DiffusionGemma(_)
-            | Self::Gemma4(_)
-            | Self::Inkling(_)
-            | Self::Muse(_)
-            | Self::QwenVl(_)
-            | Self::QwenCompositeHybrid(_) => {
-                family_parameter_role(self, name, companion, linear_shapes)
-            }
-        }
-    }
-
-    fn embedding_name(&self) -> String {
-        match self {
-            Self::NemotronLabsDiffusion(_) => "model.embed_tokens.weight".into(),
-            Self::NemotronH(_) => "model.embeddings.weight".into(),
-            Self::Gemma2(_)
-            | Self::Llama(_)
-            | Self::Nanbeige(_)
-            | Self::K2Horizon(_)
-            | Self::Qwen(_)
-            | Self::Lfm2(_)
-            | Self::KimiLinear(_)
-            | Self::QwenHybrid(_) => {
-                format!("{}.embed_tokens.weight", self.parameter_root())
-            }
-            Self::GptOss(_) => format!("{}.embed_tokens.weight", self.parameter_root()),
-            Self::DeepSeekV3(_) => "model.embed_tokens.weight".into(),
-            Self::DeepSeekV4(_) => "embed.weight".into(),
-            Self::DiffusionGemma(_) => "model.decoder.embed_tokens.weight".into(),
-            Self::Gemma4(_) => "model.language_model.embed_tokens.weight".into(),
-            Self::Inkling(_) | Self::Muse(_) | Self::QwenCompositeHybrid(_) => {
-                "model.embed_tokens.weight".into()
-            }
-            Self::QwenVl(_) => "model.language_model.embed_tokens.weight".into(),
-        }
-    }
-}
-
-fn family_linear_parameter_shapes(
-    plan: eredu_checkpoint::schema::SafetensorsCheckpointPlan,
-    native_format: impl Fn(&str) -> Option<LinearFormat>,
-    embedding: &str,
-) -> Result<BTreeMap<String, Vec<usize>>, String> {
-    let mut constraints = plan.common_tensors.iter().collect::<Vec<_>>();
-    constraints.extend(
-        plan.layout_groups
-            .iter()
-            .flat_map(|group| group.variants.iter())
-            .flat_map(|variant| variant.tensors.iter()),
-    );
-    let mut result = BTreeMap::new();
-    for constraint in constraints {
-        if constraint.role == eredu_checkpoint::schema::TensorRole::Companion
-            || constraint.key == embedding
-            || constraint.shape.len() != 2
-        {
-            continue;
-        }
-        let mut shape = constraint.shape.clone();
-        // An architecture may retain an unaligned matrix in floating storage
-        // under a family-wide quantization request. Only encoded schema tensors
-        // need their packed dimension expanded into logical coordinates.
-        let format =
-            if constraint.dtype == eredu_checkpoint::schema::StoredDtypeConstraint::Floating {
-                LinearFormat::Dense
-            } else {
-                native_format(&constraint.key).unwrap_or(LinearFormat::Dense)
-            };
-        match format {
-            LinearFormat::Affine(format) => {
-                let bits = usize::try_from(format.bits)
-                    .map_err(|_| format!("invalid affine bits for {:?}", constraint.key))?;
-                let packed = shape.last_mut().expect("rank checked above");
-                *packed = packed
-                    .checked_mul(32)
-                    .and_then(|bits_total| bits_total.checked_div(bits))
-                    .ok_or_else(|| format!("invalid affine geometry for {:?}", constraint.key))?;
-            }
-            LinearFormat::MxFp4 | LinearFormat::NvFp4 => {
-                let packed = shape.last_mut().expect("rank checked above");
-                *packed = packed
-                    .checked_mul(8)
-                    .ok_or_else(|| format!("invalid MXFP4 geometry for {:?}", constraint.key))?;
-            }
-            LinearFormat::GgufIQuant { ggml_type, .. } => {
-                let invalid = || format!("invalid GGUF block geometry for {:?}", constraint.key);
-                let (values, bytes) = ggml_type.block_and_bytes().map_err(|_| invalid())?;
-                let values = usize::try_from(values).map_err(|_| invalid())?;
-                let bytes = usize::try_from(bytes).map_err(|_| invalid())?;
-                let packed = shape.last_mut().expect("rank checked above");
-                if bytes == 0 || !packed.is_multiple_of(bytes) {
-                    return Err(invalid());
+                if args.vision.is_some() {
+                    crate::nemotron_labs_diffusion::parallel::composite_parameter_description(args)
+                } else {
+                    crate::nemotron_labs_diffusion::parallel::parameter_description(args)
                 }
-                *packed = (*packed / bytes).checked_mul(values).ok_or_else(invalid)?;
             }
-            _ => {}
+            Self::Nanbeige(args, declaration) => {
+                declaration.parameter_description(*args, ParameterEncoding::Logical)
+            }
+            Self::Gemma2(args, declaration) => {
+                declaration.parameter_description(*args, ParameterEncoding::Logical)
+            }
+            Self::Llama(args, declaration) => {
+                declaration.parameter_description(*args, ParameterEncoding::Logical)
+            }
+            Self::K2Horizon(_, declaration) => {
+                crate::k2_horizon::parameter_description(declaration)
+            }
+            Self::Qwen(_, declaration) => {
+                crate::qwen::parameter_description(declaration, ParameterEncoding::Logical)
+            }
+            Self::GptOss(_, declaration) => {
+                crate::gpt_oss::parameter_description(declaration, ParameterEncoding::Logical)
+            }
+            Self::Lfm2(declaration) => return Ok(declaration.definition().parameters().clone()),
+            Self::KimiLinear(declaration) => {
+                return Ok(declaration.definition().parameters().clone());
+            }
+            Self::NemotronH(declaration) => {
+                return Ok(declaration.definition().parameters().clone());
+            }
+            Self::QwenHybrid(args) => {
+                crate::qwen::hybrid::parameter_description(args, ParameterEncoding::Logical)
+            }
+            Self::DeepSeekV3(args) => crate::deepseek::parallel::v3_parameter_description(args)
+                .map_err(|error| eredu_runtime::ParallelPlanError::InvalidGroup(error.to_string())),
+            Self::DeepSeekV4(args) => crate::deepseek::parallel::v4_parameter_description(args)
+                .map_err(|error| eredu_runtime::ParallelPlanError::InvalidGroup(error.to_string())),
+            Self::DiffusionGemma(args) => {
+                if args.vision.is_some() {
+                    crate::diffusion_gemma::composite::parameter_description(args).map_err(
+                        |error| eredu_runtime::ParallelPlanError::InvalidGroup(error.to_string()),
+                    )
+                } else {
+                    crate::diffusion_gemma::parallel::parameter_description(args)
+                }
+            }
+            Self::Gemma4(args) => crate::gemma4::model::parameter_description(args)
+                .map_err(|error| eredu_runtime::ParallelPlanError::InvalidGroup(error.to_string())),
+            Self::Inkling(args) => crate::inkling::model::parameter_description(args)
+                .map_err(|error| eredu_runtime::ParallelPlanError::InvalidGroup(error.to_string())),
+            Self::Muse(args) => crate::muse::model::parameter_description(args)
+                .map_err(|error| eredu_runtime::ParallelPlanError::InvalidGroup(error.to_string())),
+            Self::QwenVl(args) => crate::qwen::vl::parameter_description(args)
+                .map_err(|error| eredu_runtime::ParallelPlanError::InvalidGroup(error.to_string())),
+            Self::QwenCompositeHybrid(args) => {
+                crate::qwen::hybrid::conditional_parameter_description(args).map_err(|error| {
+                    eredu_runtime::ParallelPlanError::InvalidGroup(error.to_string())
+                })
+            }
         }
-        result.entry(constraint.key.clone()).or_insert(shape);
+        .map_err(|error| error.to_string())
     }
-    Ok(result)
+
+    fn declared_parameters(
+        &self,
+        linear_shapes: &BTreeMap<String, Vec<usize>>,
+    ) -> Result<BTreeMap<String, DeclaredParameter>, String> {
+        let construction = self.static_construction()?;
+        declared_parameters(
+            &self.parameter_description()?,
+            linear_shapes,
+            construction.embedding_spec().weight.id.as_str(),
+            construction.head_spec().is_none(),
+        )
+    }
 }
 
-fn configured_linear_format(
-    default: Option<WeightQuantization>,
-    selected: Option<&std::collections::HashSet<String>>,
-    formats: Option<&HashMap<String, WeightQuantization>>,
-    name: &str,
-) -> LinearFormat {
-    formats
-        .and_then(|formats| formats.get(name))
-        .copied()
-        .or_else(|| default.filter(|_| selected.is_none_or(|names| names.contains(name))))
-        .map_or(LinearFormat::Dense, LinearFormat::from)
+fn insert_declared_linear_shapes(
+    shapes: &mut BTreeMap<String, Vec<usize>>,
+    spec: &impl eredu_nn::DeclareLogicalParameters,
+) -> Result<(), String> {
+    for declaration in spec
+        .logical_parameters()
+        .map_err(|error| error.to_string())?
+    {
+        if declaration.role == eredu_nn::LogicalParameterRole::LinearWeight {
+            shapes.insert(
+                declaration.parameter.id.as_str().to_owned(),
+                declaration.shape,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Storage-output conventions projected alongside the source matrix geometry.
+struct LinearParameterDeclarations {
+    shapes: BTreeMap<String, Vec<usize>>,
+    companions: BTreeMap<String, LinearConversionPolicy>,
+}
+
+/// Conversion policy selected by the typed ordinary or packed bank scope.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LinearConversionPolicy {
+    Ordinary,
+    PackedBank,
+    NativeOnly,
+}
+impl LinearConversionPolicy {
+    fn for_parameter(self, name: &str) -> Option<(String, String)> {
+        match self {
+            Self::Ordinary => Some(ordinary_transform_companions(name)),
+            Self::PackedBank => Some((format!("{name}_scales"), format!("{name}_biases"))),
+            Self::NativeOnly => None,
+        }
+    }
+}
+
+fn ordinary_transform_companions(name: &str) -> (String, String) {
+    let prefix = name.strip_suffix(".weight").unwrap_or(name);
+    (format!("{prefix}.scales"), format!("{prefix}.biases"))
+}
+
+fn register_linear_conversion_policy(
+    companions: &mut BTreeMap<String, LinearConversionPolicy>,
+    name: String,
+    convention: LinearConversionPolicy,
+) -> Result<(), String> {
+    if companions
+        .insert(name.clone(), convention)
+        .is_some_and(|old| old != convention)
+    {
+        return Err(format!(
+            "conflicting conversion outputs for declared parameter {name:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn insert_gated_bank_linear_shapes(
+    shapes: &mut BTreeMap<String, Vec<usize>>,
+    companions: &mut BTreeMap<String, LinearConversionPolicy>,
+    spec: &eredu_nn::GroupedGatedProductSpec,
+) -> Result<(), String> {
+    insert_declared_linear_shapes(shapes, spec)?;
+    register_gated_conversion_companions(companions, spec)
+}
+
+fn register_gated_conversion_companions(
+    companions: &mut BTreeMap<String, LinearConversionPolicy>,
+    spec: &eredu_nn::GroupedGatedProductSpec,
+) -> Result<(), String> {
+    match spec.layout() {
+        eredu_nn::GatedProductGroupLayout::Packed { gate_up, down } => {
+            for projection in [gate_up, down] {
+                let name = projection.weight().id.to_string();
+                register_linear_conversion_policy(
+                    companions,
+                    name,
+                    LinearConversionPolicy::PackedBank,
+                )?;
+            }
+        }
+        eredu_nn::GatedProductGroupLayout::Independent(groups) => {
+            for group in groups {
+                for projection in [group.gate(), group.up(), group.down()] {
+                    let name = projection.weight().id.to_string();
+                    register_linear_conversion_policy(
+                        companions,
+                        name,
+                        LinearConversionPolicy::Ordinary,
+                    )?;
+                }
+            }
+        }
+        _ => return Err("unsupported declared gated-product bank layout".into()),
+    }
+    Ok(())
 }
 
 fn insert_grouped_gated_linear_shapes(
     shapes: &mut BTreeMap<String, Vec<usize>>,
+    companions: &mut BTreeMap<String, LinearConversionPolicy>,
     plan: &crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
 ) -> Result<(), String> {
     for spec in plan.unit_specs().values() {
-        let groups = positive(spec.group_count(), "grouped expert count")?;
-        let input = positive(spec.input_dimensions(), "grouped expert input")?;
-        let intermediate = positive(
-            spec.intermediate_dimensions(),
-            "grouped expert intermediate",
-        )?;
-        let output = positive(spec.output_dimensions(), "grouped expert output")?;
-        let weight = |projection: &eredu_nn::GroupedProjectionSpec| {
-            projection.parameters()[0].id.as_str().to_owned()
-        };
-        match spec.layout() {
-            eredu_nn::GatedProductGroupLayout::Packed { gate_up, down } => {
-                shapes.insert(
-                    weight(gate_up),
-                    vec![
-                        groups,
-                        intermediate
-                            .checked_mul(2)
-                            .ok_or_else(|| "grouped expert fused width overflowed".to_owned())?,
-                        input,
-                    ],
-                );
-                shapes.insert(weight(down), vec![groups, output, intermediate]);
-            }
-            eredu_nn::GatedProductGroupLayout::Independent(members) => {
-                for member in members {
-                    shapes.insert(weight(member.gate()), vec![intermediate, input]);
-                    shapes.insert(weight(member.up()), vec![intermediate, input]);
-                    shapes.insert(weight(member.down()), vec![output, intermediate]);
-                }
-            }
-            _ => return Err("unsupported grouped expert parameter layout".into()),
-        }
+        insert_gated_bank_linear_shapes(shapes, companions, spec)?;
     }
     Ok(())
 }
 
 fn insert_grouped_relu2_linear_shapes(
     shapes: &mut BTreeMap<String, Vec<usize>>,
+    companions: &mut BTreeMap<String, LinearConversionPolicy>,
     plan: &crate::ExpertRealizationPlan<eredu_nn::GroupedRelu2Spec>,
 ) -> Result<(), String> {
     for spec in plan.unit_specs().values() {
-        let groups = positive(spec.group_count(), "ReLU2 expert count")?;
-        let hidden = positive(spec.hidden_dimensions(), "ReLU2 expert hidden width")?;
-        let intermediate = positive(
-            spec.intermediate_dimensions(),
-            "ReLU2 expert intermediate width",
-        )?;
-        shapes.insert(
-            spec.up().parameters()[0].id.as_str().to_owned(),
-            vec![groups, intermediate, hidden],
-        );
-        shapes.insert(
-            spec.down().parameters()[0].id.as_str().to_owned(),
-            vec![groups, hidden, intermediate],
+        insert_declared_linear_shapes(shapes, spec)?;
+        register_relu2_conversion_companions(companions, spec)?;
+    }
+    Ok(())
+}
+
+fn register_relu2_conversion_companions(
+    companions: &mut BTreeMap<String, LinearConversionPolicy>,
+    spec: &eredu_nn::GroupedRelu2Spec,
+) -> Result<(), String> {
+    for projection in [spec.up(), spec.down()] {
+        let name = projection.weight().id.to_string();
+        register_linear_conversion_policy(companions, name, LinearConversionPolicy::PackedBank)?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct DeclaredParameter {
+    role: ReplicatedTextParameterRole,
+    owner: Option<ReplicatedTextParameterOwner>,
+    // Source-only companion references may lack geometry until admission.
+    // Some(empty) denotes an admitted or expanded scalar.
+    shape: Option<Vec<usize>>,
+    native: Option<LinearFormat>,
+    // Construction-owned encoding and explicit source-only matrix extensions
+    // remain distinct from raw tensor geometry.
+    linear_format: Option<eredu_nn::LinearFormatSpec>,
+    source_matrix: bool,
+    companion: Option<(eredu_nn::LinearCompanionRole, eredu_nn::ParameterId)>,
+}
+
+impl DeclaredParameter {
+    fn has_linear_encoding(&self) -> bool {
+        self.linear_format.is_some() || self.source_matrix
+    }
+}
+
+fn declared_parameter_role(
+    name: &str,
+    companion: bool,
+    declarations: &BTreeMap<String, DeclaredParameter>,
+) -> ReplicatedTextParameterRole {
+    if companion {
+        ReplicatedTextParameterRole::FormatCompanion
+    } else {
+        declarations
+            .get(name)
+            .map_or(ReplicatedTextParameterRole::Other, |parameter| {
+                parameter.role
+            })
+    }
+}
+
+fn register_declared_companion(
+    declarations: &mut BTreeMap<String, DeclaredParameter>,
+    name: &str,
+    kind: eredu_nn::LinearCompanionRole,
+    primary: eredu_nn::ParameterId,
+) -> Result<(), String> {
+    if name == primary.as_str() {
+        return Err(format!("format companion {name:?} refers to itself"));
+    }
+    let target = declarations
+        .get(primary.as_str())
+        .ok_or_else(|| format!("format companion {name:?} has unresolved primary {primary:?}"))?;
+    if target.role == ReplicatedTextParameterRole::FormatCompanion {
+        return Err(format!(
+            "format companion {name:?} refers to another companion"
+        ));
+    }
+    let owner = target.owner.clone();
+    let binding = (kind, primary);
+    if let Some(parameter) = declarations.get_mut(name) {
+        if parameter.role != ReplicatedTextParameterRole::FormatCompanion
+            || parameter
+                .companion
+                .as_ref()
+                .is_some_and(|previous| previous != &binding)
+        {
+            return Err(format!("conflicting declared format companion {name:?}"));
+        }
+        if parameter.owner.is_some() && owner.is_some() && parameter.owner != owner {
+            return Err(format!(
+                "format companion {name:?} changes its primary owner"
+            ));
+        }
+        parameter.owner = owner;
+        parameter.companion = Some(binding);
+    } else {
+        declarations.insert(
+            name.to_owned(),
+            DeclaredParameter {
+                role: ReplicatedTextParameterRole::FormatCompanion,
+                owner,
+                shape: None,
+                native: Some(LinearFormat::Dense),
+                linear_format: None,
+                source_matrix: false,
+                companion: Some(binding),
+            },
         );
     }
     Ok(())
 }
 
-fn family_parameter_role(
-    config: &EligibleConfig<'_>,
-    name: &str,
-    companion: bool,
-    linear_shapes: &BTreeMap<String, Vec<usize>>,
-) -> ReplicatedTextParameterRole {
-    if companion {
-        ReplicatedTextParameterRole::FormatCompanion
-    } else if name == config.embedding_name()
-        || matches!(config, EligibleConfig::Inkling(_)) && name == "model.llm.embed.weight"
-    {
-        ReplicatedTextParameterRole::Embedding
-    } else if linear_shapes.contains_key(name)
-        || (config.tied_embeddings() && name == "lm_head.weight")
-    {
-        ReplicatedTextParameterRole::LinearWeight
-    } else if linear_shapes.keys().any(|weight| {
-        weight
-            .strip_suffix(".weight")
-            .is_some_and(|prefix| name == format!("{prefix}.bias"))
-            || name == format!("{weight}_bias")
-    }) {
-        ReplicatedTextParameterRole::LinearBias
-    } else {
-        ReplicatedTextParameterRole::Other
-    }
-}
-
-fn positive(value: i32, label: &str) -> Result<usize, String> {
-    usize::try_from(value)
-        .ok()
-        .filter(|value| *value > 0)
-        .ok_or_else(|| format!("decoder {label} must be positive"))
-}
-
-/// Returns the exact affine-projection identities and logical geometry declared
-/// by a normalized decoder. Artifact rank and name suffixes do not determine
-/// transform eligibility.
-fn decoder_linear_parameter_shapes<C: crate::decoder::Config>(
-    config: &C,
-) -> Result<BTreeMap<String, Vec<usize>>, String> {
-    config
-        .validate_config()
-        .map_err(|error| error.to_string())?;
-    let root = config.parameter_root();
-    let fields = config.block_parameter_fields();
-    let hidden = positive(config.hidden_size(), "hidden size")?;
-    let intermediate = positive(config.intermediate_size(), "intermediate size")?;
-    let head = positive(config.head_dim(), "head dimension")?;
-    let query = positive(config.num_attention_heads(), "query-head count")?
-        .checked_mul(head)
-        .ok_or_else(|| "decoder query width overflowed".to_string())?;
-    let key_value = positive(config.num_key_value_heads(), "key/value-head count")?
-        .checked_mul(head)
-        .ok_or_else(|| "decoder key/value width overflowed".to_string())?;
-    let layers = positive(config.num_hidden_layers(), "layer count")?;
-    let mut result = BTreeMap::new();
-    for layer in 0..layers {
-        if config.block_parameter_owner(layer) != layer {
-            continue;
-        }
-        let layer_prefix = format!("{root}.layers.{layer}");
-        let attention = format!("{layer_prefix}.{}", fields.attention);
-        match config.attention_projection_layout() {
-            crate::decoder::AttentionProjectionLayout::Split => {
-                result.insert(
-                    format!("{attention}.{}.weight", fields.attention_query),
-                    vec![query, hidden],
-                );
-                result.insert(
-                    format!("{attention}.{}.weight", fields.attention_key),
-                    vec![key_value, hidden],
-                );
-                result.insert(
-                    format!("{attention}.{}.weight", fields.attention_value),
-                    vec![key_value, hidden],
-                );
-            }
-            crate::decoder::AttentionProjectionLayout::Fused { field } => {
-                let output =
-                    query
-                        .checked_add(key_value.checked_mul(2).ok_or_else(|| {
-                            "decoder fused attention width overflowed".to_string()
-                        })?)
-                        .ok_or_else(|| "decoder fused attention width overflowed".to_string())?;
-                result.insert(format!("{attention}.{field}.weight"), vec![output, hidden]);
+/// Projects parameter roles without inferring operator meaning from names.
+fn declared_parameters(
+    description: &eredu_runtime::ArchitectureParameterDescription,
+    source_matrices: &BTreeMap<String, Vec<usize>>,
+    embedding: &str,
+    tied_readout_source: bool,
+) -> Result<BTreeMap<String, DeclaredParameter>, String> {
+    use eredu_nn::LogicalParameterRole;
+    let mut roles = BTreeMap::new();
+    for tagged in description.groups() {
+        let owner = ReplicatedTextParameterOwner::from_parameter_group_owner(tagged.owner())
+            .map_err(|error| error.to_string())?;
+        for member in tagged.members() {
+            let role = match member.logical_role() {
+                Some(LogicalParameterRole::LinearWeight) => {
+                    ReplicatedTextParameterRole::LinearWeight
+                }
+                Some(LogicalParameterRole::LinearBias) => ReplicatedTextParameterRole::LinearBias,
+                Some(LogicalParameterRole::Embedding) if member.target() == embedding => {
+                    ReplicatedTextParameterRole::Embedding
+                }
+                Some(LogicalParameterRole::Embedding | LogicalParameterRole::PositionEmbedding) => {
+                    ReplicatedTextParameterRole::LookupTable
+                }
+                Some(
+                    LogicalParameterRole::Normalization | LogicalParameterRole::NormalizationBias,
+                ) => ReplicatedTextParameterRole::Normalization,
+                _ if member.linear_companion().is_some() => {
+                    ReplicatedTextParameterRole::FormatCompanion
+                }
+                _ => ReplicatedTextParameterRole::Other,
+            };
+            if let Some(previous) = roles.insert(
+                member.target().to_owned(),
+                DeclaredParameter {
+                    role,
+                    owner: Some(owner.clone()),
+                    native: Some(
+                        member
+                            .logical_linear_format()
+                            .map_or(LinearFormat::Dense, |format| format.encoding()),
+                    ),
+                    shape: Some(
+                        member
+                            .logical_shape()
+                            .unwrap_or(member.global_shape())
+                            .to_vec(),
+                    ),
+                    linear_format: member.logical_linear_format().cloned(),
+                    source_matrix: false,
+                    companion: member
+                        .linear_companion()
+                        .zip(member.linear_companion_of().cloned()),
+                },
+            ) {
+                if previous.role != role
+                    || previous.has_linear_encoding() != member.logical_linear_format().is_some()
+                    || previous.owner.as_ref() != Some(&owner)
+                    || previous.companion
+                        != member
+                            .linear_companion()
+                            .zip(member.linear_companion_of().cloned())
+                    || previous.shape.as_deref()
+                        != Some(member.logical_shape().unwrap_or(member.global_shape()))
+                    || previous.native
+                        != Some(
+                            member
+                                .logical_linear_format()
+                                .map_or(LinearFormat::Dense, |format| format.encoding()),
+                        )
+                {
+                    return Err(format!(
+                        "conflicting declared decoder roles for {:?}",
+                        member.target()
+                    ));
+                }
             }
         }
-        result.insert(
-            format!("{attention}.{}.weight", fields.attention_output),
-            vec![hidden, query],
-        );
-        let feed_forward = format!("{layer_prefix}.{}", fields.feed_forward);
-        match config.gated_projection_layout() {
-            crate::decoder::GatedProjectionLayout::Split => {
-                result.insert(
-                    format!("{feed_forward}.{}.weight", fields.feed_forward_gate),
-                    vec![intermediate, hidden],
-                );
-                result.insert(
-                    format!("{feed_forward}.{}.weight", fields.feed_forward_up),
-                    vec![intermediate, hidden],
-                );
-            }
-            crate::decoder::GatedProjectionLayout::Fused { field } => {
-                result.insert(
-                    format!("{feed_forward}.{field}.weight"),
-                    vec![
-                        intermediate.checked_mul(2).ok_or_else(|| {
-                            "decoder fused feed-forward width overflowed".to_string()
-                        })?,
-                        hidden,
-                    ],
-                );
+    }
+    for member in description
+        .groups()
+        .iter()
+        .flat_map(|group| group.members())
+    {
+        if let Some(format) = member.logical_linear_format() {
+            let primary = eredu_runtime::ParameterMemberSpec::new(
+                member.target(),
+                member
+                    .logical_shape()
+                    .ok_or("encoded primary has no logical geometry")?
+                    .to_vec(),
+                eredu_runtime::MemberSharding::Replicated,
+            );
+            for companion in eredu_runtime::expand_linear_format_parameter(&primary, format)
+                .map_err(|error| error.to_string())?
+            {
+                let Some((kind, primary)) = companion
+                    .linear_companion()
+                    .zip(companion.linear_companion_of().cloned())
+                else {
+                    continue;
+                };
+                register_declared_companion(&mut roles, companion.target(), kind, primary)?;
+                let declaration = roles
+                    .get_mut(companion.target())
+                    .expect("registered companion");
+                let shape = companion.global_shape();
+                if declaration
+                    .shape
+                    .as_deref()
+                    .is_some_and(|previous| previous != shape)
+                {
+                    return Err(format!(
+                        "format companion {:?} conflicts with its encoding geometry",
+                        companion.target()
+                    ));
+                }
+                declaration.shape = Some(shape.to_vec());
             }
         }
-        result.insert(
-            format!("{feed_forward}.{}.weight", fields.feed_forward_output),
-            vec![hidden, intermediate],
-        );
     }
-    if !config.tie_word_embeddings() {
-        result.insert(
-            "lm_head.weight".into(),
-            vec![
-                positive(config.vocabulary_size(), "vocabulary size")?,
-                hidden,
-            ],
-        );
+    // Source-only split/fused layouts are explicit family extensions referencing
+    // construction slots; they do not establish another parameter owner.
+    for (source, shape) in source_matrices {
+        if let Some(parameter) = roles.get(source) {
+            let table = matches!(
+                parameter.role,
+                ReplicatedTextParameterRole::Embedding | ReplicatedTextParameterRole::LookupTable
+            );
+            if (!table && parameter.role != ReplicatedTextParameterRole::LinearWeight)
+                || parameter.shape.as_deref() != Some(shape.as_slice())
+            {
+                return Err(format!(
+                    "decoder source matrix {source:?} conflicts with its construction slot"
+                ));
+            }
+        } else {
+            roles.insert(
+                source.clone(),
+                DeclaredParameter {
+                    role: ReplicatedTextParameterRole::LinearWeight,
+                    owner: None,
+                    shape: Some(shape.clone()),
+                    native: None,
+                    linear_format: None,
+                    source_matrix: true,
+                    companion: None,
+                },
+            );
+        }
     }
-    Ok(result)
-}
-
-fn decoder_parameter_role<C: crate::decoder::Config>(
-    config: &C,
-    name: &str,
-    companion: bool,
-    linear_shapes: &BTreeMap<String, Vec<usize>>,
-) -> ReplicatedTextParameterRole {
-    if companion {
-        return ReplicatedTextParameterRole::FormatCompanion;
+    if tied_readout_source {
+        let embedding = roles
+            .get(embedding)
+            .filter(|parameter| parameter.role == ReplicatedTextParameterRole::Embedding)
+            .ok_or("tied decoder readout has no declared embedding")?;
+        let readout = DeclaredParameter {
+            role: ReplicatedTextParameterRole::LinearWeight,
+            owner: Some(ReplicatedTextParameterOwner::StaticRole("output".into())),
+            shape: embedding.shape.clone(),
+            // An optional redundant readout source has its own storage encoding;
+            // it does not materialize another owner of the tied embedding.
+            native: None,
+            linear_format: None,
+            source_matrix: true,
+            companion: None,
+        };
+        if let Some(previous) = roles.get("lm_head.weight") {
+            if previous.role != readout.role || previous.shape != readout.shape {
+                return Err("tied decoder readout source conflicts with its embedding".into());
+            }
+        }
+        roles.insert("lm_head.weight".into(), readout);
     }
-    if linear_shapes.contains_key(name)
-        || (config.tie_word_embeddings() && name == "lm_head.weight")
-    {
-        return ReplicatedTextParameterRole::LinearWeight;
-    }
-    if name == format!("{}.embed_tokens.weight", config.parameter_root()) {
-        return ReplicatedTextParameterRole::Embedding;
-    }
-    if linear_shapes.keys().any(|weight| {
-        weight
-            .strip_suffix(".weight")
-            .is_some_and(|prefix| name == format!("{prefix}.bias"))
-            || name == format!("{weight}_bias")
-    }) {
-        return ReplicatedTextParameterRole::LinearBias;
-    }
-    let fields = config.block_parameter_fields();
-    if name == format!("{}.norm.weight", config.parameter_root())
-        || (0..usize::try_from(config.num_hidden_layers()).unwrap_or_default()).any(|layer| {
-            let prefix = format!("{}.layers.{layer}", config.parameter_root());
-            name == format!("{prefix}.{}.weight", fields.input_norm)
-                || name == format!("{prefix}.{}.weight", fields.post_attention_norm)
-                || name
-                    == format!(
-                        "{prefix}.{}.{}.weight",
-                        fields.attention, fields.attention_query_norm
-                    )
-                || name
-                    == format!(
-                        "{prefix}.{}.{}.weight",
-                        fields.attention, fields.attention_key_norm
-                    )
-        })
-    {
-        return ReplicatedTextParameterRole::Normalization;
-    }
-    ReplicatedTextParameterRole::Other
+    Ok(roles)
 }
 
 /// Derives the complete replicated execution and checkpoint contract.
@@ -4345,7 +4659,7 @@ pub(crate) fn diffusion_execution_requirements(
             _ => {
                 return Err(ReplicatedTextRequirementsError::Ineligible(
                     ReplicatedTextIneligibility::BlockRefinement,
-                ))
+                ));
             }
         },
         (_, Some(plan)) => match plan.model() {
@@ -4353,13 +4667,13 @@ pub(crate) fn diffusion_execution_requirements(
             _ => {
                 return Err(ReplicatedTextRequirementsError::Ineligible(
                     ReplicatedTextIneligibility::BlockRefinement,
-                ))
+                ));
             }
         },
         _ => {
             return Err(ReplicatedTextRequirementsError::Ineligible(
                 ReplicatedTextIneligibility::BlockRefinement,
-            ))
+            ));
         }
     };
     if config.vision.is_some() {
@@ -4400,42 +4714,81 @@ pub(crate) fn k2_horizon_replicated_text_requirements(
     inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
     args: &crate::k2_horizon::ModelArgs,
 ) -> Result<ReplicatedTextRequirements, ReplicatedTextRequirementsError> {
-    replicated_text_requirements_for_config(inspection, EligibleConfig::K2Horizon(args))
+    replicated_text_requirements_for_config(
+        inspection,
+        EligibleConfig::K2Horizon(
+            args,
+            inspection
+                .architecture_plan()
+                .k2_declaration(args)
+                .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?,
+        ),
+    )
 }
 
 pub(crate) fn qwen_replicated_text_requirements(
     inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
     args: &crate::qwen::ModelArgs,
 ) -> Result<ReplicatedTextRequirements, ReplicatedTextRequirementsError> {
-    replicated_text_requirements_for_config(inspection, EligibleConfig::Qwen(args))
+    replicated_text_requirements_for_config(
+        inspection,
+        EligibleConfig::Qwen(
+            args,
+            inspection
+                .architecture_plan()
+                .qwen_declaration(args)
+                .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?,
+        ),
+    )
 }
 
 pub(crate) fn gpt_oss_replicated_text_requirements(
     inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
     args: &crate::gpt_oss::ModelArgs,
 ) -> Result<ReplicatedTextRequirements, ReplicatedTextRequirementsError> {
-    replicated_text_requirements_for_config(inspection, EligibleConfig::GptOss(args))
+    replicated_text_requirements_for_config(
+        inspection,
+        EligibleConfig::GptOss(
+            args,
+            inspection
+                .architecture_plan()
+                .gpt_oss_declaration(args)
+                .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?,
+        ),
+    )
 }
 
 pub(crate) fn nemotron_h_replicated_text_requirements(
     inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
     args: &crate::nemotron_h::ModelArgs,
 ) -> Result<ReplicatedTextRequirements, ReplicatedTextRequirementsError> {
-    replicated_text_requirements_for_config(inspection, EligibleConfig::NemotronH(args))
+    let declaration = inspection
+        .architecture_plan()
+        .nemotron_declaration(args)
+        .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?;
+    replicated_text_requirements_for_config(inspection, EligibleConfig::NemotronH(declaration))
 }
 
 pub(crate) fn lfm2_replicated_text_requirements(
     inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
     args: &crate::lfm2::ModelArgs,
 ) -> Result<ReplicatedTextRequirements, ReplicatedTextRequirementsError> {
-    replicated_text_requirements_for_config(inspection, EligibleConfig::Lfm2(args))
+    let declaration = inspection
+        .architecture_plan()
+        .lfm2_declaration(args)
+        .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?;
+    replicated_text_requirements_for_config(inspection, EligibleConfig::Lfm2(declaration))
 }
 
 pub(crate) fn kimi_linear_replicated_text_requirements(
     inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
     args: &crate::kimi_linear::ModelArgs,
 ) -> Result<ReplicatedTextRequirements, ReplicatedTextRequirementsError> {
-    replicated_text_requirements_for_config(inspection, EligibleConfig::KimiLinear(args))
+    let declaration = inspection
+        .architecture_plan()
+        .kimi_declaration(args)
+        .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?;
+    replicated_text_requirements_for_config(inspection, EligibleConfig::KimiLinear(declaration))
 }
 
 pub(crate) fn qwen_hybrid_replicated_text_requirements(
@@ -4566,8 +4919,16 @@ fn prediction_extension_materialization_parameters(
         SafetensorsModelConfig::DeepSeekV3(args) => EligibleConfig::DeepSeekV3(args),
         SafetensorsModelConfig::DeepSeekV4(args) => EligibleConfig::DeepSeekV4(args),
         SafetensorsModelConfig::Inkling(args) => EligibleConfig::Inkling(args),
+        SafetensorsModelConfig::QwenHybrid(args) if args.vision.is_some() => {
+            EligibleConfig::QwenCompositeHybrid(args)
+        }
         SafetensorsModelConfig::QwenHybrid(args) => EligibleConfig::QwenHybrid(&args.text),
-        SafetensorsModelConfig::NemotronH(args) => EligibleConfig::NemotronH(args),
+        SafetensorsModelConfig::NemotronH(_) => EligibleConfig::NemotronH(
+            extension
+                .nemotron_declaration()
+                .expect("declared prediction scopes")
+                .clone(),
+        ),
         _ => {
             return Err(ReplicatedTextRequirementsError::InvalidArchitecture(
                 "prediction extension has no supported materialization contract".into(),
@@ -4603,48 +4964,25 @@ fn prediction_extension_materialization_parameters(
             ),
         ));
     }
-    let target = inspection
-        .architecture_plan()
-        .safetensors_architecture()
-        .ok_or_else(|| {
-            ReplicatedTextRequirementsError::InvalidArtifact(
-                "prediction target is not a SafeTensors architecture".into(),
-            )
-        })?;
-    let source_keys = extension
-        .source_keys(target)
-        .map_err(|error| ReplicatedTextRequirementsError::InvalidArtifact(error.to_string()))?;
-    let target_config = match target.model() {
-        SafetensorsModelConfig::DeepSeekV3(args) => EligibleConfig::DeepSeekV3(args),
-        SafetensorsModelConfig::DeepSeekV4(args) => EligibleConfig::DeepSeekV4(args),
-        SafetensorsModelConfig::Inkling(args) => EligibleConfig::Inkling(args),
-        SafetensorsModelConfig::QwenHybrid(args) => EligibleConfig::QwenHybrid(&args.text),
-        SafetensorsModelConfig::NemotronH(args) => EligibleConfig::NemotronH(args),
-        _ => {
-            return Err(ReplicatedTextRequirementsError::InvalidArchitecture(
-                "prediction target has no supported materialization contract".into(),
-            ));
-        }
-    };
-    let target_units = target_config
-        .unit_count()
-        .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?;
-    parameters.retain(|parameter| {
-        extra_targets.contains(parameter.name())
-            || parameter
-                .physical_sources()
-                .iter()
-                .any(|source| source_keys.contains(source.catalog_key()))
-            || matches!(
-                parameter.owner(),
-                ReplicatedTextParameterOwner::ExecutionUnit { unit, .. }
-                    if *unit >= target_units
-            )
-    });
+    // Format recipes may publish intermediate source aliases. Executable
+    // bindings are exactly the canonical prediction declaration's members.
+    let residencies = extension.parameter_residencies();
+    parameters.retain(|parameter| residencies.contains_key(parameter.name()));
     let names = parameters
         .iter()
         .map(|parameter| parameter.name().to_owned())
         .collect::<BTreeSet<_>>();
+    let missing = residencies
+        .keys()
+        .filter(|name| !names.contains(*name))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(ReplicatedTextRequirementsError::InvalidArchitecture(
+            format!(
+                "declared prediction parameters have no exact materialization requirements: {missing:?}",
+            ),
+        ));
+    }
     recipes.retain(|target, _| names.contains(target));
     outputs.retain(|target, _| names.contains(target));
     if parameters.is_empty() {
@@ -4655,12 +4993,11 @@ fn prediction_extension_materialization_parameters(
     let parameters = parameters
         .into_iter()
         .map(|parameter| {
-            let residency = crate::prediction_extension::residency::parameter_residency(
-                extension,
-                parameter.name(),
-            )
-            .map_err(|error| {
-                ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
+            let residency = residencies.get(parameter.name()).cloned().ok_or_else(|| {
+                ReplicatedTextRequirementsError::InvalidArchitecture(format!(
+                    "prediction parameter {:?} has no declared physical module owner",
+                    parameter.name(),
+                ))
             })?;
             Ok(parameter.with_auxiliary_residency(residency))
         })
@@ -4757,7 +5094,9 @@ fn prediction_extension_recipes(
                     extend(
                         crate::nemotron_h::unit_recipes(
                             source,
-                            args,
+                            extension
+                                .nemotron_declaration()
+                                .expect("typed Nemotron extension"),
                             prediction + 1,
                             relative,
                             true,
@@ -4777,6 +5116,134 @@ type FinalizedMaterializationParameters = (
     BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
     BTreeMap<String, eredu_checkpoint::recipe::RecipeMetadata>,
 );
+
+/// Joins a recipe output to its declared slot, preserving encoded storage as a
+/// separate projection rather than inferring logical geometry from packed widths.
+fn derived_parameter_shape(
+    target: &str,
+    declaration: &DeclaredParameter,
+    output: &eredu_checkpoint::recipe::RecipeMetadata,
+    native: LinearFormat,
+    alias_source: Option<&ReplicatedTextParameterRequirement>,
+) -> Result<Vec<usize>, ReplicatedTextRequirementsError> {
+    use eredu_checkpoint::recipe::RecipeDtype;
+    let shape = declaration
+        .shape
+        .clone()
+        .or_else(|| alias_source.map(|source| source.logical_shape().to_vec()));
+    let Some(shape) = shape else {
+        return if declaration.companion.is_some() {
+            Ok(output.shape.clone())
+        } else {
+            Err(ReplicatedTextRequirementsError::InvalidArchitecture(
+                format!("derived parameter {target:?} has no declared logical geometry"),
+            ))
+        };
+    };
+    // A source-only alias carries the exact admitted source encoding even when
+    // it does not introduce another construction slot.
+    let encoded = declaration.has_linear_encoding()
+        || (declaration.shape.is_none() && alias_source.is_some());
+    let expected = if declaration.companion.is_some() {
+        shape.clone()
+    } else if encoded && native == LinearFormat::NvFp4 && output.dtype == RecipeDtype::U8 {
+        // ModelOpt bytes are an explicit source representation, distinct from
+        // the construction's canonical packed-word storage projection.
+        eredu_checkpoint::schema::matrix_for_nvfp4(
+            target,
+            Vec::<String>::new(),
+            shape.clone(),
+            1,
+            eredu_checkpoint::schema::NvFp4Storage::ModelOptBytes,
+        )
+        .map_err(|error| ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string()))?
+        .into_iter()
+        .next()
+        .expect("NVFP4 source projection contains its primary")
+        .shape
+    } else if encoded
+        && ((output.dtype == RecipeDtype::U32
+            && matches!(
+                native,
+                LinearFormat::Affine(_) | LinearFormat::MxFp4 | LinearFormat::NvFp4
+            ))
+            || (output.dtype == RecipeDtype::U8
+                && matches!(native, LinearFormat::GgufIQuant { .. })))
+    {
+        let format = declaration
+            .linear_format
+            .as_ref()
+            .filter(|format| format.encoding() == native);
+        let unscaled;
+        let format = if let Some(format) = format {
+            Some(format)
+        } else if matches!(native, LinearFormat::GgufIQuant { .. }) {
+            unscaled = eredu_nn::LinearFormatSpec::unscaled(native).map_err(|error| {
+                ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
+            })?;
+            Some(&unscaled)
+        } else {
+            None
+        };
+        if let Some(format) = format {
+            let primary = eredu_runtime::ParameterMemberSpec::new(
+                target,
+                shape.clone(),
+                eredu_runtime::MemberSharding::Replicated,
+            );
+            eredu_runtime::expand_linear_format_parameter(&primary, format)
+                .map_err(|error| {
+                    ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
+                })?
+                .into_iter()
+                .next()
+                .expect("encoding projection contains its primary")
+                .global_shape()
+                .to_vec()
+        } else {
+            // Admitted source-format extensions supply geometry through their
+            // existing checkpoint contract.
+            eredu_checkpoint::schema::matrix_for_linear_format(
+                target,
+                Vec::<String>::new(),
+                shape.clone(),
+                native,
+                None,
+            )
+            .map_err(|error| {
+                ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
+            })?
+            .into_iter()
+            .next()
+            .expect("source matrix projection contains its primary")
+            .shape
+        }
+    } else if (declaration.companion.is_none()
+        && (!encoded
+            || native == LinearFormat::Dense
+            || matches!(
+                output.dtype,
+                RecipeDtype::F16
+                    | RecipeDtype::BF16
+                    | RecipeDtype::F32
+                    | RecipeDtype::F64
+                    | RecipeDtype::F8E4M3
+                    | RecipeDtype::F8E5M2
+            )))
+        || output.dtype == RecipeDtype::F4
+    {
+        shape.clone()
+    } else {
+        return Ok(shape);
+    };
+    if output.shape != expected {
+        return Err(ReplicatedTextRequirementsError::InvalidArtifact(format!(
+            "derived parameter {target:?} has output geometry {:?}, expected {expected:?} for declared logical geometry {shape:?}",
+            output.shape
+        )));
+    }
+    Ok(shape)
+}
 
 fn finalize_materialization_parameters(
     config: &EligibleConfig<'_>,
@@ -4798,22 +5265,64 @@ fn finalize_materialization_parameters(
             derived_recipes.insert(target, recipe);
         }
     }
-    let linear_shapes = config
-        .linear_parameter_shapes()
+    let LinearParameterDeclarations {
+        shapes: linear_shapes,
+        mut companions,
+    } = config
+        .linear_parameter_declarations()
         .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?;
-    let derived_target_role = |target: &str| {
-        if target.ends_with("_scales")
-            || target.ends_with("_biases")
-            || target.ends_with("_scale_inv")
-            || target.ends_with(".scales")
-            || target.ends_with(".biases")
-            || target.ends_with(".weight_scale_inv")
-        {
-            ReplicatedTextParameterRole::FormatCompanion
-        } else {
-            config.parameter_role(target, false, &linear_shapes)
+    let mut declarations = config
+        .declared_parameters(&linear_shapes)
+        .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?;
+    let component_companions = declarations
+        .iter()
+        .filter(|(_, declaration)| declaration.role == ReplicatedTextParameterRole::FormatCompanion)
+        .map(|(name, _)| name.clone())
+        .collect::<BTreeSet<_>>();
+    for name in declarations.keys() {
+        companions
+            .entry(name.clone())
+            .or_insert(LinearConversionPolicy::Ordinary);
+    }
+    project_source_parameter_owners(&mut declarations, &derived_recipes)
+        .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?;
+    for parameter in &parameters {
+        if let Some((_, primary)) = parameter.linear_companion() {
+            if !declarations.contains_key(primary) {
+                let source = parameters
+                    .iter()
+                    .find(|source| source.name() == primary)
+                    .ok_or_else(|| {
+                        ReplicatedTextRequirementsError::InvalidArchitecture(format!(
+                            "source companion {:?} has unresolved primary {primary:?}",
+                            parameter.name()
+                        ))
+                    })?;
+                declarations.insert(
+                    primary.to_owned(),
+                    DeclaredParameter {
+                        role: source.role(),
+                        owner: Some(source.owner().clone()),
+                        shape: Some(source.logical_shape().to_vec()),
+                        native: Some(source.native_executable()),
+                        linear_format: None,
+                        source_matrix: true,
+                        companion: None,
+                    },
+                );
+            }
         }
-    };
+    }
+    for parameter in &parameters {
+        if let Some((kind, primary)) = parameter.linear_companion() {
+            let primary = eredu_nn::ParameterId::new(primary).map_err(|error| {
+                ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
+            })?;
+            register_declared_companion(&mut declarations, parameter.name(), kind, primary)
+                .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?;
+        }
+    }
+    let derived_target_role = |target: &str| declared_parameter_role(target, false, &declarations);
     // Multiple logical consumers of an unchanged physical tensor keep its
     // original encoding and provenance. A source alias is not an encoded-byte
     // tensor operation (notably for native GGUF blocks).
@@ -4869,6 +5378,21 @@ fn finalize_materialization_parameters(
         let replacement = if target == key {
             source.clone()
         } else {
+            let declaration = declarations.get(target).ok_or_else(|| {
+                ReplicatedTextRequirementsError::InvalidArchitecture(format!(
+                    "source alias {target:?} has no declaration"
+                ))
+            })?;
+            let output = recipe.infer(recipe_source).map_err(|error| {
+                ReplicatedTextRequirementsError::InvalidArtifact(error.to_string())
+            })?;
+            let shape = derived_parameter_shape(
+                target,
+                declaration,
+                &output,
+                source.native_executable(),
+                Some(source),
+            )?;
             parameter_requirement(
                 target.clone(),
                 source.sources().to_vec(),
@@ -4876,11 +5400,24 @@ fn finalize_materialization_parameters(
                 Vec::new(),
                 source.source_encoding().cloned(),
                 source.physical_shape().map(<[usize]>::to_vec),
-                source.logical_shape().to_vec(),
+                shape,
                 source.native_executable(),
-                source.transform_companions().is_some(),
+                source
+                    .transform_companions()
+                    .map(|_| {
+                        companions
+                            .get(target)
+                            .map(|convention| convention.for_parameter(target))
+                            .ok_or_else(|| {
+                                ReplicatedTextRequirementsError::InvalidArchitecture(format!(
+                                    "alias {target:?} has no declared conversion outputs"
+                                ))
+                            })
+                    })
+                    .transpose()?
+                    .flatten(),
                 source.role(),
-                parameter_owner(config, target),
+                declared_parameter_owner(&declarations, target)?,
                 source.presence().clone(),
             )?
             .with_permitted_native_source_dtypes(source.permitted_native_source_dtypes().to_vec())
@@ -4892,6 +5429,11 @@ fn finalize_materialization_parameters(
         }
         direct_alias_targets.insert(target.clone());
     }
+    let direct_alias_sources = direct_alias_targets
+        .iter()
+        .filter_map(|target| derived_recipes.get(target))
+        .flat_map(|recipe| recipe.source_keys().into_iter().map(str::to_owned))
+        .collect::<BTreeSet<_>>();
     for target in &direct_alias_targets {
         derived_recipes.remove(target);
     }
@@ -4934,40 +5476,22 @@ fn finalize_materialization_parameters(
             } => parameters.iter().find(|parameter| parameter.name() == key),
             _ => None,
         };
+        let declaration = declarations.get(target).ok_or_else(|| {
+            ReplicatedTextRequirementsError::InvalidArchitecture(format!(
+                "derived parameter {target:?} has no declaration"
+            ))
+        })?;
         let replacement = if let Some(index) = existing {
             let parameter = &parameters[index];
             let role = if parameter.linear_companion().is_some() {
                 ReplicatedTextParameterRole::FormatCompanion
-            } else if matches!(config, EligibleConfig::GptOss(_))
-                && target.contains(".mlp.experts.")
-                && target.ends_with("_proj_bias")
-            {
-                ReplicatedTextParameterRole::LinearBias
             } else {
                 derived_target_role(target)
             };
-            let owner = parameter_owner(config, target);
+            let owner = declared_parameter_owner(&declarations, target)?;
             let native = parameter.native_executable();
-            let mut logical_shape = parameter.logical_shape().to_vec();
-            if output.dtype == eredu_checkpoint::recipe::RecipeDtype::U32
-                && logical_shape == output.shape
-            {
-                let packed_bits = match native {
-                    LinearFormat::Affine(format) => usize::try_from(format.bits).ok(),
-                    LinearFormat::MxFp4 | LinearFormat::NvFp4 => Some(4),
-                    _ => None,
-                };
-                if let (Some(bits), Some(extent)) = (packed_bits, logical_shape.last_mut()) {
-                    *extent = extent
-                        .checked_mul(32)
-                        .and_then(|value| value.checked_div(bits))
-                        .ok_or_else(|| {
-                            ReplicatedTextRequirementsError::InvalidArchitecture(format!(
-                                "derived packed geometry for {target:?} overflowed"
-                            ))
-                        })?;
-                }
-            }
+            let logical_shape =
+                derived_parameter_shape(target, declaration, output, native, alias_source)?;
             let mut replacement = ReplicatedTextParameterRequirement::new(
                 target.clone(),
                 recipe
@@ -5013,38 +5537,22 @@ fn finalize_materialization_parameters(
             )
         } else {
             let role = derived_target_role(target);
-            let mut logical_shape = linear_shapes
-                .get(target)
-                .cloned()
-                .or_else(|| alias_source.map(|source| source.logical_shape().to_vec()))
-                .unwrap_or_else(|| output.shape.clone());
             let native = if role == ReplicatedTextParameterRole::FormatCompanion {
                 LinearFormat::Dense
             } else {
                 alias_source.map_or_else(
-                    || config.native_format_for_shape(target, &logical_shape),
-                    |source| source.native_executable(),
-                )
-            };
-            if output.dtype == eredu_checkpoint::recipe::RecipeDtype::U32
-                && logical_shape == output.shape
-            {
-                let packed_bits = match native {
-                    LinearFormat::Affine(format) => usize::try_from(format.bits).ok(),
-                    LinearFormat::MxFp4 | LinearFormat::NvFp4 => Some(4),
-                    _ => None,
-                };
-                if let (Some(bits), Some(extent)) = (packed_bits, logical_shape.last_mut()) {
-                    *extent = extent
-                        .checked_mul(32)
-                        .and_then(|value| value.checked_div(bits))
-                        .ok_or_else(|| {
+                    || {
+                        declaration.native.ok_or_else(|| {
                             ReplicatedTextRequirementsError::InvalidArchitecture(format!(
-                                "derived packed geometry for {target:?} overflowed"
+                                "derived matrix {target:?} has no declared encoding"
                             ))
-                        })?;
-                }
-            }
+                        })
+                    },
+                    |source| Ok(source.native_executable()),
+                )?
+            };
+            let logical_shape =
+                derived_parameter_shape(target, declaration, output, native, alias_source)?;
             parameter_requirement(
                 target.clone(),
                 recipe
@@ -5060,9 +5568,14 @@ fn finalize_materialization_parameters(
                 Some(output.shape.clone()),
                 logical_shape,
                 native,
-                role == ReplicatedTextParameterRole::LinearWeight,
+                // Storage extensions establish conversion eligibility; a declared
+                // weight role also covers raw convolution and recurrent kernels.
+                linear_shapes
+                    .contains_key(target)
+                    .then(|| companions[target].for_parameter(target))
+                    .flatten(),
                 role,
-                parameter_owner(config, target),
+                declared_parameter_owner(&declarations, target)?,
                 ReplicatedTextParameterPresence::Derived {
                     recipe: format!("architecture-output:{target}"),
                 },
@@ -5080,62 +5593,62 @@ fn finalize_materialization_parameters(
         }
     }
     parameters.retain(|parameter| {
-        direct_alias_targets.contains(parameter.name())
+        if direct_alias_targets.contains(parameter.name())
             || recipe_targets.contains(parameter.name())
-            || !std::iter::once(parameter.name())
+        {
+            return true;
+        }
+        let identities = || {
+            std::iter::once(parameter.name())
                 .chain(parameter.sources().iter().map(String::as_str))
                 .chain(parameter.aliases().iter().map(String::as_str))
-                .any(|identity| consumed_sources.contains(identity))
+        };
+        // A source-only companion remains provenance of its canonical output;
+        // it is not a second executable companion after a direct rename.
+        if parameter.linear_companion().is_some()
+            && !component_companions.contains(parameter.name())
+            && identities().any(|identity| direct_alias_sources.contains(identity))
+        {
+            return false;
+        }
+        !identities().any(|identity| consumed_sources.contains(identity))
     });
-    if matches!(config, EligibleConfig::GptOss(_)) {
-        for parameter in &mut parameters {
-            if parameter.name().contains(".mlp.experts.")
-                && parameter.role() == ReplicatedTextParameterRole::LinearWeight
-            {
-                *parameter = ReplicatedTextParameterRequirement::new(
-                    parameter.name().to_owned(),
-                    parameter.sources().to_vec(),
-                    parameter.physical_sources().to_vec(),
-                    parameter.aliases().to_vec(),
-                    parameter.source_encoding().cloned(),
-                    parameter.physical_shape().map(<[usize]>::to_vec),
-                    parameter.logical_shape().to_vec(),
-                    parameter.native_executable(),
-                    parameter.role(),
-                    parameter.owner().clone(),
-                    parameter.presence().clone(),
-                    ParameterTransformConstraint::None,
-                )
-                .map_err(|error| {
-                    ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
-                })?;
+    for parameter in &mut parameters {
+        if let Some(alignment) = config.optional_transform_alignment(parameter.owner()) {
+            if matches!(
+                parameter.transform_constraint(),
+                ParameterTransformConstraint::Linear { .. }
+            ) {
+                *parameter = parameter
+                    .clone()
+                    .with_optional_transform_alignment(alignment)
+                    .map_err(|error| {
+                        ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
+                    })?;
             }
         }
     }
     for parameter in &mut parameters {
-        let optional_media_transform = match config {
-            EligibleConfig::Gemma4(_) => {
-                parameter.name().starts_with("model.vision_")
-                    || parameter.name().starts_with("model.audio_")
-                    || parameter.name().starts_with("model.embed_vision.")
-                    || parameter.name().starts_with("model.embed_audio.")
-            }
-            EligibleConfig::Muse(_) => {
-                parameter.name().starts_with("model.vision_")
-                    || parameter.name().starts_with("model.audio_tower.")
-            }
-            EligibleConfig::QwenVl(_) => parameter.name().starts_with("model.visual."),
-            _ => false,
-        };
-        if optional_media_transform
-            && matches!(
-                parameter.transform_constraint(),
-                ParameterTransformConstraint::Linear { .. }
-            )
+        if let Some((kind, primary)) = declarations
+            .get(parameter.name())
+            .and_then(|declaration| declaration.companion.as_ref())
         {
+            if parameter
+                .linear_companion()
+                .is_some_and(|(actual_kind, actual_primary)| {
+                    actual_kind != *kind || actual_primary != primary.as_str()
+                })
+            {
+                return Err(ReplicatedTextRequirementsError::InvalidArchitecture(
+                    format!(
+                        "derived format companion {:?} conflicts with its declared primary",
+                        parameter.name()
+                    ),
+                ));
+            }
             *parameter = parameter
                 .clone()
-                .with_optional_transform_alignment(32)
+                .with_linear_companion(*kind, primary.as_str())
                 .map_err(|error| {
                     ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
                 })?;
@@ -5201,14 +5714,29 @@ fn safetensors_eligible_config(
             Err(ReplicatedTextIneligibility::BlockRefinement)
         }
         SafetensorsModelConfig::Qwen4Exp(_, _) => Err(ReplicatedTextIneligibility::Routed),
-        SafetensorsModelConfig::Nanbeige(args) => Ok(EligibleConfig::Nanbeige(args)),
-        SafetensorsModelConfig::Llama(args) => Ok(EligibleConfig::Llama(args)),
-        SafetensorsModelConfig::Gemma2(args) => Ok(EligibleConfig::Gemma2(args)),
+        SafetensorsModelConfig::Nanbeige(args) => Ok(EligibleConfig::Nanbeige(
+            args,
+            architecture.dense.clone().expect("admitted dense scopes"),
+        )),
+        SafetensorsModelConfig::Llama(args) => Ok(EligibleConfig::Llama(
+            args,
+            architecture.dense.clone().expect("admitted dense scopes"),
+        )),
+        SafetensorsModelConfig::Gemma2(args) => Ok(EligibleConfig::Gemma2(
+            args,
+            architecture.dense.clone().expect("admitted dense scopes"),
+        )),
         SafetensorsModelConfig::K2Horizon(args) if args.is_moe() => {
             Err(ReplicatedTextIneligibility::Routed)
         }
-        SafetensorsModelConfig::K2Horizon(args) => Ok(EligibleConfig::K2Horizon(args)),
-        SafetensorsModelConfig::Qwen(args) if !args.is_moe() => Ok(EligibleConfig::Qwen(args)),
+        SafetensorsModelConfig::K2Horizon(args) => Ok(EligibleConfig::K2Horizon(
+            args,
+            architecture.k2.clone().expect("admitted K2 scopes"),
+        )),
+        SafetensorsModelConfig::Qwen(args) if !args.is_moe() => Ok(EligibleConfig::Qwen(
+            args,
+            architecture.qwen.clone().expect("admitted Qwen scopes"),
+        )),
         SafetensorsModelConfig::Qwen(_) => Err(ReplicatedTextIneligibility::Routed),
         SafetensorsModelConfig::QwenHybrid(args) if args.vision.is_some() => {
             Err(ReplicatedTextIneligibility::CompositeInput)
@@ -5223,18 +5751,33 @@ fn safetensors_eligible_config(
         SafetensorsModelConfig::KimiLinear(args) if args.has_sparse_moe_layers() => {
             Err(ReplicatedTextIneligibility::Routed)
         }
-        SafetensorsModelConfig::KimiLinear(args) => Ok(EligibleConfig::KimiLinear(args)),
+        SafetensorsModelConfig::KimiLinear(_) => Ok(EligibleConfig::KimiLinear(
+            architecture
+                .kimi
+                .clone()
+                .expect("admitted Kimi declaration"),
+        )),
         SafetensorsModelConfig::Lfm2(args) if args.has_sparse_moe_layers() => {
             Err(ReplicatedTextIneligibility::Routed)
         }
-        SafetensorsModelConfig::Lfm2(args) => Ok(EligibleConfig::Lfm2(args)),
+        SafetensorsModelConfig::Lfm2(_) => Ok(EligibleConfig::Lfm2(
+            architecture
+                .lfm2
+                .clone()
+                .expect("admitted LFM2 declaration"),
+        )),
         SafetensorsModelConfig::NemotronH(args) if args.num_nextn_predict_layers > 0 => {
             Err(ReplicatedTextIneligibility::EmbeddedPrediction)
         }
         SafetensorsModelConfig::NemotronH(args) if args.has_sparse_moe_layers() => {
             Err(ReplicatedTextIneligibility::Routed)
         }
-        SafetensorsModelConfig::NemotronH(args) => Ok(EligibleConfig::NemotronH(args)),
+        SafetensorsModelConfig::NemotronH(_) => Ok(EligibleConfig::NemotronH(
+            architecture
+                .nemotron
+                .clone()
+                .expect("admitted Nemotron declaration"),
+        )),
         SafetensorsModelConfig::Gemma4(_)
         | SafetensorsModelConfig::Inkling(_)
         | SafetensorsModelConfig::Muse(_)
@@ -5274,20 +5817,35 @@ fn gguf_eligible_config(
         GgufModelConfig::DiffusionGemma(_) => Err(ReplicatedTextIneligibility::BlockRefinement),
         GgufModelConfig::VoiceChat(_) => Err(ReplicatedTextIneligibility::Realtime),
         GgufModelConfig::Qwen4Exp(_) => Err(ReplicatedTextIneligibility::Routed),
-        GgufModelConfig::Llama(args) => Ok(EligibleConfig::Llama(args)),
+        GgufModelConfig::Llama(args) => Ok(EligibleConfig::Llama(
+            args,
+            architecture.dense.clone().expect("admitted dense scopes"),
+        )),
         GgufModelConfig::K2Horizon(args) if args.is_moe() => {
             Err(ReplicatedTextIneligibility::Routed)
         }
-        GgufModelConfig::K2Horizon(args) => Ok(EligibleConfig::K2Horizon(args)),
-        GgufModelConfig::Gemma2(args) => Ok(EligibleConfig::Gemma2(args)),
-        GgufModelConfig::Nanbeige(args) => Ok(EligibleConfig::Nanbeige(args)),
+        GgufModelConfig::K2Horizon(args) => Ok(EligibleConfig::K2Horizon(
+            args,
+            architecture.k2.clone().expect("admitted K2 scopes"),
+        )),
+        GgufModelConfig::Gemma2(args) => Ok(EligibleConfig::Gemma2(
+            args,
+            architecture.dense.clone().expect("admitted dense scopes"),
+        )),
+        GgufModelConfig::Nanbeige(args) => Ok(EligibleConfig::Nanbeige(
+            args,
+            architecture.dense.clone().expect("admitted dense scopes"),
+        )),
         GgufModelConfig::Qwen(args)
             if matches!(
                 architecture.architecture(),
                 GgufArchitecture::Qwen2 | GgufArchitecture::Qwen3
             ) && !args.is_moe() =>
         {
-            Ok(EligibleConfig::Qwen(args))
+            Ok(EligibleConfig::Qwen(
+                args,
+                architecture.qwen.clone().expect("admitted Qwen scopes"),
+            ))
         }
         GgufModelConfig::Qwen(_) => Err(ReplicatedTextIneligibility::Routed),
         GgufModelConfig::QwenHybrid(args) if args.vision.is_some() => {
@@ -5303,18 +5861,33 @@ fn gguf_eligible_config(
         GgufModelConfig::KimiLinear(args) if args.has_sparse_moe_layers() => {
             Err(ReplicatedTextIneligibility::Routed)
         }
-        GgufModelConfig::KimiLinear(args) => Ok(EligibleConfig::KimiLinear(args)),
+        GgufModelConfig::KimiLinear(_) => Ok(EligibleConfig::KimiLinear(
+            architecture
+                .kimi
+                .clone()
+                .expect("admitted Kimi declaration"),
+        )),
         GgufModelConfig::Lfm2(args) if args.has_sparse_moe_layers() => {
             Err(ReplicatedTextIneligibility::Routed)
         }
-        GgufModelConfig::Lfm2(args) => Ok(EligibleConfig::Lfm2(args)),
+        GgufModelConfig::Lfm2(_) => Ok(EligibleConfig::Lfm2(
+            architecture
+                .lfm2
+                .clone()
+                .expect("admitted LFM2 declaration"),
+        )),
         GgufModelConfig::NemotronH(args) if args.num_nextn_predict_layers > 0 => {
             Err(ReplicatedTextIneligibility::EmbeddedPrediction)
         }
         GgufModelConfig::NemotronH(args) if args.has_sparse_moe_layers() => {
             Err(ReplicatedTextIneligibility::Routed)
         }
-        GgufModelConfig::NemotronH(args) => Ok(EligibleConfig::NemotronH(args)),
+        GgufModelConfig::NemotronH(_) => Ok(EligibleConfig::NemotronH(
+            architecture
+                .nemotron
+                .clone()
+                .expect("admitted Nemotron declaration"),
+        )),
         GgufModelConfig::Gemma4(_) | GgufModelConfig::Inkling(_) | GgufModelConfig::Muse(_) => {
             Err(ReplicatedTextIneligibility::CompositeInput)
         }
@@ -5364,16 +5937,16 @@ fn ordinary_eligible_config(
     plan: &ArtifactArchitecturePlan,
 ) -> Result<EligibleConfig<'_>, ReplicatedTextIneligibility> {
     match eligible_config(plan)? {
-        config @ (EligibleConfig::Gemma2(_)
-        | EligibleConfig::Llama(_)
-        | EligibleConfig::Nanbeige(_)
-        | EligibleConfig::K2Horizon(_)
-        | EligibleConfig::Qwen(_)) => Ok(config),
+        config @ (EligibleConfig::Gemma2(_, _)
+        | EligibleConfig::Llama(_, _)
+        | EligibleConfig::Nanbeige(_, _)
+        | EligibleConfig::K2Horizon(_, _)
+        | EligibleConfig::Qwen(_, _)) => Ok(config),
         EligibleConfig::Lfm2(_)
         | EligibleConfig::KimiLinear(_)
         | EligibleConfig::NemotronH(_)
         | EligibleConfig::QwenHybrid(_)
-        | EligibleConfig::GptOss(_)
+        | EligibleConfig::GptOss(_, _)
         | EligibleConfig::DeepSeekV3(_)
         | EligibleConfig::DeepSeekV4(_)
         | EligibleConfig::DiffusionGemma(_)
@@ -5393,6 +5966,22 @@ fn qwen_next_fused_targets(
 ) -> Result<Option<Vec<(String, Vec<usize>)>>, ReplicatedTextRequirementsError> {
     if config.variant != crate::qwen::hybrid::HybridVariant::Qwen3Next {
         return Ok(None);
+    }
+    if physical_shape.is_empty() {
+        if let Some((root, _)) = name.split_once(".linear_attn.") {
+            for (source, targets) in crate::qwen::hybrid::qwen3_next_global_sources(config, root)
+                .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?
+            {
+                if source == name {
+                    return Ok(Some(
+                        targets
+                            .into_iter()
+                            .map(|target| (target.as_str().to_owned(), Vec::new()))
+                            .collect(),
+                    ));
+                }
+            }
+        }
     }
     let (base, suffix, qkvz) = if let Some(base) = name.strip_suffix("in_proj_qkvz.weight") {
         (base, "weight", true)
@@ -5520,7 +6109,24 @@ fn finish_parameters_with_tied_output(
     mut parameters: Vec<ReplicatedTextParameterRequirement>,
     config: &EligibleConfig<'_>,
 ) -> Result<Vec<ReplicatedTextParameterRequirement>, ReplicatedTextRequirementsError> {
-    if config.tied_embeddings() {
+    let construction = config
+        .static_construction()
+        .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?;
+    if construction.head_spec().is_none() {
+        use eredu_nn::DeclareLogicalParameters;
+        let embedding = construction.embedding_spec();
+        let declaration = embedding
+            .logical_parameters()
+            .map_err(|error| {
+                ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
+            })?
+            .into_iter()
+            .find(|declaration| declaration.parameter.id == embedding.weight.id)
+            .ok_or_else(|| {
+                ReplicatedTextRequirementsError::InvalidArchitecture(
+                    "tied readout has no declared embedding weight".into(),
+                )
+            })?;
         // A redundant checkpoint head is admitted for source validation, but
         // execution uses the embedding and its own declared companions.
         let redundant = |parameter: &ReplicatedTextParameterRequirement| {
@@ -5543,15 +6149,13 @@ fn finish_parameters_with_tied_output(
                 Vec::new(),
                 None,
                 None,
-                config
-                    .embedding_shape()
-                    .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?,
+                declaration.shape,
                 LinearFormat::Dense,
-                true,
+                Some(ordinary_transform_companions("lm_head.weight")),
                 ReplicatedTextParameterRole::LinearWeight,
                 ReplicatedTextParameterOwner::StaticRole("output".into()),
                 ReplicatedTextParameterPresence::Tied {
-                    target: config.embedding_name(),
+                    target: declaration.parameter.id.as_str().to_owned(),
                 },
             )?
             .with_admitted_redundant_sources(redundant_sources)
@@ -5572,17 +6176,12 @@ fn parameter_requirement(
     physical_shape: Option<Vec<usize>>,
     logical_shape: Vec<usize>,
     native_executable: LinearFormat,
-    transformable: bool,
+    transform_companions: Option<(String, String)>,
     role: ReplicatedTextParameterRole,
     owner: ReplicatedTextParameterOwner,
     presence: ReplicatedTextParameterPresence,
 ) -> Result<ReplicatedTextParameterRequirement, ReplicatedTextRequirementsError> {
-    let owner = if role == ReplicatedTextParameterRole::Embedding {
-        ReplicatedTextParameterOwner::StaticRole("embedding".into())
-    } else {
-        owner
-    };
-    let transform = if transformable {
+    let transform = if transform_companions.is_some() {
         ParameterTransformConstraint::Linear {
             packed_axis: logical_shape.len().checked_sub(1).ok_or_else(|| {
                 ReplicatedTextRequirementsError::InvalidArchitecture(
@@ -5608,18 +6207,7 @@ fn parameter_requirement(
         transform,
     )
     .map_err(|error| ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string()))?;
-    if transformable {
-        let name = requirement.name();
-        let grouped = !name.ends_with(".weight")
-            && (name.contains(".experts.")
-                || name.ends_with(".gate_up_proj")
-                || name.ends_with(".down_proj"));
-        let (scale, bias) = if grouped {
-            (format!("{name}_scales"), format!("{name}_biases"))
-        } else {
-            let prefix = name.strip_suffix(".weight").unwrap_or(name);
-            (format!("{prefix}.scales"), format!("{prefix}.biases"))
-        };
+    if let Some((scale, bias)) = transform_companions {
         requirement
             .with_transform_companions(scale, bias)
             .map_err(|error| {
@@ -5630,263 +6218,71 @@ fn parameter_requirement(
     }
 }
 
-fn parameter_owner(config: &EligibleConfig<'_>, name: &str) -> ReplicatedTextParameterOwner {
-    let execution_unit = |prefix: &str, group: &str| {
-        name.strip_prefix(prefix)
-            .and_then(|rest| rest.split('.').next())
-            .and_then(|layer| layer.parse::<usize>().ok())
-            .map(|unit| ReplicatedTextParameterOwner::ExecutionUnit {
-                group: group.into(),
-                unit,
-            })
-    };
-    if let EligibleConfig::Nanbeige(args) = config {
-        if let Some((layer, suffix)) = name
-            .strip_prefix("model.layers.")
-            .and_then(|rest| rest.split_once('.'))
-        {
-            if let Ok(layer) = layer.parse::<usize>() {
-                let schedule =
-                    crate::decoder::DecoderSchedule::new(*args).expect("admitted decoder schedule");
-                let operation = schedule.body_operation(layer)
-                    + usize::from(suffix.starts_with("output_norm."));
-                return ReplicatedTextParameterOwner::ExecutionUnit {
-                    group: crate::decoder::TEXT_DECODER_EXECUTION_GROUP.into(),
-                    unit: schedule.owner(operation),
-                };
-            }
-        }
-    }
-    if matches!(config, EligibleConfig::NemotronLabsDiffusion(_)) {
-        if let Some(owner) = execution_unit(
-            "draft_adapter.layers.",
-            crate::decoder::TEXT_DECODER_EXECUTION_GROUP,
-        ) {
-            return owner;
-        }
-        if let Some(owner) = execution_unit("model.vision_tower.transformer.layers.", "vision") {
-            return owner;
-        }
-        if name.starts_with("model.multi_modal_projector.") {
-            return ReplicatedTextParameterOwner::ExecutionUnit {
-                group: "vision_projection".into(),
-                unit: 0,
-            };
-        }
-        if name.starts_with("model.vision_tower.") {
-            return ReplicatedTextParameterOwner::StaticRole("vision_embedding".into());
-        }
-    }
-    let composite = match config {
-        EligibleConfig::Gemma4(_) => execution_unit(
-            "model.vision_tower.encoder.layers.",
-            crate::gemma4::model::VISION_EXECUTION_GROUP,
-        )
-        .or_else(|| {
-            execution_unit(
-                "model.audio_tower.layers.",
-                crate::gemma4::model::AUDIO_EXECUTION_GROUP,
-            )
+fn declared_parameter_format(
+    declarations: &BTreeMap<String, DeclaredParameter>,
+    name: &str,
+) -> Result<LinearFormat, ReplicatedTextRequirementsError> {
+    declarations
+        .get(name)
+        .and_then(|parameter| parameter.native)
+        .ok_or_else(|| {
+            ReplicatedTextRequirementsError::InvalidArchitecture(format!(
+                "matrix {name:?} has no declared encoding"
+            ))
         })
-        .or_else(|| {
-            execution_unit(
-                "model.language_model.layers.",
-                crate::gemma4::model::TEXT_EXECUTION_GROUP,
-            )
-        }),
-        EligibleConfig::Inkling(_) => execution_unit(
-            "visual.layers.",
-            crate::inkling::model::VISION_EXECUTION_GROUP,
-        )
-        .or_else(|| execution_unit("model.layers.", crate::inkling::model::TEXT_EXECUTION_GROUP)),
-        EligibleConfig::Muse(args) => args
-            .audio_config
-            .as_ref()
-            .and_then(|audio| audio.execution_units().ok())
-            .and_then(|units| units.into_iter().position(|unit| unit.owns_parameter(name)))
-            .map(|unit| ReplicatedTextParameterOwner::ExecutionUnit {
-                group: crate::muse::audio::execution::AUDIO_EXECUTION_GROUP.into(),
-                unit,
-            })
-            .or_else(|| {
-                execution_unit(
-                    "model.vision_tower.layers.",
-                    crate::muse::model::VISION_EXECUTION_GROUP,
-                )
-            })
-            .or_else(|| execution_unit("model.layers.", crate::muse::model::TEXT_EXECUTION_GROUP)),
-        EligibleConfig::QwenVl(_) => execution_unit(
-            "model.visual.blocks.",
-            crate::qwen::vl::VISION_EXECUTION_GROUP,
-        )
-        .or_else(|| {
-            execution_unit(
-                "model.language_model.layers.",
-                crate::qwen::vl::TEXT_EXECUTION_GROUP,
-            )
-        }),
-        EligibleConfig::QwenCompositeHybrid(_) => execution_unit(
-            "model.visual.blocks.",
-            crate::qwen::hybrid::VISION_EXECUTION_GROUP,
-        )
-        .or_else(|| execution_unit("model.layers.", crate::decoder::TARGET_EXECUTION_GROUP)),
-        _ => None,
-    };
-    if let Some(owner) = composite {
-        return owner;
-    }
-    if matches!(config, EligibleConfig::DiffusionGemma(_)) {
-        if let Some(owner) = execution_unit(
-            "model.encoder.vision_tower.encoder.layers.",
-            crate::diffusion_gemma::composite::VISION_EXECUTION_GROUP,
-        ) {
-            return owner;
-        }
-        if let Some(rest) = name.strip_prefix("model.encoder.language_model.layers.") {
-            if let Some(unit) = rest
-                .split('.')
-                .next()
-                .and_then(|value| value.parse::<usize>().ok())
+}
+
+fn declared_parameter_owner(
+    declarations: &BTreeMap<String, DeclaredParameter>,
+    name: &str,
+) -> Result<ReplicatedTextParameterOwner, ReplicatedTextRequirementsError> {
+    declarations
+        .get(name)
+        .and_then(|parameter| parameter.owner.clone())
+        .ok_or_else(|| {
+            ReplicatedTextRequirementsError::InvalidArchitecture(format!(
+                "parameter {name:?} has no declared storage owner"
+            ))
+        })
+}
+
+/// Source-format tensors inherit storage from their declared materialized outputs.
+/// This never changes a construction slot's authoritative owner.
+fn project_source_parameter_owners(
+    declarations: &mut BTreeMap<String, DeclaredParameter>,
+    recipes: &BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
+) -> Result<BTreeMap<String, ReplicatedTextParameterOwner>, String> {
+    let mut sources = BTreeMap::new();
+    for (target, recipe) in recipes {
+        let Some(owner) = declarations
+            .get(target)
+            .and_then(|parameter| parameter.owner.as_ref())
+        else {
+            continue;
+        };
+        for source in recipe.source_keys() {
+            if declarations
+                .get(source)
+                .is_some_and(|parameter| parameter.owner.is_some())
             {
-                return ReplicatedTextParameterOwner::ExecutionUnit {
-                    group: config.execution_group().into(),
-                    unit,
-                };
+                continue;
+            }
+            if sources
+                .insert(source.to_owned(), owner.clone())
+                .is_some_and(|previous| previous != *owner)
+            {
+                return Err(format!(
+                    "source tensor {source:?} feeds conflicting declared storage owners"
+                ));
             }
         }
     }
-    let layer_prefix = if matches!(config, EligibleConfig::DeepSeekV4(_)) {
-        "layers.".into()
-    } else {
-        format!("{}.layers.", config.parameter_root())
-    };
-    if let Some(rest) = name.strip_prefix(&layer_prefix) {
-        if let Some(layer) = rest
-            .split('.')
-            .next()
-            .and_then(|layer| layer.parse::<usize>().ok())
-        {
-            return ReplicatedTextParameterOwner::ExecutionUnit {
-                group: config.execution_group().into(),
-                unit: layer,
-            };
+    for (source, owner) in &sources {
+        if let Some(parameter) = declarations.get_mut(source) {
+            parameter.owner = Some(owner.clone());
         }
     }
-    if let EligibleConfig::Muse(args) = config {
-        if let Some(consumers) = crate::muse::parallel::vision_static_consumer_units(args, name) {
-            return ReplicatedTextParameterOwner::StaticUnitConsumers {
-                role: "vision".into(),
-                consumers: consumers
-                    .map(|unit| (crate::muse::model::VISION_EXECUTION_GROUP.into(), unit))
-                    .collect(),
-            };
-        }
-    }
-    let vision = match config {
-        EligibleConfig::QwenVl(args) => {
-            Some((&args.vision, crate::qwen::vl::VISION_EXECUTION_GROUP))
-        }
-        EligibleConfig::QwenCompositeHybrid(args) => args
-            .vision
-            .as_ref()
-            .map(|vision| (vision, crate::qwen::hybrid::VISION_EXECUTION_GROUP)),
-        _ => None,
-    };
-    if let Some((vision, group)) = vision {
-        let consumer = if name.starts_with("model.visual.merger.") {
-            vision.layer_count().checked_sub(1)
-        } else if let Some(rest) = name.strip_prefix("model.visual.deepstack_merger_list.") {
-            rest.split('.')
-                .next()
-                .and_then(|index| index.parse::<usize>().ok())
-                .and_then(|index| vision.deepstack_layers().get(index).copied())
-                .and_then(|unit| usize::try_from(unit).ok())
-        } else {
-            None
-        };
-        if let Some(unit) = consumer {
-            return ReplicatedTextParameterOwner::StaticUnitConsumers {
-                role: "vision".into(),
-                consumers: vec![(group.into(), unit)],
-            };
-        }
-    }
-    let embedding = config.embedding_name();
-    let embedding_prefix = embedding.strip_suffix("weight").unwrap_or(&embedding);
-    let role = if matches!(config, EligibleConfig::DiffusionGemma(_)) {
-        if name.starts_with("model.decoder.self_conditioning.") {
-            "conditioning"
-        } else if name.starts_with("model.encoder.vision_tower.") {
-            "vision"
-        } else if name.starts_with("model.encoder.embed_vision.") {
-            "vision_projection"
-        } else if name == embedding || name.starts_with(embedding_prefix) {
-            "embedding"
-        } else if name.starts_with("lm_head.") {
-            "output"
-        } else {
-            "norm"
-        }
-    } else if matches!(config, EligibleConfig::Gemma4(_)) {
-        if name.starts_with("model.vision_tower.") {
-            "vision"
-        } else if name.starts_with("model.embed_vision.") {
-            "vision_projection"
-        } else if name.starts_with("model.audio_tower.") {
-            "audio"
-        } else if name.starts_with("model.embed_audio.") {
-            "audio_projection"
-        } else if name == embedding || name.starts_with(embedding_prefix) {
-            "embedding"
-        } else if name.starts_with("model.language_model.embed_tokens_per_layer.") {
-            "per_layer_embedding"
-        } else if name.starts_with("model.language_model.per_layer_model_projection.") {
-            "per_layer_projection"
-        } else if name.starts_with("model.language_model.per_layer_projection_norm.") {
-            "per_layer_norm"
-        } else if name.starts_with("lm_head.") {
-            "output"
-        } else {
-            "norm"
-        }
-    } else if matches!(
-        config,
-        EligibleConfig::QwenVl(_) | EligibleConfig::QwenCompositeHybrid(_)
-    ) && name.starts_with("model.visual.")
-    {
-        "vision"
-    } else if matches!(config, EligibleConfig::Inkling(_)) {
-        if name.starts_with("audio.") {
-            "audio"
-        } else if name.starts_with("visual.") {
-            "vision"
-        } else if name.starts_with("model.embed_norm.") {
-            "embedding_norm"
-        } else if name == embedding || name.starts_with(embedding_prefix) {
-            "embedding"
-        } else if name.starts_with("lm_head.") {
-            "output"
-        } else {
-            "norm"
-        }
-    } else if matches!(config, EligibleConfig::Muse(_)) && name.starts_with("model.vision_") {
-        "vision"
-    } else if matches!(config, EligibleConfig::Muse(_)) && name == "model.embed_tokens.weight" {
-        "embedding"
-    } else if matches!(config, EligibleConfig::DeepSeekV4(_)) && name.starts_with("hc_head_") {
-        "hyper_head"
-    } else if name == embedding || name.starts_with(embedding_prefix) {
-        "embedding"
-    } else if name == "lm_head.weight"
-        || name == "lm_head.bias"
-        || name.starts_with("lm_head.")
-        || (matches!(config, EligibleConfig::DeepSeekV4(_)) && name.starts_with("head."))
-    {
-        "output"
-    } else {
-        "norm"
-    };
-    ReplicatedTextParameterOwner::StaticRole(role.into())
+    Ok(sources)
 }
 
 fn finish_parameters(
@@ -5908,83 +6304,33 @@ fn finish_parameters(
             "replicated text artifact contains no admitted linear parameters".into(),
         ));
     }
-    let primaries = parameters
-        .iter()
-        .filter(|parameter| {
-            matches!(
-                parameter.role(),
-                ReplicatedTextParameterRole::LinearWeight | ReplicatedTextParameterRole::Embedding
-            )
-        })
-        .map(|parameter| parameter.name().to_owned())
-        .collect::<Vec<_>>();
-    let mut companions = BTreeMap::<String, Vec<_>>::new();
-    for primary in &primaries {
-        let prefix = primary.strip_suffix(".weight").unwrap_or(primary);
-        let names = [
-            (
-                format!("{prefix}.scales"),
-                eredu_nn::LinearCompanionRole::Scale,
-            ),
-            (
-                format!("{primary}_scales"),
-                eredu_nn::LinearCompanionRole::Scale,
-            ),
-            (
-                format!("{prefix}.weight_scale_inv"),
-                eredu_nn::LinearCompanionRole::Scale,
-            ),
-            (
-                format!("{primary}_scale_inv"),
-                eredu_nn::LinearCompanionRole::Scale,
-            ),
-            (
-                format!("{prefix}.biases"),
-                eredu_nn::LinearCompanionRole::AffineBias,
-            ),
-            (
-                format!("{primary}_biases"),
-                eredu_nn::LinearCompanionRole::AffineBias,
-            ),
-        ]
-        .into_iter()
-        .collect::<BTreeMap<_, _>>();
-        for (name, role) in names {
-            companions
-                .entry(name)
-                .or_default()
-                .push((role, primary.clone()));
-        }
-    }
-    for parameter in &mut parameters {
+    for parameter in &parameters {
         if parameter.role() != ReplicatedTextParameterRole::FormatCompanion {
             continue;
         }
-        if parameter.linear_companion().is_some() {
-            continue;
-        }
-        let candidates = companions
-            .get(parameter.name())
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        match candidates {
-            [(role, primary)] => {
-                *parameter = parameter
-                    .clone()
-                    .with_linear_companion(*role, primary.clone())
-                    .map_err(|error| {
-                        ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
-                    })?;
-            }
-            [] => {}
-            _ => {
-                return Err(ReplicatedTextRequirementsError::InvalidArchitecture(
-                    format!(
-                        "format companion {:?} ambiguously names multiple linear weights",
-                        parameter.name()
-                    ),
-                ));
-            }
+        let (_, primary) = parameter.linear_companion().ok_or_else(|| {
+            ReplicatedTextRequirementsError::InvalidArchitecture(format!(
+                "format companion {:?} has no declared primary",
+                parameter.name()
+            ))
+        })?;
+        let primary = parameters
+            .binary_search_by(|candidate| candidate.name().cmp(primary))
+            .ok()
+            .map(|index| &parameters[index])
+            .ok_or_else(|| {
+                ReplicatedTextRequirementsError::InvalidArchitecture(format!(
+                    "format companion {:?} refers to absent primary {primary:?}",
+                    parameter.name()
+                ))
+            })?;
+        if primary.role() == ReplicatedTextParameterRole::FormatCompanion {
+            return Err(ReplicatedTextRequirementsError::InvalidArchitecture(
+                format!(
+                    "format companion {:?} refers to another companion",
+                    parameter.name()
+                ),
+            ));
         }
     }
     Ok(parameters)
@@ -6223,6 +6569,38 @@ impl SelectedCompositeTextRealization {
         }
     }
 
+    fn retain_executable_component(
+        self,
+        inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
+    ) -> Result<Self, CompositeTextSelectionError> {
+        let retain = |selected| {
+            retain_executable_component(inspection, selected).map_err(|error| {
+                CompositeTextSelectionError {
+                    issues: vec![error],
+                }
+            })
+        };
+        Ok(match self {
+            Self::Direct(selected) => {
+                let (execution, processor) = selected.into_parts();
+                Self::Direct(eredu_runtime::SelectedCompositeRealization::from_parts(
+                    retain(execution)?,
+                    processor,
+                ))
+            }
+            Self::Routed {
+                mut execution,
+                processor,
+            } => {
+                execution.text = retain(execution.text)?;
+                Self::Routed {
+                    execution,
+                    processor,
+                }
+            }
+        })
+    }
+
     /// Selected processor realization.
     pub const fn processor(&self) -> &eredu_runtime::SelectedProcessorExecution {
         match self {
@@ -6283,10 +6661,11 @@ pub fn select_composite_text_realization(
         if !issues.is_empty() {
             return Err(CompositeTextSelectionError { issues });
         }
-        return Ok(SelectedCompositeTextRealization::Routed {
+        return SelectedCompositeTextRealization::Routed {
             execution: execution.expect("empty diagnostics imply routed selection"),
             processor: processor.expect("empty diagnostics imply processor selection"),
-        });
+        }
+        .retain_executable_component(requirements.inspection());
     }
     let execution = eredu_runtime::select_replicated_text_realization(
         requirements.execution(),
@@ -6308,12 +6687,13 @@ pub fn select_composite_text_realization(
     if !issues.is_empty() {
         return Err(CompositeTextSelectionError { issues });
     }
-    Ok(SelectedCompositeTextRealization::Direct(
+    SelectedCompositeTextRealization::Direct(
         eredu_runtime::SelectedCompositeRealization::from_parts(
             execution.expect("empty diagnostics imply direct selection"),
             processor.expect("empty diagnostics imply processor selection"),
         ),
-    ))
+    )
+    .retain_executable_component(requirements.inspection())
 }
 
 /// Selects composite decoder execution around one previously selected processor proof.
@@ -6340,10 +6720,11 @@ pub fn select_composite_text_realization_with_processor(
                 .map_err(|error| CompositeTextSelectionError {
                     issues: error.issues().to_vec(),
                 })?;
-        return Ok(SelectedCompositeTextRealization::Routed {
+        return SelectedCompositeTextRealization::Routed {
             execution,
             processor,
-        });
+        }
+        .retain_executable_component(requirements.inspection());
     }
     let execution = eredu_runtime::select_replicated_text_realization(
         requirements.execution(),
@@ -6353,9 +6734,10 @@ pub fn select_composite_text_realization_with_processor(
     .map_err(|error| CompositeTextSelectionError {
         issues: error.issues().to_vec(),
     })?;
-    Ok(SelectedCompositeTextRealization::Direct(
+    SelectedCompositeTextRealization::Direct(
         eredu_runtime::SelectedCompositeRealization::from_parts(execution, processor),
-    ))
+    )
+    .retain_executable_component(requirements.inspection())
 }
 
 /// Checked composite architecture passed to a backend-generic session constructor.
@@ -6742,7 +7124,7 @@ pub(crate) enum CompositeConfig<'a> {
     Gemma4(&'a crate::gemma4::FamilyConfig),
     Inkling(&'a crate::inkling::ModelArgs),
     Muse(&'a crate::muse::DecoderConfig),
-    QwenVl(&'a crate::qwen::vl::ModelArgs),
+    QwenVl(Arc<crate::qwen::vl::Declaration>),
     QwenHybrid(&'a crate::qwen::hybrid::ParsedHybridConfig),
 }
 
@@ -6754,7 +7136,7 @@ impl CompositeConfig<'_> {
             Self::Gemma4(args) => EligibleConfig::Gemma4(args),
             Self::Inkling(args) => EligibleConfig::Inkling(args),
             Self::Muse(args) => EligibleConfig::Muse(args),
-            Self::QwenVl(args) => EligibleConfig::QwenVl(args),
+            Self::QwenVl(args) => EligibleConfig::QwenVl(args.clone()),
             Self::QwenHybrid(args) => EligibleConfig::QwenCompositeHybrid(args),
         }
     }
@@ -6850,7 +7232,10 @@ pub(crate) fn composite_config(
             GgufMediaProjectorConfig::NemotronLabsDiffusion { config, .. } => {
                 CompositeConfig::NemotronLabsDiffusion(config)
             }
-            GgufMediaProjectorConfig::Qwen3Vl(args) => CompositeConfig::QwenVl(args),
+            GgufMediaProjectorConfig::Qwen3Vl(args) => CompositeConfig::QwenVl(
+                plan.vl_declaration(args)
+                    .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?,
+            ),
             GgufMediaProjectorConfig::Qwen35(args) => CompositeConfig::QwenHybrid(args),
             GgufMediaProjectorConfig::Qwen4Exp(_) => {
                 return Err(ReplicatedTextRequirementsError::InvalidArtifact(
@@ -6882,7 +7267,10 @@ pub(crate) fn composite_config(
         (Some(SafetensorsModelConfig::Gemma4(args)), None) => Some(CompositeConfig::Gemma4(args)),
         (Some(SafetensorsModelConfig::Inkling(args)), None) => Some(CompositeConfig::Inkling(args)),
         (Some(SafetensorsModelConfig::Muse(args)), None) => Some(CompositeConfig::Muse(args)),
-        (Some(SafetensorsModelConfig::QwenVl(args)), None) => Some(CompositeConfig::QwenVl(args)),
+        (Some(SafetensorsModelConfig::QwenVl(args)), None) => Some(CompositeConfig::QwenVl(
+            plan.vl_declaration(args)
+                .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?,
+        )),
         (Some(SafetensorsModelConfig::QwenHybrid(args)), None) if args.vision.is_some() => {
             Some(CompositeConfig::QwenHybrid(args))
         }
@@ -6918,10 +7306,16 @@ pub(crate) fn partitioned_boundary_schema(
         plan.gguf_plan().map(|plan| plan.model()),
     ) {
         (Some(SafetensorsModelConfig::K2Horizon(args)), None)
-        | (None, Some(GgufModelConfig::K2Horizon(args))) => EligibleConfig::K2Horizon(args),
-        (Some(SafetensorsModelConfig::Qwen(args)), None) if args.is_moe() => {
-            EligibleConfig::Qwen(args)
-        }
+        | (None, Some(GgufModelConfig::K2Horizon(args))) => EligibleConfig::K2Horizon(
+            args,
+            plan.k2_declaration(args)
+                .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?,
+        ),
+        (Some(SafetensorsModelConfig::Qwen(args)), None) if args.is_moe() => EligibleConfig::Qwen(
+            args,
+            plan.qwen_declaration(args)
+                .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?,
+        ),
         (Some(SafetensorsModelConfig::QwenHybrid(args)), None)
         | (None, Some(GgufModelConfig::QwenHybrid(args)))
             if args.vision.is_none() && args.text.mtp_num_hidden_layers == 0 =>
@@ -6929,36 +7323,66 @@ pub(crate) fn partitioned_boundary_schema(
             EligibleConfig::QwenHybrid(&args.text)
         }
         (Some(SafetensorsModelConfig::Lfm2(args)), None) if args.has_sparse_moe_layers() => {
-            EligibleConfig::Lfm2(args)
+            EligibleConfig::Lfm2(
+                plan.lfm2_declaration(args)
+                    .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?,
+            )
         }
         (None, Some(GgufModelConfig::Lfm2(args))) if args.has_sparse_moe_layers() => {
-            EligibleConfig::Lfm2(args)
+            EligibleConfig::Lfm2(
+                plan.lfm2_declaration(args)
+                    .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?,
+            )
         }
         (Some(SafetensorsModelConfig::KimiLinear(args)), None)
             if args.has_sparse_moe_layers() && args.num_nextn_predict_layers == 0 =>
         {
-            EligibleConfig::KimiLinear(args)
+            EligibleConfig::KimiLinear(
+                plan.kimi_declaration(args)
+                    .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?,
+            )
         }
         (None, Some(GgufModelConfig::KimiLinear(args)))
             if args.has_sparse_moe_layers() && args.num_nextn_predict_layers == 0 =>
         {
-            EligibleConfig::KimiLinear(args)
+            EligibleConfig::KimiLinear(
+                plan.kimi_declaration(args)
+                    .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?,
+            )
         }
         (Some(SafetensorsModelConfig::NemotronH(args)), None)
             if args.has_sparse_moe_layers() && args.num_nextn_predict_layers == 0 =>
         {
-            EligibleConfig::NemotronH(args)
+            EligibleConfig::NemotronH(
+                plan.nemotron_declaration(args)
+                    .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?,
+            )
         }
         (None, Some(GgufModelConfig::NemotronH(args)))
             if args.has_sparse_moe_layers() && args.num_nextn_predict_layers == 0 =>
         {
-            EligibleConfig::NemotronH(args)
+            EligibleConfig::NemotronH(
+                plan.nemotron_declaration(args)
+                    .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?,
+            )
         }
-        (Some(SafetensorsModelConfig::GptOss(args)), None) => EligibleConfig::GptOss(args),
+        (Some(SafetensorsModelConfig::GptOss(args)), None) => EligibleConfig::GptOss(
+            args,
+            plan.gpt_oss_declaration(args)
+                .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?,
+        ),
         (Some(SafetensorsModelConfig::DeepSeekV3(args)), None) => EligibleConfig::DeepSeekV3(args),
         (Some(SafetensorsModelConfig::DeepSeekV4(args)), None) => EligibleConfig::DeepSeekV4(args),
-        (None, Some(GgufModelConfig::Qwen(args))) if args.is_moe() => EligibleConfig::Qwen(args),
-        (None, Some(GgufModelConfig::GptOss(args))) => EligibleConfig::GptOss(args),
+        (None, Some(GgufModelConfig::Qwen(args))) if args.is_moe() => EligibleConfig::Qwen(
+            args,
+            plan.qwen_declaration(args)
+                .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?,
+        ),
+        (None, Some(GgufModelConfig::GptOss(args))) => EligibleConfig::GptOss(
+            args,
+            plan.gpt_oss_declaration(args)
+                .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?,
+        ),
         (None, Some(GgufModelConfig::DeepSeekV3(args))) => EligibleConfig::DeepSeekV3(args),
         (None, Some(GgufModelConfig::DeepSeekV4(args))) => EligibleConfig::DeepSeekV4(args),
         _ => eligible_config(plan)?,
@@ -7111,74 +7535,6 @@ fn replicated_expert_topology() -> Result<eredu_core::ParallelRankTopology, Stri
     .map_err(|error| error.to_string())
 }
 
-fn gemma4_replicated_expert_realization_plan(
-    args: &crate::gemma4::FamilyConfig,
-) -> Result<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>, String> {
-    let global_experts = usize::try_from(args.text.num_experts.unwrap_or_default())
-        .map_err(|error| error.to_string())?;
-    let owner_group =
-        eredu_runtime::ExecutionGroupId::new(crate::gemma4::model::TEXT_EXECUTION_GROUP)
-            .map_err(|error| error.to_string())?;
-    let mut specs = BTreeMap::new();
-    for (layer, policy) in args.text.layer_schedule.iter().enumerate() {
-        if policy.feed_forward == crate::gemma4::FeedForwardPolicy::DenseWithSparseMoe {
-            specs.insert(
-                (owner_group.clone(), layer),
-                crate::gemma4::text::expert_bank_spec(&args.text, layer)
-                    .map_err(|error| error.to_string())?,
-            );
-        }
-    }
-    crate::ExpertRealizationPlan::balanced(global_experts, replicated_expert_topology()?, specs)
-        .map_err(|error| error.to_string())
-}
-
-fn inkling_replicated_expert_realization_plan(
-    args: &crate::inkling::ModelArgs,
-) -> Result<
-    (
-        crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
-        BTreeMap<usize, usize>,
-    ),
-    String,
-> {
-    let global_experts =
-        usize::try_from(args.text_config.n_routed_experts).map_err(|error| error.to_string())?;
-    let routed_routes =
-        usize::try_from(args.text_config.num_experts_per_tok).map_err(|error| error.to_string())?;
-    let shared_routes =
-        usize::try_from(args.text_config.n_shared_experts).map_err(|error| error.to_string())?;
-    let layers =
-        usize::try_from(args.text_config.num_hidden_layers).map_err(|error| error.to_string())?;
-    let owner_group =
-        eredu_runtime::ExecutionGroupId::new(crate::inkling::model::TEXT_EXECUTION_GROUP)
-            .map_err(|error| error.to_string())?;
-    let mut specs = BTreeMap::new();
-    let mut routes = BTreeMap::new();
-    for (layer, policy) in args.text_config.layer_schedule.iter().enumerate() {
-        if policy.feed_forward != crate::inkling::FeedForwardPolicy::SparseMoe {
-            continue;
-        }
-        let (routed, shared) = crate::inkling::text::localized_expert_bank_specs(
-            args,
-            layer,
-            &args.text_config,
-            args.text_config.n_routed_experts,
-        )
-        .map_err(|error| error.to_string())?;
-        let shared_unit = layers
-            .checked_add(layer)
-            .ok_or_else(|| "Inkling shared expert unit overflowed".to_owned())?;
-        specs.insert((owner_group.clone(), layer), routed);
-        specs.insert((owner_group.clone(), shared_unit), shared);
-        routes.insert(layer, routed_routes);
-        routes.insert(shared_unit, shared_routes);
-    }
-    crate::ExpertRealizationPlan::balanced(global_experts, replicated_expert_topology()?, specs)
-        .map(|plan| (plan, routes))
-        .map_err(|error| error.to_string())
-}
-
 fn composite_routed_requirements(
     inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
     config: &CompositeConfig<'_>,
@@ -7223,12 +7579,25 @@ fn composite_routed_requirements(
         }
 
         CompositeConfig::QwenVl(args) => {
-            let plan =
-                crate::qwen::replicated_expert_realization_plan(&args.text).map_err(|error| {
-                    ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
-                })?;
-            let catalog = crate::qwen::expert_residency_catalog(recipe_source.as_ref(), &args.text)
-                .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?;
+            let plan = crate::qwen::vl::expert_realization_plan(
+                args,
+                None,
+                replicated_expert_topology()
+                    .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?,
+            )
+            .map_err(|error| {
+                ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
+            })?
+            .ok_or_else(|| {
+                ReplicatedTextRequirementsError::InvalidArchitecture(
+                    "Qwen3-VL routed parameters have no declared bank".into(),
+                )
+            })?;
+            let catalog = crate::qwen::expert_residency_catalog(
+                recipe_source.as_ref(),
+                args.text_declaration(),
+            )
+            .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?;
             (
                 eredu_runtime::ExecutionGroupId::new(crate::qwen::vl::TEXT_EXECUTION_GROUP)
                     .map_err(|error| {
@@ -7240,10 +7609,20 @@ fn composite_routed_requirements(
             )
         }
         CompositeConfig::QwenHybrid(args) => {
-            let plan = crate::qwen::hybrid::replicated_expert_realization_plan(&args.text)
-                .map_err(|error| {
-                    ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
-                })?;
+            let plan = crate::qwen::hybrid::conditional_expert_realization_plan(
+                args,
+                None,
+                replicated_expert_topology()
+                    .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?,
+            )
+            .map_err(|error| {
+                ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
+            })?
+            .ok_or_else(|| {
+                ReplicatedTextRequirementsError::InvalidArchitecture(
+                    "conditional routed Qwen has no declared bank".into(),
+                )
+            })?;
             let catalog =
                 crate::qwen::hybrid::expert_residency_catalog(recipe_source.as_ref(), &args.text)
                     .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?;
@@ -7263,12 +7642,22 @@ fn composite_routed_requirements(
                     .map_err(|error| {
                         ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
                     })?;
-            let plan = gemma4_replicated_expert_realization_plan(args).map_err(|error| {
+            let plan = crate::gemma4::expert_realization_plan(
+                args,
+                None,
+                replicated_expert_topology()
+                    .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?,
+            )
+            .map_err(|error| {
                 ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
+            })?
+            .ok_or_else(|| {
+                ReplicatedTextRequirementsError::InvalidArchitecture(
+                    "Gemma 4 expert realization requires a sparse invocation".into(),
+                )
             })?;
-            let catalog =
-                crate::gemma4::expert_residency_catalog(recipe_source.as_ref(), &args.text)
-                    .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?;
+            let catalog = crate::gemma4::expert_residency_catalog(recipe_source.as_ref(), args)
+                .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?;
             (
                 owner_group,
                 plan,
@@ -7311,8 +7700,10 @@ fn composite_routed_requirements(
                     .map_err(|error| {
                     ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
                 })?;
-            let (plan, routes_by_unit) = inkling_replicated_expert_realization_plan(args)
-                .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?;
+            let (plan, routes_by_unit) = crate::inkling::replicated_expert_realization_plan(args)
+                .map_err(|error| {
+                ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
+            })?;
             let catalog = crate::inkling::expert_residency_catalog(args, recipe_source.as_ref())
                 .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?;
             return crate::routed_text::gated_routed_text_requirements_with_routes(
@@ -7435,9 +7826,10 @@ fn derive_composite_text_requirements(
 }
 
 pub(crate) fn qwen_vl_with_formats(
-    args: &crate::qwen::vl::ModelArgs,
+    declaration: &crate::qwen::vl::Declaration,
     formats: HashMap<String, LinearFormat>,
-) -> Result<crate::qwen::vl::ModelArgs, String> {
+) -> Result<Arc<crate::qwen::vl::Declaration>, String> {
+    let args = declaration.args();
     let (vision, text): (HashMap<_, _>, HashMap<_, _>) = formats
         .into_iter()
         .partition(|(name, _)| name.starts_with("model.visual."));
@@ -7451,7 +7843,10 @@ pub(crate) fn qwen_vl_with_formats(
         .vision
         .validate_for(crate::qwen::vision::VisionMode::DeepStack)
         .map_err(|error| error.to_string())?;
-    Ok(target)
+    declaration
+        .with_formats(target)
+        .map(Arc::new)
+        .map_err(|e| e.to_string())
 }
 
 pub(crate) fn qwen_hybrid_composite_with_formats(
@@ -7462,14 +7857,25 @@ pub(crate) fn qwen_hybrid_composite_with_formats(
         .into_iter()
         .partition(|(name, _)| name.starts_with("model.visual."));
     let mut target = args.clone();
-    target.text.quantization = None;
-    target.text.fp8 = None;
-    target.text.linear_formats = text;
+    let mut policy = target.text.policy().clone();
+    policy.quantization = None;
+    policy.fp8 = None;
+    policy.linear_formats = text;
+    target.text = target
+        .text
+        .with_formats(policy)
+        .map_err(|e| e.to_string())?;
     target.text.validate().map_err(|error| error.to_string())?;
     let target_vision = target.vision.as_mut().ok_or_else(|| {
         "conditional Qwen projector formats have no vision configuration".to_owned()
     })?;
-    target_vision.linear_formats = vision;
+    let mut vision_config = target_vision.config().clone();
+    vision_config.linear_formats = vision;
+    *target_vision = Arc::new(
+        target_vision
+            .with_formats(vision_config)
+            .map_err(|e| e.to_string())?,
+    );
     target_vision
         .validate_for(crate::qwen::vision::VisionMode::WindowScheduled)
         .map_err(|error| error.to_string())?;
@@ -7637,7 +8043,7 @@ where
     match config {
         CompositeConfig::NemotronLabsDiffusion(args) => construction.nemotron_labs_diffusion(args),
         CompositeConfig::Diffusion(args) => construction.diffusion(args),
-        CompositeConfig::QwenVl(args) => construction.qwen_vl(args),
+        CompositeConfig::QwenVl(args) => construction.qwen_vl(&args),
         CompositeConfig::Gemma4(args) => construction.gemma4(args),
         CompositeConfig::Muse(args) => construction.muse(args),
         CompositeConfig::Inkling(args) => construction.inkling(args),
@@ -7732,7 +8138,7 @@ where
     #[inline(never)]
     fn qwen_vl(
         self,
-        args: &crate::qwen::vl::ModelArgs,
+        args: &crate::qwen::vl::Declaration,
     ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>> {
         let capability = crate::capability::qwen_vl(args)
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
@@ -7760,8 +8166,8 @@ where
             .map_err(ReplicatedTextDispatchError::Architecture)?;
         let effective_model_type = target.effective_model_type().to_owned();
         let cache_identity = crate::qwen::vl::prompt_cache_architecture_fingerprint(&target);
-        let definition = crate::qwen::vl::project_parameters(&target, &retained)
-            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        let definition = executable_component(self.selected.execution())
+            .map_err(ReplicatedTextDispatchError::Architecture)?;
         let architecture =
             crate::qwen::vl::VlKernel::<B>::from_definition(target, definition, self.context)
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
@@ -7796,8 +8202,7 @@ where
                 args.with_checkpoint_formats(self.source_formats.clone())
                     .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))
                     .and_then(|config| {
-                        let definition = crate::nemotron_labs_diffusion::definition::project_composite_parameters(&config, &retained)
-                            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+                        let definition = retained.clone();
                         crate::nemotron_labs_diffusion::composite::CompositeKernel::<B>::from_definition(
                             config, definition, self.context,
                         )
@@ -7811,10 +8216,8 @@ where
             .with_checkpoint_formats(self.target_formats.clone())
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
         let identity = target.architecture_fingerprint();
-        let definition = crate::nemotron_labs_diffusion::definition::project_composite_parameters(
-            &target, &retained,
-        )
-        .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        let definition = executable_component(self.selected.execution())
+            .map_err(ReplicatedTextDispatchError::Architecture)?;
         let architecture =
             crate::nemotron_labs_diffusion::composite::CompositeKernel::<B>::from_definition(
                 target,
@@ -7853,7 +8256,9 @@ where
         let source = self
             .has_transform
             .then(|| {
-                let config = args.with_checkpoint_formats(self.source_formats.clone());
+                let config = args
+                    .with_checkpoint_formats(self.source_formats.clone())
+                    .map_err(eredu_nn::Error::backend_source)?;
                 let definition =
                     crate::diffusion_gemma::composite::project_parameters(&config, &retained)?;
                 crate::diffusion_gemma::composite::CompositeKernel::<B>::from_definition(
@@ -7864,10 +8269,12 @@ where
             })
             .transpose()
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-        let target = args.with_checkpoint_formats(self.target_formats.clone());
+        let target = args
+            .with_checkpoint_formats(self.target_formats.clone())
+            .map_err(|e| ReplicatedTextDispatchError::Architecture(e.to_string()))?;
         let identity = target.architecture_fingerprint();
-        let definition = crate::diffusion_gemma::composite::project_parameters(&target, &retained)
-            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        let definition = executable_component(self.selected.execution())
+            .map_err(ReplicatedTextDispatchError::Architecture)?;
         let architecture =
             crate::diffusion_gemma::composite::CompositeKernel::<B>::from_definition(
                 target,
@@ -7931,8 +8338,8 @@ where
                 .map_err(ReplicatedTextDispatchError::Architecture)?;
         let effective_model_type = target.effective_model_type().to_owned();
         let cache_identity = target.architecture_fingerprint();
-        let definition = crate::gemma4::model::project_parameters(&target, &retained)
-            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        let definition = executable_component(self.selected.execution())
+            .map_err(ReplicatedTextDispatchError::Architecture)?;
         let architecture =
             crate::gemma4::GemmaKernel::<B>::from_definition(target, definition, self.context)
                 .and_then(|kernel| kernel.into_model())
@@ -7968,8 +8375,7 @@ where
             .transpose()
             .map_err(ReplicatedTextDispatchError::Architecture)?
             .map(|args| {
-                let definition = crate::muse::model::project_parameters(&args, &retained)?;
-                crate::muse::MuseKernel::<B>::from_definition(args, definition, self.context)
+                crate::muse::MuseKernel::<B>::from_definition(args, retained.clone(), self.context)
             })
             .transpose()
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
@@ -7977,8 +8383,8 @@ where
             .map_err(ReplicatedTextDispatchError::Architecture)?;
         let effective_model_type = target.identity.text_model_type().to_owned();
         let cache_identity = target.architecture_fingerprint();
-        let definition = crate::muse::model::project_parameters(&target, &retained)
-            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        let definition = executable_component(self.selected.execution())
+            .map_err(ReplicatedTextDispatchError::Architecture)?;
         let architecture =
             crate::muse::MuseKernel::<B>::from_definition(target, definition, self.context)
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
@@ -8024,8 +8430,8 @@ where
             .map_err(ReplicatedTextDispatchError::Architecture)?;
         let effective_model_type = target.model_type.clone();
         let cache_identity = target.architecture_fingerprint();
-        let definition = crate::inkling::model::project_parameters(&target, &parent_definition)
-            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        let definition = executable_component(self.selected.execution())
+            .map_err(ReplicatedTextDispatchError::Architecture)?;
         let architecture =
             crate::inkling::InklingKernel::<B>::from_definition(target, definition, self.context)
                 .and_then(crate::inkling::InklingKernel::into_model)
@@ -8076,8 +8482,8 @@ where
         let effective_model_type = target.text.model_type.clone();
         let cache_identity =
             crate::qwen::hybrid::conditional_prompt_cache_architecture_fingerprint(&target);
-        let definition = crate::qwen::hybrid::project_conditional_parameters(&target, &retained)
-            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        let definition = executable_component(self.selected.execution())
+            .map_err(ReplicatedTextDispatchError::Architecture)?;
         let architecture = crate::qwen::hybrid::ConditionalKernel::<B>::from_definition(
             target,
             definition,
@@ -8206,8 +8612,8 @@ where
                 .map_err(ReplicatedTextDispatchError::Architecture)?;
             let effective_model_type = target.model_type.clone();
             let cache_identity = target.architecture_fingerprint();
-            let definition = crate::inkling::model::project_parameters(&target, &parent_definition)
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+            let definition = executable_component(selected.execution())
+                .map_err(ReplicatedTextDispatchError::Architecture)?;
             let architecture =
                 crate::inkling::InklingKernel::<B>::from_definition(target, definition, context)
                     .and_then(crate::inkling::InklingKernel::into_model)
@@ -8251,10 +8657,8 @@ where
             let effective_model_type = target.text.model_type.clone();
             let cache_identity =
                 crate::qwen::hybrid::conditional_prompt_cache_architecture_fingerprint(&target);
-            let definition = crate::qwen::hybrid::project_conditional_parameters(
-                &target, &retained,
-            )
-            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+            let definition = executable_component(selected.execution())
+                .map_err(ReplicatedTextDispatchError::Architecture)?;
             let architecture = crate::qwen::hybrid::ConditionalKernel::<B>::from_definition(
                 target, definition, context,
             )

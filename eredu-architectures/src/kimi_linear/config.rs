@@ -3,15 +3,8 @@
 use std::{collections::HashMap, io::Read};
 
 use eredu_checkpoint::WeightQuantization;
-use eredu_core::{
-    cache::{
-        derive_prompt_cache_architecture_fingerprint, LayerCachePolicy, MutableStateResidency,
-        StateTensorDimension, StateTensorDtype, StateTensorPolicy, StateTensorRole,
-    },
-    AttentionPolicy, LayerSchedule,
-};
+use eredu_core::{cache::derive_prompt_cache_architecture_fingerprint, LayerSchedule};
 use eredu_gguf::MetadataValue;
-use eredu_runtime::StateLayout;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -160,7 +153,7 @@ struct Source {
 }
 
 /// Validated Kimi Linear text configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModelArgs {
     /// Canonical Hugging Face model type.
     pub model_type: String,
@@ -340,20 +333,6 @@ impl ModelArgs {
     /// Returns the exact policy for one physical layer.
     pub fn layer_policy(&self, layer: usize) -> Option<&LayerPolicy> {
         self.layer_schedule.get(layer)
-    }
-    /// Returns the canonical routed observation point for one sparse layer.
-    pub fn routed_observation_points(
-        &self,
-        unit_path: &str,
-        layer: usize,
-    ) -> Option<eredu_runtime::RoutedObservationPoints> {
-        (self.layer_policy(layer)?.feed_forward == FeedForwardPolicy::SparseMoe).then(|| {
-            eredu_runtime::RoutedObservationPoints::new(
-                eredu_runtime::RoutedBankId::new(0),
-                format!("{unit_path}.mlp"),
-                self.num_experts,
-            )
-        })
     }
     /// Returns whether any layer uses routed experts.
     pub fn has_sparse_moe_layers(&self) -> bool {
@@ -646,90 +625,6 @@ fn gguf_optional_bool(
             .ok_or_else(|| invalid(format!("GGUF metadata key {key:?} has the wrong type"))),
         None => Ok(None),
     }
-}
-
-/// Rank-local recurrent geometry resolved by semantic placement.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub struct LayerCacheGeometry {
-    /// Rank-local KDA head count, or `None` for MLA layers.
-    pub kda_heads: Option<i32>,
-}
-
-/// Declares global heterogeneous state geometry for all physical layers.
-pub fn state_layout(args: &ModelArgs) -> Result<StateLayout, ConfigError> {
-    let geometry = args
-        .layer_schedule
-        .iter()
-        .map(|p| LayerCacheGeometry {
-            kda_heads: (p.attention == AttentionKind::Kda).then_some(args.kda_config.num_heads),
-        })
-        .collect::<Vec<_>>();
-    state_layout_with_geometry(args, &geometry)
-}
-
-/// Declares heterogeneous state using placement-resolved KDA head counts.
-pub fn state_layout_with_geometry(
-    args: &ModelArgs,
-    geometry: &[LayerCacheGeometry],
-) -> Result<StateLayout, ConfigError> {
-    if geometry.len() != args.layer_schedule.len() {
-        return Err(invalid("Kimi Linear state geometry length mismatch"));
-    }
-    let history = args.kda_config.short_conv_kernel_size - 1;
-    let fixed = |v| StateTensorDimension::fixed(v).map_err(|e| invalid(e.to_string()));
-    let policies = args
-        .layer_schedule
-        .iter()
-        .zip(geometry)
-        .enumerate()
-        .map(
-            |(layer, (policy, local))| match (policy.attention, local.kda_heads) {
-                (AttentionKind::Kda, Some(heads)) => {
-                    let width = heads
-                        .checked_mul(args.kda_config.head_dim)
-                        .ok_or_else(|| invalid("KDA width overflow"))?;
-                    let mut tensors = (0..3)
-                        .map(|slot| {
-                            StateTensorPolicy::new(
-                                StateTensorRole::Convolution { slot },
-                                vec![StateTensorDimension::Batch, fixed(history)?, fixed(width)?],
-                                StateTensorDtype::Floating,
-                                MutableStateResidency::AlwaysDeviceMutable,
-                            )
-                            .map_err(|e| invalid(e.to_string()))
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    tensors.push(
-                        StateTensorPolicy::new(
-                            StateTensorRole::Recurrent,
-                            vec![
-                                StateTensorDimension::Batch,
-                                fixed(heads)?,
-                                fixed(args.kda_config.head_dim)?,
-                                fixed(args.kda_config.head_dim)?,
-                            ],
-                            StateTensorDtype::Float32,
-                            MutableStateResidency::LayerScopedOffloadable,
-                        )
-                        .map_err(|e| invalid(e.to_string()))?,
-                    );
-                    LayerCachePolicy::fixed_only(tensors).map_err(|e| invalid(e.to_string()))
-                }
-                (AttentionKind::Mla, None) => LayerCachePolicy::compressed_latent_rotary(
-                    AttentionPolicy::Full,
-                    args.kv_lora_rank,
-                    args.qk_rope_head_dim,
-                )
-                .map_err(|e| invalid(e.to_string())),
-                _ => Err(invalid(format!(
-                    "Kimi Linear state geometry mismatch at layer {layer}"
-                ))),
-            },
-        )
-        .collect::<Result<Vec<_>, _>>()?;
-    let schedule =
-        LayerSchedule::new(policies.len(), policies).map_err(|e| invalid(e.to_string()))?;
-    StateLayout::new(schedule).map_err(|e| invalid(e.to_string()))
 }
 
 /// Derives stable prompt-cache architecture identity from normalized policy.

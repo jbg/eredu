@@ -33,7 +33,7 @@ pub(crate) fn catalog_plan(
             .iter()
             .any(|key| key.split('.').any(|part| part == "mtp"))
         {
-            config.text.mtp_num_hidden_layers = 0;
+            config.text = config.text.without_prediction();
         }
     }
     let mut plan = composite_safetensors_plan(&config)?;

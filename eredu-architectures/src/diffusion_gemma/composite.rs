@@ -90,8 +90,8 @@ pub struct CompositeKernel<B: GroupedNeuralBackend + DistributedNeuralBackend> {
 }
 
 /// Reuses the common prepared image contract with this family's exact geometry.
-pub fn ingress_config(config: &FamilyConfig) -> crate::gemma4::FamilyConfig {
-    crate::gemma4::FamilyConfig {
+pub fn ingress_config(config: &FamilyConfig) -> crate::gemma4::FamilyPolicy {
+    crate::gemma4::FamilyPolicy {
         model_type: "diffusion_gemma".into(),
         text: config.text.clone(),
         vision: config.vision.clone(),
@@ -151,27 +151,10 @@ pub fn parameter_description(
             group,
         ));
     }
-    let weight = "model.encoder.embed_vision.embedding_projection.weight";
-    let projection = eredu_runtime::ParameterGroupSpec::new(
-        "model.encoder.embed_vision",
-        eredu_runtime::ParameterRole::Replicated,
-        [eredu_runtime::ParameterMemberSpec::new(
-            weight,
-            vec![
-                config.text.hidden_size as usize,
-                vision.hidden_size as usize,
-            ],
-            eredu_runtime::MemberSharding::Replicated,
-        )],
-    )
-    .map_err(Error::backend_source)?;
-    let projection = eredu_runtime::expand_linear_format_parameter_group(projection, |member| {
-        crate::linear_format::standard_parallel_linear_format(
-            member,
-            config.text.linear_format_for(member.target()),
-        )
-    })
-    .map_err(Error::backend_source)?;
+    let projection = config
+        .vision_projector()
+        .ok_or_else(|| Error::backend("image tower has no declared projection"))?
+        .parameter_group("model.encoder.embed_vision")?;
     owned.push(OwnedParameterGroupSpec::new(
         ParameterGroupOwner::static_role("vision_projection"),
         projection,
@@ -399,7 +382,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> CompositeKernel<B> {
                 DecoderInputPart::Audio(_) => {
                     return Err(Error::backend(
                         "image/text architecture does not admit audio",
-                    ))
+                    ));
                 }
             });
         }

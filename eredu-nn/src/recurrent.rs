@@ -122,6 +122,9 @@ impl<B: NeuralBackend> Lstm<B> {
                 return Err(Error::backend("adjacent LSTM layer widths do not agree"));
             }
         }
+        use crate::DeclareLogicalParameters;
+        crate::validate_logical_parameter_topology(&specs[..].logical_parameters()?)
+            .map_err(Error::backend_source)?;
         let layers = specs
             .into_iter()
             .map(|spec| {

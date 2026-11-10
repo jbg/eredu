@@ -1,11 +1,83 @@
 //! Neutral Inkling dMel audio projection.
 
 use eredu_nn::{
-    EmbeddingOperator, EmbeddingSpec, Error, NeuralBackend, NormalizationConstructionSpec,
-    NormalizationOperator, ParameterSpec, Parameterized, Tensor,
+    DeclareLogicalParameters, EmbeddingOperator, EmbeddingSpec, Error, LogicalParameterDeclaration,
+    NeuralBackend, NormalizationConstructionSpec, NormalizationOperator, ParameterSpec,
+    Parameterized, Tensor,
 };
 
-use super::AudioConfig;
+use super::{AudioConfig, AudioPolicy};
+
+/// Construction-owned dMel parameter scope, independent of frames and code IDs.
+#[derive(Debug, Clone)]
+pub(crate) struct Parameters {
+    pub embedding: EmbeddingSpec,
+    pub final_norm: NormalizationConstructionSpec,
+}
+impl Parameters {
+    pub(super) fn new(config: &AudioPolicy) -> Result<Self, Error> {
+        if config.num_codebooks <= 0
+            || config.codebook_size <= 0
+            || config.bias
+            || !config.use_audio_norm
+            || config.audio_mode != "dmel"
+        {
+            return Err(Error::backend(
+                "Inkling audio requires positive codebooks, unbiased dMel and output normalization",
+            ));
+        }
+        let name = "audio.encoder.weight";
+        let parameters = Self {
+            embedding: EmbeddingSpec {
+                vocabulary: config
+                    .num_codebooks
+                    .checked_mul(config.codebook_size)
+                    .ok_or_else(|| Error::backend("Inkling audio vocabulary overflow"))?,
+                dimensions: config.text_hidden_size,
+                weight: ParameterSpec::trainable(name).map_err(Error::backend)?,
+                format: crate::linear_format::standard_linear_format(
+                    name,
+                    config.linear_format_for(name),
+                )?,
+            },
+            final_norm: NormalizationConstructionSpec::learned(
+                config.text_hidden_size,
+                config.rms_norm_eps,
+                ParameterSpec::trainable("audio.final_norm.weight").map_err(Error::backend)?,
+            ),
+        };
+        eredu_nn::validate_logical_parameter_topology(&parameters.logical_parameters()?)
+            .map_err(Error::backend_source)?;
+        parameters.validate_formats(config)?;
+        Ok(parameters)
+    }
+    fn validate_formats(&self, config: &AudioPolicy) -> Result<(), Error> {
+        crate::format_references::validate_matrices(
+            self.logical_parameters()?,
+            config
+                .quantized_weight_configs
+                .iter()
+                .flat_map(|formats| formats.iter())
+                .map(|(name, format)| (name.as_str(), Some((*format).into()))),
+        )
+    }
+    pub(super) fn project_formats(&mut self, config: &AudioPolicy) -> Result<(), Error> {
+        self.embedding.format = crate::linear_format::standard_linear_format(
+            self.embedding.weight.id.as_str(),
+            config.linear_format_for(self.embedding.weight.id.as_str()),
+        )?;
+        eredu_nn::validate_logical_parameter_topology(&self.logical_parameters()?)
+            .map_err(Error::backend_source)?;
+        self.validate_formats(config)
+    }
+}
+impl DeclareLogicalParameters for Parameters {
+    fn logical_parameters(&self) -> Result<Vec<LogicalParameterDeclaration<'_>>, Error> {
+        let mut parameters = self.embedding.logical_parameters()?;
+        parameters.extend(self.final_norm.logical_parameters()?);
+        Ok(parameters)
+    }
+}
 
 /// Prepared dMel code IDs and host-known valid-frame count.
 pub struct AudioInput<'a, T> {
@@ -33,28 +105,10 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> AudioTower<B> {
         config: &AudioConfig,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let name = "audio.encoder.weight";
+        let parameters = config.parameters();
         Ok(Self {
-            embedding: B::embedding(
-                EmbeddingSpec {
-                    vocabulary: config.num_codebooks * config.codebook_size,
-                    dimensions: config.text_hidden_size,
-                    weight: ParameterSpec::trainable(name).map_err(Error::backend)?,
-                    format: crate::linear_format::standard_linear_format(
-                        name,
-                        config.linear_format_for(name),
-                    )?,
-                },
-                context,
-            )?,
-            final_norm: B::normalization(
-                NormalizationConstructionSpec::learned(
-                    config.text_hidden_size,
-                    config.rms_norm_eps,
-                    ParameterSpec::trainable("audio.final_norm.weight").map_err(Error::backend)?,
-                ),
-                context,
-            )?,
+            embedding: B::embedding(parameters.embedding.clone(), context)?,
+            final_norm: B::normalization(parameters.final_norm.clone(), context)?,
             num_codebooks: config.num_codebooks,
             codebook_size: config.codebook_size,
         })

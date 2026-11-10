@@ -4,6 +4,7 @@ mod artifact;
 mod block;
 mod checkpoint;
 mod config;
+mod declarations;
 mod depth;
 mod model;
 mod parallel;
@@ -19,8 +20,8 @@ pub use artifact::{prepare_moshi_from_catalog, MoshiPreparationError, MoshiPrepa
 pub use checkpoint::{canonical_recipes, safetensors_plan};
 pub use config::{
     ArtifactProfile, CheckpointLayout, EffectiveModelType, MoshiConfig, MoshiConfigError,
-    MoshiIdentity, MoshiTransformerConfig, ParameterSharing, PositionalEncoding, MOSHI_FAMILY,
-    PERSONAPLEX_VERSION,
+    MoshiIdentity, MoshiPolicy, MoshiTransformerConfig, ParameterSharing, PositionalEncoding,
+    MOSHI_FAMILY, PERSONAPLEX_VERSION,
 };
 pub use depth::DepthSlice;
 pub use model::{
@@ -30,9 +31,8 @@ pub use model::{
 };
 pub use parallel::{
     collective_count, forward_temporal_block_parallel, local_geometry, parameter_contract,
-    parameter_description, select_parallel_execution, static_parameter_groups,
-    unit_parameter_groups, LocalGeometry, LocalTransformerGeometry, MoshiCollectiveCount,
-    MoshiMatrixContract, MoshiParallelSelection, MoshiParameterContract,
+    parameter_description, select_parallel_execution, LocalGeometry, LocalTransformerGeometry,
+    MoshiCollectiveCount, MoshiMatrixContract, MoshiParallelSelection, MoshiParameterContract,
 };
 pub use realtime::{
     execute_detached_partitioned_moshi_realtime, execute_detached_replicated_moshi_realtime,

@@ -115,6 +115,15 @@ fn provenance() -> MetadataProvenance {
 fn config() -> serde_json::Value {
     serde_json::json!({"model_type":"llama", "hidden_size":32,"num_hidden_layers":2,"intermediate_size":64,"num_attention_heads":2,"num_key_value_heads":1,"head_dim":16,"rms_norm_eps":0.00001,"vocab_size":32,"max_position_embeddings":4096,"rope_theta":10000.0,"tie_word_embeddings":false})
 }
+fn k2_config() -> serde_json::Value {
+    let mut config = config();
+    config["model_type"] = serde_json::json!("k2_horizon");
+    config["layernorm_num_groups"] = serde_json::json!(2);
+    config["query_key_norm"] = serde_json::json!(true);
+    config["attention_gate_func"] = serde_json::json!("softplus");
+    config["attention_bias"] = serde_json::json!(true);
+    config
+}
 fn safetensors_fixture(split: bool) -> (tempfile::TempDir, ArtifactMetadata) {
     safetensors_fixture_with_config(split, config())
 }
@@ -280,6 +289,47 @@ fn supplied_safetensors_headers_match_local_forecasts_without_files() {
             assert_parity(local, remote);
         }
     }
+    // Repeated invocations share checkpoint sources while forecasting independent state.
+    let mut repeated = config();
+    repeated["model_type"] = serde_json::json!("nanbeige");
+    repeated["num_loops"] = serde_json::json!(3);
+    repeated["quantization"] = serde_json::json!({"group_size":32,"bits":4});
+    let (root, metadata) = safetensors_fixture_with_config(false, repeated);
+    let request = NormalizedLoadRequest::default().with_weight_residency(
+        WeightResidency::with_layers(LayerWeightResidency::LayerwiseHost(Default::default())),
+    );
+    let local = eredu_architectures::inspect_model(root.path(), &request, &Mechanisms, MEDIA);
+    root.close().unwrap();
+    assert_parity(
+        local,
+        inspect_model_metadata(&metadata, &request, &Mechanisms, MEDIA),
+    );
+    let mut qwen = config();
+    qwen["model_type"] = serde_json::json!("qwen3");
+    qwen["tie_word_embeddings"] = serde_json::json!(true);
+    qwen["quantization"] = serde_json::json!({"group_size":32,"bits":4});
+    let (root, metadata) = safetensors_fixture_with_config(false, qwen);
+    let request = NormalizedLoadRequest::default().with_weight_residency(
+        WeightResidency::with_layers(LayerWeightResidency::DenseDiskStream(
+            DenseDiskStreamLoadOptions::new(1 << 20, 1 << 20, 2, 1).unwrap(),
+        )),
+    );
+    let local = eredu_architectures::inspect_model(root.path(), &request, &Mechanisms, MEDIA);
+    root.close().unwrap();
+    assert_parity(
+        local,
+        inspect_model_metadata(&metadata, &request, &Mechanisms, MEDIA),
+    );
+    let (root, metadata) = safetensors_fixture_with_config(false, k2_config());
+    let request = NormalizedLoadRequest::default().with_weight_residency(
+        WeightResidency::with_layers(LayerWeightResidency::LayerwiseHost(Default::default())),
+    );
+    let local = eredu_architectures::inspect_model(root.path(), &request, &Mechanisms, MEDIA);
+    root.close().unwrap();
+    assert_parity(
+        local,
+        inspect_model_metadata(&metadata, &request, &Mechanisms, MEDIA),
+    );
 }
 #[test]
 fn malformed_metadata_returns_diagnostics_without_selection() {
@@ -307,12 +357,26 @@ fn malformed_metadata_returns_diagnostics_without_selection() {
 fn gguf_fixture(
     encoding: eredu_gguf::GgmlType,
     split: bool,
+    family: &str,
 ) -> (tempfile::TempDir, std::path::PathBuf, ArtifactMetadata) {
     use eredu_gguf::{GgmlType, MetadataValue as V, TensorInput, Writer};
     let root = tempfile::tempdir().unwrap();
-    let args: eredu_architectures::llama::ModelArgs =
-        eredu_architectures::llama::model_args_from_config_value(&config()).unwrap();
-    let plan = eredu_architectures::llama::gguf_plan(&args).unwrap();
+    let plan = if family == "qwen3" {
+        let mut config = config();
+        config["model_type"] = serde_json::json!("qwen3");
+        let args = eredu_architectures::qwen::model_args_from_config_value(&config).unwrap();
+        let declaration = eredu_architectures::qwen::Declaration::new(args).unwrap();
+        eredu_architectures::qwen::gguf_plan(&declaration).unwrap()
+    } else if family == "k2-horizon" {
+        let args =
+            eredu_architectures::k2_horizon::model_args_from_config_value(&k2_config()).unwrap();
+        let declaration = eredu_architectures::k2_horizon::Declaration::new(args).unwrap();
+        eredu_architectures::k2_horizon::gguf_plan(&declaration).unwrap()
+    } else {
+        let args = eredu_architectures::llama::model_args_from_config_value(&config()).unwrap();
+        let declaration = eredu_architectures::decoder::DecoderDeclaration::new(&args).unwrap();
+        eredu_architectures::llama::gguf_plan(&args, &declaration).unwrap()
+    };
     let tensors = plan
         .common_tensors
         .iter()
@@ -339,7 +403,7 @@ fn gguf_fixture(
             )
         })
         .collect::<Vec<_>>();
-    let metadata = BTreeMap::from([
+    let metadata: BTreeMap<String, V> = BTreeMap::from([
         ("general.architecture".into(), V::String("llama".into())),
         ("llama.block_count".into(), V::Uint32(2)),
         ("llama.embedding_length".into(), V::Uint32(32)),
@@ -354,6 +418,22 @@ fn gguf_fixture(
         ("llama.context_length".into(), V::Uint32(4096)),
         ("llama.rope.freq_base".into(), V::Float32(10000.0)),
     ]);
+    let mut metadata = metadata
+        .into_iter()
+        .map(|(key, value)| (key.replace("llama.", &format!("{family}.")), value))
+        .collect::<BTreeMap<_, _>>();
+    metadata.insert("general.architecture".into(), V::String(family.into()));
+    if family == "nanbeige" {
+        metadata.insert("nanbeige.num_loops".into(), V::Uint32(3));
+        metadata.insert("nanbeige.skip_loop_final_norm".into(), V::Bool(false));
+    }
+    if family == "k2-horizon" {
+        metadata.insert("k2-horizon.attention.key_length".into(), V::Uint32(16));
+        metadata.insert(
+            "k2-horizon.attention.group_norm_groups".into(),
+            V::Uint32(2),
+        );
+    }
     let mut headers = Vec::new();
     let count = if split { 2 } else { 1 };
     for shard in 0..count {
@@ -425,7 +505,7 @@ fn supplied_gguf_headers_match_local_forecasts_without_files() {
     use eredu_gguf::GgmlType::*;
     for dtype in [F32, F16, Bf16, Q4_0, Q8_0] {
         for split in [false, true] {
-            let (root, first, metadata) = gguf_fixture(dtype, split);
+            let (root, first, metadata) = gguf_fixture(dtype, split, "llama");
             let request = NormalizedLoadRequest::default();
             let local = eredu_architectures::inspect_model(&first, &request, &Mechanisms, MEDIA);
             root.close().unwrap();
@@ -433,6 +513,30 @@ fn supplied_gguf_headers_match_local_forecasts_without_files() {
             assert_parity(local, remote);
         }
     }
+    let (root, first, metadata) = gguf_fixture(Q4_0, false, "nanbeige");
+    let request = NormalizedLoadRequest::default();
+    let local = eredu_architectures::inspect_model(&first, &request, &Mechanisms, MEDIA);
+    root.close().unwrap();
+    assert_parity(
+        local,
+        inspect_model_metadata(&metadata, &request, &Mechanisms, MEDIA),
+    );
+    let (root, first, metadata) = gguf_fixture(Q8_0, false, "qwen3");
+    let request = NormalizedLoadRequest::default();
+    let local = eredu_architectures::inspect_model(&first, &request, &Mechanisms, MEDIA);
+    root.close().unwrap();
+    assert_parity(
+        local,
+        inspect_model_metadata(&metadata, &request, &Mechanisms, MEDIA),
+    );
+    let (root, first, metadata) = gguf_fixture(F32, false, "k2-horizon");
+    let request = NormalizedLoadRequest::default();
+    let local = eredu_architectures::inspect_model(&first, &request, &Mechanisms, MEDIA);
+    root.close().unwrap();
+    assert_parity(
+        local,
+        inspect_model_metadata(&metadata, &request, &Mechanisms, MEDIA),
+    );
 }
 
 #[test]

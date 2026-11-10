@@ -1,4 +1,5 @@
 //! Finite EAR encoder units over the shared resident and bounded traversal.
+use crate::ear_specs::EncoderSpec;
 use crate::{
     ear_encoder::{invalid, EncoderConfig, EncoderUnit, EncoderUnitSpec},
     Error,
@@ -11,8 +12,7 @@ use eredu_runtime::{
     ComponentAdapter, ComponentDefinition, ComponentEquations, ComponentKernel, ComponentUnit,
     ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress, ExecutionUnitLayout,
     LayeredForwardState, LayeredInvocation, LayerwisePolicy, LayerwiseRuntime, LocalModelLayout,
-    MemberSharding, OwnedParameterGroupSpec, ParallelComponentKernel, ParameterGroupOwner,
-    ParameterGroupSpec, ParameterMemberSpec, ParameterRole, StatelessComponentState,
+    OwnedParameterGroupSpec, ParallelComponentKernel, ParameterGroupOwner, StatelessComponentState,
     SubmissionBackend,
 };
 use std::marker::PhantomData;
@@ -33,13 +33,11 @@ pub struct EncoderLocalDimensions {
     /// Input projection output, block intermediate, and downsample per-group output ranges.
     pub units: Vec<EncoderUnitLocalDimensions>,
 }
-/// Validates the complete physical declaration including replicated companions.
-pub fn encoder_local_dimensions(
-    config: &EncoderConfig,
-    prefix: &str,
+pub(crate) fn declared_local_dimensions(
+    declaration: &EncoderSpec,
     layout: &LocalModelLayout,
 ) -> Result<EncoderLocalDimensions, Error> {
-    let description = encoder_parameter_description(config, prefix)?;
+    let description = declared_parameters(declaration)?;
     let mut units = Vec::new();
     eredu_runtime::validate_parameter_layout(
         description.groups().iter().map(|owned| owned.group()),
@@ -66,12 +64,11 @@ pub trait EncoderExecution<B: NeuralBackend> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error>;
 }
-/// Finite spectral encoder operations and independently leased parameter resources.
-pub fn encoder_component_definition(
-    config: &EncoderConfig,
+pub(crate) fn declared_component_definition(
     prefix: &str,
+    declaration: &EncoderSpec,
 ) -> Result<ComponentDefinition, Error> {
-    let parameters = encoder_parameter_description(config, prefix)?;
+    let parameters = declared_parameters(declaration)?;
     let units = (0..parameters.unit_layout().len())
         .map(|index| ComponentUnit {
             path: format!("{prefix}.layers.{index}"),
@@ -106,8 +103,10 @@ pub struct EncoderForward {
 }
 /// Codec-owned canonical unit construction and finite execution geometry.
 pub struct EncoderKernel<B: NeuralBackend> {
+    definition: ComponentDefinition,
     pub(crate) config: EncoderConfig,
     pub(crate) specs: Vec<EncoderUnitSpec>,
+    declaration: EncoderSpec,
     pub(crate) prefix: String,
     pub(crate) partition: Option<crate::ear_encoder_partition::EncoderPartition>,
     parallel: Option<(EncoderLocalDimensions, LocalModelLayout)>,
@@ -115,15 +114,15 @@ pub struct EncoderKernel<B: NeuralBackend> {
 }
 impl<B: NeuralBackend> EncoderKernel<B> {
     /// Validates the complete encoder before constructing native resources.
-    pub fn new(config: EncoderConfig, prefix: &str) -> Result<Self, Error> {
-        let specs = config.unit_specs()?;
-        if prefix.is_empty() {
-            return Err(invalid("empty EAR encoder parameter prefix"));
-        }
+    pub fn new(declared: crate::declarations::EncoderDeclaration) -> Result<Self, Error> {
+        let (config, prefix, declaration, definition) = declared.into_parts();
+        let specs = declaration.units.iter().map(|unit| unit.unit).collect();
         Ok(Self {
             config,
             specs,
-            prefix: prefix.into(),
+            declaration,
+            definition,
+            prefix,
             partition: None,
             parallel: None,
             backend: PhantomData,
@@ -131,22 +130,19 @@ impl<B: NeuralBackend> EncoderKernel<B> {
     }
     /// Constructs unloaded rank-local units after exact physical layout validation.
     pub fn new_parallel(
-        config: EncoderConfig,
-        prefix: &str,
+        declared: crate::declarations::EncoderDeclaration,
         layout: &LocalModelLayout,
     ) -> Result<Self, Error> {
-        let local = encoder_local_dimensions(&config, prefix, layout)?;
-        let mut value = Self::new(config, prefix)?;
+        let mut value = Self::new(declared)?;
+        let local = declared_local_dimensions(&value.declaration, layout)?;
         value.parallel = Some((local, layout.clone()));
         Ok(value)
     }
     /// Retains the validated encoder operations and their shared execution adapter.
     pub fn into_component(self) -> Result<ComponentAdapter<ComponentDefinition, Self>, Error> {
-        Ok(ComponentAdapter::new(
-            encoder_component_definition(&self.config, &self.prefix)?,
-            self,
-        )?)
+        Ok(ComponentAdapter::new(self.definition.clone(), self)?)
     }
+
     /// Whether this encoder requires tensor-parallel invocation.
     pub fn is_parallel(&self) -> bool {
         self.parallel.is_some()
@@ -205,109 +201,26 @@ fn encoder_graph() -> Result<ExecutionGraph, Error> {
         ENCODER_GROUP,
     )?)
 }
-/// Cold canonical pointwise, ConvNeXt and downsampling parameter ownership.
-pub fn encoder_parameter_description(
-    config: &EncoderConfig,
-    prefix: &str,
+pub(crate) fn declared_parameters(
+    declaration: &EncoderSpec,
 ) -> Result<ArchitectureParameterDescription, Error> {
-    let specs = config.unit_specs()?;
-    if prefix.is_empty() {
-        return Err(invalid("empty EAR encoder parameter prefix"));
-    }
     let graph = encoder_graph()?;
-    let layout = ExecutionUnitLayout::new(&graph, [specs.len()])?;
-    let mut owned = Vec::with_capacity(specs.len());
-    for spec in specs {
-        let index = spec.layer();
-        let name = format!("{prefix}.layers.{index}");
-        let member = |suffix: &str, shape: Vec<usize>, sharding: MemberSharding| {
-            ParameterMemberSpec::new(format!("{name}.{suffix}"), shape, sharding)
-        };
-        let members = match spec {
-            EncoderUnitSpec::Input { input, output, .. } => {
-                vec![member(
-                    "weight",
-                    vec![output as usize, input as usize, 1],
-                    MemberSharding::Partitioned { axis: 0 },
-                )]
-            }
-            EncoderUnitSpec::Downsample {
-                input,
-                output,
-                rate,
-                groups,
-                ..
-            } => vec![member(
-                "weight",
-                vec![output as usize, (input / groups) as usize, rate as usize],
-                MemberSharding::PartitionedSegments {
-                    axis: 0,
-                    segments: (0..groups)
-                        .map(|group| {
-                            (group * (output / groups)) as usize
-                                ..((group + 1) * (output / groups)) as usize
-                        })
-                        .collect(),
-                },
-            )],
-            EncoderUnitSpec::Block {
-                width,
-                intermediate,
-                kernel,
-                ..
-            } => {
-                let w = width as usize;
-                let h = intermediate as usize;
-                vec![
-                    member(
-                        "dwconv.weight",
-                        vec![w, 1, kernel as usize],
-                        MemberSharding::Replicated,
-                    ),
-                    member("dwconv.bias", vec![w], MemberSharding::Replicated),
-                    member("norm.weight", vec![w], MemberSharding::Replicated),
-                    member("norm.bias", vec![w], MemberSharding::Replicated),
-                    member(
-                        "pwconv1.weight",
-                        vec![h, w, 1],
-                        MemberSharding::Partitioned { axis: 0 },
-                    ),
-                    member(
-                        "pwconv1.bias",
-                        vec![h],
-                        MemberSharding::Partitioned { axis: 0 },
-                    ),
-                    member(
-                        "pwconv2.weight",
-                        vec![w, h, 1],
-                        MemberSharding::Partitioned { axis: 1 },
-                    ),
-                    member("pwconv2.bias", vec![w], MemberSharding::Replicated),
-                ]
-            }
-        };
-        let (size, role) = match spec {
-            EncoderUnitSpec::Input { output, .. } => (output, ParameterRole::Channels),
-            EncoderUnitSpec::Block { intermediate, .. } => {
-                (intermediate, ParameterRole::FeedForwardIntermediate)
-            }
-            EncoderUnitSpec::Downsample { output, groups, .. } => {
-                (output / groups, ParameterRole::Channels)
-            }
-        };
-        let group = ParameterGroupSpec::partitioned(&name, role, size as usize, members)?;
+    let layout = ExecutionUnitLayout::new(&graph, [declaration.units.len()])?;
+    let mut owned = Vec::with_capacity(declaration.units.len());
+    for unit in &declaration.units {
         owned.push(OwnedParameterGroupSpec::new(
             ParameterGroupOwner::execution_unit(
-                layout.group_id(0).expect("encoder group").clone(),
-                index,
+                layout.group_id(0).expect("declared group").clone(),
+                unit.unit.layer(),
             ),
-            group,
+            unit.group()?,
         ));
     }
     Ok(ArchitectureParameterDescription::from_owned(
         &graph, &layout, owned,
     )?)
 }
+
 impl<B: NeuralBackend> ComponentKernel<B> for EncoderKernel<B> {
     type Input<'a> = &'a B::Tensor;
     type Unit = EncoderUnit<B::Tensor>;
@@ -343,12 +256,11 @@ impl<B: NeuralBackend> ComponentKernel<B> for EncoderKernel<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<EncoderUnit<B::Tensor>, Error> {
         let index = address.index();
-        EncoderUnit::new_selected(
-            self.specs[index],
-            &self.prefix,
-            self.local_unit(index),
-            context,
-        )
+        let mut declaration = self.declaration.units[index].clone();
+        if let Some(local) = self.local_unit(index) {
+            declaration = declaration.local(local)?;
+        }
+        EncoderUnit::new(declaration, context)
     }
     fn executes_group(&self, _: usize, _: &EncoderForward) -> bool {
         true
@@ -430,7 +342,7 @@ impl<B: DistributedNeuralBackend> EncoderKernel<B> {
         )
         .map_err(|_| invalid("invalid encoder tensor rank"))?;
         let expected = eredu_runtime::derive_partitioned_local_layout(
-            &encoder_parameter_description(&self.config, &self.prefix)?,
+            &declared_parameters(&self.declaration)?,
             topology,
         )
         .map_err(|_| invalid("encoder tensor placement cannot be derived"))?;

@@ -33,11 +33,8 @@ impl SelectedTargetExecution {
         &self,
         mechanisms: &impl crate::PreparationMechanismProvider,
     ) -> Result<eredu_core::ParameterMaterializationWorkspace, String> {
-        crate::SelectedExecution::routed(self.selected.clone()).parameter_materialization_workspace(
-            self.plan.target.artifact.as_ref(),
-            None,
-            mechanisms,
-        )
+        crate::SelectedExecution::routed(self.selected.clone())
+            .parameter_materialization_workspace(self.plan.target.artifact.as_ref(), mechanisms)
     }
 
     /// Describes the complete selected state pair without payload reads or native

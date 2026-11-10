@@ -14,8 +14,11 @@ use eredu_runtime::{AppendStreamBinding, ReplicatedTextPhysicalSource, SelectedR
 /// at binding; the supplied source must match every admitted physical header.
 #[derive(Debug, Clone)]
 pub struct SafetensorsTargetPlan {
-    config: Config,
-    encoding: SafetensorsEncoding,
+    declaration: Arc<crate::qwen4_exp::Declaration>,
+    prediction: Option<SafetensorsPredictionPlan>,
+    parameters: Arc<TargetParameters>,
+    formats: ParameterFormats,
+    banks: BTreeMap<String, Arc<ParameterBankRecipes>>,
     catalog: HeaderCatalog,
     checkpoint: SafetensorsCheckpointPlan,
     resolution: ResolvedCheckpointPlan,
@@ -99,9 +102,10 @@ impl SafetensorsTargetPlan {
     /// All later validation consumes this one immutable catalog snapshot.
     pub fn prepare<C: SafetensorsCatalog + ?Sized>(
         catalog: &C,
-        config: Config,
+        declaration: Arc<crate::qwen4_exp::Declaration>,
         encoding: SafetensorsEncoding,
     ) -> Result<Self, PreparationError> {
+        let config = declaration.configuration();
         let mut headers = BTreeMap::new();
         for key in catalog.keys() {
             let metadata = catalog.metadata(&key).map_err(PreparationError::Contract)?;
@@ -123,13 +127,58 @@ impl SafetensorsTargetPlan {
                 ))
             })
             .collect::<Result<BTreeMap<_, _>, PreparationError>>()?;
-        let checkpoint = checkpoint::schema::safetensors_plan(&config, &encoding, &tables)
-            .map_err(PreparationError::Contract)?;
+        let parameters = declaration.target_parameters.clone();
+        let prediction_parameters = declaration.prediction_parameters.clone();
+        let checkpoint = checkpoint::schema::safetensors_plan(
+            &config,
+            &encoding,
+            &tables,
+            &parameters,
+            prediction_parameters.as_deref(),
+        )
+        .map_err(PreparationError::Contract)?;
         let resolution = resolve_safetensors_plan(&catalog, &checkpoint)
             .map_err(|error| PreparationError::Contract(format!("{error:?}")))?;
+        let keys = resolution.source_keys().iter().cloned().collect::<Vec<_>>();
+        let prediction = prediction_parameters
+            .map(|parameters| {
+                SafetensorsPredictionPlan::prepare_from_parameters(
+                    &catalog,
+                    config.clone(),
+                    encoding.clone(),
+                    parameters,
+                )
+            })
+            .transpose()?;
+        let target_keys = keys
+            .iter()
+            .filter(|key| !key.starts_with("mtp."))
+            .cloned()
+            .collect::<Vec<_>>();
+        let (mut formats, mut banks) = safetensors_formats_and_banks(
+            &catalog,
+            &target_keys,
+            &encoding,
+            parameters
+                .units
+                .iter()
+                .filter_map(|unit| unit.expert_bank()),
+        )?;
+        if let Some(prediction) = &prediction {
+            formats.0.extend(prediction.formats.0.clone());
+            formats.1.extend(prediction.formats.1.clone());
+            banks.extend(prediction.banks.clone());
+        }
+        let parameters = Arc::new(super::execution::target_parameters_from_formats(
+            &parameters,
+            &formats,
+        )?);
         Ok(Self {
-            config,
-            encoding,
+            parameters,
+            formats,
+            banks,
+            declaration,
+            prediction,
             catalog,
             checkpoint,
             resolution,
@@ -177,78 +226,37 @@ impl SafetensorsTargetPlan {
             .iter()
             .cloned()
             .collect::<Vec<_>>();
-        let roots = (0..self.config.layers.len())
-            .map(|l| format!("model.layers.{l}.mlp.experts"))
-            .chain(
-                (0..self
-                    .config
-                    .prediction
-                    .as_ref()
-                    .map_or(0, |p| p.layers.len()))
-                    .map(|d| format!("mtp.layers.{d}.mlp.experts")),
-            );
-        let (formats, recipes) =
-            safetensors_format_recipes(&self.catalog, &keys, &self.config, &self.encoding, roots)?;
-        let banks = recipes
-            .into_iter()
-            .map(|(root, recipes)| {
-                Ok((
-                    root,
-                    Arc::new(ParameterBankRecipes::new(
-                        &self.catalog,
-                        recipes,
-                        self.config.experts.count as usize,
-                    )?),
-                ))
-            })
-            .collect::<Result<_, PreparationError>>()?;
-        let mut static_recipes =
-            recipes::parameter_recipes(keys.clone(), &self.config, ParameterScope::Static)
-                .map_err(PreparationError::Contract)?;
+        let formats = self.formats.clone();
+        let banks = self.banks.clone();
+        let mut static_recipes = recipes::parameter_recipes(
+            keys.clone(),
+            self.declaration.configuration(),
+            ParameterScope::Static,
+        )
+        .map_err(PreparationError::Contract)?;
         static_recipes.retain(|name, _| {
             name.starts_with("model.embed_tokens.")
                 || name.starts_with("model.hyper_connection_mixer.")
                 || name.starts_with("lm_head.")
         });
-        let mut unit_recipes = Vec::new();
-        for layer in 0..self.config.layers.len() {
-            if self.tables.contains_key(&layer) {
-                unit_recipes.push(
-                    recipes::parameter_recipes(
-                        keys.clone(),
-                        &self.config,
-                        ParameterScope::Lexical(layer),
-                    )
-                    .map_err(PreparationError::Contract)?,
-                );
-            }
-            unit_recipes.push(
+        let unit_recipes = TargetInvocation::schedule(self.declaration.configuration())
+            .map(|invocation| {
                 recipes::parameter_recipes(
                     keys.clone(),
-                    &self.config,
-                    ParameterScope::Target(layer),
+                    self.declaration.configuration(),
+                    invocation.parameter_scope(),
                 )
-                .map_err(PreparationError::Contract)?,
-            );
-        }
+                .map_err(PreparationError::Contract)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let prediction = self
-            .config
             .prediction
-            .as_ref()
-            .map(|_| {
+            .clone()
+            .map(|prediction| {
                 if exact {
-                    SafetensorsPredictionPlan::prepare(
-                        &self.catalog,
-                        self.config.clone(),
-                        self.encoding.clone(),
-                        physical.clone(),
-                    )
+                    prediction.with_physical(physical.clone())
                 } else {
-                    SafetensorsPredictionPlan::prepare_metadata(
-                        &self.catalog,
-                        self.config.clone(),
-                        self.encoding.clone(),
-                    )
+                    Ok(prediction)
                 }
             })
             .transpose()?;
@@ -270,10 +278,10 @@ impl SafetensorsTargetPlan {
                 )
             })
             .collect();
+        let declaration = self.parameters.clone();
         let parameters = if exact {
             super::requirements::target_parameters(
-                &self.config,
-                &formats,
+                &declaration,
                 &self.catalog,
                 &physical,
                 &static_recipes,
@@ -289,7 +297,8 @@ impl SafetensorsTargetPlan {
             ),
         );
         Ok(TargetArtifactDeclaration {
-            config: self.config.clone(),
+            parameters: declaration,
+            config: self.declaration.configuration().clone(),
             formats,
             normalized,
             binding_keys: self.resolution.source_keys().clone(),
@@ -318,7 +327,11 @@ impl SafetensorsTargetPlan {
     }
     /// Distinct family geometry retained by this admission.
     pub fn configuration(&self) -> &Config {
-        &self.config
+        self.declaration.configuration()
+    }
+    /// Source declaration retained from configuration through complete header admission.
+    pub fn parameter_declaration(&self) -> &Arc<crate::qwen4_exp::Declaration> {
+        &self.declaration
     }
 
     /// Declares the integrated tower from this admission's exact tensor headers.
@@ -327,7 +340,7 @@ impl SafetensorsTargetPlan {
         &self,
         physical: BTreeMap<String, ReplicatedTextPhysicalSource>,
     ) -> Result<VisionPlan, PreparationError> {
-        VisionPlan::safetensors(&self.config, &self.catalog, physical)
+        VisionPlan::safetensors(self.declaration.configuration(), &self.catalog, physical)
     }
 
     /// Derives executable geometry from headers without reading hash constants,
@@ -340,33 +353,26 @@ impl SafetensorsTargetPlan {
         limits: TargetLimits,
         selected: Option<&SelectedRoutedTextRealization>,
     ) -> Result<TargetSpec, PreparationError> {
-        limits.validate_for_config(&self.config)?;
-        let keys = self
-            .resolution
-            .source_keys()
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        let roots = (0..self.config.layers.len()).map(|l| format!("model.layers.{l}.mlp.experts"));
-        let (formats, _) =
-            safetensors_format_recipes(&self.catalog, &keys, &self.config, &self.encoding, roots)?;
+        limits.validate_for_config(self.declaration.configuration())?;
         let mut rows = BTreeMap::new();
-        let mut ordinal = 0;
-        for layer in 0..self.config.layers.len() {
-            if let Some(table) = self.tables.get(&layer) {
+        for (ordinal, invocation) in
+            TargetInvocation::schedule(self.declaration.configuration()).enumerate()
+        {
+            if let TargetInvocation::Lexical { layer } = invocation {
+                let table = self.tables.get(&layer).ok_or_else(|| {
+                    PreparationError::Contract("missing declared lexical table".into())
+                })?;
                 rows.insert(
                     layer,
                     table.lookup_spec(rows.len() + 1, ordinal, limits.element)?,
                 );
-                ordinal += 1;
             }
-            ordinal += 1;
         }
-        Ok(super::execution::target_spec_from_formats(
-            self.config.clone(),
+        Ok(super::execution::target_spec_from_parameters(
+            self.declaration.configuration().clone(),
             &rows,
             limits,
-            &formats,
+            &self.parameters,
             selected,
         )?)
     }
@@ -390,51 +396,10 @@ impl SafetensorsTargetPlan {
         ),
         PreparationError,
     > {
-        let prediction = self
-            .config
-            .prediction
+        self.prediction
             .as_ref()
-            .ok_or(PreparationError::MissingPrediction)?;
-        let keys = self
-            .resolution
-            .source_keys()
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        let roots =
-            (0..prediction.layers.len()).map(|depth| format!("mtp.layers.{depth}.mlp.experts"));
-        let (formats, recipes) =
-            safetensors_format_recipes(&self.catalog, &keys, &self.config, &self.encoding, roots)?;
-        let banks = recipes
-            .into_iter()
-            .map(|(root, recipes)| {
-                Ok((
-                    root,
-                    Arc::new(ParameterBankRecipes::new(
-                        &self.catalog,
-                        recipes,
-                        self.config.experts.count as usize,
-                    )?),
-                ))
-            })
-            .collect::<Result<BTreeMap<_, _>, PreparationError>>()?;
-        let bank = eredu_runtime::RoutedBankId::new(u32::try_from(self.tables.len() + 1).map_err(
-            |_| PreparationError::Contract("prediction bank identity exceeds u32".into()),
-        )?);
-        let spec = PredictionSpec::from_prepared(
-            &self.config,
-            limits,
-            bank,
-            |depth| {
-                expert_spec(
-                    &self.config,
-                    &formats,
-                    &format!("mtp.layers.{depth}.mlp.experts"),
-                )
-            },
-            |name| formats.ordinary(name),
-        )?;
-        Ok((spec, formats, banks))
+            .ok_or(PreparationError::MissingPrediction)?
+            .parts(limits)
     }
 
     /// Declares compact row banks without readable sources. The returned contract

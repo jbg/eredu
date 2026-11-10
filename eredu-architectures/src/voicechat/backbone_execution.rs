@@ -192,7 +192,7 @@ impl<T: Tensor> BackboneInput<T> {
     /// Builds exact supplied-embedding ingress for the existing Nemotron pipeline.
     ///
     /// VoiceChat prompt and feedback IDs use I32 storage, so callers retain
-    /// `TargetBoundarySchema::from_args(args).with_signed_tokens()` in every
+    /// `TargetBoundarySchema::from_declaration(declaration).with_signed_tokens()` in every
     /// selected partition. A mismatched schema is rejected before layer execution.
     pub fn partition_input(
         &self,

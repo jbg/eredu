@@ -223,9 +223,9 @@ struct V3Source {
     tie_word_embeddings: bool,
 }
 
-/// Validated backend-neutral DeepSeek-V3/R1 text configuration.
+/// Geometry, equations and explicit storage policy for DeepSeek-V3/R1.
 #[derive(Debug, Clone)]
-pub struct V3Args {
+pub struct V3Policy {
     /// Canonical model type.
     pub model_type: String,
     /// Model hidden width.
@@ -284,6 +284,19 @@ pub struct V3Args {
     pub tie_word_embeddings: bool,
 }
 
+/// Validated V3/R1 policy and its immutable typed parameter authority.
+#[derive(Debug, Clone)]
+pub struct V3Args {
+    policy: V3Policy,
+    parameters: Option<std::sync::Arc<super::v3_declarations::Parameters>>,
+}
+impl std::ops::Deref for V3Args {
+    type Target = V3Policy;
+    fn deref(&self) -> &V3Policy {
+        &self.policy
+    }
+}
+
 impl V3Source {
     fn normalize(self) -> Result<V3Args, ConfigError> {
         let layer_count = usize::try_from(self.num_hidden_layers)
@@ -331,7 +344,7 @@ impl V3Source {
             }
             (None, None) => LinearFormat::Dense,
         };
-        let args = V3Args {
+        let policy = V3Policy {
             model_type: self.model_type,
             hidden_size: self.hidden_size,
             intermediate_size: self.intermediate_size,
@@ -361,17 +374,85 @@ impl V3Source {
             linear_formats: BTreeMap::new(),
             tie_word_embeddings: self.tie_word_embeddings,
         };
+        let mut args = V3Args {
+            policy,
+            parameters: None,
+        };
         args.validate()?;
         if self.topk_method != "noaux_tc" || self.scoring_func != "sigmoid" {
             return Err(invalid(
                 "requires topk_method=noaux_tc and scoring_func=sigmoid",
             ));
         }
+        args.parameters = Some(std::sync::Arc::new(
+            super::v3_declarations::Parameters::declare(&args)
+                .map_err(|error| invalid(error.to_string()))?,
+        ));
         Ok(args)
     }
 }
 
 impl V3Args {
+    pub(crate) fn parameters(&self) -> &super::v3_declarations::Parameters {
+        self.parameters
+            .as_deref()
+            .expect("V3 source boundary retains parameter scopes")
+    }
+    pub(crate) fn with_formats(
+        &self,
+        default: LinearFormat,
+        formats: BTreeMap<String, LinearFormat>,
+    ) -> Result<Self, ConfigError> {
+        if default == self.linear_format && formats == self.linear_formats {
+            return Ok(self.clone());
+        }
+        let mut selected = self.clone();
+        selected.policy.linear_format = default;
+        selected.policy.linear_formats = formats;
+        selected.validate()?;
+        selected.parameters = Some(std::sync::Arc::new(
+            self.parameters()
+                .with_formats(&selected)
+                .map_err(|e| invalid(e.to_string()))?,
+        ));
+        super::checkpoint::validate_v3_format_references(&selected)
+            .map_err(|e| invalid(e.to_string()))?;
+        Ok(selected)
+    }
+    pub(crate) fn with_local_geometry(
+        &self,
+        heads: i32,
+        dense: i32,
+        routed: i32,
+    ) -> Result<Self, ConfigError> {
+        if heads <= 0
+            || heads > self.num_attention_heads
+            || dense <= 0
+            || dense > self.intermediate_size
+            || routed <= 0
+            || routed > self.moe_intermediate_size
+        {
+            return Err(invalid("selected local geometry exceeds retained source"));
+        }
+        if heads == self.num_attention_heads
+            && dense == self.intermediate_size
+            && routed == self.moe_intermediate_size
+        {
+            return Ok(self.clone());
+        }
+        let mut local = self.clone();
+        local.policy.num_attention_heads = heads;
+        local.policy.intermediate_size = dense;
+        local.policy.moe_intermediate_size = routed;
+        local.validate()?;
+        local.parameters = Some(std::sync::Arc::new(
+            self.parameters()
+                .with_geometry(heads, dense, routed)
+                .map_err(|e| invalid(e.to_string()))?,
+        ));
+        Ok(local)
+    }
+
     /// Projects a complete checkpoint configuration onto its ordinary target decoder.
     ///
     /// The returned value deliberately excludes embedded prediction units while
@@ -379,8 +460,12 @@ impl V3Args {
     /// is used only after the complete artifact has passed admission; prediction
     /// parameters remain owned by the separately typed prediction extension.
     pub fn prediction_target(&self) -> Result<Self, ConfigError> {
+        if self.num_nextn_predict_layers == 0 {
+            return Ok(self.clone());
+        }
         let mut target = self.clone();
-        target.num_nextn_predict_layers = 0;
+        target.policy.num_nextn_predict_layers = 0;
+        target.parameters = Some(std::sync::Arc::new(self.parameters().target_only()));
         target.validate()?;
         Ok(target)
     }
@@ -432,6 +517,11 @@ impl V3Args {
             if value <= 0 {
                 return Err(invalid(format!("{name} must be positive, got {value}")));
             }
+        }
+        if self.layer_schedule.len() != self.num_hidden_layers as usize {
+            return Err(invalid(
+                "V3 target schedule length differs from num_hidden_layers",
+            ));
         }
         if self.qk_rope_head_dim % 2 != 0
             || self.q_lora_rank.is_some_and(|rank| rank <= 0)
@@ -706,10 +796,10 @@ struct V4Source {
     dspark_markov_rank: Option<i32>,
 }
 
-/// Validated backend-neutral DeepSeek-V4 architecture configuration.
+/// Geometry, equations and explicit storage policy for DeepSeek V4.
 #[derive(Debug, Clone)]
 #[allow(missing_docs)]
-pub struct V4Args {
+pub struct V4Policy {
     pub model_type: String,
     pub hidden_size: i32,
     pub moe_intermediate_size: i32,
@@ -751,6 +841,19 @@ pub struct V4Args {
     /// Ordered intermediate target layers retained for prediction conditioning.
     pub target_capture_policy: Option<V4TargetCapturePolicy>,
     pub dspark: Option<DsparkConfig>,
+}
+
+/// Validated V4 policy and its immutable target/prediction parameter authority.
+#[derive(Debug, Clone)]
+pub struct V4Args {
+    policy: V4Policy,
+    parameters: Option<std::sync::Arc<super::v4_declarations::Parameters>>,
+}
+impl std::ops::Deref for V4Args {
+    type Target = V4Policy;
+    fn deref(&self) -> &V4Policy {
+        &self.policy
+    }
 }
 
 impl V4Source {
@@ -828,7 +931,7 @@ impl V4Source {
             .then(|| eredu_nn::GatedProductPolicy::bounded_silu(self.swiglu_limit))
             .transpose()
             .map_err(|error| invalid_v4(error.to_string()))?;
-        let args = V4Args {
+        let policy = V4Policy {
             model_type: self.model_type,
             hidden_size: self.hidden_size,
             moe_intermediate_size: self.moe_intermediate_size,
@@ -869,29 +972,102 @@ impl V4Source {
             target_capture_policy,
             dspark,
         };
+        let mut args = V4Args {
+            policy,
+            parameters: None,
+        };
         args.validate()?;
         if self.scoring_func != "sqrtsoftplus" || self.topk_method != "noaux_tc" {
             return Err(invalid_v4(
                 "requires scoring_func=sqrtsoftplus and topk_method=noaux_tc",
             ));
         }
+        args.parameters = Some(std::sync::Arc::new(
+            super::v4_declarations::Parameters::declare(&args)
+                .map_err(|error| invalid_v4(error.to_string()))?,
+        ));
         Ok(args)
     }
 }
 
 impl V4Args {
+    pub(crate) fn parameters(&self) -> &super::v4_declarations::Parameters {
+        self.parameters
+            .as_deref()
+            .expect("V4 source boundary retains parameter scopes")
+    }
+    pub(crate) fn with_formats(
+        &self,
+        default: LinearFormat,
+        formats: BTreeMap<String, LinearFormat>,
+    ) -> Result<Self, ConfigError> {
+        if default == self.linear_format && formats == self.linear_formats {
+            return Ok(self.clone());
+        }
+        let mut selected = self.clone();
+        selected.policy.linear_format = default;
+        selected.policy.linear_formats = formats;
+        selected.validate()?;
+        selected.parameters = Some(std::sync::Arc::new(
+            self.parameters()
+                .with_formats(&selected)
+                .map_err(|e| invalid_v4(e.to_string()))?,
+        ));
+        super::checkpoint::validate_v4_format_references(&selected)
+            .map_err(|e| invalid_v4(e.to_string()))?;
+        Ok(selected)
+    }
+    pub(crate) fn with_local_geometry(
+        &self,
+        heads: i32,
+        groups: i32,
+        routed: i32,
+    ) -> Result<Self, ConfigError> {
+        if heads <= 0
+            || heads > self.num_attention_heads
+            || groups <= 0
+            || groups > self.o_groups
+            || routed <= 0
+            || routed > self.moe_intermediate_size
+        {
+            return Err(invalid_v4(
+                "selected local geometry exceeds retained source",
+            ));
+        }
+        if heads == self.num_attention_heads
+            && groups == self.o_groups
+            && routed == self.moe_intermediate_size
+        {
+            return Ok(self.clone());
+        }
+        let mut local = self.clone();
+        local.policy.num_attention_heads = heads;
+        local.policy.o_groups = groups;
+        local.policy.moe_intermediate_size = routed;
+        local.validate()?;
+        local.parameters = Some(std::sync::Arc::new(
+            self.parameters()
+                .with_geometry(heads, groups, routed)
+                .map_err(|e| invalid_v4(e.to_string()))?,
+        ));
+        Ok(local)
+    }
+
     /// Projects a complete checkpoint configuration onto its ordinary target decoder.
     ///
     /// Prediction-only local-attention entries and DSpark modules remain in the
     /// complete extension configuration. The typed target capture policy stays
     /// attached to the ordinary target so it emits the exact conditioning value.
     pub fn prediction_target(&self) -> Result<Self, ConfigError> {
+        if self.num_nextn_predict_layers == 0 {
+            return Ok(self.clone());
+        }
         let target_layers = usize::try_from(self.num_hidden_layers)
             .map_err(|_| invalid_v4("target layer count exceeds usize"))?;
         let mut target = self.clone();
-        target.num_nextn_predict_layers = 0;
-        target.dspark = None;
-        target.attention_schedule = LayerSchedule::new(
+        target.policy.num_nextn_predict_layers = 0;
+        target.policy.dspark = None;
+        target.policy.attention_schedule = LayerSchedule::new(
             target_layers,
             self.attention_schedule
                 .iter()
@@ -900,6 +1076,7 @@ impl V4Args {
                 .collect(),
         )
         .map_err(|error| invalid_v4(error.to_string()))?;
+        target.parameters = Some(std::sync::Arc::new(self.parameters().target_only()));
         target.validate()?;
         Ok(target)
     }
@@ -942,6 +1119,9 @@ impl V4Args {
                 "unsupported model_type {:?}",
                 self.model_type
             )));
+        }
+        if self.tie_word_embeddings {
+            return Err(invalid_v4("requires an independent output head"));
         }
         for (name, value) in [
             ("hidden_size", self.hidden_size),

@@ -13,7 +13,7 @@ use eredu_runtime::execution_control::{
 
 use eredu_nn::RetainedTensorRoots;
 
-use eredu_nn::{Index, PadMode, Parameter, ParameterSpec, Parameterized, Tensor};
+use eredu_nn::{Index, PadMode, Parameter, Parameterized, Tensor};
 
 use crate::Error;
 
@@ -345,23 +345,31 @@ pub struct StreamableConv1d<T: Tensor> {
 }
 
 impl<T: Tensor> StreamableConv1d<T> {
-    /// Declares unloaded parameters without allocating weight payloads.
-    pub fn unloaded(spec: Conv1dSpec, context: &T::Context) -> Result<Self, Error> {
+    /// Pairs explicitly declared parameter slots with independent causal carry.
+    pub fn new(
+        spec: Conv1dSpec,
+        weight: Parameter<T>,
+        bias: Option<Parameter<T>>,
+    ) -> Result<Self, Error> {
         let state = Conv1dState::new(spec)?;
+        if weight.as_ref().shape()
+            != [
+                spec.output_channels,
+                spec.kernel_size,
+                spec.input_channels / spec.groups,
+            ]
+            || bias.is_some() != spec.bias
+            || bias
+                .as_ref()
+                .is_some_and(|b| b.as_ref().shape() != [spec.output_channels])
+        {
+            return Err(invalid(
+                "streaming convolution slots disagree with declared geometry",
+            ));
+        }
         Ok(Self {
-            weight: parameter(
-                "weight",
-                &[
-                    spec.output_channels,
-                    spec.kernel_size,
-                    spec.input_channels / spec.groups,
-                ],
-                context,
-            )?,
-            bias: spec
-                .bias
-                .then(|| parameter("bias", &[spec.output_channels], context))
-                .transpose()?,
+            weight,
+            bias,
             state,
         })
     }
@@ -450,34 +458,41 @@ pub struct StreamableConvTranspose1d<T: Tensor> {
 }
 
 impl<T: Tensor> StreamableConvTranspose1d<T> {
-    /// Declares unloaded parameters without allocating weight payloads.
-    pub fn unloaded(spec: ConvTranspose1dSpec, context: &T::Context) -> Result<Self, Error> {
+    /// Pairs explicitly declared slots with independent overlap-add state.
+    pub fn new(
+        spec: ConvTranspose1dSpec,
+        weight: Parameter<T>,
+        bias: Option<Parameter<T>>,
+    ) -> Result<Self, Error> {
         validate_channels(spec.input_channels, spec.output_channels, spec.groups)?;
         if spec.stride <= 0 || spec.kernel_size < spec.stride {
             return Err(invalid(
                 "transposed convolution requires kernel >= positive stride",
             ));
         }
+        if weight.as_ref().shape()
+            != [
+                spec.output_channels,
+                spec.kernel_size,
+                spec.input_channels / spec.groups,
+            ]
+            || bias.is_some() != spec.bias
+            || bias
+                .as_ref()
+                .is_some_and(|b| b.as_ref().shape() != [spec.output_channels])
+        {
+            return Err(invalid(
+                "transposed convolution slots disagree with declared geometry",
+            ));
+        }
         Ok(Self {
-            weight: parameter(
-                "weight",
-                &[
-                    spec.output_channels,
-                    spec.kernel_size,
-                    spec.input_channels / spec.groups,
-                ],
-                context,
-            )?,
-            bias: spec
-                .bias
-                .then(|| parameter("bias", &[spec.output_channels], context))
-                .transpose()?,
+            weight,
+            bias,
             spec,
             carry: None,
             phase: StreamPhase::AcceptingInput,
         })
     }
-
     /// Current finite-stream lifecycle phase.
     pub const fn phase(&self) -> StreamPhase {
         self.phase
@@ -641,18 +656,6 @@ fn validate_input<T: Tensor>(input: &T, channels: i32) -> Result<(), Error> {
         ));
     }
     Ok(())
-}
-
-fn parameter<T: Tensor>(
-    name: &str,
-    shape: &[i32],
-    context: &T::Context,
-) -> Result<Parameter<T>, eredu_nn::Error> {
-    Parameter::unloaded(
-        ParameterSpec::trainable(name).expect("codec parameter names are non-empty"),
-        shape,
-        context,
-    )
 }
 
 fn empty_output<T: Tensor>(input: &T, channels: i32, context: &T::Context) -> Result<T, Error> {

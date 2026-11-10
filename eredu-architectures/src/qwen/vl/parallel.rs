@@ -8,7 +8,7 @@ use eredu_runtime::{
 
 use crate::qwen::{self, vision};
 
-use super::{prompt_cache_architecture_fingerprint, state_layout_with_key_value_heads, ModelArgs};
+use super::{prompt_cache_architecture_fingerprint, state_layout_with_text_state, ModelArgs};
 
 /// Complete local text, vision, vocabulary, media, and state geometry.
 #[derive(Debug, Clone)]
@@ -102,11 +102,12 @@ impl PartitionLocalGeometry {
 
     pub(super) fn validate_complete_geometry(
         &self,
-        args: &ModelArgs,
+        declaration: &super::Declaration,
         complete: &LocalGeometry,
     ) -> Result<(), ParallelPlanError> {
+        let args = declaration.args();
         self.validate_for(args)?;
-        complete.validate_for(args)?;
+        complete.validate_for(declaration)?;
         if self.complete_state_layout != complete.state_layout
             || self.merger_widths != complete.merger_widths
         {
@@ -294,7 +295,13 @@ impl LocalGeometry {
         &self.state_layout
     }
 
-    pub(super) fn validate_for(&self, args: &ModelArgs) -> Result<(), ParallelPlanError> {
+    pub(super) fn validate_for(
+        &self,
+        declaration: &super::Declaration,
+    ) -> Result<(), ParallelPlanError> {
+        let args = declaration.args();
+        self.text
+            .validate_with_declaration(&args.text, declaration.text_declaration().common())?;
         let text_layers = usize::try_from(args.text.num_hidden_layers)
             .map_err(|_| invalid("Qwen3-VL text layer count is negative"))?;
         if self.architecture_fingerprint != prompt_cache_architecture_fingerprint(args)
@@ -314,16 +321,9 @@ impl LocalGeometry {
         {
             return Err(invalid("Qwen3-VL local vision geometry is zero"));
         }
-        let expected = state_layout_with_key_value_heads(
-            args,
-            &self
-                .text
-                .blocks()
-                .iter()
-                .map(|block| block.num_key_value_heads)
-                .collect::<Vec<_>>(),
-        )
-        .map_err(|error| invalid(error.to_string()))?;
+        let expected =
+            state_layout_with_text_state(declaration.text_declaration(), self.text.state_layout())
+                .map_err(|error| invalid(error.to_string()))?;
         if expected != self.state_layout {
             return Err(invalid("Qwen3-VL local state geometry drifted"));
         }
@@ -333,23 +333,18 @@ impl LocalGeometry {
 
 /// Derives the complete local composite geometry exclusively from one plan.
 pub fn local_geometry(
-    args: &ModelArgs,
+    declaration: &super::Declaration,
     layout: &LocalModelLayout,
 ) -> Result<LocalGeometry, ParallelPlanError> {
-    let text = qwen::local_geometry(&args.text, layout)?;
+    let args = declaration.args();
+    let text = qwen::local_geometry(declaration.text_declaration(), layout)?;
     let vision_blocks = (0..args.vision.layer_count())
-        .map(|layer| vision::local_block_geometry(&args.vision, "model.visual", layer, layout))
+        .map(|layer| vision::local_block_geometry(declaration.vision_declaration(), layer, layout))
         .collect::<Result<Vec<_>, _>>()?;
-    let merger_widths = vision::local_merger_widths(&args.vision, "model.visual", layout)?;
-    let state_layout = state_layout_with_key_value_heads(
-        args,
-        &text
-            .blocks()
-            .iter()
-            .map(|block| block.num_key_value_heads)
-            .collect::<Vec<_>>(),
-    )
-    .map_err(|error| invalid(error.to_string()))?;
+    let merger_widths = vision::local_merger_widths(declaration.vision_declaration(), layout)?;
+    let state_layout =
+        state_layout_with_text_state(declaration.text_declaration(), text.state_layout())
+            .map_err(|error| invalid(error.to_string()))?;
     let geometry = LocalGeometry {
         text,
         vision_blocks,
@@ -357,7 +352,7 @@ pub fn local_geometry(
         state_layout,
         architecture_fingerprint: prompt_cache_architecture_fingerprint(args),
     };
-    geometry.validate_for(args)?;
+    geometry.validate_for(declaration)?;
     Ok(geometry)
 }
 
@@ -391,21 +386,27 @@ fn partition_ranges(
 
 /// Derives exact dense TP/PP-local Qwen3-VL composite geometry.
 pub fn partition_local_geometry(
-    args: &ModelArgs,
+    declaration: &super::Declaration,
     layout: &LocalModelLayout,
     group_ranges: impl IntoIterator<Item = (impl AsRef<str>, Range<usize>)>,
     ownership: &PartitionOwnership,
 ) -> Result<PartitionLocalGeometry, ParallelPlanError> {
+    let args = declaration.args();
     if args.text.is_moe() {
         return Err(invalid(
             "dense partition-local Qwen3-VL requires an explicit selected expert realization",
         ));
     }
     let (vision_units, text_units) = partition_ranges(group_ranges)?;
-    let complete = local_geometry(args, layout)?;
+    let complete = local_geometry(declaration, layout)?;
     let text = qwen::partition_local_geometry(
         &args.text,
-        qwen::dense_parameter_description(&args.text)?.invocations(),
+        declaration.text_declaration().common(),
+        qwen::parameter_description(
+            declaration.text_declaration(),
+            crate::decoder::ParameterEncoding::Stored,
+        )?
+        .invocations(),
         layout,
         text_units.clone(),
     )?;
@@ -422,22 +423,23 @@ pub fn partition_local_geometry(
 
 /// Derives exact routed TP/PP/EP-local Qwen3-VL geometry from routed-expert authority.
 pub fn partition_local_routed_geometry(
-    args: &ModelArgs,
+    declaration: &super::Declaration,
     layout: &LocalModelLayout,
     group_ranges: impl IntoIterator<Item = (impl AsRef<str>, Range<usize>)>,
     ownership: &PartitionOwnership,
     topology: eredu_core::ParallelRankTopology,
     realization: &crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
 ) -> Result<PartitionLocalGeometry, ParallelPlanError> {
+    let args = declaration.args();
     if !args.text.is_moe() {
         return Err(invalid(
             "routed partition-local Qwen3-VL requires Qwen3-VL-MoE",
         ));
     }
     let (vision_units, text_units) = partition_ranges(group_ranges)?;
-    let complete = local_geometry(args, layout)?;
+    let complete = local_geometry(declaration, layout)?;
     let text = qwen::partition_local_routed_geometry(
-        &args.text,
+        declaration.text_declaration(),
         layout,
         text_units.clone(),
         topology,

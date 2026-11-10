@@ -37,7 +37,6 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> ImageStatic<B> {
             .as_ref()
             .ok_or_else(|| Error::backend("the admitted diffusion artifact has no image tower"))?;
         vision.validate().map_err(Error::backend_source)?;
-        let key = "model.encoder.embed_vision.embedding_projection.weight";
         Ok(Self {
             config: vision.clone(),
             tower: tower
@@ -47,12 +46,13 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> ImageStatic<B> {
                 .transpose()?,
             projector: projector
                 .then(|| {
-                    ModalityProjector::new_at_with_format(
-                        &config.text,
-                        "model.encoder.embed_vision",
-                        vision.hidden_size,
-                        vision.rms_norm_eps,
-                        config.text.linear_format_for(key),
+                    ModalityProjector::new(
+                        config
+                            .vision_projector()
+                            .ok_or_else(|| {
+                                Error::backend("image tower has no declared projection")
+                            })?
+                            .clone(),
                         context,
                     )
                 })

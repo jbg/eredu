@@ -35,6 +35,23 @@ fn inferred_expert_pass<T: Tensor>(input: &T) -> ExpertPass {
     }
 }
 
+/// Dense or routed neural slots prepared before native materialization.
+#[derive(Clone, Debug)]
+pub enum FeedForwardParameters {
+    /// Ordinary dense gated projections.
+    Dense(eredu_nn::GatedProductSpec),
+    /// Global routing and selected local expert geometry.
+    Routed(eredu_nn::RoutedGatedProductSpec),
+}
+impl eredu_nn::DeclareLogicalParameters for FeedForwardParameters {
+    fn logical_parameters(&self) -> Result<Vec<eredu_nn::LogicalParameterDeclaration<'_>>, Error> {
+        match self {
+            Self::Dense(spec) => spec.logical_parameters(),
+            Self::Routed(spec) => spec.logical_parameters(),
+        }
+    }
+}
+
 /// Qwen3 top-k router and packed expert bank.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
@@ -55,16 +72,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedGatedPr
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        if !args.is_moe() {
-            return Err(Error::backend("routed Qwen block requires Qwen3-MoE args"));
-        }
-        let router = B::top_k_group_selector(selector_spec(args, layer)?, context)?;
-        let experts = B::grouped_gated_product(expert_bank_spec(args, layer)?, context)?;
-        Ok(Self {
-            layer,
-            router,
-            experts,
-        })
+        Self::from_spec(layer, routed_spec(args, layer)?, context)
     }
 
     /// Builds a partition-local bank while preserving the global router axis.
@@ -74,50 +82,70 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedGatedPr
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        if !global.is_moe() || !local.is_moe() {
+        if !local.is_moe() {
             return Err(Error::backend(
                 "partitioned routed Qwen construction requires Qwen3-MoE",
             ));
         }
-        let prefix = format!("{}.layers.{layer}.mlp", global.parameter_root);
-        let routing = global.routing_spec()?;
-        let router_name = format!("{prefix}.gate.weight");
-        let router = B::top_k_group_selector(
-            TopKGroupSelectorSpec::new(
-                global.hidden_size,
-                ParameterSpec::trainable(&router_name).map_err(Error::backend)?,
-                crate::linear_format::standard_linear_format(
-                    &router_name,
-                    global.weight_quantization_for(&router_name).into(),
-                )?,
-                routing,
-            )?,
+        Self::from_spec(
+            layer,
+            routed_spec(global, layer)?
+                .with_group_geometry(local.num_experts, local.moe_intermediate_size)?,
             context,
-        )?;
-        let experts = B::grouped_gated_product(
-            localized_expert_bank_spec(
-                global,
-                layer,
-                local.num_experts,
-                local.moe_intermediate_size,
-            )?,
-            context,
-        )?;
+        )
+    }
+
+    pub(crate) fn from_spec(
+        layer: usize,
+        spec: eredu_nn::RoutedGatedProductSpec,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        spec.validate()?;
         Ok(Self {
             layer,
-            router,
-            experts,
+            router: B::top_k_group_selector(spec.selector, context)?,
+            experts: B::grouped_gated_product(spec.experts, context)?,
         })
     }
 }
 
-pub(crate) fn selector_spec(
+pub(crate) fn execution_topology(
+    declaration: &super::Declaration,
+) -> Result<eredu_runtime::execution_topology::TextExecutionTopology, Error> {
+    let args = declaration.args();
+    if args.is_moe() {
+        crate::decoder::topology::text_with_scopes(args, declaration.common(), |layer| {
+            let spec = declaration.routed(layer)?;
+            eredu_runtime::execution_topology::FeedForwardTopology::from_grouped_specs(
+                &spec.selector,
+                &spec.experts,
+            )
+        })
+    } else {
+        declaration.common().execution_topology(args)
+    }
+}
+
+/// Declares the complete learned selector and packed bank for one routed invocation.
+pub(crate) fn routed_spec(
     args: &ModelArgs,
     layer: usize,
-) -> Result<TopKGroupSelectorSpec, Error> {
+) -> Result<eredu_nn::RoutedGatedProductSpec, Error> {
+    if !args.is_moe() {
+        return Err(Error::backend(
+            "routed Qwen declaration requires Qwen3-MoE args",
+        ));
+    }
+    args.validate().map_err(Error::backend_source)?;
+    let layers = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
+    if layer >= layers {
+        return Err(Error::backend(format!(
+            "Qwen expert layer {layer} is outside {layers} declared layers"
+        )));
+    }
     let prefix = format!("{}.layers.{layer}.mlp", args.parameter_root);
     let router_name = format!("{prefix}.gate.weight");
-    TopKGroupSelectorSpec::new(
+    let selector = TopKGroupSelectorSpec::new(
         args.hidden_size,
         ParameterSpec::trainable(&router_name).map_err(Error::backend)?,
         crate::linear_format::standard_linear_format(
@@ -125,30 +153,11 @@ pub(crate) fn selector_spec(
             args.weight_quantization_for(&router_name).into(),
         )?,
         args.routing_spec()?,
-    )
-}
-
-pub(crate) fn execution_topology(
-    args: &ModelArgs,
-) -> Result<eredu_runtime::execution_topology::TextExecutionTopology, Error> {
-    if args.is_moe() {
-        crate::decoder::topology::text_with_feed_forward(args, |layer| {
-            eredu_runtime::execution_topology::FeedForwardTopology::from_grouped_specs(
-                &selector_spec(args, layer)?,
-                &expert_bank_spec(args, layer)?,
-            )
-        })
-    } else {
-        crate::decoder::topology::text(args)
-    }
-}
-
-/// Returns the architecture-owned routed expert specification for one layer.
-pub fn expert_bank_spec(args: &ModelArgs, layer: usize) -> Result<GroupedGatedProductSpec, Error> {
+    )?;
     let experts_prefix = format!("{}.layers.{layer}.mlp.experts", args.parameter_root);
     let gate_up_name = format!("{experts_prefix}.gate_up_proj");
     let down_name = format!("{experts_prefix}.down_proj");
-    GroupedGatedProductSpec::new(
+    let experts = GroupedGatedProductSpec::new(
         args.num_experts,
         args.hidden_size,
         args.moe_intermediate_size,
@@ -159,87 +168,42 @@ pub fn expert_bank_spec(args: &ModelArgs, layer: usize) -> Result<GroupedGatedPr
                 &gate_up_name,
                 None,
                 args.weight_quantization_for(&gate_up_name).into(),
+                eredu_nn::LinearRowLayout::equal_partitions(2)?,
             )?,
             down: standard_expert_projection(
                 &down_name,
                 None,
                 args.weight_quantization_for(&down_name).into(),
+                eredu_nn::LinearRowLayout::Contiguous,
             )?,
         },
-    )
+    )?;
+    eredu_nn::RoutedGatedProductSpec::new(selector, experts)
 }
 
-/// Returns the architecture-owned routed expert specification at rank-local geometry.
-///
-/// Parameter identities, physical formats, and execution policy remain identical
-/// to the global bank; only placement-resolved cardinality and width are localized.
-pub(crate) fn localized_expert_bank_spec(
-    args: &ModelArgs,
-    layer: usize,
-    expert_count: i32,
-    intermediate_dimensions: i32,
-) -> Result<GroupedGatedProductSpec, Error> {
-    expert_bank_spec(args, layer)?.with_group_geometry(expert_count, intermediate_dimensions)
-}
-
-/// Derives complete expert ownership and rank-local bank geometry from Qwen.
-///
-/// The normalized architecture and its optional planner-derived geometry are
-/// the only inputs that may determine expert cardinality or localized width.
-pub fn expert_realization_plan<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>(
-    architecture: &super::RoutedLayeredModel<B>,
+/// Derives expert ownership and rank-local banks from validated neutral geometry.
+/// This operation requires no constructed modules or backend context.
+pub fn expert_realization_plan(
+    declaration: &super::Declaration,
+    geometry: Option<&super::LocalGeometry>,
     topology: eredu_core::ParallelRankTopology,
 ) -> Result<Option<crate::ExpertRealizationPlan<GroupedGatedProductSpec>>, Error> {
-    let args = architecture.kernel().args();
+    let args = declaration.args();
+    args.validate().map_err(Error::backend_source)?;
+    if let Some(geometry) = geometry {
+        geometry
+            .validate_with_declaration(args, declaration.common())
+            .map_err(Error::backend_source)?;
+    }
     if !args.is_moe() {
         return Ok(None);
     }
-    let global_experts = usize::try_from(args.num_experts).map_err(Error::backend)?;
-    let local_range = eredu_core::balanced_contiguous_range(
-        global_experts,
-        topology.expert_parallel_size(),
-        topology.expert_parallel_rank(),
-        false,
-    )
-    .map_err(Error::backend)?;
-    let local_experts = i32::try_from(local_range.len()).map_err(Error::backend)?;
-    let layers = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
-    let owner_group =
-        eredu_runtime::ExecutionGroupId::new("text_decoder").map_err(Error::backend)?;
-    let mut unit_specs = BTreeMap::new();
-    for layer in 0..layers {
-        let local_args = architecture
-            .kernel()
-            .parallel_geometry()
-            .and_then(|geometry| geometry.block(layer))
-            .unwrap_or(args);
-        unit_specs.insert(
-            (owner_group.clone(), layer),
-            localized_expert_bank_spec(
-                args,
-                layer,
-                local_experts,
-                local_args.moe_intermediate_size,
-            )?,
-        );
-    }
-    crate::ExpertRealizationPlan::balanced(global_experts, topology, unit_specs)
-        .map(Some)
-        .map_err(Error::backend)
-}
-
-/// Derives exact TP×EP-local expert geometry before native construction.
-pub fn partition_expert_realization_plan(
-    args: &ModelArgs,
-    layout: &eredu_runtime::LocalModelLayout,
-    topology: eredu_core::ParallelRankTopology,
-) -> Result<crate::ExpertRealizationPlan<GroupedGatedProductSpec>, Error> {
-    if !args.is_moe() {
-        return Err(Error::backend(
-            "partitioned expert planning requires routed Qwen geometry",
-        ));
-    }
-    let global_experts = usize::try_from(args.num_experts).map_err(Error::backend)?;
+    let banks = declaration.expert_banks()?;
+    let global_experts = banks
+        .values()
+        .next()
+        .ok_or_else(|| Error::backend("routed Qwen has no declared expert banks"))?
+        .group_count() as usize;
     let local_experts = i32::try_from(
         eredu_core::balanced_contiguous_range(
             global_experts,
@@ -251,43 +215,23 @@ pub fn partition_expert_realization_plan(
         .len(),
     )
     .map_err(Error::backend)?;
-    let layers = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
     let owner_group =
-        eredu_runtime::ExecutionGroupId::new("text_decoder").map_err(Error::backend)?;
-    let unit_specs = (0..layers)
-        .map(|layer| {
-            let local =
-                super::parallel::local_block_args(args, layer, layout).map_err(Error::backend)?;
-            localized_expert_bank_spec(args, layer, local_experts, local.moe_intermediate_size)
+        eredu_runtime::ExecutionGroupId::new(crate::decoder::TEXT_DECODER_EXECUTION_GROUP)
+            .map_err(Error::backend)?;
+    let unit_specs = banks
+        .into_iter()
+        .map(|(layer, bank)| {
+            let width = geometry
+                .and_then(|geometry| geometry.block(layer))
+                .map_or(bank.intermediate_dimensions(), |local| {
+                    local.moe_intermediate_size
+                });
+            bank.with_group_geometry(local_experts, width)
                 .map(|spec| ((owner_group.clone(), layer), spec))
         })
         .collect::<Result<BTreeMap<_, _>, _>>()?;
     crate::ExpertRealizationPlan::balanced(global_experts, topology, unit_specs)
-        .map_err(Error::backend)
-}
-
-/// Derives the complete replicated expert plan before architecture construction.
-pub fn replicated_expert_realization_plan(
-    args: &ModelArgs,
-) -> Result<crate::ExpertRealizationPlan<GroupedGatedProductSpec>, Error> {
-    if !args.is_moe() {
-        return Err(Error::backend(
-            "replicated expert planning requires a routed Qwen configuration",
-        ));
-    }
-    let global_experts = usize::try_from(args.num_experts).map_err(Error::backend)?;
-    let layers = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
-    let owner_group =
-        eredu_runtime::ExecutionGroupId::new("text_decoder").map_err(Error::backend)?;
-    let unit_specs = (0..layers)
-        .map(|layer| expert_bank_spec(args, layer).map(|spec| ((owner_group.clone(), layer), spec)))
-        .collect::<Result<BTreeMap<_, _>, _>>()?;
-    let topology = eredu_core::ParallelRankTopology::new(
-        eredu_core::ParallelTopology::new(1, 1, 1, 1).map_err(Error::backend)?,
-        0,
-    )
-    .map_err(Error::backend)?;
-    crate::ExpertRealizationPlan::balanced(global_experts, topology, unit_specs)
+        .map(Some)
         .map_err(Error::backend)
 }
 
@@ -660,5 +604,38 @@ impl ModelArgs {
             GroupScoring::Softmax,
             self.norm_topk_prob,
         )
+    }
+}
+
+impl FeedForwardParameters {
+    pub(crate) fn prepare(
+        global: &ModelArgs,
+        local: &ModelArgs,
+        _layer: usize,
+        dense: Option<&eredu_nn::GatedProductSpec>,
+        retained: Option<&Self>,
+    ) -> Result<Self, Error> {
+        if let Some(parameters) = retained {
+            return match (global.is_moe(), parameters) {
+                (true, Self::Routed(spec)) => Ok(Self::Routed(
+                    spec.clone()
+                        .with_group_geometry(local.num_experts, local.moe_intermediate_size)?,
+                )),
+                (false, Self::Dense(spec)) => Ok(Self::Dense(
+                    spec.with_intermediate_dimensions(local.intermediate_size)?,
+                )),
+                _ => Err(Error::backend(
+                    "Qwen projection declaration changes its equation",
+                )),
+            };
+        }
+        if global.is_moe() {
+            return Err(Error::backend(
+                "routed Qwen requires retained projection declarations",
+            ));
+        }
+        Ok(Self::Dense(dense.cloned().ok_or_else(|| {
+            Error::backend("dense Qwen requires retained feed-forward slots")
+        })?))
     }
 }

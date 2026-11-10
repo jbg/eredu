@@ -285,6 +285,7 @@ pub enum PreparationSelectionError {
 }
 
 struct ExecutionClassSelection<'a, P> {
+    inspection: &'a ArtifactInspection<ArtifactArchitecturePlan>,
     request: &'a NormalizedLoadRequest,
     admitted_session: SessionCapabilities,
     processor: Option<SelectedProcessorExecution>,
@@ -318,8 +319,13 @@ where
         let capabilities = self
             .mechanisms
             .replicated_text_capabilities(&requirements, &request);
-        eredu_runtime::select_replicated_text_realization(&requirements, &request, &capabilities)
-            .map_err(Into::into)
+        let selected = eredu_runtime::select_replicated_text_realization(
+            &requirements,
+            &request,
+            &capabilities,
+        )?;
+        crate::replicated_text::retain_executable_component(self.inspection, selected)
+            .map_err(PreparationSelectionError::ExecutionClass)
     }
 
     fn routed(self, requirements: RoutedTextRequirements) -> Result<Self::Routed, Self::Error> {
@@ -329,7 +335,11 @@ where
         let capabilities = self
             .mechanisms
             .replicated_text_capabilities(requirements.text(), request.text());
-        select_routed_text_realization(&requirements, &request, &capabilities).map_err(Into::into)
+        let mut selected = select_routed_text_realization(&requirements, &request, &capabilities)?;
+        selected.text =
+            crate::replicated_text::retain_executable_component(self.inspection, selected.text)
+                .map_err(PreparationSelectionError::ExecutionClass)?;
+        Ok(selected)
     }
 
     fn composite(
@@ -576,6 +586,7 @@ where
             .map_err(|error| PreparationSelectionError::Prediction(error.into()))?;
     }
     let base = ExecutionClassSelection {
+        inspection: execution_inspection,
         request,
         admitted_session: admission.session_capabilities(),
         processor,
@@ -634,6 +645,25 @@ where
             SelectedExecution::ordinary(selected)
         }
     };
+    if let Some(extension) = prediction_extension.as_ref() {
+        let rank = request.parallel_topology().unwrap_or(
+            eredu_core::ParallelRankTopology::new(
+                eredu_core::ParallelTopology::new(1, 1, 1, 1).map_err(prediction_error)?,
+                0,
+            )
+            .map_err(prediction_error)?,
+        );
+        execution.prediction_parameters = Some(std::sync::Arc::new(
+            crate::prediction_extension::SelectedPredictionParameters::new(
+                extension,
+                execution
+                    .text_realization()
+                    .auxiliary_materialization_tasks(),
+                rank,
+            )
+            .map_err(prediction_error)?,
+        ));
+    }
     execution.input_score_attention_workspace = mechanisms.input_score_attention_workspace();
     Ok(SelectedPreparation::new(
         inspection.admission_token(),

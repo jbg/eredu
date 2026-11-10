@@ -130,14 +130,20 @@ to F32. The largest 14B vocabulary projection requires 2,684,354,560 decoded byt
 the selected reader allocation bound covers that matrix rather than the complete
 model. Prepared binding and layer residency use the ordinary native mechanisms.
 
-`eredu-nn::low_rank::LowRankProjection` retains its down/up parameters independently
-of a base affine operator. Invocation owners borrow it explicitly. TP shards its
-input matrix and reduces rank activations before applying the replicated output
-matrix. The shared decoder composes this delta before the ordinary attention
-residual and restores the base output precision after the sum. Family-owned cold
-topology puts optional Nemotron draft matrices in their corresponding text-layer
-residency units. Its pipeline boundary carries immutable invocation semantics and
-the original canonical prefix position alongside the complete activation span.
+`eredu-nn::low_rank::LowRankProjectionSpec` declares both dense bias-free affines,
+their common rank and finite output multiplier. It validates geometry, identities
+and sharing before native allocation. `LowRankProjection` constructs those exact
+slots independently of a base affine operator. Invocation owners borrow it
+explicitly. TP shards its input matrix and reduces rank activations before applying
+the replicated output matrix. The shared decoder composes this delta before the
+ordinary attention residual and restores the base output precision after the sum. Nemotron's
+`DraftAdapterLayerSpec` supplies geometry, identities and ownership to
+source admission, construction, partitioning, discovery, memory sizing and
+collective sizing. Source aliases and floating dtype constraints remain explicit
+format extensions. Its cold topology puts optional draft matrices in their
+corresponding text-layer residency units. Its pipeline boundary carries immutable
+invocation semantics and the original canonical prefix position alongside the
+complete activation span.
 
 The MLX masked numerical mechanism uses fixed-canvas host score copies and float64
 noise arithmetic with an explicit 53-bit proposal stream. These temporary host
@@ -233,8 +239,22 @@ rotary-frequency tables use this role when the equation derives frequencies from
 the admitted configuration. GGUF tokenizer reconstruction selects explicit BPE
 merges when present, with the declared whitespace and byte-fallback policy;
 score-based Unigram vocabularies retain their own mechanism.
+
+GGUF logical layouts retain conversion-owned companion kinds and exact primary
+output identities. Name translation projects both identities from one conversion
+catalog, including companions whose canonical names have no conventional suffix.
+Architecture preparation consumes these bindings alongside SafeTensors schema
+bindings and construction-owned fused-output references. Parameter finalization
+requires an explicit companion binding and an existing non-companion primary;
+it does not reconstruct ownership from output names.
+
 `eredu-checkpoint::expert` assembles selected expert banks and their encoded
-companions together; stacking and concatenation preserve every scale and bias.
+companions together; stacking and concatenation preserve scales, affine biases
+and global multipliers. Leading expert-axis selections apply to the companions
+with the same bounded range or indices. NVFP4 byte and word views preserve the
+encoded payload. Family extensions select physical aliases and reference the
+construction-declared target identities. Qwen3-Next fused inputs share their
+scalar global-scale sources across the declared split projections.
 
 Cold invocation topology describes additive feed-forward branches and optional
 whole-canvas feedback projections. Format selection visits every projection.
@@ -250,10 +270,24 @@ parameter identities, linear formats, local geometry, normalization epsilon,
 gate activation and intermediate-rounding policy. Qwen3-Next/Qwen3.5 construction
 translates its configuration and checkpoint naming once into these specs, including
 rank-local and prediction
-construction. The reusable equations do not inspect family configuration.
+construction. The reusable equations do not inspect family configuration. `SharedRoutedGatedProductParameters`
+composes the neutral `RoutedGatedProductSpec` selector/bank scope with a
+`SplitGatedProductSpec` shared branch and its separate scalar output gate.
+The neural routed scope validates selector/bank connectivity and global routing
+cardinality; the architecture scope validates shared-branch and gate geometry.
+`SharedRoutedGatedProductSpec` adds independent invocation layer and bank coordinates.
+Cold consumers build parameters without fabricating residency-provider coordinates.
 
-`GatedDeltaStateGeometry` owns the exact convolution-history and FP32 recurrent
-matrix policies. Existing Qwen state construction and Flash-Next recurrent specs
+`eredu-nn::GatedDeltaHeadGeometry` owns checked key/value head counts, per-head
+widths and integral value-head expansion. Individual projection widths are checked
+at construction; fused Q/K/V width and component-major ranges are checked when
+requested. Shared gated-delta construction, source extensions, TP localization,
+state geometry and discovery project these axes. KDA uses the same head contract
+with its equal-head/equal-width constraint and three separate histories; its
+separate projections do not require a representable fused QKV width. The contract
+establishes no scan equation, state owner, hook or backend capability.
+`GatedDeltaStateGeometry` combines those checked axes with convolution taps and
+dilation to own the exact history and FP32 recurrent matrix policies. Existing Qwen state construction and Flash-Next recurrent specs
 consume it, including rank-local heads, dilation and history-free one-tap kernels.
 Flash-Next's recurrent and feed-forward sublayers compose those shared mechanisms
 with learned gated residual ingress/injection. Parameter identities and retained
@@ -317,6 +351,527 @@ sharing their value layout does not change the latter's equations. Architecture
 code continues to own parameter names, learned-offset normalization choices,
 module invocation order, discovery, and pipeline contracts. Family registration
 and prepared construction remain architecture-owned.
+
+`eredu-nn::DeclareLogicalParameters` projects logical identities, exact checked
+geometry, sharing metadata and neural roles from typed construction specs.
+Linear, embedding, normalization, selector and grouped-bank specs expose this
+projection without constructing tensors. Physical encoding companions remain
+explicit `LinearFormatSpec` extensions. `DeclareGroupedParameters` projects one
+addressable member from the same grouped geometry, retaining singleton packed
+axes or independently named expert slots. Routed catalog validation derives both
+required identities and shapes from this projection and the shared encoding
+expansion, including global scales and independent row-block origins. Invalid
+member indices and undeclared catalog targets are rejected before allocation.
+Primary declarations borrow their exact
+construction-owned extension through `LogicalParameterDeclaration::linear_format`.
+Collected declaration vectors implement the same visitor while retaining these
+borrowed references. Consumers can compose exact subsets of a construction scope.
+Roles and shape do not infer an encoding. Runtime placement consumes these
+declarations through `ParameterMemberSpec::from_logical_declaration`; semantic
+partition axes, fused segments and ownership remain architecture-authored.
+Logical members retain exact typed scale, affine-bias and global-scale identities
+without expanding physical storage. Prepared derived outputs use these references
+for companion roles and primary bindings; unresolved or conflicting references
+are rejected before materialization. Companion geometry comes from storage
+expansion or admitted recipe metadata, independently of scalar logical geometry.
+`ParameterMemberSpec` retains the complete construction-owned `LinearFormatSpec`,
+including companion identities and independent row-block origins. Logical and
+physical consumers borrow that same extension. The runtime's
+`expand_linear_format_parameter` projects primary and companion storage geometry;
+prepared admission uses it to check companion shapes, including FP8 row tails and
+NVFP4 global-scale partitions. A scalar companion has an empty shape and remains
+distinct from a reference whose storage geometry is unresolved. Sharing compares
+physical encoding and row layout without conflating invocation arithmetic policy.
+GGUF preparation joins translated source identities to these retained logical
+shapes and encoding references. Packed linear storage preserves its physical
+geometry independently of logical dimensions. Raw tensor shape changes require
+an explicit architecture source recipe whose inferred output matches the declared
+slot; unresolved identities and incompatible recipe geometry reject before allocation.
+Prepared parameter ownership projects the same `ArchitectureParameterDescription`
+through `ReplicatedTextParameterOwner::from_parameter_group_owner`. Shared static
+groups retain their canonical storage role; pinned unit consumers retain their
+explicit consumer addresses. Physical execution-unit owners remain distinct from
+logical invocation consumers and mutable state. Source-only split and fused
+layouts inherit storage from their declared recipe outputs. Missing owners and
+conflicting source ownership reject during preparation. Parameter names and
+primary embedding roles do not choose storage owners.
+Complete recipe preparation follows the retained invocation layout, including
+prediction units. Target and predictor source views keep their separate admission
+and materialization scopes. Shared-backbone adapter and media parameter scopes
+participate in the same ownership projection.
+Prepared text admission obtains the canonical token table's identity, exact logical
+shape and tied-readout decision from the validated static construction used by
+materialization. Additional media, position and per-layer tables retain their
+separate declared roles. SafeTensors and GGUF preparation consume the retained
+logical embedding geometry, independently of its packed physical shape. Optional
+redundant tied-head sources retain their format-specific admission obligations;
+execution uses the declared embedding owner. DeepSeek V4 requires its independent
+output head and rejects a contradictory tied-embedding configuration before
+checkpoint preparation or backend allocation.
+SafeTensors matrix constraints retain the encoding projected from the construction
+slot or its explicit source-format extension. Raw tensors and encoding companions
+carry no inferred matrix format. Llama, Gemma 2, Qwen and GPT-OSS ordinary admission
+select matrix storage through retained construction encoding references. Tensor
+rank does not select quantization or GGUF operation class. Nanbeige consumes the
+same ordinary decoder admission projection. Qwen and GPT-OSS SafeTensors router
+storage remains floating through explicit selector identity references. Qwen's
+optional redundant tied head retains an independent source encoding while execution
+shares the embedding owner. `eredu-checkpoint::schema::matrix_for_packed_words`
+owns shared U32 word, scale and affine-bias geometry for source layouts; Llama,
+LFM2 and Kimi retain their published dtype and alias rules around that projection.
+`WeightQuantization::packed_word_geometry` supplies checked word and group extents
+for source schemas, bounded quantization output sizing and runtime parameter
+expansion. Source schemas and writers retain their 32-column alignment rule;
+runtime expansion retains its own sharding and encoding alignment. Moshi external
+configuration consumes the same projection and enforces its signed-i32 intermediate
+limit before construction. No temporary parameter identity is needed for validation.
+Encoding-specific global scales and byte layouts remain explicit format extensions.
+Prepared source bindings consume those constraints; derived neural outputs consume
+their declared construction encoding. Floating
+routers and physical scale/bias companions therefore retain their declared dense
+semantics under a family-wide quantization request. Independent expert sources,
+interleaved floating projections and released packed blocks retain explicit source
+encodings. Kimi Linear and Nemotron-H retain their family-owned physical layouts,
+aliases, packing constraints and companion dtype rules as source extensions.
+Directly renamed source-only companions remain provenance of their canonical
+output; they do not create another executable companion. Independently declared
+component companions retain their storage identities.
+Conversion eligibility projects from the same typed matrix and bank identities.
+GPT-OSS declares its expert bank weights native-only while ordinary matrices retain
+their selected conversion outputs. LFM2 and Nemotron-H target routers reuse the
+family's floating-storage policy in conversion admission. Physical aliases resolve
+to canonical parameter identities before this policy is projected; prediction
+routers retain their separately admitted encodings. Admission and derived source
+aliases consume the declared conversion policy directly; source names do not
+establish expert transform eligibility.
+Gemma 4, Muse and Qwen3-VL media conversion alignment references declared vision
+and audio execution groups and pinned storage roles, including shared static
+consumers. Their linear parameters retain native storage when the input extent
+fails the component's 32-element alignment or the selected format's grouping.
+Text owners and non-linear parameters do not acquire that media conversion policy.
+Derived materialization resolves both existing and newly produced parameter slots
+through the retained declaration's logical geometry. Dense and raw recipe outputs
+match that geometry; logical F4 views retain declared value dimensions. Format
+companions use the retained encoding projection; source-only companion extensions
+retain their declared recipe geometry. Source-only aliases retain their admitted
+logical geometry.
+Renamed aliases resolve the target declaration through the same shape projection.
+Packed widths do not establish a second logical shape for a declared slot.
+Prepared primary bindings retain the construction encoding spec alongside logical
+geometry. Canonical packed-word and GGUF byte-row recipe outputs use runtime's
+encoding projection. Source-only matrices retain checkpoint format extensions;
+ModelOpt NVFP4 bytes use their explicit source layout rather than the canonical
+word layout. Floating recipe values retain logical dimensions. Incompatible byte
+rows, packed words or floating output geometry reject before backend allocation.
+
+Checkpoint resolution retains each admitted layout variant by its group identity.
+Prepared consumers use that retained choice, including through restricted source
+projections. Alternatives with identical physical tensor identities can differ in
+shape or encoding; admission selects one only when its complete constraints match
+uniquely. Ambiguous matches, malformed catalogs, partial variants, conflicting
+aliases and coexisting name-distinct layouts reject. This admits Qwen3-Next's
+published vector and matrix shared-expert gate layouts without guessing from a
+shared tensor name. Retained layout choices grant no additional source authority.
+
+`logical_parameter_members` supplies the logical projection visitor;
+`logical_parameter_group` expands retained formats and companions using caller-defined
+partition domains and per-member sharding, with runtime storage-alignment rules. Stored
+members retain complete `ParameterMetadata` from construction declarations through
+primary and companion encoding expansion, including typed sharing and companion
+references, atomic groups, default trainability and storage preferences. Raw placement
+members carry no inferred construction metadata. Group validation rejects a target
+whose retained metadata declares a different identity. Companion ownership is a
+`ParameterId` reference. Atomic groups reject incomplete companion metadata,
+references outside the group, references to another companion and repeated roles
+for one primary. Partition task projection consumes this validated ownership.
+Exact partition binding comparison includes this metadata independently of member order. Group projection uses
+`validate_logical_parameter_scope` to validate
+local geometry and identities while preserving references to authoritative slots
+in other groups. Complete preparation resolves those references; a parameter
+group alone does not establish that an external sharing target exists. Packed gated-product and ReLU-squared banks supply their typed logical
+declarations to these projections. `ArchitectureParameterDescription` rejects unresolved targets,
+indirect aliases and incompatible storage geometry before allocation. Logical
+sharing does not establish native backing identity or remove materialized
+replicas from resource accounting.
+Discovery projects ordinary affine identities, biases and authoritative sharing
+through `declared_component_read` and typed transform references through
+`declared_transform_parameter`. Vocabulary graph boundaries project the validated
+static construction's token table, readout, logical dimensions and learned final gain.
+Repeated Nanbeige discovery projects sharing from the ordinary typed static and
+logical block declarations. Aggregate module prefixes do not invent weight tensor
+identities: their declared members determine the common owner, with explicit child
+groups retaining independently owned boundaries. Complete logical topology and
+owner-group references validate before the sharing projection is published.
+Execution-pass grouping remains independent of parameter sharing and mutable state.
+
+Qwen hybrid target and prediction readout descriptions consume that same
+construction; prediction fusion and normalization remain separately declared
+parameters with explicit invocation scopes. Tying and authoritative sharing come
+from the retained slots, independently of hook support. Families supply component
+roles, ownership groups, row mappings, input stages and hook paths explicitly. Kimi KDA convolution records
+reference each declared kernel and its own channels, taps and activation; recurrent
+coefficients reference their construction slots directly. Gemma 4, Inkling, Muse,
+DeepSeek V4, K2 Horizon and Nemotron use the same affine-read projection; published
+KV-state references and source-dependent normalization stages remain explicit.
+The shared transform-parameter projection consumes exact construction slots for
+Muse compressed projections and residual coefficients, Inkling convolutions,
+relative projections and branch scales, and Gemma residual scales. It projects
+identity and authoritative sharing into explicit family parameter groups without
+establishing execution hooks or intervention support.
+Ordinary decoder discovery consumes the attention, gated feed-forward and block
+normalization construction specs. Exact declared slots supply read and write
+identities, biases and sharing, while output-projection input geometry supplies
+component widths. Family equations retain fused row offsets and grouped-query
+mapping. Repeated invocation aliases come from the construction slots; routed
+attention values have no ordinary value-projection read. Cache policies project
+the complete `AttentionHeadGeometry` supplied by those construction scopes;
+selected grouped-query ranges preserve complete query-to-KV groups. The retained
+invocation schedule supplies attention windows and independent cache owners,
+including repeated layers and provider-supplied values. Moshi temporal/depth and
+VoiceChat causal speech cache projections use their selected construction scopes.
+Low-rank component input stages project declared affine identity, sharing and
+bias through `declared_input_projection`. Families retain explicit slices,
+normalizations and execution boundaries for Kimi recurrent controls and MLA,
+DeepSeek V3 MLA, and DeepSeek V4 query stages. Nemotron attention and dense
+component reads use direct references to their construction projections.
+Nemotron `AttentionParameters` declares the complete unpositioned attention scope:
+query and KV heads, head dimensions, arithmetic, and all four affine slots. Native
+construction, SafeTensors and GGUF admission, parameter placement and discovery
+consume that declaration. VoiceChat's backbone storage extensions reference the
+same slots. Complete logical validation precedes backend allocation, and the
+scheduled attention invocation supplies its independently validated window.
+Target and prediction cache shapes project the same attention declaration;
+partition admission compares that exact state policy with retained state.
+The generic neural `UnaryFeedForwardSpec` declares an affine read, a resolved
+`UnaryActivation`, and an affine write, validating intermediate connectivity and
+parameter references. Its output width remains independent of its input width;
+family residual declarations validate their own coupling. Pointwise execution
+uses the same neutral activation contract without introducing fused arithmetic.
+Nemotron `DenseParameters` composes this scope for dense and shared branches,
+requiring ReLU-squared, equal residual widths, and the exact-zero input hint on
+the down projection. Sparse declarations validate the selector, routed bank and
+shared branch's input/output coupling before allocation, independently of local
+expert count and shared intermediate width. Construction, checkpoint catalogs,
+parameter placement, local-width resolution and discovery consume these same
+slots. VoiceChat backbone extensions project their released and split aliases
+from the same scope. Native dense modules retain the declared activation without
+adding it to parameter bindings; routed providers and explicit hooks retain their
+separate contracts.
+Ordinary decoder `AttentionParameters` owns checked `AttentionHeadGeometry`,
+split Q/K with an optional owned value affine or a component-major fused QKV
+projection, an optional separate output gate, and the attended-value output
+projection. Fused declarations retain the exact `FusedProjectionLayout` used by
+construction, partition segments and component row mappings. All slots validate
+against the head and residual geometry before allocation. Provider-owned values
+have no ordinary value slot. Construction, checkpoint admission, transform
+eligibility, cold topology, placement alignment, rank-local head resolution and
+discovery consume this scope directly. Q/K normalization and sink factories use
+its head geometry. Moshi temporal/depth declarations retain this scope and enforce
+fused multi-head attention; VoiceChat TTS format extensions reference its typed
+split slots. Repeated invocation ownership, mutable state, provider equations,
+normalization arithmetic and hook capabilities remain explicit contracts.
+VoiceChat transformer storage extensions resolve against the selected causal or
+character declaration. Encoded formats require a declared affine matrix; explicit
+dense entries may reference its other declared slots. Unknown identities and
+encoded non-affine slots reject before allocation. Artifact preparation visits
+only that stack's parameter owners when projecting component formats, excluding
+neighboring TTS parameters. Storage projection retains arithmetic and exact-zero
+policy, then applies the separately selected speech compute precision.
+`eredu-nn::GatedProductSpec` retains either a split neural scope or a
+`FusedGatedProductSpec`, including the resolved gated policy. Fused declarations
+validate equal gate/value component widths against the down projection and derive
+the exact `FusedProjectionLayout` consumed by execution. Ordinary decoder
+construction, logical traversal, cold topology, placement and discovery consume
+this declaration directly. K2 routed blocks explicitly omit the ordinary dense
+scope; VoiceChat TTS storage aliases reference its named split slots. Moshi temporal
+and depth declarations retain the fused neural scope alongside independent
+invocation and normalization ownership. Parameter sharing resolves in the enclosing
+logical topology, so repeated invocations do not create additional storage owners.
+`eredu-nn::SplitGatedProductSpec` owns generic split gate/up/down connectivity,
+logical parameter traversal and gated-product policy validation. Its output width
+is independent of its input width; enclosing family equations supply residual
+constraints. LFM2 dense, Kimi dense/shared, DeepSeek V3 dense and V3/V4 shared,
+Muse dense/DSpark and direct/convolved DFlash, Inkling dense target/prediction,
+K2 shared, Qwen hybrid dense/shared, and Qwen4 shared factories supply family
+identities, formats, widths and policies through this contract. Construction,
+admission,
+placement, topology and discovery consume the resulting scopes. Native modules
+retain their declared policies. The shared `Mlp` requires a resolved policy for
+construction from declarations and assembly from native operators. Shared/routed
+composition retains the complete shared neural scope and validates it together
+with router, expert bank and scalar output-gate declarations.
+LFM2 storage extensions retain `w1`, `w2`, `w3` ordering; LFM2 and Kimi native
+construction retain gate, down, up allocation order. Sparse construction validates
+shared scopes together with their routers and provider-owned expert banks before
+allocation. DeepSeek additionally checks router/shared input widths and routed/shared
+output agreement as part of its branch-sum equation. Discovery projects exact
+references and gated policies while retaining
+explicit component roles, groups, row mappings and hook paths. Parameter
+specifications establish no observation or backend capability contract.
+Muse target and DSpark source catalogs, ordinary MLP construction, placement and
+discovery consume the same split-gated declaration. DSpark body TP derives local
+widths from its named slots; down-projection biases use replicated placement.
+`validate_logical_parameter_topology` validates complete logical scopes for
+typed sharing references, identity uniqueness and exact shared geometry before
+storage projection or backend allocation. Shared decoder pinned construction
+and the Qwen vision declaration visitor apply this check to their full scopes.
+Embedding and output roles may share one tensor; alias chains and unresolved
+targets are rejected through `LogicalParameterTopologyError`.
+Gated-delta and shared/routed construction specs expose complete logical scopes,
+including recurrent coefficients, convolution kernels, routed banks and shared
+projections. Their declaration visitors validate geometry and typed identity
+references without allocating backend values.
+The shared decoder projects ordinary attention, fused QKV and gate/up projections,
+feed-forward blocks, normalizations and pinned vocabulary roles directly from
+construction declarations and retained encoding extensions. Dense family inspection
+and placement consume these cold descriptions. Runtime group projections consume
+the typed logical declarations and explicit sharding semantics; native parameter
+visitors bind and inspect materialized storage within their execution owners. `ParameterEncoding`
+selects logical or stored geometry through the same visitor. Head ownership,
+row-parallel bias replication, fused segments and partial block-FP8 partitions
+remain explicit architecture semantics. Pinned resources retain their ownership
+roles and tied embeddings keep one authoritative storage slot. Cold parameter
+geometry and materialization transforms consume the same construction specs.
+Llama/Phi, Gemma 2, Qwen and GPT-OSS SafeTensors and GGUF admission project
+ordinary tensor geometry from the logical decoder description and retain
+format-specific names, dtype rules, packing constraints and catalog exclusions.
+Routed descriptions explicitly select logical or stored geometry. Qwen3-MoE and
+GPT-OSS router and packed-bank groups project the construction declarations and
+their retained encoding references directly. The generic neural
+`RoutedGatedProductSpec` owns selector/bank connectivity and complete parameter
+reference validation. Qwen3-MoE, GPT-OSS and LFM2 family factories produce that same
+scope, retaining their distinct routing equations, bias rules and expert encodings.
+LFM2 retains sigmoid routing, input-precision projection and coefficients, its
+normalization epsilon, selection-only correction bias and sequential expert-ID
+accumulation. Its family validator enforces the residual width and SiLU equation. Construction validates the complete scope before allocating
+either module; admission, execution topology and placement consume the same
+declaration, and bank-only consumers project its retained experts. Discovery reads
+global routing counts and normalization from the declared selector. Provider
+invocation coordinates stay in architecture construction, separately from neural
+parameter ownership. Selected local banks retain global routing while restricting
+expert count and intermediate channels; they may contain fewer experts than the
+global top-k. The generic neural scope permits independent output width; family
+residual factories declare the complete hidden width on both ends. Logical projections omit storage
+extensions while preserving parameter identity, roles and sharing. Replacement
+feed-forward groups reach the decoder with their physical projection complete;
+the decoder attaches invocation ownership without expanding them again. K2
+routed-value, routed-SwiGLU and shared-expert groups use the same declaration
+visitor, retaining independent routing equations and head/intermediate partition
+domains. Expert source extensions reference the declared banks: Qwen retains packed, separate-packed
+and independent alternatives; GPT-OSS retains alternating MXFP4 blocks, scales,
+biases and split GGUF projections. Learned additive expert biases remain ordinary
+neural parameters; MXFP4 scales carry explicit encoding-companion bindings.
+Shared decoder normalization construction,
+cold geometry and component discovery consume the same normalization specs.
+Execution invocation ownership and
+residency boundaries remain in `ArchitectureParameterDescription`, independently
+of shared checkpoint slots and mutable state.
+
+The shared Qwen vision tower declares patch kernels, position tables, layer
+normalizations and affine projections through typed construction specs. Each
+`BlockSpec` retains checked multi-head geometry, component-major Q/K/V layout,
+readout, residual LayerNorm slots and a `UnaryFeedForwardSpec` with the selected
+GELU or SiLU equation. The complete scope validates fused rows, residual widths,
+normalization and feed-forward connectivity before allocation. Construction,
+checkpoint, partition, rotary and memory projections consume those slots and axes,
+including explicit parameter identities for local head/channel resolution. Fused
+placement segments use the retained row layout. DeepStack merger invocations keep
+their independent ownership. GGUF names are bidirectional storage
+extensions, and its patch recipe assembles two three-channel temporal slices
+into the declared kernel. Source encodings never establish observation hooks or
+transfer parameter ownership to a backend.
+
+Qwen3-Next and Qwen3.5 target and prediction declarations share attention,
+gated-delta, normalization, routed/shared-expert and fusion construction specs.
+Checkpoint admission projects their logical geometry and encoding references.
+Target GGUF admission excludes prediction-only execution and pinned consumer
+groups; shared target resources retain their canonical source requirements.
+Expert source splits use the declared packed-bank geometry. Explicit source
+extensions retain fused QKVZ/BA row layouts, independent experts, FP8 companions
+and aliases, GGUF Conv1D axis removal, recurrent dense vectors and vector/matrix
+shared-expert gate alternatives. Stored parameter
+projection preserves the existing invocation graph and residency owners; source
+layout alternatives do not introduce independent mutable state or replicas.
+`AttentionParameters` declares the hybrid's interleaved query/gate, key, value and
+output affines, query/key normalization, head geometry and rotary construction.
+Native construction, SafeTensors admission, stored placement, topology reporting
+and discovery consume that scope. Target and prediction cache policies project
+these selected construction scopes; gated-delta state comes from the retained
+mixer's state policy. Global construction borrows its configuration for each
+invocation, while selected preparation supplies complete local block configurations
+without a separate cache-only head-count catalog. Prediction state keeps its own
+segment and invocation ownership. The discovery read/write records also project
+the declared dense/shared-expert affines and scalar gate; operation hooks and
+component equations remain explicit.
+
+Nemotron-H constructs Mamba2 mixers, unpositioned attention, dense/shared ReLU²
+projections, normalization and prediction fusion from the same typed specs used
+by checkpoint admission and cold placement. The Mamba declaration includes its
+per-head timestep, transition and direct-skip coefficients, convolution channels,
+and grouped normalization scale. Its checked head/group geometry owns the fused
+gate, value, input-state, output-state and timestep rows. Declaration validation
+rejects incompatible affine widths, convolution channels or convolution policies
+before allocation. Projection and convolution segments define partition boundaries;
+native slicing, selected state and materialization shapes consume this geometry.
+The mixer projects one state policy for construction and retained partition
+validation, including convolution history when the kernel exceeds one and an F32
+recurrent matrix with its exact residency class. SafeTensors aliases, packed/split expert layouts, quantization
+companions, GGUF singleton-axis removal and negative-log transition conversion
+remain explicit storage extensions. Target routing matrices retain floating
+storage under family-wide quantization; prediction router encodings follow their
+separate admitted format policy. Component discovery projects attention,
+dense/shared expert, readout and prediction parameter identities from these
+specs while retaining explicit equations and observation hooks.
+
+LFM2 attention, normalization, dense SwiGLU, routed-bank and gated short-convolution
+construction specs provide the geometry consumed by checkpoint admission,
+placement and materialization. `AttentionParameters` retains the four affines,
+query/key norms, global head width, selected local heads, rotary construction and
+input-dtype score arithmetic. Resident and partitioned construction use one factory;
+admission, placement, topology and discovery project the same scope. Invocation
+attention policy and mutable cache state remain separate from parameter ownership.
+The generic short-convolution declaration validates
+its complete parameter scope before allocation, including exact B/C/x projection
+and kernel geometry. `GatedShortConvolutionSpec::input_layout` owns the B/C/x row
+declarations; native splitting and cold placement consume their checked ranges.
+Complete block construction geometry projects each invocation's attention or
+convolution state. The same state policy constructs caches and validates retained
+partition state, including history length, dtype and presence. One-tap convolutions
+have no history and still require valid construction channels. Cold placement
+retains explicit fused-segment axes and residency owners, and derives encoding
+alignment from declared projection formats.
+The router stays floating under family-wide quantization. Source extensions retain
+SafeTensors kernel-axis alternatives, fused/separate/per-expert storage and GGUF
+kernel-axis removal and aliases. Discovery reads projection identities, readout,
+normalization and mixer geometry from construction specs; hooks and equations
+remain explicitly declared by the family.
+
+Kimi Linear owns typed KDA and MLA construction declarations. KDA declares its
+projection stages, three convolution kernels, per-head transition, channel decay
+bias and output normalization as one validated parameter scope. Its checked head
+geometry supplies Q/K/V widths, control bottlenecks, normalization, transition and
+decay shapes. Family validation checks both control branches, residual output and
+three matching native SiLU convolutions before allocation. The same scope projects
+three independently owned histories and an offloadable FP32 recurrent matrix;
+complete selected-state validation compares that entire policy. Local head
+resolution references the declared query identity and feature width. These axes
+do not establish a softmax equation, observation hook or backend capability.
+MLA declares
+direct or normalized low-rank query projection, compressed ingress and fused or
+split latent reconstruction. Kimi and DeepSeek V3 compose the neutral
+`LatentAttentionGeometry` for query heads, positional/non-positional features,
+normalized latent rank, ingress and value widths. Fused reconstruction checks its
+packed width; split reconstruction checks independent key/value projections.
+Family declarations validate the affine and normalization connections against
+those axes before allocation. Construction, checkpoint admission, cold placement,
+state selection and materialization consume these specs. The generic normalized
+low-rank projection validates parameter identities and sharing alongside rank
+geometry before allocation. Query-head TP inference resolves declared projection
+identities and head widths. Cache declarations read latent and positional axes;
+rotary/NoPE equations, score scaling and state ownership remain family policy.
+Family format extensions retain KDA element-count admission, GGUF transition
+flattening and negative-log conversion, source aliases,
+expert alternatives and encoding companions. Discovery projects recurrent and
+latent reads from the declared parameters while retaining explicit row mappings,
+normalization equations and hook support.
+Kimi sparse feed-forward declarations compose `RoutedGatedProductSpec` with the
+always-on `SplitGatedProductSpec` branch. The complete family scope validates
+residual widths, SiLU equations, identities and sharing before feed-forward
+allocation. It retains grouped sigmoid selection, correction bias, normalization
+and routed scaling. Construction, SafeTensors/GGUF admission, discovery and
+placement project that same scope; bank-only consumers project its experts.
+Local scopes retain the global selector with independently bounded routed and
+shared channels, including expert banks smaller than the global top-k. Layer
+invocation, mutable state and residency ownership remain separate.
+KDA/MLA, dense/shared, router and expert placement groups consume the retained
+encoding references directly through the common runtime visitor. KDA bottlenecks,
+per-key decay axes and MLA rank sharing retain their explicit partition rules.
+
+DeepSeek V3/R1 MLA and prediction construction use architecture-owned typed
+specs for exact query, compressed ingress, KV reconstruction, normalization,
+fusion and vocabulary geometry. Cold parameter groups, state geometry,
+checkpoint admission and discovery project those specs. Routed construction and
+cold catalogs share selector, packed-bank and shared-projection specifications;
+construction validates the combined scope before allocation. Source extensions
+retain published dense statics and routers, FP8 inverse scales, independent or
+packed experts and fused or split GGUF KV-B layouts. Canonical and GGUF split
+KV-B source extensions share the declared reconstruction matrix identity and
+geometry, retaining their explicit transpose and concatenation axes. Unit recipes
+resolve target and prediction layer references before querying source metadata;
+the published GGUF split extension accepts target layers only. The shared SwiGLU
+discovery projection consumes typed gate, up and down specs, including their sharing and
+bias metadata, without deriving names or widths from component paths.
+Validated `V3Args` retain immutable static, block and prediction scopes alongside
+read-only policy. Initial normalization declares those slots once; checkpoint,
+placement, state, discovery and construction borrow or clone them. Encoding
+selection preserves operator policies and projects companions from typed slots.
+Rank-local head and intermediate widths project retained geometry, and target-only
+views remove prediction owners without declaring new parameters. Static native
+binding consumes retained construction directly. Source factories are confined to
+initial declaration; unresolved scope identities and normalization-width mismatches
+reject before allocation. Mutable invocation state and selected provider banks
+retain their separate ownership.
+Validated `V4Args` likewise retain static vocabulary/readout and hyper-head slots,
+decoder normalization and hyper-connection scopes, local/compressed attention and
+indexer scopes, and complete routing ownership. Sequential prediction owns its
+fusion/readout slots per depth; DSpark owns its conditioning, Markov and confidence
+slots separately from prediction decoder blocks. Source normalization declares
+these scopes once. Encoding selection and local head/output-group/expert widths
+project retained slots while preserving arithmetic, row regions and shared-branch
+ratios. Target-only projection removes prediction and DSpark parameter owners but
+retains the explicit target-capture policy. Static native binding and cold groups
+borrow retained construction; unresolved invocation, layer and hyper-head references
+reject before backend allocation. These declarations hold no native tensors.
+V3 and V4 traverse validated target and prediction schedules into typed routed
+bank declarations. Resident, replicated and partitioned expert planning share one
+localization projection over those banks, retaining parameter identities, formats
+and reduction policy. Residency and realization use the same explicit target/MTP
+invocation mapping; partition validation compares the complete declared bank
+schedule before selecting pipeline-local ownership. V3 and V4 layer groups project
+retained linear-format references through the common runtime visitor. MLA head and rank groups, V4 output groups, compressors,
+indexers, routed/shared banks and prediction slots keep explicit partition and
+ownership rules. Raw position, hyper-stream and token-routing slots retain their
+declared roles independently of matrix storage expansion.
+
+DeepSeek V4 routing declares its learned selector, correction bias or integer
+token-to-expert lookup, packed routed bank and always-on shared projections as
+one validated scope. V3 and V4 native routed construction consume the shared
+typed routed spec. V4 checkpoint admission, placement, expert recipes, residency
+sizing and discovery project those declarations. Each target and prediction
+invocation supplies its own parameter scope. Independent SafeTensors experts
+and packed GGUF MXFP4 banks are explicit storage layouts of the declared bank;
+source routers remain floating and token-routing tables retain exact I32
+admission. Encoding companions and independently leased expert units retain
+their explicit storage and residency contracts.
+
+DeepSeek V4 attention declares the normalized query bottleneck, shared KV ingress,
+grouped output stages, per-head sinks, learned pooling compressors and sparse
+indexer as one checked parameter scope. Construction, checkpoint admission,
+rank-local geometry, selected placement, cache sizing and discovery consume these
+specs. Main attention and indexer heads use checked `AttentionHeadGeometry`.
+The shared KV head, query expansion, grouped output stages and compressor/indexer
+connections validate together before allocation. Grouped output rank follows the
+declared second output stage and group count; compressor head width follows its
+normalization declaration. Local/compressed policy fixes the required compressor
+and indexer presence. Compressor pending-state widths follow declared projection
+outputs; pooled and overlap state follow declared normalization widths. Prediction attention uses
+its own invocation declarations and local-only policy. SafeTensors/GGUF names,
+FP8 inverse scales and floating position-bias storage remain format extensions.
+Parameter declarations establish neither hooks nor execution capabilities.
+
+DeepSeek V4 target and prediction residual mixing uses architecture-owned
+`HyperConnectionSpec` and `HyperHeadSpec` factories. Neural declarations own
+mixing projection, additive base and learned scale geometry and roles, validate
+checked dimensions and the complete sharing scope before allocation, and feed
+checkpoint admission, cold placement, component coefficients and MLX parameter
+allocation. The target hyper-head, per-depth prediction heads and DSpark's final
+head retain their distinct residency owners. Floating hyper-function storage and
+GGUF aliases remain explicit format rules. Sequential prediction projections and
+normalizations, DSpark captured-context fusion, dense Markov lookup, vocabulary
+projection and confidence head share validated construction declarations with
+checkpoint, placement and discovery projections. Capture concatenation and
+confidence-input widths use checked geometry. Parameter declarations establish
+no observation or intervention support.
 
 Attention arithmetic is a neutral request policy. An architecture can require
 rounding QK products, scaled/masked scores and normalized probabilities to the
@@ -508,7 +1063,20 @@ component-based inference configurations into one released equation contract and
 normalizes the pinned upstream defaults; Python
 `_target_` strings are inert. Exact auxiliary assets, canonical source recipes,
 integer-buffer values and embedded GGUF tokenizer declarations are validated
-before retention succeeds. The checkpoint crate derives ordinary affine matrix
+before retention succeeds. Declaration scopes retain each parameter's component
+owner, including independent codec encoder and decoder scopes and host-only
+control buffers. `parameter_sources` projects that owner with the canonical source
+recipe for complete and split layouts. Encoding companions inherit their declared
+primary's component; admission and missing-component checks consume these same
+declarations. Duplicate source identities, duplicate companion outputs and unresolved
+encoding targets fail before allocation. A parameter's namespace does not select
+its component owner. Physical artifact authority remains independently retained.
+Affine source eligibility joins retained construction encoding declarations with
+explicit released format policy. Configuration validation and SafeTensors format
+inference consume that same projection. RNNT predictor matrices retain their LSTM
+source convention, and the raw audio-prompt matrix has no ordinary affine source
+extension; neither tensor rank nor parameter spelling selects eligibility.
+The checkpoint crate derives ordinary affine matrix
 formats from logical geometry, U32 packing and group companion shapes. VoiceChat
 uses the same strict matrix schema for dense and packed SafeTensors input,
 including atomic scales/biases admission and agreement with explicit configuration
@@ -580,9 +1148,9 @@ pass and reports their canonical host storage separately from learned weights.
 speech feedback from those retained values. Construction does not reread the
 integer sources or reopen tokenizer assets. Saved character EOS flags remain
 independent of live text-channel EOS policy.
-`PreparedSpeechParameterUnit` projects one module's ordinary parameter traversal
-onto canonical admitted recipes and further restricts its source view to that
-unit's physical inputs. Shared runtime selection, completion-safe materialization
+`PreparedSpeechParameterUnit` projects one unit's semantic parameter declaration
+onto canonical admitted recipes and restricts its source view to that unit's
+physical inputs. Shared runtime selection, completion-safe materialization
 and atomic binding consume this projection. Individual transformer, perception,
 MoG and codec blocks can be selected independently; host preprocessing and
 integer buffers are excluded. This unit mechanism does not declare a full speech
@@ -598,9 +1166,8 @@ blocks; codec codebook depths are separate units.
 Its cold `prepare_unit` resolves recipes and validates declared geometry through
 `PreparedComponent` before native construction. Module construction and consuming
 assembly use those same exact bindings; parameter discovery needs no unloaded
-native module. The low-level module projection remains available for caller-supplied
-modules and validates their explicit aliases. Missing roles, invalid indices and
-recipe geometry errors fail before module construction. Default perception, TTS
+native module. Shared declaration validation checks explicit aliases. Missing roles,
+invalid indices and recipe geometry errors fail before module construction. Default perception, TTS
 and codec preparation selects F32 execution, with input/output conversion overlap included
 in materialization bounds. The portable speech precision policy selects eligible
 narrow perception/TTS weights and arithmetic; RNNT and function-head precision
@@ -610,38 +1177,264 @@ Preparation retains its typed `ComponentPreparationDeclaration` directly. Parame
 resource plans retain `ArchitectureParameterDescription`; semantic component preparation
 retains the complete validated `ComponentDefinition` and borrows its parameter projection.
 Identity-based projection carries the requested declaration while preserving restricted
-source authority and selected placement. RVQ consumes its retained definition alongside
-exact selected unit resources to assemble the execution adapter; native materialization
-does not reconstruct its graph, state or boundary declarations.
+source authority and selected placement. RVQ retains `RvqDeclaration`, pairing its
+validated neural scopes with the component definition. Exact selected unit resources
+transfer that declaration to the execution adapter; native materialization does not
+reconstruct its parameter geometry, graph, state or boundary declarations.
 PRVQ and EAR encoder/decoder preparation retain complete definitions as well. EAR stage
 selection keeps the global definition beside sparse selected unit resources; partition
 validation borrows its parameter and state projections. Full and pipeline native codec
 assembly consume that retained definition rather than rebuilding it from configuration.
 Addressed resource transfer preserves the declaration with global invocation addresses.
+`MogDeclaration` retains the typed MoG scopes and their component definition through
+preparation, precision selection, tensor placement and native binding. Those scopes
+own each residual block's gate/value/contraction and
+pre/post gains, the final gain and mixture logits, and the selected residual,
+log-scale, mean and expansion factors. Construction, source admission, selected
+intermediate and rank geometry, and independent residency units project those
+same typed slots. Each residual block retains a complete `SplitGatedProductSpec`;
+the enclosing MoG declaration validates its fixed GELU-tanh policy, residual and
+gain widths, and the selected intermediate bound before native allocation. Native
+execution retains separate activation and multiplication operations. Rank selection
+preserves one coherent slice in every mixture's mean rows and expansion columns;
+residual and log-scale projections remain
+replicated. The complete and split GGUF formats retain explicit encoding rules.
+Split aliases reference declared identities and apply the published full-gain to
+offset conversion. Preparation rejects unresolved identities and incompatible
+gain conventions before allocation. Guidance, supplied draws, mixture selection,
+precision policy, and explicit hooks remain separate execution contracts.
+
+VoiceChat's function-head spec owns the independent vocabulary projection's
+identity, logical geometry, and selected encoding with exact companion slots.
+Resident and parallel modules consume that spec; the kernel retains it through
+materialization and projects cold placement from its logical visitor. Source
+catalogs derive the released dimensions from normalized configuration and retain
+explicit complete/split GGUF encoding rules and aliases. Preparation uses the same
+configuration projection and hands the retained spec, definition, selected recipes,
+and source authority directly to native assembly. Vocabulary row selection covers
+primary and companion storage together; the function invocation and dual-channel output policy remain
+independent from parameter ownership and encoding support.
+
 VoiceChat MoG, conditioning and function-head preparation retain complete definitions
 through family precision transforms and tensor placement. Native assembly consumes
 those definitions with the selected bindings. Function-head encoding and companion
 admission remain family-owned and use the same retained format as its definition.
-RNNT preparation retains its complete definition; projection-only and predictor-stage
-resource projections retain their own exact semantic definitions. Predictor pipeline
-validation borrows retained parameter and carry declarations, and native full/projection/
-predictor assembly consumes those definitions alongside exact selected bindings.
-Complete, projection-only and predictor declarations use the same family phase
-constructor, which builds only the selected phases. Predictor group and unit paths
-come from that phase declaration; carry remains separate from request-local complete
-RNNT forward context.
-Perception preparation retains its complete parameter, transport and Conformer cache
-definition through precision, placement and stage selection. Pipeline validation borrows
-that declaration, and native complete and partition assembly consume it with the exact
-selected resources. Family ownership checks retain the stage-specific cache slice.
+RNNT preparation retains `RnntDeclaration<true>`, pairing its complete neural scope
+with the semantic component definition. Projection-only and recurrent-stage scopes
+project retained phases without reconstructing parameters from dimensions. The
+projection kernel consumes `RnntDeclaration<false>`; the recurrent kernel consumes
+`RnntPredictorDeclaration`. Their typed handoffs preserve exact source restriction,
+vocabulary placement and global recurrent addresses. Predictor pipeline validation
+borrows the retained parameter and carry declarations. Native full/projection/predictor
+assembly consumes those declarations alongside selected bindings. Phase group counts
+and vocabulary geometry project retained slots; phase paths and invocation contracts
+remain explicit. Carry stays separate from request-local complete RNNT forward context.
+RNNT, MoG, RVQ, perception and conditioning physical parameter groups project
+retained construction slots through runtime `logical_parameter_group`. Acquisition owners, balanced vocabulary
+rows, MLP intermediate axes and low-rank mixture segments remain family policies.
+MoG and perception derive their layer-unit counts from the declared blocks.
+Encoding references and
+companions remain attached to each typed group; this projection establishes no
+additional encoding, execution or observation support.
+RNNT parameter declarations retain the embedding, independent input/recurrent
+LSTM gate affines, and three joint projections. Resident, leased, projection-only,
+and predictor-stage construction consume these typed slots; their logical visitors
+supply source requirements, selected sharding, ownership and resource geometry.
+The published source-free RNNT scope is shared by admission, discovery, speech-unit
+construction and preparation. Standalone construction declares its scope once. The
+released dimensions come from the normalized embedded configuration. GGUF
+encoding eligibility and missing split-container companions remain explicit source
+rules. Generic neural LSTM traversal validates sharing over the complete stack
+before allocation, including aliases between layers. Parameter ownership does not
+change phase identities, request-local carry, priming, or explicit observation hooks.
+VoiceChat backbone checkpoint admission projects the ordinary Nemotron-H
+embedding, final gain, agent readout, Mamba, attention and dense construction
+specs. The published backbone inference fields have one declaration shared by
+configuration validation, parameter projection and split-container geometry
+metadata. Speech source identities map to retained Nemotron identities through a
+checked namespace adapter. Source extensions retain explicit encoding eligibility,
+aliases, SSM column controls, flattened depthwise kernels, grouped gains and the
+inverse negative-exponential recipe for transition parameters. Nemotron remains
+the owner of neural construction, invocation/state topology and selected placement;
+the source adapter introduces no parameter replicas or execution capability claims.
+
+Nemotron-Labs-Diffusion's `vision::specs` owns Pixtral ingress, bounded
+transformer blocks and the independently leased spatial projector. SafeTensors
+admission and the pinned GGUF companion project their ordinary tensor geometry
+from those same typed declarations. Source extensions retain published aliases,
+precision constraints, FP8 companions and GGUF Q/K half-head conversion rules.
+Source conversion receives the family configuration and resolves Q/K identities,
+head axes and output shape through the declared image block. Admission and
+conversion share the published companion geometry check; GGUF header dimensions
+project that validated geometry. Module recipes select their bound parameter scope
+before resolving conversions, while FP8 scales remain recipe dependencies.
+Pixtral, Nemotron-H, LFM2, Inkling and Muse affine attention slots compose the neutral
+`SelfAttentionProjectionSpec`. Its checked `AttentionHeadGeometry` owns query,
+K/V and attended widths, and its visitor validates all four affine connections.
+`AttentionQueryLayout` declares query-only rows or per-head query rows followed
+by attended-value gate rows. It checks combined row widths and projection products
+before allocation; source encoding and sharing metadata remain on the same affine.
+The contract permits independent key/value feature widths and output width;
+family declarations enforce the narrower equations consumed by their executors.
+Nemotron and LFM2 retain equal key/value widths and a residual-width output.
+LFM2 couples Q/K normalization and rotary dimensions to the declared head axis.
+Inkling validates its relative projection rows, Q/K normalization and K/V
+convolution channels against the same affine scope. Residual normalization and
+convolution channels remain coupled in its common block declaration. Pixtral
+retains equal Q/K/V head axes, residual-width normalization and its explicit
+per-image rotary equation. Score arithmetic, state policy and hooks remain
+architecture declarations. Qwen hybrid declares the interleaved layout, validates
+equal key/value widths, residual output and Q/K gain dimensions, and retains its
+partial rotary policy. Its component row strides and query/gate source widths
+project that layout; the family still owns sigmoid gating and execution support.
+Muse `AttentionSpec` retains the invocation's full/sliding policy alongside its
+parameter scope. Target construction and global/local cache projection share that
+scope, including NoPE invocations. Waveform state remains independently declared
+and is appended through the audio execution contract.
+Other consumers of this contract require query-only rows. Checkpoint admission,
+placement, discovery and native construction project the same affine scope,
+including VoiceChat's published Nemotron backbone layouts. Muse target and DSpark scopes retain the independent
+sigmoid gate, validate its input and attended-head widths, and couple any learned
+Q/K gains to the declared head axis. Target placement repeats whole K/V heads;
+DSpark placement requires distinct heads. Rotary enablement, normalization
+arithmetic and score scaling remain explicit family execution semantics.
+Pixtral's feed-forward scope is a complete `SplitGatedProductSpec`; the image
+layer validates its residual widths and fixed SiLU equation. Native execution
+retains separate SiLU activation and multiplication. Head and feed-forward channel
+partition groups project the declared affines; RMS scales retain complete residual
+width. Construction uses the same factories
+at the selected local geometry. Discovery reads declared width and head geometry
+while preserving explicit per-image attention, invocation structure and hooks.
+
+VoiceChat `TransformerDeclaration` retains the shared decoder's typed attention
+and feed-forward projections, Q/K gains, residual normalizations and final
+normalization alongside normalized family policy and its component definition.
+The validated published profile shares those source-free scopes across checkpoint
+extensions, discovery, speech-unit construction and preparation. Physical format
+selection projects companion declarations through retained affine identities;
+execution precision remains a separate policy, applied to cloned module slots.
+Canonical source parameter membership and geometry do not change with arithmetic
+selection. Local heads and intermediate channels project retained specs and their
+declared widths; cache geometry consumes those projected attention axes. Causal
+speech and bidirectional character stacks retain separate owners, attention policies and mutable-state contracts.
+Cold projection and materialization borrow the retained parameter plan, including
+rank-local block specs and complete physical formats. Shared decoder factories
+use the same normalization and sink declarations for ordinary construction.
+Published TTS source extensions reference declared slots for affine encodings,
+aliases and unit-offset gain conversions; parameter roles do not select formats
+or establish observation support. The character stack's embedding scaling and
+key masks, causal cache frontiers, rotary arithmetic and bounded unit leases
+remain explicit execution semantics.
+
+`eredu-codec::ear_specs` declares frozen encoder and decoder parameters from the
+typed neural unit geometry. ConvNeXt owners share causal depthwise convolution,
+affine native layer normalization and pointwise construction specs. Canonical
+forward OIK and transposed IOK kernels retain their separate axis meanings.
+Encoder output groups, decoder transposed-kernel columns and both intermediate
+MLP projections use coherent selected domains; normalization, depthwise kernels
+and residual output bias replicate. Independently leased units retain global
+invocation identities while their typed declarations project local shapes.
+Construction, inspection and VoiceChat source admission consume those slots.
+Published aliases, pointwise singleton-axis storage and floating constraints
+remain explicit format extensions. Streaming carry and snapshot ownership remain
+separate execution contracts; parameter roles establish no observation support.
+
+`eredu-codec::prvq_specs` owns the fixed-mean codec codebooks and retained
+variance scalars. Each residual depth has one frozen owner, an explicit global
+depth identity and a separate residency unit. Construction, cold inspection and
+selected channel placement consume these declarations; means partition along
+channels and variances replicate. Encoder and decoder invocations borrow the
+same quantizer ownership. VoiceChat source extensions reference those typed slots
+for complete-container encoding eligibility and split mean aliases and variance
+singleton storage. Codebook declaration does not choose a scoring equation,
+introduce special code IDs or establish observation support.
+
+VoiceChat RVQ feedback declares one frozen stacked codebook owner and one shared
+feedback affine. Resident and bounded construction, checkpoint requirements and
+cold placement project those typed slots. The bank's latent channels and the
+affine's input columns use the same selected domain while retaining separate
+residency units. Published source extensions specify the floating bank, affine
+encoding eligibility and split-container aliases; generic codebook roles do not
+imply a storage format. Prompt lookup and refinement share parameter ownership
+while keeping invocation identities, candidate codes and derived-norm cache
+invalidation explicit. Refinement scheduling and quantization arithmetic remain
+architecture execution contracts.
+
+VoiceChat conditioning declarations own the character lookup and output affine,
+optional continuation/special tables, BOS/null features, frozen Aria sequence and
+prompt matrix, and gated audio/text fusion. Construction and cold projections
+consume the same typed slots. Character-feature and output-feature partitions
+remain independent; flag tables, speaker/control features and normalization are
+replicated. The prompt matrix retains input-by-output storage and right-multiply
+execution. Format extensions declare encoding eligibility, aliases, scalar storage
+reshaping and the split-container unit-offset gain conversion. Parameter ownership
+does not establish hooks or change prompt substitution, guidance or fusion equations.
+
+VoiceChat Conformer declarations own the six affine layer normalizations, both
+feed-forward branches, content and relative-position attention projections and
+head biases, and pointwise/depthwise convolution kernels. Q/K/V/output slots use
+`SelfAttentionProjectionSpec`; the family retains its separate relative-position
+affine and derives both bias shapes from the same checked MHA head axes. Attention
+traversal preserves query, key, value, relative-position and output order. Local
+head axes are checked against retained selection; normalization, GLU and convolution
+widths remain coupled to global residual and carry geometry. Both branches compose
+`UnaryFeedForwardSpec` with fixed SiLU and declared half-weight residuals. The
+scope validates global residual and selected intermediate widths before native
+allocation. Native blocks retain each activation/scalar policy independently of
+parameter bindings and copy those immutable policies when cloning. Global declarations
+project complete local heads and coherent feed-forward channels while retaining
+replicated normalization, convolution and streaming-state geometry. Construction,
+source requirements, ownership and selected placement consume those slots. Split
+GGUF aliases explicitly remove convolution singleton axes; complete-container
+encoding eligibility references the declared matrices and head-bias vectors.
+Source extensions reject unresolved identities and incompatible axis layouts.
+Content and position bias roles describe their query shifts before key scoring;
+they do not declare observation or intervention support. Relative-position caches,
+causal carry, residual equations and precision policy remain execution contracts.
+Generic affine layer normalization consumes its typed dimensions, gains, bias,
+epsilon and arithmetic declaration. Conformer, Mimi, EAR and shared Qwen vision
+select native arithmetic through that contract. Qwen's family factory declares
+its required gain/bias slots and epsilon once; blocks and main/DeepStack mergers
+use the generic neural `LayerNorm` directly. Admission, replicated placement and
+cold memory invocations project that same declaration, including affine-slot
+presence and arithmetic.
+
+VoiceChat `PerceptionDeclaration` retains the typed subsampling, Conformer and
+output-projection scopes with connected geometry, precision policy and its component
+definition. The validated published profile shares that source-free declaration across
+checkpoint extensions, discovery, speech-unit construction and provider preparation.
+Its boundary slots own the five biased OIHW subsampling kernels, the flattened encoder projection, and the separate perception-to-language
+affine projection. Construction, cold parameter groups, and complete/split source
+schemas project these slots. The flattened width uses the declared causal
+subsampling length calculation. Split GGUF convolution biases append two physical
+singleton axes and retain an explicit reshape recipe; OIHW-to-OHWI views remain
+an invocation mechanism. The kernel retains the boundary declarations while
+precision, convolution padding, streaming overlap, Conformer carry, and observation
+contracts retain their independent meanings. Each boundary remains independently
+leased and replicated according to the selected component placement.
+
+Perception preparation retains its typed parameter, transport and Conformer cache
+declaration through exact source restriction, precision transforms, tensor placement
+and addressed stage handoffs. Pipeline validation borrows that declaration; native
+complete and partition kernels consume its selected precision policy and exact
+resources. Family ownership checks retain the stage-specific cache slice. Learned
+parameter ownership stays separate from runtime cache values and publication clocks.
 VoiceChat backbone preparation retains the ordinary Nemotron definition in shared
 ownership with its executable. Binding storage preferences and cold resource reports
 borrow the same parameter declaration. Resident and bounded construction retain the
 existing pinned vocabulary modules and independently leased target blocks.
-TTS transformer preparation retains its definition through precision, tensor placement
-and stage selection. Selected state geometry preserves global slot identities while
+TTS transformer preparation retains its typed declaration through precision, tensor
+placement and stage selection. Identity-based projection preserves already transformed
+bindings while updating the retained state layout. Complete and addressed handoffs
+transfer that declaration and selected layout together; native assembly rejects a
+placement mismatch before allocation. Selected state geometry preserves global slot identities while
 recording rank-local cache heads. Complete, local-partition and pipeline assembly
 consume that definition; pipeline validation borrows its parameter and cache declarations.
+Function-head and TTS transformer preparation admit U8 scales through the declared
+scale-companion role, typed primary reference and the primary's retained MXFP4
+format. Primary and companion admissions retain one component owner and exact
+canonical identities. Shared speech preparation rejects a map entry whose admitted
+identity differs from the requested declaration before recipe conversion or allocation.
 
 `SpeechConstructionPlan::assemble_with` consumes those units into
 `LearnedSpeechComponents`, preserving the bound parameter objects. The prepared
@@ -774,6 +1567,85 @@ Complete and selected decoder construction retain a validated `ComponentDefiniti
 before pinned native modules are materialized. Block factories declare canonical
 parameter topology without constructing native blocks. Graph, unit paths, state
 partition rules and parameter discovery project that retained definition.
+
+`decoder::DecoderDeclaration` composes static and common block construction specs.
+Shared decoder construction, parameter-topology projection and rank-local
+geometry require this retained authority. Dense and provider-owned stage factories
+consume supplied typed slots and reject missing declarations before allocating
+backend modules. DeepSeek replicated preparation borrows its retained static
+construction directly; cold placement and state reports use the same common scopes
+for dense K2, Qwen, GPT-OSS and Nemotron-Labs-Diffusion.
+Its ordinary constructor includes gated feed-forward slots; provider-owned stages
+use `without_feed_forward` and compose their typed slots in the family declaration.
+The same common scopes retain attention, residual/terminal normalizations, vocabulary
+parameters and independent invocation-state geometry. Complete typed factory topology
+projection validates common and provider ownership together before native allocation.
+Dense logical and stored parameter catalogs project those retained slots with the
+family's explicit partition rules. State uses the declared attention geometry and
+independent invocation schedule. Dense component and memory-topology projections use
+the same scopes, including tied readout, fused projections and inter-pass terminal
+normalization. Configuration identity validation rejects a mismatched projection;
+physical alignment remains a stored-encoding constraint. Supplied-embedding stacks
+retain their own scope and do not acquire vocabulary parameters.
+
+Llama-compatible, Gemma2, Nanbeige, ordinary dense Qwen2/Qwen3 and dense K2 SafeTensors/GGUF
+plans retain the dense declaration
+used by checkpoint admission. Immutable plan clones and declaration-only inspection
+snapshots share that source scope. Generic inspection projects parameters, state,
+statics, boundary width and memory topology from it. Selected-format projection clones
+the typed slots after family validation proves unchanged geometry, sharing and
+non-format execution policy. Checkpoint aliases, dtype constraints, layout exclusions
+and companion expansion remain explicit format extensions referencing those slots.
+Nanbeige admission projects physical tensors through authoritative sharing targets;
+its repeated invocations and inter-pass normalization retain independent execution
+identities. Recipes read declared storage members and sharing targets, including
+quantization companions, while selected partitions materialize their declared replicas.
+The complete decoder retains both ordinary and selected state layouts from its
+prepared definition; ordinary state admission does not reconstruct family geometry.
+Dense Qwen projections retain Qwen2 affine biases, Qwen3 query/key normalization,
+window schedules and the declared tied embedding. Its optional redundant checkpoint
+head remains a source-format extension with its own encoding. Rooted text checkpoint
+extensions and routed/composite factories pass their declaration choice explicitly;
+a supplied dense scope must match its configuration and cannot describe routed banks.
+K2 configuration parsing retains its common and provider scopes in one shared
+construction authority. Block-FP8 normalization visits that authority, projects
+exact formats and retains the result for admission; it does not discard a temporary
+catalog and declare geometry again. GGUF encoding normalization uses the same
+projection. Repeated declaration views and unchanged selections share both common
+and provider allocations. Local policy transformations use independently projected
+scopes and cannot reuse a stale global identity. Source format references resolve
+against logical slots and explicit SafeTensors/GGUF source matrices before allocation.
+Packed gate/up storage derives its two row origins from fused bank semantics;
+encoding projection retains operator arithmetic, reduction order and value output
+replicas. Direct blocks and local-geometry hooks consume retained owners.
+
+Dense K2 source tensors, selected placement, state, construction and discovery
+project the admitted static and body scopes, including grouped hidden normalization,
+head-owned Q/K gains and optional attention output gates. Its FP8 scale spellings,
+exclusions, dtypes and source companions remain explicit checkpoint extensions.
+Format projection preserves the normalized source FP8 policy and changes only the
+selected encoding map. Independently routed K2 value and feed-forward banks retain
+their separate provider scopes and source-layout rules.
+
+Llama-compatible, Gemma2, Nanbeige, ordinary dense Qwen2/Qwen3 and dense K2 replicated and
+partitioned preparation pass source and
+selected dense scopes into the shared kernel. Local head geometry, fused QKV and
+gate/up segments, intermediate widths, head-owned normalization and sink slots
+project retained specs. Static materialization consumes retained construction slots
+with explicit vocabulary ranges and role ownership. The dense factory consumes its
+declared gated spec; provider-specific factories retain their own projection contracts.
+Topology and configuration agreement are checked before pinned allocation.
+Complete and pipeline-local geometry project attention alignment, local state and
+vocabulary ownership from the retained dense slots. Local state validation uses
+the same projection and rejects incompatible sharing or changed local policy.
+Capability estimates use declared cache geometry and static width with explicit
+context and sliding-window policy. Discovery reads the same attention, gated,
+normalization and readout scopes; equations and hook permissions stay explicit.
+Local configurations change only selected head and intermediate dimensions;
+changes to retained positional, arithmetic or other execution policy reject.
+The same block-geometry projection serves VoiceChat's retained speech and character
+transformers. Parameter identities and arithmetic policy remain separate from local
+state, invocation order and placement.
 
 `LayeredModel` and `PartitionedLayeredModel` are `ComponentAdapter` specializations
 over the same `DecoderKernel`. `CompleteDecoderKernel::from_definition` and
@@ -1282,6 +2154,14 @@ and convolution parameters remain replicated and included in each rank's exact
 binding bytes. Both streaming caches retain full hidden width because they store
 normalized inputs and post-GLU convolution values rather than projected heads.
 The architecture reports that complete cache geometry on every tensor rank.
+Perception groups lower the retained Conformer projections, head biases, affine
+normalizations and raw convolution slots directly through the shared declaration
+visitor. Subsampling and the final projection remain separate residency units.
+Conditioning groups use the same projection for character tables, optional flags,
+speaker controls and gated fusion. The right-multiplied prompt matrix retains its
+stored input-by-output orientation and partitions its output axis; the frozen Aria
+table and other ingress controls remain replicated. These placement policies do
+not establish additional encodings, invocation modes or observation hooks.
 
 `PreparedPerceptionBindings::select_parallel` applies the selected placements to
 retained canonical recipes once, preserving source authority and bounded
@@ -1584,9 +2464,9 @@ dispatch or model equations. Its result borrows the existing coupled executor.
 The constructor accepts independent backbone and speech-provider policies under
 complete parameter allowances. Cache and distributed execution selection remain
 separate from component construction.
-The retained construction also owns `NeuralStateGeometry`. It derives
-Nemotron state through the existing hybrid contract and TTS state through the
-shared decoder contract, preserving every local/global attention window. Batch
+The retained construction also owns `NeuralStateGeometry`. It projects
+Nemotron and TTS state from the exact backbone and causal transformer declarations
+used for materialization, preserving every local/global attention window. Batch
 geometry declares one conversation row and two classifier-free guidance rows.
 Native cache initialization validates both exact selected layouts before
 allocating either owner. The shared selector requires checkpoint and
@@ -1895,6 +2775,22 @@ synthetic geometry does not bypass released-artifact admission. Its explicit
 branch and shared-scheduler runs compare output and retained state at the same
 committed boundaries with identical native RNG seeds.
 
+`eredu-codec::mimi::specs::MimiSpec` owns the validated released codec's
+canonical parameter identities, geometry, semantic roles and component groups.
+Checkpoint admission and native construction consume this same declaration;
+prepared and selected artifacts retain it through binding. Admission projects the
+full released codebook set, retaining inactive books as required source tensors,
+while materialization selects only active slots. Initialization flags, EMA usage
+and vector sums have distinct roles. SafeTensors aliases, F32 constraints and
+convolution layout permutations remain explicit source-format extensions. The
+same construction member list projects logical slots and source extensions;
+kernel extensions reference their typed weight slots. Ordinary convolutions and
+the root depthwise upsampler use `[0,2,1]`, while decoder transposed convolutions
+use `[1,2,0]`. Quantizer projection slots retain their declared layout. These
+source permutations leave native convolution geometry in OKI order.
+Streaming invocations retain independent mutable carry. Parameter roles and
+component groups establish no observation or intervention support.
+
 `eredu-codec::streaming` owns shared causal convolution carry and transposed
 convolution overlap-add. Geometry declares stride, dilation, groups, padding and
 tail policy. Carry is compact and bounded; finish is idempotent, later input is
@@ -1919,7 +2815,7 @@ these contracts, reversing the checkpoint's encoder-ordered stages. Speech
 control-code replacement, timestamps and conversational policy remain outside
 the codec.
 
-`decoder_component_definition` declares independently leased units and per-unit
+`DecoderDeclaration` declares independently leased units and per-unit
 carry identities. `DecoderKernel` supplies the same streaming neural equations to
 `ComponentAdapter` for complete and selected pipeline execution. The shared adapter
 owns graph, parameter visitation and local state-root mapping. Upsampling
@@ -2042,7 +2938,7 @@ TP/PP selection verifies that tensor participants own the same unit range.
 The MLX adapter binds these retained contracts through `MlxComponentPipeline`.
 Spectral preprocessing and borrowed quantization remain separate components.
 
-`encoder_component_definition` retains the finite encoder's canonical unit paths,
+`EncoderDeclaration` retains the finite encoder's canonical unit paths,
 parameter owners and stateless transport declaration. `EncoderKernel` supplies
 geometry, equations and route-specific channel/cadence resolution through
 `ComponentAdapter`; full and pipeline construction use that same kernel. Empty
@@ -2531,7 +3427,10 @@ unit. Resident, bounded and selected pipeline execution use this declaration.
 `TransformerExecution`, `CausalTransformerExecution` and the static parallel
 operation contract apply directly to the shared component runtime. Callers retain
 causal cache ownership and rollback authority; `TransformerRuntimeState` borrows
-those caches for each invocation. Native composition retains the selected policy,
+those caches through the selected architecture for each invocation. Global and local
+cache geometry project the retained attention slots, with attention windows supplied
+by explicit invocation policy. The component definition owns the resulting layout;
+runtime state and cache admission borrow that projection. Native composition retains the selected policy,
 cache layout and stream-bound immutable-parameter certificate.
 Typed equation hooks accept either borrowed caches or owned candidate storage;
 normalization-only stages own no attention slots. The shared adapter owns graph,
@@ -2782,7 +3681,12 @@ declarations with discovery. Shared-stack projections retain distinct logical
 execution nodes and capture paths, map them to physical layers and passes, and
 declare exact weight aliases using the same architecture-owned mapping as
 checkpoint lowering. These declarations do not imply shared mutable state or
-native allocations. Architecture descriptor schema 14 and component schema 13
+native allocations. VoiceChat's coupled descriptor projects exact neural parameter
+membership and feature widths from its typed declarations, with canonical backbone
+source names supplied by the retained architecture extension. Frozen speaker
+geometry follows the prompt table's feature axis; host buffers retain processor
+ownership. Realtime clocks, internal equations and observation support remain
+separate explicit contracts. Architecture descriptor schema 15 and component schema 13
 are independent of observation catalog/support schema 1. `eredu-runtime` combines phase/conditional
 requirements with selected session and collector facts; a backend reports only
 native collection/conversion mechanisms. The facade exposes cold discovery and
@@ -3727,13 +4631,39 @@ residency boundary remains the enclosing execution unit.
 
 The shared decoder constructor owns attention, residual normalization and optional
 terminal construction for dense, Qwen, GPT-OSS and K2 blocks. Typed `BlockFactory`
-hooks supply their projection resources and parameter topology. Partitioned hooks retain
-global routing cardinality while constructing rank-local expert banks and routed values.
-`TransformerBlockBody::from_factory` constructs those resources without a terminal;
-`terminal_normalization` constructs only the declared terminal module. Complete block
-construction uses the same body builder and terminal specification. Normalization groups,
-scale offsets, parameter aliases and optional post-residual normalizations come from the
-retained family configuration.
+hooks declare a cloneable `Parameters` type composed from neutral neural specifications.
+`ProjectionDeclarations<S>` holds typed projection specs once per canonical body
+owner and validates them against the normalized architecture identity. Its references
+join the retained parameter description's logical geometry, role, sharing, encoding
+and owning invocation before backend allocation. Projection declarations contain no
+mutable execution state or concrete rank placement.
+Preparation receives global routing policy, local geometry, any retained dense slots
+and an optional typed projection declaration. It projects supplied slots directly;
+an absent declaration selects the family's explicit producer. Integrated dense and
+separate projection declarations cannot both claim the same construction authority.
+Preparation produces complete dense or provider-owned stage parameters. The shared
+constructor validates each factory's local policy and the combined logical scope
+before allocating pinned modules. Cold family declarations supply parameter topology;
+shared decoder construction consumes the retained executable component projection.
+Partitioned preparation preserves global selector cardinality while selecting local
+expert banks, shared channels and independently routed values.
+Gated width projection retains split/fused identities, row layout and arithmetic.
+Routed and value-bank projection preserves global selector cardinality while
+rejecting local geometry outside the declared source bank. K2 source and prepared
+provider scopes use the same value/routed/shared projection helpers.
+The kernel retains common body scopes, typed projection parameters and independently
+addressed terminal normalization scopes. Complete, tensor-local and partitioned
+construction reuse them when materializing leased units. Materialization receives
+the prepared stage parameters and creates backend modules without redeclaring them.
+Physical construction authority follows canonical parameter owners, including owners
+outside a partition's invocation range. `TransformerBlockBody::from_prepared` consumes
+retained attention, normalization and projection slots without a terminal; terminal
+operations materialize their retained normalization directly. Raw block construction
+prepares and validates the same scopes before calling that materialization path.
+Complete block construction uses the same body builder and terminal slot. Normalization
+groups, scale offsets, aliases and optional post-residual normalizations remain in the
+typed scopes; invocation
+policy and provider-specific feed-forward construction remain family-owned contracts.
 
 The neutral replicated and partitioned session constructors build target and optional
 transform-source modules in canonical storage order. They reject differing source and
@@ -3787,9 +4717,11 @@ per-block offloading, tensor sharding, pipeline cuts, combined TP/PP and capture
 Exact full-source aliases retain the physical tensor's encoding and geometry,
 including native GGUF blocks, instead of treating encoded bytes as dense recipe
 outputs. Architecture policy owns repetition, checkpoint geometry and cache
-identity. Resident materialization currently creates a block for each logical
-invocation; estimates count these replicas and all invocation caches, while
-checkpoint storage describes the physical weights. Backends consume the usual
+identity. Resident construction materializes canonical parameter owners. Each
+selected pipeline partition materializes owners used by its local invocations,
+including shared owners outside its logical range. Estimates account for those
+selected replicas and all invocation caches; checkpoint storage describes the
+physical weights. Backends consume the usual
 typed replicated or partitioned architecture and add no family dispatch.
 
 `eredu-runtime::construct_replicated_text_session` and its execution-strategy
@@ -4266,6 +5198,18 @@ and provider failure. Nested bank adapters preserve the active scope instead of
 repeating callbacks. Native composition forwards the same borrowed arrays, maps
 and origin tags without evaluating or retaining component values. The first local
 error remains the source when the final callback also rejects the invocation.
+Nemotron-H's complete sparse construction declaration owns the grouped sigmoid
+selector, ReLU² bank and always-on unary branch. Canonical factories map target
+and appended prediction identities to parameter roots; format extensions retain
+explicit source roots. Bank-only consumers project the same declaration.
+Construction, checkpoint admission, placement and discovery consume its exact
+slots and equations. Local binding restricts routed and shared channels
+independently while retaining the global selector, biases, sharing and the
+shared down-projection's exact-zero-input hint. Sparse module construction
+validates the complete scope before allocating its operators. Prediction invocation
+state and residency identities
+remain separate from parameter ownership.
+
 Nemotron-H's partition adapter forwards its routed ReLU² unit observations
 through this driver, including the TP execution path.
 
@@ -4603,6 +5547,14 @@ composition binds those recipes without reconstructing the segment equation.
 Family recipe APIs derive their own checkpoint roots; in particular, Gemma 4
 and Qwen expert recipe callers provide only the catalog, normalized
 configuration, and layer identity, never a backend-selected layer namespace.
+
+Pinned recipe destinations project the component adapter's retained parameter
+owners and partition selection. Family kernels provide format-specific rewrites;
+the shared adapter retains only declared pinned targets whose physical storage
+is selected. Execution-unit recipes and neighboring partitions grant no pinned
+source authority. This selection reads no constructed module metadata. Ordinary
+parameter visitors remain the materialization and atomic binding contract.
+
 Independent expert residency is exposed to composition as a validated neutral
 architecture catalog. Each entry carries expert identity, its owning group,
 unit index, parameter path, and placement. Architecture composition maps that
@@ -4618,20 +5570,36 @@ binding names. Architecture composition validates catalog targets, owners, and
 grouped-plan coherence before producing the neutral members. It compares every
 member recipe to the exact one-expert selection of the admitted whole-bank
 recipe, including inferred physical weight, scale, affine-bias, MXFP4, and
-block-FP8 geometry. The union of routed plan addresses and catalog paths must
-also exactly match the independently derived family layer schedule, so a
-coordinated omission from both plan and catalog is invalid.
+block-FP8 geometry. Expected routed membership projects the typed expert-bank
+construction declarations. Invocation addresses and operation paths project the
+component definition retained by cold text admission. The union of routed plan
+addresses and catalog paths must exactly match that projection, so a coordinated
+omission from both plan and catalog is invalid. Parameter roles and checkpoint
+names do not establish execution paths, observation hooks, or backend support.
 
 Qwen hybrid recipes resolve admitted checkpoint aliases and assemble weights and
-FP8 scale companions through the same construction for whole banks and individual
-experts. Checkpoint inverse scales become the architecture's declared grouped
-scale parameters; derived scale companions retain floating-point storage rather
+FP8 or affine companions through the same construction for whole banks and
+individual experts. Explicit format extensions map dotted physical companions to
+canonical grouped slots. Router construction consumes the retained format policy,
+including its floating checkpoint exclusion and explicit selected overrides.
+Checkpoint inverse scales become the architecture's declared grouped scale
+parameters; derived scale companions retain floating-point storage rather
 than inheriting the weight's FP8 format. MLX represents FP8 values and exponent
 scales as byte arrays while preserving their source encoding and byte accounting.
 Its grouped adapter supports floating-point and UE8M0 scales with 128-by-128 blocks,
 and its capability report applies that geometry to both direct and derived FP8
 weights. These representation rules remain backend mechanisms; checkpoint aliases
 and companion identities remain architecture policy.
+
+Nemotron-H uses one typed bank recipe projection for packed and split storage,
+including whole banks, independently leased members, scales and affine biases.
+Only canonical declared outputs become executable bindings.
+Its SafeTensors aliases borrow complete logical declarations for geometry and
+encoding eligibility across static resources, target units and patterned prediction.
+Normalization and raw Mamba kernels retain their declared floating storage;
+matrix aliases retain their construction encodings. Split expert sources reference
+their owning bank slots while retaining explicit per-source encoding overrides.
+Alias spelling and tensor rank do not determine matrix eligibility.
 
 Expert identity is not a backend ownership address. The backend consumes the
 resulting atomic declaration directly and never infers eligibility or companion
@@ -4693,7 +5661,11 @@ than rewriting family quantization fields. GGUF adapters hand the architecture
 only canonical per-weight formats; architecture-owned `with_checkpoint_formats`
 derivations normalize family names, partition composite text/media formats,
 preserve native expert encodings, and return the complete validated source
-configuration. The same rule applies to external assistant configurations.
+configuration. Qwen, LFM2 and Kimi Linear resolve split expert formats from
+typed packed-bank owners rather than synthesizing owners from layer schedules.
+Qwen3-VL delegates text format projection to the same Qwen path, including
+gate/up encoding agreement. The shared source-format join rejects missing or
+heterogeneous split encodings and conflicting encodings for one declared owner. The same rule applies to external assistant configurations.
 Pipeline telemetry likewise resolves
 checkpoint ownership from architecture-declared execution-unit paths rather
 than synthesizing family layer prefixes. Catalog policies declare any
@@ -4761,6 +5733,10 @@ the placeholder's initial F32 dtype does not request a conversion. Packed and
 integer parameter handles retain exact dtype matching. The neutral binder
 continues to validate exact shapes, selected sources, and declared dtype
 allowances without inferring native storage flexibility.
+MLX's load-time packed conversion predicate admits ordinary floating source
+encodings. FP8 and packed source encodings do not authorize another packed
+conversion; cold selection rejects those candidates before task construction or
+native allocation. Native FP8 binding retains its own scales and layout contract.
 Partitioned materializers use that same visitor for both ordinary decoder
 families and multimodal families, leaving tensor-parallel binding selection generic and
 the role-to-module mapping entirely within the architecture. Distinct pinned
@@ -5086,7 +6062,11 @@ description. Static binding traversal is restricted to the roles owned by that
 pipeline stage, so a packed overlay need not materialize companions for an
 unowned stage merely to construct the local adapter.
 Validated architecture parameter descriptions retain their canonical
-execution-unit layout alongside owner-tagged parameter groups. Pipeline
+execution-unit layout alongside owner-tagged parameter groups. Members projected
+from neural declarations retain their logical shape and role through physical
+encoding expansion. Sharing validation checks logical and physical geometry;
+equal packed shapes alone do not establish compatible shared parameters.
+Physical encoding companions retain their separate companion roles. Pipeline
 composition consumes those declared group ranges and flat unit ordinals for
 target and prediction placement; it does not rebuild target/MTP counts from
 family configuration fields. Pipeline topology preflight and stage-range
@@ -5617,6 +6597,15 @@ projections of that definition. Pure tensor-parallel selection projects its
 group counts and state ownership, then retains a definition with validated local
 geometry. Realtime construction consumes the retained source and selected
 definitions directly before allocating pinned native resources.
+
+Moshi source extensions project matrix geometry from temporal and depth
+construction declarations. PersonaPlex packed attention sources derive their row
+count from the declared depth invocations; those invocations retain independent
+identities and their declared norm sharing. The checkpoint packed-word projection
+supplies U32 weight and per-group scale/bias geometry with checked 32-column
+alignment. Family extensions retain exact companion prefixes, dtypes and source
+alias rules. Native Moshi and PersonaPlex keep their distinct NVFP4 admission rules;
+source declarations do not establish a backend execution capability.
 
 Realtime artifact loading also crosses the backend boundary as a neutral
 architecture preparation. Moshi inspection parses optional native defaults or
@@ -6466,6 +7455,22 @@ configurations. Architecture normalization binds target-dependent geometry befor
 opening the source; the family-blind materializer constructs both encoding views
 from those retained configurations. It does not derive geometry from a native
 target or reopen an artifact.
+
+`ExternalAssistantArchitecture::parameter_declarations` projects owned snapshots of
+its typed neural scopes through `AssistantParameterDeclarations`. The projection
+retains `ParameterSpec`, exact logical geometry, neural role, encoding extensions
+and the scope's independent acquisition owner. Complete preparation validates
+sharing and geometry before consulting backend lowering support. Source and selected
+bindings use these declarations independently of packed physical source shapes;
+rank and parameter spelling do not establish a matrix role, encoding or owner.
+Assistant lookup tables, additive biases, normalization gains, convolution kernels
+and integer token mappings retain their distinct declared meanings.
+Gemma's static vocabulary/fusion scope and decoder blocks, Glimmer's DFlash scopes,
+and Spark's context, decoder and independent scoring units supply these facts.
+Spark checkpoint geometry and matrix conversion eligibility project the same
+neural scopes; BF16 source policy, exact I64 mappings, aliases and conversion
+recipes remain explicit format contracts. Target-owned tables are supplied through
+the separate target operation rather than becoming assistant-owned parameters.
 
 Runtime's `ParameterAcquisitionUnit` groups admitted materialization tasks by
 their declared independent storage owner. It validates unique primary/companion
@@ -7404,11 +8409,23 @@ ordinary block windows. Artifact profiles retain their unsharded scope, while
 native session observations report actual rank-local replicas and bank occupancy.
 
 Automatic schema version 7 also retains a separate selected-rank resource
-profile. K2's tensor-free physical parameter description feeds the same TP/EP
-placement primitive used by construction. Runtime sizing applies each output's
-own physical geometry, including scale companions and replicated global routers;
+profile. Llama-compatible, Gemma 2, Nanbeige, Qwen2/3, GPT-OSS, K2, LFM2, Kimi
+Linear, Nemotron-H, DeepSeek V3/V4, Nemotron Labs Diffusion and Muse selections retain
+their executable component projection beside the source declaration before native
+construction. Replicated and partitioned
+construction consume this target parameter description. Selected-rank reporting
+for K2, Nemotron Labs Diffusion and Muse consumes the same retained description;
+source binding and conversion retain the admitted source declaration. Native GGUF
+lowerings supply packed executable geometry and output companions even without an
+additional load-time conversion. Target projection validates invocation ownership, equations, state, selected formats and
+output companion identities and geometry. Its physical parameter description
+feeds the same TP/EP placement primitive used by construction. Runtime sizing applies
+each output's own physical geometry, including scale companions and replicated global routers;
 PP ownership selects static consumers and repeated units before aggregation.
-KV accounting uses only locally owned layers and complete KV heads. Source-recipe
+KV accounting projects the retained selected state through the same validated rank-local
+state geometry used by construction. It counts ordinary key/value components with their
+selected physical storage dtypes; fixed, compressed and append-stream state retain
+separate resource contracts. Source-recipe
 workspace uses the existing bounded binding-placement rewrite for both ordinary
 parameters and individual bank members. Ordinary native and recipe workspace
 estimates consume the same placed recipe. Compact-bank bounds preserve each bank's
@@ -7454,9 +8471,10 @@ storage/copy allowances. No family equation or analysis algorithm moves into the
 backend. See [component analysis](component-analysis.md) for current coverage and
 outstanding integration requirements.
 
-Ordinary non-gated FFNs use the architecture-owned `decoder::unary` equation
-(affine read, activation, affine write). Nemotron-H dense units reuse it for
-ReLU², including input/output biases. Its fixed-state replicated adapter forwards
+Ordinary non-gated FFNs retain their affine read, activation and affine write in
+the neural `UnaryFeedForwardSpec`. `decoder::unary` composes the neutral activation
+with architecture-owned unit and write-input observation boundaries. Nemotron-H
+dense and shared units use this path for ReLU², including input/output biases. Its fixed-state replicated adapter forwards
 observers through the same physical attention and FFN boundaries as its full
 architecture. The resident driver forwards internal unit observations as well as
 input/readout hooks. Observation stays optional and does not introduce extra
@@ -7614,8 +8632,12 @@ each partition's local width. Runtime expands scale geometry and segment coordin
 from those origins. Native grouped projection kernels consume the declaration while
 sharing the ordinary quantized input, and effective-parameter decoding and scratch
 admission use the same scale rows. Backends do not infer this layout from checkpoint
-names. The K2 checkpoint convention declares two independent row partitions for its
-fused FP8 gate/up source recipes.
+names. Architecture expert projection fields supply row origins explicitly to the
+source-format factory. Fused gate/up declarations select two independent origins
+for block-FP8 and NVFP4; down and ReLU-squared projections select contiguous rows.
+Other encodings retain contiguous rows. Source extensions retain the actual stored
+origins when they differ from the logical component boundaries. The K2 checkpoint
+convention declares two independent row partitions for its fused FP8 gate/up recipes.
 
 Shared decoder attention placement derives one GQA-head partition from the joint
 alignment of query/key/value read rows, optional gate rows and output columns.
@@ -8062,6 +9084,52 @@ without reusing their pre-reduction output as a complete contribution. Generic
 partitioned input/readout hooks execute their actual shared boundaries. Qwen and
 GPT-OSS explicitly report provider unit coverage; other custom projections retain
 the conservative default until their implementation supplies these hooks.
+
+K2 Horizon's `specs::Parameters` composes the shared decoder's pinned,
+attention, normalization and dense-MLP construction specs with its router,
+value-bank, packed SwiGLU and shared-expert declarations. Logical geometry and
+sharing validate before tensor allocation. Cold placement reads these slots
+directly; transform eligibility and discovery inherit their geometry and roles.
+`shared_expert_parameters` returns a complete `SplitGatedProductSpec` with exact
+slots, encodings, connectivity and policy, including independently retained local
+shared widths. Construction, admission, placement and discovery consume this scope.
+The routed composition checks router/shared input widths and shared/routed output
+agreement before allocation; global routing counts remain separate from local bank
+cardinality. The global routed-value invocation remains declared when a rank owns
+no value experts; selected bank cardinality is separate from the global routing
+configuration.
+
+`SourceParameter` links each ordinary format tensor to its owning logical slot.
+SafeTensors projects individual experts; GGUF projects packed expert axes and
+separate gate/up tensors from the fused neural bank. Source dtype constraints,
+FP8 companions, aliases and conversion recipes remain explicit format extensions.
+The FP8 matrix-source policy excludes the vocabulary table by its declared embedding
+role; physical matrix eligibility and module exclusions remain format rules.
+Those recipes retain bounded expert views and do not create a second parameter
+owner or change invocation/state identities.
+
+K2 Horizon's router declaration owns the global selector matrix, optional
+selection-only correction bias, floating arithmetic and distinct value/FFN
+selection equations. Native construction, ordinary source requirements, replicated
+parameter groups and discovery consume this same typed selector specification.
+FP8 scale names and GGUF storage constraints remain source-format extensions.
+Parameter ownership establishes no hook or intervention authority. The feed-forward
+scope composes `RoutedGatedProductSpec` with its optional shared
+`SplitGatedProductSpec`. Neural validation checks selector/bank connectivity and
+cardinality; family validation checks residual widths, SiLU and ordered expert
+accumulation. Attention values retain their separate selected-linear contract,
+including SiLU before mixture reduction and independent output rows.
+Expert planning and native construction localize the same retained block
+declaration before allocation, including independently selected shared channels.
+Residency traverses those same typed block declarations. Standalone parameter
+builders remain private to declaration construction.
+Each bank supplies its own cardinality and retained equation; selected placement
+localizes feed-forward intermediate channels or value output rows without changing
+the declared input width. Cold parameter groups supply inspection without a native
+module visitor. Expert recipes borrow the declared primary and companion slots to
+resolve targets, formats and source roots. Published per-expert/GGUF names and FP8
+scale aliases remain explicit format extensions. Recipe selection validates the
+configuration, invocation, bank and complete expert selection before source access.
 
 K2 Horizon supplies direct and provider component hooks. Its ordinary and observed
 feed-forward calls share one architecture driver: sparse units flow through the
@@ -8740,6 +9808,16 @@ weight. `StaticModuleSpec` supplies the same construction object to catalog and
 materialization paths. Diffusion Gemma uses its family-authored construction for
 both paths and appends its separate feedback groups; Gemma retains its own per-layer
 input resources.
+Composite discovery for Gemma 4, Muse and Inkling consumes one static declaration
+for both graph dimensions and readout identity, normalization and sharing.
+DiffusionGemma supplies its pinned declaration to the same Gemma readout projection.
+Output-domain transformations, including Inkling vocabulary unpadding, remain
+explicit family semantics; parameter geometry establishes no observation contract.
+
+Gemma media projectors and VoiceChat's independent function readout lower their
+typed parameter declarations directly through the shared physical-group visitor.
+The declarations retain exact companion references; replicated media placement
+and balanced function-vocabulary placement remain architecture policies.
 
 Moshi static construction retains one backend-neutral specification for ordered
 text/audio embedding tables, learned temporal normalization and text readout.
@@ -8748,11 +9826,27 @@ specifications before physical-format expansion. Complete and tensor-local
 materialization use the same constructor. Local table ranges resolve directly by
 the declared parameter identity; all vocabulary ranges are validated before any
 table is allocated. Input padding rows and the unpadded readout remain distinct.
+Moshi temporal and depth parameter scopes compose the shared decoder's typed
+fused-attention, gated-projection and normalization specs with the static and
+depth-edge construction specs. Complete-scope validation resolves PersonaPlex
+normalization sharing to slice zero before allocation. Native independent slices
+retain their own identities. Checkpoint catalogs and recipes share one explicit
+storage projection for native names, PersonaPlex packed slice rows, flattened
+`alpha` parameters, physical aliases and encoding companions. Cold placement and
+matrix contracts consume declared logical geometry and retained encoding references
+through the shared declaration projection. Matrix contracts pair those logical
+shapes with the projected physical primary and companion identities; they do not
+maintain a separate family format catalog. Invocation and
+residency ownership remain distinct from sharing, physical replicas and mutable
+frame state. Architecture discovery attaches those parameter scopes to its
+explicit temporal/depth graph without establishing frame observation support.
 Moshi local geometry consumes the retained parameter contract. Vocabulary groups
 and their canonical matrix identities project ranges through runtime whole-group
 balanced-axis validation, including companions, complete local/replicated storage
 and replication fallback. Expected vocabulary cardinalities derive from the same
-static and depth construction specifications. Block alignment and cache geometry
+static and depth construction specifications. Encoded local columns resolve to
+logical widths through retained matrix contracts before head and gated-width
+validation. Block alignment and cache geometry
 remain family-owned; this projection does not add a complete execution mode.
 Moshi rank-local construction selects state geometry on the retained component
 definition through runtime `select_state_layout`. Temporal invocation slots,
@@ -8837,34 +9931,72 @@ parameter placement and execution contracts before this shared projection. Decod
 and composite partition construction use the same selection without reconstructing
 state or observation ownership.
 
-Runtime `expand_linear_format_parameter_group` expands one atomic logical group
-and preserves its partition constraints and declared companions. Catalog expansion
-uses the same primitive. Families retain resource and canonical owner identities
-around that projection; Muse carries its role tags through format expansion, and
-LFM2 keeps its canonical static owners attached throughout. DeepSeek pinned
-format expansion likewise retains each resource role directly. Moshi matrix contracts,
-Qwen4 target catalogs and segmented geometry, Muse DSpark resources and Diffusion
-Gemma vision projection and the VoiceChat function head use the single-group
-projection directly. Their families retain matrix metadata, canonical owners and
-format admission; physical companion expansion preserves each atomic resource
-boundary.
+Runtime `logical_parameter_group` projects construction-owned identities, geometry,
+sharing and retained encoding references into one atomic physical group. Families
+attach their resource roles and canonical owners to the projected groups. Ordinary
+and routed decoders, media projectors, realtime readouts, Moshi matrix contracts,
+Qwen4 segmented geometry and Muse assistant resources consume this declaration
+projection. Invocation state and replica requirements remain independent contracts.
 
-`expand_tagged_linear_format_parameter_groups` moves architecture-owned resource
-tags alongside atomic groups through physical expansion. Tags need no cloning or
-ordering, and runtime assigns them no family meaning. Muse vision, Qwen vision,
-Gemma 4, Inkling, DeepSeek and shared static catalogs use this projection while
-retaining their own resource associations, canonical owners and format admission.
+`expand_linear_format_parameter_group` supplies the shared physical expansion
+primitive, preserving partition constraints and exact companion identities. Catalog
+expansion uses the same primitive for existing logical member groups; it does not
+infer family naming conventions or parameter encodings. Physical expansion retains
+each atomic resource boundary.
 
-`expand_owned_linear_format_parameter_groups` consumes canonical owned groups
-and projects their physical encodings through the same atomic-group primitive.
-Owners, shared consumers and replica requirements remain attached to each group.
-Kimi Linear, Qwen hybrid, Nemotron-H and LFM2 supply their admitted format callbacks;
-runtime owns the projection without reconstructing their family storage policy.
+Replicated text preparation projects conversion-output conventions alongside source
+matrix geometry. Typed packed banks select bank companions; independent experts
+and ordinary matrices select ordinary companions. Canonical source aliases retain
+that explicit convention, and conflicting canonical geometry or conversion outputs
+fail preparation. Prediction bank references retain their convention independently
+of source-matrix conversion eligibility. Requirement construction receives exact
+output identities and does not classify banks from parameter names.
 
-LFM2 attaches each layer's canonical owner when declaring its body groups, then
-uses this same owned projection for physical formats. Ownership does not depend
-on parsing parameter paths. Static vocabulary storage retains its existing tied
-consumers and does not participate in body-format expansion.
+Selected routed construction binds changed encodings from the retained materialization
+tasks and their exact output-companion roles and identities. Packed gate/up row
+partitions follow the typed fused-bank layout. Unchanged encodings retain their
+construction specifications, including arithmetic and storage policy. Parameter
+names do not select a companion convention during this binding.
+
+DeepSeek pinned vocabulary, normalization, hyper-head and DSpark resources project
+the same typed construction declarations as materialization and discovery. Published
+V3 embedding/readout and V4 embedding/Markov tables retain dense defaults independently
+of the model-wide linear default. Explicit admitted table encodings remain attached
+to the typed specs used by both construction and placement. Released source dtype,
+alias and physical-layout constraints remain checkpoint-format extensions.
+DeepSeek V3/V4 family factories construct the complete typed routed/shared scope:
+a neural `RoutedGatedProductSpec` for selector policy, slots and provider-owned
+expert bank, plus the independently declared shared split-gated branch. The
+neural visitor validates selector/bank connectivity and local expert extent; the
+family visitor validates shared-branch input/output coupling and resolves the
+complete scope's parameter references. Invocation coordinates pass separately to
+architecture construction and residency providers. Construction, source admission,
+placement and discovery consume that scope; bank-only consumers project its
+retained bank. V3 target/prediction validation and V4 token-table/DSpark roots remain
+family-owned. Selected local banks may have fewer experts than the global top-k;
+shared and routed widths and formats remain independent.
+DeepSeek expert source extensions reference the declared packed gate/up and down
+slots. SafeTensors alternatives, GGUF bank geometry, recipe targets and per-expert
+residency derive counts and shapes from those same logical declarations. Separate
+gate and up sources split the declared component-major row axis; independent
+sources remove the declared leading expert axis. V3 and V4 retain their distinct
+physical names, layout alternatives, encoding companions and source dtype rules.
+Residency uses each declared bank's selected encodings and keeps intermediate
+channel selection separate from whole-bank ownership. V3 and V4 each expose one
+cold realization planner over normalized configuration, optional retained local
+geometry and rank topology. Replicated and partitioned consumers call those planners
+directly; execution admission retains its prediction restrictions. Parameter
+ownership, expert planning and residency resolve flat identities through the same
+execution-layout projection, independently of V3/V4 checkpoint namespaces. Complete
+local geometry retains the global parameter declaration in shared ownership and
+compares it during preparation, alongside state, vocabulary and cache identity.
+A matching cache identity alone does not admit stale parameter geometry. V3
+configuration validation requires the target schedule to cover exactly the declared
+layer count before bank traversal or execution preparation.
+
+LFM2 attaches each layer's canonical owner to its physically projected body groups.
+Ownership does not depend on parsing parameter paths. Static vocabulary storage
+retains its tied consumers independently of body-format projection.
 
 `StaticModuleSpec::embedding_format` retains the complete physical matrix encoding,
 including block-FP8 companions. Shared decoder configuration supplies its selected
@@ -8880,13 +10012,66 @@ output partitions. Parameter identities, normalization policy and exact vocabula
 ranges come from the shared specification and retained geometry.
 
 Inkling declares vocabulary geometry, independent readout and final normalization
-in one source-free static specification. Complete and tensor-local component
+in one source-free static specification. Pinned admission and alias extensions,
+readout discovery and physical placement borrow that construction scope and the
+embedding-normalization declaration. Complete and tensor-local component
 construction use the shared selected pinned constructor; standalone `TextModel`
 uses the same specification through ordinary shared decoder construction. Cold
 catalogs project those same logical groups, retaining embedding-normalization and
 media roles separately. Inkling owns assembly normalization, muP scaling, protocol
-vocabulary trimming, MTP and media construction.
+vocabulary trimming, MTP and media construction. Target and prediction dense
+SwiGLU branches share `DenseParameters`, which composes a complete
+`SplitGatedProductSpec` with a raw learned branch scale. Named gate/up/down slots,
+logical geometry, retained encodings and gated policy come from the neural scope;
+native modules retain that policy separately from parameter bindings. Unloaded
+construction, ordinary placement, prediction dense slots, source layouts, interleaved-row recipes
+and component discovery project this scope. Dense gate/up interleaving, SafeTensors
+aliases, GGUF operation classes, partition axes and scalar observation phases remain
+explicit extensions. Prediction slots retain replicated ownership separately from
+target invocation state. Inkling joint routing uses `RouterParameters` and the
+retained `JointGroupSelectionSpec` for its raw projection, selection-only correction
+bias and learned route scale. `SparseParameters` composes that global scope with
+typed routed and always-on gated-product banks. Source layouts, aliases, conversion
+recipes, parameter placement, discovery and expert residency project those specs.
+Global selectable/always-on counts remain distinct from rank-local materialized
+bank ownership. Banks retain separate cache identities and distribution policies;
+router events and coefficient observations remain explicit execution contracts.
+`CommonParameters` supplies target and prediction
+attention projections, Q/K normalizations, the raw learned relative-profile table,
+residual normalizations and four causal convolution kernels. Common construction,
+source schemas and aliases, rank-local groups and component equations consume
+these declarations. Source extensions retain the GGUF convolution rank alternatives
+and dense relative-profile storage. Prediction bodies retain the same complete
+parameter scopes while policy, mutable histories and capture phases stay separate.
+The complete prediction declaration composes per-depth hidden/token fusion,
+common decoder and dense branch scopes plus one optional shared chain norm.
+Prediction placement projects these declarations directly without consulting a
+checkpoint schema. The hidden norm has one parameter identity across its two
+execution invocations; fusion column order, chain normalization, input hooks and
+state ownership remain explicit equation contracts. Source catalogs retain a
+configured chain norm at zero depths, while execution selects no prediction
+resources without an active depth.
+Its dMel embedding and
+normalization, hMLP stage projections and normalizations, fold schedule and
+pinned vision normalization come from typed construction declarations. Admission,
+alias recipes and placement project those declarations. SafeTensors and sibling
+mmproj GGUF names, operation classes and dtype rules remain explicit source
+extensions referencing declared identities. Inkling SafeTensors source weights use
+floating storage; conflicting text or media encoding hints reject during source
+admission. Executable load-time quantization remains a separate selection, and
+GGUF storage follows its admitted tensor encodings. The dMel table retains its
+audio-owned encoding map independently of text quantization. Vision stages remain separate
+residency units, and input/frame state remains independent of parameter ownership.
+Inkling decoder groups project retained ordinary, dense and sparse construction
+scopes directly through the shared encoding visitor. Query and K/V heads, fused
+expert gate/up rows and replicated scalars retain explicit family partition rules.
+Physical groups retain their canonical owners without a separate format catalog
+or a later name-based encoding lookup.
 
+Inkling cold selection retains the executable component projected from the admitted
+parent and selected formats. Complete, routed and partitioned construction consume
+that retained declaration; prediction targets use its target-only ownership.
+Transformation sources project their original encodings from the admitted parent.
 Inkling partition construction validates the retained definition, local geometry,
 canonical selected storage and state offset before materializing pinned modules.
 Target and transform-source preparation derive expert plans from configuration
@@ -9192,11 +10377,28 @@ one invocation at a time through `take_activation_evidence`, under the existing
 monotone delivery sequence and cumulative JSON budget. This does not recover native
 work or clear session failure.
 
-Prepared discovery keeps the ordinary target catalog and the selected prediction
-catalog separately. The latter is projected from the original admitted complete
-architecture retained with the source graph, before its target-only projection.
-Neither discovery nor the native binding reopens artifacts or reconstructs a family
-configuration to recover prediction points.
+Cold selection retains ordinary target and prediction parameter catalogs separately.
+`SelectedPredictionParameters` projects the admitted complete architecture with the
+exact auxiliary task formats, validates logical identity, sharing, ownership, state
+and physical companions, and retains its tensor-rank layout before allocation.
+DeepSeek V3/V4, Inkling, Qwen hybrid and Nemotron-H prediction construction consume
+that same executable definition, normalized configuration, layout and tasks. Source
+modules retain their admitted encodings and validated transformation-source cuts.
+Prediction layouts replicate across target pipeline and expert coordinates; resource
+reports size auxiliary tasks against their own retained catalog and classify routed
+parameters from declared expert roles. Target residency exclusions do not exclude
+resident prediction banks. Workspace reporting visits ordinary and prediction tasks
+through one recipe projection, using each scope's retained rank placement. Native
+workspace groups follow auxiliary module residency identities, and conversion
+workspace includes selected prediction outputs. Callers provide source metadata
+and mechanism facts; component placement comes from the retained selection.
+Prepared-source routes retain their rank cuts in their exact recipes.
+
+Prepared discovery projects prediction observations from the original admitted
+complete architecture retained with the source graph, before its target-only
+projection. Neither discovery nor native binding reopens artifacts or reconstructs
+a family configuration to recover prediction points. Qwen's shared prediction fusion
+uses an explicit selected format when present and otherwise retains dense storage.
 
 Embedded speculative durable copies use the same core snapshot and runtime
 reservation machinery as external drafting. Core snapshot/restore contracts return
@@ -9466,6 +10668,12 @@ replicas; component columns retain their tensor partition. The shared prediction
 driver supplies prefill, proposal and replay hooks to the existing controlled
 speculative executor. DSpark uses its own context/fused phase declarations and
 shared instrumented context/proposal equations, described below.
+V3 fusion columns and prediction vocabulary axes project their declared affines.
+V3 and V4 prediction normalization and parameter-group prefixes, sharing targets
+and optional biases project construction slots. V4 stream axes project the retained
+hyper-head geometry; DSpark context and Markov groups project their own typed
+slots. Observation paths, invocation phases and allowed operations remain explicit
+family declarations.
 
 Prepared V4 prediction replicas consume the target embedding and vocabulary head.
 The neutral selected requirements therefore replicate both static roles across
@@ -9651,6 +10859,14 @@ forward from being misclassified as an aborted policy invocation.
 
 Qwen hybrid prediction separates its checkpoint-shared fusion and three
 normalizations from the independently streamable decoder block at each depth.
+One typed shared specification supplies their identities, geometry, exact formats,
+and normalization equations to checkpoint admission, placement, construction,
+execution topology, and discovery. Fusion retains its explicitly dense format.
+Discovery registers invocation hooks separately and references the shared
+parameter declarations without deriving observability from them. Prediction
+residency projects exact parameter membership and ownership from the retained
+component definition; undeclared names cannot acquire a shared or depth owner
+through a checkpoint prefix.
 The hybrid decoder's generic pinned extension carries those canonical modules;
 conditional composition preserves that extension when consuming the text
 modules. Static unit-consumer ownership places one copy on each partition that
@@ -9733,6 +10949,11 @@ driver across ordinary and observed serial/parallel paths. Observed scheduled
 operators call the existing target component hooks; the effective normalized and
 fused values feed the actual decoder. The first physical unit owns fusion and the
 last owns readout normalization, preserving each depth's physical schedule.
+`PredictionUnitParameters` declares those boundary normalization and fusion slots,
+their exact geometry, encodings and physical invocation identity before allocation.
+Module construction, SafeTensors boundary requirements, parameter ownership and
+discovery project the same typed slots. Scheduled blocks retain independent state
+and placement, while embedding and vocabulary readout retain their target ownership.
 
 Nemotron prediction discovery keeps each depth's physical attention/MoE schedule
 separate from its target layers. Its component joins use the declared `mixer`
@@ -9844,10 +11065,31 @@ Transform records join actual input/output observations to their owning nodes
 and effective parameter groups. Constant/learned scaling, normalization and causal
 depthwise convolution remain architecture semantics. They are not extra additive
 residual terms, and their presence does not imply loaded capture or edit support.
+Inkling's joint router uses the neutral `JointGroupSelectorSpec` construction
+contract. Its checked global selectable/shared axis determines the projection,
+selection-only bias and learned scalar shapes used by admission and materialization.
+`JointGroupSelectionSpec` supplies the same combined axis to runtime input
+validation. Inkling supplies identities, source names, dtype rules and its explicit
+jointly normalized routing equation. Its complete sparse declaration validates
+router/bank connectivity, residual widths, bank cardinalities, SiLU policy,
+accumulation and sharing before construction. Selected routed and shared banks
+retain independent local widths and counts alongside the global selector.
+Block construction prepares the complete feed-forward declaration before allocating
+its normalization, attention or feed-forward modules. Parameter declarations
+establish no hook or intervention support.
 Inkling declares its four decoder convolutions and dense learned scalar from the
 same normalized layer policy used by construction. Convolution kernels use the
 canonical `[channel, 1, tap]` layout, ordered oldest to current, including the
-identity bypass. Current-position evidence does not grant historical-cache access.
+identity bypass. Released two-dimensional kernels reshape to the declared geometry;
+source preparation rejects incompatible channels or tap counts. The common block
+scope projects KV geometry and all four histories from its attention and convolution
+specifications. Global, selected and embedded-prediction state use that projection,
+retaining each convolution's channel count, history length and invocation slot.
+Dense interleaved
+gate/up extensions share a geometry projection with admission, and routed/shared
+interleaved banks reference the packed construction declaration. Parity selections
+use these declared row domains and validate the complete source shape.
+Current-position evidence does not grant historical-cache access.
 Ordinary bounded parameter operations continue to admit every read or edit.
 
 The component activation contract also distinguishes gated delta attention from
@@ -9876,26 +11118,58 @@ grouped normalization scale. Attention, dense and routed/shared expert declarati
 retain their semantic partition units. Prediction depths own group-relative units
 with flattened checkpoint paths, first-unit embedding/hidden norms and fusion,
 and last-unit normalization. Static embedding ownership includes the prediction
-role and tied output consumers. The shared runtime expands declared linear
-formats and packed ReLU-squared bank geometry into exact physical companions;
-family code retains checkpoint identities and format policy. Full metadata and
+role and tied output consumers. Parameter groups project the construction
+declarations and their retained linear-format references through the common
+runtime visitor. Mamba, attention, dense, router, routed/shared bank and fusion
+groups retain explicit family partition rules; storage expansion supplies exact
+physical companions. Family code retains checkpoint identities and format policy. Full metadata and
 selected/source preparation consume the same cold declaration.
 Materialized prediction-extension preparation also derives source and executable
 metadata from this declaration. It selects exact formats and local placement
 before constructing typed prediction units; embedding and readout continue to
 borrow target resources.
 
+Qwen realization planning accepts normalized configuration, optional validated
+local geometry and neutral rank topology without constructing modules. Qwen3-VL
+validates its retained composite geometry and projects its text geometry into this
+same planner. Replicated and partitioned consumers select their rank and geometry
+explicitly. Planning and expert residency traverse the same declared decoder banks;
+localization changes cardinality and intermediate width while retaining parameter
+identities, encoding policy and equations. Cold parameter descriptions supply dense
+and routed inspection. Local block geometry references the declared packed gate/up
+identity. Partition admission validates the complete bank specs for every declared
+invocation, including units outside the rank's pipeline interval, before binding.
 Qwen hybrid expert ownership planning accepts normalized text or conditional
 configuration, optional validated local geometry and neutral rank topology.
 Replicated and partition planning use the same derivation for target and MTP bank
 identities. Conditional planning validates the vision policy and its text-local
 geometry without a backend model, then supplies the retained expert plan before
-rank-local executable construction.
+rank-local executable construction. Target and MTP bank traversal also supplies
+hybrid expert residency and source recipes. Format extensions resolve source roots,
+canonical primary/companion outputs and expert ranges from the typed packed-bank
+projection; source aliases, conversions and companion admission remain explicit.
+One target/prediction schedule supplies the text graph, flat invocation addresses,
+unit paths and typed execution owners for parameter declarations, component
+definitions, bank traversal, recipe admission and residency. The conditional graph
+prepends vision to that text graph; its text paths and state slots retain the same
+schedule projection. Shared prediction norms and fusion resources declare their
+consumers through those execution-group identities. Unit and expert recipe
+preparation rejects unresolved layer or expert references before source access.
+Conditional recipe admission also validates the declared vision policy. Complete
+local text geometry retains the global parameter declaration in shared ownership;
+validation compares it against the requested declaration alongside state and
+vocabulary geometry. This rejects stale construction widths even when cache-state
+identity is unchanged. Replicated and partitioned callers select geometry and rank
+directly on the same cold planner.
 
 Qwen hybrid text parameter metadata is declared from normalized configuration
 and the same recurrent, attention, routed, dense and static construction specs
-used by its equations. Runtime encoding expansion supplies physical companions,
-row layouts and placement units. Target and MTP groups retain distinct execution
+used by its equations. Stored groups project retained linear-format references
+through the common runtime visitor, which supplies physical companions, row layouts
+and placement units. Logical groups retain pre-encoding geometry. Rank-local
+comparison snapshots project parameter identities, roles and complete encoding
+metadata directly from construction; they impose no checkpoint-global packing
+alignment on local extents. Target and MTP groups retain distinct execution
 owners; shared prediction fusion and norms declare their actual MTP consumers.
 Full, selected and prediction-extension text preparation consume this
 checkpoint-global declaration without constructing native modules. Conditional
@@ -9911,9 +11185,106 @@ prediction-extension preparation consume the cold parameter description without
 constructing a discovery model. Low-level unit parameter descriptions
 accept configuration and validated group coordinates without native modules.
 
+Ordinary Qwen text, GPT-OSS, LFM2, Kimi Linear and Nemotron-H declaration
+preparation resolves per-weight storage references against logical owners and
+explicit checkpoint source extensions. Both initial construction and
+selected-format projection reject unknown names,
+incompatible encodings and companion tensors used as primary weights before native
+allocation. Checkpoint aliases resolve only where a primary source constraint
+declares them; permissive artifact exclusions do not declare parameter identities.
+Qwen's redundant tied output source retains its own encoding independently of the
+shared embedding owner. GPT-OSS native expert block sources retain MXFP4 while
+ordinary matrices may use another encoding. These source references do not require
+GGUF blocks to satisfy SafeTensors packed-word layout rules. Published source
+constraints, native expert format exclusions and source-layout eligibility remain
+explicit checkpoint contracts.
+LFM2 and Nemotron-H target routers retain their floating storage rules; an explicit
+incompatible router override rejects. Nemotron-H prediction routers retain their
+separate admitted encodings. Independent Nemotron-H expert sources own storage
+separately from packed logical banks. Kimi's floating split-expert sources and
+LFM2's layout eligibility remain explicit source constraints. Raw convolution,
+normalization and recurrent transition parameters do not acquire matrix encodings from
+per-weight maps. Allowed rotary and prediction artifact exclusions do not resolve
+otherwise unknown references. Target and prediction scopes use the same preparation
+validation as selected-format projections.
+
+DeepSeek V3/V4 selected-format preparation resolves each explicit encoding against
+retained logical slots or a primary source extension. Unknown identities,
+companion identities used as weights, and incompatible raw parameter encodings
+reject before allocation. Translated V3 GGUF split KV-B and expert sources project
+the declared GGUF layouts without imposing SafeTensors word packing on native
+blocks. V4 packed GGUF expert references retain native MXFP4, including the
+explicit bank spellings accepted by format normalization; independent SafeTensors
+expert references retain the family's published expert encoding. Target and
+prediction sources retain their own layout rules. Parameter format validation
+does not establish observation permissions or backend support.
+
+Common dense decoder construction and selected-format projection invoke a family
+reference validator after composing complete neural scopes. Llama/Mistral/Phi,
+Gemma 2 and Nanbeige resolve their per-weight maps and mixed-encoding membership
+sets against those logical declarations. Strict source layouts do not admit
+additional format identities through rotary exclusions, companion names or an
+absent tied readout. Fused Phi projections use their declared fused identities.
+The shared resolver checks encoded aliases against their authoritative sharing
+targets. Nanbeige repeated blocks retain independent invocation state and
+placement, while conflicting encodings for one shared weight reject before
+allocation. Provider families validate their additional owners at their complete
+family boundary rather than treating a partial common scope as complete.
+
+Gemma 4 and DiffusionGemma resolve named storage extensions against their complete
+retained text, conditioning, media and projector scopes. Canonical source aliases
+and split expert formats reference those scopes; names outside recognized text
+prefixes receive the same resolution checks. Media references require their
+declared encoder owner, and rotary/artifact exclusions do not declare matrices.
+Standalone Gemma image/audio towers retain exact matrix eligibility and validate
+explicit requested encodings against their retained formats. Their external
+media-to-text projector references defer to the enclosing family's complete join,
+which supplies decoder width and checks the selected encoding. Explicit requests
+that fail alignment reject; uniform media quantization retains its declared dense
+fallback for ineligible projections. These checks grant no execution or observation
+capabilities.
+
+Inkling and Muse text and media encoding directives use the common matrix-reference
+resolver over their retained ownership scopes. Matrix eligibility is established
+by each slot's typed linear-format declaration, including embeddings and packed
+banks; raw convolution kernels, relative tables, gains and companions do not
+become eligible through rank or naming. The same resolver checks identities,
+encodings and shared targets after initial construction and storage projection.
+Gemma image/audio scopes use this matrix-only contract while keeping their explicit
+external projector deferrals. Family-specific source alias normalization, floating
+source constraints and uniform encoding eligibility remain separate declarations.
+
+Muse expert source formats project the retained bank's typed owner identity and
+unfused geometry into separate packed and independent SafeTensors layouts. The
+same visitor supplies schema requirements, source-shape joins, format references
+and normalization. Named source encodings remain in the validated policy; they do
+not become logical parameter owners. Source preparation infers executable bank
+encodings from complete homogeneous encoded members and rejects incomplete,
+conflicting or heterogeneous requests before native allocation. Root conversion
+metadata and explicitly selected formats use that single producer path, so split
+and independent source encodings remain available to admission after bank formats
+are inferred. Existing source aliases and encoding-companion rules remain explicit.
+GGUF references retain container-native block geometry rather than SafeTensors word
+packing. These format projections do not change layer equations or hook contracts.
+
+Gemma assistant preparation normalizes family aliases, then resolves matrix
+eligibility, encoding equality and sharing through the common resolver over its
+retained static, block and source-only per-layer declarations. Ordered vocabulary
+tables retain their dense-only contract, and unused GGUF vocabulary sources retain
+their explicit source exclusions. Muse assistant configuration checks requested
+matrix geometry before selection; initial and projected complete definitions also
+check that retained encodings match those requests. DFlash, DFlash2 and DSpark keep
+their separate body, selector and vocabulary equations and ownership. These cold
+checks allocate no backend resources and establish no observation permissions.
+
 Shared Qwen vision declarations and materialization consume the same patch,
 position, normalization, attention, MLP and merger specifications. Runtime encoding
-expansion supplies physical companions, row layouts and placement units. FP8 QKV
+expansion consumes the linear-format references retained by those declarations;
+checkpoint admission and placement use the same references. SafeTensors admission
+uses the scale identity retained by each encoded linear declaration, with exact
+FP8 block geometry, scale dtype constraints and primary-weight ownership.
+Runtime encoding expansion supplies physical companions, row layouts and placement
+units. FP8 QKV
 scale segments use block-row coordinates; weight and bias segments retain weight
 rows. Ingress storage, the final merger and each DeepStack merger keep their
 explicit static role or logical-unit consumers. Qwen3-VL and Qwen4 experimental
@@ -10013,24 +11384,30 @@ state offsets and selected local state.
 Low-level media, prediction and restricted-state operations live on
 `ConditionalKernel`; constructors return the shared adapter.
 
-Text Qwen hybrid complete, tensor-local and target-partition construction consumes
-an explicit retained `Arc<ComponentDefinition>` through `QwenKernel::from_definition`,
-`from_parallel_definition` and `from_partition`. `qwen::hybrid::project_parameters`
-selects executable formats while preserving logical consumers and observation seams.
-Identical projections reuse the allocation. Declaration producers supply target/MTP
-paths, independent state slots, transport and partition ownership to the shared
+Text Qwen hybrid cold selection retains the executable `Arc<ComponentDefinition>`
+through `qwen::hybrid::project_parameters`, preserving logical consumers and
+observation seams. Complete, routed, tensor-local and target-partition construction
+consume that retained selection through their typed definition constructors.
+Embedded-prediction targets consume the target-only retained definition; prediction
+extensions retain independent ownership. Identical projections reuse the allocation.
+Declaration producers supply target/MTP paths, independent state slots, transport
+and partition ownership to the shared
 execution-contract validator. Family checks validate global or selected recurrent,
 convolution and attention state plus retained vocabulary, head and intermediate
 placement. Routed complete preparation and dense/routed partition preparation retain
-the cold source definition and independently project source/target formats and local
-layouts. Shared partition selection validates canonical resource and state ownership
-before pinned materialization.
+the cold source definition for source-format projections and derive local layouts
+from the retained executable catalog. Shared partition selection validates canonical
+resource and state ownership before pinned materialization.
 
-Conditional hybrid construction takes the cold-admitted `Arc<ComponentDefinition>`
+Conditional hybrid cold selection retains the executable `Arc<ComponentDefinition>`
+through `project_conditional_parameters` using the full selected linear formats.
+Complete, routed and partitioned constructors consume this retained declaration
 through `ConditionalKernel::from_definition`, `from_parallel_definition` or
-`from_partition`. `project_conditional_parameters` selects executable formats
-while retaining logical consumers and observation seams; identical projections
-reuse the allocation. The family validates invocation paths, independent target
+`from_partition`. Embedded-prediction targets use the target-only retained component
+and keep prediction-extension ownership independent. Prediction admission normalizes
+the complete multimodal catalog against its composite declaration before restricting
+bindings to prediction-owned parameters. Projections retain logical consumers and
+observation seams; identical projections reuse the allocation. The family validates invocation paths, independent target
 and MTP state slots, transport and hook ownership from the same producers used
 for declaration. Global or selected state agrees with recurrent convolution,
 linear-attention and KV-cache geometry. Retained placement agrees with vocabulary
@@ -10057,14 +11434,13 @@ owner. Rank-local construction retains exact local state geometry, while the
 explicit ordinary state-layout operation returns global geometry. Group assembly
 receives dependency activations after shared adapter validation.
 
-`nemotron_h::component_definition` validates source-free target and patterned MTP
-contracts from normalized configuration and optional local geometry. Complete
-construction consumes that retained declaration through
-`CompleteNemotronKernel::from_definition` or `from_parallel_definition`; one
-materializer selects ordinary or tensor-local statics. Selected target construction
-consumes it through `NemotronKernel::from_partition`. `project_parameters` selects
-physical formats while preserving logical consumers and runtime observation seams;
-unchanged projections reuse the allocation. The family validates exact global or
+`nemotron_h::Declaration` validates source-free target and patterned MTP
+contracts from normalized configuration. Complete construction consumes its retained
+typed scopes through `CompleteNemotronKernel::from_declaration` or
+`from_selected_declaration`; one materializer selects ordinary or tensor-local
+statics. Selected target construction consumes them through
+`NemotronKernel::from_partition`. `Declaration::with_formats` selects physical
+formats while preserving logical consumers and runtime observation seams. The family validates exact global or
 selected Mamba/attention state, vocabulary ownership and target/prediction unit
 geometry before allocating modules. Shared execution-contract and partition checks
 validate paths, state references, transport and canonical resource ownership.
@@ -10086,10 +11462,20 @@ Nemotron-H derives expert ownership and rank-local ReLU-squared bank
 specifications from normalized `ModelArgs`, optional validated `LocalGeometry`
 and neutral rank topology. Target units and repeated prediction patterns retain
 separate group-relative invocation addresses and flattened bank identities.
-Replicated planning uses the same derivation. Selected and transform-source
-preparation consume these plans without constructing a native model for expert
-planning. The backend materializes the declared banks and supplies provider
+Replicated, selected and transform-source preparation call this same planner with
+explicit geometry and rank, without constructing a native model for expert planning. The backend materializes the declared banks and supplies provider
 resources.
+
+Nemotron-H shares one validated execution schedule and flat-address layout across
+parameter topology, unit recipes, residency ownership and expert realization.
+Target and appended prediction invocations reference the same typed ReLU-squared
+bank specs used by construction. Unit and expert recipes reference their up/down
+identities, and residency capacity derives expert counts from these declarations.
+The generic ReLU-squared geometry projection localizes group count and intermediate
+width while retaining parameter identities and encodings. Residency ownership uses
+typed execution groups and unit paths independently of checkpoint roots.
+Packed/split source names, companion suffixes and conversion recipes remain format
+extensions; source spelling does not establish a second parameter owner.
 
 Selected Nemotron-H targets use `ComponentAdapter` with `NemotronKernel`.
 The validated definition retains graph, canonical parameters, global unit paths,
@@ -10159,9 +11545,13 @@ routing events that the joint selector does not emit.
 
 Inkling prediction preparation retains one typed module per physical depth and
 one optional canonical chain-normalization module. The ordinary whole-chain API
-and prepared executor share the same depth equation. Source constructors retain
-checkpoint encodings; executable constructors consume the exact selected task
-formats. Module visitation reserves ordinal zero for the optional shared norm and
+and prepared executor share the same depth equation. Depth construction consumes
+the typed fusion, common decoder, and dense-branch declarations used by checkpoint
+admission and placement. The complete declaration validates before constructing
+any depth. Attention declarations retain their policy and log-scaling semantics;
+construction does not reconstruct these values from a second configuration view.
+Source constructors retain checkpoint encodings; executable constructors consume
+the exact selected task formats. Module visitation reserves ordinal zero for the optional shared norm and
 uses depth plus one for decoder modules, so a shared parameter is visited once.
 The native prediction materializer applies the retained residency policy to
 these physical owners. Shared normalization overlaps the active sequential
@@ -10235,8 +11625,13 @@ materialization mechanism. Native adapters bind them without reconstructing
 source configuration or reopening artifacts. Other composite families use the
 same handoff when their source construction supplies it.
 
-Inkling's joint routed/shared selector consumes a floating router matrix through
-its neutral tensor operation. Requirements therefore classify that matrix as a
+Inkling traverses its sparse target schedule into paired routed/shared construction
+specs for resident, replicated and rank-local realization and expert residency.
+Replicated route budgets read the joint selector's selected and always-on counts.
+Construction and residency resolve shared cache-layer identities through the same
+family projection, separately from the owning decoder invocation. Inkling's joint
+routed/shared selector consumes a floating router matrix through its neutral tensor
+operation. Requirements therefore classify that matrix as a
 raw parameter, consistently with family format policy and parallel declarations.
 Model-wide affine/MXFP4 conversion applies to the declared linear modules and
 expert banks; it preserves this router, relative-profile tables and convolution
@@ -10274,14 +11669,34 @@ LFM2 declares complete dense and routed parameter topology from normalized
 configuration without constructing native modules. Its embedding formats,
 attention/convolution geometry, dense layers, selectors and packed expert banks
 supply exact canonical members and ownership before placement. Runtime expands
-selector resources and encoded projection companions through shared neutral
-geometry helpers. Routed partition preparation uses these declarations for both
+selector resources and encoded projection companions from retained construction
+references through the common visitor. Attention, convolution and routed/dense
+groups retain their explicit axes and input-alignment partition domains.
+Routed partition preparation uses these declarations for both
 selected and transform-source layouts.
+LFM2 and Kimi traverse their validated sparse schedules to retain typed bank
+declarations for construction, residency and expert realization. Public bank lookup
+rejects invalid configuration, missing invocations and dense layers before source
+access or backend allocation. Localization changes group count and width on these
+specs, retaining parameter identities, encodings and reduction policy. Residency
+passes each retained bank directly to its expert recipe projection; published source
+aliases reference the declared packed projection identity. Partition validation
+traverses those same banks and reads their gate/up targets and intermediate domains.
+Kimi's shared-expert partition interval references its typed dense projection spec.
+LFM2, Kimi Linear and Nemotron-H complete geometry retains the global parameter
+declaration in shared ownership. Selected partitions retain that same declaration
+alongside their owned block geometry and complete state layout. Preparation compares
+it with the requested declaration, including identities, formats, sharing and owners,
+before binding. State and equation geometry remain explicit; parameter declarations
+supply the parameter comparison rather than a separate global-width snapshot.
+Replicated consumers select serial topology on the same cold realization planners.
+Qwen and GPT-OSS routed partition checks obtain expert cardinality from their
+construction-owned bank specs as well; invocation ownership remains explicit.
 LFM2 complete, tensor-local and selected construction consumes the cold-admitted
-`Arc<ComponentDefinition>` through `CompleteLfm2Kernel::from_definition`,
-`from_parallel_definition` or `Lfm2Kernel::from_partition`. `lfm2::project_parameters`
-selects executable formats while preserving logical consumers and observation seams;
-identical projections reuse the allocation. Complete serial and tensor-local resources
+`Arc<Declaration>` through `CompleteLfm2Kernel::from_selected_declaration`
+or `Lfm2Kernel::from_partition`. Its retained component definition projects executable
+formats while preserving logical consumers and observation seams; identical projections
+reuse the allocation. Complete serial and tensor-local resources
 use one materializer. The complete and partitioned geometry views expose vocabulary,
 block and state ownership to one definition selector. It validates equation paths,
 state references, transport and hook ownership through runtime's execution contract,
@@ -10290,8 +11705,8 @@ and block placement. Shared partition selection validates canonical resources an
 state ownership before pinned allocation. Routed complete preparation and dense/routed
 partition preparation retain cold source/target definitions and independent layouts.
 Parameter discovery, execution addresses and unit counts project from that declaration.
-LFM2 derives expert ownership and local bank specifications directly from
-`ModelArgs`, optional validated `LocalGeometry` and rank topology. The operation
+LFM2 derives expert ownership and local bank specifications directly from its
+retained declaration, optional validated `LocalGeometry` and rank topology. The operation
 has no backend type or native context. Replicated expert planning uses the same
 algorithm, and partition preparation consumes these neutral plans for both source
 and selected parameter layouts.
@@ -10309,10 +11724,10 @@ partition source preparation consume this declaration without constructing
 native modules for discovery.
 
 Kimi Linear complete, tensor-local and selected construction consumes the cold
-`Arc<ComponentDefinition>` through `CompleteKimiKernel::from_definition`,
-`from_parallel_definition` or `KimiKernel::from_partition`.
-`kimi_linear::project_parameters` selects exact formats while retaining logical
-consumers and runtime observation seams; unchanged projections reuse the allocation.
+`Arc<Declaration>` through `CompleteKimiKernel::from_selected_declaration`
+or `KimiKernel::from_partition`. The retained component definition projects exact
+formats while retaining logical consumers and runtime observation seams; unchanged
+projections reuse the allocation.
 One complete materializer selects serial or local pinned modules. Complete and
 partition geometry supply vocabulary, block and KDA/MLA state ownership to one
 definition selector. The shared runtime contract validates equation paths, state
@@ -10385,6 +11800,449 @@ before serial or parallel group ingress. Parallel kernels can place token lookup
 or another collective at the group's declared wave; the default uses the ordinary
 group equation. Invalid ingress cannot advance kernel state or issue a collective.
 
+Gemma 4 and DiffusionGemma normalize `VisionPolicy` and retain immutable
+`VisionConfig` static and per-block scopes once. `VisionOwner` supplies the exact
+family parameter root; source extensions, projectors, placement and construction
+reject references to another owner before backend allocation. Format projection
+updates retained affine encodings while preserving geometry, clipping slots,
+normalization and attention arithmetic, standardization and released alignment
+fallback. A lease clones only its requested construction scope. DiffusionGemma cache identity
+uses the semantic vision owner and policy, independently of retained scope storage.
+These declarations own the pinned patch projection,
+two-axis position table, optional complete pooled-feature standardization, and
+independently leased blocks. Block slots comprise attention and gated MLP matrices,
+optional complete clipping bounds, head gains, and four residual branch gains.
+Construction, SafeTensors admission, sibling projector GGUF requirements, and
+independently leased replicated groups project the same typed slots. Head geometry
+and score arithmetic remain explicit invocation facts. Admission and placement
+consume each slot's retained encoding reference; the common runtime visitor
+expands physical companions from those references.
+Per-weight encoding selection uses each family's actual tower identity; published
+source names and aliases remain format extensions. Generic neural clipping specs
+own the four scalar bound roles and their exact rank-zero geometry, and Gemma
+audio projections consume that same contract. Clipping slots never establish
+observation, intervention, or backend support.
+
+Gemma 4 audio feed-forward scopes compose the neural `UnaryFeedForwardSpec`
+with a fixed SiLU equation, input/output normalization and a finite configured
+residual weight. Learned clipping bounds attach to the read and write slots;
+ordinary geometry appears only in the neural scope. Full block admission keeps
+normalizations before affine and clipping declarations, and construction preserves
+pre-normalization, clipped read, SiLU, clipped write, post-normalization and residual
+scaling in that order. Zero and negative finite residual weights retain their
+configured equations. These declarations establish no internal audio hooks.
+
+Gemma 4 audio validates external `AudioPolicy` before building immutable
+`AudioConfig` scopes. The config retains pinned subsampling kernels and gains,
+input and output projections, and independently leased encoder blocks. Parsing
+and GGUF metadata normalization build these scopes once; source admission,
+construction, inspection and placement borrow them. Encoding changes project
+onto retained geometry and validate format references before allocation, keeping
+the released input-alignment fallback. The explicit audio-to-text projector
+format reference resolves in the enclosing family, which supplies decoder width.
+Selecting the optional output bias retains all source slots and shares the
+unchanged encoder-block scopes. Block slots
+include feed-forward projections, attention and relative-key projections,
+per-dimension query scales, causal depthwise kernels, and residual-branch gains.
+Construction, source admission, replicated ownership, and residency costs project
+these typed scopes. Published relative-key sources retain their floating-point
+constraint even when materialization selects an encoded projection. The output
+bias remains an optional source slot; its invocation policy selects whether
+construction and placement include it. The selected static scope implements the
+same logical visitor as complete source scopes. Audio admission and placement
+consume retained encoding references, with the floating relative-key source
+constraint referencing its declared identity. Complete clipping bounds use the generic
+neural contract. Request validity, local-attention masks, convolution equations,
+and explicit media hooks remain separate execution declarations.
+
+Gemma 4 vision feed-forward declarations retain one `SplitGatedProductSpec`
+for affine geometry, encoding and the fixed GELU-tanh equation. Optional learned
+input/output bounds attach to the named gate, value and contraction slots; these
+extensions do not restate matrix geometry. The complete scope validates affine
+connectivity, residual width, policy and parameter references before allocation.
+Admission and replicated residency groups visit the same scope, preserving each
+matrix followed by its clipping bounds. Native binding projects the three clipped
+affines in gate, value, contraction order and retains separate GELU-tanh activation
+and multiplication. DiffusionGemma's encoder uses this same declaration under its
+own parameter root. Clipping parameters establish no observation hooks.
+
+Gemma vision and audio attention compose `ClippedSelfAttentionProjectionSpec`.
+Its affine scope owns checked head geometry, query-row layout, encodings and sharing;
+learned scalar bounds attach to the named Q/K/V/output slots. The visitor preserves
+each affine followed by its clipping parameters, and binding projects those same
+clipped slots without restating geometry. Vision validates residual, Q/K gain and
+four-way rotary width coupling. Audio validates MHA width, relative-key projection,
+per-dimension query scale and required clipping; surrounding residual gains and
+convolution channels share the declared hidden width. Audio score caps and relative
+position equations, vision score arithmetic, and explicit hooks remain family policy.
+
+Gemma 4 and DiffusionGemma immutable family configurations retain media-to-text
+`ProjectionSpec` edges after validating normalized family policy. Checkpoint
+requirements, parameter ownership, discovery and native materialization borrow
+those exact edges. Format projection changes only their encodings and preserves
+identities, input/output geometry, normalization epsilon and arithmetic. Missing
+media owners and unresolved projector format references reject before allocation.
+Optional audio output-bias selection shares the unchanged family edge scopes.
+Request admission consumes a policy view: DiffusionGemma reuses image-ingress
+semantics without declaring Gemma4 parameter owners. Parameter edges remain
+independent of prepared input observations and mutable execution state.
+
+Gemma 4 vision/audio and DiffusionGemma image-to-text projection declarations
+own each matrix's identity, geometry, encoding, and separate weightless input RMS
+epsilon. Construction, checkpoint requirements, replicated placement and replica
+costs, component ownership, and discovery project those slots. Gemma projectors
+retain the media configuration's alignment policy; the DiffusionGemma image
+projector retains its encoder root and text-side format policy. Released aliases
+remain storage extensions. Sibling projector GGUF admission retains its dense-only
+rule, independently of encoded SafeTensors execution. These declarations add no
+internal media hooks or backend capabilities.
+
+DiffusionGemma's immutable family configuration retains the feedback declaration
+and one independent encoder residual-scale spec per logical layer. Parameter
+construction occurs once; admission, GGUF aliases, placement, discovery, iterative
+workspace topology and native binding borrow those scopes. Format projection
+changes only feedback encodings and shares unchanged encoder scale owners.
+Encoder scalar references outside the declared stack and matrix-format overrides
+of those raw scales reject before allocation.
+The feedback declaration owns the learned feedback gain and the GELU-tanh
+gate/value/contraction slots in a complete `SplitGatedProductSpec`.
+The enclosing declaration validates normalization/residual widths, the fixed
+GELU-tanh policy and output epsilon; the neural scope validates affine connectivity.
+Native feedback preserves separate GELU-tanh activation and multiplication,
+including their rounding boundary. Construction, source requirements,
+prepared GGUF aliases, static placement, and iterative workspace topology project
+those specs. The weightless post-addition RMS epsilon remains a separate equation
+fact. Local construction can reduce the retained intermediate width, keeping
+parameter identities and normalization policy. Complete static preflight resolves
+that width before any vocabulary or feedback backend factory. Preparation rejects
+zero or enlarged widths, incompatible
+adjacent widths and invalid parameter topology before native construction. Feedback
+belongs to refinement; shared-stack matrices and independent encoding scales retain
+their own owners. Discovery references this owner without inferring internal hooks
+or backend support. Cold tied-readout topology projects the embedding's actual
+identity, geometry, and encoding without declaring an additional parameter.
+
+Gemma 4 and DiffusionGemma immutable family configurations retain one static text
+scope under their actual language-model or shared-decoder root. Source admission,
+GGUF alias preparation, ownership, selected vocabulary ranges, discovery and native
+binding borrow it. GGUF alias preparation receives the declaration explicitly;
+geometry alone does not select parameter ownership. Encoding projection preserves
+the source geometry, normalization arithmetic, sharing and whole-table residency.
+Named pinned format references resolve to declared matrix slots and reject gain,
+companion and unowned readout identities before allocation.
+These declarations retain the shared ordinary vocabulary construction contract
+alongside optional per-layer identity tables, complete decoder-to-layer-input
+projections, and per-channel gains. The same
+slots project into SafeTensors/GGUF requirements, prepared aliases, tagged static
+roles, materialization, selected vocabulary ranges, and readout discovery. A tied
+readout retains the embedding's owner and encoding; an independent head has its
+own slot. Per-layer resources retain their whole static materialization strategy
+and replica costs. Admission and placement consume retained encoding references;
+the common runtime visitor expands each physical group with its declared partition
+domain. Gemma's native final gain arithmetic and DiffusionGemma's
+configured gain arithmetic remain distinct declarations. Storage aliases and
+encoding constraints remain format extensions and establish no execution support.
+
+Gemma 4 and DiffusionGemma family configurations also retain each decoder block's
+input/write gains, residual-stream multiplier and optional gated layer-input
+projections. Native binding, source requirements, placement groups and component
+discovery consume these exact scopes. Checkpoint namespace projection preserves
+logical geometry, operator arithmetic, parameter metadata and explicit companion
+ownership. Layer-owner mismatches and incompatible residual or layer-input widths
+reject during preparation. Encoding projection changes only the layer-input matrix storage;
+unchanged formats share the block allocation. Named scalar format extensions reject
+during preparation. Cold local-geometry preparation projects bounded layer-input
+widths from the retained source and validates encoded local shapes before backend
+allocation. Diffusion's shared decoder gains and multiplier remain distinct from
+its independently owned encoder invocation scale. Parameter ownership establishes
+no capture, mutation or execution capability.
+
+Gemma 4 and DiffusionGemma immutable families retain each dense branch's
+`DenseSpec`, containing the complete `SplitGatedProductSpec` with its source
+geometry, matrix encodings and resolved exact or tanh-approximated GELU equation.
+Admission, GGUF aliases, placement, discovery, execution topology and native binding
+borrow these retained scopes. Namespace projection preserves parameter metadata,
+companion ownership and arithmetic. Storage projection changes only encodings and
+shares unchanged scopes. Selected local intermediate widths reduce the retained
+source axes; cold preparation validates encoded local shapes before allocation.
+Unknown dense matrix references, companion or bias format targets, conflicting
+encoding aliases, changed layer owners and incompatible geometry or GELU equations
+reject during preparation. Native dense execution retains separate activation and
+multiplication; ordinary allocation
+order is gate, value, contraction. Construction, checkpoint requirements, placement
+groups, assistant declaration projection, DiffusionGemma execution topology, and component
+discovery consume this same scope. Discovery distinguishes the two declared GELU
+equations. The neutral gated-product policy represents both equations, and MLX
+implements each through its corresponding reusable activation mechanism.
+Ordinary, routed, per-layer-input and feedback groups project their construction
+declarations directly, retaining exact primary-to-companion references and explicit
+head, intermediate and fused-bank placement rules.
+
+Gemma 4 and DiffusionGemma immutable families retain each `AttentionSpec`, with
+owned affine/head-gain parameters and separate invocation and state-source policy.
+Admission, source aliases, placement, discovery, capability sizing and native units
+borrow those same scopes. Namespace and encoding projections preserve identities,
+companion ownership and rotary arithmetic; unchanged formats share their allocation.
+Rank-local queries and publisher K/V heads project the retained source, validate
+encoded local shapes and preserve parameter omissions on shared-state consumers.
+Global, tensor-local and pipeline-local cache geometry reads these same declarations.
+Gemma prefix state references the declared residual input width; Diffusion retains
+its context-only state policy. Invalid matrix/companion/gain references, conflicting
+formats and incompatible publisher or local head geometry reject before allocation.
+Published unused shared-KV GGUF sources remain explicit format exclusions and do not
+gain parameter ownership. Attention declarations establish no observation hooks.
+An attention invocation records its state publisher separately from its owned
+parameters: shared consumers own query/output slots without K/V slots, and
+key-as-value owners have no separate value matrix. Their shared text declaration
+uses `AttentionHeadGeometry` for checked query, K/V and attended widths, and validates
+owned slot presence against the invocation's state policy. Query/output residual
+widths, optional K/V affines, Q/K gains and rotary dimensions are checked together.
+TP construction resolves query and publisher-key identities through these scopes;
+shared history remains a state dependency, not a parameter alias. The same attention
+scope projects cache ownership and head geometry. Shared consumers have no cache
+payload; key-as-value owners retain separate normalized key and value payloads.
+Gemma's optional prefix state and DiffusionGemma's context-only histories remain
+explicit invocation contracts. Discovery reads
+the publisher's actual projections and gains. GGUF aliases reference declared ordinary slots;
+permitted unused K/V tensors on shared consumers remain explicit source exclusions
+and establish no parameter owner, shared alias, or materialized replica.
+
+Gemma external-assistant statics declare target fusion, the final gain, and the
+selected tied, independent or centroid-ordered vocabulary. Native construction,
+source requirements and materialization formats consume these typed slots.
+Ordered output retains its raw dense table, floating centroids and I32 token
+ordering; source aliases and operation constraints remain format extensions.
+Encoding overrides resolve declared matrix slots and reject gains, ordering buffers,
+unknown identities and incompatible storage before materialization. Assistant
+attention consumes externally supplied target KV, independently of parameter
+ownership. Ordinary decoder state preparation, partitioning and discovery resolve
+and validate in-stack publishers and their geometry separately from attention
+parameter declarations.
+
+Gemma 4 block declarations own four sublayer normalization specs, the one-element
+residual-stream scale, and optional per-layer input gate, projection, and gain.
+The scale has an explicit logical residual-scale role; its declared geometry also
+constructs the unloaded parameter. Admission, format aliases, placement groups,
+and discovery consume the same slots. Per-layer matrix channels remain partitioned
+while complete hidden-width gains remain replicated. DiffusionGemma encoding uses
+an independently owned scale from the same scalar contract, alongside the refinement
+scale and shared block matrices. These scales retain distinct source identities,
+placement members, and discovery groups.
+
+Gemma 4 and DiffusionGemma immutable families retain each sparse-branch declaration,
+composing the neutral `RoutedGatedProductSpec` with the three dense/sparse branch
+normalization slots. The routed scope retains router input gains, per-expert
+coefficient scales, packed expert targets and encodings. Physical split gate/up
+encodings remain explicit extensions of the fused bank's declared identity and
+geometry. Namespace and storage projections preserve parameter metadata and routing
+equations; unchanged formats share the source allocation. Neural validation checks selector/bank connectivity and routing
+cardinality; family validation checks residual and normalization widths and the
+approximate-GELU equation. Complete validation resolves sharing before allocation. Construction, checkpoint requirements, expert recipes,
+placement, residency slicing, and discovery project those typed specs. Explicit
+storage extensions retain separate or fused gate/up layouts and use the shared
+neural packed-bank projection for exact shapes and primary identities. A sparse
+schedule traversal borrows retained declarations for residency and realization planning.
+Local bank projection can reduce expert counts and intermediate axes while the
+selector retains its global routing axis. Supplied local banks must match the
+retained identities, encoding, reduction and activation policy. Complete family
+preparation resolves layer-scoped format references against the retained catalog,
+including explicit split-source extensions, and rejects unknown layers, matrices,
+gains, companions and conflicting encodings before allocation.
+Gemma 4 expert planning takes immutable family declarations and optional validated
+local geometry without a backend model; replicated, partitioned and transform-source
+consumers prepare this authority before native module construction. Prepared GGUF aliases
+reference those slots before conversion chooses execution formats, including matrix
+encoding companions and the distinct scalar coefficient scale. DiffusionGemma
+uses the same declaration under its shared decoder parameter root; encoding and
+refinement invocations retain their separate state and execution ownership.
+Discovery reads scoring and normalization from the retained selector: Gemma 4
+uses selected-only softmax without selected-sum normalization; DiffusionGemma
+uses full softmax followed by selected-sum normalization.
+Local expert counts and intermediate widths come from the retained placement;
+global route identities remain independent. Parameter slots establish no hook,
+intervention, or backend capability support.
+
+Muse scalar construction specs wrap the generic normalization construction
+contract with explicit centered/direct gain and reduction-order equations.
+Block gain slots, weightless branches, learned residual logits, and preserved
+residual coefficients project into checkpoint requirements, placement groups,
+and discovery from those same specs. Stored coefficients remain independent
+parameters; admission never reconstructs learned logits from them. DSpark
+context projection, context/final gains, and block scalars use the same typed
+edge and block declarations, retaining separate invocation and state ownership.
+Pinned embeddings, final gains, and tied/untied readout project the shared
+static-module construction. Tied readout retains the embedding's parameter owner
+and physical encoding. GGUF static/scalar names and companions resolve through
+the same format extensions that declare their source requirements. Observation
+and intervention support remains explicit and independent of these declarations.
+
+Muse target and DSpark gated attention use a single typed projection scope for
+query, key, value, channel gate, and output weights. Head geometry, selected
+encodings, and optional learned GGUF head gains project from those slots into
+construction, checkpoint requirements, placement, and component discovery.
+Their dense SwiGLU slots likewise share one typed expansion/gate/contraction
+factory across ordinary and assistant construction, admission, placement, and
+discovery. Ordinary GGUF projection aliases and encoding companions use the
+same storage extensions as the source requirements.
+Invocation specs retain independent schedules, rotary policy, temporary query
+scales, and mutable caches. Target placement permits whole K/V-head replication.
+DSpark scoring declarations retain vocabulary, predecessor-table, successor,
+confidence, and exact token-mapping slots alongside their separate acquisition
+boundaries. Native unit construction, checkpoint requirements, ownership lookup,
+and replicated placement consume those declarations. The confidence projection
+retains FP32 input arithmetic; token mapping retains nontrainable I64 storage.
+The generic neural token-mapping role describes identity translation independently
+of routing tables and establishes no execution or observation support.
+DFlash2's candidate selector declares each predecessor/successor lookup table and
+hidden projection together with its independent acquisition group. Native unit
+construction, released checkpoint shapes and acquisition-owner lookup project
+these declarations. Source extensions retain matrix encodings and their exact
+companions. Selector top-k and conditional-score equations remain invocation
+policy, separate from parameter storage and backend support.
+Glimmer and DFlash2 bodies retain typed context, attention, SwiGLU, normalization
+and proposal-local convolution scopes. Their attention affines compose
+`SelfAttentionProjectionSpec`; the family validates residual widths, even rotary
+head dimensions and Q/K gain geometry. Their SwiGLU scope is a complete
+`SplitGatedProductSpec`; native blocks retain its policy independently of their
+parameter bindings. Residual normalizations, feed-forward boundaries and paired
+convolution geometry are validated together. Memory forecasts read head axes and
+proposal-local convolution geometry from those same declarations. The DFlash2 manifest and memory forecast project its named
+affine slots. Native unit construction, SafeTensors/GGUF
+geometry, exact acquisition ownership and memory forecasts project those scopes.
+Complete-scope validation resolves identities and geometry before backend allocation.
+Context, decoder and final-gain acquisition identities come from the shared body
+contract; target-state ordering, rotary arithmetic and residual equations remain
+independent invocation policies. Source extensions retain Glimmer's floating gains,
+DFlash2's BF16 rules and the explicit GGUF namespace.
+Dynamic block convolution declares its two-sided raw kernel separately from the
+coefficient projection and selected encoding companions. Its module consumes that
+specification directly. Glimmer materialization resolves primary formats from the
+same retained declarations, keeping gains unencoded and rejecting unresolved slots
+before lowering. Glimmer format overrides reference declared matrix slots; unknown
+identities and overrides of gains fail configuration validation. Parameter declarations
+add no native support or capture claims.
+
+GGUF ordinary-projection aliases and encoding companions resolve through the
+prepared `TextGgufNames` extension before payload
+reads. Static and residual format extensions retain their separate
+contracts. Parameter declarations establish no observation or intervention support.
+
+Muse normalizes external configuration into `DecoderPolicy` and prepares immutable
+`DecoderConfig` source scopes once: pinned vocabulary resources, per-layer attention
+and invocation policy, scalar normalization/residual equations, and dense or routed
+feed-forward parameters. The complete logical visitor includes retained vision and
+audio scopes and validates identities, sharing and geometry. Format references
+resolve to declared text matrix slots; gains, companions and unresolved names are
+rejected. Tied readout retains the embedding owner without a second head slot.
+Direct and compressed routed declarations have distinct types. Source schemas, provider recipes, placement, discovery and native
+binding borrow these retained owners. Format changes project onto the existing
+pinned, attention, dense, selector, bank and compression specs; they preserve
+arithmetic, normalization,
+selection order and correction-bias meaning. Split source format aliases resolve
+to the declared fused bank identity and conflicting split/fused encodings reject.
+Media-source selection shares text owners. Rank-local configurations retain those
+source owners and project selected heads and intermediate widths only for binding
+and mutable-state geometry. Static acquisition selects retained roles and vocabulary
+ranges without rebuilding declarations. Complete block preflight resolves attention,
+feed-forward and scalar specs before native factories. GGUF schemas require the
+GGUF-normalized source policy, whose learned Q/K gains are declared by construction.
+DSpark body execution takes `DecoderPolicy` alongside its independent retained
+assistant parameter owners, so target parameter scopes do not establish assistant
+identities.
+The direct form retains the neutral `RoutedGatedProductSpec`; its router and bank
+consume decoder-width activations. The compressed form retains the decoder-width
+selector, latent-width bank and required ingress/egress projections and
+normalizations. Its family visitor validates the complete decoder/latent path,
+global routing cardinality, bank policy and accumulation order. Complete reference
+validation precedes native allocation. Local bank binding retains the selected
+equation and cannot expand its declared intermediate width or group count.
+Prepared-bank binding validates identities, roles, formats and reduction before
+any block factory allocates backend resources.
+Construction, placement groups, discovery references, and checkpoint requirements
+project those same typed specs. Format extensions retain packed, split, and
+independent expert layouts and bind recipe outputs to the declared packed targets.
+The validated routed schedule supplies retained declarations to residency and
+realization planning. Expert residency slices declared primaries into independently
+addressable expert units and reads quantization roles from their retained encodings.
+Localization changes group count and intermediate width on those bank specs;
+global selector identities, reduction order and invocation state remain explicit.
+Text, compressed expert and DSpark body groups project retained encoding references
+through the common runtime visitor. Query-head assignment and whole K/V-head
+replication remain explicit placement policies; DSpark retains distinct heads.
+GGUF conversion aliases include matrix encoding companions before execution
+formats are selected. Source constraints and conversion recipes remain responsible
+for accepting actual encodings; an alias does not establish format support.
+
+Muse vision `VisionConfig` retains immutable static and per-block construction
+scopes after normalization of `VisionPolicy`. Checkpoint admission, spatial-kernel
+recipes, parameter ownership, selected format catalogs, discovery and native
+factories borrow those scopes. A block lease clones only its requested block;
+pinned selection binds only the chosen static resources. Format projection changes
+encoding extensions while preserving attention and normalization arithmetic,
+source ingress policy, position layout, invocation schedule and logical geometry.
+Unresolved format identities and incompatible geometry reject before backend
+allocation. SafeTensors temporal patch folding and the published image-only GGUF
+spatial layout remain distinct explicit source contracts.
+
+Muse vision construction specs own patch and position geometry, affine layer
+normalization slots, attention and MLP projections, and the language adapter.
+Attention uses `SelfAttentionProjectionSpec`; the family validates equal Q/K/V
+head axes, the residual-width head product and its four-way rotary divisibility.
+Construction and source mappings use named affine slots, while placement lowers
+that same neutral visitor. Layer-normalization widths remain coupled to this scope.
+Each vision block's MLP is a `UnaryFeedForwardSpec` with fixed exact GELU and
+validated residual widths. Construction, source geometry, parameter groups and
+GGUF aliases consume that scope; native execution retains the separately declared
+expansion, activation and contraction observation phases.
+The independently selected vision adapter retains its two affine slots in a
+unary scope, the second GELU as an explicit output activation, and the language
+projection as a separate resource. Construction, format eligibility, GGUF aliases,
+placement and discovery consume these declarations. Warm input validation reads
+the adapter's declared input width; native execution retains both GELU calls and
+their distinct readout observation phases.
+The generic affine layer-normalization contract and native module live in
+`eredu-nn`. Muse requires learned gain and bias at the residual width in its
+complete declarations and binds the generic `LayerNorm` directly. The family declares native or cascaded
+moments once; the neural arithmetic contract supplies its optional backend operator
+requirement to cold admission and construction. Independently selected static
+resources require that normalization mechanism only when their norms are selected,
+and reject an unavailable mechanism before allocating those resources. Muse
+retains explicit observation phases. Checkpoint requirements,
+format eligibility, placement groups, and discovery parameter groups project
+those construction specs and their retained encoding references. Patch/position
+and static norms retain all vision-unit
+consumers; adapter and language projection retain only the final unit's consumers,
+including each physical encoding companion. The image-only GGUF extension maps
+typed slots to published names and spatial kernel storage, with its fixed position
+row count and adapter width. Prepared name mappings serve source canonicalization
+without an independent parameter-name grammar.
+
+Muse waveform `AudioConfig` retains complete immutable typed declarations for
+its patch, convolution, and output residency units. Source normalization builds
+`AudioPolicy` first, preserving SafeTensors parameter-precision ingress and GGUF
+input-preserving ingress as distinct source rules. The decoder and companion plans
+carry the retained configuration through admission, recipes, reports and native
+construction. Encoding selection projects retained affine specs while preserving
+arithmetic, geometry and cadence; unresolved projection identities reject before
+materialization. Unit factories clone only the requested owner's slots, and a
+complete pyramid traverses those same slots. Mutable histories remain request-
+and session-owned.
+
+Muse waveform construction specs declare each patch projection, convolution,
+normalization, and residual MLP once. Residual blocks compose
+`UnaryFeedForwardSpec` with fixed exact GELU and required affine/convolution bias
+slots; their normalization, convolution and network widths agree before allocation.
+Patch folding consumes the declared projection input width, with checked patch/
+channel coupling, and output normalization follows the declared projection width. Checkpoint admission projects logical
+geometry from those slots; GGUF aliases and the floating convolution requirement
+remain explicit storage extensions. Cold parameter groups, exact unit ownership
+including encoding companions, and convolution history dimensions use the same
+specs. Media admission reads each primary slot's encoding reference; the runtime
+visitor expands physical companions within its declared owner. Preparation rejects
+unresolved format references and invalid parameter
+topology before native construction. Discovery attaches these declared parameter
+groups to the audio encoder and projector without establishing internal hooks.
+
 The standalone Muse waveform tower uses `AudioKernel` with the same shared
 component adapter. Its validated definition declares each patch operation,
 convolution block, and output projection as an independently leased unit, with
@@ -10452,7 +12310,7 @@ selected layout, but its presence cannot select both alternatives. Header-only
 admission validates the complete selected layout before native materialization.
 
 Muse load-time media quantization derives eligible matrices from its checked
-architecture-owned checkpoint geometry. It selects aligned patch, position,
+architecture-owned geometry, including typed waveform projection declarations. It selects aligned patch, position,
 attention, FFN and adapter matrices, retaining dense storage where an input
 axis cannot hold the requested packed blocks. Exact checkpoint format admission
 remains separate. The retained selected formats drive cold capabilities, memory
@@ -10499,7 +12357,10 @@ companions and placement rules retain checkpoint-global geometry. Complete,
 tensor-parallel and partitioned construction consume the `ComponentDefinition`
 retained by cold admission before allocating modules. Graphs, logical paths,
 transport, parameter catalogs and complete state reports project that definition. Vision invocations declare
-no decoder state slots; text slots include the persisted mRoPE position delta.
+no decoder state slots. Ordinary text construction supplies the complete selected
+KV layout, and the VL state extension adds the persisted Int32 mRoPE position delta
+exactly once. Admission checks the base layout's invocation policies and declared
+head geometry; global and local construction use the same extension.
 Target and transform-source partition preparation derive layout from the same
 cold parameter declaration.
 
@@ -10515,6 +12376,9 @@ Complete and selected preparation use these same declaration projections for
 source and target modules; source authority and placement stay independent.
 The shared partition selector validates resource and state ownership.
 
+Qwen3-VL cold selection retains the executable component projected from the
+admitted parent and full selected linear formats, including mixed vision formats.
+Complete, routed and partitioned construction consume this retained declaration.
 Complete and selected Qwen3-VL use one resource materializer. Selected construction
 consumes a cold partition and validates its canonical parameters, state, boundary,
 vision geometry and exact normalized local text policy before native allocation.
@@ -10631,13 +12495,15 @@ Gemma flattens its padded media batch into the admitted sequence dimension and
 restores the encoder batch from the retained request geometry. Native backends
 perform ordinary tensor reshaping and transfer, without interpreting media parts.
 
-Gemma 4 materialization consumes the validated `ComponentDefinition` retained by
-cold admission. Low-level constructors take that explicit parent through
-`GemmaKernel::from_definition` or `from_parallel_definition`. Source and target
-formats project its canonical parameter catalog and logical consumers; unchanged
-formats and geometry reuse its allocation. Family unit and state producers validate
-paths, state references, transport and runtime-owned observation seams before native
-allocation. Retained placement agrees with vocabulary rows, per-layer channels and
+Gemma 4 cold selection retains the executable `ComponentDefinition` projected
+from its admitted parent and exact selected formats. Optional audio output bias
+presence comes from the admitted tensor catalog. Complete, routed and partitioned
+materialization consume that retained executable definition. Low-level constructors
+take the explicit parent through `GemmaKernel::from_definition` or
+`from_parallel_definition`. Transformation sources project their original formats;
+unchanged formats and geometry reuse the parent allocation. Family unit and state
+producers validate paths, state references, transport and runtime-owned observation
+seams before native allocation. Retained placement agrees with vocabulary rows, per-layer channels and
 text block geometry. Execution metadata projects this retained definition. Cold partition
 and transform-source preparation read the same catalog without constructing
 native media layers. Pinned text resources declare their storage roles alongside
@@ -10995,6 +12861,11 @@ inputs and the grouped static norms are available on each vision partition that
 constructs request context; the merge adapter and final projection are owned by
 the final vision unit. Cold source selection, parameter topology, materialization
 and residency sizing consume the same family decision, including replicas.
+The pinned aggregate retains the declaration's patch input width independently
+of its selected resources. A shared input validator checks patch matrices and
+merge grids on every media-ingress rank, including ranks with no vision parameters.
+Patch construction consumes the same retained static specification; request-time
+validation does not reconstruct parameter declarations or allocate missing modules.
 
 Portable partition execution preserves typed architecture, policy, state and
 communication failures through the neutral neural error source. This includes
@@ -11717,6 +13588,38 @@ all but the last target row; fused context preparation consumes the full prefix.
 The materialized executor and the descriptive contract use the same
 `PredictionExecutionMode` operation for that rule.
 
+Qwen4 prediction preparation projects global, tensor-local and transform-source
+parameter catalogs from `PredictionSpec::parameter_description`. It validates exact
+retained tensor selections, identities and encoding companions before constructing
+shared or depth-local neural modules. Shared prediction parameters retain one static
+owner; each decoder depth retains its own invocation and bounded residency owner.
+
+`PredictionExtensionPlan` retains an exact parameter-to-physical-module residency
+index before source preparation. Canonical prediction execution owners and shared
+static roles project this index for DeepSeek, Qwen hybrid and Nemotron-H. Inkling's
+typed depth and chain-normalization scopes refine its complete static placement
+role into independently leased modules. Their encoded members must exactly match
+the retained parameter declaration. Every prediction parameter has one owner;
+shared target parameters remain with their target storage. Source preparation
+uses exact index lookups and rejects undeclared identities without interpreting
+checkpoint prefixes. Executable prediction bindings contain exactly those declared
+members; format intermediates remain recipe inputs, and missing declared outputs
+fail before construction. Metadata-only catalogs retain the complete admitted
+source set before applying role restrictions, so target projection preserves prediction
+provenance without granting target recipes access to predictor sources.
+
+Prediction construction groups exact materialization tasks by declared physical
+owner before constructing operators. The cold binding index checks source identity
+coverage and exact owner agreement for primary and companion outputs. Each output
+has one producer in its declared physical module, including modules within one
+shared placement role. Construction consumes each shared or sequential module's
+task set once and rejects omitted or repeated modules. DeepSeek, Inkling, Qwen hybrid and Nemotron-H consume the retained
+extension ownership index; Qwen4 projects its typed source prediction declaration.
+Cold admission and construction use the same physical residency identities.
+Materialization retains declared scalar shapes, including empty-rank NVFP4 global
+scales, alongside positive-extent tensor shapes.
+Native slot metadata supports subsequent binding validation and parameter control.
+
 Actual prediction preparation retains local parameter declarations, physical
 module ordinals, auxiliary residency owners and local state policies alongside
 `PreparedPredictionPlacement`. These are the modules and state supplied to native
@@ -11918,11 +13821,21 @@ geometry or equations; application tooling selects the capture advancement.
 `SpeechPrecision` is an architecture-owned storage and arithmetic policy. The
 facade retains it in `VoiceChatStartOptions::speech_precision`; the default is F32.
 Cold construction converts eligible perception matrices and speech attention/MLP
-weights through exact retained recipes before resource admission. Norms, biases,
-MoG component banks, RVQ tables and codec parameters retain F32. Narrow compute
+weights through exact retained recipes before resource admission, including the
+character encoder and MoG residual MLPs. Norms, biases, mixture prediction and
+component banks, RVQ tables and codec parameters retain F32. Narrow compute
 requires matching F16 or BF16 weight storage. Perception convolution weights remain
 F32 with F32 compute and become narrow only with the matching narrow compute policy.
 Converted bindings carry their actual byte lengths and materialization recipe peaks.
+
+Precision eligibility projects typed logical parameter roles and affine encoding
+references. Raw perception kernels retain conditional convolution storage; parameter
+names and tensor ranks do not select precision. Cold bindings and TTS quantization
+selection consume the retained component parameter groups. MoG selects its declared
+residual execution group independently of prediction and component-bank groups.
+Native perception and MoG blocks retain the same projection from their construction
+specifications; forward validation uses those identities without rebuilding catalogs.
+Precision declarations establish no observation, intervention or backend support.
 
 Shared linear construction declares optional floating execution precision through
 `LinearFormatSpec`. MLX casts projection inputs, performs the projection with the
@@ -12304,6 +14217,441 @@ planning consume this declaration without constructing temporary global models.
 Parameter-member declarations retain neutral encoding relationships through
 `ParameterMemberSpec::with_parameter_metadata`.
 
+Qwen4's source-free target assembly owns static slots and the ordered lexical and
+decoder parameter scopes. A shared invocation schedule separates checkpoint layer
+identity from execution-unit ordinal; source recipes, row-provider owners and
+state-schedule validation project that schedule. Cold requirements and bounded
+target construction consume the same typed parameter assembly. Row headers,
+lookup budgets, indexed-attention state and workspace attach to those parameters
+only for executable construction. Target and prediction use the same mixer
+parameter assembly with their respective rotary policies and invocation bounds.
+Provider-owned tables and routed banks retain independent materialization and
+residency contracts.
+
+Qwen4 lexical injection's `ple::LexicalParameters` declares both feature affines,
+three grouped normalization scales and the causal convolution kernel, including
+exact geometry, roles and component ownership. Construction, SafeTensors admission,
+the GGUF lexical entries and the target parameter catalog project these same slots.
+GGUF normalization offsets and the squeezed convolution axis remain explicit
+source transformations. Provider-owned n-gram rows, scalar scales and I64 hash
+controls retain their separate admission and bounded lookup authority; they do
+not become ordinary module parameters. The target geometry identity uses the
+`qwen4_exp.target.geometry.v11` domain and includes retained static vocabulary,
+lexical, residual, recurrent, indexed-attention and shared/routed parameter ownership.
+
+Qwen4 target, unit, mixer and recurrent-sublayer specs expose complete declaration
+visitors. Preparation rejects conflicting identities across static and execution
+owners before backend construction. Parameter groups consume these visitors through
+the shared runtime encoding projection; provider-owned row tables remain separately
+admitted sources. Recurrent slots retain their component ownership independently of
+invocation state and placement. Segmented tensor partitioning resolves ordinary
+and packed or independent expert matrix geometry from these same visitors and
+lowers retained encoding companions through the runtime projection. Partition
+axes, fused component ranges, K/V replication and GGUF block alignment remain
+family semantics. Logical declarations and storage references add no observation
+hooks, mutability permissions or backend-support claims.
+
+Qwen4 `Declaration` owns immutable family policy and typed target/prediction scopes.
+Configuration resolution retains this authority in the SafeTensors model plan;
+preliminary schemas and complete header admission borrow the same scopes.
+Standalone prediction-source admission also borrows its prediction owners.
+Source aliases, encoding selection, provider-owned table geometry and hash controls
+remain separate storage contracts. SafeTensors and GGUF discovery borrow retained
+static, routed, recurrent, indexed and lexical specs while describing invocation
+structure and explicit hooks independently of parameter ownership.
+
+Qwen4 target and prediction storage callbacks receive the retained primary slot
+and its format declaration directly. Matrix projection preserves compute and
+accumulation policy and exact-zero input semantics while changing encoding and
+companions. Packed expert storage visits retained bank projections without
+redeclaring group geometry. Projection validates identities, geometry, roles and
+operator policy before allocation; physical row regions remain storage extensions.
+
+Qwen4 gated residual mixers declare normalization and coefficient projections through
+`GatedResidualSpec` and the architecture's `residual::mixer_spec` factory. Target and
+prediction admission, target placement and native construction use that geometry
+and component ownership. GGUF names and normalization-offset conversion remain
+format extensions. Normalization roles and residual-mixing roles describe the
+slots without granting observation support. Neural validation checks identities,
+sharing and compatible geometry before a backend allocates mixer parameters.
+
+Qwen4 recurrent source geometry projects `GatedDeltaMixerSpec` from the family's
+`recurrent_spec` factory. SafeTensors keeps dtype and FP8 companion constraints;
+GGUF keeps value-head permutations, the squeezed convolution axis and transition
+negative-log conversion as explicit format rules referencing declared slots.
+Target parameter groups project embedding, affine, normalization, convolution,
+gated-delta and shared/routed specifications through the common logical visitor.
+Retained linear-format references supply encoding expansion without reconstructing shapes.
+Independent and packed expert banks retain their distinct declared layouts.
+
+Replicated text artifact preparation projects semantic roles from retained neural
+parameter declarations across ordinary, routed, recurrent and composite families.
+SafeTensors admission, GGUF admission and derived recipe outputs use the same
+required projection. Normalization and additive bias roles follow their
+construction slots, including loop-terminal, recurrent and branch normalizations.
+The primary vocabulary embedding retains its distinct static role. Other token,
+position and media tables use `LookupTable`, retaining their declared geometry,
+encoding and component ownership. Lookup-table meaning does not assign vocabulary
+ownership or establish backend execution or observation support.
+Source-only matrix layouts and redundant tied readout sources remain explicit
+extensions; conflicting geometry or roles fail preparation. A redundant tied
+readout source borrows embedding geometry while retaining its own physical
+encoding and declaring no additional parameter owner.
+
+Runtime parameter members retain the construction-owned linear encoding alongside
+logical shape and role. Logical projection retains these encoding facts without
+expanding packed axes, companions or storage alignment. Stored projection resolves
+physical layout and alignment from the same declarations. Shared parameter aliases
+require compatible logical geometry and encodings before allocation. SafeTensors
+preparation and derived outputs use declared formats and logical geometry for
+known primaries; unchanged physical aliases retain their source encoding.
+Raw convolution, recurrent and hyper-connection operators retain their tensor
+semantics. Hash routing tables retain their integer tensor declarations. An affine
+semantic role does not add source-transform eligibility.
+
+`eredu-nn::GroupedGatedProductSpec::packed_parameters` projects immutable primary
+slots and optional additive biases from a validated component-major packed bank.
+It retains exact identities, logical shapes and encoding references, and derives
+the group count and unfused gate/up geometry without a second parameter catalog.
+DeepSeek, LFM2, Kimi, Qwen, GPT-OSS, Muse, Inkling and K2 Horizon source extensions
+consume this projection for packed, separate and individual expert layouts.
+Qwen ordinary and hybrid decoders, LFM2, Kimi Linear and K2 Horizon share a
+packed-gated storage visitor.
+It derives independent gate/up row origins from the retained component layout,
+including when the source uses dense storage without row annotations. Selected
+NVFP4 companions therefore retain the same two row regions as source admission.
+Projection preserves identities, geometry, arithmetic, exact-zero input policy
+and bank reduction order; ordinary matrix projections retain their arithmetic
+and exact-zero policy as well.
+The common decoder storage visitor projects retained attention, dense feed-forward
+and vocabulary slots through the same matrix projection. Compute element and
+accumulation policy remain construction-owned rather than being selected again
+from storage configuration. GPT-OSS projects its ordinary selector this way while
+retaining its native expert encoding. Qwen hybrid target and prediction matrices,
+shared prediction fusion and static slots likewise retain their declared policies.
+Shared Qwen vision quantization eligibility reads each declared affine matrix's
+logical input width. Patch kernels and position tables keep their separate tensor
+roles. Relative identities and `model.visual` aliases resolve to those affine
+slots; unknown layers, non-affine parameters and companion identities are rejected
+before allocation. Encoding projection retains arithmetic and exact-zero policy.
+Qwen3-VL and conditional hybrid quantization consume retained component scopes;
+they project selected formats without maintaining another projection-width table.
+LFM2 and Kimi source-layout visitors project independent-expert identities and
+geometry from these slots. Checkpoint admission and materialization use the same
+source projection, including aliases, order and layout eligibility. Ordinary
+source matrices retain logical shapes and roles from their architecture parameter
+description; physical packing does not determine their logical geometry.
+DeepSeek-V3 target and prediction expert layouts use one visitor over the declared
+packed bank and its released independent names. Nemotron-H joins released source
+identities to canonical target and patterned-prediction declarations. Selective
+encoding preserves declared logical widths across official and canonical aliases;
+format constraints select source identities and physical encoding independently.
+Nemotron-H storage selection visits retained ReLU-squared up/down slots through
+`GroupedRelu2Spec::map_projections`, preserving bank geometry and equations.
+Expert storage projection retains primary/bias ownership, arithmetic and exact-zero
+input policy. Target matrices, prediction fusion and static vocabulary matrices
+use the same arithmetic-preserving ordinary matrix projection. ReLU-squared
+projections have contiguous row origins; packed gated banks supply their separate
+component origins explicitly. Source aliases and physical layout alternatives
+remain checkpoint extensions of those typed identities.
+Qwen hybrid source geometry uses the logical parameter projection together with
+its fused recurrent-input and independent-expert layout extensions. Conditional
+models add matrices projected from shared vision construction declarations;
+position tables retain their position-embedding role and patch kernels retain
+their declared kernel axes. Source geometry does not impose physical block
+alignment; retained execution preparation resolves encoding and partition alignment.
+Qwen VL composes the shared vision source projection with logical Qwen text
+slots. Per-expert source tensors reference their packed bank declaration and keep
+their released dense-layout eligibility and aliases. Optional redundant tied
+readout sources project the embedding's geometry without declaring another
+parameter owner. Checkpoint admission and source geometry share these extensions.
+Gemma4 matrix-shaped source keys resolve through released, canonical and MLX
+aliases to retained logical geometry. Per-layer lookup geometry remains available
+while the primary vocabulary table is projected separately. Unresolved source
+identities and aliases with conflicting geometry fail before backend allocation.
+Floating audio relative-position sources remain independent of the selected
+materialization encoding.
+Inkling `ModelArgs` pairs immutable normalized `ModelPolicy` with complete retained
+pinned, target-block, media and prediction parameter scopes. Its logical declaration
+visitor resolves all owning components and validates text encoding references
+against declared matrix identities, excluding raw routing, profile and scale slots. HF/GGUF normalization validates source policy before declaring
+prediction depths and the optional shared chain norm. Checkpoint requirements,
+source recipes and matrix catalogs, prediction residency ownership, state geometry,
+discovery and native factories borrow those scopes. Selected encoding projects
+retained fusion, attention and dense specs without changing invocation policy,
+convolution geometry, arithmetic or identities. Media attachment retains the same
+prediction scopes. The target-only projection removes the predictor and its format
+references; source ownership still retains a configured chain norm with zero depths,
+while execution selects no predictor until a depth is active. Mutable per-depth
+state and the two hidden-normalization invocations remain separate from learned
+parameter ownership.
+
+Inkling target common scopes retain each invocation's attention projections, Q/K
+normalization, relative-profile table, residual normalization and the geometry
+of four convolution histories. Checkpoint schemas, aliases, recipes, parameter groups, discovery and
+state reports borrow those typed slots. Native attention and decoder construction
+clone only the requested invocation. Rank-local common projection preserves
+identities, arithmetic, relative-profile geometry and replicated residual widths,
+while changing head extents and their dependent convolution channels. Exact policy
+comparison rejects changes outside selected head/feed-forward widths; source head
+and width bounds reject enlargement before allocation. State projection reads the
+same localized specs. Target and prediction encoding selection use the same common
+format visitor; mutable histories and explicit hook contracts remain invocation-owned.
+
+Inkling target feed-forward ownership is a typed dense-or-sparse scope per
+invocation. Dense scopes retain split gate/up/down projections and the learned raw
+branch scale. Sparse scopes retain the joint selector, selectable routed bank and
+always-on shared bank. Admission, source recipes, parameter groups, discovery,
+expert realization and bounded provider catalogs borrow those scopes. Encoding
+projection preserves reduction and activation policy; packed gate/up row regions
+come from the declared packed layout even when a dense source format has no row
+annotation. Local width projection preserves identities and router geometry.
+Prepared bank binding validates local geometry, identities and formats before
+allocating common or feed-forward modules. GGUF split gate/up format aliases
+resolve to the declared fused identity and reject contradictory selections.
+
+Inkling pinned ownership consists of the token table, its post-embedding RMS gain,
+the final decoder RMS gain and an independent output head. Normalization builds
+these typed specs once. Source schemas and aliases, vocabulary partition ranges,
+parameter groups, target/prediction readout discovery, composite pinned binding,
+the ordinary text model and the generic construction driver consume the retained
+scope. Format selection projects only the table and head encodings, preserving
+logical rows, widths, identities, arithmetic and both normalization policies.
+Configured unpadded output limits remain execution policy rather than changing
+stored vocabulary geometry. Media attachment and predictor removal share pinned
+scopes; unresolved pinned encoding references reject before backend allocation.
+
+Inkling media normalization retains immutable dMel and hMLP parameter scopes in
+`AudioConfig` and `VisionConfig`. External field aliases and defaults normalize
+`AudioPolicy` and `VisionPolicy` before complete typed geometry, local equations
+and format references validate. Configuration encoding projections preserve stage
+folds, arithmetic, parameter identities and normalization policy. Checkpoint
+admission, source recipes, ownership reports, discovery, composite boundaries and
+native factories borrow those scopes; a vision lease clones only its requested
+stage. Model validation checks each tower's decoder-width agreement. Media
+membership grants no observation or intervention permission.
+
+Inkling projects canonical matrix and media-table geometry from construction
+slots with explicit encoding declarations. Raw relative profiles and joint-route
+weights remain raw tensor operations rather than affine conversion targets.
+Its interleaved dense source identity and geometry reference the declared gate/up
+slots; admission, recipes and materialization use the same source extension.
+Muse projects canonical matrix and media-table geometry from typed construction
+slots. Its independent expert sources reference packed bank geometry through the
+same extension used by checkpoint admission. NVFP4 calibration arrays retain
+their recipe-input role and do not declare quantizable matrices. GGUF media
+extensions retain image-only spatial axes beside the typed patch projection.
+Their kernel layout, flattened source matrix and reshape recipe share one
+projection referencing that weight and its output channels. The spatial source
+excludes the temporal folding used by SafeTensors construction.
+GPT-OSS bias geometry remains separate from MXFP4 scales and physical block axes;
+its released alternating-row layout and GGUF split layout reference the same slots.
+Recipe targets and independently resident expert units reference the same primary slots. Family aliases, physical layouts, quantization companions,
+source exclusions and conversion rules remain architecture-owned format extensions;
+parameter projection establishes no backend support or observation contract.
+
+`k2_horizon::Declaration` retains K2 static/common scopes and optional typed
+provider scopes. A routed stack places dense prefixes, shared SwiGLU, routed
+SwiGLU and independently selected value banks in `ProjectionParameters`; common
+scopes retain attention, sinks, normalization, vocabulary and invocation state.
+Complete block views compose those retained slots without running a geometry
+producer. Dense-only models reuse integrated common scopes. The family visitor
+covers each logical slot once, and common/provider equation conflicts reject
+before backend allocation.
+
+K2 SafeTensors/GGUF source layouts, recipes, linear conversion, residency catalogs,
+placement, discovery and construction consume this declaration. Source-format
+normalization groups projected physical sources by their typed logical owner;
+fused and packed banks require homogeneous source encodings before preparation. The common scope
+builder accepts already declared blocks; temporary common projections attach the
+retained dense-prefix slots for ordinary partition and discovery visitors. Selected
+formats update typed affines/selectors/banks while retaining identities, sharing,
+sequential reduction, scoring/correction semantics, row layout and value output
+ownership. Partition policy comparison restores explicitly local head widths,
+expert cardinality, shared width and value output offset before comparing global
+policy. Bank selection separately validates exact rank ownership and local specs.
+
+K2 execution-memory topology describes its dense, routed and additive shared
+feed-forward equations from these scopes. The generic topology explicitly marks
+routed attention-value invocations as incomplete; parameter declarations grant no
+mechanism or observation support. Source FP8 normalization and naming remain format
+extensions, including their published block size and exclusions.
+
+Qwen hybrid `HybridConfig` owns immutable complete text construction scopes.
+External configuration normalizes into `HybridPolicy` before source declaration;
+SafeTensors and GGUF admission retain static, target, independent prediction and
+shared fusion slots through that configuration. Cloning a configuration shares
+its source scopes. Explicit format projection preserves non-format policy and
+parameter identities; a target view removes prediction invocations and slots.
+Rank-local configurations retain the source allocation and project only requested
+units, preserving metadata bounds across layer-local views. State geometry,
+checkpoint extensions, cold reports, discovery and ordinary/conditional/prediction
+construction consume those retained scopes. Scalar invocation policy has no
+mutable access through the retained configuration.
+
+Qwen hybrid `BlockParameters` composes the complete residual normalization,
+recurrent or gated-attention mixer, and dense or routed/shared feed-forward slots
+for one target or prediction owner. SafeTensors and GGUF extensions, parameter
+groups, local-policy comparison, expert-bank projections and execution-memory
+topology consume those typed slots. Fused QKVZ/BA storage, independent expert
+sources, scale companions and source dtype rules remain format extensions.
+Target and conditional native kernels retain prepared local block scopes across
+unit leases. Prediction fusion/normalization specs and independent prediction
+units are prepared before pinned allocation; construction binds the prepared
+slots. Selected expert banks preserve canonical parameter identities and validate
+shared/routed geometry. Parameter declarations establish no observation permissions;
+routed/shared invocation-memory topology retains its explicit completeness limit.
+
+`qwen::Declaration` retains complete Qwen2, Qwen3 and Qwen3-MoE text scopes.
+Dense text shares its integrated `DecoderDeclaration`; routed text composes the
+same common attention, normalization, vocabulary and state scopes with typed
+`FeedForwardParameters`. Source admission retains that composition for SafeTensors
+and GGUF, including Qwen3-VL text GGUF. Ordinary dense-source access borrows the
+same immutable common allocation. Parameter reports, linear-conversion catalogs,
+state/capability reports, discovery, memory topology, recipes, placement and plain
+text construction project these retained slots. Selected encoding projection
+preserves non-format policy, selector cardinality, bank geometry and row layout.
+Common and provider scopes reject conflicting feed-forward ownership before native
+allocation. Partition policy comparison restores the family-owned head, dense-width,
+expert-count and routed-width dimensions; selected ownership remains independently
+validated against the Cartesian rank.
+Qwen checkpoint roots belong to the typed configuration used to declare slots.
+The SafeTensors schema accepts an explicit derived-expert-layout policy; source
+aliases, physical layouts, quantization companions and floating router storage
+remain format extensions. `qwen::vl::Declaration` retains the text declaration
+through SafeTensors composite admission; GGUF projector admission retains the
+re-rooted text declaration before media token binding. Composite source and
+selected-format projections, inspection, discovery, recipes, KV-state validation
+and text construction consume those scopes. Text bodies are projected and
+validated before pinned allocation and retained across unit leases. VL also retains
+a shared `qwen::vision::Declaration`: exact patch, position, fused attention, unary
+MLP, normalization and final/DeepStack merger construction slots. SafeTensors and
+GGUF projector schemas, conversion catalogs, placement, resource selection and
+mechanism-memory reports project those slots. GGUF temporal patch slices and
+physical aliases remain explicit format extensions. Selected encodings clone slots
+without changing invocation policy; TP local blocks are prepared before pinned
+allocation and retained across vision unit leases. Static merger projection checks
+local shapes and encodings before allocating ingress resources. Normalized
+`ParsedHybridConfig` and Qwen4 `Config` retain vision declarations alongside their
+text policy. Conditional schemas, groups, geometry and construction borrow those
+source scopes; selected formats project their encodings without rebuilding global
+parameter geometry. Conditional native drivers retain local vision construction
+slots across unit leases. Observation and
+intervention permission remains explicit execution policy.
+
+Qwen and GPT-OSS whole-bank and rank-local recipes bind canonical outputs to
+construction-declared primaries; GPT-OSS scale and additive-bias outputs retain
+their exact declared identities. Residency and realization plans derive expert
+cardinality from the same bank specs. Source suffixes, independent-expert aliases,
+alternating rows and separate projection layouts remain explicit storage rules.
+GPT-OSS source admission retains a `gpt_oss::Declaration` containing typed routing
+and native MXFP4 bank specs, keyed by canonical decoder body owners. SafeTensors
+and GGUF schemas, recipes, residency catalogs, parameter reports and routed discovery
+project those retained slots. Selected ordinary-matrix formats update selector
+encoding while preserving expert layout, additive biases and execution policy.
+The family declaration composes these provider scopes with a retained common
+`DecoderDeclaration`. Its parameter visitor covers attention, sinks, normalization,
+vocabulary, selectors and expert slots together. Checkpoint admission, cold parameter
+and linear-conversion catalogs, static binding, state/capability reports and discovery
+consume that composition. The replicated materializer receives source and selected
+common/provider scopes; partitioned placement and construction receive the selected
+scopes. Native construction validates the complete family topology and materializes
+those slots without redeclaring common or routed geometry.
+Local policy validation restores explicitly partition-owned attention, intermediate
+and expert-bank dimensions before comparing the source fingerprint. This accepts
+selected EP-local banks while rejecting changes to other execution policy.
+GPT-OSS traverses these retained banks for admission, recipes, residency and one
+cold expert planner. Replicated and partitioned consumers supply retained local
+geometry and rank topology to that planner before native construction. Partition
+validation compares complete localized bank specs, including identities, encodings,
+additive biases and gating policy, before selecting owned units. Cold parameter
+descriptions supply inspection and placement without native module traversal.
+Execution-unit identities and local group ordering remain separate from parameter
+ownership; rank selection preserves the requested expert order and companions.
+
+Qwen4 `indexed::IndexedParameters` owns attention head geometry, the gated query,
+key, value and output affines, per-head normalization and the fused QSA query/key projection.
+Main projections use `SelfAttentionProjectionSpec` with `InterleavedGate` query
+rows; the replicated indexer uses checked `AttentionHeadGeometry` with one shared
+key head. Normalization widths, GGUF split-source axes, state policy, component
+attributes and TP cuts project those declared axes. Family validation requires
+matching key/value widths, gated query rows and residual output connectivity.
+It declares logical geometry, roles, sharing and component ownership independently
+of invocation bounds. The complete sublayer validates identities and sharing across
+its residual and attention slots before backend allocation. `IndexedSublayerSpec`
+combines these slots with explicit
+rotary, selection, state and workspace contracts; its indexer construction is a
+projection of those retained slots. SafeTensors, target parameter groups and local
+partition construction consume the same parameter declaration. GGUF split index
+sources reference the fused logical identity and derive their axes from it;
+concatenation, normalization offsets and physical companions remain format rules.
+
+Qwen4 shared/routed admission and construction use `feed_forward_parameters` and
+`expert_spec`. Ordinary affines and routed banks project their typed declarations;
+SafeTensors packed and individual-expert alternatives and GGUF split banks retain
+physical names and encoding constraints as source extensions. Each expert source
+references its canonical fused gate/up or down slot through the shared neural
+packed-bank projection, including exact group counts and unfused shapes. Target
+and prediction preparation resolve bank namespaces and primary/companion outputs
+from these declared identities; unresolved bindings fail before allocation.
+Prepared format adapters retain row-partition boundaries when separate source
+projections become one fused bank. Reconstructed dense banks use contiguous rows;
+reconstructed block-FP8 banks retain independent gate/up block origins. Prepared
+expert format callbacks receive component row origins from the typed gate/up or
+down projection and retain source-specific layout choices independently of names.
+Prepared expert encodings project the retained construction-format references, including
+module exclusions, before target or prediction specs are constructed. Provider leases, invocation ordinals and bank
+identities remain separate from parameter ownership. The complete feed-forward
+sublayer validates residual and routed/shared identities before backend allocation.
+
+Qwen4 `static_parameters::StaticParameters` owns the token table, optional
+independent head and final gated residual collapse. Header admission, construction,
+inspection and discovery project those slots and validate their geometry and sharing
+before backend allocation. A tied output references the table through
+`EmbeddingSpec::output_projection`; this neural projection retains identity and
+encoding without declaring another slot. Ordinary decoder readouts use the same
+projection. Source aliases for tied output weights and their physical companions
+remain format extensions. Selected placement retains any physical table replicas. State admission checks that static declarations agree
+with the retained vocabulary and sharing policy. Observation hooks retain their
+explicit phases and permissions independently of these parameter declarations.
+
+Prediction fusion declares its two normalization scales and two shared affines
+through `PredictionFusionSpec::from_config`. Construction, SafeTensors admission
+and discovery borrow those slots. Hidden normalization spans the complete flattened
+residual with no groups; the shared hidden projection then executes per stream.
+Token-embedding normalization remains a separate hidden-width reduction. Fusion
+ownership and affine roles do not establish capture or intervention support.
+
+`PredictionSharedSpec` composes fusion and gated collapse without decoder state
+or invocation limits. `PredictionSpec` and `PredictionUnitSpec` expose complete
+logical visitors and a shared/depth-owned parameter description, including retained
+encoding companions. Target, prediction and vision recipe requirements project
+logical geometry, roles, retained formats and ownership from their typed
+construction declarations. Encoding expansion supplies exact stored shapes and
+companion references. Preparation rejects recipe shape mismatches, undeclared or
+repeated outputs and incomplete scopes before allocation. Ordinary and expert
+load-time transform companion names remain explicit storage policy.
+Target and prediction preparation reference each declared expert bank's primary
+identities when selecting that storage policy. Tensor rank does not choose ordinary
+versus bank companion names; an expert reference outside its containing scope
+rejects before recipe binding. SafeTensors matrix eligibility and the visual dense
+exclusion check consume construction-owned encoding references rather than ranks
+or parameter suffixes. Physical table controls, aliases, dtypes and layout variants
+remain explicit source-format contracts.
+Prepared semantic roles remain independent of conversion eligibility: structured
+convolution weights retain their weight role, position tables retain lookup-table
+meaning and normalization biases remain normalization parameters. A role alone
+does not authorize a matrix conversion; that permission comes from the retained
+construction encoding reference and its storage extension.
+Vision block normalization slots carry their declared normalization role; position
+tables retain positional meaning independently of token vocabulary tables. The
+conditional parameter and state identity uses `qwen4_exp.conditional.v2`.
+Target and prediction scopes reject conflicting parameter identities; target
+vocabulary slots retain their single owner. Target and prediction bank cardinality
+and route counts project the retained expert and selector declarations. The joint cache
+identity uses `qwen4_exp.target_prediction.v4`; invocation state, residency units
+and observation permissions remain independent of parameter declarations.
+
 Qwen4 target, prediction, tensor-partition and vision preparation expose runtime
 `PreparedParameterRecipes` for ordinary parameters and bounded expert selections.
 Family code retains naming, format admission, expert recipes and exceptional
@@ -12527,7 +14875,13 @@ buffer does not become an ordinary layer parameter because it shares a checkpoin
 ### Media ingress, processing and chunked control
 
 `VisionPlan` and `GgufVisionPlan` own source-free metadata, recipes, processor policy and
-layer-sized owners; `PreparedVision` retains bound source authority. Shared Qwen vision
+layer-sized owners and the shared vision construction declaration. Integrated
+SafeTensors uses the same declaration retained by configuration admission; GGUF
+retains its projector declaration before tokenizer binding and projects admitted
+encodings from it. Header-only joint requirements and bound construction borrow
+these scopes; `PreparedVision` retains them alongside bound source authority.
+Selected-format memory reports and transform-source construction use the same
+source declaration. Shared Qwen vision
 modules provide full attention, bilinearly interpolated learned positions, LayerNorm and
 exact merger GELU. Flash-Next declares no DeepStack captures. Temporal patch recipes are
 shared across Qwen families, with explicit dense promotion and retained encoded companions.
@@ -13501,6 +15855,12 @@ definition with their requirements. Selected-plan identity validates the retaine
 semantic definition, rather than constructing another graph from a family depth.
 Checkpoint recipes still use the family's parameter and logical-layer geometry.
 
+Cold text selection retains each family's executable parameter projection before
+construction or rank reporting. Composite projection dispatch is exhaustive, and
+an architecture without an executable projection rejects before materialization.
+Constructors consume the retained executable component; transformation sources
+retain their independently admitted encoding catalog.
+
 `ReplicatedTextStateAccess::from_layout` infers the exact state capability from
 neutral component roles. Cold requirement construction and runtime profile
 validation consume this same rule for ordinary attention, compressed attention,
@@ -13576,8 +15936,18 @@ Nemotron-Labs-Diffusion text materialization consumes its retained family
 The shared decoder checks equation paths, operation/state geometry and hook
 ownership independently of the component's discovery identifier. The family
 retains its text identity and specialized causal, diffusion and draft semantics;
-no second base-decoder declaration is required. Local-state projection preserves
-observation seams and parameter references, including draft-adapter ownership.
+its `FamilyConfig` also retains the complete typed `DecoderDeclaration`. Source
+SafeTensors and GGUF schemas project those text slots through explicit naming,
+dtype and FP8 conversion extensions. Static bindings, matrix descriptions,
+placement, state forecasts, discovery and native units borrow that same declaration.
+Encoding selection projects formats; local geometry projects cloned block slots
+and cache geometry while retaining static ownership and arithmetic. Restoration
+borrows global scopes and verifies draft policy before replacing local state.
+Local-state projection preserves observation seams and parameter references,
+including draft-adapter ownership. Invocation visibility remains request-local. Common
+decoder topology validation accepts family-owned additional groups through the
+neutral `Config::extend_common_parameters` contract; the draft adapter contributes
+its retained layer owners without changing common decoder construction.
 
 Text preparation shares the admitted source declaration with transformation
 sources. Selected formats project only canonical parameter geometry through
@@ -13587,13 +15957,45 @@ rules. Composite construction supplies an explicit child text declaration to the
 same materializers. Image assembly and cross-component state transport remain
 family-owned.
 
-DiffusionGemma text materializers consume the retained text declaration for
-complete, tensor-local and partitioned execution. `model::project_parameters`
-selects exact executable parameter geometry while retaining operation identities,
-mutable-state slots, observation seams and logical references. Unchanged formats
-reuse the retained allocation. Dense and routed preparation share the admitted
-source declaration with transformation sources and use the same projection for
-their selected resources.
+Nemotron-Labs-Diffusion's `PixtralConfig` pairs immutable validated `PixtralPolicy`
+with an Arc-backed tower declaration. The patch kernel, ingress normalization and
+all image blocks are declared once. Source schemas, GGUF Q/K conversion recipes,
+parameter placement, discovery and native image units borrow those scopes.
+Tensor-local invocations clone and project retained attention and SwiGLU slots,
+preserving parameter identities, operator policy and full-width normalization.
+Cloned configurations and text encoding selection share the source tower; mutable
+image state and invocation placement remain independent.
+
+`FamilyConfig` retains an independently acquired spatial-projector scope beside
+immutable `FamilyPolicy`. Source validation constructs its normalization, spatial
+merger and two text projections once. Checkpoint schemas, parameter groups,
+materialization and discovery project those same slots, including normalization
+epsilon and channel-major merge geometry. Text encoding and tensor-rank selection
+share this replicated projector without changing its residency owner. A text-only
+projection of an admitted source omits tower and projector resources while retaining
+artifact identity and text equations; it validates as an explicit execution view.
+Editable media geometry requires constructing a new validated family configuration.
+
+Draft-adapter admission retains one `Arc<DraftAdapterDeclaration>` with complete
+per-layer low-rank scopes and its ancestry/alpha policy. The strict SafeTensors
+schema visits those scopes and retains released aliases and F16/BF16/F32 admission.
+Primary text and media plans attach the same declaration after validating backbone
+layer count, head axes and residual width. Native units, partition groups, discovery
+and draft workspace/transport forecasts consume that retained authority.
+Local head selection clones the input projection while preserving the replicated
+rank and up projection, source identities, scale and arithmetic. Configuration
+projection validates before replacing local state; unchanged heads and text encoding
+selection share the source declaration. Adapter invocation remains explicitly
+selected by draft execution policy and does not follow from parameter ownership.
+
+DiffusionGemma cold selection retains the executable text or composite declaration
+through `model::project_parameters` or `composite::project_parameters`. Complete,
+routed, tensor-local and partitioned materializers consume that retained selection.
+The projection selects exact executable parameter geometry while retaining operation
+identities, mutable-state slots, observation seams and logical references. Unchanged
+formats reuse the retained allocation. Transformation sources retain their admitted
+source declaration. Packed expert-bank conversion companions use the naming policy
+projected from the same typed grouped specs used for bank construction.
 
 The family validates equation paths, state-slot references, transport and hook
 ownership before materializing native text modules. Canonical resource topology
@@ -13728,3 +16130,391 @@ The BF16 row-projection dispatch schedules adjacent input rows against the same
 weight row, allowing prefill to reuse weights in native caches. Each output dot
 retains its original lane reduction and final cast; only independent workgroup
 coordinates change.
+
+External Gemma and Muse assistant selection retains source and executable logical
+parameter declarations alongside their target-proven construction geometry.
+Identical source and executable formats share the declaration allocation.
+Materialization tasks project identities, logical geometry, semantic roles and
+acquisition owners from these declarations; the shared encoding visitor projects
+physical weights and quantization companions. Source and executable projections
+must preserve logical identities, sharing, roles, owners and geometry.
+
+SafeTensors aliases, optional source members and physical layout selection remain
+checkpoint extensions. Assistant selection consumes the layout variants retained
+by source admission, rather than selecting a target checkpoint schema to enumerate
+executable parameters. GGUF retains its exact canonical source store and encoding
+provenance. Native module and bounded-unit construction receive the retained
+construction/declaration bundle; tensor-rank projection retains global parameter
+facts separately from the selected local construction and binding layout.
+
+Gemma assistant selection retains an `AssistantDefinition` containing the exact
+static vocabulary/fusion scopes and typed decoder block specs. Its logical
+parameter catalog is a projection of those scopes. Source and executable module
+construction and individual-unit construction consume the retained specs directly.
+The shared Gemma block materializer accepts the complete attention, dense, routed
+and residual specs; operator arithmetic and invocation ordinals remain explicit.
+SafeTensors requirements, GGUF geometry and source aliases visit those same retained
+scopes. Named storage extensions resolve against the complete assistant declaration,
+including its actual tied, independent-output or ordered vocabulary owner. Shared-KV
+consumers declare no independent key/value matrices. Required but unused GGUF
+vocabulary tables remain explicit source extensions referencing the retained
+vocabulary geometry; they do not acquire executable parameter ownership. Source-only
+vocabulary formats do not enter the executable matrix projection. Optional unused
+static per-layer input sources retain the shared typed source declaration and format
+rules; they do not establish an assistant input execution path. Routed SafeTensors
+bank alternatives retain their released, canonical and conversion aliases, while
+ordinary assistant slots retain canonical-only admission. Cold preparation retains
+its admitted definition through selection. Exact GGUF encoding projection
+validates unchanged logical identities, geometry, sharing and acquisition owners.
+External assistant dispatch carries the family-typed parameter definition through
+its associated type, while checkpoint task selection borrows its logical projection.
+Both exact checkpoint encoding and load-time conversion project storage on those
+retained scopes. Format preparation resolves named references against the retained
+matrix identities and rejects changes to geometry, acquisition ownership or
+execution policy before materialization. Physical row-origin layouts and encoding
+companions follow the selected storage; operator arithmetic remains retained.
+
+Muse assistant parameter definitions retain Glimmer's direct DFlash body and
+DFlash2's convolved body and candidate selector. Logical catalogs project those
+exact specs, including convolution taps, lookup tables and acquisition ownership.
+Source admission creates and retains the definition before visiting its schema.
+Source-format extensions preserve Glimmer's floating dtype admission, Spark's
+exact BF16 tensors and I64 token mapping, and selected encoding companions.
+Glimmer GGUF names and operation classes reference those declared identities;
+Spark's absence of a released GGUF layout remains an explicit rejection. Format
+references resolve against the retained scopes rather than configuration-time
+parameter builders.
+Target compatibility binds the retained definitions without rebuilding their
+parameter scopes. Source and executable formats keep separate definitions when
+conversion is selected. Encoding projection clones the retained body, selector and
+head scopes, preserving convolution taps, mapping tables, scalar gains and operator
+arithmetic. Uniform conversion enumerates declared matrices; named format
+extensions resolve against that same catalog. DSpark retains context, causal-block, normalization,
+residual and scoring-head scopes as well. The proven target supplies invocation
+arithmetic, rotary policy and capture compatibility without rebuilding parameters.
+All three equations retain their existing unit-policy and placement contracts;
+target-owned embedding and vocabulary operations remain explicit calls.
+
+DSpark tensor-rank projection consumes parameter groups from those retained scopes.
+Global scopes remain immutable and shared; local scopes are separate projections.
+Local head and intermediate dimensions come from the selected layout and update
+cloned specs while preserving identities, roles, sharing and encoding metadata.
+Transformation sources select the same local logical dimensions with their original
+formats. Unit construction, memory topology and parameter descriptions consume the
+resulting scopes; a separate per-block configuration catalog does not define them.
+
+External assistant source projection indexes the aliases of the exact admitted
+layout variants, retaining optional-source rules and rejecting conflicting names.
+Logical identities resolve to their selected physical keys; excluded and unselected
+source names do not gain authority through this view. Gemma assistant expert layout
+extensions reference retained routed-bank identities and use the ordinary expert
+resolver for separate gate/up sources. Recipes retain the physical inputs and
+inferred output geometry rather than inventing a fused physical tensor.
+
+`ReplicatedTextMaterializationTask::from_exact_sources` constructs direct or derived
+auxiliary work with exact input provenance. Derived tasks require matching recipe
+references, inferred scalar encoding, geometry, byte extent and lowering kind.
+Existing binding and transformation mechanisms consume those recipes and retain
+the declared acquisition owner and companion roles. Packed primary values retain their source-native encoded path. Companion recipes
+retain exact metadata and bounded transformations. An admitted fused NVFP4 bank
+with one global multiplier per expert projects that multiplier into both canonical
+gate/up slots by stacking the same source, preserving all packed values and scale
+bits. Split sources retain their two independent multipliers. Expert residency
+catalogs include these global-scale companions alongside weights and block scales;
+selected units account for their complete immutable payload.
+
+Gemma GGUF bank outputs use the parameter identities declared by their routed
+scopes. Packed weights and companions share the standard expert naming policy;
+ordinary matrix `.weight` naming remains a physical source convention. Compatible
+separate gate/up encodings select the same canonical fused-bank format. Conflicting,
+incomplete or fused-and-split format assignments reject before native construction.
+
+Assistant bank recipes preserve encoded primary values and their scale/bias
+companions through the existing companion-aware expert resolver. Inferred output
+geometry is checked against the source declaration's physical encoding projection,
+while backend lowering retains its separate logical geometry and exact GGUF input
+provenance. Standalone companion tasks carry exact recipes, format-companion roles
+and owners. Each companion retains one generated, catalog, recipe or task-backed
+source authority. Metadata accessors project that authority for binding, compute
+precision and residency accounting; overlapping optional catalogs do not define it.
+
+Qwen4 target admission projects ordinary tensor constraints from the typed static,
+lexical, recurrent, indexed and routed/shared parameter declarations. Packed and
+separate expert layouts, aliases, dtypes, companions and table controls are explicit
+source extensions referencing those declarations. Header plans project admitted
+formats onto the same logical scopes and retain the resulting specs. Expert recipes,
+ordinary requirements, bounded executable construction and their discovery projections
+consume those declarations. Row-provider contracts and invocation/state limits
+attach separately. Selected storage formats project cloned specs and exact expert
+bank bindings; unchanged projections retain source companion identities. Encoded
+independent row-block origins belong to storage extensions. Projection
+rejects changes to logical identities, geometry, roles, sharing or ownership before
+native allocation. Expert reduction and routing equations remain declaration-owned.
+
+Qwen4 prediction admission retains shared fusion/readout declarations and independent
+decoder-depth parameter scopes. Embedded and standalone artifacts use those same
+scopes for schema constraints, exact bank recipes, storage projections and bounded
+construction. Attaching a companion retains its declarations with its source roles;
+target vocabulary parameters remain target-owned. Invocation limits, prediction
+rotary policy, bank binding and mutable state attach separately. Selected prediction
+formats project the retained specs through the shared target/prediction format visitor,
+which preserves logical metadata and equations while resolving storage extensions.
+
+Qwen4 GGUF text admission retains the same source-free target parameter scopes.
+Tensor entries, indexer fusion, residual offsets, recurrent head reordering and expert
+bank recipes reference those scopes rather than reconstructing geometry. Source
+layout and conversion rules remain explicit GGUF extensions. Bounded expert cuts
+and bank preparation derive cardinality and ownership from the declared bank;
+provider-owned lexical tables retain their separate row and literal contracts.
+The GGUF target wrapper projects admitted storage formats onto the retained scopes
+for ordinary requirements, state-bound construction and discovery.
+
+Moshi normalization retains the complete typed temporal, shared-depth and edge
+parameter scopes in immutable `MoshiConfig`, alongside read-only `MoshiPolicy`.
+Parameter contracts borrow that configuration's scopes and project ownership,
+physical matrices and component definitions; no constructor pairs independent
+configuration and scope objects. Checkpoint schemas, canonical recipes, discovery
+and artifact preparation consume those retained declarations. Storage changes
+project formats once on the configuration while preserving logical slots, sharing,
+geometry and arithmetic. Temporal/depth module construction consumes those same
+scopes, and tensor ranks project fused attention and gated widths from retained
+specs. Rank-local state and vocabulary ranges derive from the selected placement
+and retained declarations; configuration/declaration mismatches reject before
+allocation. Repeated depth invocations keep their explicit sharing and frame-local
+state lifetime. Native Moshi and PersonaPlex source layouts retain their distinct
+aliases, packed slice rows and flattened normalization extensions.
+
+EAR encoder/decoder and PRVQ declarations pair typed neural specs with normalized
+component policy and their `ComponentDefinition` projection. Exact preparation retains
+that declaration through casts, tensor placement, pipeline selection and consuming
+binding handoffs. Resident adoption and native adapters construct kernels from it;
+configuration does not rebuild parameter geometry during materialization. Unit
+construction remains independently leased, and state and transport retain their
+separate component contracts.
+
+VoiceChat's validated published profile shares source-free codec, RVQ, conditioning,
+MoG and function-head declarations across physical schema/alias extensions, inspection,
+speech-unit construction and learned
+provider preparation. These immutable scopes contain no checkpoint values, mutable
+invocation state or backend resources. Physical sources and bounded F32 conversion
+remain artifact-owned. Mimi admits the complete released declaration and projects its
+active codebooks from that scope, retaining the same encoder, decoder and quantizer
+parameter identities through backend construction.
+
+`ConditioningDeclaration` retains the character, ingress and fusion neural scopes
+with their component definition. Published source aliases, speech-unit construction,
+discovery, exact preparation and native binding consume that declaration. Character
+rows and fixed speaker frames come from its slots; admitted source metadata validates
+against those shapes before allocation. Standalone resident construction declares once
+and passes the same scope through unit adoption and kernel construction. Rank-local
+character and speech features project the retained global scopes, while guidance lanes,
+phase activity, control slots and hook permissions remain explicit execution contracts.
+
+
+`FunctionHeadDeclaration` retains the independent readout spec and its component
+projection. Physical format selection derives companions from that retained spec;
+exact preparation transfers the selected declaration alongside restricted recipes
+and vocabulary-row placement. Provider-owned load-time quantization replacements
+reuse the scope and its declared weight identity. Native construction consumes the
+same declaration, and validates its retained physical parameter projection against
+the communicator before acquisition. Floating conversion and packed storage bounds
+remain explicit source contracts; the shared normalized input and separate readout
+invocations retain their execution and observation contracts.
+
+Nemotron's `Declaration` retains static scopes, typed target blocks and complete
+prediction units together with their `ComponentDefinition`. Prediction units include
+boundary normalization/fusion slots and their scheduled attention or routed block.
+Parameter ownership, released SafeTensors aliases, packed/independent expert layouts,
+quantization companions and the published GGUF target catalog project these scopes.
+Format selection clones the scopes and rejects changes to retained architecture
+policy. Physical aliases, ordering, transforms and format exclusions remain explicit
+checkpoint extensions; declaring parameters adds no observation permissions.
+
+Complete kernels retain this declaration for independently materialized target and
+prediction units. Partitioned target kernels retain the same typed global scopes and
+project owned local widths and expert banks. Complete and partitioned target/static
+normalization uses the existing full-width F32 reduction; replicated static and
+prediction normalization retain their existing arithmetic contracts. Prediction
+source/local preparation projects retained scopes and validates invocation-policy
+agreement before allocation. Parameter identity, mutable
+state, depth-relative invocation and selected placement remain separate contracts.
+
+VoiceChat's backbone shares its immutable published Nemotron declaration across
+complete/split source extensions, discovery, normalized recipe-output admission,
+exact binding preparation and resident/layerwise construction. Its preparation
+requires a target-only configuration. Canonical recipe-output constraints derive
+from logical declarations after source normalization; aliases, encoded companions
+and SSM transforms remain format extensions referencing those identities.
+
+Nemotron cold architecture plans retain their source `Declaration` independently
+of artifact payload admission. Immutable plan clones and declaration-only snapshots
+share that scope. Selected
+formats and prediction-free targets clone/project its typed slots, rejecting changes
+to family equations. Component ownership and selected-format reporting project the
+same scope before backend construction.
+
+Replicated Nemotron profiles retain `Arc<Declaration>` as their construction input.
+Pinned modules and independently leased blocks consume its typed specs; the generic
+fixed-state driver delegates static construction through a family-owned typed method.
+Complete routed and partitioned kernels also require a retained declaration and
+validate selected ownership/placement against its parameter and state projections.
+They do not declare new parameter geometry at the native construction boundary.
+
+Embedded Nemotron prediction plans retain complete typed scopes in the architecture
+extension, and cold executable selection retains the format-projected scopes. Other
+prediction families retain their component definitions through the same typed sum.
+Native prediction construction consumes the selected and source scopes directly;
+configuration remains external policy and provenance rather than a geometry builder
+at materialization. These declarations contain no source leases or mutable state.
+
+
+Nemotron discovery borrows the retained source declaration for static, target and
+prediction components. Attention and dense read/write geometry, shared-expert scopes,
+routed banks and normalization references project typed slots. Execution edges,
+component equations, hook phases and allowed operations remain explicit discovery
+contracts; parameter ownership supplies no additional observation permissions.
+
+`Declaration::expert_banks` projects routed banks by independent invocation ordinal
+while retaining canonical parameter owners. Unit storage recipes, per-expert recipes,
+residency catalogs, physical source-shape joins and tensor/expert placement borrow
+these banks. Mamba storage reshapes use the retained convolution geometry. Packed
+versus independent expert names, encoding companions and SSM storage transforms remain
+explicit checkpoint extensions. Recipe enumeration uses retained unit paths and
+addresses independently of bank ownership.
+
+Cold materialization profiles carry retained declarations into recipe, source-shape,
+parameter, state and static projections. Complete prediction normalization and discovery
+use the extension's complete source declaration; target admission retains its
+prediction-free projection. Target boundary metadata reads the retained static scopes.
+Selected routed partitions
+project both expert and shared widths from the same source scope. These metadata
+projections allocate no backend parameters and acquire no checkpoint payloads.
+
+
+Nemotron state declaration projects each retained operator scope into its cache
+policy. Target and prediction segments retain distinct invocation ranges, lifetimes
+and causal offsets. Rank-local attention heads and Mamba state groups follow typed
+projection/convolution slots and selected parameter identities. Dense and routed
+feed-forward widths do not change their `NoState` cache policies; parameter encoding
+admission remains separate from state forecasting.
+
+Complete and partition-local geometry validate against the retained declaration's
+parameter and state projections. Vocabulary ranges come from its typed static scopes.
+Rank-local construction and state validation do not rebuild Mamba, attention or static
+parameter geometry from configuration. Capability and generation-memory reports borrow
+the retained state layout and static width. Hybrid strategy counts describe target
+invocations; complete state estimates also include the separately owned prediction
+segments. Context and draft availability remain explicit family policies.
+Nemotron's dimension-based block constructors and configuration-to-state builder are absent; native
+unit construction consumes prepared typed scopes.
+
+
+LFM2's `Declaration` pairs existing typed static, attention/convolution, normalization,
+dense and routed feed-forward scopes with component ownership and state. Its parameter
+projection borrows those scopes. Format projection clones parameter identities and
+logical dimensions while preserving arithmetic, rotary, selector and grouped reduction
+policy; changes to family equations reject before backend allocation.
+
+LFM2 SafeTensors and GGUF admission builds its declaration before projecting checkpoint
+constraints and retains it across immutable clones and declaration-only inspection
+snapshots. Complete, partitioned and replicated source and selected construction receive it as
+`Arc<Declaration>`; pinned modules and independently materialized blocks consume its
+specs. Local blocks project head counts, convolution rows and feed-forward widths from
+those scopes. Routed bank overrides must preserve declared identities, formats,
+arithmetic and reduction policy while selecting local expert geometry. Static placement
+uses the retained embedding, normalization and readout specs. The existing dense-only
+replicated admission remains explicit. Checkpoint source constraints and local geometry
+validation retain their own preparation contracts.
+These immutable declarations contain no payload leases or mutable invocation state.
+
+LFM2 checkpoint visitors borrow retained parameter identities, logical shapes, roles and
+linear encodings. Explicit source extensions describe convolution axis layouts, GGUF
+names, floating router storage, fused or separate packed experts, independent expert
+aliases and encoding companions. Unit recipes, ordinary source-shape joins and expert
+residency borrow the same scopes. Expert residency retains independently addressable
+banks, exact inferred bytes and canonical target identities. Source enumeration and
+metadata inference acquire no tensor payloads or backend resources.
+
+LFM2 local geometry and state validators project its retained attention or
+short-convolution scopes, parameter identities and static vocabulary. State forecasts
+select active mixer dimensions from the same scopes. Geometry retains the shared
+component definition for exact topology comparison, including encoded companions,
+without rebuilding a parameter catalog. The declaration exposes its global state through
+the retained component definition. Convolution history, floating mutable storage
+and key/value head geometry retain their existing contracts independently of
+feed-forward ownership.
+
+LFM2 discovery borrows these static and block scopes for graph attributes, component
+reads and writes, normalization references and routed banks. Its execution-memory
+topology projects the same attention/convolution, dense/routed and readout specs,
+including storage formats and normalization promotion references. Capability estimates
+use the retained global state and active mixer kinds alongside explicit context policy.
+Component equations, observation phases, hook permissions and completeness remain
+family-authored contracts. Routed hook declarations reference invocation identities and
+declared bank cardinality; parameter ownership alone grants no observation or intervention.
+
+LFM2's generic text-inspection value retains `Arc<Declaration>` alongside the other
+families' validated inputs. Admission-identity checks, state eligibility, static
+construction metadata, parameter/source joins, tied-readout completion and boundary
+schemas project this scope. Configuration-to-catalog wrappers are absent. Fixed-state
+replicated families supply their actual static-module constructor directly; the kernel
+does not require a second static metadata factory alongside a retained constructor.
+
+Kimi Linear's `Declaration` retains typed KDA or MLA mixers, dense or routed/shared
+feed-forward scopes, normalization and static modules. Parameter ownership and partition
+groups borrow those scopes; global state projects KDA histories/recurrent matrices or
+head-independent MLA latent state. Selected encoding projection clones the scopes and
+preserves identities, geometry, sharing, arithmetic, routing and reduction policy.
+Changes to non-format family policy reject before native allocation.
+
+Cold Kimi plans share the source declaration across immutable clones and inspection
+snapshots. Fixed-state KDA and compressed replicated construction receive retained
+source and selected scopes. Pinned modules and independently materialized blocks consume
+their typed slots. Dense-only replicated admission and the fixed profile's KDA-only
+constraint remain explicit. Compressed replicated families supply their actual static
+constructor directly. These declarations hold no payload leases or mutable state;
+invocation placement and observation permissions remain separate contracts.
+
+Complete and partitioned Kimi kernels retain these scopes for static placement and
+local unit construction. Local KDA scopes project head-dependent affines, convolution
+channels and recurrent axes while preserving shared head-dimension projections. MLA
+scopes project direct or low-rank query output and fused or split reconstruction heads;
+latent ingress, normalization and score scale remain retained. Dense and routed/shared
+widths project independently. Compact routed bank overrides must preserve declared
+identities, formats, geometry, arithmetic and reduction policy. Global ordinary state
+and complete vocabulary geometry borrow the declaration; selected invocation/state
+ownership and geometry admission remain explicit preparation contracts.
+
+Kimi local geometry and state admission project retained mixer, feed-forward and static
+scopes. Local geometry shares the component definition for exact parameter topology,
+encoding, sharing and owner comparison. State forecasts select retained KDA heads;
+MLA latent/rotary state remains head-independent. EP authority projects declared banks
+and shared-expert intervals at the selected rank coordinates. Global state is exposed
+through the retained component definition. Independent cache-geometry
+catalogs and dimension-based block factories are absent; cache-policy identity and
+pipeline invocation ownership remain separate checks.
+
+Kimi SafeTensors and GGUF admission retains the declaration used to project its
+checkpoint schema. Checkpoint recipes and selected native construction borrow that scope
+across immutable plan clones and inspection snapshots. Schema visitors obtain identities,
+logical geometry, roles and linear encodings from typed static, mixer and feed-forward
+slots. Ordinary source-shape joins, unit/expert recipes and expert residency use the
+same scopes; independently addressable banks retain canonical targets and inferred
+materialization bytes.
+
+Kimi source extensions specify strict SafeTensors catalog policy, published aliases,
+KDA element-count storage shapes, convolution/history reshapes and GGUF transition-rate
+conversion. MLA direct/low-rank and fused/split reconstruction follow retained slots.
+Packed versus independent expert names, floating split-source eligibility, quantization
+companions and GGUF physical ordering remain explicit format contracts. These metadata
+projections acquire no payload leases or native resources and grant no execution or
+observation capabilities.
+
+Kimi discovery projects graph attributes, component read/write geometry, normalization
+references and readout ownership from retained neural scopes. Capability estimates use
+retained mixer kinds and state alongside explicit context policy. Generic text inspection
+also retains `Arc<Declaration>` for admission identity, parameter/source joins, tied
+readout, boundary schemas and state eligibility. Configuration-to-catalog wrappers are
+absent. Explicit routed hooks reference invocation identity and declared bank cardinality;
+component equations, observation phases, allowed operations and completeness remain
+independent family contracts.

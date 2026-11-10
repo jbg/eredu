@@ -1,4 +1,5 @@
 //! Separately leased character conditioning, speaker ingress and gated fusion.
+use super::tts_conditioning_specs::{ConditioningDeclaration, Declaration};
 use super::{
     config::TtsConfig,
     tts_conditioning::{CharacterBatch, CharacterDimensions, CharacterEmbedding, GatedFusion},
@@ -10,7 +11,9 @@ use super::{
     tts_rvq_layered::RvqExecution,
 };
 use eredu_core::BackendFailure;
-use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Parameterized, Tensor};
+use eredu_nn::{
+    DeclareLogicalParameters, DistributedNeuralBackend, NeuralBackend, Parameterized, Tensor,
+};
 use eredu_runtime::{
     ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitectureGroupTransport,
     ArchitectureMergeDestination, ArchitectureParameterDescription, ArchitectureStatePartitionPlan,
@@ -18,8 +21,8 @@ use eredu_runtime::{
     ComponentKernel, ComponentUnit, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress,
     ExecutionUnitLayout, LayeredForwardState, LayeredInvocation, LayerwisePolicy, LayerwiseRuntime,
     LocalModelLayout, MemberSharding, OwnedParameterGroupSpec, ParallelComponentKernel,
-    ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec, ParameterRole, ResidentRuntime,
-    StatelessComponentState, SubmissionBackend,
+    ParameterGroupOwner, ParameterRole, ResidentRuntime, StatelessComponentState,
+    SubmissionBackend,
 };
 use std::marker::PhantomData;
 
@@ -81,12 +84,11 @@ pub struct ConditioningLocalDimensions {
     /// Number of speech features on this rank.
     pub output: i32,
 }
-/// Validates every physical parameter placement, including replicated control parameters.
-pub fn conditioning_local_dimensions(
-    dimensions: ConditioningDimensions,
+pub(crate) fn declared_local_dimensions(
+    declaration: &Declaration,
     layout: &LocalModelLayout,
 ) -> Result<ConditioningLocalDimensions, TtsError> {
-    let description = conditioning_parameter_description(dimensions)?;
+    let description = declared_parameters(declaration)?;
     let range = |name, width| {
         layout
             .tensor(name)
@@ -97,12 +99,12 @@ pub fn conditioning_local_dimensions(
             .map_err(TtsError::from)
     };
     let character = range(
-        "tts_model.tts_model.embed_subword.embed_tokens.weight",
-        dimensions.character.width as usize,
+        declaration.character.tokens.weight.id.as_str(),
+        declaration.character.tokens.dimensions as usize,
     )?;
     let output = range(
-        "tts_model.tts_model.embed_subword.proj_embedding.weight",
-        dimensions.character.output_width as usize,
+        declaration.character.projection.weight.id.as_str(),
+        declaration.character.projection.output as usize,
     )?;
     if character.is_empty() || output.is_empty() {
         return Err(TtsError::Configuration(
@@ -316,34 +318,36 @@ impl<T> ConditioningForward<T> {
 /// Shared graph for resident and bounded conditioning phases.
 pub struct ConditioningKernel<B: NeuralBackend> {
     dimensions: ConditioningDimensions,
+    declaration: Declaration,
+    definition: ComponentDefinition,
     parallel: Option<(ConditioningLocalDimensions, LocalModelLayout)>,
     backend: PhantomData<fn() -> B>,
 }
 impl<B: NeuralBackend> ConditioningKernel<B> {
     /// Combines selected semantic equations with the validated component declaration.
     pub fn into_component(self) -> Result<ComponentAdapter<ComponentDefinition, Self>, TtsError> {
-        Ok(ComponentAdapter::new(
-            tts_conditioning_component_definition(self.dimensions)?,
-            self,
-        )?)
+        Ok(ComponentAdapter::new(self.definition.clone(), self)?)
     }
 
-    /// Validates geometry without learned parameter allocation.
-    pub fn new(dimensions: ConditioningDimensions) -> Result<Self, TtsError> {
-        ConditioningDimensions::new(dimensions.character, dimensions.speaker_frames)?;
+    /// Retains validated scopes without learned parameter allocation.
+    pub fn new(declaration: ConditioningDeclaration) -> Result<Self, TtsError> {
+        let dimensions = declaration.dimensions();
+        let (declaration, definition) = declaration.into_parts();
         Ok(Self {
             dimensions,
+            declaration,
+            definition,
             parallel: None,
             backend: PhantomData,
         })
     }
     /// Selects an exact retained rank-local parameter layout before materialization.
     pub fn new_parallel(
-        dimensions: ConditioningDimensions,
+        declaration: ConditioningDeclaration,
         layout: &LocalModelLayout,
     ) -> Result<Self, TtsError> {
-        let local = conditioning_local_dimensions(dimensions, layout)?;
-        let mut architecture = Self::new(dimensions)?;
+        let mut architecture = Self::new(declaration)?;
+        let local = declared_local_dimensions(&architecture.declaration, layout)?;
         architecture.parallel = Some((local, layout.clone()));
         Ok(architecture)
     }
@@ -428,11 +432,10 @@ impl<B: NeuralBackend> ConditioningKernel<B> {
         })
     }
 }
-/// Validated logical invocations, independent parameter units and transport semantics.
-pub fn tts_conditioning_component_definition(
-    dimensions: ConditioningDimensions,
+pub(crate) fn declared_component_definition(
+    declaration: &Declaration,
 ) -> Result<ComponentDefinition, TtsError> {
-    let parameters = conditioning_parameter_description(dimensions)?;
+    let parameters = declared_parameters(declaration)?;
     let paths: Vec<String> = [CHARACTER, INGRESS, FUSION].map(str::to_owned).to_vec();
     let transport = (0..parameters.graph().groups().len())
         .map(|group| {
@@ -473,153 +476,107 @@ fn conditioning_graph() -> Result<ExecutionGraph, TtsError> {
         FUSION,
     )?)
 }
-/// Cold canonical parameter shapes, partitioned by the exact learned phase.
-pub fn conditioning_parameter_description(
-    d: ConditioningDimensions,
+pub(super) fn declared_parameters(
+    d: &Declaration,
 ) -> Result<ArchitectureParameterDescription, TtsError> {
-    ConditioningDimensions::new(d.character, d.speaker_frames)?;
     let graph = conditioning_graph()?;
     let layout = ExecutionUnitLayout::new(&graph, [1, 1, 1])?;
-    let c = d.character;
-    let w = c.output_width as usize;
-    let h = c.width as usize;
-    let member = |name: &str, shape: Vec<usize>, sharding| {
-        ParameterMemberSpec::new(format!("tts_model.tts_model.{name}"), shape, sharding)
-    };
     let mut owned = Vec::new();
-    let mut push = |unit: usize, spec: ParameterGroupSpec| {
+    let mut push = |unit, spec| {
         owned.push(OwnedParameterGroupSpec::new(
             ParameterGroupOwner::execution_unit(
                 layout.group_id(unit).expect("declared group").clone(),
                 0,
             ),
             spec,
-        ));
+        ))
     };
+    let c = &d.character;
+    let i = &d.ingress;
+    let f = &d.fusion;
     push(
         0,
-        ParameterGroupSpec::partitioned(
+        eredu_runtime::logical_parameter_group(
             format!("{CHARACTER}.tokens"),
             ParameterRole::Channels,
-            h,
-            [member(
-                "embed_subword.embed_tokens.weight",
-                vec![c.characters as usize + 1, h],
-                MemberSharding::Partitioned { axis: 1 },
-            )],
+            Some(c.tokens.dimensions as usize),
+            &c.tokens,
+            |_| MemberSharding::Partitioned { axis: 1 },
         )?,
     );
     push(
         0,
-        ParameterGroupSpec::partitioned(
+        eredu_runtime::logical_parameter_group(
             format!("{CHARACTER}.projection"),
             ParameterRole::ColumnProjection,
-            w,
-            [member(
-                "embed_subword.proj_embedding.weight",
-                vec![w, h],
-                MemberSharding::Partitioned { axis: 0 },
-            )],
+            Some(c.projection.output as usize),
+            &c.projection,
+            |_| MemberSharding::Partitioned { axis: 0 },
         )?,
     );
     let mut flags = Vec::new();
-    if c.use_continuation {
-        flags.push(member(
-            "embed_subword.subword_flag_emb.cont_emb.weight",
-            vec![2, h],
-            MemberSharding::Replicated,
-        ));
-    }
-    if c.use_special {
-        flags.push(member(
-            "embed_subword.bos_eos_emb.special_emb.weight",
-            vec![3, h],
-            MemberSharding::Replicated,
-        ));
+    for spec in [&c.continuation, &c.special].into_iter().flatten() {
+        flags.extend(spec.logical_parameters()?);
     }
     if !flags.is_empty() {
         push(
             0,
-            ParameterGroupSpec::new(
+            eredu_runtime::logical_parameter_group(
                 format!("{CHARACTER}.flags"),
                 ParameterRole::Replicated,
-                flags,
+                None,
+                &flags,
+                |_| MemberSharding::Replicated,
             )?,
         );
     }
     push(
         1,
-        ParameterGroupSpec::partitioned(
+        eredu_runtime::logical_parameter_group(
             format!("{INGRESS}.projection"),
             ParameterRole::ColumnProjection,
-            w,
-            [member(
-                "audio_prompt_projection_W",
-                vec![w, w],
-                MemberSharding::Partitioned { axis: 1 },
-            )],
+            Some(i.projection.shape[1] as usize),
+            &i.projection,
+            |_| MemberSharding::Partitioned { axis: 1 },
         )?,
     );
-    push(
-        1,
-        ParameterGroupSpec::new(
-            format!("{INGRESS}.controls"),
-            ParameterRole::Replicated,
-            [
-                member("bos_emb", vec![w], MemberSharding::Replicated),
-                member("null_emb", vec![w], MemberSharding::Replicated),
-                ParameterMemberSpec::new(
-                    "tts_model.audio_prompt_latents.Aria",
-                    vec![1, d.speaker_frames as usize, w],
-                    MemberSharding::Replicated,
-                ),
-            ],
-        )?,
-    );
-    let mut projections = Vec::new();
-    for prefix in ["audio_proj", "text_proj"] {
-        projections.push(member(
-            &format!("gated_fusion_audio_text.{prefix}.weight"),
-            vec![w, w],
-            MemberSharding::Partitioned { axis: 0 },
-        ));
-        projections.push(member(
-            &format!("gated_fusion_audio_text.{prefix}.bias"),
-            vec![w],
-            MemberSharding::Partitioned { axis: 0 },
-        ));
+    let mut controls = Vec::new();
+    for spec in [&i.bos, &i.null, &i.aria] {
+        controls.extend(spec.logical_parameters()?);
     }
     push(
-        2,
-        ParameterGroupSpec::partitioned(
-            format!("{FUSION}.projections"),
-            ParameterRole::ColumnProjection,
-            w,
-            projections,
+        1,
+        eredu_runtime::logical_parameter_group(
+            format!("{INGRESS}.controls"),
+            ParameterRole::Replicated,
+            None,
+            &controls,
+            |_| MemberSharding::Replicated,
         )?,
     );
+    let mut projections = f.audio.logical_parameters()?;
+    projections.extend(f.text.logical_parameters()?);
     push(
         2,
-        ParameterGroupSpec::new(
+        eredu_runtime::logical_parameter_group(
+            format!("{FUSION}.projections"),
+            ParameterRole::ColumnProjection,
+            Some(f.audio.output as usize),
+            &projections,
+            |_| MemberSharding::Partitioned { axis: 0 },
+        )?,
+    );
+    let mut controls = f.gate.logical_parameters()?;
+    controls.extend(f.residual_scale.logical_parameters()?);
+    controls.extend(f.norm.logical_parameters()?);
+    push(
+        2,
+        eredu_runtime::logical_parameter_group(
             format!("{FUSION}.controls"),
             ParameterRole::Replicated,
-            [
-                member(
-                    "gated_fusion_audio_text.gate",
-                    vec![w],
-                    MemberSharding::Replicated,
-                ),
-                member(
-                    "gated_fusion_audio_text.residual_scale",
-                    vec![],
-                    MemberSharding::Replicated,
-                ),
-                member(
-                    "gated_fusion_audio_text.final_norm.weight",
-                    vec![w],
-                    MemberSharding::Replicated,
-                ),
-            ],
+            None,
+            &controls,
+            |_| MemberSharding::Replicated,
         )?,
     );
     Ok(ArchitectureParameterDescription::from_owned(
@@ -666,23 +623,23 @@ impl<B: NeuralBackend> ComponentKernel<B> for ConditioningKernel<B> {
     ) -> Result<ConditioningUnit<B>, TtsError> {
         let group = address.group();
 
-        let d = self.dimensions;
         Ok(match group {
-            0 => ConditioningUnit::Character(CharacterEmbedding::new_local(
-                d.character,
-                self.local().character,
-                self.local().output,
+            0 => ConditioningUnit::Character(CharacterEmbedding::new(
+                self.declaration
+                    .character
+                    .clone()
+                    .local(self.local().character, self.local().output)?,
                 context,
             )?),
-            1 => ConditioningUnit::Ingress(TtsIngress::new_local(
-                d.character.output_width,
-                d.speaker_frames,
-                self.local().output,
+            1 => ConditioningUnit::Ingress(TtsIngress::new(
+                self.declaration
+                    .ingress
+                    .clone()
+                    .local(self.local().output)?,
                 context,
             )?),
-            _ => ConditioningUnit::Fusion(GatedFusion::new_local(
-                d.character.output_width,
-                self.local().output,
+            _ => ConditioningUnit::Fusion(GatedFusion::new(
+                self.declaration.fusion.clone().local(self.local().output)?,
                 context,
             )?),
         })
@@ -859,24 +816,21 @@ impl<B: NeuralBackend> ResidentConditioning<B> {
         dimensions: ConditioningDimensions,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, TtsError> {
-        Self::from_parts(
-            dimensions,
-            CharacterEmbedding::new(dimensions.character, context)?,
-            TtsIngress::new(
-                dimensions.character.output_width,
-                dimensions.speaker_frames,
-                context,
-            )?,
-            GatedFusion::new(dimensions.character.output_width, context)?,
-        )
+        let declaration = ConditioningDeclaration::new(dimensions)?;
+        let spec = declaration.spec();
+        let character = CharacterEmbedding::new(spec.character.clone(), context)?;
+        let ingress = TtsIngress::new(spec.ingress.clone(), context)?;
+        let fusion = GatedFusion::new(spec.fusion.clone(), context)?;
+        Self::from_parts(declaration, character, ingress, fusion)
     }
     /// Adopts previously materialized modules into ordinary resident traversal.
     pub fn from_parts(
-        dimensions: ConditioningDimensions,
+        declaration: ConditioningDeclaration,
         character: CharacterEmbedding<B>,
         ingress: TtsIngress<B>,
         fusion: GatedFusion<B>,
     ) -> Result<Self, TtsError> {
+        let dimensions = declaration.dimensions();
         let c = dimensions.character;
         if character.geometry() != (c, c.width, c.output_width)
             || ingress.geometry() != (c.output_width, dimensions.speaker_frames, c.output_width)
@@ -886,7 +840,7 @@ impl<B: NeuralBackend> ResidentConditioning<B> {
                 "resident conditioning units differ from complete geometry",
             ));
         }
-        let architecture = ConditioningKernel::new(dimensions)?.into_component()?;
+        let architecture = ConditioningKernel::new(declaration)?.into_component()?;
         let runtime = ResidentRuntime::from_units(
             architecture,
             vec![
@@ -1062,10 +1016,10 @@ impl<B: DistributedNeuralBackend> ConditioningKernel<B> {
         let (_, selected) = self.parallel.as_ref().ok_or(TtsError::Configuration(
             "parallel conditioning requires rank-local construction",
         ))?;
-        let description = conditioning_parameter_description(self.dimensions)?;
+        let description = self.definition.parameters();
         eredu_runtime::validate_tensor_parallel_layout(
             "voicechat.tts.conditioning",
-            &description,
+            description,
             selected,
             B::parallel_size(parallel),
             B::parallel_rank(parallel),

@@ -1,61 +1,64 @@
 //! Channelwise learned or stored residual coefficients in decoder order.
 use super::*;
 
+fn parameter(slot: &eredu_nn::ParameterSpec) -> ComponentTransformParameter {
+    let name = slot.id.as_str().to_owned();
+    declared_transform_parameter(
+        slot,
+        format!(
+            "parameters:{}",
+            name.rsplit_once('.').expect("declared residual slot").0
+        ),
+    )
+}
 pub(super) fn attach(g: &mut Builder, c: &DecoderConfig, layer: usize) {
-    if matches!(c.residual_equation, crate::muse::ResidualEquation::Add) {
-        return;
-    }
-    for (branch, field) in [
-        ("attention", "post_attention_residual_gate"),
-        ("feed_forward", "post_feedforward_residual_gate"),
-    ] {
-        g.attach_parameters(
-            &format!("decoder.{layer}.{branch}"),
-            &format!("model.layers.{layer}.{field}"),
-        );
+    use eredu_nn::DeclareLogicalParameters;
+    let scalar = c.scalar(layer).expect("validated Muse scalar declarations");
+    for (branch, spec) in ["attention", "feed_forward"]
+        .into_iter()
+        .zip(&scalar.residuals)
+    {
+        for declaration in spec.logical_parameters().expect("validated residual slots") {
+            let prefix = declaration
+                .parameter
+                .id
+                .as_str()
+                .rsplit_once('.')
+                .expect("declared residual slot")
+                .0;
+            g.attach_parameters(&format!("decoder.{layer}.{branch}"), prefix);
+        }
     }
 }
-
 pub(super) fn cycles(c: &DecoderConfig) -> Vec<ComponentResidualCycle> {
+    use crate::muse::equations::specs::ResidualSpec;
     let mut cycles = Vec::new();
     for layer in 0..c.num_hidden_layers as usize {
         let path = format!("model.layers.{layer}");
-        for (branch, field, input) in [
-            (
-                "attention",
-                "post_attention_residual_gate",
-                format!("{path}.input.effective"),
-            ),
+        let scalar = c.scalar(layer).expect("validated Muse scalar declarations");
+        for ((branch, input), spec) in [
+            ("attention", format!("{path}.input.effective")),
             (
                 "feed_forward",
-                "post_feedforward_residual_gate",
                 format!("{path}.attention.residual.effective"),
             ),
-        ] {
-            let parameter = |suffix| {
-                let name = format!("{path}.{field}.{suffix}");
-                ComponentTransformParameter {
-                    parameter: name.clone(),
-                    shared_parameter: name,
-                    parameter_group: format!("parameters:{path}.{field}"),
-                }
-            };
-            let combination = match c.residual_equation {
-                crate::muse::ResidualEquation::Add => continue,
-                crate::muse::ResidualEquation::Learned {
-                    temperature,
-                    minimum_variance,
-                } => ComponentResidualCombination::LearnedVariancePreserving {
-                    gate: parameter("gate"),
-                    temperature: ComponentScalar::new(temperature),
-                    minimum_variance: ComponentScalar::new(minimum_variance),
-                },
-                crate::muse::ResidualEquation::StoredCoefficients => {
-                    ComponentResidualCombination::StoredCoefficients {
-                        alpha: parameter("alpha"),
-                        beta: parameter("beta"),
+        ]
+        .into_iter()
+        .zip(&scalar.residuals)
+        {
+            let combination = match spec {
+                ResidualSpec::Add => continue,
+                ResidualSpec::Learned(spec) => {
+                    ComponentResidualCombination::LearnedVariancePreserving {
+                        gate: parameter(&spec.gate),
+                        temperature: ComponentScalar::new(spec.temperature),
+                        minimum_variance: ComponentScalar::new(spec.minimum_variance),
                     }
                 }
+                ResidualSpec::Stored(spec) => ComponentResidualCombination::StoredCoefficients {
+                    alpha: parameter(&spec.alpha),
+                    beta: parameter(&spec.beta),
+                },
             };
             cycles.push(ComponentResidualCycle {
                 id: format!("decoder.{layer}.{branch}.residual_combination"),

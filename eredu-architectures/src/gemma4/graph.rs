@@ -1,11 +1,10 @@
 //! Typed component and mutable-state graphs for Gemma 4.
 
 use eredu_core::cache::{
-    LayerCachePolicy, MutableStateResidency, StateTensorDimension, StateTensorDtype,
-    StateTensorPolicy, StateTensorRole,
+    MutableStateResidency, StateTensorDimension, StateTensorDtype, StateTensorPolicy,
+    StateTensorRole,
 };
 use eredu_core::LayerSchedule;
-use eredu_nn::AttentionStateSource;
 use eredu_runtime::{
     ComponentDomain, ComponentGraph, ComponentGraphError, ComponentKind, ComponentResidencyClass,
     ComponentSpec, StateError, StateLayout,
@@ -127,44 +126,84 @@ pub fn component_graph(
 
 /// Builds exact key/value, shared, and prefix state geometry from the
 /// same layer schedule used by execution.
-pub fn state_layout(args: &ModelArgs) -> Result<StateLayout, StateError> {
-    let prefix = StateTensorPolicy::new(
-        StateTensorRole::PrefixEmbedding,
-        vec![
-            StateTensorDimension::Batch,
-            StateTensorDimension::PrefixTokens,
-            StateTensorDimension::fixed(args.hidden_size)
-                .map_err(|error| StateError::InvalidResidency(error.to_string()))?,
-        ],
-        StateTensorDtype::Floating,
-        MutableStateResidency::AlwaysDeviceMutable,
-    )
-    .map_err(|error| StateError::InvalidResidency(error.to_string()))?
-    .optional();
+pub fn state_layout(config: &super::FamilyConfig) -> Result<StateLayout, StateError> {
+    declared_state_layout(&config.text, config.attention_scopes(), None)
+}
+
+pub(crate) fn tensor_state_layout(
+    config: &super::FamilyConfig,
+    rank: eredu_core::ParallelRankTopology,
+) -> Result<StateLayout, StateError> {
+    declared_state_layout(&config.text, config.attention_scopes(), Some(rank))
+}
+
+pub(crate) fn local_state_layout(
+    config: &super::FamilyConfig,
+    blocks: &[ModelArgs],
+) -> Result<StateLayout, StateError> {
+    if blocks.is_empty() || blocks.len() != config.text.num_hidden_layers() {
+        return Err(StateError::InvalidResidency(
+            "local attention scopes do not cover the declared stack".into(),
+        ));
+    }
+    let attention = blocks
+        .iter()
+        .enumerate()
+        .map(|(layer, args)| {
+            config
+                .attention(layer)
+                .and_then(|spec| spec.for_invocation(args, layer))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| StateError::InvalidResidency(e.to_string()))?;
+    declared_state_layout(&config.text, &attention, None)
+}
+
+fn declared_state_layout(
+    args: &ModelArgs,
+    attention: &[super::text::specs::AttentionSpec],
+    rank: Option<eredu_core::ParallelRankTopology>,
+) -> Result<StateLayout, StateError> {
     let layers = args
         .layer_schedule
         .iter()
         .enumerate()
-        .map(|(layer, policy)| {
-            if policy.key_value == AttentionStateSource::Shared {
-                return Ok(LayerCachePolicy::NoState);
-            }
-            let kv_heads = policy.num_key_value_heads.get() as i32;
-            let head_dim = policy.head_dim.get() as i32;
-            // Sharing the K/V projection does not share its cache payload:
-            // learned key normalization and RoPE differ from value normalization.
-            if layer == 0 {
-                LayerCachePolicy::key_value_with_state(
-                    policy.attention,
-                    kv_heads,
-                    head_dim,
-                    vec![prefix.clone()],
-                    Vec::new(),
+        .map(|(layer, _policy)| {
+            args.attention_state_owner(layer)
+                .map_err(|error| StateError::InvalidResidency(error.to_string()))?;
+            let spec = attention.get(layer).ok_or_else(|| {
+                StateError::InvalidResidency("missing declared attention state scope".into())
+            })?;
+            let tensors = if layer == 0 {
+                vec![StateTensorPolicy::new(
+                    StateTensorRole::PrefixEmbedding,
+                    vec![
+                        StateTensorDimension::Batch,
+                        StateTensorDimension::PrefixTokens,
+                        StateTensorDimension::fixed(spec.query.input)
+                            .map_err(|error| StateError::InvalidResidency(error.to_string()))?,
+                    ],
+                    StateTensorDtype::Floating,
+                    MutableStateResidency::AlwaysDeviceMutable,
                 )
+                .map_err(|error| StateError::InvalidResidency(error.to_string()))?
+                .optional()]
             } else {
-                LayerCachePolicy::key_value(policy.attention, kv_heads, head_dim)
-            }
-            .map_err(|error| StateError::InvalidResidency(error.to_string()))
+                Vec::new()
+            };
+            let range = rank
+                .map(|rank| {
+                    eredu_core::balanced_contiguous_range(
+                        spec.geometry.key_value_heads() as usize,
+                        rank.tensor_parallel_size(),
+                        rank.tensor_parallel_rank(),
+                        false,
+                    )
+                })
+                .transpose()
+                .map_err(|error| StateError::InvalidResidency(error.to_string()))?;
+            spec.state_policy(range, tensors)
+                .map_err(|error| StateError::InvalidResidency(error.to_string()))
         })
         .collect::<Result<Vec<_>, _>>()?;
     StateLayout::new(

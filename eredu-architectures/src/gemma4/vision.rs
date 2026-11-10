@@ -1,6 +1,7 @@
 //! Backend-neutral Gemma 4 vision configuration and reusable projection units.
 
 pub(crate) mod parameters;
+pub mod specs;
 
 use std::collections::{HashMap, HashSet};
 
@@ -10,9 +11,8 @@ use eredu_nn::{
     multimodal::{
         multi_axis_rotary_embeddings, MultiAxisRotaryLayout, MultiAxisRotarySpec, RotaryAxisSpec,
     },
-    AttentionArithmetic, AttentionRequest, Error, Index, LinearOperator, LinearSpec, NeuralBackend,
-    NormalizationConstructionSpec, NormalizationOperator, NormalizationScale, Parameter,
-    ParameterSpec, Parameterized, Tensor, TensorElementType,
+    AttentionArithmetic, AttentionRequest, DeclareLogicalParameters, Error, Index, LinearOperator,
+    NeuralBackend, NormalizationOperator, Parameter, Parameterized, Tensor, TensorElementType,
 };
 use serde::Deserialize;
 
@@ -27,9 +27,9 @@ pub enum VisionConfigError {
     Invalid(String),
 }
 
-/// Validated Gemma 4 image-tower geometry.
+/// Normalized shared Gemma image-tower geometry and storage policy.
 #[derive(Debug, Clone, Deserialize)]
-pub struct VisionConfig {
+pub struct VisionPolicy {
     /// Encoder hidden width.
     pub hidden_size: i32,
     /// Gated-GELU intermediate width.
@@ -84,16 +84,19 @@ fn default_clipped_linears() -> bool {
     true
 }
 
-impl VisionConfig {
-    /// Parses and validates a standalone embedded vision config object.
-    pub fn from_json(bytes: &[u8]) -> Result<Self, VisionConfigError> {
-        let config: Self = serde_json::from_slice(bytes)?;
-        config.validate()?;
-        Ok(config)
-    }
-
+impl VisionPolicy {
     /// Validates exact executable geometry.
     pub fn validate(&self) -> Result<(), VisionConfigError> {
+        for format in self.weight_quantization.iter().chain(
+            self.quantized_weight_configs
+                .iter()
+                .flat_map(|f| f.values()),
+        ) {
+            format
+                .validate()
+                .map_err(|e| VisionConfigError::Invalid(e.to_string()))?;
+        }
+
         for (name, value) in [
             ("hidden_size", self.hidden_size),
             ("intermediate_size", self.intermediate_size),
@@ -175,6 +178,161 @@ impl VisionConfig {
     }
 }
 
+/// Family ownership of the shared image equations and canonical parameter roots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisionOwner {
+    /// Gemma 4's independently leased image tower.
+    Gemma4,
+    /// DiffusionGemma's encoder-owned image tower.
+    DiffusionGemma,
+}
+impl VisionOwner {
+    /// Authoritative parameter root used by source extensions and invocation binding.
+    pub const fn root(self) -> &'static str {
+        match self {
+            Self::Gemma4 => "model.vision_tower",
+            Self::DiffusionGemma => "model.encoder.vision_tower",
+        }
+    }
+}
+/// Validated image policy and immutable parameter scopes under one family owner.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(try_from = "VisionPolicy")]
+pub struct VisionConfig {
+    policy: VisionPolicy,
+    owner: VisionOwner,
+    pinned: std::sync::Arc<specs::StaticSpec>,
+    layers: std::sync::Arc<Vec<specs::BlockSpec>>,
+}
+impl VisionConfig {
+    /// Validates external policy and prepares all parameter owners before allocation.
+    pub fn new(policy: VisionPolicy, owner: VisionOwner) -> Result<Self, VisionConfigError> {
+        policy.validate()?;
+        let pinned =
+            specs::StaticSpec::at(&policy, owner.root()).map_err(vision_declaration_error)?;
+        let layers = (0..policy.num_hidden_layers as usize)
+            .map(|layer| specs::BlockSpec::at(&policy, layer, owner.root()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(vision_declaration_error)?;
+        let exact = Self {
+            policy,
+            owner,
+            pinned: pinned.into(),
+            layers: layers.into(),
+        };
+        exact.validate()?;
+        Ok(exact)
+    }
+    /// Parses a standalone Gemma 4 image configuration and prepares its owners.
+    pub fn from_json(bytes: &[u8]) -> Result<Self, VisionConfigError> {
+        Ok(serde_json::from_slice(bytes)?)
+    }
+    /// Source geometry, arithmetic and storage policy.
+    pub fn policy(&self) -> &VisionPolicy {
+        &self.policy
+    }
+    /// Owning family, independent of mutable invocation state.
+    pub const fn owner(&self) -> VisionOwner {
+        self.owner
+    }
+    pub(crate) fn pinned(&self, root: &str) -> Result<&specs::StaticSpec, Error> {
+        self.require_root(root)?;
+        Ok(&self.pinned)
+    }
+    pub(crate) fn layer(&self, index: usize, root: &str) -> Result<&specs::BlockSpec, Error> {
+        self.require_root(root)?;
+        self.layers
+            .get(index)
+            .ok_or_else(|| Error::backend("vision block outside its declared stack"))
+    }
+    pub(crate) fn require_root(&self, root: &str) -> Result<(), Error> {
+        if root != self.owner.root() {
+            return Err(Error::backend(
+                "vision reference belongs to another declared component",
+            ));
+        }
+        Ok(())
+    }
+    /// Validates complete geometry, topology and storage-extension references.
+    pub fn validate(&self) -> Result<(), VisionConfigError> {
+        self.policy.validate()?;
+        let parameters = self
+            .logical_parameters()
+            .map_err(vision_declaration_error)?;
+        eredu_nn::validate_logical_parameter_topology(&parameters)
+            .map_err(|e| VisionConfigError::Invalid(e.to_string()))?;
+        crate::format_references::validate_matrices(
+            parameters,
+            super::text::specs::format_references(
+                self.weight_quantization,
+                self.quantized_weights.as_ref(),
+                self.quantized_weight_configs.as_ref(),
+            )
+            .filter(|(name, _)| {
+                !(self.owner == VisionOwner::Gemma4
+                    && *name == super::media::ProjectionKind::Vision.gemma_weight())
+            }),
+        )
+        .map_err(vision_declaration_error)?;
+        Ok(())
+    }
+    /// Projects encodings onto retained geometry, preserving alignment and equations.
+    pub fn with_formats(
+        &self,
+        default: Option<WeightQuantization>,
+        names: Option<HashSet<String>>,
+        formats: Option<HashMap<String, WeightQuantization>>,
+    ) -> Result<Self, VisionConfigError> {
+        if default == self.weight_quantization
+            && names == self.quantized_weights
+            && formats == self.quantized_weight_configs
+        {
+            return Ok(self.clone());
+        }
+        let mut exact = self.clone();
+        exact.policy.weight_quantization = default;
+        exact.policy.quantized_weights = names;
+        exact.policy.quantized_weight_configs = formats;
+        exact.policy.validate()?;
+        let mut pinned = self.pinned.as_ref().clone();
+        pinned
+            .project_formats(&exact.policy)
+            .map_err(vision_declaration_error)?;
+        let mut layers = self.layers.as_ref().clone();
+        for layer in &mut layers {
+            layer
+                .project_formats(&exact.policy)
+                .map_err(vision_declaration_error)?;
+        }
+        exact.pinned = pinned.into();
+        exact.layers = layers.into();
+        exact.validate()?;
+        Ok(exact)
+    }
+}
+fn vision_declaration_error(error: Error) -> VisionConfigError {
+    VisionConfigError::Invalid(error.to_string())
+}
+impl TryFrom<VisionPolicy> for VisionConfig {
+    type Error = VisionConfigError;
+    fn try_from(policy: VisionPolicy) -> Result<Self, Self::Error> {
+        Self::new(policy, VisionOwner::Gemma4)
+    }
+}
+impl std::ops::Deref for VisionConfig {
+    type Target = VisionPolicy;
+    fn deref(&self) -> &VisionPolicy {
+        &self.policy
+    }
+}
+impl DeclareLogicalParameters for VisionConfig {
+    fn logical_parameters(&self) -> Result<Vec<eredu_nn::LogicalParameterDeclaration<'_>>, Error> {
+        let mut parameters = self.pinned.logical_parameters()?;
+        parameters.extend(self.layers.as_slice().logical_parameters()?);
+        Ok(parameters)
+    }
+}
+
 /// Atomic learned input and output clipping bounds.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "T")]
@@ -200,58 +358,23 @@ pub struct MediaLinear<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
 }
 
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> MediaLinear<B> {
-    /// Builds one unloaded optionally clipped projection under its checkpoint prefix.
+    /// Builds a projection and its complete clipping slots from a validated declaration.
     pub fn new(
-        config: &VisionConfig,
-        prefix: &str,
-        input: i32,
-        output: i32,
+        spec: eredu_nn::ClippedLinearSpec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let weight_name = format!("{prefix}.linear.weight");
-        Self::from_format(
-            prefix,
-            input,
-            output,
-            config.linear_format_for(&weight_name, input),
-            config.use_clipped_linears,
-            context,
-        )
-    }
-
-    /// Builds a projection from an already-normalized physical format.
-    pub fn from_format(
-        prefix: &str,
-        input: i32,
-        output: i32,
-        format: LinearFormat,
-        clipped: bool,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        let parameter = |suffix: &str| {
-            let spec =
-                ParameterSpec::trainable(format!("{prefix}.{suffix}")).map_err(Error::backend)?;
-            Parameter::unloaded(spec, &[], context)
-        };
-        let weight_name = format!("{prefix}.linear.weight");
+        spec.validate()?;
         Ok(Self {
-            linear: B::linear(
-                LinearSpec {
-                    input,
-                    output,
-                    weight: ParameterSpec::trainable(&weight_name).map_err(Error::backend)?,
-                    bias: None,
-                    format: crate::linear_format::standard_linear_format(&weight_name, format)?,
-                },
-                context,
-            )?,
-            bounds: clipped
-                .then(|| {
+            linear: B::linear(spec.linear, context)?,
+            bounds: spec
+                .bounds
+                .map(|bounds| {
+                    let shape = eredu_nn::LinearClippingSpec::SHAPE;
                     Ok::<_, Error>(ClipBounds {
-                        input_min: parameter("input_min")?,
-                        input_max: parameter("input_max")?,
-                        output_min: parameter("output_min")?,
-                        output_max: parameter("output_max")?,
+                        input_min: Parameter::unloaded(bounds.input_min, shape, context)?,
+                        input_max: Parameter::unloaded(bounds.input_max, shape, context)?,
+                        output_min: Parameter::unloaded(bounds.output_min, shape, context)?,
+                        output_max: Parameter::unloaded(bounds.output_max, shape, context)?,
                     })
                 })
                 .transpose()?,
@@ -311,32 +434,13 @@ pub struct PatchEmbedder<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> 
 
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> PatchEmbedder<B> {
     fn new(
-        config: &VisionConfig,
-        root: &str,
+        projection: eredu_nn::LinearSpec,
+        position: specs::PositionSpec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let weight = format!("{root}.patch_embedder.input_proj.weight");
         Ok(Self {
-            input_projection: B::linear(
-                LinearSpec {
-                    input: 3 * config.patch_size * config.patch_size,
-                    output: config.hidden_size,
-                    weight: ParameterSpec::trainable(&weight).map_err(Error::backend)?,
-                    bias: None,
-                    format: crate::linear_format::standard_linear_format(
-                        &weight,
-                        config
-                            .linear_format_for(&weight, 3 * config.patch_size * config.patch_size),
-                    )?,
-                },
-                context,
-            )?,
-            position_table: Parameter::unloaded(
-                ParameterSpec::trainable(format!("{root}.patch_embedder.position_embedding_table"))
-                    .map_err(Error::backend)?,
-                &[2, config.position_embedding_size, config.hidden_size],
-                context,
-            )?,
+            input_projection: B::linear(projection, context)?,
+            position_table: Parameter::unloaded(position.table, &position.shape, context)?,
         })
     }
 
@@ -419,63 +523,23 @@ struct VisionAttention<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
 
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionAttention<B> {
     fn new(
-        config: &VisionConfig,
-        layer: usize,
-        root: &str,
+        spec: specs::AttentionSpec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let prefix = format!("{root}.encoder.layers.{layer}.self_attn");
-        let norm = |field: &str| {
-            B::normalization(
-                NormalizationConstructionSpec {
-                    reduction: eredu_nn::NormalizationReduction::Native,
-                    groups: None,
-                    dimensions: config.head_dim,
-                    epsilon: config.rms_norm_eps,
-                    scale: NormalizationScale::LearnedOffset {
-                        weight: ParameterSpec::trainable(format!("{prefix}.{field}.weight"))
-                            .map_err(Error::backend)?,
-                        offset: 0.0,
-                    },
-                },
-                context,
-            )
-        };
+        spec.logical_parameters()?;
+        let heads = spec.projections.projection.geometry;
+        let [query, key, value, output] = spec.projections.into_projections()?;
         Ok(Self {
-            query_heads: config.num_attention_heads,
-            input_score_arithmetic: config.input_score_arithmetic,
-            key_value_heads: config.num_key_value_heads,
-            head_dim: config.head_dim,
-            query: MediaLinear::new(
-                config,
-                &format!("{prefix}.q_proj"),
-                config.hidden_size,
-                config.num_attention_heads * config.head_dim,
-                context,
-            )?,
-            key: MediaLinear::new(
-                config,
-                &format!("{prefix}.k_proj"),
-                config.hidden_size,
-                config.num_key_value_heads * config.head_dim,
-                context,
-            )?,
-            value: MediaLinear::new(
-                config,
-                &format!("{prefix}.v_proj"),
-                config.hidden_size,
-                config.num_key_value_heads * config.head_dim,
-                context,
-            )?,
-            output: MediaLinear::new(
-                config,
-                &format!("{prefix}.o_proj"),
-                config.num_attention_heads * config.head_dim,
-                config.hidden_size,
-                context,
-            )?,
-            query_norm: norm("q_norm")?,
-            key_norm: norm("k_norm")?,
+            query_heads: heads.query_heads(),
+            input_score_arithmetic: spec.input_score_arithmetic,
+            key_value_heads: heads.key_value_heads(),
+            head_dim: heads.key_dimensions(),
+            query: MediaLinear::new(query, context)?,
+            key: MediaLinear::new(key, context)?,
+            value: MediaLinear::new(value, context)?,
+            output: MediaLinear::new(output, context)?,
+            query_norm: B::normalization(spec.query_norm, context)?,
+            key_norm: B::normalization(spec.key_norm, context)?,
         })
     }
 
@@ -543,41 +607,22 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionAttention<B> {
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 struct VisionMlp<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
+    #[parameter(skip)]
+    policy: eredu_nn::GatedProductPolicy,
     gate: MediaLinear<B>,
     up: MediaLinear<B>,
     down: MediaLinear<B>,
 }
 
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionMlp<B> {
-    fn new(
-        config: &VisionConfig,
-        layer: usize,
-        root: &str,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        let prefix = format!("{root}.encoder.layers.{layer}.mlp");
+    fn new(spec: specs::MlpSpec, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
+        let policy = spec.product.policy;
+        let [gate, up, down] = spec.into_projections()?;
         Ok(Self {
-            gate: MediaLinear::new(
-                config,
-                &format!("{prefix}.gate_proj"),
-                config.hidden_size,
-                config.intermediate_size,
-                context,
-            )?,
-            up: MediaLinear::new(
-                config,
-                &format!("{prefix}.up_proj"),
-                config.hidden_size,
-                config.intermediate_size,
-                context,
-            )?,
-            down: MediaLinear::new(
-                config,
-                &format!("{prefix}.down_proj"),
-                config.intermediate_size,
-                config.hidden_size,
-                context,
-            )?,
+            policy,
+            gate: MediaLinear::new(gate, context)?,
+            up: MediaLinear::new(up, context)?,
+            down: MediaLinear::new(down, context)?,
         })
     }
 
@@ -586,7 +631,13 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionMlp<B> {
         input: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let gate = B::gelu_approximate(self.gate.forward(input, context)?, context)?;
+        let gate = self.gate.forward(input, context)?;
+        let gate = match self.policy.activation() {
+            eredu_nn::GatedProductActivation::GeluApproximate => {
+                B::gelu_approximate(gate, context)?
+            }
+            _ => return Err(Error::backend("unsupported Gemma vision gated equation")),
+        };
         let up = self.up.forward(input, context)?;
         self.down.forward(&gate.multiply(&up, context)?, context)
     }
@@ -621,30 +672,15 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionLayer<B> {
         root: &str,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let prefix = format!("{root}.encoder.layers.{layer}");
-        let norm = |field: &str| {
-            B::normalization(
-                NormalizationConstructionSpec {
-                    reduction: eredu_nn::NormalizationReduction::Native,
-                    groups: None,
-                    dimensions: config.hidden_size,
-                    epsilon: config.rms_norm_eps,
-                    scale: NormalizationScale::LearnedOffset {
-                        weight: ParameterSpec::trainable(format!("{prefix}.{field}.weight"))
-                            .map_err(Error::backend)?,
-                        offset: 0.0,
-                    },
-                },
-                context,
-            )
-        };
+        let spec = config.layer(layer, root)?.clone();
+        let [input, post_attention, pre_feed_forward, post_feed_forward] = spec.norms;
         Ok(Self {
-            attention: VisionAttention::new(config, layer, root, context)?,
-            mlp: VisionMlp::new(config, layer, root, context)?,
-            input_norm: norm("input_layernorm")?,
-            post_attention_norm: norm("post_attention_layernorm")?,
-            pre_feed_forward_norm: norm("pre_feedforward_layernorm")?,
-            post_feed_forward_norm: norm("post_feedforward_layernorm")?,
+            attention: VisionAttention::new(spec.attention, context)?,
+            mlp: VisionMlp::new(spec.mlp, context)?,
+            input_norm: B::normalization(input, context)?,
+            post_attention_norm: B::normalization(post_attention, context)?,
+            pre_feed_forward_norm: B::normalization(pre_feed_forward, context)?,
+            post_feed_forward_norm: B::normalization(post_feed_forward, context)?,
         })
     }
 
@@ -858,22 +894,18 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
         root: &str,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        config.validate().map_err(Error::backend)?;
-        let patch_embedder = PatchEmbedder::new(&config, root, context)?;
-        let parameter = |name: &str| {
-            Parameter::unloaded(
-                ParameterSpec::trainable(name).map_err(Error::backend)?,
-                &[config.hidden_size],
-                context,
-            )
-        };
-        let (standardization_bias, standardization_scale) = if config.standardize {
-            (
-                Some(parameter(&format!("{root}.std_bias"))?),
-                Some(parameter(&format!("{root}.std_scale"))?),
-            )
-        } else {
-            (None, None)
+        let spec = config.pinned(root)?.clone();
+        let patch_embedder = PatchEmbedder::new(spec.patch, spec.position, context)?;
+        let (standardization_bias, standardization_scale) = match spec.standardization {
+            Some(spec) => (
+                Some(Parameter::unloaded(spec.bias, &[spec.dimensions], context)?),
+                Some(Parameter::unloaded(
+                    spec.scale,
+                    &[spec.dimensions],
+                    context,
+                )?),
+            ),
+            None => (None, None),
         };
         Ok(Self {
             config,

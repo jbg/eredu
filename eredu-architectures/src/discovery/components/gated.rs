@@ -7,15 +7,17 @@ pub(super) fn gated_units(
     node: &str,
     layer: usize,
     parameter_group: &str,
-    prefix: &str,
+    projections: [&eredu_nn::LinearSpec; 3],
+    policy: eredu_nn::GatedProductPolicy,
     scope: &str,
     input: &str,
-    count: usize,
-    width: usize,
     normalization: ComponentNormalization,
     write_partition: ComponentWritePartition,
 ) {
-    let write = format!("{prefix}.down_proj.weight");
+    let [gate, up, down] = projections;
+    let count = down.input as usize;
+    let width = gate.input as usize;
+    let write = down.weight.id.as_str().to_owned();
     g.descriptor.components.push(ComponentGroup {
         id: format!("{node}.units"),
         node_id: node.into(),
@@ -29,40 +31,27 @@ pub(super) fn gated_units(
         write_partition,
         input: input.into(),
         reads: [
-            ("gate_proj", ComponentReadRole::Gate),
-            ("up_proj", ComponentReadRole::Value),
+            (gate, ComponentReadRole::Gate),
+            (up, ComponentReadRole::Value),
         ]
         .into_iter()
-        .map(|(field, role)| {
-            let weight = format!("{prefix}.{field}.weight");
-            ComponentRead {
-                source: None,
-                projection_output: None,
+        .map(|(projection, role)| {
+            declared_component_read(
+                projection,
+                parameter_group.into(),
                 role,
-                shared_weight: weight.clone(),
-                weight,
-                parameter_group: parameter_group.into(),
-                bias: None,
-                rows: ComponentRowMapping::Direct { offset: 0 },
-                head_normalization: None,
-                input_projections: vec![],
-            }
+                ComponentRowMapping::Direct { offset: 0 },
+            )
         })
         .collect(),
         routed_reads: vec![],
-        shared_write_weight: write.clone(),
+        shared_write_weight: declared_shared_weight(&down.weight).into(),
         write_weight: write,
         write_input_projection: None,
         write_parameter_group: parameter_group.into(),
-        write_bias: None,
-        activation_equation: ComponentActivation::Gated {
-            activation: ComponentNonlinearity::Silu {
-                multiplier: ComponentScalar::new(1.0),
-            },
-            gate_upper_bound: None,
-            value_absolute_bound: None,
-            value_offset: ComponentScalar::new(0.0),
-        },
+        write_bias: down.bias.as_ref().map(|p| p.id.as_str().into()),
+        activation_equation: declared_gated_product(policy)
+            .expect("declared gated component policy"),
         input_normalization: normalization,
         output_gate: None,
         output_normalization: None,

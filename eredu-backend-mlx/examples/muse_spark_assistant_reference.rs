@@ -3,7 +3,10 @@
 use clap::Parser;
 use eredu_architectures::muse::{
     assistant::{
-        integration::{MuseAssistantModule, MuseAssistantProposal},
+        integration::{
+            MuseAssistantConfig, MuseAssistantModule, MuseAssistantParameterDefinition,
+            MuseAssistantProposal,
+        },
         spark::{SparkAssistantConfig, SparkAssistantLoadConfig},
     },
     DecoderConfig,
@@ -213,8 +216,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     let config = SparkAssistantLoadConfig::new(SparkAssistantConfig::from_hf_value(
         &serde_json::from_slice(&config_bytes)?,
     )?);
-    let definition = config.construction(&target)?.execution_definition()?;
-    let plan = config.safetensors_plan()?;
+    let parameters =
+        MuseAssistantParameterDefinition::new(&MuseAssistantConfig::Spark(config.clone()))?;
+    let construction = parameters.construction(Some(&target))?;
+    let definition = construction.execution_definition().clone();
+    let plan = parameters.safetensors_plan()?;
     let catalog = SafetensorsMetadataCatalog::discover(&args.checkpoint)?;
     let resolution = resolve_safetensors_plan(&catalog, &plan)
         .map_err(|issues| std::io::Error::other(format!("admission: {issues:?}")))?;
@@ -336,7 +342,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         &stream,
         &weights,
         |_| false,
-        definition.unit_layout().clone(),
+        eredu_runtime::ExecutionUnitAddressMap::identity(definition.unit_layout()),
         Vec::new(),
         bindings,
         Vec::new(),

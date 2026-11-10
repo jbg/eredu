@@ -561,9 +561,11 @@ impl ComponentDefinition {
             for member in group.members() {
                 match (member.linear_companion(), member.linear_companion_of()) {
                     (Some(_), Some(primary))
-                        if primaries.get(primary).is_some_and(|(owner, selected)| {
-                            *selected && *owner == group.owner()
-                        }) => {}
+                        if primaries
+                            .get(primary.as_str())
+                            .is_some_and(|(owner, selected)| {
+                                *selected && *owner == group.owner()
+                            }) => {}
                     (None, None) => {}
                     _ => {
                         return Err(invalid(&format!(
@@ -877,7 +879,9 @@ impl<B: NeuralBackend> RuntimeState<B> for StatelessComponentState {
 /// Typed resource construction and request roots for independently leased modules.
 /// Implementing this trait alone declares no parallel or partition capability.
 pub trait ComponentKernel<B: NeuralBackend> {
-    /// Family-authored checkpoint rewrites for pinned canonical resources.
+    /// Family-authored checkpoint rewrites for canonical resources.
+    /// The component adapter selects pinned destinations from its retained
+    /// declaration and partition ownership before publishing these recipes.
     fn static_parameter_recipes(
         &self,
         _source: &dyn eredu_checkpoint::store::CheckpointSource,
@@ -1653,7 +1657,24 @@ where
         std::collections::BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
         String,
     > {
-        self.kernel.static_parameter_recipes(source)
+        let targets = self
+            .definition()
+            .parameters()
+            .groups()
+            .iter()
+            .filter(|group| {
+                let storage = ParameterStorageId::from_owner(group.owner());
+                matches!(storage, ParameterStorageId::StaticRole(_))
+                    && self
+                        .selection
+                        .as_ref()
+                        .is_none_or(|selection| selection.owns_storage(&storage))
+            })
+            .flat_map(|group| group.members().iter().map(|member| member.target()))
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut recipes = self.kernel.static_parameter_recipes(source)?;
+        recipes.retain(|name, _| targets.contains(name.as_str()));
+        Ok(recipes)
     }
     fn visit_static_parameters<V: StaticParameterVisitor<B>>(
         &self,

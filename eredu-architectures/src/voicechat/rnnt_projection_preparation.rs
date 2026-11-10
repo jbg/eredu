@@ -2,9 +2,7 @@
 use super::{
     rnnt::RnntDimensions,
     rnnt_preparation::{PreparedRnntBindings, RnntPreparationError},
-    rnnt_projection_layered::{
-        rnnt_projection_component_definition, rnnt_projection_local_dimensions,
-    },
+    rnnt_specs::RnntDeclaration,
 };
 use eredu_checkpoint::store::SharedCheckpointSource;
 use eredu_runtime::{LocalModelLayout, PreparedComponent, WeightBinding};
@@ -12,25 +10,20 @@ use eredu_runtime::{LocalModelLayout, PreparedComponent, WeightBinding};
 /// Exact four-unit source authority, including vocabulary placement when selected.
 /// Recurrent recipes and replica declarations are excluded from this owner.
 pub struct PreparedRnntProjectionBindings {
-    dimensions: RnntDimensions,
-    prepared: PreparedComponent<eredu_runtime::ComponentDefinition>,
+    prepared: PreparedComponent<RnntDeclaration<false>>,
 }
 impl PreparedRnntProjectionBindings {
     /// Projects existing retained RNNT recipes without reading parameter payloads.
     /// Existing tensor selection is retained exactly; recipes are never sliced twice.
     pub fn from_rnnt(bindings: PreparedRnntBindings) -> Result<Self, RnntPreparationError> {
-        let dimensions = bindings.dimensions();
-        let definition = rnnt_projection_component_definition(dimensions)?;
+        let declaration = bindings.declaration().projections()?;
         let prepared = bindings
             .prepared
-            .project("voicechat/rnnt/projection-units", definition)?;
+            .project("voicechat/rnnt/projection-units", declaration)?;
         if let Some(layout) = prepared.local_layout() {
-            rnnt_projection_local_dimensions(dimensions, layout)?;
+            prepared.declaration().local_dimensions(layout)?;
         }
-        Ok(Self {
-            dimensions,
-            prepared,
-        })
+        Ok(Self { prepared })
     }
 
     /// Selects vocabulary shards and exact encoder/prediction replicas for one cohort.
@@ -46,13 +39,13 @@ impl PreparedRnntProjectionBindings {
         mut self,
         layout: &LocalModelLayout,
     ) -> Result<Self, RnntPreparationError> {
-        rnnt_projection_local_dimensions(self.dimensions, layout)?;
+        self.prepared.declaration().local_dimensions(layout)?;
         self.prepared = self.prepared.select(layout)?;
         Ok(self)
     }
     /// Global geometry used by projection equations and the shared greedy driver.
     pub fn dimensions(&self) -> RnntDimensions {
-        self.dimensions
+        self.prepared.declaration().dimensions()
     }
     /// Exact optional vocabulary placement with no recurrent replica declarations.
     pub fn local_layout(&self) -> Option<&LocalModelLayout> {
@@ -68,24 +61,23 @@ impl PreparedRnntProjectionBindings {
     }
     /// Projection semantic declaration retained independently of excluded recurrent resources.
     pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
-        self.prepared.declaration()
+        self.prepared.declaration().definition()
     }
     /// Transfers compact layout and exactly the authority needed by its four units.
     pub fn into_parts(
         self,
     ) -> (
-        RnntDimensions,
-        eredu_runtime::ComponentDefinition,
+        RnntDeclaration<false>,
         Option<LocalModelLayout>,
         eredu_runtime::ExecutionUnitAddressMap,
         SharedCheckpointSource,
         Vec<Vec<WeightBinding>>,
     ) {
-        let (definition, local, layout, source, units) = self
+        let (declaration, local, layout, source, units) = self
             .prepared
             .into_declared_unit_parts()
             .expect("RNNT projection declares only independently leased units");
-        (self.dimensions, definition, local, layout, source, units)
+        (declaration, local, layout, source, units)
     }
 }
 

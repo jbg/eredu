@@ -256,9 +256,9 @@ pub enum VisionInputPolicy {
     ImagesAndVideo,
 }
 
-/// Validated Muse vision tower geometry and source policy.
-#[derive(Debug, Clone)]
-pub struct VisionConfig {
+/// Muse vision geometry and source policy validated by `VisionConfig`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VisionPolicy {
     /// Accepted inputs of this component, independently of decoder encoding.
     pub input_policy: VisionInputPolicy,
     /// Patch, rotary and attention precision boundaries.
@@ -299,7 +299,7 @@ pub struct VisionConfig {
     pub perception_normalization: PerceptionNormalization,
 }
 
-impl VisionConfig {
+impl VisionPolicy {
     /// Returns the exact number of vision blocks.
     pub fn layer_count(&self) -> usize {
         self.schedule.len()
@@ -318,6 +318,64 @@ impl VisionConfig {
         self.weight_quantization_for(name)
             .map(Into::into)
             .unwrap_or(LinearFormat::Dense)
+    }
+}
+
+/// Immutable source policy and complete typed vision parameter scopes.
+#[derive(Debug, Clone)]
+pub struct VisionConfig {
+    policy: VisionPolicy,
+    declaration: std::sync::Arc<super::vision::specs::Declarations>,
+}
+impl VisionConfig {
+    /// Validates source geometry and declares all residency owners once.
+    pub fn new(policy: VisionPolicy) -> Result<Self, eredu_nn::Error> {
+        let declaration = super::vision::specs::Declarations::new(&policy)?;
+        Ok(Self {
+            policy,
+            declaration: std::sync::Arc::new(declaration),
+        })
+    }
+    /// Normalized source geometry, arithmetic, invocation and encoding policy.
+    pub fn policy(&self) -> &VisionPolicy {
+        &self.policy
+    }
+    pub(crate) fn declaration(&self) -> &super::vision::specs::Declarations {
+        &self.declaration
+    }
+    /// Projects physical encodings without changing invocation or equation policy.
+    pub fn with_formats(
+        &self,
+        formats: HashMap<String, WeightQuantization>,
+        uniform: Option<WeightQuantization>,
+    ) -> Result<Self, eredu_nn::Error> {
+        if formats == self.policy.quantized_weight_configs
+            && uniform == self.policy.weight_quantization
+        {
+            return Ok(self.clone());
+        }
+        let mut policy = self.policy.clone();
+        policy.quantized_weight_configs = formats;
+        policy.weight_quantization = uniform;
+        let mut declaration = self.declaration.as_ref().clone();
+        declaration.project_formats(&policy)?;
+        Ok(Self {
+            policy,
+            declaration: std::sync::Arc::new(declaration),
+        })
+    }
+}
+impl std::ops::Deref for VisionConfig {
+    type Target = VisionPolicy;
+    fn deref(&self) -> &Self::Target {
+        &self.policy
+    }
+}
+impl eredu_nn::DeclareLogicalParameters for VisionConfig {
+    fn logical_parameters(
+        &self,
+    ) -> Result<Vec<eredu_nn::LogicalParameterDeclaration<'_>>, eredu_nn::Error> {
+        self.declaration.logical_parameters()
     }
 }
 
@@ -340,9 +398,9 @@ struct VisionSource {
     rope_parameters: HashMap<String, Value>,
 }
 
-/// Validated text, media-token, and projector configuration.
+/// Normalized text, media-token, and projector policy.
 #[derive(Debug, Clone)]
-pub struct DecoderConfig {
+pub struct DecoderPolicy {
     /// Precision boundary between media adapters and text embeddings.
     pub media_embedding_precision: MediaEmbeddingPrecision,
     /// Checkpoint identity, separate from shared equation policies.
@@ -431,6 +489,336 @@ pub struct DecoderConfig {
     pub projector_hidden_size: i32,
 }
 
+/// Validated decoder policy with immutable text parameter owners and invocation specs.
+#[derive(Debug, Clone)]
+pub struct DecoderConfig {
+    policy: DecoderPolicy,
+    routed: std::sync::Arc<std::collections::BTreeMap<usize, super::text::routed::Declaration>>,
+    pinned: std::sync::Arc<crate::decoder::StaticModuleConstruction>,
+    attention: std::sync::Arc<Vec<super::text::specs::AttentionSpec>>,
+    scalar: std::sync::Arc<Vec<super::text::specs::BlockScalarSpec>>,
+    dense: std::sync::Arc<std::collections::BTreeMap<usize, eredu_nn::SplitGatedProductSpec>>,
+}
+impl DecoderConfig {
+    /// Validates normalized policy and prepares complete text source scopes once.
+    pub fn new(policy: DecoderPolicy) -> Result<Self, ConfigError> {
+        policy.validate()?;
+        let routed = if policy.is_moe() {
+            (0..policy.num_hidden_layers as usize)
+                .map(|layer| {
+                    super::text::routed::Declaration::new(&policy, layer).map(|p| (layer, p))
+                })
+                .collect::<Result<_, _>>()
+                .map_err(|e| invalid(e.to_string()))?
+        } else {
+            Default::default()
+        };
+        let pinned =
+            super::text::specs::pinned_parameters(&policy).map_err(|e| invalid(e.to_string()))?;
+        let attention = (0..policy.num_hidden_layers as usize)
+            .map(|layer| super::text::specs::AttentionSpec::for_layer(&policy, layer))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| invalid(e.to_string()))?;
+        let scalar = (0..policy.num_hidden_layers as usize)
+            .map(|layer| super::text::specs::BlockScalarSpec::target(&policy, layer))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| invalid(e.to_string()))?;
+        let dense = if policy.is_moe() {
+            Default::default()
+        } else {
+            (0..policy.num_hidden_layers as usize)
+                .map(|layer| {
+                    super::text::specs::dense_parameters(
+                        policy.hidden_size,
+                        policy.intermediate_size,
+                        &format!("model.layers.{layer}.mlp"),
+                        |name| policy.linear_format_for(name),
+                    )
+                    .map(|p| (layer, p))
+                })
+                .collect::<Result<_, _>>()
+                .map_err(|e| invalid(e.to_string()))?
+        };
+        let exact = Self {
+            policy,
+            routed: std::sync::Arc::new(routed),
+            pinned: std::sync::Arc::new(pinned),
+            attention: std::sync::Arc::new(attention),
+            scalar: std::sync::Arc::new(scalar),
+            dense: std::sync::Arc::new(dense),
+        };
+        let exact = exact.with_formats(
+            exact.quantization,
+            exact.quantized_weights.clone(),
+            exact.quantized_weight_configs.clone(),
+        )?;
+        exact.validate()?;
+        Ok(exact)
+    }
+    pub(crate) fn pinned(&self) -> &crate::decoder::StaticModuleConstruction {
+        &self.pinned
+    }
+    pub(crate) fn attention(
+        &self,
+        layer: usize,
+    ) -> Result<&super::text::specs::AttentionSpec, eredu_nn::Error> {
+        self.attention.get(layer).ok_or_else(|| {
+            eredu_nn::Error::backend("Muse attention invocation outside its decoder")
+        })
+    }
+    pub(crate) fn scalar(
+        &self,
+        layer: usize,
+    ) -> Result<&super::text::specs::BlockScalarSpec, eredu_nn::Error> {
+        self.scalar
+            .get(layer)
+            .ok_or_else(|| eredu_nn::Error::backend("Muse scalar invocation outside its decoder"))
+    }
+    pub(crate) fn dense(
+        &self,
+        layer: usize,
+    ) -> Result<&eredu_nn::SplitGatedProductSpec, eredu_nn::Error> {
+        self.dense
+            .get(&layer)
+            .ok_or_else(|| eredu_nn::Error::backend("Muse dense invocation outside its decoder"))
+    }
+    pub(crate) fn selected_attention(
+        &self,
+        layer: usize,
+    ) -> Result<super::text::specs::AttentionSpec, eredu_nn::Error> {
+        let mut local = self.attention(layer)?.clone();
+        local.parameters = local
+            .parameters
+            .select_dimensions(self.num_attention_heads, self.num_key_value_heads)?;
+        Ok(local)
+    }
+    pub(crate) fn selected_dense(
+        &self,
+        layer: usize,
+    ) -> Result<eredu_nn::SplitGatedProductSpec, eredu_nn::Error> {
+        use eredu_nn::DeclareLogicalParameters;
+        let source = self.dense(layer)?;
+        if self.intermediate_size <= 0 || self.intermediate_size > source.gate.output {
+            return Err(eredu_nn::Error::backend(
+                "Muse selected dense width exceeds source geometry",
+            ));
+        }
+        let mut local = source.clone();
+        local.gate.output = self.intermediate_size;
+        local.up.output = self.intermediate_size;
+        local.down.input = self.intermediate_size;
+        local.logical_parameters()?;
+        Ok(local)
+    }
+    /// Normalized policy, separate from prepared parameter ownership.
+    pub fn policy(&self) -> &DecoderPolicy {
+        &self.policy
+    }
+    /// Parses and prepares one released Hugging Face configuration.
+    pub fn from_hf_json(bytes: &[u8]) -> Result<Self, ConfigError> {
+        Self::new(DecoderPolicy::from_hf_json(bytes)?)
+    }
+    /// Parses an already-decoded released configuration and prepares its owners.
+    pub fn from_hf_value(value: &Value) -> Result<Self, ConfigError> {
+        Self::new(DecoderPolicy::from_hf_value(value)?)
+    }
+    /// Normalizes released GGUF geometry and prepares its owners.
+    pub fn from_gguf_catalog<C: GgufTensorCatalog + ?Sized>(
+        catalog: &C,
+        metadata: &HashMap<String, MetadataValue>,
+    ) -> Result<Self, ConfigError> {
+        Self::new(DecoderPolicy::from_gguf_catalog(catalog, metadata)?)
+    }
+    /// Adds independently admitted media without rebuilding text parameter ownership.
+    pub fn with_gguf_projector_metadata(
+        self,
+        metadata: &HashMap<String, MetadataValue>,
+        formats: HashMap<String, WeightQuantization>,
+    ) -> Result<Self, ConfigError> {
+        let policy = self
+            .policy
+            .clone()
+            .with_gguf_projector_metadata(metadata, formats)?;
+        self.with_media(policy.vision_config, policy.audio_config)
+    }
+    pub(crate) fn with_media(
+        &self,
+        vision: Option<VisionConfig>,
+        audio: Option<super::audio::AudioConfig>,
+    ) -> Result<Self, ConfigError> {
+        let mut exact = self.clone();
+        exact.policy.vision_config = vision;
+        exact.policy.audio_config = audio;
+        exact.validate()?;
+        Ok(exact)
+    }
+    /// Projects physical formats onto retained text geometry and equations.
+    pub fn with_formats(
+        &self,
+        default: Option<WeightQuantization>,
+        names: Option<HashSet<String>>,
+        mut formats: Option<HashMap<String, WeightQuantization>>,
+    ) -> Result<Self, ConfigError> {
+        super::checkpoint::normalize_expert_formats(self, default, names.as_ref(), &mut formats)
+            .map_err(|e| invalid(e.to_string()))?;
+        if default == self.quantization
+            && names == self.quantized_weights
+            && formats == self.quantized_weight_configs
+        {
+            return Ok(self.clone());
+        }
+        let mut exact = self.clone();
+        exact.policy.quantization = default;
+        exact.policy.quantized_weights = names;
+        exact.policy.quantized_weight_configs = formats;
+        exact.policy.validate()?;
+        let mut routed = self.routed.as_ref().clone();
+        for declaration in routed.values_mut() {
+            declaration
+                .project_formats(&exact.policy)
+                .map_err(|e| invalid(e.to_string()))?;
+        }
+        exact.routed = std::sync::Arc::new(routed);
+        exact.pinned = std::sync::Arc::new(
+            super::text::specs::project_pinned_formats(&self.pinned, &exact.policy)
+                .map_err(|e| invalid(e.to_string()))?,
+        );
+        let mut attention = self.attention.as_ref().clone();
+        for spec in &mut attention {
+            spec.parameters
+                .project_formats(&exact.policy)
+                .map_err(|e| invalid(e.to_string()))?;
+        }
+        exact.attention = std::sync::Arc::new(attention);
+        let mut dense = self.dense.as_ref().clone();
+        for spec in dense.values_mut() {
+            super::text::specs::project_dense_formats(spec, &exact.policy)
+                .map_err(|e| invalid(e.to_string()))?;
+        }
+        exact.dense = std::sync::Arc::new(dense);
+
+        exact.validate()?;
+        Ok(exact)
+    }
+    pub(crate) fn routed(
+        &self,
+        layer: usize,
+    ) -> Result<&super::text::routed::Declaration, eredu_nn::Error> {
+        self.routed.get(&layer).ok_or_else(|| {
+            eredu_nn::Error::backend("Muse routed invocation is outside its declared decoder")
+        })
+    }
+    pub(crate) fn routed_layers(
+        &self,
+    ) -> &std::collections::BTreeMap<usize, super::text::routed::Declaration> {
+        &self.routed
+    }
+    pub(crate) fn selected_routed(
+        &self,
+        layer: usize,
+    ) -> Result<super::text::routed::Declaration, eredu_nn::Error> {
+        let source = self.routed(layer)?;
+        source.clone().with_bank(
+            source
+                .bank()
+                .clone()
+                .with_group_geometry(source.bank().group_count(), self.moe_intermediate_size)?,
+        )
+    }
+    pub(crate) fn with_local_dimensions(
+        &self,
+        queries: i32,
+        keys: i32,
+        dense: i32,
+        experts: i32,
+    ) -> Result<Self, ConfigError> {
+        if queries <= 0
+            || queries > self.num_attention_heads
+            || keys <= 0
+            || keys > self.num_key_value_heads
+            || dense < 0
+            || (!self.is_moe() && dense == 0)
+            || dense > self.intermediate_size
+            || experts < 0
+            || experts > self.moe_intermediate_size
+            || (self.is_moe() && experts == 0)
+        {
+            return Err(invalid("Muse local dimensions exceed the retained decoder"));
+        }
+        let mut exact = self.clone();
+        exact.policy.num_attention_heads = queries;
+        exact.policy.num_key_value_heads = keys;
+        exact.policy.intermediate_size = dense;
+        exact.policy.moe_intermediate_size = experts;
+        exact.policy.validate()?;
+        Ok(exact)
+    }
+    fn text_parameters(
+        &self,
+    ) -> Result<Vec<eredu_nn::LogicalParameterDeclaration<'_>>, eredu_nn::Error> {
+        use eredu_nn::DeclareLogicalParameters;
+        let mut parameters = self.pinned.logical_parameters()?;
+        for attention in self.attention.iter() {
+            parameters.extend(attention.parameters.logical_parameters()?);
+        }
+        parameters.extend(self.scalar.as_slice().logical_parameters()?);
+        for spec in self.dense.values() {
+            parameters.extend(spec.logical_parameters()?);
+        }
+        for spec in self.routed.values() {
+            parameters.extend(spec.logical_parameters()?);
+        }
+        Ok(parameters)
+    }
+    pub(crate) fn validate(&self) -> Result<(), ConfigError> {
+        self.policy.validate()?;
+        let parameters = self.text_parameters().map_err(|e| invalid(e.to_string()))?;
+        eredu_nn::validate_logical_parameter_topology(
+            &eredu_nn::DeclareLogicalParameters::logical_parameters(self)
+                .map_err(|e| invalid(e.to_string()))?,
+        )
+        .map_err(|e| invalid(e.to_string()))?;
+        let formats = self
+            .quantized_weight_configs
+            .iter()
+            .flat_map(|formats| formats.iter())
+            .map(|(name, format)| (name.as_str(), Some((*format).into())));
+        let selected = self.quantized_weights.iter().flatten().map(|name| {
+            (
+                name.as_str(),
+                self.weight_quantization_for(name).map(Into::into),
+            )
+        });
+        crate::format_references::validate_matrix_sources(
+            parameters,
+            formats.chain(selected),
+            || super::checkpoint::expert_source_formats(self),
+        )
+        .map_err(|e| invalid(e.to_string()))?;
+        Ok(())
+    }
+}
+impl eredu_nn::DeclareLogicalParameters for DecoderConfig {
+    fn logical_parameters(
+        &self,
+    ) -> Result<Vec<eredu_nn::LogicalParameterDeclaration<'_>>, eredu_nn::Error> {
+        let mut parameters = self.text_parameters()?;
+        if let Some(vision) = &self.vision_config {
+            parameters.extend(vision.logical_parameters()?);
+        }
+        if let Some(audio) = &self.audio_config {
+            parameters.extend(audio.logical_parameters()?);
+        }
+        Ok(parameters)
+    }
+}
+impl std::ops::Deref for DecoderConfig {
+    type Target = DecoderPolicy;
+    fn deref(&self) -> &Self::Target {
+        &self.policy
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct TextSource {
     model_type: String,
@@ -493,7 +881,7 @@ fn default_silu() -> String {
     "silu".into()
 }
 
-impl DecoderConfig {
+impl DecoderPolicy {
     /// Rotary products follow the selected attention and physical source equations.
     pub const fn rotary_arithmetic(&self) -> eredu_nn::RotaryArithmetic {
         match (self.attention_equation, self.weight_convention) {
@@ -694,13 +1082,13 @@ impl DecoderConfig {
     }
 
     /// Parses and strictly validates one released Hugging Face family config.
-    pub fn from_hf_json(bytes: &[u8]) -> Result<Self, ConfigError> {
+    fn from_hf_json(bytes: &[u8]) -> Result<Self, ConfigError> {
         let value: Value = serde_json::from_slice(bytes)?;
         Self::from_hf_value(&value)
     }
 
     /// Parses an already-decoded Hugging Face family config.
-    pub fn from_hf_value(value: &Value) -> Result<Self, ConfigError> {
+    fn from_hf_value(value: &Value) -> Result<Self, ConfigError> {
         let identity = match value.get("model_type").and_then(Value::as_str) {
             Some("muse_glimmer") => MuseIdentity::Glimmer,
             Some("muse_spark") => MuseIdentity::Spark,
@@ -746,7 +1134,9 @@ impl DecoderConfig {
                         || source.num_shared_experts != 0
                         || source.num_experts <= 0
                     {
-                        return Err(invalid("Spark checkpoint requires its declared sparse-expert schedule without shared experts"));
+                        return Err(invalid(
+                            "Spark checkpoint requires its declared sparse-expert schedule without shared experts",
+                        ));
                     }
                     (
                         AttentionEquation::NormalizedHeads,
@@ -798,7 +1188,7 @@ impl DecoderConfig {
                 },
             )?),
             None if identity == MuseIdentity::Glimmer => {
-                return Err(invalid("Muse Glimmer config is missing vision_config"))
+                return Err(invalid("Muse Glimmer config is missing vision_config"));
             }
             None => None,
         };
@@ -884,7 +1274,7 @@ impl DecoderConfig {
     /// Parses the released text GGUF metadata and architecture-owned physical
     /// tensor semantics without depending on a backend checkpoint type.
     /// Projector metadata is admitted independently.
-    pub fn from_gguf_catalog<C: GgufTensorCatalog + ?Sized>(
+    fn from_gguf_catalog<C: GgufTensorCatalog + ?Sized>(
         catalog: &C,
         metadata: &HashMap<String, MetadataValue>,
     ) -> Result<Self, ConfigError> {
@@ -895,7 +1285,7 @@ impl DecoderConfig {
             _ => {
                 return Err(invalid(format!(
                     "unsupported Muse GGUF architecture {architecture:?}"
-                )))
+                )));
             }
         };
         let key = |suffix: &str| format!("{architecture}.{suffix}");
@@ -1078,7 +1468,7 @@ impl DecoderConfig {
     }
 
     /// Validates and applies the selected GGUF vision and waveform companion geometry.
-    pub fn with_gguf_projector_metadata(
+    fn with_gguf_projector_metadata(
         mut self,
         metadata: &HashMap<String, MetadataValue>,
         quantized_weight_configs: HashMap<String, WeightQuantization>,
@@ -1152,13 +1542,13 @@ impl DecoderConfig {
         } else {
             None
         };
+        let mut audio_formats = HashMap::new();
         for (name, format) in quantized_weight_configs {
             if name.starts_with("model.audio_tower.") {
-                audio
-                    .as_mut()
-                    .ok_or_else(|| invalid("audio format declared without a waveform tower"))?
-                    .linear_formats
-                    .insert(name, format.into());
+                if audio.is_none() {
+                    return Err(invalid("audio format declared without a waveform tower"));
+                }
+                audio_formats.insert(name, format.into());
             } else if name.starts_with("model.vision_") {
                 vision.quantized_weight_configs.insert(name, format);
             } else {
@@ -1167,7 +1557,12 @@ impl DecoderConfig {
                 ));
             }
         }
-        self.vision_config = Some(vision);
+        if let Some(config) = &mut audio {
+            *config = config
+                .with_formats(audio_formats)
+                .map_err(|e| invalid(e.to_string()))?;
+        }
+        self.vision_config = Some(VisionConfig::new(vision).map_err(|e| invalid(e.to_string()))?);
         self.audio_config = audio;
         self.validate()?;
         Ok(self)
@@ -1202,6 +1597,23 @@ impl DecoderConfig {
     }
 
     pub(crate) fn validate(&self) -> Result<(), ConfigError> {
+        if self.num_hidden_layers <= 0
+            || self.attention_schedule.len() != self.num_hidden_layers as usize
+            || self.layer_uses_rope.len() != self.num_hidden_layers as usize
+            || self.num_experts < 0
+        {
+            return Err(invalid(
+                "Muse invocation schedule or expert count is invalid",
+            ));
+        }
+
+        for format in self.quantization.iter().chain(
+            self.quantized_weight_configs
+                .iter()
+                .flat_map(|f| f.values()),
+        ) {
+            format.validate().map_err(|e| invalid(e.to_string()))?;
+        }
         if let RoutedFeedForwardEquation::CompressedSigmoid {
             expert_width,
             logit_scale,
@@ -1215,7 +1627,9 @@ impl DecoderConfig {
                 || !coefficient_scale.is_finite()
                 || coefficient_scale <= 0.0
             {
-                return Err(invalid("Muse compressed experts require positive routed geometry and finite positive scales"));
+                return Err(invalid(
+                    "Muse compressed experts require positive routed geometry and finite positive scales",
+                ));
             }
         }
         if let ResidualEquation::Learned {
@@ -1302,9 +1716,10 @@ impl DecoderConfig {
                     "Muse perception epsilon must be finite and positive",
                 ));
             }
-            if self.vision_out_hidden_size != vision.hidden_size * 4 {
+            let spec = &vision.declaration().statics;
+            if self.vision_out_hidden_size != spec.adapter.up.input {
                 return Err(invalid(
-                    "out_hidden_size must be four times the vision hidden width",
+                    "vision output width differs from the declared spatial merge",
                 ));
             }
         }
@@ -1384,7 +1799,8 @@ fn vision_config(
         || source.merge_size <= 0
         || source.pos_emb_height <= 0
         || source.pos_emb_width <= 0
-        || source.pos_emb_height * source.pos_emb_width != source.max_position_embeddings
+        || source.pos_emb_height.checked_mul(source.pos_emb_width)
+            != Some(source.max_position_embeddings)
         || !source.layer_norm_eps.is_finite()
         || source.layer_norm_eps <= 0.0
     {
@@ -1422,7 +1838,7 @@ fn vision_config(
             "vision rotary declaration differs from its Muse identity",
         ));
     }
-    Ok(VisionConfig {
+    VisionConfig::new(VisionPolicy {
         input_policy: VisionInputPolicy::ImagesAndVideo,
         arithmetic: match identity {
             MuseIdentity::Glimmer => VisionArithmetic::Native,
@@ -1449,10 +1865,11 @@ fn vision_config(
         projector_hidden_size,
         perception_normalization,
     })
+    .map_err(|e| invalid(e.to_string()))
 }
 
-fn official_gguf_vision(language_hidden_size: i32) -> VisionConfig {
-    VisionConfig {
+fn official_gguf_vision(language_hidden_size: i32) -> VisionPolicy {
+    VisionPolicy {
         input_policy: VisionInputPolicy::Images,
         arithmetic: VisionArithmetic::Native,
         position_layout: VisionPositionLayout::Raster,
@@ -1501,7 +1918,7 @@ fn gguf_attention_schedule(
             return Err(invalid(format!(
                 "Muse GGUF sliding pattern has {} entries for {count} layers",
                 values.len()
-            )))
+            )));
         }
         Some(_) => return Err(invalid("Muse GGUF sliding pattern must be boolean")),
         None => None,

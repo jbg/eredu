@@ -3,6 +3,8 @@
 pub mod block;
 pub mod checkpoint;
 pub mod config;
+mod declarations;
+pub use declarations::Declaration;
 pub mod model;
 pub mod moe;
 pub mod parallel;
@@ -16,21 +18,16 @@ pub use checkpoint::{
 };
 pub use config::{
     model_args_from_config_reader, model_args_from_config_value, model_args_from_gguf_catalog,
-    prompt_cache_architecture_fingerprint, state_identity, state_layout, ConfigError, ModelArgs,
-    MxFp4Config,
+    prompt_cache_architecture_fingerprint, state_identity, ConfigError, ModelArgs, MxFp4Config,
 };
 pub use model::{LayeredModel, PartitionedLayeredModel};
-pub use moe::{
-    expert_bank_spec, expert_realization_plan, partition_expert_realization_plan,
-    replicated_expert_realization_plan, RoutedMlp,
-};
+pub use moe::{expert_realization_plan, RoutedMlp};
 pub use parallel::{
-    layer_parallel_parameter_groups, local_block_args, local_geometry, local_key_value_heads,
-    partition_local_routed_geometry, static_parameter_groups, LocalGeometry,
+    local_block_args, local_geometry, partition_local_routed_geometry, LocalGeometry,
 };
 
 pub use crate::decoder::{
-    cache_layout, cache_layout_with_key_value_heads, create_caches, validate_caches,
+    cache_layout, cache_layout_with_attention_geometry, create_caches, validate_caches,
     AttentionInput, ForwardContext, LayeredInput, PartitionLocalGeometry, PartitionStaticModules,
     StaticModules,
 };

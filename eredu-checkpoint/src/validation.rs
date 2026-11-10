@@ -204,6 +204,7 @@ pub struct ResolvedCheckpointPlan {
     identity: String,
     source_keys: BTreeSet<String>,
     unclaimed_keys: BTreeSet<String>,
+    layout_variants: BTreeMap<String, String>,
 }
 
 impl ResolvedCheckpointPlan {
@@ -220,6 +221,12 @@ impl ResolvedCheckpointPlan {
     /// Returns catalog names admitted but not claimed by a non-strict plan.
     pub fn unclaimed_keys(&self) -> &BTreeSet<String> {
         &self.unclaimed_keys
+    }
+
+    /// Returns the exact variant chosen during header admission for one layout group.
+    /// Source projections retain this choice while restricting payload authority.
+    pub fn layout_variant(&self, group: &str) -> Option<&str> {
+        self.layout_variants.get(group).map(String::as_str)
     }
 
     /// Projects an admitted resolution onto an exact subset of its claimed sources.
@@ -246,6 +253,7 @@ impl ResolvedCheckpointPlan {
             identity: identity.into(),
             source_keys,
             unclaimed_keys: self.unclaimed_keys.clone(),
+            layout_variants: self.layout_variants.clone(),
         })
     }
 }
@@ -543,7 +551,9 @@ where
         select_constraint(constraint);
     }
 
-    for variant in selected_layouts {
+    let mut layout_variants = BTreeMap::new();
+    for (group, variant) in selected_layouts {
+        layout_variants.insert(group.to_owned(), variant.id.clone());
         for constraint in &variant.tensors {
             select_constraint(constraint);
         }
@@ -576,6 +586,7 @@ where
         identity: identity.into(),
         source_keys,
         unclaimed_keys,
+        layout_variants,
     })
 }
 
@@ -648,7 +659,7 @@ fn validate_catalog_layouts<'a, E, T>(
     policy: &CatalogPolicy,
 ) -> (
     Vec<CheckpointIssue>,
-    Vec<&'a crate::schema::LayoutVariant<T>>,
+    Vec<(&'a str, &'a crate::schema::LayoutVariant<T>)>,
 )
 where
     E: std::fmt::Debug,
@@ -685,6 +696,43 @@ where
                 present.push(variant);
             } else if count != 0 {
                 partial.push((variant, count, missing.first().copied().cloned()));
+            }
+        }
+
+        // Identical physical identities can describe distinct shapes or encodings.
+        // Name-distinct alternatives retain strict coexistence/partial-layout rejection.
+        if present.len() > 1 && partial.is_empty() {
+            let identities = |variant: &crate::schema::LayoutVariant<T>| {
+                variant
+                    .tensors
+                    .iter()
+                    .map(|constraint| (constraint.key().to_owned(), constraint.aliases().to_vec()))
+                    .collect::<Vec<_>>()
+            };
+            let first = identities(present[0]);
+            if present.iter().all(|variant| {
+                variant.discriminator_keys == present[0].discriminator_keys
+                    && identities(variant) == first
+            }) {
+                let exact = present
+                    .iter()
+                    .copied()
+                    .filter(|variant| {
+                        let mut candidate_issues = Vec::new();
+                        for constraint in &variant.tensors {
+                            validate_constraint(
+                                catalog,
+                                identity,
+                                constraint,
+                                &mut candidate_issues,
+                            );
+                        }
+                        candidate_issues.is_empty()
+                    })
+                    .collect::<Vec<_>>();
+                if exact.len() == 1 {
+                    present = exact;
+                }
             }
         }
 
@@ -767,7 +815,7 @@ where
         }
 
         if present.len() == 1 && partial.is_empty() {
-            selected_layouts.push(present[0]);
+            selected_layouts.push((group.id.as_str(), present[0]));
         }
         for variant in present {
             for constraint in &variant.tensors {
@@ -1154,6 +1202,7 @@ mod tests {
             identity: "complete".into(),
             source_keys: BTreeSet::from(["target".into(), "extension".into()]),
             unclaimed_keys: BTreeSet::from(["metadata".into()]),
+            layout_variants: BTreeMap::new(),
         };
         let target = admitted
             .project_claimed_sources("target", BTreeSet::from(["target".into()]))
@@ -1188,7 +1237,7 @@ mod tests {
                 vec![1, 1],
                 StoredDtypeConstraint::Floating,
             )
-            .companion(),
+            .linear_companion("weight", crate::schema::LinearCompanionKind::Scale),
         ];
         let plan = safe_plan(constraints, Vec::new(), CatalogPolicy::strict());
         for floating in [StoredDtype::F16, StoredDtype::BF16, StoredDtype::F32] {

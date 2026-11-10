@@ -679,6 +679,9 @@ impl NeuralBackend for MlxNeuralBackend {
                 let probability = compute(sigmoid(scaled, context))?;
                 compute(gate.multiply(probability, context))?
             }
+            eredu_nn::GatedProductActivation::Gelu => {
+                compute(super::super::layers::gelu(gate, context))?
+            }
             eredu_nn::GatedProductActivation::GeluApproximate => {
                 if let Some(output) = compute(super::super::gated_arithmetic::gelu_product(
                     &gate, &up, context,

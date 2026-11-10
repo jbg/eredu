@@ -734,24 +734,33 @@ fn safetensors_schema_parameters(
     config: &EligibleConfig<'_>,
     source_catalog: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
 ) -> Result<Vec<ReplicatedTextParameterRequirement>, ReplicatedTextRequirementsError> {
-    let source_linear_shapes = config
-        .linear_parameter_shapes()
+    let LinearParameterDeclarations {
+        shapes: source_linear_shapes,
+        companions,
+    } = config
+        .linear_parameter_declarations()
         .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?;
     let mut constraints = plan.common_tensors.iter().collect::<Vec<_>>();
     for group in &plan.layout_groups {
-        for variant in &group.variants {
-            if variant.tensors.iter().all(|constraint| {
-                selected.source_keys().contains(&constraint.key)
-                    || constraint
-                        .aliases
-                        .iter()
-                        .any(|alias| selected.source_keys().contains(alias))
-                    || constraint.requirement
-                        == eredu_checkpoint::schema::TensorRequirement::Optional
-            }) {
-                constraints.extend(variant.tensors.iter());
-                break;
-            }
+        if let Some(selected_variant) = selected.layout_variant(&group.id) {
+            let variant = group
+                .variants
+                .iter()
+                .find(|variant| variant.id == selected_variant)
+                .ok_or_else(|| {
+                    ReplicatedTextRequirementsError::InvalidArchitecture(format!(
+                        "admitted variant {selected_variant:?} is absent from layout group {:?}",
+                        group.id
+                    ))
+                })?;
+            constraints.extend(&variant.tensors);
+        } else if group.required {
+            return Err(ReplicatedTextRequirementsError::InvalidArchitecture(
+                format!(
+                    "required layout group {:?} has no admitted variant",
+                    group.id
+                ),
+            ));
         }
     }
     let mut constraints_by_name = BTreeMap::new();
@@ -786,17 +795,79 @@ fn safetensors_schema_parameters(
             })
         })
         .collect::<BTreeMap<_, _>>();
-    let linear_shapes = source_linear_shapes
-        .into_iter()
-        .map(|(name, shape)| {
-            let canonical = constraints_by_name
-                .get(name.as_str())
-                .map_or(name, |constraint| {
-                    config.canonical_parameter_name(&constraint.key, &constraint.aliases)
-                });
-            (canonical, shape)
-        })
-        .collect::<BTreeMap<_, _>>();
+    let mut linear_shapes = BTreeMap::new();
+    let mut canonical_companions = BTreeMap::new();
+    for (name, shape) in source_linear_shapes {
+        let canonical = constraints_by_name.get(name.as_str()).map_or_else(
+            || name.clone(),
+            |constraint| config.canonical_parameter_name(&constraint.key, &constraint.aliases),
+        );
+        let convention = companions[&name];
+        if linear_shapes
+            .insert(canonical.clone(), shape.clone())
+            .is_some_and(|old| old != shape)
+            || canonical_companions
+                .insert(canonical.clone(), convention)
+                .is_some_and(|old| old != convention)
+        {
+            return Err(ReplicatedTextRequirementsError::InvalidArchitecture(
+                format!("source matrices conflict at canonical identity {canonical:?}"),
+            ));
+        }
+    }
+    let mut declarations = config
+        .declared_parameters(&linear_shapes)
+        .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?;
+    let source_owners = project_source_parameter_owners(
+        &mut declarations,
+        &config
+            .derived_recipes(source_catalog)
+            .map_err(ReplicatedTextRequirementsError::InvalidArtifact)?,
+    )
+    .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?;
+    for constraint in &constraints {
+        let canonical = config.canonical_parameter_name(&constraint.key, &constraint.aliases);
+        if constraint.role == eredu_checkpoint::schema::TensorRole::Companion
+            || declarations
+                .get(&canonical)
+                .is_some_and(|parameter| parameter.owner.is_some())
+        {
+            continue;
+        }
+        let owner = std::iter::once(&constraint.key)
+            .chain(&constraint.aliases)
+            .find_map(|name| {
+                declarations
+                    .get(name)
+                    .and_then(|parameter| parameter.owner.clone())
+                    .or_else(|| source_owners.get(name).cloned())
+            });
+        if let Some(owner) = owner {
+            declarations
+                .entry(canonical)
+                .or_insert(DeclaredParameter {
+                    role: ReplicatedTextParameterRole::Other,
+                    owner: None,
+                    shape: None,
+                    native: None,
+                    linear_format: None,
+                    source_matrix: false,
+                    companion: None,
+                })
+                .owner = Some(owner);
+        }
+    }
+    for (name, (kind, primary)) in &declared_companions {
+        register_declared_companion(
+            &mut declarations,
+            name,
+            *kind,
+            eredu_nn::ParameterId::new(primary).map_err(|error| {
+                ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
+            })?,
+        )
+        .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?;
+    }
     let mut parameters = Vec::new();
     for constraint in constraints {
         if matches!(
@@ -838,15 +909,16 @@ fn safetensors_schema_parameters(
                 )));
             }
         };
-        let role = config.parameter_role(
+        let role = declared_parameter_role(
             &canonical,
             constraint.role == eredu_checkpoint::schema::TensorRole::Companion,
-            &linear_shapes,
+            &declarations,
         );
-        let logical_shape = if role == ReplicatedTextParameterRole::Embedding {
-            config
-                .embedding_shape()
-                .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?
+        let logical_shape = if let Some(shape) = declarations
+            .get(&canonical)
+            .and_then(|parameter| parameter.shape.as_ref())
+        {
+            shape.clone()
         } else {
             linear_shapes
                 .get(&canonical)
@@ -891,10 +963,10 @@ fn safetensors_schema_parameters(
                         source_encoding.clone(),
                         physical_shape.clone(),
                         shape,
-                        config.native_format(&target),
-                        false,
+                        declared_parameter_format(&declarations, &target)?,
+                        None,
                         role,
-                        parameter_owner(config, &target),
+                        declared_parameter_owner(&declarations, &target)?,
                         ReplicatedTextParameterPresence::Derived {
                             recipe: "qwen3_next.grouped_projection_split".into(),
                         },
@@ -903,23 +975,22 @@ fn safetensors_schema_parameters(
                 continue;
             }
         }
-        let native_executable = if matches!(config, EligibleConfig::GptOss(_))
-            && canonical.contains(".mlp.experts.")
-            && (canonical.ends_with("gate_up_proj") || canonical.ends_with("down_proj"))
-        {
-            config.native_format(&canonical)
-        } else {
-            match role {
-                ReplicatedTextParameterRole::LinearWeight
-                | ReplicatedTextParameterRole::Embedding => {
-                    config.native_format_for_shape(&canonical, &logical_shape)
-                }
-                ReplicatedTextParameterRole::FormatCompanion
-                | ReplicatedTextParameterRole::Normalization
-                | ReplicatedTextParameterRole::LinearBias
-                | ReplicatedTextParameterRole::Other => LinearFormat::Dense,
-                _ => LinearFormat::Dense,
-            }
+        let native_executable = match role {
+            ReplicatedTextParameterRole::LinearWeight
+            | ReplicatedTextParameterRole::Embedding
+            | ReplicatedTextParameterRole::LookupTable => constraint
+                .linear_format
+                .or_else(|| {
+                    declarations
+                        .get(&canonical)
+                        .and_then(|parameter| parameter.native)
+                })
+                .ok_or_else(|| {
+                    ReplicatedTextRequirementsError::InvalidArchitecture(format!(
+                        "source matrix {canonical:?} has no declared encoding"
+                    ))
+                })?,
+            _ => LinearFormat::Dense,
         };
         parameters.push(parameter_requirement(
             canonical.clone(),
@@ -930,17 +1001,29 @@ fn safetensors_schema_parameters(
             physical_shape,
             logical_shape,
             native_executable,
-            linear_shapes.contains_key(&canonical),
+            linear_shapes
+                .contains_key(&canonical)
+                .then(|| canonical_companions[&canonical].for_parameter(&canonical))
+                .flatten(),
             role,
-            parameter_owner(config, &canonical),
+            declared_parameter_owner(&declarations, &canonical)?,
             presence,
         )?);
     }
     for parameter in &mut parameters {
-        if let Some((role, primary)) = declared_companions.get(parameter.name()) {
+        let binding = declared_companions
+            .get(parameter.name())
+            .cloned()
+            .or_else(|| {
+                declarations
+                    .get(parameter.name())
+                    .and_then(|declaration| declaration.companion.as_ref())
+                    .map(|(role, primary)| (*role, primary.as_str().to_owned()))
+            });
+        if let Some((role, primary)) = binding {
             *parameter = parameter
                 .clone()
-                .with_linear_companion(*role, primary.clone())
+                .with_linear_companion(role, primary)
                 .map_err(|error| {
                     ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
                 })?;
@@ -972,6 +1055,45 @@ fn metadata_source_keys(plan: &eredu_checkpoint::schema::GgufCheckpointPlan) -> 
         .collect()
 }
 
+/// Projects logical geometry without confusing encoded packing with tensor operations.
+fn gguf_parameter_geometry(
+    name: &str,
+    translated_shape: Vec<usize>,
+    declarations: &BTreeMap<String, DeclaredParameter>,
+    recipes: &BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
+    catalog: &(impl eredu_checkpoint::recipe::RecipeCatalog + ?Sized),
+) -> Result<(Vec<usize>, bool), ReplicatedTextRequirementsError> {
+    let declaration = declarations.get(name).ok_or_else(|| {
+        ReplicatedTextRequirementsError::InvalidArchitecture(format!(
+            "GGUF parameter {name:?} has no declaration"
+        ))
+    })?;
+    let Some(shape) = &declaration.shape else {
+        // Recipe-only sources and format companions retain admitted source geometry.
+        return Ok((translated_shape, false));
+    };
+    if declaration.has_linear_encoding() || shape == &translated_shape {
+        return Ok((shape.clone(), false));
+    }
+    let recipe = recipes.get(name).ok_or_else(|| {
+        ReplicatedTextRequirementsError::InvalidArchitecture(format!(
+            "GGUF parameter {name:?} changes geometry without a declared source recipe"
+        ))
+    })?;
+    let output = recipe
+        .infer(catalog)
+        .map_err(|error| ReplicatedTextRequirementsError::InvalidArtifact(error.to_string()))?;
+    if output.shape() != shape {
+        return Err(ReplicatedTextRequirementsError::InvalidArchitecture(
+            format!(
+                "GGUF source recipe for {name:?} has geometry {:?}, expected {shape:?}",
+                output.shape()
+            ),
+        ));
+    }
+    Ok((shape.clone(), true))
+}
+
 pub(super) fn gguf_parameters(
     tensor_mapping: &[eredu_gguf::TranslatedTensorLayout],
     metadata_sources: &BTreeSet<&str>,
@@ -979,9 +1101,65 @@ pub(super) fn gguf_parameters(
     config: &EligibleConfig<'_>,
     source_catalog: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
 ) -> Result<Vec<ReplicatedTextParameterRequirement>, ReplicatedTextRequirementsError> {
-    let linear_shapes = config
-        .linear_parameter_shapes()
+    let LinearParameterDeclarations {
+        shapes: linear_shapes,
+        companions,
+    } = config
+        .linear_parameter_declarations()
         .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?;
+    let mut declarations = config
+        .declared_parameters(&linear_shapes)
+        .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?;
+    let converted_companions = tensor_mapping
+        .iter()
+        .filter_map(|mapping| {
+            mapping
+                .layout
+                .linear_companion
+                .as_ref()
+                .map(|companion| (mapping.layout.name.as_str(), companion))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let recipes = config
+        .derived_recipes(source_catalog)
+        .map_err(ReplicatedTextRequirementsError::InvalidArtifact)?;
+    let source_owners = project_source_parameter_owners(&mut declarations, &recipes)
+        .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?;
+    for mapping in tensor_mapping {
+        if mapping.layout.linear_companion.is_none() {
+            if let Some(owner) = source_owners.get(&mapping.layout.name) {
+                declarations
+                    .entry(mapping.layout.name.clone())
+                    .or_insert(DeclaredParameter {
+                        role: ReplicatedTextParameterRole::Other,
+                        owner: None,
+                        shape: None,
+                        native: None,
+                        linear_format: None,
+                        source_matrix: false,
+                        companion: None,
+                    })
+                    .owner = Some(owner.clone());
+            }
+        }
+    }
+    for (name, companion) in &converted_companions {
+        let kind = match companion.kind {
+            eredu_gguf::LinearCompanionKind::Scale => eredu_nn::LinearCompanionRole::Scale,
+            eredu_gguf::LinearCompanionKind::AffineBias => {
+                eredu_nn::LinearCompanionRole::AffineBias
+            }
+        };
+        register_declared_companion(
+            &mut declarations,
+            name,
+            kind,
+            eredu_nn::ParameterId::new(&companion.primary).map_err(|error| {
+                ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
+            })?,
+        )
+        .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?;
+    }
     let mut physical = BTreeMap::new();
     for shard in checkpoint.shards() {
         for tensor in shard.tensors() {
@@ -1013,8 +1191,8 @@ pub(super) fn gguf_parameters(
         };
         let native = crate::linear_format::gguf_tensor_format(tensor, *endian)
             .map_err(ReplicatedTextRequirementsError::InvalidArtifact)?;
-        let companion = mapping.original_name != mapping.physical_name;
-        let role = config.parameter_role(&mapping.layout.name, companion, &linear_shapes);
+        let companion = mapping.layout.linear_companion.is_some();
+        let role = declared_parameter_role(&mapping.layout.name, companion, &declarations);
         let translated_shape = mapping
             .layout
             .shape
@@ -1070,9 +1248,9 @@ pub(super) fn gguf_parameters(
                         } else {
                             LinearFormat::Dense
                         },
-                        false,
+                        None,
                         role,
-                        parameter_owner(config, &target),
+                        declared_parameter_owner(&declarations, &target)?,
                         ReplicatedTextParameterPresence::Derived {
                             recipe: "qwen3_next.grouped_projection_split".into(),
                         },
@@ -1081,20 +1259,14 @@ pub(super) fn gguf_parameters(
                 continue;
             }
         }
-        let logical_shape = if role == ReplicatedTextParameterRole::Embedding {
-            config
-                .embedding_shape()
-                .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?
-        } else {
-            let discovered = linear_shapes
-                .get(&mapping.layout.name)
-                .cloned()
-                .unwrap_or(translated_shape.clone());
-            config.logical_parameter_shape(&mapping.layout.name, discovered)
-        };
-        let derived = companion
-            || (config.parameter_requires_shape_recipe(&mapping.layout.name)
-                && logical_shape != translated_shape);
+        let (logical_shape, shape_recipe) = gguf_parameter_geometry(
+            &mapping.layout.name,
+            translated_shape,
+            &declarations,
+            &recipes,
+            source_catalog,
+        )?;
+        let derived = companion || shape_recipe;
         let presence = if derived {
             ReplicatedTextParameterPresence::Derived {
                 recipe: format!(
@@ -1127,9 +1299,11 @@ pub(super) fn gguf_parameters(
             }?),
             logical_shape,
             if derived { LinearFormat::Dense } else { native },
-            !derived && linear_shapes.contains_key(&mapping.layout.name),
+            (!derived && linear_shapes.contains_key(&mapping.layout.name))
+                .then(|| companions[&mapping.layout.name].for_parameter(&mapping.layout.name))
+                .flatten(),
             role,
-            parameter_owner(config, &mapping.layout.name),
+            declared_parameter_owner(&declarations, &mapping.layout.name)?,
             presence,
         )?);
     }
@@ -1140,6 +1314,35 @@ pub(super) fn gguf_parameters(
         if parameter.role() != ReplicatedTextParameterRole::FormatCompanion {
             continue;
         }
+        let binding = converted_companions
+            .get(parameter.name())
+            .map(|companion| {
+                let role = match companion.kind {
+                    eredu_gguf::LinearCompanionKind::Scale => eredu_nn::LinearCompanionRole::Scale,
+                    eredu_gguf::LinearCompanionKind::AffineBias => {
+                        eredu_nn::LinearCompanionRole::AffineBias
+                    }
+                };
+                (role, companion.primary.clone())
+            })
+            .or_else(|| {
+                declarations
+                    .get(parameter.name())
+                    .and_then(|declaration| declaration.companion.as_ref())
+                    .map(|(role, primary)| (*role, primary.as_str().to_owned()))
+            })
+            .ok_or_else(|| {
+                ReplicatedTextRequirementsError::InvalidArchitecture(format!(
+                    "GGUF companion {:?} has no declared primary",
+                    parameter.name()
+                ))
+            })?;
+        *parameter = parameter
+            .clone()
+            .with_linear_companion(binding.0, binding.1)
+            .map_err(|error| {
+                ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
+            })?;
         let dtypes = parameter
             .sources()
             .iter()

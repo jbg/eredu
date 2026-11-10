@@ -1,5 +1,8 @@
 //! Backend-neutral LFM2 and LFM2-MoE architecture policy.
 
+pub mod declarations;
+pub use declarations::Declaration;
+
 /// Exact heterogeneous block equations and residual order.
 pub mod block;
 /// Pure SafeTensors/GGUF plans and canonical name translation.
@@ -15,29 +18,23 @@ pub mod partitioned;
 
 pub use block::{Block, BlockGeometry, TokenMixer};
 pub use checkpoint::{
-    expert_recipes, expert_residency_catalog, gguf_plan, load_time_quantization,
-    normalize_weight_formats, safetensors_plan, translate_gguf_weight_name, unit_recipes,
-    with_checkpoint_formats,
+    expert_recipes, expert_residency_catalog, gguf_plan, load_time_quantization, safetensors_plan,
+    translate_gguf_weight_name, unit_recipes, with_checkpoint_formats,
 };
 
 pub use config::{
     model_args_from_config_reader, model_args_from_config_value, model_args_from_gguf_catalog,
-    prompt_cache_architecture_fingerprint, state_layout, state_layout_with_geometry, ConfigError,
-    FeedForwardPolicy, LayerCacheGeometry, LayerPolicy, ModelArgs, OperatorPolicy, RopeConfig,
+    prompt_cache_architecture_fingerprint, ConfigError, FeedForwardPolicy, LayerPolicy, ModelArgs,
+    OperatorPolicy, RopeConfig,
 };
-pub use moe::{
-    expert_realization_plan, replicated_expert_realization_plan, DenseSwiGlu, FeedForward,
-    RoutedGatedProduct,
-};
+pub use moe::{expert_realization_plan, DenseSwiGlu, FeedForward, RoutedGatedProduct};
 pub use parallel::{
-    dense_parameter_description, layer_parallel_parameter_groups, local_block_geometry,
-    local_geometry, local_state_geometry, parameter_description, partition_local_geometry,
-    partition_local_routed_geometry, partitioned_state_layout, static_parallel_parameter_groups,
-    LocalGeometry, PartitionExpertBankOwnership, PartitionLocalGeometry,
+    local_block_geometry, local_geometry, partition_local_geometry,
+    partition_local_routed_geometry, partitioned_state_layout, LocalGeometry,
+    PartitionExpertBankOwnership, PartitionLocalGeometry,
 };
 pub use partitioned::{
-    project_parameters, CompleteLfm2Geometry, CompleteLfm2Kernel, Lfm2Geometry, Lfm2Kernel,
-    PartitionedLayeredModel,
+    CompleteLfm2Geometry, CompleteLfm2Kernel, Lfm2Geometry, Lfm2Kernel, PartitionedLayeredModel,
 };
 
 use crate::decoder::StaticModuleSpec;
@@ -51,15 +48,6 @@ pub(crate) const CHUNKED_TEXT_PREFILL: bool = true;
 /// Architecture-owned values retained for one LFM2 forward pass.
 pub struct ForwardContext<T> {
     mask: Option<T>,
-}
-
-/// Validates complete LFM2 parameter, invocation, state and transport declarations.
-/// This operation requires no native backend resources.
-pub fn component_definition(args: &ModelArgs) -> Result<eredu_runtime::ComponentDefinition, Error> {
-    partitioned::component_definition(
-        parameter_description(args).map_err(Error::backend)?,
-        state_layout(args).map_err(Error::backend)?,
-    )
 }
 
 /// Complete LFM2 execution through the shared typed component adapter.

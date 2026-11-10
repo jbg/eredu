@@ -104,8 +104,13 @@ pub struct GatedResidualSpec {
 }
 
 impl GatedResidualSpec {
-    /// Validates all geometry and formats before backend construction.
+    /// Validates geometry, formats, identities and sharing before backend construction.
     pub fn validate(&self) -> Result<(), Error> {
+        use crate::DeclareLogicalParameters;
+        self.logical_parameters().map(|_| ())
+    }
+
+    pub(crate) fn validate_geometry(&self) -> Result<(), Error> {
         self.normalization.validate()?;
         let width = self.geometry.width;
         if self.normalization.dimensions != width

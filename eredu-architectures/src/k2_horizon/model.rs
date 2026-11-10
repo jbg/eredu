@@ -5,7 +5,7 @@ use crate::decoder::{
     self, DecoderProjectionOperator, RoutedProjectionOperator, TensorParallelProjectionOperator,
     TensorParallelRoutedProjectionOperator,
 };
-use eredu_nn::{Error, GroupedNeuralBackend, LinearSpec, ParameterSpec, Parameterized, Tensor};
+use eredu_nn::{Error, GroupedNeuralBackend, Parameterized, Tensor};
 use eredu_runtime::{
     ExpertPass, ParameterProvider, ResidentExpertProvider, RoutedBankId, RoutedExpertRequest,
     TensorParallelParameterProvider,
@@ -346,38 +346,19 @@ impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeur
 }
 
 fn shared_mlp<B: GroupedNeuralBackend>(
-    args: &ModelArgs,
-    layer: usize,
+    parameters: Option<eredu_nn::SplitGatedProductSpec>,
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<Option<decoder::Mlp<B>>, Error> {
-    if args.num_shared_experts == 0 {
-        return Ok(None);
-    }
-    let width = args
-        .local_shared_intermediate_size
-        .unwrap_or(args.moe_intermediate_size * args.num_shared_experts);
-    let linear = |field: &str, input, output| {
-        let name = format!("model.layers.{layer}.mlp.shared_experts.{field}.weight");
-        B::linear(
-            LinearSpec {
-                input,
-                output,
-                weight: ParameterSpec::trainable(&name).map_err(Error::backend)?,
-                bias: None,
-                format: crate::linear_format::standard_linear_format(
-                    &name,
-                    args.linear_format_for(&name),
-                )?,
-            },
-            context,
-        )
-    };
-    Ok(Some(decoder::Mlp::from_parts(
-        linear("gate_proj", args.hidden_size, width)?,
-        linear("up_proj", args.hidden_size, width)?,
-        linear("down_proj", width, args.hidden_size)?,
-        None,
-    )))
+    parameters
+        .map(|spec| {
+            Ok(decoder::Mlp::from_parts(
+                B::linear(spec.gate, context)?,
+                B::linear(spec.up, context)?,
+                B::linear(spec.down, context)?,
+                spec.policy,
+            ))
+        })
+        .transpose()
 }
 
 /// Shared decoder block specialized to the K2 projection equation.
@@ -386,6 +367,35 @@ pub type TransformerBlock<B> = decoder::TransformerBlock<B, Projections<B>>;
 pub type LayeredModel<B> = decoder::LayeredModel<B, ModelArgs, BlockFactory>;
 /// Shared pipeline-local ordinary-KV execution specialized to K2.
 pub type PartitionedLayeredModel<B> = decoder::PartitionedLayeredModel<B, ModelArgs, BlockFactory>;
+
+/// Complete dense/shared/routed stage parameters, independent of native modules.
+#[derive(Clone, Debug)]
+pub struct ProjectionParameters {
+    pub(crate) dense: Option<eredu_nn::GatedProductSpec>,
+    pub(crate) routed: Option<super::specs::RoutedSpec>,
+    pub(crate) values: Option<super::specs::ValueSpec>,
+    pub(crate) points: Option<eredu_runtime::RoutedObservationPoints>,
+}
+impl eredu_nn::DeclareLogicalParameters for ProjectionParameters {
+    fn logical_parameters(&self) -> Result<Vec<eredu_nn::LogicalParameterDeclaration<'_>>, Error> {
+        if self.dense.is_some() == self.routed.is_some() {
+            return Err(Error::backend(
+                "K2 projections require exactly one feed-forward equation",
+            ));
+        }
+        let mut parameters = Vec::new();
+        if let Some(dense) = &self.dense {
+            parameters.extend(dense.logical_parameters()?);
+        }
+        if let Some(routed) = &self.routed {
+            parameters.extend(routed.logical_parameters()?);
+        }
+        if let Some(values) = &self.values {
+            parameters.extend(values.logical_parameters()?);
+        }
+        Ok(parameters)
+    }
+}
 
 /// Portable construction policy; no backend selects a K2 equation.
 pub struct BlockFactory;
@@ -397,60 +407,67 @@ impl<B: GroupedNeuralBackend> decoder::BlockFactory<B, ModelArgs> for BlockFacto
     fn validate_partitioned(global: &ModelArgs, _local: &ModelArgs) -> Result<(), Error> {
         <Self as decoder::BlockFactory<B, ModelArgs>>::validate(global)
     }
-    fn build_feed_forward(
-        args: &ModelArgs,
-        layer: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self::FeedForward, Error> {
-        Self::build_partitioned_feed_forward(args, args, layer, context)
-    }
-    fn build_partitioned_feed_forward(
+    type Parameters = ProjectionParameters;
+    fn prepare_parameters(
         global: &ModelArgs,
         local: &ModelArgs,
         layer: usize,
+        dense: Option<&eredu_nn::GatedProductSpec>,
+        retained: Option<&Self::Parameters>,
+    ) -> Result<Self::Parameters, Error> {
+        ProjectionParameters::prepare(global, local, layer, dense, retained)
+    }
+    fn parameter_description(
+        config: &ModelArgs,
+        common: &decoder::DecoderDeclaration,
+        projections: Option<&decoder::ProjectionDeclarations<Self::Parameters>>,
+    ) -> Result<eredu_runtime::ArchitectureParameterDescription, Error> {
+        super::parameter_description(&super::Declaration::from_scopes(
+            config.clone(),
+            std::sync::Arc::new(common.clone()),
+            projections.cloned(),
+        )?)
+        .map_err(Error::backend_source)
+    }
+    fn build_feed_forward(
+        _global: &ModelArgs,
+        _local: &ModelArgs,
+        layer: usize,
+        parameters: &Self::Parameters,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::FeedForward, Error> {
-        let values = if global.is_mova_layer(layer) {
-            let spec = super::value_expert_spec(global, layer)?
-                .partition_output(local.value_output_range())?
-                .with_group_count(local.mova_num_experts)?;
+        let values = if let Some(values) = parameters.values.clone() {
+            let spec = values.experts;
+            let output_width = spec.output_dimensions();
             Some(RoutedValues {
-                router: super::new_router::<B>(global, layer, ExpertBank::AttentionValue, context)?,
+                router: B::top_k_group_selector(values.router, context)?,
                 experts: B::grouped_linear_bank(spec, context)?,
-                output_width: local.num_key_value_heads * local.head_dim,
+                output_width,
             })
         } else {
             None
         };
-        let feed_forward = if global.is_sparse_layer(layer) {
+        let feed_forward = if let Some(routed) = parameters.routed.clone() {
             FeedForward::Routed {
-                router: super::new_router::<B>(global, layer, ExpertBank::FeedForward, context)?,
-                experts: B::grouped_gated_product(
-                    super::feed_forward_expert_spec(global, layer)?
-                        .with_group_geometry(local.num_experts, local.moe_intermediate_size)?,
-                    context,
-                )?,
-                shared: shared_mlp::<B>(local, layer, context)?,
+                router: B::top_k_group_selector(routed.parameters.selector, context)?,
+                experts: B::grouped_gated_product(routed.parameters.experts, context)?,
+                shared: shared_mlp::<B>(routed.shared, context)?,
             }
         } else {
-            FeedForward::Dense(decoder::Mlp::new(local, layer, context)?)
+            FeedForward::Dense(decoder::Mlp::from_parameters(
+                parameters
+                    .dense
+                    .as_ref()
+                    .ok_or_else(|| Error::backend("missing prepared dense K2 slots"))?,
+                context,
+            )?)
         };
         Ok(Projections {
             layer,
-            points: <ModelArgs as decoder::Config>::routed_observation_points(
-                global,
-                &format!("model.layers.{layer}"),
-                layer,
-            ),
+            points: parameters.points.clone(),
             values,
             feed_forward,
         })
-    }
-    fn parameter_description(
-        args: &ModelArgs,
-    ) -> Result<eredu_runtime::ArchitectureParameterDescription, eredu_runtime::ParallelPlanError>
-    {
-        super::parallel::parameter_description(args)
     }
 }
 
@@ -460,7 +477,14 @@ pub fn new_block<B: GroupedNeuralBackend>(
     layer: usize,
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<TransformerBlock<B>, Error> {
-    TransformerBlock::from_factory::<_, BlockFactory>(args, args, layer, context)
+    let declaration = super::Declaration::new(args.clone())?;
+    TransformerBlock::from_factory::<_, BlockFactory>(
+        args,
+        args,
+        layer,
+        &declaration.block(layer)?.common,
+        context,
+    )
 }
 
 /// Shared dense decoder execution for configurations with no routed invocations.
@@ -478,17 +502,79 @@ impl<B: eredu_nn::NeuralBackend> decoder::BlockFactory<B, ModelArgs> for DenseBl
         }
         Ok(())
     }
+    type Parameters = eredu_nn::GatedProductSpec;
+    fn prepare_parameters(
+        _global: &ModelArgs,
+        local: &ModelArgs,
+        _layer: usize,
+        dense: Option<&eredu_nn::GatedProductSpec>,
+        retained: Option<&Self::Parameters>,
+    ) -> Result<Self::Parameters, Error> {
+        if let Some(parameters) = retained {
+            return parameters.with_intermediate_dimensions(local.intermediate_size);
+        }
+        dense
+            .cloned()
+            .ok_or_else(|| Error::backend("dense K2 requires retained feed-forward slots"))
+    }
     fn build_feed_forward(
-        args: &ModelArgs,
-        layer: usize,
+        _global: &ModelArgs,
+        _local: &ModelArgs,
+        _layer: usize,
+        parameters: &Self::Parameters,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::FeedForward, Error> {
-        decoder::Mlp::new(args, layer, context)
+        decoder::Mlp::from_parameters(parameters, context)
     }
-    fn parameter_description(
-        args: &ModelArgs,
-    ) -> Result<eredu_runtime::ArchitectureParameterDescription, eredu_runtime::ParallelPlanError>
-    {
-        decoder::dense_parameter_description(args)
+}
+
+impl ProjectionParameters {
+    pub(crate) fn prepare(
+        global: &ModelArgs,
+        local: &ModelArgs,
+        _layer: usize,
+        dense: Option<&eredu_nn::GatedProductSpec>,
+        retained: Option<&Self>,
+    ) -> Result<Self, Error> {
+        if let Some(parameters) = retained {
+            return parameters.clone().with_local_geometry(local);
+        }
+        if global.is_moe() {
+            return Err(Error::backend(
+                "routed K2 requires retained projection declarations",
+            ));
+        }
+        Ok(Self {
+            dense: Some(
+                dense.cloned().ok_or_else(|| {
+                    Error::backend("dense K2 requires retained feed-forward slots")
+                })?,
+            ),
+            routed: None,
+            values: None,
+            points: None,
+        })
+    }
+}
+
+impl ProjectionParameters {
+    fn with_local_geometry(mut self, local: &ModelArgs) -> Result<Self, Error> {
+        self.dense = self
+            .dense
+            .map(|spec| spec.with_intermediate_dimensions(local.intermediate_size))
+            .transpose()?;
+        self.routed = self
+            .routed
+            .map(|spec| spec.with_local_geometry(local))
+            .transpose()?;
+        self.values = self
+            .values
+            .map(|spec| spec.with_local_geometry(local))
+            .transpose()?;
+        eredu_nn::validate_logical_parameter_scope(
+            &eredu_nn::DeclareLogicalParameters::logical_parameters(&self)?,
+        )
+        .map_err(Error::backend_source)?;
+        Ok(self)
     }
 }

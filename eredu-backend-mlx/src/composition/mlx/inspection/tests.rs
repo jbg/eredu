@@ -95,19 +95,34 @@ fn write_configured_safetensors_fixture(
         )
         .map(|tensor| {
             let elements = tensor.shape.iter().product::<usize>();
+            let dtype = if tensor.dtype.accepts(&eredu_checkpoint::StoredDtype::F32) {
+                Dtype::F32
+            } else if tensor.dtype.accepts(&eredu_checkpoint::StoredDtype::I32) {
+                Dtype::I32
+            } else {
+                panic!("fixture does not support {:?}", tensor.dtype);
+            };
             (
                 tensor.key.clone(),
                 tensor.shape.clone(),
+                dtype,
                 (0..elements)
-                    .flat_map(|index| value(&tensor.key, index).to_le_bytes())
+                    .flat_map(|index| {
+                        let value = value(&tensor.key, index);
+                        if dtype == Dtype::I32 {
+                            (value as i32).to_le_bytes()
+                        } else {
+                            value.to_le_bytes()
+                        }
+                    })
                     .collect::<Vec<_>>(),
             )
         })
         .collect::<Vec<_>>();
-    let views = tensors.iter().map(|(name, shape, bytes)| {
+    let views = tensors.iter().map(|(name, shape, dtype, bytes)| {
         (
             name.as_str(),
-            TensorView::new(Dtype::F32, shape.clone(), bytes).unwrap(),
+            TensorView::new(*dtype, shape.clone(), bytes).unwrap(),
         )
     });
     serialize_to_file(views, None, &root.join("model.safetensors")).unwrap();

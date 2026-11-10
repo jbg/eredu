@@ -15,25 +15,25 @@ pub mod text;
 pub mod vision;
 
 pub use assistant::{
-    dflash_gguf_plan, dflash_safetensors_plan, translate_dflash_gguf_weight_name, DFlash,
-    DFlashCompatibility, DFlashCompatibilityError, DFlashConfig, DFlashConfigError, DFlashContext,
-    DFlashLayerContext,
+    translate_dflash_gguf_weight_name, DFlash, DFlashCompatibility, DFlashCompatibilityError,
+    DFlashConfig, DFlashConfigError, DFlashContext, DFlashLayerContext,
 };
 pub use audio::{
-    AudioConfig, AudioConvBlock, AudioPatchEmbedding, AudioProjection, AudioPyramid, AudioStage,
-    AudioState, AudioUnit, AudioUnitKind,
+    AudioConfig, AudioConvBlock, AudioPatchEmbedding, AudioPolicy, AudioProjection, AudioPyramid,
+    AudioStage, AudioState, AudioUnit, AudioUnitKind,
 };
 pub use checkpoint::{
     expert_recipes, expert_residency_catalog, gguf_plan, load_time_quantization,
-    projector_gguf_plan, resolve_safetensors_config, safetensors_parameter_names, safetensors_plan,
-    safetensors_recipes, static_safetensors_recipes, translate_projector_gguf_name,
-    translate_text_gguf_name, unit_safetensors_recipes, with_checkpoint_formats, ArtifactConfig,
+    projector_gguf_name_mapping, projector_gguf_plan, resolve_safetensors_config, safetensors_plan,
+    safetensors_recipes, static_safetensors_recipes, unit_safetensors_recipes,
+    with_checkpoint_formats, ArtifactConfig, TextGgufNames,
 };
 pub use config::{
-    AttentionEquation, BlockNormalization, ConfigError, DecoderConfig, MediaEmbeddingPrecision,
-    MediaInputPrecision, MuseIdentity, PerceptionNormalization, ResidualEquation,
-    RoutedFeedForwardEquation, VisionArithmetic, VisionAttentionPolicy, VisionConfig,
-    VisionInputPolicy, VisionPositionLayout, VocabularyArithmetic, WeightConvention,
+    AttentionEquation, BlockNormalization, ConfigError, DecoderConfig, DecoderPolicy,
+    MediaEmbeddingPrecision, MediaInputPrecision, MuseIdentity, PerceptionNormalization,
+    ResidualEquation, RoutedFeedForwardEquation, VisionArithmetic, VisionAttentionPolicy,
+    VisionConfig, VisionInputPolicy, VisionPolicy, VisionPositionLayout, VocabularyArithmetic,
+    WeightConvention,
 };
 pub use equations::{
     BranchNorm, LearnedResidualCombination, LearnedRmsNorm, ResidualCombination, RmsGain,
@@ -72,7 +72,13 @@ pub fn expert_realization_plan(
     if !args.is_moe() {
         return Ok(None);
     }
-    let global_experts = usize::try_from(args.num_experts).map_err(eredu_nn::Error::backend)?;
+    let declarations = args.routed_layers();
+    let global_experts = declarations
+        .values()
+        .next()
+        .ok_or_else(|| eredu_nn::Error::backend("routed decoder has no declared expert banks"))?
+        .bank()
+        .group_count() as usize;
     let local_experts = i32::try_from(
         eredu_core::balanced_contiguous_range(
             global_experts,
@@ -84,22 +90,19 @@ pub fn expert_realization_plan(
         .len(),
     )
     .map_err(eredu_nn::Error::backend)?;
-    let layers = usize::try_from(args.num_hidden_layers).map_err(eredu_nn::Error::backend)?;
     let owner_group = eredu_runtime::ExecutionGroupId::new(TEXT_EXECUTION_GROUP)
         .map_err(eredu_nn::Error::backend)?;
     let mut unit_specs = std::collections::BTreeMap::new();
-    for layer in 0..layers {
-        let local = geometry
-            .and_then(|geometry| geometry.text_block(layer))
-            .unwrap_or(args);
+    for (layer, declaration) in declarations {
+        let bank = declaration.bank().clone();
+        let width = geometry
+            .and_then(|geometry| geometry.text_block(*layer))
+            .map_or(bank.intermediate_dimensions(), |local| {
+                local.moe_intermediate_size
+            });
         unit_specs.insert(
-            (owner_group.clone(), layer),
-            text::localized_expert_bank_spec(
-                args,
-                layer,
-                local_experts,
-                local.moe_intermediate_size,
-            )?,
+            (owner_group.clone(), *layer),
+            bank.with_group_geometry(local_experts, width)?,
         );
     }
     crate::ExpertRealizationPlan::balanced(global_experts, topology, unit_specs)

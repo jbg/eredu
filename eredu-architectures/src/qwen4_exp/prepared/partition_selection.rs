@@ -263,7 +263,7 @@ impl SelectedTargetPartitionExecution {
         mechanisms: &impl crate::PreparationMechanismProvider,
     ) -> Result<eredu_core::ParameterMaterializationWorkspace, String> {
         crate::SelectedExecution::partitioned_routed(self.selected.clone())
-            .parameter_materialization_workspace(&self.plan.header, None, mechanisms)
+            .parameter_materialization_workspace(&self.plan.header, mechanisms)
     }
     /// Exact stage state, rows and source partition without native realization.
     pub fn plan(&self) -> &TargetPartitionExecutionPlan {
@@ -547,7 +547,7 @@ pub(super) fn prediction_capture_limits(
     request: PartitionedSelectionRequest,
 ) -> Result<Option<(usize, usize)>, PreparationError> {
     spec.map(|spec| {
-        let geometry = spec.fusion.geometry;
+        let geometry = spec.shared.fusion.geometry;
         let elements = [
             request.maximum_batch_size(),
             request.maximum_sequence_length(),

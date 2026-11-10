@@ -54,7 +54,7 @@ impl SelectedTargetExecution {
             ));
         }
         let target = &self.plan.target.spec;
-        let mut declaration = Declaration::new(target.boundary.geometry);
+        let mut declaration = Declaration::new(target.static_parameters.readout.geometry);
         let scope = SpeculativeCaptureScope::Target;
         declaration.owner = "target.embedding".into();
         declaration.point("readout.embedding", true, scope, false, None);
@@ -92,12 +92,17 @@ impl SelectedTargetExecution {
                 }
             }
         }
-        declaration.readout("readout", "target", scope, target.config.vocabulary);
+        declaration.readout(
+            "readout",
+            "target",
+            scope,
+            target.static_parameters.output_projection().output,
+        );
         declaration.owner = "target.logits".into();
         declaration.publication(
             MODEL_LOGITS_OBSERVATION_PATH,
             scope,
-            target.config.vocabulary,
+            target.static_parameters.output_projection().output,
         );
         let prepared =
             self.plan.prediction.as_ref().ok_or_else(|| {
@@ -106,7 +111,7 @@ impl SelectedTargetExecution {
         for unit in &prepared.0.spec.units {
             let scope = SpeculativeCaptureScope::Prediction { depth: unit.depth };
             execution.validate_scope(scope)?;
-            declaration.prediction(unit, target.config.vocabulary);
+            declaration.prediction(unit, target.static_parameters.output_projection().output);
             declaration.feed_forward(
                 &format!("mtp.layers.{}.mlp", unit.depth),
                 &format!("prediction.{}.feed_forward", unit.depth),
@@ -192,9 +197,9 @@ pub(super) fn prediction_points(
     target: &super::TargetSpec,
     prediction: &crate::qwen4_exp::mtp::PredictionSpec,
 ) -> Vec<ObservationPoint> {
-    let mut declaration = Declaration::new(target.boundary.geometry);
+    let mut declaration = Declaration::new(target.static_parameters.readout.geometry);
     for unit in &prediction.units {
-        declaration.prediction(unit, target.config.vocabulary);
+        declaration.prediction(unit, target.static_parameters.output_projection().output);
     }
     declaration.points.sort_by(|a, b| a.path.cmp(&b.path));
     declaration.points
@@ -401,14 +406,14 @@ impl Declaration {
                     self.channels(
                         &format!("{path}.attention.{suffix}"),
                         "attention_channel",
-                        spec.projections[3].input,
+                        spec.parameters.projection.output.input,
                         scope,
                         readonly,
                     );
                 }
                 // Validated QSA geometry includes the complete-block budget plus
                 // its incomplete tail, even when most slots are padding.
-                let selection = spec.indexer.selection;
+                let selection = spec.selection;
                 self.tensor_point(
                     &format!("{path}.attention.selected_positions"),
                     Self::sequence_axes(
@@ -490,9 +495,13 @@ impl Declaration {
         let edit = crate::discovery::routing_intervention_point(
             &node,
             path,
-            spec.router.selection(),
+            spec.parameters.routed.selector.selection(),
             1,
-            spec.router.coefficient_scale().is_some(),
+            spec.parameters
+                .routed
+                .selector
+                .coefficient_scale()
+                .is_some(),
         )
         .ok_or_else(|| {
             CaptureError::Unsupported("routing policy has no intervention declaration".into())
@@ -507,30 +516,40 @@ impl Declaration {
             (
                 "feed_forward.units",
                 "shared_unit",
-                spec.shared[0].output,
+                spec.parameters.shared.gate.output,
                 false,
             ),
             (
                 "feed_forward.write_input",
                 "shared_unit",
-                spec.shared[2].input,
+                spec.parameters.shared.down.input,
                 true,
             ),
-            ("feed_forward.write", "hidden", spec.shared[2].output, false),
+            (
+                "feed_forward.write",
+                "hidden",
+                spec.parameters.shared.down.output,
+                false,
+            ),
             (
                 "feed_forward.output",
                 "hidden",
-                spec.shared[2].output,
+                spec.parameters.shared.down.output,
                 false,
             ),
-            ("gate.input", "hidden", spec.shared_gate.input, true),
+            (
+                "gate.input",
+                "hidden",
+                spec.parameters.shared_gate.input,
+                true,
+            ),
             (
                 "gate.projection_input",
                 "hidden",
-                spec.shared_gate.input,
+                spec.parameters.shared_gate.input,
                 true,
             ),
-            ("gate", "gate", spec.shared_gate.output, false),
+            ("gate", "gate", spec.parameters.shared_gate.output, false),
         ] {
             self.channels(&format!("{shared}.{suffix}"), axis, width, scope, readonly);
         }
@@ -538,7 +557,7 @@ impl Declaration {
         self.channels(
             &format!("{path}.output"),
             "hidden",
-            spec.shared[2].output,
+            spec.parameters.shared.down.output,
             scope,
             false,
         );
@@ -569,11 +588,11 @@ impl Declaration {
                     TensorAxis {
                         name: "selected_expert".into(),
                         dimension: SymbolicDimension::Known(
-                            spec.router.selection().top_k() as usize
+                            spec.parameters.routed.selector.selection().top_k() as usize,
                         ),
                     },
                 ],
-                _ => Self::sequence_axes("hidden", spec.shared[2].output),
+                _ => Self::sequence_axes("hidden", spec.parameters.shared.down.output),
             };
             self.tensor_point(
                 &field.path(path),
@@ -602,9 +621,9 @@ impl Declaration {
         scope: SpeculativeCaptureScope,
     ) -> Result<(), CaptureError> {
         let geometry = RoutedUnitGeometry {
-            experts: spec.experts.group_count() as u64,
-            units_per_expert: spec.experts.intermediate_dimensions() as u64,
-            routes_per_token: spec.router.selection().top_k() as u64,
+            experts: spec.parameters.routed.experts.group_count() as u64,
+            units_per_expert: spec.parameters.routed.experts.intermediate_dimensions() as u64,
+            routes_per_token: spec.parameters.routed.selector.selection().top_k() as u64,
         };
         // Components name logical expert units; the native source contains only
         // selected routes. This virtual extent must never allocate expert-dense storage.

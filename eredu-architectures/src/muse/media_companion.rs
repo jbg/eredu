@@ -5,7 +5,7 @@ use std::{
     sync::Arc,
 };
 
-use super::{checkpoint, ConfigError, DecoderConfig, RoutedFeedForwardEquation};
+use super::{checkpoint, ConfigError, DecoderConfig};
 use crate::{
     artifact_preparation::{ArtifactSourceRole, PhysicalArtifactPreparation},
     processor_plan::{MuseProcessorPlan, ProcessorPlanError},
@@ -177,25 +177,27 @@ impl Bf16MediaCompanion {
             })?;
             assets.push((file.clone(), Arc::<[u8]>::from(bytes)));
         }
-        let mut config = DecoderConfig::from_hf_json(&assets[0].1)?;
+        let config = DecoderConfig::from_hf_json(&assets[0].1)?;
         compatible_decoder(target, &config, &requested)?;
+        let mut vision_config = config.vision_config.clone();
+        let mut audio_config = config.audio_config.clone();
         if requested.contains(&ArtifactSourceRole::Vision) {
-            let vision = config.vision_config.as_mut().ok_or_else(missing)?;
-            vision.weight_quantization = None;
-            vision.quantized_weight_configs.clear();
+            let vision = vision_config.as_mut().ok_or_else(missing)?;
+            *vision = vision
+                .with_formats(Default::default(), None)
+                .map_err(|e| MediaCompanionError::Catalog(e.to_string()))?;
         } else {
-            config.vision_config = None;
+            vision_config = None;
         }
         if requested.contains(&ArtifactSourceRole::Audio) {
-            config
-                .audio_config
-                .as_mut()
-                .ok_or_else(missing)?
-                .linear_formats
-                .clear();
+            let audio = audio_config.as_mut().ok_or_else(missing)?;
+            *audio = audio
+                .with_formats(Default::default())
+                .map_err(|e| MediaCompanionError::Catalog(e.to_string()))?;
         } else {
-            config.audio_config = None;
+            audio_config = None;
         }
+        let config = config.with_media(vision_config, audio_config)?;
         let processor = MuseProcessorPlan::from_hf_json(&assets[1].1)?;
         processor.validate_components(&config)?;
         let catalog = SafetensorsMetadataCatalog::discover_members_matching(root, |name| {
@@ -385,9 +387,13 @@ fn compatible_decoder(
     if target.num_experts == 0 {
         same!(intermediate_size);
     }
-    let expert_width = |config: &DecoderConfig| match config.routed_feed_forward {
-        RoutedFeedForwardEquation::CompressedSigmoid { expert_width, .. } => Some(expert_width),
-        _ => None,
+    let expert_width = |config: &DecoderConfig| {
+        config
+            .routed_layers()
+            .values()
+            .next()
+            .and_then(|declaration| declaration.compression())
+            .map(|spec| spec.input.output)
     };
     if expert_width(target) != expert_width(source) {
         return Err(MediaCompanionError::Incompatible {

@@ -12,7 +12,7 @@ use eredu_nn::{
 use eredu_runtime::{ArchitectureParameterDescription, ExecutionGroupId, LocalModelLayout};
 use std::collections::BTreeMap;
 
-const OWNER: &str = "prediction";
+const OWNER: &str = super::PREDICTION_EXECUTION_GROUP;
 fn invalid(detail: impl std::fmt::Display) -> Error {
     Error::backend(format!("qwen4_exp prediction partition: {detail}"))
 }
@@ -43,7 +43,7 @@ impl PredictionTensorPartition {
     pub fn parameter_selections(&self, parameter: &str) -> Option<&[TensorSelection]> {
         self.selections.get(parameter).map(Vec::as_slice)
     }
-    /// Validates an independently described local module against retained ranges.
+    /// Validates the projected local parameter declaration against retained ranges.
     pub fn local_layout(
         &self,
         global: &ArchitectureParameterDescription,
@@ -84,7 +84,7 @@ impl PredictionTensorPartition {
             self.local
                 .units
                 .iter()
-                .map(|unit| &unit.feed_forward.feed_forward.experts),
+                .map(|unit| &unit.feed_forward.feed_forward.parameters.routed.experts),
             realization.global_expert_count(),
             first..first + groups.len(),
             expert_ranks,
@@ -163,7 +163,10 @@ impl PredictionSpec {
             .map(|unit| {
                 Ok((
                     (owner.clone(), unit.depth),
-                    local_expert_spec(&unit.feed_forward.feed_forward.experts, groups.clone())?,
+                    local_expert_spec(
+                        &unit.feed_forward.feed_forward.parameters.routed.experts,
+                        groups.clone(),
+                    )?,
                 ))
             })
             .collect::<Result<BTreeMap<_, _>, Error>>()?;
@@ -193,8 +196,10 @@ impl PredictionSpec {
         }
         let mut local = self.clone();
         for unit in &mut local.units {
-            let expected =
-                local_expert_spec(&unit.feed_forward.feed_forward.experts, groups.clone())?;
+            let expected = local_expert_spec(
+                &unit.feed_forward.feed_forward.parameters.routed.experts,
+                groups.clone(),
+            )?;
             let selected = realization
                 .unit_spec(OWNER, unit.depth)
                 .ok_or_else(|| invalid("expert realization omits prediction depth"))?;
@@ -203,25 +208,41 @@ impl PredictionSpec {
                     "expert realization differs from prediction parameters or equation",
                 ));
             }
-            unit.feed_forward.feed_forward.experts = selected.clone();
+            unit.feed_forward.feed_forward.parameters.routed.experts = selected.clone();
             unit.feed_forward.validate()?;
         }
         local.state_layout()?;
         Ok(local)
     }
-    fn global_expert_count(&self) -> Result<usize, Error> {
+    pub(crate) fn global_expert_count(&self) -> Result<usize, Error> {
         let first = self
             .units
             .first()
             .ok_or_else(|| invalid("prediction has no depths"))?;
-        let global = usize::try_from(first.feed_forward.feed_forward.experts.group_count())
-            .map_err(invalid)?;
+        let global = usize::try_from(
+            first
+                .feed_forward
+                .feed_forward
+                .parameters
+                .routed
+                .experts
+                .group_count(),
+        )
+        .map_err(invalid)?;
         if self.units.iter().any(|unit| {
-            unit.feed_forward.feed_forward.experts.group_count() as usize != global
+            unit.feed_forward
+                .feed_forward
+                .parameters
+                .routed
+                .experts
+                .group_count() as usize
+                != global
                 || unit
                     .feed_forward
                     .feed_forward
-                    .router
+                    .parameters
+                    .routed
+                    .selector
                     .selection()
                     .group_count() as usize
                     != global

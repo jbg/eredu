@@ -258,6 +258,7 @@ pub(super) fn gated(
         eredu_nn::GatedProductActivation::Silu => ComponentNonlinearity::Silu {
             multiplier: ComponentScalar::new(policy.sigmoid_multiplier()),
         },
+        eredu_nn::GatedProductActivation::Gelu => ComponentNonlinearity::Gelu,
         eredu_nn::GatedProductActivation::GeluApproximate => ComponentNonlinearity::GeluApproximate,
         _ => {
             g.partial("expert-unit activation equation is not described");

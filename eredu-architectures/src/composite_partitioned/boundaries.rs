@@ -413,10 +413,14 @@ pub(crate) fn from_config(
         }
         CompositeConfig::Inkling(args) => {
             if let Some(vision) = &args.vision_config {
-                let schemas = vision
-                    .layer_specs()
-                    .iter()
-                    .map(|spec| hidden(spec.1, false))
+                let schemas = (0..vision.num_hidden_layers as usize)
+                    .map(|layer| {
+                        let spec = vision
+                            .parameters()
+                            .layer(layer)
+                            .map_err(|error| error.to_string())?;
+                        hidden(spec.projection.output, false)
+                    })
                     .collect::<Result<Vec<_>, _>>()?;
                 plan = plan.with_boundary(
                     0,

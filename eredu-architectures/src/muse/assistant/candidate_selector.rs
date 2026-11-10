@@ -1,9 +1,12 @@
 //! Conditional transition lattice for DFlash2 proposal candidates.
 
 use eredu_nn::{
-    EmbeddingLookupPolicy, EmbeddingOperator, EmbeddingSpec, Error, Index, LinearOperator,
-    LinearSpec, NeuralBackend, ParameterSpec, Parameterized, Tensor, TensorElementType,
+    DeclareLogicalParameters, EmbeddingLookupPolicy, EmbeddingOperator, Error, Index,
+    LinearOperator, LogicalParameterDeclaration, NeuralBackend, Parameterized, Tensor,
+    TensorElementType,
 };
+
+mod specs;
 
 /// Replicated candidate-selector geometry, independent of target head sharding.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -22,9 +25,19 @@ pub struct CandidateSelectorGeometry {
 #[derive(Debug, Clone)]
 pub struct CandidateSelectorDefinition {
     geometry: CandidateSelectorGeometry,
-    formats: std::collections::HashMap<String, eredu_checkpoint::WeightQuantization>,
+    units: [specs::UnitConstruction; 3],
     layout: eredu_runtime::ExecutionUnitLayout,
 }
+impl DeclareLogicalParameters for CandidateSelectorDefinition {
+    fn logical_parameters(&self) -> Result<Vec<LogicalParameterDeclaration<'_>>, Error> {
+        let mut parameters = Vec::new();
+        for unit in &self.units {
+            parameters.extend(unit.module.logical_parameters()?);
+        }
+        Ok(parameters)
+    }
+}
+
 /// Exactly one selector table or projection, independent of body and vocabulary weights.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
@@ -38,6 +51,25 @@ enum CandidateSelectorModule<B: NeuralBackend> {
     Projection(B::Linear),
 }
 impl CandidateSelectorDefinition {
+    pub(super) fn project_formats(
+        &self,
+        format: &impl Fn(&str) -> eredu_checkpoint::LinearFormat,
+    ) -> Result<Self, Error> {
+        let mut projected = self.clone();
+        for unit in &mut projected.units {
+            match &mut unit.module {
+                specs::Construction::Table(spec) => {
+                    super::body::project_embedding_encoding(spec, format)?
+                }
+                specs::Construction::Projection(spec) => {
+                    super::body::project_linear_encoding(spec, format)?
+                }
+            }
+        }
+        eredu_nn::validate_logical_parameter_topology(&projected.logical_parameters()?)
+            .map_err(Error::backend_source)?;
+        Ok(projected)
+    }
     /// Validates selected geometry without allocating a native tensor.
     pub fn new(
         geometry: CandidateSelectorGeometry,
@@ -54,19 +86,34 @@ impl CandidateSelectorDefinition {
                 "invalid assistant candidate-selector geometry",
             ));
         }
-        let graph = eredu_runtime::ExecutionGraph::chain([
-            "assistant.predecessor_table",
-            "assistant.successor_table",
-            "assistant.conditional_projection",
-        ])
-        .map_err(Error::backend)?;
-        let layout =
-            eredu_runtime::ExecutionUnitLayout::new(&graph, [1; 3]).map_err(Error::backend)?;
-        Ok(Self {
+        let units = specs::units(geometry, &formats)?;
+        let graph = eredu_runtime::ExecutionGraph::chain(units.iter().map(|unit| unit.group))
+            .map_err(Error::backend)?;
+        let layout = eredu_runtime::ExecutionUnitLayout::new(&graph, units.iter().map(|_| 1))
+            .map_err(Error::backend)?;
+        let definition = Self {
             geometry,
-            formats,
+            units,
             layout,
-        })
+        };
+        eredu_nn::validate_logical_parameter_topology(&definition.logical_parameters()?)
+            .map_err(Error::backend_source)?;
+        Ok(definition)
+    }
+    pub(super) fn append_parameters(
+        &self,
+        declaration: &mut crate::external_assistant::AssistantParameterDeclarations,
+    ) -> Result<(), Error> {
+        for unit in &self.units {
+            declaration.append(
+                eredu_runtime::ReplicatedTextParameterOwner::ExecutionUnit {
+                    group: unit.group.into(),
+                    unit: 0,
+                },
+                &unit.module,
+            )?;
+        }
+        Ok(())
     }
     /// Cold selector geometry without parameter construction.
     pub const fn geometry(&self) -> CandidateSelectorGeometry {
@@ -82,49 +129,21 @@ impl CandidateSelectorDefinition {
         ordinal: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<CandidateSelectorUnit<B>, Error> {
-        let g = self.geometry;
-        let formats = &self.formats;
-        let format = |name: &str| {
-            crate::linear_format::matrix_linear_format(
-                name,
-                name.strip_suffix(".weight").unwrap_or(name),
-                formats
-                    .get(name)
-                    .copied()
-                    .map(Into::into)
-                    .unwrap_or(eredu_checkpoint::LinearFormat::Dense),
-            )
-        };
-        let table = |name: &str| {
-            B::embedding(
-                EmbeddingSpec {
-                    vocabulary: g.vocabulary,
-                    dimensions: g.rank,
-                    weight: ParameterSpec::trainable(format!("candidate_selector.{name}"))
-                        .map_err(Error::backend)?,
-                    format: format(&format!("candidate_selector.{name}"))?,
-                },
-                context,
-            )
-        };
-        let module = match ordinal {
-            0 => CandidateSelectorModule::Table(table("predecessor_codebook")?),
-            1 => CandidateSelectorModule::Table(table("successor_codebook")?),
-            2 => CandidateSelectorModule::Projection(B::linear(
-                LinearSpec {
-                    input: g.hidden,
-                    output: g.rank,
-                    weight: ParameterSpec::trainable("candidate_selector.hidden_projection.weight")
-                        .map_err(Error::backend)?,
-                    bias: None,
-                    format: format("candidate_selector.hidden_projection.weight")?,
-                },
-                context,
-            )?),
-            _ => return Err(Error::backend("invalid candidate-selector unit ordinal")),
+        let unit = self
+            .units
+            .get(ordinal)
+            .ok_or_else(|| Error::backend("invalid candidate-selector unit ordinal"))?;
+        let module = match &unit.module {
+            specs::Construction::Table(spec) => {
+                CandidateSelectorModule::Table(B::embedding(spec.clone(), context)?)
+            }
+            specs::Construction::Projection(spec) => {
+                CandidateSelectorModule::Projection(B::linear(spec.clone(), context)?)
+            }
         };
         Ok(CandidateSelectorUnit { module })
     }
+
     /// Constructs resident units through the individual constructors.
     pub fn build_units<B: NeuralBackend>(
         &self,

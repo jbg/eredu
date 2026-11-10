@@ -270,8 +270,14 @@ impl<B: NeuralBackend> TtsGenerator<B> {
                 ConditioningDimensions::from_config(config, characters, speaker_frames)?,
                 context,
             )?,
-            TtsTransformer::new(character_config, context)?,
-            TtsTransformer::new(causal, context)?,
+            TtsTransformer::new(
+                super::tts_transformer_specs::TransformerDeclaration::new(character_config)?,
+                context,
+            )?,
+            TtsTransformer::new(
+                super::tts_transformer_specs::TransformerDeclaration::new(causal)?,
+                context,
+            )?,
             RvqRefinement::new(
                 geometry.cardinality,
                 geometry.latent,

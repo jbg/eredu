@@ -4,10 +4,7 @@
 //! receive OHWI views over NHWC activations. Streaming window ownership and the
 //! removal of overlapping output frames belong to the perception driver.
 
-use eredu_nn::{
-    Error, LinearFormatSpec, LinearOperator, LinearSpec, NeuralBackend, PadMode, Parameter,
-    ParameterSpec, Parameterized, Tensor,
-};
+use eredu_nn::{Error, LinearOperator, NeuralBackend, PadMode, Parameter, Parameterized, Tensor};
 
 use super::config::PerceptionEncoderConfig;
 
@@ -75,7 +72,7 @@ impl SubsamplingDimensions {
         Ok(length)
     }
 
-    fn flattened_width(self) -> Result<i32, SubsamplingError> {
+    pub(super) fn flattened_width(self) -> Result<i32, SubsamplingError> {
         self.output_frames(self.features)?
             .checked_mul(self.channels)
             .filter(|width| *width > 0)
@@ -115,31 +112,14 @@ struct Convolution<T> {
 
 impl<T: Tensor> Convolution<T> {
     fn new(
-        index: usize,
-        input: i32,
-        output: i32,
-        kernel: i32,
-        stride: i32,
-        groups: i32,
+        spec: super::perception_specs::ConvolutionSpec,
         context: &T::Context,
     ) -> Result<Self, Error> {
-        let parameter = |name| {
-            let mut parameter = ParameterSpec::trainable(format!(
-                "stt_model.perception.encoder.pre_encode.conv.{index}.{name}"
-            ))
-            .expect("valid canonical identifier");
-            parameter.group = Some(format!("voicechat.perception.subsampling.conv.{index}"));
-            parameter
-        };
         Ok(Self {
-            weight: Parameter::unloaded(
-                parameter("weight"),
-                &[output, input / groups, kernel, kernel],
-                context,
-            )?,
-            bias: Parameter::unloaded(parameter("bias"), &[output], context)?,
-            stride,
-            groups,
+            weight: Parameter::unloaded(spec.weight, &spec.shape, context)?,
+            bias: Parameter::unloaded(spec.bias, &[spec.shape[0]], context)?,
+            stride: spec.stride,
+            groups: spec.groups,
         })
     }
 
@@ -184,6 +164,8 @@ pub struct CausalSubsampling<B: NeuralBackend> {
     #[parameter(skip)]
     precision: super::precision::SpeechPrecision,
     #[parameter(skip)]
+    precision_declaration: super::precision::SpeechPrecisionDeclaration,
+    #[parameter(skip)]
     dimensions: SubsamplingDimensions,
     initial: Convolution<B::Tensor>,
     depthwise1: Convolution<B::Tensor>,
@@ -197,6 +179,7 @@ impl<B: NeuralBackend> Clone for CausalSubsampling<B> {
     fn clone(&self) -> Self {
         Self {
             precision: self.precision,
+            precision_declaration: self.precision_declaration.clone(),
             dimensions: self.dimensions,
             initial: self.initial.clone(),
             depthwise1: self.depthwise1.clone(),
@@ -223,37 +206,21 @@ impl<B: NeuralBackend> CausalSubsampling<B> {
 
     /// Constructs canonical released convolution and output parameter identities.
     pub fn new(
-        dimensions: SubsamplingDimensions,
+        spec: super::perception_specs::SubsamplingSpec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, SubsamplingError> {
-        dimensions.validate()?;
-        let channels = dimensions.channels;
-        let parameter = |name| {
-            let mut parameter = ParameterSpec::trainable(format!(
-                "stt_model.perception.encoder.pre_encode.out.{name}"
-            ))
-            .expect("valid canonical identifier");
-            parameter.group = Some("voicechat.perception.subsampling.output".to_owned());
-            parameter
-        };
+        let precision_declaration = super::precision::SpeechPrecisionDeclaration::from_spec(&spec)?;
+        let [initial, depthwise1, pointwise1, depthwise2, pointwise2] = spec.convolutions;
         Ok(Self {
             precision: Default::default(),
-            dimensions,
-            initial: Convolution::new(0, 1, channels, 3, 2, 1, context)?,
-            depthwise1: Convolution::new(2, channels, channels, 3, 2, channels, context)?,
-            pointwise1: Convolution::new(3, channels, channels, 1, 1, 1, context)?,
-            depthwise2: Convolution::new(5, channels, channels, 3, 2, channels, context)?,
-            pointwise2: Convolution::new(6, channels, channels, 1, 1, 1, context)?,
-            projection: B::linear(
-                LinearSpec {
-                    input: dimensions.flattened_width()?,
-                    output: dimensions.width,
-                    weight: parameter("weight"),
-                    bias: Some(parameter("bias")),
-                    format: LinearFormatSpec::unscaled(eredu_checkpoint::LinearFormat::Dense)?,
-                },
-                context,
-            )?,
+            precision_declaration,
+            dimensions: spec.dimensions,
+            initial: Convolution::new(initial, context)?,
+            depthwise1: Convolution::new(depthwise1, context)?,
+            pointwise1: Convolution::new(pointwise1, context)?,
+            depthwise2: Convolution::new(depthwise2, context)?,
+            pointwise2: Convolution::new(pointwise2, context)?,
+            projection: B::linear(spec.output, context)?,
         })
     }
 
@@ -279,7 +246,7 @@ impl<B: NeuralBackend> CausalSubsampling<B> {
         }
         let frames = self.dimensions.output_frames(shape[1])?;
         self.precision
-            .require(self, input)
+            .require(self, input, &self.precision_declaration)
             .map_err(SubsamplingError::Precision)?;
         let input = input.expand_dims(-1, context)?;
         let hidden = self

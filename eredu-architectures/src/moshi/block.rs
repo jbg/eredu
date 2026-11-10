@@ -10,14 +10,15 @@ use super::MoshiTransformerConfig;
 pub type Block<B> = TransformerBlock<B>;
 
 /// Builds one unloaded shared decoder block.
-pub fn build<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
+pub(super) fn build<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
     config: &MoshiTransformerConfig,
     layer: usize,
+    declared: &super::declarations::BlockConstruction,
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<Block<B>, Error> {
-    TransformerBlock::new(config, layer, context)
+    let spec = declared.localized(config.num_attention_heads(), config.gated_hidden_size())?;
+    TransformerBlock::from_parameters(config, layer, &spec.decoder_parameters(), context)
 }
-
 /// Executes one shared block against its architecture-global state slot.
 pub fn forward<B, S>(
     block: &mut Block<B>,

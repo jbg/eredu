@@ -4,15 +4,12 @@ use std::{collections::BTreeSet, num::NonZeroU8, sync::Arc};
 
 use eredu_checkpoint::store::SharedCheckpointSource;
 use eredu_core::{ArtifactInspection, ParallelRankTopology, ParallelTopology, SessionCapabilities};
-use eredu_runtime::{
-    CacheResidencyPolicy, CommunicationManifest, ReplicatedTextMaterializationTask,
-};
+use eredu_runtime::{CacheResidencyPolicy, CommunicationManifest};
 
 use crate::{
-    capability::CapabilityEstimate, configuration::PredictionExtensionPlan,
-    preparation::FloatingStateDtypeSource, prepared_sources::PreparedModelSources,
-    processor_execution::PreparedProcessor, processor_plan::ArtifactArchitecturePlan,
-    selected_execution::*,
+    capability::CapabilityEstimate, preparation::FloatingStateDtypeSource,
+    prepared_sources::PreparedModelSources, processor_execution::PreparedProcessor,
+    processor_plan::ArtifactArchitecturePlan, selected_execution::*,
 };
 
 mod direct_session;
@@ -189,12 +186,11 @@ impl<C> PreparedPartitionPredictionResources<C> {
 #[doc(hidden)]
 pub struct PreparedPredictionSelection {
     placement: crate::prediction_extension::PredictionPlacementSlot,
-    extension: PredictionExtensionPlan,
+    parameters: Arc<crate::prediction_extension::SelectedPredictionParameters>,
     source: SharedCheckpointSource,
     realization: eredu_runtime::SelectedSpeculativeRealization,
     capability: CapabilityEstimate,
     topology: ParallelRankTopology,
-    tasks: Vec<ReplicatedTextMaterializationTask>,
     residency: eredu_runtime::LayerWeightResidency,
 }
 
@@ -484,21 +480,29 @@ where
         selected.prediction_realization(),
     ) {
         (Some(extension), Some(source_extension), Some(source), Some(realization))
-            if extension.same_admission(source_extension) =>
+            if extension.same_admission(source_extension)
+                && selected
+                    .execution()
+                    .prediction_parameters()
+                    .is_some_and(|parameters| parameters.same_admission(extension)) =>
         {
             Some(PreparedPredictionSelection {
                 placement: Arc::clone(&graph.prediction_placement),
-                extension: extension.clone(),
+                parameters: selected
+                    .execution()
+                    .prediction_parameters()
+                    .cloned()
+                    .ok_or_else(|| {
+                        PreparedExecutionError::Architecture(
+                            "prediction selection has no retained executable parameters".into(),
+                        )
+                    })?,
                 source: Arc::clone(source),
                 realization: realization.clone(),
                 capability: crate::prediction_extension::prediction_extension_capability(extension)
                     .map_err(|error| PreparedExecutionError::Architecture(error.to_string()))?,
                 topology,
                 residency: selected.text_realization().residency(),
-                tasks: selected
-                    .text_realization()
-                    .auxiliary_materialization_tasks()
-                    .to_vec(),
             })
         }
         (None, None, None, None) => None,

@@ -8,10 +8,7 @@ use std::{
 
 use eredu_checkpoint::{AffineQuantization, WeightQuantization};
 use eredu_core::{
-    cache::{
-        derive_prompt_cache_architecture_fingerprint, LayerCachePolicy, MutableStateResidency,
-        StateTensorDimension, StateTensorDtype, StateTensorPolicy, StateTensorRole,
-    },
+    cache::{derive_prompt_cache_architecture_fingerprint, LayerCachePolicy},
     AttentionPolicy, LayerSchedule,
 };
 use eredu_gguf::MetadataValue;
@@ -176,7 +173,7 @@ struct Source {
 }
 
 /// Validated Nemotron-H family policy.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 #[allow(missing_docs)]
 pub struct ModelArgs {
     pub model_type: String,
@@ -348,8 +345,17 @@ impl ModelArgs {
                 .is_ok_and(|policies| policies.contains(&LayerPolicy::SparseMoe))
     }
 
+    /// Target routers retain floating source storage under family-wide conversions.
+    /// Prediction routers retain their separately admitted encodings.
+    pub(crate) fn preserves_linear_source(&self, name: &str) -> bool {
+        name.ends_with(".moe.gate.weight")
+    }
+
     /// Resolves the physical encoding for one canonical parameter identity.
     pub fn weight_quantization_for(&self, name: &str) -> Option<WeightQuantization> {
+        if self.preserves_linear_source(name) {
+            return None;
+        }
         if let Some(configs) = &self.quantized_weight_configs {
             return configs.get(name).copied();
         }
@@ -796,109 +802,10 @@ fn gguf_optional_f32(
     }
 }
 
-/// Declares global state for every target and appended prediction unit.
-pub fn state_layout(args: &ModelArgs) -> Result<StateLayout, ConfigError> {
-    let mut geometry = args
-        .layer_schedule
-        .iter()
-        .map(|policy| match policy {
-            LayerPolicy::Mamba => LayerGeometry::Mamba {
-                heads: args.mamba_num_heads,
-                groups: args.n_groups,
-            },
-            LayerPolicy::SelfAttention(_) => LayerGeometry::Attention {
-                query_heads: args.num_attention_heads,
-                kv_heads: args.num_key_value_heads,
-            },
-            LayerPolicy::DenseMlp => LayerGeometry::DenseMlp {
-                intermediate: args.intermediate_size,
-            },
-            LayerPolicy::SparseMoe => LayerGeometry::SparseMoe {
-                routed: args.moe_intermediate_size,
-                shared: args.moe_shared_expert_intermediate_size,
-            },
-        })
-        .collect::<Vec<_>>();
-    geometry.extend(args.mtp_policies()?.into_iter().map(|policy| match policy {
-        LayerPolicy::SelfAttention(_) => LayerGeometry::Attention {
-            query_heads: args.num_attention_heads,
-            kv_heads: args.num_key_value_heads,
-        },
-        LayerPolicy::SparseMoe => LayerGeometry::SparseMoe {
-            routed: args.moe_intermediate_size,
-            shared: args.moe_shared_expert_intermediate_size,
-        },
-        _ => unreachable!("validated MTP policies contain only attention and MoE"),
-    }));
-    state_layout_with_geometry(args, &geometry)
-}
-
-/// Declares rank-local state from placement-resolved unit geometry.
-pub fn state_layout_with_geometry(
-    args: &ModelArgs,
-    geometry: &[LayerGeometry],
+pub(super) fn state_layout_from_policies(
+    target_layers: usize,
+    policies: Vec<LayerCachePolicy>,
 ) -> Result<StateLayout, ConfigError> {
-    let mut schedule = args.layer_schedule.iter().copied().collect::<Vec<_>>();
-    schedule.extend(args.mtp_policies()?);
-    if geometry.len() != schedule.len() {
-        return Err(invalid(
-            "state geometry does not match the target plus MTP physical schedule",
-        ));
-    }
-    let history = args.conv_kernel - 1;
-    let fixed = |value| StateTensorDimension::fixed(value).map_err(|e| invalid(e.to_string()));
-    let policies = schedule
-        .iter()
-        .zip(geometry)
-        .map(|(policy, geometry)| match (*policy, *geometry) {
-            (LayerPolicy::Mamba, LayerGeometry::Mamba { heads, groups }) => {
-                let conv_width = heads * args.mamba_head_dim + 2 * groups * args.ssm_state_size;
-                let mut tensors = Vec::new();
-                if history > 0 {
-                    tensors.push(
-                        StateTensorPolicy::new(
-                            StateTensorRole::Convolution { slot: 0 },
-                            vec![
-                                StateTensorDimension::Batch,
-                                fixed(history)?,
-                                fixed(conv_width)?,
-                            ],
-                            StateTensorDtype::Floating,
-                            MutableStateResidency::AlwaysDeviceMutable,
-                        )
-                        .map_err(|e| invalid(e.to_string()))?,
-                    );
-                }
-                tensors.push(
-                    StateTensorPolicy::new(
-                        StateTensorRole::Recurrent,
-                        vec![
-                            StateTensorDimension::Batch,
-                            fixed(heads)?,
-                            fixed(args.mamba_head_dim)?,
-                            fixed(args.ssm_state_size)?,
-                        ],
-                        StateTensorDtype::Float32,
-                        MutableStateResidency::LayerScopedOffloadable,
-                    )
-                    .map_err(|e| invalid(e.to_string()))?,
-                );
-                LayerCachePolicy::fixed_only(tensors).map_err(|e| invalid(e.to_string()))
-            }
-            (LayerPolicy::SelfAttention(attention), LayerGeometry::Attention { kv_heads, .. }) => {
-                LayerCachePolicy::key_value(attention, kv_heads, args.head_dim)
-                    .map_err(|e| invalid(e.to_string()))
-            }
-            (LayerPolicy::DenseMlp, LayerGeometry::DenseMlp { .. })
-            | (LayerPolicy::SparseMoe, LayerGeometry::SparseMoe { .. }) => {
-                Ok(LayerCachePolicy::NoState)
-            }
-            _ => Err(invalid(
-                "state geometry does not match its scheduled operator",
-            )),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let target_layers = args.layer_schedule.len();
     let prediction_layers = policies.len() - target_layers;
     let mut segments = vec![StateSegmentSpec::new(
         TARGET_STATE_SEGMENT,

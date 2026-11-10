@@ -566,6 +566,189 @@ pub struct ArtifactArchitecturePlan {
 }
 
 impl ArtifactArchitecturePlan {
+    pub(crate) fn prediction_source(
+        extension: &crate::configuration::PredictionExtensionPlan,
+    ) -> Self {
+        Self::from_safetensors_architecture(extension.complete_architecture().clone())
+    }
+
+    pub(crate) fn kimi_declaration(
+        &self,
+        args: &crate::kimi_linear::ModelArgs,
+    ) -> Result<std::sync::Arc<crate::kimi_linear::Declaration>, String> {
+        let retained = match (self.safetensors_architecture(), self.gguf_plan()) {
+            (Some(p), None) => p.kimi.as_ref(),
+            (None, Some(p)) => p.kimi.as_ref(),
+            _ => None,
+        }
+        .ok_or("architecture has no admitted Kimi declaration")?;
+        if retained.args() == args {
+            return Ok(std::sync::Arc::clone(retained));
+        }
+        retained
+            .with_formats(args.clone())
+            .map(std::sync::Arc::new)
+            .map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn lfm2_declaration(
+        &self,
+        args: &crate::lfm2::ModelArgs,
+    ) -> Result<std::sync::Arc<crate::lfm2::Declaration>, String> {
+        let retained = match (self.safetensors_architecture(), self.gguf_plan()) {
+            (Some(plan), None) => plan.lfm2.as_ref(),
+            (None, Some(plan)) => plan.lfm2.as_ref(),
+            _ => None,
+        }
+        .ok_or("architecture has no admitted LFM2 declaration")?;
+        if retained.args() == args {
+            return Ok(std::sync::Arc::clone(retained));
+        }
+        retained
+            .with_formats(args.clone())
+            .map(std::sync::Arc::new)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Retains immutable family scopes without artifact payloads or backend resources.
+    /// Exact ordinary dense scopes retained by source admission.
+    pub(crate) fn dense_declaration(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::decoder::DecoderDeclaration>> {
+        self.safetensors_architecture()
+            .and_then(|plan| plan.dense.as_ref())
+            .or_else(|| self.gguf_plan().and_then(|plan| plan.dense.as_ref()))
+    }
+
+    pub(crate) fn k2_declaration(
+        &self,
+        args: &crate::k2_horizon::ModelArgs,
+    ) -> Result<std::sync::Arc<crate::k2_horizon::Declaration>, String> {
+        let retained = self
+            .safetensors_architecture()
+            .and_then(|p| p.k2.as_ref())
+            .or_else(|| self.gguf_plan().and_then(|p| p.k2.as_ref()))
+            .ok_or("architecture has no admitted K2 declaration")?;
+        if crate::decoder::Config::architecture_fingerprint(retained.args())
+            == crate::decoder::Config::architecture_fingerprint(args)
+        {
+            return Ok(retained.clone());
+        }
+        retained
+            .with_formats(args.clone())
+            .map(std::sync::Arc::new)
+            .map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn vl_declaration(
+        &self,
+        args: &crate::qwen::vl::ModelArgs,
+    ) -> Result<std::sync::Arc<crate::qwen::vl::Declaration>, String> {
+        let retained =
+            if let Some(source) = self.safetensors_architecture().and_then(|p| p.vl.as_ref()) {
+                source.clone()
+            } else {
+                let projector = self
+                    .gguf_media_projector()
+                    .ok_or("architecture has no admitted VL text scopes")?;
+                let crate::gguf_companion::GgufMediaProjectorConfig::Qwen3Vl(source) =
+                    projector.model()
+                else {
+                    return Err("VL protocol identities are not bound".into());
+                };
+                std::sync::Arc::new(
+                    crate::qwen::vl::Declaration::from_components(
+                        source.clone(),
+                        projector
+                            .qwen_text_declaration()
+                            .ok_or("missing VL text declaration")?
+                            .clone(),
+                        projector
+                            .qwen_vision_declaration()
+                            .ok_or("missing VL vision declaration")?
+                            .clone(),
+                    )
+                    .map_err(|e| e.to_string())?,
+                )
+            };
+        if crate::qwen::vl::prompt_cache_architecture_fingerprint(retained.args())
+            == crate::qwen::vl::prompt_cache_architecture_fingerprint(args)
+        {
+            return Ok(retained);
+        }
+        retained
+            .with_formats(args.clone())
+            .map(std::sync::Arc::new)
+            .map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn qwen_declaration(
+        &self,
+        args: &crate::qwen::ModelArgs,
+    ) -> Result<std::sync::Arc<crate::qwen::Declaration>, String> {
+        let retained = self
+            .safetensors_architecture()
+            .and_then(|p| p.qwen.as_ref())
+            .or_else(|| self.gguf_plan().and_then(|p| p.qwen.as_ref()))
+            .ok_or("architecture has no admitted Qwen declaration")?;
+        if crate::decoder::Config::architecture_fingerprint(retained.args())
+            == crate::decoder::Config::architecture_fingerprint(args)
+        {
+            return Ok(retained.clone());
+        }
+        retained
+            .with_formats(args.clone())
+            .map(std::sync::Arc::new)
+            .map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn gpt_oss_declaration(
+        &self,
+        args: &crate::gpt_oss::ModelArgs,
+    ) -> Result<std::sync::Arc<crate::gpt_oss::Declaration>, String> {
+        let retained = self
+            .safetensors_architecture()
+            .and_then(|p| p.gpt_oss.as_ref())
+            .or_else(|| self.gguf_plan().and_then(|p| p.gpt_oss.as_ref()))
+            .ok_or("architecture has no admitted GPT-OSS declaration")?;
+        if crate::decoder::Config::architecture_fingerprint(retained.args())
+            == crate::decoder::Config::architecture_fingerprint(args)
+        {
+            return Ok(std::sync::Arc::clone(retained));
+        }
+        retained
+            .with_formats(args.clone())
+            .map(std::sync::Arc::new)
+            .map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn nemotron_declaration(
+        &self,
+        args: &crate::nemotron_h::ModelArgs,
+    ) -> Result<std::sync::Arc<crate::nemotron_h::Declaration>, String> {
+        let retained = match (self.safetensors_architecture(), self.gguf_plan()) {
+            (Some(p), None) => p.nemotron.as_ref(),
+            (None, Some(p)) => p.nemotron.as_ref(),
+            _ => None,
+        }
+        .ok_or("architecture has no admitted Nemotron declaration")?;
+        if retained.args() == args {
+            return Ok(std::sync::Arc::clone(retained));
+        }
+        let target;
+        let source =
+            if retained.args().num_nextn_predict_layers > 0 && args.num_nextn_predict_layers == 0 {
+                target = retained.prediction_target().map_err(|e| e.to_string())?;
+                &target
+            } else {
+                retained.as_ref()
+            };
+        source
+            .with_formats(args.clone())
+            .map(std::sync::Arc::new)
+            .map_err(|error| error.to_string())
+    }
+
     pub(crate) fn draft_adapter(
         &self,
     ) -> Option<&crate::nemotron_labs_diffusion::adapter::AdmittedDraftAdapter> {
@@ -590,15 +773,15 @@ impl ArtifactArchitecturePlan {
         let adapter =
             crate::nemotron_labs_diffusion::adapter::AdmittedDraftAdapter::admit(config, source)?;
         self.family = match self.family {
-            ArtifactFamilyPlan::Safetensors(plan) => {
-                ArtifactFamilyPlan::Safetensors(plan.with_draft_adapter(adapter.config.clone())?)
-            }
-            ArtifactFamilyPlan::Gguf(plan) => {
-                ArtifactFamilyPlan::Gguf(plan.with_draft_adapter(adapter.config.clone())?)
-            }
+            ArtifactFamilyPlan::Safetensors(plan) => ArtifactFamilyPlan::Safetensors(
+                plan.with_draft_adapter(std::sync::Arc::clone(&adapter.declaration))?,
+            ),
+            ArtifactFamilyPlan::Gguf(plan) => ArtifactFamilyPlan::Gguf(
+                plan.with_draft_adapter(std::sync::Arc::clone(&adapter.declaration))?,
+            ),
         };
         if let Some(projector) = &mut self.media_projector {
-            projector.attach_draft_adapter(adapter.config.clone())?;
+            projector.attach_draft_adapter(std::sync::Arc::clone(&adapter.declaration))?;
         }
         self.draft_adapter = Some(std::sync::Arc::new(adapter));
         self.validation = Default::default();
@@ -2714,7 +2897,7 @@ fn metadata_rgb(
         _ => {
             return Err(invalid(format!(
                 "Muse-Glimmer projector GGUF requires three Float32 values in {key:?}"
-            )))
+            )));
         }
     };
     values.as_slice().try_into().map_err(|_| {

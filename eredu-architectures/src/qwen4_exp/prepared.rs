@@ -10,7 +10,10 @@ use super::{
         PreparedNGramTable,
     },
     config::Config,
-    target::{BoundTargetSpec, TargetLimits, TargetSpec, UnitSpec},
+    target::{
+        declarations::{TargetInvocation, TargetParameters},
+        BoundTargetSpec, TargetLimits, TargetSpec, UnitSpec,
+    },
 };
 use eredu_checkpoint::{
     recipe::DerivedWeightRecipe,
@@ -22,10 +25,7 @@ use eredu_checkpoint::{
     LinearFormat,
 };
 use eredu_core::residency::ResidencyPolicy;
-use eredu_nn::{
-    Error, GatedProductGroupLayout, GatedProductPolicy, GroupedGatedProductSpec,
-    GroupedProjectionSpec, LinearFormatSpec, ParameterSpec,
-};
+use eredu_nn::{Error, LinearFormatSpec};
 use eredu_runtime::{
     ParameterBankRecipes, PreparedParameterRecipes, PreparedRowLookup, RowLookupLimits,
     RowResidencyRange,
@@ -92,10 +92,12 @@ pub enum PreparationError {
 /// Table payloads are never concatenated or decoded during this preparation.
 #[derive(Clone)]
 pub struct PreparedTarget {
+    prediction_parameters: Option<Arc<crate::qwen4_exp::mtp::declarations::PredictionParameters>>,
     prediction_recipes: Option<(
         BTreeMap<String, DerivedWeightRecipe>,
         Vec<BTreeMap<String, DerivedWeightRecipe>>,
     )>,
+    parameters: Arc<TargetParameters>,
     artifact: SharedCheckpointSource,
     formats: ParameterFormats,
     expert_banks: BTreeMap<String, Arc<ParameterBankRecipes>>,
@@ -109,7 +111,7 @@ impl PreparedTarget {
     /// owners. Only bounded integer controls and optional table scalars are read.
     pub fn safetensors(
         source: SharedCheckpointSource,
-        config: Config,
+        declaration: Arc<crate::qwen4_exp::Declaration>,
         encoding: SafetensorsEncoding,
         limits: TargetLimits,
     ) -> Result<Self, PreparationError> {
@@ -119,7 +121,7 @@ impl PreparedTarget {
             "qwen4_exp prepared owner",
             source.source_keys().into_iter().collect(),
         )?);
-        SafetensorsTargetPlan::prepare(source.as_ref(), config, encoding)?.bind(source, limits)
+        SafetensorsTargetPlan::prepare(source.as_ref(), declaration, encoding)?.bind(source, limits)
     }
     /// Exact construction specs; callers do not select family names or equations.
     pub fn spec(&self) -> &TargetSpec {
@@ -270,40 +272,17 @@ impl ParameterFormats {
     fn ordinary(&self, name: &str) -> Result<LinearFormatSpec, Error> {
         crate::linear_format::standard_linear_format(name, self.get(name)?)
     }
-}
-fn expert_spec(
-    config: &Config,
-    formats: &ParameterFormats,
-    root: &str,
-) -> Result<GroupedGatedProductSpec, Error> {
-    let projection = |name: &str| {
-        let name = format!("{root}.{name}");
-        GroupedProjectionSpec::new(
-            ParameterSpec::trainable(&name).map_err(Error::backend)?,
-            None,
-            crate::linear_format::standard_expert_format(&name, formats.get(&name)?)?
-                .with_row_layout(
-                    formats
-                        .1
-                        .get(&name)
-                        .copied()
-                        .unwrap_or(eredu_nn::LinearRowLayout::Contiguous),
-                )?,
+    fn expert(&self, name: &str) -> Result<LinearFormatSpec, Error> {
+        crate::linear_format::standard_expert_format(
+            name,
+            self.get(name)?,
+            self.1
+                .get(name)
+                .copied()
+                .unwrap_or(eredu_nn::LinearRowLayout::Contiguous),
         )
-    };
-    GroupedGatedProductSpec::new(
-        config.experts.count,
-        config.hidden_size,
-        config.experts.intermediate,
-        config.hidden_size,
-        GatedProductPolicy::ordinary_silu(),
-        GatedProductGroupLayout::Packed {
-            gate_up: projection("gate_up_proj")?,
-            down: projection("down_proj")?,
-        },
-    )
+    }
 }
-
 mod tensor_partition;
 pub use tensor_partition::PreparedTensorTarget;
 
@@ -346,19 +325,28 @@ mod resources;
 pub use observations::{PredictionDiscovery, PredictionObservationBinding};
 pub use resources::TargetResourceReport;
 
-fn safetensors_format_recipes<C: eredu_checkpoint::recipe::RecipeCatalog + ?Sized>(
+fn safetensors_formats_and_banks<'a, C: eredu_checkpoint::recipe::RecipeCatalog + ?Sized>(
     catalog: &C,
     keys: &[String],
-    config: &Config,
     encoding: &SafetensorsEncoding,
-    roots: impl IntoIterator<Item = String>,
+    banks: impl IntoIterator<Item = &'a eredu_nn::GroupedGatedProductSpec>,
 ) -> Result<
     (
         ParameterFormats,
-        BTreeMap<String, BTreeMap<String, DerivedWeightRecipe>>,
+        BTreeMap<String, Arc<ParameterBankRecipes>>,
     ),
     PreparationError,
 > {
+    let banks = banks
+        .into_iter()
+        .map(|bank| {
+            let packed = bank.packed_parameters()?;
+            let root = checkpoint::experts::source_root(&packed)
+                .map_err(PreparationError::Contract)?
+                .to_owned();
+            Ok((root, bank))
+        })
+        .collect::<Result<BTreeMap<_, _>, PreparationError>>()?;
     // A fused logical bank must preserve every physical member's encoding.
     // The released policy is homogeneous; do not silently reinterpret a
     // custom per-expert exclusion as a block-scaled packed parameter.
@@ -372,15 +360,21 @@ fn safetensors_format_recipes<C: eredu_checkpoint::recipe::RecipeCatalog + ?Size
         {
             continue;
         }
-        let projection = if member == "down_proj" || member.ends_with(".down_proj.weight") {
-            "down_proj"
+        let declared = banks.get(&format!("{root}.mlp.experts")).ok_or_else(|| {
+            PreparationError::Contract(format!("physical expert {key} has no declared bank"))
+        })?;
+        let source = declared.packed_parameters()?;
+        let logical = if member == "down_proj" || member.ends_with(".down_proj.weight") {
+            source.down()
         } else {
-            "gate_up_proj"
+            source.gate_up()
         };
-        let logical = format!("{root}.mlp.experts.{projection}");
-        if encoding.linear_format(&canonical) != encoding.linear_format(&logical) {
+        if encoding.linear_format(&canonical)
+            != encoding.linear_format(logical.parameter.id.as_str())
+        {
             return Err(PreparationError::Contract(format!(
-                "physical expert encoding for {key} differs from logical bank {logical}"
+                "physical expert encoding for {key} differs from logical bank {}",
+                logical.parameter.id,
             )));
         }
     }
@@ -395,31 +389,42 @@ fn safetensors_format_recipes<C: eredu_checkpoint::recipe::RecipeCatalog + ?Size
         BTreeMap::new(),
     );
     let mut expert_banks = BTreeMap::new();
-    for root in roots {
+    for (root, declared) in banks {
+        use eredu_nn::DeclareLogicalParameters;
+        let source = declared.packed_parameters()?;
         let bank = crate::shared_routed::checkpoint::gated_expert_recipes(
             catalog,
-            &root,
-            0..config.experts.count as usize,
+            checkpoint::experts::source_root(&source).map_err(PreparationError::Contract)?,
+            0..source.group_count(),
             eredu_checkpoint::store::TensorSelection::Full,
             checkpoint::schema::aliases,
         )
         .map_err(PreparationError::Contract)?;
-        if !matches!(
+        if matches!(
+            encoding.linear_format(source.gate_up().parameter.id.as_str()),
+            LinearFormat::E4M3BlockFp8(_)
+        ) && !matches!(
             bank.get("gate_up_proj"),
             Some(DerivedWeightRecipe::Source { .. })
         ) {
             formats.1.insert(
-                format!("{root}.gate_up_proj"),
+                source.gate_up().parameter.id.to_string(),
                 eredu_nn::LinearRowLayout::equal_partitions(2)?,
             );
         }
-        for name in ["gate_up_proj", "down_proj"] {
-            let name = format!("{root}.{name}");
-            formats
-                .0
-                .insert(name.clone(), encoding.linear_format(&name));
+        for parameter in declared.logical_parameters()? {
+            let name = parameter.parameter.id.to_string();
+            let format = encoding.linear_format(&name);
+            formats.0.insert(name, format);
         }
-        expert_banks.insert(root, bank);
+        expert_banks.insert(
+            root,
+            Arc::new(ParameterBankRecipes::new(
+                catalog,
+                bank,
+                source.group_count(),
+            )?),
+        );
     }
     Ok((formats, expert_banks))
 }

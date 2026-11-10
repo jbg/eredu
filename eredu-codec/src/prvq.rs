@@ -6,7 +6,7 @@
 
 use std::ops::Range;
 
-use eredu_nn::{NeuralBackend, Parameter, ParameterSpec, Parameterized, Tensor, TensorElementType};
+use eredu_nn::{NeuralBackend, Parameter, Parameterized, Tensor, TensorElementType};
 
 use crate::Error;
 
@@ -210,60 +210,38 @@ pub struct Codebook<T: Tensor> {
     /// Retained scalar variance; nearest-mean encode/decode does not use it.
     pub variance: Parameter<T>,
     #[parameter(skip)]
-    geometry: Geometry,
-    #[parameter(skip)]
-    depth: usize,
-    #[parameter(skip)]
-    prefix: String,
+    declaration: crate::prvq_specs::CodebookSpec,
 }
 
 impl<T: Tensor> Codebook<T> {
-    /// Declares the released `mus_list.N` and `_variance_list.N.variance` slots.
-    pub fn unloaded(
-        geometry: Geometry,
-        prefix: &str,
-        depth: usize,
-        context: &T::Context,
-    ) -> Result<Self, Error> {
-        geometry.validate()?;
-        if prefix.is_empty() || depth >= geometry.depth {
-            return Err(invalid("invalid codebook parameter prefix or depth"));
-        }
-        let group = format!("{prefix}.codebook.{depth}");
-        let parameter = |name: String, shape: &[i32]| {
-            let mut spec =
-                ParameterSpec::trainable(name).map_err(|error| invalid(error.to_string()))?;
-            spec.trainable = false;
-            spec.group = Some(group.clone());
-            Ok::<_, Error>(Parameter::unloaded(spec, shape, context)?)
-        };
+    /// Constructs one declared codebook without allocating derived execution state.
+    pub fn new(spec: crate::prvq_specs::CodebookSpec, context: &T::Context) -> Result<Self, Error> {
         Ok(Self {
-            means: parameter(
-                format!("{prefix}.mus_list.{depth}"),
-                &[geometry.cardinality, geometry.channels],
+            means: Parameter::unloaded(spec.means().clone(), &spec.mean_shape(), context)?,
+            variance: Parameter::unloaded(
+                spec.variance().clone(),
+                &spec.variance_shape(),
+                context,
             )?,
-            variance: parameter(format!("{prefix}._variance_list.{depth}.variance"), &[])?,
-            geometry,
-            depth,
-            prefix: prefix.into(),
+            declaration: spec,
         })
     }
     /// Exact selected geometry.
     pub fn geometry(&self) -> Geometry {
-        self.geometry
+        self.declaration.geometry
     }
     /// Global residual depth of this independently leased unit.
     pub fn depth(&self) -> usize {
-        self.depth
+        self.declaration.depth
     }
     /// Canonical source namespace.
     pub fn prefix(&self) -> &str {
-        &self.prefix
+        &self.declaration.prefix
     }
     /// Validates the loaded table and scalar before any numerical operation.
     pub fn validate_bound(&self) -> Result<(), Error> {
-        if self.means.as_ref().shape() != [self.geometry.cardinality, self.geometry.channels]
-            || !self.variance.as_ref().shape().is_empty()
+        if self.means.as_ref().shape() != self.declaration.mean_shape()
+            || self.variance.as_ref().shape() != self.declaration.variance_shape()
         {
             return Err(invalid(
                 "bound residual codebook geometry does not match declaration",
@@ -322,30 +300,30 @@ impl<B: NeuralBackend> ResidualQuantizer<B> {
         prefix: &str,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        geometry.validate()?;
-        let books = (0..geometry.depth)
-            .map(|depth| Codebook::unloaded(geometry, prefix, depth, context))
+        let declaration = crate::declarations::QuantizerDeclaration::new(geometry, prefix)?;
+        let books = declaration
+            .spec()
+            .codebooks()
+            .iter()
+            .cloned()
+            .map(|spec| Codebook::new(spec, context))
             .collect::<Result<_, _>>()?;
-        Self::from_codebooks(geometry, books)
+        Self::from_codebooks(declaration, books)
     }
     /// Adopts complete canonical codebooks without copying learned tensors.
     pub fn from_codebooks(
-        geometry: Geometry,
+        declaration: crate::declarations::QuantizerDeclaration,
         codebooks: Vec<Codebook<B::Tensor>>,
     ) -> Result<Self, Error> {
-        geometry.validate()?;
-        let prefix = codebooks
-            .first()
-            .ok_or_else(|| invalid("residual quantizer has no codebooks"))?
-            .prefix()
-            .to_owned();
-        if codebooks.len() != geometry.depth
-            || codebooks.iter().enumerate().any(|(depth, book)| {
-                book.geometry() != geometry
-                    || book.depth() != depth
+        let prefix = declaration.prefix();
+        let declared = declaration.spec().codebooks();
+        if codebooks.len() != declared.len()
+            || codebooks.iter().zip(declared).any(|(book, spec)| {
+                book.geometry() != spec.geometry()
+                    || book.depth() != spec.depth()
                     || book.prefix() != prefix
-                    || book.means.as_ref().shape() != [geometry.cardinality, geometry.channels]
-                    || !book.variance.as_ref().shape().is_empty()
+                    || book.means.as_ref().shape() != spec.mean_shape()
+                    || book.variance.as_ref().shape() != spec.variance_shape()
             })
         {
             return Err(invalid(
@@ -353,7 +331,7 @@ impl<B: NeuralBackend> ResidualQuantizer<B> {
             ));
         }
         let architecture =
-            crate::prvq_layered::QuantizerKernel::new(geometry, &prefix)?.into_component()?;
+            crate::prvq_layered::QuantizerKernel::new(declaration)?.into_component()?;
         let runtime = eredu_runtime::ResidentRuntime::from_units(
             architecture,
             codebooks.into_iter().map(|book| vec![book]).collect(),
@@ -361,6 +339,7 @@ impl<B: NeuralBackend> ResidualQuantizer<B> {
         .map_err(eredu_runtime::ResidentUnitsError::into_architecture)?;
         Ok(Self { runtime })
     }
+
     /// Exact selected codebook geometry.
     pub fn geometry(&self) -> Geometry {
         self.runtime.architecture().kernel().geometry()

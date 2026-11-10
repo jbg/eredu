@@ -4,11 +4,9 @@
 //! modules, not session caches, scheduling, or a full-graph residency policy.
 
 use super::function_head_layered::{FunctionHeadDimensions, FunctionHeadExecution};
-use super::tts_conditioning_layered::{
-    ConditioningDimensions, ConditioningExecution, ResidentConditioning,
-};
+use super::tts_conditioning_layered::{ConditioningExecution, ResidentConditioning};
 use super::tts_mog_layered::MogExecution;
-use super::tts_rvq::{RvqDimensions, RvqRefinement};
+use super::tts_rvq::RvqRefinement;
 use super::tts_rvq_layered::RvqExecution;
 use super::tts_transformer_layered::TransformerExecution;
 use eredu_codec::ear_decoder_layered::DecoderExecution;
@@ -40,9 +38,9 @@ use super::{
     rnnt::{Rnnt, RnntDimensions, RnntExecution},
     speech::SpeechComponents,
     tts_generator::{TtsGenerator, TtsGeneratorParts},
-    tts_mog::{MogDimensions, MogHead, TtsError},
+    tts_mog::{MogHead, TtsError},
     tts_prompt::{AriaPromptPlan, PreparedTtsPrompt},
-    tts_transformer::{TransformerConfig, TtsTransformer},
+    tts_transformer::TtsTransformer,
 };
 
 /// Failed construction or binding publishes no assembled aggregate.
@@ -393,10 +391,9 @@ impl SpeechConstructionPlan {
         }
         use SpeechUnitId as Id;
         let perception = Perception::from_parts(
-            PerceptionDimensions::from_config(&config.perception)
-                .map_err(ConstructionError::from)?,
+            self.perception.clone(),
             take!(Id::PerceptionSubsampling, PerceptionSubsampling),
-            (0..config.perception.encoder.n_layers)
+            (0..self.perception.spec().blocks.len())
                 .map(|i| Ok(take!(Id::PerceptionBlock(i), PerceptionBlock)))
                 .collect::<Result<_, AssemblyError>>()?,
             take!(Id::PerceptionProjection, PerceptionProjection),
@@ -405,25 +402,24 @@ impl SpeechConstructionPlan {
         let rnnt = take!(Id::Rnnt, Rnnt);
         let function = take!(Id::FunctionHead, FunctionHead);
         let character_transformer = TtsTransformer::from_parts(
-            TransformerConfig::new(&config.tts.character_encoder)
-                .map_err(ConstructionError::from)?,
-            (0..config.tts.character_encoder.num_hidden_layers)
+            self.character.clone(),
+            (0..self.character.spec().parameters.blocks.len())
                 .map(|i| Ok(take!(Id::CharacterBlock(i), CharacterBlock)))
                 .collect::<Result<_, AssemblyError>>()?,
             take!(Id::CharacterNorm, CharacterNorm),
         )
         .map_err(TtsError::from)?;
         let transformer = TtsTransformer::from_parts(
-            TransformerConfig::new(&config.tts.backbone).map_err(ConstructionError::from)?,
-            (0..config.tts.backbone.num_hidden_layers)
+            self.tts.clone(),
+            (0..self.tts.spec().parameters.blocks.len())
                 .map(|i| Ok(take!(Id::TtsBlock(i), TtsBlock)))
                 .collect::<Result<_, AssemblyError>>()?,
             take!(Id::TtsNorm, TtsNorm),
         )
         .map_err(TtsError::from)?;
         let mog = MogHead::from_parts(
-            MogDimensions::from_config(&config.tts)?,
-            (0..config.tts.mog.num_layers)
+            self.mog.clone(),
+            (0..self.mog.spec().blocks.len())
                 .map(|i| Ok(take!(Id::MogBlock(i), MogBlock)))
                 .collect::<Result<_, AssemblyError>>()?,
             take!(Id::MogPredictionHead, MogPredictionHead),
@@ -436,7 +432,7 @@ impl SpeechConstructionPlan {
             prompt.frames(),
             TtsGeneratorParts::new(
                 ResidentConditioning::from_parts(
-                    ConditioningDimensions::from_config(&config.tts, 256, prompt.frames())?,
+                    self.conditioning.clone(),
                     take!(Id::CharacterEmbedding, CharacterEmbedding),
                     take!(Id::TtsIngress, TtsIngress),
                     take!(Id::TtsFusion, TtsFusion),
@@ -444,30 +440,28 @@ impl SpeechConstructionPlan {
                 character_transformer,
                 transformer,
                 RvqRefinement::from_parts(
-                    RvqDimensions::from_config(&config.tts)?,
+                    self.rvq.clone(),
                     take!(Id::TtsRvqBank, TtsRvqBank),
                     take!(Id::TtsRvqProjection, TtsRvqProjection),
                 )?,
                 mog,
             ),
         )?;
-        let encoder_config = waveform_encoder_config(&config.codec)?;
-        let decoder_config = waveform_decoder_config(&config.codec)?;
         let encoder_neural = NeuralEncoder::<B>::from_units(
-            encoder_config.neural.clone(),
-            (0..encoder_config.neural.unit_specs()?.len())
+            self.codec.encoder.clone(),
+            (0..self.codec.encoder.spec().units().len())
                 .map(|i| Ok(take!(Id::CodecEncoder(i), CodecEncoder)))
                 .collect::<Result<_, AssemblyError>>()?,
         )?;
         let decoder_neural = NeuralDecoder::<B>::from_units(
-            decoder_config.neural.clone(),
-            (0..decoder_config.neural.unit_specs()?.len())
+            self.codec.decoder.clone(),
+            (0..self.codec.decoder.spec().units().len())
                 .map(|i| Ok(take!(Id::CodecDecoder(i), CodecDecoder)))
                 .collect::<Result<_, AssemblyError>>()?,
         )?;
         let quantizer = ResidualQuantizer::<B>::from_codebooks(
-            decoder_config.quantizer,
-            (0..config.codec.num_quantizers)
+            self.codec.quantizer.clone(),
+            (0..self.codec.quantizer.spec().codebooks().len())
                 .map(|i| Ok(take!(Id::CodecCodebook(i), CodecCodebook)))
                 .collect::<Result<_, AssemblyError>>()?,
         )?;

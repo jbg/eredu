@@ -39,14 +39,8 @@ impl PreparedEncoderPipelineBindings {
             component: "EAR encoder",
             reason,
         };
-        validate_encoder_partition(
-            bindings.definition(),
-            bindings.config(),
-            bindings.prefix(),
-            bindings.local_layout(),
-            &partition,
-        )
-        .map_err(ComponentPipelinePreparationError::Component)?;
+        validate_encoder_partition(bindings.declaration(), bindings.local_layout(), &partition)
+            .map_err(ComponentPipelinePreparationError::Component)?;
         if cuts.config() != bindings.config()
             || activation_dtype != PipelineActivationDtype::Float32
         {

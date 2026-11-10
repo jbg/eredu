@@ -8,8 +8,8 @@ use super::{
 };
 use crate::decoder::ComponentInstrumentation;
 use eredu_nn::{
-    DistributedNeuralBackend, Error, LinearSpec, NeuralBackend, NormalizationOperator,
-    ParameterSpec, Parameterized, Tensor,
+    DeclareLogicalParameters, DistributedNeuralBackend, Error, LogicalParameterDeclaration,
+    NeuralBackend, NormalizationOperator, Parameterized, Tensor,
 };
 
 /// Validated direct/convolved DFlash body geometry, without resident parameters.
@@ -17,23 +17,49 @@ use eredu_nn::{
 pub struct DFlashBodyDefinition {
     config: DFlashDecoderConfig,
     geometry: AssistantBodyGeometry,
+    parameters: super::super::dflash_specs::Parameters,
 }
 impl DFlashBodyDefinition {
+    pub(in crate::muse::assistant) fn project_formats(
+        &self,
+        formats: &std::collections::HashMap<String, eredu_checkpoint::WeightQuantization>,
+        uniform: Option<eredu_checkpoint::WeightQuantization>,
+    ) -> Result<Self, Error> {
+        let mut projected = self.clone();
+        projected.config.quantization = uniform;
+        projected.config.quantized_weights = formats.clone();
+        projected.parameters = self
+            .parameters
+            .project_formats(&|name| projected.config.linear_format_for(name))?;
+        Ok(projected)
+    }
     /// Validates architecture geometry before constructing any parameter unit.
     pub fn new(config: DFlashDecoderConfig) -> Result<Self, Error> {
-        config.validate()?;
+        let parameters = super::super::dflash_specs::Parameters::new(&config)?;
+        let attention = &parameters.blocks[0].attention;
         let geometry = AssistantBodyGeometry::new(
-            config.hidden_size,
+            parameters.edge.projection.output,
             config.target_layer_ids.len(),
-            config.num_hidden_layers as usize,
-            config.num_key_value_heads,
-            config.head_dim,
+            parameters.blocks.len(),
+            attention.projection.geometry.key_value_heads(),
+            attention.projection.geometry.key_dimensions(),
             config.block_size,
             config.sliding_window,
             ProposalLayout::AnchorThenMasks,
         )?;
-        Ok(Self { config, geometry })
+        Ok(Self {
+            config,
+            geometry,
+            parameters,
+        })
     }
+    pub(in crate::muse::assistant) fn append_parameters(
+        &self,
+        declaration: &mut crate::external_assistant::AssistantParameterDeclarations,
+    ) -> Result<(), Error> {
+        self.parameters.append_parameters(declaration)
+    }
+
     /// Ordered target publications selected by the trained encoder.
     pub fn target_layer_ids(&self) -> &[usize] {
         &self.config.target_layer_ids
@@ -49,28 +75,34 @@ impl DFlashBodyDefinition {
         use eredu_runtime::memory_forecast::{
             ConditionedBlockConvolution, ConditionedPredictionBody,
         };
-        let c = &self.config;
         let g = &self.geometry;
+        let attention = &self.parameters.blocks[0].attention;
         ConditionedPredictionBody {
             hidden: g.hidden as u64,
             captures: g.captures as u64,
             layers: g.layers as u64,
-            query_heads: c.num_attention_heads as u64,
-            head_width: c.head_dim as u64,
-            key_value_width: c.num_key_value_heads as u64 * c.head_dim as u64,
-            intermediate: c.intermediate_size as u64,
+            query_heads: attention.projection.geometry.query_heads() as u64,
+            head_width: attention.projection.geometry.key_dimensions() as u64,
+            key_value_width: attention.projection.key.output as u64,
+            intermediate: self.parameters.blocks[0].mlp.gate.output as u64,
             context_window: g.window as u64,
             block_positions: g.block as u64,
-            convolution: match c.sublayer {
-                super::super::DFlashSublayerPolicy::Direct => None,
-                super::super::DFlashSublayerPolicy::BlockConvolution { taps, group_size } => {
-                    Some(ConditionedBlockConvolution {
-                        taps: taps as u64,
-                        group_size: group_size as u64,
-                    })
-                }
-            },
+            convolution: self.parameters.blocks[0].convolutions[0]
+                .as_ref()
+                .map(|spec| {
+                    let geometry = spec.geometry();
+                    ConditionedBlockConvolution {
+                        taps: geometry.taps as u64,
+                        group_size: geometry.group_size as u64,
+                    }
+                }),
         }
+    }
+}
+
+impl DeclareLogicalParameters for DFlashBodyDefinition {
+    fn logical_parameters(&self) -> Result<Vec<LogicalParameterDeclaration<'_>>, Error> {
+        self.parameters.logical_parameters()
     }
 }
 
@@ -109,38 +141,25 @@ impl<B: NeuralBackend + DistributedNeuralBackend> AssistantBodyDefinition<B>
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Unit, Error> {
         let config = &self.config;
-        let norm = |name: &str| {
-            B::normalization(
-                config.equation.normalization(
-                    config.hidden_size,
-                    config.rms_norm_eps,
-                    ParameterSpec::trainable(name).map_err(Error::backend)?,
-                ),
-                context,
-            )
-        };
         let module = if ordinal == 0 {
-            let (encoder, normalization) = config.context_projection.names();
             Module::Context(ContextEncoder {
-                projection: B::linear(
-                    LinearSpec {
-                        input: self.geometry.hidden * self.geometry.captures,
-                        output: config.hidden_size,
-                        weight: ParameterSpec::trainable(encoder).map_err(Error::backend)?,
-                        bias: None,
-                        format: crate::linear_format::standard_linear_format(
-                            encoder,
-                            config.linear_format_for(encoder),
-                        )?,
-                    },
+                projection: B::linear(self.parameters.edge.projection.clone(), context)?,
+                normalization: B::normalization(
+                    self.parameters.edge.context_norm.clone(),
                     context,
                 )?,
-                normalization: norm(normalization)?,
             })
-        } else if ordinal <= self.geometry.layers {
-            Module::Decoder(DFlashBlock::new(config, ordinal - 1, context)?)
-        } else if ordinal == self.geometry.layers + 1 {
-            Module::Final(norm("norm.weight")?)
+        } else if ordinal <= self.parameters.blocks.len() {
+            Module::Decoder(DFlashBlock::new(
+                config,
+                &self.parameters.blocks[ordinal - 1],
+                context,
+            )?)
+        } else if ordinal == self.parameters.blocks.len() + 1 {
+            Module::Final(B::normalization(
+                self.parameters.edge.final_norm.clone(),
+                context,
+            )?)
         } else {
             return Err(Error::backend("unknown DFlash parameter unit"));
         };

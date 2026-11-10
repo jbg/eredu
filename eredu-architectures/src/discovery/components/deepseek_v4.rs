@@ -1,6 +1,6 @@
 //! V4 scalar boundaries retain grouped writes and dynamic residual evidence.
 use super::*;
-use crate::deepseek::V4Args;
+use crate::deepseek::{v4_specs, V4Args};
 
 mod prediction;
 pub(in crate::discovery) use prediction::declare as declare_prediction;
@@ -19,9 +19,14 @@ fn norm(c: &V4Args, gain: Option<String>) -> ComponentNormalization {
 }
 
 pub(in crate::discovery) fn readout(g: &mut Builder, c: &V4Args) {
-    let width = c.hidden_size as usize;
-    let streams = c.hc_mult as usize;
-    readout_observations(g, width, c.vocab_size as usize);
+    let text = &c.parameters().statics;
+    let embedding_spec = text.embedding_spec();
+    let output = text.head_spec().expect("V4 declares an untied output head");
+    let head_spec =
+        v4_specs::hyper_head_spec(c, "hc_head").expect("validated V4 hyper-head declaration");
+    let width = head_spec.hidden_size as usize;
+    let streams = head_spec.streams as usize;
+    readout_observations(g, width, output.output as usize);
     let collapse = "output.stream_collapse";
     g.node(
         collapse,
@@ -75,9 +80,9 @@ pub(in crate::discovery) fn readout(g: &mut Builder, c: &V4Args) {
         token_embedding_normalization: None,
         embedding_normalization: None,
         embedding: "readout.embedding".into(),
-        embedding_weight: "embed.weight".into(),
+        embedding_weight: embedding_spec.weight.id.as_str().into(),
         embedding_scale: ComponentScalar::new(1.0),
-        tied_embeddings: false,
+        tied_embeddings: text.head_spec().is_none(),
         equation: ComponentReadoutEquation {
             residual_cycles: vec![],
             block_transforms: vec![],
@@ -91,7 +96,7 @@ pub(in crate::discovery) fn readout(g: &mut Builder, c: &V4Args) {
                 head: ComponentStreamHead {
                     input: "readout.streams.effective".into(),
                     coefficients: "readout.stream_coefficients".into(),
-                    parameters: coefficients(c, "parameters:hc_head", "hc_head"),
+                    parameters: head_coefficients("parameters:hc_head", &head_spec),
                 },
             }),
             residual: "readout.residual".into(),
@@ -99,9 +104,9 @@ pub(in crate::discovery) fn readout(g: &mut Builder, c: &V4Args) {
             projection_input: Some("readout.projection_input".into()),
             linear_scores: "readout.linear".into(),
             logits: MODEL_LOGITS_OBSERVATION_PATH.into(),
-            normalization: norm(c, Some("norm.weight".into())),
-            weight: "head.weight".into(),
-            bias: None,
+            normalization: declared_normalization(text.normalization_spec()),
+            weight: output.weight.id.as_str().into(),
+            bias: output.bias.as_ref().map(|p| p.id.as_str().into()),
             output_transform: ComponentOutputTransform::Identity,
             block_normalizations: vec![],
             other_writes: vec![],
@@ -109,24 +114,49 @@ pub(in crate::discovery) fn readout(g: &mut Builder, c: &V4Args) {
     });
 }
 
-fn coefficients(c: &V4Args, group: &str, prefix: &str) -> ComponentStreamCoefficients {
+fn coefficients(
+    group: &str,
+    function: &eredu_nn::ParameterSpec,
+    base: &eredu_nn::ParameterSpec,
+    scale: &eredu_nn::ParameterSpec,
+    norm_epsilon: f32,
+    epsilon: f32,
+) -> ComponentStreamCoefficients {
     ComponentStreamCoefficients {
         parameter_group: group.into(),
-        function: format!("{prefix}_fn"),
-        base: format!("{prefix}_base"),
-        scale: format!("{prefix}_scale"),
-        normalization: norm(c, None),
-        epsilon: ComponentScalar::new(c.hc_eps),
+        function: function.id.as_str().into(),
+        base: base.id.as_str().into(),
+        scale: scale.id.as_str().into(),
+        normalization: ComponentNormalization {
+            kind: ComponentNormalizationKind::Rms,
+            epsilon: ComponentScalar::new(norm_epsilon),
+            gain: None,
+            gain_offset: ComponentScalar::new(0.0),
+            bias: None,
+            groups: 1,
+        },
+        epsilon: ComponentScalar::new(epsilon),
     }
 }
 
-fn stream_axes(c: &V4Args) -> Vec<TensorAxis> {
-    let mut shape = axes(c.hidden_size as usize);
+fn head_coefficients(group: &str, spec: &eredu_nn::HyperHeadSpec) -> ComponentStreamCoefficients {
+    coefficients(
+        group,
+        &spec.function,
+        &spec.base,
+        &spec.scale,
+        spec.norm_epsilon,
+        spec.epsilon,
+    )
+}
+
+fn stream_axes(head: &eredu_nn::HyperHeadSpec) -> Vec<TensorAxis> {
+    let mut shape = axes(head.hidden_size as usize);
     shape.insert(
         2,
         TensorAxis {
             name: "stream".into(),
-            dimension: SymbolicDimension::Known(c.hc_mult as usize),
+            dimension: SymbolicDimension::Known(head.streams as usize),
         },
     );
     shape
@@ -140,7 +170,13 @@ fn stream_cycles(
     attention_node: &str,
     ffn_node: &str,
 ) -> [ComponentStreamCycle; 2] {
-    [true, false].map(|attention| {
+    let hyper_spec = v4_specs::hyper_block_spec(c, parameters)
+        .expect("validated V4 hyper-connection declaration");
+    [
+        (true, &hyper_spec.attention),
+        (false, &hyper_spec.feed_forward),
+    ]
+    .map(|(attention, spec)| {
         let kind = if attention {
             "attention"
         } else {
@@ -170,11 +206,14 @@ fn stream_cycles(
             post: format!("{hyper}.post"),
             combination: format!("{hyper}.combination"),
             coefficients: coefficients(
-                c,
                 &format!("parameters:{parameters}"),
-                &format!("{parameters}.hc_{}", if attention { "attn" } else { "ffn" }),
+                &spec.function,
+                &spec.base,
+                &spec.scale,
+                c.rms_norm_eps,
+                spec.epsilon,
             ),
-            sinkhorn_iterations: c.hc_sinkhorn_iters as usize,
+            sinkhorn_iterations: spec.sinkhorn_iterations,
         }
     })
 }
@@ -188,10 +227,19 @@ pub(in crate::discovery) fn unit(
     attention: &str,
     ffn: &str,
 ) {
-    let width = c.hidden_size as usize;
-    let heads = c.num_attention_heads as usize;
-    let dim = c.head_dim as usize;
     let prefix = format!("{parameters}.attn");
+    let spec =
+        v4_specs::attention_spec(c, layer, &prefix).expect("validated V4 attention declaration");
+    let [attention_norm, _] = v4_specs::block_normalizations(c, parameters)
+        .expect("validated V4 block normalization declarations");
+    let width = spec.kv.input as usize;
+    let heads = spec.geometry.query_heads() as usize;
+    let dim = spec.geometry.key_dimensions() as usize;
+    let query_first = spec
+        .query
+        .first
+        .as_ref()
+        .expect("V4 query has a bottleneck projection");
     let scope = format!("{path}.compressed_attention");
     let parameter_group = format!("parameters:{prefix}");
     let head_rows = |sharing| ComponentRowMapping::HeadRows {
@@ -201,29 +249,27 @@ pub(in crate::discovery) fn unit(
         component_heads_per_read_head: sharing,
         read_head_stride: None,
     };
-    let read = |field: &str, role, sharing, normalization, input_projections| {
-        let weight = format!("{prefix}.{field}.weight");
-        ComponentRead {
-            source: None,
-            projection_output: None,
-            role,
-            shared_weight: weight.clone(),
-            weight,
-            parameter_group: parameter_group.clone(),
-            bias: None,
-            rows: head_rows(sharing),
-            head_normalization: Some(ComponentHeadNormalization {
-                output_scale: ComponentScalar::new(1.0),
-                heads: heads / sharing,
-                head_width: dim,
-                independent_gains: false,
-                normalization,
-            }),
-            input_projections,
-        }
-    };
-    let write = format!("{prefix}.wo_b.weight");
-    let first = format!("{prefix}.wo_a.weight");
+    let read =
+        |projection: &eredu_nn::LinearSpec, role, sharing, normalization, input_projections| {
+            ComponentRead {
+                head_normalization: Some(ComponentHeadNormalization {
+                    output_scale: ComponentScalar::new(1.0),
+                    heads: heads / sharing,
+                    head_width: dim,
+                    independent_gains: false,
+                    normalization,
+                }),
+                input_projections,
+                ..declared_component_read(
+                    projection,
+                    parameter_group.clone(),
+                    role,
+                    head_rows(sharing),
+                )
+            }
+        };
+    let write = spec.output_b.weight.id.as_str().to_owned();
+    let first = spec.output_a.weight.id.as_str().to_owned();
     g.descriptor.components.push(ComponentGroup {
         id: format!("{attention}.channels"),
         node_id: attention.into(),
@@ -238,59 +284,68 @@ pub(in crate::discovery) fn unit(
         input: format!("{scope}.input"),
         reads: vec![
             read(
-                "wq_b",
+                &spec.query.second,
                 ComponentReadRole::Query,
                 1,
-                norm(c, None),
-                vec![ComponentInputProjection {
-                    weight: format!("{prefix}.wq_a.weight"),
-                    shared_weight: format!("{prefix}.wq_a.weight"),
-                    parameter_group: parameter_group.clone(),
-                    bias: None,
-                    rows: 0..c.q_lora_rank as usize,
-                    normalization: Some(norm(c, Some(format!("{prefix}.q_norm.weight")))),
-                    output: format!("{scope}.query.latent.effective"),
-                }],
+                ComponentNormalization {
+                    epsilon: ComponentScalar::new(spec.normalization_epsilon),
+                    ..norm(c, None)
+                },
+                vec![declared_input_projection(
+                    query_first,
+                    parameter_group.clone(),
+                    0..query_first.output as usize,
+                    Some(declared_normalization(&spec.query.normalization)),
+                    format!("{scope}.query.latent.effective"),
+                )],
             ),
             read(
-                "wkv",
+                &spec.kv,
                 ComponentReadRole::Key,
                 heads,
-                norm(c, Some(format!("{prefix}.kv_norm.weight"))),
+                declared_normalization(&spec.kv_norm),
                 vec![],
             ),
             read(
-                "wkv",
+                &spec.kv,
                 ComponentReadRole::Value,
                 heads,
-                norm(c, Some(format!("{prefix}.kv_norm.weight"))),
+                declared_normalization(&spec.kv_norm),
                 vec![],
             ),
         ],
         routed_reads: vec![],
-        shared_write_weight: write.clone(),
+        shared_write_weight: declared_shared_weight(&spec.output_b.weight).into(),
         write_weight: write,
         write_input_projection: Some(ComponentGroupedWriteProjection {
-            shared_weight: first.clone(),
+            shared_weight: declared_shared_weight(&spec.output_a.weight).into(),
             weight: first,
             parameter_group: parameter_group.clone(),
-            bias: None,
-            groups: c.o_groups as usize,
-            rank: c.o_lora_rank as usize,
+            bias: spec
+                .output_a
+                .bias
+                .as_ref()
+                .map(|p| p.id.as_str().to_owned()),
+            groups: spec.groups as usize,
+            rank: spec.output_rank() as usize,
             input: format!("{scope}.grouped_input"),
             output: format!("{scope}.projection"),
             final_input: format!("{scope}.projection_input"),
         }),
         write_parameter_group: parameter_group,
-        write_bias: None,
+        write_bias: spec
+            .output_b
+            .bias
+            .as_ref()
+            .map(|p| p.id.as_str().to_owned()),
         activation_equation: ComponentActivation::Attention {
             attended_head_normalization: None,
             query_heads: heads,
-            key_value_heads: 1,
+            key_value_heads: spec.geometry.key_value_heads() as usize,
             head_width: dim,
             output_gate: None,
         },
-        input_normalization: norm(c, Some(format!("{parameters}.attn_norm.weight"))),
+        input_normalization: declared_normalization(&attention_norm),
         output_gate: None,
         output_normalization: None,
         residual_scale: ComponentScalar::new(1.0),
@@ -310,7 +365,7 @@ pub(in crate::discovery) fn unit(
         ),
         (
             "query.latent",
-            c.q_lora_rank as usize,
+            query_first.output as usize,
             "hidden",
             "Learned-normalized query latent before query-head projection",
         ),
@@ -399,78 +454,27 @@ fn hyper_observations(g: &mut Builder, c: &V4Args, path: &str, attention: &str, 
 
 fn shared(g: &mut Builder, c: &V4Args, layer: usize, path: &str, parameters: &str, ffn: &str) {
     let node = format!("{ffn}.shared");
-    let prefix = format!("{parameters}.ffn.shared_experts");
     let scope = format!("{path}.feed_forward.shared");
-    let parameter_group = format!("parameters:{parameters}.ffn");
-    let count = (c.moe_intermediate_size * c.n_shared_experts) as usize;
-    let write = format!("{prefix}.w2.weight");
-    g.descriptor.components.push(ComponentGroup {
-        id: format!("{node}.units"),
-        node_id: node.clone(),
-        layer_index: layer,
-        count,
-        activation: format!("{scope}.units"),
-        effective_activation: format!("{scope}.units.effective"),
-        write_input: Some(format!("{scope}.write_input")),
-        write_output: Some(format!("{scope}.write")),
-        output: Some(format!("{scope}.output")),
-        write_partition: ComponentWritePartition::TensorParallelSum,
-        input: format!("{scope}.input"),
-        reads: [
-            ("w1", ComponentReadRole::Gate),
-            ("w3", ComponentReadRole::Value),
-        ]
-        .into_iter()
-        .map(|(field, role)| {
-            let weight = format!("{prefix}.{field}.weight");
-            ComponentRead {
-                source: None,
-                projection_output: None,
-                role,
-                shared_weight: weight.clone(),
-                weight,
-                parameter_group: parameter_group.clone(),
-                bias: None,
-                rows: ComponentRowMapping::Direct { offset: 0 },
-                head_normalization: None,
-                input_projections: vec![],
-            }
-        })
-        .collect(),
-        routed_reads: vec![],
-        shared_write_weight: write.clone(),
-        write_weight: write,
-        write_input_projection: None,
-        write_parameter_group: parameter_group,
-        write_bias: None,
-        // V4 clamps routed experts; its shared experts use ordinary SwiGLU.
-        activation_equation: ComponentActivation::Gated {
-            activation: ComponentNonlinearity::Silu {
-                multiplier: ComponentScalar::new(1.0),
-            },
-            gate_upper_bound: None,
-            value_absolute_bound: None,
-            value_offset: ComponentScalar::new(0.0),
-        },
-        input_normalization: norm(c, Some(format!("{parameters}.ffn_norm.weight"))),
-        output_gate: None,
-        output_normalization: None,
-        residual_scale: ComponentScalar::new(1.0),
-    });
-    for suffix in ["input", "units", "write", "output"] {
-        let mut shape = axes(if suffix == "units" {
-            count
-        } else {
-            c.hidden_size as usize
-        });
-        if suffix == "units" {
-            shape[2].name = "component".into();
-        }
-        g.component_observation(
-            &node,
-            format!("{scope}.{suffix}"),
-            "Actual shared expert boundary before the routed/shared contribution sum",
-            shape,
-        );
-    }
+    let spec = v4_specs::moe_spec(c, layer, &format!("{parameters}.ffn"), None)
+        .expect("validated V4 routed declaration");
+    let [_, normalization] = v4_specs::block_normalizations(c, parameters)
+        .expect("validated V4 normalization declaration");
+    g.component_observation(
+        &node,
+        format!("{scope}.input"),
+        "Actual shared expert boundary before the routed/shared contribution sum",
+        axes(spec.routed.shared.gate.input as usize),
+    );
+    super::gated::gated_units(
+        g,
+        &node,
+        layer,
+        &format!("parameters:{parameters}.ffn"),
+        spec.routed.shared.projections(),
+        spec.routed.shared.policy,
+        &scope,
+        &format!("{scope}.input"),
+        declared_normalization(&normalization),
+        ComponentWritePartition::TensorParallelSum,
+    );
 }

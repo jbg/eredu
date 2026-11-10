@@ -6,7 +6,7 @@
 
 use super::{
     config::TtsConfig,
-    tts_mog::{f32_shape, linear, parameter, TtsError},
+    tts_mog::{f32_shape, TtsError},
 };
 use eredu_codec::prvq::{quantize_residual_with_norms_and_score_reduction, DistanceMetric};
 use eredu_nn::{
@@ -147,8 +147,7 @@ impl<T> RefinementState<T> {
 #[derive(Debug)]
 pub struct RvqBank<B: NeuralBackend> {
     table: Parameter<B::Tensor>,
-    dimensions: RvqDimensions,
-    local: super::tts_rvq_layered::RvqLocalDimensions,
+    declaration: super::tts_rvq_specs::BankSpec,
     squared_norms: std::cell::RefCell<Option<B::Tensor>>,
 }
 impl<B: NeuralBackend> Parameterized<B::Tensor> for RvqBank<B> {
@@ -171,34 +170,15 @@ impl<B: NeuralBackend> Parameterized<B::Tensor> for RvqBank<B> {
     }
 }
 impl<B: NeuralBackend> RvqBank<B> {
-    /// Declares the exact immutable checkpoint bank without a projection copy.
+    /// Constructs the declared immutable bank without a projection copy.
     pub fn new(
-        dimensions: RvqDimensions,
+        spec: super::tts_rvq_specs::BankSpec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, TtsError> {
-        Self::new_local(
-            dimensions,
-            super::tts_rvq_layered::RvqLocalDimensions {
-                latent_start: 0,
-                latent: dimensions.latent,
-            },
-            context,
-        )
-    }
-    /// Declares a coherent latent-channel slice of all 31 codebooks.
-    pub fn new_local(
-        dimensions: RvqDimensions,
-        local: super::tts_rvq_layered::RvqLocalDimensions,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, TtsError> {
-        dimensions.validate()?;
-        local.validate(dimensions)?;
-        let mut spec = parameter("rvq_embs", "voicechat.tts.rvq")?;
-        spec.trainable = false;
+        let shape = spec.shape();
         Ok(Self {
-            table: Parameter::unloaded(spec, &[31, dimensions.cardinality, local.latent], context)?,
-            dimensions,
-            local,
+            table: Parameter::unloaded(spec.table.clone(), &shape, context)?,
+            declaration: spec,
             squared_norms: std::cell::RefCell::new(None),
         })
     }
@@ -214,7 +194,7 @@ impl<B: NeuralBackend> RvqBank<B> {
         Ok(norms)
     }
     pub(super) fn geometry(&self) -> (RvqDimensions, super::tts_rvq_layered::RvqLocalDimensions) {
-        (self.dimensions, self.local)
+        (self.declaration.dimensions, self.declaration.local)
     }
     /// Sums codebook means in depth order. Only PAD (`cardinality`) maps to zero;
     /// BOS/EOS and out-of-domain codes are rejected by the ordinary strict gather.
@@ -224,7 +204,7 @@ impl<B: NeuralBackend> RvqBank<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, TtsError> {
         if self.table.as_ref().element_type() != Some(TensorElementType::F32)
-            || self.table.as_ref().shape() != [31, self.dimensions.cardinality, self.local.latent]
+            || self.table.as_ref().shape() != self.declaration.shape()
         {
             return Err(TtsError::Shape(
                 "feedback codebook requires its declared F32 geometry",
@@ -255,7 +235,7 @@ impl<B: NeuralBackend> RvqBank<B> {
         latent: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<RefinementState<B::Tensor>, TtsError> {
-        if self.local.latent != self.dimensions.latent {
+        if self.declaration.local.latent != self.declaration.dimensions.latent {
             return Err(TtsError::Configuration(
                 "sharded RVQ requires parallel quantization",
             ));
@@ -275,10 +255,10 @@ impl<B: NeuralBackend> RvqBank<B> {
     ) -> Result<RefinementState<B::Tensor>, TtsError> {
         let mut squared_norms = None;
         let prepared = (|| {
-            state.validate(self.dimensions)?;
-            f32_shape(latent, self.local.latent)?;
+            state.validate(self.declaration.dimensions)?;
+            f32_shape(latent, self.declaration.local.latent)?;
             super::precision::require_float32(&self.table, latent).map_err(TtsError::Shape)?;
-            if self.table.as_ref().shape() != [31, self.dimensions.cardinality, self.local.latent]
+            if self.table.as_ref().shape() != self.declaration.shape()
                 || state.next_slot().is_none()
                 || state.codes.shape().len() != 3
                 || state.codes.dim(2) != 31
@@ -359,8 +339,8 @@ impl<B: NeuralBackend> RvqBank<B> {
             codes: transition(100, false, codes)?,
             slot: slot + 1,
             depth: end,
-            cardinality: self.dimensions.cardinality,
-            latent: self.dimensions.latent,
+            cardinality: self.declaration.dimensions.cardinality,
+            latent: self.declaration.dimensions.latent,
         })
     }
 }
@@ -379,14 +359,14 @@ impl<B: DistributedNeuralBackend> RvqBank<B> {
         ) -> Result<B::Tensor, TtsError>,
     ) -> Result<RefinementState<B::Tensor>, TtsError> {
         let prepared = (|| {
-            f32_shape(latent, self.dimensions.latent)?;
+            f32_shape(latent, self.declaration.dimensions.latent)?;
             Ok(latent.index(
                 &[
                     Index::Full,
                     Index::Full,
                     Index::Range(
-                        self.local.latent_start,
-                        self.local.latent_start + self.local.latent,
+                        self.declaration.local.latent_start,
+                        self.declaration.local.latent_start + self.declaration.local.latent,
                     ),
                 ],
                 context,
@@ -415,33 +395,15 @@ pub struct RvqProjection<B: NeuralBackend> {
     latent: i32,
 }
 impl<B: NeuralBackend> RvqProjection<B> {
-    /// Declares the canonical embed_code weight exactly once.
+    /// Constructs the declared shared feedback projection.
     pub fn new(
-        dimensions: RvqDimensions,
+        spec: super::tts_rvq_specs::ProjectionSpec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, TtsError> {
-        Self::new_local(dimensions, dimensions.latent, context)
-    }
-    /// Declares the projection columns corresponding to one local codebook slice.
-    pub fn new_local(
-        dimensions: RvqDimensions,
-        latent: i32,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, TtsError> {
-        dimensions.validate()?;
-        if latent <= 0 || latent > dimensions.latent {
-            return Err(TtsError::Configuration("invalid RVQ projection shard"));
-        }
         Ok(Self {
-            embedding: linear::<B>(
-                "embed_code",
-                "voicechat.tts.embed_code",
-                latent,
-                dimensions.hidden,
-                context,
-            )?,
-            dimensions,
-            latent,
+            dimensions: spec.dimensions,
+            latent: spec.embedding.input,
+            embedding: B::linear(spec.embedding, context)?,
         })
     }
     pub(super) fn geometry(&self) -> (RvqDimensions, i32) {
@@ -516,11 +478,13 @@ impl<B: NeuralBackend> RvqRefinement<B> {
     ) -> Result<Self, TtsError> {
         Ok(Self {
             runtime: eredu_runtime::ResidentRuntime::new(
-                super::tts_rvq_layered::RvqKernel::new(RvqDimensions {
-                    cardinality,
-                    latent,
-                    hidden,
-                })?
+                super::tts_rvq_layered::RvqKernel::new(super::tts_rvq_specs::RvqDeclaration::new(
+                    RvqDimensions {
+                        cardinality,
+                        latent,
+                        hidden,
+                    },
+                )?)?
                 .into_component()?,
                 context,
             )
@@ -529,14 +493,14 @@ impl<B: NeuralBackend> RvqRefinement<B> {
     }
     /// Adopts independently materialized codebook and shared projection units.
     pub(super) fn from_parts(
-        dimensions: RvqDimensions,
+        declaration: super::tts_rvq_specs::RvqDeclaration,
         bank: RvqBank<B>,
         projection: RvqProjection<B>,
     ) -> Result<Self, TtsError> {
         use super::tts_rvq_layered::{RvqKernel, RvqUnit};
         Ok(Self {
             runtime: eredu_runtime::ResidentRuntime::from_units(
-                RvqKernel::new(dimensions)?.into_component()?,
+                RvqKernel::new(declaration)?.into_component()?,
                 vec![
                     vec![RvqUnit::Bank(bank)],
                     vec![RvqUnit::Projection(projection)],

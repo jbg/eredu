@@ -237,8 +237,12 @@ impl<B: NeuralBackend> PerceptionRnnt<B> {
             ));
         }
         Self::from_parts(
-            Perception::new_with_precision(perception, precision, context)?,
-            Rnnt::new(rnnt, context)?,
+            Perception::new(
+                super::perception_specs::PerceptionDeclaration::new(perception)?
+                    .with_precision(precision)?,
+                context,
+            )?,
+            Rnnt::new(super::rnnt_specs::RnntDeclaration::new(rnnt)?, context)?,
         )
     }
 }

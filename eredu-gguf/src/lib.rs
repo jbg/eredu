@@ -24,8 +24,8 @@ mod writer;
 pub use block_decode::BlockDecoder;
 pub use catalog::{
     CatalogShard, CatalogTensor, Checkpoint, CheckpointHeader, ConvertedCheckpointTensor,
-    ConvertedTensorIter, LogicalDtype, LogicalTensorLayout, QuantizedTensorRepresentation,
-    RawCheckpointTensor, TensorMaterializer, TranslatedTensorLayout,
+    ConvertedTensorIter, LinearCompanion, LinearCompanionKind, LogicalDtype, LogicalTensorLayout,
+    QuantizedTensorRepresentation, RawCheckpointTensor, TensorMaterializer, TranslatedTensorLayout,
 };
 pub use codebook::IQuantCodebook;
 pub use convert::{

@@ -1,15 +1,8 @@
 //! Exact released assistant admission, separate from ordinary target discovery.
 
 mod construction;
-pub use construction::{SparkAssistantConstruction, SparkAssistantLoadConfig};
+pub use construction::SparkAssistantLoadConfig;
 
-use eredu_checkpoint::{
-    schema::{
-        CatalogPolicy, SafetensorsCheckpointPlan, SafetensorsTensorConstraint,
-        StoredDtypeConstraint,
-    },
-    StoredDtype,
-};
 use serde_json::Value;
 
 use super::super::{DecoderConfig, MuseIdentity};
@@ -56,7 +49,7 @@ pub enum SparkAssistantEquation {
 }
 
 /// Normalized released geometry without backend tensors or inference policy.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SparkAssistantConfig {
     identity: SparkAssistantIdentity,
     equation: SparkAssistantEquation,
@@ -406,117 +399,70 @@ impl SparkAssistantConfig {
         Ok(())
     }
 
-    /// Strict physical BF16 source schema, including the assistants' distinct
-    /// auxiliary heads. DFlash2 borrows its vocabulary modules from the target.
-    pub fn safetensors_plan(&self) -> Result<SafetensorsCheckpointPlan, SparkAssistantError> {
-        let mut tensors = Vec::new();
-        let mut add = |name: String, shape: Vec<usize>| {
-            tensors.push(SafetensorsTensorConstraint::required(
-                name,
-                shape,
-                StoredDtypeConstraint::Exact(StoredDtype::BF16),
-            ))
-        };
-        let h = self.hidden;
-        add("fc.weight".into(), vec![h, h * self.capture_layers.len()]);
-        add("hidden_norm.weight".into(), vec![h]);
-        add("norm.weight".into(), vec![h]);
-        for layer in 0..self.layers {
-            let root = format!("layers.{layer}");
-            for (name, output, input) in [
-                ("self_attn.q_proj", self.query_heads * self.head_dim, h),
-                ("self_attn.k_proj", self.kv_heads * self.head_dim, h),
-                ("self_attn.v_proj", self.kv_heads * self.head_dim, h),
-                ("self_attn.o_proj", h, self.query_heads * self.head_dim),
-            ] {
-                add(format!("{root}.{name}.weight"), vec![output, input]);
-            }
-            let mlp = match self.identity {
-                SparkAssistantIdentity::DSpark => "feed_forward",
-                SparkAssistantIdentity::DFlash2 => "mlp",
-            };
-            for (name, output, input) in [
-                ("gate_proj", self.intermediate, h),
-                ("up_proj", self.intermediate, h),
-                ("down_proj", h, self.intermediate),
-            ] {
-                add(format!("{root}.{mlp}.{name}.weight"), vec![output, input]);
-            }
-            match self.equation {
-                SparkAssistantEquation::MarkovConfidence { .. } => {
-                    for local in [
-                        "self_attn.pre_qkv_proj_norm.weight",
-                        "pre_ffn_norm.weight",
-                        "post_ffn_norm.weight",
-                        "add_attn.gate",
-                        "add_ffn.gate",
-                    ] {
-                        add(format!("{root}.{local}"), vec![h]);
-                    }
-                    add(format!("{root}.self_attn.o_gate_proj.weight"), vec![h, h]);
-                }
-                SparkAssistantEquation::ConvolutionSelector {
-                    taps, group_size, ..
-                } => {
-                    for norm in ["input_layernorm", "post_attention_layernorm"] {
-                        add(format!("{root}.{norm}.weight"), vec![h]);
-                    }
-                    for norm in ["q_norm", "k_norm"] {
-                        add(
-                            format!("{root}.self_attn.{norm}.weight"),
-                            vec![self.head_dim],
-                        );
-                    }
-                    for convolution in ["attention_conv", "mlp_conv"] {
-                        add(
-                            format!("{root}.{convolution}.base_kernel"),
-                            vec![2, taps, h],
-                        );
-                        add(
-                            format!("{root}.{convolution}.kernel_projection.weight"),
-                            vec![2 * taps * (h / group_size), h],
-                        );
-                    }
-                }
-            }
+    pub(in crate::muse::assistant) fn dspark_scopes(
+        &self,
+        formats: &std::collections::HashMap<String, eredu_checkpoint::WeightQuantization>,
+    ) -> Result<
+        (
+            super::body::DsparkBodyParameters,
+            super::dspark::DsparkHeadDefinition,
+        ),
+        SparkAssistantError,
+    > {
+        if self.identity != SparkAssistantIdentity::DSpark {
+            return Err(SparkAssistantError(
+                "DFlash2 has no DSpark parameter scopes".into(),
+            ));
         }
-        match self.equation {
-            SparkAssistantEquation::MarkovConfidence { rank } => {
-                add("lm_head.weight".into(), vec![self.vocabulary, h]);
-                for name in ["markov_w1", "markov_w2"] {
-                    add(
-                        format!("markov_head.{name}.weight"),
-                        vec![self.vocabulary, rank],
-                    );
-                }
-                add("confidence_head.proj.weight".into(), vec![1, h + rank]);
-                add("confidence_head.proj.bias".into(), vec![1]);
-                tensors.push(SafetensorsTensorConstraint::required(
-                    "d2t",
-                    vec![self.vocabulary],
-                    StoredDtypeConstraint::Exact(StoredDtype::I64),
-                ));
-            }
-            SparkAssistantEquation::ConvolutionSelector { rank, .. } => {
-                add(
-                    "candidate_selector.hidden_projection.weight".into(),
-                    vec![rank, h],
-                );
-                for name in ["predecessor_codebook", "successor_codebook"] {
-                    add(
-                        format!("candidate_selector.{name}"),
-                        vec![self.vocabulary, rank],
-                    );
-                }
-            }
-        }
-        SafetensorsCheckpointPlan::new(
-            self.identity.architecture(),
-            tensors,
-            vec![],
-            CatalogPolicy::strict(),
+        let dimension =
+            |value| i32::try_from(value).map_err(|e| SparkAssistantError(format!("{e}")));
+        let body = super::body::DsparkBodyParameters::new(
+            crate::muse::text::specs::AttentionGeometry {
+                hidden: dimension(self.hidden)?,
+                query_heads: dimension(self.query_heads)?,
+                key_value_heads: dimension(self.kv_heads)?,
+                head_width: dimension(self.head_dim)?,
+            },
+            dimension(self.intermediate)?,
+            self.layers,
+            self.capture_layers.len(),
+            |name| {
+                formats
+                    .get(name)
+                    .copied()
+                    .map(Into::into)
+                    .unwrap_or(eredu_checkpoint::LinearFormat::Dense)
+            },
+            crate::muse::text::specs::DsparkScalarPolicy::released(),
         )
-        .map_err(|error| SparkAssistantError(error.to_string()))
+        .map_err(|e| SparkAssistantError(e.to_string()))?;
+        let heads =
+            super::dspark::DsparkHeadDefinition::new(self.dspark_head_geometry()?, formats.clone())
+                .map_err(|e| SparkAssistantError(e.to_string()))?;
+        Ok((body, heads))
+    }
+
+    pub(in crate::muse::assistant) fn dflash2_scopes(
+        &self,
+        formats: &std::collections::HashMap<String, eredu_checkpoint::WeightQuantization>,
+    ) -> Result<
+        (
+            super::body::DFlashBodyDefinition,
+            super::candidate_selector::CandidateSelectorDefinition,
+        ),
+        SparkAssistantError,
+    > {
+        let mut config = self.dflash_decoder_config()?;
+        config.quantized_weights = formats.clone();
+        Ok((
+            super::body::DFlashBodyDefinition::new(config)
+                .map_err(|e| SparkAssistantError(e.to_string()))?,
+            super::candidate_selector::CandidateSelectorDefinition::new(
+                self.candidate_selector_geometry()?,
+                formats.clone(),
+            )
+            .map_err(|e| SparkAssistantError(e.to_string()))?,
+        ))
     }
 
     /// Accepted-context attention window, distinct from the configured context limit.
@@ -577,17 +523,17 @@ impl SparkAssistantConfig {
 
     /// Normalizes the released causal dense assistant independently of target
     /// checkpoint admission. Shared decoder modules consume the resulting geometry.
-    pub fn dspark_decoder_config(
+    pub fn dspark_decoder_policy(
         &self,
         target: &DecoderConfig,
-    ) -> Result<DecoderConfig, SparkAssistantError> {
+    ) -> Result<super::super::DecoderPolicy, SparkAssistantError> {
         self.prove_compatibility(target)?;
         if self.identity != SparkAssistantIdentity::DSpark {
             return Err(SparkAssistantError(
                 "DFlash2 does not use the causal Muse assistant body".into(),
             ));
         }
-        let mut args = target.clone();
+        let mut args = target.policy().clone();
         args.hidden_size = self.hidden as i32;
         args.num_hidden_layers = self.layers as i32;
         args.intermediate_size = self.intermediate as i32;
@@ -608,12 +554,13 @@ impl SparkAssistantConfig {
         .map_err(|e| SparkAssistantError(e.to_string()))?;
         args.qk_scale_factor = (43.7840518911_f64 / (self.head_dim as f64).sqrt()) as f32;
         args.weight_convention = super::super::WeightConvention::HuggingFace;
-        args.rms_norm_eps = 1e-5;
-        args.post_norm_eps = 1e-8;
+        let scalar_policy = crate::muse::text::specs::DsparkScalarPolicy::released();
+        args.rms_norm_eps = scalar_policy.epsilon;
+        args.post_norm_eps = scalar_policy.post_epsilon;
         args.block_normalization = super::super::BlockNormalization::InputScaledFeedForward;
         args.residual_equation = super::super::ResidualEquation::Learned {
-            temperature: 0.3,
-            minimum_variance: 1e-3,
+            temperature: scalar_policy.temperature,
+            minimum_variance: scalar_policy.minimum_variance,
         };
         args.output_multiplier = (self.hidden as f64 / 256.0).powf(-0.5) as f32;
         args.final_logit_softcapping = 20.0;

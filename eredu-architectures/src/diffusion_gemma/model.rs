@@ -149,10 +149,11 @@ pub fn expert_realization_plan(
             .validate_for(config)
             .map_err(Error::backend_source)?;
     }
-    let Some(count) = config.text.num_experts else {
+    let declarations = config.routed_layers();
+    let Some((_, first)) = config.routed_layers().next() else {
         return Ok(None);
     };
-    let global = usize::try_from(count).map_err(Error::backend)?;
+    let global = first.routed.experts.group_count() as usize;
     let local = eredu_core::balanced_contiguous_range(
         global,
         topology.expert_parallel_size(),
@@ -163,10 +164,8 @@ pub fn expert_realization_plan(
     let owner =
         eredu_runtime::ExecutionGroupId::new(TEXT_EXECUTION_GROUP).map_err(Error::backend)?;
     let mut specs = std::collections::BTreeMap::new();
-    for (index, policy) in config.text.layer_schedule.iter().enumerate() {
-        if policy.feed_forward != crate::gemma4::FeedForwardPolicy::DenseWithSparseMoe {
-            continue;
-        }
+    for (index, declaration) in declarations {
+        let bank = &declaration.routed.experts;
         let args = geometry
             .as_ref()
             .and_then(|g| g.block_args(index))
@@ -175,10 +174,7 @@ pub fn expert_realization_plan(
             .as_ref()
             .is_some_and(|g| g.block_args(index).is_none())
         {
-            let global_width = config
-                .text
-                .moe_intermediate_size
-                .ok_or_else(|| Error::backend("missing routed intermediate geometry"))?;
+            let global_width = bank.intermediate_dimensions();
             let owned = eredu_core::balanced_contiguous_range(
                 global_width as usize,
                 topology.tensor_parallel_size(),
@@ -191,11 +187,8 @@ pub fn expert_realization_plan(
             args.moe_intermediate_size
                 .ok_or_else(|| Error::backend("missing routed intermediate geometry"))?
         };
-        let spec = crate::gemma4::text::expert_bank_spec_at(
-            &config.text,
-            &format!("model.decoder.layers.{index}.experts.switch_glu"),
-        )?
-        .with_group_geometry(i32::try_from(local.len()).map_err(Error::backend)?, width)?;
+        let spec =
+            declaration.local_bank(i32::try_from(local.len()).map_err(Error::backend)?, width)?;
         specs.insert((owner.clone(), index), spec);
     }
     if specs.is_empty() {
@@ -307,26 +300,27 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TextKernel<B>
                 .collect::<Vec<_>>();
             let visible = B::Tensor::from_i32_slice(&values, &[1, 1, query, keys], context)?
                 .equal_i32(1, context)?;
-            let merged =
-                match mask.element_type() {
-                    Some(eredu_nn::TensorElementType::Bool) => {
-                        let excluded =
-                            B::Tensor::from_i32_slice(&[0], &[], context)?.equal_i32(1, context)?;
-                        B::Tensor::where_condition(mask, &visible, &excluded, context)?
-                    }
-                    Some(
-                        eredu_nn::TensorElementType::F16
-                        | eredu_nn::TensorElementType::Bf16
-                        | eredu_nn::TensorElementType::F32
-                        | eredu_nn::TensorElementType::F64,
-                    ) => {
-                        let excluded = B::Tensor::full_f32(f32::NEG_INFINITY, &[], context)?;
-                        B::Tensor::where_condition(&visible, mask, &excluded, context)?
-                    }
-                    _ => return Err(Error::backend(
+            let merged = match mask.element_type() {
+                Some(eredu_nn::TensorElementType::Bool) => {
+                    let excluded =
+                        B::Tensor::from_i32_slice(&[0], &[], context)?.equal_i32(1, context)?;
+                    B::Tensor::where_condition(mask, &visible, &excluded, context)?
+                }
+                Some(
+                    eredu_nn::TensorElementType::F16
+                    | eredu_nn::TensorElementType::Bf16
+                    | eredu_nn::TensorElementType::F32
+                    | eredu_nn::TensorElementType::F64,
+                ) => {
+                    let excluded = B::Tensor::full_f32(f32::NEG_INFINITY, &[], context)?;
+                    B::Tensor::where_condition(&visible, mask, &excluded, context)?
+                }
+                _ => {
+                    return Err(Error::backend(
                         "context mask requires known boolean visibility or floating attention bias",
-                    )),
-                };
+                    ));
+                }
+            };
             return Ok(Some(merged));
         }
         if self.config.encoder_attention == super::EncoderAttention::CausalWithVisionSpans {
@@ -752,7 +746,17 @@ where
             .as_ref()
             .and_then(|plan| plan.unit_spec(TEXT_EXECUTION_GROUP, index))
             .cloned();
-        TextLayer::new_with_experts(args, index, experts, context)
+        TextLayer::new_with_experts(
+            args,
+            self.config.encoder_scalar(index)?,
+            self.config.block(index)?,
+            self.config.dense(index)?,
+            self.config.attention(index)?,
+            self.config.routed(index)?,
+            index,
+            experts,
+            context,
+        )
     }
     fn executes_group(&self, _: usize, _: &Self::ForwardContext) -> bool {
         true
@@ -1299,7 +1303,9 @@ where
                 }
                 let words = auxiliary.invocation.to_i32_vec(context)?;
                 if words.len() != 2 || words[1] != position {
-                    return Err(Error::backend("diffusion pipeline context frontier differs from the transported invocation"));
+                    return Err(Error::backend(
+                        "diffusion pipeline context frontier differs from the transported invocation",
+                    ));
                 }
                 let phase = match words[0] {
                     0 => TextInvocationPhase::Context,

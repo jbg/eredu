@@ -10,22 +10,20 @@ pub(super) struct CompressedSite {
 pub(super) fn declare(
     g: &mut Builder,
     c: &DecoderConfig,
+    layer: usize,
     node: &str,
     path: &str,
     parameter: &str,
 ) -> Option<CompressedSite> {
-    let crate::muse::RoutedFeedForwardEquation::CompressedSigmoid { expert_width, .. } =
-        c.routed_feed_forward
-    else {
-        return None;
-    };
-    let latent = expert_width as usize;
-    let width = c.hidden_size as usize;
+    let declaration = c.routed(layer).expect("validated Muse routed declaration");
+    let compression = declaration.compression()?;
+    let scalar = c.scalar(layer).expect("validated Muse scalar declaration");
+    let norms = &compression.norms;
+    let latent = compression.input.output as usize;
+    let width = compression.input.input as usize;
     let boundary = |field| format!("{path}.feed_forward.{field}");
-    let matrix = |field: &str| ComponentTransformParameter {
-        parameter: format!("{parameter}.{field}.weight"),
-        shared_parameter: format!("{parameter}.{field}.weight"),
-        parameter_group: format!("parameters:{parameter}"),
+    let matrix = |projection: &eredu_nn::LinearSpec| {
+        declared_transform_parameter(&projection.weight, format!("parameters:{parameter}"))
     };
     let rows = |channels| {
         vec![
@@ -59,7 +57,9 @@ pub(super) fn declare(
                 },
                 TensorAxis {
                     name: "route".into(),
-                    dimension: SymbolicDimension::Known(c.num_experts_per_tok as usize),
+                    dimension: SymbolicDimension::Known(
+                        declaration.selector().selection().top_k() as usize
+                    ),
                 },
                 TensorAxis {
                     name: "channel".into(),
@@ -85,11 +85,7 @@ pub(super) fn declare(
         format!("{path}.attention.residual.effective"),
         boundary("input"),
         ComponentTensorTransformEquation::Normalization {
-            normalization: norm(
-                c,
-                Some(format!("{path}.pre_feedforward_layernorm.weight")),
-                NormStage::Input,
-            ),
+            normalization: declared_target_norm(&scalar.pre_feed_forward),
         },
     );
     transform(
@@ -97,17 +93,13 @@ pub(super) fn declare(
         format!("{}.effective", boundary("input")),
         boundary("compressed_input"),
         ComponentTensorTransformEquation::AffineProjection {
-            weight: matrix("pre_expert_proj"),
+            weight: matrix(&compression.input),
             bias: None,
             input_width: width,
             output_width: latent,
         },
     );
-    let normalization = norm(
-        c,
-        Some(format!("{parameter}.pre_expert_norm.weight")),
-        NormStage::Input,
-    );
+    let normalization = declared_target_norm(&norms[0]);
     transform(
         format!("{parameter}.pre_expert_norm"),
         format!("{}.effective", boundary("compressed_input")),
@@ -122,11 +114,7 @@ pub(super) fn declare(
         format!("{}.effective", boundary("expert_outputs")),
         boundary("normalized_experts"),
         ComponentTensorTransformEquation::Normalization {
-            normalization: norm(
-                c,
-                Some(format!("{expert_transform}.weight")),
-                NormStage::FeedForwardOutput,
-            ),
+            normalization: declared_target_norm(&norms[1]),
         },
     );
     transform(
@@ -134,7 +122,7 @@ pub(super) fn declare(
         format!("{}.effective", boundary("expert_mixture")),
         boundary("write"),
         ComponentTensorTransformEquation::AffineProjection {
-            weight: matrix("post_expert_proj"),
+            weight: matrix(&compression.output),
             bias: None,
             input_width: latent,
             output_width: width,

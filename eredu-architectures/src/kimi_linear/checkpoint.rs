@@ -3,17 +3,19 @@
 use std::collections::{BTreeMap, HashMap};
 
 use eredu_checkpoint::schema::{
-    AlternativeLayoutGroup, CatalogPolicy, DepthwiseConvolutionSchema, GgufCheckpointPlan,
-    GgufTensorConstraint, GgufTypeConstraint, LayoutVariant, SafetensorsCheckpointPlan,
-    SafetensorsTensorConstraint, StoredDtypeConstraint, TensorOperation,
+    AlternativeLayoutGroup, CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint,
+    GgufTypeConstraint, LayoutVariant, SafetensorsCheckpointPlan, SafetensorsTensorConstraint,
+    StoredDtypeConstraint, TensorOperation,
 };
 use eredu_checkpoint::{
     recipe::DerivedWeightRecipe,
     store::{TensorSelection, WeightStoreBackend},
-    StoredDtype, WeightQuantization,
+    WeightQuantization,
 };
 
-use super::{AttentionKind, FeedForwardPolicy, ModelArgs};
+use super::declarations::{FeedForwardParameters, MixerParameters};
+use super::{Declaration, ModelArgs};
+use eredu_nn::{DeclareLogicalParameters, LogicalParameterRole};
 
 /// Derives a Kimi Linear configuration whose physical matrix formats reflect
 /// load-time quantization instead of checkpoint-specific format selections.
@@ -35,7 +37,29 @@ pub fn with_checkpoint_formats(
     args: &ModelArgs,
     mut formats: HashMap<String, WeightQuantization>,
 ) -> Result<ModelArgs, String> {
-    normalize_weight_formats(args, &mut formats);
+    let source = Declaration::new(args.clone()).map_err(|error| error.to_string())?;
+    for scope in &source.blocks {
+        let FeedForwardParameters::Sparse(spec) = &scope.feed_forward else {
+            continue;
+        };
+        let packed = spec
+            .routed
+            .experts
+            .packed_parameters()
+            .map_err(|error| error.to_string())?;
+        let prefix = packed
+            .gate_up()
+            .parameter
+            .id
+            .as_str()
+            .strip_suffix(".gate_up_proj")
+            .ok_or("expert bank has no declared source root")?;
+        crate::format_references::rehome_split_matrix_format(
+            &mut formats,
+            &packed.gate_up().parameter.id,
+            [format!("{prefix}.gate_proj"), format!("{prefix}.up_proj")],
+        )?;
+    }
     let mut target = args.clone();
     target.quantized_weight_configs = Some(formats);
     target.weight_quantization = None;
@@ -81,13 +105,14 @@ fn expert_source(
 /// Returns the complete neutral recipe catalog for one Kimi execution unit.
 pub fn unit_recipes(
     store: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
-    args: &ModelArgs,
+    declaration: &Declaration,
     layer: usize,
     include_experts: bool,
 ) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
-    let policy = args
-        .layer_policy(layer)
-        .ok_or_else(|| format!("Kimi Linear has no layer policy {layer}"))?;
+    let scope = declaration
+        .blocks
+        .get(layer)
+        .ok_or_else(|| format!("Kimi Linear has no declared layer {layer}"))?;
     let mut recipes = BTreeMap::new();
     let root = format!("model.layers.{layer}");
     let expert_prefix = format!("{root}.mlp.experts");
@@ -104,52 +129,49 @@ pub fn unit_recipes(
         }
     }
 
-    let attention = format!("{root}.self_attn");
-    let projection = checked_mul(
-        dimension(args.kda_config.num_heads, "KDA head count")?,
-        dimension(args.kda_config.head_dim, "KDA head width")?,
-        "KDA projection width",
-    )?;
-    let kernel = dimension(
-        args.kda_config.short_conv_kernel_size,
-        "KDA convolution width",
-    )?;
-    for local in ["q_conv1d.weight", "k_conv1d.weight", "v_conv1d.weight"] {
-        let name = format!("{attention}.{local}");
-        if store.source_metadata(&name).is_ok() {
-            recipes.insert(
-                name.clone(),
-                DerivedWeightRecipe::Reshape {
-                    input: Box::new(DerivedWeightRecipe::source(&name, TensorSelection::Full)),
-                    shape: vec![projection, 1, kernel],
-                },
-            );
+    if let MixerParameters::Kda(spec) = &scope.mixer {
+        for declaration in spec.logical_parameters().map_err(|e| e.to_string())? {
+            let name = declaration.parameter.id.as_str();
+            if store.source_metadata(name).is_err() {
+                continue;
+            }
+            if declaration.parameter.id == spec.a_log.id {
+                let mut recipe = DerivedWeightRecipe::Reshape {
+                    input: Box::new(DerivedWeightRecipe::source(name, TensorSelection::Full)),
+                    shape: declaration.shape,
+                };
+                if store.source_backend().map_err(|e| e.to_string())? == WeightStoreBackend::Gguf {
+                    recipe = DerivedWeightRecipe::NegLog {
+                        input: Box::new(recipe),
+                    };
+                }
+                recipes.insert(name.to_owned(), recipe);
+            } else if spec
+                .convolutions
+                .iter()
+                .any(|c| c.weight.id == declaration.parameter.id)
+            {
+                recipes.insert(
+                    name.to_owned(),
+                    DerivedWeightRecipe::Reshape {
+                        input: Box::new(DerivedWeightRecipe::source(name, TensorSelection::Full)),
+                        shape: declaration.shape,
+                    },
+                );
+            }
         }
-    }
-    let a_log = format!("{attention}.A_log");
-    if store.source_metadata(&a_log).is_ok() {
-        let mut recipe = DerivedWeightRecipe::Reshape {
-            input: Box::new(DerivedWeightRecipe::source(&a_log, TensorSelection::Full)),
-            shape: vec![
-                1,
-                1,
-                dimension(args.kda_config.num_heads, "KDA head count")?,
-                1,
-            ],
-        };
-        if store.source_backend().map_err(|error| error.to_string())? == WeightStoreBackend::Gguf {
-            recipe = DerivedWeightRecipe::NegLog {
-                input: Box::new(recipe),
-            };
-        }
-        recipes.insert(a_log, recipe);
     }
 
-    if !include_experts || policy.feed_forward != FeedForwardPolicy::SparseMoe {
+    if !include_experts {
         return Ok(recipes);
     }
-    let gate_up = format!("{expert_prefix}.gate_up_proj");
-    let down = format!("{expert_prefix}.down_proj");
+    let FeedForwardParameters::Sparse(parameters) = &scope.feed_forward else {
+        return Ok(recipes);
+    };
+    let bank = &parameters.routed.experts;
+    let source = bank.packed_parameters().map_err(|e| e.to_string())?;
+    let gate_up = source.gate_up().parameter.id.as_str().to_owned();
+    let down = source.down().parameter.id.as_str().to_owned();
     if let (Some(gate_up_source), Some(down_source)) =
         (normalized.get(&gate_up), normalized.get(&down))
     {
@@ -183,7 +205,7 @@ pub fn unit_recipes(
         );
         return Ok(recipes);
     }
-    let experts = dimension(args.num_experts, "expert count")?;
+    let experts = source.group_count();
     let mut gate_up_inputs = Vec::with_capacity(experts);
     let mut down_inputs = Vec::with_capacity(experts);
     for expert in 0..experts {
@@ -221,26 +243,42 @@ pub fn unit_recipes(
 /// Returns neutral lazy-loading recipes for one Kimi routed expert.
 pub fn expert_recipes(
     store: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
-    args: &ModelArgs,
+    declaration: &Declaration,
     layer: usize,
     expert: usize,
 ) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
-    let policy = args
-        .layer_policy(layer)
-        .ok_or_else(|| format!("Kimi Linear has no layer {layer}"))?;
-    if policy.feed_forward != FeedForwardPolicy::SparseMoe {
-        return Err(format!("Kimi Linear layer {layer} is not sparse MoE"));
-    }
-    let experts = dimension(args.num_experts, "expert count")?;
-    if expert >= experts {
+    let scope = declaration
+        .blocks
+        .get(layer)
+        .ok_or_else(|| format!("Kimi Linear has no declared layer {layer}"))?;
+    let FeedForwardParameters::Sparse(p) = &scope.feed_forward else {
+        return Err(format!("Kimi Linear layer {layer} has no declared bank"));
+    };
+    expert_recipes_for_bank(store, layer, expert, &p.routed.experts)
+}
+
+fn expert_recipes_for_bank(
+    store: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
+    layer: usize,
+    expert: usize,
+    bank: &eredu_nn::GroupedGatedProductSpec,
+) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
+    let source = bank.packed_parameters().map_err(|e| e.to_string())?;
+    if expert >= source.group_count() {
         return Err(format!(
             "Kimi Linear has no expert {expert} in layer {layer}"
         ));
     }
     let normalized = normalized_checkpoint_keys(store);
-    let prefix = format!("model.layers.{layer}.mlp.experts");
-    let packed_gate_up = format!("{prefix}.gate_up_proj");
-    let packed_down = format!("{prefix}.down_proj");
+    let prefix = source
+        .gate_up()
+        .parameter
+        .id
+        .as_str()
+        .strip_suffix(".gate_up_proj")
+        .ok_or("unresolved Kimi Linear expert source root")?;
+    let packed_gate_up = source.gate_up().parameter.id.as_str().to_owned();
+    let packed_down = source.down().parameter.id.as_str().to_owned();
     let selection = TensorSelection::Range {
         axis: 0,
         start: expert,
@@ -320,8 +358,11 @@ pub fn expert_recipes(
         }
         return Ok(recipes);
     }
-    if args.weight_quantization_for(&packed_gate_up).is_some()
-        || args.weight_quantization_for(&packed_down).is_some()
+    if source
+        .encodings()
+        .map_err(|e| e.to_string())?
+        .iter()
+        .any(|format| format.weight_quantization().is_some())
     {
         return Err("split Kimi Linear experts cannot be lazily load-time quantized".into());
     }
@@ -351,23 +392,19 @@ pub fn expert_recipes(
 /// Builds the complete architecture-owned schedule for independently resident experts.
 pub fn expert_residency_catalog(
     store: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
-    args: &ModelArgs,
+    declaration: &Declaration,
 ) -> Result<crate::ExpertResidencyCatalog, String> {
-    if !args.has_sparse_moe_layers() {
+    if declaration.expert_banks().is_empty() {
         return Err("independent expert residency requires Kimi Linear-MoE".into());
     }
-    let experts = dimension(args.num_experts, "expert count")?;
     let owner_group = eredu_runtime::ExecutionGroupId::new(crate::decoder::TARGET_EXECUTION_GROUP)
         .map_err(|error| error.to_string())?;
     let mut units = Vec::new();
-    for (layer, policy) in args.layer_schedule.iter().enumerate() {
-        if policy.feed_forward != FeedForwardPolicy::SparseMoe {
-            continue;
-        }
+    for (layer, bank) in declaration.expert_banks() {
         let unit_path = format!("model.layers.{layer}");
-        let expert_root = format!("{unit_path}.mlp.experts");
-        for expert in 0..experts {
-            let recipes = expert_recipes(store, args, layer, expert)?;
+        let source = bank.packed_parameters().map_err(|e| e.to_string())?;
+        for expert in 0..source.group_count() {
+            let recipes = expert_recipes_for_bank(store, layer, expert, &bank)?;
             let gate_up_quantizable = !recipes.contains_key("gate_up_proj_scales")
                 && !recipes.contains_key("gate_up_proj_biases");
             let down_quantizable = !recipes.contains_key("down_proj_scales")
@@ -390,7 +427,17 @@ pub fn expert_residency_catalog(
                         }
                         _ => crate::ExpertParameterRole::Preserved,
                     };
-                    let target = format!("{expert_root}.{binding}");
+                    let (primary, suffix) = binding
+                        .strip_prefix("gate_up_proj")
+                        .map(|suffix| (source.gate_up(), suffix))
+                        .or_else(|| {
+                            binding
+                                .strip_prefix("down_proj")
+                                .map(|suffix| (source.down(), suffix))
+                        })
+                        .filter(|(_, suffix)| matches!(*suffix, "" | "_scales" | "_biases"))
+                        .ok_or_else(|| format!("undeclared expert binding {binding}"))?;
+                    let target = format!("{}{suffix}", primary.parameter.id);
                     crate::ExpertParameterRecipe::new(binding, target, recipe, role)
                         .map_err(|error| error.to_string())
                 })
@@ -414,48 +461,29 @@ pub fn expert_residency_catalog(
 }
 
 /// Builds the strict SafeTensors catalog plan.
-pub fn safetensors_plan(args: &ModelArgs) -> Result<SafetensorsCheckpointPlan, String> {
-    let hidden = dimension(args.hidden_size, "hidden size")?;
-    let vocab = dimension(args.vocab_size, "vocabulary size")?;
+pub fn safetensors_plan(declaration: &Declaration) -> Result<SafetensorsCheckpointPlan, String> {
+    let statics = &declaration.statics;
     let mut common = Vec::new();
     let mut groups = Vec::new();
-    add_safe_matrix(
-        args,
-        &mut common,
-        "model.embed_tokens.weight",
-        vec![vocab, hidden],
-    )?;
-    common.push(safe_aliases("model.norm.weight", vec![hidden]));
-    if !args.tie_word_embeddings {
-        add_safe_matrix(args, &mut common, "lm_head.weight", vec![vocab, hidden])?;
+    add_safe_spec(&mut common, statics.embedding_spec())?;
+    add_safe_spec(&mut common, statics.normalization_spec())?;
+    if let Some(head) = statics.head_spec() {
+        add_safe_spec(&mut common, head)?;
     }
-
-    for (layer, policy) in args.layer_schedule.iter().enumerate() {
-        let root = format!("model.layers.{layer}");
-        common.extend([
-            safe_aliases(&format!("{root}.input_layernorm.weight"), vec![hidden]),
-            safe_aliases(
-                &format!("{root}.post_attention_layernorm.weight"),
-                vec![hidden],
-            ),
-        ]);
-        match policy.attention {
-            AttentionKind::Kda => add_safe_kda(args, &root, &mut common)?,
-            AttentionKind::Mla => add_safe_mla(args, &root, &mut common)?,
+    for (layer, scope) in declaration.blocks.iter().enumerate() {
+        for spec in [&scope.input_norm, &scope.post_attention_norm] {
+            add_safe_spec(&mut common, spec)?;
         }
-        match policy.feed_forward {
-            FeedForwardPolicy::Dense => {
-                let intermediate = dimension(args.intermediate_size, "dense intermediate size")?;
-                for (local, shape) in [
-                    ("gate_proj.weight", vec![intermediate, hidden]),
-                    ("up_proj.weight", vec![intermediate, hidden]),
-                    ("down_proj.weight", vec![hidden, intermediate]),
-                ] {
-                    add_safe_matrix(args, &mut common, &format!("{root}.mlp.{local}"), shape)?;
-                }
+        match &scope.mixer {
+            MixerParameters::Kda(p) => add_safe_kda(p, &mut common)?,
+            MixerParameters::Mla(p) => add_safe_spec(&mut common, p)?,
+        }
+        match &scope.feed_forward {
+            FeedForwardParameters::Dense(spec) => {
+                add_safe_spec(&mut common, spec)?;
             }
-            FeedForwardPolicy::SparseMoe => {
-                add_safe_moe(args, layer, &root, &mut common, &mut groups)?;
+            FeedForwardParameters::Sparse(parameters) => {
+                add_safe_moe(parameters, layer, &mut common, &mut groups)?
             }
         }
     }
@@ -463,212 +491,92 @@ pub fn safetensors_plan(args: &ModelArgs) -> Result<SafetensorsCheckpointPlan, S
     policy.allowed_prefixes.push("model.mtp.".into());
     policy.allowed_suffixes.push(".rotary_emb.inv_freq".into());
     SafetensorsCheckpointPlan::new("Kimi Linear SafeTensors", common, groups, policy)
-        .map_err(|error| error.to_string())
+        .map_err(|e| e.to_string())
 }
 
-fn add_safe_kda(
-    args: &ModelArgs,
-    root: &str,
+fn add_safe_spec(
     output: &mut Vec<SafetensorsTensorConstraint>,
+    spec: &impl DeclareLogicalParameters,
 ) -> Result<(), String> {
-    let hidden = dimension(args.hidden_size, "hidden size")?;
-    let heads = dimension(args.kda_config.num_heads, "KDA head count")?;
-    let head = dimension(args.kda_config.head_dim, "KDA head width")?;
-    let kernel = dimension(
-        args.kda_config.short_conv_kernel_size,
-        "KDA convolution width",
-    )?;
-    let projection = checked_mul(heads, head, "KDA projection width")?;
-    let prefix = format!("{root}.self_attn");
-    for (local, shape) in [
-        ("q_proj.weight", vec![projection, hidden]),
-        ("k_proj.weight", vec![projection, hidden]),
-        ("v_proj.weight", vec![projection, hidden]),
-        ("f_a_proj.weight", vec![head, hidden]),
-        ("f_b_proj.weight", vec![projection, head]),
-        ("b_proj.weight", vec![heads, hidden]),
-        ("g_a_proj.weight", vec![head, hidden]),
-        ("g_b_proj.weight", vec![projection, head]),
-        ("o_proj.weight", vec![hidden, projection]),
-    ] {
-        add_safe_matrix(args, output, &format!("{prefix}.{local}"), shape)?;
+    for declaration in spec.logical_parameters().map_err(|e| e.to_string())? {
+        if matches!(
+            declaration.role,
+            LogicalParameterRole::LinearWeight | LogicalParameterRole::Embedding
+        ) {
+            output.extend(source_matrix_constraints(
+                declaration.parameter.id.as_str(),
+                declaration.shape,
+                declaration
+                    .linear_format
+                    .and_then(|format| format.encoding().weight_quantization()),
+            )?);
+        } else {
+            output.push(safe_aliases(
+                declaration.parameter.id.as_str(),
+                declaration.shape,
+            ));
+        }
     }
-    output.extend([
-        safe_aliases(&format!("{prefix}.dt_bias"), vec![projection]),
-        safe_aliases(&format!("{prefix}.o_norm.weight"), vec![head]),
-    ]);
-    let convolution_elements = checked_mul(projection, kernel, "KDA convolution elements")?;
-    let convolution = DepthwiseConvolutionSchema::new(projection, kernel, false)?;
-    for name in ["q_conv1d.weight", "k_conv1d.weight", "v_conv1d.weight"] {
-        output.push(
-            safe_aliases(&format!("{prefix}.{name}"), convolution.storage_shape())
-                .with_element_count(convolution_elements),
-        );
-    }
-    output.push(
-        safe_aliases(&format!("{prefix}.A_log"), vec![1, 1, heads, 1]).with_element_count(heads),
-    );
     Ok(())
 }
 
-fn add_safe_mla(
-    args: &ModelArgs,
-    root: &str,
+fn add_safe_kda(
+    spec: &super::specs::KdaSpec,
     output: &mut Vec<SafetensorsTensorConstraint>,
 ) -> Result<(), String> {
-    let hidden = dimension(args.hidden_size, "hidden size")?;
-    let heads = dimension(args.num_attention_heads, "attention head count")?;
-    let nope = dimension(args.qk_nope_head_dim, "MLA no-PE width")?;
-    let rope = dimension(args.qk_rope_head_dim, "MLA RoPE width")?;
-    let value = dimension(args.v_head_dim, "MLA value width")?;
-    let kv_rank = dimension(args.kv_lora_rank, "KV LoRA rank")?;
-    let query_head = checked_add(nope, rope, "MLA query head width")?;
-    let prefix = format!("{root}.self_attn");
-    if let Some(rank) = args.q_lora_rank {
-        let rank = dimension(rank, "query LoRA rank")?;
-        add_safe_matrix(
-            args,
-            output,
-            &format!("{prefix}.q_a_proj.weight"),
-            vec![rank, hidden],
-        )?;
-        output.push(safe_aliases(
-            &format!("{prefix}.q_a_layernorm.weight"),
-            vec![rank],
-        ));
-        add_safe_matrix(
-            args,
-            output,
-            &format!("{prefix}.q_b_proj.weight"),
-            vec![
-                checked_mul(heads, query_head, "query projection width")?,
-                rank,
-            ],
-        )?;
-    } else {
-        add_safe_matrix(
-            args,
-            output,
-            &format!("{prefix}.q_proj.weight"),
-            vec![
-                checked_mul(heads, query_head, "query projection width")?,
-                hidden,
-            ],
-        )?;
+    for declaration in spec.logical_parameters().map_err(|e| e.to_string())? {
+        let slot = declaration.parameter;
+        if slot.id == spec.a_log.id || spec.convolutions.iter().any(|c| c.weight.id == slot.id) {
+            let elements = declaration.shape.iter().product();
+            output.push(
+                safe_aliases(slot.id.as_str(), declaration.shape).with_element_count(elements),
+            );
+        } else if declaration.role == LogicalParameterRole::LinearWeight {
+            output.extend(source_matrix_constraints(
+                slot.id.as_str(),
+                declaration.shape,
+                declaration
+                    .linear_format
+                    .and_then(|format| format.encoding().weight_quantization()),
+            )?);
+        } else {
+            output.push(safe_aliases(slot.id.as_str(), declaration.shape));
+        }
     }
-    add_safe_matrix(
-        args,
-        output,
-        &format!("{prefix}.kv_a_proj_with_mqa.weight"),
-        vec![checked_add(kv_rank, rope, "KV-A width")?, hidden],
-    )?;
-    output.push(safe_aliases(
-        &format!("{prefix}.kv_a_layernorm.weight"),
-        vec![kv_rank],
-    ));
-    if args.split_kv_b {
-        add_safe_matrix(
-            args,
-            output,
-            &format!("{prefix}.k_b_proj.weight"),
-            vec![checked_mul(heads, nope, "K-B width")?, kv_rank],
-        )?;
-        add_safe_matrix(
-            args,
-            output,
-            &format!("{prefix}.v_b_proj.weight"),
-            vec![checked_mul(heads, value, "V-B width")?, kv_rank],
-        )?;
-    } else {
-        add_safe_matrix(
-            args,
-            output,
-            &format!("{prefix}.kv_b_proj.weight"),
-            vec![
-                checked_mul(
-                    heads,
-                    checked_add(nope, value, "KV-B head width")?,
-                    "KV-B width",
-                )?,
-                kv_rank,
-            ],
-        )?;
-    }
-    add_safe_matrix(
-        args,
-        output,
-        &format!("{prefix}.o_proj.weight"),
-        vec![hidden, checked_mul(heads, value, "attention output width")?],
-    )
+    Ok(())
 }
 
 fn add_safe_moe(
-    args: &ModelArgs,
+    parameters: &super::moe::SparseParameters,
     layer: usize,
-    root: &str,
     common: &mut Vec<SafetensorsTensorConstraint>,
     groups: &mut Vec<AlternativeLayoutGroup<SafetensorsTensorConstraint>>,
 ) -> Result<(), String> {
-    let hidden = dimension(args.hidden_size, "hidden size")?;
-    let experts = dimension(args.num_experts, "expert count")?;
-    let intermediate = dimension(args.moe_intermediate_size, "MoE intermediate size")?;
-    for (local, shape, matrix) in [
-        ("gate.weight", vec![experts, hidden], true),
-        ("gate.e_score_correction_bias", vec![experts], false),
-        (
-            "shared_experts.gate_proj.weight",
-            vec![intermediate, hidden],
-            true,
-        ),
-        (
-            "shared_experts.up_proj.weight",
-            vec![intermediate, hidden],
-            true,
-        ),
-        (
-            "shared_experts.down_proj.weight",
-            vec![hidden, intermediate],
-            true,
-        ),
-    ] {
-        let name = format!("{root}.mlp.{local}");
-        if matrix {
-            add_safe_matrix(args, common, &name, shape)?;
-        } else {
-            common.push(safe_aliases(&name, shape));
-        }
-    }
-
-    let prefix = format!("{root}.mlp.experts");
-    let gate_up = format!("{prefix}.gate_up_proj");
-    let down = format!("{prefix}.down_proj");
-    let mut packed_tensors = safe_matrix_constraints(
-        &gate_up,
-        vec![
-            experts,
-            checked_mul(2, intermediate, "fused expert width")?,
-            hidden,
-        ],
-        args.weight_quantization_for(&gate_up),
-    )?;
-    packed_tensors.extend(safe_matrix_constraints(
+    add_safe_spec(common, &parameters.routed.selector)?;
+    add_safe_spec(common, &parameters.shared)?;
+    let bank = &parameters.routed.experts;
+    let source = bank.packed_parameters().map_err(|e| e.to_string())?;
+    let gate_shape = source.gate_up().shape.clone();
+    let down_shape = source.down().shape.clone();
+    let gate_up = source.gate_up().parameter.id.as_str().to_owned();
+    let down = source.down().parameter.id.as_str().to_owned();
+    let [gate_up_format, down_format] = source.encodings().map_err(|e| e.to_string())?;
+    let mut packed_tensors =
+        source_matrix_constraints(&gate_up, gate_shape, gate_up_format.weight_quantization())?;
+    packed_tensors.extend(source_matrix_constraints(
         &down,
-        vec![experts, hidden, intermediate],
-        args.weight_quantization_for(&down),
+        down_shape.clone(),
+        down_format.weight_quantization(),
     )?);
     let mut split_tensors = Vec::new();
     let mut split_discriminators = Vec::new();
-    for expert in 0..experts {
-        for (projection, shape) in [
-            ("w1", vec![intermediate, hidden]),
-            ("w2", vec![hidden, intermediate]),
-            ("w3", vec![intermediate, hidden]),
-        ] {
-            let name = format!("{prefix}.{expert}.{projection}.weight");
-            split_discriminators.push(name.clone());
-            split_tensors.push(safe_aliases(&name, shape));
-        }
-    }
+    visit_split_expert_sources(&source, |_, name, shape| {
+        split_discriminators.push(name.clone());
+        split_tensors.push(
+            safe_aliases(&name, shape).with_linear_format(eredu_checkpoint::LinearFormat::Dense),
+        );
+        Ok(())
+    })?;
     groups.push(AlternativeLayoutGroup {
         id: format!("Kimi Linear layer {layer} expert storage"),
         required: true,
@@ -688,89 +596,84 @@ fn add_safe_moe(
     Ok(())
 }
 
-fn add_safe_matrix(
-    args: &ModelArgs,
-    output: &mut Vec<SafetensorsTensorConstraint>,
-    name: &str,
-    shape: Vec<usize>,
+/// Projects ordinary source matrix geometry from the neural declaration and
+/// the admitted independent-expert extension, without undoing physical packing.
+pub(crate) fn source_linear_shapes(
+    declaration: &Declaration,
+) -> Result<BTreeMap<String, Vec<usize>>, String> {
+    let mut shapes = declaration
+        .definition()
+        .parameters()
+        .groups()
+        .iter()
+        .flat_map(|group| group.members())
+        .filter(|member| member.logical_role() == Some(LogicalParameterRole::LinearWeight))
+        .filter_map(|member| {
+            member
+                .logical_shape()
+                .filter(|shape| shape.len() == 2)
+                .map(|shape| (member.target().to_owned(), shape.to_vec()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    for bank in declaration.expert_banks().values() {
+        let source = bank.packed_parameters().map_err(|e| e.to_string())?;
+        visit_split_expert_sources(&source, |_, name, shape| {
+            shapes.insert(name, shape);
+            Ok(())
+        })?;
+    }
+    Ok(shapes)
+}
+
+fn visit_split_expert_sources(
+    source: &eredu_nn::PackedGatedProductParameters<'_>,
+    mut visit: impl FnMut(
+        &eredu_nn::LogicalParameterDeclaration<'_>,
+        String,
+        Vec<usize>,
+    ) -> Result<(), String>,
 ) -> Result<(), String> {
-    output.extend(safe_matrix_constraints(
-        name,
-        shape,
-        args.weight_quantization_for(name),
-    )?);
+    let root = source
+        .gate_up()
+        .parameter
+        .id
+        .as_str()
+        .strip_suffix(".gate_up_proj")
+        .ok_or("Kimi expert source has no declared gate/up root")?;
+    let read_shape = source.unfused_shape();
+    for expert in 0..source.group_count() {
+        for (logical, physical, shape) in [
+            (source.gate_up(), "w1", read_shape[1..].to_vec()),
+            (source.down(), "w2", source.down().shape[1..].to_vec()),
+            (source.gate_up(), "w3", read_shape[1..].to_vec()),
+        ] {
+            visit(logical, format!("{root}.{expert}.{physical}.weight"), shape)?;
+        }
+    }
     Ok(())
 }
 
-fn safe_matrix_constraints(
+fn source_matrix_constraints(
     name: &str,
     shape: Vec<usize>,
     quantization: Option<WeightQuantization>,
 ) -> Result<Vec<SafetensorsTensorConstraint>, String> {
     let Some(quantization) = quantization else {
-        return Ok(vec![safe_aliases(name, shape)]);
+        return Ok(vec![
+            safe_aliases(name, shape).with_linear_format(eredu_checkpoint::LinearFormat::Dense)
+        ]);
     };
-    let input = *shape
-        .last()
-        .ok_or_else(|| format!("Kimi Linear matrix {name:?} has scalar shape"))?;
-    let bits = dimension(quantization.bits(), "affine bit width")?;
-    let group = dimension(quantization.group_size(), "affine group size")?;
-    let packed_bits = checked_mul(input, bits, "affine packing")?;
-    if !input.is_multiple_of(group) || !input.is_multiple_of(32) || !packed_bits.is_multiple_of(32)
-    {
-        return Err(format!(
-            "Kimi Linear quantized tensor {name:?} input dimension {input} is incompatible with group size {group} and {bits}-bit packing"
-        ));
-    }
-    let mut packed = shape.clone();
-    *packed.last_mut().expect("matrix shape") = packed_bits / 32;
-    let mut companion_shape = shape;
-    *companion_shape.last_mut().expect("matrix shape") = input / group;
-    let canonical_prefix = outer_prefix(name);
-    let aliases_for = |suffix: &str| {
-        let canonical = format!("{canonical_prefix}.{suffix}");
+    let mut constraints = eredu_checkpoint::schema::matrix_for_packed_words(
+        name,
         physical_names(name)
             .into_iter()
-            .map(|candidate| format!("{}.{suffix}", outer_prefix(&candidate)))
-            .filter(|candidate| candidate != &canonical)
-            .collect::<Vec<_>>()
-    };
-    let companion_dtype = || {
-        StoredDtypeConstraint::OneOf(vec![
-            StoredDtype::F16,
-            StoredDtype::BF16,
-            StoredDtype::F32,
-            StoredDtype::U8,
-        ])
-    };
-    let mut constraints = vec![safe_aliases_with_dtype(
-        name,
-        packed,
-        StoredDtypeConstraint::Exact(StoredDtype::U32),
-    )];
-    constraints.push(
-        SafetensorsTensorConstraint::required(
-            format!("{canonical_prefix}.scales"),
-            companion_shape.clone(),
-            companion_dtype(),
-        )
-        .with_aliases(aliases_for("scales"))
-        .linear_companion(name, eredu_checkpoint::schema::LinearCompanionKind::Scale),
-    );
-    if quantization.has_biases() {
-        constraints.push(
-            SafetensorsTensorConstraint::required(
-                format!("{canonical_prefix}.biases"),
-                companion_shape,
-                companion_dtype(),
-            )
-            .with_aliases(aliases_for("biases"))
-            .linear_companion(
-                name,
-                eredu_checkpoint::schema::LinearCompanionKind::AffineBias,
-            ),
-        );
-    }
+            .filter(|candidate| candidate != name),
+        shape,
+        quantization,
+        None,
+    )
+    .map_err(|error| error.to_string())?;
+    constraints[0].linear_format = Some(quantization.into());
     Ok(constraints)
 }
 
@@ -800,104 +703,44 @@ fn physical_names(canonical: &str) -> Vec<String> {
     names
 }
 
-fn outer_prefix(name: &str) -> &str {
-    name.strip_suffix(".weight").unwrap_or(name)
-}
-
 /// Builds the GGUF physical catalog plan.
-pub fn gguf_plan(args: &ModelArgs) -> Result<GgufCheckpointPlan, String> {
-    let hidden = dimension(args.hidden_size, "hidden size")?;
-    let vocab = dimension(args.vocab_size, "vocabulary size")?;
-    let mut tensors = vec![
-        gguf(
-            "token_embd.weight",
-            vec![vocab, hidden],
-            TensorOperation::Matrix,
-        ),
-        gguf("output_norm.weight", vec![hidden], TensorOperation::Vector),
-    ];
-    if !args.tie_word_embeddings {
-        tensors.push(gguf(
-            "output.weight",
-            vec![vocab, hidden],
-            TensorOperation::Matrix,
-        ));
+pub fn gguf_plan(declaration: &Declaration) -> Result<GgufCheckpointPlan, String> {
+    let statics = &declaration.statics;
+    let mut tensors = Vec::new();
+    add_gguf_spec(&mut tensors, statics.embedding_spec())?;
+    add_gguf_spec(&mut tensors, statics.normalization_spec())?;
+    if let Some(head) = statics.head_spec() {
+        add_gguf_spec(&mut tensors, head)?;
     }
-    for (layer, policy) in args.layer_schedule.iter().enumerate() {
+    for (layer, scope) in declaration.blocks.iter().enumerate() {
         let block = format!("blk.{layer}");
-        tensors.extend([
-            gguf(
-                format!("{block}.attn_norm.weight"),
-                vec![hidden],
-                TensorOperation::Vector,
-            ),
-            gguf(
-                format!("{block}.ffn_norm.weight"),
-                vec![hidden],
-                TensorOperation::Vector,
-            ),
-        ]);
-        match policy.attention {
-            AttentionKind::Kda => add_gguf_kda(args, &block, &mut tensors)?,
-            AttentionKind::Mla => add_gguf_mla(args, &block, &mut tensors)?,
+        for spec in [&scope.input_norm, &scope.post_attention_norm] {
+            add_gguf_spec(&mut tensors, spec)?;
         }
-        match policy.feed_forward {
-            FeedForwardPolicy::Dense => {
-                let intermediate = dimension(args.intermediate_size, "dense intermediate size")?;
-                for (local, shape) in [
-                    ("ffn_gate.weight", vec![intermediate, hidden]),
-                    ("ffn_up.weight", vec![intermediate, hidden]),
-                    ("ffn_down.weight", vec![hidden, intermediate]),
+        match &scope.mixer {
+            MixerParameters::Kda(p) => add_gguf_kda(p, &mut tensors)?,
+            MixerParameters::Mla(p) => add_gguf_spec(&mut tensors, p)?,
+        }
+        match &scope.feed_forward {
+            FeedForwardParameters::Dense(spec) => {
+                add_gguf_spec(&mut tensors, spec)?;
+            }
+            FeedForwardParameters::Sparse(parameters) => {
+                add_gguf_spec(&mut tensors, &parameters.routed.selector)?;
+                add_gguf_spec(&mut tensors, &parameters.shared)?;
+                let bank = &parameters.routed.experts;
+                let source = bank.packed_parameters().map_err(|e| e.to_string())?;
+                let read_shape = source.unfused_shape();
+                for (field, shape) in [
+                    ("ffn_gate_exps.weight", read_shape.clone()),
+                    ("ffn_up_exps.weight", read_shape.clone()),
+                    ("ffn_down_exps.weight", source.down().shape.clone()),
                 ] {
                     tensors.push(gguf(
-                        format!("{block}.{local}"),
+                        format!("{block}.{field}"),
                         shape,
                         TensorOperation::Matrix,
                     ));
-                }
-            }
-            FeedForwardPolicy::SparseMoe => {
-                let experts = dimension(args.num_experts, "expert count")?;
-                let intermediate = dimension(args.moe_intermediate_size, "MoE intermediate size")?;
-                for (local, shape, operation) in [
-                    (
-                        "ffn_gate_inp.weight",
-                        vec![experts, hidden],
-                        TensorOperation::Matrix,
-                    ),
-                    ("exp_probs_b.bias", vec![experts], TensorOperation::Vector),
-                    (
-                        "ffn_gate_shexp.weight",
-                        vec![intermediate, hidden],
-                        TensorOperation::Matrix,
-                    ),
-                    (
-                        "ffn_up_shexp.weight",
-                        vec![intermediate, hidden],
-                        TensorOperation::Matrix,
-                    ),
-                    (
-                        "ffn_down_shexp.weight",
-                        vec![hidden, intermediate],
-                        TensorOperation::Matrix,
-                    ),
-                    (
-                        "ffn_gate_exps.weight",
-                        vec![experts, intermediate, hidden],
-                        TensorOperation::Matrix,
-                    ),
-                    (
-                        "ffn_up_exps.weight",
-                        vec![experts, intermediate, hidden],
-                        TensorOperation::Matrix,
-                    ),
-                    (
-                        "ffn_down_exps.weight",
-                        vec![experts, hidden, intermediate],
-                        TensorOperation::Matrix,
-                    ),
-                ] {
-                    tensors.push(gguf(format!("{block}.{local}"), shape, operation));
                 }
             }
         }
@@ -908,181 +751,88 @@ pub fn gguf_plan(args: &ModelArgs) -> Result<GgufCheckpointPlan, String> {
         Vec::new(),
         CatalogPolicy::non_strict(),
     )
-    .map_err(|error| error.to_string())
+    .map_err(|e| e.to_string())
+}
+
+fn add_gguf_spec(
+    output: &mut Vec<GgufTensorConstraint>,
+    spec: &impl DeclareLogicalParameters,
+) -> Result<(), String> {
+    for declaration in spec.logical_parameters().map_err(|e| e.to_string())? {
+        let operation = if matches!(
+            declaration.role,
+            LogicalParameterRole::LinearWeight | LogicalParameterRole::Embedding
+        ) {
+            TensorOperation::Matrix
+        } else {
+            TensorOperation::Vector
+        };
+        output.push(gguf(
+            gguf_parameter_name(declaration.parameter)?,
+            declaration.shape,
+            operation,
+        ));
+    }
+    Ok(())
 }
 
 fn add_gguf_kda(
-    args: &ModelArgs,
-    block: &str,
+    spec: &super::specs::KdaSpec,
     output: &mut Vec<GgufTensorConstraint>,
 ) -> Result<(), String> {
-    let hidden = dimension(args.hidden_size, "hidden size")?;
-    let heads = dimension(args.kda_config.num_heads, "KDA head count")?;
-    let head = dimension(args.kda_config.head_dim, "KDA head width")?;
-    let kernel = dimension(
-        args.kda_config.short_conv_kernel_size,
-        "KDA convolution width",
-    )?;
-    let projection = checked_mul(heads, head, "KDA projection width")?;
-    for (local, shape, operation) in [
-        (
-            "attn_q.weight",
-            vec![projection, hidden],
-            TensorOperation::Matrix,
-        ),
-        (
-            "attn_k.weight",
-            vec![projection, hidden],
-            TensorOperation::Matrix,
-        ),
-        (
-            "attn_v.weight",
-            vec![projection, hidden],
-            TensorOperation::Matrix,
-        ),
-        (
-            "ssm_f_a.weight",
-            vec![head, hidden],
-            TensorOperation::Matrix,
-        ),
-        (
-            "ssm_f_b.weight",
-            vec![projection, head],
-            TensorOperation::Matrix,
-        ),
-        (
-            "ssm_beta.weight",
-            vec![heads, hidden],
-            TensorOperation::Matrix,
-        ),
-        (
-            "ssm_g_a.weight",
-            vec![head, hidden],
-            TensorOperation::Matrix,
-        ),
-        (
-            "ssm_g_b.weight",
-            vec![projection, head],
-            TensorOperation::Matrix,
-        ),
-        ("ssm_dt.bias", vec![projection], TensorOperation::Vector),
-        ("ssm_norm.weight", vec![head], TensorOperation::Vector),
-        (
-            "attn_output.weight",
-            vec![hidden, projection],
-            TensorOperation::Matrix,
-        ),
-    ] {
-        output.push(gguf(format!("{block}.{local}"), shape, operation));
+    let mut declarations = spec.logical_parameters().map_err(|e| e.to_string())?;
+    declarations.sort_by_key(|d| kda_gguf_storage_order(d.parameter.id.as_str()));
+    for declaration in declarations {
+        let name = gguf_parameter_name(declaration.parameter)?;
+        if declaration.parameter.id == spec.a_log.id {
+            let count = declaration.shape.iter().product::<usize>();
+            output.push(
+                gguf(&name, vec![count], TensorOperation::Vector)
+                    .with_aliases([format!("{name}.weight")])
+                    .with_element_count(count),
+            );
+        } else if spec
+            .convolutions
+            .iter()
+            .any(|c| c.weight.id == declaration.parameter.id)
+        {
+            let count = declaration.shape.iter().product();
+            output.push(
+                gguf(name, declaration.shape, TensorOperation::Dense).with_element_count(count),
+            );
+        } else {
+            let operation = if declaration.role == LogicalParameterRole::LinearWeight {
+                TensorOperation::Matrix
+            } else {
+                TensorOperation::Vector
+            };
+            output.push(gguf(name, declaration.shape, operation));
+        }
     }
-    let convolution_elements = checked_mul(projection, kernel, "KDA convolution elements")?;
-    for local in [
-        "ssm_conv1d_q.weight",
-        "ssm_conv1d_k.weight",
-        "ssm_conv1d_v.weight",
-    ] {
-        output.push(
-            gguf(
-                format!("{block}.{local}"),
-                vec![projection, 1, kernel],
-                TensorOperation::Dense,
-            )
-            .with_element_count(convolution_elements),
-        );
-    }
-    output.push(
-        gguf(
-            format!("{block}.ssm_a"),
-            vec![heads],
-            TensorOperation::Vector,
-        )
-        .with_aliases([format!("{block}.ssm_a.weight")])
-        .with_element_count(heads),
-    );
     Ok(())
 }
 
-fn add_gguf_mla(
-    args: &ModelArgs,
-    block: &str,
-    output: &mut Vec<GgufTensorConstraint>,
-) -> Result<(), String> {
-    let hidden = dimension(args.hidden_size, "hidden size")?;
-    let heads = dimension(args.num_attention_heads, "attention head count")?;
-    let nope = dimension(args.qk_nope_head_dim, "MLA no-PE width")?;
-    let rope = dimension(args.qk_rope_head_dim, "MLA RoPE width")?;
-    let value = dimension(args.v_head_dim, "MLA value width")?;
-    let kv_rank = dimension(args.kv_lora_rank, "KV LoRA rank")?;
-    let query_head = checked_add(nope, rope, "MLA query head width")?;
-    if let Some(rank) = args.q_lora_rank {
-        let rank = dimension(rank, "query LoRA rank")?;
-        for (local, shape, operation) in [
-            (
-                "attn_q_a.weight",
-                vec![rank, hidden],
-                TensorOperation::Matrix,
-            ),
-            ("attn_q_a_norm.weight", vec![rank], TensorOperation::Vector),
-            (
-                "attn_q_b.weight",
-                vec![checked_mul(heads, query_head, "query width")?, rank],
-                TensorOperation::Matrix,
-            ),
-        ] {
-            output.push(gguf(format!("{block}.{local}"), shape, operation));
-        }
-    } else {
-        output.push(gguf(
-            format!("{block}.attn_q.weight"),
-            vec![checked_mul(heads, query_head, "query width")?, hidden],
-            TensorOperation::Matrix,
-        ));
-    }
-    output.extend([
-        gguf(
-            format!("{block}.attn_kv_a_mqa.weight"),
-            vec![checked_add(kv_rank, rope, "KV-A width")?, hidden],
-            TensorOperation::Matrix,
-        ),
-        gguf(
-            format!("{block}.attn_kv_a_norm.weight"),
-            vec![kv_rank],
-            TensorOperation::Vector,
-        ),
-    ]);
-    if args.split_kv_b {
-        output.extend([
-            gguf(
-                format!("{block}.attn_k_b.weight"),
-                vec![checked_mul(heads, nope, "K-B width")?, kv_rank],
-                TensorOperation::Matrix,
-            ),
-            gguf(
-                format!("{block}.attn_v_b.weight"),
-                vec![checked_mul(heads, value, "V-B width")?, kv_rank],
-                TensorOperation::Matrix,
-            ),
-        ]);
-    } else {
-        output.push(gguf(
-            format!("{block}.attn_kv_b.weight"),
-            vec![
-                checked_mul(
-                    heads,
-                    checked_add(nope, value, "KV-B head width")?,
-                    "KV-B width",
-                )?,
-                kv_rank,
-            ],
-            TensorOperation::Matrix,
-        ));
-    }
-    output.push(gguf(
-        format!("{block}.attn_output.weight"),
-        vec![hidden, checked_mul(heads, value, "attention output width")?],
-        TensorOperation::Matrix,
-    ));
-    Ok(())
+fn kda_gguf_storage_order(name: &str) -> usize {
+    [
+        "q_proj.weight",
+        "k_proj.weight",
+        "v_proj.weight",
+        "f_a_proj.weight",
+        "f_b_proj.weight",
+        "b_proj.weight",
+        "g_a_proj.weight",
+        "g_b_proj.weight",
+        "dt_bias",
+        "o_norm.weight",
+        "o_proj.weight",
+        "q_conv1d.weight",
+        "k_conv1d.weight",
+        "v_conv1d.weight",
+        "A_log",
+    ]
+    .iter()
+    .position(|field| name.ends_with(&format!(".{field}")))
+    .expect("declared KDA parameter")
 }
 
 fn gguf(
@@ -1093,30 +843,86 @@ fn gguf(
     GgufTensorConstraint::required(key, shape, GgufTypeConstraint::OperationClass(operation))
 }
 
-fn dimension(value: i32, name: &str) -> Result<usize, String> {
-    usize::try_from(value)
-        .ok()
-        .filter(|value| *value > 0)
-        .ok_or_else(|| format!("Kimi Linear {name} must be positive, got {value}"))
-}
+const GGUF_ROOTS: [(&str, &str); 3] = [
+    ("token_embd", "model.embed_tokens"),
+    ("output_norm", "model.norm"),
+    ("output", "lm_head"),
+];
 
-fn checked_add(left: usize, right: usize, name: &str) -> Result<usize, String> {
-    left.checked_add(right)
-        .ok_or_else(|| format!("Kimi Linear {name} geometry overflows"))
-}
+const GGUF_EXPERT_PARAMETERS: [(&str, &str); 3] = [
+    ("ffn_gate_exps", "mlp.experts.gate_proj"),
+    ("ffn_up_exps", "mlp.experts.up_proj"),
+    ("ffn_down_exps", "mlp.experts.down_proj"),
+];
 
-fn checked_mul(left: usize, right: usize, name: &str) -> Result<usize, String> {
-    left.checked_mul(right)
-        .ok_or_else(|| format!("Kimi Linear {name} geometry overflows"))
+const GGUF_PARAMETERS: [(&str, &str); 30] = [
+    ("attn_q", "self_attn.q_proj"),
+    ("attn_k", "self_attn.k_proj"),
+    ("attn_v", "self_attn.v_proj"),
+    ("attn_q_a", "self_attn.q_a_proj"),
+    ("attn_q_b", "self_attn.q_b_proj"),
+    ("attn_kv_a_mqa", "self_attn.kv_a_proj_with_mqa"),
+    ("attn_kv_b", "self_attn.kv_b_proj"),
+    ("attn_k_b", "self_attn.k_b_proj"),
+    ("attn_v_b", "self_attn.v_b_proj"),
+    ("attn_q_a_norm", "self_attn.q_a_layernorm"),
+    ("attn_kv_a_norm", "self_attn.kv_a_layernorm"),
+    ("attn_output", "self_attn.o_proj"),
+    ("ssm_conv1d_q", "self_attn.q_conv1d"),
+    ("ssm_conv1d_k", "self_attn.k_conv1d"),
+    ("ssm_conv1d_v", "self_attn.v_conv1d"),
+    ("ssm_f_a", "self_attn.f_a_proj"),
+    ("ssm_f_b", "self_attn.f_b_proj"),
+    ("ssm_beta", "self_attn.b_proj"),
+    ("ssm_g_a", "self_attn.g_a_proj"),
+    ("ssm_g_b", "self_attn.g_b_proj"),
+    ("ssm_norm", "self_attn.o_norm"),
+    ("attn_norm", "input_layernorm"),
+    ("ffn_norm", "post_attention_layernorm"),
+    ("ffn_gate", "mlp.gate_proj"),
+    ("ffn_up", "mlp.up_proj"),
+    ("ffn_down", "mlp.down_proj"),
+    ("ffn_gate_shexp", "mlp.shared_experts.gate_proj"),
+    ("ffn_up_shexp", "mlp.shared_experts.up_proj"),
+    ("ffn_down_shexp", "mlp.shared_experts.down_proj"),
+    ("ffn_gate_inp", "mlp.gate"),
+];
+
+fn gguf_parameter_name(parameter: &eredu_nn::ParameterSpec) -> Result<String, String> {
+    let canonical = parameter.id.as_str();
+    for (source, target) in GGUF_ROOTS {
+        if canonical == target || canonical.starts_with(&format!("{target}.")) {
+            return Ok(canonical.replacen(target, source, 1));
+        }
+    }
+    if let Some((layer, parameter)) = canonical
+        .strip_prefix("model.layers.")
+        .and_then(|s| s.split_once('.'))
+    {
+        if parameter == "self_attn.A_log" {
+            return Ok(format!("blk.{layer}.ssm_a"));
+        }
+        if parameter == "self_attn.dt_bias" {
+            return Ok(format!("blk.{layer}.ssm_dt.bias"));
+        }
+        if parameter == "mlp.gate.e_score_correction_bias" {
+            return Ok(format!("blk.{layer}.exp_probs_b.bias"));
+        }
+        for (source, target) in GGUF_PARAMETERS {
+            if parameter == target || parameter.starts_with(&format!("{target}.")) {
+                return Ok(format!(
+                    "blk.{layer}.{}",
+                    parameter.replacen(target, source, 1)
+                ));
+            }
+        }
+    }
+    Err(format!("unresolved Kimi GGUF declaration {canonical}"))
 }
 
 /// Translates a physical GGUF tensor name to canonical Kimi parameter identity.
 pub fn translate_gguf_weight_name(name: &str) -> String {
-    for (source, target) in [
-        ("token_embd", "model.embed_tokens"),
-        ("output_norm", "model.norm"),
-        ("output", "lm_head"),
-    ] {
+    for (source, target) in GGUF_ROOTS {
         if name == source || name.starts_with(&format!("{source}.")) {
             return name.replacen(source, target, 1);
         }
@@ -1127,11 +933,7 @@ pub fn translate_gguf_weight_name(name: &str) -> String {
     let Some((layer, parameter)) = rest.split_once('.') else {
         return name.to_owned();
     };
-    for (source, target) in [
-        ("ffn_gate_exps", "mlp.experts.gate_proj"),
-        ("ffn_up_exps", "mlp.experts.up_proj"),
-        ("ffn_down_exps", "mlp.experts.down_proj"),
-    ] {
+    for (source, target) in GGUF_EXPERT_PARAMETERS {
         if parameter == source || parameter.starts_with(&format!("{source}.")) {
             let suffix = match parameter.strip_prefix(source).unwrap_or_default() {
                 ".weight" => "",
@@ -1145,38 +947,7 @@ pub fn translate_gguf_weight_name(name: &str) -> String {
     if matches!(parameter, "exp_probs_b.bias" | "ffn_exp_probs_b.bias") {
         return format!("model.layers.{layer}.mlp.gate.e_score_correction_bias");
     }
-    for (source, target) in [
-        ("attn_q", "self_attn.q_proj"),
-        ("attn_k", "self_attn.k_proj"),
-        ("attn_v", "self_attn.v_proj"),
-        ("attn_q_a", "self_attn.q_a_proj"),
-        ("attn_q_b", "self_attn.q_b_proj"),
-        ("attn_kv_a_mqa", "self_attn.kv_a_proj_with_mqa"),
-        ("attn_kv_b", "self_attn.kv_b_proj"),
-        ("attn_k_b", "self_attn.k_b_proj"),
-        ("attn_v_b", "self_attn.v_b_proj"),
-        ("attn_q_a_norm", "self_attn.q_a_layernorm"),
-        ("attn_kv_a_norm", "self_attn.kv_a_layernorm"),
-        ("attn_output", "self_attn.o_proj"),
-        ("ssm_conv1d_q", "self_attn.q_conv1d"),
-        ("ssm_conv1d_k", "self_attn.k_conv1d"),
-        ("ssm_conv1d_v", "self_attn.v_conv1d"),
-        ("ssm_f_a", "self_attn.f_a_proj"),
-        ("ssm_f_b", "self_attn.f_b_proj"),
-        ("ssm_beta", "self_attn.b_proj"),
-        ("ssm_g_a", "self_attn.g_a_proj"),
-        ("ssm_g_b", "self_attn.g_b_proj"),
-        ("ssm_norm", "self_attn.o_norm"),
-        ("attn_norm", "input_layernorm"),
-        ("ffn_norm", "post_attention_layernorm"),
-        ("ffn_gate", "mlp.gate_proj"),
-        ("ffn_up", "mlp.up_proj"),
-        ("ffn_down", "mlp.down_proj"),
-        ("ffn_gate_shexp", "mlp.shared_experts.gate_proj"),
-        ("ffn_up_shexp", "mlp.shared_experts.up_proj"),
-        ("ffn_down_shexp", "mlp.shared_experts.down_proj"),
-        ("ffn_gate_inp", "mlp.gate"),
-    ] {
+    for (source, target) in GGUF_PARAMETERS {
         if parameter == source || parameter.starts_with(&format!("{source}.")) {
             return format!(
                 "model.layers.{layer}.{}",
@@ -1193,18 +964,4 @@ pub fn translate_gguf_weight_name(name: &str) -> String {
         return format!("model.layers.{layer}.self_attn.dt_bias");
     }
     name.to_owned()
-}
-
-/// Rehomes split expert GGUF formats onto the canonical fused runtime weights.
-pub fn normalize_weight_formats<V>(args: &ModelArgs, formats: &mut HashMap<String, V>) {
-    for (layer, policy) in args.layer_schedule.iter().enumerate() {
-        if policy.feed_forward != FeedForwardPolicy::SparseMoe {
-            continue;
-        }
-        let prefix = format!("model.layers.{layer}.mlp.experts");
-        if let Some(format) = formats.remove(&format!("{prefix}.gate_proj")) {
-            formats.remove(&format!("{prefix}.up_proj"));
-            formats.insert(format!("{prefix}.gate_up_proj"), format);
-        }
-    }
 }

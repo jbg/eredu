@@ -16,7 +16,7 @@ use super::{
     checkpoint::Component,
     parameters::{admitted_member, execution_parameter, SpeechParameterError},
     tts_mog::{MogDimensions, TtsError},
-    tts_mog_layered::tts_mog_component_definition,
+    tts_mog_specs::{released_declaration, MogDeclaration},
 };
 
 /// Invalid component geometry or exact retained parameter contract.
@@ -62,8 +62,7 @@ pub enum MogPreparationError {
 /// contract declares no full VoiceChat execution capability.
 pub struct PreparedMogBindings {
     precision: super::precision::SpeechPrecision,
-    dimensions: MogDimensions,
-    prepared: PreparedComponent<eredu_runtime::ComponentDefinition>,
+    prepared: PreparedComponent<MogDeclaration>,
 }
 
 impl PreparedMogBindings {
@@ -80,9 +79,15 @@ impl PreparedMogBindings {
         precision
             .validate()
             .map_err(MogPreparationError::Precision)?;
+        let declaration = super::precision::SpeechPrecisionDeclaration::from_groups(
+            self.definition().parameters().groups().iter().filter(|owned| matches!(
+                owned.owner(), eredu_runtime::ParameterGroupOwner::ExecutionUnit { group, .. }
+                    if group.as_str() == super::tts_mog_layered::BLOCKS
+            )),
+        );
         self.prepared = self.prepared.transform_units(|source, units| {
             precision
-                .bindings(source, units)
+                .bindings(source, units, &declaration)
                 .map_err(MogPreparationError::from)
         })?;
         self.precision = precision;
@@ -101,7 +106,7 @@ impl PreparedMogBindings {
             .component_source(Component::Tts)
             .ok_or(SpeechParameterError::MissingComponent(Component::Tts))?;
         Self::from_parameters(
-            MogDimensions::from_config(&artifacts.plan().config().tts)?,
+            released_declaration()?.clone(),
             source.clone(),
             artifacts.plan().parameters(),
         )
@@ -111,14 +116,13 @@ impl PreparedMogBindings {
     /// discovery or native allocation. Shapes follow the symbolic architecture;
     /// neighboring TTS component payloads are excluded.
     pub fn from_parameters(
-        dimensions: MogDimensions,
+        declaration: MogDeclaration,
         source: SharedCheckpointSource,
         parameters: &BTreeMap<String, ParameterAdmission>,
     ) -> Result<Self, MogPreparationError> {
-        let definition = tts_mog_component_definition(dimensions)?;
         let prepared = PreparedComponent::prepare(
             "voicechat/tts_mog/leased-units",
-            definition,
+            declaration,
             source.clone(),
             |member| {
                 let name = member.target();
@@ -132,7 +136,6 @@ impl PreparedMogBindings {
         )?;
         Ok(Self {
             precision: Default::default(),
-            dimensions,
             prepared,
         })
     }
@@ -149,7 +152,7 @@ impl PreparedMogBindings {
 
     /// Lowers each canonical binding through the selected shared physical layout.
     pub fn into_parallel(mut self, layout: &LocalModelLayout) -> Result<Self, MogPreparationError> {
-        super::tts_mog_layered::mog_local_dimensions(self.dimensions, layout)?;
+        self.prepared.declaration().local_dimensions(layout)?;
         self.prepared = self.prepared.select(layout)?;
         Ok(self)
     }
@@ -161,7 +164,7 @@ impl PreparedMogBindings {
 
     /// Validated MoG geometry; no other speech stack is selected.
     pub fn dimensions(&self) -> MogDimensions {
-        self.dimensions
+        self.prepared.declaration().dimensions()
     }
 
     /// Exact prepared unit bindings for cold resource accounting.
@@ -176,25 +179,24 @@ impl PreparedMogBindings {
 
     /// Complete semantic declaration retained through precision and placement selection.
     pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
-        self.prepared.declaration()
+        self.prepared.declaration().definition()
     }
 
     /// Consumes exact source authority and the canonical ordered binding plan.
     pub fn into_parts(
         self,
     ) -> (
-        MogDimensions,
-        eredu_runtime::ComponentDefinition,
+        MogDeclaration,
         Option<LocalModelLayout>,
         eredu_runtime::ExecutionUnitAddressMap,
         SharedCheckpointSource,
         Vec<Vec<WeightBinding>>,
     ) {
-        let (definition, local, layout, source, units) = self
+        let (declaration, local, layout, source, units) = self
             .prepared
             .into_declared_unit_parts()
             .expect("component declares only independently leased units");
-        (self.dimensions, definition, local, layout, source, units)
+        (declaration, local, layout, source, units)
     }
 }
 

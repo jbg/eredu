@@ -29,18 +29,15 @@ impl PreparedTarget {
         let bank = eredu_runtime::RoutedBankId::new(u32::try_from(self.tables.len() + 1).map_err(
             |_| PreparationError::Contract("prediction bank identity exceeds u32".into()),
         )?);
-        let spec = PredictionSpec::from_prepared(
+        let parameters = self
+            .prediction_parameters
+            .as_ref()
+            .ok_or(PreparationError::MissingPrediction)?;
+        let spec = PredictionSpec::from_parameters(
             &self.spec.config,
             limits,
             bank,
-            |depth| {
-                expert_spec(
-                    &self.spec.config,
-                    &self.formats,
-                    &format!("mtp.layers.{depth}.mlp.experts"),
-                )
-            },
-            |name| self.formats.ordinary(name),
+            parameters.as_ref().clone(),
         )?;
         let (shared, recipes) = self
             .prediction_recipes
@@ -52,7 +49,7 @@ impl PreparedTarget {
             .iter()
             .filter(|(name, _)| {
                 name.starts_with("model.embed_tokens.")
-                    || (self.spec.head.is_some() && name.starts_with("lm_head."))
+                    || (self.spec.static_parameters.head.is_some() && name.starts_with("lm_head."))
             })
             .map(|(name, _)| name.clone())
             .collect();

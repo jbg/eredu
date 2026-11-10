@@ -19,9 +19,11 @@ use crate::{
     linear_format::standard_expert_projection,
 };
 
-use super::{recurrent_spec, HybridConfig, HybridLayerPolicy};
+use super::HybridConfig;
 use crate::gated_delta::GatedDeltaMixer;
-use crate::shared_routed::{SharedRoutedGatedProduct, SharedRoutedGatedProductSpec};
+use crate::shared_routed::{
+    SharedRoutedGatedProduct, SharedRoutedGatedProductParameters, SharedRoutedGatedProductSpec,
+};
 
 /// Scheduled hybrid token mixer.
 #[derive(Debug, Clone, Parameterized)]
@@ -38,17 +40,39 @@ pub fn expert_bank_spec(
     config: &HybridConfig,
     layer: usize,
 ) -> Result<GroupedGatedProductSpec, Error> {
-    let target = config.num_hidden_layers as usize;
-    let root = if layer < target {
-        format!("model.layers.{layer}.mlp.experts")
+    config.validate().map_err(Error::backend_source)?;
+    let (schedule, _, layout) = super::parameters::execution_schedule(config)?;
+    expert_bank_in_schedule(config, &schedule, &layout, layer)
+}
+
+fn expert_bank_in_schedule(
+    config: &HybridConfig,
+    schedule: &crate::decoder::SequentialPredictionGroups,
+    layout: &eredu_runtime::ExecutionUnitLayout,
+    layer: usize,
+) -> Result<GroupedGatedProductSpec, Error> {
+    let address = layout.address(layer).ok_or_else(|| {
+        Error::backend(format!("Qwen hybrid has no declared expert layer {layer}"))
+    })?;
+    let root = schedule.unit_path(address.group(), address.index())?;
+    let policy = if address.group() == 0 {
+        *config
+            .layer_schedule
+            .get(address.index())
+            .ok_or_else(|| Error::backend("expert unit has no declared policy"))?
     } else {
-        format!("mtp.layers.{}.mlp.experts", layer - target)
+        super::HybridLayerPolicy::SelfAttention(eredu_core::AttentionPolicy::Full)
     };
-    expert_bank_spec_at(config, &root)
+    match super::BlockParameters::at(config, &root, policy)?.feed_forward {
+        super::specs::FeedForwardParameters::Routed(spec) => Ok(spec.routed.experts),
+        super::specs::FeedForwardParameters::Dense(_) => {
+            Err(Error::backend("dense hybrid unit has no expert bank"))
+        }
+    }
 }
 
 fn expert_bank_spec_at(
-    config: &HybridConfig,
+    config: &super::HybridPolicy,
     expert_prefix: &str,
 ) -> Result<GroupedGatedProductSpec, Error> {
     let gate_up_name = format!("{expert_prefix}.gate_up_proj");
@@ -64,20 +88,32 @@ fn expert_bank_spec_at(
                 &gate_up_name,
                 None,
                 config.linear_format(&gate_up_name),
+                eredu_nn::LinearRowLayout::equal_partitions(2)?,
             )?,
-            down: standard_expert_projection(&down_name, None, config.linear_format(&down_name))?,
+            down: standard_expert_projection(
+                &down_name,
+                None,
+                config.linear_format(&down_name),
+                eredu_nn::LinearRowLayout::Contiguous,
+            )?,
         },
     )
 }
 
-/// Returns the canonical expert bank at rank-local cardinality and width.
-pub(crate) fn localized_expert_bank_spec(
+/// Traverses validated target and prediction units into construction-owned banks.
+pub(crate) fn expert_bank_specs(
     config: &HybridConfig,
-    layer: usize,
-    expert_count: i32,
-    intermediate_dimensions: i32,
-) -> Result<GroupedGatedProductSpec, Error> {
-    expert_bank_spec(config, layer)?.with_group_geometry(expert_count, intermediate_dimensions)
+) -> Result<std::collections::BTreeMap<usize, GroupedGatedProductSpec>, Error> {
+    config.validate().map_err(Error::backend_source)?;
+    if !config.is_moe() {
+        return Ok(std::collections::BTreeMap::new());
+    }
+    let (schedule, _, layout) = super::parameters::execution_schedule(config)?;
+    (0..layout.len())
+        .map(|layer| {
+            expert_bank_in_schedule(config, &schedule, &layout, layer).map(|bank| (layer, bank))
+        })
+        .collect()
 }
 
 /// Dense or routed/shared-expert feed-forward policy selected by configuration.
@@ -91,27 +127,26 @@ pub enum FeedForward<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBacken
 }
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B> {
-    fn new(
-        config: &HybridConfig,
+    fn from_parameters(
+        parameters: super::specs::FeedForwardParameters,
         layer: usize,
-        prefix: &str,
-        routed_spec: Option<GroupedGatedProductSpec>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        if config.is_moe() {
-            SharedRoutedGatedProduct::new(
-                shared_routed_spec(config, layer, prefix, routed_spec)?,
-                context,
-            )
-            .map(Self::Routed)
-        } else {
-            new_mlp(
-                config,
-                &format!("{prefix}.mlp"),
-                config.intermediate_size,
-                context,
-            )
-            .map(Self::Dense)
+        match parameters {
+            super::specs::FeedForwardParameters::Dense(spec) => {
+                bind_mlp(spec, context).map(Self::Dense)
+            }
+            super::specs::FeedForwardParameters::Routed(parameters) => {
+                SharedRoutedGatedProduct::new(
+                    SharedRoutedGatedProductSpec {
+                        layer,
+                        bank: eredu_runtime::RoutedBankId::new(0),
+                        parameters,
+                    },
+                    context,
+                )
+                .map(Self::Routed)
+            }
         }
     }
 
@@ -179,56 +214,21 @@ pub(crate) struct ReplicatedBlock<B: NeuralBackend> {
 }
 
 impl<B: NeuralBackend> ReplicatedBlock<B> {
-    pub(crate) fn new(
-        config: &HybridConfig,
-        layer: usize,
+    pub(crate) fn from_parameters(
+        spec: super::BlockParameters,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        if config.is_moe() {
+        let super::specs::FeedForwardParameters::Dense(feed_forward) = spec.feed_forward else {
             return Err(Error::backend(
-                "replicated Qwen hybrid unit rejects routed computation",
+                "replicated hybrid unit requires dense feed-forward",
             ));
-        }
-        let policy = config
-            .layer_schedule
-            .get(layer)
-            .copied()
-            .ok_or_else(|| Error::backend(format!("Qwen hybrid has no layer {layer}")))?;
-        let root = format!("model.layers.{layer}");
-        let mixer = match policy {
-            HybridLayerPolicy::LinearAttention => TokenMixer::Linear(GatedDeltaMixer::new(
-                recurrent_spec(config, layer)?,
-                context,
-            )?),
-            HybridLayerPolicy::SelfAttention(_) => {
-                TokenMixer::Attention(new_attention(config, &root, context)?)
-            }
         };
-        let norm = |field: &str| {
-            B::normalization(
-                NormalizationConstructionSpec {
-                    reduction: eredu_nn::NormalizationReduction::Native,
-                    groups: None,
-                    dimensions: config.hidden_size,
-                    epsilon: config.rms_norm_eps,
-                    scale: NormalizationScale::LearnedOffset {
-                        weight: parameter(format!("{root}.{field}.weight"))?,
-                        offset: 1.0,
-                    },
-                },
-                context,
-            )
-        };
+        let [input, post] = spec.norms;
         Ok(Self {
-            mixer,
-            feed_forward: new_mlp(
-                config,
-                &format!("{root}.mlp"),
-                config.intermediate_size,
-                context,
-            )?,
-            input_norm: norm("input_layernorm")?,
-            post_attention_norm: norm("post_attention_layernorm")?,
+            mixer: bind_mixer(spec.mixer, context)?,
+            feed_forward: bind_mlp(feed_forward, context)?,
+            input_norm: B::normalization(input, context)?,
+            post_attention_norm: B::normalization(post, context)?,
         })
     }
 
@@ -285,95 +285,18 @@ impl<B: NeuralBackend> ReplicatedBlock<B> {
 }
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
-    /// Builds one global-geometry physical decoder layer.
-    pub fn new(
-        config: &HybridConfig,
+    /// Binds a complete prepared block without reconstructing parameter policy.
+    pub fn from_parameters(
+        spec: super::BlockParameters,
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        Self::new_with_routed_spec(config, layer, None, context)
-    }
-
-    pub(crate) fn new_with_routed_spec(
-        config: &HybridConfig,
-        layer: usize,
-        routed_spec: Option<GroupedGatedProductSpec>,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        let policy = config
-            .layer_schedule
-            .get(layer)
-            .copied()
-            .ok_or_else(|| Error::backend(format!("Qwen hybrid has no layer {layer}")))?;
-        Self::new_at(
-            config,
-            layer,
-            &format!("model.layers.{layer}"),
-            policy,
-            routed_spec,
-            context,
-        )
-    }
-
-    /// Builds one configured MTP prediction block at its checkpoint path.
-    pub fn new_mtp(
-        config: &HybridConfig,
-        depth: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        if depth >= usize::try_from(config.mtp_num_hidden_layers).map_err(Error::backend)? {
-            return Err(Error::backend(format!(
-                "Qwen hybrid MTP depth {depth} is outside {} configured layers",
-                config.mtp_num_hidden_layers
-            )));
-        }
-        Self::new_at(
-            config,
-            config.num_hidden_layers as usize + depth,
-            &format!("mtp.layers.{depth}"),
-            HybridLayerPolicy::SelfAttention(eredu_core::attention::AttentionPolicy::Full),
-            None,
-            context,
-        )
-    }
-
-    fn new_at(
-        config: &HybridConfig,
-        layer: usize,
-        root: &str,
-        policy: HybridLayerPolicy,
-        routed_spec: Option<GroupedGatedProductSpec>,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        let mixer = match policy {
-            HybridLayerPolicy::LinearAttention => TokenMixer::Linear(GatedDeltaMixer::new(
-                recurrent_spec(config, layer)?,
-                context,
-            )?),
-            HybridLayerPolicy::SelfAttention(_) => {
-                TokenMixer::Attention(new_attention(config, root, context)?)
-            }
-        };
-        let norm = |field: &str| {
-            B::normalization(
-                NormalizationConstructionSpec {
-                    reduction: eredu_nn::NormalizationReduction::Native,
-                    groups: None,
-                    dimensions: config.hidden_size,
-                    epsilon: config.rms_norm_eps,
-                    scale: NormalizationScale::LearnedOffset {
-                        weight: parameter(format!("{root}.{field}.weight"))?,
-                        offset: 1.0,
-                    },
-                },
-                context,
-            )
-        };
+        let [input, post] = spec.norms;
         Ok(Self {
-            mixer,
-            feed_forward: FeedForward::new(config, layer, root, routed_spec, context)?,
-            input_norm: norm("input_layernorm")?,
-            post_attention_norm: norm("post_attention_layernorm")?,
+            mixer: bind_mixer(spec.mixer, context)?,
+            feed_forward: FeedForward::from_parameters(spec.feed_forward, layer, context)?,
+            input_norm: B::normalization(input, context)?,
+            post_attention_norm: B::normalization(post, context)?,
         })
     }
 
@@ -696,122 +619,154 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
     }
 }
 
-fn new_attention<B: NeuralBackend>(
-    config: &HybridConfig,
-    root: &str,
+fn bind_mixer<B: NeuralBackend>(
+    spec: super::specs::MixerParameters,
+    context: &<B::Tensor as Tensor>::Context,
+) -> Result<TokenMixer<B>, Error> {
+    match spec {
+        super::specs::MixerParameters::Recurrent(s) => {
+            GatedDeltaMixer::new(s, context).map(TokenMixer::Linear)
+        }
+        super::specs::MixerParameters::Attention(s) => {
+            bind_attention(s, context).map(TokenMixer::Attention)
+        }
+    }
+}
+
+fn bind_attention<B: NeuralBackend>(
+    spec: AttentionParameters,
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<Attention<B>, Error> {
-    let prefix = format!("{root}.self_attn");
-    let [query, key, value, output] = attention_projection_specs(config, root)?;
-    let norm = |field: &str| {
-        B::normalization(
-            NormalizationConstructionSpec {
-                reduction: eredu_nn::NormalizationReduction::Native,
-                groups: None,
-                dimensions: config.head_dim,
-                epsilon: config.rms_norm_eps,
-                scale: NormalizationScale::LearnedOffset {
-                    weight: parameter(format!("{prefix}.{field}.weight"))?,
-                    offset: 1.0,
-                },
-            },
-            context,
-        )
-    };
-    let rope_config = config.rope_config();
+    let heads = spec.projection.geometry;
     Attention::from_gated_parts(
-        config.num_attention_heads,
-        config.num_key_value_heads,
-        config.head_dim,
-        B::linear(query, context)?,
-        B::linear(key, context)?,
-        B::linear(value, context)?,
-        B::linear(output, context)?,
-        Some(norm("q_norm")?),
-        Some(norm("k_norm")?),
-        Some(B::rotary(
-            RotarySpec {
+        heads.query_heads(),
+        heads.key_value_heads(),
+        heads.key_dimensions(),
+        B::linear(spec.projection.query, context)?,
+        B::linear(spec.projection.key, context)?,
+        B::linear(spec.projection.value, context)?,
+        B::linear(spec.projection.output, context)?,
+        Some(B::normalization(spec.query_norm, context)?),
+        Some(B::normalization(spec.key_norm, context)?),
+        Some(B::rotary(spec.rotary, context)?),
+        None,
+    )
+}
+
+fn bind_mlp<B: NeuralBackend>(
+    spec: eredu_nn::SplitGatedProductSpec,
+    context: &<B::Tensor as Tensor>::Context,
+) -> Result<Mlp<B>, Error> {
+    Ok(Mlp::from_parts(
+        B::linear(spec.gate, context)?,
+        B::linear(spec.up, context)?,
+        B::linear(spec.down, context)?,
+        spec.policy,
+    ))
+}
+
+/// Interleaved query/gate attention slots and geometry shared by cold and native consumers.
+#[derive(Debug, Clone)]
+pub(crate) struct AttentionParameters {
+    pub projection: eredu_nn::SelfAttentionProjectionSpec,
+    pub query_norm: NormalizationConstructionSpec,
+    pub key_norm: NormalizationConstructionSpec,
+    pub rotary: RotarySpec,
+}
+
+impl AttentionParameters {
+    pub const QUERY_LAYOUT: eredu_nn::AttentionQueryLayout =
+        eredu_nn::AttentionQueryLayout::InterleavedGate;
+    pub(super) fn new(config: &super::HybridPolicy, root: &str) -> Result<Self, Error> {
+        let heads = config.attention_head_geometry()?;
+        let prefix = format!("{root}.self_attn");
+        let projection = |field: &str, input, output| {
+            linear_spec(
+                config,
+                &format!("{prefix}.{field}"),
+                input,
+                output,
+                config.attention_bias,
+            )
+        };
+        let norm = |field: &str| {
+            normalization_spec(config, format!("{prefix}.{field}.weight"), config.head_dim)
+        };
+        let rope_config = config.rope_config();
+        let spec = Self {
+            projection: eredu_nn::SelfAttentionProjectionSpec::new(
+                heads,
+                Self::QUERY_LAYOUT,
+                projection(
+                    "q_proj",
+                    config.hidden_size,
+                    Self::QUERY_LAYOUT.projected_width(heads)?,
+                )?,
+                projection("k_proj", config.hidden_size, heads.key_width())?,
+                projection("v_proj", config.hidden_size, heads.value_width())?,
+                projection("o_proj", heads.attended_width(), config.hidden_size)?,
+            )?,
+            query_norm: norm("q_norm")?,
+            key_norm: norm("k_norm")?,
+            rotary: RotarySpec {
                 arithmetic: eredu_nn::RotaryArithmetic::Native,
                 dimensions: config.rope_dimensions(),
                 base: config.rope_theta(),
                 traditional: false,
                 algorithm: crate::rotary::normalize_algorithm(rope_config.as_ref())
-                    .expect("validated Qwen hybrid RoPE algorithm"),
+                    .map_err(Error::backend)?,
             },
-            context,
-        )?),
-        None,
-    )
+        };
+        use eredu_nn::DeclareLogicalParameters;
+        spec.logical_parameters()?;
+        Ok(spec)
+    }
+    pub(crate) fn state_policy(
+        &self,
+        attention: eredu_core::AttentionPolicy,
+    ) -> Result<eredu_core::cache::LayerCachePolicy, Error> {
+        use eredu_nn::DeclareLogicalParameters;
+        self.logical_parameters()?;
+        let heads = self.projection.geometry;
+        eredu_core::cache::LayerCachePolicy::key_value(
+            attention,
+            heads.key_value_heads(),
+            heads.key_dimensions(),
+        )
+        .map_err(Error::backend_source)
+    }
 }
 
-fn new_mlp<B: NeuralBackend>(
-    config: &HybridConfig,
+impl eredu_nn::DeclareLogicalParameters for AttentionParameters {
+    fn logical_parameters(&self) -> Result<Vec<eredu_nn::LogicalParameterDeclaration<'_>>, Error> {
+        let heads = self.projection.geometry;
+        if self.projection.query_layout != Self::QUERY_LAYOUT
+            || heads.key_dimensions() != heads.value_dimensions()
+            || self.projection.output.output != self.projection.query.input
+            || self.query_norm.dimensions != heads.key_dimensions()
+            || self.key_norm.dimensions != heads.key_dimensions()
+            || self.rotary.dimensions < 2
+            || self.rotary.dimensions > heads.key_dimensions()
+        {
+            return Err(Error::backend(
+                "Qwen hybrid attention residual, gate, normalization or rotary geometry mismatch",
+            ));
+        }
+        let mut parameters = self.projection.logical_parameters()?;
+        parameters.extend(self.query_norm.logical_parameters()?);
+        parameters.extend(self.key_norm.logical_parameters()?);
+        eredu_nn::validate_logical_parameter_topology(&parameters)
+            .map_err(Error::backend_source)?;
+        Ok(parameters)
+    }
+}
+
+pub(super) fn mlp_parameters(
+    config: &super::HybridPolicy,
     prefix: &str,
     intermediate: i32,
-    context: &<B::Tensor as Tensor>::Context,
-) -> Result<Mlp<B>, Error> {
-    let [gate, up, down] = mlp_projection_specs(config, prefix, intermediate)?;
-    Ok(Mlp::from_parts(
-        B::linear(gate, context)?,
-        B::linear(up, context)?,
-        B::linear(down, context)?,
-        None,
-    ))
-}
-
-pub(super) fn attention_projection_specs(
-    config: &HybridConfig,
-    root: &str,
-) -> Result<[LinearSpec; 4], Error> {
-    let prefix = format!("{root}.self_attn");
-    let query = config
-        .num_attention_heads
-        .checked_mul(config.head_dim)
-        .ok_or_else(|| Error::backend("query width overflow"))?;
-    let kv = config
-        .num_key_value_heads
-        .checked_mul(config.head_dim)
-        .ok_or_else(|| Error::backend("key/value width overflow"))?;
-    Ok([
-        linear_spec(
-            config,
-            &format!("{prefix}.q_proj"),
-            config.hidden_size,
-            query
-                .checked_mul(2)
-                .ok_or_else(|| Error::backend("gated query width overflow"))?,
-            config.attention_bias,
-        )?,
-        linear_spec(
-            config,
-            &format!("{prefix}.k_proj"),
-            config.hidden_size,
-            kv,
-            config.attention_bias,
-        )?,
-        linear_spec(
-            config,
-            &format!("{prefix}.v_proj"),
-            config.hidden_size,
-            kv,
-            config.attention_bias,
-        )?,
-        linear_spec(
-            config,
-            &format!("{prefix}.o_proj"),
-            query,
-            config.hidden_size,
-            config.attention_bias,
-        )?,
-    ])
-}
-
-pub(super) fn mlp_projection_specs(
-    config: &HybridConfig,
-    prefix: &str,
-    intermediate: i32,
-) -> Result<[LinearSpec; 3], Error> {
-    Ok([
+) -> Result<eredu_nn::SplitGatedProductSpec, Error> {
+    eredu_nn::SplitGatedProductSpec::new(
         linear_spec(
             config,
             &format!("{prefix}.gate_proj"),
@@ -833,11 +788,31 @@ pub(super) fn mlp_projection_specs(
             config.hidden_size,
             false,
         )?,
-    ])
+        eredu_nn::GatedProductPolicy::ordinary_silu(),
+    )
+}
+
+pub(super) fn normalization_spec(
+    config: &super::HybridPolicy,
+    name: impl AsRef<str>,
+    width: i32,
+) -> Result<NormalizationConstructionSpec, Error> {
+    let spec = NormalizationConstructionSpec {
+        reduction: eredu_nn::NormalizationReduction::Native,
+        groups: None,
+        dimensions: width,
+        epsilon: config.rms_norm_eps,
+        scale: NormalizationScale::LearnedOffset {
+            weight: parameter(name)?,
+            offset: 1.0,
+        },
+    };
+    spec.validate()?;
+    Ok(spec)
 }
 
 pub(super) fn linear_spec(
-    config: &HybridConfig,
+    config: &super::HybridPolicy,
     prefix: &str,
     input: i32,
     output: i32,
@@ -862,7 +837,7 @@ fn parameter(name: impl AsRef<str>) -> Result<ParameterSpec, Error> {
     ParameterSpec::trainable(name.as_ref()).map_err(Error::backend)
 }
 
-impl HybridConfig {
+impl super::HybridPolicy {
     /// Selection policy shared by module construction and intervention discovery.
     pub(crate) fn routing_spec(&self) -> Result<TopKGroupSelectionSpec, Error> {
         TopKGroupSelectionSpec::new(
@@ -936,33 +911,35 @@ fn finish_feed_forward<B: NeuralBackend>(
     instrumentation.apply("feed_forward.residual", hidden.add(&output, context)?)
 }
 
-pub(super) fn shared_routed_spec(
-    config: &HybridConfig,
-    layer: usize,
+pub(super) fn shared_routed_parameters(
+    config: &super::HybridPolicy,
     prefix: &str,
     routed_spec: Option<GroupedGatedProductSpec>,
-) -> Result<SharedRoutedGatedProductSpec, Error> {
+) -> Result<SharedRoutedGatedProductParameters, Error> {
     let prefix = format!("{prefix}.mlp");
     let router_name = format!("{prefix}.gate.weight");
-    Ok(SharedRoutedGatedProductSpec {
-        layer,
-        bank: eredu_runtime::RoutedBankId::new(0),
-        router: TopKGroupSelectorSpec::new(
-            config.hidden_size,
-            parameter(&router_name)?,
-            crate::linear_format::standard_linear_format(&router_name, config.quantization.into())?,
-            config.routing_spec()?,
-        )?,
-        experts: match routed_spec {
-            Some(spec) => spec,
-            None => expert_bank_spec_at(config, &format!("{prefix}.experts"))?,
+    let shared = mlp_parameters(
+        config,
+        &format!("{prefix}.shared_expert"),
+        config.shared_expert_intermediate_size,
+    )?;
+    let spec = SharedRoutedGatedProductParameters {
+        routed: eredu_nn::RoutedGatedProductSpec {
+            selector: TopKGroupSelectorSpec::new(
+                config.hidden_size,
+                parameter(&router_name)?,
+                crate::linear_format::standard_linear_format(
+                    &router_name,
+                    config.linear_format(&router_name),
+                )?,
+                config.routing_spec()?,
+            )?,
+            experts: match routed_spec {
+                Some(spec) => spec,
+                None => expert_bank_spec_at(config, &format!("{prefix}.experts"))?,
+            },
         },
-        shared: mlp_projection_specs(
-            config,
-            &format!("{prefix}.shared_expert"),
-            config.shared_expert_intermediate_size,
-        )?,
-        shared_policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
+        shared,
         shared_gate: linear_spec(
             config,
             &format!("{prefix}.shared_expert_gate"),
@@ -971,5 +948,7 @@ pub(super) fn shared_routed_spec(
             false,
         )?,
         gate_activation: eredu_nn::OutputGateActivation::Sigmoid,
-    })
+    };
+    spec.validate()?;
+    Ok(spec)
 }

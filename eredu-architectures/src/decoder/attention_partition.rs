@@ -1,6 +1,6 @@
 //! Joint projection alignment while retaining complete grouped-query heads.
 
-use super::{AttentionProjectionLayout, Config};
+use super::topology::{AttentionInputParameters, AttentionParameters};
 use eredu_checkpoint::LinearFormat;
 use eredu_runtime::{MemberSharding, ParallelPlanError, ParameterGroupSpec, ParameterRole};
 
@@ -11,41 +11,26 @@ pub(crate) struct AttentionPartition {
 }
 
 impl AttentionPartition {
-    pub(crate) fn new(config: &impl Config, layer: usize) -> Result<Self, ParallelPlanError> {
+    pub(crate) fn from_parameters(
+        parameters: &AttentionParameters,
+        implicit_value_format: LinearFormat,
+    ) -> Result<Self, ParallelPlanError> {
         let invalid = |message: &str| ParallelPlanError::InvalidGroup(message.into());
-        let heads = usize::try_from(config.num_key_value_heads())
-            .map_err(|_| invalid("attention key/value head count is negative"))?;
-        let queries = usize::try_from(config.num_attention_heads())
-            .map_err(|_| invalid("attention query head count is negative"))?;
-        let width = usize::try_from(config.head_dim())
-            .map_err(|_| invalid("attention head width is negative"))?;
-        if heads == 0 || queries == 0 || width == 0 || !queries.is_multiple_of(heads) {
-            return Err(invalid(
-                "attention partition requires complete positive GQA groups",
-            ));
-        }
-        let query_width = (queries / heads)
-            .checked_mul(width)
-            .ok_or_else(|| invalid("attention group width overflows"))?;
-        let fields = config
-            .block_parameter_fields()
-            .validate()
-            .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-        let prefix = format!(
-            "{}.layers.{layer}.{}",
-            config.parameter_root(),
-            fields.attention
-        );
-        let format = |field: &str| config.linear_format(&format!("{prefix}.{field}.weight"));
-        let (query, key, value) = match config.attention_projection_layout() {
-            AttentionProjectionLayout::Split => (
-                format(fields.attention_query),
-                format(fields.attention_key),
-                config.attention_value_format(layer),
+        let geometry = parameters.geometry;
+        let heads = geometry.key_value_heads() as usize;
+        let width = geometry.key_dimensions() as usize;
+        let query_width = geometry.query_width() as usize / heads;
+        let (query, key, value) = match &parameters.input {
+            AttentionInputParameters::Split { query, key, value } => (
+                query.format.encoding(),
+                key.format.encoding(),
+                value
+                    .as_ref()
+                    .map_or_else(|| implicit_value_format, |spec| spec.format.encoding()),
             ),
-            AttentionProjectionLayout::Fused { field } => {
-                let fused = format(field);
-                (fused, fused, fused)
+            AttentionInputParameters::Fused { projection, .. } => {
+                let format = projection.format.encoding();
+                (format, format, format)
             }
         };
         let mut heads_per_chunk = 1usize;
@@ -62,14 +47,14 @@ impl AttentionPartition {
         for (format, elements) in [(query, query_width), (key, width), (value, width)] {
             constrain(elements, row_alignment(format)?)?;
         }
-        if let Some((field, _)) = config.attention_output_gate() {
-            constrain(query_width, row_alignment(format(field))?)?;
+        if let Some((gate, _)) = &parameters.gate {
+            constrain(query_width, row_alignment(gate.format.encoding())?)?;
         }
         constrain(
             query_width,
-            usize::try_from(crate::linear_format::input_partition_alignment(format(
-                fields.attention_output,
-            )))
+            usize::try_from(crate::linear_format::input_partition_alignment(
+                parameters.output.format.encoding(),
+            ))
             .map_err(|_| invalid("attention output alignment is negative"))?,
         )?;
         Ok(Self {
@@ -136,23 +121,22 @@ impl AttentionPartition {
                     _ => {
                         return Err(ParallelPlanError::InvalidTensor(
                             "attention member has no shared head partition".into(),
-                        ))
+                        ));
                     }
                 };
-                let fp8_owner =
-                    member
-                        .linear_companion_of()
-                        .and_then(|owner| match format_of(owner) {
-                            LinearFormat::E4M3BlockFp8(format) => Some((owner, format)),
-                            _ => None,
-                        });
+                let fp8_owner = member.linear_companion_of().and_then(|owner| {
+                    match format_of(owner.as_str()) {
+                        LinearFormat::E4M3BlockFp8(format) => Some((owner, format)),
+                        _ => None,
+                    }
+                });
                 let (primary, divisor) = if let Some((owner, format)) = fp8_owner {
                     format
                         .validate()
                         .map_err(|error| ParallelPlanError::InvalidTensor(error.to_string()))?;
                     let primary = members
                         .iter()
-                        .find(|candidate| candidate.target() == owner)
+                        .find(|candidate| candidate.target() == owner.as_str())
                         .ok_or_else(|| {
                             ParallelPlanError::InvalidTensor(
                                 "attention scale has no primary in its group".into(),
@@ -164,7 +148,7 @@ impl AttentionPartition {
                         _ => {
                             return Err(ParallelPlanError::InvalidTensor(
                                 "attention scale does not partition a matrix axis".into(),
-                            ))
+                            ));
                         }
                     };
                     (primary, divisor)

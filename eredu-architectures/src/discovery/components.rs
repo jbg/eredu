@@ -11,31 +11,154 @@ use gated::gated_units;
 pub(super) mod k2_horizon;
 pub(super) mod nemotron;
 pub(super) mod qwen_hybrid;
-use crate::decoder::{
-    AttentionProjection, AttentionProjectionLayout, Config, GatedProjectionLayout,
-    OutputGateActivation,
-};
+use crate::decoder::{topology::AttentionInputParameters, Config, OutputGateActivation};
 use eredu_core::component::*;
 
-pub(super) fn readout<C: Config>(g: &mut Builder, c: &C) {
-    let root = c.parameter_root();
-    let width = c.hidden_size() as usize;
-    let normalization = |gain| ComponentNormalization {
-        kind: ComponentNormalizationKind::Rms,
-        epsilon: ComponentScalar::new(c.rms_norm_epsilon()),
-        gain: Some(gain),
-        gain_offset: ComponentScalar::new(c.normalization_offset()),
-        bias: None,
-        groups: c.normalization_groups().unwrap_or(1) as usize,
+/// Prefix of an explicitly declared ordinary weight slot.
+/// Execution-node identities and hook paths remain family-authored.
+pub(super) fn declared_weight_prefix(weight: &eredu_nn::ParameterSpec) -> &str {
+    weight
+        .id
+        .as_str()
+        .strip_suffix(".weight")
+        .expect("declared ordinary weight identity")
+}
+
+fn declared_shared_weight(weight: &eredu_nn::ParameterSpec) -> &str {
+    weight.alias_of.as_ref().unwrap_or(&weight.id).as_str()
+}
+
+pub(super) fn declared_normalization_prefix(
+    spec: &eredu_nn::NormalizationConstructionSpec,
+) -> Option<&str> {
+    use eredu_nn::{DeclareLogicalParameters, LogicalParameterRole};
+    spec.logical_parameters()
+        .expect("admitted normalization declaration")
+        .into_iter()
+        .find(|declaration| declaration.role == LogicalParameterRole::Normalization)
+        .map(|declaration| declared_weight_prefix(declaration.parameter))
+}
+
+/// Projects affine parameter metadata into caller-authored component roles and row mappings.
+fn declared_component_read(
+    projection: &eredu_nn::LinearSpec,
+    parameter_group: String,
+    role: ComponentReadRole,
+    rows: ComponentRowMapping,
+) -> ComponentRead {
+    ComponentRead {
+        source: None,
+        projection_output: None,
+        role,
+        weight: projection.weight.id.to_string(),
+        shared_weight: declared_shared_weight(&projection.weight).into(),
+        parameter_group,
+        bias: projection.bias.as_ref().map(|bias| bias.id.to_string()),
+        rows,
+        head_normalization: None,
+        input_projections: Vec::new(),
+    }
+}
+
+/// Projects a declared affine stage while retaining its explicit slice and execution boundary.
+fn declared_input_projection(
+    projection: &eredu_nn::LinearSpec,
+    parameter_group: String,
+    rows: std::ops::Range<usize>,
+    normalization: Option<ComponentNormalization>,
+    output: String,
+) -> ComponentInputProjection {
+    ComponentInputProjection {
+        weight: projection.weight.id.to_string(),
+        shared_weight: declared_shared_weight(&projection.weight).into(),
+        parameter_group,
+        bias: projection.bias.as_ref().map(|bias| bias.id.to_string()),
+        rows,
+        normalization,
+        output,
+    }
+}
+
+fn declared_gated_product(policy: eredu_nn::GatedProductPolicy) -> Option<ComponentActivation> {
+    Some(ComponentActivation::Gated {
+        activation: match policy.activation() {
+            eredu_nn::GatedProductActivation::Silu => ComponentNonlinearity::Silu {
+                multiplier: ComponentScalar::new(policy.sigmoid_multiplier()),
+            },
+            eredu_nn::GatedProductActivation::Gelu => ComponentNonlinearity::Gelu,
+            eredu_nn::GatedProductActivation::GeluApproximate => {
+                ComponentNonlinearity::GeluApproximate
+            }
+            _ => return None,
+        },
+        gate_upper_bound: policy.gate_upper_bound().map(ComponentScalar::new),
+        value_absolute_bound: policy.up_absolute_bound().map(ComponentScalar::new),
+        value_offset: ComponentScalar::new(policy.up_offset()),
+    })
+}
+
+fn declared_transform_parameter(
+    parameter: &eredu_nn::ParameterSpec,
+    parameter_group: String,
+) -> ComponentTransformParameter {
+    ComponentTransformParameter {
+        parameter: parameter.id.to_string(),
+        shared_parameter: declared_shared_weight(parameter).into(),
+        parameter_group,
+    }
+}
+
+pub(super) fn declared_normalization(
+    spec: &eredu_nn::NormalizationConstructionSpec,
+) -> ComponentNormalization {
+    let (gain, offset) = match &spec.scale {
+        eredu_nn::NormalizationScale::Learned(weight) => (Some(weight.id.as_str().to_owned()), 0.0),
+        eredu_nn::NormalizationScale::LearnedOffset { weight, offset } => {
+            (Some(weight.id.as_str().to_owned()), *offset)
+        }
+        eredu_nn::NormalizationScale::Unit => (None, 0.0),
     };
-    readout_observations(g, width, c.vocabulary_size() as usize);
+    ComponentNormalization {
+        kind: ComponentNormalizationKind::Rms,
+        epsilon: ComponentScalar::new(spec.epsilon),
+        gain,
+        gain_offset: ComponentScalar::new(offset),
+        bias: None,
+        groups: spec.groups.unwrap_or(1) as usize,
+    }
+}
+
+pub(super) fn readout<C: Config>(
+    g: &mut Builder,
+    c: &C,
+    declaration: &crate::decoder::DecoderDeclaration,
+) {
+    let root = c.parameter_root();
+    let declared = declaration.static_construction();
+    let embedding = declared.embedding_spec();
+    let width = embedding.dimensions as usize;
+    let terminals = (0..c.num_hidden_layers() as usize)
+        .filter_map(|layer_index| {
+            declaration
+                .block_parameters(layer_index)
+                .terminal
+                .as_ref()
+                .map(|spec| ComponentResidualNormalization {
+                    layer_index,
+                    input: format!("{root}.layers.{layer_index}.feed_forward.residual"),
+                    output: format!("{root}.layers.{layer_index}.output"),
+                    normalization: declared_normalization(spec),
+                })
+        })
+        .collect();
+    readout_observations(g, width, embedding.vocabulary as usize);
     g.descriptor.component_readout = Some(ComponentReadout {
         token_embedding_normalization: None,
         embedding_normalization: None,
         embedding: "readout.embedding".into(),
-        embedding_weight: format!("{root}.embed_tokens.weight"),
+        embedding_weight: embedding.weight.id.as_str().to_owned(),
         embedding_scale: ComponentScalar::new(c.embedding_scale()),
-        tied_embeddings: c.tie_word_embeddings(),
+        tied_embeddings: declared.head_spec().is_none(),
         equation: ComponentReadoutEquation {
             residual_cycles: vec![],
             block_transforms: vec![],
@@ -46,12 +169,13 @@ pub(super) fn readout<C: Config>(g: &mut Builder, c: &C) {
             projection_input: Some("readout.projection_input".into()),
             linear_scores: "readout.linear".into(),
             logits: MODEL_LOGITS_OBSERVATION_PATH.into(),
-            normalization: normalization(format!("{root}.norm.weight")),
-            weight: if c.tie_word_embeddings() {
-                format!("{root}.embed_tokens.weight")
-            } else {
-                "lm_head.weight".into()
-            },
+            normalization: declared_normalization(declared.normalization_spec()),
+            weight: declared
+                .head_spec()
+                .map_or(&embedding.weight, |head| &head.weight)
+                .id
+                .as_str()
+                .to_owned(),
             bias: None,
             output_transform: c.output_softcap().map_or(
                 ComponentOutputTransform::Identity,
@@ -59,18 +183,7 @@ pub(super) fn readout<C: Config>(g: &mut Builder, c: &C) {
                     cap: ComponentScalar::new(cap),
                 },
             ),
-            block_normalizations: (0..c.num_hidden_layers() as usize)
-                .filter_map(|layer_index| {
-                    c.block_output_normalization(layer_index).map(|gain| {
-                        ComponentResidualNormalization {
-                            layer_index,
-                            input: format!("{root}.layers.{layer_index}.feed_forward.residual"),
-                            output: format!("{root}.layers.{layer_index}.output"),
-                            normalization: normalization(gain),
-                        }
-                    })
-                })
-                .collect(),
+            block_normalizations: terminals,
             other_writes: vec![],
         },
     });
@@ -84,63 +197,36 @@ pub(super) fn decoder_unit<C: Config>(
     attention: &str,
     ffn: &str,
     dense_ffn: bool,
+    scope: &crate::decoder::topology::BlockParameters,
 ) {
     let fields = c.block_parameter_fields();
     let attention_prefix = format!("{path}.{}", fields.attention);
     let ffn_prefix = format!("{path}.{}", fields.feed_forward);
-    let heads = c.num_attention_heads() as usize;
-    let kv = c.num_key_value_heads() as usize;
-    let dim = c.head_dim() as usize;
-    let width = c.intermediate_size() as usize;
-    let normalization = |gain: String| ComponentNormalization {
-        kind: ComponentNormalizationKind::Rms,
-        epsilon: ComponentScalar::new(c.rms_norm_epsilon()),
-        gain: Some(gain),
-        gain_offset: ComponentScalar::new(c.normalization_offset()),
-        bias: None,
-        groups: c.normalization_groups().unwrap_or(1) as usize,
-    };
-    let read = |prefix: &str, field: &str, role, rows, bias: bool| {
-        let weight = format!("{prefix}.{field}.weight");
+    let attention_parameters = &scope.attention;
+    let feed_forward_projections = dense_ffn.then_some(scope.feed_forward.as_ref()).flatten();
+    let normalizations = &scope.normalizations;
+    let head_norms = &scope.query_key;
+    let geometry = attention_parameters.geometry;
+    let heads = geometry.query_heads() as usize;
+    let kv = geometry.key_value_heads() as usize;
+    let dim = geometry.key_dimensions() as usize;
+    let attention_write = &attention_parameters.output;
+    let read = |spec: &eredu_nn::LinearSpec, prefix: &str, role, rows| {
         let head_normalization = match role {
-            ComponentReadRole::Query => Some((heads, fields.attention_query_norm)),
-            ComponentReadRole::Key => Some((kv, fields.attention_key_norm)),
+            ComponentReadRole::Query => head_norms[0].as_ref().map(|spec| (heads, spec)),
+            ComponentReadRole::Key => head_norms[1].as_ref().map(|spec| (kv, spec)),
             _ => None,
         }
-        .and_then(|(heads, field)| {
-            c.query_key_norm_epsilon()
-                .map(|epsilon| ComponentHeadNormalization {
-                    output_scale: ComponentScalar::new(1.0),
-                    heads,
-                    head_width: dim,
-                    independent_gains: c.query_key_norm_per_head_weights(),
-                    normalization: ComponentNormalization {
-                        kind: ComponentNormalizationKind::Rms,
-                        epsilon: ComponentScalar::new(epsilon),
-                        gain: Some(format!("{prefix}.{field}.weight")),
-                        // Q/K construction uses learned full gains independently of
-                        // the sublayer normalization's checkpoint offset convention.
-                        gain_offset: ComponentScalar::new(0.0),
-                        bias: None,
-                        groups: if c.query_key_norm_per_head_weights() {
-                            heads
-                        } else {
-                            1
-                        },
-                    },
-                })
+        .map(|(heads, spec)| ComponentHeadNormalization {
+            output_scale: ComponentScalar::new(1.0),
+            heads,
+            head_width: dim,
+            independent_gains: c.query_key_norm_per_head_weights(),
+            normalization: declared_normalization(spec),
         });
         ComponentRead {
-            source: None,
-            projection_output: None,
-            role,
-            shared_weight: weight.clone(),
-            weight,
-            parameter_group: format!("parameters:{prefix}"),
-            bias: bias.then(|| format!("{prefix}.{field}.bias")),
-            rows,
             head_normalization,
-            input_projections: Vec::new(),
+            ..declared_component_read(spec, format!("parameters:{prefix}"), role, rows)
         }
     };
     let direct = |offset| ComponentRowMapping::Direct { offset };
@@ -156,61 +242,64 @@ pub(super) fn decoder_unit<C: Config>(
         component_heads_per_read_head: sharing,
         read_head_stride: None,
     };
-    let mut reads = match c.attention_projection_layout() {
-        AttentionProjectionLayout::Split => vec![
-            read(
-                &attention_prefix,
-                fields.attention_query,
-                ComponentReadRole::Query,
-                head_rows(0, 1),
-                c.attention_bias(AttentionProjection::Query),
-            ),
-            read(
-                &attention_prefix,
-                fields.attention_key,
-                ComponentReadRole::Key,
-                head_rows(0, heads / kv),
-                c.attention_bias(AttentionProjection::Key),
-            ),
-            read(
-                &attention_prefix,
-                fields.attention_value,
-                ComponentReadRole::Value,
-                grouped(0),
-                c.attention_bias(AttentionProjection::Value),
-            ),
-        ],
-        AttentionProjectionLayout::Fused { field } => vec![
-            read(
-                &attention_prefix,
-                field,
-                ComponentReadRole::Query,
-                head_rows(0, 1),
-                c.attention_bias(AttentionProjection::Query),
-            ),
-            read(
-                &attention_prefix,
-                field,
-                ComponentReadRole::Key,
-                head_rows(heads * dim, heads / kv),
-                c.attention_bias(AttentionProjection::Key),
-            ),
-            read(
-                &attention_prefix,
-                field,
-                ComponentReadRole::Value,
-                grouped((heads + kv) * dim),
-                c.attention_bias(AttentionProjection::Value),
-            ),
-        ],
+    let mut reads = match &attention_parameters.input {
+        AttentionInputParameters::Split { query, key, value } => {
+            let mut reads = vec![
+                read(
+                    query,
+                    &attention_prefix,
+                    ComponentReadRole::Query,
+                    head_rows(0, 1),
+                ),
+                read(
+                    key,
+                    &attention_prefix,
+                    ComponentReadRole::Key,
+                    head_rows(0, heads / kv),
+                ),
+            ];
+            if let Some(value) = value {
+                reads.push(read(
+                    value,
+                    &attention_prefix,
+                    ComponentReadRole::Value,
+                    grouped(0),
+                ));
+            }
+            reads
+        }
+        AttentionInputParameters::Fused { projection, .. } => {
+            let segments = attention_parameters
+                .fused_segments()
+                .expect("fused attention layout");
+            vec![
+                read(
+                    projection,
+                    &attention_prefix,
+                    ComponentReadRole::Query,
+                    head_rows(segments[0].start, 1),
+                ),
+                read(
+                    projection,
+                    &attention_prefix,
+                    ComponentReadRole::Key,
+                    head_rows(segments[1].start, heads / kv),
+                ),
+                read(
+                    projection,
+                    &attention_prefix,
+                    ComponentReadRole::Value,
+                    grouped(segments[2].start),
+                ),
+            ]
+        }
     };
-    if let Some((field, _)) = c.attention_output_gate() {
+    if let Some((gate, _)) = &attention_parameters.gate {
         reads.push(read(
+            gate,
             &attention_prefix,
-            field,
             ComponentReadRole::OutputGate,
             direct(0),
-            false,
         ));
     }
     let mut group = ComponentGroup {
@@ -218,7 +307,7 @@ pub(super) fn decoder_unit<C: Config>(
         id: format!("{attention}.channels"),
         node_id: attention.into(),
         layer_index: layer,
-        count: heads * dim,
+        count: attention_write.input as usize,
         activation: format!("{path}.attention.channels"),
         effective_activation: format!("{path}.attention.channels.effective"),
         write_input: Some(format!("{path}.attention.write_input")),
@@ -227,21 +316,21 @@ pub(super) fn decoder_unit<C: Config>(
         write_partition: ComponentWritePartition::Complete,
         input: format!("{path}.attention.input"),
         reads,
-        write_weight: format!("{attention_prefix}.{}.weight", fields.attention_output),
+        write_weight: attention_write.weight.id.to_string(),
         write_input_projection: None,
         write_parameter_group: format!("parameters:{attention_prefix}"),
-        shared_write_weight: format!("{attention_prefix}.{}.weight", fields.attention_output),
-        write_bias: c
-            .attention_bias(AttentionProjection::Output)
-            .then(|| format!("{attention_prefix}.{}.bias", fields.attention_output)),
+        shared_write_weight: declared_shared_weight(&attention_write.weight).into(),
+        write_bias: attention_write
+            .bias
+            .as_ref()
+            .map(|bias| bias.id.to_string()),
         activation_equation: ComponentActivation::Attention {
             attended_head_normalization: None,
             query_heads: heads,
             key_value_heads: kv,
             head_width: dim,
-            output_gate: c
-                .attention_output_gate()
-                .map(|(_, activation)| match activation {
+            output_gate: attention_parameters.gate.as_ref().map(
+                |(_, activation)| match *activation {
                     OutputGateActivation::Softplus(beta) => ComponentNonlinearity::Softplus {
                         beta: ComponentScalar::new(beta),
                     },
@@ -249,17 +338,26 @@ pub(super) fn decoder_unit<C: Config>(
                     OutputGateActivation::Silu => ComponentNonlinearity::Silu {
                         multiplier: ComponentScalar::new(1.0),
                     },
-                }),
+                },
+            ),
         },
-        input_normalization: normalization(format!("{path}.{}.weight", fields.input_norm)),
+        input_normalization: declared_normalization(&normalizations.input),
         output_gate: None,
-        output_normalization: c.attention_output_normalization(layer).map(&normalization),
+        output_normalization: normalizations
+            .attention_output
+            .as_ref()
+            .map(declared_normalization),
         residual_scale: ComponentScalar::new(1.0),
     };
     g.descriptor.components.push(group.clone());
     if !dense_ffn {
         return;
     }
+    let feed_forward_projections = feed_forward_projections
+        .as_ref()
+        .expect("declared dense feed-forward projections");
+    let feed_forward_write = feed_forward_projections.down();
+    let width = feed_forward_write.input as usize;
     group.id = format!("{ffn}.units");
     group.node_id = ffn.into();
     group.count = width;
@@ -269,132 +367,102 @@ pub(super) fn decoder_unit<C: Config>(
     group.write_output = Some(format!("{path}.feed_forward.write"));
     group.output = Some(format!("{path}.feed_forward.output"));
     group.input = format!("{path}.feed_forward.input");
-    group.reads = match c.gated_projection_layout() {
-        GatedProjectionLayout::Split => vec![
-            read(
-                &ffn_prefix,
-                fields.feed_forward_gate,
-                ComponentReadRole::Gate,
-                direct(0),
-                c.mlp_bias(),
-            ),
-            read(
-                &ffn_prefix,
-                fields.feed_forward_up,
-                ComponentReadRole::Value,
-                direct(0),
-                c.mlp_bias(),
-            ),
+    group.reads = match feed_forward_projections {
+        eredu_nn::GatedProductSpec::Split(spec) => vec![
+            read(&spec.gate, &ffn_prefix, ComponentReadRole::Gate, direct(0)),
+            read(&spec.up, &ffn_prefix, ComponentReadRole::Value, direct(0)),
         ],
-        GatedProjectionLayout::Fused { field } => vec![
+        eredu_nn::GatedProductSpec::Fused(spec) => vec![
             read(
+                &spec.gate_up,
                 &ffn_prefix,
-                field,
                 ComponentReadRole::Gate,
                 direct(0),
-                c.mlp_bias(),
             ),
             read(
+                &spec.gate_up,
                 &ffn_prefix,
-                field,
                 ComponentReadRole::Value,
                 direct(width),
-                c.mlp_bias(),
             ),
         ],
     };
-    group.write_weight = format!("{ffn_prefix}.{}.weight", fields.feed_forward_output);
-    group.shared_write_weight = group.write_weight.clone();
+    group.write_weight = feed_forward_write.weight.id.to_string();
+    group.shared_write_weight = declared_shared_weight(&feed_forward_write.weight).into();
     group.write_parameter_group = format!("parameters:{ffn_prefix}");
-    group.write_bias = c
-        .mlp_bias()
-        .then(|| format!("{ffn_prefix}.{}.bias", fields.feed_forward_output));
-    let policy = c.gated_product_policy().unwrap_or_default();
-    group.activation_equation = ComponentActivation::Gated {
-        activation: match policy.activation() {
-            eredu_nn::GatedProductActivation::Silu => ComponentNonlinearity::Silu {
-                multiplier: ComponentScalar::new(policy.sigmoid_multiplier()),
-            },
-            eredu_nn::GatedProductActivation::GeluApproximate => {
-                ComponentNonlinearity::GeluApproximate
-            }
-            _ => return,
-        },
-        gate_upper_bound: policy.gate_upper_bound().map(ComponentScalar::new),
-        value_absolute_bound: policy.up_absolute_bound().map(ComponentScalar::new),
-        value_offset: ComponentScalar::new(policy.up_offset()),
+    group.write_bias = feed_forward_write
+        .bias
+        .as_ref()
+        .map(|bias| bias.id.to_string());
+    let policy = feed_forward_projections.policy();
+    let Some(activation) = declared_gated_product(policy) else {
+        return;
     };
-    group.input_normalization =
-        normalization(format!("{path}.{}.weight", fields.post_attention_norm));
-    group.output_normalization = c
-        .feed_forward_output_normalization(layer)
-        .map(normalization);
+    group.activation_equation = activation;
+    group.input_normalization = declared_normalization(&normalizations.post_attention);
+    group.output_normalization = normalizations
+        .feed_forward_output
+        .as_ref()
+        .map(declared_normalization);
     g.descriptor.components.push(group);
 }
 
 /// Nemotron physical units each contain a single pre-normalized residual operator.
 pub(super) fn nemotron_unit(
     g: &mut Builder,
-    c: &crate::nemotron_h::ModelArgs,
+    scope: &crate::nemotron_h::declarations::TargetBlockParameters,
     layer: usize,
     path: &str,
     node: &str,
-    attention: bool,
 ) {
-    let field = if attention { "attention" } else { "mlp" };
-    nemotron_unit_at(
-        g,
-        c,
-        layer,
-        path,
-        node,
-        attention,
-        &format!("{path}.{field}"),
-    );
-}
-
-fn nemotron_unit_at(
-    g: &mut Builder,
-    c: &crate::nemotron_h::ModelArgs,
-    layer: usize,
-    path: &str,
-    node: &str,
-    attention: bool,
-    prefix: &str,
-) {
+    use crate::nemotron_h::declarations::TargetOperatorParameters as P;
+    let (projections, heads, kv, dim, activation, attention) = match &scope.operator {
+        P::Attention(spec) => (
+            spec.projection
+                .projections()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            spec.projection.geometry.query_heads() as usize,
+            spec.projection.geometry.key_value_heads() as usize,
+            spec.projection.geometry.key_dimensions() as usize,
+            None,
+            true,
+        ),
+        P::Dense(spec) => (
+            spec.network
+                .projections()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            0,
+            1,
+            0,
+            Some(spec.network.activation),
+            false,
+        ),
+        _ => unreachable!("component units are declared only for attention and dense scopes"),
+    };
+    let prefix = projections[0]
+        .weight
+        .id
+        .as_str()
+        .rsplit_once('.')
+        .expect("affine weight identity")
+        .0
+        .rsplit_once('.')
+        .expect("projection owner")
+        .0;
+    let width = projections[0].input as usize;
     let boundary = if attention {
         "attention"
     } else {
         "feed_forward"
     };
     let scalar = if attention { "channels" } else { "units" };
-    let heads = c.num_attention_heads as usize;
-    let kv = c.num_key_value_heads as usize;
-    let dim = c.head_dim as usize;
-    let count = if attention {
-        heads * dim
-    } else {
-        c.intermediate_size as usize
-    };
-    let bias = if attention {
-        c.attention_bias
-    } else {
-        c.mlp_bias
-    };
-    let read = |field: &str, role, rows| {
-        let weight = format!("{prefix}.{field}.weight");
-        ComponentRead {
-            source: None,
-            projection_output: None,
-            shared_weight: weight.clone(),
-            weight,
-            parameter_group: format!("parameters:{prefix}"),
-            role,
-            rows,
-            bias: bias.then(|| format!("{prefix}.{field}.bias")),
-            head_normalization: None,
-            input_projections: Vec::new(),
-        }
+    let count = projections.last().expect("output projection").input as usize;
+    let read = |projection: &eredu_nn::LinearSpec, role, rows| {
+        declared_component_read(projection, format!("parameters:{prefix}"), role, rows)
     };
     let direct = ComponentRowMapping::Direct { offset: 0 };
     let grouped = ComponentRowMapping::GroupedQuery {
@@ -411,15 +479,19 @@ fn nemotron_unit_at(
     };
     let reads = if attention {
         vec![
-            read("q_proj", ComponentReadRole::Query, head_rows(1)),
-            read("k_proj", ComponentReadRole::Key, head_rows(heads / kv)),
-            read("v_proj", ComponentReadRole::Value, grouped),
+            read(&projections[0], ComponentReadRole::Query, head_rows(1)),
+            read(
+                &projections[1],
+                ComponentReadRole::Key,
+                head_rows(heads / kv),
+            ),
+            read(&projections[2], ComponentReadRole::Value, grouped),
         ]
     } else {
-        vec![read("up_proj", ComponentReadRole::Input, direct)]
+        vec![read(&projections[0], ComponentReadRole::Input, direct)]
     };
-    let write = if attention { "o_proj" } else { "down_proj" };
-    let write_weight = format!("{prefix}.{write}.weight");
+    let write = projections.last().expect("output projection");
+    let write_weight = write.weight.id.as_str().to_owned();
     g.descriptor.components.push(ComponentGroup {
         routed_reads: Vec::new(),
         id: format!("{node}.{scalar}"),
@@ -434,11 +506,11 @@ fn nemotron_unit_at(
         write_partition: ComponentWritePartition::Complete,
         input: format!("{path}.{boundary}.input"),
         reads,
-        shared_write_weight: write_weight.clone(),
+        shared_write_weight: declared_shared_weight(&write.weight).into(),
         write_weight,
         write_input_projection: None,
         write_parameter_group: format!("parameters:{prefix}"),
-        write_bias: bias.then(|| format!("{prefix}.{write}.bias")),
+        write_bias: write.bias.as_ref().map(|p| p.id.as_str().into()),
         activation_equation: if attention {
             ComponentActivation::Attention {
                 attended_head_normalization: None,
@@ -449,39 +521,30 @@ fn nemotron_unit_at(
             }
         } else {
             ComponentActivation::Unary {
-                activation: crate::decoder::unary::Activation::ReluSquared.component(),
+                activation: crate::decoder::unary::component(
+                    activation.expect("declared dense activation"),
+                ),
             }
         },
-        input_normalization: ComponentNormalization {
-            kind: ComponentNormalizationKind::Rms,
-            epsilon: ComponentScalar::new(c.layer_norm_epsilon),
-            gain: Some(format!("{path}.norm.weight")),
-            gain_offset: ComponentScalar::new(0.0),
-            bias: None,
-            groups: 1,
-        },
+        input_normalization: declared_normalization(&scope.norm),
         output_gate: None,
         output_normalization: None,
         residual_scale: ComponentScalar::new(1.0),
     });
     for (suffix, meaning, extent) in [
-        ("input", "Normalized operator input", c.hidden_size as usize),
+        ("input", "Normalized operator input", width),
         (
             scalar,
             "Activated units or aggregated channels consumed by the output projection",
             count,
         ),
-        ("write", "Affine operator write", c.hidden_size as usize),
+        ("write", "Affine operator write", width),
         (
             "output",
             "Operator contribution before residual addition",
-            c.hidden_size as usize,
+            width,
         ),
-        (
-            "residual",
-            "Residual after operator addition",
-            c.hidden_size as usize,
-        ),
+        ("residual", "Residual after operator addition", width),
     ] {
         let mut shape = axes(extent);
         if suffix == scalar {
@@ -547,15 +610,23 @@ pub(super) fn nemotron_other_unit(
     }
 }
 
-pub(super) fn nemotron_readout(g: &mut Builder, c: &crate::nemotron_h::ModelArgs) {
-    readout_observations(g, c.hidden_size as usize, c.vocab_size as usize);
+pub(super) fn nemotron_readout(g: &mut Builder, declaration: &crate::nemotron_h::Declaration) {
+    let c = declaration.args();
+    let statics = &declaration.statics;
+    let embedding = statics.embedding_spec();
+    let output = statics.head_spec();
+    readout_observations(
+        g,
+        embedding.dimensions as usize,
+        embedding.vocabulary as usize,
+    );
     g.descriptor.component_readout = Some(ComponentReadout {
         token_embedding_normalization: None,
         embedding_normalization: None,
         embedding: "readout.embedding".into(),
-        embedding_weight: "model.embeddings.weight".into(),
+        embedding_weight: embedding.weight.id.as_str().into(),
         embedding_scale: ComponentScalar::new(1.0),
-        tied_embeddings: c.tie_word_embeddings,
+        tied_embeddings: statics.head_spec().is_none(),
         equation: ComponentReadoutEquation {
             residual_cycles: vec![],
             block_transforms: vec![],
@@ -566,20 +637,11 @@ pub(super) fn nemotron_readout(g: &mut Builder, c: &crate::nemotron_h::ModelArgs
             projection_input: Some("readout.projection_input".into()),
             linear_scores: "readout.linear".into(),
             logits: MODEL_LOGITS_OBSERVATION_PATH.into(),
-            normalization: ComponentNormalization {
-                kind: ComponentNormalizationKind::Rms,
-                epsilon: ComponentScalar::new(c.layer_norm_epsilon),
-                gain: Some("model.norm_f.weight".into()),
-                gain_offset: ComponentScalar::new(0.0),
-                bias: None,
-                groups: 1,
-            },
-            weight: if c.tie_word_embeddings {
-                "model.embeddings.weight"
-            } else {
-                "lm_head.weight"
-            }
-            .into(),
+            normalization: declared_normalization(statics.normalization_spec()),
+            weight: output
+                .map(|p| p.weight.id.as_str())
+                .unwrap_or(embedding.weight.id.as_str())
+                .into(),
             bias: None,
             output_transform: ComponentOutputTransform::Identity,
             block_normalizations: vec![],
@@ -613,44 +675,29 @@ pub(super) fn nemotron_readout(g: &mut Builder, c: &crate::nemotron_h::ModelArgs
 /// after either attention or convolution. Convolution is an undecomposed write.
 pub(super) fn lfm2_unit(
     g: &mut Builder,
-    c: &crate::lfm2::ModelArgs,
+    declaration: &crate::lfm2::Declaration,
     layer: usize,
     path: &str,
     mixer_node: &str,
     ffn_node: &str,
 ) {
-    use crate::lfm2::{FeedForwardPolicy, OperatorPolicy};
-    let policy = c.layer_policy(layer).expect("declared LFM2 layer");
-    let width = c.hidden_size as usize;
-    let heads = c.num_attention_heads as usize;
-    let kv = c.num_key_value_heads as usize;
-    let dim = width / heads;
-    let norm = |gain: String| ComponentNormalization {
-        kind: ComponentNormalizationKind::Rms,
-        epsilon: ComponentScalar::new(c.norm_eps),
-        gain: Some(gain),
-        gain_offset: ComponentScalar::new(0.0),
-        bias: None,
-        groups: 1,
-    };
-    let read = |prefix: &str, field: &str, role, rows, head_normalization| {
-        let weight = format!("{prefix}.{field}.weight");
+    use crate::lfm2::declarations::{FeedForwardParameters as F, MixerParameters as M};
+    let scope = &declaration.blocks[layer];
+    let width = declaration.statics.embedding_spec().dimensions as usize;
+    let read = |projection: &eredu_nn::LinearSpec, prefix: &str, role, rows, head_normalization| {
         ComponentRead {
-            source: None,
-            projection_output: None,
-            role,
-            weight: weight.clone(),
-            shared_weight: weight,
-            parameter_group: format!("parameters:{prefix}"),
-            bias: None,
-            rows,
             head_normalization,
-            input_projections: Vec::new(),
+            ..declared_component_read(projection, format!("parameters:{prefix}"), role, rows)
         }
     };
-    let attention = matches!(policy.operator, OperatorPolicy::SelfAttention(_));
-    if attention {
+    let attention = matches!(scope.mixer, M::Attention(..));
+    if let M::Attention(spec, _) = &scope.mixer {
         let prefix = format!("{path}.self_attn");
+        let [query, key, value, write] = spec.projection.projections();
+        let normalizations = [&spec.query_norm, &spec.key_norm];
+        let dim = spec.projection.geometry.key_dimensions() as usize;
+        let heads = spec.projection.geometry.query_heads() as usize;
+        let kv = spec.projection.geometry.key_value_heads() as usize;
         let head_rows = |sharing| ComponentRowMapping::HeadRows {
             offset: 0,
             component_head_width: dim,
@@ -658,22 +705,22 @@ pub(super) fn lfm2_unit(
             component_heads_per_read_head: sharing,
             read_head_stride: None,
         };
-        let head_norm = |heads, field| {
+        let head_norm = |heads, index: usize| {
             Some(ComponentHeadNormalization {
                 output_scale: ComponentScalar::new(1.0),
                 heads,
                 head_width: dim,
                 independent_gains: false,
-                normalization: norm(format!("{prefix}.{field}.weight")),
+                normalization: declared_normalization(normalizations[index]),
             })
         };
-        let write_weight = format!("{prefix}.out_proj.weight");
+        let write_weight = write.weight.id.as_str().to_owned();
         g.descriptor.components.push(ComponentGroup {
             routed_reads: Vec::new(),
             id: format!("{mixer_node}.channels"),
             node_id: mixer_node.into(),
             layer_index: layer,
-            count: heads * dim,
+            count: write.input as usize,
             activation: format!("{path}.attention.channels"),
             effective_activation: format!("{path}.attention.channels.effective"),
             write_input: Some(format!("{path}.attention.write_input")),
@@ -683,22 +730,22 @@ pub(super) fn lfm2_unit(
             input: format!("{path}.attention.input"),
             reads: vec![
                 read(
+                    query,
                     &prefix,
-                    "q_proj",
                     ComponentReadRole::Query,
                     head_rows(1),
-                    head_norm(heads, "q_layernorm"),
+                    head_norm(heads, 0),
                 ),
                 read(
+                    key,
                     &prefix,
-                    "k_proj",
                     ComponentReadRole::Key,
                     head_rows(heads / kv),
-                    head_norm(kv, "k_layernorm"),
+                    head_norm(kv, 1),
                 ),
                 read(
+                    value,
                     &prefix,
-                    "v_proj",
                     ComponentReadRole::Value,
                     ComponentRowMapping::GroupedQuery {
                         offset: 0,
@@ -720,7 +767,7 @@ pub(super) fn lfm2_unit(
                 head_width: dim,
                 output_gate: None,
             },
-            input_normalization: norm(format!("{path}.operator_norm.weight")),
+            input_normalization: declared_normalization(&scope.operator_norm),
             output_gate: None,
             output_normalization: None,
             residual_scale: ComponentScalar::new(1.0),
@@ -734,10 +781,13 @@ pub(super) fn lfm2_unit(
             shape,
         );
     }
-    if policy.feed_forward == FeedForwardPolicy::Dense {
+    if let F::Dense(spec) = &scope.feed_forward {
         let prefix = format!("{path}.feed_forward");
-        let write_weight = format!("{prefix}.w2.weight");
-        let count = c.dense_intermediate_size as usize;
+        let gate = &spec.gate;
+        let up = &spec.up;
+        let write = &spec.down;
+        let write_weight = write.weight.id.as_str().to_owned();
+        let count = write.input as usize;
         g.descriptor.components.push(ComponentGroup {
             routed_reads: Vec::new(),
             id: format!("{ffn_node}.units"),
@@ -753,15 +803,15 @@ pub(super) fn lfm2_unit(
             input: format!("{path}.feed_forward.input"),
             reads: vec![
                 read(
+                    gate,
                     &prefix,
-                    "w1",
                     ComponentReadRole::Gate,
                     ComponentRowMapping::Direct { offset: 0 },
                     None,
                 ),
                 read(
+                    up,
                     &prefix,
-                    "w3",
                     ComponentReadRole::Value,
                     ComponentRowMapping::Direct { offset: 0 },
                     None,
@@ -769,18 +819,12 @@ pub(super) fn lfm2_unit(
             ],
             write_weight: write_weight.clone(),
             write_input_projection: None,
-            shared_write_weight: write_weight,
+            shared_write_weight: declared_shared_weight(&write.weight).into(),
             write_parameter_group: format!("parameters:{prefix}"),
-            write_bias: None,
-            activation_equation: ComponentActivation::Gated {
-                activation: ComponentNonlinearity::Silu {
-                    multiplier: ComponentScalar::new(1.0),
-                },
-                gate_upper_bound: None,
-                value_absolute_bound: None,
-                value_offset: ComponentScalar::new(0.0),
-            },
-            input_normalization: norm(format!("{path}.ffn_norm.weight")),
+            write_bias: write.bias.as_ref().map(|bias| bias.id.to_string()),
+            activation_equation: declared_gated_product(spec.policy)
+                .expect("admitted LFM2 gated product policy"),
+            input_normalization: declared_normalization(&scope.feed_forward_norm),
             output_gate: None,
             output_normalization: None,
             residual_scale: ComponentScalar::new(1.0),
@@ -806,7 +850,7 @@ pub(super) fn lfm2_unit(
         ] {
             let suffix = if boundary == "feed_forward"
                 && suffix == "output"
-                && policy.feed_forward == FeedForwardPolicy::SparseMoe
+                && matches!(scope.feed_forward, F::Routed(_))
             {
                 "contribution"
             } else {
@@ -822,15 +866,21 @@ pub(super) fn lfm2_unit(
     }
 }
 
-pub(super) fn lfm2_readout(g: &mut Builder, c: &crate::lfm2::ModelArgs) {
-    readout_observations(g, c.hidden_size as usize, c.vocab_size as usize);
+pub(super) fn lfm2_readout(g: &mut Builder, declaration: &crate::lfm2::Declaration) {
+    let statics = &declaration.statics;
+    let embedding = statics.embedding_spec();
+    readout_observations(
+        g,
+        embedding.dimensions as usize,
+        embedding.vocabulary as usize,
+    );
     g.descriptor.component_readout = Some(ComponentReadout {
         token_embedding_normalization: None,
         embedding_normalization: None,
         embedding: "readout.embedding".into(),
-        embedding_weight: "model.embed_tokens.weight".into(),
+        embedding_weight: embedding.weight.id.as_str().into(),
         embedding_scale: ComponentScalar::new(1.0),
-        tied_embeddings: c.tie_word_embeddings,
+        tied_embeddings: statics.head_spec().is_none(),
         equation: ComponentReadoutEquation {
             residual_cycles: vec![],
             block_transforms: vec![],
@@ -841,20 +891,12 @@ pub(super) fn lfm2_readout(g: &mut Builder, c: &crate::lfm2::ModelArgs) {
             projection_input: Some("readout.projection_input".into()),
             linear_scores: "readout.linear".into(),
             logits: MODEL_LOGITS_OBSERVATION_PATH.into(),
-            normalization: ComponentNormalization {
-                kind: ComponentNormalizationKind::Rms,
-                epsilon: ComponentScalar::new(c.norm_eps),
-                gain: Some("model.embedding_norm.weight".into()),
-                gain_offset: ComponentScalar::new(0.0),
-                bias: None,
-                groups: 1,
-            },
-            weight: if c.tie_word_embeddings {
-                "model.embed_tokens.weight"
-            } else {
-                "lm_head.weight"
-            }
-            .into(),
+            normalization: declared_normalization(statics.normalization_spec()),
+            weight: statics
+                .head_spec()
+                .map(|p| p.weight.id.as_str())
+                .unwrap_or(embedding.weight.id.as_str())
+                .into(),
             bias: None,
             output_transform: ComponentOutputTransform::Identity,
             block_normalizations: vec![],
@@ -863,23 +905,17 @@ pub(super) fn lfm2_readout(g: &mut Builder, c: &crate::lfm2::ModelArgs) {
     });
 }
 
-pub(super) fn lfm2_other_writes(g: &mut Builder, c: &crate::lfm2::ModelArgs) {
-    use crate::lfm2::{FeedForwardPolicy, OperatorPolicy};
+pub(super) fn lfm2_other_writes(g: &mut Builder, declaration: &crate::lfm2::Declaration) {
+    use crate::lfm2::declarations::{FeedForwardParameters as F, MixerParameters as M};
     let readout = g
         .descriptor
         .component_readout
         .as_mut()
         .expect("LFM2 readout");
-    for (layer, policy) in c.layer_schedule.iter().enumerate() {
+    for (layer, scope) in declaration.blocks.iter().enumerate() {
         for (present, boundary) in [
-            (
-                matches!(policy.operator, OperatorPolicy::CausalConvolution),
-                "mixer",
-            ),
-            (
-                policy.feed_forward == FeedForwardPolicy::SparseMoe,
-                "feed_forward",
-            ),
+            (matches!(scope.mixer, M::Convolution(_)), "mixer"),
+            (matches!(scope.feed_forward, F::Routed(_)), "feed_forward"),
         ] {
             if present {
                 let output_suffix = if boundary == "feed_forward" {

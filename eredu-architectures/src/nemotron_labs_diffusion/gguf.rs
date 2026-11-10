@@ -425,7 +425,15 @@ impl TextGgufPlan {
         config
             .validate_config()
             .map_err(|e| invalid(e.to_string()))?;
-        let plan = crate::llama::gguf_plan(config.dense()).map_err(invalid)?;
+        let parameters = config
+            .text_declaration()
+            .parameter_description(&config, crate::decoder::ParameterEncoding::Logical)
+            .map_err(|e| invalid(e.to_string()))?;
+        let plan = crate::llama::checkpoint::gguf_plan_from_parameters(
+            config.dense(),
+            parameters.groups().iter().flat_map(|g| g.members()),
+        )
+        .map_err(invalid)?;
         let resolution = eredu_checkpoint::validation::resolve_gguf_plan(checkpoint, &plan)
             .map_err(|issues| invalid(format!("Nemotron GGUF tensor admission: {issues:?}")))?;
         let mapping = checkpoint
@@ -434,11 +442,7 @@ impl TextGgufPlan {
         Ok(Self {
             fingerprints,
             source: checkpoint.clone(),
-            text_config: {
-                let mut text = config.clone();
-                text.vision = None;
-                text
-            },
+            text_config: config.text_only()?,
             config,
             checkpoint: plan,
             resolution,
@@ -467,11 +471,13 @@ impl TextGgufPlan {
     }
     pub(crate) fn with_draft_adapter(
         mut self,
-        adapter: super::adapter::DraftAdapterConfig,
-    ) -> Self {
-        self.config = self.config.with_draft_adapter(adapter.clone());
-        self.text_config = self.text_config.with_draft_adapter(adapter);
-        self
+        adapter: std::sync::Arc<super::adapter::DraftAdapterDeclaration>,
+    ) -> Result<Self, String> {
+        self.config = self
+            .config
+            .with_draft_parameters(std::sync::Arc::clone(&adapter))?;
+        self.text_config = self.text_config.with_draft_parameters(adapter)?;
+        Ok(self)
     }
 
     /// One normalized geometry for every shared-backbone invocation.

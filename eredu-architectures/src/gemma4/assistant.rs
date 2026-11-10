@@ -8,19 +8,330 @@ use eredu_checkpoint::{
         GgufTypeConstraint, SafetensorsCheckpointPlan, SafetensorsTensorConstraint,
         StoredDtypeConstraint, TensorOperation,
     },
-    LinearFormat, StoredDtype, WeightQuantization,
+    StoredDtype, WeightQuantization,
 };
 use eredu_core::{AttentionPolicy, LayerSchedule};
 use eredu_gguf::MetadataValue;
 use eredu_nn::{
     multimodal::{masked_output_projection, MaskedOutputProjectionInput},
-    AttentionCache, AttentionStateSource, EmbeddingOperator, EmbeddingSpec, Error,
-    GroupedNeuralBackend, LinearOperator, LinearSpec, NeuralBackend, NormalizationConstructionSpec,
-    NormalizationOperator, Parameter, ParameterSpec, Parameterized, RotaryPosition, Tensor,
+    AttentionCache, AttentionStateSource, DeclareLogicalParameters, EmbeddingOperator, Error,
+    GroupedNeuralBackend, LinearOperator, NeuralBackend, NormalizationOperator, Parameter,
+    Parameterized, RotaryPosition, Tensor,
 };
 use serde::Deserialize;
 
 use super::{BlockInput, DenseBlock, ModelArgs, SharedAttentionStates};
+
+mod parameters;
+use parameters::{StaticParameters, Vocabulary};
+
+/// Complete typed Gemma assistant construction, shared by cold consumers and materialization.
+#[derive(Debug, Clone)]
+pub struct AssistantDefinition {
+    config: AssistantConfig,
+    static_parameters: StaticParameters,
+    source_per_layer: Option<super::text::pinned::PerLayerSpec>,
+    blocks: Vec<super::text::specs::DecoderBlockSpec>,
+    parameters: crate::external_assistant::AssistantParameterDeclarations,
+}
+impl AssistantDefinition {
+    /// Validates and retains every construction scope without native resources.
+    pub fn new(config: AssistantConfig) -> Result<Self, Error> {
+        let static_parameters = StaticParameters::new(&config)?;
+        let source_per_layer = super::text::pinned::PerLayerSpec::at(&config.text_config, "model")?;
+        let blocks = (0..config.text_config.num_hidden_layers())
+            .map(|layer| {
+                super::text::specs::DecoderBlockSpec::from_scopes(
+                    &config.text_config,
+                    layer,
+                    super::text::specs::BlockSpec::at(&config.text_config, layer, "model.layers")?,
+                    super::text::specs::DenseSpec::at(&config.text_config, layer, "model.layers")?,
+                    super::text::specs::AttentionSpec::at(
+                        &config.text_config,
+                        layer,
+                        "model.layers",
+                    )?,
+                    (config.text_config.layer_policy(layer).is_some_and(|p| {
+                        p.feed_forward == super::FeedForwardPolicy::DenseWithSparseMoe
+                    }))
+                    .then(|| {
+                        super::text::routed::Declaration::at(
+                            &config.text_config,
+                            layer,
+                            "model.layers",
+                        )
+                    })
+                    .transpose()?,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::from_scopes(config, static_parameters, source_per_layer, blocks)
+    }
+    fn from_scopes(
+        config: AssistantConfig,
+        static_parameters: StaticParameters,
+        source_per_layer: Option<super::text::pinned::PerLayerSpec>,
+        blocks: Vec<super::text::specs::DecoderBlockSpec>,
+    ) -> Result<Self, Error> {
+        use eredu_runtime::ReplicatedTextParameterOwner;
+        let mut parameters = crate::external_assistant::AssistantParameterDeclarations::new();
+        parameters.append(
+            ReplicatedTextParameterOwner::StaticRole("external_assistant".into()),
+            &static_parameters,
+        )?;
+        for (unit, block) in blocks.iter().enumerate() {
+            parameters.append(
+                ReplicatedTextParameterOwner::ExecutionUnit {
+                    group: "assistant.decoder".into(),
+                    unit,
+                },
+                block,
+            )?;
+        }
+        parameters.validate()?;
+        let mut declared = parameters.logical_parameters()?;
+        if let Some(scope) = &source_per_layer {
+            declared.extend(scope.logical_parameters()?);
+        }
+        eredu_nn::validate_logical_parameter_topology(&declared).map_err(Error::backend_source)?;
+        // Alias normalization is a family source rule; the shared resolver owns
+        // matrix eligibility, encoding equality and sharing validation.
+        let references = config
+            .text_config
+            .quantized_weight_configs
+            .iter()
+            .flat_map(|formats| formats.keys())
+            .chain(config.text_config.quantized_weights.iter().flatten())
+            .map(|name| {
+                let canonical = super::config::canonical_weight_name(name);
+                let parameter = declared
+                    .iter()
+                    .find(|p| {
+                        super::config::canonical_weight_name(p.parameter.id.as_str()) == canonical
+                    })
+                    .ok_or_else(|| {
+                        Error::backend(format!("undeclared assistant parameter {name}"))
+                    })?;
+                Ok((
+                    parameter.parameter.id.to_string(),
+                    Some(config.text_config.linear_format_for(name)),
+                ))
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        crate::format_references::validate_matrices(
+            declared,
+            references
+                .iter()
+                .map(|(name, format)| (name.as_str(), *format)),
+        )?;
+
+        Ok(Self {
+            config,
+            static_parameters,
+            source_per_layer,
+            blocks,
+            parameters,
+        })
+    }
+    /// Applies canonical checkpoint formats to a complete assistant
+    /// configuration.
+    pub fn with_checkpoint_formats(
+        &self,
+        formats: HashMap<String, WeightQuantization>,
+    ) -> Result<AssistantConfig, AssistantConfigError> {
+        let mut formats = formats;
+        // Required but unused GGUF vocabulary sources have no executable matrix owner.
+        for (_, target, _) in self.gguf_source_vocabulary_extensions() {
+            formats.remove(target);
+        }
+        for routed in self.blocks.iter().filter_map(|block| block.routed.as_ref()) {
+            let names =
+                super::checkpoint::expert_layout_names(routed, |base| format!("{base}.weight"))
+                    .map_err(AssistantConfigError::Invalid)?;
+            let gate = formats.remove(&names.separate_gate);
+            let up = formats.remove(&names.separate_up);
+            if gate.is_some() || up.is_some() {
+                let format = match (gate, up) {
+                    (Some(gate), Some(up)) if gate == up => gate,
+                    _ => {
+                        return Err(AssistantConfigError::Invalid(
+                            "split assistant expert gate/up encodings differ or are incomplete"
+                                .into(),
+                        ));
+                    }
+                };
+                let target = super::config::canonical_weight_name(&names.target_gate_up);
+                if formats
+                    .keys()
+                    .any(|name| super::config::canonical_weight_name(name) == target)
+                {
+                    return Err(AssistantConfigError::Invalid(
+                        "assistant fused and split expert encodings conflict".into(),
+                    ));
+                }
+                formats.insert(names.target_gate_up, format);
+            }
+        }
+        let mut declared = self
+            .parameters
+            .logical_parameters()
+            .map_err(|e| AssistantConfigError::Invalid(e.to_string()))?;
+        if let Some(scope) = &self.source_per_layer {
+            declared.extend(
+                scope
+                    .logical_parameters()
+                    .map_err(|e| AssistantConfigError::Invalid(e.to_string()))?,
+            );
+        }
+        for (name, format) in &formats {
+            let canonical = super::config::canonical_weight_name(name);
+            let parameter = declared
+                .iter()
+                .find(|p| {
+                    p.linear_format.is_some()
+                        && super::config::canonical_weight_name(p.parameter.id.as_str())
+                            == canonical
+                })
+                .ok_or_else(|| {
+                    AssistantConfigError::Invalid(format!(
+                        "{name} is not a declared assistant matrix"
+                    ))
+                })?;
+            format
+                .validate()
+                .map_err(|e| AssistantConfigError::Invalid(e.to_string()))?;
+            matrix_for_linear_format(
+                name,
+                std::iter::empty::<String>(),
+                parameter.shape.clone(),
+                (*format).into(),
+                None,
+            )
+            .map_err(|e| AssistantConfigError::Invalid(e.to_string()))?;
+        }
+        let mut target = self.config.clone();
+        target.text_config.quantized_weight_configs = (!formats.is_empty()).then_some(formats);
+        target.validate()?;
+        Ok(target)
+    }
+
+    /// Selects physical storage on retained construction scopes, preserving all source semantics.
+    pub fn project_formats(&self, config: AssistantConfig) -> Result<Self, Error> {
+        let neutral_text = |args: &ModelArgs| {
+            let mut args = args.clone();
+            args.weight_quantization = None;
+            args.quantized_weights = None;
+            args.quantized_weight_configs = None;
+            args
+        };
+        let source = &self.config;
+        if source.model_type != config.model_type
+            || source.backbone_hidden_size != config.backbone_hidden_size
+            || source.use_ordered_embeddings != config.use_ordered_embeddings
+            || source.num_centroids != config.num_centroids
+            || source.centroid_intermediate_top_k != config.centroid_intermediate_top_k
+            || source.tie_word_embeddings != config.tie_word_embeddings
+            || source.block_size != config.block_size
+            || neutral_text(&source.text_config) != neutral_text(&config.text_config)
+        {
+            return Err(Error::backend(
+                "assistant encoding projection changes retained geometry, ownership or execution policy",
+            ));
+        }
+        let static_parameters = self.static_parameters.project_formats(&config)?;
+        let source_per_layer = self
+            .source_per_layer
+            .as_ref()
+            .map(|spec| spec.project_formats(&config.text_config))
+            .transpose()?;
+        let blocks = self
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(layer, source)| {
+                super::text::specs::DecoderBlockSpec::from_scopes(
+                    &config.text_config,
+                    layer,
+                    source.block.project_formats(&config.text_config)?,
+                    source.dense.project_formats(&config.text_config)?,
+                    source.attention.project_formats(&config.text_config)?,
+                    source
+                        .routed
+                        .as_ref()
+                        .map(|spec| spec.project_formats(&config.text_config))
+                        .transpose()?,
+                )
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        let projected = Self::from_scopes(config, static_parameters, source_per_layer, blocks)?;
+        self.parameters.validate_projection(&projected.parameters)?;
+        Ok(projected)
+    }
+    /// Logical facts projected from these exact retained construction scopes.
+    pub fn parameter_declarations(
+        &self,
+    ) -> &crate::external_assistant::AssistantParameterDeclarations {
+        &self.parameters
+    }
+    pub(crate) fn source_recipes(
+        &self,
+        catalog: &dyn eredu_checkpoint::recipe::RecipeCatalog,
+    ) -> Result<
+        std::collections::BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
+        String,
+    > {
+        let mut recipes = std::collections::BTreeMap::new();
+        for block in &self.blocks {
+            let Some(routed) = &block.routed else {
+                continue;
+            };
+            let names = super::checkpoint::expert_layout_names(routed, |base| {
+                catalog
+                    .tensor_metadata(base)
+                    .or_else(|_| catalog.tensor_metadata(&format!("{base}.weight")))
+                    .map(|metadata| metadata.name)
+                    .unwrap_or_else(|_| format!("{base}.weight"))
+            })?;
+            let needs_global_projection = routed
+                .routed
+                .experts
+                .packed_parameters()
+                .map_err(|e| e.to_string())?
+                .gate_up()
+                .linear_format
+                .is_some_and(|format| format.encoding() == eredu_checkpoint::LinearFormat::NvFp4);
+            if !needs_global_projection
+                && catalog.tensor_metadata(&names.target_gate_up).is_ok()
+                && catalog.tensor_metadata(&names.target_down).is_ok()
+            {
+                continue;
+            }
+            let resolved =
+                eredu_checkpoint::expert::resolve_gated_product_expert_recipes(catalog, &names)
+                    .map_err(|error| error.to_string())?;
+            for (target, recipe) in
+                eredu_checkpoint::expert::gated_product_materialization_recipes(catalog, &resolved)?
+            {
+                if recipes.insert(target.clone(), recipe).is_some() {
+                    return Err(format!("duplicate assistant source recipe {target:?}"));
+                }
+            }
+        }
+        Ok(recipes)
+    }
+
+    pub(crate) fn build_unit<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>(
+        &self,
+        ordinal: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<DenseBlock<B>, Error> {
+        let spec = self
+            .blocks
+            .get(ordinal)
+            .ok_or_else(|| Error::backend("invalid assistant decoder unit"))?;
+        DenseBlock::from_spec(ordinal, spec.clone(), context)
+    }
+}
 
 /// Invalid Gemma assistant configuration.
 #[derive(Debug, thiserror::Error)]
@@ -340,18 +651,6 @@ impl AssistantConfig {
         Ok(target)
     }
 
-    /// Applies canonical checkpoint formats to a complete assistant
-    /// configuration.
-    pub fn with_checkpoint_formats(
-        &self,
-        formats: HashMap<String, WeightQuantization>,
-    ) -> Result<Self, AssistantConfigError> {
-        let mut target = self.clone();
-        target.text_config.quantized_weight_configs = (!formats.is_empty()).then_some(formats);
-        target.validate()?;
-        Ok(target)
-    }
-
     /// Proves that this assistant can consume shared state from `target`.
     ///
     /// This relationship is independent of tensor storage and execution backend.
@@ -413,181 +712,228 @@ impl AssistantConfig {
 
 /// Builds the strict released assistant SafeTensors catalog.
 pub fn assistant_safetensors_plan(
-    config: &AssistantConfig,
+    definition: &AssistantDefinition,
 ) -> Result<SafetensorsCheckpointPlan, String> {
-    config.validate().map_err(|error| error.to_string())?;
-    let family = super::FamilyConfig {
-        model_type: "gemma4".into(),
-        text: config.text_config.clone(),
-        vision: None,
-        image_token_id: None,
-        video_token_id: None,
-        audio: None,
-        audio_token_id: None,
-    };
-    let base = super::checkpoint::safetensors_plan(&family)?;
-    let mut common = base.common_tensors;
-    let canonical_names = common
+    let mut common = Vec::new();
+    let mut groups = Vec::new();
+    let mut static_slots = definition
+        .static_parameters
+        .logical_parameters()
+        .map_err(|e| e.to_string())?;
+    if let Some(scope) = &definition.source_per_layer {
+        static_slots.extend(scope.logical_parameters().map_err(|e| e.to_string())?);
+    }
+    for parameter in static_slots {
+        let name = parameter.parameter.id.as_str();
+        let dense_centroids = matches!(&definition.static_parameters.vocabulary,
+            Vocabulary::Ordered(spec) if spec.centroids.weight.id == parameter.parameter.id);
+        if dense_centroids {
+            common.push(SafetensorsTensorConstraint::required(
+                name,
+                parameter.shape,
+                StoredDtypeConstraint::Floating,
+            ));
+        } else if let Some(format) = parameter.linear_format {
+            common.extend(
+                matrix_for_linear_format(
+                    name,
+                    std::iter::empty::<String>(),
+                    parameter.shape,
+                    format.encoding(),
+                    None,
+                )
+                .map_err(|e| e.to_string())?,
+            );
+        } else {
+            let dtype = if parameter.role == eredu_nn::LogicalParameterRole::TokenMapping {
+                StoredDtypeConstraint::Exact(StoredDtype::I32)
+            } else {
+                StoredDtypeConstraint::Floating
+            };
+            common.push(SafetensorsTensorConstraint::required(
+                name,
+                parameter.shape,
+                dtype,
+            ));
+        }
+    }
+    for (layer, block) in definition.blocks.iter().enumerate() {
+        super::checkpoint::add_safetensors_block(
+            layer,
+            block,
+            &format!("model.language_model.layers.{layer}"),
+            &mut common,
+            &mut groups,
+        )?;
+    }
+    // Ordinary assistant slots use canonical names; bank alternatives retain
+    // the released and canonical source spellings declared by the format extension.
+    let canonical = common
         .iter()
         .filter_map(|tensor| {
-            super::checkpoint::neutral_alias(tensor)
-                .map(|canonical| (tensor.key.clone(), canonical.clone()))
+            tensor
+                .aliases
+                .first()
+                .map(|alias| (tensor.key.clone(), alias.clone()))
         })
         .collect::<std::collections::BTreeMap<_, _>>();
     for tensor in &mut common {
-        if let Some(canonical) = super::checkpoint::neutral_alias(tensor).cloned() {
-            tensor.key = canonical;
+        if let Some(target) = canonical.get(&tensor.key) {
+            tensor.key = target.clone();
         }
         if let Some(companion) = &mut tensor.linear_companion {
-            if let Some(canonical) = canonical_names.get(&companion.primary) {
-                companion.primary = canonical.clone();
+            if let Some(target) = canonical.get(&companion.primary) {
+                companion.primary = target.clone();
             }
         }
         tensor.aliases.clear();
     }
-    if config.use_ordered_embeddings {
-        common.retain(|tensor| !tensor.key.starts_with("lm_head."));
-    }
-    if !config.tie_word_embeddings && !config.use_ordered_embeddings {
-        common.retain(|tensor| !tensor.key.starts_with("model.embed_tokens."));
-    }
-
-    let hidden = usize::try_from(config.text_config.hidden_size)
-        .map_err(|_| "Gemma 4 assistant hidden size is invalid".to_string())?;
-    let backbone = usize::try_from(config.backbone_hidden_size)
-        .map_err(|_| "Gemma 4 assistant target width is invalid".to_string())?;
-    let format = |name: &str| {
-        config
-            .quantization
-            .map(LinearFormat::from)
-            .unwrap_or_else(|| config.text_config.linear_format_for(name))
-    };
-    let mut add_matrix = |name: &str, shape: Vec<usize>| -> Result<(), String> {
-        common.extend(
-            matrix_for_linear_format(
-                name,
-                std::iter::empty::<String>(),
-                shape,
-                format(name),
-                None,
-            )
-            .map_err(|error| error.to_string())?,
-        );
-        Ok(())
-    };
-    add_matrix(
-        "pre_projection.weight",
-        vec![
-            hidden,
-            backbone
-                .checked_mul(2)
-                .ok_or("assistant input width overflows")?,
-        ],
-    )?;
-    add_matrix("post_projection.weight", vec![backbone, hidden])?;
-    if config.use_ordered_embeddings {
-        let centroids = usize::try_from(config.num_centroids)
-            .map_err(|_| "Gemma 4 assistant centroid count is invalid".to_string())?;
-        let vocabulary = usize::try_from(config.text_config.vocab_size)
-            .map_err(|_| "Gemma 4 assistant vocabulary is invalid".to_string())?;
-        common.extend([
-            SafetensorsTensorConstraint::required(
-                "masked_embedding.centroids.weight",
-                vec![centroids, hidden],
-                StoredDtypeConstraint::Floating,
-            ),
-            SafetensorsTensorConstraint::required(
-                "masked_embedding.token_ordering",
-                vec![vocabulary],
-                StoredDtypeConstraint::Exact(StoredDtype::I32),
-            ),
-        ]);
+    for group in &mut groups {
+        for variant in &mut group.variants {
+            for tensor in &mut variant.tensors {
+                super::checkpoint::add_mlx_vlm_aliases(tensor);
+            }
+        }
     }
     SafetensorsCheckpointPlan::new(
         "Gemma 4 assistant SafeTensors",
         common,
-        base.layout_groups,
+        groups,
         CatalogPolicy::strict(),
     )
-    .map_err(|error| error.to_string())
+    .map_err(|e| e.to_string())
 }
 
 /// Builds the strict released assistant GGUF catalog.
-pub fn assistant_gguf_plan(config: &AssistantConfig) -> Result<GgufCheckpointPlan, String> {
-    let mut plan = super::gguf_plan(&config.text_config)?;
-    let hidden = usize::try_from(config.text_config.hidden_size)
-        .map_err(|_| "Gemma 4 assistant hidden size is invalid".to_string())?;
-    let backbone = usize::try_from(config.backbone_hidden_size)
-        .map_err(|_| "Gemma 4 assistant target width is invalid".to_string())?;
-    let matrix = |name: &str, aliases: &[&str], shape: Vec<usize>| {
-        GgufTensorConstraint::required(
-            name,
+pub fn assistant_gguf_plan(definition: &AssistantDefinition) -> Result<GgufCheckpointPlan, String> {
+    let mut common = Vec::new();
+    for (parameter, source) in definition.gguf_slots()? {
+        let operation = if parameter.role == eredu_nn::LogicalParameterRole::TokenMapping {
+            TensorOperation::I32
+        } else if parameter.linear_format.is_some() {
+            TensorOperation::Matrix
+        } else {
+            TensorOperation::Vector
+        };
+        let alias = source
+            .strip_prefix("mtp.")
+            .map(|local| format!("nextn.{local}"));
+        let mut tensor = GgufTensorConstraint::required(
+            source,
+            parameter.shape,
+            GgufTypeConstraint::OperationClass(operation),
+        );
+        if let Some(alias) = alias {
+            tensor = tensor.with_aliases([alias]);
+        }
+        common.push(tensor);
+    }
+    for (source, _, shape) in definition.gguf_source_vocabulary_extensions() {
+        common.push(GgufTensorConstraint::required(
+            source,
             shape,
             GgufTypeConstraint::OperationClass(TensorOperation::Matrix),
-        )
-        .with_aliases(aliases.iter().copied())
-    };
-    plan.common_tensors.extend([
-        matrix(
-            "mtp.pre_projection.weight",
-            &["nextn.pre_projection.weight"],
-            vec![hidden, backbone * 2],
-        ),
-        matrix(
-            "mtp.post_projection.weight",
-            &["nextn.post_projection.weight"],
-            vec![backbone, hidden],
-        ),
-    ]);
-    if config.use_ordered_embeddings {
-        let centroids = usize::try_from(config.num_centroids)
-            .map_err(|_| "Gemma 4 assistant centroid count is invalid".to_string())?;
-        let vocabulary = usize::try_from(config.text_config.vocab_size)
-            .map_err(|_| "Gemma 4 assistant vocabulary is invalid".to_string())?;
-        plan.common_tensors.extend([
-            matrix(
-                "mtp.centroids.weight",
-                &["nextn.centroids.weight"],
-                vec![centroids, hidden],
-            ),
-            GgufTensorConstraint::required(
-                "mtp.token_ordering.weight",
-                vec![vocabulary],
-                GgufTypeConstraint::OperationClass(TensorOperation::I32),
-            )
-            .with_aliases(["nextn.token_ordering.weight"]),
-        ]);
+        ));
     }
-    GgufCheckpointPlan::new(
-        "Gemma 4 assistant GGUF",
-        plan.common_tensors,
-        plan.layout_groups,
-        plan.catalog_policy,
-    )
-    .map_err(|error| error.to_string())
+    let mut groups = Vec::new();
+    let mut catalog = CatalogPolicy::strict();
+    catalog.allowed_prefixes.push("rope_freqs.".into());
+    super::checkpoint::add_gguf_blocks(&definition.blocks, &mut common, &mut groups, &mut catalog)?;
+    GgufCheckpointPlan::new("Gemma 4 assistant GGUF", common, groups, catalog)
+        .map_err(|e| e.to_string())
 }
 
-/// Translates one assistant GGUF tensor to its neutral parameter identity.
-pub fn translate_assistant_gguf_weight_name(name: &str) -> String {
-    if matches!(
-        name,
-        "mtp.token_ordering.weight" | "nextn.token_ordering.weight"
-    ) {
-        return "masked_embedding.token_ordering".into();
+impl AssistantDefinition {
+    fn gguf_slots(
+        &self,
+    ) -> Result<Vec<(eredu_nn::LogicalParameterDeclaration<'_>, String)>, String> {
+        let declared = &self.static_parameters;
+        let mut slots = Vec::new();
+        for (spec, source) in [
+            (&declared.pre, "mtp.pre_projection.weight"),
+            (&declared.post, "mtp.post_projection.weight"),
+        ] {
+            slots.extend(
+                spec.logical_parameters()
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .map(|p| (p, source.to_owned())),
+            );
+        }
+        slots.extend(
+            declared
+                .norm
+                .logical_parameters()
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .map(|p| (p, "output_norm.weight".into())),
+        );
+        let vocabulary = declared
+            .vocabulary
+            .logical_parameters()
+            .map_err(|e| e.to_string())?;
+        for parameter in vocabulary {
+            let source = match &declared.vocabulary {
+                Vocabulary::Tied(_) => "token_embd.weight",
+                Vocabulary::Output(_) => "output.weight",
+                Vocabulary::Ordered(ordered) => {
+                    if parameter.parameter.id == ordered.ordering.parameter.id {
+                        "mtp.token_ordering.weight"
+                    } else if parameter.parameter.id == ordered.centroids.weight.id {
+                        "mtp.centroids.weight"
+                    } else {
+                        "token_embd.weight"
+                    }
+                }
+            };
+            slots.push((parameter, source.into()));
+        }
+        if let Some(scope) = &self.source_per_layer {
+            slots.extend(super::checkpoint::per_layer_gguf_slots(scope)?);
+        }
+        Ok(slots)
     }
-    for (source, target) in [
-        ("mtp.pre_projection", "pre_projection"),
-        ("nextn.pre_projection", "pre_projection"),
-        ("mtp.post_projection", "post_projection"),
-        ("nextn.post_projection", "post_projection"),
-        ("mtp.centroids", "masked_embedding.centroids"),
-        ("nextn.centroids", "masked_embedding.centroids"),
-    ] {
-        if name == source || name.starts_with(&format!("{source}.")) {
-            return name.replacen(source, target, 1);
+    /// Released GGUF carries vocabulary source tables even when the assistant
+    /// equation reads only its independent output or centroid-selected table.
+    /// These source-only requirements reference the retained vocabulary geometry.
+    fn gguf_source_vocabulary_extensions(&self) -> Vec<(&'static str, &'static str, Vec<usize>)> {
+        match &self.static_parameters.vocabulary {
+            Vocabulary::Output(spec) => vec![(
+                "token_embd.weight",
+                "model.embed_tokens.weight",
+                vec![spec.output as usize, spec.input as usize],
+            )],
+            Vocabulary::Ordered(spec) if !self.config.text_config.tie_word_embeddings => vec![(
+                "output.weight",
+                "lm_head.weight",
+                vec![
+                    spec.table.vocabulary as usize,
+                    spec.table.dimensions as usize,
+                ],
+            )],
+            _ => Vec::new(),
         }
     }
-    super::translate_gguf_weight_name(name)
+    /// Source aliases resolve against the same scopes as admission and materialization.
+    pub fn gguf_names(&self) -> Result<super::TextGgufNames, String> {
+        let mut bindings = Vec::new();
+        for (parameter, source) in self.gguf_slots()? {
+            let target = parameter.parameter.id.to_string();
+            if let Some(local) = source.strip_prefix("mtp.") {
+                bindings.push((
+                    format!("nextn.{local}"),
+                    target.clone(),
+                    parameter.linear_format.is_some(),
+                ));
+            }
+            // Token ordering has an integer source suffix but no matrix companions.
+            bindings.push((source, target, parameter.linear_format.is_some()));
+        }
+        for (source, target, _) in self.gguf_source_vocabulary_extensions() {
+            bindings.push((source.into(), target.into(), true));
+        }
+        super::TextGgufNames::from_scopes(bindings, &self.blocks)
+    }
 }
 
 /// Forkable assistant progress for one speculative branch.
@@ -622,37 +968,23 @@ struct MaskedHead<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
 
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> MaskedHead<B> {
     fn new(
-        config: &AssistantConfig,
+        spec: &parameters::OrderedParameters,
+        top_k: i32,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let args = &config.text_config;
         Ok(Self {
-            centroids: B::linear(
-                LinearSpec {
-                    input: args.hidden_size,
-                    output: config.num_centroids,
-                    weight: ParameterSpec::trainable("masked_embedding.centroids.weight")
-                        .map_err(Error::backend)?,
-                    bias: None,
-                    format: crate::linear_format::standard_linear_format(
-                        "masked_embedding.centroids.weight",
-                        LinearFormat::Dense,
-                    )?,
-                },
-                context,
-            )?,
+            centroids: B::linear(spec.centroids.clone(), context)?,
             token_ordering: Parameter::unloaded_i32(
-                ParameterSpec::trainable("masked_embedding.token_ordering")
-                    .map_err(Error::backend)?,
-                &[args.vocab_size],
+                spec.ordering.parameter.clone(),
+                &spec.ordering.shape,
                 context,
             )?,
             output_weight: Parameter::unloaded(
-                ParameterSpec::trainable("model.embed_tokens.weight").map_err(Error::backend)?,
-                &[args.vocab_size, args.hidden_size],
+                spec.table.weight.clone(),
+                &[spec.table.vocabulary, spec.table.dimensions],
                 context,
             )?,
-            top_k: config.centroid_intermediate_top_k,
+            top_k,
         })
     }
 
@@ -694,76 +1026,32 @@ pub struct Assistant<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBacken
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Assistant<B> {
     /// Builds an unloaded assistant under released SafeTensors identities.
     pub fn new(
-        config: AssistantConfig,
+        definition: &AssistantDefinition,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        config.validate().map_err(Error::backend)?;
-        let args = &config.text_config;
-        let layers = (0..args.num_hidden_layers())
-            .map(|layer| DenseBlock::new_at(args, layer, "model.layers", context))
+        let config = definition.config.clone();
+        let declared = definition.static_parameters.clone();
+        let layers = (0..definition.blocks.len())
+            .map(|layer| definition.build_unit::<B>(layer, context))
             .collect::<Result<Vec<_>, _>>()?;
-        let format = |name: &str| {
-            config
-                .quantization
-                .map(LinearFormat::from)
-                .unwrap_or_else(|| args.linear_format_for(name))
-        };
-        let linear = |name: &str, input, output| {
-            B::linear(
-                LinearSpec {
-                    input,
-                    output,
-                    weight: ParameterSpec::trainable(name).map_err(Error::backend)?,
-                    bias: None,
-                    format: crate::linear_format::standard_linear_format(name, format(name))?,
-                },
-                context,
-            )
-        };
-        let masked_head = config
-            .use_ordered_embeddings
-            .then(|| MaskedHead::new(&config, context))
-            .transpose()?;
-        let tied_embedding = (config.tie_word_embeddings && !config.use_ordered_embeddings)
-            .then(|| {
-                B::embedding(
-                    EmbeddingSpec {
-                        vocabulary: args.vocab_size,
-                        dimensions: args.hidden_size,
-                        weight: ParameterSpec::trainable("model.embed_tokens.weight")
-                            .map_err(Error::backend)?,
-                        format: crate::linear_format::standard_linear_format(
-                            "model.embed_tokens.weight",
-                            args.linear_format_for("model.embed_tokens.weight"),
-                        )?,
-                    },
+        let (tied_embedding, output_head, masked_head) = match &declared.vocabulary {
+            Vocabulary::Tied(spec) => (Some(B::embedding(spec.clone(), context)?), None, None),
+            Vocabulary::Output(spec) => (None, Some(B::linear(spec.clone(), context)?), None),
+            Vocabulary::Ordered(spec) => (
+                None,
+                None,
+                Some(MaskedHead::new(
+                    spec,
+                    config.centroid_intermediate_top_k,
                     context,
-                )
-            })
-            .transpose()?;
-        let output_head = (!config.tie_word_embeddings && !config.use_ordered_embeddings)
-            .then(|| linear("lm_head.weight", args.hidden_size, args.vocab_size))
-            .transpose()?;
+                )?),
+            ),
+        };
         Ok(Self {
             layers,
-            final_norm: B::normalization(
-                NormalizationConstructionSpec::learned(
-                    args.hidden_size,
-                    args.rms_norm_eps,
-                    ParameterSpec::trainable("model.norm.weight").map_err(Error::backend)?,
-                ),
-                context,
-            )?,
-            pre_projection: linear(
-                "pre_projection.weight",
-                2 * config.backbone_hidden_size,
-                args.hidden_size,
-            )?,
-            post_projection: linear(
-                "post_projection.weight",
-                args.hidden_size,
-                config.backbone_hidden_size,
-            )?,
+            final_norm: B::normalization(declared.norm, context)?,
+            pre_projection: B::linear(declared.pre, context)?,
+            post_projection: B::linear(declared.post, context)?,
             tied_embedding,
             output_head,
             masked_head,

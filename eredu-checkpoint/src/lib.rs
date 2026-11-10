@@ -215,6 +215,29 @@ pub enum WeightQuantization {
     },
 }
 
+/// Checked U32 word and per-group extents for one logical input axis.
+/// Layout-specific alignment, positive parameter axes and container-native byte
+/// layouts remain contracts of the consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackedWordGeometry {
+    packed_bits: usize,
+    group_columns: usize,
+}
+impl PackedWordGeometry {
+    /// Bit extent before conversion to complete U32 words.
+    pub const fn packed_bits(self) -> usize {
+        self.packed_bits
+    }
+    /// Number of U32 words along the input axis.
+    pub const fn word_columns(self) -> usize {
+        self.packed_bits / 32
+    }
+    /// Number of scale or affine-bias groups along the input axis.
+    pub const fn group_columns(self) -> usize {
+        self.group_columns
+    }
+}
+
 /// Physical encoding of the scale companion for an E4M3 block-FP8 matrix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockFp8ScaleEncoding {
@@ -343,6 +366,29 @@ impl WeightQuantization {
     pub const MXFP4_GROUP_SIZE: i32 = 32;
     /// MXFP4 packed value width fixed by the format.
     pub const MXFP4_BITS: i32 = 4;
+
+    /// Projects checked complete-word and per-group geometry from this descriptor.
+    /// Consumers retain any stricter column alignment and scalar-width limits.
+    /// This projection does not establish source-layout or execution support.
+    pub fn packed_word_geometry(self, input: usize) -> Result<PackedWordGeometry, Error> {
+        self.validate()?;
+        let bits = usize::try_from(self.bits())
+            .map_err(|_| Error::invalid("packed bit width exceeds usize"))?;
+        let group = usize::try_from(self.group_size())
+            .map_err(|_| Error::invalid("packed group size exceeds usize"))?;
+        let packed_bits = input
+            .checked_mul(bits)
+            .ok_or_else(|| Error::invalid("packed input bit extent overflows usize"))?;
+        if group == 0 || !input.is_multiple_of(group) || !packed_bits.is_multiple_of(32) {
+            return Err(Error::invalid(format!(
+                "packed input {input} is incompatible with group {group} and {bits} bits"
+            )));
+        }
+        Ok(PackedWordGeometry {
+            packed_bits,
+            group_columns: input / group,
+        })
+    }
 
     /// Returns the grouping used by packed execution.
     pub fn group_size(self) -> i32 {

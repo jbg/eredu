@@ -45,7 +45,7 @@ impl TargetTensorPartition {
                 .iter()
                 .filter_map(|unit| match unit {
                     UnitSpec::Decoder { feed_forward, .. } => {
-                        Some(&feed_forward.feed_forward.experts)
+                        Some(&feed_forward.feed_forward.parameters.routed.experts)
                     }
                     _ => None,
                 }),
@@ -84,7 +84,7 @@ impl TargetTensorPartition {
                 .iter()
                 .filter_map(|unit| match unit {
                     UnitSpec::Decoder { feed_forward, .. } => {
-                        Some(&feed_forward.feed_forward.experts)
+                        Some(&feed_forward.feed_forward.parameters.routed.experts)
                     }
                     _ => None,
                 }),
@@ -186,11 +186,11 @@ pub(crate) fn partition_unit_observations(
         },
         TensorAxis {
             name: "stream".into(),
-            dimension: D::Known(spec.boundary.geometry.streams() as usize),
+            dimension: D::Known(spec.static_parameters.readout.geometry.streams() as usize),
         },
         TensorAxis {
             name: "hidden".into(),
-            dimension: D::Known(spec.boundary.geometry.hidden_size() as usize),
+            dimension: D::Known(spec.static_parameters.readout.geometry.hidden_size() as usize),
         },
     ];
     let group = eredu_runtime::ExecutionGroupId::new(crate::decoder::TARGET_EXECUTION_GROUP)

@@ -1,41 +1,11 @@
 //! RNNT embedding and joint affines without recurrent parameter ownership.
 use super::{
     rnnt::{RnntDimensions, RnntError, RnntProjectionExecution},
-    rnnt_layered::{
-        rnnt_local_dimensions_for_description, rnnt_parameter_description_for_phases,
-        runtime_error, RnntForward, RnntInput, RnntKernel, RnntLocalDimensions, RnntSelection,
-        RnntUnit,
-    },
+    rnnt_layered::{runtime_error, RnntForward, RnntInput, RnntKernel, RnntUnit},
 };
 use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Tensor};
 use eredu_runtime::*;
 
-/// Exact projection-only ownership from the common RNNT semantic declaration.
-pub fn rnnt_projection_parameter_description(
-    dimensions: RnntDimensions,
-) -> Result<ArchitectureParameterDescription, RnntError> {
-    rnnt_parameter_description_for_phases(dimensions, RnntSelection::Projections.phases())
-}
-/// Projection-only semantic definition, without recurrent parameter or state ownership.
-pub fn rnnt_projection_component_definition(
-    dimensions: RnntDimensions,
-) -> Result<ComponentDefinition, RnntError> {
-    super::rnnt_layered::rnnt_definition_for_selection(
-        dimensions,
-        super::rnnt_layered::RnntSelection::Projections,
-    )
-}
-/// Checks vocabulary slices and joint replicas in the compact projection-only topology.
-pub fn rnnt_projection_local_dimensions(
-    dimensions: RnntDimensions,
-    layout: &LocalModelLayout,
-) -> Result<RnntLocalDimensions, RnntError> {
-    rnnt_local_dimensions_for_description(
-        dimensions,
-        layout,
-        &rnnt_projection_parameter_description(dimensions)?,
-    )
-}
 /// One nonrecurrent phase; no predictor request can enter this graph.
 pub enum RnntProjectionInput<'a, T> {
     /// Global vocabulary token, including blank.

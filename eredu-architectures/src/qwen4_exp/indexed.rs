@@ -5,38 +5,29 @@ use super::{
         CachedQsaSelector, QsaError, QsaExecutionLimits, QsaIndexerSpec, QsaSelectionInput,
         QsaSelectionSpec, QsaStreamStateSpec,
     },
-    residual::mixer_spec,
 };
 use crate::decoder::{Attention, AttentionInput, ComponentInstrumentation};
 use eredu_nn::{
     residual_streams::{GatedResidual, GatedResidualSpec},
-    AttentionArithmetic, AttentionCache, Error, LinearFormatSpec, LinearSpec, NeuralBackend,
-    NeuralOperatorCapabilities as C, NormalizationConstructionSpec, NormalizationScale,
-    ParameterSpec, RotaryPosition, RotarySpec, Tensor, TensorElementType,
+    AttentionArithmetic, AttentionCache, DeclareLogicalParameters, Error, NeuralBackend,
+    NeuralOperatorCapabilities as C, RotaryPosition, RotarySpec, Tensor, TensorElementType,
 };
 use eredu_runtime::{RuntimeAppendStreams, RuntimeStateComponents};
+
+mod parameters;
+pub use parameters::IndexedParameters;
 
 /// Complete architecture-owned parameters, state and workspace for an indexed sublayer.
 #[derive(Debug, Clone)]
 pub struct IndexedSublayerSpec {
     /// Replicated small residual mixer, including the injection projection.
     pub residual: GatedResidualSpec,
-    /// Query heads, optionally localized after global artifact validation.
-    pub heads: i32,
-    /// K/V heads; may be replicated for tensor partitions smaller than query groups.
-    pub kv_heads: i32,
-    /// Per-head attention width.
-    pub head_dim: i32,
-    /// Exact query (with gate), key, value and output projections.
-    pub projections: [LinearSpec; 4],
-    /// Per-head query normalization.
-    pub query_norm: NormalizationConstructionSpec,
-    /// Per-head key normalization.
-    pub key_norm: NormalizationConstructionSpec,
+    /// Validated geometry and ownership shared with cold consumers.
+    pub parameters: IndexedParameters,
     /// Rotary policy shared with the indexer.
     pub rotary: RotarySpec,
-    /// Query/key index projections and tiled selection geometry.
-    pub indexer: QsaIndexerSpec,
+    /// Tiled selection geometry and retained scratch limits.
+    pub selection: QsaSelectionSpec,
     /// Exact fixed and named-stream state ownership.
     pub state: QsaStreamStateSpec,
     /// Finite coordinator workspace and invocation bounds.
@@ -45,80 +36,23 @@ pub struct IndexedSublayerSpec {
     pub arithmetic: AttentionArithmetic,
 }
 impl IndexedSublayerSpec {
-    /// Constructs the released target namespace and equations; prediction callers
+    /// Attaches state and workspace to declared parameters; prediction callers
     /// supply their architecture-selected rotary policy before construction.
     #[allow(clippy::too_many_arguments)]
-    pub fn from_config(
+    pub fn from_parameters(
         config: &Config,
-        root: &str,
+        residual: GatedResidualSpec,
+        parameters: IndexedParameters,
         tile_blocks: i32,
         selection_workspace: u64,
         limits: QsaExecutionLimits,
         element: TensorElementType,
         rotary_element: TensorElementType,
-        mut format: impl FnMut(&str) -> Result<LinearFormatSpec, Error>,
     ) -> Result<Self, QsaError> {
         let a = &config.attention;
-        let query = a.heads.checked_mul(a.head_dim).ok_or(QsaError::Geometry)?;
-        let kv = a
-            .kv_heads
-            .checked_mul(a.head_dim)
-            .ok_or(QsaError::Geometry)?;
-        let index = a
-            .index_heads
-            .checked_add(1)
-            .and_then(|heads| heads.checked_mul(a.index_head_dim))
-            .ok_or(QsaError::Geometry)?;
-        let residual = mixer_spec(
-            config,
-            &format!("{root}.attn_hyper_connection"),
-            true,
-            &mut format,
-        )?;
-        let root = format!("{root}.self_attn");
-        let parameter = |suffix: &str| {
-            ParameterSpec::trainable(format!("{root}.{suffix}")).map_err(Error::backend)
-        };
-        let mut projection = |suffix: &str, input, output, bias| -> Result<LinearSpec, Error> {
-            let name = format!("{root}.{suffix}.weight");
-            Ok(LinearSpec {
-                input,
-                output,
-                weight: parameter(&format!("{suffix}.weight"))?,
-                bias: if bias {
-                    Some(parameter(&format!("{suffix}.bias"))?)
-                } else {
-                    None
-                },
-                format: format(&name)?,
-            })
-        };
-        let projections = [
-            projection(
-                "q_proj",
-                config.hidden_size,
-                query.checked_mul(2).ok_or(QsaError::Geometry)?,
-                a.bias,
-            )?,
-            projection("k_proj", config.hidden_size, kv, a.bias)?,
-            projection("v_proj", config.hidden_size, kv, a.bias)?,
-            projection("o_proj", query, config.hidden_size, false)?,
-        ];
-        let norm = |suffix: &str, dimensions| -> Result<NormalizationConstructionSpec, Error> {
-            Ok(NormalizationConstructionSpec {
-                reduction: eredu_nn::NormalizationReduction::Native,
-                dimensions,
-                groups: None,
-                epsilon: config.norm_epsilon,
-                scale: NormalizationScale::LearnedOffset {
-                    weight: parameter(&format!("{suffix}.weight"))?,
-                    offset: 1.,
-                },
-            })
-        };
         let selection = QsaSelectionSpec {
-            heads: a.index_heads,
-            dimensions: a.index_head_dim,
+            heads: parameters.index_geometry.query_heads(),
+            dimensions: parameters.index_geometry.key_dimensions(),
             ratio: a.ratio,
             token_budget: a.budget,
             tile_blocks,
@@ -126,20 +60,9 @@ impl IndexedSublayerSpec {
         };
         let spec = Self {
             residual,
-            heads: a.heads,
-            kv_heads: a.kv_heads,
-            head_dim: a.head_dim,
-            projections,
-            query_norm: norm("q_norm", a.head_dim)?,
-            key_norm: norm("k_norm", a.head_dim)?,
+            parameters,
             rotary: a.rotary,
-            indexer: QsaIndexerSpec {
-                selection,
-                query_key: projection("indexer.index_qk_proj", config.hidden_size, index, false)?,
-                query_norm: norm("indexer.q_layernorm", a.index_head_dim)?,
-                key_norm: norm("indexer.k_layernorm", a.index_head_dim)?,
-                rotary: a.rotary,
-            },
+            selection,
             state: QsaStreamStateSpec::new(
                 selection,
                 a.rotary.dimensions,
@@ -152,55 +75,50 @@ impl IndexedSublayerSpec {
         spec.validate()?;
         Ok(spec)
     }
+    /// Projects the indexer invocation from its authoritative logical slots.
+    pub fn indexer_spec(&self) -> QsaIndexerSpec {
+        QsaIndexerSpec {
+            selection: self.selection,
+            query_key: self.parameters.index_projection.clone(),
+            query_norm: self.parameters.index_query_norm.clone(),
+            key_norm: self.parameters.index_key_norm.clone(),
+            rotary: self.rotary,
+        }
+    }
     /// Validates composition geometry without touching any native device or parameter.
     pub fn validate(&self) -> Result<(), QsaError> {
+        self.validate_geometry()?;
+        self.declarations()?;
+        Ok(())
+    }
+    fn declarations(&self) -> Result<Vec<eredu_nn::LogicalParameterDeclaration<'_>>, Error> {
+        let mut parameters = self.residual.logical_parameters()?;
+        parameters.extend(self.parameters.logical_parameters()?);
+        eredu_nn::validate_logical_parameter_topology(&parameters)
+            .map_err(Error::backend_source)?;
+        Ok(parameters)
+    }
+    fn validate_geometry(&self) -> Result<(), QsaError> {
         self.residual.validate()?;
-        self.state.validate_indexer(&self.indexer)?;
-        if self.heads <= 0
-            || self.kv_heads <= 0
-            || self.heads % self.kv_heads != 0
-            || self.head_dim <= 0
-            || self.rotary.dimensions <= 0
-            || self.rotary.dimensions > self.head_dim
-            || self.rotary != self.indexer.rotary
+        self.parameters.validate()?;
+        self.state.validate_indexer(&self.indexer_spec())?;
+        if self.rotary.dimensions <= 0
+            || self.rotary.dimensions > self.parameters.projection.geometry.key_dimensions()
             || self.residual.injection.is_none()
+            || self.parameters.projection.query.input != self.residual.geometry.hidden_size()
+            || self.selection.heads != self.parameters.index_geometry.query_heads()
+            || self.selection.dimensions != self.parameters.index_geometry.key_dimensions()
         {
             return Err(QsaError::Geometry);
         }
-        let query = self
-            .heads
-            .checked_mul(self.head_dim)
-            .ok_or(QsaError::Geometry)?;
-        let kv = self
-            .kv_heads
-            .checked_mul(self.head_dim)
-            .ok_or(QsaError::Geometry)?;
-        let h = self.residual.geometry.hidden_size();
-        if self.indexer.query_key.input != h {
-            return Err(QsaError::Geometry);
-        }
-        for (p, i, o) in [
-            (
-                &self.projections[0],
-                h,
-                query.checked_mul(2).ok_or(QsaError::Geometry)?,
-            ),
-            (&self.projections[1], h, kv),
-            (&self.projections[2], h, kv),
-            (&self.projections[3], query, h),
-        ] {
-            if p.input != i || p.output != o {
-                return Err(QsaError::Geometry);
-            }
-            p.format.validate_for_weight(&p.weight)?;
-        }
-        for n in [&self.query_norm, &self.key_norm] {
-            n.validate()?;
-            if n.dimensions != self.head_dim || n.groups.is_some() {
-                return Err(QsaError::Geometry);
-            }
-        }
         Ok(())
+    }
+}
+
+impl DeclareLogicalParameters for IndexedSublayerSpec {
+    fn logical_parameters(&self) -> Result<Vec<eredu_nn::LogicalParameterDeclaration<'_>>, Error> {
+        self.validate_geometry().map_err(Error::backend_source)?;
+        self.declarations()
     }
 }
 
@@ -235,18 +153,27 @@ impl<B: NeuralBackend> IndexedSublayer<B> {
                 .union(C::BROADCAST_TO)
                 .union(C::SIGMOID),
         )?;
-        let selector = CachedQsaSelector::new(spec.indexer, spec.state, spec.limits, context)?;
-        let [q, k, v, o] = spec.projections;
+        let selector =
+            CachedQsaSelector::new(spec.indexer_spec(), spec.state, spec.limits, context)?;
+        let parameters = spec.parameters;
+        let geometry = parameters.projection.geometry;
+        let eredu_nn::SelfAttentionProjectionSpec {
+            query: q,
+            key: k,
+            value: v,
+            output: o,
+            ..
+        } = parameters.projection;
         let mut attention = Attention::from_gated_parts(
-            spec.heads,
-            spec.kv_heads,
-            spec.head_dim,
+            geometry.query_heads(),
+            geometry.key_value_heads(),
+            geometry.key_dimensions(),
             B::linear(q, context)?,
             B::linear(k, context)?,
             B::linear(v, context)?,
             B::linear(o, context)?,
-            Some(B::normalization(spec.query_norm, context)?),
-            Some(B::normalization(spec.key_norm, context)?),
+            Some(B::normalization(parameters.query_norm, context)?),
+            Some(B::normalization(parameters.key_norm, context)?),
             Some(B::rotary(spec.rotary, context)?),
             None,
         )?;

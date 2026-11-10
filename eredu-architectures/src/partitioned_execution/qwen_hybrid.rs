@@ -67,7 +67,7 @@ where
         .shared_component_definition()
         .ok_or_else(|| architecture("Qwen hybrid selection has no retained definition"))?;
     let definition =
-        crate::qwen::hybrid::project_parameters(&selected_args, &retained).map_err(architecture)?;
+        crate::replicated_text::executable_component(selected.base()).map_err(architecture)?;
     let parameters = definition.parameters().clone();
     let rank = selected.requirements().topology();
     let layout = derive_partitioned_local_layout(&parameters, rank).map_err(architecture)?;
@@ -220,8 +220,8 @@ where
         .requirements()
         .shared_component_definition()
         .ok_or_else(|| architecture("Qwen hybrid selection has no retained definition"))?;
-    let definition =
-        crate::qwen::hybrid::project_parameters(&selected_args, &retained).map_err(architecture)?;
+    let definition = crate::replicated_text::executable_component(selected.base().text())
+        .map_err(architecture)?;
     let parameters = definition.parameters().clone();
     let rank = selected.requirements().topology();
     let layout = derive_partitioned_local_layout(&parameters, rank).map_err(architecture)?;
@@ -237,9 +237,9 @@ where
     }
     let geometry =
         crate::qwen::hybrid::local_geometry(&selected_args, &layout).map_err(architecture)?;
-    let plan =
-        crate::qwen::hybrid::partition_expert_realization_plan(&selected_args, &geometry, rank)
-            .map_err(architecture)?;
+    let plan = crate::qwen::hybrid::expert_realization_plan(&selected_args, Some(&geometry), rank)
+        .map_err(architecture)?
+        .ok_or_else(|| architecture("Qwen partition has no routed units"))?;
     let complete_state = geometry.state_layout().clone();
     let state_plan = crate::transport::pipeline_state(0, &complete_state);
     let partition = selected
@@ -267,8 +267,9 @@ where
             ));
         }
         let source_plan =
-            crate::qwen::hybrid::partition_expert_realization_plan(args, &source_geometry, rank)
-                .map_err(architecture)?;
+            crate::qwen::hybrid::expert_realization_plan(args, Some(&source_geometry), rank)
+                .map_err(architecture)?
+                .ok_or_else(|| architecture("Qwen source partition has no routed units"))?;
         let source_partition = selected
             .requirements()
             .construct_partition(

@@ -23,7 +23,7 @@ use eredu_checkpoint::{
     WeightQuantization,
 };
 
-use super::{BlockNormalization, DecoderConfig, ResidualEquation, RoutedFeedForwardEquation};
+use super::DecoderConfig;
 
 /// Exact source views for independently consumed media towers. Keys retain their
 /// admitted source spelling; namespace normalization only determines ownership.
@@ -65,29 +65,30 @@ where
     C: RecipeCatalog + eredu_checkpoint::validation::SafetensorsCatalog + ?Sized,
 {
     let keys = eredu_checkpoint::validation::SafetensorsCatalog::keys(catalog);
-    let mut target = args.clone();
     let canonical = keys
         .iter()
         .map(|key| canonical_safetensors_target(key))
         .collect::<Vec<_>>();
-    if !canonical
-        .iter()
-        .any(|key| key.starts_with("model.vision_tower."))
-    {
-        target.vision_config = None;
-    }
-    if !canonical
-        .iter()
-        .any(|key| key.starts_with("model.audio_tower."))
-    {
-        target.audio_config = None;
-    }
+    let target = args
+        .with_media(
+            args.vision_config.clone().filter(|_| {
+                canonical
+                    .iter()
+                    .any(|key| key.starts_with("model.vision_tower."))
+            }),
+            args.audio_config.clone().filter(|_| {
+                canonical
+                    .iter()
+                    .any(|key| key.starts_with("model.audio_tower."))
+            }),
+        )
+        .map_err(|e| e.to_string())?;
     let quantization = match (
         source_config.get("quantization"),
         source_config.get("quantization_config"),
     ) {
         (Some(first), Some(second)) if first != second => {
-            return Err("Muse root quantization declarations disagree".into())
+            return Err("Muse root quantization declarations disagree".into());
         }
         (Some(value), _) | (_, Some(value)) => Some(value),
         _ => None,
@@ -169,30 +170,6 @@ where
             return Err(format!("Muse override {module} has no scale companion"));
         }
     }
-    for layer in 0..dimension(target.num_hidden_layers, "text layer count")? {
-        let root = format!("model.layers.{layer}.mlp.experts");
-        match (
-            formats.get(&format!("{root}.gate_proj")),
-            formats.get(&format!("{root}.up_proj")),
-        ) {
-            (Some(gate), Some(up)) if gate == up => {
-                formats.insert(format!("{root}.gate_up_proj"), *gate);
-            }
-            (None, None) => {}
-            _ => {
-                return Err(format!(
-                    "Muse layer {layer} split gate/up physical encodings disagree"
-                ))
-            }
-        }
-    }
-    target.quantization = None;
-    target.quantized_weights = None;
-    target.quantized_weight_configs = None;
-    if let Some(vision) = target.vision_config.as_mut() {
-        vision.weight_quantization = None;
-        vision.quantized_weight_configs.clear();
-    }
     with_checkpoint_formats(&target, formats)
 }
 
@@ -206,62 +183,55 @@ pub fn load_time_quantization(
     if quantization == WeightQuantization::NvFp4 {
         return Err("NVFP4 load-time calibration/encoding is unavailable".into());
     }
-    let mut target = args.clone();
-    target.quantization = Some(quantization);
-    target.quantized_weights = None;
-    target.quantized_weight_configs = None;
-    if let Some(vision) = &mut target.vision_config {
-        vision.weight_quantization = None;
-        vision.quantized_weight_configs.clear();
-    }
-    if target.vision_config.is_some() {
-        // Derive candidates from the same checked geometry that owns source
-        // admission. Small patch inputs and other unaligned media matrices
-        // remain dense; explicit checkpoint formats are handled separately.
-        let mut tensors = Vec::new();
-        add_safetensors_vision(
-            &target,
-            dimension(target.hidden_size, "text hidden size")?,
-            &mut tensors,
-        )?;
+    let target = args
+        .with_formats(Some(quantization), None, None)
+        .map_err(|e| e.to_string())?;
+    let mut vision = target.vision_config.clone();
+    let mut audio = target.audio_config.clone();
+    if let Some(vision) = &mut vision {
+        use eredu_nn::DeclareLogicalParameters;
+        let declarations = vision.declaration();
         let group = usize::try_from(quantization.group_size())
             .map_err(|_| "negative quantization group size")?;
-        if let Some(vision) = &mut target.vision_config {
-            vision.quantized_weight_configs = tensors
-                .into_iter()
-                .filter(|tensor| {
-                    tensor.shape.len() == 2
-                        && tensor.shape[1] > 0
-                        && tensor.shape[1].is_multiple_of(group)
-                        && tensor.shape[1].is_multiple_of(32)
-                })
-                .map(|tensor| (tensor.key, quantization))
-                .collect();
-        }
-    }
-    if let Some(audio) = &mut target.audio_config {
-        let group = usize::try_from(quantization.group_size())
-            .map_err(|_| "negative quantization group size")?;
-        audio.linear_formats = audio_tensor_layouts(audio)?
+        let formats = declarations
+            .logical_parameters()
+            .map_err(|error| error.to_string())?
             .into_iter()
-            .filter(|tensor| {
-                tensor.operation == TensorOperation::Matrix
-                    && tensor.shape[1].is_multiple_of(group)
-                    && tensor.shape[1].is_multiple_of(32)
+            .filter(|parameter| {
+                parameter.linear_format.is_some()
+                    && parameter.shape[1].is_multiple_of(group)
+                    && parameter.shape[1].is_multiple_of(32)
             })
-            .map(|tensor| (tensor.canonical, quantization.into()))
+            .map(|parameter| (parameter.parameter.id.as_str().to_owned(), quantization))
             .collect();
+        *vision = vision
+            .with_formats(formats, None)
+            .map_err(|e| e.to_string())?;
     }
-    target.validate().map_err(|error| error.to_string())?;
-    Ok(target)
+    if let Some(audio) = &mut audio {
+        let group = usize::try_from(quantization.group_size())
+            .map_err(|_| "negative quantization group size")?;
+        let declarations = audio.declaration();
+        let formats = declarations
+            .units
+            .iter()
+            .flat_map(|(_, spec)| spec.projections())
+            .filter(|spec| {
+                (spec.input as usize).is_multiple_of(group)
+                    && (spec.input as usize).is_multiple_of(32)
+            })
+            .map(|spec| (spec.weight.id.as_str().to_owned(), quantization.into()))
+            .collect();
+        *audio = audio.with_formats(formats).map_err(|e| e.to_string())?;
+    }
+    target.with_media(vision, audio).map_err(|e| e.to_string())
 }
 
-/// Applies exact selected text and vision formats to a complete composite.
+/// Projects checkpoint encodings onto retained text/media owners and source layouts.
 pub fn with_checkpoint_formats(
     args: &DecoderConfig,
     formats: HashMap<String, WeightQuantization>,
 ) -> Result<DecoderConfig, String> {
-    let mut target = args.clone();
     let mut text = HashMap::new();
     let mut vision = HashMap::new();
     let mut audio = HashMap::new();
@@ -274,20 +244,26 @@ pub fn with_checkpoint_formats(
             text.insert(name, format);
         }
     }
-    target.quantization = None;
-    target.quantized_weights = None;
-    target.quantized_weight_configs = (!text.is_empty()).then_some(text);
-    if let Some(config) = target.vision_config.as_mut() {
-        config.weight_quantization = None;
-        config.quantized_weight_configs = vision;
+    let target = args
+        .with_formats(None, None, (!text.is_empty()).then_some(text))
+        .map_err(|e| e.to_string())?;
+    let mut vision_config = target.vision_config.clone();
+    let mut audio_config = target.audio_config.clone();
+    if let Some(config) = vision_config.as_mut() {
+        *config = config
+            .with_formats(vision, None)
+            .map_err(|e| e.to_string())?;
+    } else if !vision.is_empty() {
+        return Err("vision checkpoint formats have no selected vision tower".into());
     }
-    if let Some(config) = target.audio_config.as_mut() {
-        config.linear_formats = audio;
+    if let Some(config) = audio_config.as_mut() {
+        *config = config.with_formats(audio).map_err(|e| e.to_string())?;
     } else if !audio.is_empty() {
         return Err("audio checkpoint formats have no selected waveform tower".into());
     }
-    target.validate().map_err(|error| error.to_string())?;
-    Ok(target)
+    target
+        .with_media(vision_config, audio_config)
+        .map_err(|e| e.to_string())
 }
 
 /// Decoder plus optional split projector/assistant artifact policy.
@@ -401,199 +377,344 @@ impl ArtifactConfig {
     }
 }
 
-fn decoder_norm_names(args: &DecoderConfig) -> Vec<&'static str> {
-    let mut names = vec![
-        "input_layernorm.weight",
-        "pre_feedforward_layernorm.weight",
-        "post_feedforward_layernorm.weight",
-    ];
-    if args.block_normalization == BlockNormalization::OutputScaled {
-        names.push("post_attention_layernorm.weight");
-    }
-    names
-}
-
-pub(super) fn residual_parameter_names(args: &DecoderConfig) -> Vec<&'static str> {
-    match args.residual_equation {
-        ResidualEquation::Add => Vec::new(),
-        ResidualEquation::Learned { .. } => vec![
-            "post_attention_residual_gate.gate",
-            "post_feedforward_residual_gate.gate",
-        ],
-        ResidualEquation::StoredCoefficients => vec![
-            "post_attention_residual_gate.alpha",
-            "post_attention_residual_gate.beta",
-            "post_feedforward_residual_gate.alpha",
-            "post_feedforward_residual_gate.beta",
-        ],
-    }
-}
-
-/// Returns stable parameter identities for one SafeTensors artifact.
-pub fn safetensors_parameter_names(args: &DecoderConfig) -> Vec<String> {
-    let mut names = vec![
-        "model.embed_tokens.weight".into(),
-        "model.norm.weight".into(),
-    ];
-    if !args.tie_word_embeddings {
-        names.push("lm_head.weight".into());
-    }
-    for layer in 0..args.num_hidden_layers as usize {
-        let root = format!("model.layers.{layer}");
-        for local in [
-            "self_attn.q_proj.weight",
-            "self_attn.k_proj.weight",
-            "self_attn.v_proj.weight",
-            "self_attn.o_proj.weight",
-            "self_attn.gate_proj.weight",
-        ] {
-            names.push(format!("{root}.{local}"));
-        }
-        names.extend(
-            decoder_norm_names(args)
-                .into_iter()
-                .chain(residual_parameter_names(args))
-                .map(|name| format!("{root}.{name}")),
-        );
-        if args.is_moe() {
-            names.extend([
-                format!("{root}.mlp.gate.weight"),
-                format!("{root}.mlp.experts.gate_up_proj"),
-                format!("{root}.mlp.experts.down_proj"),
-            ]);
-            if let RoutedFeedForwardEquation::CompressedSigmoid { .. } = args.routed_feed_forward {
-                names.extend(
-                    [
-                        "gate.e_score_correction_bias",
-                        "pre_expert_proj.weight",
-                        "pre_expert_norm.weight",
-                        "experts.post_expert_norm.weight",
-                        "post_expert_proj.weight",
-                    ]
-                    .map(|name| format!("{root}.mlp.{name}")),
-                );
+/// Projects source matrices from construction slots and explicit storage extensions.
+pub(crate) fn source_linear_shapes(
+    args: &DecoderConfig,
+) -> Result<BTreeMap<String, Vec<usize>>, String> {
+    use eredu_nn::DeclareLogicalParameters;
+    args.validate().map_err(|error| error.to_string())?;
+    let mut shapes = BTreeMap::new();
+    let mut insert = |name: String, shape: Vec<usize>| -> Result<(), String> {
+        if let Some(previous) = shapes.insert(name.clone(), shape.clone()) {
+            if previous != shape {
+                return Err(format!("conflicting Muse source geometry for {name}"));
             }
-        } else {
-            names.extend([
-                format!("{root}.mlp.gate_proj.weight"),
-                format!("{root}.mlp.up_proj.weight"),
-                format!("{root}.mlp.down_proj.weight"),
-            ]);
         }
-    }
-    names.extend(vision_parameter_names(args));
-    names.extend(audio_parameter_names(args));
-    names
-}
-
-fn vision_parameter_names(args: &DecoderConfig) -> Vec<String> {
-    let Some(vision) = &args.vision_config else {
-        return Vec::new();
+        Ok(())
     };
-    let mut names = vec![
-        "model.vision_tower.patch_embedder.patch_embedding.weight".into(),
-        "model.vision_tower.patch_embedder.position_embedding_table.weight".into(),
-        "model.vision_tower.ln_pre.weight".into(),
-        "model.vision_tower.ln_pre.bias".into(),
-        "model.vision_tower.ln_post.weight".into(),
-        "model.vision_tower.ln_post.bias".into(),
-        "model.vision_adapter.fc1.weight".into(),
-        "model.vision_adapter.fc2.weight".into(),
-        "model.vision_projection.weight".into(),
-    ];
-    for layer in 0..vision.layer_count() {
-        let root = format!("model.vision_tower.layers.{layer}");
-        for local in [
-            "norm1.weight",
-            "norm1.bias",
-            "norm2.weight",
-            "norm2.bias",
-            "attn.q_proj.weight",
-            "attn.q_proj.bias",
-            "attn.k_proj.weight",
-            "attn.k_proj.bias",
-            "attn.v_proj.weight",
-            "attn.v_proj.bias",
-            "attn.proj.weight",
-            "attn.proj.bias",
-            "mlp.fc1.weight",
-            "mlp.fc1.bias",
-            "mlp.fc2.weight",
-            "mlp.fc2.bias",
-        ] {
-            names.push(format!("{root}.{local}"));
+    if args.weight_convention == super::WeightConvention::Gguf {
+        let mut tensors = static_gguf_layouts(args)?;
+        for layer in 0..dimension(args.num_hidden_layers, "text layer count")? {
+            tensors.extend(attention_gguf_layouts(args, layer)?);
+            tensors.extend(if args.is_moe() {
+                routed_gguf_layouts(args, layer)?
+            } else {
+                dense_gguf_layouts(args, layer)?
+            });
+        }
+        for tensor in tensors {
+            if tensor.shape.len() == 2 && tensor.gguf != "token_embd.weight" {
+                insert(tensor.canonical, tensor.shape)?;
+            }
+        }
+        if let Some(vision) = &args.vision_config {
+            // Validate the released image-only storage contract, including the
+            // position table and adapter widths. Flatten the declared spatial
+            // kernel without the temporal folding used by SafeTensors.
+            for tensor in vision_gguf_layouts(vision)? {
+                if tensor.shape.len() == 2 {
+                    insert(tensor.canonical, tensor.shape)?;
+                }
+            }
+            let statics = &vision.declaration().statics;
+            let spatial = statics
+                .spatial_source()
+                .map_err(|error| error.to_string())?;
+            insert(
+                spatial.weight.id.as_str().into(),
+                spatial.matrix_shape.to_vec(),
+            )?;
+            if let Some(audio) = &args.audio_config {
+                for tensor in audio_gguf_layouts(audio)? {
+                    if tensor.shape.len() == 2 {
+                        insert(tensor.canonical, tensor.shape)?;
+                    }
+                }
+            }
+        }
+        return Ok(shapes);
+    }
+    let construction = args.pinned();
+    let embedding = construction.embedding_spec().weight.id.as_str();
+    let mut visit = |spec: &dyn DeclareLogicalParameters| -> Result<(), String> {
+        for parameter in spec
+            .logical_parameters()
+            .map_err(|error| error.to_string())?
+        {
+            if parameter.shape.len() == 2
+                && parameter.linear_format.is_some()
+                && parameter.parameter.id.as_str() != embedding
+            {
+                insert(parameter.parameter.id.as_str().into(), parameter.shape)?;
+            }
+        }
+        Ok(())
+    };
+    visit(construction)?;
+    for layer in 0..dimension(args.num_hidden_layers, "text layer count")? {
+        let attention = args
+            .attention(layer)
+            .map(|spec| &spec.parameters)
+            .map_err(|error| error.to_string())?;
+        for projection in attention.projections() {
+            visit(projection)?;
+        }
+        if args.is_moe() {
+            let declaration = args.routed(layer).map_err(|error| error.to_string())?;
+            visit(declaration)?;
+        } else {
+            let dense = args.dense(layer).map_err(|error| error.to_string())?;
+            visit(dense)?;
         }
     }
-    names
+    if let Some(vision) = &args.vision_config {
+        visit(vision.declaration())?;
+    }
+    if let Some(audio) = &args.audio_config {
+        let declarations = audio.declaration();
+        for (_, unit) in &declarations.units {
+            visit(unit)?;
+        }
+    }
+    if args.is_moe() {
+        for layer in 0..dimension(args.num_hidden_layers, "text layer count")? {
+            visit_expert_source_matrices(args, layer, |source| {
+                if source.layout == ExpertSourceLayout::Independent {
+                    insert(source.canonical, source.shape)?;
+                }
+                Ok(())
+            })?;
+        }
+    }
+    Ok(shapes)
 }
 
-/// Builds the complete released SafeTensors catalog, including native vision
-/// weights and every admitted dense or routed-expert representation.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+enum ExpertSourceLayout {
+    Split,
+    Independent,
+}
+
+/// A physical layout projection; ownership and geometry originate in the packed bank.
+struct ExpertMatrixSource {
+    layout: ExpertSourceLayout,
+    source: String,
+    canonical: String,
+    owner: eredu_nn::ParameterId,
+    shape: Vec<usize>,
+}
+fn visit_expert_source_matrices(
+    args: &DecoderConfig,
+    layer: usize,
+    mut visit: impl FnMut(ExpertMatrixSource) -> Result<(), String>,
+) -> Result<(), String> {
+    let declaration = args.routed(layer).map_err(|e| e.to_string())?;
+    let bank = declaration
+        .bank()
+        .packed_parameters()
+        .map_err(|e| e.to_string())?;
+    let (root, _, _) = declared_expert_targets(&bank)?;
+    let released = format!("model.language_model.layers.{layer}.mlp.experts");
+    for (field, owner, shape) in [
+        ("gate_proj", bank.gate_up(), bank.unfused_shape()),
+        ("up_proj", bank.gate_up(), bank.unfused_shape()),
+        ("down_proj", bank.down(), bank.down().shape.clone()),
+    ] {
+        visit(ExpertMatrixSource {
+            layout: ExpertSourceLayout::Split,
+            source: format!("{released}.{field}"),
+            canonical: format!("{root}.{field}"),
+            owner: owner.parameter.id.clone(),
+            shape: shape.clone(),
+        })?;
+        if args.weight_convention == super::WeightConvention::HuggingFace {
+            for expert in 0..bank.group_count() {
+                visit(ExpertMatrixSource {
+                    layout: ExpertSourceLayout::Independent,
+                    source: format!("{released}.{expert}.{field}.weight"),
+                    canonical: format!("{root}.{expert}.{field}.weight"),
+                    owner: owner.parameter.id.clone(),
+                    shape: shape[1..].to_vec(),
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Derives executable bank formats while retaining the physical source encodings.
+/// Encoded members of a fused bank must have one homogeneous representation.
+pub(crate) fn normalize_expert_formats(
+    args: &DecoderConfig,
+    default: Option<WeightQuantization>,
+    selected: Option<&std::collections::HashSet<String>>,
+    formats: &mut Option<HashMap<String, WeightQuantization>>,
+) -> Result<(), String> {
+    let names = || {
+        formats
+            .iter()
+            .flat_map(|formats| formats.keys())
+            .chain(selected.into_iter().flatten())
+    };
+    if names().next().is_none() {
+        return Ok(());
+    }
+    let owned = eredu_nn::DeclareLogicalParameters::logical_parameters(args)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|p| p.parameter.id.as_str())
+        .collect::<BTreeSet<_>>();
+    if names().all(|name| owned.contains(name.as_str())) {
+        return Ok(());
+    }
+    for layer in args.routed_layers().keys().copied() {
+        let mut groups = BTreeMap::<_, Vec<String>>::new();
+        visit_expert_source_matrices(args, layer, |source| {
+            if source.canonical != source.owner.as_str() {
+                groups
+                    .entry((source.layout, source.owner))
+                    .or_default()
+                    .push(source.canonical);
+            }
+            Ok(())
+        })?;
+        for ((_, owner), names) in groups {
+            if !names.iter().any(|name| {
+                formats.as_ref().is_some_and(|f| f.contains_key(name))
+                    || selected.is_some_and(|names| names.contains(name))
+            }) {
+                continue;
+            }
+            let requested = names
+                .iter()
+                .map(|name| {
+                    formats
+                        .as_ref()
+                        .and_then(|f| f.get(name))
+                        .copied()
+                        .or_else(|| {
+                            default.filter(|_| selected.is_none_or(|names| names.contains(name)))
+                        })
+                })
+                .collect::<Vec<_>>();
+            let Some(format) = requested.iter().copied().flatten().next() else {
+                continue;
+            };
+            if requested.iter().any(|candidate| *candidate != Some(format)) {
+                return Err(format!(
+                    "Muse expert source encodings are incomplete or heterogeneous for {owner}"
+                ));
+            }
+            format.validate().map_err(|e| e.to_string())?;
+            let formats = formats.get_or_insert_default();
+            if formats
+                .get(owner.as_str())
+                .is_some_and(|old| *old != format)
+            {
+                return Err(format!(
+                    "Muse fused and source expert encodings disagree for {owner}"
+                ));
+            }
+            formats.insert(owner.to_string(), format);
+            for name in names {
+                formats.insert(name, format);
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn expert_source_formats(
+    args: &DecoderConfig,
+) -> Result<Vec<(String, eredu_checkpoint::LinearFormat)>, String> {
+    let mut references = Vec::new();
+    for layer in args.routed_layers().keys().copied() {
+        visit_expert_source_matrices(args, layer, |source| {
+            let format = args.linear_format_for(&source.canonical);
+            if args.weight_convention == super::WeightConvention::HuggingFace {
+                matrix_for_linear_format(
+                    &source.canonical,
+                    Vec::<String>::new(),
+                    source.shape,
+                    format,
+                    None,
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            references.push((source.canonical, format));
+            Ok(())
+        })?;
+    }
+    Ok(references)
+}
+
+/// Builds exact SafeTensors requirements and explicit released layout alternatives.
 pub fn safetensors_plan(args: &DecoderConfig) -> Result<SafetensorsCheckpointPlan, String> {
     args.validate().map_err(|error| error.to_string())?;
     let hidden = dimension(args.hidden_size, "text hidden size")?;
-    let vocabulary = dimension(args.vocab_size, "vocabulary size")?;
     let layers = dimension(args.num_hidden_layers, "text layer count")?;
-    let query = checked_mul(
-        dimension(args.num_attention_heads, "attention head count")?,
-        dimension(args.head_dim, "attention head width")?,
-        "query projection width",
-    )?;
-    let key_value = checked_mul(
-        dimension(args.num_key_value_heads, "key/value head count")?,
-        dimension(args.head_dim, "attention head width")?,
-        "key/value projection width",
-    )?;
     let mut common = Vec::new();
     let mut alternatives = Vec::new();
-    add_text_matrix(
-        args,
-        &mut common,
-        "model.language_model.embed_tokens.weight",
-        "model.embed_tokens.weight",
-        vec![vocabulary, hidden],
-    )?;
-    common.push(safe_alias(
-        "model.language_model.norm.weight",
-        "model.norm.weight",
-        vec![hidden],
-    ));
-    if !args.tie_word_embeddings {
-        add_text_matrix(
-            args,
-            &mut common,
-            "lm_head.weight",
-            "lm_head.weight",
-            vec![vocabulary, hidden],
-        )?;
+    use eredu_nn::{DeclareLogicalParameters, LogicalParameterRole};
+    let construction = args.pinned();
+    for parameter in construction
+        .logical_parameters()
+        .map_err(|error| error.to_string())?
+    {
+        let canonical = parameter.parameter.id.as_str();
+        let source = canonical.strip_prefix("model.").map_or_else(
+            || canonical.to_owned(),
+            |local| format!("model.language_model.{local}"),
+        );
+        if matches!(
+            parameter.role,
+            LogicalParameterRole::Embedding | LogicalParameterRole::LinearWeight
+        ) {
+            add_text_matrix(args, &mut common, &source, canonical, parameter.shape)?;
+        } else {
+            common.push(safe_alias(source, canonical, parameter.shape));
+        }
     }
     for layer in 0..layers {
         let released = format!("model.language_model.layers.{layer}");
         let canonical = format!("model.layers.{layer}");
-        for local in decoder_norm_names(args)
-            .into_iter()
-            .chain(residual_parameter_names(args))
+        let scalar = args.scalar(layer).map_err(|error| error.to_string())?;
+        for parameter in scalar
+            .logical_parameters()
+            .map_err(|error| error.to_string())?
         {
+            let name = parameter.parameter.id.as_str();
+            let local = name
+                .strip_prefix(&format!("{canonical}."))
+                .ok_or("scalar source extension references another unit")?;
             common.push(safe_alias(
                 format!("{released}.{local}"),
-                format!("{canonical}.{local}"),
-                vec![hidden],
+                name,
+                parameter.shape,
             ));
         }
-        for (local, shape) in [
-            ("self_attn.q_proj.weight", vec![query, hidden]),
-            ("self_attn.k_proj.weight", vec![key_value, hidden]),
-            ("self_attn.v_proj.weight", vec![key_value, hidden]),
-            ("self_attn.o_proj.weight", vec![hidden, query]),
-            ("self_attn.gate_proj.weight", vec![query, hidden]),
-        ] {
-            add_text_matrix(
-                args,
-                &mut common,
-                &format!("{released}.{local}"),
-                &format!("{canonical}.{local}"),
-                shape,
-            )?;
+        use eredu_nn::DeclareLogicalParameters;
+        let attention = args
+            .attention(layer)
+            .map(|spec| &spec.parameters)
+            .map_err(|error| error.to_string())?;
+        for projection in attention.projections() {
+            for parameter in projection
+                .logical_parameters()
+                .map_err(|error| error.to_string())?
+            {
+                let name = parameter.parameter.id.as_str();
+                let local = name
+                    .strip_prefix(&format!("{canonical}."))
+                    .ok_or("attention source extension references another unit")?;
+                add_text_matrix(
+                    args,
+                    &mut common,
+                    &format!("{released}.{local}"),
+                    name,
+                    parameter.shape,
+                )?;
+            }
         }
         if args.is_moe() {
             add_moe_layout(
@@ -601,24 +722,28 @@ pub fn safetensors_plan(args: &DecoderConfig) -> Result<SafetensorsCheckpointPla
                 layer,
                 &released,
                 &canonical,
-                hidden,
                 &mut common,
                 &mut alternatives,
             )?;
         } else {
-            let intermediate = dimension(args.intermediate_size, "text intermediate size")?;
-            for (local, shape) in [
-                ("mlp.gate_proj.weight", vec![intermediate, hidden]),
-                ("mlp.up_proj.weight", vec![intermediate, hidden]),
-                ("mlp.down_proj.weight", vec![hidden, intermediate]),
-            ] {
-                add_text_matrix(
-                    args,
-                    &mut common,
-                    &format!("{released}.{local}"),
-                    &format!("{canonical}.{local}"),
-                    shape,
-                )?;
+            let projections = args.dense(layer).map_err(|error| error.to_string())?;
+            for projection in projections.projections() {
+                for parameter in projection
+                    .logical_parameters()
+                    .map_err(|error| error.to_string())?
+                {
+                    let name = parameter.parameter.id.as_str();
+                    let local = name
+                        .strip_prefix(&format!("{canonical}."))
+                        .ok_or("dense source extension references another unit")?;
+                    add_text_matrix(
+                        args,
+                        &mut common,
+                        &format!("{released}.{local}"),
+                        name,
+                        parameter.shape,
+                    )?;
+                }
             }
         }
     }
@@ -762,7 +887,7 @@ pub fn static_safetensors_recipes<C: RecipeCatalog + ?Sized>(
 /// Selects the complete architecture-owned SafeTensors recipe group for one execution unit.
 ///
 /// `group` and `index` use the canonical Muse-Glimmer layout: vision is group zero and the text
-/// decoder is group one. No backend-native parameter topology participates in selection.
+/// decoder is group one, and waveform units are group two. Selection uses no native topology.
 pub fn unit_safetensors_recipes<C: RecipeCatalog + ?Sized>(
     args: &DecoderConfig,
     catalog: &C,
@@ -784,8 +909,8 @@ pub fn unit_safetensors_recipes<C: RecipeCatalog + ?Sized>(
             .unwrap_or(0),
         _ => {
             return Err(format!(
-                "Muse-Glimmer recipe group {group} is outside two groups"
-            ))
+                "Muse-Glimmer recipe group {group} is outside three groups"
+            ));
         }
     };
     if index >= available {
@@ -812,17 +937,18 @@ fn select_safetensors_recipe_group<C: RecipeCatalog + ?Sized>(
         let expert = safetensors_expert_recipes(catalog, args, layer)?;
         recipes.extend(gated_product_materialization_recipes(catalog, &expert)?);
     }
+    let audio_owners = args
+        .audio_config
+        .as_ref()
+        .map(|audio| audio.declaration().owners())
+        .transpose()
+        .map_err(|error| error.to_string())?
+        .unwrap_or_default();
     for (target, recipe) in recipes {
         let owner = if target.starts_with("model.audio_tower.") {
-            let audio = args
-                .audio_config
-                .as_ref()
-                .ok_or("audio recipe has no declared tower")?;
-            let index = audio
-                .execution_units()
-                .map_err(|error| error.to_string())?
-                .iter()
-                .position(|kind| kind.owns_parameter(&target))
+            let index = audio_owners
+                .get(&target)
+                .copied()
                 .ok_or_else(|| format!("unowned Muse audio recipe {target}"))?;
             Some((2, index))
         } else if let Some(index) = indexed_recipe_target(&target, "model.vision_tower.layers.")? {
@@ -911,7 +1037,12 @@ fn safetensors_expert_recipes<C: RecipeCatalog + ?Sized>(
     args: &DecoderConfig,
     layer: usize,
 ) -> Result<GatedProductExpertRecipes, String> {
-    let target = format!("model.layers.{layer}.mlp.experts");
+    let declaration = args.routed(layer).map_err(|error| error.to_string())?;
+    let source = declaration
+        .bank()
+        .packed_parameters()
+        .map_err(|error| error.to_string())?;
+    let (target, target_gate_up, target_down) = declared_expert_targets(&source)?;
     let released = format!("model.language_model.layers.{layer}.mlp.experts");
     let packed_gate_up = first_existing(
         catalog,
@@ -948,7 +1079,7 @@ fn safetensors_expert_recipes<C: RecipeCatalog + ?Sized>(
             format!("{released}.up_proj.weight"),
         ],
     );
-    let independent = (0..dimension(args.num_experts, "expert count")?)
+    let independent = (0..source.group_count())
         .map(|expert| {
             let root = format!("{released}.{expert}");
             IndependentGatedProductExpertNames {
@@ -961,8 +1092,8 @@ fn safetensors_expert_recipes<C: RecipeCatalog + ?Sized>(
     resolve_gated_product_expert_recipes(
         catalog,
         &GatedProductExpertLayoutNames {
-            target_gate_up: format!("{target}.gate_up_proj"),
-            target_down: format!("{target}.down_proj"),
+            target_gate_up,
+            target_down,
             packed_gate_up: packed_gate_up.unwrap_or_default(),
             packed_down: packed_down.unwrap_or_default(),
             separate_gate: separate_gate.unwrap_or_default(),
@@ -1006,108 +1137,92 @@ fn add_moe_layout(
     layer: usize,
     released: &str,
     canonical: &str,
-    hidden: usize,
     common: &mut Vec<SafetensorsTensorConstraint>,
     alternatives: &mut Vec<AlternativeLayoutGroup<SafetensorsTensorConstraint>>,
 ) -> Result<(), String> {
-    let experts = dimension(args.num_experts, "expert count")?;
-    let intermediate = dimension(args.moe_intermediate_size, "expert intermediate size")?;
-    add_text_matrix(
-        args,
-        common,
-        &format!("{released}.mlp.gate.weight"),
-        &format!("{canonical}.mlp.gate.weight"),
-        vec![experts, hidden],
-    )?;
-    let hidden = match args.routed_feed_forward {
-        RoutedFeedForwardEquation::DirectSoftmax => hidden,
-        RoutedFeedForwardEquation::CompressedSigmoid { expert_width, .. } => {
-            let latent = dimension(expert_width, "compressed expert width")?;
-            for (local, shape) in [
-                ("pre_expert_proj.weight", vec![latent, hidden]),
-                ("post_expert_proj.weight", vec![hidden, latent]),
-            ] {
-                add_text_matrix(
-                    args,
-                    common,
-                    &format!("{released}.mlp.{local}"),
-                    &format!("{canonical}.mlp.{local}"),
-                    shape,
-                )?;
-            }
-            for (local, width) in [
-                ("gate.e_score_correction_bias", experts),
-                ("pre_expert_norm.weight", latent),
-                ("experts.post_expert_norm.weight", latent),
-            ] {
-                common.push(safe_alias(
-                    format!("{released}.mlp.{local}"),
-                    format!("{canonical}.mlp.{local}"),
-                    vec![width],
-                ));
-            }
-            latent
+    use eredu_nn::DeclareLogicalParameters;
+    let declaration = args.routed(layer).map_err(|error| error.to_string())?;
+    let add_parameter = |parameter: eredu_nn::LogicalParameterDeclaration<'_>,
+                         matrix: bool,
+                         common: &mut Vec<SafetensorsTensorConstraint>|
+     -> Result<(), String> {
+        let name = parameter.parameter.id.as_str();
+        let local = name
+            .strip_prefix(&format!("{canonical}."))
+            .ok_or("routed source extension references another unit")?;
+        let source = format!("{released}.{local}");
+        if matrix {
+            add_text_matrix(args, common, &source, name, parameter.shape)
+        } else {
+            common.push(safe_alias(source, name, parameter.shape));
+            Ok(())
         }
     };
+    for parameter in declaration
+        .selector()
+        .logical_parameters()
+        .map_err(|error| error.to_string())?
+    {
+        let matrix = parameter.parameter.id == declaration.selector().weight().id;
+        add_parameter(parameter, matrix, common)?;
+    }
+    if let Some(spec) = declaration.compression() {
+        for parameter in spec
+            .logical_parameters()
+            .map_err(|error| error.to_string())?
+        {
+            let matrix = parameter.parameter.id == spec.input.weight.id
+                || parameter.parameter.id == spec.output.weight.id;
+            add_parameter(parameter, matrix, common)?;
+        }
+    }
+    let source = declaration
+        .bank()
+        .packed_parameters()
+        .map_err(|error| error.to_string())?;
+    if source.gate_up_bias().is_some() || source.down_bias().is_some() {
+        return Err("Muse expert storage extension does not cover bank bias slots".into());
+    }
     let released_root = format!("{released}.mlp.experts");
-    let canonical_root = format!("{canonical}.mlp.experts");
     let packed_gate_up = format!("{released_root}.gate_up_proj");
     let packed_down = format!("{released_root}.down_proj");
     let mut packed = Vec::new();
-    add_packed_expert_matrix(
-        args,
-        &mut packed,
-        &packed_gate_up,
-        &format!("{canonical_root}.gate_up_proj"),
-        vec![
-            experts,
-            checked_mul(2, intermediate, "fused expert width")?,
-            hidden,
-        ],
-    )?;
-    add_packed_expert_matrix(
-        args,
-        &mut packed,
-        &packed_down,
-        &format!("{canonical_root}.down_proj"),
-        vec![experts, hidden, intermediate],
-    )?;
+    add_packed_expert_matrix(&mut packed, &packed_gate_up, source.gate_up())?;
+    add_packed_expert_matrix(&mut packed, &packed_down, source.down())?;
     let split_gate = format!("{released_root}.gate_proj");
     let split_up = format!("{released_root}.up_proj");
-    let split_down = format!("{released_root}.down_proj");
     let mut split = Vec::new();
-    for (source, target, shape) in [
-        (
-            &split_gate,
-            format!("{canonical_root}.gate_proj"),
-            vec![experts, intermediate, hidden],
-        ),
-        (
-            &split_up,
-            format!("{canonical_root}.up_proj"),
-            vec![experts, intermediate, hidden],
-        ),
-        (
-            &split_down,
-            format!("{canonical_root}.down_proj"),
-            vec![experts, hidden, intermediate],
-        ),
-    ] {
-        add_text_matrix(args, &mut split, source, &target, shape)?;
-    }
     let mut independent = Vec::new();
     let mut independent_keys = Vec::new();
-    for expert in 0..experts {
-        for (local, shape) in [
-            ("gate_proj.weight", vec![intermediate, hidden]),
-            ("up_proj.weight", vec![intermediate, hidden]),
-            ("down_proj.weight", vec![hidden, intermediate]),
-        ] {
-            let source = format!("{released_root}.{expert}.{local}");
-            add_text_matrix(args, &mut independent, &source, &source, shape)?;
-            independent_keys.push(source);
-        }
-    }
+    visit_expert_source_matrices(args, layer, |source| {
+        let output = match source.layout {
+            ExpertSourceLayout::Split => &mut split,
+            ExpertSourceLayout::Independent => {
+                independent_keys.push(source.source.clone());
+                &mut independent
+            }
+        };
+        // Independent slices keep their published source aliases; their format
+        // reference is canonical, without introducing a logical parameter owner.
+        let aliases = safetensors_aliases(
+            &source.source,
+            match source.layout {
+                ExpertSourceLayout::Split => &source.canonical,
+                ExpertSourceLayout::Independent => &source.source,
+            },
+        );
+        output.extend(
+            matrix_for_linear_format(
+                &source.source,
+                aliases,
+                source.shape,
+                args.linear_format_for(&source.canonical),
+                None,
+            )
+            .map_err(|e| e.to_string())?,
+        );
+        Ok(())
+    })?;
     alternatives.push(AlternativeLayoutGroup {
         id: format!("Muse-Glimmer layer {layer} expert storage"),
         required: true,
@@ -1134,213 +1249,132 @@ fn add_moe_layout(
     Ok(())
 }
 
-fn audio_parameter_names(args: &DecoderConfig) -> Vec<String> {
-    let Some(audio) = &args.audio_config else {
-        return Vec::new();
-    };
-    let mut names = [
-        "norm.weight",
-        "proj.weight",
-        "proj.bias",
-        "post_proj_norm.weight",
-    ]
-    .map(|name| format!("model.audio_tower.{name}"))
-    .to_vec();
-    for (stage, &depth) in audio.depths.iter().enumerate() {
-        let root = format!("model.audio_tower.layers.{stage}");
-        names.extend(
-            [
-                "patch_embedder.proj.weight",
-                "patch_embedder.proj.bias",
-                "patch_embedder.norm.weight",
-            ]
-            .map(|name| format!("{root}.{name}")),
-        );
-        for block in 0..depth {
-            names.extend(
-                [
-                    "conv.weight",
-                    "conv.bias",
-                    "norm.weight",
-                    "mlp.fc1.weight",
-                    "mlp.fc1.bias",
-                    "mlp.fc2.weight",
-                    "mlp.fc2.bias",
-                ]
-                .map(|name| format!("{root}.conv_blocks.{block}.{name}")),
-            );
-        }
-    }
-    names
-}
-
 fn add_audio_matrix(
-    audio: &super::AudioConfig,
+    format: eredu_checkpoint::LinearFormat,
     output: &mut Vec<SafetensorsTensorConstraint>,
     name: &str,
     shape: Vec<usize>,
 ) -> Result<(), String> {
     output.extend(
-        matrix_for_linear_format(
-            name,
-            std::iter::empty::<String>(),
-            shape,
-            audio.linear_format_for(name),
-            None,
-        )
-        .map_err(|error| error.to_string())?,
+        matrix_for_linear_format(name, std::iter::empty::<String>(), shape, format, None)
+            .map_err(|error| error.to_string())?,
     );
     Ok(())
 }
 
-pub(crate) struct AudioTensorLayout {
-    pub(crate) canonical: String,
+struct DeclaredGgufTensor {
+    canonical: String,
     gguf: String,
-    pub(crate) shape: Vec<usize>,
-    pub(crate) operation: TensorOperation,
+    shape: Vec<usize>,
+    operation: TensorOperation,
 }
 
-pub(crate) fn audio_tensor_layouts(
-    audio: &super::AudioConfig,
-) -> Result<Vec<AudioTensorLayout>, String> {
-    audio.validate().map_err(|error| error.to_string())?;
+fn audio_gguf_layouts(audio: &super::AudioConfig) -> Result<Vec<DeclaredGgufTensor>, String> {
+    use super::audio::{specs::UnitSpec, AudioUnitKind};
+    use eredu_nn::DeclareLogicalParameters;
+    let declarations = audio.declaration();
     let mut tensors = Vec::new();
-    let mut add = |canonical: String, gguf: String, shape, operation| {
-        tensors.push(AudioTensorLayout {
-            canonical,
-            gguf,
-            shape,
-            operation,
-        });
+    // Storage aliases reference typed construction slots; they do not supply geometry.
+    let mut bind = |spec: &dyn DeclareLogicalParameters,
+                    sources: Vec<(String, TensorOperation)>|
+     -> Result<(), String> {
+        let parameters = spec
+            .logical_parameters()
+            .map_err(|error| error.to_string())?;
+        if parameters.len() != sources.len() {
+            return Err("Muse audio storage extension does not cover its declared slots".into());
+        }
+        for (parameter, (gguf, operation)) in parameters.into_iter().zip(sources) {
+            tensors.push(DeclaredGgufTensor {
+                canonical: parameter.parameter.id.as_str().to_owned(),
+                gguf,
+                shape: parameter.shape,
+                operation,
+            });
+        }
+        Ok(())
     };
     let mut flat_block = 0usize;
-    for stage in 0..audio.hidden_sizes.len() {
-        let width = dimension(audio.hidden_sizes[stage], "audio stage width")?;
-        let input = if stage == 0 {
-            1
-        } else {
-            dimension(audio.hidden_sizes[stage - 1], "audio input channels")?
-        };
-        let patch = dimension(audio.patch_sizes[stage], "audio patch size")?;
-        let intermediate = dimension(
-            audio
-                .intermediate_size(stage)
-                .map_err(|error| error.to_string())?,
-            "audio MLP width",
-        )?;
-        let root = format!("model.audio_tower.layers.{stage}");
-        add(
-            format!("{root}.patch_embedder.proj.weight"),
-            format!("a.patch.{stage}.weight"),
-            vec![width, checked_mul(input, patch, "audio patch input width")?],
-            TensorOperation::Matrix,
-        );
-        add(
-            format!("{root}.patch_embedder.proj.bias"),
-            format!("a.patch.{stage}.bias"),
-            vec![width],
-            TensorOperation::Vector,
-        );
-        add(
-            format!("{root}.patch_embedder.norm.weight"),
-            format!("a.patch.{stage}.norm.weight"),
-            vec![width],
-            TensorOperation::Vector,
-        );
-        for block in 0..audio.depths[stage] {
-            let root = format!("{root}.conv_blocks.{block}");
-            for (canonical, source, shape, operation) in [
-                (
-                    "conv.weight",
-                    format!("a.conv1d.{flat_block}.weight"),
+    for (kind, unit) in &declarations.units {
+        match (kind, unit) {
+            (AudioUnitKind::Patch { stage }, UnitSpec::Patch(spec)) => {
+                bind(
+                    &spec.projection,
                     vec![
-                        width,
-                        1,
-                        dimension(audio.conv_kernel_size, "audio kernel width")?,
+                        (format!("a.patch.{stage}.weight"), TensorOperation::Matrix),
+                        (format!("a.patch.{stage}.bias"), TensorOperation::Vector),
                     ],
-                    TensorOperation::Dense,
-                ),
-                (
-                    "conv.bias",
-                    format!("a.conv1d.{flat_block}.bias"),
-                    vec![width],
-                    TensorOperation::Vector,
-                ),
-                (
-                    "norm.weight",
-                    format!("a.conv1d.{flat_block}.norm.weight"),
-                    vec![width],
-                    TensorOperation::Vector,
-                ),
-                (
-                    "mlp.fc1.weight",
-                    format!("a.blk.{flat_block}.ffn_up.weight"),
-                    vec![intermediate, width],
-                    TensorOperation::Matrix,
-                ),
-                (
-                    "mlp.fc1.bias",
-                    format!("a.blk.{flat_block}.ffn_up.bias"),
-                    vec![intermediate],
-                    TensorOperation::Vector,
-                ),
-                (
-                    "mlp.fc2.weight",
-                    format!("a.blk.{flat_block}.ffn_down.weight"),
-                    vec![width, intermediate],
-                    TensorOperation::Matrix,
-                ),
-                (
-                    "mlp.fc2.bias",
-                    format!("a.blk.{flat_block}.ffn_down.bias"),
-                    vec![width],
-                    TensorOperation::Vector,
-                ),
-            ] {
-                add(format!("{root}.{canonical}"), source, shape, operation);
+                )?;
+                bind(
+                    &spec.norm,
+                    vec![(
+                        format!("a.patch.{stage}.norm.weight"),
+                        TensorOperation::Vector,
+                    )],
+                )?;
             }
-            flat_block = flat_block
-                .checked_add(1)
-                .ok_or("audio flat block index overflowed")?;
+            (AudioUnitKind::Convolution { .. }, UnitSpec::Convolution(spec)) => {
+                bind(
+                    &spec.convolution,
+                    vec![
+                        (
+                            format!("a.conv1d.{flat_block}.weight"),
+                            TensorOperation::Dense,
+                        ),
+                        (
+                            format!("a.conv1d.{flat_block}.bias"),
+                            TensorOperation::Vector,
+                        ),
+                    ],
+                )?;
+                bind(
+                    &spec.norm,
+                    vec![(
+                        format!("a.conv1d.{flat_block}.norm.weight"),
+                        TensorOperation::Vector,
+                    )],
+                )?;
+                for (projection, name) in [
+                    (&spec.network.up, "ffn_up"),
+                    (&spec.network.down, "ffn_down"),
+                ] {
+                    bind(
+                        projection,
+                        vec![
+                            (
+                                format!("a.blk.{flat_block}.{name}.weight"),
+                                TensorOperation::Matrix,
+                            ),
+                            (
+                                format!("a.blk.{flat_block}.{name}.bias"),
+                                TensorOperation::Vector,
+                            ),
+                        ],
+                    )?;
+                }
+                flat_block = flat_block
+                    .checked_add(1)
+                    .ok_or("audio flat block index overflowed")?;
+            }
+            (AudioUnitKind::Projection, UnitSpec::Projection(spec)) => {
+                bind(
+                    &spec.norm,
+                    vec![("a.pre_ln.weight".into(), TensorOperation::Vector)],
+                )?;
+                bind(
+                    &spec.projection,
+                    vec![
+                        ("mm.a.fc.weight".into(), TensorOperation::Matrix),
+                        ("mm.a.fc.bias".into(), TensorOperation::Vector),
+                    ],
+                )?;
+                bind(
+                    &spec.post_norm,
+                    vec![("a.post_ln.weight".into(), TensorOperation::Vector)],
+                )?;
+            }
+            _ => return Err("Muse audio storage extension references an incompatible unit".into()),
         }
-    }
-    let width = dimension(
-        *audio.hidden_sizes.last().ok_or("audio stages are empty")?,
-        "audio final width",
-    )?;
-    let language = dimension(audio.out_hidden_size, "audio language width")?;
-    for (canonical, source, shape, operation) in [
-        (
-            "norm.weight",
-            "a.pre_ln.weight",
-            vec![width],
-            TensorOperation::Vector,
-        ),
-        (
-            "proj.weight",
-            "mm.a.fc.weight",
-            vec![language, width],
-            TensorOperation::Matrix,
-        ),
-        (
-            "proj.bias",
-            "mm.a.fc.bias",
-            vec![language],
-            TensorOperation::Vector,
-        ),
-        (
-            "post_proj_norm.weight",
-            "a.post_ln.weight",
-            vec![language],
-            TensorOperation::Vector,
-        ),
-    ] {
-        add(
-            format!("model.audio_tower.{canonical}"),
-            source.into(),
-            shape,
-            operation,
-        );
     }
     Ok(tensors)
 }
@@ -1352,11 +1386,19 @@ fn add_safetensors_audio(
     let Some(audio) = &args.audio_config else {
         return Ok(());
     };
-    for tensor in audio_tensor_layouts(audio)? {
-        if tensor.operation == TensorOperation::Matrix {
-            add_audio_matrix(audio, output, &tensor.canonical, tensor.shape)?;
-        } else {
-            output.push(safe(tensor.canonical, tensor.shape));
+    use eredu_nn::DeclareLogicalParameters;
+    let declarations = audio.declaration();
+    for (_, unit) in &declarations.units {
+        for parameter in unit
+            .logical_parameters()
+            .map_err(|error| error.to_string())?
+        {
+            let name = parameter.parameter.id.as_str();
+            if let Some(format) = parameter.linear_format {
+                add_audio_matrix(format.encoding(), output, name, parameter.shape)?;
+            } else {
+                output.push(safe(name, parameter.shape));
+            }
         }
     }
     Ok(())
@@ -1370,78 +1412,21 @@ fn add_safetensors_vision(
     let vision = args.vision_config.as_ref().ok_or_else(|| {
         "Muse-Glimmer SafeTensors plan requires a vision configuration".to_string()
     })?;
-    let hidden = dimension(vision.hidden_size, "vision hidden size")?;
-    let intermediate = dimension(vision.intermediate_size, "vision intermediate size")?;
-    let patch = dimension(vision.patch_size, "vision patch size")?;
-    let temporal = dimension(vision.temporal_patch_size, "vision temporal patch size")?;
-    let patch_input = checked_mul(
-        checked_mul(3, temporal, "vision temporal channel width")?,
-        checked_mul(patch, patch, "vision patch area")?,
-        "vision patch input width",
-    )?;
-    let positions = checked_mul(
-        dimension(vision.position_height, "vision position height")?,
-        dimension(vision.position_width, "vision position width")?,
-        "vision position count",
-    )?;
-    for (name, shape) in [
-        (
-            "model.vision_tower.patch_embedder.patch_embedding.weight",
-            vec![hidden, patch_input],
-        ),
-        (
-            "model.vision_tower.patch_embedder.position_embedding_table.weight",
-            vec![positions, hidden],
-        ),
-    ] {
-        add_vision_matrix(vision, output, name, shape)?;
+    use eredu_nn::DeclareLogicalParameters;
+    let declarations = vision.declaration();
+    if vision.language_hidden_size as usize != text_hidden {
+        return Err("Muse vision projection differs from the decoder width".into());
     }
-    for local in [
-        "ln_pre.weight",
-        "ln_pre.bias",
-        "ln_post.weight",
-        "ln_post.bias",
-    ] {
-        output.push(safe(
-            local_with_root("model.vision_tower", local),
-            vec![hidden],
-        ));
-    }
-    for layer in 0..vision.layer_count() {
-        let root = format!("model.vision_tower.layers.{layer}");
-        for norm in ["norm1", "norm2"] {
-            output.push(safe(format!("{root}.{norm}.weight"), vec![hidden]));
-            output.push(safe(format!("{root}.{norm}.bias"), vec![hidden]));
+    for parameter in declarations
+        .logical_parameters()
+        .map_err(|error| error.to_string())?
+    {
+        let name = parameter.parameter.id.as_str();
+        if let Some(format) = parameter.linear_format {
+            add_vision_matrix(format.encoding(), output, name, parameter.shape)?;
+        } else {
+            output.push(safe(name, parameter.shape));
         }
-        for projection in ["q_proj", "k_proj", "v_proj", "proj"] {
-            let weight = format!("{root}.attn.{projection}.weight");
-            add_vision_matrix(vision, output, &weight, vec![hidden, hidden])?;
-            output.push(safe(format!("{root}.attn.{projection}.bias"), vec![hidden]));
-        }
-        let fc1 = format!("{root}.mlp.fc1.weight");
-        add_vision_matrix(vision, output, &fc1, vec![intermediate, hidden])?;
-        output.push(safe(format!("{root}.mlp.fc1.bias"), vec![intermediate]));
-        let fc2 = format!("{root}.mlp.fc2.weight");
-        add_vision_matrix(vision, output, &fc2, vec![hidden, intermediate])?;
-        output.push(safe(format!("{root}.mlp.fc2.bias"), vec![hidden]));
-    }
-    let projector = dimension(args.projector_hidden_size, "projector hidden size")?;
-    let vision_out = dimension(args.vision_out_hidden_size, "vision output width")?;
-    for (name, shape) in [
-        (
-            "model.vision_adapter.fc1.weight",
-            vec![projector, vision_out],
-        ),
-        (
-            "model.vision_adapter.fc2.weight",
-            vec![projector, projector],
-        ),
-        (
-            "model.vision_projection.weight",
-            vec![text_hidden, projector],
-        ),
-    ] {
-        add_vision_matrix(vision, output, name, shape)?;
     }
     Ok(())
 }
@@ -1468,20 +1453,29 @@ fn add_text_matrix(
 }
 
 fn add_packed_expert_matrix(
-    args: &DecoderConfig,
     output: &mut Vec<SafetensorsTensorConstraint>,
     source: &str,
-    canonical: &str,
-    shape: Vec<usize>,
+    parameter: &eredu_nn::LogicalParameterDeclaration<'_>,
 ) -> Result<(), String> {
-    if args.linear_format_for(canonical) != eredu_checkpoint::LinearFormat::NvFp4 {
-        return add_text_matrix(args, output, source, canonical, shape);
+    let canonical = parameter.parameter.id.as_str();
+    let shape = parameter.shape.clone();
+    let format = parameter
+        .linear_format
+        .ok_or("Muse packed matrix has no declared encoding")?;
+    if format.encoding() != eredu_checkpoint::LinearFormat::NvFp4 {
+        output.extend(
+            matrix_for_linear_format(
+                source,
+                safetensors_aliases(source, canonical),
+                shape,
+                format.encoding(),
+                None,
+            )
+            .map_err(|error| error.to_string())?,
+        );
+        return Ok(());
     }
-    let parts = if canonical.ends_with(".gate_up_proj") {
-        2
-    } else {
-        1
-    };
+    let parts = format.row_layout().partitions();
     output.extend(
         matrix_for_nvfp4(
             source,
@@ -1507,203 +1501,319 @@ fn add_packed_expert_matrix(
 }
 
 fn add_vision_matrix(
-    vision: &super::VisionConfig,
+    format: eredu_checkpoint::LinearFormat,
     output: &mut Vec<SafetensorsTensorConstraint>,
     name: &str,
     shape: Vec<usize>,
 ) -> Result<(), String> {
     output.extend(
-        matrix_for_linear_format(
-            name,
-            safetensors_aliases(name, name),
-            shape,
-            vision.linear_format_for(name),
-            None,
-        )
-        .map_err(|error| error.to_string())?,
+        matrix_for_linear_format(name, safetensors_aliases(name, name), shape, format, None)
+            .map_err(|error| error.to_string())?,
     );
     Ok(())
 }
 
-/// Builds the complete text GGUF catalog admitted for Muse-Glimmer.
-pub fn gguf_plan(args: &DecoderConfig) -> Result<GgufCheckpointPlan, String> {
-    let hidden = dimension(args.hidden_size, "text hidden size")?;
-    let vocabulary = dimension(args.vocab_size, "vocabulary size")?;
-    let layers = dimension(args.num_hidden_layers, "text layer count")?;
-    let head = dimension(args.head_dim, "attention head width")?;
-    let query = checked_mul(
-        dimension(args.num_attention_heads, "attention head count")?,
-        head,
-        "query projection width",
-    )?;
-    let key_value = checked_mul(
-        dimension(args.num_key_value_heads, "key/value head count")?,
-        head,
-        "key/value projection width",
-    )?;
-    let mut tensors = vec![
-        gguf(
-            "token_embd.weight",
-            vec![vocabulary, hidden],
-            TensorOperation::Matrix,
-        ),
-        gguf("output_norm.weight", vec![hidden], TensorOperation::Vector),
-    ];
-    if !args.tie_word_embeddings {
-        tensors.push(gguf(
-            "output.weight",
-            vec![vocabulary, hidden],
-            TensorOperation::Matrix,
-        ));
-    }
-    for layer in 0..layers {
-        let root = format!("blk.{layer}");
-        for (local, shape, operation) in [
-            ("attn_norm.weight", vec![hidden], TensorOperation::Vector),
-            (
-                "post_attention_norm.weight",
-                vec![hidden],
-                TensorOperation::Vector,
-            ),
-            ("ffn_norm.weight", vec![hidden], TensorOperation::Vector),
-            (
-                "post_ffw_norm.weight",
-                vec![hidden],
-                TensorOperation::Vector,
-            ),
-            ("attn_q_norm.weight", vec![head], TensorOperation::Vector),
-            ("attn_k_norm.weight", vec![head], TensorOperation::Vector),
-            (
-                "attn_q.weight",
-                vec![query, hidden],
-                TensorOperation::Matrix,
-            ),
-            (
-                "attn_k.weight",
-                vec![key_value, hidden],
-                TensorOperation::Matrix,
-            ),
-            (
-                "attn_v.weight",
-                vec![key_value, hidden],
-                TensorOperation::Matrix,
-            ),
-            (
-                "attn_output.weight",
-                vec![hidden, query],
-                TensorOperation::Matrix,
-            ),
-            (
-                "attn_gate.weight",
-                vec![query, hidden],
-                TensorOperation::Matrix,
-            ),
-        ] {
-            if local == "post_attention_norm.weight"
-                && args.block_normalization == BlockNormalization::InputScaledFeedForward
-            {
-                continue;
-            }
-            tensors.push(gguf(format!("{root}.{local}"), shape, operation));
+fn attention_gguf_layouts(
+    args: &DecoderConfig,
+    layer: usize,
+) -> Result<Vec<DeclaredGgufTensor>, String> {
+    use eredu_nn::DeclareLogicalParameters;
+    let attention = &args
+        .attention(layer)
+        .map_err(|error| error.to_string())?
+        .parameters;
+    let mut tensors = Vec::new();
+    for (projection, source) in attention.projections().into_iter().zip([
+        "attn_q",
+        "attn_k",
+        "attn_v",
+        "attn_output",
+        "attn_gate",
+    ]) {
+        for parameter in projection
+            .logical_parameters()
+            .map_err(|error| error.to_string())?
+        {
+            tensors.push(DeclaredGgufTensor {
+                canonical: parameter.parameter.id.as_str().to_owned(),
+                gguf: format!("blk.{layer}.{source}.weight"),
+                shape: parameter.shape,
+                operation: TensorOperation::Matrix,
+            });
         }
-        match args.residual_equation {
-            ResidualEquation::Add => {}
-            ResidualEquation::Learned { .. } => {
+    }
+    for (norm, source) in attention.norms.iter().zip(["attn_q_norm", "attn_k_norm"]) {
+        for parameter in norm
+            .logical_parameters()
+            .map_err(|error| error.to_string())?
+        {
+            tensors.push(DeclaredGgufTensor {
+                canonical: parameter.parameter.id.as_str().to_owned(),
+                gguf: format!("blk.{layer}.{source}.weight"),
+                shape: parameter.shape,
+                operation: TensorOperation::Vector,
+            });
+        }
+    }
+    Ok(tensors)
+}
+
+fn dense_gguf_layouts(
+    args: &DecoderConfig,
+    layer: usize,
+) -> Result<Vec<DeclaredGgufTensor>, String> {
+    use eredu_nn::DeclareLogicalParameters;
+    let projections = args.dense(layer).map_err(|error| error.to_string())?;
+    let mut tensors = Vec::new();
+    for (projection, source) in projections
+        .projections()
+        .into_iter()
+        .zip(["ffn_gate", "ffn_up", "ffn_down"])
+    {
+        for parameter in projection
+            .logical_parameters()
+            .map_err(|error| error.to_string())?
+        {
+            tensors.push(DeclaredGgufTensor {
+                canonical: parameter.parameter.id.as_str().to_owned(),
+                gguf: format!("blk.{layer}.{source}.weight"),
+                shape: parameter.shape,
+                operation: TensorOperation::Matrix,
+            });
+        }
+    }
+    Ok(tensors)
+}
+
+fn static_gguf_layouts(args: &DecoderConfig) -> Result<Vec<DeclaredGgufTensor>, String> {
+    use eredu_nn::DeclareLogicalParameters;
+    let construction = args.pinned();
+    let embedding = construction.embedding_spec();
+    let head = construction.head_spec();
+    construction
+        .logical_parameters()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|parameter| {
+            let id = parameter.parameter.id.as_str();
+            let (source, operation) = if id == embedding.weight.id.as_str() {
+                ("token_embd.weight", TensorOperation::Matrix)
+            } else if head.filter(|head| head.weight.id.as_str() == id).is_some() {
+                ("output.weight", TensorOperation::Matrix)
+            } else if parameter.role == eredu_nn::LogicalParameterRole::Normalization {
+                ("output_norm.weight", TensorOperation::Vector)
+            } else {
+                return Err(format!("unresolved Muse static GGUF slot {id}"));
+            };
+            Ok(DeclaredGgufTensor {
+                canonical: id.into(),
+                gguf: source.into(),
+                shape: parameter.shape,
+                operation,
+            })
+        })
+        .collect()
+}
+fn scalar_gguf_layouts(
+    args: &DecoderConfig,
+    layer: usize,
+) -> Result<Vec<DeclaredGgufTensor>, String> {
+    use super::equations::specs::ResidualSpec;
+    use eredu_nn::DeclareLogicalParameters;
+    let scalar = args.scalar(layer).map_err(|error| error.to_string())?;
+    let mut tensors = Vec::new();
+    let mut bind = |spec: &dyn DeclareLogicalParameters, source: &str| -> Result<(), String> {
+        for parameter in spec
+            .logical_parameters()
+            .map_err(|error| error.to_string())?
+        {
+            tensors.push(DeclaredGgufTensor {
+                canonical: parameter.parameter.id.as_str().to_owned(),
+                gguf: format!("blk.{layer}.{source}.weight"),
+                shape: parameter.shape,
+                operation: TensorOperation::Vector,
+            });
+        }
+        Ok(())
+    };
+    for (spec, source) in [
+        (&scalar.input as &dyn DeclareLogicalParameters, "attn_norm"),
+        (&scalar.post_attention, "post_attention_norm"),
+        (&scalar.pre_feed_forward, "ffn_norm"),
+        (&scalar.post_feed_forward, "post_ffw_norm"),
+    ] {
+        bind(spec, source)?;
+    }
+    for (spec, source) in scalar.residuals.iter().zip(["attn_resid", "ffn_resid"]) {
+        match spec {
+            ResidualSpec::Add => {}
+            ResidualSpec::Learned(_) => {
                 return Err(
                     "Muse GGUF residual gates require stored coefficient normalization".into(),
-                )
+                );
             }
-            ResidualEquation::StoredCoefficients => {
-                for local in [
-                    "attn_resid_alpha",
-                    "attn_resid_beta",
-                    "ffn_resid_alpha",
-                    "ffn_resid_beta",
-                ] {
-                    tensors.push(gguf(
-                        format!("{root}.{local}.weight"),
-                        vec![hidden],
-                        TensorOperation::Vector,
-                    ));
+            ResidualSpec::Stored(spec) => {
+                let parameters = spec
+                    .logical_parameters()
+                    .map_err(|error| error.to_string())?;
+                for (parameter, suffix) in parameters.into_iter().zip(["alpha", "beta"]) {
+                    tensors.push(DeclaredGgufTensor {
+                        canonical: parameter.parameter.id.as_str().to_owned(),
+                        gguf: format!("blk.{layer}.{source}_{suffix}.weight"),
+                        shape: parameter.shape,
+                        operation: TensorOperation::Vector,
+                    });
                 }
             }
         }
-        if args.is_moe() {
-            let experts = dimension(args.num_experts, "expert count")?;
-            let intermediate = dimension(args.moe_intermediate_size, "expert intermediate size")?;
-            let expert_hidden = match args.routed_feed_forward {
-                RoutedFeedForwardEquation::DirectSoftmax => hidden,
-                RoutedFeedForwardEquation::CompressedSigmoid { expert_width, .. } => {
-                    let latent = dimension(expert_width, "compressed expert width")?;
-                    for (local, shape, operation) in [
-                        (
-                            "ffn_latent_down.weight",
-                            vec![latent, hidden],
-                            TensorOperation::Matrix,
-                        ),
-                        (
-                            "ffn_latent_up.weight",
-                            vec![hidden, latent],
-                            TensorOperation::Matrix,
-                        ),
-                        (
-                            "ffn_pre_exp_norm.weight",
-                            vec![latent],
-                            TensorOperation::Vector,
-                        ),
-                        (
-                            "ffn_post_exp_norm.weight",
-                            vec![latent],
-                            TensorOperation::Vector,
-                        ),
-                        ("exp_probs_b.bias", vec![experts], TensorOperation::Vector),
-                    ] {
-                        tensors.push(gguf(format!("{root}.{local}"), shape, operation));
-                    }
-                    latent
-                }
-            };
-            tensors.extend([
-                gguf(
-                    format!("{root}.ffn_gate_inp.weight"),
-                    vec![experts, hidden],
-                    TensorOperation::Matrix,
-                ),
-                gguf(
-                    format!("{root}.ffn_gate_exps.weight"),
-                    vec![experts, intermediate, expert_hidden],
-                    TensorOperation::Matrix,
-                ),
-                gguf(
-                    format!("{root}.ffn_up_exps.weight"),
-                    vec![experts, intermediate, expert_hidden],
-                    TensorOperation::Matrix,
-                ),
-                gguf(
-                    format!("{root}.ffn_down_exps.weight"),
-                    vec![experts, expert_hidden, intermediate],
-                    TensorOperation::Matrix,
-                ),
-            ]);
+    }
+    Ok(tensors)
+}
+
+fn routed_gguf_layouts(
+    args: &DecoderConfig,
+    layer: usize,
+) -> Result<Vec<DeclaredGgufTensor>, String> {
+    use eredu_nn::DeclareLogicalParameters;
+    let declaration = args.routed(layer).map_err(|error| error.to_string())?;
+    let mut tensors = Vec::new();
+    let mut bind = |spec: &dyn DeclareLogicalParameters,
+                    sources: &[&str],
+                    matrix: bool|
+     -> Result<(), String> {
+        let parameters = spec
+            .logical_parameters()
+            .map_err(|error| error.to_string())?;
+        if parameters.len() != sources.len() {
+            return Err("Muse routed GGUF extension does not cover its slots".into());
+        }
+        for (parameter, source) in parameters.into_iter().zip(sources) {
+            tensors.push(DeclaredGgufTensor {
+                canonical: parameter.parameter.id.as_str().to_owned(),
+                gguf: format!("blk.{layer}.{source}"),
+                shape: parameter.shape,
+                operation: if matrix {
+                    TensorOperation::Matrix
+                } else {
+                    TensorOperation::Vector
+                },
+            });
+        }
+        Ok(())
+    };
+    if let Some(compression) = declaration.compression() {
+        bind(&compression.input, &["ffn_latent_down.weight"], true)?;
+        bind(&compression.output, &["ffn_latent_up.weight"], true)?;
+        bind(&compression.norms[0], &["ffn_pre_exp_norm.weight"], false)?;
+        bind(&compression.norms[1], &["ffn_post_exp_norm.weight"], false)?;
+    }
+    for parameter in declaration
+        .selector()
+        .logical_parameters()
+        .map_err(|error| error.to_string())?
+    {
+        let (source, operation) = if parameter.parameter.id == declaration.selector().weight().id {
+            ("ffn_gate_inp.weight", TensorOperation::Matrix)
+        } else if Some(&parameter.parameter.id)
+            == declaration.selector().correction_bias().map(|p| &p.id)
+        {
+            ("exp_probs_b.bias", TensorOperation::Vector)
         } else {
-            let intermediate = dimension(args.intermediate_size, "text intermediate size")?;
-            tensors.extend([
-                gguf(
-                    format!("{root}.ffn_gate.weight"),
-                    vec![intermediate, hidden],
-                    TensorOperation::Matrix,
-                ),
-                gguf(
-                    format!("{root}.ffn_up.weight"),
-                    vec![intermediate, hidden],
-                    TensorOperation::Matrix,
-                ),
-                gguf(
-                    format!("{root}.ffn_down.weight"),
-                    vec![hidden, intermediate],
-                    TensorOperation::Matrix,
-                ),
-            ]);
+            return Err("unresolved Muse selector GGUF slot".into());
+        };
+        tensors.push(DeclaredGgufTensor {
+            canonical: parameter.parameter.id.as_str().to_owned(),
+            gguf: format!("blk.{layer}.{source}"),
+            shape: parameter.shape,
+            operation,
+        });
+    }
+    let source = declaration
+        .bank()
+        .packed_parameters()
+        .map_err(|error| error.to_string())?;
+    let root = source
+        .gate_up()
+        .parameter
+        .id
+        .as_str()
+        .strip_suffix(".gate_up_proj")
+        .ok_or("unresolved Muse packed bank")?;
+    let split = source.unfused_shape();
+    let down_shape = source.down().shape.clone();
+    // Split sources are checkpoint inputs, not additional parameter owners.
+    for (source, local, shape) in [
+        ("ffn_gate_exps", "gate_proj", split.clone()),
+        ("ffn_up_exps", "up_proj", split),
+        ("ffn_down_exps", "down_proj", down_shape),
+    ] {
+        tensors.push(DeclaredGgufTensor {
+            canonical: format!("{root}.{local}.weight"),
+            gguf: format!("blk.{layer}.{source}.weight"),
+            shape,
+            operation: TensorOperation::Matrix,
+        });
+    }
+    Ok(tensors)
+}
+
+// Source conversion precedes retained execution-format selection. Matrix outputs
+// can therefore include affine or MXFP4 companions even with a dense execution spec.
+fn gguf_source_bindings(tensor: DeclaredGgufTensor) -> Result<Vec<(String, String)>, String> {
+    let mut bindings = vec![(tensor.gguf.clone(), tensor.canonical.clone())];
+    if tensor.operation == TensorOperation::Matrix {
+        let source_prefix = tensor
+            .gguf
+            .strip_suffix(".weight")
+            .ok_or("GGUF matrix has no weight suffix")?;
+        let source_format = crate::linear_format::standard_linear_format(
+            &tensor.canonical,
+            eredu_checkpoint::LinearFormat::Affine(
+                eredu_checkpoint::AffineQuantization::new(32, 4)
+                    .map_err(|error| error.to_string())?,
+            ),
+        )
+        .map_err(|error| error.to_string())?;
+        for (suffix, parameter) in [
+            ("scales", source_format.scale()),
+            ("biases", source_format.affine_bias()),
+        ] {
+            if let Some(parameter) = parameter {
+                bindings.push((
+                    format!("{source_prefix}.{suffix}"),
+                    parameter.id.as_str().to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(bindings)
+}
+
+/// Builds the complete text GGUF catalog admitted for Muse-Glimmer.
+pub fn gguf_plan(args: &DecoderConfig) -> Result<GgufCheckpointPlan, String> {
+    if args.weight_convention != super::WeightConvention::Gguf {
+        return Err("Muse GGUF admission requires GGUF-normalized source declarations".into());
+    }
+    let layers = dimension(args.num_hidden_layers, "text layer count")?;
+    let mut tensors = static_gguf_layouts(args)?
+        .into_iter()
+        .map(|tensor| gguf(tensor.gguf, tensor.shape, tensor.operation))
+        .collect::<Vec<_>>();
+    for layer in 0..layers {
+        for tensor in scalar_gguf_layouts(args, layer)?
+            .into_iter()
+            .chain(attention_gguf_layouts(args, layer)?)
+        {
+            tensors.push(gguf(tensor.gguf, tensor.shape, tensor.operation));
+        }
+        if args.is_moe() {
+            for tensor in routed_gguf_layouts(args, layer)? {
+                tensors.push(gguf(tensor.gguf, tensor.shape, tensor.operation));
+            }
+        } else {
+            for tensor in dense_gguf_layouts(args, layer)? {
+                tensors.push(gguf(tensor.gguf, tensor.shape, tensor.operation));
+            }
         }
     }
     GgufCheckpointPlan::new(
@@ -1715,96 +1825,149 @@ pub fn gguf_plan(args: &DecoderConfig) -> Result<GgufCheckpointPlan, String> {
     .map_err(|error| error.to_string())
 }
 
+// Image-only storage extensions reference the ordinary construction slots.
+fn vision_gguf_layouts(vision: &super::VisionConfig) -> Result<Vec<DeclaredGgufTensor>, String> {
+    use eredu_nn::DeclareLogicalParameters;
+    let declarations = vision.declaration();
+    let statics = &declarations.statics;
+    if statics.position.vocabulary != 1024 || statics.adapter.up.output != 4096 {
+        return Err(
+            "published Muse image-only GGUF requires 1024 position rows and a 4096-wide adapter"
+                .into(),
+        );
+    }
+    let mut tensors = Vec::new();
+    let mut bind = |spec: &dyn DeclareLogicalParameters,
+                    names: Vec<String>,
+                    matrix: bool,
+                    physical: Option<Vec<usize>>|
+     -> Result<(), String> {
+        let parameters = spec
+            .logical_parameters()
+            .map_err(|error| error.to_string())?;
+        if parameters.len() != names.len() {
+            return Err("Muse vision storage extension does not cover its declared slots".into());
+        }
+        for (index, (parameter, gguf)) in parameters.into_iter().zip(names).enumerate() {
+            tensors.push(DeclaredGgufTensor {
+                canonical: parameter.parameter.id.as_str().to_owned(),
+                gguf,
+                shape: physical.clone().unwrap_or(parameter.shape),
+                operation: if matrix && index == 0 {
+                    TensorOperation::Matrix
+                } else {
+                    TensorOperation::Dense
+                },
+            });
+        }
+        Ok(())
+    };
+    bind(
+        &statics.patch,
+        vec!["v.patch_embd.weight".into()],
+        false,
+        Some(
+            statics
+                .spatial_source()
+                .map_err(|error| error.to_string())?
+                .kernel_shape
+                .to_vec(),
+        ),
+    )?;
+    bind(
+        &statics.position,
+        vec!["v.position_embd.weight".into()],
+        false,
+        None,
+    )?;
+    for (norm, prefix) in statics.norms.iter().zip(["v.pre_ln", "v.post_ln"]) {
+        bind(
+            norm,
+            vec![format!("{prefix}.weight"), format!("{prefix}.bias")],
+            false,
+            None,
+        )?;
+    }
+    for (layer, spec) in declarations.blocks.iter().enumerate() {
+        for (norm, name) in spec.norms.iter().zip(["ln1", "ln2"]) {
+            bind(
+                norm,
+                vec![
+                    format!("v.blk.{layer}.{name}.weight"),
+                    format!("v.blk.{layer}.{name}.bias"),
+                ],
+                false,
+                None,
+            )?;
+        }
+        for (projection, name) in spec
+            .attention
+            .projections()
+            .into_iter()
+            .chain(spec.mlp.projections())
+            .zip([
+                "attn_q", "attn_k", "attn_v", "attn_out", "ffn_up", "ffn_down",
+            ])
+        {
+            bind(
+                projection,
+                vec![
+                    format!("v.blk.{layer}.{name}.weight"),
+                    format!("v.blk.{layer}.{name}.bias"),
+                ],
+                true,
+                None,
+            )?;
+        }
+    }
+    for (index, projection) in statics
+        .adapter
+        .projections()
+        .into_iter()
+        .chain([&statics.projection])
+        .enumerate()
+    {
+        bind(projection, vec![format!("mm.{index}.weight")], true, None)?;
+    }
+    Ok(tensors)
+}
+
+/// Resolves released media GGUF names to exact declared parameter identities.
+pub fn projector_gguf_name_mapping(
+    args: &DecoderConfig,
+) -> Result<BTreeMap<String, String>, String> {
+    let mut tensors = args
+        .vision_config
+        .as_ref()
+        .map(vision_gguf_layouts)
+        .transpose()?
+        .unwrap_or_default();
+    if let Some(audio) = &args.audio_config {
+        tensors.extend(audio_gguf_layouts(audio)?);
+    }
+    let mut names = BTreeMap::new();
+    for tensor in tensors {
+        for (source, target) in gguf_source_bindings(tensor)? {
+            if names.insert(source.clone(), target).is_some() {
+                return Err(format!("conflicting Muse media GGUF name {source}"));
+            }
+        }
+    }
+    Ok(names)
+}
+
 /// Builds the official image-only sibling projector GGUF catalog.
 pub fn projector_gguf_plan(args: &DecoderConfig) -> Result<GgufCheckpointPlan, String> {
     let vision = args
         .vision_config
         .as_ref()
         .ok_or_else(|| "Muse-Glimmer projector plan requires vision geometry".to_string())?;
-    let hidden = dimension(vision.hidden_size, "vision hidden size")?;
-    let intermediate = dimension(vision.intermediate_size, "vision intermediate size")?;
-    let patch = dimension(vision.patch_size, "vision patch size")?;
-    let merge = dimension(vision.merge_size, "vision merge size")?;
-    let merged = checked_mul(
-        hidden,
-        checked_mul(merge, merge, "vision merge area")?,
-        "merged vision width",
-    )?;
-    let mut tensors = vec![
-        gguf(
-            "v.patch_embd.weight",
-            vec![hidden, 3, patch, patch],
-            TensorOperation::Dense,
-        ),
-        gguf(
-            "v.position_embd.weight",
-            vec![1024, hidden],
-            TensorOperation::Dense,
-        ),
-    ];
-    for name in [
-        "v.pre_ln.weight",
-        "v.pre_ln.bias",
-        "v.post_ln.weight",
-        "v.post_ln.bias",
-    ] {
-        tensors.push(gguf(name, vec![hidden], TensorOperation::Dense));
-    }
-    for layer in 0..vision.layer_count() {
-        let root = format!("v.blk.{layer}");
-        for local in ["ln1.weight", "ln1.bias", "ln2.weight", "ln2.bias"] {
-            tensors.push(gguf(
-                format!("{root}.{local}"),
-                vec![hidden],
-                TensorOperation::Dense,
-            ));
-        }
-        for projection in ["attn_q", "attn_k", "attn_v", "attn_out"] {
-            tensors.push(gguf(
-                format!("{root}.{projection}.weight"),
-                vec![hidden, hidden],
-                TensorOperation::Matrix,
-            ));
-            tensors.push(gguf(
-                format!("{root}.{projection}.bias"),
-                vec![hidden],
-                TensorOperation::Dense,
-            ));
-        }
-        tensors.extend([
-            gguf(
-                format!("{root}.ffn_up.weight"),
-                vec![intermediate, hidden],
-                TensorOperation::Matrix,
-            ),
-            gguf(
-                format!("{root}.ffn_up.bias"),
-                vec![intermediate],
-                TensorOperation::Dense,
-            ),
-            gguf(
-                format!("{root}.ffn_down.weight"),
-                vec![hidden, intermediate],
-                TensorOperation::Matrix,
-            ),
-            gguf(
-                format!("{root}.ffn_down.bias"),
-                vec![hidden],
-                TensorOperation::Dense,
-            ),
-        ]);
-    }
-    tensors.extend([
-        gguf("mm.0.weight", vec![4096, merged], TensorOperation::Matrix),
-        gguf("mm.1.weight", vec![4096, 4096], TensorOperation::Matrix),
-        gguf(
-            "mm.2.weight",
-            vec![dimension(args.hidden_size, "text hidden size")?, 4096],
-            TensorOperation::Matrix,
-        ),
-    ]);
+    let mut tensors = vision_gguf_layouts(vision)?
+        .into_iter()
+        .map(|tensor| gguf(tensor.gguf, tensor.shape, tensor.operation))
+        .collect::<Vec<_>>();
     if let Some(audio) = &args.audio_config {
-        for tensor in audio_tensor_layouts(audio)? {
+        for tensor in audio_gguf_layouts(audio)? {
             tensors.push(gguf(tensor.gguf, tensor.shape, tensor.operation));
         }
     }
@@ -1825,17 +1988,16 @@ pub fn projector_gguf_recipes<C: RecipeCatalog + ?Sized>(
     let Some(vision) = args.vision_config.as_ref() else {
         return Ok(BTreeMap::new());
     };
-    let target = "model.vision_tower.patch_embedder.patch_embedding.weight";
+    let spec = &vision.declaration().statics;
+    let spatial = spec.spatial_source().map_err(|error| error.to_string())?;
+    let target = spatial.weight.id.as_str();
     let source = first_existing(catalog, [target.to_owned(), "v.patch_embd.weight".into()])
         .ok_or_else(|| "Muse-Glimmer projector patch kernel is missing".to_owned())?;
-    let hidden = dimension(vision.hidden_size, "vision hidden size")?;
-    let patch = dimension(vision.patch_size, "vision patch size")?;
-    let width = checked_mul(3, checked_mul(patch, patch, "patch area")?, "patch width")?;
     let metadata = catalog
         .tensor_metadata(&source)
         .map_err(|error| error.to_string())?;
-    if metadata.logical_shape != [hidden, 3, patch, patch]
-        && metadata.logical_shape != [hidden, width]
+    if metadata.logical_shape != spatial.kernel_shape
+        && metadata.logical_shape != spatial.matrix_shape
     {
         return Err(format!(
             "Muse-Glimmer projector patch kernel has invalid shape {:?}",
@@ -1846,7 +2008,7 @@ pub fn projector_gguf_recipes<C: RecipeCatalog + ?Sized>(
         target.into(),
         DerivedWeightRecipe::Reshape {
             input: Box::new(DerivedWeightRecipe::source(source, TensorSelection::Full)),
-            shape: vec![hidden, width],
+            shape: spatial.matrix_shape.to_vec(),
         },
     )]))
 }
@@ -1911,21 +2073,33 @@ fn dimension(value: i32, name: &str) -> Result<usize, String> {
         .ok_or_else(|| format!("Muse-Glimmer {name} must be positive, got {value}"))
 }
 
-fn checked_mul(left: usize, right: usize, name: &str) -> Result<usize, String> {
-    left.checked_mul(right)
-        .ok_or_else(|| format!("Muse-Glimmer {name} geometry overflows"))
-}
-
-fn local_with_root(root: &str, local: &str) -> String {
-    format!("{root}.{local}")
+fn declared_expert_targets(
+    source: &eredu_nn::PackedGatedProductParameters<'_>,
+) -> Result<(String, String, String), String> {
+    let gate_up = source.gate_up().parameter.id.as_str().to_owned();
+    let root = gate_up
+        .strip_suffix(".gate_up_proj")
+        .ok_or("unresolved Muse expert source root")?
+        .to_owned();
+    Ok((
+        root,
+        gate_up,
+        source.down().parameter.id.as_str().to_owned(),
+    ))
 }
 
 /// Resolves packed, separate, or independent expert tensors into neutral packed slots.
 pub fn expert_recipes<C: RecipeCatalog + ?Sized>(
     catalog: &C,
+    args: &DecoderConfig,
     layer: usize,
 ) -> Result<GatedProductExpertRecipes, String> {
-    let root = format!("model.layers.{layer}.mlp.experts");
+    let declaration = args.routed(layer).map_err(|error| error.to_string())?;
+    let source = declaration
+        .bank()
+        .packed_parameters()
+        .map_err(|error| error.to_string())?;
+    let (root, target_gate_up, target_down) = declared_expert_targets(&source)?;
     let raw = format!("blk.{layer}");
     let source = |canonical: String, raw: String| {
         first_existing(catalog, [canonical, raw]).unwrap_or_default()
@@ -1933,10 +2107,10 @@ pub fn expert_recipes<C: RecipeCatalog + ?Sized>(
     resolve_gated_product_expert_recipes(
         catalog,
         &GatedProductExpertLayoutNames {
-            target_gate_up: format!("{root}.gate_up_proj"),
-            target_down: format!("{root}.down_proj"),
-            packed_gate_up: format!("{root}.gate_up_proj"),
-            packed_down: format!("{root}.down_proj"),
+            target_gate_up: target_gate_up.clone(),
+            target_down: target_down.clone(),
+            packed_gate_up: target_gate_up,
+            packed_down: target_down,
             separate_gate: source(
                 format!("{root}.gate_proj.weight"),
                 format!("{raw}.ffn_gate_exps.weight"),
@@ -1963,21 +2137,30 @@ pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
     if !args.is_moe() {
         return Err("Muse-Glimmer expert residency requires a routed model".into());
     }
-    let layers = dimension(args.num_hidden_layers, "layer count")?;
-    let experts = dimension(args.num_experts, "expert count")?;
-    let capacity = layers
-        .checked_mul(experts)
-        .ok_or_else(|| "Muse-Glimmer expert residency catalog size overflows".to_string())?;
+    let declarations = args.routed_layers();
+    let capacity = declarations
+        .values()
+        .try_fold(0usize, |capacity, declaration| {
+            capacity
+                .checked_add(declaration.bank().group_count() as usize)
+                .ok_or_else(|| "Muse-Glimmer expert residency catalog size overflows".to_string())
+        })?;
     let owner_group = eredu_runtime::ExecutionGroupId::new(super::TEXT_EXECUTION_GROUP)
         .map_err(|error| error.to_string())?;
     let mut units = Vec::with_capacity(capacity);
-    for layer in 0..layers {
+    for (layer, declaration) in declarations {
+        let source = declaration
+            .bank()
+            .packed_parameters()
+            .map_err(|error| error.to_string())?;
+        let experts = source.group_count();
+        let formats = source.encodings().map_err(|error| error.to_string())?;
         let unit_path = format!("model.layers.{layer}");
         let bank = match args.weight_convention {
             super::WeightConvention::HuggingFace => {
-                safetensors_expert_recipes(catalog, args, layer)?
+                safetensors_expert_recipes(catalog, args, *layer)?
             }
-            super::WeightConvention::Gguf => expert_recipes(catalog, layer)?,
+            super::WeightConvention::Gguf => expert_recipes(catalog, args, *layer)?,
         };
         let outputs = gated_product_materialization_recipes(catalog, &bank)?;
         let mut materialization = Vec::new();
@@ -2012,18 +2195,18 @@ pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
                         .get(target.as_str())
                         .expect("declared bank parameter")
                         .clone();
-                    let role = if args.linear_format_for(target)
-                        == eredu_checkpoint::LinearFormat::Dense
-                    {
-                        match binding {
-                            "gate_up_proj" | "down_proj" => {
-                                crate::ExpertParameterRole::quantizable_projection(
-                                    format!("{binding}_scales"),
-                                    format!("{binding}_biases"),
-                                )
-                            }
-                            _ => crate::ExpertParameterRole::Preserved,
-                        }
+                    let quantizable = [source.gate_up(), source.down()]
+                        .into_iter()
+                        .zip(formats)
+                        .any(|(parameter, format)| {
+                            parameter.parameter.id.as_str() == target.as_str()
+                                && format == eredu_checkpoint::LinearFormat::Dense
+                        });
+                    let role = if quantizable {
+                        crate::ExpertParameterRole::quantizable_projection(
+                            format!("{binding}_scales"),
+                            format!("{binding}_biases"),
+                        )
                     } else {
                         crate::ExpertParameterRole::Preserved
                     };
@@ -2033,9 +2216,9 @@ pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
                 .collect::<Result<Vec<_>, String>>()?;
             units.push(
                 crate::ExpertResidencyUnit::new(
-                    eredu_runtime::ParameterBankKey::new(0, layer, expert),
+                    eredu_runtime::ParameterBankKey::new(0, *layer, expert),
                     owner_group.clone(),
-                    layer,
+                    *layer,
                     &unit_path,
                     crate::ExpertResidencyDistribution::ExpertParallel,
                     parameters,
@@ -2049,124 +2232,41 @@ pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
         .map_err(|error| error.to_string())
 }
 
-/// Translates one released dense text GGUF name to its neutral identity.
-pub fn translate_text_gguf_name(name: &str) -> String {
-    for (source, target) in [
-        ("token_embd", "model.embed_tokens"),
-        ("output_norm", "model.norm"),
-        ("output", "lm_head"),
-    ] {
-        if name == source || name.starts_with(&format!("{source}.")) {
-            return name.replacen(source, target, 1);
-        }
-    }
-    let Some(rest) = name.strip_prefix("blk.") else {
-        return name.into();
-    };
-    let Some((layer, parameter)) = rest.split_once('.') else {
-        return name.into();
-    };
-    for (source, target) in [
-        (
-            "attn_resid_alpha.weight",
-            "post_attention_residual_gate.alpha",
-        ),
-        (
-            "attn_resid_beta.weight",
-            "post_attention_residual_gate.beta",
-        ),
-        (
-            "ffn_resid_alpha.weight",
-            "post_feedforward_residual_gate.alpha",
-        ),
-        (
-            "ffn_resid_beta.weight",
-            "post_feedforward_residual_gate.beta",
-        ),
-        ("ffn_latent_down", "mlp.pre_expert_proj"),
-        ("ffn_latent_up", "mlp.post_expert_proj"),
-        ("ffn_pre_exp_norm", "mlp.pre_expert_norm"),
-        ("ffn_post_exp_norm", "mlp.experts.post_expert_norm"),
-        ("exp_probs_b.bias", "mlp.gate.e_score_correction_bias"),
-        ("attn_q_norm", "self_attn.q_norm"),
-        ("attn_k_norm", "self_attn.k_norm"),
-        ("attn_q", "self_attn.q_proj"),
-        ("attn_k", "self_attn.k_proj"),
-        ("attn_v", "self_attn.v_proj"),
-        ("attn_output", "self_attn.o_proj"),
-        ("attn_gate", "self_attn.gate_proj"),
-        ("attn_norm", "input_layernorm"),
-        ("post_attention_norm", "post_attention_layernorm"),
-        ("ffn_norm", "pre_feedforward_layernorm"),
-        ("post_ffw_norm", "post_feedforward_layernorm"),
-        ("ffn_gate_inp", "mlp.gate"),
-        ("ffn_gate_exps", "mlp.experts.gate_proj"),
-        ("ffn_up_exps", "mlp.experts.up_proj"),
-        ("ffn_down_exps", "mlp.experts.down_proj"),
-        ("ffn_gate", "mlp.gate_proj"),
-        ("ffn_down", "mlp.down_proj"),
-        ("ffn_up", "mlp.up_proj"),
-    ] {
-        if parameter == source || parameter.starts_with(&format!("{source}.")) {
-            return format!(
-                "model.layers.{layer}.{}",
-                parameter.replacen(source, target, 1)
-            );
-        }
-    }
-    name.into()
+/// Prepared released text GGUF aliases with ordinary projection slots and companions resolved.
+#[derive(Debug, Clone)]
+pub struct TextGgufNames {
+    projections: BTreeMap<String, String>,
 }
-
-/// Translates one official projector GGUF name to its neutral identity.
-pub fn translate_projector_gguf_name(name: &str, audio: Option<&super::AudioConfig>) -> String {
-    if name.starts_with("a.") || name.starts_with("mm.a.") {
-        if let Some(target) = audio
-            .and_then(|audio| audio_tensor_layouts(audio).ok())
-            .and_then(|tensors| tensors.into_iter().find(|tensor| tensor.gguf == name))
-        {
-            return target.canonical;
+impl TextGgufNames {
+    /// Resolves ordinary projection aliases against typed construction geometry before payload reads.
+    pub fn new(args: &DecoderConfig) -> Result<Self, String> {
+        let layers = dimension(args.num_hidden_layers, "text layer count")?;
+        let mut projections = BTreeMap::new();
+        let mut tensors = static_gguf_layouts(args)?;
+        for layer in 0..layers {
+            tensors.extend(scalar_gguf_layouts(args, layer)?);
+            tensors.extend(attention_gguf_layouts(args, layer)?);
+            if args.is_moe() {
+                tensors.extend(routed_gguf_layouts(args, layer)?);
+            } else {
+                tensors.extend(dense_gguf_layouts(args, layer)?);
+            }
         }
-        return name.into();
-    }
-    let exact = match name {
-        "v.patch_embd.weight" => Some("vision_tower.patch_embedder.patch_embedding.weight"),
-        "v.position_embd.weight" => {
-            Some("vision_tower.patch_embedder.position_embedding_table.weight")
+        for tensor in tensors {
+            let bindings = gguf_source_bindings(tensor)?;
+            for (source, target) in bindings {
+                if projections.insert(source.clone(), target).is_some() {
+                    return Err(format!("conflicting Muse projection alias {source}"));
+                }
+            }
         }
-        "v.pre_ln.weight" => Some("vision_tower.ln_pre.weight"),
-        "v.pre_ln.bias" => Some("vision_tower.ln_pre.bias"),
-        "v.post_ln.weight" => Some("vision_tower.ln_post.weight"),
-        "v.post_ln.bias" => Some("vision_tower.ln_post.bias"),
-        "mm.0.weight" => Some("vision_adapter.fc1.weight"),
-        "mm.1.weight" => Some("vision_adapter.fc2.weight"),
-        "mm.2.weight" => Some("vision_projection.weight"),
-        _ => None,
-    };
-    if let Some(target) = exact {
-        return format!("model.{target}");
+        Ok(Self { projections })
     }
-    let Some(rest) = name.strip_prefix("v.blk.") else {
-        return name.into();
-    };
-    let Some((layer, parameter)) = rest.split_once('.') else {
-        return name.into();
-    };
-    for (source, target) in [
-        ("attn_q", "attn.q_proj"),
-        ("attn_k", "attn.k_proj"),
-        ("attn_v", "attn.v_proj"),
-        ("attn_out", "attn.proj"),
-        ("ffn_up", "mlp.fc1"),
-        ("ffn_down", "mlp.fc2"),
-        ("ln1", "norm1"),
-        ("ln2", "norm2"),
-    ] {
-        if parameter == source || parameter.starts_with(&format!("{source}.")) {
-            return format!(
-                "model.vision_tower.layers.{layer}.{}",
-                parameter.replacen(source, target, 1)
-            );
-        }
+    /// Translates declared projection outputs and explicit remaining format extensions.
+    pub fn translate(&self, name: &str) -> String {
+        self.projections
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.into())
     }
-    name.into()
 }

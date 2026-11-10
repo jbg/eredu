@@ -20,18 +20,16 @@ where
     S::LayerState: eredu_nn::ReadOnlyAttentionCache<B::Tensor>,
     V: FamilyRoutedPartitionVisitor<B, S, crate::diffusion_gemma::model::TextModel<B>>,
 {
-    let mut selected_args = args.clone();
-    selected_args.text.weight_quantization = None;
-    selected_args.text.quantized_weights = None;
-    let formats = selected.base().text().quantized_formats();
-    selected_args.text.quantized_weight_configs = (!formats.is_empty()).then_some(formats);
+    let selected_args = args
+        .with_text_formats(selected.base().text().quantized_formats())
+        .map_err(architecture)?;
     let retained = selected
         .base()
         .text()
         .requirements()
         .shared_component_definition()
         .ok_or_else(|| architecture("shared iterative selection has no retained definition"))?;
-    let definition = crate::diffusion_gemma::model::project_parameters(&selected_args, &retained)
+    let definition = crate::replicated_text::executable_component(selected.base().text())
         .map_err(architecture)?;
     let parameters = definition.parameters().clone();
     let rank = selected.requirements().topology();
@@ -163,18 +161,16 @@ where
     S::LayerState: eredu_nn::ReadOnlyAttentionCache<B::Tensor>,
     V: PartitionedArchitectureVisitor<B, S>,
 {
-    let mut selected_args = args.clone();
-    selected_args.text.weight_quantization = None;
-    selected_args.text.quantized_weights = None;
-    let formats = selected.base().quantized_formats();
-    selected_args.text.quantized_weight_configs = (!formats.is_empty()).then_some(formats);
+    let selected_args = args
+        .with_text_formats(selected.base().quantized_formats())
+        .map_err(architecture)?;
     let retained = selected
         .base()
         .requirements()
         .shared_component_definition()
         .ok_or_else(|| architecture("shared iterative selection has no retained definition"))?;
-    let definition = crate::diffusion_gemma::model::project_parameters(&selected_args, &retained)
-        .map_err(architecture)?;
+    let definition =
+        crate::replicated_text::executable_component(selected.base()).map_err(architecture)?;
     let parameters = definition.parameters().clone();
     let rank = selected.requirements().topology();
     let layout = derive_partitioned_local_layout(&parameters, rank).map_err(architecture)?;

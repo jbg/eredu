@@ -645,7 +645,7 @@ pub fn admit_qwen_hybrid_input<Tensor>(
 
 /// Admits a complete Gemma 4 request before composite graph execution.
 pub fn admit_gemma4_input<Tensor>(
-    args: &crate::gemma4::FamilyConfig,
+    args: &crate::gemma4::FamilyPolicy,
     input: &PreparedModelInput<Tensor>,
     inspector: &impl PreparedInputInspector<Tensor>,
 ) -> Result<AdmittedCompositeInput<Gemma4InputPartPlan>, CapabilityError> {
@@ -1206,7 +1206,7 @@ pub fn qwen_hybrid_input_part<Tensor>(
     qwen_input_part_with_policy(
         &args.text.model_type,
         args.text.hidden_size,
-        args.vision.as_ref(),
+        args.vision.as_ref().map(|v| v.config()),
         args.image_token_id,
         args.video_token_id,
         input,
@@ -1256,7 +1256,7 @@ fn gemma_batch_one_sequence(
 }
 
 fn gemma_placeholder_token(
-    args: &crate::gemma4::FamilyConfig,
+    args: &crate::gemma4::FamilyPolicy,
     modality: InputModality,
 ) -> Result<u32, CapabilityError> {
     let token = match modality {
@@ -1279,7 +1279,7 @@ fn gemma_placeholder_token(
 /// Validates one prepared Gemma 4 part and derives the exact placeholder,
 /// ingress geometry, and capability-accounting plan consumed by a backend.
 pub fn gemma4_input_part<Tensor>(
-    args: &crate::gemma4::FamilyConfig,
+    args: &crate::gemma4::FamilyPolicy,
     input: &PreparedInputPart<Tensor>,
     inspector: &impl PreparedInputInspector<Tensor>,
 ) -> Result<Gemma4InputPartPlan, CapabilityError> {
@@ -1715,7 +1715,7 @@ fn gemma_audio(
 
 /// Derives prepared Gemma 4 media geometry from normalized family policy.
 fn gemma4(
-    args: &crate::gemma4::FamilyConfig,
+    args: &crate::gemma4::FamilyPolicy,
     input: &MediaAdmissionInput,
 ) -> Result<MediaShapePlan, CapabilityError> {
     let text_hidden = positive(args.text.hidden_size, "Gemma text hidden size")?;
@@ -2168,7 +2168,10 @@ pub fn muse_input_part<Tensor>(
                         | eredu_core::checkpoint::TensorDtype::Bf16
                 )
             {
-                return Err(unsupported(args.identity.text_model_type(), "Muse waveform must be floating mono PCM padded only to its final token cadence"));
+                return Err(unsupported(
+                    args.identity.text_model_type(),
+                    "Muse waveform must be floating mono PCM padded only to its final token cadence",
+                ));
             }
             let positions = samples / cadence;
             let mut frames = samples;

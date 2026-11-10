@@ -44,10 +44,11 @@ type Model = TextModel<Backend>;
 type State = MlxKeyValueState;
 
 fn bindings<M: Parameterized<MlxTensor>>(
+    config: &FamilyConfig,
     module: &M,
     source: &dyn CheckpointSource,
 ) -> Result<Vec<eredu_runtime::WeightBinding>, eredu_backend_mlx::backend::error::Error> {
-    let mut recipes = nemotron_labs_diffusion::source_recipes(source)
+    let mut recipes = nemotron_labs_diffusion::source_recipes(config, source)
         .map_err(eredu_backend_mlx::backend::error::Error::Parallel)?;
     for key in source.source_keys() {
         let canonical = nemotron_labs_diffusion::canonical_parameter_name(&key);
@@ -85,11 +86,12 @@ fn bindings<M: Parameterized<MlxTensor>>(
     build_neutral_module_bindings_with_recipes(module, source, &mut recipes).map_err(Into::into)
 }
 fn load_vision<M: Parameterized<MlxTensor>>(
+    config: &FamilyConfig,
     module: &mut M,
     source: &dyn CheckpointSource,
     stream: &Stream,
 ) -> Result<(), Box<dyn Error>> {
-    let bindings = bindings(module, source)?;
+    let bindings = bindings(config, module, source)?;
     let arrays = materialize_module_bindings(source, &bindings, stream, stream)?;
     populate_module_from_arrays_excluding(module, &arrays, |_| false)?;
     Ok(())
@@ -300,7 +302,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         .map_err(std::io::Error::other)?;
         let catalog =
             SafetensorsMetadataCatalog::discover(directory.join("adapter_model.safetensors"))?;
-        let plan = nemotron_labs_diffusion::adapter::safetensors_plan(&config, &adapter)
+        let configured = config.clone().with_draft_adapter(adapter)?;
+        let plan = configured
+            .draft_parameters()
+            .expect("declared adapter")
+            .safetensors_plan()
             .map_err(std::io::Error::other)?;
         let resolution = resolve_safetensors_plan(&catalog, &plan)
             .map_err(|issues| std::io::Error::other(format!("adapter admission: {issues:?}")))?;
@@ -311,7 +317,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             2,
         )?;
         source = std::sync::Arc::new(CompositeCheckpointSource::new([source, adapter_source])?);
-        Some(adapter)
+        Some(configured)
     } else {
         None
     };
@@ -337,8 +343,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             stream,
             &weights_stream,
             |key| key.ends_with(".rotary_emb.inv_freq"),
-            |modules, source| bindings(modules, source),
-            |_, _, _, unit, source, _| bindings(&unit, source),
+            |modules, source| bindings(&config, modules, source),
+            |_, _, _, unit, source, _| bindings(&config, &unit, source),
         )?;
         println!("residency: {metadata:?}");
         if residency == LayerWeightResidency::FullyResident {
@@ -387,7 +393,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             stream,
         )?;
         let mut image = ImageEmbedding::<Backend>::new(&config, stream)?;
-        load_vision(&mut image, source.as_ref(), stream)?;
+        load_vision(&config, &mut image, source.as_ref(), stream)?;
         let (mut hidden, state) = image.begin(
             ImageInput {
                 patches: &patches,
@@ -409,7 +415,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         {
             let mut layer =
                 ImageLayer::<Backend>::new(config.vision.as_ref().unwrap(), index, stream)?;
-            load_vision(&mut layer, source.as_ref(), stream)?;
+            load_vision(&config, &mut layer, source.as_ref(), stream)?;
             hidden = layer.forward(&hidden, &state, stream)?;
             compare(
                 &format!("vision.layer.{index}"),
@@ -419,7 +425,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             )?;
         }
         let mut projector = ImageProjector::<Backend>::new(&config, stream)?;
-        load_vision(&mut projector, source.as_ref(), stream)?;
+        load_vision(&config, &mut projector, source.as_ref(), stream)?;
         let projected = projector.finish(&hidden, &state, stream)?;
         compare(
             "vision.projected",
@@ -429,10 +435,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         )?;
         return Ok(());
     }
-    let text_config = match adapter {
-        Some(adapter) => config.clone().with_draft_adapter(adapter),
-        None => config.clone(),
-    };
+    let text_config = adapter.unwrap_or_else(|| config.clone());
     let text_definition = std::sync::Arc::new(nemotron_labs_diffusion::definition::text(
         &text_config,
         None,
@@ -447,8 +450,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         stream,
         &weights_stream,
         |key| key.ends_with(".rotary_emb.inv_freq"),
-        |modules, source| bindings(modules, source),
-        |_, _, _, unit, source, _| bindings(&unit, source),
+        |modules, source| bindings(&config, modules, source),
+        |_, _, _, unit, source, _| bindings(&config, &unit, source),
     )?;
     println!("residency: {metadata:?}");
     if residency == LayerWeightResidency::FullyResident {

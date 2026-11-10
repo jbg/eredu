@@ -1,16 +1,12 @@
 //! Semantic tensor-parallel placement for Inkling text and media components.
 
-use std::{collections::BTreeMap, ops::Range};
+use std::ops::Range;
 
-use eredu_checkpoint::LinearFormat;
-use eredu_nn::VocabularyParallelRange;
+use eredu_nn::{DeclareLogicalParameters, VocabularyParallelRange};
 use eredu_runtime::{
-    expand_linear_format_parameter_groups, ArchitecturePartition, LocalModelLayout, MemberSharding,
-    ParallelPlanError, ParameterGroupSpec, ParameterMemberSpec, ParameterRole, PartitionOwnership,
-    PartitionState, StateLayout,
+    ArchitecturePartition, LocalModelLayout, MemberSharding, ParallelPlanError, ParameterGroupSpec,
+    ParameterRole, PartitionOwnership, PartitionState, StateLayout,
 };
-
-use crate::linear_format::standard_parallel_linear_format;
 
 use super::{FeedForwardPolicy, ModelArgs};
 
@@ -303,12 +299,12 @@ pub fn local_geometry(
     layout: &LocalModelLayout,
 ) -> Result<LocalGeometry, ParallelPlanError> {
     let text_layers = (0..args.text_config.num_hidden_layers as usize)
-        .map(|layer| local_text_args(&args.text_config, layer, layout))
+        .map(|layer| local_text_args(args, layer, layout))
         .collect::<Result<Vec<_>, _>>()?;
     let state_layout = super::parallel_state_layout(args, &text_layers)
         .map_err(|error| invalid(error.to_string()))?;
     let prediction_state = prediction_state(args, state_layout.len())?;
-    let (embedding_range, output_range) = super::static_spec(&args.text_config).vocabulary_ranges(
+    let (embedding_range, output_range) = args.pinned().ordinary.vocabulary_ranges(
         layout,
         "model.embed_tokens",
         "model.norm",
@@ -470,27 +466,33 @@ fn prediction_state(
 /// intermediate dimensions are taken from the semantic placement result so
 /// the ordinary layer constructor creates exactly the local projections.
 pub fn local_text_args(
-    args: &super::TextArgs,
+    source: &ModelArgs,
     layer: usize,
     layout: &eredu_runtime::LocalModelLayout,
 ) -> Result<super::TextArgs, ParallelPlanError> {
+    let args = &source.text_config;
     let policy = args
         .layer_policy(layer)
         .ok_or_else(|| invalid(format!("Inkling layer {layer} is out of range")))?;
-    let root = format!("model.layers.{layer}");
-    let tensor = |suffix: &str| {
-        layout
-            .tensor(&format!("{root}.{suffix}.weight"))
-            .or_else(|| layout.tensor(&format!("{root}.{suffix}")))
-            .ok_or_else(|| {
-                ParallelPlanError::InvalidTensor(format!(
-                    "missing local layout for {root}.{suffix}"
-                ))
-            })
+    let parameters = &source
+        .common(layer)
+        .map_err(|error| invalid(error.to_string()))?
+        .attention;
+    let declared = |weight: &eredu_nn::ParameterSpec| {
+        layout.tensor(weight.id.as_str()).ok_or_else(|| {
+            invalid(format!(
+                "missing selected Inkling parameter {}",
+                weight.id.as_str()
+            ))
+        })
     };
-    let query_width = local_axis(tensor("self_attn.q_proj")?, 0, "query width")?;
-    let key_width = local_axis(tensor("self_attn.k_proj")?, 0, "key width")?;
-    let head_dim = args.attention_head_dim(policy.attention.window().is_some());
+    let query_width = local_axis(
+        declared(&parameters.projection.query.weight)?,
+        0,
+        "query width",
+    )?;
+    let key_width = local_axis(declared(&parameters.projection.key.weight)?, 0, "key width")?;
+    let head_dim = parameters.projection.geometry.key_dimensions();
     if query_width % head_dim != 0 || key_width % head_dim != 0 {
         return Err(ParallelPlanError::InvalidTensor(format!(
             "local Inkling attention widths q={query_width}, k={key_width} split head dimension {head_dim}"
@@ -506,18 +508,29 @@ pub fn local_text_args(
     }
     match policy.feed_forward {
         FeedForwardPolicy::Dense => {
-            local.dense_intermediate_size = Some(local_axis(
-                tensor("dense.gate_proj")?,
-                0,
-                "dense intermediate width",
-            )?);
+            let parameters = source
+                .dense(layer)
+                .map_err(|error| invalid(error.to_string()))?;
+            let gate = layout
+                .tensor(parameters.product.gate.weight.id.as_str())
+                .ok_or_else(|| invalid("missing selected Inkling dense gate projection"))?;
+            local.dense_intermediate_size = Some(local_axis(gate, 0, "dense intermediate width")?);
         }
         FeedForwardPolicy::SparseMoe => {
-            let fused = local_axis(
-                tensor("moe.experts.gate_up_proj")?,
-                1,
-                "expert gate/up width",
-            )?;
+            let parameters = source
+                .sparse(layer)
+                .map_err(|error| invalid(error.to_string()))?;
+            let eredu_nn::GatedProductGroupLayout::Packed { gate_up, .. } =
+                parameters.routed.layout()
+            else {
+                return Err(invalid(
+                    "Inkling local geometry requires a packed expert bank",
+                ));
+            };
+            let gate_up = layout
+                .tensor(gate_up.weight().id.as_str())
+                .ok_or_else(|| invalid("missing selected Inkling expert gate/up projection"))?;
+            let fused = local_axis(gate_up, 1, "expert gate/up width")?;
             if fused % 2 != 0 {
                 return Err(ParallelPlanError::InvalidTensor(format!(
                     "local Inkling expert gate/up width {fused} is not even"
@@ -561,58 +574,42 @@ pub fn static_parameter_groups(
 pub(super) fn pinned_parameter_groups(
     args: &ModelArgs,
 ) -> Result<Vec<(&'static str, ParameterGroupSpec)>, ParallelPlanError> {
-    let hidden = dim(args.text_config.hidden_size)?;
-    let embedding_norm = replicated(
-        "model.embed_norm",
-        [("model.embed_norm.weight", vec![hidden])],
-    )?;
-    let mut groups = super::static_spec(&args.text_config)
-        .logical_pinned_parameter_groups("model.embed_tokens", "model.norm", "lm_head")?
+    let replicated = |name: &str, spec: &dyn eredu_nn::DeclareLogicalParameters| {
+        eredu_runtime::logical_parameter_group(name, ParameterRole::Replicated, None, spec, |_| {
+            MemberSharding::Replicated
+        })
+    };
+    let embedding_norm = replicated("model.embed_norm", &args.pinned().embedding_norm)?;
+    let mut groups = args
+        .pinned()
+        .ordinary
+        .pinned_parameter_groups(
+            crate::decoder::ParameterEncoding::Stored,
+            "model.embed_tokens",
+            "model.norm",
+            "lm_head",
+        )?
         .into_iter()
         .flat_map(|(role, group)| {
             std::iter::once((role, group))
                 .chain((role == "embedding").then(|| ("embedding_norm", embedding_norm.clone())))
         })
         .collect::<Vec<_>>();
-    if let Some(audio) = &args.audio_config {
-        let audio_vocabulary = dim(audio.num_codebooks)?
-            .checked_mul(dim(audio.codebook_size)?)
-            .ok_or_else(|| invalid("Inkling audio vocabulary overflow"))?;
+    if let Some(config) = &args.audio_config {
+        let audio = config.parameters();
         groups.push((
             "audio",
-            replicated(
-                "audio.codebook_embedding",
-                [("audio.encoder.weight", vec![audio_vocabulary, hidden])],
-            )?,
+            replicated("audio.codebook_embedding", &audio.embedding)?,
         ));
-        groups.push((
-            "audio",
-            replicated(
-                "audio.final_norm",
-                [("audio.final_norm.weight", vec![hidden])],
-            )?,
-        ));
+        groups.push(("audio", replicated("audio.final_norm", &audio.final_norm)?));
     }
-    if args.vision_config.is_some() {
+    if let Some(config) = &args.vision_config {
         groups.push((
             "vision",
-            replicated(
-                "visual.final_norm",
-                [("visual.final_norm.weight", vec![hidden])],
-            )?,
+            replicated("visual.final_norm", &config.parameters().final_norm)?,
         ));
     }
-    eredu_runtime::expand_tagged_linear_format_parameter_groups(groups, |member| {
-        let name = member.target();
-        let format = if name.starts_with("visual.") {
-            args.vision_config
-                .as_ref()
-                .map_or(LinearFormat::Dense, |config| config.linear_format_for(name))
-        } else {
-            args.text_config.linear_format_for(name)
-        };
-        standard_parallel_linear_format(member, format)
-    })
+    Ok(groups)
 }
 
 /// Declares one replicated Inkling vision execution unit.
@@ -620,35 +617,24 @@ pub fn vision_layer_parameter_groups(
     config: &super::VisionConfig,
     index: usize,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    let (input, output, _, _) = config
-        .layer_specs()
-        .get(index)
-        .copied()
-        .filter(|_| index < config.num_hidden_layers as usize)
-        .ok_or_else(|| invalid(format!("Inkling vision layer {index} is out of range")))?;
+    let spec = config
+        .parameters()
+        .layer(index)
+        .map_err(|error| invalid(error.to_string()))?;
     let root = format!("visual.layers.{index}");
-    let projection = expand_linear_format_parameter_groups(
-        vec![ParameterGroupSpec::new(
-            &root,
-            ParameterRole::Replicated,
-            [member(
-                format!("{root}.projection.weight"),
-                vec![dim(output)?, dim(input)?],
-                MemberSharding::Replicated,
-            )],
-        )?],
-        |member| standard_parallel_linear_format(member, config.linear_format_for(member.target())),
+    let projection = eredu_runtime::logical_parameter_group(
+        &root,
+        ParameterRole::Replicated,
+        None,
+        &spec.projection,
+        |_| MemberSharding::Replicated,
     )?;
-    // Canonical projection traversal orders physical parameters by identity;
-    // the following normalization remains a separate module in that traversal.
-    let mut members = projection[0].members().to_vec();
+    let mut members = projection.members().to_vec();
     members.sort_by(|left, right| left.target().cmp(right.target()));
-    if index + 1 != config.num_hidden_layers as usize {
-        members.push(member(
-            format!("{root}.layer_norm.weight"),
-            vec![dim(output)?],
-            MemberSharding::Replicated,
-        ));
+    if let Some(norm) = &spec.norm {
+        members.extend(eredu_runtime::logical_parameter_members(norm, |_| {
+            MemberSharding::Replicated
+        })?);
     }
     Ok(vec![ParameterGroupSpec::new(
         root,
@@ -666,58 +652,21 @@ pub fn vision_layer_parameter_groups(
 pub fn mtp_parameter_groups(
     args: &ModelArgs,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    if args
-        .mtp_config
-        .as_ref()
-        .is_none_or(|mtp| mtp.num_nextn_predict_layers <= 0)
-    {
+    let parameters = args.prediction();
+    if parameters.depths.is_empty() {
         return Ok(Vec::new());
     }
-    let plan = super::safetensors_plan(args).map_err(invalid)?;
-    let mut members = BTreeMap::<String, Vec<usize>>::new();
-    let mut add = |constraint: &eredu_checkpoint::schema::SafetensorsTensorConstraint| {
-        let target = constraint.aliases.last().unwrap_or(&constraint.key);
-        if target.starts_with("model.mtp.") {
-            members.insert(target.clone(), constraint.shape.clone());
-        }
-    };
-    for constraint in &plan.common_tensors {
-        add(constraint);
-    }
-    for group in &plan.layout_groups {
-        if !group.variants.iter().any(|variant| {
-            variant.tensors.iter().any(|constraint| {
-                constraint.key.starts_with("model.mtp.")
-                    || constraint
-                        .aliases
-                        .iter()
-                        .any(|alias| alias.starts_with("model.mtp."))
-            })
-        }) {
-            continue;
-        }
-        let canonical = group
-            .variants
-            .iter()
-            .find(|variant| variant.id == "canonical split")
-            .ok_or_else(|| {
-                invalid(format!(
-                    "Inkling MTP layout group {:?} has no canonical split",
-                    group.id
-                ))
-            })?;
-        for constraint in &canonical.tensors {
-            add(constraint);
-        }
-    }
-    if members.is_empty() {
-        return Err(invalid(
-            "Inkling checkpoint declares MTP depths but no MTP parameters",
-        ));
-    }
-    expand_linear_format_parameter_groups(vec![replicated("model.mtp", members)?], |member| {
-        standard_parallel_linear_format(member, args.text_config.linear_format_for(member.target()))
-    })
+    let mut declarations = parameters
+        .logical_parameters()
+        .map_err(|error| invalid(error.to_string()))?;
+    declarations.sort_by(|a, b| a.parameter.id.as_str().cmp(b.parameter.id.as_str()));
+    Ok(vec![eredu_runtime::logical_parameter_group(
+        "model.mtp",
+        ParameterRole::Replicated,
+        None,
+        &declarations,
+        |_| MemberSharding::Replicated,
+    )?])
 }
 
 /// Declares one decoder layer's head, convolution, dense/expert, and replicated
@@ -730,229 +679,181 @@ pub fn layer_parameter_groups(
     let policy = text
         .layer_policy(layer)
         .ok_or_else(|| invalid(format!("Inkling layer {layer} is out of range")))?;
-    let local = policy.attention.window().is_some();
-    let hidden = dim(text.hidden_size)?;
-    let query_heads = dim(text.query_heads(local))?;
-    let key_value_heads = dim(text.key_value_heads(local))?;
-    let head = dim(text.attention_head_dim(local))?;
-    let query_width = query_heads
-        .checked_mul(head)
-        .ok_or_else(|| invalid("Inkling query width overflow"))?;
-    let key_value_width = key_value_heads
-        .checked_mul(head)
-        .ok_or_else(|| invalid("Inkling key/value width overflow"))?;
-    let relative_width = query_heads
-        .checked_mul(dim(text.d_rel)?)
-        .ok_or_else(|| invalid("Inkling relative-query width overflow"))?;
     let root = format!("model.layers.{layer}");
+    let common = args
+        .common(layer)
+        .map_err(|error| invalid(error.to_string()))?;
     let attention = format!("{root}.self_attn");
-    let mut query_members = vec![
-        member(
-            format!("{attention}.q_proj.weight"),
-            vec![query_width, hidden],
-            partitioned(0),
-        ),
-        member(
-            format!("{attention}.r_proj.weight"),
-            vec![relative_width, hidden],
-            partitioned(0),
-        ),
-        member(
-            format!("{attention}.o_proj.weight"),
-            vec![hidden, query_width],
-            partitioned(1),
-        ),
-    ];
-    if text.q_bias {
-        query_members.push(member(
-            format!("{attention}.q_proj.bias"),
-            vec![query_width],
-            partitioned(0),
-        ));
+    let heads = &common.attention;
+    let dense = (policy.feed_forward == FeedForwardPolicy::Dense)
+        .then(|| args.dense(layer))
+        .transpose()
+        .map_err(|error| invalid(error.to_string()))?;
+    let sparse = (policy.feed_forward == FeedForwardPolicy::SparseMoe)
+        .then(|| args.sparse(layer))
+        .transpose()
+        .map_err(|error| invalid(error.to_string()))?;
+    let mut query = Vec::new();
+    for projection in [
+        &heads.projection.query,
+        &heads.relative,
+        &heads.projection.output,
+    ] {
+        query.extend(
+            projection
+                .logical_parameters()
+                .map_err(|error| invalid(error.to_string()))?,
+        );
     }
-    if text.o_bias {
-        query_members.push(member(
-            format!("{attention}.o_proj.bias"),
-            vec![hidden],
-            MemberSharding::Replicated,
-        ));
-    }
-    let mut groups = vec![ParameterGroupSpec::partitioned(
+    let mut groups = vec![eredu_runtime::logical_parameter_group(
         format!("{attention}.query_heads"),
         ParameterRole::AttentionHeads,
-        query_heads,
-        query_members,
+        Some(dim(heads.projection.geometry.query_heads())?),
+        &query,
+        |parameter| {
+            if parameter.parameter.id == heads.projection.output.weight.id {
+                partitioned(1)
+            } else if heads
+                .projection
+                .output
+                .bias
+                .as_ref()
+                .is_some_and(|bias| bias.id == parameter.parameter.id)
+            {
+                MemberSharding::Replicated
+            } else {
+                partitioned(0)
+            }
+        },
     )?];
-    groups.push(ParameterGroupSpec::partitioned(
+    let mut key_value = heads
+        .projection
+        .key
+        .logical_parameters()
+        .map_err(|error| invalid(error.to_string()))?;
+    key_value.extend(
+        heads
+            .projection
+            .value
+            .logical_parameters()
+            .map_err(|error| invalid(error.to_string()))?,
+    );
+    key_value.extend(
+        heads
+            .key_convolution
+            .logical_parameters()
+            .map_err(|error| invalid(error.to_string()))?,
+    );
+    key_value.extend(
+        heads
+            .value_convolution
+            .logical_parameters()
+            .map_err(|error| invalid(error.to_string()))?,
+    );
+    groups.push(eredu_runtime::logical_parameter_group(
         format!("{attention}.key_value_heads"),
         ParameterRole::AttentionHeads,
-        key_value_heads,
-        [
-            member(
-                format!("{attention}.k_proj.weight"),
-                vec![key_value_width, hidden],
-                partitioned(0),
-            ),
-            member(
-                format!("{attention}.v_proj.weight"),
-                vec![key_value_width, hidden],
-                partitioned(0),
-            ),
-            member(
-                format!("{attention}.k_sconv.weight"),
-                vec![key_value_width, 1, dim(text.sconv_kernel_size)?],
-                partitioned(0),
-            ),
-            member(
-                format!("{attention}.v_sconv.weight"),
-                vec![key_value_width, 1, dim(text.sconv_kernel_size)?],
-                partitioned(0),
-            ),
-        ],
+        Some(dim(heads.projection.geometry.key_value_heads())?),
+        &key_value,
+        |_| partitioned(0),
     )?);
     match policy.feed_forward {
         FeedForwardPolicy::Dense => {
-            let intermediate = dim(text.dense_intermediate_size())?;
-            groups.push(ParameterGroupSpec::partitioned(
+            let dense = dense.as_ref().expect("declared dense branch");
+            let projections = dense
+                .product
+                .logical_parameters()
+                .map_err(|error| invalid(error.to_string()))?;
+            groups.push(eredu_runtime::logical_parameter_group(
                 format!("{root}.dense.intermediate"),
                 ParameterRole::FeedForwardIntermediate,
-                intermediate,
-                [
-                    member(
-                        format!("{root}.dense.gate_proj.weight"),
-                        vec![intermediate, hidden],
-                        partitioned(0),
-                    ),
-                    member(
-                        format!("{root}.dense.up_proj.weight"),
-                        vec![intermediate, hidden],
-                        partitioned(0),
-                    ),
-                    member(
-                        format!("{root}.dense.down_proj.weight"),
-                        vec![hidden, intermediate],
-                        partitioned(1),
-                    ),
-                ],
+                Some(dim(dense.product.down.input)?),
+                &projections,
+                |parameter| {
+                    if parameter.parameter.id == dense.product.down.weight.id {
+                        partitioned(1)
+                    } else if dense
+                        .product
+                        .down
+                        .bias
+                        .as_ref()
+                        .is_some_and(|bias| bias.id == parameter.parameter.id)
+                    {
+                        MemberSharding::Replicated
+                    } else {
+                        partitioned(0)
+                    }
+                },
             )?);
         }
         FeedForwardPolicy::SparseMoe => {
-            let intermediate = dim(text.moe_intermediate_size())?;
-            let routed = dim(text.n_routed_experts)?;
-            let shared = dim(text.n_shared_experts)?;
-            for (name, count, role) in [
-                ("experts", routed, ParameterRole::ExpertIntermediate),
+            let sparse = sparse.as_ref().expect("declared sparse branch");
+            for (name, bank, role) in [
+                ("experts", &sparse.routed, ParameterRole::ExpertIntermediate),
                 (
                     "shared_experts",
-                    shared,
+                    &sparse.shared,
                     ParameterRole::SharedExpertIntermediate,
                 ),
             ] {
-                groups.push(ParameterGroupSpec::partitioned(
+                let eredu_nn::GatedProductGroupLayout::Packed { gate_up, .. } = bank.layout()
+                else {
+                    return Err(invalid(
+                        "Inkling placement requires packed gated-product banks",
+                    ));
+                };
+                let intermediate = dim(bank.intermediate_dimensions())?;
+                groups.push(eredu_runtime::logical_parameter_group(
                     format!("{root}.moe.{name}.intermediate"),
                     role,
-                    intermediate,
-                    [
-                        member(
-                            format!("{root}.moe.{name}.gate_up_proj"),
-                            vec![count, 2 * intermediate, hidden],
+                    Some(intermediate),
+                    bank,
+                    |parameter| {
+                        if parameter.parameter.id == gate_up.weight().id
+                            || gate_up
+                                .bias()
+                                .is_some_and(|bias| bias.id == parameter.parameter.id)
+                        {
                             MemberSharding::PartitionedSegments {
                                 axis: 1,
                                 segments: vec![0..intermediate, intermediate..2 * intermediate],
-                            },
-                        ),
-                        member(
-                            format!("{root}.moe.{name}.down_proj"),
-                            vec![count, hidden, intermediate],
-                            partitioned(2),
-                        ),
-                    ],
+                            }
+                        } else if parameter.role == eredu_nn::LogicalParameterRole::LinearWeight {
+                            partitioned(2)
+                        } else {
+                            MemberSharding::Replicated
+                        }
+                    },
                 )?);
             }
-            groups.push(replicated(
+            groups.push(eredu_runtime::logical_parameter_group(
                 format!("{root}.moe.router"),
-                [
-                    (
-                        format!("{root}.moe.router.weight"),
-                        vec![routed + shared, hidden],
-                    ),
-                    (format!("{root}.moe.router.bias"), vec![routed]),
-                    (format!("{root}.moe.router.global_scale"), vec![1]),
-                ],
+                ParameterRole::Replicated,
+                None,
+                &sparse.router,
+                |_| MemberSharding::Replicated,
             )?);
         }
     }
-    let relative_extent = policy
-        .attention
-        .window()
-        .map(|window| window.get() as usize)
-        .unwrap_or(dim(text.rel_extent)?);
-    let mut replicated_members = vec![
-        (format!("{attention}.q_norm.weight"), vec![head]),
-        (format!("{attention}.k_norm.weight"), vec![head]),
-        (
-            format!("{attention}.rel_proj"),
-            vec![dim(text.d_rel)?, relative_extent],
-        ),
-        (format!("{root}.input_layernorm.weight"), vec![hidden]),
-        (
-            format!("{root}.post_attention_layernorm.weight"),
-            vec![hidden],
-        ),
-        (
-            format!("{root}.attn_sconv.weight"),
-            vec![hidden, 1, dim(text.sconv_kernel_size)?],
-        ),
-        (
-            format!("{root}.mlp_sconv.weight"),
-            vec![hidden, 1, dim(text.sconv_kernel_size)?],
-        ),
-    ];
-    if policy.feed_forward == FeedForwardPolicy::Dense {
-        replicated_members.push((format!("{root}.dense_global_scale"), vec![1]));
+
+    let mut replicated = common
+        .replicated_parameters()
+        .map_err(|error| invalid(error.to_string()))?;
+    if let Some(dense) = &dense {
+        replicated.push(
+            dense
+                .scale_declaration()
+                .map_err(|error| invalid(error.to_string()))?,
+        );
     }
-    groups.push(replicated(
+    groups.push(eredu_runtime::logical_parameter_group(
         format!("{root}.replicated"),
-        replicated_members,
-    )?);
-    expand_linear_format_parameter_groups(groups, |member| {
-        standard_parallel_linear_format(member, args.text_config.linear_format_for(member.target()))
-    })
-}
-
-fn group(
-    name: impl Into<String>,
-    role: ParameterRole,
-    members: impl IntoIterator<Item = (impl Into<String>, Vec<usize>, MemberSharding)>,
-) -> Result<ParameterGroupSpec, ParallelPlanError> {
-    ParameterGroupSpec::new(
-        name,
-        role,
-        members
-            .into_iter()
-            .map(|(name, shape, sharding)| member(name, shape, sharding)),
-    )
-}
-
-fn replicated(
-    name: impl Into<String>,
-    members: impl IntoIterator<Item = (impl Into<String>, Vec<usize>)>,
-) -> Result<ParameterGroupSpec, ParallelPlanError> {
-    group(
-        name,
         ParameterRole::Replicated,
-        members
-            .into_iter()
-            .map(|(name, shape)| (name, shape, MemberSharding::Replicated)),
-    )
-}
-
-fn member(
-    name: impl Into<String>,
-    shape: Vec<usize>,
-    sharding: MemberSharding,
-) -> ParameterMemberSpec {
-    ParameterMemberSpec::new(name, shape, sharding)
+        None,
+        &replicated,
+        |_| MemberSharding::Replicated,
+    )?);
+    Ok(groups)
 }
 
 const fn partitioned(axis: usize) -> MemberSharding {

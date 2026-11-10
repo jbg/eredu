@@ -3,12 +3,11 @@
 use crate::decoder::ComponentInstrumentation;
 use eredu_nn::{
     BlockwiseAttentionBackend, CompressedAttentionCache, Error, GroupedNeuralBackend,
-    NeuralBackend, NormalizationConstructionSpec, NormalizationOperator, ParameterSpec,
-    Parameterized, Tensor,
+    NeuralBackend, NormalizationOperator, Parameterized, Tensor,
 };
 use eredu_runtime::{ParameterProvider, RuntimeStateComponents};
 
-use super::{AttentionKind, FeedForward, KimiDeltaAttention, KimiLatentAttention, ModelArgs};
+use super::{FeedForward, KimiDeltaAttention, KimiLatentAttention};
 
 /// Scheduled KDA or no-positional MLA token mixer.
 #[derive(Debug, Clone, Parameterized)]
@@ -60,42 +59,29 @@ pub(crate) struct KdaReplicatedBlock<B: NeuralBackend> {
 }
 
 impl<B: NeuralBackend> KdaReplicatedBlock<B> {
-    pub(crate) fn new(
-        args: &ModelArgs,
-        layer: usize,
+    pub(crate) fn from_parameters(
+        parameters: super::declarations::BlockParameters,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let policy = args
-            .layer_policy(layer)
-            .ok_or_else(|| Error::backend(format!("Kimi Linear has no layer {layer}")))?;
-        if policy.feed_forward != super::FeedForwardPolicy::Dense
-            || policy.attention != AttentionKind::Kda
-        {
+        use eredu_nn::DeclareLogicalParameters;
+        eredu_nn::validate_logical_parameter_topology(&parameters.logical_parameters()?)
+            .map_err(Error::backend_source)?;
+        let super::declarations::FeedForwardParameters::Dense(feed_forward) =
+            parameters.feed_forward
+        else {
             return Err(Error::backend(
-                "fixed-state Kimi unit requires dense KDA policy",
+                "replicated Kimi scope requires dense feed-forward",
             ));
-        }
-        let norm = |field: &str| {
-            B::normalization(
-                NormalizationConstructionSpec::learned(
-                    args.hidden_size,
-                    args.rms_norm_eps,
-                    ParameterSpec::trainable(format!("model.layers.{layer}.{field}.weight"))
-                        .map_err(Error::backend)?,
-                ),
-                context,
-            )
         };
+        let super::declarations::MixerParameters::Kda(mixer) = parameters.mixer else {
+            return Err(Error::backend("fixed Kimi scope requires KDA"));
+        };
+        let mixer = KimiDeltaAttention::from_spec(mixer, context)?;
         Ok(Self {
-            mixer: KimiDeltaAttention::new(args, layer, context)?,
-            feed_forward: super::moe::DenseSwiGlu::new(
-                args,
-                &format!("model.layers.{layer}.mlp"),
-                args.intermediate_size,
-                context,
-            )?,
-            input_norm: norm("input_layernorm")?,
-            post_attention_norm: norm("post_attention_layernorm")?,
+            mixer,
+            feed_forward: super::moe::DenseSwiGlu::from_parameters(feed_forward, context)?,
+            input_norm: B::normalization(parameters.input_norm, context)?,
+            post_attention_norm: B::normalization(parameters.post_attention_norm, context)?,
         })
     }
 
@@ -136,44 +122,33 @@ impl<B: NeuralBackend> KdaReplicatedBlock<B> {
 }
 
 impl<B: NeuralBackend + BlockwiseAttentionBackend> ReplicatedBlock<B> {
-    pub(crate) fn new(
-        args: &ModelArgs,
-        layer: usize,
+    pub(crate) fn from_parameters(
+        parameters: super::declarations::BlockParameters,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let policy = args
-            .layer_policy(layer)
-            .ok_or_else(|| Error::backend(format!("Kimi Linear has no layer {layer}")))?;
-        if policy.feed_forward != super::FeedForwardPolicy::Dense {
+        use eredu_nn::DeclareLogicalParameters;
+        eredu_nn::validate_logical_parameter_topology(&parameters.logical_parameters()?)
+            .map_err(Error::backend_source)?;
+        let super::declarations::FeedForwardParameters::Dense(feed_forward) =
+            parameters.feed_forward
+        else {
             return Err(Error::backend(
-                "replicated Kimi Linear unit requires a dense feed-forward policy",
+                "replicated Kimi scope requires dense feed-forward",
             ));
-        }
-        let mixer = match policy.attention {
-            AttentionKind::Kda => TokenMixer::Kda(KimiDeltaAttention::new(args, layer, context)?),
-            AttentionKind::Mla => TokenMixer::Mla(KimiLatentAttention::new(args, layer, context)?),
         };
-        let norm = |field: &str| {
-            B::normalization(
-                NormalizationConstructionSpec::learned(
-                    args.hidden_size,
-                    args.rms_norm_eps,
-                    ParameterSpec::trainable(format!("model.layers.{layer}.{field}.weight"))
-                        .map_err(Error::backend)?,
-                ),
-                context,
-            )
+        let mixer = match parameters.mixer {
+            super::declarations::MixerParameters::Kda(p) => {
+                TokenMixer::Kda(KimiDeltaAttention::from_spec(p, context)?)
+            }
+            super::declarations::MixerParameters::Mla(p) => {
+                TokenMixer::Mla(KimiLatentAttention::from_spec(p, context)?)
+            }
         };
         Ok(Self {
             mixer,
-            feed_forward: super::moe::DenseSwiGlu::new(
-                args,
-                &format!("model.layers.{layer}.mlp"),
-                args.intermediate_size,
-                context,
-            )?,
-            input_norm: norm("input_layernorm")?,
-            post_attention_norm: norm("post_attention_layernorm")?,
+            feed_forward: super::moe::DenseSwiGlu::from_parameters(feed_forward, context)?,
+            input_norm: B::normalization(parameters.input_norm, context)?,
+            post_attention_norm: B::normalization(parameters.post_attention_norm, context)?,
         })
     }
 
@@ -243,90 +218,31 @@ pub struct BlockGeometry {
     pub shared_intermediate: i32,
 }
 
-impl BlockGeometry {
-    /// Returns global replicated geometry.
-    pub const fn replicated(args: &ModelArgs) -> Self {
-        Self {
-            kda_heads: args.kda_config.num_heads,
-            mla_heads: args.num_attention_heads,
-            dense_intermediate: args.intermediate_size,
-            routed_intermediate: args.moe_intermediate_size,
-            shared_intermediate: args.moe_intermediate_size * args.num_shared_experts,
-        }
-    }
-}
-
 impl<B> Block<B>
 where
     B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAttentionBackend,
 {
-    /// Builds one unloaded block from the validated physical schedule.
-    pub fn new(
-        args: &ModelArgs,
+    pub(crate) fn from_parameters(
         layer: usize,
+        parameters: super::declarations::BlockParameters,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        Self::new_with_geometry(args, layer, BlockGeometry::replicated(args), context)
-    }
-
-    /// Builds one unloaded block from placement-resolved local geometry.
-    pub fn new_with_geometry(
-        args: &ModelArgs,
-        layer: usize,
-        geometry: BlockGeometry,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        Self::new_with_geometry_and_routed_spec(args, layer, geometry, None, context)
-    }
-
-    pub(crate) fn new_with_geometry_and_routed_spec(
-        args: &ModelArgs,
-        layer: usize,
-        geometry: BlockGeometry,
-        routed_spec: Option<eredu_nn::GroupedGatedProductSpec>,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        let policy = args
-            .layer_policy(layer)
-            .ok_or_else(|| Error::backend(format!("Kimi Linear has no layer {layer}")))?;
-        let mixer = match policy.attention {
-            AttentionKind::Kda => TokenMixer::Kda(KimiDeltaAttention::new_with_heads(
-                args,
-                layer,
-                geometry.kda_heads,
-                context,
-            )?),
-            AttentionKind::Mla => TokenMixer::Mla(KimiLatentAttention::new_with_heads(
-                args,
-                layer,
-                geometry.mla_heads,
-                context,
-            )?),
-        };
-        let norm = |field: &str| {
-            B::normalization(
-                NormalizationConstructionSpec::learned(
-                    args.hidden_size,
-                    args.rms_norm_eps,
-                    ParameterSpec::trainable(format!("model.layers.{layer}.{field}.weight"))
-                        .map_err(Error::backend)?,
-                ),
-                context,
-            )
+        use eredu_nn::DeclareLogicalParameters;
+        eredu_nn::validate_logical_parameter_topology(&parameters.logical_parameters()?)
+            .map_err(Error::backend_source)?;
+        let mixer = match parameters.mixer {
+            super::declarations::MixerParameters::Kda(p) => {
+                TokenMixer::Kda(KimiDeltaAttention::from_spec(p, context)?)
+            }
+            super::declarations::MixerParameters::Mla(p) => {
+                TokenMixer::Mla(KimiLatentAttention::from_spec(p, context)?)
+            }
         };
         Ok(Self {
             mixer,
-            feed_forward: FeedForward::new_with_geometry_and_routed_spec(
-                args,
-                layer,
-                geometry.dense_intermediate,
-                geometry.routed_intermediate,
-                geometry.shared_intermediate,
-                routed_spec,
-                context,
-            )?,
-            input_norm: norm("input_layernorm")?,
-            post_attention_norm: norm("post_attention_layernorm")?,
+            feed_forward: FeedForward::from_parameters(layer, parameters.feed_forward, context)?,
+            input_norm: B::normalization(parameters.input_norm, context)?,
+            post_attention_norm: B::normalization(parameters.post_attention_norm, context)?,
         })
     }
 

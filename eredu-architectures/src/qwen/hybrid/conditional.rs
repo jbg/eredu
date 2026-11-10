@@ -888,6 +888,8 @@ pub type ConditionalLayeredModel<B> = eredu_runtime::ComponentAdapter<
 
 /// Conditional Qwen semantic equations, native resource factories and media geometry.
 pub struct ConditionalKernel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
+    text_construction: std::collections::BTreeMap<(usize, usize), super::BlockParameters>,
+    vision_construction: std::collections::BTreeMap<usize, crate::qwen::vision::BlockSpec>,
     parsed: ParsedHybridConfig,
     definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
     static_modules: ConditionalStaticModules<B>,
@@ -950,8 +952,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> eredu_runtime
         std::collections::BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
         String,
     > {
-        let recipes = super::static_recipes(source)?;
-        crate::static_parameters::module_recipes(&self.static_modules, recipes)
+        super::static_recipes(source)
     }
     fn build_unit(
         &self,
@@ -1291,9 +1292,46 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalKe
                 eredu_nn::NeuralOperatorCapabilities::SUM_PARALLEL,
             )?;
         }
+        let vision = parsed
+            .vision
+            .as_ref()
+            .expect("validated conditional vision")
+            .clone();
+        let vision_declaration = vision;
+        let vision_construction = (0..vision_declaration.layer_count())
+            .filter(|&index| {
+                partition.is_none_or(|p| p.local_geometry().vision_block(index).is_some())
+            })
+            .map(|index| {
+                let (heads, intermediate) = partition
+                    .and_then(|p| p.local_geometry().vision_block(index))
+                    .or_else(|| geometry.as_ref().and_then(|g| g.vision_block(index)))
+                    .unwrap_or((
+                        vision_declaration.num_heads,
+                        vision_declaration.intermediate_size,
+                    ));
+                Ok((
+                    index,
+                    vision_declaration.local_block(index, heads, intermediate)?,
+                ))
+            })
+            .collect::<Result<_, Error>>()?;
+        let text_construction = super::model::prepare_unit_parameters(
+            &parsed.text,
+            geometry.as_ref().map(|g| g.text()),
+        )?;
         let prediction_steps = definition.prediction_groups().len();
-        let text = PartitionStaticModules::<B>::from_selected_spec(
-            super::static_module_spec(&parsed.text),
+        let prediction_shared = (prediction_steps > 0)
+            .then(|| {
+                parsed
+                    .text
+                    .prediction_shared()
+                    .cloned()
+                    .ok_or_else(|| Error::backend("undeclared prediction shared scope"))
+            })
+            .transpose()?;
+        let text = PartitionStaticModules::<B>::from_selected_construction(
+            parsed.text.statics().clone(),
             geometry.as_ref().map(|geometry| {
                 (
                     geometry.text().embedding_range().clone(),
@@ -1308,24 +1346,18 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalKe
             },
             context,
         )?;
-        let prediction = (prediction_steps > 0)
-            .then(|| super::PredictionShared::new(&parsed.text, context))
+        let prediction = prediction_shared
+            .map(|spec| super::PredictionShared::from_parameters(spec, context))
             .transpose()?;
-        let vision = parsed
-            .vision
-            .as_ref()
-            .expect("validated conditional vision")
-            .clone();
         let selection = match partition {
             Some(partition) => crate::qwen::vision::VisionStaticSelection::from_parameter_bindings(
-                vision,
-                "model.visual",
+                vision_declaration.clone(),
                 eredu_runtime::ExecutionGroupId::new(VISION_EXECUTION_GROUP)
                     .map_err(Error::backend)?,
                 "vision",
                 partition.parameter_bindings(),
             ),
-            None => crate::qwen::vision::VisionStaticSelection::all(vision, "model.visual"),
+            None => crate::qwen::vision::VisionStaticSelection::all(vision_declaration.clone()),
         }
         .map_err(Error::backend_source)?;
         let complete_widths;
@@ -1341,6 +1373,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalKe
         let vision = VisionStatic::from_selection(selection, widths, context)?;
         let selected_state = partition.and_then(|partition| partition.state());
         let kernel = Self {
+            text_construction,
+            vision_construction,
             parsed,
             definition: std::sync::Arc::clone(&definition),
             static_modules: ConditionalStaticModules {
@@ -1438,30 +1472,17 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalKe
         let (group, index) = (address.group(), address.index());
         match group {
             0 => {
-                let vision = self.parsed.vision.as_ref().expect("validated vision");
-                match self
-                    .parallel_geometry
-                    .as_ref()
-                    .and_then(|geometry| geometry.vision_block(index))
-                {
-                    Some((heads, intermediate)) => VisionBlock::new_parallel_with_root(
-                        vision,
-                        "model.visual",
-                        index,
-                        heads,
-                        intermediate,
-                        context,
-                    ),
-                    None => VisionBlock::new_with_root(vision, "model.visual", index, context),
-                }
-                .map(ConditionalUnit::Vision)
+                let scope = self.vision_construction.get(&index).ok_or_else(|| {
+                    Error::backend("vision unit has no retained construction scope")
+                })?;
+                VisionBlock::from_spec(scope.clone(), context).map(ConditionalUnit::Vision)
             }
             1 => {
-                let config = self
-                    .parallel_geometry
-                    .as_ref()
-                    .and_then(|geometry| geometry.text().target(index))
-                    .unwrap_or(&self.parsed.text);
+                let parameters = self
+                    .text_construction
+                    .get(&(0, index))
+                    .ok_or_else(|| Error::backend("conditional target has no prepared parameters"))?
+                    .clone();
                 let spec = self
                     .expert_realization
                     .as_ref()
@@ -1475,16 +1496,26 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalKe
                             })
                     })
                     .transpose()?;
-                Block::new_with_routed_spec(config, index, spec, context)
-                    .map(ConditionalUnit::Target)
+                let parameters = match spec {
+                    Some(bank) => parameters.with_experts(bank)?,
+                    None => parameters,
+                };
+                Block::from_parameters(parameters, index, context).map(ConditionalUnit::Target)
             }
             _ => {
-                let config = self
-                    .parallel_geometry
-                    .as_ref()
-                    .and_then(|geometry| geometry.text().prediction(group - 2))
-                    .unwrap_or(&self.parsed.text);
-                PredictionUnit::new(config, group - 2, context).map(ConditionalUnit::Prediction)
+                let parameters = self
+                    .text_construction
+                    .get(&(group - 1, index))
+                    .ok_or_else(|| {
+                        Error::backend("conditional prediction has no prepared parameters")
+                    })?
+                    .clone();
+                PredictionUnit::from_parameters(
+                    parameters,
+                    self.parsed.text.num_hidden_layers as usize + group - 2,
+                    context,
+                )
+                .map(ConditionalUnit::Prediction)
             }
         }
     }

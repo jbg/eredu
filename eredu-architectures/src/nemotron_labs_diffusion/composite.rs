@@ -413,7 +413,7 @@ impl<B: DistributedNeuralBackend, R: CompositeResources<B>> eredu_runtime::Compo
         std::collections::BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
         String,
     > {
-        super::checkpoint::module_source_recipes(&self.statics, source)
+        super::checkpoint::module_source_recipes(&self.config, &self.statics, source)
     }
     fn output_score_kind(
         forward: &Self::ForwardContext,
@@ -861,6 +861,17 @@ where
                     .map_err(|error| error.to_string())
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            let adapter_rank = self
+                .kernel()
+                .config
+                .draft_parameters()
+                .map(|adapter| {
+                    adapter
+                        .layer(0)
+                        .map(|declaration| declaration.projection().down.output)
+                        .map_err(|error| error.to_string())
+                })
+                .transpose()?;
             let last = self.kernel().config.num_hidden_layers() as usize;
             return Ok(Some(stage_units.iter().map(|range| {
                 let mut operations = Vec::new();
@@ -870,8 +881,8 @@ where
                 for _ in range.clone() {
                     operations.push(crate::composite_execution::CompositeTensorCollective::Sum { shape: vec![1, sequence, width] });
                     if input.attention_invocation().is_some_and(|invocation| invocation.adapters == eredu_core::decoding::AdapterScope::Draft) {
-                        if let Some(adapter) = self.kernel().config.draft_adapter() {
-                            operations.push(crate::composite_execution::CompositeTensorCollective::Sum { shape: vec![1, sequence, adapter.rank()] });
+                        if let Some(rank) = adapter_rank {
+                            operations.push(crate::composite_execution::CompositeTensorCollective::Sum { shape: vec![1, sequence, rank] });
                         }
                     }
                     operations.push(crate::composite_execution::CompositeTensorCollective::Sum { shape: vec![1, sequence, width] });
@@ -1329,7 +1340,7 @@ impl<B: DistributedNeuralBackend> CompositeKernel<B> {
         let definition = super::definition::select_composite(
             &config,
             definition,
-            &crate::decoder::state_layout(&config)?,
+            config.text_declaration().state_layout(),
             None,
         )?;
         let image_embedding = ImageEmbedding::new(&config, context)?;
@@ -1358,11 +1369,16 @@ impl<B: DistributedNeuralBackend> CompositeKernel<B> {
         layout: eredu_runtime::LocalModelLayout,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Model<B>, Error> {
-        let geometry = crate::decoder::local_geometry(&config, &layout, |config, index, layout| {
-            config
-                .local_block_config(index, layout)
-                .map_err(|e| eredu_runtime::ParallelPlanError::InvalidGroup(e.to_string()))
-        })
+        let geometry = crate::decoder::local_geometry(
+            &config,
+            config.text_declaration().as_ref(),
+            &layout,
+            |config, index, layout| {
+                config
+                    .local_block_config(index, layout)
+                    .map_err(|e| eredu_runtime::ParallelPlanError::InvalidGroup(e.to_string()))
+            },
+        )
         .map_err(Error::backend)?;
         let definition = super::definition::select_composite(
             &config,

@@ -58,7 +58,7 @@ impl TargetExecutionPlan {
         let requirements = joint_requirements(
             &self.requirements,
             &self.target.spec,
-            vision.config(),
+            vision.scopes(),
             vision.static_parameters().recipes(),
             &blocks,
             source.as_ref(),
@@ -85,43 +85,52 @@ impl TargetExecutionPlan {
 pub(super) fn joint_requirements<C: eredu_checkpoint::recipe::RecipeCatalog + ?Sized>(
     target: &crate::routed_text::RoutedTextRequirements,
     spec: &TargetSpec,
-    vision_config: &crate::qwen::vision::VisionConfig,
+    vision_scope: &crate::qwen::vision::Declaration,
     vision_static: &BTreeMap<String, DerivedWeightRecipe>,
     vision_blocks: &[BTreeMap<String, DerivedWeightRecipe>],
     source: &C,
     physical: &BTreeMap<String, eredu_runtime::ReplicatedTextPhysicalSource>,
     media_identity: &str,
 ) -> Result<crate::routed_text::RoutedTextRequirements, PreparationError> {
-    let mut formats = ParameterFormats(BTreeMap::new(), BTreeMap::new());
-    for params in std::iter::once(vision_static).chain(vision_blocks.iter()) {
-        for name in params.keys() {
-            formats
-                .0
-                .insert(name.clone(), vision_config.linear_format(name));
+    let definition = conditional::definition(&spec.definition()?, vision_scope)?;
+    let parameters = vision_scope;
+    let mut declared = ParameterRequirements::new(source, physical);
+    declared.declare(parameters, None, |name| {
+        let owner = definition
+            .parameters()
+            .groups()
+            .iter()
+            .find(|group| group.members().iter().any(|member| member.target() == name))
+            .ok_or_else(|| invalid(format!("vision slot {name} has no declared owner")))?
+            .owner();
+        match owner {
+            eredu_runtime::ParameterGroupOwner::StaticRole(role) => {
+                Ok(Owner::StaticRole(role.clone()))
+            }
+            eredu_runtime::ParameterGroupOwner::ExecutionUnit {
+                group, global_unit, ..
+            } => Ok(Owner::ExecutionUnit {
+                group: group.as_str().into(),
+                unit: *global_unit,
+            }),
+            _ => Err(invalid(format!(
+                "vision slot {name} has incompatible ownership"
+            ))),
         }
+    })?;
+    if vision_blocks.len() != vision_scope.layer_count() {
+        return Err(invalid(
+            "vision recipes do not match declared execution owners",
+        ));
     }
-    let mut declared = ParameterRequirements::new(source, physical, &formats);
-    for (name, recipe) in vision_static {
-        declared.add(name, recipe, Owner::StaticRole("vision".into()), false)?;
-    }
-    for (index, block) in vision_blocks[..vision_config.layer_count()]
+    for (name, recipe) in vision_static
         .iter()
-        .enumerate()
+        .chain(vision_blocks.iter().flat_map(|block| block.iter()))
     {
-        for (name, recipe) in block {
-            declared.add(
-                name,
-                recipe,
-                Owner::ExecutionUnit {
-                    group: conditional::VISION_GROUP.into(),
-                    unit: index,
-                },
-                false,
-            )?;
-        }
+        declared.add(name, recipe)?;
     }
+    declared.validate_complete()?;
     let old = target.text();
-    let definition = conditional::definition(&spec.definition()?, vision_config)?;
     let graph = definition.parameters().graph().clone();
     let layout = definition.parameters().unit_layout().clone();
     let transport = (0..graph.groups().len())
@@ -149,7 +158,7 @@ pub(super) fn joint_requirements<C: eredu_checkpoint::recipe::RecipeCatalog + ?S
     let mut parameters = old.parameters().to_vec();
     parameters.extend(declared.parameters);
     let identity = eredu_core::cache::derive_prompt_cache_architecture_fingerprint(
-        "qwen4_exp.conditional.v1",
+        "qwen4_exp.conditional.v2",
         [
             ("target", old.architecture_identity().to_owned()),
             ("media", media_identity.to_owned()),
@@ -267,7 +276,9 @@ impl SelectedConditionalExecution {
         self.selected.prediction_state()
     }
 
-    fn selected_vision_config(&self) -> crate::qwen::vision::VisionConfig {
+    fn selected_vision_scopes(
+        &self,
+    ) -> Result<Arc<crate::qwen::vision::Declaration>, eredu_nn::Error> {
         let mut vision = self.ingress.vision().config().clone();
         vision.linear_formats.clear();
         let text = self.selected.selected.text();
@@ -276,7 +287,11 @@ impl SelectedConditionalExecution {
                 vision.linear_formats.insert(name, format);
             }
         }
-        vision
+        self.ingress
+            .vision()
+            .scopes()
+            .with_formats(vision)
+            .map(Arc::new)
     }
 
     /// Reports the admitted request's shared vision invocations using the retained
@@ -303,7 +318,7 @@ impl SelectedConditionalExecution {
             })
             .copied()
             .collect::<Vec<_>>();
-        Ok(self.selected_vision_config().memory_report(
+        Ok(self.selected_vision_scopes()?.memory_report(
             &grids,
             element,
             |invocation| B::mechanism_memory_in_context(invocation, context),
@@ -529,7 +544,7 @@ impl SelectedConditionalExecution {
             + eredu_runtime::RoutedLayeredArchitecture<B, S>,
         A::StaticModules: Clone,
     {
-        let vision = self.selected_vision_config();
+        let vision = self.selected_vision_scopes()?;
         let SelectedTargetExecution { plan, selected, .. } = self.selected;
         crate::routed_text::validate_selected_routed_handoff(&plan.requirements, &selected)
             .map_err(invalid)?;
@@ -539,7 +554,7 @@ impl SelectedConditionalExecution {
             eredu_runtime::SourceHandoffScope::Primary,
         )
         .map_err(|handoff| invalid(handoff.to_string()))?;
-        let source_vision = self.ingress.vision().config().clone();
+        let source_vision = self.ingress.vision().scopes().clone();
         let spec = plan
             .target
             .bind_spec(plan.target.selected_spec(&selected)?)?;

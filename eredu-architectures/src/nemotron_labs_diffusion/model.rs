@@ -243,14 +243,13 @@ where
         let base = self.base.construct_block(index, context)?;
         let draft_adapter = self
             .config()
-            .draft_adapter()
+            .draft_parameters()
             .map(|adapter| {
-                adapter.layer(
-                    index,
-                    base.body.self_attention.query_heads * self.config().head_dim(),
-                    self.config().hidden_size(),
-                    context,
-                )
+                let declaration = adapter
+                    .layer(index)?
+                    .clone()
+                    .with_local_heads(base.body.self_attention.query_heads)?;
+                eredu_nn::low_rank::LowRankProjection::new(declaration.projection, context)
             })
             .transpose()?;
         Ok(TextLayer {
@@ -404,7 +403,7 @@ where
         std::collections::BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
         String,
     > {
-        super::checkpoint::module_source_recipes(self.base.static_modules(), source)
+        super::checkpoint::module_source_recipes(self.config(), self.base.static_modules(), source)
     }
     fn build_unit(
         &self,
@@ -789,9 +788,15 @@ impl<B: NeuralBackend> TextKernel<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<TextModel<B>, Error> {
         super::definition::validate_text_identity(&definition)?;
-        let (definition, base, _) =
-            decoder::CompleteDecoderKernel::from_definition(config, definition, context)?
-                .into_parts();
+        let scopes = std::sync::Arc::clone(config.text_declaration());
+        let (definition, base, _) = decoder::CompleteDecoderKernel::from_definition(
+            config,
+            definition,
+            scopes.as_ref(),
+            None,
+            context,
+        )?
+        .into_parts();
         let kernel = Self {
             definition: definition.clone(),
             base,
@@ -809,8 +814,14 @@ impl<B: NeuralBackend> TextKernel<B> {
         B: eredu_nn::DistributedNeuralBackend,
     {
         super::definition::validate_text_identity(&definition)?;
+        let scopes = std::sync::Arc::clone(config.text_declaration());
         let (definition, base, _) = decoder::CompleteDecoderKernel::from_parallel_definition(
-            config, definition, geometry, context,
+            config,
+            definition,
+            scopes.as_ref(),
+            None,
+            geometry,
+            context,
         )?
         .into_parts();
         let kernel = Self {

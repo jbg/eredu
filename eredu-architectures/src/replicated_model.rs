@@ -15,7 +15,7 @@ use eredu_runtime::{
     StateLayout, StaticParameterVisitor, StaticParameterVisitorMut, TextComponentKernel,
 };
 
-use crate::decoder::{DecoderStaticResources, LayeredInput, StaticModuleSpec, StaticModules};
+use crate::decoder::{DecoderStaticResources, LayeredInput, StaticModules};
 
 pub(crate) struct ReplicatedForwardContext<T> {
     pub(crate) mask: Option<T>,
@@ -30,7 +30,11 @@ pub(crate) trait FixedReplicatedFamily<B: NeuralBackend>: 'static {
 
     fn validate(config: &Self::Config) -> Result<(), Error>;
     fn definition(config: &Self::Config) -> Result<ComponentDefinition, Error>;
-    fn static_spec(config: &Self::Config) -> StaticModuleSpec;
+    fn construct_statics(
+        config: &Self::Config,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<StaticModules<B>, Error>;
+
     fn state_identity(
         config: &Self::Config,
         layout: &StateLayout,
@@ -76,7 +80,10 @@ pub(crate) trait CompressedReplicatedFamily<B: BlockwiseAttentionBackend>: 'stat
 
     fn validate(config: &Self::Config) -> Result<(), Error>;
     fn definition(config: &Self::Config) -> Result<ComponentDefinition, Error>;
-    fn static_spec(config: &Self::Config) -> StaticModuleSpec;
+    fn construct_statics(
+        config: &Self::Config,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<StaticModules<B>, Error>;
     fn state_identity(
         config: &Self::Config,
         layout: &StateLayout,
@@ -534,7 +541,7 @@ impl<B: NeuralBackend, F: FixedReplicatedFamily<B>, P: 'static> FixedReplicatedK
     ) -> Result<Self, Error> {
         F::validate(&config)?;
         let definition = select_definition(definition, F::definition(&config)?)?;
-        let static_modules = StaticModules::from_spec(F::static_spec(&config), context)?;
+        let static_modules = F::construct_statics(&config, context)?;
         Ok(Self {
             config,
             definition,
@@ -824,7 +831,7 @@ impl<B: BlockwiseAttentionBackend, F: CompressedReplicatedFamily<B>, P: 'static>
     ) -> Result<Self, Error> {
         F::validate(&config)?;
         let definition = select_definition(definition, F::definition(&config)?)?;
-        let static_modules = StaticModules::from_spec(F::static_spec(&config), context)?;
+        let static_modules = F::construct_statics(&config, context)?;
         Ok(Self {
             config,
             definition,

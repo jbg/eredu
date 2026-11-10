@@ -6,8 +6,9 @@ use crate::{
 };
 use eredu_nn::{
     residual_streams::{GatedResidual, GatedResidualInput, GatedResidualSpec},
-    CausalDepthwiseConvolutionSpec, ConvolutionActivation, DistributedNeuralBackend, Error,
-    LinearFormatSpec, LinearSpec, NeuralBackend, ParameterSpec, Tensor,
+    CausalDepthwiseConvolutionSpec, ConvolutionActivation, DeclareLogicalParameters,
+    DistributedNeuralBackend, Error, LinearFormatSpec, LinearSpec, NeuralBackend, ParameterSpec,
+    Tensor,
 };
 use eredu_runtime::RuntimeStateComponents;
 
@@ -19,39 +20,32 @@ pub fn recurrent_spec(
     mut format: impl FnMut(&str) -> Result<LinearFormatSpec, Error>,
 ) -> Result<GatedDeltaMixerSpec, Error> {
     let r = &config.recurrent;
-    let key = r
-        .key_heads
-        .checked_mul(r.key_dim)
-        .ok_or_else(|| Error::backend("qwen4_exp recurrent key width overflowed"))?;
-    let value = r
-        .value_heads
-        .checked_mul(r.value_dim)
-        .ok_or_else(|| Error::backend("qwen4_exp recurrent value width overflowed"))?;
-    let qkv = key
-        .checked_mul(2)
-        .and_then(|k| k.checked_add(value))
-        .ok_or_else(|| Error::backend("qwen4_exp recurrent projection width overflowed"))?;
-    let parameter =
-        |suffix: &str| ParameterSpec::trainable(format!("{root}.{suffix}")).map_err(Error::backend);
+    let geometry =
+        eredu_nn::GatedDeltaHeadGeometry::new(r.key_heads, r.value_heads, r.key_dim, r.value_dim)?;
+    let value = geometry.value_width();
+    let qkv = geometry.qkv_width()?;
+    let parameter = |suffix: &str| -> Result<ParameterSpec, Error> {
+        let mut parameter =
+            ParameterSpec::trainable(format!("{root}.{suffix}")).map_err(Error::backend)?;
+        parameter.group = Some(root.into());
+        Ok(parameter)
+    };
     let mut linear = |suffix: &str, input, output| {
         let name = format!("{root}.{suffix}.weight");
         Ok::<_, Error>(LinearSpec {
             input,
             output,
-            weight: ParameterSpec::trainable(&name).map_err(Error::backend)?,
+            weight: parameter(&format!("{suffix}.weight"))?,
             bias: None,
             format: format(&name)?,
         })
     };
     let spec = GatedDeltaMixerSpec {
-        key_heads: r.key_heads,
-        value_heads: r.value_heads,
-        key_head_dim: r.key_dim,
-        value_head_dim: r.value_dim,
+        geometry,
         input_qkv: linear("in_proj_qkv", config.hidden_size, qkv)?,
         input_gate: linear("in_proj_z", config.hidden_size, value)?,
-        input_beta: linear("in_proj_b", config.hidden_size, r.value_heads)?,
-        input_decay: linear("in_proj_a", config.hidden_size, r.value_heads)?,
+        input_beta: linear("in_proj_b", config.hidden_size, geometry.value_heads())?,
+        input_decay: linear("in_proj_a", config.hidden_size, geometry.value_heads())?,
         convolution: CausalDepthwiseConvolutionSpec {
             arithmetic: eredu_nn::ConvolutionArithmetic::Native,
             dilation: 1,
@@ -103,6 +97,9 @@ impl RecurrentSublayerSpec {
     }
     /// Rejects inconsistent composition before allocating any operator.
     pub fn validate(&self) -> Result<(), Error> {
+        self.logical_parameters().map(|_| ())
+    }
+    fn validate_geometry(&self) -> Result<(), Error> {
         self.residual.validate()?;
         self.mixer.validate()?;
         if self.residual.injection.is_none()
@@ -113,6 +110,17 @@ impl RecurrentSublayerSpec {
             ));
         }
         Ok(())
+    }
+}
+
+impl DeclareLogicalParameters for RecurrentSublayerSpec {
+    fn logical_parameters(&self) -> Result<Vec<eredu_nn::LogicalParameterDeclaration<'_>>, Error> {
+        self.validate_geometry()?;
+        let mut parameters = self.residual.logical_parameters()?;
+        parameters.extend(self.mixer.logical_parameters()?);
+        eredu_nn::validate_logical_parameter_topology(&parameters)
+            .map_err(Error::backend_source)?;
+        Ok(parameters)
     }
 }
 

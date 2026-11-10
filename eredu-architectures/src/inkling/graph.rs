@@ -1,12 +1,6 @@
 //! Typed Inkling component and runtime-state graphs.
 
-use eredu_core::{
-    cache::{
-        LayerCachePolicy, MutableStateResidency, StateTensorDimension, StateTensorDtype,
-        StateTensorPolicy, StateTensorRole,
-    },
-    LayerSchedule,
-};
+use eredu_core::LayerSchedule;
 use eredu_runtime::{
     ComponentDomain, ComponentGraph, ComponentGraphError, ComponentKind, ComponentResidencyClass,
     ComponentSpec, StateError, StateLayout, StateSegmentLifetime, StateSegmentSpec,
@@ -111,7 +105,19 @@ pub fn component_graph(args: &ModelArgs) -> Result<ComponentGraph, ComponentGrap
 /// Declares key/value state plus all four bounded convolution histories from
 /// the same normalized layer schedule consumed by execution.
 pub fn state_layout(args: &ModelArgs) -> Result<StateLayout, StateError> {
-    text_state_layout(&args.text_config)
+    let layers = args
+        .common_layers()
+        .iter()
+        .map(|parameters| {
+            parameters
+                .state_policy()
+                .map_err(|error| StateError::InvalidResidency(error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    StateLayout::new(
+        LayerSchedule::new(layers.len(), layers)
+            .map_err(|error| StateError::InvalidResidency(error.to_string()))?,
+    )
 }
 
 /// Declares rank-local text state from the per-layer geometries produced by
@@ -129,8 +135,12 @@ pub fn parallel_state_layout(
     }
     let policies = local_layers
         .iter()
-        .zip(args.text_config.layer_schedule.iter())
-        .map(|(text, policy)| text_state_policy(text, *policy))
+        .enumerate()
+        .map(|(layer, local)| {
+            args.local_common(layer, local)
+                .and_then(|parameters| parameters.state_policy())
+                .map_err(|error| StateError::InvalidResidency(error.to_string()))
+        })
         .collect::<Result<Vec<_>, _>>()?;
     StateLayout::new(
         LayerSchedule::new(policies.len(), policies)
@@ -141,45 +151,21 @@ pub fn parallel_state_layout(
 /// Declares the embedded predictor's KV and convolution state using the same
 /// ordinary decoder-layer geometry as execution.
 pub fn mtp_state_layout(args: &ModelArgs) -> Result<Option<StateLayout>, StateError> {
-    let Some(config) = args
-        .mtp_config
-        .as_ref()
-        .filter(|config| config.num_nextn_predict_layers > 0)
-    else {
+    if args.prediction().depths.is_empty() {
         return Ok(None);
-    };
-    let count = usize::try_from(config.num_nextn_predict_layers)
-        .map_err(|_| StateError::InvalidResidency("Inkling MTP depth is negative".into()))?;
-    let mut policies = Vec::with_capacity(count);
-    for depth in 0..count {
-        let attention = if config.local_layer_ids.contains(&depth) {
-            args.text_config
-                .layer_schedule
-                .iter()
-                .find_map(|policy| {
-                    policy
-                        .attention
-                        .window()
-                        .map(|window| eredu_core::AttentionPolicy::Sliding { window })
-                })
-                .ok_or_else(|| {
-                    StateError::InvalidResidency(
-                        "Inkling MTP requests local attention without a sliding window".into(),
-                    )
-                })?
-        } else {
-            eredu_core::AttentionPolicy::Full
-        };
-        let text = super::mtp::mtp_text_args(&args.text_config, config, attention)
-            .map_err(|error| StateError::InvalidResidency(error.to_string()))?;
-        policies.push(text_state_policy(
-            &text,
-            *text
-                .layer_schedule
-                .get(0)
-                .expect("one-layer MTP geometry has one policy"),
-        )?);
     }
+    let count = args.prediction().depths.len();
+    let policies = args
+        .prediction()
+        .depths
+        .iter()
+        .map(|depth| {
+            depth
+                .common
+                .state_policy()
+                .map_err(|error| StateError::InvalidResidency(error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let layers = LayerSchedule::new(policies.len(), policies)
         .map_err(|error| StateError::InvalidResidency(error.to_string()))?;
     StateLayout::segmented(
@@ -236,57 +222,4 @@ pub fn composite_state_layout(
             .map_err(|error| StateError::InvalidResidency(error.to_string()))?,
         segments,
     )
-}
-
-fn text_state_layout(text: &super::TextArgs) -> Result<StateLayout, StateError> {
-    let layers = text
-        .layer_schedule
-        .iter()
-        .map(|policy| text_state_policy(text, *policy))
-        .collect::<Result<Vec<_>, _>>()?;
-    StateLayout::new(
-        LayerSchedule::new(layers.len(), layers)
-            .map_err(|error| StateError::InvalidResidency(error.to_string()))?,
-    )
-}
-
-fn text_state_policy(
-    text: &super::TextArgs,
-    policy: super::LayerPolicy,
-) -> Result<LayerCachePolicy, StateError> {
-    let history = text.sconv_kernel_size - 1;
-    let fixed = |value| {
-        StateTensorDimension::fixed(value)
-            .map_err(|error| StateError::InvalidResidency(error.to_string()))
-    };
-    let local = policy.attention.window().is_some();
-    let kv_width = text
-        .key_value_heads(local)
-        .checked_mul(text.attention_head_dim(local))
-        .ok_or_else(|| StateError::InvalidResidency("Inkling KV width overflow".into()))?;
-    let tensors = [kv_width, kv_width, text.hidden_size, text.hidden_size]
-        .into_iter()
-        .enumerate()
-        .map(|(slot, channels)| {
-            StateTensorPolicy::new(
-                StateTensorRole::Convolution { slot: slot as u32 },
-                vec![
-                    StateTensorDimension::Batch,
-                    fixed(history)?,
-                    fixed(channels)?,
-                ],
-                StateTensorDtype::Floating,
-                MutableStateResidency::AlwaysDeviceMutable,
-            )
-            .map_err(|error| StateError::InvalidResidency(error.to_string()))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    LayerCachePolicy::key_value_with_state(
-        policy.attention,
-        text.key_value_heads(local),
-        text.attention_head_dim(local),
-        tensors,
-        Vec::new(),
-    )
-    .map_err(|error| StateError::InvalidResidency(error.to_string()))
 }

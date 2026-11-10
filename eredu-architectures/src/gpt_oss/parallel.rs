@@ -1,108 +1,30 @@
 //! Semantic TP/PP/EP placement for neutral GPT-OSS blocks.
 
-use eredu_nn::GroupedNeuralBackend;
-use eredu_runtime::{
-    aligned_partition_units, module_parameter_group, partitioned_module_parameter_group,
-    MemberSharding, ParallelPlanError, ParameterGroupSpec, ParameterRole,
-};
+use eredu_runtime::ParallelPlanError;
 
-use crate::decoder::{block_common_parallel_parameter_groups, static_parallel_parameter_groups};
-
-use super::{block::TransformerBlock, config::ModelArgs};
+use super::config::ModelArgs;
 
 /// Complete parameter topology derived from neutral router and expert specifications.
 pub fn parameter_description(
-    args: &ModelArgs,
+    declaration: &super::Declaration,
+    encoding: crate::decoder::ParameterEncoding,
 ) -> Result<eredu_runtime::ArchitectureParameterDescription, ParallelPlanError> {
-    crate::decoder::routed_parameter_description(args, |layer| {
+    let args = declaration.args();
+    crate::decoder::routed_parameter_description(args, encoding, declaration.common(), |layer| {
         let root = format!("{}.layers.{layer}.mlp", args.parameter_root);
+        let spec = declaration.projections().parameters(layer)?.clone();
         Ok(crate::decoder::RoutedBlockParameters {
             selector_name: format!("{root}.router"),
             bank_name: format!("{root}.experts.intermediate"),
-            selector: super::moe::selector_spec(args, layer)?,
-            bank: super::moe::expert_bank_spec(args, layer)?,
+            parameters: spec,
         })
     })
-}
-
-fn expert_member_sharding(
-    name: &str,
-    shape: &[usize],
-    intermediate: usize,
-) -> Result<MemberSharding, ParallelPlanError> {
-    if name.contains("gate_up_proj") {
-        if shape.len() < 2 {
-            return Err(ParallelPlanError::InvalidTensor(format!(
-                "GPT-OSS gate/up expert member {name} has rank {}",
-                shape.len()
-            )));
-        }
-        return Ok(MemberSharding::PartitionedSegments {
-            axis: 1,
-            segments: vec![0..intermediate, intermediate..2 * intermediate],
-        });
-    }
-    if name.contains("down_proj") {
-        return match shape.len() {
-            2 if name.ends_with("down_proj_bias") => Ok(MemberSharding::Replicated),
-            rank if rank >= 3 => Ok(MemberSharding::Partitioned { axis: 2 }),
-            _ => Err(ParallelPlanError::InvalidTensor(format!(
-                "GPT-OSS down expert member {name} has unsupported shape {shape:?}"
-            ))),
-        };
-    }
-    Err(ParallelPlanError::InvalidTensor(format!(
-        "unexpected GPT-OSS expert-bank parameter {name}"
-    )))
-}
-
-/// Declares attention, sinks, router, biased expert bank, and norms for a layer.
-pub fn layer_parallel_parameter_groups<
-    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
->(
-    block: &TransformerBlock<B>,
-    args: &ModelArgs,
-    layer: usize,
-) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    let mut groups = block_common_parallel_parameter_groups(block, args, layer)?;
-    let prefix = format!("{}.layers.{layer}.mlp", args.parameter_root);
-    groups.push(module_parameter_group::<B::Tensor, _>(
-        format!("{prefix}.router"),
-        ParameterRole::Replicated,
-        &block.body.mlp.router,
-        |_, _| Ok(MemberSharding::Replicated),
-    )?);
-
-    let intermediate = usize::try_from(args.intermediate_size).map_err(|_| {
-        ParallelPlanError::InvalidGroup("GPT-OSS expert width exceeds usize".into())
-    })?;
-    let units = aligned_partition_units(&format!("{prefix}.experts"), intermediate, 1, 32)?;
-    groups.push(partitioned_module_parameter_group::<B::Tensor, _>(
-        format!("{prefix}.experts.intermediate"),
-        ParameterRole::ExpertIntermediate,
-        units,
-        &block.body.mlp.experts,
-        |metadata, shape| expert_member_sharding(metadata.id.as_str(), shape, intermediate),
-    )?);
-    Ok(groups)
-}
-
-/// Declares pinned embedding, final norm, and separate head placement.
-pub fn static_parameter_groups<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>(
-    modules: &crate::decoder::StaticModules<B>,
-    args: &ModelArgs,
-) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    static_parallel_parameter_groups::<B>(
-        &modules.embeddings,
-        &modules.boundary.norm,
-        modules.lm_head.as_ref(),
-        &args.parameter_root,
-    )
 }
 
 /// Derives TP-local attention and expert geometry from semantic placement.
 pub fn local_block_args(
     args: &ModelArgs,
+    bank: &eredu_nn::GroupedGatedProductSpec,
     layer: usize,
     layout: &eredu_runtime::LocalModelLayout,
 ) -> Result<ModelArgs, ParallelPlanError> {
@@ -133,7 +55,10 @@ pub fn local_block_args(
         )));
     }
 
-    let gate_up = tensor(&format!("{prefix}.mlp.experts.gate_up_proj"))?;
+    let packed = bank
+        .packed_parameters()
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+    let gate_up = tensor(packed.gate_up().parameter.id.as_str())?;
     let gate_up_shape = gate_up.local_shape();
     if gate_up_shape.len() < 2
         || gate_up_shape[0] == 0
@@ -160,60 +85,58 @@ pub fn local_block_args(
     Ok(local)
 }
 
-/// Returns TP-local key/value head geometry in global layer order.
-pub fn local_key_value_heads(
-    args: &ModelArgs,
-    layout: &eredu_runtime::LocalModelLayout,
-) -> Result<Vec<i32>, ParallelPlanError> {
-    (0..args.num_hidden_layers as usize)
-        .map(|layer| Ok(local_block_args(args, layer, layout)?.num_key_value_heads))
-        .collect()
-}
-
 /// Complete rank-local geometry for the canonical neutral GPT-OSS model.
 pub type LocalGeometry = crate::decoder::LocalGeometry<ModelArgs>;
 
 /// Derives GPT-OSS unit, vocabulary, and state geometry from one typed plan.
 pub fn local_geometry(
-    args: &ModelArgs,
+    declaration: &super::Declaration,
     layout: &eredu_runtime::LocalModelLayout,
 ) -> Result<LocalGeometry, ParallelPlanError> {
-    crate::decoder::local_geometry(args, layout, local_block_args)
+    crate::decoder::local_geometry(
+        declaration.args(),
+        declaration.common(),
+        layout,
+        |_, layer, layout| {
+            local_block_args(
+                declaration.args(),
+                declaration
+                    .expert_bank(layer)
+                    .map_err(|e| ParallelPlanError::InvalidGroup(e.to_string()))?,
+                layer,
+                layout,
+            )
+        },
+    )
 }
 
 /// Derives exact PP×TP×EP-local GPT-OSS geometry from the selected realization.
 pub fn partition_local_routed_geometry(
-    args: &ModelArgs,
+    declaration: &super::Declaration,
     layout: &eredu_runtime::LocalModelLayout,
     owned_units: std::ops::Range<usize>,
     topology: eredu_core::ParallelRankTopology,
     realization: &crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
 ) -> Result<crate::decoder::PartitionLocalGeometry<ModelArgs>, ParallelPlanError> {
-    validate_routed_realization(args, topology, realization)?;
+    let args = declaration.args();
+    validate_routed_realization(declaration, layout, topology, realization)?;
     crate::decoder::partition_local_geometry_with(
         args,
-        parameter_description(args)?.invocations(),
+        declaration.common(),
+        parameter_description(declaration, crate::decoder::ParameterEncoding::Stored)?
+            .invocations(),
         layout,
         owned_units,
-        |args, layer, layout| {
-            let mut local = local_block_args(args, layer, layout)
-                .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
-            let spec = realization
-                .unit_spec(crate::decoder::TEXT_DECODER_EXECUTION_GROUP, layer)
-                .ok_or_else(|| {
-                    eredu_nn::Error::backend(format!(
-                        "selected GPT-OSS realization omits unit {layer}"
-                    ))
-                })?;
+        |_, layer, layout| {
+            let mut local = local_block_args(
+                declaration.args(),
+                declaration.expert_bank(layer)?,
+                layer,
+                layout,
+            )
+            .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
             let local_experts = i32::try_from(realization.local_global_group_indices().len())
                 .map_err(eredu_nn::Error::backend)?;
-            if spec.group_count() != local_experts
-                || spec.intermediate_dimensions() != local.intermediate_size
-            {
-                return Err(eredu_nn::Error::backend(format!(
-                    "selected GPT-OSS unit {layer} bank geometry drifted"
-                )));
-            }
             local.num_local_experts = local_experts;
             Ok(local)
         },
@@ -221,13 +144,21 @@ pub fn partition_local_routed_geometry(
 }
 
 fn validate_routed_realization(
-    args: &ModelArgs,
+    declaration: &super::Declaration,
+    layout: &eredu_runtime::LocalModelLayout,
     topology: eredu_core::ParallelRankTopology,
     realization: &crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
 ) -> Result<(), ParallelPlanError> {
-    let global_experts = usize::try_from(args.num_local_experts).map_err(|_| {
-        ParallelPlanError::InvalidGroup("GPT-OSS expert count exceeds usize".into())
-    })?;
+    let banks = declaration
+        .expert_banks()
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+    let global_experts = banks
+        .values()
+        .next()
+        .ok_or_else(|| {
+            ParallelPlanError::InvalidGroup("GPT-OSS has no declared expert banks".into())
+        })?
+        .group_count() as usize;
     let expected_local = eredu_core::balanced_contiguous_range(
         global_experts,
         topology.expert_parallel_size(),
@@ -245,18 +176,33 @@ fn validate_routed_realization(
             "selected GPT-OSS expert ownership differs from the Cartesian rank".into(),
         ));
     }
-    let layers = usize::try_from(args.num_hidden_layers)
-        .map_err(|_| ParallelPlanError::InvalidGroup("GPT-OSS layer count exceeds usize".into()))?;
-    if realization.unit_specs().len() != layers
-        || (0..layers).any(|layer| {
-            realization
-                .unit_spec(crate::decoder::TEXT_DECODER_EXECUTION_GROUP, layer)
-                .is_none()
-        })
-    {
+    if realization.unit_specs().len() != banks.len() {
         return Err(ParallelPlanError::InvalidGroup(
             "selected GPT-OSS realization unit schedule drifted".into(),
         ));
+    }
+    let local_count = i32::try_from(expected_local.len()).map_err(|_| {
+        ParallelPlanError::InvalidGroup("GPT-OSS local expert count exceeds i32".into())
+    })?;
+    for (layer, bank) in banks {
+        let local = local_block_args(
+            declaration.args(),
+            declaration
+                .expert_bank(layer)
+                .map_err(|e| ParallelPlanError::InvalidGroup(e.to_string()))?,
+            layer,
+            layout,
+        )?;
+        let expected = bank
+            .with_group_geometry(local_count, local.intermediate_size)
+            .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+        if realization.unit_spec(crate::decoder::TEXT_DECODER_EXECUTION_GROUP, layer)
+            != Some(&expected)
+        {
+            return Err(ParallelPlanError::InvalidGroup(format!(
+                "selected GPT-OSS bank declaration drifted at layer {layer}"
+            )));
+        }
     }
     Ok(())
 }

@@ -35,7 +35,10 @@ pub(super) fn artifacts() -> (Fixture, Fixture) {
     let config = eredu_architectures::gemma4::AssistantConfig::from_json(&json).unwrap();
     write_tensor_plan(
         &draft.0,
-        &eredu_architectures::gemma4::assistant_safetensors_plan(&config).unwrap(),
+        &eredu_architectures::gemma4::assistant_safetensors_plan(
+            &eredu_architectures::gemma4::AssistantDefinition::new(config.clone()).unwrap(),
+        )
+        .unwrap(),
     );
     (target, draft)
 }

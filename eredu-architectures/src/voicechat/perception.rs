@@ -12,7 +12,7 @@ use super::{
     conformer::{ConformerBlock, ConformerDimensions, ConformerError, ConformerState},
     subsampling::{CausalSubsampling, SubsamplingDimensions, SubsamplingError},
 };
-use eredu_nn::{LinearFormatSpec, LinearSpec, NeuralBackend, ParameterSpec, Parameterized, Tensor};
+use eredu_nn::{NeuralBackend, Parameterized, Tensor};
 
 /// Geometry of the subsampler, independently materializable layers and final projection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,34 +61,6 @@ impl PerceptionDimensions {
                 PerceptionError::Configuration("projection width exceeds tensor indexing")
             })?,
         })
-    }
-
-    /// Constructs the final projection independently of all perception layers.
-    pub fn build_projection<B: NeuralBackend>(
-        self,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Linear, PerceptionError> {
-        if self.block.width <= 0 || self.output_width <= 0 {
-            return Err(PerceptionError::Configuration(
-                "invalid perception projection widths",
-            ));
-        }
-        let parameter = |name: &str| {
-            let mut spec = ParameterSpec::trainable(format!("stt_model.perception.proj.{name}"))
-                .expect("canonical projection identifier");
-            spec.group = Some("voicechat.perception.projection".into());
-            spec
-        };
-        Ok(B::linear(
-            LinearSpec {
-                input: self.block.width,
-                output: self.output_width,
-                weight: parameter("weight"),
-                bias: Some(parameter("bias")),
-                format: LinearFormatSpec::unscaled(eredu_checkpoint::LinearFormat::Dense)?,
-            },
-            context,
-        )?)
     }
 }
 
@@ -251,22 +223,12 @@ impl<B: NeuralBackend> Parameterized<B::Tensor> for Perception<B> {
 impl<B: NeuralBackend> Perception<B> {
     /// Constructs unloaded units using the ordinary resident runtime.
     pub fn new(
-        dimensions: PerceptionDimensions,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, PerceptionError> {
-        Self::new_with_precision(dimensions, Default::default(), context)
-    }
-    /// Constructs units with the selected portable projection precision.
-    pub fn new_with_precision(
-        dimensions: PerceptionDimensions,
-        precision: super::precision::SpeechPrecision,
+        declaration: super::perception_specs::PerceptionDeclaration,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, PerceptionError> {
         Ok(Self {
             runtime: eredu_runtime::ResidentRuntime::new(
-                super::perception_layered::PerceptionKernel::new(dimensions)?
-                    .with_precision(precision)?
-                    .into_component()?,
+                super::perception_layered::PerceptionKernel::new(declaration)?.into_component()?,
                 context,
             )
             .map_err(eredu_runtime::ResidentUnitsError::into_architecture)?,
@@ -274,13 +236,13 @@ impl<B: NeuralBackend> Perception<B> {
     }
     /// Adopts independently materialized units without replacement allocations.
     pub(super) fn from_parts(
-        dimensions: PerceptionDimensions,
+        declaration: super::perception_specs::PerceptionDeclaration,
         subsampling: CausalSubsampling<B>,
         blocks: Vec<ConformerBlock<B>>,
         projection: B::Linear,
     ) -> Result<Self, PerceptionError> {
         use super::perception_layered::{PerceptionKernel, PerceptionUnit};
-        let architecture = PerceptionKernel::new(dimensions)?.into_component()?;
+        let architecture = PerceptionKernel::new(declaration)?.into_component()?;
         let units = vec![
             vec![PerceptionUnit::Subsampling(subsampling)],
             blocks.into_iter().map(PerceptionUnit::Block).collect(),

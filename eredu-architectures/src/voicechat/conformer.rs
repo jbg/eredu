@@ -12,8 +12,8 @@ use eredu_runtime::execution_control::{
 use eredu_nn::RetainedTensorRoots;
 
 use eredu_nn::{
-    Error, Index, LayerNorm, LinearFormatSpec, LinearOperator, LinearSpec, NeuralBackend, PadMode,
-    Parameter, ParameterSpec, Parameterized, Tensor,
+    Error, Index, LayerNorm, LinearOperator, NeuralBackend, PadMode, Parameter, Parameterized,
+    Tensor,
 };
 
 use super::config::PerceptionEncoderConfig;
@@ -243,9 +243,13 @@ pub struct ConformerBlock<B: NeuralBackend> {
     #[parameter(skip)]
     precision: super::precision::SpeechPrecision,
     #[parameter(skip)]
+    precision_declaration: super::precision::SpeechPrecisionDeclaration,
+    #[parameter(skip)]
     dimensions: ConformerDimensions,
     #[parameter(skip)]
     local: ConformerLocalDimensions,
+    #[parameter(skip)]
+    feed_forward_policy: [(eredu_nn::UnaryActivation, f32); 2],
     norm_feed_forward1: LayerNorm<B::Tensor>,
     ff1_up: B::Linear,
     ff1_down: B::Linear,
@@ -272,8 +276,10 @@ impl<B: NeuralBackend> Clone for ConformerBlock<B> {
     fn clone(&self) -> Self {
         Self {
             precision: self.precision,
+            precision_declaration: self.precision_declaration.clone(),
             dimensions: self.dimensions,
             local: self.local,
+            feed_forward_policy: self.feed_forward_policy,
             norm_feed_forward1: self.norm_feed_forward1.clone(),
             ff1_up: self.ff1_up.clone(),
             ff1_down: self.ff1_down.clone(),
@@ -327,109 +333,57 @@ impl<B: NeuralBackend> ConformerBlock<B> {
         Ok(self)
     }
 
-    /// Constructs exact canonical parameter identities for one encoder layer.
+    /// Constructs a complete or rank-local typed parameter declaration.
     pub fn new(
-        dimensions: ConformerDimensions,
-        layer: usize,
+        spec: super::perception_specs::ConformerSpec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, ConformerError> {
-        Self::new_parallel(
-            dimensions,
-            ConformerLocalDimensions {
-                heads: dimensions.heads,
-                ff_hidden: dimensions.ff_hidden,
-            },
-            layer,
-            context,
-        )
-    }
-
-    /// Constructs complete local heads and intermediate channels while keeping
-    /// global residual, convolution and streaming-state geometry.
-    pub fn new_parallel(
-        dimensions: ConformerDimensions,
-        local: ConformerLocalDimensions,
-        layer: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, ConformerError> {
-        local.validate(dimensions)?;
-        let d = dimensions.width;
-        let attention_width = local.heads * (d / dimensions.heads);
-        let prefix = format!("stt_model.perception.encoder.layers.{layer}");
-        let parameter = |name: &str| {
-            let mut spec = ParameterSpec::trainable(format!("{prefix}.{name}"))
-                .expect("valid canonical identifier");
-            spec.group = Some(format!("voicechat.perception.layer.{layer}"));
-            spec
-        };
-        let norm = |name: &str| {
-            LayerNorm::unloaded(
-                d,
-                1e-5,
-                Some(parameter(&format!("{name}.weight"))),
-                Some(parameter(&format!("{name}.bias"))),
-                context,
-            )
-        };
-        let linear = |name: &str, input: i32, output: i32| {
-            B::linear(
-                LinearSpec {
-                    input,
-                    output,
-                    weight: parameter(&format!("{name}.weight")),
-                    bias: None,
-                    format: LinearFormatSpec::unscaled(eredu_checkpoint::LinearFormat::Dense)?,
-                },
-                context,
-            )
-        };
+        let precision_declaration = super::precision::SpeechPrecisionDeclaration::from_spec(&spec)?;
+        spec.validate()?;
+        let [ff1_norm, attention_norm, conv_pre_norm, conv_norm, ff2_norm, output_norm] =
+            spec.norms;
+        let [first, second] = spec.feed_forward;
+        let u_shape = spec.attention.bias_shape();
+        let v_shape = spec.attention.bias_shape();
+        let input_shape = spec.pointwise_input.shape();
+        let output_shape = spec.pointwise_output.shape();
+        let depthwise_shape = [spec.depthwise.channels, 1, spec.depthwise.kernel_size];
         Ok(Self {
             precision: Default::default(),
-            dimensions,
-            local,
-            norm_feed_forward1: norm("norm_feed_forward1")?,
-            ff1_up: linear("feed_forward1.linear1", d, local.ff_hidden)?,
-            ff1_down: linear("feed_forward1.linear2", local.ff_hidden, d)?,
-            norm_self_att: norm("norm_self_att")?,
-            query: linear("self_attn.linear_q", d, attention_width)?,
-            key: linear("self_attn.linear_k", d, attention_width)?,
-            value: linear("self_attn.linear_v", d, attention_width)?,
-            attention_output: linear("self_attn.linear_out", attention_width, d)?,
+            precision_declaration,
+            dimensions: spec.dimensions,
+            local: spec.local,
+            feed_forward_policy: [
+                (first.network.activation, first.residual_weight),
+                (second.network.activation, second.residual_weight),
+            ],
+            norm_feed_forward1: LayerNorm::new(ff1_norm, context)?,
+            ff1_up: B::linear(first.network.up, context)?,
+            ff1_down: B::linear(first.network.down, context)?,
+            norm_self_att: LayerNorm::new(attention_norm, context)?,
+            query: B::linear(spec.attention.projection.query, context)?,
+            key: B::linear(spec.attention.projection.key, context)?,
+            value: B::linear(spec.attention.projection.value, context)?,
+            attention_output: B::linear(spec.attention.projection.output, context)?,
             position: RelativePositionProjection::new(
-                linear("self_attn.linear_pos", d, attention_width)?,
-                dimensions.left_context.saturating_add(1),
+                B::linear(spec.attention.position, context)?,
+                spec.dimensions.left_context.saturating_add(1),
             ),
-            pos_bias_u: Parameter::unloaded(
-                parameter("self_attn.pos_bias_u"),
-                &[local.heads, d / dimensions.heads],
-                context,
-            )?,
+            pos_bias_u: Parameter::unloaded(spec.attention.content_bias.weight, &u_shape, context)?,
             pos_bias_v: Parameter::unloaded(
-                parameter("self_attn.pos_bias_v"),
-                &[local.heads, d / dimensions.heads],
+                spec.attention.position_bias.weight,
+                &v_shape,
                 context,
             )?,
-            norm_conv: norm("norm_conv")?,
-            pointwise1: Parameter::unloaded(
-                parameter("conv.pointwise_conv1.weight"),
-                &[2 * d, d, 1],
-                context,
-            )?,
-            depthwise: Parameter::unloaded(
-                parameter("conv.depthwise_conv.weight"),
-                &[d, 1, dimensions.conv_kernel],
-                context,
-            )?,
-            conv_norm: norm("conv.batch_norm")?,
-            pointwise2: Parameter::unloaded(
-                parameter("conv.pointwise_conv2.weight"),
-                &[d, d, 1],
-                context,
-            )?,
-            norm_feed_forward2: norm("norm_feed_forward2")?,
-            ff2_up: linear("feed_forward2.linear1", d, local.ff_hidden)?,
-            ff2_down: linear("feed_forward2.linear2", local.ff_hidden, d)?,
-            norm_out: norm("norm_out")?,
+            norm_conv: LayerNorm::new(conv_pre_norm, context)?,
+            pointwise1: Parameter::unloaded(spec.pointwise_input.weight, &input_shape, context)?,
+            depthwise: Parameter::unloaded(spec.depthwise.weight, &depthwise_shape, context)?,
+            conv_norm: LayerNorm::new(conv_norm, context)?,
+            pointwise2: Parameter::unloaded(spec.pointwise_output.weight, &output_shape, context)?,
+            norm_feed_forward2: LayerNorm::new(ff2_norm, context)?,
+            ff2_up: B::linear(second.network.up, context)?,
+            ff2_down: B::linear(second.network.down, context)?,
+            norm_out: LayerNorm::new(output_norm, context)?,
         })
     }
 
@@ -551,7 +505,7 @@ impl<B: NeuralBackend> ConformerBlock<B> {
     ) -> Result<(B::Tensor, ConformerState<B::Tensor>), ConformerError> {
         self.validate(input, previous)?;
         self.precision
-            .require(self, input)
+            .require(self, input, &self.precision_declaration)
             .map_err(ConformerError::Precision)?;
         let mut next = self.initialize(input, previous, context)?;
         let d = self.dimensions;
@@ -561,11 +515,14 @@ impl<B: NeuralBackend> ConformerBlock<B> {
         let ff = self.ff1_up.forward(&ff, context)?;
         let ff = residual_projection::<B>(
             &mut self.ff1_down,
-            &B::silu(ff, context)?,
+            &self.feed_forward_policy[0].0.apply::<B>(ff, context)?,
             parallel,
             context,
         )?;
-        let residual = input.add(&ff.multiply_scalar(0.5, context)?, context)?;
+        let residual = input.add(
+            &ff.multiply_scalar(self.feed_forward_policy[0].1, context)?,
+            context,
+        )?;
         let normalized = self.norm_self_att.forward(&residual, context)?;
         let channel = B::Tensor::concatenate(
             &[
@@ -670,12 +627,15 @@ impl<B: NeuralBackend> ConformerBlock<B> {
         let ff = self.ff2_up.forward(&ff, context)?;
         let ff = residual_projection::<B>(
             &mut self.ff2_down,
-            &B::silu(ff, context)?,
+            &self.feed_forward_policy[1].0.apply::<B>(ff, context)?,
             parallel,
             context,
         )?;
         let output = self.norm_out.forward(
-            &residual.add(&ff.multiply_scalar(0.5, context)?, context)?,
+            &residual.add(
+                &ff.multiply_scalar(self.feed_forward_policy[1].1, context)?,
+                context,
+            )?,
             context,
         )?;
         debug_assert_eq!(output.shape(), &[batch, count, d.width]);

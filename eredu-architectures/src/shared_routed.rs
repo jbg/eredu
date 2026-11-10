@@ -3,51 +3,49 @@
 pub mod checkpoint;
 use crate::decoder::{ComponentInstrumentation, DecoderProjectionOperator, Mlp};
 use eredu_nn::{
-    Error, GatedProductPolicy, GroupSelectionOperator, GroupedGatedProductSpec,
-    GroupedNeuralBackend, LinearSpec, OutputGateActivation, Parameterized, Tensor,
-    TopKGroupSelectorSpec,
+    Error, GroupSelectionOperator, GroupedNeuralBackend, LinearSpec, OutputGateActivation,
+    Parameterized, Tensor,
 };
 use eredu_runtime::{
     ExpertPass, ParameterProvider, RoutedExpertRequest, TensorParallelParameterProvider,
 };
 
-/// Exact construction of a routed bank and its always-on shared contribution.
+/// Logical slots and equations of a routed bank and its always-on shared contribution.
 #[derive(Debug, Clone)]
-pub struct SharedRoutedGatedProductSpec {
-    /// Physical layer coordinate supplied to the residency provider.
-    pub layer: usize,
-    /// Architecture-declared bank identity within the layer.
-    pub bank: eredu_runtime::RoutedBankId,
-    /// Router parameters, formats and selection policy.
-    pub router: TopKGroupSelectorSpec,
-    /// Independently addressable expert bank.
-    pub experts: GroupedGatedProductSpec,
-    /// Shared gate, up and down projections, in that order.
-    pub shared: [LinearSpec; 3],
-    /// Shared feed-forward activation and clipping policy.
-    pub shared_policy: GatedProductPolicy,
+pub struct SharedRoutedGatedProductParameters {
+    /// Global selector and independently addressable expert-bank parameters.
+    pub routed: eredu_nn::RoutedGatedProductSpec,
+    /// Complete shared branch, including affine slots and gated-product policy.
+    pub shared: eredu_nn::SplitGatedProductSpec,
     /// Projection to one scalar gate per input row.
     pub shared_gate: LinearSpec,
     /// Shared output gate activation.
     pub gate_activation: OutputGateActivation,
 }
 
-impl SharedRoutedGatedProductSpec {
+impl eredu_nn::DeclareLogicalParameters for SharedRoutedGatedProductParameters {
+    fn logical_parameters(&self) -> Result<Vec<eredu_nn::LogicalParameterDeclaration<'_>>, Error> {
+        self.validate_geometry()?;
+        let mut declarations = self.routed.logical_parameters()?;
+        declarations.extend(self.shared.logical_parameters()?);
+        declarations.extend(self.shared_gate.logical_parameters()?);
+        eredu_nn::validate_logical_parameter_topology(&declarations)
+            .map_err(Error::backend_source)?;
+        Ok(declarations)
+    }
+}
+
+impl SharedRoutedGatedProductParameters {
     /// Validates composition geometry before backend construction.
     pub fn validate(&self) -> Result<(), Error> {
-        self.router.validate()?;
-        self.experts.validate()?;
-        self.shared_policy.validate()?;
-        let input = self.experts.input_dimensions();
-        let output = self.experts.output_dimensions();
-        let [gate, up, down] = &self.shared;
-        if self.router.input_dimensions() != input
-            || gate.input != input
-            || up.input != input
-            || gate.output <= 0
-            || gate.output != up.output
-            || down.input != gate.output
-            || down.output != output
+        eredu_nn::DeclareLogicalParameters::logical_parameters(self).map(|_| ())
+    }
+
+    fn validate_geometry(&self) -> Result<(), Error> {
+        let input = self.routed.experts.input_dimensions();
+        let output = self.routed.experts.output_dimensions();
+        if self.shared.gate.input != input
+            || self.shared.down.output != output
             || self.shared_gate.input != input
             || self.shared_gate.output != 1
         {
@@ -55,10 +53,29 @@ impl SharedRoutedGatedProductSpec {
                 "shared/routed feed-forward geometry mismatch",
             ));
         }
-        for projection in [gate, up, down, &self.shared_gate] {
-            projection.format.validate_for_weight(&projection.weight)?;
-        }
         Ok(())
+    }
+}
+
+/// Invocation ownership, independent of the bank's parameter identities.
+#[derive(Debug, Clone)]
+pub struct SharedRoutedGatedProductSpec {
+    /// Physical layer coordinate supplied to the residency provider.
+    pub layer: usize,
+    /// Architecture-declared bank identity within the layer.
+    pub bank: eredu_runtime::RoutedBankId,
+    /// Authoritative logical slots and neural construction policy.
+    pub parameters: SharedRoutedGatedProductParameters,
+}
+impl SharedRoutedGatedProductSpec {
+    /// Validates slots and equations before backend allocation.
+    pub fn validate(&self) -> Result<(), Error> {
+        self.parameters.validate()
+    }
+}
+impl eredu_nn::DeclareLogicalParameters for SharedRoutedGatedProductSpec {
+    fn logical_parameters(&self) -> Result<Vec<eredu_nn::LogicalParameterDeclaration<'_>>, Error> {
+        self.parameters.logical_parameters()
     }
 }
 
@@ -91,21 +108,21 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SharedRoutedG
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         spec.validate()?;
-        let [gate, up, down] = spec.shared;
+        let parameters = spec.parameters;
         Ok(Self {
             layer: spec.layer,
             bank: spec.bank,
-            gate_activation: spec.gate_activation,
+            gate_activation: parameters.gate_activation,
             resident_unit_coordinates: None,
-            router: B::top_k_group_selector(spec.router, context)?,
-            experts: B::grouped_gated_product(spec.experts, context)?,
+            router: B::top_k_group_selector(parameters.routed.selector, context)?,
+            experts: B::grouped_gated_product(parameters.routed.experts, context)?,
             shared_expert: Mlp::from_parts(
-                B::linear(gate, context)?,
-                B::linear(up, context)?,
-                B::linear(down, context)?,
-                Some(spec.shared_policy),
+                B::linear(parameters.shared.gate, context)?,
+                B::linear(parameters.shared.up, context)?,
+                B::linear(parameters.shared.down, context)?,
+                parameters.shared.policy,
             ),
-            shared_expert_gate: B::linear(spec.shared_gate, context)?,
+            shared_expert_gate: B::linear(parameters.shared_gate, context)?,
         })
     }
 

@@ -9,9 +9,9 @@ use serde::{Deserialize, Serialize};
 /// Current wire schema for observation catalogs and support reports.
 pub const DISCOVERY_SCHEMA_VERSION: u32 = 1;
 
-/// Current architecture descriptor schema, including layer execution groups.
+/// Current architecture descriptor schema for logical graphs and declared parameter groups.
 /// Observation catalogs and support reports retain their independent version.
-pub const ARCHITECTURE_DESCRIPTOR_SCHEMA_VERSION: u32 = 14;
+pub const ARCHITECTURE_DESCRIPTOR_SCHEMA_VERSION: u32 = 15;
 
 /// Coverage of a descriptor, node, or catalog.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]

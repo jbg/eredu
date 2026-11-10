@@ -2,12 +2,10 @@
 
 use eredu_nn::{
     AttentionMask, BlockwiseAttentionBackend, BlockwiseAttentionSpec, CompressedAttentionCache,
-    CompressedAttentionState, Error, Index, LinearOperator, LinearSpec, LowRankProjection,
-    LowRankProjectionSpec, NormalizationConstructionSpec, NormalizationOperator, ParameterSpec,
-    Parameterized, Tensor,
+    CompressedAttentionState, Error, Index, LinearOperator, LowRankProjection,
+    NormalizationOperator, Parameterized, Tensor,
 };
 
-use super::ModelArgs;
 use crate::decoder::ComponentInstrumentation;
 
 /// Direct or normalized low-rank Kimi query projection.
@@ -77,127 +75,41 @@ pub struct KimiLatentAttention<B: BlockwiseAttentionBackend> {
 }
 
 impl<B: BlockwiseAttentionBackend> KimiLatentAttention<B> {
-    /// Creates unloaded no-positional MLA parameters for one physical layer.
-    pub fn new(
-        args: &ModelArgs,
-        layer: usize,
+    pub(crate) fn from_spec(
+        spec: super::specs::MlaSpec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        Self::new_with_heads(args, layer, args.num_attention_heads, context)
-    }
-
-    /// Creates unloaded MLA for a placement-resolved query-head count.
-    pub fn new_with_heads(
-        args: &ModelArgs,
-        layer: usize,
-        heads: i32,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        args.validate().map_err(Error::backend)?;
-        let root = format!("model.layers.{layer}.self_attn");
-        let query_dimensions = heads
-            .checked_mul(args.qk_nope_head_dim + args.qk_rope_head_dim)
-            .ok_or_else(|| Error::backend("Kimi MLA query width overflowed"))?;
-        let linear_spec = |name: String, input, output| -> Result<LinearSpec, Error> {
-            let format = args.weight_quantization_for(&name).into();
-            Ok(LinearSpec {
-                input,
-                output,
-                weight: parameter(name.clone())?,
-                bias: None,
-                format: crate::linear_format::standard_linear_format(&name, format)?,
-            })
-        };
-        let query = if let Some(rank) = args.q_lora_rank {
-            QueryProjection::LowRank(LowRankProjection::new(
-                LowRankProjectionSpec {
-                    first: Some(linear_spec(
-                        format!("{root}.q_a_proj.weight"),
-                        args.hidden_size,
-                        rank,
-                    )?),
-                    normalization: NormalizationConstructionSpec::learned(
-                        rank,
-                        args.rms_norm_eps,
-                        parameter(format!("{root}.q_a_layernorm.weight"))?,
-                    ),
-                    second: linear_spec(format!("{root}.q_b_proj.weight"), rank, query_dimensions)?,
-                },
-                context,
-            )?)
-        } else {
-            QueryProjection::Direct(B::linear(
-                linear_spec(
-                    format!("{root}.q_proj.weight"),
-                    args.hidden_size,
-                    query_dimensions,
-                )?,
-                context,
-            )?)
+        use eredu_nn::DeclareLogicalParameters;
+        spec.logical_parameters()?;
+        let geometry = spec.geometry;
+        let query = match spec.query {
+            super::specs::QuerySpec::Direct(projection) => {
+                QueryProjection::Direct(B::linear(projection, context)?)
+            }
+            super::specs::QuerySpec::LowRank(projection) => {
+                QueryProjection::LowRank(LowRankProjection::new(projection, context)?)
+            }
         };
         Ok(Self {
-            heads,
-            nope_dimensions: args.qk_nope_head_dim,
-            positional_dimensions: args.qk_rope_head_dim,
-            value_dimensions: args.v_head_dim,
-            latent_dimensions: args.kv_lora_rank,
-            scale: ((args.qk_nope_head_dim + args.qk_rope_head_dim) as f32)
-                .sqrt()
-                .recip(),
+            heads: geometry.heads(),
+            nope_dimensions: geometry.non_positional_dimensions(),
+            positional_dimensions: geometry.positional_dimensions(),
+            value_dimensions: geometry.value_dimensions(),
+            latent_dimensions: geometry.latent_dimensions(),
+            scale: spec.scale,
             query,
-            kv_a: B::linear(
-                linear_spec(
-                    format!("{root}.kv_a_proj_with_mqa.weight"),
-                    args.hidden_size,
-                    args.kv_lora_rank + args.qk_rope_head_dim,
-                )?,
-                context,
-            )?,
-            kv_norm: B::normalization(
-                NormalizationConstructionSpec::learned(
-                    args.kv_lora_rank,
-                    args.rms_norm_eps,
-                    parameter(format!("{root}.kv_a_layernorm.weight"))?,
-                ),
-                context,
-            )?,
-            kv_b: if args.split_kv_b {
-                LatentProjection::Split {
-                    key: B::linear(
-                        linear_spec(
-                            format!("{root}.k_b_proj.weight"),
-                            args.kv_lora_rank,
-                            heads * args.qk_nope_head_dim,
-                        )?,
-                        context,
-                    )?,
-                    value: B::linear(
-                        linear_spec(
-                            format!("{root}.v_b_proj.weight"),
-                            args.kv_lora_rank,
-                            heads * args.v_head_dim,
-                        )?,
-                        context,
-                    )?,
+            kv_a: B::linear(spec.kv_a, context)?,
+            kv_norm: B::normalization(spec.kv_norm, context)?,
+            kv_b: match spec.kv_b {
+                super::specs::LatentSpec::Fused(projection) => {
+                    LatentProjection::Fused(B::linear(projection, context)?)
                 }
-            } else {
-                LatentProjection::Fused(B::linear(
-                    linear_spec(
-                        format!("{root}.kv_b_proj.weight"),
-                        args.kv_lora_rank,
-                        heads * (args.qk_nope_head_dim + args.v_head_dim),
-                    )?,
-                    context,
-                )?)
+                super::specs::LatentSpec::Split { key, value } => LatentProjection::Split {
+                    key: B::linear(key, context)?,
+                    value: B::linear(value, context)?,
+                },
             },
-            output: B::linear(
-                linear_spec(
-                    format!("{root}.o_proj.weight"),
-                    heads * args.v_head_dim,
-                    args.hidden_size,
-                )?,
-                context,
-            )?,
+            output: B::linear(spec.output, context)?,
         })
     }
 
@@ -421,8 +333,4 @@ fn slice_last<T: Tensor>(
     let last = indexes.len() - 1;
     indexes[last] = Index::Range(start, end);
     value.index(&indexes, context)
-}
-
-fn parameter(name: impl Into<String>) -> Result<ParameterSpec, Error> {
-    ParameterSpec::trainable(name).map_err(Error::backend)
 }

@@ -5,14 +5,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::TensorSelection};
 
 use eredu_checkpoint::schema::{
-    AlternativeLayoutGroup, CatalogPolicy, DepthwiseConvolutionSchema, FusedProjectionSegment,
-    FusedSegmentedProjectionSchema, GgufCheckpointPlan, GgufTensorConstraint, GgufTypeConstraint,
-    LayoutVariant, RecurrentParameterGroupSchema, SafetensorsCheckpointPlan,
-    SafetensorsTensorConstraint, StoredDtypeConstraint, TensorOperation,
+    AlternativeLayoutGroup, CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint,
+    GgufTypeConstraint, LayoutVariant, SafetensorsCheckpointPlan, SafetensorsTensorConstraint,
+    StoredDtypeConstraint, TensorOperation,
 };
 use eredu_checkpoint::{StoredDtype, WeightQuantization};
 
 use super::{LayerPolicy, ModelArgs};
+use eredu_nn::DeclareLogicalParameters;
 
 /// Derives a Nemotron-H configuration whose physical matrix formats reflect
 /// load-time quantization instead of checkpoint-specific format selections.
@@ -41,39 +41,6 @@ pub fn with_checkpoint_formats(
     target.weight_quantization = None;
     target.validate().map_err(|error| error.to_string())?;
     Ok(target)
-}
-
-fn unit_root(
-    args: &ModelArgs,
-    group: usize,
-    index: usize,
-) -> Result<(LayerPolicy, String, usize), String> {
-    if group == 0 {
-        let policy = args
-            .layer_schedule
-            .get(index)
-            .copied()
-            .ok_or_else(|| format!("Nemotron-H has no target layer {index}"))?;
-        return Ok((policy, format!("model.layers.{index}"), index));
-    }
-    let steps = usize::try_from(args.num_nextn_predict_layers)
-        .map_err(|_| "invalid Nemotron-H MTP count".to_string())?;
-    if group > steps || steps == 0 {
-        return Err(format!("Nemotron-H has no MTP group {group}"));
-    }
-    let policies = args.mtp_policies().map_err(|error| error.to_string())?;
-    let pattern = policies.len() / steps;
-    if index >= pattern {
-        return Err(format!(
-            "Nemotron-H has no MTP unit {index} in group {group}"
-        ));
-    }
-    let physical = (group - 1) * pattern + index;
-    Ok((
-        policies[physical],
-        format!("model.mtp.layers.{physical}"),
-        args.num_hidden_layers as usize + physical,
-    ))
 }
 
 /// Resolves all released Nemotron-H names to canonical runtime names.
@@ -166,15 +133,55 @@ pub fn static_recipes(
         .collect())
 }
 
+fn expert_source_root(bank: &eredu_nn::GroupedRelu2Spec) -> Result<&str, String> {
+    bank.up()
+        .weight()
+        .id
+        .as_str()
+        .strip_suffix(".up_proj")
+        .ok_or_else(|| "Nemotron-H expert bank has no declared source root".into())
+}
+
+fn expert_binding_target(
+    bank: &eredu_nn::GroupedRelu2Spec,
+    binding: &str,
+) -> Result<String, String> {
+    let (projection, suffix) = binding
+        .strip_prefix("up_proj")
+        .map(|suffix| (bank.up(), suffix))
+        .or_else(|| {
+            binding
+                .strip_prefix("down_proj")
+                .map(|suffix| (bank.down(), suffix))
+        })
+        .filter(|(_, suffix)| matches!(*suffix, "" | "_scales" | "_biases"))
+        .ok_or_else(|| format!("undeclared Nemotron-H expert binding {binding}"))?;
+    Ok(format!("{}{suffix}", projection.weight().id))
+}
+
 /// Returns the complete recipe catalog for one Nemotron-H execution unit.
 pub fn unit_recipes(
     store: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
-    args: &ModelArgs,
+    declaration: &super::Declaration,
     group: usize,
     index: usize,
     include_experts: bool,
 ) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
-    let (policy, root, _) = unit_root(args, group, index)?;
+    let args = declaration.args();
+    let definition = declaration.definition();
+    let identity = definition
+        .parameters()
+        .unit_layout()
+        .ordinal(group, index)
+        .ok_or_else(|| format!("Nemotron-H has no unit {index} in group {group}"))?;
+    let root = definition
+        .unit(group, index)
+        .map_err(|e| e.to_string())?
+        .path
+        .clone();
+    let scope = declaration
+        .block(identity)
+        .ok_or("unresolved Nemotron invocation scope")?;
     let normalized = normalized_checkpoint_keys(store, args)?;
     let mut recipes = normalized
         .iter()
@@ -186,7 +193,7 @@ pub fn unit_recipes(
             )
         })
         .collect::<BTreeMap<_, _>>();
-    if policy == LayerPolicy::Mamba {
+    if let super::declarations::TargetOperatorParameters::Mamba(spec) = &scope.operator {
         let a_log = format!("{root}.mamba.A_log");
         if let Some(raw) = normalized.get(&a_log) {
             recipes.insert(
@@ -202,12 +209,14 @@ pub fn unit_recipes(
         let conv = format!("{root}.mamba.conv1d.weight");
         if let Some(raw) = normalized.get(&conv) {
             let recipe = DerivedWeightRecipe::source(raw.clone(), TensorSelection::Full);
-            let channels = usize::try_from(
-                args.mamba_num_heads * args.mamba_head_dim
-                    + 2 * args.n_groups * args.ssm_state_size,
-            )
-            .map_err(|_| "invalid Mamba channels".to_string())?;
-            let expected = vec![channels, 1, args.conv_kernel as usize];
+            let expected = spec
+                .convolution
+                .logical_parameters()
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .find(|d| d.parameter.id == spec.convolution.weight.id)
+                .expect("declared convolution weight")
+                .shape;
             if recipe
                 .infer(store)
                 .map_err(|error| error.to_string())?
@@ -224,50 +233,28 @@ pub fn unit_recipes(
             }
         }
     }
-    if policy != LayerPolicy::SparseMoe {
+    let super::declarations::TargetOperatorParameters::Sparse(spec) = &scope.operator else {
         return Ok(recipes);
-    }
-    let expert_root = if group == 0 {
-        format!("{root}.moe.experts")
-    } else {
-        format!("{root}.mixer.experts")
     };
+    let bank = &spec.experts;
+    let expert_root = expert_source_root(&bank)?;
     if !include_experts {
         let expert_prefix = format!("{expert_root}.");
         recipes.retain(|name, _| !name.starts_with(&expert_prefix));
         return Ok(recipes);
     }
-    let split_prefix = format!("{expert_root}.");
-    recipes.retain(|name, _| {
-        name.strip_prefix(&split_prefix)
-            .and_then(|suffix| suffix.split_once('.'))
-            .is_none_or(|(segment, _)| segment.parse::<usize>().is_err())
-    });
-    for projection in ["up_proj", "down_proj"] {
-        let packed = format!("{expert_root}.{projection}");
-        for suffix in ["scales", "biases"] {
-            if let Some(raw) = normalized.get(&format!("{packed}.{suffix}")) {
-                recipes.insert(
-                    format!("{packed}_{suffix}"),
-                    DerivedWeightRecipe::source(raw.clone(), TensorSelection::Full),
-                );
-            }
-        }
-        if normalized.contains_key(&packed) {
+    // Raw packed and split names are recipe inputs. Only the typed bank's
+    // canonical outputs are published, including its encoding companions.
+    recipes.retain(|name, _| !name.starts_with(&format!("{expert_root}.")));
+    for (binding, recipe) in bank_recipes(&normalized, &bank, None)? {
+        let target = expert_binding_target(&bank, &binding)?;
+        if matches!(
+            &recipe,
+            DerivedWeightRecipe::Source { key, selection: TensorSelection::Full } if key == &target
+        ) {
             continue;
         }
-        let inputs = (0..args.n_routed_experts)
-            .map(|expert| {
-                normalized
-                    .get(&format!("{expert_root}.{expert}.{projection}.weight"))
-                    .cloned()
-                    .map(|raw| DerivedWeightRecipe::source(raw, TensorSelection::Full))
-                    .ok_or_else(|| {
-                        format!("Nemotron-H checkpoint is missing expert {expert} {projection}")
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        recipes.insert(packed, DerivedWeightRecipe::Stack { axis: 0, inputs });
+        recipes.insert(target, recipe);
     }
     Ok(recipes)
 }
@@ -275,34 +262,19 @@ pub fn unit_recipes(
 /// Returns the unit recipe catalog for one flat target/MTP residency ordinal.
 pub fn unit_recipes_flat(
     store: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
-    args: &ModelArgs,
+    declaration: &super::Declaration,
     flat: usize,
     include_experts: bool,
 ) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
-    let target = args.num_hidden_layers as usize;
-    if flat < target {
-        return unit_recipes(store, args, 0, flat, include_experts);
-    }
-    let steps = args.num_nextn_predict_layers as usize;
-    if steps == 0 {
-        return Err(format!(
-            "Nemotron-H flat unit {flat} is outside the target schedule"
-        ));
-    }
-    let pattern = args
-        .mtp_policies()
-        .map_err(|error| error.to_string())?
-        .len()
-        / steps;
-    if pattern == 0 {
-        return Err("Nemotron-H MTP operator pattern cannot be empty".into());
-    }
-    let physical = flat - target;
+    let layout = declaration.definition().parameters().unit_layout();
+    let address = layout
+        .address(flat)
+        .ok_or_else(|| format!("Nemotron-H flat unit {flat} is outside its declared schedule"))?;
     unit_recipes(
         store,
-        args,
-        physical / pattern + 1,
-        physical % pattern,
+        declaration,
+        address.group(),
+        address.index(),
         include_experts,
     )
 }
@@ -310,87 +282,84 @@ pub fn unit_recipes_flat(
 /// Returns canonical lazy-loading recipes for one Nemotron-H routed expert.
 pub fn expert_recipes(
     store: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
-    args: &ModelArgs,
+    declaration: &super::Declaration,
     identity_layer: usize,
     expert: usize,
 ) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
-    if expert >= args.n_routed_experts as usize {
+    let args = declaration.args();
+    let bank = declaration
+        .expert_bank(identity_layer)
+        .map_err(|error| error.to_string())?;
+    expert_recipes_for_bank(store, args, identity_layer, expert, &bank)
+}
+
+fn expert_recipes_for_bank(
+    store: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
+    args: &ModelArgs,
+    identity_layer: usize,
+    expert: usize,
+    bank: &eredu_nn::GroupedRelu2Spec,
+) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
+    if expert >= bank.group_count() as usize {
         return Err(format!(
             "Nemotron-H has no expert {expert} in layer {identity_layer}"
         ));
     }
-    let target = args.num_hidden_layers as usize;
-    let (policy, prefix) = if identity_layer < target {
-        (
-            args.layer_schedule
-                .get(identity_layer)
-                .copied()
-                .ok_or_else(|| format!("Nemotron-H has no layer {identity_layer}"))?,
-            format!("model.layers.{identity_layer}.moe.experts"),
-        )
-    } else {
-        let physical = identity_layer - target;
-        let policies = args.mtp_policies().map_err(|error| error.to_string())?;
-        (
-            *policies
-                .get(physical)
-                .ok_or_else(|| format!("Nemotron-H has no MTP layer {physical}"))?,
-            format!("model.mtp.layers.{physical}.mixer.experts"),
-        )
-    };
-    if policy != LayerPolicy::SparseMoe {
-        return Err(format!(
-            "Nemotron-H layer {identity_layer} is not sparse MoE"
-        ));
-    }
     let normalized = normalized_checkpoint_keys(store, args)?;
-    let packed = normalized.contains_key(&format!("{prefix}.up_proj"));
+    bank_recipes(&normalized, bank, Some(expert))
+}
+
+fn bank_recipes(
+    normalized: &BTreeMap<String, String>,
+    bank: &eredu_nn::GroupedRelu2Spec,
+    expert: Option<usize>,
+) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
+    let prefix = expert_source_root(bank)?;
+    let packed = normalized.contains_key(bank.up().weight().id.as_str());
+    let range = expert.map_or(0..bank.group_count() as usize, |expert| expert..expert + 1);
     let mut recipes = BTreeMap::new();
-    for projection in ["up_proj", "down_proj"] {
-        let runtime = format!("{prefix}.{projection}");
-        let recipe = if packed {
-            DerivedWeightRecipe::source(
-                normalized
-                    .get(&runtime)
-                    .ok_or_else(|| format!("missing packed Nemotron-H tensor {runtime}"))?
-                    .clone(),
-                TensorSelection::Range {
-                    axis: 0,
-                    start: expert,
-                    end: expert + 1,
-                },
-            )
-        } else {
-            DerivedWeightRecipe::Stack {
-                axis: 0,
-                inputs: vec![DerivedWeightRecipe::source(
-                    normalized
-                        .get(&format!("{prefix}.{expert}.{projection}.weight"))
-                        .ok_or_else(|| {
-                            format!("missing split Nemotron-H expert {expert} {projection}")
-                        })?
-                        .clone(),
-                    TensorSelection::Full,
-                )],
+    for (projection, spec) in [("up_proj", bank.up()), ("down_proj", bank.down())] {
+        let primary = spec.weight().id.as_str();
+        for (binding_suffix, source_suffix, present) in [
+            ("", "weight", true),
+            ("_scales", "scales", spec.format().scale().is_some()),
+            ("_biases", "biases", spec.format().affine_bias().is_some()),
+        ] {
+            if !present {
+                continue;
             }
-        };
-        recipes.insert(projection.into(), recipe);
-        if packed {
-            for suffix in ["scales", "biases"] {
-                if let Some(raw) = normalized.get(&format!("{runtime}.{suffix}")) {
-                    recipes.insert(
-                        format!("{projection}_{suffix}"),
-                        DerivedWeightRecipe::source(
-                            raw.clone(),
-                            TensorSelection::Range {
-                                axis: 0,
-                                start: expert,
-                                end: expert + 1,
-                            },
-                        ),
-                    );
-                }
-            }
+            let recipe = if packed {
+                let source = if binding_suffix.is_empty() {
+                    primary.to_owned()
+                } else {
+                    format!("{primary}.{source_suffix}")
+                };
+                let raw = normalized
+                    .get(&source)
+                    .ok_or_else(|| format!("missing packed Nemotron-H tensor {source}"))?;
+                DerivedWeightRecipe::source(
+                    raw.clone(),
+                    expert.map_or(TensorSelection::Full, |_| TensorSelection::Range {
+                        axis: 0,
+                        start: range.start,
+                        end: range.end,
+                    }),
+                )
+            } else {
+                let inputs = range
+                    .clone()
+                    .map(|expert| {
+                        let source = format!("{prefix}.{expert}.{projection}.{source_suffix}");
+                        normalized
+                            .get(&source)
+                            .cloned()
+                            .map(|raw| DerivedWeightRecipe::source(raw, TensorSelection::Full))
+                            .ok_or_else(|| format!("missing split Nemotron-H tensor {source}"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                DerivedWeightRecipe::Stack { axis: 0, inputs }
+            };
+            recipes.insert(format!("{projection}{binding_suffix}"), recipe);
         }
     }
     Ok(recipes)
@@ -399,84 +368,47 @@ pub fn expert_recipes(
 /// Builds the complete architecture-owned schedule for independently resident experts.
 pub fn expert_residency_catalog(
     store: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
-    args: &ModelArgs,
+    declaration: &super::Declaration,
 ) -> Result<crate::ExpertResidencyCatalog, String> {
+    let args = declaration.args();
     args.validate().map_err(|error| error.to_string())?;
     if !args.has_sparse_moe_layers() {
         return Err("Nemotron-H expert residency requires sparse MoE units".into());
     }
-    let target = usize::try_from(args.num_hidden_layers)
-        .map_err(|_| "invalid Nemotron-H target layer count".to_string())?;
-    let experts = usize::try_from(args.n_routed_experts)
-        .map_err(|_| "invalid Nemotron-H expert count".to_string())?;
-    let prediction_steps = usize::try_from(args.num_nextn_predict_layers)
-        .map_err(|_| "invalid Nemotron-H MTP prediction count".to_string())?;
-    let prediction_policies = args.mtp_policies().map_err(|error| error.to_string())?;
-    let prediction_pattern = if prediction_steps == 0 {
-        0
-    } else {
-        prediction_policies
-            .len()
-            .checked_div(prediction_steps)
-            .filter(|pattern| *pattern > 0)
-            .ok_or_else(|| "Nemotron-H MTP operator pattern cannot be empty".to_string())?
-    };
-    let sparse_units = args
-        .layer_schedule
-        .iter()
-        .filter(|policy| **policy == LayerPolicy::SparseMoe)
-        .count()
-        .checked_add(
-            prediction_policies
-                .iter()
-                .filter(|policy| **policy == LayerPolicy::SparseMoe)
-                .count(),
-        )
-        .ok_or_else(|| "Nemotron-H sparse unit count overflowed".to_string())?;
-    let capacity = sparse_units
-        .checked_mul(experts)
-        .ok_or_else(|| "Nemotron-H expert residency catalog size overflowed".to_string())?;
+    let layout = declaration.definition().parameters().unit_layout();
+    let banks = declaration.expert_banks();
+    let capacity = banks.values().try_fold(0usize, |total, bank| {
+        total
+            .checked_add(bank.group_count() as usize)
+            .ok_or_else(|| "Nemotron-H expert residency catalog size overflowed".to_string())
+    })?;
     let mut units = Vec::with_capacity(capacity);
 
-    for (identity_layer, policy) in args.layer_schedule.iter().copied().enumerate() {
-        if policy != LayerPolicy::SparseMoe {
-            continue;
-        }
+    for (identity_layer, bank) in banks {
+        let address = layout
+            .address(identity_layer)
+            .ok_or_else(|| "unresolved Nemotron-H expert invocation".to_string())?;
+        let owner_group = layout
+            .group_id(address.group())
+            .ok_or_else(|| "unresolved Nemotron-H expert owner".to_string())?
+            .clone();
+        let unit_path = declaration
+            .definition()
+            .unit(address.group(), address.index())
+            .map_err(|error| error.to_string())?
+            .path
+            .clone();
         add_expert_residency_units(
             &mut units,
             store,
             args,
             SparseUnitResidency {
                 identity_layer,
-                owner_group: "target".to_owned(),
-                owner_unit: identity_layer,
-                unit_path: format!("model.layers.{identity_layer}"),
-                expert_root: format!("model.layers.{identity_layer}.moe.experts"),
+                owner_group,
+                owner_unit: address.index(),
+                unit_path,
             },
-            experts,
-        )?;
-    }
-    for (physical, policy) in prediction_policies.into_iter().enumerate() {
-        if policy != LayerPolicy::SparseMoe {
-            continue;
-        }
-        let depth = physical / prediction_pattern;
-        let owner_unit = physical % prediction_pattern;
-        let identity_layer = target
-            .checked_add(physical)
-            .ok_or_else(|| "Nemotron-H MTP identity layer overflowed".to_string())?;
-        add_expert_residency_units(
-            &mut units,
-            store,
-            args,
-            SparseUnitResidency {
-                identity_layer,
-                owner_group: format!("mtp.{depth}"),
-                owner_unit,
-                unit_path: format!("model.mtp.layers.{physical}"),
-                expert_root: format!("model.mtp.layers.{physical}.mixer.experts"),
-            },
-            experts,
+            &bank,
         )?;
     }
     crate::ExpertResidencyCatalog::new(units)
@@ -486,10 +418,9 @@ pub fn expert_residency_catalog(
 
 struct SparseUnitResidency {
     identity_layer: usize,
-    owner_group: String,
+    owner_group: eredu_runtime::ExecutionGroupId,
     owner_unit: usize,
     unit_path: String,
-    expert_root: String,
 }
 
 fn add_expert_residency_units(
@@ -497,12 +428,11 @@ fn add_expert_residency_units(
     store: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
     args: &ModelArgs,
     topology: SparseUnitResidency,
-    experts: usize,
+    bank: &eredu_nn::GroupedRelu2Spec,
 ) -> Result<(), String> {
-    let owner_group = eredu_runtime::ExecutionGroupId::new(topology.owner_group)
-        .map_err(|error| error.to_string())?;
-    for expert in 0..experts {
-        let recipes = expert_recipes(store, args, topology.identity_layer, expert)?;
+    let owner_group = topology.owner_group;
+    for expert in 0..bank.group_count() as usize {
+        let recipes = expert_recipes_for_bank(store, args, topology.identity_layer, expert, bank)?;
         let up_quantizable =
             !recipes.contains_key("up_proj_scales") && !recipes.contains_key("up_proj_biases");
         let down_quantizable =
@@ -510,7 +440,7 @@ fn add_expert_residency_units(
         let parameters = recipes
             .into_iter()
             .map(|(binding, recipe)| {
-                let target = format!("{}.{binding}", topology.expert_root);
+                let target = expert_binding_target(bank, &binding)?;
                 let role = match binding.as_str() {
                     "up_proj" if up_quantizable => {
                         crate::ExpertParameterRole::quantizable_projection(
@@ -545,43 +475,51 @@ fn add_expert_residency_units(
     Ok(())
 }
 
-/// Builds the strict SafeTensors catalog plan for target and MTP units.
-pub fn safetensors_plan(args: &ModelArgs) -> Result<SafetensorsCheckpointPlan, String> {
-    let hidden = dimension(args.hidden_size, "hidden size")?;
-    let vocab = dimension(args.vocab_size, "vocabulary size")?;
+fn logical_shape(
+    spec: &impl DeclareLogicalParameters,
+    slot: &eredu_nn::ParameterSpec,
+) -> Result<Vec<usize>, String> {
+    spec.logical_parameters()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|d| d.parameter.id == slot.id)
+        .map(|d| d.shape)
+        .ok_or_else(|| format!("unresolved logical parameter {}", slot.id))
+}
+
+pub(super) fn safetensors_plan_from_declaration(
+    declaration: &super::Declaration,
+) -> Result<SafetensorsCheckpointPlan, String> {
+    let args = declaration.args();
+    let statics = &declaration.statics;
     let mut common = Vec::new();
     let mut groups = Vec::new();
-    add_safe_alias(
-        args,
-        &mut common,
-        "backbone.embeddings.weight",
-        "model.embeddings.weight",
-        vec![vocab, hidden],
-    )?;
-    add_safe_alias(
-        args,
+    for declaration in statics
+        .embedding_spec()
+        .logical_parameters()
+        .map_err(|e| e.to_string())?
+    {
+        add_safe_declaration(&mut common, "backbone.embeddings.weight", &declaration)?;
+    }
+    add_safe_normalization(
         &mut common,
         "backbone.norm_f.weight",
-        "model.norm_f.weight",
-        vec![hidden],
+        statics.normalization_spec(),
     )?;
-    if !args.tie_word_embeddings {
-        add_safe_matrix(args, &mut common, "lm_head.weight", vec![vocab, hidden])?;
+    if let Some(head) = statics.head_spec() {
+        for declaration in head.logical_parameters().map_err(|e| e.to_string())? {
+            add_safe_declaration(&mut common, declaration.parameter.id.as_str(), &declaration)?;
+        }
     }
 
-    for (layer, policy) in args.layer_schedule.iter().copied().enumerate() {
+    for (layer, block) in declaration.blocks.iter().enumerate() {
         let official = format!("backbone.layers.{layer}");
         let canonical = format!("model.layers.{layer}");
-        add_safe_alias(
-            args,
-            &mut common,
-            &format!("{official}.norm.weight"),
-            &format!("{canonical}.norm.weight"),
-            vec![hidden],
-        )?;
+        add_safe_normalization(&mut common, &format!("{official}.norm.weight"), &block.norm)?;
         add_safe_layer(
             args,
-            policy,
+            block,
+            false,
             &official,
             &canonical,
             &format!("layer {layer}"),
@@ -591,31 +529,20 @@ pub fn safetensors_plan(args: &ModelArgs) -> Result<SafetensorsCheckpointPlan, S
     }
 
     if args.num_nextn_predict_layers > 0 {
-        let policies = args.mtp_policies().map_err(|error| error.to_string())?;
-        let steps = dimension(args.num_nextn_predict_layers, "MTP prediction-step count")?;
-        if !policies.len().is_multiple_of(steps) {
-            return Err(format!(
-                "Nemotron-H MTP policy count {} is not divisible by prediction-step count {steps}",
-                policies.len()
-            ));
-        }
-        let pattern_len = policies.len() / steps;
-        if pattern_len == 0 {
-            return Err("Nemotron-H MTP operator pattern cannot be empty".into());
-        }
-        for (layer, policy) in policies.iter().copied().enumerate() {
+        let (_, _, layout) =
+            super::parameters::execution_schedule(args).map_err(|error| error.to_string())?;
+        for (layer, parameters) in declaration.predictions.iter().enumerate() {
             let official = format!("mtp.layers.{layer}");
             let canonical = format!("model.mtp.layers.{layer}");
-            add_safe_alias(
-                args,
+            add_safe_normalization(
                 &mut common,
                 &format!("{official}.norm.weight"),
-                &format!("{canonical}.norm.weight"),
-                vec![hidden],
+                &parameters.block.norm,
             )?;
-            add_safe_mtp_layer(
+            add_safe_layer(
                 args,
-                policy,
+                &parameters.block,
+                true,
                 &official,
                 &canonical,
                 &format!("MTP physical layer {layer}"),
@@ -623,31 +550,26 @@ pub fn safetensors_plan(args: &ModelArgs) -> Result<SafetensorsCheckpointPlan, S
                 &mut groups,
             )?;
         }
-        for step in 0..steps {
-            let start = checked_mul(step, pattern_len, "MTP physical layer offset")?;
-            let end = start
-                .checked_add(pattern_len - 1)
-                .ok_or_else(|| "Nemotron-H MTP physical layer range overflows".to_string())?;
-            for (layer, suffix, shape) in [
-                (start, "enorm.weight", vec![hidden]),
-                (start, "hnorm.weight", vec![hidden]),
-                (
-                    start,
-                    "eh_proj.weight",
-                    vec![
-                        hidden,
-                        checked_mul(hidden, 2, "MTP concatenated hidden width")?,
-                    ],
-                ),
-                (end, "final_layernorm.weight", vec![hidden]),
-            ] {
-                add_safe_alias(
-                    args,
-                    &mut common,
-                    &format!("mtp.layers.{layer}.{suffix}"),
-                    &format!("model.mtp.layers.{layer}.{suffix}"),
-                    shape,
-                )?;
+        for group in 1..layout.group_count() {
+            let range = layout
+                .group_range(group)
+                .ok_or("unresolved Nemotron-H prediction range")?;
+            for relative in 0..range.len() {
+                let physical = layout
+                    .ordinal(group, relative)
+                    .and_then(|ordinal| ordinal.checked_sub(args.num_hidden_layers as usize))
+                    .ok_or("unresolved prediction invocation")?;
+                let parameters = &declaration.predictions[physical];
+                for declaration in parameters
+                    .boundary_parameters()
+                    .map_err(|error| error.to_string())?
+                {
+                    let canonical = declaration.parameter.id.as_str();
+                    let official = canonical.strip_prefix("model.").ok_or_else(|| {
+                        format!("invalid Nemotron-H prediction identity {canonical}")
+                    })?;
+                    add_safe_declaration(&mut common, official, &declaration)?;
+                }
             }
         }
     }
@@ -660,212 +582,122 @@ pub fn safetensors_plan(args: &ModelArgs) -> Result<SafetensorsCheckpointPlan, S
 
 fn add_safe_layer(
     args: &ModelArgs,
-    policy: LayerPolicy,
+    block: &super::declarations::TargetBlockParameters,
+    prediction: bool,
     official: &str,
     canonical: &str,
     label: &str,
     common: &mut Vec<SafetensorsTensorConstraint>,
     groups: &mut Vec<AlternativeLayoutGroup<SafetensorsTensorConstraint>>,
 ) -> Result<(), String> {
-    match policy {
-        LayerPolicy::Mamba => add_safe_mamba(args, official, canonical, common),
-        LayerPolicy::SelfAttention(_) => {
-            add_safe_attention(args, official, canonical, "attention", common)
-        }
-        LayerPolicy::DenseMlp => add_safe_dense(args, official, canonical, common),
-        LayerPolicy::SparseMoe => {
-            add_safe_moe(args, official, canonical, "moe", label, common, groups)
-        }
-    }
-}
-
-fn add_safe_mtp_layer(
-    args: &ModelArgs,
-    policy: LayerPolicy,
-    official: &str,
-    canonical: &str,
-    label: &str,
-    common: &mut Vec<SafetensorsTensorConstraint>,
-    groups: &mut Vec<AlternativeLayoutGroup<SafetensorsTensorConstraint>>,
-) -> Result<(), String> {
-    match policy {
-        LayerPolicy::SelfAttention(_) => {
-            add_safe_attention(args, official, canonical, "mixer", common)
-        }
-        LayerPolicy::SparseMoe => {
-            add_safe_moe(args, official, canonical, "mixer", label, common, groups)
-        }
-        _ => Err(format!(
-            "Nemotron-H {label} uses unsupported policy {policy:?}"
-        )),
+    use super::declarations::TargetOperatorParameters as P;
+    match &block.operator {
+        P::Mamba(spec) => add_safe_mamba(spec, official, canonical, common),
+        P::Attention(spec) => add_safe_attention(
+            spec,
+            official,
+            canonical,
+            if prediction { "mixer" } else { "attention" },
+            common,
+        ),
+        P::Dense(spec) => add_safe_dense(spec, official, canonical, common),
+        P::Sparse(spec) => add_safe_moe(
+            args,
+            spec,
+            official,
+            canonical,
+            if prediction { "mixer" } else { "moe" },
+            label,
+            common,
+            groups,
+        ),
     }
 }
 
 fn add_safe_mamba(
-    args: &ModelArgs,
+    spec: &super::mamba::Mamba2Spec,
     official: &str,
     canonical: &str,
     output: &mut Vec<SafetensorsTensorConstraint>,
 ) -> Result<(), String> {
-    let hidden = dimension(args.hidden_size, "hidden size")?;
-    let heads = dimension(args.mamba_num_heads, "Mamba head count")?;
-    let head = dimension(args.mamba_head_dim, "Mamba head width")?;
-    let groups = dimension(args.n_groups, "Mamba state group count")?;
-    let state = dimension(args.ssm_state_size, "Mamba state width")?;
-    let kernel = dimension(args.conv_kernel, "Mamba convolution width")?;
-    let intermediate = checked_mul(heads, head, "Mamba intermediate width")?;
-    let grouped_state = checked_mul(groups, state, "Mamba grouped state width")?;
-    let recurrent = RecurrentParameterGroupSchema::new(heads, groups, head, state)?;
-    let conv = checked_add(
-        intermediate,
-        checked_mul(2, grouped_state, "Mamba B/C state width")?,
-        "Mamba convolution channels",
-    )?;
-    let projection_schema = FusedSegmentedProjectionSchema::new(
-        hidden,
-        [
-            FusedProjectionSegment::new("gate", intermediate)?,
-            FusedProjectionSegment::new("value", intermediate)?,
-            FusedProjectionSegment::new("input_state", grouped_state)?,
-            FusedProjectionSegment::new("output_state", grouped_state)?,
-            FusedProjectionSegment::new("time_step", heads)?,
-        ],
-    )?;
-    let projection = projection_schema.output_width();
-    let convolution = DepthwiseConvolutionSchema::new(conv, kernel, args.use_conv_bias)?;
-    for (source, target, shape) in [
-        (
-            "in_proj.weight",
-            "in_proj.weight",
-            projection_schema.matrix_shape(),
-        ),
-        (
-            "conv1d.weight",
-            "conv1d.weight",
-            convolution.storage_shape(),
-        ),
-        ("dt_bias", "dt_bias", recurrent.per_head_shape().to_vec()),
-        ("A_log", "A_log", recurrent.per_head_shape().to_vec()),
-        ("D", "D", recurrent.per_head_shape().to_vec()),
-        ("norm.weight", "norm.weight", vec![intermediate]),
-        (
-            "out_proj.weight",
-            "out_proj.weight",
-            vec![hidden, intermediate],
-        ),
-    ] {
-        add_safe_alias(
-            args,
-            output,
-            &format!("{official}.mixer.{source}"),
-            &format!("{canonical}.mamba.{target}"),
-            shape,
-        )?;
-    }
-    if args.use_conv_bias {
-        add_safe_alias(
-            args,
-            output,
-            &format!("{official}.mixer.conv1d.bias"),
-            &format!("{canonical}.mamba.conv1d.bias"),
-            convolution
-                .bias_shape()
-                .expect("bias-enabled convolution schema"),
-        )?;
-    }
-    if args.use_bias {
-        for (projection_name, size) in [("in_proj", projection), ("out_proj", hidden)] {
-            add_safe_alias(
-                args,
-                output,
-                &format!("{official}.mixer.{projection_name}.bias"),
-                &format!("{canonical}.mamba.{projection_name}.bias"),
-                vec![size],
-            )?;
-        }
+    let prefix = format!("{canonical}.mamba");
+    let mut declarations = spec.logical_parameters().map_err(|e| e.to_string())?;
+    declarations.sort_by_key(|d| {
+        mamba_storage_order(
+            d.parameter
+                .id
+                .as_str()
+                .strip_prefix(&format!("{prefix}."))
+                .expect("declared mixer prefix"),
+        )
+    });
+    for declaration in declarations {
+        let target = declaration.parameter.id.as_str();
+        let field = target
+            .strip_prefix(&format!("{prefix}."))
+            .expect("declared mixer prefix");
+        add_safe_declaration(output, &format!("{official}.mixer.{field}"), &declaration)?;
     }
     Ok(())
 }
 
+// Stable storage order is independent of the construction visitor's traversal order.
+fn mamba_storage_order(field: &str) -> usize {
+    [
+        "in_proj.weight",
+        "conv1d.weight",
+        "dt_bias",
+        "A_log",
+        "D",
+        "norm.weight",
+        "out_proj.weight",
+        "conv1d.bias",
+        "in_proj.bias",
+        "out_proj.bias",
+    ]
+    .iter()
+    .position(|&candidate| candidate == field)
+    .expect("declared Mamba slot")
+}
+
 fn add_safe_attention(
-    args: &ModelArgs,
+    spec: &super::attention::AttentionParameters,
     official: &str,
     canonical: &str,
     canonical_field: &str,
     output: &mut Vec<SafetensorsTensorConstraint>,
 ) -> Result<(), String> {
-    let hidden = dimension(args.hidden_size, "hidden size")?;
-    let head = dimension(args.head_dim, "attention head width")?;
-    let query = checked_mul(
-        dimension(args.num_attention_heads, "attention head count")?,
-        head,
-        "query projection width",
-    )?;
-    let key_value = checked_mul(
-        dimension(args.num_key_value_heads, "key/value head count")?,
-        head,
-        "key/value projection width",
-    )?;
-    for (projection, outer, inner) in [
-        ("q_proj", query, hidden),
-        ("k_proj", key_value, hidden),
-        ("v_proj", key_value, hidden),
-        ("o_proj", hidden, query),
-    ] {
-        add_safe_alias(
-            args,
-            output,
-            &format!("{official}.mixer.{projection}.weight"),
-            &format!("{canonical}.{canonical_field}.{projection}.weight"),
-            vec![outer, inner],
-        )?;
-        if args.attention_bias {
-            add_safe_alias(
-                args,
-                output,
-                &format!("{official}.mixer.{projection}.bias"),
-                &format!("{canonical}.{canonical_field}.{projection}.bias"),
-                vec![outer],
-            )?;
-        }
+    let prefix = format!("{canonical}.{canonical_field}");
+    for declaration in spec.logical_parameters().map_err(|e| e.to_string())? {
+        let target = declaration.parameter.id.as_str();
+        let field = target
+            .strip_prefix(&format!("{prefix}."))
+            .expect("declared attention prefix");
+        add_safe_declaration(output, &format!("{official}.mixer.{field}"), &declaration)?;
     }
     Ok(())
 }
 
 fn add_safe_dense(
-    args: &ModelArgs,
+    spec: &super::mlp::DenseParameters,
     official: &str,
     canonical: &str,
     output: &mut Vec<SafetensorsTensorConstraint>,
 ) -> Result<(), String> {
-    let hidden = dimension(args.hidden_size, "hidden size")?;
-    let intermediate = dimension(args.intermediate_size, "dense intermediate width")?;
-    for (projection, shape, bias) in [
-        ("up_proj", vec![intermediate, hidden], intermediate),
-        ("down_proj", vec![hidden, intermediate], hidden),
-    ] {
-        add_safe_alias(
-            args,
-            output,
-            &format!("{official}.mixer.{projection}.weight"),
-            &format!("{canonical}.mlp.{projection}.weight"),
-            shape,
-        )?;
-        if args.mlp_bias {
-            add_safe_alias(
-                args,
-                output,
-                &format!("{official}.mixer.{projection}.bias"),
-                &format!("{canonical}.mlp.{projection}.bias"),
-                vec![bias],
-            )?;
-        }
+    let prefix = format!("{canonical}.mlp");
+    for declaration in spec.logical_parameters().map_err(|e| e.to_string())? {
+        let target = declaration.parameter.id.as_str();
+        let field = target
+            .strip_prefix(&format!("{prefix}."))
+            .expect("declared MLP prefix");
+        add_safe_declaration(output, &format!("{official}.mixer.{field}"), &declaration)?;
     }
     Ok(())
 }
 
 fn add_safe_moe(
     args: &ModelArgs,
+    spec: &super::mlp::SparseMoeSpec,
     official: &str,
     canonical: &str,
     canonical_field: &str,
@@ -873,73 +705,62 @@ fn add_safe_moe(
     common: &mut Vec<SafetensorsTensorConstraint>,
     groups: &mut Vec<AlternativeLayoutGroup<SafetensorsTensorConstraint>>,
 ) -> Result<(), String> {
-    let hidden = dimension(args.hidden_size, "hidden size")?;
-    let experts = dimension(args.n_routed_experts, "routed expert count")?;
-    let intermediate = dimension(args.moe_intermediate_size, "expert intermediate width")?;
-    let shared = dimension(
-        args.moe_shared_expert_intermediate_size,
-        "shared expert intermediate width",
-    )?;
-    for (suffix, shape) in [
-        ("gate.weight", vec![experts, hidden]),
-        ("gate.e_score_correction_bias", vec![experts]),
-        ("shared_experts.up_proj.weight", vec![shared, hidden]),
-        ("shared_experts.down_proj.weight", vec![hidden, shared]),
+    let prefix = format!("{canonical}.{canonical_field}");
+    let canonical_experts = format!("{prefix}.experts");
+    let selector = &spec.selector;
+    let shared = &spec.shared;
+    let bank = &spec.experts;
+    let mut ordinary = selector.logical_parameters().map_err(|e| e.to_string())?;
+    for role in [
+        eredu_nn::LogicalParameterRole::LinearWeight,
+        eredu_nn::LogicalParameterRole::LinearBias,
     ] {
-        add_safe_alias(
-            args,
-            common,
-            &format!("{official}.mixer.{suffix}"),
-            &format!("{canonical}.{canonical_field}.{suffix}"),
-            shape,
-        )?;
-    }
-    if args.mlp_bias {
-        for (projection, size) in [("up_proj", shared), ("down_proj", hidden)] {
-            add_safe_alias(
-                args,
-                common,
-                &format!("{official}.mixer.shared_experts.{projection}.bias"),
-                &format!("{canonical}.{canonical_field}.shared_experts.{projection}.bias"),
-                vec![size],
-            )?;
+        for spec in shared.network.projections() {
+            ordinary.extend(
+                spec.logical_parameters()
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .filter(|d| d.role == role),
+            );
         }
     }
-
+    for declaration in ordinary {
+        let target = declaration.parameter.id.as_str();
+        let field = target
+            .strip_prefix(&format!("{prefix}."))
+            .expect("declared MoE prefix");
+        add_safe_declaration(common, &format!("{official}.mixer.{field}"), &declaration)?;
+    }
     let official_experts = format!("{official}.mixer.experts");
-    let canonical_experts = format!("{canonical}.{canonical_field}.experts");
+    let declarations = bank.logical_parameters().map_err(|e| e.to_string())?;
     let mut packed = Vec::new();
-    add_safe_alias(
-        args,
-        &mut packed,
-        &format!("{official_experts}.up_proj"),
-        &format!("{canonical_experts}.up_proj"),
-        vec![experts, intermediate, hidden],
-    )?;
-    add_safe_alias(
-        args,
-        &mut packed,
-        &format!("{official_experts}.down_proj"),
-        &format!("{canonical_experts}.down_proj"),
-        vec![experts, hidden, intermediate],
-    )?;
-    let mut split = Vec::new();
-    for expert in 0..experts {
-        add_safe_alias(
-            args,
-            &mut split,
-            &format!("{official_experts}.{expert}.up_proj.weight"),
-            &format!("{canonical_experts}.{expert}.up_proj.weight"),
-            vec![intermediate, hidden],
-        )?;
-        add_safe_alias(
-            args,
-            &mut split,
-            &format!("{official_experts}.{expert}.down_proj.weight"),
-            &format!("{canonical_experts}.{expert}.down_proj.weight"),
-            vec![hidden, intermediate],
+    for declaration in &declarations {
+        let target = declaration.parameter.id.as_str();
+        let field = target
+            .strip_prefix(&format!("{canonical_experts}."))
+            .expect("declared expert prefix");
+        add_safe_declaration(
+            &mut packed,
+            &format!("{official_experts}.{field}"),
+            declaration,
         )?;
     }
+    let mut split = Vec::new();
+    visit_split_expert_sources(bank, |declaration, target, shape| {
+        let suffix = target
+            .strip_prefix(&canonical_experts)
+            .expect("declared independent expert root");
+        let format = declaration
+            .linear_format
+            .map(|_| args.weight_quantization_for(&target).into());
+        split.extend(safe_alias_constraints(
+            &format!("{official_experts}{suffix}"),
+            &target,
+            shape,
+            format,
+        )?);
+        Ok(())
+    })?;
     groups.push(AlternativeLayoutGroup {
         id: format!("Nemotron-H {label} routed experts"),
         required: true,
@@ -967,39 +788,107 @@ fn add_safe_moe(
     Ok(())
 }
 
-fn add_safe_alias(
-    args: &ModelArgs,
+/// Projects source matrix geometry by joining released identities to retained
+/// logical slots. Format constraints select source names, never logical widths.
+pub(crate) fn source_linear_shapes(
+    declaration: &super::Declaration,
+) -> Result<BTreeMap<String, Vec<usize>>, String> {
+    let args = declaration.args();
+    let mut logical = declaration
+        .definition()
+        .parameters()
+        .groups()
+        .iter()
+        .flat_map(|group| group.members())
+        .filter(|member| {
+            matches!(
+                member.logical_role(),
+                Some(
+                    eredu_nn::LogicalParameterRole::LinearWeight
+                        | eredu_nn::LogicalParameterRole::Embedding
+                )
+            )
+        })
+        .filter_map(|member| {
+            member
+                .logical_shape()
+                .filter(|shape| shape.len() == 2)
+                .map(|shape| (member.target().to_owned(), shape.to_vec()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    for bank in declaration.expert_banks().values() {
+        visit_split_expert_sources(bank, |_, target, shape| {
+            logical.insert(target, shape);
+            Ok(())
+        })?;
+    }
+    let plan = declaration.safetensors_plan()?;
+    let mut sources = BTreeMap::new();
+    for constraint in plan.common_tensors.iter().chain(
+        plan.layout_groups
+            .iter()
+            .flat_map(|group| &group.variants)
+            .flat_map(|variant| &variant.tensors),
+    ) {
+        let canonical = normalized_parameter_key(&constraint.key, args)?;
+        if let Some(shape) = logical.get(&canonical) {
+            sources.insert(constraint.key.clone(), shape.clone());
+        }
+    }
+    Ok(sources)
+}
+
+fn visit_split_expert_sources(
+    bank: &eredu_nn::GroupedRelu2Spec,
+    mut visit: impl FnMut(
+        &eredu_nn::LogicalParameterDeclaration<'_>,
+        String,
+        Vec<usize>,
+    ) -> Result<(), String>,
+) -> Result<(), String> {
+    let root = expert_source_root(bank)?;
+    let declarations = bank.logical_parameters().map_err(|e| e.to_string())?;
+    for expert in 0..bank.group_count() as usize {
+        for declaration in &declarations {
+            let field = declaration
+                .parameter
+                .id
+                .as_str()
+                .strip_prefix(root)
+                .ok_or("Nemotron-H expert projection differs from its declared root")?;
+            visit(
+                declaration,
+                format!("{root}.{expert}{field}.weight"),
+                declaration.shape[1..].to_vec(),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Source aliases borrow exact geometry and encoding eligibility from the neural slot.
+pub(super) fn add_safe_declaration(
     output: &mut Vec<SafetensorsTensorConstraint>,
     official: &str,
-    canonical: &str,
-    shape: Vec<usize>,
+    declaration: &eredu_nn::LogicalParameterDeclaration<'_>,
 ) -> Result<(), String> {
-    let quantizable = shape.len() >= 2
-        && (canonical.ends_with(".weight")
-            || canonical.ends_with(".experts.up_proj")
-            || canonical.ends_with(".experts.down_proj"))
-        && !canonical.contains(".conv1d.weight")
-        && !canonical.ends_with(".moe.gate.weight");
-    let quantization = quantizable
-        .then(|| args.weight_quantization_for(canonical))
-        .flatten();
     output.extend(safe_alias_constraints(
         official,
-        canonical,
-        shape,
-        quantization,
+        declaration.parameter.id.as_str(),
+        declaration.shape.clone(),
+        declaration.linear_format.map(|format| format.encoding()),
     )?);
     Ok(())
 }
 
-fn add_safe_matrix(
-    args: &ModelArgs,
+fn add_safe_normalization(
     output: &mut Vec<SafetensorsTensorConstraint>,
-    name: &str,
-    shape: Vec<usize>,
+    official: &str,
+    spec: &eredu_nn::NormalizationConstructionSpec,
 ) -> Result<(), String> {
-    let quantization = args.weight_quantization_for(name);
-    output.extend(safe_alias_constraints(name, name, shape, quantization)?);
+    for declaration in spec.logical_parameters().map_err(|e| e.to_string())? {
+        add_safe_declaration(output, official, &declaration)?;
+    }
     Ok(())
 }
 
@@ -1007,7 +896,7 @@ fn safe_alias_constraints(
     official: &str,
     canonical: &str,
     shape: Vec<usize>,
-    quantization: Option<WeightQuantization>,
+    format: Option<eredu_checkpoint::LinearFormat>,
 ) -> Result<Vec<SafetensorsTensorConstraint>, String> {
     let mut names = vec![official.to_string(), canonical.to_string()];
     names.sort();
@@ -1018,13 +907,13 @@ fn safe_alias_constraints(
         .filter(|name| **name != primary)
         .cloned()
         .collect::<Vec<_>>();
-    let Some(quantization) = quantization else {
-        return Ok(vec![SafetensorsTensorConstraint::required(
-            primary,
-            shape,
-            StoredDtypeConstraint::Floating,
-        )
-        .with_aliases(aliases)]);
+    let Some(quantization) = format.and_then(eredu_checkpoint::LinearFormat::weight_quantization)
+    else {
+        let mut tensor =
+            SafetensorsTensorConstraint::required(primary, shape, StoredDtypeConstraint::Floating)
+                .with_aliases(aliases);
+        tensor.linear_format = format;
+        return Ok(vec![tensor]);
     };
     let input = *shape
         .last()
@@ -1047,7 +936,8 @@ fn safe_alias_constraints(
         packed_shape,
         StoredDtypeConstraint::Exact(StoredDtype::U32),
     )
-    .with_aliases(aliases)];
+    .with_aliases(aliases)
+    .with_linear_format(quantization.into())];
     let companion_dtype = || {
         StoredDtypeConstraint::OneOf(vec![
             StoredDtype::F16,
@@ -1094,37 +984,49 @@ fn outer_prefix(name: &str) -> &str {
     name.strip_suffix(".weight").unwrap_or(name)
 }
 
-/// Builds the strict GGUF tensor plan for the normalized physical schedule.
-pub fn gguf_plan(args: &ModelArgs) -> Result<GgufCheckpointPlan, String> {
-    let hidden = dimension(args.hidden_size, "hidden size")?;
-    let vocab = dimension(args.vocab_size, "vocabulary size")?;
+pub(super) fn gguf_plan_from_declaration(
+    declaration: &super::Declaration,
+) -> Result<GgufCheckpointPlan, String> {
+    let statics = &declaration.statics;
     let mut tensors = vec![
         gguf(
             "token_embd.weight",
-            vec![vocab, hidden],
+            logical_shape(statics.embedding_spec(), &statics.embedding_spec().weight)?,
             TensorOperation::Matrix,
         ),
-        gguf("output_norm.weight", vec![hidden], TensorOperation::Vector),
+        gguf(
+            "output_norm.weight",
+            statics
+                .normalization_spec()
+                .logical_parameters()
+                .map_err(|e| e.to_string())?[0]
+                .shape
+                .clone(),
+            TensorOperation::Vector,
+        ),
     ];
-    if !args.tie_word_embeddings {
+    if let Some(head) = statics.head_spec() {
         tensors.push(gguf(
             "output.weight",
-            vec![vocab, hidden],
+            logical_shape(head, &head.weight)?,
             TensorOperation::Matrix,
         ));
     }
-    for (layer, policy) in args.layer_schedule.iter().copied().enumerate() {
+    for (layer, scope) in declaration.blocks.iter().enumerate() {
         let block = format!("blk.{layer}");
         tensors.push(gguf(
             format!("{block}.attn_norm.weight"),
-            vec![hidden],
+            scope.norm.logical_parameters().map_err(|e| e.to_string())?[0]
+                .shape
+                .clone(),
             TensorOperation::Vector,
         ));
-        match policy {
-            LayerPolicy::Mamba => add_gguf_mamba(args, &block, &mut tensors)?,
-            LayerPolicy::SelfAttention(_) => add_gguf_attention(args, &block, &mut tensors)?,
-            LayerPolicy::DenseMlp => add_gguf_dense(args, &block, &mut tensors)?,
-            LayerPolicy::SparseMoe => add_gguf_moe(args, &block, &mut tensors)?,
+        use super::declarations::TargetOperatorParameters as P;
+        match &scope.operator {
+            P::Mamba(spec) => add_gguf_mamba(spec, &block, &mut tensors)?,
+            P::Attention(spec) => add_gguf_attention(spec, &block, &mut tensors)?,
+            P::Dense(spec) => add_gguf_dense(spec, &block, &mut tensors)?,
+            P::Sparse(spec) => add_gguf_moe(spec, &block, &mut tensors)?,
         }
     }
     let mut policy = CatalogPolicy::strict();
@@ -1134,232 +1036,146 @@ pub fn gguf_plan(args: &ModelArgs) -> Result<GgufCheckpointPlan, String> {
 }
 
 fn add_gguf_mamba(
-    args: &ModelArgs,
+    spec: &super::mamba::Mamba2Spec,
     block: &str,
     output: &mut Vec<GgufTensorConstraint>,
 ) -> Result<(), String> {
-    let hidden = dimension(args.hidden_size, "hidden size")?;
-    let heads = dimension(args.mamba_num_heads, "Mamba head count")?;
-    let intermediate = checked_mul(
-        heads,
-        dimension(args.mamba_head_dim, "Mamba head width")?,
-        "Mamba intermediate width",
-    )?;
-    let conv = checked_add(
-        intermediate,
-        checked_mul(
-            2,
-            checked_mul(
-                dimension(args.n_groups, "Mamba state group count")?,
-                dimension(args.ssm_state_size, "Mamba state width")?,
-                "Mamba grouped state width",
-            )?,
-            "Mamba B/C state width",
-        )?,
-        "Mamba convolution channels",
-    )?;
-    let projection = checked_add(
-        checked_add(intermediate, conv, "Mamba projection content width")?,
-        heads,
-        "Mamba projection width",
-    )?;
-    output.extend([
-        gguf(
-            format!("{block}.ssm_in.weight"),
-            vec![projection, hidden],
-            TensorOperation::Matrix,
-        ),
-        gguf(
-            format!("{block}.ssm_conv1d.weight"),
-            vec![
-                conv,
-                dimension(args.conv_kernel, "Mamba convolution width")?,
-            ],
-            TensorOperation::Dense,
-        ),
-        gguf(
-            format!("{block}.ssm_dt.bias"),
-            vec![heads],
-            TensorOperation::Vector,
-        ),
-        gguf(
-            format!("{block}.ssm_a"),
-            vec![heads],
-            TensorOperation::Dense,
-        ),
-        gguf(
-            format!("{block}.ssm_d"),
-            vec![heads],
-            TensorOperation::Vector,
-        ),
-        gguf(
-            format!("{block}.ssm_norm.weight"),
-            vec![intermediate],
-            TensorOperation::Vector,
-        ),
-        gguf(
-            format!("{block}.ssm_out.weight"),
-            vec![hidden, intermediate],
-            TensorOperation::Matrix,
-        ),
-    ]);
-    if args.use_conv_bias {
-        output.push(gguf(
-            format!("{block}.ssm_conv1d.bias"),
-            vec![conv],
-            TensorOperation::Vector,
-        ));
-    }
-    if args.use_bias {
-        output.extend([
-            gguf(
-                format!("{block}.ssm_in.bias"),
-                vec![projection],
-                TensorOperation::Vector,
-            ),
-            gguf(
-                format!("{block}.ssm_out.bias"),
-                vec![hidden],
-                TensorOperation::Vector,
-            ),
-        ]);
+    let prefix = format!("{}.mamba", gguf_unit_root(block)?);
+    let mut declarations = spec.logical_parameters().map_err(|e| e.to_string())?;
+    declarations.sort_by_key(|d| {
+        mamba_storage_order(
+            d.parameter
+                .id
+                .as_str()
+                .strip_prefix(&format!("{prefix}."))
+                .expect("declared mixer prefix"),
+        )
+    });
+    for declaration in declarations {
+        let field = declaration
+            .parameter
+            .id
+            .as_str()
+            .strip_prefix(&format!("{prefix}."))
+            .expect("declared mixer prefix");
+        let name = gguf_unit_parameter_name(declaration.parameter.id.as_str())?;
+        let mut shape = declaration.shape;
+        let operation = match field {
+            "in_proj.weight" | "out_proj.weight" => TensorOperation::Matrix,
+            "conv1d.weight" => {
+                // GGUF stores the depthwise kernel without the singleton input-channel axis.
+                shape.remove(1);
+                TensorOperation::Dense
+            }
+            "A_log" => TensorOperation::Dense,
+            _ => TensorOperation::Vector,
+        };
+        output.push(gguf(format!("{block}.{name}"), shape, operation));
     }
     Ok(())
 }
 
 fn add_gguf_attention(
-    args: &ModelArgs,
+    spec: &super::attention::AttentionParameters,
     block: &str,
     output: &mut Vec<GgufTensorConstraint>,
 ) -> Result<(), String> {
-    let hidden = dimension(args.hidden_size, "hidden size")?;
-    let head = dimension(args.head_dim, "attention head width")?;
-    let query = checked_mul(
-        dimension(args.num_attention_heads, "attention head count")?,
-        head,
-        "query projection width",
-    )?;
-    let key_value = checked_mul(
-        dimension(args.num_key_value_heads, "key/value head count")?,
-        head,
-        "key/value projection width",
-    )?;
-    for (name, outer, inner) in [
-        ("attn_q", query, hidden),
-        ("attn_k", key_value, hidden),
-        ("attn_v", key_value, hidden),
-        ("attn_output", hidden, query),
-    ] {
+    for declaration in spec.logical_parameters().map_err(|e| e.to_string())? {
+        let matrix = declaration.role == eredu_nn::LogicalParameterRole::LinearWeight;
         output.push(gguf(
-            format!("{block}.{name}.weight"),
-            vec![outer, inner],
-            TensorOperation::Matrix,
+            format!(
+                "{block}.{}",
+                gguf_unit_parameter_name(declaration.parameter.id.as_str())?
+            ),
+            declaration.shape,
+            if matrix {
+                TensorOperation::Matrix
+            } else {
+                TensorOperation::Vector
+            },
         ));
-        if args.attention_bias {
-            output.push(gguf(
-                format!("{block}.{name}.bias"),
-                vec![outer],
-                TensorOperation::Vector,
-            ));
-        }
     }
     Ok(())
 }
 
 fn add_gguf_dense(
-    args: &ModelArgs,
+    spec: &super::mlp::DenseParameters,
     block: &str,
     output: &mut Vec<GgufTensorConstraint>,
 ) -> Result<(), String> {
-    let hidden = dimension(args.hidden_size, "hidden size")?;
-    let intermediate = dimension(args.intermediate_size, "dense intermediate width")?;
-    output.extend([
-        gguf(
-            format!("{block}.ffn_up.weight"),
-            vec![intermediate, hidden],
-            TensorOperation::Matrix,
-        ),
-        gguf(
-            format!("{block}.ffn_down.weight"),
-            vec![hidden, intermediate],
-            TensorOperation::Matrix,
-        ),
-    ]);
-    if args.mlp_bias {
-        output.extend([
-            gguf(
-                format!("{block}.ffn_up.bias"),
-                vec![intermediate],
-                TensorOperation::Vector,
-            ),
-            gguf(
-                format!("{block}.ffn_down.bias"),
-                vec![hidden],
-                TensorOperation::Vector,
-            ),
-        ]);
+    // GGUF orders weights before optional biases.
+    for role in [
+        eredu_nn::LogicalParameterRole::LinearWeight,
+        eredu_nn::LogicalParameterRole::LinearBias,
+    ] {
+        for spec in spec.network.projections() {
+            for declaration in spec
+                .logical_parameters()
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .filter(|d| d.role == role)
+            {
+                let matrix = role == eredu_nn::LogicalParameterRole::LinearWeight;
+                output.push(gguf(
+                    format!(
+                        "{block}.{}",
+                        gguf_unit_parameter_name(declaration.parameter.id.as_str())?
+                    ),
+                    declaration.shape,
+                    if matrix {
+                        TensorOperation::Matrix
+                    } else {
+                        TensorOperation::Vector
+                    },
+                ));
+            }
+        }
     }
     Ok(())
 }
 
 fn add_gguf_moe(
-    args: &ModelArgs,
+    spec: &super::mlp::SparseMoeSpec,
     block: &str,
     output: &mut Vec<GgufTensorConstraint>,
 ) -> Result<(), String> {
-    let hidden = dimension(args.hidden_size, "hidden size")?;
-    let experts = dimension(args.n_routed_experts, "routed expert count")?;
-    let intermediate = dimension(args.moe_intermediate_size, "expert intermediate width")?;
-    let shared = dimension(
-        args.moe_shared_expert_intermediate_size,
-        "shared expert intermediate width",
-    )?;
-    output.extend([
-        gguf(
-            format!("{block}.ffn_gate_inp.weight"),
-            vec![experts, hidden],
-            TensorOperation::Matrix,
-        ),
-        gguf(
-            format!("{block}.exp_probs_b.bias"),
-            vec![experts],
-            TensorOperation::Vector,
-        )
-        .with_aliases([format!("{block}.ffn_exp_probs_b.bias")]),
-        gguf(
-            format!("{block}.ffn_up_shexp.weight"),
-            vec![shared, hidden],
-            TensorOperation::Matrix,
-        ),
-        gguf(
-            format!("{block}.ffn_down_shexp.weight"),
-            vec![hidden, shared],
-            TensorOperation::Matrix,
-        ),
-        gguf(
-            format!("{block}.ffn_up_exps.weight"),
-            vec![experts, intermediate, hidden],
-            TensorOperation::Matrix,
-        ),
-        gguf(
-            format!("{block}.ffn_down_exps.weight"),
-            vec![experts, hidden, intermediate],
-            TensorOperation::Matrix,
-        ),
-    ]);
-    if args.mlp_bias {
-        output.extend([
-            gguf(
-                format!("{block}.ffn_up_shexp.bias"),
-                vec![shared],
-                TensorOperation::Vector,
-            ),
-            gguf(
-                format!("{block}.ffn_down_shexp.bias"),
-                vec![hidden],
-                TensorOperation::Vector,
-            ),
-        ]);
+    let selector = &spec.selector;
+    let shared = &spec.shared;
+    let bank = &spec.experts;
+    let mut declarations = selector.logical_parameters().map_err(|e| e.to_string())?;
+    for spec in shared.network.projections() {
+        declarations.extend(
+            spec.logical_parameters()
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .filter(|d| d.role == eredu_nn::LogicalParameterRole::LinearWeight),
+        );
+    }
+    declarations.extend(bank.logical_parameters().map_err(|e| e.to_string())?);
+    for spec in shared.network.projections() {
+        declarations.extend(
+            spec.logical_parameters()
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .filter(|d| d.role == eredu_nn::LogicalParameterRole::LinearBias),
+        );
+    }
+    for declaration in declarations {
+        let id = declaration.parameter.id.as_str();
+        let name = gguf_unit_parameter_name(id)?;
+        let mut tensor = gguf(
+            format!("{block}.{name}"),
+            declaration.shape,
+            if declaration.role == eredu_nn::LogicalParameterRole::LinearWeight {
+                TensorOperation::Matrix
+            } else {
+                TensorOperation::Vector
+            },
+        );
+        if name == "exp_probs_b.bias" {
+            tensor = tensor.with_aliases([format!("{block}.ffn_exp_probs_b.bias")]);
+        }
+        output.push(tensor);
     }
     Ok(())
 }
@@ -1379,14 +1195,85 @@ fn dimension(value: i32, name: &str) -> Result<usize, String> {
         .ok_or_else(|| format!("Nemotron-H {name} must be positive, got {value}"))
 }
 
-fn checked_add(left: usize, right: usize, name: &str) -> Result<usize, String> {
-    left.checked_add(right)
-        .ok_or_else(|| format!("Nemotron-H {name} geometry overflows"))
-}
-
 fn checked_mul(left: usize, right: usize, name: &str) -> Result<usize, String> {
     left.checked_mul(right)
         .ok_or_else(|| format!("Nemotron-H {name} geometry overflows"))
+}
+
+const GGUF_MOE_PARAMETERS: [(&str, &str); 7] = [
+    ("ffn_gate_inp", "gate"),
+    ("exp_probs_b", "gate.e_score_correction_bias"),
+    ("ffn_up_exps", "experts.up_proj"),
+    ("ffn_down_exps", "experts.down_proj"),
+    ("ffn_up_shexp", "shared_experts.up_proj"),
+    ("ffn_down_shexp", "shared_experts.down_proj"),
+    ("ffn_exp_probs_b", "gate.e_score_correction_bias"),
+];
+
+const GGUF_PARAMETERS: [(&str, &str); 16] = [
+    ("attn_norm", "norm"),
+    ("attn_q", "attention.q_proj"),
+    ("attn_k", "attention.k_proj"),
+    ("attn_v", "attention.v_proj"),
+    ("attn_output", "attention.o_proj"),
+    ("ffn_up", "mlp.up_proj"),
+    ("ffn_down", "mlp.down_proj"),
+    ("ssm_in", "mamba.in_proj"),
+    ("ssm_conv1d", "mamba.conv1d"),
+    ("ssm_dt.bias", "mamba.dt_bias"),
+    ("ssm_a", "mamba.A_log"),
+    ("ssm_d", "mamba.D"),
+    ("ssm_norm", "mamba.norm"),
+    ("ssm_out", "mamba.out_proj"),
+    ("rope_freqs", "rope_freqs"),
+    ("ffn_norm", "ffn_norm"),
+];
+
+fn gguf_unit_root(block: &str) -> Result<String, String> {
+    let layer = block
+        .strip_prefix("blk.")
+        .ok_or_else(|| format!("unresolved GGUF block {block}"))?;
+    Ok(format!("model.layers.{layer}"))
+}
+
+fn gguf_unit_parameter_name(canonical: &str) -> Result<String, String> {
+    let canonical = canonical
+        .strip_prefix("model.layers.")
+        .and_then(|rest| rest.split_once('.'))
+        .map(|(_, parameter)| parameter)
+        .ok_or_else(|| format!("unresolved GGUF parameter {canonical}"))?;
+    if let Some(parameter) = canonical.strip_prefix("moe.") {
+        if let Some((source, target)) = GGUF_MOE_PARAMETERS
+            .iter()
+            .copied()
+            .filter(|&(_, target)| {
+                parameter == target || parameter.starts_with(&format!("{target}."))
+            })
+            .max_by_key(|&(_, target)| target.len())
+        {
+            let suffix = parameter.strip_prefix(target).expect("matched target");
+            let suffix = if target == "gate.e_score_correction_bias" && suffix.is_empty() {
+                ".bias"
+            } else if target.starts_with("experts.") && suffix.is_empty() {
+                ".weight"
+            } else {
+                suffix
+            };
+            // Both physical correction-bias spellings map to the same slot.
+            let source = if source == "ffn_exp_probs_b" {
+                "exp_probs_b"
+            } else {
+                source
+            };
+            return Ok(format!("{source}{suffix}"));
+        }
+    }
+    for (source, target) in GGUF_PARAMETERS {
+        if canonical == target || canonical.starts_with(&format!("{target}.")) {
+            return Ok(canonical.replacen(target, source, 1));
+        }
+    }
+    Err(format!("unresolved GGUF parameter {canonical}"))
 }
 
 /// Translates one physical GGUF tensor name to its canonical parameter identity.
@@ -1409,16 +1296,7 @@ pub fn translate_gguf_weight_name(name: &str) -> String {
         return name.to_string();
     };
 
-    const MOE_PARAMETERS: [(&str, &str); 7] = [
-        ("ffn_gate_inp", "gate"),
-        ("exp_probs_b", "gate.e_score_correction_bias"),
-        ("ffn_up_exps", "experts.up_proj"),
-        ("ffn_down_exps", "experts.down_proj"),
-        ("ffn_up_shexp", "shared_experts.up_proj"),
-        ("ffn_down_shexp", "shared_experts.down_proj"),
-        ("ffn_exp_probs_b", "gate.e_score_correction_bias"),
-    ];
-    for (source, target) in MOE_PARAMETERS {
+    for (source, target) in GGUF_MOE_PARAMETERS {
         if parameter == source || parameter.starts_with(&format!("{source}.")) {
             let suffix = parameter.strip_prefix(source).unwrap_or_default();
             let suffix = if target == "gate.e_score_correction_bias" && suffix == ".bias" {
@@ -1437,25 +1315,7 @@ pub fn translate_gguf_weight_name(name: &str) -> String {
         }
     }
 
-    const PARAMETERS: [(&str, &str); 16] = [
-        ("attn_norm", "norm"),
-        ("attn_q", "attention.q_proj"),
-        ("attn_k", "attention.k_proj"),
-        ("attn_v", "attention.v_proj"),
-        ("attn_output", "attention.o_proj"),
-        ("ffn_up", "mlp.up_proj"),
-        ("ffn_down", "mlp.down_proj"),
-        ("ssm_in", "mamba.in_proj"),
-        ("ssm_conv1d", "mamba.conv1d"),
-        ("ssm_dt.bias", "mamba.dt_bias"),
-        ("ssm_a", "mamba.A_log"),
-        ("ssm_d", "mamba.D"),
-        ("ssm_norm", "mamba.norm"),
-        ("ssm_out", "mamba.out_proj"),
-        ("rope_freqs", "rope_freqs"),
-        ("ffn_norm", "ffn_norm"),
-    ];
-    for (source, target) in PARAMETERS {
+    for (source, target) in GGUF_PARAMETERS {
         if parameter == source || parameter.starts_with(&format!("{source}.")) {
             return format!(
                 "model.layers.{layer}.{}",

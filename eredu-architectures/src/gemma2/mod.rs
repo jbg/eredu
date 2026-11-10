@@ -4,7 +4,7 @@ use crate::decoder::{AttentionProjection, BlockParameterFields, Config};
 use eredu_checkpoint::{
     schema::{
         GgufCheckpointPlan, GgufTensorConstraint, GgufTypeConstraint, SafetensorsCheckpointPlan,
-        SafetensorsTensorConstraint, StoredDtypeConstraint, TensorOperation,
+        TensorOperation,
     },
     WeightQuantization,
 };
@@ -338,6 +338,12 @@ impl Config for ModelArgs {
     fn validate_config(&self) -> Result<(), Error> {
         self.validate().map_err(Error::backend)
     }
+    fn validate_parameter_formats(
+        &self,
+        declaration: &crate::decoder::DecoderDeclaration,
+    ) -> Result<(), Error> {
+        self.dense.validate_declaration_formats(declaration)
+    }
     fn hidden_size(&self) -> i32 {
         self.dense.hidden_size
     }
@@ -453,50 +459,80 @@ pub fn with_checkpoint_formats(
     Ok(target)
 }
 /// Exact SafeTensors catalog, reusing dense projection and quantization contracts.
-pub fn safetensors_plan(args: &ModelArgs) -> Result<SafetensorsCheckpointPlan, String> {
-    let mut plan = crate::llama::safetensors_plan(&args.dense).map_err(|e| e.to_string())?;
-    for tensor in &mut plan.common_tensors {
-        tensor.key = tensor
-            .key
-            .replace(".post_attention_layernorm.", ".pre_feedforward_layernorm.");
-    }
-    for layer in 0..args.dense.num_hidden_layers {
-        for field in ["post_attention_layernorm", "post_feedforward_layernorm"] {
-            plan.common_tensors
-                .push(SafetensorsTensorConstraint::required(
-                    format!("model.layers.{layer}.{field}.weight"),
-                    vec![args.dense.hidden_size as usize],
-                    StoredDtypeConstraint::Floating,
-                ));
+pub fn safetensors_plan(
+    args: &ModelArgs,
+    declaration: &crate::decoder::DecoderDeclaration,
+) -> Result<SafetensorsCheckpointPlan, String> {
+    let declarations = declaration
+        .parameter_description(args, crate::decoder::ParameterEncoding::Logical)
+        .map_err(|error| error.to_string())?;
+    let mut tensors = Vec::new();
+    for group in declarations.groups() {
+        for parameter in group.members() {
+            let quantization = parameter
+                .logical_linear_format()
+                .and_then(|format| format.encoding().weight_quantization());
+            if let Some(quantization) = quantization {
+                tensors.extend(
+                    eredu_checkpoint::schema::matrix_for_packed_words(
+                        parameter.target(),
+                        Vec::<String>::new(),
+                        parameter.global_shape().to_vec(),
+                        quantization,
+                        None,
+                    )
+                    .map_err(|error| error.to_string())?,
+                );
+            } else {
+                tensors.push(
+                    eredu_checkpoint::schema::SafetensorsTensorConstraint::required(
+                        parameter.target(),
+                        parameter.global_shape().to_vec(),
+                        eredu_checkpoint::schema::StoredDtypeConstraint::Floating,
+                    ),
+                );
+            }
         }
     }
-    SafetensorsCheckpointPlan::new(
-        "Gemma 2 SafeTensors",
-        plan.common_tensors,
-        plan.layout_groups,
-        plan.catalog_policy,
-    )
-    .map_err(|e| e.to_string())
+    let mut policy = eredu_checkpoint::schema::CatalogPolicy::strict();
+    policy.allowed_prefixes.push("rope_freqs.".into());
+    policy.allowed_suffixes.push(".rotary_emb.inv_freq".into());
+    SafetensorsCheckpointPlan::new("Gemma 2 SafeTensors", tensors, Vec::new(), policy)
+        .map_err(|error| error.to_string())
 }
 /// Exact published GGUF tensor catalog, including all four sublayer norms.
-pub fn gguf_plan(args: &ModelArgs) -> Result<GgufCheckpointPlan, String> {
-    let mut plan = crate::llama::gguf_plan(&args.dense)?;
-    for layer in 0..args.dense.num_hidden_layers {
-        for field in ["attn_post_norm", "ffn_post_norm"] {
-            plan.common_tensors.push(GgufTensorConstraint::required(
-                format!("blk.{layer}.{field}.weight"),
-                vec![args.dense.hidden_size as usize],
-                GgufTypeConstraint::OperationClass(TensorOperation::Vector),
+pub fn gguf_plan(
+    args: &ModelArgs,
+    declaration: &crate::decoder::DecoderDeclaration,
+) -> Result<GgufCheckpointPlan, String> {
+    let declarations = declaration
+        .parameter_description(args, crate::decoder::ParameterEncoding::Logical)
+        .map_err(|error| error.to_string())?;
+    let mut tensors = Vec::new();
+    for group in declarations.groups() {
+        for parameter in group.members() {
+            let name = parameter
+                .target()
+                .replace(".post_attention_layernorm.", ".attn_post_norm.")
+                .replace(".post_feedforward_layernorm.", ".ffn_post_norm.")
+                .replace(".pre_feedforward_layernorm.", ".post_attention_layernorm.");
+            tensors.push(GgufTensorConstraint::required(
+                crate::llama::gguf_parameter_name(&name, &args.dense),
+                parameter.global_shape().to_vec(),
+                GgufTypeConstraint::OperationClass(
+                    if parameter.logical_linear_format().is_some() {
+                        TensorOperation::Matrix
+                    } else {
+                        TensorOperation::Vector
+                    },
+                ),
             ));
         }
     }
-    GgufCheckpointPlan::new(
-        "Gemma 2 GGUF",
-        plan.common_tensors,
-        plan.layout_groups,
-        plan.catalog_policy,
-    )
-    .map_err(|e| e.to_string())
+    let mut policy = eredu_checkpoint::schema::CatalogPolicy::strict();
+    policy.allowed_prefixes.push("rope_freqs.".into());
+    GgufCheckpointPlan::new("Gemma 2 GGUF", tensors, Vec::new(), policy)
+        .map_err(|error| error.to_string())
 }
 /// Translates only the architecture-owned checkpoint vocabulary.
 pub fn translate_gguf_weight_name(name: &str) -> String {
@@ -505,4 +541,23 @@ pub fn translate_gguf_weight_name(name: &str) -> String {
         .replace("ffn_post_norm", "post_feedforward_layernorm")
         .replace("ffn_norm", "pre_feedforward_layernorm");
     crate::llama::translate_gguf_weight_name(&name)
+}
+
+/// Selects physical formats while retaining all Gemma normalization and attention policy.
+pub(crate) fn project_declaration_formats(
+    declaration: &crate::decoder::DecoderDeclaration,
+    source: &ModelArgs,
+    selected: &ModelArgs,
+) -> Result<crate::decoder::DecoderDeclaration, Error> {
+    declaration.validate_for(source)?;
+    let mut policy = selected.clone();
+    policy.dense.quantization = source.dense.quantization;
+    policy.dense.quantized_weights = source.dense.quantized_weights.clone();
+    policy.dense.quantized_weight_configs = source.dense.quantized_weight_configs.clone();
+    if policy.architecture_fingerprint() != source.architecture_fingerprint() {
+        return Err(Error::backend(
+            "Gemma2 format projection changes architecture policy",
+        ));
+    }
+    declaration.with_formats(selected)
 }

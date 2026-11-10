@@ -157,7 +157,11 @@ fn state_memory_layout_from_layout(
     )
 }
 
-fn llama_spec(args: &LlamaModelArgs, multimodal: bool) -> Result<Spec, CapabilityError> {
+fn llama_spec(
+    args: &LlamaModelArgs,
+    multimodal: bool,
+    state: StateMemoryLayout,
+) -> Result<Spec, CapabilityError> {
     let context = context_from_rope(args.max_position_embeddings, args.rope_scaling.as_ref())?;
     let layers = positive(args.num_hidden_layers, "num_hidden_layers")?;
     if args.attention_schedule.len() != layers as usize {
@@ -197,7 +201,6 @@ fn llama_spec(args: &LlamaModelArgs, multimodal: bool) -> Result<Spec, Capabilit
     } else {
         base
     };
-    let completeness = EstimationCompleteness::Complete;
     Ok((
         context.0,
         context.1,
@@ -212,16 +215,15 @@ fn llama_spec(args: &LlamaModelArgs, multimodal: bool) -> Result<Spec, Capabilit
         } else {
             text_modalities()
         },
-        state_memory_layout(
-            crate::llama::state_layout(args),
-            args.hidden_size,
-            1,
-            completeness,
-        )?,
+        state,
     ))
 }
 
-fn qwen_spec(args: &QwenModelArgs, multimodal: bool) -> Result<Spec, CapabilityError> {
+fn qwen_spec(
+    args: &QwenModelArgs,
+    multimodal: bool,
+    state: StateMemoryLayout,
+) -> Result<Spec, CapabilityError> {
     let mut spec = llama_spec(
         &LlamaModelArgs {
             model_type: args.model_type.clone(),
@@ -246,12 +248,7 @@ fn qwen_spec(args: &QwenModelArgs, multimodal: bool) -> Result<Spec, CapabilityE
             quantized_weight_configs: None,
         },
         multimodal,
-    )?;
-    spec.4 = state_memory_layout(
-        crate::qwen::state_layout(args),
-        args.hidden_size,
-        1,
-        EstimationCompleteness::Complete,
+        state,
     )?;
     let full_layers = args.attention_schedule.full_layer_count() as u64;
     let sliding = args
@@ -451,14 +448,20 @@ fn neutral_deepseek_v4_spec(args: &crate::deepseek::V4Args) -> Result<Spec, Capa
     ))
 }
 
-fn kimi_linear_spec(args: &kimi_linear::ModelArgs) -> Result<Spec, CapabilityError> {
+fn kimi_linear_spec(declaration: &kimi_linear::Declaration) -> Result<Spec, CapabilityError> {
+    let args = declaration.args();
     let context = plain_context(args.model_max_length)?;
-    let attention = args
-        .layer_schedule
+    let attention = declaration
+        .blocks
         .iter()
-        .filter(|policy| policy.attention == kimi_linear::AttentionKind::Mla)
+        .filter(|policy| {
+            matches!(
+                policy.mixer,
+                kimi_linear::declarations::MixerParameters::Mla(_)
+            )
+        })
         .count() as u64;
-    let recurrent = args.layer_schedule.len() as u64 - attention;
+    let recurrent = declaration.blocks.len() as u64 - attention;
     Ok((
         context.0,
         context.1,
@@ -468,16 +471,17 @@ fn kimi_linear_spec(args: &kimi_linear::ModelArgs) -> Result<Spec, CapabilityErr
             recurrent_layers: recurrent,
         },
         text_modalities(),
-        state_memory_layout(
-            kimi_linear::state_layout(args),
-            args.hidden_size,
+        state_memory_layout_from_layout(
+            declaration.definition().state_layout().clone(),
+            declaration.statics.embedding_spec().dimensions,
             256,
             EstimationCompleteness::Complete,
         )?,
     ))
 }
 
-fn gpt_oss_spec(args: &gpt_oss::ModelArgs) -> Result<Spec, CapabilityError> {
+fn gpt_oss_spec(declaration: &gpt_oss::Declaration) -> Result<Spec, CapabilityError> {
+    let args = declaration.args();
     let context = context_from_rope(args.max_position_embeddings, args.rope_scaling.as_ref())?;
     positive(args.num_hidden_layers, "num_hidden_layers")?;
     let full = args.attention_schedule.full_layer_count() as u64;
@@ -505,9 +509,13 @@ fn gpt_oss_spec(args: &gpt_oss::ModelArgs) -> Result<Spec, CapabilityError> {
         context.1,
         state_strategy,
         text_modalities(),
-        state_memory_layout(
-            gpt_oss::state_layout(args),
-            args.hidden_size,
+        state_memory_layout_from_layout(
+            declaration.common().state_layout().clone(),
+            declaration
+                .common()
+                .static_construction()
+                .embedding_spec()
+                .dimensions,
             1,
             EstimationCompleteness::Complete,
         )?,
@@ -517,6 +525,7 @@ fn gpt_oss_spec(args: &gpt_oss::ModelArgs) -> Result<Spec, CapabilityError> {
 fn gemma4_spec(
     args: &gemma4::ModelArgs,
     modalities: InputModalities,
+    state: Result<eredu_runtime::StateLayout, eredu_runtime::StateError>,
 ) -> Result<Spec, CapabilityError> {
     let context = context_from_rope(args.max_position_embeddings, args.rope_scaling.as_ref())?;
     let layers = args.num_hidden_layers() as u64;
@@ -564,7 +573,7 @@ fn gemma4_spec(
         },
         modalities,
         state_memory_layout(
-            gemma4::state_layout(args),
+            state,
             args.hidden_size,
             256,
             EstimationCompleteness::Complete,
@@ -633,17 +642,28 @@ fn inkling_spec(args: &crate::inkling::ModelArgs) -> Result<Spec, CapabilityErro
     ))
 }
 
-fn lfm2_spec(args: &lfm2::ModelArgs) -> Result<Spec, CapabilityError> {
+fn lfm2_spec(declaration: &lfm2::Declaration) -> Result<Spec, CapabilityError> {
+    let args = declaration.args();
     let context = plain_context(args.max_position_embeddings)?;
-    let attention = args
-        .layer_schedule
+    let attention = declaration
+        .blocks
         .iter()
-        .filter(|policy| matches!(policy.operator, lfm2::OperatorPolicy::SelfAttention(_)))
+        .filter(|policy| {
+            matches!(
+                policy.mixer,
+                lfm2::declarations::MixerParameters::Attention(..)
+            )
+        })
         .count() as u64;
-    let conv = args
-        .layer_schedule
+    let conv = declaration
+        .blocks
         .iter()
-        .filter(|policy| matches!(policy.operator, lfm2::OperatorPolicy::CausalConvolution))
+        .filter(|policy| {
+            matches!(
+                policy.mixer,
+                lfm2::declarations::MixerParameters::Convolution(_)
+            )
+        })
         .count() as u64;
     Ok((
         context.0,
@@ -654,27 +674,28 @@ fn lfm2_spec(args: &lfm2::ModelArgs) -> Result<Spec, CapabilityError> {
             recurrent_layers: conv,
         },
         text_modalities(),
-        state_memory_layout(
-            lfm2::state_layout(args),
-            args.hidden_size,
+        state_memory_layout_from_layout(
+            declaration.definition().state_layout().clone(),
+            declaration.statics.embedding_spec().dimensions,
             256,
             EstimationCompleteness::Complete,
         )?,
     ))
 }
 
-fn nemotron_spec(args: &nemotron_h::ModelArgs) -> Result<Spec, CapabilityError> {
-    let context = plain_context(args.max_position_embeddings)?;
-    let mamba = args
-        .layer_schedule
-        .iter()
-        .filter(|policy| **policy == nemotron_h::LayerPolicy::Mamba)
-        .count() as u64;
+fn nemotron_spec(declaration: &nemotron_h::Declaration) -> Result<Spec, CapabilityError> {
+    let context = plain_context(declaration.args().max_position_embeddings)?;
+    let layout = declaration.definition().state_layout();
+    let mut mamba = 0;
     let mut attention_groups = BTreeMap::<Option<u64>, u64>::new();
-    for policy in args.layer_schedule.iter() {
-        if let nemotron_h::LayerPolicy::SelfAttention(policy) = policy {
-            let window = policy.window().map(|window| u64::from(window.get()));
-            *attention_groups.entry(window).or_default() += 1;
+    for policy in layout.layers().iter().take(declaration.blocks.len()) {
+        match policy {
+            LayerCachePolicy::FixedState { .. } => mamba += 1,
+            LayerCachePolicy::KeyValue { attention, .. } => {
+                let window = attention.window().map(|window| u64::from(window.get()));
+                *attention_groups.entry(window).or_default() += 1;
+            }
+            _ => {}
         }
     }
     let full_attention_layers = attention_groups.get(&None).copied().unwrap_or(0);
@@ -696,9 +717,9 @@ fn nemotron_spec(args: &nemotron_h::ModelArgs) -> Result<Spec, CapabilityError> 
             recurrent_layers: mamba,
         },
         text_modalities(),
-        state_memory_layout(
-            nemotron_h::state_layout(args),
-            args.hidden_size,
+        state_memory_layout_from_layout(
+            layout.clone(),
+            declaration.statics.embedding_spec().dimensions,
             1,
             EstimationCompleteness::Complete,
         )?,
@@ -996,9 +1017,36 @@ fn embedded_mtp_draft_source(layers: i32) -> Option<SpeculativeDraftSource> {
     (layers > 0).then_some(SpeculativeDraftSource::Embedded)
 }
 
-/// Derives Llama/Mistral capabilities from normalized architecture policy.
-pub fn llama(args: &crate::llama::ModelArgs) -> Result<CapabilityEstimate, CapabilityError> {
-    Ok(finish(args.model_type.clone(), llama_spec(args, false)?))
+/// Derives Llama/Mistral capabilities from retained geometry and explicit context policy.
+pub fn llama(
+    args: &crate::llama::ModelArgs,
+    declaration: &crate::decoder::DecoderDeclaration,
+) -> Result<CapabilityEstimate, CapabilityError> {
+    Ok(finish(
+        args.model_type.clone(),
+        llama_spec(args, false, dense_state_memory(args, declaration)?)?,
+    ))
+}
+
+fn dense_state_memory(
+    config: &impl crate::decoder::Config,
+    declaration: &crate::decoder::DecoderDeclaration,
+) -> Result<StateMemoryLayout, CapabilityError> {
+    declaration
+        .validate_for(config)
+        .map_err(|error| CapabilityError::InvalidConfiguration {
+            field: "dense_declaration",
+            detail: error.to_string(),
+        })?;
+    state_memory_layout_from_layout(
+        declaration.state_layout().clone(),
+        declaration
+            .static_construction()
+            .embedding_spec()
+            .dimensions,
+        1,
+        EstimationCompleteness::Complete,
+    )
 }
 
 /// Derives one shared causal cache and the retained masked-draft declaration.
@@ -1016,7 +1064,16 @@ pub fn nemotron_labs_diffusion(
     }
     let estimate = finish(
         args.model_identity().to_owned(),
-        llama_spec(args.dense(), image_input)?,
+        llama_spec(
+            args.dense(),
+            image_input,
+            state_memory_layout(
+                Ok::<_, eredu_nn::Error>(args.text_declaration().state_layout().clone()),
+                args.dense().hidden_size,
+                1,
+                EstimationCompleteness::Complete,
+            )?,
+        )?,
     );
     if args.block_size.get() < 2 {
         return Ok(estimate);
@@ -1031,22 +1088,20 @@ pub fn nemotron_labs_diffusion(
 }
 
 /// Derives state memory for every logical decoder invocation.
-pub fn nanbeige(args: &crate::nanbeige::ModelArgs) -> Result<CapabilityEstimate, CapabilityError> {
+pub fn nanbeige(
+    args: &crate::nanbeige::ModelArgs,
+    declaration: &crate::decoder::DecoderDeclaration,
+) -> Result<CapabilityEstimate, CapabilityError> {
     let dense = args.dense_config();
-    let mut spec = llama_spec(dense, false)?;
-    spec.4 = state_memory_layout(
-        crate::nanbeige::state_layout(args),
-        dense.hidden_size,
-        1,
-        EstimationCompleteness::Complete,
-    )?;
+    let spec = llama_spec(dense, false, dense_state_memory(args, declaration)?)?;
     Ok(finish("nanbeige".into(), spec))
 }
 
 /// Derives context and ordinary KV geometry from the normalized K2 schedule.
 pub fn k2_horizon(
-    args: &crate::k2_horizon::ModelArgs,
+    declaration: &crate::k2_horizon::Declaration,
 ) -> Result<CapabilityEstimate, CapabilityError> {
+    let args = declaration.args();
     let context = context_from_rope(
         args.max_position_embeddings,
         args.rope_parameters.as_ref().or(args.rope_scaling.as_ref()),
@@ -1071,9 +1126,13 @@ pub fn k2_horizon(
             sliding,
         },
     };
-    let state = state_memory_layout(
-        crate::decoder::state_layout(args),
-        args.hidden_size,
+    let state = state_memory_layout_from_layout(
+        declaration.common().state_layout().clone(),
+        declaration
+            .common()
+            .static_construction()
+            .embedding_spec()
+            .dimensions,
         1,
         EstimationCompleteness::Complete,
     )?;
@@ -1087,20 +1146,39 @@ pub fn k2_horizon(
 }
 
 /// Derives Qwen text capabilities from normalized architecture policy.
-pub fn qwen(args: &crate::qwen::ModelArgs) -> Result<CapabilityEstimate, CapabilityError> {
-    Ok(finish(args.model_type.clone(), qwen_spec(args, false)?))
+pub fn qwen(declaration: &crate::qwen::Declaration) -> Result<CapabilityEstimate, CapabilityError> {
+    let args = declaration.args();
+    let state = state_memory_layout_from_layout(
+        declaration.common().state_layout().clone(),
+        declaration
+            .common()
+            .static_construction()
+            .embedding_spec()
+            .dimensions,
+        1,
+        EstimationCompleteness::Complete,
+    )?;
+    Ok(finish(
+        args.model_type.clone(),
+        qwen_spec(args, false, state)?,
+    ))
 }
 
 /// Derives Qwen3-VL capabilities from its complete normalized family policy.
-pub fn qwen_vl(args: &crate::qwen::vl::ModelArgs) -> Result<CapabilityEstimate, CapabilityError> {
-    let mut spec = qwen_spec(&args.text, true)?;
-    spec.4 = state_memory_layout(
-        crate::qwen::vl::state_layout(args),
+pub fn qwen_vl(
+    declaration: &crate::qwen::vl::Declaration,
+) -> Result<CapabilityEstimate, CapabilityError> {
+    let args = declaration.args();
+    let state = state_memory_layout_from_layout(
+        declaration.state_layout().clone(),
         args.text.hidden_size,
         1,
         EstimationCompleteness::Complete,
     )?;
-    Ok(finish(args.effective_model_type().into(), spec))
+    Ok(finish(
+        args.effective_model_type().into(),
+        qwen_spec(&args.text, true, state)?,
+    ))
 }
 
 /// Derives Muse capabilities from selected component coverage and normalized policy.
@@ -1151,16 +1229,24 @@ pub fn deepseek_v4(args: &crate::deepseek::V4Args) -> Result<CapabilityEstimate,
     ))
 }
 
-/// Derives Kimi Linear capabilities from normalized architecture policy.
+/// Derives Kimi capabilities from retained construction and state declarations.
 pub fn kimi_linear(
-    args: &crate::kimi_linear::ModelArgs,
+    declaration: &crate::kimi_linear::Declaration,
 ) -> Result<CapabilityEstimate, CapabilityError> {
-    Ok(finish(args.model_type.clone(), kimi_linear_spec(args)?))
+    Ok(finish(
+        declaration.args().model_type.clone(),
+        kimi_linear_spec(declaration)?,
+    ))
 }
 
 /// Derives GPT-OSS capabilities from normalized architecture policy.
-pub fn gpt_oss(args: &crate::gpt_oss::ModelArgs) -> Result<CapabilityEstimate, CapabilityError> {
-    Ok(finish(args.model_type.clone(), gpt_oss_spec(args)?))
+pub fn gpt_oss(
+    declaration: &crate::gpt_oss::Declaration,
+) -> Result<CapabilityEstimate, CapabilityError> {
+    Ok(finish(
+        declaration.args().model_type.clone(),
+        gpt_oss_spec(declaration)?,
+    ))
 }
 
 /// Derives shared-context state and input geometry for block refinement.
@@ -1169,12 +1255,10 @@ pub fn gpt_oss(args: &crate::gpt_oss::ModelArgs) -> Result<CapabilityEstimate, C
 pub fn diffusion_gemma(
     args: &crate::diffusion_gemma::FamilyConfig,
 ) -> Result<CapabilityEstimate, CapabilityError> {
-    let mut spec = gemma4_spec(&args.text, args.input_modalities())?;
-    spec.4 = state_memory_layout(
+    let spec = gemma4_spec(
+        &args.text,
+        args.input_modalities(),
         crate::diffusion_gemma::state_layout(args),
-        args.text.hidden_size,
-        256,
-        EstimationCompleteness::Complete,
     )?;
     let mut estimate = finish("diffusion_gemma_text".into(), spec);
     estimate.ordinary_refinement = Some(
@@ -1208,7 +1292,11 @@ pub fn gemma4(args: &crate::gemma4::FamilyConfig) -> Result<CapabilityEstimate, 
     Ok(with_speculative_draft_source(
         finish(
             args.effective_model_type().into(),
-            gemma4_spec(&args.text, args.input_modalities())?,
+            gemma4_spec(
+                &args.text,
+                args.input_modalities(),
+                gemma4::state_layout(args),
+            )?,
         ),
         Some(SpeculativeDraftSource::Separate),
     ))
@@ -1226,18 +1314,24 @@ pub fn inkling(args: &crate::inkling::ModelArgs) -> Result<CapabilityEstimate, C
     ))
 }
 
-/// Derives LFM2 capabilities from normalized architecture policy.
-pub fn lfm2(args: &crate::lfm2::ModelArgs) -> Result<CapabilityEstimate, CapabilityError> {
-    Ok(finish(args.model_type.clone(), lfm2_spec(args)?))
+/// Derives LFM2 capabilities from retained construction and state declarations.
+pub fn lfm2(declaration: &crate::lfm2::Declaration) -> Result<CapabilityEstimate, CapabilityError> {
+    Ok(finish(
+        declaration.args().model_type.clone(),
+        lfm2_spec(declaration)?,
+    ))
 }
 
-/// Derives Nemotron-H capabilities from normalized architecture policy.
+/// Derives Nemotron-H capabilities from retained construction and state declarations.
 pub fn nemotron_h(
-    args: &crate::nemotron_h::ModelArgs,
+    declaration: &crate::nemotron_h::Declaration,
 ) -> Result<CapabilityEstimate, CapabilityError> {
     Ok(with_speculative_draft_source(
-        finish(args.model_type.clone(), nemotron_spec(args)?),
-        embedded_mtp_draft_source(args.num_nextn_predict_layers),
+        finish(
+            declaration.args().model_type.clone(),
+            nemotron_spec(declaration)?,
+        ),
+        embedded_mtp_draft_source(declaration.args().num_nextn_predict_layers),
     ))
 }
 
@@ -1388,10 +1482,17 @@ pub(crate) fn qwen4_exp_conditional(
     Ok(estimate)
 }
 
-/// Derives Gemma 2 context and mixed full/sliding KV residency from its schedule.
-pub fn gemma2(args: &crate::gemma2::ModelArgs) -> Result<CapabilityEstimate, CapabilityError> {
+/// Derives Gemma 2 context and KV residency from its retained declaration and schedule.
+pub fn gemma2(
+    args: &crate::gemma2::ModelArgs,
+    declaration: &crate::decoder::DecoderDeclaration,
+) -> Result<CapabilityEstimate, CapabilityError> {
     Ok(finish(
         "gemma2".into(),
-        llama_spec(args.dense_config(), false)?,
+        llama_spec(
+            args.dense_config(),
+            false,
+            dense_state_memory(args, declaration)?,
+        )?,
     ))
 }

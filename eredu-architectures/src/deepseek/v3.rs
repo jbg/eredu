@@ -23,7 +23,7 @@ use crate::decoder::{DecoderStaticResources, PartitionStaticModules, StaticModul
 
 use super::{
     block::V3Block,
-    moe::MoePolicy,
+    moe::RoutedSpec,
     mtp::{EmbeddedInput, ForwardMode, RetainedValues, V3PredictionLayer},
     LayerPolicy, V3Args,
 };
@@ -148,7 +148,7 @@ pub struct TargetBoundarySchema {
 
 impl TargetBoundarySchema {
     /// Derives the boundary schema from the normalized target configuration.
-    pub const fn from_args(args: &V3Args) -> Self {
+    pub fn from_args(args: &V3Args) -> Self {
         Self {
             hidden_size: args.hidden_size,
         }
@@ -425,8 +425,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
             .as_ref()
             .and_then(|selection| selection.state())
             .map_or(0, |state| state.global_layer_offset());
-        let static_modules = PartitionStaticModules::from_selected_spec(
-            static_spec(&construction.args),
+        let static_modules = PartitionStaticModules::from_selected_construction(
+            construction.args.parameters().statics.clone(),
             construction.parallel_geometry.as_ref().map(|geometry| {
                 (
                     geometry.embedding_range().clone(),
@@ -1383,7 +1383,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
     }
 }
 
-pub(crate) fn static_spec(args: &V3Args) -> StaticModuleSpec {
+pub(super) fn declare_static_spec(args: &V3Args) -> StaticModuleSpec {
     StaticModuleSpec {
         normalization_groups: None,
         embedding_weight: "model.embed_tokens.weight".into(),
@@ -1393,11 +1393,7 @@ pub(crate) fn static_spec(args: &V3Args) -> StaticModuleSpec {
         hidden_size: args.hidden_size,
         normalization_epsilon: args.rms_norm_eps,
         normalization_offset: 0.0,
-        embedding_format: args
-            .linear_formats
-            .get("model.embed_tokens.weight")
-            .and_then(|format| format.weight_quantization())
-            .into(),
+        embedding_format: args.linear_format_for("model.embed_tokens.weight"),
         // Published V3/R1 checkpoints keep the output head dense, including
         // otherwise block-FP8 models. An explicit selected format also covers
         // GGUF storage and admitted load-time transformations of the head.
@@ -1410,90 +1406,129 @@ pub(crate) fn static_spec(args: &V3Args) -> StaticModuleSpec {
     }
 }
 
-/// Builds the shared MoE assembly policy for one sparse target layer.
-pub fn moe_policy(args: &V3Args, layer: usize) -> Result<MoePolicy, Error> {
-    if args.layer_schedule.get(layer) != Some(&LayerPolicy::SparseMoe) {
-        return Err(Error::backend(format!("V3 layer {layer} is not sparse")));
-    }
-    moe_policy_for_layer(args, layer)
-}
-
-/// Returns the architecture-owned routed bank specification for a target or MTP layer.
+/// Returns the provider-owned bank projected from the complete routed declaration.
 pub fn expert_bank_spec(
     args: &V3Args,
     layer: usize,
 ) -> Result<eredu_nn::GroupedGatedProductSpec, Error> {
-    let policy = if layer < usize::try_from(args.num_hidden_layers).map_err(Error::backend)? {
-        moe_policy(args, layer)?
-    } else {
-        prediction_moe_policy(args, layer)?
-    };
-    crate::deepseek::moe::expert_bank_spec(&policy)
+    Ok(routed_spec(args, layer, None)?.parameters.experts)
 }
 
-pub(crate) fn localized_expert_bank_spec(
+/// Traverses the validated target and prediction schedule into construction-owned banks.
+pub(crate) fn expert_bank_specs(
     args: &V3Args,
-    layer: usize,
-    expert_count: i32,
-    intermediate_dimensions: i32,
-) -> Result<eredu_nn::GroupedGatedProductSpec, Error> {
-    expert_bank_spec(args, layer)?.with_group_geometry(expert_count, intermediate_dimensions)
+) -> Result<std::collections::BTreeMap<usize, eredu_nn::GroupedGatedProductSpec>, Error> {
+    args.validate().map_err(Error::backend)?;
+    let target = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
+    let prediction = usize::try_from(args.num_nextn_predict_layers).map_err(Error::backend)?;
+    let total = target
+        .checked_add(prediction)
+        .ok_or_else(|| Error::backend("DeepSeek expert layer count overflowed"))?;
+    (0..total)
+        .filter(|layer| {
+            *layer >= target || args.layer_schedule.get(*layer) == Some(&LayerPolicy::SparseMoe)
+        })
+        .map(|layer| expert_bank_spec(args, layer).map(|bank| (layer, bank)))
+        .collect()
 }
 
-pub(crate) fn prediction_moe_policy(args: &V3Args, layer: usize) -> Result<MoePolicy, Error> {
-    let start = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
-    let end = usize::try_from(args.num_hidden_layers + args.num_nextn_predict_layers)
-        .map_err(Error::backend)?;
-    if !(start..end).contains(&layer) {
+/// Declares one sparse target or prediction invocation and its complete parameter scope.
+pub(super) fn declare_routed_spec(args: &V3Args, layer: usize) -> Result<RoutedSpec, Error> {
+    use eredu_nn::{
+        DeclareLogicalParameters, GatedProductPolicy, GroupScoring, LinearSpec, ParameterSpec,
+        TopKGroupSelectionSpec, TopKGroupSelectorSpec,
+    };
+    let target = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
+    let end = usize::try_from(
+        args.num_hidden_layers
+            .checked_add(args.num_nextn_predict_layers)
+            .ok_or_else(|| Error::backend("V3 total layer count overflowed"))?,
+    )
+    .map_err(Error::backend)?;
+    if layer < target {
+        if args.layer_schedule.get(layer) != Some(&LayerPolicy::SparseMoe) {
+            return Err(Error::backend(format!("V3 layer {layer} is not sparse")));
+        }
+    } else if layer >= end {
         return Err(Error::backend(format!(
-            "V3 prediction layer {layer} is outside {start}..{end}"
+            "V3 prediction layer {layer} is outside {target}..{end}"
         )));
     }
-    moe_policy_for_layer(args, layer)
-}
-
-fn moe_policy_for_layer(args: &V3Args, layer: usize) -> Result<MoePolicy, Error> {
     let root = format!("model.layers.{layer}.mlp");
-    Ok(MoePolicy {
-        layer,
-        hidden: args.hidden_size,
-        expert_count: args.n_routed_experts,
-        routes_per_token: args.num_experts_per_tok,
-        expert_width: args.moe_intermediate_size,
-        shared_width: args
-            .moe_intermediate_size
-            .checked_mul(args.n_shared_experts)
-            .ok_or_else(|| Error::backend("V3 shared expert width overflowed"))?,
-        scoring: eredu_nn::GroupScoring::Sigmoid,
-        normalize_routes: args.norm_topk_prob,
-        normalization_epsilon: 1e-20,
-        routed_scaling: args.routed_scaling_factor,
-        expert_groups: args.n_group,
-        selected_groups: args.topk_group,
-        router_weight: format!("{root}.gate.weight"),
-        // Released routers stay dense unless exact selected encoding facts
-        // explicitly request a different realization (including load transforms).
-        router_format: args
-            .linear_formats
-            .get(&format!("{root}.gate.weight"))
-            .copied()
-            .unwrap_or(eredu_checkpoint::LinearFormat::Dense),
-        correction_bias: Some(format!("{root}.gate.e_score_correction_bias")),
-        expert_gate_up: format!("{root}.experts.gate_up_proj"),
-        expert_down: format!("{root}.experts.down_proj"),
-        shared_gate: format!("{root}.shared_experts.gate_proj.weight"),
-        shared_up: format!("{root}.shared_experts.up_proj.weight"),
-        shared_down: format!("{root}.shared_experts.down_proj.weight"),
-        shared_gate_format: args
-            .linear_format_for(&format!("{root}.shared_experts.gate_proj.weight")),
-        shared_up_format: args.linear_format_for(&format!("{root}.shared_experts.up_proj.weight")),
-        shared_down_format: args
-            .linear_format_for(&format!("{root}.shared_experts.down_proj.weight")),
-        expert_gate_up_format: args.linear_format_for(&format!("{root}.experts.gate_up_proj")),
-        expert_down_format: args.linear_format_for(&format!("{root}.experts.down_proj")),
-        shared_limit: None,
-        limit: None,
-    })
+    let parameter = |name: String| ParameterSpec::trainable(name).map_err(Error::backend);
+    let router_name = format!("{root}.gate.weight");
+    let router_format = args
+        .linear_formats
+        .get(&router_name)
+        .copied()
+        .unwrap_or(eredu_checkpoint::LinearFormat::Dense);
+    let selector = TopKGroupSelectorSpec::new(
+        args.hidden_size,
+        parameter(router_name.clone())?,
+        crate::linear_format::standard_linear_format(&router_name, router_format)?,
+        TopKGroupSelectionSpec::new(
+            args.n_routed_experts,
+            args.num_experts_per_tok,
+            GroupScoring::Sigmoid,
+            args.norm_topk_prob,
+        )?
+        .with_groups(args.n_group, args.topk_group)?
+        .with_weight_policy(1e-20, args.routed_scaling_factor)?,
+    )?
+    .with_correction_bias(parameter(format!("{root}.gate.e_score_correction_bias"))?)?;
+    let experts = {
+        let projection = |field: &str, row_layout| {
+            let name = format!("{root}.experts.{field}");
+            crate::linear_format::standard_expert_projection(
+                &name,
+                None,
+                args.linear_format_for(&name),
+                row_layout,
+            )
+        };
+        eredu_nn::GroupedGatedProductSpec::new(
+            args.n_routed_experts,
+            args.hidden_size,
+            args.moe_intermediate_size,
+            args.hidden_size,
+            GatedProductPolicy::ordinary_silu(),
+            eredu_nn::GatedProductGroupLayout::Packed {
+                gate_up: projection(
+                    "gate_up_proj",
+                    eredu_nn::LinearRowLayout::equal_partitions(2)?,
+                )?,
+                down: projection("down_proj", eredu_nn::LinearRowLayout::Contiguous)?,
+            },
+        )?
+    };
+    let width = args
+        .moe_intermediate_size
+        .checked_mul(args.n_shared_experts)
+        .ok_or_else(|| Error::backend("V3 shared expert width overflowed"))?;
+    let linear = |field: &str, input, output| {
+        let name = format!("{root}.shared_experts.{field}.weight");
+        Ok::<_, Error>(LinearSpec {
+            input,
+            output,
+            format: crate::linear_format::standard_linear_format(
+                &name,
+                args.linear_format_for(&name),
+            )?,
+            weight: parameter(name)?,
+            bias: None,
+        })
+    };
+    let spec = RoutedSpec {
+        parameters: eredu_nn::RoutedGatedProductSpec { selector, experts },
+        shared: eredu_nn::SplitGatedProductSpec::new(
+            linear("gate_proj", args.hidden_size, width)?,
+            linear("up_proj", args.hidden_size, width)?,
+            linear("down_proj", width, args.hidden_size)?,
+            GatedProductPolicy::ordinary_silu(),
+        )?,
+    };
+    spec.logical_parameters()?;
+    Ok(spec)
 }
 
 /// Declares compressed latent plus rotary state for target and embedded MTP
@@ -1507,11 +1542,13 @@ pub fn state_layout(args: &V3Args) -> Result<StateLayout, Error> {
     )
     .map_err(Error::backend)?;
     let policies = (0..layers)
-        .map(|_| {
+        .map(|layer| {
+            let spec =
+                super::v3_specs::attention_spec(args, &format!("model.layers.{layer}.self_attn"))?;
             LayerCachePolicy::compressed_latent_rotary(
                 AttentionPolicy::Full,
-                args.kv_lora_rank,
-                args.qk_rope_head_dim,
+                spec.geometry.latent_dimensions(),
+                spec.geometry.positional_dimensions(),
             )
             .map_err(Error::backend)
         })
@@ -2463,4 +2500,23 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
     fn text_input<'a>(tokens: &'a B::Tensor, mask: Option<&'a B::Tensor>) -> Self::Input<'a> {
         EmbeddedInput::Target { tokens, mask }
     }
+}
+
+/// Retained routed ownership with an explicitly selected provider bank.
+pub(crate) fn routed_spec(
+    args: &V3Args,
+    layer: usize,
+    experts: Option<eredu_nn::GroupedGatedProductSpec>,
+) -> Result<RoutedSpec, Error> {
+    let mut spec = args
+        .parameters()
+        .block(&format!("model.layers.{layer}"))?
+        .routed
+        .clone()
+        .ok_or_else(|| Error::backend("V3 invocation has no routed scope"))?;
+    if let Some(experts) = experts {
+        spec.parameters.experts = experts;
+    }
+    eredu_nn::DeclareLogicalParameters::logical_parameters(&spec)?;
+    Ok(spec)
 }

@@ -6,58 +6,65 @@ mod compressed;
 mod residual;
 
 #[derive(Clone, Copy)]
-enum NormStage {
-    Input,
-    AttentionOutput,
-    FeedForwardOutput,
+enum ReadNormStage {
     Head,
     Embedding,
-    Vocabulary,
 }
-
-fn norm(c: &DecoderConfig, gain: Option<String>, stage: NormStage) -> ComponentNormalization {
-    let post = matches!(
-        stage,
-        NormStage::AttentionOutput | NormStage::FeedForwardOutput
-    );
-    let centered = matches!(
-        stage,
-        NormStage::Input | NormStage::AttentionOutput | NormStage::FeedForwardOutput
-    );
-    let (kind, gain) = match c.block_normalization {
-        BlockNormalization::OutputScaled => (ComponentNormalizationKind::Rms, gain),
-        BlockNormalization::InputScaledFeedForward => match stage {
-            NormStage::AttentionOutput => (ComponentNormalizationKind::RmsFloat32, None),
-            NormStage::FeedForwardOutput => {
-                (ComponentNormalizationKind::InputScaledRmsFloat32, gain)
-            }
-            _ => (ComponentNormalizationKind::RmsFloat32, gain),
-        },
+fn read_norm(
+    c: &DecoderConfig,
+    gain: Option<String>,
+    stage: ReadNormStage,
+) -> ComponentNormalization {
+    let mut kind = match c.block_normalization {
+        BlockNormalization::OutputScaled => ComponentNormalizationKind::Rms,
+        BlockNormalization::InputScaledFeedForward => ComponentNormalizationKind::RmsFloat32,
     };
-    let kind = if matches!(stage, NormStage::Embedding)
+    if matches!(stage, ReadNormStage::Embedding)
         && c.vocabulary_arithmetic() == crate::muse::VocabularyArithmetic::Float32
     {
-        ComponentNormalizationKind::RmsFloat32Output
-    } else {
-        kind
-    };
-    let offset =
-        if gain.is_some() && centered && c.weight_convention == WeightConvention::HuggingFace {
-            1.0
-        } else {
-            0.0
-        };
+        kind = ComponentNormalizationKind::RmsFloat32Output;
+    }
     ComponentNormalization {
         kind,
-        epsilon: ComponentScalar::new(if post {
-            c.post_norm_eps
-        } else {
-            c.rms_norm_eps
-        }),
+        epsilon: ComponentScalar::new(c.rms_norm_eps),
         gain,
-        gain_offset: ComponentScalar::new(offset),
+        gain_offset: ComponentScalar::new(0.0),
         bias: None,
         groups: 1,
+    }
+}
+
+fn declared_target_norm(
+    spec: &crate::muse::equations::specs::LearnedRmsNormSpec,
+) -> ComponentNormalization {
+    let mut normalization = super::declared_normalization(spec.normalization());
+    normalization.kind = match spec.equation() {
+        crate::muse::RmsNormEquation::OutputScaled(_) => ComponentNormalizationKind::Rms,
+        crate::muse::RmsNormEquation::OutputScaledFp32(_) => ComponentNormalizationKind::RmsFloat32,
+        crate::muse::RmsNormEquation::InputScaled(_) => {
+            ComponentNormalizationKind::InputScaledRmsFloat32
+        }
+        _ => unreachable!(
+            "assistant compute-precision equations are outside ordinary target component discovery"
+        ),
+    };
+    normalization
+}
+fn declared_branch_norm(
+    spec: &crate::muse::equations::specs::BranchNormSpec,
+) -> ComponentNormalization {
+    match spec {
+        crate::muse::equations::specs::BranchNormSpec::Learned(spec) => declared_target_norm(spec),
+        crate::muse::equations::specs::BranchNormSpec::Weightless { epsilon } => {
+            ComponentNormalization {
+                kind: ComponentNormalizationKind::RmsFloat32,
+                epsilon: ComponentScalar::new(*epsilon),
+                gain: None,
+                gain_offset: ComponentScalar::new(0.0),
+                bias: None,
+                groups: 1,
+            }
+        }
     }
 }
 
@@ -69,9 +76,14 @@ pub(in crate::discovery) fn unit(g: &mut Builder, c: &DecoderConfig, layer: usiz
     let ap = format!("{path}.self_attn");
     let fp = format!("{path}.mlp");
     let width = c.hidden_size as usize;
-    let heads = c.num_attention_heads as usize;
-    let kv = c.num_key_value_heads as usize;
-    let dim = c.head_dim as usize;
+    let spec = c
+        .attention(layer)
+        .expect("validated Muse attention declaration");
+    let slots = &spec.parameters;
+    let heads = slots.projection.geometry.query_heads() as usize;
+    let kv = slots.projection.geometry.key_value_heads() as usize;
+    let dim = slots.projection.geometry.key_dimensions() as usize;
+    let scalar = c.scalar(layer).expect("validated Muse scalar declarations");
     g.attach_parameters(&attention, &ap);
     g.attach_parameters(&ffn, &fp);
     residual::attach(g, c, layer);
@@ -90,39 +102,38 @@ pub(in crate::discovery) fn unit(g: &mut Builder, c: &DecoderConfig, layer: usiz
         g.get_mut(&block).observation_paths.push(point.path.clone());
         g.descriptor.observations.points.push(point);
     }
-    for (boundary, node, field, stage) in [
+    for (boundary, node, field, post, normalization) in [
         (
             "attention.input",
             &attention,
             "input_layernorm",
-            NormStage::Input,
+            false,
+            declared_target_norm(&scalar.input),
         ),
         (
             "attention.output",
             &attention,
             "post_attention_layernorm",
-            NormStage::AttentionOutput,
+            true,
+            declared_branch_norm(&scalar.post_attention),
         ),
         (
             "feed_forward.input",
             &ffn,
             "pre_feedforward_layernorm",
-            NormStage::Input,
+            false,
+            declared_target_norm(&scalar.pre_feed_forward),
         ),
         (
             "feed_forward.output",
             &ffn,
             "post_feedforward_layernorm",
-            NormStage::FeedForwardOutput,
+            true,
+            declared_target_norm(&scalar.post_feed_forward),
         ),
     ] {
         let prefix = format!("{path}.{field}");
         let id = format!("{block}.{field}");
-        let normalization = norm(c, Some(format!("{prefix}.weight")), stage);
-        let post = matches!(
-            stage,
-            NormStage::AttentionOutput | NormStage::FeedForwardOutput
-        );
         g.node(
             &id,
             ArchitectureNodeKind::Normalization,
@@ -164,8 +175,7 @@ pub(in crate::discovery) fn unit(g: &mut Builder, c: &DecoderConfig, layer: usiz
             }
         }
     }
-    let read = |field: &str, role, rows, head_count: Option<usize>| {
-        let weight = format!("{ap}.{field}.weight");
+    let read = |projection: &eredu_nn::LinearSpec, role, rows, head_count: Option<usize>| {
         let head_normalization = head_count.map(|head_count| {
             let query = role == ComponentReadRole::Query;
             let gguf = c.weight_convention == WeightConvention::Gguf;
@@ -178,24 +188,22 @@ pub(in crate::discovery) fn unit(g: &mut Builder, c: &DecoderConfig, layer: usiz
                 heads: head_count,
                 head_width: dim,
                 independent_gains: false,
-                normalization: norm(
+                normalization: read_norm(
                     c,
-                    gguf.then(|| format!("{ap}.{}_norm.weight", if query { "q" } else { "k" })),
-                    NormStage::Head,
+                    slots.norms.get(if query { 0 } else { 1 }).and_then(|norm| {
+                        use eredu_nn::DeclareLogicalParameters;
+                        norm.logical_parameters()
+                            .expect("validated Muse head norm")
+                            .first()
+                            .map(|parameter| parameter.parameter.id.as_str().to_owned())
+                    }),
+                    ReadNormStage::Head,
                 ),
             }
         });
         ComponentRead {
-            source: None,
-            projection_output: None,
-            role,
-            shared_weight: weight.clone(),
-            weight,
-            parameter_group: format!("parameters:{ap}"),
-            bias: None,
-            rows,
             head_normalization,
-            input_projections: vec![],
+            ..declared_component_read(projection, format!("parameters:{ap}"), role, rows)
         }
     };
     let head_rows = |sharing| ComponentRowMapping::HeadRows {
@@ -219,19 +227,19 @@ pub(in crate::discovery) fn unit(g: &mut Builder, c: &DecoderConfig, layer: usiz
         input: format!("{path}.attention.input"),
         reads: vec![
             read(
-                "q_proj",
+                &slots.projection.query,
                 ComponentReadRole::Query,
                 head_rows(1),
                 Some(heads),
             ),
             read(
-                "k_proj",
+                &slots.projection.key,
                 ComponentReadRole::Key,
                 head_rows(heads / kv),
                 Some(kv),
             ),
             read(
-                "v_proj",
+                &slots.projection.value,
                 ComponentReadRole::Value,
                 ComponentRowMapping::GroupedQuery {
                     offset: 0,
@@ -241,15 +249,15 @@ pub(in crate::discovery) fn unit(g: &mut Builder, c: &DecoderConfig, layer: usiz
                 None,
             ),
             read(
-                "gate_proj",
+                &slots.gate,
                 ComponentReadRole::OutputGate,
                 ComponentRowMapping::Direct { offset: 0 },
                 None,
             ),
         ],
         routed_reads: vec![],
-        write_weight: format!("{ap}.o_proj.weight"),
-        shared_write_weight: format!("{ap}.o_proj.weight"),
+        write_weight: slots.projection.output.weight.id.as_str().to_owned(),
+        shared_write_weight: slots.projection.output.weight.id.as_str().to_owned(),
         write_parameter_group: format!("parameters:{ap}"),
         write_input_projection: None,
         write_bias: None,
@@ -261,24 +269,16 @@ pub(in crate::discovery) fn unit(g: &mut Builder, c: &DecoderConfig, layer: usiz
             )
             .then(|| ComponentAttendedHeadNormalization {
                 input: format!("{path}.attention.attended_heads"),
-                normalization: norm(c, None, NormStage::Head),
+                normalization: read_norm(c, None, ReadNormStage::Head),
             }),
             query_heads: heads,
             key_value_heads: kv,
             head_width: dim,
             output_gate: Some(ComponentNonlinearity::Sigmoid),
         },
-        input_normalization: norm(
-            c,
-            Some(format!("{path}.input_layernorm.weight")),
-            NormStage::Input,
-        ),
+        input_normalization: declared_target_norm(&scalar.input),
         output_gate: None,
-        output_normalization: Some(norm(
-            c,
-            Some(format!("{path}.post_attention_layernorm.weight")),
-            NormStage::AttentionOutput,
-        )),
+        output_normalization: Some(declared_branch_norm(&scalar.post_attention)),
         residual_scale: ComponentScalar::new(1.0),
     });
     let mut channels = axes(heads * dim);
@@ -318,22 +318,18 @@ pub(in crate::discovery) fn unit(g: &mut Builder, c: &DecoderConfig, layer: usiz
             ],
         );
     }
-    let input_norm = norm(
-        c,
-        Some(format!("{path}.pre_feedforward_layernorm.weight")),
-        NormStage::Input,
-    );
+    let input_norm = declared_target_norm(&scalar.pre_feed_forward);
     if c.num_experts == 0 {
+        let projections = c.dense(layer).expect("admitted Muse dense declaration");
         gated_units(
             g,
             &ffn,
             layer,
             &format!("parameters:{fp}"),
-            &fp,
+            projections.projections(),
+            projections.policy,
             &format!("{path}.feed_forward"),
             &format!("{path}.feed_forward.input"),
-            c.intermediate_size as usize,
-            width,
             input_norm,
             ComponentWritePartition::Complete,
         );
@@ -341,13 +337,9 @@ pub(in crate::discovery) fn unit(g: &mut Builder, c: &DecoderConfig, layer: usiz
             .components
             .last_mut()
             .unwrap()
-            .output_normalization = Some(norm(
-            c,
-            Some(format!("{path}.post_feedforward_layernorm.weight")),
-            NormStage::FeedForwardOutput,
-        ));
+            .output_normalization = Some(declared_target_norm(&scalar.post_feed_forward));
     } else {
-        let compressed = compressed::declare(g, c, &ffn, &path, &fp);
+        let compressed = compressed::declare(g, c, layer, &ffn, &path, &fp);
         let count = g.descriptor.routed_components.len();
         super::super::routed_components::gated(
             g,
@@ -366,12 +358,19 @@ pub(in crate::discovery) fn unit(g: &mut Builder, c: &DecoderConfig, layer: usiz
                 ),
                 residual_scale: None,
             },
-            crate::muse::text::expert_bank_spec(c, layer),
+            c.routed(layer)
+                .map(|declaration| declaration.bank().clone()),
         );
         if let Some(compressed) = compressed {
             if g.descriptor.routed_components.len() == count + 1 {
                 let group = g.descriptor.routed_components.last_mut().unwrap();
-                group.routes_per_token = Some(c.num_experts_per_tok as usize);
+                group.routes_per_token = Some(
+                    c.routed(layer)
+                        .expect("validated Muse routed declaration")
+                        .selector()
+                        .selection()
+                        .top_k() as usize,
+                );
                 group.expert_output_transform = Some(compressed.expert_transform);
                 group.write_output = Some(format!("{path}.feed_forward.expert_mixture"));
                 group.output = Some(format!("{path}.feed_forward.write"));
@@ -380,22 +379,40 @@ pub(in crate::discovery) fn unit(g: &mut Builder, c: &DecoderConfig, layer: usiz
     }
 }
 
-pub(in crate::discovery) fn readout(g: &mut Builder, c: &DecoderConfig) {
-    let width = c.hidden_size as usize;
-    g.attach_parameters("embedding", "model.embed_tokens");
-    g.attach_parameters(
-        "output",
-        if c.tie_word_embeddings {
-            "model.embed_tokens"
+pub(in crate::discovery) fn readout(
+    g: &mut Builder,
+    c: &DecoderConfig,
+    construction: &crate::decoder::StaticModuleConstruction,
+) {
+    let embedding = construction.embedding_spec();
+    let width = embedding.dimensions as usize;
+    let output = construction
+        .head_spec()
+        .map(|head| head.weight.id.as_str())
+        .unwrap_or(embedding.weight.id.as_str());
+    let mut final_normalization = super::declared_normalization(construction.normalization_spec());
+    final_normalization.kind =
+        if c.vocabulary_arithmetic() == crate::muse::VocabularyArithmetic::Backend {
+            ComponentNormalizationKind::Rms
         } else {
-            "lm_head"
-        },
+            ComponentNormalizationKind::RmsFloat32
+        };
+    let final_prefix = final_normalization
+        .gain
+        .as_deref()
+        .expect("declared Muse final gain")
+        .trim_end_matches(".weight")
+        .to_owned();
+    g.attach_parameters(
+        "embedding",
+        embedding.weight.id.as_str().trim_end_matches(".weight"),
     );
+    g.attach_parameters("output", output.trim_end_matches(".weight"));
     g.node(
         "output.norm",
         ArchitectureNodeKind::Normalization,
         Some("output"),
-        Some("model.norm"),
+        Some(&final_prefix),
         Some(width),
     );
     for (node, path, meaning) in [
@@ -417,7 +434,7 @@ pub(in crate::discovery) fn readout(g: &mut Builder, c: &DecoderConfig) {
     ] {
         g.component_observation(node, path.into(), meaning, axes(width));
     }
-    let mut scores = axes(c.vocab_size as usize);
+    let mut scores = axes(embedding.vocabulary as usize);
     scores[2].name = "vocabulary".into();
     g.component_observation(
         "output",
@@ -427,11 +444,11 @@ pub(in crate::discovery) fn readout(g: &mut Builder, c: &DecoderConfig) {
     );
     g.descriptor.component_readout = Some(ComponentReadout {
         embedding: "readout.embedding".into(),
-        embedding_weight: "model.embed_tokens.weight".into(),
+        embedding_weight: embedding.weight.id.as_str().into(),
         embedding_scale: ComponentScalar::new(1.0),
         embedding_normalization: None,
-        token_embedding_normalization: Some(norm(c, None, NormStage::Embedding)),
-        tied_embeddings: c.tie_word_embeddings,
+        token_embedding_normalization: Some(read_norm(c, None, ReadNormStage::Embedding)),
+        tied_embeddings: construction.head_spec().is_none(),
         equation: ComponentReadoutEquation {
             residual_cycles: residual::cycles(c),
             block_transforms: vec![],
@@ -441,13 +458,8 @@ pub(in crate::discovery) fn readout(g: &mut Builder, c: &DecoderConfig) {
             projection_input: Some("readout.projection_input".into()),
             linear_scores: "readout.linear".into(),
             logits: MODEL_LOGITS_OBSERVATION_PATH.into(),
-            normalization: norm(c, Some("model.norm.weight".into()), NormStage::Vocabulary),
-            weight: if c.tie_word_embeddings {
-                "model.embed_tokens.weight"
-            } else {
-                "lm_head.weight"
-            }
-            .into(),
+            normalization: final_normalization,
+            weight: output.into(),
             bias: None,
             score_writes: vec![],
             output_transform: ComponentOutputTransform::ScaledSoftcap {

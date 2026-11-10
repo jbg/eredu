@@ -13,7 +13,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ConditionalKernel<B> {
         spec: BoundTargetSpec,
         target: TargetTensorPartition,
         ingress: MediaIngress,
-        vision: VisionConfig,
+        vision: std::sync::Arc<crate::qwen::vision::Declaration>,
         topology: eredu_core::ParallelRankTopology,
         layout: &LocalModelLayout,
         state: &PartitionState,
@@ -36,30 +36,33 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ConditionalKernel<B> {
         let definition = definition
             .project_parameters(parameters)?
             .select_state_layout(&target.local_spec().state_layout()?)?;
+
         let blocks = (0..vision.layer_count())
             .map(|index| {
-                crate::qwen::vision::local_block_geometry(&vision, "model.visual", index, layout)
+                crate::qwen::vision::local_block_geometry(&vision, index, layout)
                     .map_err(Error::backend)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let mergers = crate::qwen::vision::local_merger_widths(&vision, "model.visual", layout)
-            .map_err(Error::backend)?;
+        let vision_construction = blocks
+            .iter()
+            .enumerate()
+            .map(|(index, &(heads, intermediate))| {
+                Ok((index, vision.local_block(index, heads, intermediate)?))
+            })
+            .collect::<Result<_, Error>>()?;
+        let mergers =
+            crate::qwen::vision::local_merger_widths(&vision, layout).map_err(Error::backend)?;
         let target = TargetKernel::new_tensor_parallel(spec, target, context)?
             .with_partition_state(state)?;
         let modules = ConditionalStatic {
             target,
-            vision: VisionStatic::new_parallel_with_root(
-                vision.clone(),
-                "model.visual",
-                &mergers,
-                context,
-            )?,
+            vision: VisionStatic::new_parallel(vision.clone(), &mergers, context)?,
         };
         Ok(Self {
             modules,
             ingress,
             vision,
-            vision_local: Some(blocks),
+            vision_construction,
             vision_input_owner: topology.pipeline_parallel_rank() == 0,
             partition_state: Some(state.clone()),
             definition,
@@ -85,7 +88,6 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ConditionalKernel<B> {
         }
         let vision = crate::qwen::vision::VisionStaticSelection::from_parameter_bindings(
             self.vision.clone(),
-            "model.visual",
             partition
                 .unit_layout()
                 .group_id(VISION_INDEX)

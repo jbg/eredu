@@ -171,7 +171,7 @@ pub fn prepare_execution_plan_assistant(
         _ => {
             return Err(AutomaticPlanningError::Invalid(
                 "external assistant selection requires an external drafting plan".into(),
-            ))
+            ));
         }
     };
     let quantization = execution_plan_quantization(plan.weight_transformation())

@@ -1,20 +1,14 @@
 //! Semantic tensor-parallel placement for LFM2 physical blocks.
 
-use eredu_nn::{GroupedNeuralBackend, VocabularyParallelRange};
+use eredu_nn::{LogicalParameterRole, VocabularyParallelRange};
 use eredu_runtime::{
-    aligned_partition_units, module_parameter_group, partitioned_module_parameter_group,
-    ArchitectureParameterDescription, ExecutionGraph, ExecutionUnitLayout, LocalModelLayout,
-    MemberSharding, OwnedParameterGroupSpec, ParallelPlanError, ParameterGroupOwner,
-    ParameterGroupSpec, ParameterMemberSpec, ParameterRole, StateLayout,
+    aligned_partition_units, ArchitectureParameterDescription, ExecutionGraph, ExecutionUnitLayout,
+    LocalModelLayout, MemberSharding, OwnedParameterGroupSpec, ParallelPlanError,
+    ParameterGroupOwner, ParameterRole, StateLayout,
 };
 use std::ops::Range;
 
-use crate::decoder::StaticModules;
-
-use super::{
-    prompt_cache_architecture_fingerprint, state_layout_with_geometry, Block, BlockGeometry,
-    DenseSwiGlu, FeedForward, LayerCacheGeometry, ModelArgs, OperatorPolicy, TokenMixer,
-};
+use super::{prompt_cache_architecture_fingerprint, BlockGeometry, Declaration, ModelArgs};
 
 /// Complete planner-derived construction and state geometry for one LFM2 rank.
 ///
@@ -27,7 +21,7 @@ pub struct LocalGeometry {
     output_range: Option<VocabularyParallelRange>,
     state_layout: StateLayout,
     architecture_fingerprint: String,
-    global_block_geometry: BlockGeometry,
+    definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
     tied_head: bool,
 }
 
@@ -45,6 +39,7 @@ pub struct PartitionLocalGeometry {
     output_range: Option<VocabularyParallelRange>,
     complete_state_layout: StateLayout,
     architecture_fingerprint: String,
+    definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
     tied_head: bool,
     static_roles: Vec<String>,
     boundary_schema: eredu_runtime::NoAuxiliaryBoundarySchema,
@@ -177,37 +172,40 @@ impl PartitionLocalGeometry {
         self.expert_intermediate_range.clone()
     }
 
-    pub(super) fn validate_for(&self, args: &ModelArgs) -> Result<(), ParallelPlanError> {
-        args.validate()
-            .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-        if args.has_sparse_moe_layers() != self.expert_realization.is_some() {
+    pub(super) fn validate_for(&self, declaration: &Declaration) -> Result<(), ParallelPlanError> {
+        let args = declaration.args();
+        if !declaration.expert_banks().is_empty() != self.expert_realization.is_some() {
             return Err(ParallelPlanError::InvalidGroup(
                 "partition-local LFM2 routed authority differs from its schedule".into(),
             ));
         }
-        let count = usize::try_from(args.num_hidden_layers).map_err(|_| {
-            ParallelPlanError::InvalidGroup("LFM2 layer count exceeds usize".into())
-        })?;
+        let count = declaration.blocks.len();
         if self.owned_units.is_empty()
             || self.owned_units.end > count
             || self.blocks.len() != self.owned_units.len()
             || self.architecture_fingerprint != prompt_cache_architecture_fingerprint(args)
-            || self.tied_head != args.tie_word_embeddings
+            || self.definition.parameters() != declaration.definition().parameters()
+            || self.tied_head != declaration.statics.head_spec().is_none()
             || self.static_roles != expected_static_roles(&self.owned_units, count)
             || self.boundary_schema
-                != eredu_runtime::NoAuxiliaryBoundarySchema::new(args.hidden_size)
+                != eredu_runtime::NoAuxiliaryBoundarySchema::new(
+                    declaration.statics.embedding_spec().dimensions,
+                )
         {
             return Err(ParallelPlanError::InvalidGroup(
                 "partition-local LFM2 geometry belongs to a different model or range".into(),
             ));
         }
         self.embedding_range
-            .validate_global_rows(args.vocab_size)
+            .validate_global_rows(declaration.statics.embedding_spec().vocabulary)
             .map_err(|error| ParallelPlanError::InvalidTensor(error.to_string()))?;
-        match (args.tie_word_embeddings, &self.output_range) {
+        match (
+            declaration.statics.head_spec().is_none(),
+            &self.output_range,
+        ) {
             (true, None) => {}
             (false, Some(range)) => range
-                .validate_global_rows(args.vocab_size)
+                .validate_global_rows(declaration.statics.embedding_spec().vocabulary)
                 .map_err(|error| ParallelPlanError::InvalidTensor(error.to_string()))?,
             _ => {
                 return Err(ParallelPlanError::InvalidGroup(
@@ -225,37 +223,12 @@ impl PartitionLocalGeometry {
             let policy = self.complete_state_layout.layer(global).ok_or_else(|| {
                 ParallelPlanError::InvalidGroup("missing LFM2 complete state layer".into())
             })?;
-            let operator = args
-                .layer_policy(global)
-                .ok_or_else(|| {
-                    ParallelPlanError::InvalidGroup(format!("LFM2 has no layer {global}"))
-                })?
-                .operator;
-            let matches = match (operator, policy) {
-                (
-                    OperatorPolicy::SelfAttention(_),
-                    eredu_core::cache::LayerCachePolicy::KeyValue {
-                        num_key_value_heads,
-                        ..
-                    },
-                ) => i32::try_from(num_key_value_heads.get())
-                    .is_ok_and(|heads| heads == block.key_value_heads),
-                (
-                    OperatorPolicy::CausalConvolution,
-                    eredu_core::cache::LayerCachePolicy::FixedState { tensors },
-                ) => tensors.first().is_some_and(|tensor| {
-                    matches!(
-                        tensor.shape.get(2),
-                        Some(eredu_core::cache::StateTensorDimension::Fixed(width))
-                            if i32::try_from(width.get()).is_ok_and(|width| width == block.convolution_channels)
-                    )
-                }),
-                (
-                    OperatorPolicy::CausalConvolution,
-                    eredu_core::cache::LayerCachePolicy::NoState,
-                ) => args.conv_l_cache == 1,
-                _ => false,
-            };
+            let expected = declaration.blocks[global]
+                .clone()
+                .local(*block, None)
+                .and_then(|scope| scope.mixer.state_policy())
+                .map_err(invalid)?;
+            let matches = *policy == expected;
             if !matches {
                 return Err(ParallelPlanError::InvalidGroup(format!(
                     "owned LFM2 block {global} differs from complete TP-local state geometry"
@@ -292,26 +265,28 @@ impl LocalGeometry {
         &self.state_layout
     }
 
-    pub(super) fn validate_for(&self, args: &ModelArgs) -> Result<(), ParallelPlanError> {
-        let expected_layers = usize::try_from(args.num_hidden_layers).map_err(|_| {
-            ParallelPlanError::InvalidGroup("LFM2 layer count exceeds usize".into())
-        })?;
+    pub(super) fn validate_for(&self, declaration: &Declaration) -> Result<(), ParallelPlanError> {
+        let args = declaration.args();
+        let expected_layers = declaration.blocks.len();
         if self.blocks.len() != expected_layers
             || self.architecture_fingerprint != prompt_cache_architecture_fingerprint(args)
-            || self.global_block_geometry != BlockGeometry::replicated(args)
-            || self.tied_head != args.tie_word_embeddings
+            || self.definition.parameters() != declaration.definition().parameters()
+            || self.tied_head != declaration.statics.head_spec().is_none()
         {
             return Err(ParallelPlanError::InvalidGroup(
                 "rank-local LFM2 geometry belongs to a different model configuration".into(),
             ));
         }
         self.embedding_range
-            .validate_global_rows(args.vocab_size)
+            .validate_global_rows(declaration.statics.embedding_spec().vocabulary)
             .map_err(|error| ParallelPlanError::InvalidTensor(error.to_string()))?;
-        match (args.tie_word_embeddings, &self.output_range) {
+        match (
+            declaration.statics.head_spec().is_none(),
+            &self.output_range,
+        ) {
             (true, None) => {}
             (false, Some(range)) => range
-                .validate_global_rows(args.vocab_size)
+                .validate_global_rows(declaration.statics.embedding_spec().vocabulary)
                 .map_err(|error| ParallelPlanError::InvalidTensor(error.to_string()))?,
             (true, Some(_)) => {
                 return Err(ParallelPlanError::InvalidGroup(
@@ -324,7 +299,8 @@ impl LocalGeometry {
                 ));
             }
         }
-        let expected = state_layout_with_geometry(args, &state_geometry(args, &self.blocks))
+        let expected = declaration
+            .state_layout_with_geometry(&self.blocks)
             .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
         if expected != self.state_layout {
             return Err(ParallelPlanError::InvalidGroup(
@@ -360,21 +336,21 @@ fn local_width(
 
 /// Derives one block's local widths exclusively from the resolved placement.
 pub fn local_block_geometry(
-    args: &ModelArgs,
+    declaration: &Declaration,
     layer: usize,
     layout: &LocalModelLayout,
 ) -> Result<BlockGeometry, ParallelPlanError> {
-    let root = format!("model.layers.{layer}");
-    let mut geometry = BlockGeometry::replicated(args);
-    match args
-        .layer_policy(layer)
-        .ok_or_else(|| ParallelPlanError::InvalidGroup(format!("LFM2 has no layer {layer}")))?
-        .operator
-    {
-        OperatorPolicy::SelfAttention(_) => {
-            let head = args.hidden_size / args.num_attention_heads;
-            let query = local_width(layout, &format!("{root}.self_attn.q_proj.weight"), 0)?;
-            let key = local_width(layout, &format!("{root}.self_attn.k_proj.weight"), 0)?;
+    use super::declarations::{FeedForwardParameters as F, MixerParameters as M};
+    let scope = declaration
+        .blocks
+        .get(layer)
+        .ok_or_else(|| ParallelPlanError::InvalidGroup(format!("LFM2 has no layer {layer}")))?;
+    let mut geometry = scope.geometry(declaration.args());
+    match &scope.mixer {
+        M::Attention(spec, _) => {
+            let head = spec.projection.geometry.key_dimensions();
+            let query = local_width(layout, spec.projection.query.weight.id.as_str(), 0)?;
+            let key = local_width(layout, spec.projection.key.weight.id.as_str(), 0)?;
             if query % head != 0 || key % head != 0 {
                 return Err(ParallelPlanError::InvalidTensor(format!(
                     "local LFM2 attention widths q={query} k={key} split head dimension {head}"
@@ -383,22 +359,18 @@ pub fn local_block_geometry(
             geometry.query_heads = query / head;
             geometry.key_value_heads = key / head;
         }
-        OperatorPolicy::CausalConvolution => {
+        M::Convolution(spec) => {
             geometry.convolution_channels =
-                local_width(layout, &format!("{root}.conv.conv.weight"), 0)?;
+                local_width(layout, spec.convolution.weight.id.as_str(), 0)?;
         }
     }
-    match args.layer_policy(layer).unwrap().feed_forward {
-        super::FeedForwardPolicy::Dense => {
-            geometry.dense_intermediate =
-                local_width(layout, &format!("{root}.feed_forward.w1.weight"), 0)?;
+    match &scope.feed_forward {
+        F::Dense(spec) => {
+            geometry.dense_intermediate = local_width(layout, spec.gate.weight.id.as_str(), 0)?
         }
-        super::FeedForwardPolicy::SparseMoe => {
-            let fused = local_width(
-                layout,
-                &format!("{root}.feed_forward.experts.gate_up_proj"),
-                1,
-            )?;
+        F::Routed(spec) => {
+            let source = spec.experts.packed_parameters().map_err(invalid)?;
+            let fused = local_width(layout, source.gate_up().parameter.id.as_str(), 1)?;
             if fused % 2 != 0 {
                 return Err(ParallelPlanError::InvalidTensor(format!(
                     "local LFM2 packed expert width {fused} is not even"
@@ -407,18 +379,8 @@ pub fn local_block_geometry(
             geometry.expert_intermediate = fused / 2;
         }
     }
+    scope.clone().local(geometry, None).map_err(invalid)?;
     Ok(geometry)
-}
-
-/// Returns rank-local mutable-state geometry for every scheduled block.
-pub fn local_state_geometry(
-    args: &ModelArgs,
-    layout: &LocalModelLayout,
-) -> Result<Vec<LayerCacheGeometry>, ParallelPlanError> {
-    let blocks = (0..args.num_hidden_layers as usize)
-        .map(|layer| local_block_geometry(args, layer, layout))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(state_geometry(args, &blocks))
 }
 
 /// Derives complete TP-local heterogeneous state before pipeline slicing.
@@ -426,12 +388,11 @@ pub fn local_state_geometry(
 /// State follows attention key/value heads or convolution output channels;
 /// feed-forward routing does not alter either state-bearing width.
 pub fn partitioned_state_layout(
-    args: &ModelArgs,
+    declaration: &Declaration,
     tensor_rank: usize,
     tensor_size: usize,
 ) -> Result<StateLayout, ParallelPlanError> {
-    args.validate()
-        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+    let args = declaration.args();
     if tensor_size == 0 || tensor_rank >= tensor_size {
         return Err(ParallelPlanError::InvalidGroup(format!(
             "invalid LFM2 tensor coordinate {tensor_rank}/{tensor_size}"
@@ -446,58 +407,47 @@ pub fn partitioned_state_layout(
         i32::try_from(local)
             .map_err(|_| ParallelPlanError::InvalidGroup(format!("LFM2 local {role} exceeds i32")))
     };
-    let key_value_heads = select(args.num_key_value_heads, "key/value head count")?;
-    let convolution_channels = select(args.hidden_size, "convolution channel count")?;
-    let geometry = args
-        .layer_schedule
+    let geometry = declaration
+        .blocks
         .iter()
-        .map(|policy| match policy.operator {
-            OperatorPolicy::CausalConvolution => LayerCacheGeometry {
-                kv_heads: None,
-                convolution_channels: Some(convolution_channels),
-            },
-            OperatorPolicy::SelfAttention(_) => LayerCacheGeometry {
-                kv_heads: Some(key_value_heads),
-                convolution_channels: None,
-            },
+        .map(|scope| {
+            let mut block = scope.geometry(args);
+            match &scope.mixer {
+                super::declarations::MixerParameters::Attention(spec, _) => {
+                    block.query_heads =
+                        select(spec.projection.geometry.query_heads(), "query head count")?;
+                    block.key_value_heads = select(
+                        spec.projection.geometry.key_value_heads(),
+                        "key/value head count",
+                    )?;
+                }
+                super::declarations::MixerParameters::Convolution(spec) => {
+                    block.convolution_channels =
+                        select(spec.channels, "convolution channel count")?;
+                }
+            }
+            Ok(block)
         })
-        .collect::<Vec<_>>();
-    state_layout_with_geometry(args, &geometry)
-        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))
-}
-
-fn state_geometry(args: &ModelArgs, blocks: &[BlockGeometry]) -> Vec<LayerCacheGeometry> {
-    args.layer_schedule
-        .iter()
-        .zip(blocks)
-        .map(|(policy, geometry)| match policy.operator {
-            OperatorPolicy::SelfAttention(_) => LayerCacheGeometry {
-                kv_heads: Some(geometry.key_value_heads),
-                convolution_channels: None,
-            },
-            OperatorPolicy::CausalConvolution => LayerCacheGeometry {
-                kv_heads: None,
-                convolution_channels: Some(geometry.convolution_channels),
-            },
-        })
-        .collect()
+        .collect::<Result<Vec<_>, ParallelPlanError>>()?;
+    declaration
+        .state_layout_with_geometry(&geometry)
+        .map_err(invalid)
 }
 
 /// Derives complete rank-local LFM2 construction geometry from one typed plan.
 pub fn local_geometry(
-    args: &ModelArgs,
+    declaration: &Declaration,
     layout: &LocalModelLayout,
 ) -> Result<LocalGeometry, ParallelPlanError> {
-    args.validate()
-        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    let layers = usize::try_from(args.num_hidden_layers)
-        .map_err(|_| ParallelPlanError::InvalidGroup("LFM2 layer count exceeds usize".into()))?;
+    let args = declaration.args();
+    let layers = declaration.blocks.len();
     let blocks = (0..layers)
-        .map(|layer| local_block_geometry(args, layer, layout))
+        .map(|layer| local_block_geometry(declaration, layer, layout))
         .collect::<Result<Vec<_>, _>>()?;
-    let state_layout = state_layout_with_geometry(args, &state_geometry(args, &blocks))
+    let state_layout = declaration
+        .state_layout_with_geometry(&blocks)
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    let (embedding_range, output_range) = super::static_spec(args).vocabulary_ranges(
+    let (embedding_range, output_range) = declaration.statics.vocabulary_ranges(
         layout,
         "model.embed_tokens",
         "model.embedding_norm",
@@ -509,34 +459,31 @@ pub fn local_geometry(
         output_range,
         state_layout,
         architecture_fingerprint: prompt_cache_architecture_fingerprint(args),
-        global_block_geometry: BlockGeometry::replicated(args),
-        tied_head: args.tie_word_embeddings,
+        definition: std::sync::Arc::clone(declaration.definition()),
+        tied_head: declaration.statics.head_spec().is_none(),
     };
-    geometry.validate_for(args)?;
+    geometry.validate_for(declaration)?;
     Ok(geometry)
 }
 
 /// Derives exact TP-local and PP-local construction geometry for dense LFM2.
 pub fn partition_local_geometry(
-    args: &ModelArgs,
+    declaration: &Declaration,
     layout: &LocalModelLayout,
     owned_units: Range<usize>,
 ) -> Result<PartitionLocalGeometry, ParallelPlanError> {
-    args.validate()
-        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    if args.has_sparse_moe_layers() {
+    if !declaration.expert_banks().is_empty() {
         return Err(ParallelPlanError::InvalidGroup(
             "partitioned resident LFM2 does not accept routed feed-forward layers".into(),
         ));
     }
-    let count = usize::try_from(args.num_hidden_layers)
-        .map_err(|_| ParallelPlanError::InvalidGroup("LFM2 layer count exceeds usize".into()))?;
+    let count = declaration.blocks.len();
     if owned_units.is_empty() || owned_units.end > count {
         return Err(ParallelPlanError::InvalidGroup(format!(
             "LFM2 local unit range {owned_units:?} is outside {count} layers"
         )));
     }
-    let complete = local_geometry(args, layout)?;
+    let complete = local_geometry(declaration, layout)?;
     let blocks = owned_units
         .clone()
         .map(|unit| {
@@ -552,32 +499,34 @@ pub fn partition_local_geometry(
         output_range: complete.output_range.clone(),
         complete_state_layout: complete.state_layout.clone(),
         architecture_fingerprint: complete.architecture_fingerprint.clone(),
+        definition: std::sync::Arc::clone(&complete.definition),
         tied_head: complete.tied_head,
         static_roles: expected_static_roles(&owned_units, count),
-        boundary_schema: eredu_runtime::NoAuxiliaryBoundarySchema::new(args.hidden_size),
+        boundary_schema: eredu_runtime::NoAuxiliaryBoundarySchema::new(
+            declaration.statics.embedding_spec().dimensions,
+        ),
         expert_realization: None,
         expert_intermediate_range: None,
         expert_banks: Vec::new(),
     };
-    geometry.validate_for(args)?;
+    geometry.validate_for(declaration)?;
     Ok(geometry)
 }
 
 /// Derives prediction-free routed LFM2 geometry from the selected expert plan.
 pub fn partition_local_routed_geometry(
-    args: &ModelArgs,
+    declaration: &Declaration,
     layout: &LocalModelLayout,
     owned_units: Range<usize>,
     topology: eredu_core::ParallelRankTopology,
     realization: &crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
 ) -> Result<PartitionLocalGeometry, ParallelPlanError> {
-    if !args.has_sparse_moe_layers() {
+    if declaration.expert_banks().is_empty() {
         return Err(ParallelPlanError::InvalidGroup(
             "routed LFM2 requires sparse units".into(),
         ));
     }
-    let count = usize::try_from(args.num_hidden_layers)
-        .map_err(|_| ParallelPlanError::InvalidGroup("LFM2 layer count exceeds usize".into()))?;
+    let count = declaration.blocks.len();
     let expected_units = eredu_core::balanced_contiguous_range(
         count,
         topology.pipeline_parallel_size(),
@@ -590,25 +539,26 @@ pub fn partition_local_routed_geometry(
             "routed LFM2 PP ownership differs from its Cartesian rank".into(),
         ));
     }
-    let complete = local_geometry(args, layout)?;
-    let global_experts = usize::try_from(args.num_experts)
-        .map_err(|_| ParallelPlanError::InvalidGroup("LFM2 expert count exceeds usize".into()))?;
+    let complete = local_geometry(declaration, layout)?;
+    let banks = declaration.expert_banks();
+    let global_experts = banks
+        .values()
+        .next()
+        .ok_or_else(|| {
+            ParallelPlanError::InvalidGroup("sparse schedule has no declared expert bank".into())
+        })?
+        .group_count() as usize;
     let local_experts = validate_realization(topology, global_experts, realization)?;
     let owner_local_count = i32::try_from(local_experts.len()).map_err(|_| {
         ParallelPlanError::InvalidGroup("LFM2 local expert count exceeds i32".into())
     })?;
     let mut intermediate_range = None;
-    let mut expected_sparse_units = 0;
-    for (unit, policy) in args.layer_schedule.iter().enumerate() {
-        if policy.feed_forward != super::FeedForwardPolicy::SparseMoe {
-            continue;
-        }
-        expected_sparse_units += 1;
+    for (&unit, declared) in &banks {
         let block = complete.block(unit).ok_or_else(|| {
             ParallelPlanError::InvalidGroup("missing local LFM2 sparse block".into())
         })?;
-        let expected = super::moe::expert_bank_spec(args, unit)
-            .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?
+        let expected = declared
+            .clone()
             .with_group_geometry(owner_local_count, block.expert_intermediate)
             .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
         if realization.unit_spec(crate::decoder::TARGET_EXECUTION_GROUP, unit) != Some(&expected) {
@@ -616,8 +566,14 @@ pub fn partition_local_routed_geometry(
                 "LFM2 expert plan drifted at unit {unit}"
             )));
         }
-        let target = format!("model.layers.{unit}.feed_forward.experts.gate_up_proj");
-        let range = exact_logical_range(layout, &target, args.moe_intermediate_size)?;
+        let source = declared
+            .packed_parameters()
+            .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+        let range = exact_logical_range(
+            layout,
+            source.gate_up().parameter.id.as_str(),
+            declared.intermediate_dimensions(),
+        )?;
         if intermediate_range
             .as_ref()
             .is_some_and(|current| current != &range)
@@ -628,7 +584,7 @@ pub fn partition_local_routed_geometry(
         }
         intermediate_range = Some(range);
     }
-    if realization.unit_specs().len() != expected_sparse_units {
+    if realization.unit_specs().len() != banks.len() {
         return Err(ParallelPlanError::InvalidGroup(
             "LFM2 expert unit schedule drifted".into(),
         ));
@@ -646,10 +602,7 @@ pub fn partition_local_routed_geometry(
         .collect::<Result<Vec<_>, _>>()?;
     let expert_banks = owned_units
         .clone()
-        .filter(|unit| {
-            args.layer_policy(*unit)
-                .is_some_and(|policy| policy.feed_forward == super::FeedForwardPolicy::SparseMoe)
-        })
+        .filter(|unit| banks.contains_key(unit))
         .flat_map(|global_unit| {
             local_experts.iter().copied().enumerate().map({
                 let range = intermediate_range.clone();
@@ -669,14 +622,17 @@ pub fn partition_local_routed_geometry(
         output_range: complete.output_range.clone(),
         complete_state_layout: complete.state_layout.clone(),
         architecture_fingerprint: complete.architecture_fingerprint.clone(),
+        definition: std::sync::Arc::clone(&complete.definition),
         tied_head: complete.tied_head,
         static_roles: expected_static_roles(&owned_units, count),
-        boundary_schema: eredu_runtime::NoAuxiliaryBoundarySchema::new(args.hidden_size),
+        boundary_schema: eredu_runtime::NoAuxiliaryBoundarySchema::new(
+            declaration.statics.embedding_spec().dimensions,
+        ),
         expert_realization: Some(realization.clone()),
         expert_intermediate_range: Some(intermediate_range),
         expert_banks,
     };
-    geometry.validate_for(args)?;
+    geometry.validate_for(declaration)?;
     Ok(geometry)
 }
 
@@ -737,28 +693,13 @@ fn validate_realization(
     Ok(local)
 }
 
-/// Describes dense LFM2 parameter topology without constructing backend modules.
-pub fn dense_parameter_description(
+pub(super) fn parameter_description_from_scopes(
     args: &ModelArgs,
+    statics: &crate::decoder::StaticModuleConstruction,
+    blocks: &[super::declarations::BlockParameters],
 ) -> Result<ArchitectureParameterDescription, ParallelPlanError> {
-    args.validate()
-        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    if args.has_sparse_moe_layers() {
-        return Err(ParallelPlanError::InvalidGroup(
-            "dense LFM2 parameter topology does not accept routed layers".into(),
-        ));
-    }
-    parameter_description(args)
-}
-
-/// Declares complete dense and routed parameter ownership without native resources.
-pub fn parameter_description(
-    args: &ModelArgs,
-) -> Result<ArchitectureParameterDescription, ParallelPlanError> {
-    args.validate()
-        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    let layers = usize::try_from(args.num_hidden_layers)
-        .map_err(|_| ParallelPlanError::InvalidGroup("LFM2 layer count exceeds usize".into()))?;
+    args.validate().map_err(invalid)?;
+    let layers = blocks.len();
     let graph = ExecutionGraph::new(
         vec![eredu_runtime::ExecutionGroupSpec::root(
             crate::decoder::TARGET_EXECUTION_GROUP,
@@ -768,8 +709,13 @@ pub fn parameter_description(
     .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
     let layout = ExecutionUnitLayout::new(&graph, [layers])
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    let mut owned = super::static_spec(args)
-        .pinned_parameter_groups("model.embed_tokens", "model.embedding_norm", "lm_head")?
+    let mut owned = statics
+        .pinned_parameter_groups(
+            crate::decoder::ParameterEncoding::Stored,
+            "model.embed_tokens",
+            "model.embedding_norm",
+            "lm_head",
+        )?
         .into_iter()
         .map(|(role, group)| {
             let owner = if role == "embedding" && args.tie_word_embeddings {
@@ -780,195 +726,147 @@ pub fn parameter_description(
             OwnedParameterGroupSpec::new(owner, group)
         })
         .collect::<Vec<_>>();
-    let head_dim = usize::try_from(args.hidden_size / args.num_attention_heads)
-        .map_err(|_| ParallelPlanError::InvalidGroup("LFM2 head width exceeds usize".into()))?;
-    let hidden = usize::try_from(args.hidden_size)
-        .map_err(|_| ParallelPlanError::InvalidGroup("LFM2 hidden width exceeds usize".into()))?;
-    let kv_heads = usize::try_from(args.num_key_value_heads)
-        .map_err(|_| ParallelPlanError::InvalidGroup("LFM2 KV heads exceed usize".into()))?;
-    let mut formats = std::collections::BTreeMap::new();
     for layer in 0..layers {
         let mut groups = Vec::new();
         let root = format!("model.layers.{layer}");
-        match args
-            .layer_policy(layer)
-            .expect("validated LFM2 schedule")
-            .operator
-        {
-            OperatorPolicy::SelfAttention(_) => groups.push(ParameterGroupSpec::partitioned(
-                format!("{root}.self_attn.heads"),
-                ParameterRole::AttentionHeads,
-                kv_heads,
-                [
-                    ParameterMemberSpec::new(
-                        format!("{root}.self_attn.q_proj.weight"),
-                        vec![hidden, hidden],
-                        MemberSharding::Partitioned { axis: 0 },
-                    ),
-                    ParameterMemberSpec::new(
-                        format!("{root}.self_attn.k_proj.weight"),
-                        vec![kv_heads * head_dim, hidden],
-                        MemberSharding::Partitioned { axis: 0 },
-                    ),
-                    ParameterMemberSpec::new(
-                        format!("{root}.self_attn.v_proj.weight"),
-                        vec![kv_heads * head_dim, hidden],
-                        MemberSharding::Partitioned { axis: 0 },
-                    ),
-                    ParameterMemberSpec::new(
-                        format!("{root}.self_attn.out_proj.weight"),
-                        vec![hidden, hidden],
-                        MemberSharding::Partitioned { axis: 1 },
-                    ),
-                    ParameterMemberSpec::new(
-                        format!("{root}.self_attn.q_layernorm.weight"),
-                        vec![head_dim],
-                        MemberSharding::Replicated,
-                    ),
-                    ParameterMemberSpec::new(
-                        format!("{root}.self_attn.k_layernorm.weight"),
-                        vec![head_dim],
-                        MemberSharding::Replicated,
-                    ),
-                ],
-            )?),
-            OperatorPolicy::CausalConvolution => {
-                let segments = vec![0..hidden, hidden..2 * hidden, 2 * hidden..3 * hidden];
-                let mut members = vec![
-                    ParameterMemberSpec::new(
-                        format!("{root}.conv.in_proj.weight"),
-                        vec![3 * hidden, hidden],
-                        MemberSharding::PartitionedSegments {
-                            axis: 0,
-                            segments: segments.clone(),
-                        },
-                    ),
-                    ParameterMemberSpec::new(
-                        format!("{root}.conv.conv.weight"),
-                        vec![hidden, 1, args.conv_l_cache as usize],
-                        MemberSharding::Partitioned { axis: 0 },
-                    ),
-                    ParameterMemberSpec::new(
-                        format!("{root}.conv.out_proj.weight"),
-                        vec![hidden, hidden],
-                        MemberSharding::Partitioned { axis: 1 },
-                    ),
-                ];
-                if args.conv_bias {
-                    members.extend([
-                        ParameterMemberSpec::new(
-                            format!("{root}.conv.in_proj.bias"),
-                            vec![3 * hidden],
+        let scope = &blocks[layer];
+        match &scope.mixer {
+            super::declarations::MixerParameters::Attention(spec, _) => {
+                let output = &spec.projection.output;
+                groups.push(eredu_runtime::logical_parameter_group(
+                    format!("{root}.self_attn.heads"),
+                    ParameterRole::AttentionHeads,
+                    Some(spec.projection.geometry.key_value_heads() as usize),
+                    spec,
+                    |p| {
+                        if p.role == LogicalParameterRole::Normalization {
+                            MemberSharding::Replicated
+                        } else if p.parameter.id == output.weight.id {
+                            MemberSharding::Partitioned { axis: 1 }
+                        } else {
+                            MemberSharding::Partitioned { axis: 0 }
+                        }
+                    },
+                )?);
+            }
+            super::declarations::MixerParameters::Convolution(spec) => {
+                let channels = spec.channels as usize;
+                let segments = eredu_nn::GatedShortConvolutionSpec::input_layout(spec.channels)
+                    .map_err(invalid)?
+                    .ranges()
+                    .map(|range| range.start as usize..range.end as usize)
+                    .collect::<Vec<_>>();
+                groups.push(eredu_runtime::logical_parameter_group(
+                    format!("{root}.conv.channels"),
+                    ParameterRole::Channels,
+                    Some(channels),
+                    spec,
+                    |declaration| {
+                        let id = &declaration.parameter.id;
+                        if id == &spec.input_projection.weight.id
+                            || spec
+                                .input_projection
+                                .bias
+                                .as_ref()
+                                .is_some_and(|p| &p.id == id)
+                        {
                             MemberSharding::PartitionedSegments {
                                 axis: 0,
                                 segments: segments.clone(),
-                            },
-                        ),
-                        ParameterMemberSpec::new(
-                            format!("{root}.conv.out_proj.bias"),
-                            vec![hidden],
-                            MemberSharding::Replicated,
-                        ),
-                        ParameterMemberSpec::new(
-                            format!("{root}.conv.conv.bias"),
-                            vec![hidden],
-                            MemberSharding::Partitioned { axis: 0 },
-                        ),
-                    ]);
-                }
-                groups.push(ParameterGroupSpec::partitioned(
-                    format!("{root}.conv.channels"),
-                    ParameterRole::Channels,
-                    hidden,
-                    members,
+                            }
+                        } else if id == &spec.output_projection.weight.id {
+                            MemberSharding::Partitioned { axis: 1 }
+                        } else if spec
+                            .output_projection
+                            .bias
+                            .as_ref()
+                            .is_some_and(|p| &p.id == id)
+                        {
+                            MemberSharding::Replicated
+                        } else {
+                            MemberSharding::Partitioned { axis: 0 }
+                        }
+                    },
                 )?);
             }
         }
-        for name in ["operator_norm", "ffn_norm"] {
-            groups.push(ParameterGroupSpec::new(
+        for (name, spec) in [
+            ("operator_norm", &scope.operator_norm),
+            ("ffn_norm", &scope.feed_forward_norm),
+        ] {
+            groups.push(eredu_runtime::logical_parameter_group(
                 format!("{root}.{name}"),
                 ParameterRole::Replicated,
-                [ParameterMemberSpec::new(
-                    format!("{root}.{name}.weight"),
-                    vec![hidden],
-                    MemberSharding::Replicated,
-                )],
+                None,
+                spec,
+                |_| MemberSharding::Replicated,
             )?);
         }
-        match args
-            .layer_policy(layer)
-            .expect("validated LFM2 schedule")
-            .feed_forward
-        {
-            super::FeedForwardPolicy::Dense => {
-                let intermediate = args.dense_intermediate_size as usize;
-                let alignment = args
-                    .weight_quantization_for(&format!("{root}.feed_forward.w2.weight"))
-                    .map_or(Ok(1), |quantization| {
-                        usize::try_from(quantization.group_size()).map_err(|_| {
-                            ParallelPlanError::InvalidGroup(
-                                "LFM2 dense quantization group exceeds usize".into(),
-                            )
-                        })
-                    })?;
-                groups.push(ParameterGroupSpec::partitioned(
+        match &scope.feed_forward {
+            super::declarations::FeedForwardParameters::Dense(spec) => {
+                let down = &spec.down;
+                let units = aligned_partition_units(
+                    &root,
+                    down.input as usize,
+                    1,
+                    crate::linear_format::input_partition_alignment(down.format.encoding())
+                        as usize,
+                )?;
+                groups.push(eredu_runtime::logical_parameter_group(
                     format!("{root}.feed_forward.intermediate"),
                     ParameterRole::FeedForwardIntermediate,
-                    aligned_partition_units(&root, intermediate, 1, alignment)?,
-                    [
-                        ParameterMemberSpec::new(
-                            format!("{root}.feed_forward.w1.weight"),
-                            vec![intermediate, hidden],
-                            MemberSharding::Partitioned { axis: 0 },
-                        ),
-                        ParameterMemberSpec::new(
-                            format!("{root}.feed_forward.w3.weight"),
-                            vec![intermediate, hidden],
-                            MemberSharding::Partitioned { axis: 0 },
-                        ),
-                        ParameterMemberSpec::new(
-                            format!("{root}.feed_forward.w2.weight"),
-                            vec![hidden, intermediate],
-                            MemberSharding::Partitioned { axis: 1 },
-                        ),
-                    ],
+                    Some(units),
+                    spec,
+                    |p| {
+                        if p.parameter.id == down.weight.id {
+                            MemberSharding::Partitioned { axis: 1 }
+                        } else {
+                            MemberSharding::Partitioned { axis: 0 }
+                        }
+                    },
                 )?);
             }
-            super::FeedForwardPolicy::SparseMoe => {
-                let selector = super::moe::selector_spec(args, layer)
-                    .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-                let bank = super::moe::expert_bank_spec(args, layer)
-                    .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-                formats.insert(
-                    selector.weight().id.as_str().to_owned(),
-                    selector.format().clone(),
-                );
+            super::declarations::FeedForwardParameters::Routed(spec) => {
+                let bank = &spec.experts;
                 let eredu_nn::GatedProductGroupLayout::Packed { gate_up, down } = bank.layout()
                 else {
-                    return Err(ParallelPlanError::InvalidGroup(
-                        "LFM2 requires packed expert projections".into(),
-                    ));
+                    return Err(invalid("LFM2 requires packed expert projections"));
                 };
-                for projection in [gate_up, down] {
-                    formats.insert(
-                        projection.weight().id.as_str().to_owned(),
-                        projection.format().clone(),
-                    );
-                }
                 let name = format!("{root}.feed_forward.experts.intermediate");
+                let width = bank.intermediate_dimensions() as usize;
                 let units = aligned_partition_units(
                     &name,
-                    bank.intermediate_dimensions() as usize,
+                    width,
                     1,
                     crate::linear_format::input_partition_alignment(down.format().encoding())
                         as usize,
                 )?;
-                groups.push(eredu_runtime::top_k_group_selector_logical_group(
+                groups.push(eredu_runtime::logical_parameter_group(
                     format!("{root}.feed_forward.gate"),
-                    &selector,
+                    ParameterRole::Replicated,
+                    None,
+                    &spec.selector,
+                    |_| MemberSharding::Replicated,
                 )?);
-                groups.push(eredu_runtime::packed_gated_product_logical_group(
-                    name, &bank, units,
+                groups.push(eredu_runtime::logical_parameter_group(
+                    name,
+                    ParameterRole::ExpertIntermediate,
+                    Some(units),
+                    bank,
+                    |p| {
+                        if p.parameter.id == gate_up.weight().id
+                            || gate_up.bias().is_some_and(|bias| p.parameter.id == bias.id)
+                        {
+                            MemberSharding::PartitionedSegments {
+                                axis: 1,
+                                segments: vec![0..width, width..2 * width],
+                            }
+                        } else if p.role == LogicalParameterRole::LinearWeight {
+                            MemberSharding::Partitioned { axis: 2 }
+                        } else {
+                            MemberSharding::Replicated
+                        }
+                    },
                 )?);
             }
         }
@@ -982,216 +880,10 @@ pub fn parameter_description(
                 .map(|group| OwnedParameterGroupSpec::new(owner.clone(), group)),
         );
     }
-    let owned = eredu_runtime::expand_owned_linear_format_parameter_groups(owned, |member| {
-        let name = member.target();
-        if let Some(format) = formats.get(name) {
-            return Ok(Some(format.clone()));
-        }
-        let linear = name.ends_with(".weight")
-            && (name.contains("_proj.weight") || name.contains("feed_forward.w"));
-        linear
-            .then(|| {
-                crate::linear_format::standard_linear_format(
-                    name,
-                    args.weight_quantization_for(name).into(),
-                )
-                .map_err(|error| ParallelPlanError::InvalidTensor(error.to_string()))
-            })
-            .transpose()
-    })?;
     ArchitectureParameterDescription::from_owned(&graph, &layout, owned)
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))
 }
 
-/// Declares vocabulary and replicated final-normalization groups.
-pub fn static_parallel_parameter_groups<
-    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
->(
-    modules: &StaticModules<B>,
-) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    let mut groups = vec![
-        module_parameter_group::<B::Tensor, _>(
-            "model.embed_tokens",
-            ParameterRole::Vocabulary,
-            &modules.embeddings,
-            |_, shape| {
-                if shape.is_empty() {
-                    Err(ParallelPlanError::InvalidTensor(
-                        "LFM2 embedding parameter is scalar".into(),
-                    ))
-                } else {
-                    Ok(MemberSharding::Balanced { axis: 0 })
-                }
-            },
-        )?,
-        module_parameter_group::<B::Tensor, _>(
-            "model.embedding_norm",
-            ParameterRole::Replicated,
-            &modules.boundary.norm,
-            |_, _| Ok(MemberSharding::Replicated),
-        )?,
-    ];
-    if let Some(head) = &modules.lm_head {
-        groups.push(module_parameter_group::<B::Tensor, _>(
-            "lm_head",
-            ParameterRole::Vocabulary,
-            head,
-            |_, shape| {
-                if shape.is_empty() {
-                    Err(ParallelPlanError::InvalidTensor(
-                        "LFM2 output parameter is scalar".into(),
-                    ))
-                } else {
-                    Ok(MemberSharding::Balanced { axis: 0 })
-                }
-            },
-        )?);
-    }
-    Ok(groups)
-}
-
-/// Declares semantic groups for one scheduled LFM2 block.
-pub fn layer_parallel_parameter_groups<
-    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
->(
-    block: &Block<B>,
-    args: &ModelArgs,
-    layer: usize,
-) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    let root = format!("model.layers.{layer}");
-    let mut groups = Vec::new();
-    match &block.mixer {
-        TokenMixer::Attention(attention) => {
-            let kv_heads = usize::try_from(args.num_key_value_heads).map_err(|_| {
-                ParallelPlanError::InvalidGroup("LFM2 KV head count exceeds usize".into())
-            })?;
-            groups.push(partitioned_module_parameter_group::<B::Tensor, _>(
-                format!("{root}.self_attn.heads"),
-                ParameterRole::AttentionHeads,
-                kv_heads,
-                attention,
-                |metadata, shape| {
-                    let name = metadata
-                        .linear_companion_of
-                        .as_ref()
-                        .unwrap_or(&metadata.id)
-                        .as_str();
-                    if name.ends_with("q_proj.weight")
-                        || name.ends_with("k_proj.weight")
-                        || name.ends_with("v_proj.weight")
-                    {
-                        Ok(MemberSharding::Partitioned { axis: 0 })
-                    } else if name.ends_with("out_proj.weight") && shape.len() >= 2 {
-                        Ok(MemberSharding::Partitioned { axis: 1 })
-                    } else {
-                        Ok(MemberSharding::Replicated)
-                    }
-                },
-            )?);
-        }
-        TokenMixer::ShortConvolution(convolution) => {
-            let channels = usize::try_from(args.hidden_size).map_err(|_| {
-                ParallelPlanError::InvalidGroup("LFM2 convolution width exceeds usize".into())
-            })?;
-            let segments = vec![
-                0..channels,
-                channels..2 * channels,
-                2 * channels..3 * channels,
-            ];
-            groups.push(partitioned_module_parameter_group::<B::Tensor, _>(
-                format!("{root}.conv.channels"),
-                ParameterRole::Channels,
-                channels,
-                convolution,
-                |metadata, shape| {
-                    let name = metadata
-                        .linear_companion_of
-                        .as_ref()
-                        .unwrap_or(&metadata.id)
-                        .as_str();
-                    if name.contains("in_proj") {
-                        Ok(MemberSharding::PartitionedSegments {
-                            axis: 0,
-                            segments: segments.clone(),
-                        })
-                    } else if name.ends_with("conv.weight") || name.ends_with("conv.bias") {
-                        Ok(MemberSharding::Partitioned { axis: 0 })
-                    } else if name.ends_with("out_proj.weight") && shape.len() >= 2 {
-                        Ok(MemberSharding::Partitioned { axis: 1 })
-                    } else {
-                        Ok(MemberSharding::Replicated)
-                    }
-                },
-            )?);
-        }
-    }
-    for (name, norm) in [
-        ("operator_norm", &block.operator_norm),
-        ("ffn_norm", &block.feed_forward_norm),
-    ] {
-        groups.push(module_parameter_group::<B::Tensor, _>(
-            format!("{root}.{name}"),
-            ParameterRole::Replicated,
-            norm,
-            |_, _| Ok(MemberSharding::Replicated),
-        )?);
-    }
-    match &block.feed_forward {
-        FeedForward::Dense(DenseSwiGlu { gate, down, up }) => {
-            let width = usize::try_from(args.dense_intermediate_size).map_err(|_| {
-                ParallelPlanError::InvalidGroup("LFM2 dense width exceeds usize".into())
-            })?;
-            let alignment = args
-                .weight_quantization_for(&format!("{root}.feed_forward.w2.weight"))
-                .map_or(Ok(1), |quantization| {
-                    usize::try_from(quantization.group_size()).map_err(|_| {
-                        ParallelPlanError::InvalidGroup(
-                            "LFM2 dense quantization group exceeds usize".into(),
-                        )
-                    })
-                })?;
-            groups.push(eredu_runtime::partitioned_projection_group::<
-                B::Tensor,
-                B::Linear,
-            >(
-                format!("{root}.feed_forward.intermediate"),
-                ParameterRole::FeedForwardIntermediate,
-                &[
-                    (gate, eredu_runtime::ProjectionSharding::Column),
-                    (up, eredu_runtime::ProjectionSharding::Column),
-                    (down, eredu_runtime::ProjectionSharding::Row),
-                ],
-                aligned_partition_units(&root, width, 1, alignment)?,
-            )?);
-        }
-        FeedForward::Routed(moe) => {
-            groups.push(module_parameter_group::<B::Tensor, _>(
-                format!("{root}.feed_forward.gate"),
-                ParameterRole::Replicated,
-                &moe.router,
-                |_, _| Ok(MemberSharding::Replicated),
-            )?);
-            let width = usize::try_from(args.moe_intermediate_size).map_err(|_| {
-                ParallelPlanError::InvalidGroup("LFM2 expert width exceeds usize".into())
-            })?;
-            let segments = vec![0..width, width..2 * width];
-            groups.push(partitioned_module_parameter_group::<B::Tensor, _>(
-                format!("{root}.feed_forward.experts.intermediate"),
-                ParameterRole::ExpertIntermediate,
-                width,
-                &moe.experts,
-                |metadata, _| {
-                    if metadata.id.as_str().contains("gate_up_proj") {
-                        Ok(MemberSharding::PartitionedSegments {
-                            axis: 1,
-                            segments: segments.clone(),
-                        })
-                    } else {
-                        Ok(MemberSharding::Partitioned { axis: 2 })
-                    }
-                },
-            )?);
-        }
-    }
-    Ok(groups)
+fn invalid(error: impl std::fmt::Display) -> ParallelPlanError {
+    ParallelPlanError::InvalidGroup(error.to_string())
 }

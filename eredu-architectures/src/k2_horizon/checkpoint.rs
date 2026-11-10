@@ -6,145 +6,176 @@ use eredu_checkpoint::schema::{
     StoredDtypeConstraint, TensorOperation,
 };
 
-use super::ModelArgs;
+use super::Declaration;
+use eredu_nn::DeclareLogicalParameters;
 
-/// Declares all floating logical parameters. GGUF packs each independent bank
-/// along its own leading expert axis; SafeTensors stores individual experts.
-pub fn parameter_shapes(
-    args: &ModelArgs,
-    packed_experts: bool,
-) -> Result<Vec<(String, Vec<usize>)>, String> {
-    args.validate().map_err(|e| e.to_string())?;
-    let hidden = args.hidden_size as usize;
-    let query = args.num_attention_heads as usize * args.head_dim as usize;
-    let kv = args.num_key_value_heads as usize * args.head_dim as usize;
-    let mut output = vec![
-        (
-            "model.embed_tokens.weight".into(),
-            vec![args.vocab_size as usize, hidden],
-        ),
-        ("model.norm.weight".into(), vec![hidden]),
-    ];
-    if !args.tie_word_embeddings {
-        output.push((
-            "lm_head.weight".into(),
-            vec![args.vocab_size as usize, hidden],
-        ));
+/// Published source organization for independently routed parameter banks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceLayout {
+    /// Each expert has separate projection tensors.
+    Safetensors,
+    /// Expert axes are packed, with separate gate and up matrices.
+    Gguf,
+}
+
+/// A format tensor linked to its authoritative logical construction slot.
+#[derive(Debug, Clone)]
+pub struct SourceParameter {
+    /// Exact ordinary source identity before encoding companions are expanded.
+    pub name: String,
+    /// Exact logical source axes before scalar encoding.
+    pub shape: Vec<usize>,
+    /// Owning logical slot, including packed and fused expert matrices.
+    pub logical: eredu_nn::ParameterId,
+    /// Meaning inherited from the owning neural slot.
+    pub role: eredu_nn::LogicalParameterRole,
+}
+impl SourceParameter {
+    fn projected(
+        p: &eredu_nn::LogicalParameterDeclaration<'_>,
+        name: String,
+        shape: Vec<usize>,
+    ) -> Self {
+        Self {
+            name,
+            shape,
+            logical: p.parameter.id.clone(),
+            role: p.role,
+        }
     }
-    for layer in 0..args.num_hidden_layers as usize {
-        let prefix = format!("model.layers.{layer}");
-        output.extend([
-            (format!("{prefix}.input_layernorm.weight"), vec![hidden]),
-            (
-                format!("{prefix}.post_attention_layernorm.weight"),
-                vec![hidden],
-            ),
-        ]);
-        for (projection, rows, columns) in [
-            ("q_proj", query, hidden),
-            ("k_proj", kv, hidden),
-            ("o_proj", hidden, query),
-        ] {
-            output.push((
-                format!("{prefix}.self_attn.{projection}.weight"),
-                vec![rows, columns],
-            ));
-            if args.attention_bias {
-                output.push((format!("{prefix}.self_attn.{projection}.bias"), vec![rows]));
-            }
+    fn direct(p: eredu_nn::LogicalParameterDeclaration<'_>) -> Self {
+        Self {
+            name: p.parameter.id.to_string(),
+            shape: p.shape,
+            logical: p.parameter.id.clone(),
+            role: p.role,
         }
-        if args.attention_gate_func.is_some() {
-            output.push((
-                format!("{prefix}.self_attn.gate_proj.weight"),
-                vec![query, hidden],
-            ));
-        }
-        if args.query_key_norm {
-            output.push((format!("{prefix}.self_attn.q_norm.weight"), vec![query]));
-            output.push((format!("{prefix}.self_attn.k_norm.weight"), vec![kv]));
-        }
-        if args.is_mova_layer(layer) {
-            output.push((
-                format!("{prefix}.self_attn.v_router.weight"),
-                vec![args.mova_num_experts as usize, hidden],
-            ));
-            if args.moe_gate_bias {
-                output.push((
-                    format!("{prefix}.self_attn.v_router.bias"),
-                    vec![args.mova_num_experts as usize],
-                ));
-            }
-            if packed_experts {
-                output.push((
-                    format!("{prefix}.self_attn.v_experts.weight"),
-                    vec![args.mova_num_experts as usize, kv, hidden],
-                ));
-            } else {
-                for expert in 0..args.mova_num_experts {
-                    output.push((
-                        format!("{prefix}.self_attn.v_experts.{expert}.weight"),
-                        vec![kv, hidden],
-                    ));
+    }
+}
+
+/// Projects ordinary source identities and geometry from the actual construction declarations.
+/// Encoding companions, aliases and dtype constraints are separate format extensions.
+pub fn source_parameters(
+    declaration: &Declaration,
+    layout: SourceLayout,
+) -> Result<Vec<SourceParameter>, String> {
+    let blocks = declaration.blocks().map_err(|e| e.to_string())?;
+    let mut output = declaration
+        .common()
+        .static_construction()
+        .logical_parameters()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(SourceParameter::direct)
+        .collect::<Vec<_>>();
+    for block in &blocks {
+        output.extend(
+            block
+                .common
+                .logical_parameters()
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .map(SourceParameter::direct),
+        );
+        if let Some(values) = &block.values {
+            output.extend(
+                values
+                    .router
+                    .logical_parameters()
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .map(SourceParameter::direct),
+            );
+            for p in values
+                .experts
+                .logical_parameters()
+                .map_err(|e| e.to_string())?
+            {
+                match layout {
+                    SourceLayout::Gguf => output.push(SourceParameter::direct(p)),
+                    SourceLayout::Safetensors => {
+                        let root = p
+                            .parameter
+                            .id
+                            .as_str()
+                            .strip_suffix(".weight")
+                            .ok_or("value bank has no declared weight slot")?;
+                        for expert in 0..p.shape[0] {
+                            output.push(SourceParameter::projected(
+                                &p,
+                                format!("{root}.{expert}.weight"),
+                                p.shape[1..].to_vec(),
+                            ));
+                        }
+                    }
                 }
             }
-        } else {
-            output.push((
-                format!("{prefix}.self_attn.v_proj.weight"),
-                vec![kv, hidden],
-            ));
-            if args.attention_bias {
-                output.push((format!("{prefix}.self_attn.v_proj.bias"), vec![kv]));
-            }
         }
-        let mut mlp = |root: &str, width: usize, count: Option<usize>| {
-            for (projection, rows, columns) in [
-                ("gate_proj", width, hidden),
-                ("up_proj", width, hidden),
-                ("down_proj", hidden, width),
+        if let Some(routed) = &block.routed {
+            let source = routed
+                .parameters
+                .experts
+                .packed_parameters()
+                .map_err(|e| e.to_string())?;
+            for (p, fields) in [
+                (
+                    source.gate_up(),
+                    vec![
+                        ("gate_proj", source.unfused_shape()),
+                        ("up_proj", source.unfused_shape()),
+                    ],
+                ),
+                (
+                    source.down(),
+                    vec![("down_proj", source.down().shape.clone())],
+                ),
             ] {
-                let mut shape = count.into_iter().collect::<Vec<_>>();
-                shape.extend([rows, columns]);
-                output.push((format!("{root}.{projection}.weight"), shape));
-            }
-        };
-        if args.is_sparse_layer(layer) {
-            if packed_experts {
-                mlp(
-                    &format!("{prefix}.mlp.experts"),
-                    args.moe_intermediate_size as usize,
-                    Some(args.num_experts as usize),
-                );
-            } else {
-                for expert in 0..args.num_experts {
-                    mlp(
-                        &format!("{prefix}.mlp.experts.{expert}"),
-                        args.moe_intermediate_size as usize,
-                        None,
-                    );
+                let root = p
+                    .parameter
+                    .id
+                    .as_str()
+                    .strip_suffix(if p.parameter.id == source.gate_up().parameter.id {
+                        ".gate_up_proj"
+                    } else {
+                        ".down_proj"
+                    })
+                    .ok_or("unresolved K2 packed expert projection")?;
+                for (field, shape) in fields {
+                    match layout {
+                        SourceLayout::Gguf => output.push(SourceParameter::projected(
+                            p,
+                            format!("{root}.{field}.weight"),
+                            shape,
+                        )),
+                        SourceLayout::Safetensors => {
+                            for expert in 0..shape[0] {
+                                output.push(SourceParameter::projected(
+                                    p,
+                                    format!("{root}.{expert}.{field}.weight"),
+                                    shape[1..].to_vec(),
+                                ));
+                            }
+                        }
+                    }
                 }
             }
-            if args.num_shared_experts > 0 {
-                mlp(
-                    &format!("{prefix}.mlp.shared_experts"),
-                    (args.moe_intermediate_size * args.num_shared_experts) as usize,
-                    None,
+            if let Some(shared) = &routed.shared {
+                output.extend(
+                    shared
+                        .logical_parameters()
+                        .map_err(|e| e.to_string())?
+                        .into_iter()
+                        .map(SourceParameter::direct),
                 );
             }
-            output.push((
-                format!("{prefix}.mlp.gate.weight"),
-                vec![args.num_experts as usize, hidden],
-            ));
-            if args.moe_gate_bias {
-                output.push((
-                    format!("{prefix}.mlp.gate.bias"),
-                    vec![args.num_experts as usize],
-                ));
-            }
-        } else {
-            mlp(
-                &format!("{prefix}.mlp"),
-                args.intermediate_size as usize,
-                None,
+            output.extend(
+                routed
+                    .parameters
+                    .selector
+                    .logical_parameters()
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .map(SourceParameter::direct),
             );
         }
     }
@@ -153,9 +184,11 @@ pub fn parameter_shapes(
 
 /// Strict official SafeTensors admission, using stored encodings rather than
 /// the descriptive `dtype` field in config.json.
-pub fn safetensors_plan(args: &ModelArgs) -> Result<SafetensorsCheckpointPlan, String> {
+pub fn safetensors_plan(declaration: &Declaration) -> Result<SafetensorsCheckpointPlan, String> {
+    let args = declaration.args();
     let mut tensors = Vec::new();
-    for (name, shape) in parameter_shapes(args, false)? {
+    for parameter in source_parameters(declaration, SourceLayout::Safetensors)? {
+        let SourceParameter { name, shape, .. } = parameter;
         if shape.len() >= 2 {
             tensors.extend(
                 matrix_for_linear_format(
@@ -282,10 +315,10 @@ fn gguf_name(name: &str) -> Result<String, String> {
 }
 
 /// Strict publisher GGUF catalog, including separately stacked value/MLP banks.
-pub fn gguf_plan(args: &ModelArgs) -> Result<GgufCheckpointPlan, String> {
-    let tensors = parameter_shapes(args, true)?
+pub fn gguf_plan(declaration: &Declaration) -> Result<GgufCheckpointPlan, String> {
+    let tensors = source_parameters(declaration, SourceLayout::Gguf)?
         .into_iter()
-        .map(|(name, shape)| {
+        .map(|SourceParameter { name, shape, .. }| {
             let operation = if shape.len() == 1 {
                 TensorOperation::Vector
             } else {

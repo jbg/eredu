@@ -2,9 +2,8 @@
 
 use eredu_nn::{
     BlockwiseAttentionBackend, CompressedAttentionCache, Error, GroupedNeuralBackend,
-    HyperConnection, HyperConnectionSpec, HyperNeuralBackend, LinearOperator, LinearSpec,
-    NeuralBackend, NormalizationConstructionSpec, NormalizationOperator, Parameter, ParameterSpec,
-    Parameterized, PoolingAttentionCache, Tensor,
+    HyperConnection, HyperNeuralBackend, LinearOperator, NeuralBackend, NormalizationOperator,
+    Parameter, Parameterized, PoolingAttentionCache, Tensor,
 };
 use eredu_runtime::{
     observe_and_intervene, ActivationObserver, ExpertPass, ParameterProvider,
@@ -26,6 +25,8 @@ pub struct DenseSwiGlu<B: NeuralBackend> {
     gate: B::Linear,
     up: B::Linear,
     down: B::Linear,
+    #[parameter(skip)]
+    policy: eredu_nn::GatedProductPolicy,
 }
 
 /// One V4 hyper-connected decoder block with scheduled local/compressed
@@ -101,51 +102,22 @@ where
         if layer >= total {
             return Err(Error::backend(format!("V4 layer {layer} is out of range")));
         }
-        let norm = |name: String| {
-            B::normalization(
-                NormalizationConstructionSpec::learned(
-                    args.hidden_size,
-                    args.rms_norm_eps,
-                    parameter(name)?,
-                ),
-                context,
-            )
-        };
-        let connection = |kind: &str| {
-            HyperConnection::new(
-                HyperConnectionSpec {
-                    streams: args.hc_mult,
-                    hidden_size: args.hidden_size,
-                    sinkhorn_iterations: usize::try_from(args.hc_sinkhorn_iters)
-                        .map_err(Error::backend)?,
-                    epsilon: args.hc_eps,
-                    function: parameter(format!("{root}.hc_{kind}_fn"))?,
-                    base: parameter(format!("{root}.hc_{kind}_base"))?,
-                    scale: parameter(format!("{root}.hc_{kind}_scale"))?,
-                },
-                context,
-            )
-        };
+        let [attention_norm, feed_forward_norm] =
+            super::v4_specs::block_normalizations(args, root)?;
+        let hyper = super::v4_specs::hyper_block_spec(args, root)?;
+        let moe = super::v4_specs::moe_spec(args, layer, &format!("{root}.ffn"), expert_spec)?;
         Ok(Self {
             attention: V4Attention::new_at(args, layer, &format!("{root}.attn"), context)?,
-            feed_forward: {
-                let policy = super::v4::moe_policy_at(args, layer, &format!("{root}.ffn"))?;
-                match expert_spec {
-                    Some(spec) => RoutedPlusShared::new_with_expert_spec(&policy, spec, context)?,
-                    None => RoutedPlusShared::new(&policy, context)?,
-                }
-            },
-            attention_norm: norm(format!("{root}.attn_norm.weight"))?,
-            feed_forward_norm: norm(format!("{root}.ffn_norm.weight"))?,
-            attention_connection: connection("attn")?,
-            feed_forward_connection: connection("ffn")?,
-            token_experts: (layer < args.num_hash_layers as usize)
-                .then(|| {
-                    Parameter::unloaded_i32(
-                        parameter(format!("{root}.ffn.gate.tid2eid"))?,
-                        &[args.vocab_size, args.num_experts_per_tok],
-                        context,
-                    )
+            feed_forward: RoutedPlusShared::from_spec(layer, moe.routed, context)?,
+            attention_norm: B::normalization(attention_norm, context)?,
+            feed_forward_norm: B::normalization(feed_forward_norm, context)?,
+            attention_connection: HyperConnection::new(hyper.attention, context)?,
+            feed_forward_connection: HyperConnection::new(hyper.feed_forward, context)?,
+            token_experts: moe
+                .token_table
+                .map(|spec| {
+                    let shape = spec.shape();
+                    Parameter::unloaded_i32(spec.parameter, &shape, context)
                 })
                 .transpose()?,
             normalization_epsilon: args.rms_norm_eps,
@@ -611,27 +583,13 @@ impl<B: NeuralBackend> DenseSwiGlu<B> {
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let root = format!("model.layers.{layer}.mlp");
-        let linear = |field: &str, input, output| {
-            let name = format!("{root}.{field}.weight");
-            B::linear(
-                LinearSpec {
-                    input,
-                    output,
-                    weight: parameter(&name)?,
-                    bias: None,
-                    format: crate::linear_format::standard_linear_format(
-                        &name,
-                        args.linear_format_for(&name),
-                    )?,
-                },
-                context,
-            )
-        };
+        let parameters =
+            super::v3_specs::dense_parameters(args, &format!("model.layers.{layer}.mlp"))?;
         Ok(Self {
-            gate: linear("gate_proj", args.hidden_size, args.intermediate_size)?,
-            up: linear("up_proj", args.hidden_size, args.intermediate_size)?,
-            down: linear("down_proj", args.intermediate_size, args.hidden_size)?,
+            gate: B::linear(parameters.gate, context)?,
+            up: B::linear(parameters.up, context)?,
+            down: B::linear(parameters.down, context)?,
+            policy: parameters.policy,
         })
     }
 
@@ -662,8 +620,7 @@ impl<B: NeuralBackend> DenseSwiGlu<B> {
     ) -> Result<B::Tensor, Error> {
         let gate = self.gate.forward(input, context)?;
         let up = self.up.forward(input, context)?;
-        let activated =
-            B::gated_product(gate, up, eredu_nn::GatedProductPolicy::default(), context)?;
+        let activated = B::gated_product(gate, up, self.policy, context)?;
         let activated = instrumentation.apply("feed_forward.units", activated)?;
         instrumentation.project::<B>(
             "feed_forward.write_input",
@@ -778,18 +735,18 @@ impl<B: BlockwiseAttentionBackend> DenseV3Block<B> {
             Some(LayerPolicy::SparseMoe) => {
                 return Err(Error::backend(format!(
                     "dense V3 block received routed layer {layer}"
-                )))
+                )));
             }
             None => return Err(Error::backend(format!("missing V3 layer policy {layer}"))),
         }
         let root = format!("model.layers.{layer}");
         let norm = |field: &str| {
             B::normalization(
-                NormalizationConstructionSpec::learned(
+                super::v3_specs::normalization_spec(
+                    args,
+                    &format!("{root}.{field}.weight"),
                     args.hidden_size,
-                    args.rms_norm_eps,
-                    parameter(format!("{root}.{field}.weight"))?,
-                ),
+                )?,
                 context,
             )
         };
@@ -926,11 +883,11 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
         let root = format!("model.layers.{layer}");
         let norm = |field: &str| {
             B::normalization(
-                NormalizationConstructionSpec::learned(
+                super::v3_specs::normalization_spec(
+                    args,
+                    &format!("{root}.{field}.weight"),
                     args.hidden_size,
-                    args.rms_norm_eps,
-                    parameter(format!("{root}.{field}.weight"))?,
-                ),
+                )?,
                 context,
             )
         };
@@ -940,19 +897,11 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
                 LayerPolicy::DenseMlp => {
                     V3FeedForward::Dense(DenseSwiGlu::new(args, layer, context)?)
                 }
-                LayerPolicy::SparseMoe => {
-                    let policy = if layer < args.layer_schedule.len() {
-                        super::v3::moe_policy(args, layer)?
-                    } else {
-                        super::v3::prediction_moe_policy(args, layer)?
-                    };
-                    V3FeedForward::Routed(match expert_spec {
-                        Some(spec) => {
-                            RoutedPlusShared::new_with_expert_spec(&policy, spec, context)?
-                        }
-                        None => RoutedPlusShared::new(&policy, context)?,
-                    })
-                }
+                LayerPolicy::SparseMoe => V3FeedForward::Routed(RoutedPlusShared::from_spec(
+                    layer,
+                    super::v3::routed_spec(args, layer, expert_spec)?,
+                    context,
+                )?),
             },
             input_norm: norm("input_layernorm")?,
             post_attention_norm: norm("post_attention_layernorm")?,
@@ -1310,8 +1259,4 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
             },
         )
     }
-}
-
-fn parameter(name: impl Into<String>) -> Result<ParameterSpec, Error> {
-    ParameterSpec::trainable(name).map_err(Error::backend)
 }

@@ -1,12 +1,17 @@
 //! Shared SwiGLU and routed attention-value relationships in K2 Horizon.
 use super::*;
 
-pub(in crate::discovery) fn complete(g: &mut Builder, c: &crate::k2_horizon::ModelArgs) {
+pub(in crate::discovery) fn complete(g: &mut Builder, source: &crate::k2_horizon::Declaration) {
+    let c = source.args();
     for layer in 0..c.num_hidden_layers as usize {
         let path = format!("model.layers.{layer}");
-        if c.is_mova_layer(layer) {
+        let declaration = source
+            .block(layer)
+            .expect("validated K2 component declaration");
+        if let Some(values) = &declaration.values {
+            let selector = &values.router;
             let node = format!("decoder.layers.{layer}.attention.values");
-            let parameter = format!("{path}.self_attn.v_experts.weight");
+            let parameter = values.experts.projection().weight().id.to_string();
             let parameter_group = format!("parameters:{path}.self_attn.v_experts");
             let group = g
                 .descriptor
@@ -14,14 +19,11 @@ pub(in crate::discovery) fn complete(g: &mut Builder, c: &crate::k2_horizon::Mod
                 .iter_mut()
                 .find(|group| group.id == format!("decoder.layers.{layer}.attention.channels"))
                 .expect("decoder attention group");
-            group
-                .reads
-                .retain(|read| read.role != ComponentReadRole::Value);
             group.routed_reads.push(ComponentRoutedRead {
                 node_id: node.clone(),
                 routing: format!("{path}.self_attn.values"),
-                expert_count: c.mova_num_experts as usize,
-                input_width: c.hidden_size as usize,
+                expert_count: selector.selection().group_count() as usize,
+                input_width: selector.input_dimensions() as usize,
                 read: RoutedComponentRead {
                     role: ComponentReadRole::Value,
                     weight: RoutedComponentParameter::Packed {
@@ -32,7 +34,7 @@ pub(in crate::discovery) fn complete(g: &mut Builder, c: &crate::k2_horizon::Mod
                         },
                     },
                     bias: None,
-                    projection_rows: (c.num_key_value_heads * c.head_dim) as usize,
+                    projection_rows: values.experts.output_dimensions() as usize,
                     rows: ComponentRowMapping::GroupedQuery {
                         offset: 0,
                         head_width: c.head_dim as usize,
@@ -42,10 +44,8 @@ pub(in crate::discovery) fn complete(g: &mut Builder, c: &crate::k2_horizon::Mod
                 activation: ComponentNonlinearity::Silu {
                     multiplier: ComponentScalar::new(1.0),
                 },
-                selector_weight: format!("{path}.self_attn.v_router.weight"),
-                selector_correction_bias: c
-                    .moe_gate_bias
-                    .then(|| format!("{path}.self_attn.v_router.bias")),
+                selector_weight: selector.weight().id.to_string(),
+                selector_correction_bias: selector.correction_bias().map(|p| p.id.to_string()),
             });
             g.edge(
                 &format!("{node}.sum"),
@@ -53,28 +53,20 @@ pub(in crate::discovery) fn complete(g: &mut Builder, c: &crate::k2_horizon::Mod
                 ArchitectureEdgeKind::Data,
             );
         }
-        if !c.is_sparse_layer(layer) || c.num_shared_experts == 0 {
+        let Some(shared) = declaration.routed.as_ref().and_then(|r| r.shared.as_ref()) else {
             continue;
-        }
+        };
         let node = format!("decoder.layers.{layer}.feed_forward.shared");
-        let root = format!("{path}.mlp.shared_experts");
         let group = format!("parameters:{path}.mlp");
         let scope = format!("{path}.shared.feed_forward");
-        let width = (c.moe_intermediate_size * c.num_shared_experts) as usize;
-        let read = |field, role| {
-            let weight = format!("{root}.{field}.weight");
-            ComponentRead {
-                source: None,
-                projection_output: None,
+        let width = shared.gate.output as usize;
+        let read = |projection: &eredu_nn::LinearSpec, role| {
+            declared_component_read(
+                projection,
+                group.clone(),
                 role,
-                weight: weight.clone(),
-                shared_weight: weight,
-                parameter_group: group.clone(),
-                bias: None,
-                rows: ComponentRowMapping::Direct { offset: 0 },
-                head_normalization: None,
-                input_projections: Vec::new(),
-            }
+                ComponentRowMapping::Direct { offset: 0 },
+            )
         };
         g.descriptor.components.push(ComponentGroup {
             id: format!("{node}.units"),
@@ -89,31 +81,20 @@ pub(in crate::discovery) fn complete(g: &mut Builder, c: &crate::k2_horizon::Mod
             write_partition: ComponentWritePartition::Complete,
             input: format!("{scope}.input"),
             reads: vec![
-                read("gate_proj", ComponentReadRole::Gate),
-                read("up_proj", ComponentReadRole::Value),
+                read(&shared.gate, ComponentReadRole::Gate),
+                read(&shared.up, ComponentReadRole::Value),
             ],
             routed_reads: vec![],
-            write_weight: format!("{root}.down_proj.weight"),
+            write_weight: shared.down.weight.id.to_string(),
             write_input_projection: None,
-            shared_write_weight: format!("{root}.down_proj.weight"),
+            shared_write_weight: declared_shared_weight(&shared.down.weight).into(),
             write_parameter_group: group,
-            write_bias: None,
-            activation_equation: ComponentActivation::Gated {
-                activation: ComponentNonlinearity::Silu {
-                    multiplier: ComponentScalar::new(1.0),
-                },
-                gate_upper_bound: None,
-                value_absolute_bound: None,
-                value_offset: ComponentScalar::new(0.0),
-            },
-            input_normalization: ComponentNormalization {
-                kind: ComponentNormalizationKind::Rms,
-                epsilon: ComponentScalar::new(c.rms_norm_eps),
-                gain: Some(format!("{path}.post_attention_layernorm.weight")),
-                gain_offset: ComponentScalar::new(0.0),
-                bias: None,
-                groups: c.layernorm_num_groups as usize,
-            },
+            write_bias: shared.down.bias.as_ref().map(|bias| bias.id.to_string()),
+            activation_equation: declared_gated_product(shared.policy)
+                .expect("validated K2 shared gated-product policy"),
+            input_normalization: declared_normalization(
+                &declaration.common.normalizations.post_attention,
+            ),
             output_gate: None,
             output_normalization: None,
             residual_scale: ComponentScalar::new(1.0),
@@ -121,7 +102,7 @@ pub(in crate::discovery) fn complete(g: &mut Builder, c: &crate::k2_horizon::Mod
         for (suffix, extent, axis, meaning) in [
             (
                 "input",
-                c.hidden_size as usize,
+                shared.gate.input as usize,
                 "hidden",
                 "Normalized shared-expert input",
             ),
@@ -133,13 +114,13 @@ pub(in crate::discovery) fn complete(g: &mut Builder, c: &crate::k2_horizon::Mod
             ),
             (
                 "write",
-                c.hidden_size as usize,
+                shared.down.output as usize,
                 "hidden",
                 "Shared-expert affine write",
             ),
             (
                 "output",
-                c.hidden_size as usize,
+                shared.down.output as usize,
                 "hidden",
                 "Shared-expert contribution to the feed-forward sum",
             ),

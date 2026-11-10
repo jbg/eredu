@@ -11,11 +11,7 @@ impl HyperNeuralBackend for MlxNeuralBackend {
     ) -> Result<Self::HyperConnection, ComputeError> {
         spec.validate()?;
         let module = compute(common::hyper_connections::HyperConnection::unloaded(
-            spec.streams,
-            spec.hidden_size,
-            spec.sinkhorn_iterations,
-            spec.epsilon,
-            context,
+            &spec, context,
         ))?;
         let topology = exact_parameter_topology(
             &module,
@@ -31,11 +27,7 @@ impl HyperNeuralBackend for MlxNeuralBackend {
     fn hyper_head(spec: HyperHeadSpec, context: &Stream) -> Result<Self::HyperHead, ComputeError> {
         spec.validate()?;
         let module = compute(common::hyper_connections::HyperHead::unloaded(
-            spec.streams,
-            spec.hidden_size,
-            spec.norm_epsilon,
-            spec.epsilon,
-            context,
+            &spec, context,
         ))?;
         let topology = exact_parameter_topology(
             &module,
