@@ -156,13 +156,51 @@ impl<B: NeuralBackend> ReplicatedBlock<B> {
             context,
             instrumentation,
         )?;
-        let normalized = self.feed_forward_norm.forward(&hidden, context)?;
+        self.finish(&hidden, context, instrumentation)
+    }
+
+    /// Runs a full-attention block with bidirectional visibility and no cache.
+    pub(crate) fn forward_bidirectional(
+        &mut self,
+        hidden: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        let TokenMixer::Attention(attention) = &mut self.mixer else {
+            return Err(Error::backend(
+                "LFM3 bidirectional execution requires full attention",
+            ));
+        };
+        if attention.sliding_window.is_some() {
+            return Err(Error::backend(
+                "LFM3 bidirectional execution requires full attention",
+            ));
+        }
+        let normalized = self.operator_norm.forward(hidden, context)?;
+        let mixed = attention.forward_uncached(&normalized, None, context)?;
+        let mixed = match &mut self.post_operator_norm {
+            Some(norm) => norm.forward(&mixed, context)?,
+            None => mixed,
+        };
+        self.finish(
+            &hidden.add(&mixed, context)?,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
+    }
+
+    fn finish(
+        &mut self,
+        hidden: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
+        let normalized = self.feed_forward_norm.forward(hidden, context)?;
         let normalized = instrumentation.apply("feed_forward.input", normalized)?;
         let feed_forward =
             self.feed_forward
                 .forward_instrumented(&normalized, None, context, instrumentation)?;
         finish_feed_forward::<B>(
-            &hidden,
+            hidden,
             feed_forward,
             &mut self.post_ffn_norm,
             "feed_forward.output",

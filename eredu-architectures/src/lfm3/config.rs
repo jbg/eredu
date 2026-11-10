@@ -156,7 +156,7 @@ struct ModelArgsSource {
     #[serde(default = "default_true")]
     use_sandwich_norm: bool,
     #[serde(default)]
-    sliding_window: u32,
+    sliding_window: Option<u32>,
     #[serde(default)]
     head_dim: Option<i32>,
     #[serde(default = "default_true")]
@@ -167,9 +167,11 @@ struct ModelArgsSource {
     quantization_config: Option<WeightQuantization>,
 }
 impl ModelArgsSource {
-    fn normalize(self) -> Result<ModelArgs, ConfigError> {
-        if !self.is_causal {
-            return Err(invalid("the LFM3 text decoder requires causal execution"));
+    fn normalize(self, causal: bool) -> Result<ModelArgs, ConfigError> {
+        if self.is_causal != causal {
+            return Err(invalid(
+                "LFM3 attention direction differs from the declared task",
+            ));
         }
         let layer_count = usize::try_from(self.num_hidden_layers)
             .map_err(|_| invalid("invalid LFM3 layer count"))?;
@@ -178,7 +180,10 @@ impl ModelArgsSource {
             .iter()
             .map(|value| {
                 Ok(LayerPolicy {
-                    operator: OperatorPolicy::parse(value, self.sliding_window)?,
+                    operator: OperatorPolicy::parse(
+                        value,
+                        self.sliding_window.unwrap_or_default(),
+                    )?,
                     feed_forward: FeedForwardPolicy::Dense,
                 })
             })
@@ -345,6 +350,13 @@ pub fn model_args_from_config_reader(reader: impl Read) -> Result<ModelArgs, Con
 
 /// Normalizes and validates Hugging Face configuration.
 pub fn model_args_from_config_value(config: &Value) -> Result<ModelArgs, ConfigError> {
+    model_args_for_attention(config, true)
+}
+
+pub(super) fn model_args_for_attention(
+    config: &Value,
+    causal: bool,
+) -> Result<ModelArgs, ConfigError> {
     if config
         .get("architectures")
         .and_then(Value::as_array)
@@ -368,7 +380,7 @@ pub fn model_args_from_config_value(config: &Value) -> Result<ModelArgs, ConfigE
         ));
     }
     let source: ModelArgsSource = serde_json::from_value(config.clone())?;
-    let args = source.normalize()?;
+    let args = source.normalize(causal)?;
     args.validate()?;
     Ok(args)
 }

@@ -86,6 +86,6 @@ prepared codec selection, GGUF admission, host-layerwise/disk-streamed adapters,
 TP/PP construction, selected memory reports and controlled-session/capture
 integration are not implemented. The independent units and caller-owned state
 are building blocks for these paths; they do not establish support for them.
-The LFM3 audio encoder, depth decoder, audio language-model feedback and omni
-orchestration have no implementation here. No complete audio-family support is
-advertised by this standalone codec acceptance.
+LFM3 Audio has standalone speech input, depth scoring and feedback components.
+Public audio and omni orchestration still need to connect them to the codec.
+Standalone codec acceptance does not establish audio language-model acceptance.

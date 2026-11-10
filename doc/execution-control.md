@@ -277,8 +277,11 @@ the family tasks without an implementation.
 
 LFM3 speech input exposes caller-owned PCM overlap and causal encoder
 continuation. The encoder retains its feature overlap separately from sliding
-attention and convolution state. Public controlled speech sessions are still
-unimplemented.
+attention and convolution state. The standalone speech depth decoder separates
+score evaluation from committing each complete codebook group. The frame exposes
+speech or EOS only after the final group. The request owner supplies the reveal
+order, sampling policy and native completion. Public controlled speech sessions
+are still unimplemented.
 
 LiquidCodec's standalone `Tokenizer` implements finite audio-tokenizer calls and
 explicit decode-stream advancement over shared neural/spectral equations. Its

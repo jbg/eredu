@@ -13,22 +13,22 @@ pub(crate) enum MixerParameters {
     Convolution(eredu_nn::GatedShortConvolutionSpec),
 }
 impl MixerParameters {
-    pub(crate) fn new(
+    fn at(
         args: &ModelArgs,
         layer: usize,
         geometry: super::BlockGeometry,
+        root: &str,
     ) -> Result<Self, Error> {
         let policy = args
             .layer_policy(layer)
             .ok_or_else(|| Error::backend("LFM3 invocation is outside its schedule"))?;
-        let root = format!("model.layers.{layer}");
         Ok(match policy.operator {
             OperatorPolicy::SelfAttention(p) => Self::Attention(
-                super::block::AttentionParameters::new(args, &root, geometry)?,
+                super::block::AttentionParameters::new(args, root, geometry)?,
                 p,
             ),
             OperatorPolicy::CausalConvolution => Self::Convolution(
-                super::block::short_convolution_spec(args, &root, geometry.convolution_channels)?,
+                super::block::short_convolution_spec(args, root, geometry.convolution_channels)?,
             ),
         })
     }
@@ -77,14 +77,17 @@ pub(crate) struct BlockParameters {
 }
 impl BlockParameters {
     fn new(args: &ModelArgs, layer: usize) -> Result<Self, Error> {
+        Self::at(args, layer, &format!("model.layers.{layer}"))
+    }
+
+    pub(crate) fn at(args: &ModelArgs, layer: usize, root: &str) -> Result<Self, Error> {
         let policy = args
             .layer_policy(layer)
             .ok_or_else(|| Error::backend("LFM3 invocation is outside its schedule"))?;
-        let root = format!("model.layers.{layer}");
-        let mixer = MixerParameters::new(args, layer, super::BlockGeometry::replicated(args))?;
+        let mixer = MixerParameters::at(args, layer, super::BlockGeometry::replicated(args), root)?;
         let feed_forward = match policy.feed_forward {
             FeedForwardPolicy::Dense => FeedForwardParameters::Dense(
-                super::feed_forward::dense_parameters(args, layer, args.dense_intermediate_size)?,
+                super::feed_forward::dense_parameters(args, root, args.dense_intermediate_size)?,
             ),
         };
         Ok(Self {
