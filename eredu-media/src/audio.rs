@@ -1,6 +1,8 @@
 //! Shared PCM validation and log-mel feature extraction.
 
 pub mod admission;
+#[cfg(feature = "audio")]
+pub mod power_mel;
 
 #[cfg(feature = "audio-processing")]
 pub mod processing;

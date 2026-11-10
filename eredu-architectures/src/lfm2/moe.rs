@@ -31,12 +31,12 @@ pub struct DenseSwiGlu<B: NeuralBackend> {
 }
 
 /// Declares one dense SwiGLU branch at global or rank-local intermediate width.
-pub(crate) fn dense_parameters(
+pub(crate) fn dense_parameters_at(
     args: &ModelArgs,
-    layer: usize,
+    root: &str,
     intermediate: i32,
 ) -> Result<eredu_nn::SplitGatedProductSpec, Error> {
-    let prefix = format!("model.layers.{layer}.feed_forward");
+    let prefix = format!("{root}.feed_forward");
     let linear = |field: &str, input, output| -> Result<LinearSpec, Error> {
         let name = format!("{prefix}.{field}.weight");
         Ok(LinearSpec {

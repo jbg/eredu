@@ -13,12 +13,11 @@ Ordinary and controlled text generation use the shared drivers. The existing tag
 tool dialect consumes the released template's function/parameter tags; the LFM2
 Python-call dialect does not describe this template.
 
-This is a text implementation with independent vision and codec components, not
-complete LFM3-family integration. Standalone resident LiquidCodec execution has
-F32 reference acceptance. Public vision/video generation, audio language-model
-tasks, omni and d1 decision execution are not implemented. Published
-NVFP4 GGUF encoding is not admitted by the current generic GGUF reader. No support
-for these paths is inferred from the shared text backbone or source inventory.
+The public LFM3 route supports text. Vision and speech input have standalone
+neural components, and resident LiquidCodec has independent F32 reference
+acceptance. Public vision/video generation, audio language-model tasks, omni and
+d1 decision execution remain unimplemented. The generic GGUF reader does not
+admit published NVFP4 encoding.
 
 ## Released SafeTensors evidence
 
@@ -164,6 +163,16 @@ These components have no public VL task admission, conditional text composition,
 GGUF admission, selected memory/residency reports, TP/PP construction or controlled
 media-session integration. No corresponding support is advertised by their
 existence or by encoder/projector comparison.
+
+The speech input path admits the released Audio SafeTensors encoder and projector
+geometry. Its host processor accepts 16-kHz mono PCM and computes 128-bin Slaney
+power-mel features with an uncentered 400-sample window and 160-sample hop.
+Right padding completes the final window. Three convolutional stages reduce
+time by a factor of eight before the causal LFM2 backbone, whose attention
+uses a 32-token window. The encoder can advance over complete stride groups
+and emit the final partial group on flush. Finite batches contain equal-length
+unpadded clips. The standalone encoder and projector do not establish full
+audio language-model acceptance.
 
 Standalone LiquidCodec neural encoding and finite/cached decoding, CPU/Metal
 F32 reference results and integration limits are documented in

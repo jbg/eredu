@@ -13,22 +13,22 @@ pub(crate) enum MixerParameters {
     Convolution(eredu_nn::GatedShortConvolutionSpec),
 }
 impl MixerParameters {
-    pub(crate) fn new(
+    fn at(
         args: &ModelArgs,
         layer: usize,
         geometry: super::BlockGeometry,
+        root: &str,
     ) -> Result<Self, Error> {
         let policy = args
             .layer_policy(layer)
             .ok_or_else(|| Error::backend("LFM2 invocation is outside its schedule"))?;
-        let root = format!("model.layers.{layer}");
         Ok(match policy.operator {
             OperatorPolicy::SelfAttention(p) => Self::Attention(
-                super::block::AttentionParameters::new(args, &root, geometry)?,
+                super::block::AttentionParameters::new(args, root, geometry)?,
                 p,
             ),
             OperatorPolicy::CausalConvolution => Self::Convolution(
-                super::block::short_convolution_spec(args, &root, geometry.convolution_channels)?,
+                super::block::short_convolution_spec(args, root, geometry.convolution_channels)?,
             ),
         })
     }
@@ -76,20 +76,28 @@ pub(crate) struct BlockParameters {
 }
 impl BlockParameters {
     fn new(args: &ModelArgs, layer: usize) -> Result<Self, Error> {
+        Self::at(args, layer, &format!("model.layers.{layer}"))
+    }
+
+    /// Declares a block in a caller-owned component namespace.
+    pub(crate) fn at(args: &ModelArgs, layer: usize, root: &str) -> Result<Self, Error> {
         let policy = args
             .layer_policy(layer)
             .ok_or_else(|| Error::backend("LFM2 invocation is outside its schedule"))?;
-        let root = format!("model.layers.{layer}");
-        let mixer = MixerParameters::new(args, layer, super::BlockGeometry::replicated(args))?;
-        let feed_forward =
-            match policy.feed_forward {
-                FeedForwardPolicy::Dense => FeedForwardParameters::Dense(
-                    super::moe::dense_parameters(args, layer, args.dense_intermediate_size)?,
-                ),
-                FeedForwardPolicy::SparseMoe => {
-                    FeedForwardParameters::Routed(super::moe::routed_spec(args, layer)?)
+        let mixer = MixerParameters::at(args, layer, super::BlockGeometry::replicated(args), root)?;
+        let feed_forward = match policy.feed_forward {
+            FeedForwardPolicy::Dense => FeedForwardParameters::Dense(
+                super::moe::dense_parameters_at(args, root, args.dense_intermediate_size)?,
+            ),
+            FeedForwardPolicy::SparseMoe => {
+                if root != format!("model.layers.{layer}") {
+                    return Err(Error::backend(
+                        "LFM2 routed banks require the text namespace",
+                    ));
                 }
-            };
+                FeedForwardParameters::Routed(super::moe::routed_spec(args, layer)?)
+            }
+        };
         Ok(Self {
             mixer,
             feed_forward,

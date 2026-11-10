@@ -16,7 +16,14 @@
     },
     {
       "repository": "LiquidAI/LFM3-Audio-2B",
-      "revision": "2d6c1f99c129b3ef07a8d168bc0ff08e2bdb93f1"
+      "revision": "2d6c1f99c129b3ef07a8d168bc0ff08e2bdb93f1",
+      "source_sha256": {
+        "config.json": "1eb2a8349a1ec9eda2ed8e8bb1a8788007ae2ae9baa38a7d959743c5379d30d8",
+        "preprocessor_config.json": "6c991f650c2ec718ffe752c78ac2af66b2085b05b25bff3b8fef57310cc100ee",
+        "configuration_lfm3_audio.py": "820dd7b7aaf5c70677569b282ba4e3c31866a03e25c06d5744ba6e0b465e9a32",
+        "feature_extraction_lfm3_audio.py": "494061ef2db58af5fe3d4964afd36e334225b7ca8db546e740272da38841f70d",
+        "modeling_lfm3_audio.py": "8d7225d892b8b09edbe2285a8add883ce46e28c4027edc2b8c59b501eeadb9e0"
+      }
     },
     {
       "repository": "LiquidAI/LFM3-Omni-2B",

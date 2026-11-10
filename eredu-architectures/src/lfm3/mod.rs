@@ -1,5 +1,7 @@
 //! Backend-neutral LFM3 tri-hybrid decoder architecture.
 
+/// Speech input feature policy and encoder.
+pub mod audio;
 pub mod declarations;
 pub use declarations::Declaration;
 

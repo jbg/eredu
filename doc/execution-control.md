@@ -275,6 +275,11 @@ conformance case covers bounded residency and controlled/uninterrupted agreement
 [released-checkpoint evidence](lfm3-validation.md) records numerical coverage and
 the family tasks without an implementation.
 
+LFM3 speech input exposes caller-owned PCM overlap and causal encoder
+continuation. The encoder retains its feature overlap separately from sliding
+attention and convolution state. Public controlled speech sessions are still
+unimplemented.
+
 LiquidCodec's standalone `Tokenizer` implements finite audio-tokenizer calls and
 explicit decode-stream advancement over shared neural/spectral equations. Its
 caller-owned decoder state retains KV/convolution state and overlap-add roots.
