@@ -1,5 +1,10 @@
 //! Resident Audio composition over the shared language traversal.
 
+#[cfg(feature = "audio")]
+mod ingress;
+#[cfg(feature = "audio")]
+pub use ingress::{AudioIngress, AudioIngressError, AudioIngressProgress, AudioIngressRequest};
+
 use super::{
     AudioExecutionKernel, AudioMode, AudioPrompt, AudioSampling, AudioSchedulePolicy, AudioSession,
     AudioSessionError, AudioTokens, BindingSource, DepthDeclaration, DepthDecoder, DepthFrame,
@@ -418,17 +423,12 @@ where
         let mut language = self
             .binding
             .state(self.artifact.language.definition().state_layout())?;
-        let hidden = AudioPrompt::new(
+        let hidden = self.forward_prompt(
+            &mut language,
             &tokens,
-            self.artifact.tokens,
-            args.hidden_size,
             speech_input.as_ref(),
             speech_output.as_ref(),
-            ctx,
-        )
-        .and_then(|input| input.forward_resident(&mut self.language, &mut language, ctx))
-        .and_then(|hidden| last_position(&hidden, ctx))
-        .map_err(failure)?;
+        )?;
         let state = ResidentAudioState {
             language,
             hidden,
@@ -454,24 +454,34 @@ where
     B: GroupedNeuralBackend + DistributedNeuralBackend,
     H: ResidentAudioBinding<B>,
 {
+    fn forward_prompt(
+        &mut self,
+        language: &mut H::State,
+        tokens: &[i32],
+        input: Option<&B::Tensor>,
+        output: Option<&B::Tensor>,
+    ) -> Result<B::Tensor, BackendFailure> {
+        let ctx = self.binding.context();
+        AudioPrompt::new(
+            tokens,
+            self.artifact.tokens,
+            self.artifact.language.args().hidden_size,
+            input,
+            output,
+            ctx,
+        )
+        .and_then(|input| input.forward_resident(&mut self.language, language, ctx))
+        .and_then(|hidden| last_position(&hidden, ctx))
+        .map_err(failure)
+    }
+
     fn append(
         &mut self,
         state: &mut ResidentAudioState<B, H>,
         token: i32,
         output: Option<&B::Tensor>,
     ) -> Result<(), BackendFailure> {
-        let ctx = self.binding.context();
-        state.hidden = AudioPrompt::new(
-            &[token],
-            self.artifact.tokens,
-            self.artifact.language.args().hidden_size,
-            None,
-            output,
-            ctx,
-        )
-        .and_then(|input| input.forward_resident(&mut self.language, &mut state.language, ctx))
-        .and_then(|hidden| last_position(&hidden, ctx))
-        .map_err(failure)?;
+        state.hidden = self.forward_prompt(&mut state.language, &[token], None, output)?;
         Ok(())
     }
 }

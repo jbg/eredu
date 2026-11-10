@@ -259,8 +259,10 @@ mono PCM, and speech EOS. Both `advance` and `events` use the same controlled
 driver. Idle snapshots and restore use explicit copy limits and preserve
 unfinished refinement and codec carry. Live forks resume the settled state
 on the same resident graph, with independent restore origins and a shared
-copy budget. Live ingress, distributed execution and bounded residency remain
-unimplemented for Audio.
+copy budget. The audio feature also exposes controlled mono 16-kHz PCM
+ingress for one streamed utterance. The caller supplies token spans around
+the utterance and finalizes it before generating a response. Distributed
+execution and bounded residency remain unimplemented for Audio.
 
 A CPU loader check uses the pinned Audio checkpoint with the weight file and
 asset directory supplied separately. The selected language, encoder, depth
@@ -298,3 +300,12 @@ reject before charging. A CPU run capped at the initial retention rejects
 the child's first speech commit on both attempts, leaves its slot count at
 zero, and lets the source publish that frame. Dropping the child releases
 its retention and keeps cumulative copying charged.
+
+The ingress check sends the same 2,151 samples as three chunks ending at
+samples 399, 1,520, and 2,151. One projected speech position commits before
+finish and a second enters the prompt on flush. The streamed and finite
+prompts produce identical codebooks and all 5,760 PCM samples within each
+device on CPU and precise Metal. Invalid sample rates and non-finite samples
+leave progress unchanged. A separate CPU check reserves one audio position,
+accepts its exactly aligned 1,520 samples, rejects an additional sample,
+and finalizes with zero new mel frames before emitting a text token.

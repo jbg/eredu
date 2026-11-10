@@ -76,7 +76,7 @@ projector.
 | Kimi Linear | text | yes | `kimi-linear` | KDA/MLA hybrid layers, dense and routed/shared experts |
 | LFM2 / LFM2.5 | text | yes | `lfm2`, `lfm2moe` | causal-convolution/attention hybrid, dense and MoE |
 | LFM3 text/base | text | `lfm3` | `lfm3` | experimental text route: gated global/sliding attention, width-seven convolutions and sandwich norms; [validation and family coverage](lfm3-validation.md) |
-| LFM3 Audio | pretokenized text and finite speech input, text and streaming PCM output | `lfm3_audio` + LiquidCodec | — | experimental resident MLX session via the shared realtime loader, with F32 widening, controlled depth advancement, snapshots, restore, and live forks. [Scope and validation](lfm3-validation.md#resident-audio-sessions) |
+| LFM3 Audio | pretokenized text, finite speech or streamed mono PCM prompt input, text and streaming PCM output | `lfm3_audio` + LiquidCodec | — | experimental resident MLX session via the shared realtime loader, with F32 widening, controlled depth advancement, snapshots, restore, and live forks. [Scope and validation](lfm3-validation.md#resident-audio-sessions) |
 | Nemotron-H | text | yes | `nemotron_h`, `nemotron_h_moe` | Mamba, attention, dense MLP, and MoE layers |
 | Inkling | text, image, audio | yes | `inkling` + projector | multimodal hMLP ingress and dense/MoE text execution |
 | Muse-Glimmer | text, image, video | yes | `muse-glimmer`; optional image-only projector | vision tower, mixed attention, ATEM/DFlash paths |

@@ -11,6 +11,12 @@ pub use eredu_architectures::lfm3::audio::{
     AudioResidentParameterBytes, AudioSession, AudioSessionError, AudioSnapshot,
     AudioSnapshotError, PreparedAudio, ResidentAudioError,
 };
+#[cfg(feature = "audio")]
+pub use eredu_architectures::lfm3::audio::{
+    AudioIngress, AudioIngressError, AudioIngressProgress, AudioIngressRequest,
+};
+#[cfg(all(feature = "mlx", feature = "audio"))]
+pub use eredu_backend_mlx::native::MlxAudioIngress;
 #[cfg(feature = "mlx")]
 pub use eredu_backend_mlx::native::{MlxAudioModel, MlxAudioSession, MlxAudioSnapshot};
 

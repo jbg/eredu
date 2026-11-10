@@ -20,6 +20,10 @@ use eredu_architectures::lfm3::audio::{
     AudioSnapshotError, BindingSource, PreparedAudio, PreparedResidentAudio, ResidentAudio,
     ResidentAudioBinding, ResidentAudioError,
 };
+#[cfg(feature = "audio")]
+use eredu_architectures::lfm3::audio::{
+    AudioIngress, AudioIngressError, AudioIngressProgress, AudioIngressRequest,
+};
 use eredu_core::{
     execution_control::{SnapshotLimits, SnapshotUsage},
     BackendFailure,
@@ -135,6 +139,50 @@ impl MlxAudioModel {
     ) -> Result<MlxAudioSession, ResidentAudioError> {
         let random = RandomState::with_seed(seed).map_err(failure)?;
         Ok(MlxAudioSession(self.0.start(request, random)?))
+    }
+
+    /// Prepares one streamed mono PCM utterance between the supplied token spans.
+    #[cfg(feature = "audio")]
+    pub fn prepare_ingress(
+        self,
+        request: AudioIngressRequest<'_>,
+        seed: u64,
+    ) -> Result<MlxAudioIngress, AudioIngressError> {
+        let random = RandomState::with_seed(seed).map_err(failure)?;
+        Ok(MlxAudioIngress(self.0.prepare_ingress(request, random)?))
+    }
+}
+
+/// Controlled PCM ingress for a resident LFM3 Audio prompt.
+#[cfg(feature = "audio")]
+pub struct MlxAudioIngress(AudioIngress<MlxNeuralBackend, Binding>);
+
+#[cfg(feature = "audio")]
+impl MlxAudioIngress {
+    /// Current committed sample and audio-token positions.
+    pub fn progress(&self) -> AudioIngressProgress {
+        self.0.progress()
+    }
+
+    /// Accepts finite mono 16-kHz PCM and advances complete input positions.
+    pub fn submit(
+        &mut self,
+        samples: &[f32],
+        sample_rate: u32,
+    ) -> Result<AudioIngressProgress, AudioIngressError> {
+        let _scope = Recovery::begin(Vec::<safemlx::Array>::new()).map_err(failure)?;
+        self.0.submit(samples, sample_rate)
+    }
+
+    /// Flushes the utterance and starts the same response driver as finite prompts.
+    pub fn finish(self) -> Result<MlxAudioSession, AudioIngressError> {
+        let _scope = Recovery::begin(Vec::<safemlx::Array>::new()).map_err(failure)?;
+        self.0.finish().map(MlxAudioSession)
+    }
+
+    /// Drops the incomplete prompt without starting a response.
+    pub fn cancel(self) {
+        self.0.cancel();
     }
 }
 

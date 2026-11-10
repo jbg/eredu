@@ -302,8 +302,17 @@ admit retained state growth before publishing a step. A refused step leaves
 its generation state and output frontier unchanged. Restoring a child does
 not refund the child's high-water retention or the lineage's copy usage.
 
-Capture, live PCM ingress, and bounded or distributed speech sessions have
-no selected implementation.
+With the audio feature, `MlxAudioModel::prepare_ingress` starts a controlled
+prompt with one live mono 16-kHz PCM utterance between caller-supplied token
+spans. Each `submit` advances complete mel windows and appends any newly
+projected positions to the language cache. Rejected chunks leave both sample
+and model frontiers unchanged. `finish` flushes the remaining input, appends
+the suffix and enters the ordinary response session. Cancelling ingress drops
+the incomplete prompt. Snapshots and forks are available after finish.
+
+Ingress prepares a prompt for turn-based generation. Continuous transcription
+while PCM is arriving, snapshots during ingress, capture, and bounded or
+distributed speech sessions have no selected implementation.
 
 LiquidCodec's standalone `Tokenizer` implements finite audio-tokenizer calls and
 explicit decode-stream advancement over shared neural/spectral equations. Its

@@ -25,7 +25,7 @@ const PLAN: &str = "LFM3 Audio speech input";
 const ROOT: &str = "model.audio_encoder";
 const PROJECTOR: &str = "model.audio_projector";
 const MEL_BINS: i32 = 128;
-const STRIDE: i32 = 8;
+pub(super) const STRIDE: i32 = 8;
 
 fn invalid(message: impl Into<String>) -> Error {
     Error::backend(message.into())
@@ -228,6 +228,11 @@ impl Declaration {
     /// Layout of sliding KV and independent causal-convolution history.
     pub fn state_layout(&self) -> &StateLayout {
         &self.layout
+    }
+
+    #[cfg(feature = "audio")]
+    pub(super) fn context_length(&self) -> usize {
+        self.context_length as usize
     }
 
     /// Logical invocations with independent checkpoint ownership.
@@ -493,6 +498,14 @@ pub struct EncoderState<S, T: Tensor> {
 }
 
 impl<S, T: Tensor> EncoderState<S, T> {
+    #[cfg(feature = "audio")]
+    pub(super) fn try_branch<E>(&self, branch: impl FnOnce(&S) -> Result<S, E>) -> Result<Self, E> {
+        Ok(Self {
+            backbone: branch(&self.backbone)?,
+            features: self.features.clone(),
+            ..*self
+        })
+    }
     /// Returns the LFM2 layer-state realization.
     pub fn backbone(&self) -> &S {
         &self.backbone
