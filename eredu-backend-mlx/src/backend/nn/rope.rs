@@ -131,14 +131,28 @@ where
             let cos = cos(&angles, stream)?.try_index_device((NewAxis, .., ..), stream)?;
             let sin = sin(&angles, stream)?.try_index_device((NewAxis, .., ..), stream)?;
             let x1 = x.try_index_device((.., .., ..half_dims), stream)?;
-            let x2 = x.try_index_device((.., .., half_dims..), stream)?;
+            let x2 = x.try_index_device((.., .., half_dims..self.dimensions), stream)?;
             let out1 = x1
                 .multiply(&cos, stream)?
                 .subtract(x2.multiply(&sin, stream)?, stream)?;
             let out2 = x2
                 .multiply(cos, stream)?
                 .add(x1.multiply(sin, stream)?, stream)?;
-            return concatenate_axis(&[out1, out2], -1, stream)?.reshape(shape, stream);
+            let rotated =
+                concatenate_axis(&[out1, out2], -1, stream)?.as_dtype(x.dtype(), stream)?;
+            let output = if self.dimensions == x.dim(-1) {
+                rotated
+            } else {
+                concatenate_axis(
+                    &[
+                        rotated,
+                        x.try_index_device((.., .., self.dimensions..), stream)?,
+                    ],
+                    -1,
+                    stream,
+                )?
+            };
+            return output.reshape(shape, stream);
         }
         let x = safemlx::fast::rope(
             x,
@@ -271,11 +285,13 @@ where
     fn forward(&mut self, input: Input, stream: &Stream) -> Result<Self::Output, Self::Error> {
         let nn::RopeInput { x, offset } = input.into();
         let shape = x.shape();
-        let x = x
-            .multiply(Array::from_f32(self.concentration), stream)?
-            .reshape(&[-1, x.dim(-2), x.dim(-1)], stream)?;
-        let x = safemlx::fast::rope(
-            x,
+        let dtype = x.dtype();
+        let x = x.reshape(&[-1, x.dim(-2), x.dim(-1)], stream)?;
+        let rotary = x
+            .try_index_device((.., .., ..self.dimensions), stream)?
+            .multiply(Array::from_f32(self.concentration), stream)?;
+        let rotated = safemlx::fast::rope(
+            rotary,
             self.dimensions,
             self.traditional,
             None::<f32>,
@@ -283,8 +299,21 @@ where
             offset,
             &self.freqs,
             stream,
-        )?;
-        x.reshape(shape, stream)
+        )?
+        .as_dtype(dtype, stream)?;
+        let output = if self.dimensions == x.dim(-1) {
+            rotated
+        } else {
+            concatenate_axis(
+                &[
+                    rotated,
+                    x.try_index_device((.., .., self.dimensions..), stream)?,
+                ],
+                -1,
+                stream,
+            )?
+        };
+        output.reshape(shape, stream)
     }
 }
 

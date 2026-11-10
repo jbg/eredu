@@ -3,7 +3,7 @@
 use safemlx::{
     array,
     error::{Exception, Result as MlxResult},
-    ops::{erf, exp, maximum, r#where, tanh},
+    ops::{erf, expm1, maximum, r#where, tanh},
     Array, Stream,
 };
 
@@ -115,13 +115,21 @@ pub fn elu(
 ) -> MlxResult<Array> {
     let stream = stream.as_ref();
     let x = x.as_ref();
+    let dtype = x.dtype();
+    let work = match dtype {
+        safemlx::Dtype::Bfloat16 | safemlx::Dtype::Float16 => {
+            x.as_dtype(safemlx::Dtype::Float32, stream)?
+        }
+        _ => x.clone(),
+    };
     let alpha = array!(alpha.into().unwrap_or(1.0));
     r#where(
-        &x.gt(array!(0.0), stream)?,
-        x,
-        alpha.multiply(exp(x, stream)?.subtract(array!(1.0), stream)?, stream)?,
+        &work.gt(array!(0.0), stream)?,
+        &work,
+        alpha.multiply(expm1(&work, stream)?, stream)?,
         stream,
-    )
+    )?
+    .as_dtype(dtype, stream)
 }
 
 /// Applies softplus.
