@@ -723,6 +723,26 @@ pub struct GenerationSampler {
     generated_tokens: Vec<u32>,
 }
 
+impl crate::execution_control::SnapshotValue for GenerationSampler {
+    fn estimate_snapshot_value(
+        &self,
+    ) -> Result<eredu_core::execution_control::SnapshotEstimate, eredu_core::BackendFailure> {
+        crate::execution_control::snapshot_value_estimate::<Self>([self
+            .generated_tokens
+            .estimate_snapshot_value()])
+    }
+
+    fn copy_snapshot_value(
+        &self,
+        retention: &crate::execution_control::SnapshotReservation,
+    ) -> Result<Self, eredu_core::BackendFailure> {
+        Ok(Self {
+            generated_tokens: self.generated_tokens.copy_snapshot_value(retention)?,
+            ..*self
+        })
+    }
+}
+
 impl Default for GenerationSampler {
     fn default() -> Self {
         Self {

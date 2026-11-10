@@ -214,6 +214,35 @@ pub struct OverlapAddStream<T: Tensor> {
     phase: crate::streaming::StreamPhase,
 }
 
+impl<T: Tensor + eredu_runtime::execution_control::SnapshotValue>
+    eredu_runtime::execution_control::SnapshotValue for OverlapAddStream<T>
+{
+    fn estimate_snapshot_value(
+        &self,
+    ) -> Result<eredu_core::execution_control::SnapshotEstimate, eredu_core::BackendFailure> {
+        eredu_runtime::execution_control::snapshot_value_estimate::<Self>(
+            self.retained_values().map(T::estimate_snapshot_value),
+        )
+    }
+
+    fn copy_snapshot_value(
+        &self,
+        retention: &eredu_runtime::execution_control::SnapshotReservation,
+    ) -> Result<Self, eredu_core::BackendFailure> {
+        let carry = self
+            .carry
+            .as_ref()
+            .map(|carry| {
+                Ok::<_, eredu_core::BackendFailure>(OverlapAddOutput {
+                    audio: carry.audio.copy_snapshot_value(retention)?,
+                    envelope: carry.envelope.copy_snapshot_value(retention)?,
+                })
+            })
+            .transpose()?;
+        Ok(Self { carry, ..*self })
+    }
+}
+
 impl<T: Tensor> OverlapAddStream<T> {
     /// Starts one finite stream. Even symmetric endpoint trimming is explicit;
     /// batch geometry cannot change while its sample/envelope carry is live.

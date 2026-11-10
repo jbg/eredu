@@ -8,11 +8,11 @@
 
 pub use eredu_architectures::lfm3::audio::{
     ArtifactError as AudioArtifactError, AudioAdvance, AudioMode, AudioPhase, AudioRequest,
-    AudioResidentParameterBytes, AudioSession, AudioSessionError, PreparedAudio,
-    ResidentAudioError,
+    AudioResidentParameterBytes, AudioSession, AudioSessionError, AudioSnapshot,
+    AudioSnapshotError, PreparedAudio, ResidentAudioError,
 };
 #[cfg(feature = "mlx")]
-pub use eredu_backend_mlx::native::{MlxAudioModel, MlxAudioSession};
+pub use eredu_backend_mlx::native::{MlxAudioModel, MlxAudioSession, MlxAudioSnapshot};
 
 pub use eredu_architectures::voicechat::precision::{SpeechFloat, SpeechPrecision};
 

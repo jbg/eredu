@@ -286,8 +286,16 @@ same driver. Cancellation occurs between settled advances and drops any
 unpublished speech frame.
 
 The shared realtime loader selects resident MLX execution before the caller
-starts a prompt. Public snapshots, forks, capture, live PCM ingress, and
-bounded or distributed speech sessions have no selected implementation.
+starts a prompt. After configuring snapshot limits, a caller can save or restore
+any settled boundary, including between depth passes and after generation
+finishes. A snapshot retains the language and codec state, unfinished
+refinement, sampler histories and RNG. Restore only accepts snapshots from the
+same session and preserves cumulative copy charges. A caller that restores
+can receive the same token or PCM samples again and owns delivery of those
+events. Cancellation is terminal.
+
+Live forks, capture, live PCM ingress, and bounded or distributed speech
+sessions have no selected implementation.
 
 LiquidCodec's standalone `Tokenizer` implements finite audio-tokenizer calls and
 explicit decode-stream advancement over shared neural/spectral equations. Its
