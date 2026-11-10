@@ -16477,6 +16477,21 @@ portable. Host preprocessing takes mono PCM at the admitted rate. These
 components supply encoder embeddings and do not register a public speech task
 or select bounded, distributed or controlled execution.
 
+`lfm3::audio` also declares the speech depth decoder and language feedback table.
+The depth trunk reuses LFM3 blocks with bidirectional visibility over the entire
+codebook axis and invokes the shared decoder attention mechanism without KV
+state. Each codebook table supplies both the known-code embedding and the score
+head. The head applies its learned scale in F32 before casting back to the
+activation dtype. Released redundant head tensors are excluded from payload
+binding, following the publisher's loader. Language feedback gathers from a
+separate table and sums one vector per codebook.
+
+A frame retains the caller-supplied slot permutation, sampled codes and next
+pass. Scoring does not mutate the frame. Each commit reveals one complete group
+from the checkpoint schedule. Completion distinguishes valid codec codes from
+speech EOS. The request owner supplies sampling, random state and execution
+completion. The standalone components do not select a realtime execution graph.
+
 `eredu-codec::liquid` owns LiquidCodec configuration, complete neural encoder and
 decoder equations, reflective analysis, scalar-product alphabet ordering and
 polar synthesis. It consumes neutral neural/storage/runtime contracts without

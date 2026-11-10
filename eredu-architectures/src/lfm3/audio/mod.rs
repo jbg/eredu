@@ -1,6 +1,10 @@
 //! LFM3 speech-input processor and encoder declarations.
 
+mod depth;
 mod encoder;
+pub use depth::{
+    CompletedSpeechFrame, DepthDeclaration, DepthDecoder, DepthFrame, DepthUnit, Feedback,
+};
 pub use encoder::{Declaration, Downsampler, Encoder, EncoderState, Projector, Unit};
 
 use eredu_nn::Error;

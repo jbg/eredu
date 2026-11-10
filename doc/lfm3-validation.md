@@ -13,7 +13,7 @@ Ordinary and controlled text generation use the shared drivers. The existing tag
 tool dialect consumes the released template's function/parameter tags; the LFM2
 Python-call dialect does not describe this template.
 
-The public LFM3 route supports text. Vision and speech input have standalone
+The public LFM3 route supports text. Vision and speech input/output have standalone
 neural components, and resident LiquidCodec has independent F32 reference
 acceptance. Public vision/video generation, audio language-model tasks, omni and
 d1 decision execution remain unimplemented. The generic GGUF reader does not
@@ -173,6 +173,16 @@ uses a 32-token window. The encoder can advance over complete stride groups
 and emit the final partial group on flush. Finite batches contain equal-length
 unpadded clips. The standalone encoder and projector do not establish full
 audio language-model acceptance.
+
+The standalone speech output path admits the released depth and feedback
+SafeTensors scopes. The three depth blocks score all twelve codebook positions
+bidirectionally. The checkpoint schedule reveals four codebooks per pass in a
+request-supplied permutation. Codebook tables are shared between input lookup
+and output scoring. A frame containing any EOS code terminates the speech
+segment. The completed frame exposes either ordinary codec codes or EOS. The
+language feedback table embeds ordinary frames and canonical all-EOS frames.
+Public speech generation and selected audio execution remain unimplemented.
+Native BF16 numerical parity remains unvalidated.
 
 Standalone LiquidCodec neural encoding and finite/cached decoding, CPU/Metal
 F32 reference results and integration limits are documented in

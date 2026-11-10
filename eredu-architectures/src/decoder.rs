@@ -1446,6 +1446,33 @@ fn validate_schedule<C: Config>(config: &C) -> Result<(), Error> {
     Ok(())
 }
 
+// Type witness for the missing cache in un-cached attention.
+enum AbsentAttentionCache {}
+
+impl<T: Tensor> AttentionCache<T> for AbsentAttentionCache {
+    fn offset(&self) -> i32 {
+        match *self {}
+    }
+    fn max_size(&self) -> Option<i32> {
+        match *self {}
+    }
+    fn update_for_attention(
+        &mut self,
+        _keys: T,
+        _values: T,
+        _context: &T::Context,
+    ) -> Result<(T, T), Error> {
+        match *self {}
+    }
+    fn attention(
+        &mut self,
+        _request: AttentionRequest<'_, T>,
+        _context: &T::Context,
+    ) -> Result<T, Error> {
+        match *self {}
+    }
+}
+
 /// Hidden-state input for one decoder block.
 pub struct AttentionInput<'a, T, C> {
     /// Hidden states shaped `[batch, sequence, hidden]`.
@@ -2160,6 +2187,26 @@ impl<B: NeuralBackend> Attention<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
         self.forward_with_value(input, None, context)
+    }
+
+    /// Runs attention over the complete input without allocating or updating a cache.
+    pub(crate) fn forward_uncached(
+        &mut self,
+        hidden: &B::Tensor,
+        mask: Option<&B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        self.forward::<AbsentAttentionCache>(
+            AttentionInput {
+                hidden,
+                mask,
+                selected_positions: None,
+                cache: None,
+                allow_sliding_prefill: false,
+                rotary_position: None,
+            },
+            context,
+        )
     }
 
     /// Executes the actual post-aggregation channel boundary before projection.
