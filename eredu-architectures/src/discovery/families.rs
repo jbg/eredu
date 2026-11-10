@@ -788,6 +788,7 @@ pub(super) fn remaining_safetensors(
         | SafetensorsModelConfig::Nanbeige(_)
         | SafetensorsModelConfig::KimiLinear(_)
         | SafetensorsModelConfig::Lfm2(_)
+        | SafetensorsModelConfig::Lfm3(_)
         | SafetensorsModelConfig::NemotronH(_)
         | SafetensorsModelConfig::Gemma2(_)
         | SafetensorsModelConfig::Llama(_)
@@ -817,6 +818,7 @@ pub(super) fn remaining_gguf(g: &mut Builder, c: &GgufModelConfig) {
         GgufModelConfig::K2Horizon(_)
         | GgufModelConfig::KimiLinear(_)
         | GgufModelConfig::Lfm2(_)
+        | GgufModelConfig::Lfm3(_)
         | GgufModelConfig::NemotronH(_)
         | GgufModelConfig::Gemma2(_)
         | GgufModelConfig::Llama(_)
@@ -922,6 +924,86 @@ pub(super) fn lfm2(g: &mut Builder, declaration: &crate::lfm2::Declaration) {
     declared_static_output(g, &previous, statics);
     super::components::lfm2_readout(g, declaration);
     super::components::lfm2_other_writes(g, declaration);
+}
+pub(super) fn lfm3(g: &mut Builder, declaration: &crate::lfm3::Declaration) {
+    use crate::lfm3::declarations::MixerParameters as M;
+    let statics = &declaration.statics;
+    let width = statics.embedding_spec().dimensions as usize;
+    let mut previous = declared_static_input(g, statics);
+    for (i, scope) in declaration.blocks.iter().enumerate() {
+        let path = format!("model.layers.{i}");
+        let block = g.block(&previous, i, &path, width);
+        let conv = matches!(scope.mixer, M::Convolution(_));
+        let (op, join) = g.sublayer(
+            &block,
+            &block,
+            "mixer",
+            &format!("{path}.operator_norm"),
+            &format!("{path}.{}", if conv { "conv" } else { "self_attn" }),
+            width,
+            if conv {
+                ArchitectureNodeKind::Mixer
+            } else {
+                ArchitectureNodeKind::Attention
+            },
+        );
+        match &scope.mixer {
+            M::Convolution(spec) => {
+                g.get_mut(&op).mixer = Some(MixerAttributes {
+                    mechanism: MixerMechanism::ShortConvolution,
+                    recurrent: true,
+                    convolution_width: Some(spec.convolution.kernel_size as usize),
+                })
+            }
+            M::Attention(spec, p) => {
+                g.get_mut(&op).attention = Some(attention(
+                    spec.projection.geometry.query_heads(),
+                    spec.projection.geometry.key_value_heads(),
+                    spec.projection.geometry.key_dimensions(),
+                    *p,
+                ))
+            }
+        }
+        post_sublayer_norm(
+            g,
+            &block,
+            &op,
+            &join,
+            scope
+                .post_operator_norm
+                .as_ref()
+                .and_then(super::components::declared_normalization_prefix)
+                .map(|p| format!("{p}.weight")),
+            width,
+        );
+        let (ff, output) = g.sublayer(
+            &block,
+            &join,
+            "feed_forward",
+            &format!("{path}.ffn_norm"),
+            &format!("{path}.feed_forward"),
+            width,
+            ArchitectureNodeKind::FeedForward,
+        );
+        post_sublayer_norm(
+            g,
+            &block,
+            &ff,
+            &output,
+            scope
+                .post_ffn_norm
+                .as_ref()
+                .and_then(super::components::declared_normalization_prefix)
+                .map(|p| format!("{p}.weight")),
+            width,
+        );
+
+        super::components::lfm3_unit(g, declaration, i, &path, &op, &ff);
+        previous = output;
+    }
+    declared_static_output(g, &previous, statics);
+    super::components::lfm3_readout(g, declaration);
+    super::components::lfm3_other_writes(g, declaration);
 }
 
 pub(super) fn kimi(g: &mut Builder, declaration: &crate::kimi_linear::Declaration) {

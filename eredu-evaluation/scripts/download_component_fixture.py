@@ -8,6 +8,9 @@ from pathlib import Path
 from huggingface_hub import HfApi, snapshot_download
 
 FIXTURES = {
+    'lfm3': ('LiquidAI/LFM3-1.7B',
+             '1da06bec6a819da10b54c67e5c90972b46d81871',
+             '135922caef64e81e52af88ede8b7c3ddaa9d6da220a9737fb3065275dbfb4330'),
     'smollm2': ('HuggingFaceTB/SmolLM2-135M-Instruct',
                 '12fd25f77366fa6b3b4b768ec3050bf629380bac',
                 '5af571cbf074e6d21a03528d2330792e532ca608f24ac70a143f6b369968ab8c'),
@@ -51,7 +54,7 @@ def main():
             'config.json', 'generation_config.json', *expected,
             'model.safetensors.index.json',
             'tokenizer.json', 'tokenizer_config.json', 'special_tokens_map.json',
-            'chat_template.jinja']))
+            'chat_template.jinja', *(['*.py'] if args.model == 'lfm3' else [])]))
     digests = {}
     for name, expected_digest in expected.items():
         with (checkpoint / name).open('rb') as source:

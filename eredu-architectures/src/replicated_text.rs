@@ -42,6 +42,7 @@ use crate::{
 };
 
 struct Lfm2Replicated;
+struct Lfm3Replicated;
 struct KimiLinearReplicated;
 struct DeepSeekV3DenseReplicated;
 pub(crate) struct NemotronHReplicated;
@@ -106,6 +107,101 @@ impl<B: NeuralBackend> FixedReplicatedFamily<B> for Lfm2Replicated {
             matches!(
                 policy.operator,
                 crate::lfm2::OperatorPolicy::SelfAttention(_)
+            )
+        })
+    }
+    fn forward_unit<C>(
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut C,
+        forward: &ReplicatedForwardContext<B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, eredu_nn::Error>
+    where
+        C: AttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
+    {
+        unit.forward(hidden, forward.mask.as_ref(), state, context)
+    }
+    fn forward_unit_observed<C, O>(
+        unit: &mut Self::Unit,
+        path: &str,
+        hidden: &B::Tensor,
+        state: &mut C,
+        forward: &ReplicatedForwardContext<B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, eredu_nn::Error>
+    where
+        C: AttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
+        O: eredu_runtime::ActivationObserver<B::Tensor, eredu_nn::Error> + ?Sized,
+    {
+        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+        unit.forward_instrumented(
+            hidden,
+            forward.mask.as_ref(),
+            state,
+            context,
+            &mut crate::decoder::ComponentInstrumentation::new(path, &mut borrowed),
+        )
+    }
+}
+impl<B: NeuralBackend> FixedReplicatedFamily<B> for Lfm3Replicated {
+    const CHUNKED_PREFILL: bool = crate::lfm3::CHUNKED_TEXT_PREFILL;
+    type Config = Arc<crate::lfm3::Declaration>;
+    type Unit = crate::lfm3::block::ReplicatedBlock<B>;
+
+    fn validate(config: &Self::Config) -> Result<(), eredu_nn::Error> {
+        config
+            .args()
+            .validate()
+            .map_err(eredu_nn::Error::backend_source)
+    }
+    fn definition(
+        config: &Self::Config,
+    ) -> Result<eredu_runtime::ComponentDefinition, eredu_nn::Error> {
+        Ok(config.definition().as_ref().clone())
+    }
+
+    fn construct_statics(
+        config: &Self::Config,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<crate::decoder::StaticModules<B>, eredu_nn::Error> {
+        let s = &config.statics;
+        let boundary =
+            crate::decoder::NormalizedBoundary::new(s.normalization_spec().clone(), context)?;
+        crate::decoder::StaticModules::from_boundary(
+            s.embedding_spec().clone(),
+            s.head_spec().cloned(),
+            boundary,
+            context,
+        )
+    }
+
+    fn state_identity(
+        config: &Self::Config,
+        layout: &eredu_runtime::StateLayout,
+        global_layer_start: usize,
+        topology: eredu_core::cache::PromptCacheTopology,
+    ) -> Result<eredu_runtime::ModelStateIdentity, eredu_nn::Error> {
+        crate::lfm3::state_identity(config.args(), layout, global_layer_start, topology)
+    }
+    fn build_unit(
+        config: &Self::Config,
+        index: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self::Unit, eredu_nn::Error> {
+        let parameters = config
+            .blocks
+            .get(index)
+            .cloned()
+            .ok_or_else(|| eredu_nn::Error::backend("retained LFM3 scope omits target unit"))?;
+        crate::lfm3::block::ReplicatedBlock::from_parameters(parameters, context)
+    }
+    fn mask_layer(config: &Self::Config) -> Option<usize> {
+        config.args().layer_schedule.iter().position(|policy| {
+            matches!(
+                policy.operator,
+                crate::lfm3::OperatorPolicy::SelfAttention(_)
             )
         })
     }
@@ -1136,6 +1232,7 @@ where
             )
         }
         EligibleConfig::Lfm2(_)
+        | EligibleConfig::Lfm3(_)
         | EligibleConfig::KimiLinear(_)
         | EligibleConfig::NemotronH(_)
         | EligibleConfig::QwenHybrid(_)
@@ -1355,6 +1452,14 @@ pub(crate) fn retain_executable_component(
             | (None, Some(GgufModelConfig::Lfm2(args))) => {
                 let target = selected_lfm2_args(args, &selected)?;
                 let declaration = plan.lfm2_declaration(&target)?;
+                retained
+                    .project_parameters(declaration.definition().parameters().clone())
+                    .map_err(|error| error.to_string())?
+            }
+            (Some(SafetensorsModelConfig::Lfm3(args)), None)
+            | (None, Some(GgufModelConfig::Lfm3(args))) => {
+                let target = selected_lfm3_args(args, &selected)?;
+                let declaration = plan.lfm3_declaration(&target)?;
                 retained
                     .project_parameters(declaration.definition().parameters().clone())
                     .map_err(|error| error.to_string())?
@@ -1664,6 +1769,17 @@ pub(crate) fn selected_lfm2_args(
         crate::lfm2::with_checkpoint_formats(args, formats)
     }
 }
+pub(crate) fn selected_lfm3_args(
+    args: &crate::lfm3::ModelArgs,
+    selected: &SelectedReplicatedTextRealization,
+) -> Result<crate::lfm3::ModelArgs, String> {
+    let formats = selected.quantized_formats();
+    if formats.is_empty() {
+        Ok(args.clone())
+    } else {
+        crate::lfm3::with_checkpoint_formats(args, formats)
+    }
+}
 
 pub(crate) fn selected_kimi_linear_args(
     args: &crate::kimi_linear::ModelArgs,
@@ -1865,7 +1981,8 @@ where
     B: NeuralBackend,
     S: LayerRuntimeState<B>,
     V: ReplicatedTextArchitectureVisitor<B, S>,
-    P: FixedProfile<B, S, Lfm2Replicated>
+    P: FixedProfile<B, S, Lfm3Replicated>
+        + FixedProfile<B, S, Lfm2Replicated>
         + FixedProfile<B, S, KimiLinearReplicated>
         + FixedProfile<B, S, NemotronHReplicated>
         + FixedProfile<B, S, QwenHybridReplicated>,
@@ -1911,6 +2028,51 @@ where
                 .map_err(ReplicatedTextDispatchError::Architecture)?;
             let architecture = <P as FixedProfile<B, S, Lfm2Replicated>>::from_definition(
                 plan.lfm2_declaration(&args)
+                    .map_err(ReplicatedTextDispatchError::Architecture)?,
+                definition,
+                context,
+            )
+            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+            let prepared = prepare_architecture_handoff::<B, S, _>(
+                architecture,
+                source_architecture,
+                requirements,
+                selected,
+                capability_estimate,
+                effective_model_type,
+                prompt_cache_architecture_identity,
+                context,
+            )
+            .map_err(ReplicatedTextDispatchError::Architecture)?;
+            visitor
+                .visit(prepared, store)
+                .map_err(ReplicatedTextDispatchError::Backend)
+        }
+        EligibleConfig::Lfm3(declaration) => {
+            let args = declaration.args();
+            visitor.construction_started();
+            let capability_estimate = crate::capability::lfm3(&declaration)
+                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+            let effective_model_type = args.model_type.clone();
+            let source_architecture = selected
+                .uses_weight_transform()
+                .then(|| {
+                    <P as FixedProfile<B, S, Lfm3Replicated>>::from_definition(
+                        Arc::clone(&declaration),
+                        retained.clone(),
+                        context,
+                    )
+                })
+                .transpose()
+                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+            let args = selected_lfm3_args(args, &selected)
+                .map_err(ReplicatedTextDispatchError::Architecture)?;
+            let prompt_cache_architecture_identity =
+                crate::lfm3::prompt_cache_architecture_fingerprint(&args);
+            let definition = executable_component(&selected)
+                .map_err(ReplicatedTextDispatchError::Architecture)?;
+            let architecture = <P as FixedProfile<B, S, Lfm3Replicated>>::from_definition(
+                plan.lfm3_declaration(&args)
                     .map_err(ReplicatedTextDispatchError::Architecture)?,
                 definition,
                 context,
@@ -2929,6 +3091,7 @@ enum EligibleConfig<'a> {
     ),
     Qwen(&'a crate::qwen::ModelArgs, Arc<crate::qwen::Declaration>),
     Lfm2(Arc<crate::lfm2::Declaration>),
+    Lfm3(Arc<crate::lfm3::Declaration>),
     KimiLinear(Arc<crate::kimi_linear::Declaration>),
     NemotronH(Arc<crate::nemotron_h::Declaration>),
     QwenHybrid(&'a crate::qwen::hybrid::HybridConfig),
@@ -2968,6 +3131,7 @@ impl EligibleConfig<'_> {
                 }
             }
             Self::Lfm2(declaration) => crate::lfm2::execution_topology(declaration)?,
+            Self::Lfm3(declaration) => crate::lfm3::execution_topology(declaration)?,
             Self::QwenHybrid(args) => crate::qwen::hybrid::topology::target(args)?,
             Self::QwenCompositeHybrid(args) => crate::qwen::hybrid::topology::target(&args.text)?,
             _ => return Ok(None),
@@ -2998,6 +3162,7 @@ impl EligibleConfig<'_> {
             | Self::GptOss(_, _) => crate::decoder::CHUNKED_TEXT_PREFILL,
             Self::Muse(_) => crate::muse::model::RETAINED_PREFILL,
             Self::Lfm2(_) => crate::lfm2::CHUNKED_TEXT_PREFILL,
+            Self::Lfm3(_) => crate::lfm3::CHUNKED_TEXT_PREFILL,
             Self::QwenHybrid(_) | Self::QwenCompositeHybrid(_) => {
                 crate::qwen::hybrid::CHUNKED_TEXT_PREFILL
             }
@@ -3051,6 +3216,7 @@ impl EligibleConfig<'_> {
                     .dimensions,
             ),
             Self::Lfm2(declaration) => standard(declaration.statics.embedding_spec().dimensions),
+            Self::Lfm3(declaration) => standard(declaration.statics.embedding_spec().dimensions),
             Self::KimiLinear(declaration) => {
                 standard(declaration.statics.embedding_spec().dimensions)
             }
@@ -3199,6 +3365,11 @@ impl EligibleConfig<'_> {
             Self::Lfm2(declaration) => {
                 for layer in 0..declaration.definition().parameters().unit_layout().len() {
                     extend(crate::lfm2::unit_recipes(source, &declaration, layer)?)?;
+                }
+            }
+            Self::Lfm3(declaration) => {
+                for layer in 0..declaration.definition().parameters().unit_layout().len() {
+                    extend(crate::lfm3::unit_recipes(source, &declaration, layer)?)?;
                 }
             }
             Self::KimiLinear(declaration) => {
@@ -3393,6 +3564,9 @@ impl EligibleConfig<'_> {
             Self::Lfm2(declaration) => {
                 crate::lfm2::prompt_cache_architecture_fingerprint(declaration.args())
             }
+            Self::Lfm3(declaration) => {
+                crate::lfm3::prompt_cache_architecture_fingerprint(declaration.args())
+            }
             Self::KimiLinear(declaration) => {
                 crate::kimi_linear::prompt_cache_architecture_fingerprint(declaration.args())
             }
@@ -3474,6 +3648,7 @@ impl EligibleConfig<'_> {
             | Self::Nanbeige(_, _)
             | Self::Qwen(_, _)
             | Self::Lfm2(_)
+            | Self::Lfm3(_)
             | Self::GptOss(_, _) => NeuralOperatorCapabilities::NONE,
             Self::KimiLinear(declaration)
                 if declaration.blocks.iter().any(|scope| {
@@ -3530,6 +3705,7 @@ impl EligibleConfig<'_> {
             Self::Qwen(_, declaration) => declaration.component_definition(),
             Self::GptOss(_, declaration) => declaration.component_definition(),
             Self::Lfm2(declaration) => Ok(declaration.definition().as_ref().clone()),
+            Self::Lfm3(declaration) => Ok(declaration.definition().as_ref().clone()),
             Self::KimiLinear(declaration) => Ok(declaration.definition().as_ref().clone()),
             Self::NemotronH(declaration) => Ok(declaration.definition().as_ref().clone()),
             Self::QwenHybrid(args) => crate::qwen::hybrid::component_definition(args, None),
@@ -3565,6 +3741,7 @@ impl EligibleConfig<'_> {
             }
             Self::Qwen(_, declaration) => return Ok(declaration.common().state_layout().len()),
             Self::Lfm2(declaration) => return Ok(declaration.blocks.len()),
+            Self::Lfm3(declaration) => return Ok(declaration.blocks.len()),
             Self::KimiLinear(declaration) => return Ok(declaration.blocks.len()),
             Self::NemotronH(declaration) => return Ok(declaration.blocks.len()),
             Self::QwenHybrid(args) => args.num_hidden_layers,
@@ -3637,6 +3814,7 @@ impl EligibleConfig<'_> {
             Self::K2Horizon(_, declaration) => Ok(declaration.common().state_layout().clone()),
             Self::Qwen(_, declaration) => Ok(declaration.common().state_layout().clone()),
             Self::Lfm2(declaration) => Ok(declaration.definition().state_layout().clone()),
+            Self::Lfm3(declaration) => Ok(declaration.definition().state_layout().clone()),
             Self::KimiLinear(declaration) => Ok(declaration.definition().state_layout().clone()),
             Self::NemotronH(declaration) => Ok(declaration.definition().state_layout().clone()),
             Self::QwenHybrid(args) => {
@@ -3801,6 +3979,7 @@ impl EligibleConfig<'_> {
                 }
                 Ok(shapes)
             }
+            Self::Lfm3(declaration) => crate::lfm3::checkpoint::source_linear_shapes(&declaration),
             Self::KimiLinear(declaration) => {
                 let args = declaration.args();
                 let mut shapes =
@@ -4089,6 +4268,7 @@ impl EligibleConfig<'_> {
                 return Ok(declaration.common().static_construction().clone());
             }
             Self::Lfm2(declaration) => return Ok(declaration.statics.clone()),
+            Self::Lfm3(declaration) => return Ok(declaration.statics.clone()),
             Self::KimiLinear(declaration) => return Ok(declaration.statics.clone()),
             Self::NemotronH(declaration) => return Ok(declaration.statics.clone()),
             Self::QwenHybrid(args) => return Ok(args.statics().clone()),
@@ -4145,6 +4325,7 @@ impl EligibleConfig<'_> {
                 crate::gpt_oss::parameter_description(declaration, ParameterEncoding::Logical)
             }
             Self::Lfm2(declaration) => return Ok(declaration.definition().parameters().clone()),
+            Self::Lfm3(declaration) => return Ok(declaration.definition().parameters().clone()),
             Self::KimiLinear(declaration) => {
                 return Ok(declaration.definition().parameters().clone());
             }
@@ -5760,11 +5941,18 @@ fn safetensors_eligible_config(
         SafetensorsModelConfig::Lfm2(args) if args.has_sparse_moe_layers() => {
             Err(ReplicatedTextIneligibility::Routed)
         }
+
         SafetensorsModelConfig::Lfm2(_) => Ok(EligibleConfig::Lfm2(
             architecture
                 .lfm2
                 .clone()
                 .expect("admitted LFM2 declaration"),
+        )),
+        SafetensorsModelConfig::Lfm3(_) => Ok(EligibleConfig::Lfm3(
+            architecture
+                .lfm3
+                .clone()
+                .expect("admitted LFM3 declaration"),
         )),
         SafetensorsModelConfig::NemotronH(args) if args.num_nextn_predict_layers > 0 => {
             Err(ReplicatedTextIneligibility::EmbeddedPrediction)
@@ -5870,11 +6058,18 @@ fn gguf_eligible_config(
         GgufModelConfig::Lfm2(args) if args.has_sparse_moe_layers() => {
             Err(ReplicatedTextIneligibility::Routed)
         }
+
         GgufModelConfig::Lfm2(_) => Ok(EligibleConfig::Lfm2(
             architecture
                 .lfm2
                 .clone()
                 .expect("admitted LFM2 declaration"),
+        )),
+        GgufModelConfig::Lfm3(_) => Ok(EligibleConfig::Lfm3(
+            architecture
+                .lfm3
+                .clone()
+                .expect("admitted LFM3 declaration"),
         )),
         GgufModelConfig::NemotronH(args) if args.num_nextn_predict_layers > 0 => {
             Err(ReplicatedTextIneligibility::EmbeddedPrediction)
@@ -5943,6 +6138,7 @@ fn ordinary_eligible_config(
         | EligibleConfig::K2Horizon(_, _)
         | EligibleConfig::Qwen(_, _)) => Ok(config),
         EligibleConfig::Lfm2(_)
+        | EligibleConfig::Lfm3(_)
         | EligibleConfig::KimiLinear(_)
         | EligibleConfig::NemotronH(_)
         | EligibleConfig::QwenHybrid(_)
@@ -7328,6 +7524,7 @@ pub(crate) fn partitioned_boundary_schema(
                     .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?,
             )
         }
+
         (None, Some(GgufModelConfig::Lfm2(args))) if args.has_sparse_moe_layers() => {
             EligibleConfig::Lfm2(
                 plan.lfm2_declaration(args)

@@ -6613,6 +6613,17 @@ fn direct_partitioned_state_layout(
             .map(Some)
             .map_err(|error| error.to_string())
         }
+        (Some(crate::configuration::SafetensorsModelConfig::Lfm3(args)), None)
+        | (None, Some(crate::configuration::GgufModelConfig::Lfm3(args))) => {
+            let declaration = inspection.architecture_plan().lfm3_declaration(args)?;
+            crate::lfm3::partitioned_state_layout(
+                &declaration,
+                rank.tensor_parallel_rank(),
+                rank.tensor_parallel_size(),
+            )
+            .map(Some)
+            .map_err(|error| error.to_string())
+        }
         (Some(crate::configuration::SafetensorsModelConfig::KimiLinear(args)), None)
         | (None, Some(crate::configuration::GgufModelConfig::KimiLinear(args))) => {
             let declaration = inspection.architecture_plan().kimi_declaration(args)?;
@@ -9053,6 +9064,61 @@ where
             capability_estimate,
         );
     }
+    if matches!(
+        (safetensors, gguf),
+        (
+            Some(crate::configuration::SafetensorsModelConfig::Lfm3(_)),
+            None
+        ) | (None, Some(crate::configuration::GgufModelConfig::Lfm3(_)))
+    ) {
+        let expected =
+            crate::replicated_text::replicated_text_requirements(inspection).map_err(|error| {
+                DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
+            })?;
+        if &expected != selected.requirements().execution() {
+            return Err(DenseDecoderPartitionedDispatchError::Architecture(
+                "partitioned admission belongs to a different architecture or artifact".into(),
+            ));
+        }
+        eredu_runtime::validate_checkpoint_handoff(
+            &expected,
+            store.as_ref(),
+            eredu_runtime::SourceHandoffScope::Primary,
+        )
+        .map_err(|handoff| {
+            DenseDecoderPartitionedDispatchError::Architecture(handoff.to_string())
+        })?;
+        let args = match (safetensors, gguf) {
+            (Some(crate::configuration::SafetensorsModelConfig::Lfm3(args)), None)
+            | (None, Some(crate::configuration::GgufModelConfig::Lfm3(args))) => args,
+            _ => unreachable!("LFM3 partitioned dispatch was classified above"),
+        };
+        let selected_args = crate::replicated_text::selected_lfm3_args(args, selected.base())
+            .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+        let source_args = selected
+            .base()
+            .uses_weight_transform()
+            .then(|| args.clone());
+        let capability_estimate = crate::capability::lfm3(
+            inspection
+                .architecture_plan()
+                .lfm3_declaration(&selected_args)
+                .map_err(DenseDecoderPartitionedDispatchError::Architecture)?
+                .as_ref(),
+        )
+        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+        return prepare_lfm3_partition::<B, S, V>(
+            inspection.architecture_plan(),
+            selected_args.model_type.clone(),
+            selected_args,
+            source_args,
+            selected,
+            store,
+            context,
+            visitor,
+            capability_estimate,
+        );
+    }
     let is_lfm2 = match (safetensors, gguf) {
         (Some(crate::configuration::SafetensorsModelConfig::Lfm2(args)), None)
         | (None, Some(crate::configuration::GgufModelConfig::Lfm2(args))) => {
@@ -9806,6 +9872,159 @@ where
         )
         .map_err(DenseDecoderPartitionedDispatchError::Visitor)
 }
+#[allow(clippy::too_many_arguments)]
+fn prepare_lfm3_partition<B, S, V>(
+    architecture: &ArtifactArchitecturePlan,
+    effective_model_type: String,
+    selected_args: crate::lfm3::ModelArgs,
+    source_args: Option<crate::lfm3::ModelArgs>,
+    selected: SelectedPartitionedAdmission<
+        eredu_runtime::SelectedReplicatedTextRealization,
+        eredu_runtime::ReplicatedTextRequirements,
+    >,
+    store: eredu_checkpoint::store::SharedCheckpointSource,
+    context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    visitor: V,
+    capability_estimate: crate::capability::CapabilityEstimate,
+) -> Result<V::Output, DenseDecoderPartitionedDispatchError<V::Error>>
+where
+    B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+    S: eredu_runtime::LayerRuntimeState<B>,
+    S::LayerState: eredu_nn::AttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
+    V: PartitionedArchitectureVisitor<B, S>,
+{
+    let retained = selected
+        .base()
+        .requirements()
+        .shared_component_definition()
+        .ok_or_else(|| {
+            DenseDecoderPartitionedDispatchError::Architecture(
+                "LFM3 selection has no retained definition".into(),
+            )
+        })?;
+    let definition = crate::replicated_text::executable_component(selected.base())
+        .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+    let parameters = definition.parameters().clone();
+    let rank = selected.requirements().topology();
+    let layout = derive_partitioned_local_layout(&parameters, rank)
+        .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+    let [owned] = selected.requirements().groups() else {
+        return Err(DenseDecoderPartitionedDispatchError::Architecture(
+            "dense LFM3 must own exactly one execution group".into(),
+        ));
+    };
+    if owned.group().as_str() != crate::decoder::TARGET_EXECUTION_GROUP {
+        return Err(DenseDecoderPartitionedDispatchError::Architecture(
+            "LFM3 admission names a different execution group".into(),
+        ));
+    }
+    let declaration = architecture
+        .lfm3_declaration(&selected_args)
+        .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+    let geometry = crate::lfm3::partition_local_geometry(&declaration, &layout, owned.units())
+        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    let complete_state = geometry.complete_state_layout().clone();
+    let state_plan = crate::transport::pipeline_state(0, &complete_state);
+    let partition = selected
+        .requirements()
+        .construct_partition(
+            &parameters,
+            &complete_state,
+            &state_plan,
+            geometry,
+            eredu_runtime::NoAuxiliaryBoundarySchema::new(selected_args.hidden_size),
+        )
+        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    let tasks = eredu_runtime::partition_selected_replicated_text_materialization_tasks(
+        selected.materialization_tasks(),
+        &parameters,
+        &partition,
+    )
+    .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    let source_architecture = source_args
+        .map(|source_args| {
+            let source_args = crate::lfm3::with_checkpoint_formats(
+                &source_args,
+                selected.base().requirements().native_quantized_formats(),
+            )
+            .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+            let source_declaration = architecture
+                .lfm3_declaration(&source_args)
+                .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+            let source_definition = retained
+                .project_parameters(source_declaration.definition().parameters().clone())
+                .map_err(|error| {
+                    DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
+                })?;
+            let source_parameters = source_definition.parameters().clone();
+            let source_layout =
+                derive_partitioned_transform_source_layout(&source_parameters, &parameters, rank)
+                    .map_err(|error| {
+                    DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
+                })?;
+            let source_geometry = crate::lfm3::partition_local_geometry(
+                &source_declaration,
+                &source_layout,
+                owned.units(),
+            )
+            .map_err(|error| {
+                DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
+            })?;
+            if source_geometry.complete_state_layout() != &complete_state {
+                return Err(DenseDecoderPartitionedDispatchError::Architecture(
+                    "LFM3 transform source changed rank-local state geometry".into(),
+                ));
+            }
+            let source_partition = selected
+                .requirements()
+                .construct_partition(
+                    &source_parameters,
+                    &complete_state,
+                    &state_plan,
+                    source_geometry,
+                    eredu_runtime::NoAuxiliaryBoundarySchema::new(source_args.hidden_size),
+                )
+                .map_err(|error| {
+                    DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
+                })?;
+            let source_architecture = crate::lfm3::Lfm3Kernel::<B>::from_partition(
+                source_declaration,
+                source_definition,
+                &source_partition,
+                context,
+            )
+            .map_err(|error| {
+                DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
+            })?;
+            Ok((source_architecture, source_layout))
+        })
+        .transpose()?;
+    let architecture = crate::lfm3::Lfm3Kernel::<B>::from_partition(
+        architecture
+            .lfm3_declaration(&selected_args)
+            .map_err(DenseDecoderPartitionedDispatchError::Architecture)?,
+        definition,
+        &partition,
+        context,
+    )
+    .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    let prepared = prepare_partitioned::<B, S, _, _, _, _, _>(architecture, selected, partition)
+        .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+    visitor
+        .visit(
+            PreparedPartitionedArchitecture {
+                prepared,
+                source_architecture,
+                layout,
+                tasks,
+                capability_estimate,
+                effective_model_type,
+                backend: std::marker::PhantomData,
+            },
+            store,
+        )
+        .map_err(DenseDecoderPartitionedDispatchError::Visitor)
+}
 
 fn prepare_dense_decoder_partition<B, S, C, P, V>(
     effective_model_type: String,
@@ -10011,6 +10230,8 @@ pub fn is_supported_dense_decoder_partition(plan: &ArtifactArchitecturePlan) -> 
         | (None, Some(crate::configuration::GgufModelConfig::DiffusionGemma(args))) => {
             args.vision.is_none() && !args.has_sparse_moe_layers()
         }
+        (Some(crate::configuration::SafetensorsModelConfig::Lfm3(_)), None)
+        | (None, Some(crate::configuration::GgufModelConfig::Lfm3(_))) => true,
         _ => false,
     }
 }
@@ -12326,6 +12547,12 @@ pub fn dense_decoder_partitioned_production_route(
         models,
         (None, Some(crate::configuration::GgufModelConfig::Lfm2(args)))
             if !args.has_sparse_moe_layers()
+    ) || matches!(
+        models,
+        (
+            Some(crate::configuration::SafetensorsModelConfig::Lfm3(_)),
+            None
+        ) | (None, Some(crate::configuration::GgufModelConfig::Lfm3(_)))
     ) || matches!(
         models,
         (Some(crate::configuration::SafetensorsModelConfig::KimiLinear(args)), None)

@@ -609,6 +609,24 @@ impl ArtifactArchitecturePlan {
             .map(std::sync::Arc::new)
             .map_err(|e| e.to_string())
     }
+    pub(crate) fn lfm3_declaration(
+        &self,
+        args: &crate::lfm3::ModelArgs,
+    ) -> Result<std::sync::Arc<crate::lfm3::Declaration>, String> {
+        let retained = match (self.safetensors_architecture(), self.gguf_plan()) {
+            (Some(plan), None) => plan.lfm3.as_ref(),
+            (None, Some(plan)) => plan.lfm3.as_ref(),
+            _ => None,
+        }
+        .ok_or("architecture has no admitted LFM3 declaration")?;
+        if retained.args() == args {
+            return Ok(std::sync::Arc::clone(retained));
+        }
+        retained
+            .with_formats(args.clone())
+            .map(std::sync::Arc::new)
+            .map_err(|e| e.to_string())
+    }
 
     /// Retains immutable family scopes without artifact payloads or backend resources.
     /// Exact ordinary dense scopes retained by source admission.

@@ -468,14 +468,20 @@ impl ElementwiseRotary {
             .expand_dims(-1, stream)?;
         let angles = positions.multiply(&self.inverse_frequencies, stream)?;
         let amplitude = Array::from_f32(self.amplitude);
+        let table_type = if self.arithmetic == eredu_nn::RotaryArithmetic::Float32Products {
+            safemlx::Dtype::Float32
+        } else {
+            input.dtype()
+        };
         let cos = cos(&angles, stream)?
             .multiply(&amplitude, stream)?
-            .as_dtype(input.dtype(), stream)?;
+            .as_dtype(table_type, stream)?;
         let sin = sin(&angles, stream)?
             .multiply(&amplitude, stream)?
-            .as_dtype(input.dtype(), stream)?;
+            .as_dtype(table_type, stream)?;
         let (cos, sin, rotary) = match self.arithmetic {
-            eredu_nn::RotaryArithmetic::InputTableFloat32Products => (
+            eredu_nn::RotaryArithmetic::InputTableFloat32Products
+            | eredu_nn::RotaryArithmetic::Float32Products => (
                 cos.as_dtype(safemlx::Dtype::Float32, stream)?,
                 sin.as_dtype(safemlx::Dtype::Float32, stream)?,
                 x.try_index_device((.., .., ..self.dimensions), stream)?
@@ -561,7 +567,33 @@ pub fn initialize_rope(
     algorithm: RotaryAlgorithm,
     stream: &Stream,
 ) -> Result<RopeVariant, Exception> {
+    algorithm
+        .validate()
+        .map_err(|error| Exception::custom(error.to_string()))?;
+    if dims <= 0 || dims % 2 != 0 || !base.is_finite() || base <= 0.0 {
+        return Err(Exception::custom(
+            "invalid rotary head geometry or frequency base",
+        ));
+    }
     match algorithm {
+        RotaryAlgorithm::ZeroTail { rotary_fraction } => {
+            let active = (rotary_fraction * dims as f32) as i32 / 2;
+            let denominators = (0..dims / 2)
+                .map(|index| {
+                    if index < active {
+                        base.powf(2.0 * index as f32 / dims as f32)
+                    } else {
+                        f32::INFINITY
+                    }
+                })
+                .collect::<Vec<_>>();
+            Ok(RopeVariant::FrequencyScaled(FrequencyScaledRope {
+                dimensions: dims,
+                traditional,
+                scale: 1.0,
+                freqs: Array::from_slice(&denominators, &[dims / 2]),
+            }))
+        }
         RotaryAlgorithm::Default | RotaryAlgorithm::Linear { .. } => {
             let scale = match algorithm {
                 RotaryAlgorithm::Linear { factor } => factor.recip(),

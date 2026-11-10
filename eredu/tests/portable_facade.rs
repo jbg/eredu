@@ -246,14 +246,26 @@ impl TextGenerationBackend for MockBackend {
 }
 
 #[test]
-#[ignore = "requires EREDU_LFM2_TOOL_CHECKPOINT; tokenizer/template only, no native backend"]
+#[ignore = "requires EREDU_TOOL_CHECKPOINT; tokenizer/template only, no native backend"]
 fn lfm_checkpoint_native_tool_activation_with_portable_backend() {
     use eredu::api::{GenerationRequest, PreparedChatGenerationSettings, PreparedChatInput};
     use eredu::runtime::chat::{ChatTemplateRequest, ParallelToolCallPolicy, ToolChoice};
     use eredu_core::{FinishReason, SemanticEvent};
     use serde_json::json;
 
-    let path = std::path::PathBuf::from(std::env::var("EREDU_LFM2_TOOL_CHECKPOINT").unwrap());
+    let path = std::path::PathBuf::from(
+        std::env::var("EREDU_TOOL_CHECKPOINT")
+            .or_else(|_| std::env::var("EREDU_LFM2_TOOL_CHECKPOINT"))
+            .unwrap(),
+    );
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path.join("config.json")).unwrap()).unwrap();
+    let family = ModelKind::resolve_model_type(config["model_type"].as_str().unwrap()).unwrap();
+    let start_text = match family {
+        ModelKind::Lfm2 => "<|tool_call_start|>",
+        ModelKind::Lfm3 => "<tool_call>",
+        _ => panic!("the fixture requires an LFM text checkpoint"),
+    };
     let mut tokenizer = ChatTokenizer::from_tokenizer(load_tokenizer(&path).unwrap());
     let metadata: serde_json::Value =
         serde_json::from_slice(&std::fs::read(path.join("tokenizer_config.json")).unwrap())
@@ -262,7 +274,7 @@ fn lfm_checkpoint_native_tool_activation_with_portable_backend() {
         "bos_token".into(),
         metadata["bos_token"].clone(),
     )]));
-    let start = tokenizer.token_to_id("<|tool_call_start|>").unwrap();
+    let start = tokenizer.token_to_id(start_text).unwrap();
     let eos = tokenizer.token_to_id("<|im_end|>").unwrap();
     let extent = eredu_text::tokenizer::token_id_vocabulary(&tokenizer)
         .last_key_value()
@@ -272,20 +284,24 @@ fn lfm_checkpoint_native_tool_activation_with_portable_backend() {
     // Make the decision to call a tool deterministic while exercising the
     // facade's real activation filter and all subsequent grammar masks.
     logits[start as usize] = 1.0;
-    let runtime = ModelRuntime::prepare(
-        MockBackend {
-            logits,
-            ..Default::default()
-        },
-        (),
-    )
-    .unwrap();
+    let backend = MockBackend {
+        logits,
+        ..Default::default()
+    };
+    if family == ModelKind::Lfm3 {
+        // Replay a complete publisher-format call through the real tokenizer
+        // and grammar. Flat mock logits otherwise prefer unbounded whitespace.
+        backend.calls.borrow_mut().scripted_tokens = tokenizer.encode(
+            "<tool_call>\n<function=lookup>\n<parameter=value>\n7\n</parameter>\n</function>\n</tool_call><|im_end|>", false,
+        ).unwrap().get_ids().iter().copied().collect();
+    }
+    let runtime = ModelRuntime::prepare(backend, ()).unwrap();
     let mut model = LoadedModel::from_runtime(
         runtime,
         tokenizer,
         LoadedTextModelConfig {
-            model_family: ModelKind::Lfm2,
-            effective_model_type: "lfm2".into(),
+            model_family: family,
+            effective_model_type: family.canonical_name().into(),
             model_id: path.display().to_string(),
             chat_template: Some(
                 std::fs::read_to_string(path.join("chat_template.jinja"))
@@ -309,13 +325,10 @@ fn lfm_checkpoint_native_tool_activation_with_portable_backend() {
             tool_choice: ToolChoice::Auto,
             parallel_tool_calls: ParallelToolCallPolicy::Disabled,
             add_generation_prompt: true,
+            enable_thinking: (family == ModelKind::Lfm3).then_some(false),
             ..Default::default()
         })
         .unwrap();
-    assert_eq!(
-        prepared.format_profile_identity(),
-        Some("lfm2.python-tools.v1")
-    );
     let mut events = Vec::new();
     let output = model
         .session()

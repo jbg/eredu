@@ -100,6 +100,12 @@ impl ArtifactArchitecturePlan {
                         .lfm2_declaration(args)
                         .expect("admitted LFM2 declaration"),
                 ),
+                SafetensorsModelConfig::Lfm3(args) => families::lfm3(
+                    &mut graph,
+                    &self
+                        .lfm3_declaration(args)
+                        .expect("admitted LFM3 declaration"),
+                ),
                 SafetensorsModelConfig::KimiLinear(args) => families::kimi(
                     &mut graph,
                     &self
@@ -157,6 +163,12 @@ impl ArtifactArchitecturePlan {
                     &self
                         .lfm2_declaration(args)
                         .expect("admitted LFM2 declaration"),
+                ),
+                GgufModelConfig::Lfm3(args) => families::lfm3(
+                    &mut graph,
+                    &self
+                        .lfm3_declaration(args)
+                        .expect("admitted LFM3 declaration"),
                 ),
                 GgufModelConfig::KimiLinear(args) => families::kimi(
                     &mut graph,

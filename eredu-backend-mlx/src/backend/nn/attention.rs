@@ -132,7 +132,14 @@ pub fn apply_rotary_embeddings_with_arithmetic(
                 ))
             }
         }
-        .as_dtype(value.dtype(), stream)?;
+        .as_dtype(
+            if arithmetic == eredu_nn::RotaryArithmetic::Float32Products {
+                Dtype::Float32
+            } else {
+                value.dtype()
+            },
+            stream,
+        )?;
         if embedding.dim(-1) == dimensions {
             return Ok(embedding);
         }
@@ -150,7 +157,11 @@ pub fn apply_rotary_embeddings_with_arithmetic(
             concatenate_axis(&[embedding.clone(), embedding], -1, stream)
         }
     };
-    let work_type = if arithmetic == eredu_nn::RotaryArithmetic::InputTableFloat32Products {
+    let work_type = if matches!(
+        arithmetic,
+        eredu_nn::RotaryArithmetic::InputTableFloat32Products
+            | eredu_nn::RotaryArithmetic::Float32Products
+    ) {
         Dtype::Float32
     } else {
         value.dtype()
