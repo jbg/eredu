@@ -360,8 +360,8 @@ pub fn load(
     };
     match prepared.load(&weights, &execution)? {
         LoadedMlxRealtime::Speech(session) => Ok(session),
-        LoadedMlxRealtime::Categorical { .. } => {
-            anyhow::bail!("WAV input requires a PCM speech artifact")
+        LoadedMlxRealtime::Categorical { .. } | LoadedMlxRealtime::Lfm3Audio(_) => {
+            anyhow::bail!("this WAV conversation command requires a VoiceChat artifact")
         }
     }
 }

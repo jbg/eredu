@@ -8,7 +8,8 @@
 
 pub use eredu_architectures::lfm3::audio::{
     ArtifactError as AudioArtifactError, AudioAdvance, AudioMode, AudioPhase, AudioRequest,
-    AudioSession, AudioSessionError, PreparedAudio, ResidentAudioError,
+    AudioResidentParameterBytes, AudioSession, AudioSessionError, PreparedAudio,
+    ResidentAudioError,
 };
 #[cfg(feature = "mlx")]
 pub use eredu_backend_mlx::native::{MlxAudioModel, MlxAudioSession};

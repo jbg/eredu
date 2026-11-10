@@ -17,7 +17,8 @@ pub use realtime::{
     AudioAdvance, AudioExecutionKernel, AudioSampling, AudioSession, AudioSessionError,
 };
 pub use resident::{
-    AudioRequest, ResidentAudio, ResidentAudioBinding, ResidentAudioError, ResidentAudioState,
+    AudioRequest, AudioResidentParameterBytes, PreparedResidentAudio, ResidentAudio,
+    ResidentAudioBinding, ResidentAudioError, ResidentAudioState,
 };
 pub use schedule::{
     AudioMode, AudioPhase, AudioSchedule, AudioScheduleError, AudioSchedulePolicy, DepthProgress,

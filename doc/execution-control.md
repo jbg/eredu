@@ -285,9 +285,9 @@ or response termination flushes the codec tail. The event iterator drains the
 same driver. Cancellation occurs between settled advances and drops any
 unpublished speech frame.
 
-This entry point uses explicitly selected resident MLX execution. Public
-snapshots, forks, capture, live PCM ingress, and bounded or distributed speech
-sessions have no selected implementation.
+The shared realtime loader selects resident MLX execution before the caller
+starts a prompt. Public snapshots, forks, capture, live PCM ingress, and
+bounded or distributed speech sessions have no selected implementation.
 
 LiquidCodec's standalone `Tokenizer` implements finite audio-tokenizer calls and
 explicit decode-stream advancement over shared neural/spectral equations. Its

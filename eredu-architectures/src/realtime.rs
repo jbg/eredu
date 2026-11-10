@@ -8,6 +8,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::lfm3::audio::{ArtifactError as AudioArtifactError, PreparedAudio};
 use crate::voicechat::{
     artifact::{
         AdmissionError, AdmittedVoiceChatSource, RetainedVoiceChatArtifacts, VoiceChatArtifactPlan,
@@ -86,6 +87,8 @@ pub enum PreparedRealtimeArtifact {
     Moshi(MoshiPreparationPlan),
     /// VoiceChat component stores, preprocessing and auxiliary assets.
     VoiceChat(RetainedVoiceChatArtifacts),
+    /// LFM3 Audio model and retained LiquidCodec companion.
+    Lfm3Audio(Box<PreparedAudio>),
 }
 impl PreparedRealtimeArtifact {
     /// Discovered architecture identity.
@@ -93,6 +96,7 @@ impl PreparedRealtimeArtifact {
         match self {
             Self::Moshi(_) => ModelKind::Moshi,
             Self::VoiceChat(_) => ModelKind::VoiceChat,
+            Self::Lfm3Audio(_) => ModelKind::Lfm3Audio,
         }
     }
     /// Dispatches backend-independent preparation through an exhaustive visitor.
@@ -103,6 +107,7 @@ impl PreparedRealtimeArtifact {
         match self {
             Self::Moshi(plan) => visitor.moshi(plan),
             Self::VoiceChat(artifacts) => visitor.voicechat(artifacts),
+            Self::Lfm3Audio(artifact) => visitor.lfm3_audio(artifact),
         }
     }
 }
@@ -115,6 +120,8 @@ pub trait RealtimeArtifactVisitor<'a>: Sized {
     type Error;
     /// Uses the exact Moshi-family preparation.
     fn moshi(self, preparation: &'a MoshiPreparationPlan) -> Result<Self::Output, Self::Error>;
+    /// Uses the exact Audio model, processor, tokenizer and codec sources.
+    fn lfm3_audio(self, artifact: &'a PreparedAudio) -> Result<Self::Output, Self::Error>;
     /// Uses the exact VoiceChat component stores and assets.
     fn voicechat(
         self,
@@ -152,6 +159,9 @@ pub enum RealtimePreparationError {
     /// Referenced VoiceChat auxiliary assets failed exact validation.
     #[error(transparent)]
     VoiceChatAssets(#[from] VoiceChatAssetError),
+    /// LFM3 Audio checkpoint or companion admission failed.
+    #[error(transparent)]
+    Lfm3Audio(#[from] AudioArtifactError),
 }
 
 /// Discovers a realtime family, admits its exact sources and retains its assets.
@@ -200,6 +210,14 @@ pub fn prepare_realtime_model(
             Ok(PreparedRealtimeArtifact::Moshi(
                 crate::moshi::prepare_artifact(path, Some(&config))?,
             ))
+        }
+        ModelKind::Lfm3Audio => {
+            let RealtimeArtifactSource::SafeTensors { path } = &request.source else {
+                return Err(RealtimePreparationError::SourceLayout(family));
+            };
+            Ok(PreparedRealtimeArtifact::Lfm3Audio(Box::new(
+                PreparedAudio::open_source(path, model_root, &config, 2)?,
+            )))
         }
         ModelKind::VoiceChat => {
             let architecture =

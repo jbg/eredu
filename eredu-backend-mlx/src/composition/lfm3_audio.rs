@@ -16,15 +16,15 @@ use crate::backend::{
 use crate::{MlxTensor, Stream};
 use eredu_architectures::lfm3::audio::{
     AudioAdvance, AudioPhase, AudioRequest, AudioSession, AudioSessionError, BindingSource,
-    PreparedAudio, ResidentAudio, ResidentAudioBinding, ResidentAudioError,
+    PreparedAudio, PreparedResidentAudio, ResidentAudio, ResidentAudioBinding, ResidentAudioError,
 };
 use eredu_core::BackendFailure;
 use eredu_nn::Parameterized;
 use eredu_runtime::{RuntimeLayerState, StateLayout};
 
 struct Binding {
-    execution: ExecutionContext,
-    weights: ExecutionContext,
+    execution: Stream,
+    weights: Stream,
 }
 
 fn failure(error: impl std::error::Error + Send + Sync + 'static) -> BackendFailure {
@@ -37,7 +37,7 @@ impl ResidentAudioBinding<MlxNeuralBackend> for Binding {
     type Sampling = MlxSamplingBackend;
 
     fn context(&self) -> &Stream {
-        self.execution.stream()
+        &self.execution
     }
 
     fn bind<M: Parameterized<MlxTensor>>(
@@ -50,13 +50,9 @@ impl ResidentAudioBinding<MlxNeuralBackend> for Binding {
         let bindings =
             build_neutral_module_bindings_with_recipes(module, source.as_ref(), &mut recipes)
                 .map_err(failure)?;
-        let arrays = materialize_module_bindings(
-            source.as_ref(),
-            &bindings,
-            self.weights.stream(),
-            self.context(),
-        )
-        .map_err(failure)?;
+        let arrays =
+            materialize_module_bindings(source.as_ref(), &bindings, &self.weights, self.context())
+                .map_err(failure)?;
         populate_module_from_arrays_excluding(module, &arrays, |_| false).map_err(failure)
     }
 
@@ -90,10 +86,23 @@ impl MlxAudioModel {
         artifact: PreparedAudio,
         execution: ExecutionContext,
     ) -> Result<Self, ResidentAudioError> {
+        let prepared = PreparedResidentAudio::select(artifact)?;
         let weights = ExecutionContext::cpu().map_err(failure)?;
-        Ok(Self(ResidentAudio::new(
-            artifact,
-            Binding { execution, weights },
+        Self::load_prepared(prepared, &weights, &execution)
+    }
+
+    /// Binds a retained resident selection on the supplied execution and weight streams.
+    pub fn load_prepared(
+        prepared: PreparedResidentAudio,
+        weights: &ExecutionContext,
+        execution: &ExecutionContext,
+    ) -> Result<Self, ResidentAudioError> {
+        Ok(Self(ResidentAudio::from_prepared(
+            prepared,
+            Binding {
+                execution: execution.stream().clone(),
+                weights: weights.stream().clone(),
+            },
         )?))
     }
 
