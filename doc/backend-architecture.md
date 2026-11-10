@@ -600,6 +600,11 @@ retain their declared policies. The shared `Mlp` requires a resolved policy for
 construction from declarations and assembly from native operators. Shared/routed
 composition retains the complete shared neural scope and validates it together
 with router, expert bank and scalar output-gate declarations.
+MLX dense and grouped gated products share the same pointwise implementation.
+Bounds, offsets and sigmoid multipliers retain full scalar precision during each
+operation and round the result to the branch dtype before the next operation.
+Reduced-precision gated activations therefore reach the down projection without
+promoting its resident weights to F32.
 LFM2 storage extensions retain `w1`, `w2`, `w3` ordering; LFM2 and Kimi native
 construction retain gate, down, up allocation order. Sparse construction validates
 shared scopes together with their routers and provider-owned expert banks before
@@ -721,7 +726,11 @@ remain explicit storage extensions. SafeTensors stores Mamba `A_log` directly;
 only GGUF transitions stored as `-exp(A_log)` require `log(-x)` conversion.
 Target routing matrices retain floating
 storage under family-wide quantization; prediction router encodings follow their
-separate admitted format policy. Component discovery projects attention,
+separate admitted format policy. ReLU² preserves the activation dtype. Routed
+coefficients and reduction may use F32; the complete routed contribution returns
+to the input precision after tensor-parallel reduction and before shared-expert
+addition. This keeps subsequent reduced-precision expert projections from
+promoting entire resident weight banks to F32. Component discovery projects attention,
 dense/shared expert, readout and prediction parameter identities from these
 specs while retaining explicit equations and observation hooks.
 
@@ -829,7 +838,12 @@ bank declarations. Resident, replicated and partitioned expert planning share on
 localization projection over those banks, retaining parameter identities, formats
 and reduction policy. Residency and realization use the same explicit target/MTP
 invocation mapping; partition validation compares the complete declared bank
-schedule before selecting pipeline-local ownership. V3 and V4 layer groups project
+schedule before selecting pipeline-local ownership. V3 and V4 execution casts
+the completed routed contribution back to the input dtype before adding the
+shared branch. Tensor-parallel execution reduces routed and shared branches
+separately, including literal routed post-reduction bias before the cast; this
+preserves the branch rounding boundary in observed and ordinary execution.
+V3 and V4 layer groups project
 retained linear-format references through the common runtime visitor. MLA head and rank groups, V4 output groups, compressors,
 indexers, routed/shared banks and prediction slots keep explicit partition and
 ownership rules. Raw position, hyper-stream and token-routing slots retain their

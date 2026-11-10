@@ -308,6 +308,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
                 context,
             )
             .map_err(Error::backend_source)?;
+        let routed = restore_routed_precision(routed, input, context)?;
         routed.add(&self.shared_experts.forward(input, context)?, context)
     }
 
@@ -355,6 +356,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
             },
         )
         .map_err(eredu_runtime::ObservedExpertProviderError::into_neural_error)?;
+        let routed = restore_routed_precision(routed, input, context)?;
         let shared = self.forward_shared_observed(path, input, None, context, observer)?;
         let combined = routed.add(&shared, context)?;
         observer.observe_routing(eredu_runtime::RoutingObservation {
@@ -426,6 +428,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
         .map_err(eredu_runtime::ObservedExpertProviderError::into_neural_error)?;
         let routed =
             eredu_runtime::reduce_routed_expert_tensor_parallel::<B>(routed, parallel, context)?;
+        let routed = restore_routed_precision(routed, input, context)?;
         let shared =
             self.forward_shared_observed(path, input, Some(parallel), context, observer)?;
         let combined = routed.add(&shared, context)?;
@@ -515,12 +518,30 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
             .map_err(Error::backend_source)?;
         let routed =
             eredu_runtime::reduce_routed_expert_tensor_parallel::<B>(routed, parallel, context)?;
+        let routed = restore_routed_precision(routed, input, context)?;
         routed.add(
             &self
                 .shared_experts
                 .forward_parallel(input, parallel, context)?,
             context,
         )
+    }
+}
+
+// Router coefficients and their reduction may use F32. The complete routed
+// contribution returns to the input precision before adding the shared branch.
+fn restore_routed_precision<T: Tensor>(
+    routed: T,
+    input: &T,
+    context: &T::Context,
+) -> Result<T, Error> {
+    let element = input
+        .element_type()
+        .ok_or_else(|| Error::backend("unknown Nemotron routed input precision"))?;
+    if routed.element_type() == Some(element) {
+        Ok(routed)
+    } else {
+        routed.cast_float(element, context)
     }
 }
 
