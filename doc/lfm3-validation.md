@@ -16,8 +16,9 @@ Python-call dialect does not describe this template.
 The public LFM3 route supports text. Vision has standalone neural components.
 The Audio architecture admits the complete floating checkpoint and its codec
 companion and supports resident mixed-input traversal. Both this path and
-standalone LiquidCodec have independent F32 reference acceptance. Public vision/video generation, audio language-model tasks, omni and
-d1 decision execution remain unimplemented. The generic GGUF reader does not
+standalone LiquidCodec have independent F32 reference acceptance. The explicit
+resident Audio session exposes controlled text and speech events. Public
+vision/video generation, omni and d1 decision execution remain unimplemented. The generic GGUF reader does not
 admit published NVFP4 encoding.
 
 ## Released SafeTensors evidence
@@ -182,7 +183,7 @@ request-supplied permutation. Codebook tables are shared between input lookup
 and output scoring. A frame containing any EOS code terminates the speech
 segment. The completed frame exposes either ordinary codec codes or EOS. The
 language feedback table embeds ordinary frames and canonical all-EOS frames.
-Public speech generation and selected audio execution remain unimplemented.
+The resident driver uses these components for controlled speech output.
 Native BF16 numerical parity remains unvalidated.
 
 Standalone LiquidCodec neural encoding and finite/cached decoding, CPU/Metal
@@ -235,6 +236,31 @@ MLX_ENABLE_TF32=0 cargo run -p eredu-backend-mlx --features audio,metal --exampl
 ```
 
 The retained evidence covers resident conditional execution with a fixed
-sampler. The public realtime driver, selected audio residency and
-distribution, official audio GGUF, and native BF16 reference coverage remain
-outside this path.
+sampler. It does not compare the publisher's random sampling stream or realtime
+mode transitions. Official audio GGUF, native BF16, and selected bounded and
+distributed audio execution remain outside this path.
+
+
+## Resident Audio sessions
+
+`eredu::api::realtime::PreparedAudio` admits a local SafeTensors directory.
+`MlxAudioModel::load` binds it to an explicit execution context, and `start`
+accepts a batch-one `AudioRequest` and sampling seed. The request supplies
+token IDs with expanded speech placeholders, finite mel features in prompt
+order, optional replayed speech codes, a mode, and a slot budget. The retained
+processor transforms mono 16-kHz PCM to the input features.
+
+The session emits text token IDs, completed codebook frames with 24-kHz
+mono PCM, and speech EOS. Both `advance` and `events` use the same controlled
+driver. The explicit resident entry point does not select live ingress,
+public snapshots or forks, distributed execution, or bounded residency.
+
+The released-checkpoint session check uses seed 41, a three-slot speech
+budget, and prompt IDs `[124894,5,125031,125031,13,21,34]` before marker
+insertion. The input is 2,151 samples of 413-Hz and 863-Hz sine waves
+with amplitudes 0.12 and 0.05 at 16 kHz. Controlled advancement and iterator
+draining produce identical events within each device on CPU and precise Metal.
+Each run
+commits three speech frames after six intermediate depth advances and emits
+5,760 samples, including the final codec tail. Cancelling a separate session
+after its first depth pass leaves zero committed slots.

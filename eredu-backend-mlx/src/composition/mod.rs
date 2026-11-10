@@ -389,3 +389,5 @@ mod expert_selection_tests {
 #[cfg(test)]
 #[path = "tests/neutral_observer.rs"]
 mod neutral_observer_tests;
+
+pub(crate) mod lfm3_audio;

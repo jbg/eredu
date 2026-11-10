@@ -2,7 +2,7 @@
 
 use super::{DepthDeclaration, ProcessorConfig};
 use eredu_checkpoint::{
-    recipe::DerivedWeightRecipe,
+    recipe::{DerivedWeightRecipe, RecipeDtype},
     safetensors::SafetensorsMetadataCatalog,
     schema::{CatalogPolicy, SafetensorsCheckpointPlan},
     store::{
@@ -102,6 +102,26 @@ pub struct BindingSource {
 }
 
 impl BindingSource {
+    /// Projects the resident F32 execution profile before native materialization.
+    pub(super) fn widened_f32(&self) -> Self {
+        let mut recipes = self.recipes.clone();
+        for key in self.source.source_keys() {
+            recipes
+                .entry(key.clone())
+                .or_insert_with(|| DerivedWeightRecipe::source(key, TensorSelection::Full));
+        }
+        for recipe in recipes.values_mut() {
+            *recipe = DerivedWeightRecipe::Cast {
+                input: Box::new(recipe.clone()),
+                dtype: RecipeDtype::F32,
+            };
+        }
+        Self {
+            source: self.source.clone(),
+            recipes,
+        }
+    }
+
     /// Exact retained source for this scope, without checkpoint rediscovery.
     pub fn source(&self) -> &SharedCheckpointSource {
         &self.source
@@ -143,6 +163,8 @@ pub struct PreparedAudio {
     pub processor: ProcessorConfig,
     /// Special token identities in the language vocabulary.
     pub tokens: AudioTokens,
+    interleaved_text_slots: usize,
+    interleaved_speech_slots: usize,
     /// Retained tokenizer, template and generation configuration.
     pub text_assets: TextAssets,
     /// Restricted language checkpoint binding.
@@ -209,9 +231,29 @@ fn restrict(
 }
 
 impl PreparedAudio {
+    /// Number of text slots per interleaved block.
+    pub fn interleaved_text_slots(&self) -> usize {
+        self.interleaved_text_slots
+    }
+
+    /// Number of speech slots per interleaved block.
+    pub fn interleaved_speech_slots(&self) -> usize {
+        self.interleaved_speech_slots
+    }
+
     /// Admits the model and bundled audio_tokenizer without materializing tensor payloads.
     pub fn open(root: &Path, max_cached_shards: usize) -> Result<Self, ArtifactError> {
         let config: Value = serde_json::from_slice(&read(root, "config.json")?)?;
+        let cadence = |key: &str, default: usize| match config.get(key) {
+            None => Ok(default),
+            Some(value) => value
+                .as_u64()
+                .and_then(|n| usize::try_from(n).ok())
+                .filter(|n| *n > 0)
+                .ok_or_else(|| checkpoint(format!("invalid LFM3 Audio cadence {key}"))),
+        };
+        let interleaved_text_slots = cadence("interleaved_n_text", 6)?;
+        let interleaved_speech_slots = cadence("interleaved_n_audio", 12)?;
         let encoder = super::Declaration::from_config(&config)?;
         let depth = DepthDeclaration::from_config(&config)?;
         let mut text = config.get("lfm").unwrap_or(&config["text_config"]).clone();
@@ -370,6 +412,8 @@ impl PreparedAudio {
             codec,
             processor,
             tokens,
+            interleaved_text_slots,
+            interleaved_speech_slots,
             text_assets,
             language_weights,
             encoder_weights,

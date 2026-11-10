@@ -275,15 +275,19 @@ conformance case covers bounded residency and controlled/uninterrupted agreement
 [released-checkpoint evidence](lfm3-validation.md) records numerical coverage and
 the family tasks without an implementation.
 
-LFM3 speech input exposes caller-owned PCM overlap and causal encoder
-continuation. The encoder retains its feature overlap separately from sliding
-attention and convolution state. The standalone speech depth decoder separates
-score evaluation from committing each complete codebook group. The frame exposes
-speech or EOS only after the final group. The request owner supplies the reveal
-order, sampling policy and native completion. The prepared Audio artifact and
-mixed language prefill preserve ordinary decoder cache continuation. Public
-controlled speech sessions still require orchestration of all component
-submissions, including codec state and speech sampling.
+The resident LFM3 Audio session accepts a batch-one token prompt with finite
+mel features and replayed speech codes. Each advance settles one text decision
+or one depth pass. The shared realtime transaction publishes the resulting
+language and codec state, schedule, sampler histories and RNG together.
+Intermediate depth advances expose progress while retaining tentative codes in
+the frame. A complete speech frame publishes its stable PCM prefix. Speech EOS
+or response termination flushes the codec tail. The event iterator drains the
+same driver. Cancellation occurs between settled advances and drops any
+unpublished speech frame.
+
+This entry point uses explicitly selected resident MLX execution. Public
+snapshots, forks, capture, live PCM ingress, and bounded or distributed speech
+sessions have no selected implementation.
 
 LiquidCodec's standalone `Tokenizer` implements finite audio-tokenizer calls and
 explicit decode-stream advancement over shared neural/spectral equations. Its
