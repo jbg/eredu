@@ -217,6 +217,51 @@ impl Tensor for MlxTensor {
         evaluated.try_to_vec::<i32>().map_err(Error::backend)
     }
 
+    fn require_finite(&self, context: &Self::Context) -> Result<(), Error> {
+        if !matches!(
+            self.0.dtype(),
+            Dtype::Float16 | Dtype::Bfloat16 | Dtype::Float32 | Dtype::Float64
+        ) {
+            return Err(Error::backend(
+                "finite-value admission requires floating values",
+            ));
+        }
+        let invalid = backend(
+            backend(backend(self.0.is_finite(context))?.logical_not(context))?.any(false, context),
+        )?;
+        backend(crate::backend::nn::tensor::register_device_validation(
+            invalid,
+            "non-finite floating values",
+        ))
+    }
+
+    fn round_to_i32(&self, context: &Self::Context) -> Result<Self, Error> {
+        self.require_finite(context)?;
+        let rounded = backend(self.0.round(0, context))?;
+        let below = backend(rounded.lt(Array::from_f32(-2147483648.0), context))?;
+        let above = backend(rounded.ge(Array::from_f32(2147483648.0), context))?;
+        let invalid = backend(backend(rounded.is_finite(context))?.logical_not(context))?;
+        let invalid =
+            backend(backend(invalid.logical_or(&below, context))?.logical_or(&above, context))?;
+        backend(crate::backend::nn::tensor::register_device_validation(
+            backend(invalid.any(false, context))?,
+            "rounded value is outside I32",
+        ))?;
+        let zero = backend(Array::from_f32(0.0).as_dtype(rounded.dtype(), context))?;
+        let safe = backend(safemlx::ops::r#where(&invalid, &zero, &rounded, context))?;
+        tensor(safe.as_dtype(Dtype::Int32, context))
+    }
+
+    fn log1p(&self, context: &Self::Context) -> Result<Self, Error> {
+        if !matches!(
+            self.0.dtype(),
+            Dtype::Float16 | Dtype::Bfloat16 | Dtype::Float32 | Dtype::Float64
+        ) {
+            return Err(Error::backend("log1p requires floating values"));
+        }
+        tensor(self.0.log1p(context))
+    }
+
     fn full_f32(value: f32, shape: &[i32], context: &Self::Context) -> Result<Self, Error> {
         tensor(Array::full::<f32>(shape, Array::from_f32(value), context))
     }

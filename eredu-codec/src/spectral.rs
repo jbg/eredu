@@ -3,7 +3,16 @@
 use crate::Error;
 use eredu_nn::{Index, NeuralOperatorCapabilities, PadMode, Tensor, TensorElementType};
 
-/// Parameter-free finite STFT with zero endpoint padding. Input is mono
+/// Explicit finite-analysis endpoint extension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnalysisEndpoints {
+    /// Extend both endpoints with zero samples.
+    Zero,
+    /// Reflect around each endpoint without repeating its edge sample.
+    Reflect,
+}
+
+/// Parameter-free finite STFT with explicit endpoint padding. Input is mono
 /// `[batch, 1, samples]`; output components use `[batch, bins, frames]`.
 /// The periodic window covers the complete FFT; the transform is unnormalized.
 #[derive(Debug, Clone)]
@@ -11,10 +20,20 @@ pub struct PeriodicHannStft<T: Tensor> {
     fft_size: i32,
     hop_length: i32,
     window: T,
+    endpoints: AnalysisEndpoints,
 }
 impl<T: Tensor> PeriodicHannStft<T> {
     /// Constructs a periodic Hann window; no waveform or transform state is retained.
     pub fn new(fft_size: i32, hop_length: i32, context: &T::Context) -> Result<Self, Error> {
+        Self::with_endpoints(fft_size, hop_length, AnalysisEndpoints::Zero, context)
+    }
+    /// Constructs the same periodic-Hann transform with explicit endpoint policy.
+    pub fn with_endpoints(
+        fft_size: i32,
+        hop_length: i32,
+        endpoints: AnalysisEndpoints,
+        context: &T::Context,
+    ) -> Result<Self, Error> {
         if fft_size < 2 || hop_length <= 0 || hop_length > fft_size {
             return Err(invalid("forward STFT requires FFT>=2 and 0<hop<=FFT"));
         }
@@ -22,6 +41,7 @@ impl<T: Tensor> PeriodicHannStft<T> {
             fft_size,
             hop_length,
             window: periodic_hann::<T>(fft_size, context)?.reshape(&[1, 1, fft_size], context)?,
+            endpoints,
         })
     }
     /// Optional numerical capabilities required before native construction.
@@ -32,7 +52,7 @@ impl<T: Tensor> PeriodicHannStft<T> {
             .union(NeuralOperatorCapabilities::FULL_F32)
             .union(NeuralOperatorCapabilities::FROM_I32_SLICE)
     }
-    /// Number of complete analysis windows after the explicit zero padding.
+    /// Number of complete analysis windows after the explicit endpoint padding.
     pub fn output_frames(&self, samples: i32) -> Result<i32, Error> {
         if samples < self.hop_length {
             return Err(invalid("forward STFT requires at least one hop of samples"));
@@ -42,7 +62,8 @@ impl<T: Tensor> PeriodicHannStft<T> {
             .ok_or_else(|| invalid("forward STFT padded input exceeds i32"))?;
         Ok(samples / self.hop_length)
     }
-    /// Analyzes a finite waveform in F32. Left padding is
+    /// Analyzes a finite waveform in F32. Reflective endpoints require each
+    /// padding extent to be smaller than the input. Left padding is
     /// `floor((FFT-hop)/2)` and right padding receives the remaining samples.
     /// The returned tensors are Cartesian components, not magnitude and phase.
     pub fn analyze(&self, pcm: &T, context: &T::Context) -> Result<(T, T), Error> {
@@ -68,7 +89,35 @@ impl<T: Tensor> PeriodicHannStft<T> {
         let input = pcm
             .cast_float(TensorElementType::F32, context)?
             .squeeze_axes(&[1], context)?;
-        let padded = T::pad(&input, &[(0, 0), (left, right)], PadMode::Constant, context)?;
+        let padded = match self.endpoints {
+            AnalysisEndpoints::Zero => {
+                T::pad(&input, &[(0, 0), (left, right)], PadMode::Constant, context)?
+            }
+            AnalysisEndpoints::Reflect => {
+                let samples = pcm.dim(2);
+                if left >= samples || right >= samples {
+                    return Err(invalid(
+                        "reflective STFT padding must be smaller than the waveform",
+                    ));
+                }
+                let indices = (-left..samples + right)
+                    .map(|i| {
+                        if i < 0 {
+                            -i
+                        } else if i >= samples {
+                            samples - 2 - (i - samples)
+                        } else {
+                            i
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                input.take_axis(
+                    &T::from_i32_slice(&indices, &[samples + left + right], context)?,
+                    1,
+                    context,
+                )?
+            }
+        };
         let framed = padded
             .take_axis(&T::from_i32_slice(&indices, &[count], context)?, 1, context)?
             .reshape(&[pcm.dim(0), frames, self.fft_size], context)?
@@ -78,6 +127,145 @@ impl<T: Tensor> PeriodicHannStft<T> {
             real.transpose_axes(&[0, 2, 1], context)?,
             imaginary.transpose_axes(&[0, 2, 1], context)?,
         ))
+    }
+}
+
+/// Unnormalized inverse-FFT overlap-add values before endpoint trimming.
+#[derive(Debug, Clone)]
+pub struct OverlapAddOutput<T> {
+    /// Windowed sample sums shaped `[batch, samples, 1]`.
+    pub audio: T,
+    /// Window-square sums shaped `[1, samples, 1]`, shared across the batch.
+    pub envelope: T,
+}
+
+/// Bounded sample/envelope continuation for finite spectral chunks. Only the
+/// unfinished `FFT-hop` tail and the unconsumed initial trim are retained.
+#[derive(Debug, Clone)]
+pub struct OverlapAddStream<T: Tensor> {
+    batch: i32,
+    fft_size: i32,
+    hop_length: i32,
+    left_trim: i32,
+    carry: Option<OverlapAddOutput<T>>,
+    phase: crate::streaming::StreamPhase,
+}
+
+impl<T: Tensor> OverlapAddStream<T> {
+    /// Starts one finite stream. Even symmetric endpoint trimming is explicit;
+    /// batch geometry cannot change while its sample/envelope carry is live.
+    pub fn new(batch: i32, fft_size: i32, hop_length: i32) -> Result<Self, Error> {
+        if batch <= 0
+            || fft_size < 4
+            || hop_length <= 0
+            || hop_length > fft_size - 2
+            || (fft_size - hop_length) % 2 != 0
+        {
+            return Err(invalid("invalid spectral streaming geometry"));
+        }
+        Ok(Self {
+            batch,
+            fft_size,
+            hop_length,
+            left_trim: (fft_size - hop_length) / 2,
+            carry: None,
+            phase: crate::streaming::StreamPhase::AcceptingInput,
+        })
+    }
+    /// Finite-input lifecycle; a finalized stream rejects subsequent input.
+    pub fn phase(&self) -> crate::streaming::StreamPhase {
+        self.phase
+    }
+    /// Exact unfinished roots retained for a snapshot or transport owner.
+    pub fn retained_values(&self) -> impl Iterator<Item = &T> {
+        self.carry.iter().flat_map(|c| [&c.audio, &c.envelope])
+    }
+    /// Consumes raw overlap-add sums. `None` supplies no new spectral frames;
+    /// finalizing with `None` flushes the held tail. Output is normalized F32
+    /// `[batch,1,samples]`, possibly empty. State publication follows successful
+    /// construction of all new roots; submission owners still establish native
+    /// completion before exposing samples or persistent snapshots.
+    pub fn push(
+        &mut self,
+        output: Option<OverlapAddOutput<T>>,
+        finalize: bool,
+        context: &T::Context,
+    ) -> Result<T, Error> {
+        use crate::streaming::StreamPhase;
+        if self.phase == StreamPhase::Finished {
+            return Err(Error::StreamFinished);
+        }
+        let tail = self.fft_size - self.hop_length;
+        let trim = tail / 2;
+        let flush = output.is_none();
+        let Some(mut output) = output.or_else(|| if finalize { self.carry.clone() } else { None })
+        else {
+            let empty = T::full_f32(0.0, &[self.batch, 1, 0], context)?;
+            if finalize {
+                self.phase = StreamPhase::Finished;
+            }
+            return Ok(empty);
+        };
+        // A flush already owns the accumulated tail. New chunks include their
+        // full FFT extent, and overlap that tail at the first sample.
+        let length = output.audio.shape().get(1).copied().unwrap_or(0);
+        if output.audio.shape() != [self.batch, length, 1]
+            || output.envelope.shape() != [1, length, 1]
+            || output.audio.element_type() != Some(TensorElementType::F32)
+            || output.envelope.element_type() != Some(TensorElementType::F32)
+            || (!flush
+                && (length < self.fft_size || (length - self.fft_size) % self.hop_length != 0))
+            || (flush && (!finalize || length != tail))
+        {
+            return Err(invalid(
+                "spectral stream requires complete matching F32 sample/envelope sums",
+            ));
+        }
+        let slice = |value: &T, start, end| {
+            value.index(
+                &[Index::Full, Index::Range(start, end), Index::Full],
+                context,
+            )
+        };
+        if !flush {
+            if let Some(carry) = &self.carry {
+                output.audio = T::concatenate(
+                    &[
+                        slice(&output.audio, 0, tail)?.add(&carry.audio, context)?,
+                        slice(&output.audio, tail, length)?,
+                    ],
+                    1,
+                    context,
+                )?;
+                output.envelope = T::concatenate(
+                    &[
+                        slice(&output.envelope, 0, tail)?.add(&carry.envelope, context)?,
+                        slice(&output.envelope, tail, length)?,
+                    ],
+                    1,
+                    context,
+                )?;
+            }
+        }
+        let stable = length - if finalize { trim } else { tail };
+        let skip = self.left_trim.min(stable);
+        let samples = slice(&output.audio, skip, stable)?
+            .divide(&slice(&output.envelope, skip, stable)?, context)?
+            .transpose_axes(&[0, 2, 1], context)?;
+        let carry = if finalize {
+            None
+        } else {
+            Some(OverlapAddOutput {
+                audio: slice(&output.audio, stable, length)?.compact(context)?,
+                envelope: slice(&output.envelope, stable, length)?.compact(context)?,
+            })
+        };
+        self.carry = carry;
+        self.left_trim -= skip;
+        if finalize {
+            self.phase = StreamPhase::Finished;
+        }
+        Ok(samples)
     }
 }
 
@@ -153,6 +341,29 @@ impl<T: Tensor> PeriodicHannIstft<T> {
         constrain: bool,
         context: &T::Context,
     ) -> Result<T, Error> {
+        let output = self.overlap_add(real, imaginary, constrain, context)?;
+        let output_length = output.audio.dim(1);
+        let slice = [
+            Index::Full,
+            Index::Range(self.pad, output_length - self.pad),
+            Index::Full,
+        ];
+        Ok(output
+            .audio
+            .index(&slice, context)?
+            .divide(&output.envelope.index(&slice, context)?, context)?
+            .transpose_axes(&[0, 2, 1], context)?)
+    }
+    /// Reconstructs unnormalized sample and envelope sums for a caller-owned
+    /// finite or streaming endpoint policy. Arithmetic matches `reconstruct`;
+    /// neither endpoint is trimmed and no division occurs here.
+    pub fn overlap_add(
+        &self,
+        real: &T,
+        imaginary: &T,
+        constrain: bool,
+        context: &T::Context,
+    ) -> Result<OverlapAddOutput<T>, Error> {
         if real.shape().len() != 3
             || real.shape() != imaginary.shape()
             || real.dim(0) <= 0
@@ -200,15 +411,17 @@ impl<T: Tensor> PeriodicHannIstft<T> {
             .transpose_axes(&[0, 2, 1], context)?
             .broadcast_to(&[1, frames, self.fft_size], context)?;
         let envelope = fold(&envelope_frames)?;
-        let slice = [
-            Index::Full,
-            Index::Range(self.pad, output_length - self.pad),
-            Index::Full,
-        ];
-        Ok(wave
-            .index(&slice, context)?
-            .divide(&envelope.index(&slice, context)?, context)?
-            .transpose_axes(&[0, 2, 1], context)?)
+        if wave.shape() != [real.dim(0), output_length, 1]
+            || envelope.shape() != [1, output_length, 1]
+        {
+            return Err(invalid(
+                "inverse STFT overlap-add mechanism returned invalid geometry",
+            ));
+        }
+        Ok(OverlapAddOutput {
+            audio: wave,
+            envelope,
+        })
     }
     /// Number of samples returned by an ordinary finite reconstruction.
     pub fn output_samples(&self, frames: i32) -> Result<i32, Error> {

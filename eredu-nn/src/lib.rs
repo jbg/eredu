@@ -4473,8 +4473,14 @@ impl NeuralOperatorCapabilities {
     pub const RANKED_TOPK: Self = Self(1 << 52);
     /// Strict unique-index final-axis scatter without integer narrowing.
     pub const SCATTER_LAST_AXIS: Self = Self(1 << 53);
+    /// Finite floating-value admission, with deferred validation tied to completion.
+    pub const REQUIRE_FINITE: Self = Self(1 << 54);
+    /// Checked ties-to-even rounding from floating values into I32.
+    pub const ROUND_TO_I32: Self = Self(1 << 55);
+    /// Elementwise natural logarithm of one plus a floating value.
+    pub const LOG1P: Self = Self(1 << 56);
     /// Every currently declared optional operation.
-    pub const ALL: Self = Self((1 << 54) - 1);
+    pub const ALL: Self = Self((1 << 57) - 1);
 
     /// Returns the union of two capability sets.
     pub const fn union(self, other: Self) -> Self {
@@ -4489,6 +4495,9 @@ impl NeuralOperatorCapabilities {
     /// Returns stable names for every required capability absent from this set.
     pub fn missing_capability_names(self, required: Self) -> Vec<&'static str> {
         const NAMES: &[(NeuralOperatorCapabilities, &str)] = &[
+            (NeuralOperatorCapabilities::REQUIRE_FINITE, "require_finite"),
+            (NeuralOperatorCapabilities::ROUND_TO_I32, "round_to_i32"),
+            (NeuralOperatorCapabilities::LOG1P, "log1p"),
             (
                 NeuralOperatorCapabilities::CASCADED_LAYER_NORM,
                 "cascaded_layer_norm",
@@ -5710,6 +5719,33 @@ pub trait Tensor: Clone + Debug + Sized + 'static {
         let _ = context;
         Err(Error::backend(
             "tanh is not implemented by this tensor backend",
+        ))
+    }
+    /// Rejects non-floating inputs and non-finite values. A backend may retain
+    /// a device assertion with the submission; it must fail before successful
+    /// completion and before publishing results from that submission.
+    fn require_finite(&self, context: &Self::Context) -> Result<(), Error> {
+        let _ = context;
+        Err(Error::backend(
+            "finite-value admission is not implemented by this tensor backend",
+        ))
+    }
+    /// Rounds finite floating values to nearest integers, choosing the even
+    /// integer at a tie, and returns I32 without changing shape. Rounded values
+    /// outside I32 fail. Deferred admission must sanitize invalid values before
+    /// native conversion and fail the owning submission before publication.
+    fn round_to_i32(&self, context: &Self::Context) -> Result<Self, Error> {
+        let _ = context;
+        Err(Error::backend(
+            "checked I32 rounding is not implemented by this tensor backend",
+        ))
+    }
+    /// Elementwise natural logarithm of one plus the input, preserving its
+    /// floating representation. Values near zero avoid the rounding of `1+x`.
+    fn log1p(&self, context: &Self::Context) -> Result<Self, Error> {
+        let _ = context;
+        Err(Error::backend(
+            "log1p is not implemented by this tensor backend",
         ))
     }
     /// Elementwise maximum with a scalar, preserving a floating input type.

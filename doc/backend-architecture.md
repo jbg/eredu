@@ -16459,6 +16459,28 @@ with the last actual frame. It performs no family selection or device allocation
 These independently constructible components do not register conditional-generation
 support, selected residency/distribution capabilities or controlled media sessions.
 
+`eredu-codec::liquid` owns LiquidCodec component configuration, reflective analysis,
+scalar-product alphabet ordering, learned scalar projections and polar synthesis.
+It depends on neutral neural/storage/runtime contracts and does not import the
+language-model architecture crate. Its scalar projections have exact SafeTensors
+geometry and canonical/legacy aliases. Fixed scalar lookup tables are immutable
+constants exposed separately from learned parameters and mutable streaming carry.
+
+The shared spectral mechanism selects zero or reflective analysis endpoints and
+exposes unnormalized inverse-FFT sample/envelope sums. Its streaming continuation
+retains only `FFT-hop` samples of each sum and the unconsumed initial trim; final
+flush consumes the tail and closes the stream. Ordinary finite reconstruction
+uses the same overlap-add arithmetic. Native spectral transforms remain backend
+mechanisms. General neural finite-value admission, `log1p` and checked ties-to-even
+I32 rounding are portable contracts; MLX implements them without codec-family
+dispatch. Deferred value assertions belong to the existing submission validation
+batch and must fail before completed results are published. Invalid rounded values
+are sanitized before native integer conversion while validation is pending.
+
+These codec components do not register a complete neural codec, speech-generation
+task or controlled realtime session. Current evidence and the unresolved analysis
+phase comparison are recorded in [LiquidCodec validation](liquid-codec-validation.md).
+
 LFM2's `Declaration` pairs existing typed static, attention/convolution, normalization,
 dense and routed feed-forward scopes with component ownership and state. Its parameter
 projection borrows those scopes. Format projection clones parameter identities and

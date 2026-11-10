@@ -20,3 +20,5 @@ eredu-checkpoint.workspace = true
 eredu-nn.workspace = true
 eredu-runtime.workspace = true
 thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
