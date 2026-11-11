@@ -18,6 +18,62 @@ def digest(path):
         return hashlib.file_digest(source, 'sha256').hexdigest()
 
 
+def gguf_depth(root, projector, out, fixtures):
+    import gguf
+
+    manifest = json.loads((fixtures / 'audio-gguf-sources.json').read_text())
+    expected = manifest['variants']['Q4_K_M']['projector']['publisher_sha256']
+    if digest(projector) != expected:
+        raise ValueError('projector hash differs from the pinned Q4_K_M artifact')
+
+    def load_class(module, name):
+        return get_class_from_dynamic_module(f'{module}.{name}', root, local_files_only=True)
+
+    config = load_class('configuration_lfm3_audio', 'Lfm3AudioConfig').from_pretrained(
+        root, local_files_only=True
+    )
+    config.depth_config._attn_implementation = 'eager'
+    model = load_class('modeling_lfm3_audio', 'Lfm3AudioDepthDecoder')(config).eval()
+    names = {
+        'ln1': 'operator_norm', 'ln2': 'ffn_norm',
+        'attn_q': 'self_attn.q_proj', 'attn_k': 'self_attn.k_proj',
+        'attn_v': 'self_attn.v_proj', 'attn_out': 'self_attn.o_proj',
+        'attn_q_norm': 'self_attn.q_norm', 'attn_k_norm': 'self_attn.k_norm',
+        'attn_gate': 'self_attn.gate_proj',
+        'ffn_gate': 'feed_forward.w1', 'ffn_down': 'feed_forward.w2', 'ffn_up': 'feed_forward.w3',
+    }
+    weights = {}
+    for tensor in gguf.GGUFReader(projector).tensors:
+        name = tensor.name.removeprefix('a.gen.code.')
+        if name == tensor.name or name == 'out_embd.weight':
+            continue
+        value = torch.from_numpy(gguf.dequantize(tensor.data, tensor.tensor_type).copy())
+        if name.startswith('blk.'):
+            _, layer, field, _ = name.split('.')
+            weights[f'model.layers.{layer}.{names[field]}.weight'] = value
+        elif name in ('embd.weight', 'head_norm.weight'):
+            slot = 'embedding' if name == 'embd.weight' else 'embedding_norm'
+            weights.update({f'depth_embeddings.{i}.{slot}.weight': row for i, row in enumerate(value)})
+        else:
+            key = {
+                'mask_embd': 'mask_embedding', 'proj_in.bias': 'depth_linear.bias',
+                'proj_in.weight': 'depth_linear.weight', 'output_norm.weight': 'model.embedding_norm.weight',
+            }[name]
+            weights[key] = value
+    model.load_state_dict(weights, strict=True)
+    hidden = (torch.arange(config.text_config.hidden_size) % 67 - 33).float()[None] / 32
+    codes = torch.zeros((1, 12), dtype=torch.long)
+    masked = torch.ones_like(codes, dtype=torch.bool)
+    order = [0, 3, 6, 9, 1, 4, 7, 10, 2, 5, 8, 11]
+    with torch.inference_mode(), (out / 'depth-scores.f32').open('wb') as trace:
+        for pass_index in range(3):
+            logits = model(hidden, codes, masked)
+            logits.numpy().astype('<f4', copy=False).tofile(trace)
+            slots = order[4 * pass_index:4 * (pass_index + 1)]
+            codes[:, slots] = logits[:, slots, :config.audio_eos_code].argmax(-1)
+            masked[:, slots] = False
+
+
 def live_asr(model, extractor, root, wav_path, out, provenance):
     with wave.open(str(wav_path), 'rb') as wav:
         if (wav.getnchannels(), wav.getsampwidth(), wav.getframerate()) != (1, 2, 16000):
@@ -67,6 +123,7 @@ def main():
     parser.add_argument('checkpoint', type=Path)
     parser.add_argument('output', type=Path)
     parser.add_argument('--live-asr-wav', type=Path, help='compare the publisher LiveASR protocol')
+    parser.add_argument('--gguf-depth', type=Path, help='decode the pinned GGUF depth weights into the publisher model')
     args = parser.parse_args()
     root = args.checkpoint.resolve()
     out = args.output.resolve()
@@ -81,6 +138,11 @@ def main():
     for name, expected in (audio['source_sha256'] | liquid['source_sha256']).items():
         if digest(root / name) != expected:
             parser.error(f'pinned source hash differs: {name}')
+    if args.gguf_depth:
+        out.mkdir(parents=True, exist_ok=True)
+        torch.set_num_threads(4)
+        gguf_depth(root, args.gguf_depth, out, fixtures)
+        return
     model_hash = digest(root / 'model.safetensors')
     codec_hash = digest(root / liquid['weight_file'])
     if model_hash != audio['weights_sha256'] or codec_hash != liquid['weights_sha256']:

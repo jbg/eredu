@@ -6,7 +6,7 @@ use crate::backend::{
     runtime::{
         cache::state::MlxHybridState,
         checkpoint::binding::{
-            build_neutral_module_bindings_with_policy, materialize_module_bindings,
+            build_neutral_module_bindings_with_shared_sources, materialize_module_bindings,
             populate_module_from_arrays_excluding,
         },
         generation::MlxSamplingBackend,
@@ -66,7 +66,7 @@ impl ResidentAudioBinding<MlxNeuralBackend> for Binding {
     ) -> Result<(), BackendFailure> {
         let source = weights.source();
         let mut recipes = weights.recipes().clone();
-        let bindings = build_neutral_module_bindings_with_policy(
+        let bindings = build_neutral_module_bindings_with_shared_sources(
             module,
             source.as_ref(),
             &mut recipes,

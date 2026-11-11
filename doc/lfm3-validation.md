@@ -459,8 +459,8 @@ exact emitted codebooks and PCM between the two execution paths. It exercises
 the loaded speech input, backbone, depth, feedback and codec graph, with
 controlled budgets carried from prompt ingestion into the response. The F32
 CPU run matched all three speech frames and 5,760 PCM samples exactly, including
-the restored and forked prompt continuations. Independent depth score parity
-and resident execution on the other encodings remain unverified.
+the restored and forked prompt continuations. Resident execution on the other
+encodings remains unverified.
 Audio currently selects resident placement.
 
 ```sh
@@ -505,6 +505,51 @@ cargo run -p eredu-backend-mlx --features audio --example lfm3_audio_reference -
   --gguf-backbone "$audio_dir/LFM3-Audio-2B-Q4_K_M.gguf" \
   --gguf-projector "$audio_dir/mmproj-LFM3-Audio-2B-Q4_K_M.gguf" \
   --gguf-scores "$audio_dir/audio-scores.f32"
+```
+
+### Q4_K_M depth decoder
+
+Both references score all 2,017 entries in each codebook across the three
+masked refinement passes. They use the same fixed 2,048-value conditioning
+vector `(index % 67 - 33) / 32` and reveal four codebooks per pass in order
+`[0, 3, 6, 9, 1, 4, 7, 10, 2, 5, 8, 11]`. Each pass feeds the
+reference's preceding greedy choices to both models. Greedy selection excludes
+EOS, which remains in the score comparison.
+
+The two references use the released Q4_K_M projector. The pinned llama.cpp
+Metal runner executes the encoded weights, while the publisher's pinned Python
+depth decoder uses F32 values decoded by the pinned llama.cpp `gguf-py` package.
+Eredu executes F32 from the same encoded weights on CPU.
+
+| Reference | Rows within tolerance | Maximum relative L2 | Maximum absolute error | Greedy reveals |
+| --- | ---: | ---: | ---: | ---: |
+| llama.cpp Metal | 35/36 | 0.02820427 | 0.14743495 | 12/12 |
+| Publisher Python, decoded F32 | 36/36 | 0.00000299 | 0.00002456 | 12/12 |
+
+Both references agree on all 36 argmax IDs and each row's top-five set. The
+llama.cpp row for codebook 7 in the second pass exceeds the shared relative
+L2 limit of 0.02. The decoded-F32 result passes the additional maximum
+absolute limit of `5e-4`. Both references and Eredu reveal
+`[296, 820, 1404, 55, 0, 622, 24, 616, 2, 620, 1302, 323]` in codebook order.
+The fixture exercises greedy reveals with a fixed order and conditioning vector.
+
+```sh
+llama_dir=/private/tmp/eredu-llama-audio-reference
+audio_dir=/private/tmp/eredu-audio-gguf
+backbone="$audio_dir/LFM3-Audio-2B-Q4_K_M.gguf"
+projector="$audio_dir/mmproj-LFM3-Audio-2B-Q4_K_M.gguf"
+"$llama_dir/audio-reference" "$backbone" "$projector" "$audio_dir/depth-scores.f32" --depth
+cargo run -p eredu-backend-mlx --features audio --example lfm3_audio_reference -- \
+  /private/tmp/lfm3-audio validation/fixtures/lfm3/audio-gguf-sources.json \
+  "$audio_dir/depth-score-parity.json" --gguf-backbone "$backbone" \
+  --gguf-projector "$projector" --gguf-depth-scores "$audio_dir/depth-scores.f32"
+PYTHONPATH="$llama_dir/gguf-py" python validation/lfm3_audio_reference.py \
+  /private/tmp/lfm3-audio "$audio_dir/publisher-depth" --gguf-depth "$projector"
+cargo run -p eredu-backend-mlx --features audio --example lfm3_audio_reference -- \
+  /private/tmp/lfm3-audio validation/fixtures/lfm3/audio-gguf-sources.json \
+  "$audio_dir/publisher-depth-parity.json" --gguf-backbone "$backbone" \
+  --gguf-projector "$projector" --gguf-depth-scores "$audio_dir/publisher-depth/depth-scores.f32" \
+  --gguf-depth-f32
 ```
 
 ### Q4_K_M LiquidCodec PCM

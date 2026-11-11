@@ -14,7 +14,7 @@ use eredu_backend_mlx::{
         runtime::{
             cache::state::MlxHybridState,
             checkpoint::binding::{
-                build_neutral_module_bindings_with_recipes, materialize_module_bindings,
+                build_neutral_module_bindings_with_shared_sources, materialize_module_bindings,
                 populate_module_from_arrays_excluding,
             },
         },
@@ -64,8 +64,14 @@ struct Args {
     #[arg(long, requires = "gguf_backbone")]
     gguf_projector: Option<PathBuf>,
     /// Raw F32 score rows from the pinned llama.cpp Audio reference.
-    #[arg(long, requires = "gguf_backbone", conflicts_with_all = ["ingress_replay", "live_asr"])]
+    #[arg(long, requires = "gguf_backbone", conflicts_with_all = ["ingress_replay", "live_asr", "gguf_depth_scores"])]
     gguf_scores: Option<PathBuf>,
+    /// Raw F32 depth score rows from the pinned llama.cpp Audio reference.
+    #[arg(long, requires = "gguf_backbone", conflicts_with_all = ["ingress_replay", "live_asr"])]
+    gguf_depth_scores: Option<PathBuf>,
+    /// Require the F32 absolute tolerance for a reference using decoded GGUF weights.
+    #[arg(long, requires = "gguf_depth_scores")]
+    gguf_depth_f32: bool,
 }
 
 fn sha256(path: &Path) -> Result<String, Box<dyn Error>> {
@@ -105,8 +111,13 @@ fn bind<M: Parameterized<MlxTensor>>(
             dtype: RecipeDtype::F32,
         };
     }
-    let bindings =
-        build_neutral_module_bindings_with_recipes(module, source.as_ref(), &mut recipes)?;
+    let bindings = build_neutral_module_bindings_with_shared_sources(
+        module,
+        source.as_ref(),
+        &mut recipes,
+        weights.shared_source_keys().clone(),
+        |_| false,
+    )?;
     let arrays = materialize_module_bindings(source.as_ref(), &bindings, cpu, ctx)?;
     populate_module_from_arrays_excluding(module, &arrays, |_| false)?;
     Ok(())
@@ -137,8 +148,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         if let Some(scores) = &args.gguf_scores {
             return compare_gguf_scores(&args, &artifact, native, scores);
         }
+        if let Some(scores) = &args.gguf_depth_scores {
+            return compare_gguf_depth(&args, &artifact, native, scores);
+        }
         if !args.ingress_replay {
-            return Err("GGUF acceptance requires --gguf-scores or --ingress-replay".into());
+            return Err(
+                "GGUF acceptance requires --gguf-scores, --gguf-depth-scores or --ingress-replay"
+                    .into(),
+            );
         }
         return compare_ingress_replay(&args, *artifact, native);
     }
@@ -635,20 +652,8 @@ fn compare_gguf_scores(
     native: ExecutionContext,
     scores: &Path,
 ) -> Result<(), Box<dyn Error>> {
-    use eredu_core::{ObservationSet, ObservationValue, TensorObservation, TensorObservationData};
-    use eredu_evaluation::{
-        compare_observations, CheckpointParityOptions, ParityComparison, ParityPolicy,
-    };
-
     let vocabulary = usize::try_from(model.language.args().vocab_size)?;
-    let bytes = std::fs::read(scores)?;
-    if bytes.len() != 9 * vocabulary * 4 {
-        return Err("expected nine full-vocabulary F32 score rows".into());
-    }
-    let expected = bytes
-        .chunks_exact(4)
-        .map(|value| f32::from_le_bytes(value.try_into().expect("one F32 value")))
-        .collect();
+    let expected = read_score_rows(scores, 9, vocabulary)?;
     let cpu = ExecutionContext::cpu()?;
     let ctx = native.stream();
     let mut encoder = Encoder::<MlxNeuralBackend>::new(&model.encoder, ctx)?;
@@ -696,27 +701,132 @@ fn compare_gguf_scores(
     for token in [5, 8, 13, 21, 34, 55, 3] {
         advance(std::slice::from_ref(&token), None, None)?;
     }
+    let report = score_parity(rows, expected, 9, vocabulary)?;
+    std::fs::write(&args.output, serde_json::to_vec_pretty(&report)?)?;
+    if !report.passed {
+        return Err("mixed Audio GGUF score rows exceed the shared logit tolerance".into());
+    }
+    Ok(())
+}
+
+fn read_score_rows(path: &Path, rows: usize, width: usize) -> Result<Vec<f32>, Box<dyn Error>> {
+    let bytes = std::fs::read(path)?;
+    if bytes.len() != rows * width * 4 {
+        return Err(format!("expected {rows} F32 score rows of width {width}").into());
+    }
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|value| f32::from_le_bytes(value.try_into().expect("one F32 value")))
+        .collect())
+}
+
+fn score_parity(
+    actual: Vec<f32>,
+    expected: Vec<f32>,
+    rows: usize,
+    width: usize,
+) -> Result<eredu_evaluation::ParityReport, Box<dyn Error>> {
+    use eredu_core::{ObservationSet, ObservationValue, TensorObservation, TensorObservationData};
+    use eredu_evaluation::{
+        compare_observations, CheckpointParityOptions, ParityComparison, ParityPolicy,
+    };
     let observe = |values| -> Result<ObservationSet, Box<dyn Error>> {
         let mut set = ObservationSet::new();
         set.insert(
             "logits",
             ObservationValue::Tensor(TensorObservation::new(
-                vec![9, vocabulary],
+                vec![rows, width],
                 TensorObservationData::F32(values),
             )?),
         )?;
         Ok(set)
     };
     let tolerance = CheckpointParityOptions::default().logits;
-    let policy = ParityPolicy {
-        default: ParityComparison::Logits { tolerance },
-        rules: vec![],
-        require_same_paths: true,
+    Ok(compare_observations(
+        &observe(actual)?,
+        &observe(expected)?,
+        &ParityPolicy {
+            default: ParityComparison::Logits { tolerance },
+            rules: vec![],
+            require_same_paths: true,
+        },
+    )?)
+}
+
+fn compare_gguf_depth(
+    args: &Args,
+    model: &PreparedAudio,
+    native: ExecutionContext,
+    scores: &Path,
+) -> Result<(), Box<dyn Error>> {
+    const ORDER: [usize; 12] = [0, 3, 6, 9, 1, 4, 7, 10, 2, 5, 8, 11];
+    let width = model.language.args().hidden_size;
+    let vocabulary = usize::try_from(model.depth.vocabulary())?;
+    let expected = read_score_rows(scores, 36, vocabulary)?;
+    let cpu = ExecutionContext::cpu()?;
+    let ctx = native.stream();
+    let mut depth = DepthDecoder::<MlxNeuralBackend>::new(&model.depth, ctx)?;
+    bind(&mut depth, &model.depth_weights, cpu.stream(), ctx)?;
+    let values = (0..width)
+        .map(|i| (i % 67 - 33) as f32 / 32.0)
+        .collect::<Vec<_>>();
+    let hidden = MlxTensor::from_f32_slice(&values, &[1, width], ctx)?;
+    let mut frame = model.depth.begin_frame(&ORDER)?;
+    let mut rows = Vec::with_capacity(expected.len());
+    let mut codes = [0; 12];
+    let mut reference_codes = [0; 12];
+    let best = |values: &[f32], start: usize| -> i32 {
+        let row = &values[start..start + vocabulary - 1];
+        row.iter()
+            .enumerate()
+            .rev()
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
+            .expect("nonempty codec vocabulary")
+            .0 as i32
     };
-    let report = compare_observations(&observe(rows)?, &observe(expected)?, &policy)?;
-    std::fs::write(&args.output, serde_json::to_vec_pretty(&report)?)?;
-    if !report.passed {
-        return Err("mixed Audio GGUF score rows exceed the shared logit tolerance".into());
+    while let Some((pass, slots)) = frame.next_pass() {
+        let logits = depth.score_frame(&hidden, &frame, ctx)?;
+        let actual = logits.as_array().evaluated()?.try_to_vec::<f32>()?;
+        let reference = slots
+            .iter()
+            .map(|&slot| -> Result<i32, eredu_nn::Error> {
+                let start = slot * vocabulary;
+                let row = logits.index(
+                    &[
+                        Index::At(0),
+                        Index::At(slot as i32),
+                        Index::Range(0, model.depth.eos_code()),
+                    ],
+                    ctx,
+                )?;
+                codes[slot] = row.ranked_topk(1, ctx)?.1.to_i32_vec(ctx)?[0];
+                let code = best(&expected, pass * 12 * vocabulary + start);
+                reference_codes[slot] = code;
+                Ok(code)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.extend(actual);
+        frame.reveal(pass, &reference)?;
+    }
+    let maximum_absolute_error = rows
+        .iter()
+        .zip(&expected)
+        .map(|(&actual, &expected)| (actual - expected).abs())
+        .fold(0.0, f32::max);
+    let report = score_parity(rows, expected, 36, vocabulary)?;
+    let passed = report.passed
+        && codes == reference_codes
+        && (!args.gguf_depth_f32 || maximum_absolute_error <= 5e-4);
+    std::fs::write(
+        &args.output,
+        serde_json::to_vec_pretty(&json!({
+            "passed": passed, "codes": codes, "reference_codes": reference_codes, "parity": report,
+            "maximum_absolute_error": maximum_absolute_error,
+            "f32_absolute_tolerance": args.gguf_depth_f32.then_some(5e-4),
+        }))?,
+    )?;
+    if !passed {
+        return Err("depth GGUF scores or greedy reveals exceed reference tolerance".into());
     }
     Ok(())
 }

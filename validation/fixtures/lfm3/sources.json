@@ -23,7 +23,10 @@
         "preprocessor_config.json": "6c991f650c2ec718ffe752c78ac2af66b2085b05b25bff3b8fef57310cc100ee",
         "configuration_lfm3_audio.py": "820dd7b7aaf5c70677569b282ba4e3c31866a03e25c06d5744ba6e0b465e9a32",
         "feature_extraction_lfm3_audio.py": "494061ef2db58af5fe3d4964afd36e334225b7ca8db546e740272da38841f70d",
-        "modeling_lfm3_audio.py": "8d7225d892b8b09edbe2285a8add883ce46e28c4027edc2b8c59b501eeadb9e0"
+        "modeling_lfm3_audio.py": "8d7225d892b8b09edbe2285a8add883ce46e28c4027edc2b8c59b501eeadb9e0",
+        "configuration_lfm3.py": "176cced35657aedfea7d7002221360582d1c05fcaca882c21508bc3a73b282e5",
+        "modeling_lfm3.py": "e8cd5254ea99ce6bd731b57b10908c2e8b5010ce8315341f895a38484885eeab",
+        "lfm3_conv.py": "80d4a985382a22774212759248a6b4c737bfbf9c2a47b3dd7f797dda748e4bb4"
       }
     },
     {
