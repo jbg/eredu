@@ -459,8 +459,8 @@ exact emitted codebooks and PCM between the two execution paths. It exercises
 the loaded speech input, backbone, depth, feedback and codec graph, with
 controlled budgets carried from prompt ingestion into the response. The F32
 CPU run matched all three speech frames and 5,760 PCM samples exactly, including
-the restored and forked prompt continuations. Independent GGUF backbone and depth score
-parity and resident execution on the other encodings remain unverified.
+the restored and forked prompt continuations. Independent depth score parity
+and resident execution on the other encodings remain unverified.
 Audio currently selects resident placement.
 
 ```sh
@@ -470,6 +470,41 @@ cargo run -p eredu-backend-mlx --features audio --example lfm3_audio_reference -
   "$audio_dir/ingress-cpu.json" --device cpu --ingress-replay \
   --gguf-backbone "$audio_dir/LFM3-Audio-2B-Q4_K_M.gguf" \
   --gguf-projector "$audio_dir/mmproj-LFM3-Audio-2B-Q4_K_M.gguf"
+```
+
+### Q4_K_M mixed Audio scores
+
+The independent runner uses the same pinned Audio backbone and projector as
+resident replay. llama.cpp runs on Metal with F32 KV and flash attention
+disabled. Both runtimes encode a 2,151-sample 16-kHz prompt into two audio rows
+between token spans `[124894, 5]` and `[13, 21, 34]`. The first cached position
+uses speech feedback from codebook IDs `149 * book_index`. The seven remaining
+cached inputs are teacher-forced IDs `[5, 8, 13, 21, 34, 55, 3]`.
+Eredu executes F32 on CPU from the same encoded weights. The comparison
+passes the shared quantized logit tolerance across all 128,000 scores in each
+of the nine rows. The maximum relative L2 is `0.00297663`, minimum cosine is
+`0.99999704`, and maximum absolute error is `0.05620670`. Every row has 5/5
+top-five overlap, with matching argmax IDs `[13, 39, 13, 13, 13, 21, 34, 7, 13]`.
+The speech-feedback row has relative L2 `0.00297663`. These results cover the
+speech encoder, backbone and fixed-code feedback under teacher forcing.
+
+Use the pinned Metal llama.cpp build described below for the PCM reference.
+
+```sh
+llama_dir=/private/tmp/eredu-llama-audio-reference
+audio_dir=/private/tmp/eredu-audio-gguf
+c++ -std=c++17 -O2 -I "$llama_dir/include" -I "$llama_dir/ggml/include" \
+  -I "$llama_dir/tools/mtmd" validation/lfm3_audio_gguf_reference.cpp \
+  -L "$llama_dir/build-metal/bin" -Wl,-rpath,"$llama_dir/build-metal/bin" \
+  -lmtmd -lllama -o "$llama_dir/audio-reference"
+"$llama_dir/audio-reference" "$audio_dir/LFM3-Audio-2B-Q4_K_M.gguf" \
+  "$audio_dir/mmproj-LFM3-Audio-2B-Q4_K_M.gguf" "$audio_dir/audio-scores.f32"
+cargo run -p eredu-backend-mlx --features audio --example lfm3_audio_reference -- \
+  /private/tmp/lfm3-audio validation/fixtures/lfm3/audio-gguf-sources.json \
+  "$audio_dir/audio-score-parity.json" --device cpu \
+  --gguf-backbone "$audio_dir/LFM3-Audio-2B-Q4_K_M.gguf" \
+  --gguf-projector "$audio_dir/mmproj-LFM3-Audio-2B-Q4_K_M.gguf" \
+  --gguf-scores "$audio_dir/audio-scores.f32"
 ```
 
 ### Q4_K_M LiquidCodec PCM

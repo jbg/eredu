@@ -6,7 +6,7 @@ use eredu_architectures::lfm3::{
         AudioPrompt, BindingSource, CompletedSpeechFrame, DepthDecoder, Encoder, Feedback,
         PreparedAudio, Projector,
     },
-    CompleteLfm3Kernel,
+    CompleteLfm3Kernel, LayeredModel,
 };
 use eredu_backend_mlx::{
     backend::{
@@ -57,12 +57,15 @@ struct Args {
     /// Compare restored streamed prompts with finite resident inference.
     #[arg(long, conflicts_with = "live_asr")]
     ingress_replay: bool,
-    /// Released GGUF language weights for the ingress/replay case.
-    #[arg(long, requires_all = ["gguf_projector", "ingress_replay"])]
+    /// Released GGUF language weights.
+    #[arg(long, requires = "gguf_projector")]
     gguf_backbone: Option<PathBuf>,
     /// Released GGUF speech input, depth and codec decoder weights.
     #[arg(long, requires = "gguf_backbone")]
     gguf_projector: Option<PathBuf>,
+    /// Raw F32 score rows from the pinned llama.cpp Audio reference.
+    #[arg(long, requires = "gguf_backbone", conflicts_with_all = ["ingress_replay", "live_asr"])]
+    gguf_scores: Option<PathBuf>,
 }
 
 fn sha256(path: &Path) -> Result<String, Box<dyn Error>> {
@@ -130,7 +133,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         else {
             return Err("expected an LFM3 Audio GGUF artifact".into());
         };
-        return compare_ingress_replay(&args, *artifact, execution_context(&args.device));
+        let native = execution_context(&args.device);
+        if let Some(scores) = &args.gguf_scores {
+            return compare_gguf_scores(&args, &artifact, native, scores);
+        }
+        if !args.ingress_replay {
+            return Err("GGUF acceptance requires --gguf-scores or --ingress-replay".into());
+        }
+        return compare_ingress_replay(&args, *artifact, native);
     }
     let reference_name = if args.live_asr {
         "live-reference.json"
@@ -223,24 +233,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         &MlxTensor::full_i32(model.depth.eos_code(), &[1, 12], ctx)?,
         ctx,
     )?;
-    let architecture = CompleteLfm3Kernel::<MlxNeuralBackend>::from_selected_declaration(
-        model.language.clone(),
-        model.language.definition().clone(),
-        None,
-        ctx,
-    )?;
-    let layout = architecture.definition().state_layout().clone();
-    let mut runtime = ResidentRuntime::new(architecture, ctx)?;
-    bind(
-        runtime.architecture_mut().kernel_mut().static_modules_mut(),
-        &model.language_weights,
-        cpu.stream(),
-        ctx,
-    )?;
-    for unit in runtime.units_mut().iter_mut().flatten() {
-        bind(unit, &model.language_weights, cpu.stream(), ctx)?;
-    }
-    let mut state = MlxHybridState::device(layout, &[])?;
+    let (mut runtime, mut state) = bind_language(&model, cpu.stream(), ctx)?;
     let width = model.language.args().hidden_size;
     let hidden = AudioPrompt::new(
         &prompt,
@@ -597,6 +590,137 @@ fn compare_live_block(
     assert_eq!(result.tokens, block.tokens, "block {index}");
 }
 
+fn audio_fixture() -> Vec<f32> {
+    (0..2151)
+        .map(|sample| {
+            let time = sample as f32 / 16_000.0;
+            0.12 * (std::f32::consts::TAU * 413.0 * time).sin()
+                + 0.05 * (std::f32::consts::TAU * 863.0 * time).sin()
+        })
+        .collect()
+}
+
+type LanguageRuntime =
+    ResidentRuntime<LayeredModel<MlxNeuralBackend>, MlxNeuralBackend, MlxHybridState>;
+
+fn bind_language(
+    model: &PreparedAudio,
+    cpu: &<MlxTensor as Tensor>::Context,
+    ctx: &<MlxTensor as Tensor>::Context,
+) -> Result<(LanguageRuntime, MlxHybridState), Box<dyn Error>> {
+    let architecture = CompleteLfm3Kernel::<MlxNeuralBackend>::from_selected_declaration(
+        model.language.clone(),
+        model.language.definition().clone(),
+        None,
+        ctx,
+    )?;
+    let layout = architecture.definition().state_layout().clone();
+    let mut runtime = ResidentRuntime::new(architecture, ctx)?;
+    bind(
+        runtime.architecture_mut().kernel_mut().static_modules_mut(),
+        &model.language_weights,
+        cpu,
+        ctx,
+    )?;
+    for unit in runtime.units_mut().iter_mut().flatten() {
+        bind(unit, &model.language_weights, cpu, ctx)?;
+    }
+    let state = MlxHybridState::device(layout, &[])?;
+    Ok((runtime, state))
+}
+
+fn compare_gguf_scores(
+    args: &Args,
+    model: &PreparedAudio,
+    native: ExecutionContext,
+    scores: &Path,
+) -> Result<(), Box<dyn Error>> {
+    use eredu_core::{ObservationSet, ObservationValue, TensorObservation, TensorObservationData};
+    use eredu_evaluation::{
+        compare_observations, CheckpointParityOptions, ParityComparison, ParityPolicy,
+    };
+
+    let vocabulary = usize::try_from(model.language.args().vocab_size)?;
+    let bytes = std::fs::read(scores)?;
+    if bytes.len() != 9 * vocabulary * 4 {
+        return Err("expected nine full-vocabulary F32 score rows".into());
+    }
+    let expected = bytes
+        .chunks_exact(4)
+        .map(|value| f32::from_le_bytes(value.try_into().expect("one F32 value")))
+        .collect();
+    let cpu = ExecutionContext::cpu()?;
+    let ctx = native.stream();
+    let mut encoder = Encoder::<MlxNeuralBackend>::new(&model.encoder, ctx)?;
+    let mut projector = Projector::<MlxNeuralBackend>::new(&model.encoder, ctx)?;
+    let mut feedback = Feedback::<MlxNeuralBackend>::new(&model.depth, ctx)?;
+    bind(&mut encoder, &model.encoder_weights, cpu.stream(), ctx)?;
+    bind(&mut projector, &model.encoder_weights, cpu.stream(), ctx)?;
+    bind(&mut feedback, &model.depth_weights, cpu.stream(), ctx)?;
+    let pcm = audio_fixture();
+    let features = model
+        .processor
+        .transform()?
+        .extract(AudioWaveform::new(&pcm, 16000)?)?;
+    let features =
+        MlxTensor::from_f32_slice(&features.values, &[1, features.frames as i32, 128], ctx)?
+            .transpose_axes(&[0, 2, 1], ctx)?;
+    let mut encoder_state = MlxHybridState::device(model.encoder.state_layout().clone(), &[])?;
+    let input = projector
+        .forward(&encoder.forward(&features, &mut encoder_state, ctx)?, ctx)?
+        .squeeze_axes(&[0], ctx)?;
+    let codes = (0..12).map(|book| 149 * book).collect::<Vec<_>>();
+    let codes = MlxTensor::from_i32_slice(&codes, &[1, 12], ctx)?;
+    let output = feedback.embed(&codes, ctx)?;
+    let (mut runtime, mut state) = bind_language(model, cpu.stream(), ctx)?;
+    let width = model.language.args().hidden_size;
+    let mut rows = Vec::with_capacity(9 * vocabulary);
+    let mut advance = |ids: &[i32],
+                       input: Option<&MlxTensor>,
+                       output: Option<&MlxTensor>|
+     -> Result<(), Box<dyn Error>> {
+        let hidden = AudioPrompt::new(ids, model.tokens, width, input, output, ctx)?
+            .forward_resident(&mut runtime, &mut state, ctx)?;
+        let last = hidden.index(&[Index::Full, Index::At(-1)], ctx)?;
+        let logits = runtime
+            .architecture_mut()
+            .kernel_mut()
+            .static_modules_mut()
+            .project_normalized(&last, ctx)?;
+        rows.extend(logits.as_array().evaluated()?.try_to_vec::<f32>()?);
+        Ok(())
+    };
+    let speech = model.tokens.input;
+    advance(&[124894, 5, speech, speech, 13, 21, 34], Some(&input), None)?;
+    advance(&[model.tokens.output], None, Some(&output))?;
+    for token in [5, 8, 13, 21, 34, 55, 3] {
+        advance(std::slice::from_ref(&token), None, None)?;
+    }
+    let observe = |values| -> Result<ObservationSet, Box<dyn Error>> {
+        let mut set = ObservationSet::new();
+        set.insert(
+            "logits",
+            ObservationValue::Tensor(TensorObservation::new(
+                vec![9, vocabulary],
+                TensorObservationData::F32(values),
+            )?),
+        )?;
+        Ok(set)
+    };
+    let tolerance = CheckpointParityOptions::default().logits;
+    let policy = ParityPolicy {
+        default: ParityComparison::Logits { tolerance },
+        rules: vec![],
+        require_same_paths: true,
+    };
+    let report = compare_observations(&observe(rows)?, &observe(expected)?, &policy)?;
+    std::fs::write(&args.output, serde_json::to_vec_pretty(&report)?)?;
+    if !report.passed {
+        return Err("mixed Audio GGUF score rows exceed the shared logit tolerance".into());
+    }
+    Ok(())
+}
+
 fn compare_ingress_replay(
     args: &Args,
     artifact: PreparedAudio,
@@ -608,13 +732,7 @@ fn compare_ingress_replay(
     };
     use eredu_core::execution_control::SnapshotLimits;
 
-    let pcm = (0..2151)
-        .map(|sample| {
-            let time = sample as f32 / 16_000.0;
-            0.12 * (std::f32::consts::TAU * 413.0 * time).sin()
-                + 0.05 * (std::f32::consts::TAU * 863.0 * time).sin()
-        })
-        .collect::<Vec<_>>();
+    let pcm = audio_fixture();
     let prefix = [124894, 5];
     let suffix = [13, 21, 34];
     let finite = {
