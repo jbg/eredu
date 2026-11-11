@@ -16569,6 +16569,13 @@ and the stream lifecycle. The PCM variant also captures the mel queue and
 partial analysis window in the same reservation. Its immutable transform
 stays with the session.
 
+LiveASR forks share one resident graph and immutable transcription policy.
+Each child owns a new restore origin and shares the lineage's snapshot and
+copy budget. Encoder and language growth is admitted after native completion
+and before publication. PCM window growth is admitted before accepting the
+chunk. Native recovery retains the child reservation while submitted work
+can remain live.
+
 `eredu-codec::liquid` owns LiquidCodec configuration, complete neural encoder and
 decoder equations, reflective analysis, scalar-product alphabet ordering and
 polar synthesis. It consumes neutral neural/storage/runtime contracts without

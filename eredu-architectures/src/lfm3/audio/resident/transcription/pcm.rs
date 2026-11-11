@@ -23,11 +23,9 @@ struct PcmInput {
     finished: bool,
 }
 
-impl SnapshotValue for PcmInput {
-    fn estimate_snapshot_value(&self) -> Result<SnapshotEstimate, BackendFailure> {
-        use eredu_core::execution_control::ExecutionControlError;
-        let bytes = self
-            .mel
+impl PcmInput {
+    fn estimate_with_mel(&self, mel: &PowerMelState) -> Result<SnapshotEstimate, BackendFailure> {
+        let bytes = mel
             .snapshot_storage_bytes()
             .and_then(|carry| {
                 carry.checked_add(
@@ -39,6 +37,12 @@ impl SnapshotValue for PcmInput {
             retained_bytes: bytes,
             copy_bytes: bytes,
         })])
+    }
+}
+
+impl SnapshotValue for PcmInput {
+    fn estimate_snapshot_value(&self) -> Result<SnapshotEstimate, BackendFailure> {
+        self.estimate_with_mel(&self.mel)
     }
 
     fn copy_snapshot_value(&self, _: &SnapshotReservation) -> Result<Self, BackendFailure> {
@@ -87,6 +91,15 @@ where
         saved: &AudioPcmTranscriptionSnapshot<B, H>,
     ) -> Result<(), AudioSnapshotError> {
         self.session.restore(&saved.0)
+    }
+
+    /// Forks the transcript, queued mel frames and partial PCM window.
+    pub fn fork(&self) -> Result<Self, AudioSnapshotError> {
+        Ok(Self {
+            session: self.session.fork()?,
+            transform: self.transform.clone(),
+            frame_capacity: self.frame_capacity,
+        })
     }
 }
 
@@ -169,14 +182,7 @@ where
                 available,
             });
         }
-        let features = self.transform.advance(
-            &mut self.session.state.input.mel,
-            samples,
-            sample_rate,
-            false,
-        )?;
-        self.session.state.input.values.extend(features.values);
-        Ok(())
+        self.process_pcm(samples, sample_rate, false)
     }
 
     /// Closes PCM input and right-pads the last incomplete window when needed.
@@ -186,12 +192,33 @@ where
             return Err(AudioTranscriptionError::Finished);
         }
         if !self.session.state.input.finished {
-            let features =
-                self.transform
-                    .advance(&mut self.session.state.input.mel, &[], 16_000, true)?;
-            self.session.state.input.values.extend(features.values);
-            self.session.state.input.finished = true;
+            self.process_pcm(&[], 16_000, true)?;
         }
+        Ok(())
+    }
+
+    fn process_pcm(
+        &mut self,
+        samples: &[f32],
+        rate: u32,
+        final_chunk: bool,
+    ) -> Result<(), AudioTranscriptionError> {
+        let input = &mut self.session.state.input;
+        let features = if let Some(fork) = &self.session.fork {
+            let mut mel = input.mel.clone();
+            let features = self
+                .transform
+                .advance(&mut mel, samples, rate, final_chunk)?;
+            fork.input
+                .admit(input.estimate_with_mel(&mel)?.retained_bytes)?;
+            input.mel = mel;
+            features
+        } else {
+            self.transform
+                .advance(&mut input.mel, samples, rate, final_chunk)?
+        };
+        input.values.extend(features.values);
+        input.finished = final_chunk;
         Ok(())
     }
 

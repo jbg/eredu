@@ -333,7 +333,13 @@ finished. After restore, callers resubmit PCM accepted after the snapshot
 and may receive the same text again. Snapshots belong to their originating
 stream and preserve cumulative copy charges. Explicit cancellation is terminal.
 
-Snapshots during prompt ingress, LiveASR forks, capture, and bounded or
+Both LiveASR input modes can fork a settled continuation. The child can
+accept its own input, restart its language context, and finish independently.
+Forks share a synchronous advancement lane and the source's snapshot and
+copy budget. A child's retained model and input growth must fit that budget
+before state is published.
+
+Snapshots and forks during prompt ingress, capture, and bounded or
 distributed speech sessions have no selected implementation.
 
 LiquidCodec's standalone `Tokenizer` implements finite audio-tokenizer calls and
