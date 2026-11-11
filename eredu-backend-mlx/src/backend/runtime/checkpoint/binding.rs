@@ -121,10 +121,17 @@ where
     M: Parameterized<crate::MlxTensor>,
     F: Fn(&str) -> bool,
 {
-    build_neutral_module_bindings_with_policy(module, store, recipes, BTreeSet::new(), exclude)
+    build_neutral_module_bindings_with_shared_sources(
+        module,
+        store,
+        recipes,
+        BTreeSet::new(),
+        exclude,
+    )
 }
 
-pub(crate) fn build_neutral_module_bindings_with_policy<M, F>(
+/// Builds neutral bindings with the caller’s explicit shared physical source keys.
+pub fn build_neutral_module_bindings_with_shared_sources<M, F>(
     module: &M,
     store: &dyn eredu_checkpoint::store::CheckpointSource,
     recipes: &mut BTreeMap<String, DerivedWeightRecipe>,

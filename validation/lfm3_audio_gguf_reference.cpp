@@ -12,10 +12,43 @@
 #include <string_view>
 #include <vector>
 
+static void depth_reference(mtmd_context * media, const char * path, int width) {
+    if (width != 2048) throw std::runtime_error("unexpected Audio backbone width");
+    constexpr int books = 12;
+    constexpr int vocabulary = 2017;
+    constexpr int order[books] = {0, 3, 6, 9, 1, 4, 7, 10, 2, 5, 8, 11};
+    std::array<int32_t, books> codes;
+    codes.fill(-1);
+    std::vector<float> hidden(width);
+    for (int i = 0; i < width; ++i) hidden[i] = float(i % 67 - 33) / 32.0f;
+    mtmd::gen_state_ptr state(mtmd_gen_state_init(media, mtmd_gen_state_params_default()));
+    if (!state) throw std::runtime_error("cannot initialize depth decoder");
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    out.exceptions(std::ios::failbit | std::ios::badbit);
+    for (int pass = 0; pass < 3; ++pass) {
+        auto input = mtmd_gen_inp_default(media);
+        input.type = MTMD_GEN_PROCESS_TYPE_GEN_CODE;
+        input.embd = hidden.data();
+        input.codes = codes.data();
+        input.n_codes = codes.size();
+        mtmd_gen_out result{};
+        if (mtmd_gen_audio_process(media, state.get(), &input, &result) ||
+            !result.feats || result.n_feats != books * vocabulary) {
+            throw std::runtime_error("missing full depth score rows");
+        }
+        out.write(reinterpret_cast<const char *>(result.feats), result.n_feats * sizeof(float));
+        for (int i = pass * 4; i < (pass + 1) * 4; ++i) {
+            const auto * scores = result.feats + order[i] * vocabulary;
+            codes[order[i]] = int32_t(std::max_element(scores, scores + vocabulary - 1) - scores);
+        }
+    }
+}
+
 int main(int argc, char ** argv) {
     try {
-        if (argc != 4) {
-            throw std::runtime_error("usage: audio-reference BACKBONE.gguf PROJECTOR.gguf SCORES.f32");
+        const bool depth = argc == 5 && std::string_view(argv[4]) == "--depth";
+        if (argc != 4 && !depth) {
+            throw std::runtime_error("usage: audio-reference BACKBONE.gguf PROJECTOR.gguf SCORES.f32 [--depth]");
         }
         llama_backend_init();
         auto mp = llama_model_default_params();
@@ -29,15 +62,20 @@ int main(int argc, char ** argv) {
         cp.n_ubatch = 32;
         cp.type_k = cp.type_v = GGML_TYPE_F32;
         cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
-        std::unique_ptr<llama_context, decltype(&llama_free)> ctx(
-            llama_init_from_model(model.get(), cp), llama_free);
         auto media_params = mtmd_context_params_default();
         media_params.use_gpu = true;
         media_params.warmup = false;
         media_params.n_threads = 4;
         std::unique_ptr<mtmd_context, decltype(&mtmd_free)> media(
             mtmd_init_from_file(argv[2], model.get(), media_params), mtmd_free);
-        if (!ctx || !media) throw std::runtime_error("cannot initialize reference context");
+        if (!media) throw std::runtime_error("cannot initialize media context");
+        if (depth) {
+            depth_reference(media.get(), argv[3], llama_model_n_embd_inp(model.get()));
+            return 0;
+        }
+        std::unique_ptr<llama_context, decltype(&llama_free)> ctx(
+            llama_init_from_model(model.get(), cp), llama_free);
+        if (!ctx) throw std::runtime_error("cannot initialize text context");
 
         std::vector<float> pcm(2151);
         constexpr float tau = 6.2831853071795864769f;
