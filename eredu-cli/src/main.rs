@@ -19,10 +19,7 @@ fn cli_command() -> clap::Command {
 #[cfg(feature = "realtime")]
 #[derive(Debug, clap::Subcommand)]
 enum CliCommand {
-    /// Converse using system audio or a recorded WAV, with bounded realtime sessions.
-    #[cfg(feature = "realtime")]
-    Realtime(realtime::Args),
-    /// Transcribe, translate, synthesize, or answer one audio request.
+    /// Run a turn-based audio task or a full-duplex conversation.
     Audio(audio::Args),
 }
 
@@ -2051,7 +2048,6 @@ fn main() -> Result<()> {
     #[cfg(feature = "realtime")]
     if matches.subcommand_name().is_some() {
         return match CliCommand::from_arg_matches(&matches)? {
-            CliCommand::Realtime(args) => realtime::run(args),
             CliCommand::Audio(args) => audio::run(args),
         };
     }
@@ -3606,11 +3602,15 @@ mod tests {
             .try_get_matches_from(["eredu"].into_iter().chain(controls))
             .unwrap();
         let audio_matches = super::cli_command()
-            .try_get_matches_from(["eredu", "realtime"].into_iter().chain(controls))
+            .try_get_matches_from(["eredu", "audio", "realtime"].into_iter().chain(controls))
             .unwrap();
         let text_common = super::common::CommonOptions::from_arg_matches(&text_matches).unwrap();
         let audio_common = super::common::CommonOptions::from_arg_matches(
-            audio_matches.subcommand_matches("realtime").unwrap(),
+            audio_matches
+                .subcommand_matches("audio")
+                .unwrap()
+                .subcommand_matches("realtime")
+                .unwrap(),
         )
         .unwrap();
         assert_eq!(text_common, audio_common);
@@ -3619,13 +3619,17 @@ mod tests {
             audio_common.weight_transformation().unwrap()
         );
         let audio = super::cli_command()
-            .try_get_matches_from(["eredu", "realtime", "--list-audio-devices"])
+            .try_get_matches_from(["eredu", "audio", "realtime", "--list-audio-devices"])
             .unwrap();
-        assert_eq!(audio.subcommand_name(), Some("realtime"));
+        assert_eq!(
+            audio.subcommand_matches("audio").unwrap().subcommand_name(),
+            Some("realtime")
+        );
         assert!(<super::CliCommand as clap::FromArgMatches>::from_arg_matches(&audio).is_ok());
         let audio = super::cli_command()
             .try_get_matches_from([
                 "eredu",
+                "audio",
                 "realtime",
                 "--config",
                 "voicechat.json",
@@ -3637,13 +3641,17 @@ mod tests {
                 "8",
             ])
             .unwrap();
-        assert_eq!(audio.subcommand_name(), Some("realtime"));
+        assert_eq!(
+            audio.subcommand_matches("audio").unwrap().subcommand_name(),
+            Some("realtime")
+        );
         assert!(super::cli_command()
-            .try_get_matches_from(["eredu", "realtime", "--offline"])
+            .try_get_matches_from(["eredu", "audio", "realtime", "--offline"])
             .is_err());
         assert!(super::cli_command()
             .try_get_matches_from([
                 "eredu",
+                "audio",
                 "realtime",
                 "--config",
                 "voicechat.json",
@@ -3653,6 +3661,7 @@ mod tests {
         assert!(super::cli_command()
             .try_get_matches_from([
                 "eredu",
+                "audio",
                 "realtime",
                 "--config",
                 "voicechat.json",

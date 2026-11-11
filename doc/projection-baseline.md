@@ -163,7 +163,7 @@ The WAV application selects one explicit advancement and replays after drain:
 
 ```sh
 cargo build --release -p eredu-cli --no-default-features --features mlx,realtime,metal,projection-profiling
-target/release/eredu realtime --offline --no-playback --config CONFIG.json --input INPUT.wav \
+target/release/eredu audio realtime --offline --no-playback --config CONFIG.json --input INPUT.wav \
   --output SPEECH.wav --events EVENTS.jsonl --projection-profile PROFILE.json \
   --profile-advance 22 --profile-samples 5
 ```

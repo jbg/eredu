@@ -1918,7 +1918,7 @@ bound session loader remain single-device compositions; distributed conversation
 commit, snapshots and externally delivered speech are not established by the
 component's commit agreement.
 
-The `eredu realtime` command advances this bound session with wall-clock or recorded timestamps,
+The `eredu audio realtime` command advances this bound session with wall-clock or recorded timestamps,
 retries bounded PCM submission and drains committed publications to speakers,
 WAV and JSONL. Pending microphone input is distinct from EOF. In offline mode,
 pending native completion holds recorded time fixed. System playback receipts

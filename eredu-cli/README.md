@@ -269,7 +269,11 @@ eredu audio speak --model /models/audio-backbone.gguf \
 execution uses the two GGUF payloads. Build with `mlx,realtime` for WAV-only
 operation or with `mlx,system-audio` for device I/O.
 
-## Realtime speech
+## Full-duplex audio
+
+`eredu audio realtime` runs a conversation with microphone and speaker active
+at the same time, or replays a WAV through the same session. Run
+`eredu audio --help` to see all audio tasks.
 
 Build with `realtime,system-audio` for microphone/speaker conversations; both
 features are enabled by default. `system-audio` uses CPAL's native platform host.
@@ -284,9 +288,9 @@ bundled library downloads pinned Abseil sources when a suitable system dependenc
 is unavailable.
 
 ```sh
-eredu realtime --list-audio-devices
+eredu audio realtime --list-audio-devices
 MLX_MAX_OPS_PER_BUFFER=25 MLX_MAX_MB_PER_BUFFER=256 \
-  eredu realtime --model /models/voicechat-official \
+  eredu audio realtime --model /models/voicechat-official \
   --base-assets /models/nemotron-base --device gpu:0 \
   --quantize 8 --speech-weights f16 --speech-compute f16 \
   --seconds 60 --output speech.wav --events events.jsonl
@@ -295,7 +299,7 @@ MLX_MAX_OPS_PER_BUFFER=25 MLX_MAX_MB_PER_BUFFER=256 \
 Cached official repositories can be passed directly:
 
 ```sh
-eredu realtime --model nvidia/NVIDIA-NemotronLabs-VoiceChat-11B \
+eredu audio realtime --model nvidia/NVIDIA-NemotronLabs-VoiceChat-11B \
   --base-assets nvidia/NVIDIA-Nemotron-Nano-9B-v2 \
   --quantize 8 --speech-weights f16 --speech-compute f16
 ```
@@ -378,7 +382,7 @@ includes silence and cannot identify a useful speech threshold by itself.
 For example:
 
 ```sh
-eredu realtime \
+eredu audio realtime \
   --model nvidia/NVIDIA-NemotronLabs-VoiceChat-11B \
   --base-assets nvidia/NVIDIA-Nemotron-Nano-9B-v2 \
   --quantize 8 --speech-weights f16 --speech-compute f16 \
@@ -443,7 +447,7 @@ and base tokenizer/configuration sources described in
 Recorded input and unattended measurements use the same controlled driver:
 
 ```sh
-eredu realtime --config voicechat.json --input conversation.wav \
+eredu audio realtime --config voicechat.json --input conversation.wav \
   --offline --no-playback --quantize 8 \
   --speech-weights f16 --speech-compute f16 \
   --output speech.wav --events events.jsonl
@@ -456,4 +460,4 @@ committed text, transcription, tools, turns, wall time and invocation execution
 time. Execution timing excludes input pacing and output delivery; it does not measure complete
 microphone-to-speaker latency.
 
-Run `eredu realtime --help` for the complete option list.
+Run `eredu audio realtime --help` for the complete option list.

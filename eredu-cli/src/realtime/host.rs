@@ -1,12 +1,10 @@
 use super::{run::AudioIo, Args};
+use crate::audio::pcm::{finish_wav, PcmOutput, WavInput, WavOutput};
 use anyhow::{ensure, Result};
 use eredu_media::audio::admission::{SpeechAdmission, SpeechAdmissionConfig};
 #[cfg(feature = "system-audio")]
 use eredu_media::audio::system::{SystemAudioInput, SystemAudioOutput};
-use eredu_media::audio::wav::{WavReader, WavWriter};
 use std::{
-    fs::File,
-    io::{BufReader, BufWriter, Write},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -15,16 +13,14 @@ use std::{
 };
 
 pub struct HostIo {
-    file: Option<WavReader<BufReader<File>>>,
-    wav: Option<WavWriter<BufWriter<File>>>,
-    input_recording: Option<WavWriter<BufWriter<File>>>,
+    file: Option<WavInput>,
+    output: PcmOutput,
+    input_recording: Option<WavOutput>,
     accepted_samples: u64,
     input_energy: f64,
     input_peak: f32,
     #[cfg(feature = "system-audio")]
     microphone: Option<SystemAudioInput>,
-    #[cfg(feature = "system-audio")]
-    speaker: Option<SystemAudioOutput>,
     admission: Option<SpeechAdmission>,
     admitted: std::collections::VecDeque<f32>,
     admission_finished: bool,
@@ -40,9 +36,9 @@ pub struct HostIo {
 }
 impl HostIo {
     pub fn new(
-        file: Option<WavReader<BufReader<File>>>,
-        wav: Option<WavWriter<BufWriter<File>>>,
-        input_recording: Option<WavWriter<BufWriter<File>>>,
+        file: Option<WavInput>,
+        wav: Option<WavOutput>,
+        input_recording: Option<WavOutput>,
         args: &Args,
         stop: Arc<AtomicUsize>,
         max_seconds: f64,
@@ -128,15 +124,17 @@ impl HostIo {
             .transpose()?;
         Ok(Self {
             file,
-            wav,
+            output: PcmOutput {
+                wav,
+                #[cfg(feature = "system-audio")]
+                speaker,
+            },
             input_recording,
             accepted_samples: 0,
             input_energy: 0.0,
             input_peak: 0.0,
             #[cfg(feature = "system-audio")]
             microphone,
-            #[cfg(feature = "system-audio")]
-            speaker,
             admission,
             admitted: Default::default(),
             admission_finished: false,
@@ -208,24 +206,8 @@ impl HostIo {
             let _ = microphone.stop();
         }
         // Finalize committed file output independently of native playback success.
-        let wav: Result<_> = self
-            .wav
-            .take()
-            .map(|wav| -> Result<()> {
-                let mut file = wav.finish()?;
-                file.flush()?;
-                Ok(())
-            })
-            .transpose();
-        let recording: Result<_> = self
-            .input_recording
-            .take()
-            .map(|wav| -> Result<()> {
-                let mut file = wav.finish()?;
-                file.flush()?;
-                Ok(())
-            })
-            .transpose();
+        let wav = self.output.wav.take().map(finish_wav).transpose();
+        let recording = self.input_recording.take().map(finish_wav).transpose();
         let rms = (self.input_energy / self.accepted_samples.max(1) as f64).sqrt();
         eprintln!(
             "input audio: {} source samples accepted, RMS={:.6} ({:.1} dBFS), peak={:.6}",
@@ -235,7 +217,7 @@ impl HostIo {
             self.input_peak
         );
         #[cfg(feature = "system-audio")]
-        let playback = if let Some(speaker) = &mut self.speaker {
+        let playback = if let Some(speaker) = &mut self.output.speaker {
             let result = if success {
                 speaker.finish()
             } else {
@@ -301,14 +283,7 @@ impl AudioIo for HostIo {
         Ok(())
     }
     fn write(&mut self, samples: &[f32]) -> Result<()> {
-        if let Some(wav) = &mut self.wav {
-            wav.write_samples(samples)?;
-        }
-        #[cfg(feature = "system-audio")]
-        if let Some(speaker) = &mut self.speaker {
-            speaker.write(samples)?;
-        }
-        Ok(())
+        self.output.write(samples)
     }
     fn clock(&self, recorded: Duration) -> Duration {
         if self.paced {
@@ -345,7 +320,7 @@ impl AudioIo for HostIo {
             if let Some(microphone) = &self.microphone {
                 microphone.check()?;
             }
-            if let Some(speaker) = &self.speaker {
+            if let Some(speaker) = &self.output.speaker {
                 speaker.check()?;
             }
         }
@@ -353,14 +328,14 @@ impl AudioIo for HostIo {
     }
     fn playback_ticket(&mut self, output_samples: u64) -> Result<u64> {
         #[cfg(feature = "system-audio")]
-        if let Some(speaker) = &mut self.speaker {
+        if let Some(speaker) = &mut self.output.speaker {
             return Ok(speaker.flush_segment()?);
         }
         Ok(output_samples)
     }
     fn played(&self, ticket: u64) -> bool {
         #[cfg(feature = "system-audio")]
-        if let Some(speaker) = &self.speaker {
+        if let Some(speaker) = &self.output.speaker {
             return speaker.completed(ticket);
         }
         let _ = ticket;
@@ -368,7 +343,7 @@ impl AudioIo for HostIo {
     }
     fn interrupt(&mut self) -> Result<()> {
         #[cfg(feature = "system-audio")]
-        if let Some(speaker) = &mut self.speaker {
+        if let Some(speaker) = &mut self.output.speaker {
             speaker.interrupt()?;
         }
         Ok(())
@@ -379,6 +354,8 @@ impl AudioIo for HostIo {
 mod tests {
     use super::*;
     use clap::Parser;
+    use eredu_media::audio::wav::{WavReader, WavWriter};
+    use std::io::BufReader;
     #[derive(Parser)]
     struct Options {
         #[command(flatten)]
