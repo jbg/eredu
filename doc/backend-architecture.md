@@ -16504,9 +16504,10 @@ The shared realtime loader dispatches `lfm3_audio` to this preparation. It
 retains the selected SafeTensors payload independently of the model asset
 directory. `PreparedResidentAudio` selects F32 binding recipes and validates
 the sampling defaults without creating native tensors. Its parameter report
-counts the selected language, encoder, depth and codec bindings. MLX consumes
-this selection with the supplied weight and execution contexts. Callers
-prepare each prompt separately from model loading.
+counts the selected language, speech encoder, depth and codec decoder bindings.
+The codec encoder is available through the separate full codec composition.
+MLX consumes this selection with the supplied weight and execution contexts.
+Callers prepare each prompt separately from model loading.
 
 `AdmittedAudioGguf` validates an explicit LFM3 Audio backbone and projector
 pair. The backbone uses the shared LFM3 declaration and checks its rotary
@@ -16527,7 +16528,9 @@ checks learned parameter shapes and verifies the exported scalar code table
 against the same mixed-radix lookup used by the neural codec. The decoder view
 retains the learned weights from the shared projector and an in-memory periodic
 Hann synthesis window reconstructed from the published GGUF decoder geometry.
-The decoder binding is independent of a codec encoder source.
+The portable `NeuralDecoder` executes finite and streamed synthesis with only
+those decoder bindings and caller-owned state. Full `NeuralCodec`
+composition delegates synthesis to the same decoder.
 
 `AudioPrompt` pairs token IDs with exact speech input and output row counts.
 The shared language traversal replaces the placeholder spans at the execution

@@ -16,7 +16,9 @@ use serde::Deserialize;
 mod gguf;
 mod neural;
 pub use gguf::GgufDecoderBindings;
-pub use neural::{BackboneBlock, Declaration, DecoderState, NeuralCodec, Tokenizer, Unit};
+pub use neural::{
+    BackboneBlock, Declaration, DecoderState, NeuralCodec, NeuralDecoder, Tokenizer, Unit,
+};
 
 /// Released codec component geometry, independent of language-model architectures.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -336,8 +338,57 @@ impl DeclareLogicalParameters for QuantizerSpec {
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct Quantizer<B: NeuralBackend> {
+    encoder: ScalarEncoder<B>,
+    decoder: ScalarDecoder<B>,
+}
+
+impl<B: NeuralBackend> Quantizer<B> {
+    /// Immutable non-parameter roots retained for residency and allocation inspection.
+    pub fn constants(&self) -> [&B::Tensor; 6] {
+        [
+            &self.encoder.half_width,
+            &self.encoder.basis,
+            &self.encoder.half_levels,
+            &self.encoder.offset,
+            &self.encoder.shift,
+            &self.decoder.table,
+        ]
+    }
+
+    /// Constructs unloaded learned projections and the exact finite alphabets.
+    pub fn new(
+        spec: &QuantizerSpec,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            encoder: ScalarEncoder::new(spec, context)?,
+            decoder: ScalarDecoder::new(spec, context)?,
+        })
+    }
+
+    /// Encodes `[batch,latent_width,frames]` to exact I32 `[batch,codebooks,frames]`.
+    pub fn encode(
+        &mut self,
+        latents: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        self.encoder.encode(latents, context)
+    }
+
+    /// Decodes exact nonnegative I32 codes to `[batch,latent_width,frames]`.
+    pub fn decode(
+        &mut self,
+        codes: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        self.decoder.decode(codes, context)
+    }
+}
+
+#[derive(Debug, Clone, Parameterized)]
+#[parameterized(tensor = "B::Tensor")]
+struct ScalarEncoder<B: NeuralBackend> {
     input: Option<B::Linear>,
-    output: Option<B::Linear>,
     #[parameter(skip)]
     config: Config,
     #[parameter(skip)]
@@ -350,37 +401,18 @@ pub struct Quantizer<B: NeuralBackend> {
     offset: B::Tensor,
     #[parameter(skip)]
     shift: B::Tensor,
-    #[parameter(skip)]
-    table: B::Tensor,
 }
 
-impl<B: NeuralBackend> Quantizer<B> {
-    /// Immutable non-parameter roots retained for residency and allocation inspection.
-    pub fn constants(&self) -> [&B::Tensor; 6] {
-        [
-            &self.half_width,
-            &self.basis,
-            &self.half_levels,
-            &self.offset,
-            &self.shift,
-            &self.table,
-        ]
-    }
-    /// Constructs unloaded learned projections and the exact finite alphabets.
-    pub fn new(
-        spec: &QuantizerSpec,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
+impl<B: NeuralBackend> ScalarEncoder<B> {
+    fn new(spec: &QuantizerSpec, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
+        use eredu_nn::NeuralOperatorCapabilities as Ops;
         B::require_operator_capabilities(
-            "finite scalar quantizer",
-            eredu_nn::NeuralOperatorCapabilities::ROUND_TO_I32
-                .union(eredu_nn::NeuralOperatorCapabilities::REQUIRE_FINITE)
-                .union(eredu_nn::NeuralOperatorCapabilities::TANH)
-                .union(eredu_nn::NeuralOperatorCapabilities::CAST_FLOAT)
-                .union(eredu_nn::NeuralOperatorCapabilities::FROM_I32_SLICE)
-                .union(eredu_nn::NeuralOperatorCapabilities::FULL_I32)
-                .union(eredu_nn::NeuralOperatorCapabilities::EQUAL_I32)
-                .union(eredu_nn::NeuralOperatorCapabilities::WHERE_CONDITION),
+            "finite scalar encoder",
+            Ops::ROUND_TO_I32
+                .union(Ops::REQUIRE_FINITE)
+                .union(Ops::TANH)
+                .union(Ops::CAST_FLOAT)
+                .union(Ops::FROM_I32_SLICE),
         )?;
         let config = spec.config.clone();
         let dimension = config.fsq_levels.len() as i32;
@@ -398,22 +430,9 @@ impl<B: NeuralBackend> Quantizer<B> {
             offsets.push(offset);
             shifts.push((offset / h).atanh());
         }
-        let mut table = Vec::new();
-        let count = (config.codebook_size()? as usize)
-            .checked_mul(dimension as usize)
-            .ok_or_else(|| invalid("finite scalar lookup extent overflow"))?;
-        table
-            .try_reserve_exact(count)
-            .map_err(|e| invalid(e.to_string()))?;
-        table.extend((0..config.codebook_size()?).flat_map(|code| config.scalar_code(code)));
         Ok(Self {
             input: spec
                 .input
-                .clone()
-                .map(|s| B::linear(s, context))
-                .transpose()?,
-            output: spec
-                .output
                 .clone()
                 .map(|s| B::linear(s, context))
                 .transpose()?,
@@ -426,14 +445,10 @@ impl<B: NeuralBackend> Quantizer<B> {
             half_levels: B::Tensor::from_f32_slice(&half, &[dimension], context)?,
             offset: B::Tensor::from_f32_slice(&offsets, &[dimension], context)?,
             shift: B::Tensor::from_f32_slice(&shifts, &[dimension], context)?,
-            table: B::Tensor::from_f32_slice(
-                &table,
-                &[config.codebook_size()?, dimension],
-                context,
-            )?,
             config,
         })
     }
+
     /// Encodes `[batch,latent_width,frames]` to exact I32 `[batch,codebooks,frames]`.
     pub fn encode(
         &mut self,
@@ -476,6 +491,51 @@ impl<B: NeuralBackend> Quantizer<B> {
             .multiply(&self.basis, context)?;
         let codes = B::Tensor::sum_axis(&digits, -1, false, context)?;
         Ok(codes.transpose_axes(&[0, 2, 1], context)?)
+    }
+}
+
+#[derive(Debug, Clone, Parameterized)]
+#[parameterized(tensor = "B::Tensor")]
+struct ScalarDecoder<B: NeuralBackend> {
+    output: Option<B::Linear>,
+    #[parameter(skip)]
+    config: Config,
+    #[parameter(skip)]
+    table: B::Tensor,
+}
+
+impl<B: NeuralBackend> ScalarDecoder<B> {
+    fn new(spec: &QuantizerSpec, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
+        use eredu_nn::NeuralOperatorCapabilities as Ops;
+        B::require_operator_capabilities(
+            "finite scalar decoder",
+            Ops::FULL_I32
+                .union(Ops::EQUAL_I32)
+                .union(Ops::WHERE_CONDITION),
+        )?;
+        let config = spec.config.clone();
+        let dimension = config.fsq_levels.len() as i32;
+        let mut table = Vec::new();
+        let count = (config.codebook_size()? as usize)
+            .checked_mul(dimension as usize)
+            .ok_or_else(|| invalid("finite scalar lookup extent overflow"))?;
+        table
+            .try_reserve_exact(count)
+            .map_err(|e| invalid(e.to_string()))?;
+        table.extend((0..config.codebook_size()?).flat_map(|code| config.scalar_code(code)));
+        Ok(Self {
+            output: spec
+                .output
+                .clone()
+                .map(|s| B::linear(s, context))
+                .transpose()?,
+            table: B::Tensor::from_f32_slice(
+                &table,
+                &[config.codebook_size()?, dimension],
+                context,
+            )?,
+            config,
+        })
     }
     /// Decodes exact nonnegative I32 codes to `[batch,latent_width,frames]`.
     pub fn decode(

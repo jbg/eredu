@@ -21,7 +21,7 @@ use super::{
     Encoder, EncoderState, Feedback, PreparedAudio, Projector,
 };
 use crate::lfm3::{CompleteLfm3Kernel, LayeredModel};
-use eredu_codec::liquid::{DecoderState, NeuralCodec};
+use eredu_codec::liquid::{DecoderState, NeuralDecoder};
 use eredu_core::{
     execution_control::SnapshotEstimate, scheduler::SemanticStateTransaction, BackendFailure,
     Completion,
@@ -126,7 +126,7 @@ pub struct AudioResidentParameterBytes {
     pub encoder: u64,
     /// Depth, tied codebook heads and feedback weights.
     pub depth: u64,
-    /// LiquidCodec weights and retained synthesis window.
+    /// LiquidCodec decoder weights and retained synthesis window.
     pub codec: u64,
 }
 
@@ -144,7 +144,9 @@ impl PreparedResidentAudio {
         let (language_weights, language) = artifact.language_weights.widened_f32()?;
         let (encoder_weights, encoder) = artifact.encoder_weights.widened_f32()?;
         let (depth_weights, depth) = artifact.depth_weights.widened_f32()?;
-        let (codec_weights, codec) = artifact.codec_weights.widened_f32()?;
+        let (codec_weights, codec) =
+            super::artifact::restrict_codec_decoder(&artifact.codec, &artifact.codec_weights)?
+                .widened_f32()?;
         artifact.language_weights = language_weights;
         artifact.encoder_weights = encoder_weights;
         artifact.depth_weights = depth_weights;
@@ -179,7 +181,7 @@ where
     projector: Projector<B>,
     depth: DepthDecoder<B>,
     feedback: Feedback<B>,
-    codec: NeuralCodec<B>,
+    codec: NeuralDecoder<B>,
     binding: H,
     artifact: PreparedAudio,
     sampling: AudioSampling,
@@ -342,7 +344,7 @@ where
         let mut feedback = Feedback::new(&artifact.depth, ctx).map_err(failure)?;
         binding.bind(&mut depth, &artifact.depth_weights)?;
         binding.bind(&mut feedback, &artifact.depth_weights)?;
-        let mut codec = NeuralCodec::new(&artifact.codec, ctx).map_err(failure)?;
+        let mut codec = NeuralDecoder::new(&artifact.codec, ctx).map_err(failure)?;
         binding.bind(&mut codec, &artifact.codec_weights)?;
         Ok(Self {
             language,
