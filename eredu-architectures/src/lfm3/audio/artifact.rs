@@ -102,6 +102,21 @@ pub struct BindingSource {
 }
 
 impl BindingSource {
+    pub(super) fn from_recipes(
+        source: SharedCheckpointSource,
+        scope: &str,
+        recipes: BTreeMap<String, DerivedWeightRecipe>,
+    ) -> Result<Self, eredu_checkpoint::store::StoreError> {
+        let keys = recipes
+            .values()
+            .flat_map(|recipe| recipe.source_keys().into_iter().map(str::to_owned))
+            .collect();
+        Ok(Self {
+            source: Arc::new(RestrictedCheckpointSource::including(source, scope, keys)?),
+            recipes,
+        })
+    }
+
     /// Projects the resident F32 execution profile before native materialization.
     pub(super) fn widened_f32(&self) -> Result<(Self, u64), ArtifactError> {
         let mut recipes = self.recipes.clone();

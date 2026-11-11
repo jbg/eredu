@@ -7,6 +7,9 @@ use eredu_checkpoint::{
 use eredu_gguf::{Checkpoint, GgmlType, Limits, MetadataValue, QuantizedTensorRepresentation};
 use std::path::Path;
 
+mod speech;
+pub use speech::{AudioGgufSpeechBindings, AudioGgufSpeechSources};
+
 /// Physical layouts published for either part of LFM3 Audio.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioGgufEncoding {
@@ -58,6 +61,9 @@ pub enum AudioGgufError {
     /// Container structure or storage failed validation.
     #[error(transparent)]
     Container(#[from] eredu_gguf::Error),
+    /// The retained source cannot realize its admitted tensor catalog.
+    #[error(transparent)]
+    Source(#[from] eredu_checkpoint::store::StoreError),
     /// Required role, geometry or encoding metadata differs.
     #[error("invalid LFM3 Audio GGUF metadata {0}")]
     Metadata(&'static str),
