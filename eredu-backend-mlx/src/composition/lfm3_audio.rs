@@ -214,6 +214,11 @@ pub struct MlxAudioTranscription(AudioTranscription<MlxNeuralBackend, Binding>);
 pub struct MlxAudioTranscriptionSnapshot(AudioTranscriptionSnapshot<MlxNeuralBackend, Binding>);
 
 impl MlxAudioTranscription {
+    /// Forks the settled continuation on the same resident graph.
+    pub fn fork(&self) -> Result<Self, AudioSnapshotError> {
+        self.0.fork().map(Self)
+    }
+
     /// Configures bounded snapshot and restore.
     pub fn enable_snapshots(&mut self, limits: SnapshotLimits) -> Result<(), AudioSnapshotError> {
         self.0.enable_snapshots(limits)
@@ -271,6 +276,11 @@ pub struct MlxAudioPcmTranscriptionSnapshot(
 
 #[cfg(feature = "audio")]
 impl MlxAudioPcmTranscription {
+    /// Forks the settled continuation on the same resident graph.
+    pub fn fork(&self) -> Result<Self, AudioSnapshotError> {
+        self.0.fork().map(Self)
+    }
+
     /// Configures bounded snapshot and restore.
     pub fn enable_snapshots(&mut self, limits: SnapshotLimits) -> Result<(), AudioSnapshotError> {
         self.0.enable_snapshots(limits)

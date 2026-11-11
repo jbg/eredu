@@ -373,7 +373,7 @@ fn compare_live_mel(
     let mut session = MlxAudioModel::load(model, native)?.prepare_live_transcription()?;
     session.enable_snapshots(eredu_core::execution_control::SnapshotLimits {
         max_snapshots: 1,
-        max_branches: 0,
+        max_branches: 1,
         retained_bytes: 1 << 28,
         cumulative_copy_bytes: 1 << 28,
     })?;
@@ -388,9 +388,30 @@ fn compare_live_mel(
             mel_bins: features.mel_bins,
         };
         let saved = (index == 1).then(|| session.snapshot()).transpose()?;
+        let child = (index == 1).then(|| session.fork()).transpose()?;
         let result = session.advance(&features, block.final_chunk, block.restart)?;
         compare_live_block(index, &result, block);
-        if let Some(saved) = saved {
+        if let (Some(saved), Some(mut child)) = (saved, child) {
+            let before = session.snapshot_usage().ok_or("missing fork usage")?;
+            assert_eq!(child.snapshot_usage(), Some(before));
+            assert!(child.fork().is_err());
+            assert!(child.restore(&saved).is_err());
+            assert_eq!(child.snapshot_usage(), Some(before));
+            assert_eq!(
+                child.advance(&features, block.final_chunk, block.restart)?,
+                result
+            );
+            let after = child.snapshot_usage().ok_or("missing child growth usage")?;
+            assert!(after.retained_bytes > before.retained_bytes);
+            assert_eq!(after.cumulative_copy_bytes, before.cumulative_copy_bytes);
+            drop(child);
+            assert_eq!(
+                session
+                    .snapshot_usage()
+                    .ok_or("missing released fork usage")?
+                    .branches,
+                0
+            );
             session.restore(&saved)?;
             assert_eq!(
                 session.advance(&features, block.final_chunk, block.restart)?,
@@ -414,7 +435,7 @@ fn compare_live_pcm(
     let mut session = model.prepare_pcm_transcription()?;
     session.enable_snapshots(SnapshotLimits {
         max_snapshots: 1,
-        max_branches: 0,
+        max_branches: 1,
         retained_bytes: 1 << 28,
         cumulative_copy_bytes: 1 << 28,
     })?;
@@ -484,6 +505,8 @@ fn compare_live_pcm(
     }
     assert!(matched > 1 && saved.is_none());
     let before_finish = session.snapshot()?;
+    let mut child = session.fork()?;
+    assert_eq!(child.available_samples(), session.available_samples());
     session.finish_input()?;
     assert!(matches!(
         session.submit(&[], 16_000),
@@ -499,6 +522,16 @@ fn compare_live_pcm(
         tokens += result.tokens.len();
     }
     assert!(session.is_finished());
+    assert!(!child.is_finished());
+    child.finish_input()?;
+    for &(index, block) in &pending {
+        let result = child
+            .advance(block.restart)?
+            .ok_or("missing child LiveASR block")?;
+        compare_live_block(index, &result, block);
+    }
+    assert!(child.is_finished());
+    drop(child);
     assert!(matches!(
         session.advance(false),
         Err(AudioTranscriptionError::Finished)

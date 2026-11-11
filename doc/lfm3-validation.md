@@ -346,6 +346,13 @@ PCM window, restores before replaying the next block, and repeats the final
 flush from a second snapshot. It also checks the snapshot count limit,
 release of retained storage, and cumulative copying across restore.
 
+The mel comparison also forks after the initial seven frames and compares
+the first transcript block in both continuations. It checks that the
+branch limit and foreign snapshots are rejected before charging, and that
+growth charges retention while preserving cumulative copy usage. The PCM
+comparison forks before the final flush and closes the parent and child
+independently with the same transcript.
+
 ```sh
 python validation/lfm3_audio_reference.py /private/tmp/lfm3-audio /private/tmp/lfm3-live --live-asr-wav /private/tmp/speech.wav
 cargo run -p eredu-backend-mlx --features audio --example lfm3_audio_reference -- /private/tmp/lfm3-audio /private/tmp/lfm3-live /private/tmp/lfm3-live/cpu.json --live-asr --device cpu

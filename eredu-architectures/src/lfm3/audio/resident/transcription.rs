@@ -4,11 +4,16 @@ use super::*;
 use crate::lfm3::audio::encoder::STRIDE;
 use crate::lfm3::audio::AudioSnapshotError;
 use eredu_core::{
-    execution_control::{SnapshotLimits, SnapshotUsage},
+    execution_control::{
+        ExecutionControlError, SnapshotLimits, SnapshotResourceKind, SnapshotUsage,
+    },
     TokenFilter,
 };
-use eredu_runtime::execution_control::{IsolatedStateSnapshot, SnapshotBudget};
+use eredu_runtime::execution_control::{
+    IsolatedStateError, IsolatedStateSnapshot, SnapshotBudget, SnapshotRetainedGrowth,
+};
 use eredu_text::tokenizer::Tokenizer;
+use std::{cell::RefCell, rc::Rc};
 
 #[cfg(feature = "audio")]
 mod pcm;
@@ -32,6 +37,12 @@ pub struct AudioTranscriptionBlock {
 /// Failure to prepare or advance a LiveASR stream.
 #[derive(Debug, thiserror::Error)]
 pub enum AudioTranscriptionError {
+    /// Another stream is already advancing on the shared resident graph.
+    #[error("the shared LFM3 Audio LiveASR graph is busy")]
+    Busy,
+    /// A child cannot retain the proposed state under its shared budget.
+    #[error(transparent)]
+    Retention(#[from] ExecutionControlError),
     /// Host PCM processing rejected the input.
     #[cfg(feature = "audio")]
     #[error(transparent)]
@@ -138,11 +149,21 @@ where
     B: GroupedNeuralBackend + DistributedNeuralBackend,
     H: ResidentAudioBinding<B>,
 {
-    model: ResidentAudio<B, H>,
+    model: Rc<RefCell<ResidentAudio<B, H>>>,
     state: TranscriptionState<H::State, B::Tensor, I>,
-    policy: Policy,
+    policy: Rc<Policy>,
     snapshot_budget: Option<SnapshotBudget>,
     cancelled: bool,
+    fork: Option<ForkRetention<H::State, B::Tensor>>,
+}
+
+type EstimateModel<S, T> = fn(&EncoderState<S, T>, &S) -> Result<SnapshotEstimate, BackendFailure>;
+
+struct ForkRetention<S, T: Tensor> {
+    model: SnapshotRetainedGrowth,
+    estimate_model: EstimateModel<S, T>,
+    #[cfg(feature = "audio")]
+    input: SnapshotRetainedGrowth,
 }
 
 struct TranscriptionState<S, T: Tensor, I> {
@@ -154,6 +175,16 @@ struct TranscriptionState<S, T: Tensor, I> {
     origin: Arc<()>,
 }
 
+fn estimate_model<S: SnapshotValue, T: Tensor + SnapshotValue>(
+    encoder: &EncoderState<S, T>,
+    language: &S,
+) -> Result<SnapshotEstimate, BackendFailure> {
+    snapshot_value_estimate::<()>([
+        encoder.estimate_snapshot_value(),
+        language.estimate_snapshot_value(),
+    ])
+}
+
 impl<S: SnapshotValue, T: Tensor + SnapshotValue, I: SnapshotValue> IsolatedStateCopy
     for TranscriptionState<S, T, I>
 {
@@ -161,8 +192,7 @@ impl<S: SnapshotValue, T: Tensor + SnapshotValue, I: SnapshotValue> IsolatedStat
 
     fn estimate_isolated_copy(&self) -> Result<SnapshotEstimate, BackendFailure> {
         snapshot_value_estimate::<Self>([
-            self.encoder.estimate_snapshot_value(),
-            self.language.estimate_snapshot_value(),
+            estimate_model(&self.encoder, &self.language),
             self.input.estimate_snapshot_value(),
         ])
     }
@@ -244,6 +274,54 @@ where
         Ok(())
     }
 
+    /// Forks the current settled stream on the same resident graph.
+    /// The child owns its continuation and shares the original copy budget.
+    pub fn fork(&self) -> Result<Self, AudioSnapshotError> {
+        self.check_snapshot_boundary()?;
+        let budget = self
+            .snapshot_budget
+            .as_ref()
+            .ok_or(AudioSnapshotError::NotConfigured)?;
+        let model = estimate_model(&self.state.encoder, &self.state.language)
+            .map_err(IsolatedStateError::Backend)?;
+        let input = self
+            .state
+            .input
+            .estimate_snapshot_value()
+            .map_err(IsolatedStateError::Backend)?;
+        // The child owns an origin and heap-backed reservation/high-water counters.
+        let estimate = snapshot_value_estimate::<Self>([
+            Ok(model),
+            Ok(input),
+            Ok(SnapshotEstimate {
+                retained_bytes: 256,
+                copy_bytes: 256,
+            }),
+        ])
+        .map_err(IsolatedStateError::Backend)?;
+        let retention = budget
+            .reserve(SnapshotResourceKind::Branch, Some(estimate))
+            .map_err(IsolatedStateError::Admission)?;
+        let mut state = self
+            .state
+            .copy_isolated(&retention)
+            .map_err(IsolatedStateError::Backend)?;
+        state.origin = Arc::new(());
+        Ok(Self {
+            model: self.model.clone(),
+            state,
+            policy: self.policy.clone(),
+            snapshot_budget: Some(budget.clone()),
+            cancelled: false,
+            fork: Some(ForkRetention {
+                model: SnapshotRetainedGrowth::new(&retention, model.retained_bytes),
+                estimate_model: estimate_model::<H::State, B::Tensor>,
+                #[cfg(feature = "audio")]
+                input: SnapshotRetainedGrowth::new(&retention, input.retained_bytes),
+            }),
+        })
+    }
+
     fn check_snapshot_boundary(&self) -> Result<(), AudioSnapshotError> {
         if self.cancelled {
             return Err(AudioSnapshotError::Cancelled);
@@ -278,7 +356,7 @@ where
             .binding
             .state(self.artifact.language.definition().state_layout())?;
         Ok(AudioTranscription {
-            model: self,
+            model: Rc::new(RefCell::new(self)),
             state: TranscriptionState {
                 encoder,
                 language,
@@ -287,9 +365,10 @@ where
                 finished: false,
                 origin: Arc::new(()),
             },
-            policy,
+            policy: Rc::new(policy),
             snapshot_budget: None,
             cancelled: false,
+            fork: None,
         })
     }
 }
@@ -307,6 +386,21 @@ where
     /// Advances one live mel block, optionally restarting the text context.
     /// Blocks contain no batch padding. An empty final block closes the stream.
     pub fn advance(
+        &mut self,
+        features: &LogMelFeatures,
+        final_chunk: bool,
+        restart: bool,
+    ) -> Result<AudioTranscriptionBlock, AudioTranscriptionError> {
+        if let Some(fork) = &self.fork {
+            H::with_fork_retention(fork.model.clone(), || {
+                self.advance_block(features, final_chunk, restart)
+            })?
+        } else {
+            self.advance_block(features, final_chunk, restart)
+        }
+    }
+
+    fn advance_block(
         &mut self,
         features: &LogMelFeatures,
         final_chunk: bool,
@@ -343,26 +437,26 @@ where
             .ok_or(AudioTranscriptionError::Features)?;
         let budget = if final_chunk { 96 } else { 48 };
         let generate = count != 0 || final_chunk;
+        let mut model = self
+            .model
+            .try_borrow_mut()
+            .map_err(|_| AudioTranscriptionError::Busy)?;
         if generate
             && position
                 .checked_add(pending.len())
                 .and_then(|n| n.checked_add(count))
                 .and_then(|n| n.checked_add(budget))
-                .is_none_or(|n| {
-                    n > self.model.artifact.language.args().max_position_embeddings as usize
-                })
+                .is_none_or(|n| n > model.artifact.language.args().max_position_embeddings as usize)
         {
             return Err(AudioTranscriptionError::Context);
         }
         let mut encoder = self.state.encoder.try_branch(H::branch_state)?;
-        let projected = self
-            .model
-            .project_stream_chunk(features, &mut encoder, final_chunk)?;
+        let projected = model.project_stream_chunk(features, &mut encoder, final_chunk)?;
         let mut language = if restart {
             Some(
-                self.model
+                model
                     .binding
-                    .state(self.model.artifact.language.definition().state_layout())?,
+                    .state(model.artifact.language.definition().state_layout())?,
             )
         } else if generate {
             Some(H::branch_state(&self.state.language)?)
@@ -377,18 +471,16 @@ where
         let mut hidden = None;
         if let Some(language) = language.as_mut().filter(|_| generate) {
             let mut tokens = pending.to_vec();
-            tokens.extend(std::iter::repeat_n(self.model.artifact.tokens.input, count));
-            let mut state =
-                self.model
-                    .forward_prompt(language, &tokens, projected.as_ref(), None)?;
+            tokens.extend(std::iter::repeat_n(model.artifact.tokens.input, count));
+            let mut state = model.forward_prompt(language, &tokens, projected.as_ref(), None)?;
             let filter = if final_chunk {
                 &self.policy.final_filter
             } else {
                 &self.policy.intermediate_filter
             };
             for _ in 0..budget {
-                let logits = self.model.language_logits(&state)?;
-                let context = self.model.binding.context();
+                let logits = model.language_logits(&state)?;
+                let context = model.binding.context();
                 let logits =
                     H::Sampling::apply_token_filter(&logits, filter, context).map_err(failure)?;
                 let token =
@@ -401,7 +493,7 @@ where
                     block.closed = true;
                     break;
                 }
-                state = self.model.forward_prompt(language, &[token], None, None)?;
+                state = model.forward_prompt(language, &[token], None, None)?;
                 block.tokens.push(token);
             }
             position += tokens.len() + block.tokens.len();
@@ -413,9 +505,14 @@ where
             roots.extend(H::retained_values(language));
         }
         roots.extend(hidden.as_ref());
-        B::submit(self.model.binding.context(), roots)
+        B::submit(model.binding.context(), roots)
             .and_then(|completion| completion.wait())
             .map_err(failure)?;
+        if let Some(fork) = &self.fork {
+            let estimate =
+                (fork.estimate_model)(&encoder, language.as_ref().unwrap_or(&self.state.language))?;
+            fork.model.admit(estimate.retained_bytes)?;
+        }
         self.state.encoder = encoder;
         if let Some(language) = language {
             self.state.language = language;
