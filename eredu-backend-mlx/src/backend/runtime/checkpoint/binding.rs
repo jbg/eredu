@@ -121,6 +121,20 @@ where
     M: Parameterized<crate::MlxTensor>,
     F: Fn(&str) -> bool,
 {
+    build_neutral_module_bindings_with_policy(module, store, recipes, BTreeSet::new(), exclude)
+}
+
+pub(crate) fn build_neutral_module_bindings_with_policy<M, F>(
+    module: &M,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
+    recipes: &mut BTreeMap<String, DerivedWeightRecipe>,
+    shared_source_keys: BTreeSet<String>,
+    exclude: F,
+) -> Result<Vec<WeightBinding>, ModuleBindingError>
+where
+    M: Parameterized<crate::MlxTensor>,
+    F: Fn(&str) -> bool,
+{
     let parameters = neutral_parameter_refs(module, false).flatten();
     let names = parameters.keys().cloned().collect::<BTreeSet<_>>();
     let selected = recipes
@@ -137,9 +151,18 @@ where
             (name, recipe)
         })
         .collect();
-    build_module_binding_plan_with_recipes_excluding(module, "", store, selected, exclude)?
-        .build_bindings(store)
-        .map_err(|error| ModuleBindingError::BindingPlan(error.to_string()))
+    eredu_runtime::build_module_binding_plan(
+        module,
+        "",
+        store,
+        selected,
+        shared_source_keys,
+        exclude,
+        mlx_parameter_binding_target,
+    )
+    .map_err(|error| ModuleBindingError::BindingPlan(error.to_string()))?
+    .build_bindings(store)
+    .map_err(|error| ModuleBindingError::BindingPlan(error.to_string()))
 }
 
 /// Resolves one exact replicated-text task partition to native module handles.

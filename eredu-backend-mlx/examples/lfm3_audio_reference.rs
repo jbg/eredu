@@ -43,6 +43,7 @@ use std::{
 #[derive(Parser)]
 struct Args {
     checkpoint: PathBuf,
+    /// Reference directory, or the pinned source manifest in GGUF mode.
     reference: PathBuf,
     output: PathBuf,
     #[arg(long, default_value = "cpu", value_parser = ["cpu", "gpu"])]
@@ -56,6 +57,12 @@ struct Args {
     /// Compare restored streamed prompts with finite resident inference.
     #[arg(long, conflicts_with = "live_asr")]
     ingress_replay: bool,
+    /// Released GGUF language weights for the ingress/replay case.
+    #[arg(long, requires_all = ["gguf_projector", "ingress_replay"])]
+    gguf_backbone: Option<PathBuf>,
+    /// Released GGUF speech input, depth and codec decoder weights.
+    #[arg(long, requires = "gguf_backbone")]
+    gguf_projector: Option<PathBuf>,
 }
 
 fn sha256(path: &Path) -> Result<String, Box<dyn Error>> {
@@ -104,6 +111,27 @@ fn bind<M: Parameterized<MlxTensor>>(
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
+    if let (Some(backbone), Some(projector)) = (&args.gguf_backbone, &args.gguf_projector) {
+        use eredu_architectures::realtime::{
+            prepare_realtime_model, PreparedRealtimeArtifact, RealtimeArtifactRequest,
+        };
+        let manifest: Value = serde_json::from_slice(&std::fs::read(&args.reference)?)?;
+        for (role, path) in [("backbone", backbone), ("projector", projector)] {
+            let digest = sha256(path)?;
+            if manifest["variants"]["Q4_K_M"][role]["publisher_sha256"] != digest {
+                return Err(
+                    format!("GGUF {role} hash differs from the pinned Q4_K_M release").into(),
+                );
+            }
+        }
+        let PreparedRealtimeArtifact::Lfm3Audio(artifact) = prepare_realtime_model(
+            &RealtimeArtifactRequest::audio_gguf(backbone, projector, &args.checkpoint),
+        )?
+        else {
+            return Err("expected an LFM3 Audio GGUF artifact".into());
+        };
+        return compare_ingress_replay(&args, *artifact, execution_context(&args.device));
+    }
     let reference_name = if args.live_asr {
         "live-reference.json"
     } else {
@@ -118,12 +146,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let model = PreparedAudio::open(&args.checkpoint, 2)?;
     let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-    let device = if args.device == "gpu" {
-        DeviceType::Gpu
-    } else {
-        DeviceType::Cpu
-    };
-    let native = ExecutionContext::new(Device::new(device, 0));
+    let native = execution_context(&args.device);
     if args.live_asr {
         return compare_live_asr(&args, &metadata, model, native);
     }
@@ -321,6 +344,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         }))?,
     )?;
     Ok(())
+}
+
+fn execution_context(device: &str) -> ExecutionContext {
+    let device = if device == "gpu" {
+        DeviceType::Gpu
+    } else {
+        DeviceType::Cpu
+    };
+    ExecutionContext::new(Device::new(device, 0))
 }
 
 #[derive(serde::Deserialize)]

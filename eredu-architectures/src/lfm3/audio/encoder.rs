@@ -230,6 +230,19 @@ impl Declaration {
         &self.layout
     }
 
+    pub(super) fn matches_gguf_execution(&self) -> bool {
+        use crate::lfm2::declarations::MixerParameters;
+        let window = AttentionPolicy::sliding(32).expect("valid published window");
+        self.context_length == 128_000
+            && self.final_norm.epsilon == 1e-5
+            && self.blocks.iter().all(|block| match &block.mixer {
+                MixerParameters::Attention(attention, policy) => {
+                    *policy == window && attention.rotary.base == 1_000_000.0
+                }
+                MixerParameters::Convolution(_) => true,
+            })
+    }
+
     #[cfg(feature = "audio")]
     pub(super) fn context_length(&self) -> usize {
         self.context_length as usize

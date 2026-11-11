@@ -200,6 +200,19 @@ impl DepthDeclaration {
         &self.schedule
     }
 
+    pub(super) fn matches_gguf_execution(&self) -> bool {
+        self.schedule == [4, 4, 4]
+            && self.final_norm.epsilon == 1e-5
+            && self.blocks.iter().all(|block| {
+                matches!(
+                    &block.mixer,
+                    super::super::declarations::MixerParameters::Attention(attention, AttentionPolicy::Full)
+                        if attention.rotary.base == 1_000_000.0
+                            && attention.rotary.algorithm == (eredu_nn::RotaryAlgorithm::ZeroTail { rotary_fraction: 1.0 })
+                )
+            })
+    }
+
     /// Vocabulary size including the speech end code.
     pub fn vocabulary(&self) -> i32 {
         self.vocabulary

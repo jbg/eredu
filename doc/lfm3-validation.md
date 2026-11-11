@@ -244,7 +244,15 @@ distributed audio execution remain outside this path.
 ## Resident Audio sessions
 
 `eredu::api::realtime::prepare_realtime_model` discovers `lfm3_audio` from
-the model assets and admits the specified SafeTensors file or directory.
+the model assets and admits the specified SafeTensors file or directory, or
+the explicit backbone/projector pair in `RealtimeArtifactRequest::audio_gguf`.
+GGUF preparation uses a local publisher asset directory with tokenizer,
+generation and processor metadata and `audio_tokenizer/config.json`.
+The local directory can omit both SafeTensors weight files. The embedded
+GGUF vocabulary, BPE merges, task templates and sampling settings determine
+the admitted pair's text policy alongside the publisher's EOS set.
+This preparation is exposed through the Rust realtime facade. The CLI WAV
+conversation command requires VoiceChat.
 `prepare_mlx_realtime` with `RealtimeLoadOptions::Lfm3Audio` selects the
 resident model and reports the logical F32 parameter bytes by component.
 The report excludes session state and temporary allocations. Load consumes
@@ -385,7 +393,8 @@ Add `--live-asr-pcm` to the native command to compare the PCM path.
 backbone and projector headers. The backbone retains tokenizer and template
 metadata. The projector contains the input encoder, depth decoder, feedback,
 and LiquidCodec decoder. A complete LiquidCodec encoder requires an additional
-source. Resident Audio execution uses the floating SafeTensors route.
+source. The resident Audio selector uses the same F32 binding mechanism for
+SafeTensors and GGUF pairs.
 
 The [pinned source manifest](../validation/fixtures/lfm3/audio-gguf-sources.json)
 records publisher payload hashes, downloaded header hashes, and per-type tensor
@@ -439,6 +448,28 @@ cargo run -p eredu-architectures --example inspect_lfm3_audio_gguf_headers -- \
   /private/tmp/lfm3-audio/config.json \
   /private/tmp/eredu-audio-gguf/mmproj-LFM3-Audio-2B-Q4_K_M.gguf \
   /private/tmp/lfm3-audio/audio_tokenizer/config.json
+```
+
+### Resident Q4_K_M Audio replay
+
+The native Audio runner accepts the released Q4_K_M pair with both publisher
+hashes checked. The same speech-only request runs from a finite mel prompt
+and from partitioned PCM with snapshots, restore and fork. This compares
+exact emitted codebooks and PCM between the two execution paths. It exercises
+the loaded speech input, backbone, depth, feedback and codec graph, with
+controlled budgets carried from prompt ingestion into the response. The F32
+CPU run matched all three speech frames and 5,760 PCM samples exactly, including
+the restored and forked prompt continuations. Independent GGUF backbone and depth score
+parity and resident execution on the other encodings remain unverified.
+Audio currently selects resident placement.
+
+```sh
+audio_dir=/private/tmp/eredu-audio-gguf
+cargo run -p eredu-backend-mlx --features audio --example lfm3_audio_reference -- \
+  /private/tmp/lfm3-audio validation/fixtures/lfm3/audio-gguf-sources.json \
+  "$audio_dir/ingress-cpu.json" --device cpu --ingress-replay \
+  --gguf-backbone "$audio_dir/LFM3-Audio-2B-Q4_K_M.gguf" \
+  --gguf-projector "$audio_dir/mmproj-LFM3-Audio-2B-Q4_K_M.gguf"
 ```
 
 ### Q4_K_M LiquidCodec PCM

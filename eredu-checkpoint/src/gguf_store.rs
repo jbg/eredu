@@ -250,7 +250,7 @@ impl GgufLeaseIdentity {
 pub enum GgufPhysicalSelection {
     /// Selection along one logical tensor axis.
     Axis(GgufTensorSelection),
-    /// Contiguous scalar span from an unquantized dense tensor.
+    /// Block-aligned contiguous span in the physical descriptor's scalar coordinates.
     DenseSpan(DenseTensorSpan),
 }
 

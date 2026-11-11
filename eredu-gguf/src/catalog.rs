@@ -124,13 +124,25 @@ impl CatalogTensor {
         reader: &mut Reader<R>,
         plan: Option<&TensorSelectionPlan>,
     ) -> Result<ConvertedTensor> {
+        self.read_descriptor(
+            reader,
+            plan.map_or(&self.descriptor, TensorSelectionPlan::selected_descriptor),
+            plan,
+        )
+    }
+
+    fn read_descriptor<R: Read + Seek>(
+        &self,
+        reader: &mut Reader<R>,
+        descriptor: &TensorDescriptor,
+        plan: Option<&TensorSelectionPlan>,
+    ) -> Result<ConvertedTensor> {
         if self.representation.is_none() {
             return match plan {
                 Some(plan) => reader.read_tensor_plan(plan),
-                None => reader.read_tensor(&self.descriptor),
+                None => reader.read_tensor(descriptor),
             };
         }
-        let descriptor = plan.map_or(&self.descriptor, TensorSelectionPlan::selected_descriptor);
         if self.is_decoded_f32() {
             let bytes = descriptor
                 .element_count()?
@@ -927,7 +939,7 @@ impl TensorMaterializer {
         })
     }
 
-    /// Materialize one bounded contiguous span from an unquantized dense tensor.
+    /// Materialize a bounded, block-aligned contiguous span in its selected representation.
     pub fn converted_dense_tensor_span(
         &mut self,
         name: &str,
@@ -936,12 +948,17 @@ impl TensorMaterializer {
         let (location, descriptor, _) = self.location_and_reader(name)?;
         let output_names = self.catalog_output_names(location);
         let plan = DenseTensorSpanPlan::new(&descriptor, selection.clone())?;
-        let converted = self
-            .reader
-            .as_mut()
-            .expect("requested shard reader opened above")
-            .1
-            .read_dense_tensor_span(&plan)
+        let tensor = &self.checkpoint.shards[location.shard_index].tensors[location.tensor_index];
+        let converted = tensor
+            .read_descriptor(
+                &mut self
+                    .reader
+                    .as_mut()
+                    .expect("requested shard reader opened above")
+                    .1,
+                plan.selected_descriptor(),
+                None,
+            )
             .map_err(|source| Error::Shard {
                 path: self.checkpoint.shards[location.shard_index].path.clone(),
                 source: Box::new(source),

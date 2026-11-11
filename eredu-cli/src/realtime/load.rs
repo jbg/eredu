@@ -150,6 +150,13 @@ impl Config {
         resolve(&mut self.base_assets, directory);
         match &mut self.source {
             Source::SafeTensors { path } | Source::Gguf { path } => resolve(path, directory),
+            Source::AudioGguf {
+                backbone,
+                projector,
+            } => {
+                resolve(backbone, directory);
+                resolve(projector, directory);
+            }
             Source::SplitGguf {
                 perception,
                 backbone,
@@ -225,6 +232,9 @@ impl Config {
                 "GGUF source is not a file: {}",
                 path.display()
             ),
+            Source::AudioGguf { .. } => {
+                anyhow::bail!("this WAV conversation command requires a VoiceChat artifact");
+            }
             Source::SplitGguf {
                 perception,
                 backbone,

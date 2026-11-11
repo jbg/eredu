@@ -1,11 +1,17 @@
 //! Physical admission for the released LFM3 Audio GGUF backbone and projector.
 
 use eredu_checkpoint::{
+    gguf_store::{open_prepared_gguf_source, GgufCatalog},
+    recipe::DerivedWeightRecipe,
     schema::{CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint, GgufTypeConstraint},
+    store::TensorSelection,
     validation::{resolve_gguf_plan, CheckpointValidation, ResolvedCheckpointPlan},
 };
 use eredu_gguf::{Checkpoint, GgmlType, Limits, MetadataValue, QuantizedTensorRepresentation};
-use std::path::Path;
+use eredu_nn::DeclareLogicalParameters;
+use std::{collections::BTreeMap, path::Path, sync::Arc};
+
+use super::{AudioTokens, BindingSource, TextAssets};
 
 mod speech;
 pub use speech::{AudioGgufSpeechBindings, AudioGgufSpeechSources};
@@ -119,17 +125,7 @@ impl AdmittedAudioGguf {
         let projector_encoding = AudioGgufEncoding::from_checkpoint(&projector)?;
         let declaration = super::super::Declaration::new(args)
             .map_err(|error| AudioGgufError::Declaration(error.to_string()))?;
-        let mut plan = super::super::checkpoint::gguf_plan(&declaration)
-            .map_err(AudioGgufError::Declaration)?;
-        plan.catalog_policy = CatalogPolicy::strict();
-        for tensor in &mut plan.common_tensors {
-            tensor.encoding =
-                if tensor.shape.len() == 1 || tensor.key.ends_with("shortconv.conv.weight") {
-                    GgufTypeConstraint::Exact(GgmlType::F32)
-                } else {
-                    backbone_encoding.matrix(tensor.key == "token_embd.weight")
-                };
-        }
+        let plan = backbone_plan(&declaration, backbone_encoding)?;
         let backbone_layout =
             resolve_gguf_plan(&backbone, &plan).map_err(AudioGgufError::Schema)?;
         let projector_layout = resolve_gguf_plan(&projector, &projector_plan(projector_encoding)?)
@@ -169,6 +165,231 @@ impl AdmittedAudioGguf {
     pub fn encodings(&self) -> (AudioGgufEncoding, AudioGgufEncoding) {
         (self.backbone_encoding, self.projector_encoding)
     }
+
+    pub(super) fn chat_template(&self) -> Result<&str, AudioGgufError> {
+        self.backbone
+            .metadata()
+            .get("tokenizer.chat_template")
+            .and_then(MetadataValue::as_str)
+            .ok_or(AudioGgufError::Metadata("tokenizer.chat_template"))
+    }
+
+    pub(super) fn bind_text_assets(
+        &self,
+        assets: &mut TextAssets,
+        tokens: AudioTokens,
+    ) -> Result<(), AudioGgufError> {
+        let metadata = self.backbone.metadata();
+        let vocabulary = metadata
+            .get("tokenizer.ggml.tokens")
+            .and_then(MetadataValue::as_strings)
+            .ok_or(AudioGgufError::Metadata("tokenizer.ggml.tokens"))?;
+        let tokenizer = eredu_text::tokenizer::Tokenizer::from_bytes(&assets.tokenizer)
+            .map_err(|error| AudioGgufError::Declaration(error.to_string()))?;
+        let size = tokenizer.get_vocab_size(true);
+        let token_types = match metadata.get("tokenizer.ggml.token_type") {
+            Some(MetadataValue::Array(eredu_gguf::MetadataArray::Int32(types)))
+                if types.len() == vocabulary.len() =>
+            {
+                types
+            }
+            _ => return Err(AudioGgufError::Metadata("tokenizer.ggml.token_type")),
+        };
+        if size > vocabulary.len()
+            || vocabulary
+                .iter()
+                .zip(token_types)
+                .enumerate()
+                .any(|(id, (token, kind))| {
+                    if id < size {
+                        tokenizer.token_to_id(token) != Some(id as u32)
+                    } else {
+                        *kind != 5 || tokenizer.token_to_id(token).is_some()
+                    }
+                })
+        {
+            return Err(AudioGgufError::Metadata(
+                "sidecar vocabulary differs from tokenizer.ggml.tokens",
+            ));
+        }
+        let tokenizer_json: serde_json::Value = serde_json::from_slice(&assets.tokenizer)
+            .map_err(|error| AudioGgufError::Declaration(error.to_string()))?;
+        let merges = metadata
+            .get("tokenizer.ggml.merges")
+            .and_then(MetadataValue::as_strings)
+            .ok_or(AudioGgufError::Metadata("tokenizer.ggml.merges"))?;
+        let sidecar_merges = tokenizer_json["model"]["merges"]
+            .as_array()
+            .ok_or(AudioGgufError::Metadata("sidecar tokenizer merges"))?;
+        if merges.len() != sidecar_merges.len()
+            || merges.iter().zip(sidecar_merges).any(|(rule, sidecar)| {
+                match (rule.split_once(' '), sidecar.as_array().map(Vec::as_slice)) {
+                    (Some((left, right)), Some([a, b])) => {
+                        a.as_str() != Some(left) || b.as_str() != Some(right)
+                    }
+                    _ => sidecar.as_str() != Some(rule),
+                }
+            })
+        {
+            return Err(AudioGgufError::Metadata(
+                "sidecar merges differ from tokenizer.ggml.merges",
+            ));
+        }
+        for (id, token) in [
+            (tokens.input, "<|audio|>"),
+            (tokens.output, "<|audio_out|>"),
+            (tokens.audio_start, "<|audio_start|>"),
+            (tokens.text_end, "<|text_end|>"),
+            (tokens.mixed_start, "<|mixed_start|>"),
+        ] {
+            if vocabulary[id as usize] != token {
+                return Err(AudioGgufError::Metadata("Audio protocol token identity"));
+            }
+        }
+        for (name, key) in [
+            ("asr", "tokenizer.chat_template.asr"),
+            ("tts", "tokenizer.chat_template.tts"),
+        ] {
+            let template = metadata
+                .get(key)
+                .and_then(MetadataValue::as_str)
+                .ok_or(AudioGgufError::Metadata(key))?;
+            assets
+                .named_chat_templates
+                .insert(name.into(), template.into());
+        }
+        let generation = assets
+            .generation
+            .as_object_mut()
+            .ok_or(AudioGgufError::Metadata("sidecar generation config"))?;
+        let eos = metadata
+            .get("tokenizer.ggml.eos_token_id")
+            .and_then(MetadataValue::as_i64)
+            .ok_or(AudioGgufError::Metadata("tokenizer.ggml.eos_token_id"))?;
+        let contains_eos = generation.get("eos_token_id").is_some_and(|value| {
+            value.as_i64() == Some(eos)
+                || value
+                    .as_array()
+                    .is_some_and(|ids| ids.iter().any(|id| id.as_i64() == Some(eos)))
+        });
+        if !contains_eos {
+            return Err(AudioGgufError::Metadata(
+                "sidecar EOS differs from tokenizer.ggml.eos_token_id",
+            ));
+        }
+        let projector = self.projector.metadata();
+        for (source, key, target) in [
+            (metadata, "general.sampling.temp", "temperature"),
+            (
+                metadata,
+                "general.sampling.penalty_repeat",
+                "repetition_penalty",
+            ),
+            (
+                projector,
+                "clip.gen.audio.sampling.temp",
+                "audio_temperature",
+            ),
+            (
+                projector,
+                "clip.gen.audio.sampling.penalty_repeat",
+                "audio_repetition_penalty",
+            ),
+        ] {
+            let value = source
+                .get(key)
+                .and_then(MetadataValue::as_f32)
+                .filter(|v| v.is_finite())
+                .ok_or(AudioGgufError::Metadata(key))?;
+            generation.insert(target.into(), serde_json::json!(value));
+        }
+        for (source, key, target) in [
+            (metadata, "general.sampling.top_k", "top_k"),
+            (projector, "clip.gen.audio.sampling.top_k", "audio_top_k"),
+            (
+                projector,
+                "clip.gen.audio.sampling.penalty_last_n",
+                "audio_repetition_window",
+            ),
+        ] {
+            let value = source
+                .get(key)
+                .and_then(MetadataValue::as_i64)
+                .filter(|v| (0..=i64::from(i32::MAX)).contains(v))
+                .ok_or(AudioGgufError::Metadata(key))?;
+            generation.insert(target.into(), serde_json::json!(value));
+        }
+        generation.insert(
+            "do_sample".into(),
+            serde_json::json!(generation["temperature"].as_f64().is_some_and(|v| v > 0.0)),
+        );
+        Ok(())
+    }
+
+    pub(super) fn retain_backbone(
+        self,
+        max_cached_readers: usize,
+    ) -> Result<(Arc<super::super::Declaration>, BindingSource), AudioGgufError> {
+        let plan = backbone_plan(&self.declaration, self.backbone_encoding)?;
+        let mapping = self
+            .backbone
+            .translated_outputs(super::super::translate_gguf_weight_name)?;
+        let catalog =
+            GgufCatalog::from_resolved_checkpoint(&self.backbone, &self.backbone_layout, &mapping)?;
+        let mut recipes = BTreeMap::new();
+        for parameter in self
+            .declaration
+            .logical_parameters()
+            .map_err(|e| AudioGgufError::Declaration(e.to_string()))?
+        {
+            let key = parameter.parameter.id.as_str();
+            let source = DerivedWeightRecipe::source(key, TensorSelection::Full);
+            let recipe = if key.ends_with(".conv.conv.weight") {
+                DerivedWeightRecipe::Reshape {
+                    input: Box::new(source),
+                    shape: parameter.shape.clone(),
+                }
+            } else {
+                source
+            };
+            let inferred = recipe
+                .infer(&catalog)
+                .map_err(|e| AudioGgufError::Declaration(e.to_string()))?;
+            if inferred.shape != parameter.shape {
+                return Err(AudioGgufError::Declaration(format!(
+                    "{key}: projected shape {:?}, expected {:?}",
+                    inferred.shape, parameter.shape,
+                )));
+            }
+            recipes.insert(key.to_owned(), recipe);
+        }
+        let source = Arc::new(open_prepared_gguf_source(
+            self.backbone,
+            &plan,
+            &mapping,
+            max_cached_readers,
+        )?);
+        let binding = BindingSource::from_recipes(source, "LFM3 Audio GGUF backbone", recipes)?;
+        Ok((Arc::new(self.declaration), binding))
+    }
+}
+
+fn backbone_plan(
+    declaration: &super::super::Declaration,
+    encoding: AudioGgufEncoding,
+) -> Result<GgufCheckpointPlan, AudioGgufError> {
+    let mut plan =
+        super::super::checkpoint::gguf_plan(declaration).map_err(AudioGgufError::Declaration)?;
+    plan.catalog_policy = CatalogPolicy::strict();
+    for tensor in &mut plan.common_tensors {
+        tensor.encoding =
+            if tensor.shape.len() == 1 || tensor.key.ends_with("shortconv.conv.weight") {
+                GgufTypeConstraint::Exact(GgmlType::F32)
+            } else {
+                encoding.matrix(tensor.key == "token_embd.weight")
+            };
+    }
+    Ok(plan)
 }
 
 fn backbone_args(checkpoint: &Checkpoint) -> Result<super::super::ModelArgs, AudioGgufError> {

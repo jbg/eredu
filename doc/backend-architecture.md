@@ -16500,9 +16500,9 @@ feedback aliases into their canonical destinations before materialization.
 The tokenizer, chat template, generation defaults and processor policy are
 retained alongside the component declarations.
 
-The shared realtime loader dispatches `lfm3_audio` to this preparation. It
-retains the selected SafeTensors payload independently of the model asset
-directory. `PreparedResidentAudio` selects F32 binding recipes and validates
+The shared realtime loader dispatches `lfm3_audio` to SafeTensors or explicit
+GGUF backbone/projector preparation. It retains the selected payloads
+independently of the model asset directory. `PreparedResidentAudio` selects F32 binding recipes and validates
 the sampling defaults without creating native tensors. Its parameter report
 counts the selected language, speech encoder, depth and codec decoder bindings.
 The codec encoder is available through the separate full codec composition.
@@ -16513,15 +16513,25 @@ Callers prepare each prompt separately from model loading.
 pair. The backbone uses the shared LFM3 declaration and checks its rotary
 companion when opened from files. The projector schema covers the released
 input encoder, depth decoder, feedback and LiquidCodec decoder layouts. Each
-container supplies its own encoding metadata. Admission retains the original
-container metadata and does not select an Audio execution graph.
+container supplies its own encoding metadata. Resident preparation projects
+the backbone onto the shared LFM3 declaration, including reshaping GGUF's
+squeezed convolution kernels. The exact backbone and projector stores
+remain retained for ordinary weight binding. Tokenizer vocabulary and BPE
+merges are checked against the embedded tables. Default, ASR and TTS
+templates and sampling settings come from the admitted GGUF metadata.
 
 The Audio GGUF speech binding plan projects the admitted projector onto the
 existing input encoder, projector, depth decoder and feedback declarations.
 It checks canonical shapes and complete scope coverage before payload access.
-The two retained source views share the original GGUF container and restrict
+The retained source views share the original GGUF projector and restrict
 reads to their own physical keys. The twelve tied codebook tables and their
-normalizers bind through contiguous selections of the packed tensors.
+normalizers bind through contiguous selections of the packed tensors. The
+architecture declares those physical keys as shared across their logical
+destinations and the native visitor forwards that declaration to the neutral
+binding plan.
+The GGUF reader applies the selected tensor representation to contiguous reads
+as well as full and axis-selected reads. A decoded F32 slice reads only its
+aligned encoded blocks before conversion.
 
 The portable LiquidCodec crate owns the decoder's GGUF projection. Its binding
 checks learned parameter shapes and verifies the exported scalar code table

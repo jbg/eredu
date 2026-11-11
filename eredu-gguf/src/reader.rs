@@ -65,9 +65,8 @@ pub struct EncodedSpan {
 
 /// A non-empty row-major scalar span exposed with a new logical shape.
 ///
-/// This selection is intentionally distinct from [`TensorSelection`]: it is
-/// legal only for unquantized F32, F16, and BF16 tensors. Packed GGUF blocks
-/// therefore cannot enter a dequantize/requantize path accidentally.
+/// A span uses the physical descriptor's scalar coordinates. Quantized spans
+/// must align their offset, extent and fastest dimension to GGML blocks.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DenseTensorSpan {
     offset_elements: u64,

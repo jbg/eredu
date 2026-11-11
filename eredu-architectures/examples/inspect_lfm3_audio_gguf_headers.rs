@@ -7,7 +7,8 @@ use eredu_checkpoint::{
 };
 use eredu_codec::liquid::{Config as CodecConfig, Declaration as CodecDeclaration};
 use eredu_gguf::{
-    Checkpoint, CheckpointHeader, ConvertedTensor, Limits, QuantizedTensorRepresentation,
+    Checkpoint, CheckpointHeader, ConvertedTensor, DenseDtype, Limits,
+    QuantizedTensorRepresentation,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -189,14 +190,15 @@ fn verify_projector(
     let proof = lease.bounded_read_proof();
     assert!(proof.physically_bounded && proof.offset_bytes != 0);
     assert_eq!(lease.output_shape(), [2017, 1024]);
-    let ConvertedTensor::IQuant(encoded) = lease.materialize_portable()?.into_converted() else {
-        return Err("expected selected GGML blocks".into());
+    let ConvertedTensor::Dense(decoded) = lease.materialize_portable()?.into_converted() else {
+        return Err("expected the bounded GGML selection decoded to F32".into());
     };
-    assert_eq!(encoded.shape, [2017, 1024]);
-    assert_eq!(encoded.data.len() as u64, proof.length_bytes);
-    let decoded = encoded.dequantize_f32()?;
-    assert_eq!(decoded.len(), 2017 * 1024);
-    assert!(decoded.iter().all(|value| value.is_finite()));
+    assert_eq!(decoded.shape, [2017, 1024]);
+    assert_eq!(decoded.dtype, DenseDtype::F32);
+    assert_eq!(decoded.data.len(), 2017 * 1024 * 4);
+    assert!(decoded.data.chunks_exact(4).all(|bytes| {
+        f32::from_ne_bytes(bytes.try_into().expect("one F32 sample")).is_finite()
+    }));
     println!(
         "Q4_K_M projector: decoded codebook 11 from {} encoded bytes",
         proof.length_bytes

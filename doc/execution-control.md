@@ -275,7 +275,8 @@ conformance case covers bounded residency and controlled/uninterrupted agreement
 [released-checkpoint evidence](lfm3-validation.md) records numerical coverage and
 the family tasks without an implementation.
 
-The resident LFM3 Audio session accepts a batch-one token prompt with finite
+The resident LFM3 Audio session accepts prepared SafeTensors or explicit GGUF
+backbone/projector sources. Both use the same driver for batch-one token prompts with finite
 mel features and replayed speech codes. Each advance settles one text decision
 or one depth pass. The shared realtime transaction publishes the resulting
 language and codec state, schedule, sampler histories and RNG together.
