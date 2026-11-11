@@ -444,6 +444,11 @@ where
         })
     }
 
+    #[cfg(feature = "audio")]
+    pub(super) fn inherit_snapshot_budget(&mut self, budget: Option<SnapshotBudget>) {
+        self.snapshot_budget = budget;
+    }
+
     /// Executes a text decision or one depth pass and publishes it on completion.
     pub fn advance(&mut self) -> Result<AudioAdvance, AudioSessionError> {
         if self.cancelled || self.phase() == AudioPhase::Finished {

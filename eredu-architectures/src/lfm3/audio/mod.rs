@@ -20,7 +20,7 @@ pub use realtime::{
 #[cfg(feature = "audio")]
 pub use resident::{
     AudioIngress, AudioIngressError, AudioIngressProgress, AudioIngressRequest,
-    AudioPcmTranscription, AudioPcmTranscriptionSnapshot,
+    AudioIngressSnapshot, AudioPcmTranscription, AudioPcmTranscriptionSnapshot,
 };
 pub use resident::{
     AudioRequest, AudioResidentParameterBytes, AudioTranscription, AudioTranscriptionBlock,

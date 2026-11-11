@@ -16551,6 +16551,11 @@ The input progress and candidate caches commit together after completion.
 Finalization passes the existing language state into the ordinary response
 driver. MLX supplies tensor binding and recovery scopes for these advances.
 
+Prompt ingress uses the shared isolated snapshot budget for the PCM window,
+encoder and language caches, retained readout, and input progress. The FFT
+plan, prompt policy, and unused response RNG stay with the session. Finishing
+ingress transfers the same budget to the response driver.
+
 The LiveASR owner reuses the streamed encoder, projector and prompt traversal.
 The architecture owns the retained-tokenizer prompt, block cadence, greedy
 text filters and closing rules. Restarting the language context preserves

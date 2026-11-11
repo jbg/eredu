@@ -24,7 +24,7 @@ use eredu_architectures::lfm3::audio::{
 #[cfg(feature = "audio")]
 use eredu_architectures::lfm3::audio::{
     AudioIngress, AudioIngressError, AudioIngressProgress, AudioIngressRequest,
-    AudioPcmTranscription, AudioPcmTranscriptionSnapshot,
+    AudioIngressSnapshot, AudioPcmTranscription, AudioPcmTranscriptionSnapshot,
 };
 use eredu_core::{
     execution_control::{SnapshotLimits, SnapshotUsage},
@@ -178,8 +178,32 @@ impl MlxAudioModel {
 #[cfg(feature = "audio")]
 pub struct MlxAudioIngress(AudioIngress<MlxNeuralBackend, Binding>);
 
+/// Saved continuation for one resident Audio prompt ingress.
+#[cfg(feature = "audio")]
+pub struct MlxAudioIngressSnapshot(AudioIngressSnapshot<MlxNeuralBackend, Binding>);
+
 #[cfg(feature = "audio")]
 impl MlxAudioIngress {
+    /// Configures the shared ingress and response snapshot limits.
+    pub fn enable_snapshots(&mut self, limits: SnapshotLimits) -> Result<(), AudioSnapshotError> {
+        self.0.enable_snapshots(limits)
+    }
+
+    /// Reports current retained storage and cumulative copying.
+    pub fn snapshot_usage(&self) -> Option<SnapshotUsage> {
+        self.0.snapshot_usage()
+    }
+
+    /// Saves the settled prompt continuation.
+    pub fn snapshot(&self) -> Result<MlxAudioIngressSnapshot, AudioSnapshotError> {
+        self.0.snapshot().map(MlxAudioIngressSnapshot)
+    }
+
+    /// Restores PCM carry and both model caches from this ingress.
+    pub fn restore(&mut self, saved: &MlxAudioIngressSnapshot) -> Result<(), AudioSnapshotError> {
+        self.0.restore(&saved.0)
+    }
+
     /// Current committed sample and audio-token positions.
     pub fn progress(&self) -> AudioIngressProgress {
         self.0.progress()

@@ -4,7 +4,10 @@
 mod ingress;
 mod transcription;
 #[cfg(feature = "audio")]
-pub use ingress::{AudioIngress, AudioIngressError, AudioIngressProgress, AudioIngressRequest};
+pub use ingress::{
+    AudioIngress, AudioIngressError, AudioIngressProgress, AudioIngressRequest,
+    AudioIngressSnapshot,
+};
 #[cfg(feature = "audio")]
 pub use transcription::{AudioPcmTranscription, AudioPcmTranscriptionSnapshot};
 pub use transcription::{
