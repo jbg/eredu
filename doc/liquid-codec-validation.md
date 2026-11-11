@@ -32,8 +32,10 @@ polynomial arithmetic. Analysis selects the neutral host-F32 FFT mechanism;
 on Metal this transfers windowed frames to the CPU and Cartesian results back
 to the device. These transfers and temporary host arrays are real execution
 costs. Synthesis uses the checkpoint's F32 window and native inverse FFT.
-Streaming overlap-add retains a 960-sample tail for sample and envelope sums,
-consumes the initial 480-sample trim once, and flushes the final 480 samples.
+Overlap-add sums four shifted 320-sample blocks per spectral frame for both
+the waveform and its normalization envelope. Streaming retains a 960-sample
+tail for both sums, consumes the initial 480-sample trim once, and flushes
+the final 480 samples.
 Empty intermediate chunks preserve neural state. Finite empty-code decoding
 returns empty audio. A synchronous streaming error invalidates the tokenizer's
 owned stream; native completion and transactional state publication belong to
@@ -63,7 +65,7 @@ require exact agreement. CPU and precise Metal acceptance results are retained
 in `validation/fixtures/lfm3/liquid-acceptance-results.json`. All criteria pass.
 The largest encoder latent errors are `5.007e-6` on CPU and `4.292e-6` on
 Metal. Maximum finite/streamed PCM errors are `5.208e-6`/`6.333e-6` on CPU and
-`5.186e-6`/`5.410e-6` on Metal.
+`5.215e-6`/`5.417e-6` on Metal.
 
 This evidence covers F32 execution of exact widened publisher weights, not native
 BF16 execution or an audio language-model task.
