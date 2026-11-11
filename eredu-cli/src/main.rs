@@ -2048,7 +2048,7 @@ fn main() -> Result<()> {
     #[cfg(feature = "realtime")]
     if matches.subcommand_name().is_some() {
         return match CliCommand::from_arg_matches(&matches)? {
-            CliCommand::Audio(args) => audio::run(args),
+            CliCommand::Audio(args) => audio::run(args, total_started),
         };
     }
     let automatic_overrides = AutomaticCliOverrides::from_matches(&matches);

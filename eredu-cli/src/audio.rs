@@ -5,6 +5,7 @@ pub(crate) mod pcm;
 use std::{
     io::{self, Write},
     path::PathBuf,
+    time::Instant,
 };
 
 use anyhow::{bail, ensure, Context, Result};
@@ -29,6 +30,9 @@ enum Task {
 
 #[derive(Debug, ClapArgs)]
 pub struct Args {
+    /// Report audio timing statistics to stderr.
+    #[arg(long, global = true)]
+    timing: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -99,18 +103,19 @@ struct TurnArgs {
     seed: u64,
 }
 
-pub fn run(args: Args) -> Result<()> {
-    let (task, args) = match args.command {
+pub fn run(args: Args, total_started: Instant) -> Result<()> {
+    let Args { timing, command } = args;
+    let (task, args) = match command {
         Command::Transcribe(args) => (Task::Transcribe, args),
         Command::Translate(args) => (Task::Translate, args),
         Command::Speak(args) => (Task::Speak, args),
         Command::Respond(args) => (Task::Respond, args),
-        Command::Realtime(args) => return crate::realtime::run(args),
+        Command::Realtime(args) => return crate::realtime::run(args, timing, total_started),
     };
-    run_turn(task, args)
+    run_turn(task, args, timing, total_started)
 }
 
-fn run_turn(task_kind: Task, args: TurnArgs) -> Result<()> {
+fn run_turn(task_kind: Task, args: TurnArgs, timing: bool, total_started: Instant) -> Result<()> {
     let task = match task_kind {
         Task::Transcribe => AudioTask::Transcribe,
         Task::Translate => AudioTask::Translate {
@@ -167,6 +172,7 @@ fn run_turn(task_kind: Task, args: TurnArgs) -> Result<()> {
         "device I/O requires the system-audio feature"
     );
 
+    let load_started = timing.then(Instant::now);
     let model = resolve_model(
         &args.model,
         args.revision.as_deref(),
@@ -220,9 +226,21 @@ fn run_turn(task_kind: Task, args: TurnArgs) -> Result<()> {
     let mut session = prepared
         .load(&weights, &execution)
         .map_err(anyhow::Error::from_boxed)?;
+    let load_elapsed = load_started.map(|start| start.elapsed());
+    if let Some(elapsed) = load_elapsed {
+        eprintln!("model loaded in {:.3} s", elapsed.as_secs_f64());
+    }
+    let task_started = timing.then(Instant::now);
+    let mut first_output = None;
+    let mut observe_output = |nonempty: bool| {
+        if nonempty && first_output.is_none() {
+            first_output = task_started.map(|start| start.elapsed());
+        }
+    };
     let mut stdout = io::stdout().lock();
     let mut publish_input = |samples: &[f32]| -> Result<()> {
         let text = session.push(samples).map_err(anyhow::Error::from_boxed)?;
+        observe_output(!text.is_empty());
         stdout.write_all(text.as_bytes())?;
         stdout.flush()?;
         Ok(())
@@ -270,6 +288,7 @@ fn run_turn(task_kind: Task, args: TurnArgs) -> Result<()> {
     while let Some(output) = session.next_output().map_err(anyhow::Error::from_boxed)? {
         match output {
             AudioTaskOutput::Text(text) => {
+                observe_output(!text.is_empty());
                 stdout.write_all(text.as_bytes())?;
                 stdout.flush()?;
             }
@@ -277,6 +296,7 @@ fn run_turn(task_kind: Task, args: TurnArgs) -> Result<()> {
                 if output_rate.is_none() {
                     bail!("selected text task emitted PCM");
                 }
+                observe_output(!samples.is_empty());
                 sink.write(&samples)?;
             }
         }
@@ -291,6 +311,17 @@ fn run_turn(task_kind: Task, args: TurnArgs) -> Result<()> {
     if output_rate.is_none() {
         writeln!(stdout)?;
     }
+    if let (Some(load), Some(task)) = (load_elapsed, task_started) {
+        let task_elapsed = task.elapsed();
+        let total = total_started.elapsed();
+        eprintln!("load_time: {:.3} s", load.as_secs_f64());
+        eprintln!("audio_task_time: {:.3} s", task_elapsed.as_secs_f64());
+        match first_output {
+            Some(elapsed) => eprintln!("time_to_first_output: {:.3} s", elapsed.as_secs_f64()),
+            None => eprintln!("time_to_first_output: n/a"),
+        }
+        eprintln!("total_execution_time: {:.3} s", total.as_secs_f64());
+    }
     Ok(())
 }
 
@@ -302,7 +333,7 @@ fn capture(
     mut publish: impl FnMut(&[f32]) -> Result<()>,
 ) -> Result<()> {
     use eredu_media::audio::{processing::NoiseSuppression, system::SystemAudioInput};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     let samples = (seconds * f64::from(rate)).round();
     ensure!(

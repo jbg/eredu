@@ -345,7 +345,7 @@ fn quantization(args: &Args) -> Result<SpeechQuantizationPolicy> {
     }
     Ok(policy)
 }
-pub fn run(args: Args) -> Result<()> {
+pub fn run(args: Args, timing: bool, total_started: Instant) -> Result<()> {
     if args.list_audio_devices {
         #[cfg(feature = "system-audio")]
         {
@@ -467,10 +467,8 @@ pub fn run(args: Args) -> Result<()> {
         args.common.cached_shards,
         sampling,
     )?;
-    eprintln!(
-        "loaded in {:.3} s on {device}",
-        started.elapsed().as_secs_f64()
-    );
+    let load_elapsed = started.elapsed();
+    eprintln!("loaded in {:.3} s on {device}", load_elapsed.as_secs_f64());
     let stop = Arc::new(AtomicUsize::new(0));
     #[cfg(feature = "system-audio")]
     {
@@ -538,13 +536,21 @@ pub fn run(args: Args) -> Result<()> {
             ""
         }
     );
+    let conversation_started = timing.then(Instant::now);
     let result = run::run_io(&mut session, &mut io, &mut events, options, scripts);
     let event_finish = events.flush();
     let finalize = io.finish(result.is_ok());
+    let conversation_elapsed = conversation_started.map(|start| start.elapsed());
+    let total_elapsed = total_started.elapsed();
     events.summary();
     result?;
     finalize?;
     event_finish?;
+    if let Some(elapsed) = conversation_elapsed {
+        eprintln!("load_time: {:.3} s", load_elapsed.as_secs_f64());
+        eprintln!("conversation_time: {:.3} s", elapsed.as_secs_f64());
+        eprintln!("total_execution_time: {:.3} s", total_elapsed.as_secs_f64());
+    }
     Ok(())
 }
 fn destination(path: &Path) -> Result<PathBuf> {

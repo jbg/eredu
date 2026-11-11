@@ -243,7 +243,7 @@ full-prompt fallbacks. See [formulas, coverage and calibration](../doc/generatio
 this command with resident MLX execution.
 
 ```sh
-eredu audio transcribe --model /models/audio --input speech.wav
+eredu audio transcribe --model /models/audio --input speech.wav --timing
 eredu audio translate --model /models/audio --input speech.wav --source-language English --language French
 eredu audio speak --model /models/audio --text "Hello there." --output speech.wav
 eredu audio respond --model /models/audio --input question.wav --output answer.wav
@@ -256,6 +256,13 @@ WAV with the current Audio model. Speech WAVs are mono 24 kHz. With
 `system-audio`, `--microphone-seconds` records a finite utterance and
 `--play` plays a speech response. `--input-device` and `--output-device`
 select devices. `--device cpu` or `--device gpu:0` selects model execution.
+
+Add `--timing` to any `eredu audio` subcommand for wall-clock timings on
+stderr. Turn-based commands report model load time, time to the first text
+fragment or PCM chunk, task time, and total execution time. Task time includes
+input capture or reading and output writing or playback. `realtime` reports
+load, conversation, and total execution times. Conversation time includes
+input pacing, the response tail, and output finalization.
 
 For a split GGUF, supply the backbone, projector, and publisher assets:
 
