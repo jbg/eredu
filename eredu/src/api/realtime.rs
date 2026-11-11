@@ -7,10 +7,11 @@
 //! selected native mechanisms.
 
 pub use eredu_architectures::lfm3::audio::{
-    ArtifactError as AudioArtifactError, AudioAdvance, AudioMode, AudioPhase, AudioRequest,
-    AudioResidentParameterBytes, AudioSession, AudioSessionError, AudioSnapshot,
-    AudioSnapshotError, AudioTranscription, AudioTranscriptionBlock, AudioTranscriptionError,
-    AudioTranscriptionSnapshot, LogMelFeatures, PreparedAudio, ResidentAudioError,
+    AdmittedAudioGguf, ArtifactError as AudioArtifactError, AudioAdvance, AudioGgufEncoding,
+    AudioGgufError, AudioMode, AudioPhase, AudioRequest, AudioResidentParameterBytes, AudioSession,
+    AudioSessionError, AudioSnapshot, AudioSnapshotError, AudioTranscription,
+    AudioTranscriptionBlock, AudioTranscriptionError, AudioTranscriptionSnapshot, LogMelFeatures,
+    PreparedAudio, ResidentAudioError,
 };
 #[cfg(feature = "audio")]
 pub use eredu_architectures::lfm3::audio::{

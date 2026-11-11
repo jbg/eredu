@@ -1,0 +1,130 @@
+{
+  "repository": "LiquidAI/LFM3-Audio-2B-GGUF",
+  "revision": "39670cb5c42e9c4bfe046519ba7ffbe47f9552ad",
+  "converter_revision": "7c2653acc749258dc62067da62d07024d971ccd2",
+  "variants": {
+    "BF16": {
+      "backbone": {
+        "file": "LFM3-Audio-2B-BF16.gguf",
+        "bytes": 3466624544,
+        "publisher_sha256": "80948b38aa7b9c86c8afdc74ad785d73ed6929f8912212b6679d06858eaf3a15",
+        "header_bytes": 8245536,
+        "header_sha256": "5c7620a7842693f7e86c41e6bcbfc58a8788ba2f28db69ffa2e941de4c33a077",
+        "tensor_types": {
+          "BF16": 154,
+          "F32": 133
+        }
+      },
+      "projector": {
+        "file": "mmproj-LFM3-Audio-2B-BF16.gguf",
+        "bytes": 570846400,
+        "publisher_sha256": "683b3648484cb5b0bf06185eac8be37b1a9bff03591360641248bd482119afc1",
+        "header_bytes": 22688,
+        "header_sha256": "850089c174a04fb86002420661ba0423fe11ca0e9ab5847e7566a358fbbd8349",
+        "tensor_types": {
+          "BF16": 180,
+          "F32": 139
+        }
+      }
+    },
+    "F16": {
+      "backbone": {
+        "file": "LFM3-Audio-2B-F16.gguf",
+        "bytes": 3466624544,
+        "publisher_sha256": "aaac1e611220b38fb73da44118480acafab0c1076acd25a99088f35960b6f47d",
+        "header_bytes": 8245536,
+        "header_sha256": "9a95f43d9295ed4e9bfd0ee88314d23227a8914d2312f8cb07312b28144aa83f",
+        "tensor_types": {
+          "F16": 154,
+          "F32": 133
+        }
+      },
+      "projector": {
+        "file": "mmproj-LFM3-Audio-2B-F16.gguf",
+        "bytes": 570846400,
+        "publisher_sha256": "bd0fce0670c96e405a753f996701dee6568bc6a1318a80091d74fb58f7510d79",
+        "header_bytes": 22688,
+        "header_sha256": "20f0b80164b01b005b834beb979eaab2df92cc9b253722c31b8b44679d3dd423",
+        "tensor_types": {
+          "F16": 180,
+          "F32": 139
+        }
+      }
+    },
+    "Q4_0": {
+      "backbone": {
+        "file": "LFM3-Audio-2B-Q4_0.gguf",
+        "bytes": 1049613856,
+        "publisher_sha256": "112e4acb79be79dcd8df5749495614817e51c064cd9ca576aead02b64b2b7584",
+        "header_bytes": 8245536,
+        "header_sha256": "53b823ae9b925c7babc862c7a24e6a7daad3d7638327adb30f74c3740c5243a3",
+        "tensor_types": {
+          "F32": 133,
+          "Q4_0": 153,
+          "Q6_K": 1
+        }
+      },
+      "projector": {
+        "file": "mmproj-LFM3-Audio-2B-Q4_0.gguf",
+        "bytes": 161393408,
+        "publisher_sha256": "467a1ee5512a3faba79bf04e789a838959cc48c72a802bf6d9cb951a77736cfc",
+        "header_bytes": 22688,
+        "header_sha256": "a3f70df9e75766c7d0731632d7b33e0fc4dfc7c7f9305bd3fe69d50a0dde20cd",
+        "tensor_types": {
+          "F32": 139,
+          "Q4_0": 180
+        }
+      }
+    },
+    "Q4_K_M": {
+      "backbone": {
+        "file": "LFM3-Audio-2B-Q4_K_M.gguf",
+        "bytes": 1099626016,
+        "publisher_sha256": "9a773289bd321ed879cd3a76545f6aca506e403851a45fb315420aee45625be2",
+        "header_bytes": 8245536,
+        "header_sha256": "c31742d4e4b7bd9b04ea6fe7187d5d40f6aaf67288f670c5e8b16a5219f52254",
+        "tensor_types": {
+          "F32": 133,
+          "Q4_K": 136,
+          "Q6_K": 18
+        }
+      },
+      "projector": {
+        "file": "mmproj-LFM3-Audio-2B-Q4_K_M.gguf",
+        "bytes": 172418048,
+        "publisher_sha256": "1a3a895160aad17c1f52117a6ee4cea8e68988651ea5a33c5b990539e8eae81d",
+        "header_bytes": 22688,
+        "header_sha256": "082be37c7c49de93795e6971a2440a5e62ec1b76c11cb672dc3752dcde26fdee",
+        "tensor_types": {
+          "F32": 139,
+          "Q4_K": 146,
+          "Q6_K": 34
+        }
+      }
+    },
+    "Q8_0": {
+      "backbone": {
+        "file": "LFM3-Audio-2B-Q8_0.gguf",
+        "bytes": 1846236704,
+        "publisher_sha256": "d4e36902ba8f0ee7b333596030a59d650f88ac76660b4d9ba5ff77c3c2258fc0",
+        "header_bytes": 8245536,
+        "header_sha256": "4bd1043c92a09cd650c287a769996e6a1a0f8654797aff2cd4891ea5520b242f",
+        "tensor_types": {
+          "F32": 133,
+          "Q8_0": 154
+        }
+      },
+      "projector": {
+        "file": "mmproj-LFM3-Audio-2B-Q8_0.gguf",
+        "bytes": 303811840,
+        "publisher_sha256": "2b6648b1fd48af16aa0877b0592b144d15070783673e038a379fdbc51d40e365",
+        "header_bytes": 22688,
+        "header_sha256": "8338ebad46919f7057ff215ff693eab4b65acb49365a8b78a6c712a68c0cc261",
+        "tensor_types": {
+          "F32": 139,
+          "Q8_0": 180
+        }
+      }
+    }
+  }
+}

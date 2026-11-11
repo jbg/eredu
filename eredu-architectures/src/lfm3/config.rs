@@ -448,7 +448,16 @@ pub fn model_args_from_gguf_catalog(
             .collect(),
     )
     .map_err(|error| invalid(format!("LFM3 GGUF {error}")))?;
-    let vocab_size = gguf_i32(metadata, &key("vocab_size"))?;
+    let vocab_key = key("vocab_size");
+    let vocab_size = if metadata.contains_key(&vocab_key) {
+        gguf_i32(metadata, &vocab_key)?
+    } else {
+        let tokens = metadata
+            .get("tokenizer.ggml.tokens")
+            .and_then(MetadataValue::as_strings)
+            .ok_or_else(|| missing("tokenizer.ggml.tokens"))?;
+        i32::try_from(tokens.len()).map_err(|_| invalid("LFM3 GGUF vocabulary is too large"))?
+    };
     let args = ModelArgs {
         model_type: "lfm3".into(),
         vocab_size,

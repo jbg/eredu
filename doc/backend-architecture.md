@@ -16508,6 +16508,13 @@ counts the selected language, encoder, depth and codec bindings. MLX consumes
 this selection with the supplied weight and execution contexts. Callers
 prepare each prompt separately from model loading.
 
+`AdmittedAudioGguf` validates an explicit LFM3 Audio backbone and projector
+pair. The backbone uses the shared LFM3 declaration and checks its rotary
+companion when opened from files. The projector schema covers the released
+input encoder, depth decoder, feedback and LiquidCodec decoder layouts. Each
+container supplies its own encoding metadata. Admission retains the original
+container metadata and does not select an Audio execution graph.
+
 `AudioPrompt` pairs token IDs with exact speech input and output row counts.
 The shared language traversal replaces the placeholder spans at the execution
 group's embedding boundary, preserving the causal cache positions. The readout
