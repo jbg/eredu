@@ -12,7 +12,6 @@ use eredu_checkpoint::{
     StoredDtype,
 };
 use eredu_gguf::{ConvertedTensor, DenseDtype};
-use eredu_nn::DeclareLogicalParameters;
 use std::{collections::BTreeMap, sync::Arc};
 
 const CODE_TABLE: &str = "a.gen.wav.quant.first.codebook.weight";
@@ -50,14 +49,8 @@ impl GgufDecoderBindings {
             return Err(invalid("invalid LiquidCodec GGUF scalar code table layout"));
         }
         let mut recipes = BTreeMap::new();
-        for parameter in declaration.logical_parameters()? {
+        for parameter in declaration.decoder_parameters()? {
             let key = parameter.parameter.id.as_str();
-            if !key.starts_with("decoder.")
-                && !key.starts_with("from_quantizer.")
-                && !key.starts_with("quantizer.project_out.")
-            {
-                continue;
-            }
             let recipe = decoder_recipe(key, &parameter.shape)
                 .ok_or_else(|| invalid(format!("no LiquidCodec GGUF projection for {key}")))?;
             if key != WINDOW {

@@ -431,8 +431,7 @@ The released Q4_K_M payload also supplies the complete 8,064-value F32 scalar
 code table for exact comparison against the codec's mixed-radix lookup. The
 retained decoder scope includes 1,280 generated Hann samples using the
 [pinned llama.cpp window construction](https://github.com/ggml-org/llama.cpp/blob/7c2653acc749258dc62067da62d07024d971ccd2/tools/mtmd/mtmd-audio.cpp#L27).
-This runner covers source admission and binding. End-to-end GGUF Audio
-execution and PCM parity remain unverified.
+This runner covers source admission and binding.
 
 ```sh
 cargo run -p eredu-architectures --example inspect_lfm3_audio_gguf_headers -- \
@@ -440,4 +439,52 @@ cargo run -p eredu-architectures --example inspect_lfm3_audio_gguf_headers -- \
   /private/tmp/lfm3-audio/config.json \
   /private/tmp/eredu-audio-gguf/mmproj-LFM3-Audio-2B-Q4_K_M.gguf \
   /private/tmp/lfm3-audio/audio_tokenizer/config.json
+```
+
+### Q4_K_M LiquidCodec PCM
+
+The decoder-only reference supplies ten deterministic twelve-codebook frames
+in chunks of 1, 3 and 6 frames, followed by an empty final flush. This crosses
+the 30-position decoder window and compares all 19,200 output samples from the
+same released Q4_K_M projector. Eredu widens its GGUF weights for F32 CPU
+execution. The pinned llama.cpp revision is
+`7c2653acc749258dc62067da62d07024d971ccd2`.
+
+| llama.cpp execution | Maximum absolute PCM error | Relative L2 | Result |
+| --- | ---: | ---: | --- |
+| Metal | 0.02080601 | 0.02159048 | Pass |
+| CPU | 0.16601064 | 0.16216959 | Outside tolerance |
+
+The tolerance is 0.05 maximum absolute error and 0.08 relative L2. Both runs
+agree on the per-chunk sample counts `[1440, 5760, 11520, 480]`. The llama.cpp
+CPU quantized matrix path also quantizes activations for its block dot products.
+This comparison covers standalone PCM synthesis. It does not exercise GGUF
+backbone, encoder, depth sampling or speech feedback execution.
+
+Build the pinned llama.cpp checkout with Metal and the `mtmd` target enabled.
+The text GGUF used by the C++ runner is the pinned Q4_K_M artifact from
+[same-artifact text acceptance](#same-artifact-gguf-evidence), loaded in
+vocabulary-only mode to initialize the projector interface. The Audio backbone
+header is used by Eredu to validate the projector pairing.
+
+```sh
+llama_dir=/private/tmp/eredu-llama-audio-reference
+audio_dir=/private/tmp/eredu-audio-gguf
+cmake -S "$llama_dir" -B "$llama_dir/build-metal" -DGGML_METAL=ON \
+  -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TOOLS=ON \
+  -DLLAMA_BUILD_SERVER=OFF -DLLAMA_CURL=OFF -DCMAKE_BUILD_TYPE=Release
+cmake --build "$llama_dir/build-metal" --target mtmd -j 8
+c++ -std=c++17 -O2 -I "$llama_dir/include" -I "$llama_dir/ggml/include" \
+  -I "$llama_dir/tools/mtmd" validation/lfm3_liquid_gguf_reference.cpp \
+  -L "$llama_dir/build-metal/bin" -Wl,-rpath,"$llama_dir/build-metal/bin" \
+  -lmtmd -lllama -o "$llama_dir/liquid-reference"
+"$llama_dir/liquid-reference" /private/tmp/eredu-lfm3-gguf/LFM3-1.7B-Q4_K_M.gguf \
+  "$audio_dir/mmproj-LFM3-Audio-2B-Q4_K_M.gguf" "$llama_dir/codec.f32" --metal
+cargo run -p eredu-backend-mlx --no-default-features \
+  --example lfm3_liquid_gguf_reference -- \
+  validation/fixtures/lfm3/audio-gguf-sources.json \
+  "$audio_dir/LFM3-Audio-2B-Q4_K_M.gguf.header" \
+  "$audio_dir/mmproj-LFM3-Audio-2B-Q4_K_M.gguf" \
+  /private/tmp/lfm3-audio/config.json /private/tmp/lfm3-audio/audio_tokenizer/config.json \
+  "$llama_dir/codec.f32"
 ```

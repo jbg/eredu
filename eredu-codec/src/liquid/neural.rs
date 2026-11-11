@@ -1,5 +1,5 @@
 //! LiquidCodec neural equations, retained source slots and caller-owned state.
-use super::{Analysis, Config, Quantizer, QuantizerSpec, Synthesis};
+use super::{Analysis, Config, QuantizerSpec, ScalarDecoder, ScalarEncoder, Synthesis};
 use crate::{spectral::OverlapAddStream, streaming::StreamPhase, Error};
 use eredu_core::{
     cache::{LayerCachePolicy, StateTensorRole},
@@ -337,6 +337,20 @@ impl Declaration {
             }
         }
         Ok(p)
+    }
+
+    /// Canonical learned weights and synthesis buffer required for decode.
+    pub fn decoder_parameters(&self) -> Result<Vec<LogicalParameterDeclaration<'_>>, Error> {
+        let mut parameters = Vec::new();
+        if let Some(output) = &self.quantizer.output {
+            parameters.extend(output.logical_parameters()?);
+        }
+        parameters.extend(self.unit_parameters(Unit::DecoderInput)?);
+        for layer in 0..LAYERS {
+            parameters.extend(self.unit_parameters(Unit::DecoderBlock(layer))?);
+        }
+        parameters.extend(self.unit_parameters(Unit::DecoderOutput)?);
+        Ok(parameters)
     }
     /// Exact official floating SafeTensors schema, including the F32 synthesis buffer.
     pub fn safetensors_plan(
@@ -736,18 +750,30 @@ impl<S, T: Tensor> DecoderState<S, T> {
 pub struct NeuralCodec<B: NeuralBackend> {
     frontend: Vec<Conv<B::Tensor>>,
     encoder: Vec<BackboneBlock<B>>,
-    decoder: Vec<BackboneBlock<B>>,
     encoder_norm: B::Normalization,
-    decoder_norm: B::Normalization,
     to_quantizer: B::Linear,
-    from_quantizer: B::Linear,
-    quantizer: Quantizer<B>,
-    polar: B::Linear,
-    window: Parameter<B::Tensor>,
+    quantizer: ScalarEncoder<B>,
+    decoder: NeuralDecoder<B>,
     #[parameter(skip)]
     declaration: Declaration,
     #[parameter(skip)]
     analysis: Analysis<B::Tensor>,
+}
+
+/// Resident LiquidCodec speech synthesis with only the decoder parameters.
+#[derive(Debug, Clone, Parameterized)]
+#[parameterized(tensor = "B::Tensor")]
+pub struct NeuralDecoder<B: NeuralBackend> {
+    decoder: Vec<BackboneBlock<B>>,
+    decoder_norm: B::Normalization,
+    from_quantizer: B::Linear,
+    quantizer: ScalarDecoder<B>,
+    polar: B::Linear,
+    window: Parameter<B::Tensor>,
+    #[parameter(skip)]
+    config: Config,
+    #[parameter(skip)]
+    state_layout: StateLayout,
     #[parameter(skip)]
     synthesis: Synthesis<B>,
 }
@@ -889,61 +915,15 @@ impl<B: NeuralBackend> NeuralCodec<B> {
                 .cloned()
                 .map(|s| BackboneBlock::from_spec(s, None, ctx))
                 .collect::<Result<_, _>>()?,
-            decoder: d
-                .decoder
-                .iter()
-                .cloned()
-                .map(|s| BackboneBlock::from_spec(s, Some(d.config.decoder_window), ctx))
-                .collect::<Result<_, _>>()?,
             encoder_norm: B::normalization(d.encoder_norm.clone(), ctx)?,
-            decoder_norm: B::normalization(d.decoder_norm.clone(), ctx)?,
             to_quantizer: B::linear(d.to_quantizer.clone(), ctx)?,
-            from_quantizer: B::linear(d.from_quantizer.clone(), ctx)?,
-            quantizer: Quantizer::new(&d.quantizer, ctx)?,
-            polar: B::linear(d.polar.clone(), ctx)?,
-            window: Parameter::unloaded(d.window.clone(), &[d.config.stft_n_fft], ctx)?,
+            quantizer: ScalarEncoder::new(&d.quantizer, ctx)?,
             analysis: Analysis::new(&d.config, ctx)?,
-            synthesis: Synthesis::new(&d.config, ctx)?,
+            decoder: NeuralDecoder::new(d, ctx)?,
             declaration: d.clone(),
         })
     }
-    fn validate_state<S>(
-        &self,
-        state: &mut S,
-        decoder: bool,
-        tokens: i32,
-        fresh: bool,
-    ) -> Result<(), Error>
-    where
-        S: LayerRuntimeState<B>,
-        S::LayerState: RuntimeStateComponents<B>,
-    {
-        let expected = if decoder {
-            &self.declaration.decoder_state
-        } else {
-            &self.declaration.encoder_state
-        };
-        if state.optional_layout() != Some(expected) {
-            return Err(invalid(
-                "LiquidCodec state belongs to a different backbone layout",
-            ));
-        }
-        let mut frontier = None;
-        for i in 0..LAYERS {
-            let position = state.layer(i)?.position();
-            if position < 0
-                || frontier.is_some_and(|n| n != position)
-                || (fresh && position != 0)
-                || position.checked_add(tokens).is_none_or(|n| n > CONTEXT)
-            {
-                return Err(invalid(
-                    "LiquidCodec state frontier is inconsistent, nonempty or exceeds context",
-                ));
-            }
-            frontier = Some(position);
-        }
-        Ok(())
-    }
+
     /// Computes trained encoder latents from finite PCM using an empty encoder state.
     pub fn encode_latents<S>(
         &mut self,
@@ -966,7 +946,7 @@ impl<B: NeuralBackend> NeuralCodec<B> {
             .checked_add(frame - 1)
             .ok_or_else(|| invalid("LiquidCodec padded waveform exceeds I32"))?
             / frame;
-        self.validate_state(state, false, frames, true)?;
+        validate_state(state, self.declaration.encoder_state_layout(), frames, true)?;
         let f = self.analysis.features(pcm, ctx)?;
         let h = B::silu(self.frontend[0].forward(&f, ctx)?, ctx)?;
         let n = h.dim(2);
@@ -1000,6 +980,111 @@ impl<B: NeuralBackend> NeuralCodec<B> {
         let latents = self.encode_latents(pcm, state, ctx)?;
         self.quantizer.encode(&latents, ctx)
     }
+    /// Decodes complete codebooks with a fresh decoder state and symmetric endpoints.
+    pub fn decode<S>(
+        &mut self,
+        codes: &B::Tensor,
+        state: &mut S,
+        ctx: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+    {
+        self.decoder.decode(codes, state, ctx)
+    }
+
+    /// Pairs a fresh caller-realized neural state with bounded spectral carry.
+    pub fn decoder_state<S>(
+        &self,
+        neural: S,
+        batch: i32,
+    ) -> Result<DecoderState<S, B::Tensor>, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: RuntimeStateComponents<B>,
+    {
+        self.decoder.decoder_state(neural, batch)
+    }
+
+    /// Advances synthesis with caller-owned state. Empty input can flush once.
+    pub fn decode_chunk<S>(
+        &mut self,
+        codes: Option<&B::Tensor>,
+        state: &mut DecoderState<S, B::Tensor>,
+        finalize: bool,
+        ctx: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+    {
+        self.decoder.decode_chunk(codes, state, finalize, ctx)
+    }
+}
+
+fn validate_state<B, S>(
+    state: &mut S,
+    expected: &StateLayout,
+    tokens: i32,
+    fresh: bool,
+) -> Result<(), Error>
+where
+    B: NeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: RuntimeStateComponents<B>,
+{
+    if state.optional_layout() != Some(expected) {
+        return Err(invalid(
+            "LiquidCodec state belongs to a different backbone layout",
+        ));
+    }
+    let mut frontier = None;
+    for i in 0..LAYERS {
+        let position = state.layer(i)?.position();
+        if position < 0
+            || frontier.is_some_and(|n| n != position)
+            || (fresh && position != 0)
+            || position.checked_add(tokens).is_none_or(|n| n > CONTEXT)
+        {
+            return Err(invalid(
+                "LiquidCodec state frontier is inconsistent, nonempty or exceeds context",
+            ));
+        }
+        frontier = Some(position);
+    }
+    Ok(())
+}
+
+impl<B: NeuralBackend> NeuralDecoder<B> {
+    /// Constructs only the synthesis graph from retained codec geometry.
+    pub fn new(
+        declaration: &Declaration,
+        ctx: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        B::require_operator_capabilities(
+            "LiquidCodec neural decoder",
+            eredu_nn::NeuralOperatorCapabilities::SIGMOID,
+        )?;
+        let d = declaration;
+        Ok(Self {
+            decoder: d
+                .decoder
+                .iter()
+                .cloned()
+                .map(|s| BackboneBlock::from_spec(s, Some(d.config.decoder_window), ctx))
+                .collect::<Result<_, _>>()?,
+            decoder_norm: B::normalization(d.decoder_norm.clone(), ctx)?,
+            from_quantizer: B::linear(d.from_quantizer.clone(), ctx)?,
+            quantizer: ScalarDecoder::new(&d.quantizer, ctx)?,
+            polar: B::linear(d.polar.clone(), ctx)?,
+            window: Parameter::unloaded(d.window.clone(), &[d.config.stft_n_fft], ctx)?,
+            config: d.config.clone(),
+            state_layout: d.decoder_state.clone(),
+            synthesis: Synthesis::new(&d.config, ctx)?,
+        })
+    }
+
     fn decode_spectrum<S>(
         &mut self,
         codes: &B::Tensor,
@@ -1012,7 +1097,7 @@ impl<B: NeuralBackend> NeuralCodec<B> {
     {
         if codes.shape().len() != 3
             || codes.dim(0) <= 0
-            || codes.dim(1) != self.declaration.config.n_q
+            || codes.dim(1) != self.config.n_q
             || codes.dim(2) <= 0
         {
             return Err(invalid(
@@ -1021,15 +1106,15 @@ impl<B: NeuralBackend> NeuralCodec<B> {
         }
         let time = codes
             .dim(2)
-            .checked_mul(self.declaration.config.stft_frame_stack)
+            .checked_mul(self.config.stft_frame_stack)
             .ok_or_else(|| invalid("codec spectral frame count overflow"))?;
-        self.validate_state(state, true, time, false)?;
+        validate_state(state, &self.state_layout, time, false)?;
         let latents = self
             .quantizer
             .decode(codes, ctx)?
             .transpose_axes(&[0, 2, 1], ctx)?;
         let h = self.from_quantizer.forward(&latents, ctx)?;
-        let stack = self.declaration.config.stft_frame_stack;
+        let stack = self.config.stft_frame_stack;
         let mut h = h
             .expand_dims(2, ctx)?
             .broadcast_to(&[h.dim(0), h.dim(1), stack, WIDTH], ctx)?
@@ -1042,7 +1127,7 @@ impl<B: NeuralBackend> NeuralCodec<B> {
             .polar
             .forward(&h, ctx)?
             .transpose_axes(&[0, 2, 1], ctx)?;
-        let bins = self.declaration.config.stft_n_fft / 2 + 1;
+        let bins = self.config.stft_n_fft / 2 + 1;
         Ok((
             polar.index(&[Index::Full, Index::Range(0, bins), Index::Full], ctx)?,
             polar.index(
@@ -1062,10 +1147,10 @@ impl<B: NeuralBackend> NeuralCodec<B> {
         S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
     {
-        self.validate_state(state, true, 0, true)?;
+        validate_state(state, &self.state_layout, 0, true)?;
         if codes.shape().len() == 3
             && codes.dim(0) > 0
-            && codes.dim(1) == self.declaration.config.n_q
+            && codes.dim(1) == self.config.n_q
             && codes.dim(2) == 0
             && codes.element_type() == Some(TensorElementType::I32)
         {
@@ -1087,15 +1172,15 @@ impl<B: NeuralBackend> NeuralCodec<B> {
         S: LayerRuntimeState<B>,
         S::LayerState: RuntimeStateComponents<B>,
     {
-        self.validate_state(&mut neural, true, 0, true)?;
+        validate_state(&mut neural, &self.state_layout, 0, true)?;
         Ok(DecoderState {
             neural,
             overlap: OverlapAddStream::new(
                 batch,
-                self.declaration.config.stft_n_fft,
-                self.declaration.config.stft_hop_length,
+                self.config.stft_n_fft,
+                self.config.stft_hop_length,
             )?,
-            config: self.declaration.config.clone(),
+            config: self.config.clone(),
             batch,
         })
     }
@@ -1115,7 +1200,7 @@ impl<B: NeuralBackend> NeuralCodec<B> {
         if state.phase() == StreamPhase::Finished {
             return Err(Error::StreamFinished);
         }
-        if state.config != self.declaration.config {
+        if state.config != self.config {
             return Err(invalid(
                 "LiquidCodec stream belongs to a different configuration",
             ));

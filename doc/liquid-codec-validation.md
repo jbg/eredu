@@ -6,6 +6,9 @@ available without a concrete backend and has no language-model architecture
 dependency. `Tokenizer` implements the shared `AudioTokenizer` contract using an
 already bound codec and a caller-supplied neutral state factory. Finite calls and
 caller-advanced decoding use the same neural and spectral equations.
+`NeuralDecoder` exposes those synthesis equations and state requirements to
+output-only callers using only the scalar output projection, decoder backbone,
+and synthesis parameters. Resident LFM3 Audio uses this composition.
 
 The configuration uses 24-kHz mono PCM, FFT/window 1280, hop 320, six spectral
 frames per 1920-sample codec frame, and twelve codebooks. Each codebook combines
@@ -81,8 +84,9 @@ MLX_ENABLE_TF32=0 cargo run -p eredu-backend-mlx --features metal --example lfm3
 
 ## Integration scope
 
-Resident codec execution and explicit decode continuation are implemented. Public
-prepared codec selection, GGUF admission, host-layerwise/disk-streamed adapters,
+Resident codec execution and explicit decode continuation are implemented. The
+Audio GGUF projector supplies the decoder-only source. Public standalone
+prepared codec selection, host-layerwise/disk-streamed adapters,
 TP/PP construction, selected memory reports and controlled-session/capture
 integration are not implemented. The independent units and caller-owned state
 are building blocks for these paths; they do not establish support for them.

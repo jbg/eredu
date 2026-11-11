@@ -163,6 +163,27 @@ impl BindingSource {
     }
 }
 
+pub(super) fn restrict_codec_decoder(
+    declaration: &eredu_codec::liquid::Declaration,
+    binding: &BindingSource,
+) -> Result<BindingSource, ArtifactError> {
+    let recipes = declaration
+        .decoder_parameters()?
+        .into_iter()
+        .map(|parameter| {
+            let key = parameter.parameter.id.to_string();
+            let recipe = binding
+                .recipes
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| DerivedWeightRecipe::source(&key, TensorSelection::Full));
+            (key, recipe)
+        })
+        .collect();
+    BindingSource::from_recipes(binding.source.clone(), "LiquidCodec decoder", recipes)
+        .map_err(checkpoint)
+}
+
 /// Released tokenizer and generation assets retained at preparation.
 #[derive(Debug, Clone)]
 pub struct TextAssets {
