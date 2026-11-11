@@ -1,13 +1,20 @@
 //! Streaming input for one utterance in a resident Audio prompt.
 
 use super::*;
-use crate::lfm3::audio::{encoder::STRIDE, AudioSchedule, AudioSnapshotError};
-use eredu_core::execution_control::{ExecutionControlError, SnapshotLimits, SnapshotUsage};
+use crate::lfm3::audio::{
+    encoder::STRIDE, realtime::Transition, AudioSchedule, AudioSnapshotError,
+};
+use eredu_core::execution_control::{
+    ExecutionControlError, SnapshotLimits, SnapshotResourceKind, SnapshotUsage,
+};
 use eredu_media::{
     audio::power_mel::{PowerMel, PowerMelState},
     MediaError,
 };
-use eredu_runtime::execution_control::{IsolatedStateSnapshot, SnapshotBudget};
+use eredu_runtime::execution_control::{
+    IsolatedStateError, IsolatedStateSnapshot, SnapshotBudget, SnapshotRetainedGrowth,
+};
+use std::{cell::RefCell, rc::Rc};
 
 /// Text spans surrounding a single live utterance in checkpoint template order.
 pub struct AudioIngressRequest<'a> {
@@ -33,6 +40,15 @@ pub struct AudioIngressProgress {
 /// Failure while preparing or advancing streamed input.
 #[derive(Debug, thiserror::Error)]
 pub enum AudioIngressError {
+    /// Another continuation is advancing on the same resident graph.
+    #[error("the shared LFM3 Audio graph is busy")]
+    Busy,
+    /// A child cannot retain the proposed state under the shared budget.
+    #[error(transparent)]
+    Retention(#[from] ExecutionControlError),
+    /// The child could not transfer its retained state to response generation.
+    #[error(transparent)]
+    Snapshot(#[from] AudioSnapshotError),
     /// The text spans or output reservation do not fit the streamed prompt.
     #[error("invalid LFM3 Audio streamed prompt")]
     Prompt,
@@ -59,18 +75,38 @@ pub enum AudioIngressError {
 /// Completed input positions enter the language cache before the utterance ends.
 pub struct AudioIngress<B, H>
 where
-    B: GroupedNeuralBackend + DistributedNeuralBackend,
+    B: GroupedNeuralBackend + DistributedNeuralBackend + SubmissionBackend<Executor = Context<B>>,
     H: ResidentAudioBinding<B>,
 {
-    model: ResidentAudio<B, H>,
+    transition: Rc<RefCell<Transition<ResidentAudio<B, H>>>>,
     transform: PowerMel,
     state: IngressState<H::State, B::Tensor>,
     snapshot_budget: Option<SnapshotBudget>,
-    prefix: Vec<i32>,
-    suffix: Vec<i32>,
-    schedule: AudioSchedule,
+    prefix: Arc<[i32]>,
+    suffix: Arc<[i32]>,
+    schedule: Rc<AudioSchedule>,
     random: <H::Sampling as SamplingBackend>::RandomState,
     max_samples: usize,
+    fork: Option<IngressFork<B, H>>,
+}
+
+type EstimateIngress<S, T> = fn(
+    &PowerMelState,
+    &EncoderState<S, T>,
+    &S,
+    Option<&T>,
+) -> Result<SnapshotEstimate, BackendFailure>;
+type TransferFork<K> =
+    fn(&mut AudioSession<K>, SnapshotRetainedGrowth) -> Result<(), AudioSnapshotError>;
+
+struct IngressFork<B: GroupedNeuralBackend + DistributedNeuralBackend, H: ResidentAudioBinding<B>>
+where
+    B: SubmissionBackend<Executor = Context<B>>,
+{
+    growth: SnapshotRetainedGrowth,
+    estimate: EstimateIngress<H::State, B::Tensor>,
+    random_bytes: u64,
+    transfer: TransferFork<ResidentAudio<B, H>>,
 }
 
 struct IngressState<S, T: Tensor> {
@@ -86,19 +122,12 @@ impl<S: SnapshotValue, T: Tensor + SnapshotValue> IsolatedStateCopy for IngressS
     type Error = BackendFailure;
 
     fn estimate_isolated_copy(&self) -> Result<SnapshotEstimate, BackendFailure> {
-        let bytes = self
-            .mel
-            .snapshot_storage_bytes()
-            .ok_or_else(|| failure(ExecutionControlError::Overflow))?;
-        snapshot_value_estimate::<Self>([
-            Ok(SnapshotEstimate {
-                retained_bytes: bytes,
-                copy_bytes: bytes,
-            }),
-            self.encoder.estimate_snapshot_value(),
-            self.language.estimate_snapshot_value(),
-            self.hidden.estimate_snapshot_value(),
-        ])
+        estimate_ingress(
+            &self.mel,
+            &self.encoder,
+            &self.language,
+            self.hidden.as_ref(),
+        )
     }
 
     fn copy_isolated(&self, retention: &SnapshotReservation) -> Result<Self, BackendFailure> {
@@ -127,6 +156,29 @@ impl<S: SnapshotValue, T: Tensor + SnapshotValue> IsolatedStateCopy for IngressS
     }
 }
 
+fn estimate_ingress<S: SnapshotValue, T: Tensor + SnapshotValue>(
+    mel: &PowerMelState,
+    encoder: &EncoderState<S, T>,
+    language: &S,
+    hidden: Option<&T>,
+) -> Result<SnapshotEstimate, BackendFailure> {
+    let bytes = mel
+        .snapshot_storage_bytes()
+        .ok_or_else(|| failure(ExecutionControlError::Overflow))?;
+    snapshot_value_estimate::<IngressState<S, T>>(
+        [
+            Ok(SnapshotEstimate {
+                retained_bytes: bytes,
+                copy_bytes: bytes,
+            }),
+            encoder.estimate_snapshot_value(),
+            language.estimate_snapshot_value(),
+        ]
+        .into_iter()
+        .chain(hidden.map(T::estimate_snapshot_value)),
+    )
+}
+
 /// Reusable snapshot of settled PCM, encoder and language prompt ingress.
 pub struct AudioIngressSnapshot<B, H>(IsolatedStateSnapshot<IngressState<H::State, B::Tensor>>)
 where
@@ -135,7 +187,9 @@ where
 
 impl<B, H> AudioIngress<B, H>
 where
-    B: GroupedNeuralBackend + DistributedNeuralBackend<Tensor: SnapshotValue>,
+    B: GroupedNeuralBackend
+        + DistributedNeuralBackend<Tensor: SnapshotValue>
+        + SubmissionBackend<Executor = Context<B>>,
     H: ResidentAudioBinding<B, State: SnapshotValue>,
 {
     /// Configures the limits shared by prompt ingress and its eventual response.
@@ -171,6 +225,71 @@ where
     ) -> Result<(), AudioSnapshotError> {
         saved.0.restore(&mut self.state)?;
         Ok(())
+    }
+}
+
+impl<B, H> AudioIngress<B, H>
+where
+    B: GroupedNeuralBackend
+        + DistributedNeuralBackend<Tensor: SnapshotValue>
+        + SubmissionBackend<Executor = Context<B>>,
+    H: ResidentAudioBinding<B, State: SnapshotValue>,
+    <H::Sampling as SamplingBackend>::RandomState: Clone + SnapshotValue,
+{
+    /// Forks a settled prompt with an independent PCM and model continuation.
+    pub fn fork(&self) -> Result<Self, AudioSnapshotError> {
+        let budget = self
+            .snapshot_budget
+            .as_ref()
+            .ok_or(AudioSnapshotError::NotConfigured)?;
+        let random = self
+            .random
+            .estimate_snapshot_value()
+            .map_err(IsolatedStateError::Backend)?;
+        let state = self
+            .state
+            .estimate_isolated_copy()
+            .map_err(IsolatedStateError::Backend)?;
+        let continuation = snapshot_value_estimate::<()>([Ok(random), Ok(state)])
+            .map_err(IsolatedStateError::Backend)?;
+        // Includes the fresh restore origin and reservation metadata.
+        let estimate = snapshot_value_estimate::<Self>([
+            Ok(continuation),
+            Ok(SnapshotEstimate {
+                retained_bytes: 256,
+                copy_bytes: 256,
+            }),
+        ])
+        .map_err(IsolatedStateError::Backend)?;
+        let retention = budget
+            .reserve(SnapshotResourceKind::Branch, Some(estimate))
+            .map_err(IsolatedStateError::Admission)?;
+        let random_state = self
+            .random
+            .copy_snapshot_value(&retention)
+            .map_err(IsolatedStateError::Backend)?;
+        let mut state = self
+            .state
+            .copy_isolated(&retention)
+            .map_err(IsolatedStateError::Backend)?;
+        state.origin = Arc::new(());
+        Ok(Self {
+            transition: self.transition.clone(),
+            transform: self.transform.clone(),
+            state,
+            snapshot_budget: Some(budget.clone()),
+            prefix: self.prefix.clone(),
+            suffix: self.suffix.clone(),
+            schedule: self.schedule.clone(),
+            random: random_state,
+            max_samples: self.max_samples,
+            fork: Some(IngressFork {
+                growth: SnapshotRetainedGrowth::new(&retention, continuation.retained_bytes),
+                estimate: estimate_ingress::<H::State, B::Tensor>,
+                random_bytes: random.retained_bytes,
+                transfer: AudioSession::inherit_fork_growth,
+            }),
+        })
     }
 }
 
@@ -227,7 +346,7 @@ where
         let mut suffix = request.suffix.to_vec();
         suffix.extend(marker);
         Ok(AudioIngress {
-            model: self,
+            transition: Rc::new(RefCell::new(Transition(self))),
             transform,
             state: IngressState {
                 mel: PowerMelState::default(),
@@ -238,11 +357,12 @@ where
                 origin: Arc::new(()),
             },
             snapshot_budget: None,
-            prefix: request.prefix.to_vec(),
-            suffix,
-            schedule,
+            prefix: request.prefix.into(),
+            suffix: suffix.into(),
+            schedule: Rc::new(schedule),
             random,
             max_samples,
+            fork: None,
         })
     }
 }
@@ -280,10 +400,24 @@ where
             fork_retention: None,
             binding: PhantomData,
         };
-        let sampling = self.model.sampling.clone();
-        let mut session =
-            AudioSession::new(self.model, state, self.schedule, sampling, self.random)?;
+        let sampling = self
+            .transition
+            .try_borrow()
+            .map_err(|_| AudioIngressError::Busy)?
+            .0
+            .sampling
+            .clone();
+        let mut session = AudioSession::with_transition(
+            self.transition,
+            state,
+            Rc::unwrap_or_clone(self.schedule),
+            sampling,
+            self.random,
+        )?;
         session.inherit_snapshot_budget(self.snapshot_budget);
+        if let Some(fork) = self.fork {
+            (fork.transfer)(&mut session, fork.growth)?;
+        }
         Ok(session)
     }
 
@@ -291,6 +425,21 @@ where
     pub fn cancel(self) {}
 
     fn advance(
+        &mut self,
+        samples: &[f32],
+        sample_rate: u32,
+        final_chunk: bool,
+    ) -> Result<(), AudioIngressError> {
+        if let Some(fork) = &self.fork {
+            H::with_fork_retention(fork.growth.clone(), || {
+                self.advance_input(samples, sample_rate, final_chunk)
+            })?
+        } else {
+            self.advance_input(samples, sample_rate, final_chunk)
+        }
+    }
+
+    fn advance_input(
         &mut self,
         samples: &[f32],
         sample_rate: u32,
@@ -308,20 +457,29 @@ where
             .transform
             .advance(&mut mel, samples, sample_rate, final_chunk)?;
         if features.frames == 0 && !final_chunk {
+            self.admit_growth(
+                &mel,
+                &self.state.encoder,
+                &self.state.language,
+                self.state.hidden.as_ref(),
+            )?;
             self.state.mel = mel;
             self.state.progress.samples += samples.len();
             return Ok(());
         }
+        let mut transition = self
+            .transition
+            .try_borrow_mut()
+            .map_err(|_| AudioIngressError::Busy)?;
+        let model = &mut transition.0;
         let mut encoder = self.state.encoder.try_branch(H::branch_state)?;
-        let projected = self
-            .model
-            .project_stream_chunk(&features, &mut encoder, final_chunk)?;
+        let projected = model.project_stream_chunk(&features, &mut encoder, final_chunk)?;
         let count = projected.as_ref().map_or(0, |rows| rows.dim(0) as usize);
         let mut tokens = Vec::new();
         if count != 0 && self.state.progress.audio_tokens == 0 {
             tokens.extend_from_slice(&self.prefix);
         }
-        tokens.extend(std::iter::repeat_n(self.model.artifact.tokens.input, count));
+        tokens.extend(std::iter::repeat_n(model.artifact.tokens.input, count));
         if final_chunk {
             tokens.extend_from_slice(&self.suffix);
         }
@@ -329,9 +487,7 @@ where
             None
         } else {
             let mut candidate = H::branch_state(&self.state.language)?;
-            let hidden =
-                self.model
-                    .forward_prompt(&mut candidate, &tokens, projected.as_ref(), None)?;
+            let hidden = model.forward_prompt(&mut candidate, &tokens, projected.as_ref(), None)?;
             Some((candidate, hidden))
         };
         let mut roots = H::retained_values(encoder.backbone());
@@ -340,9 +496,14 @@ where
             roots.extend(H::retained_values(state));
             roots.push(hidden);
         }
-        B::submit(self.model.binding.context(), roots)
+        B::submit(model.binding.context(), roots)
             .and_then(|completion| completion.wait())
             .map_err(failure)?;
+        let (candidate, hidden) = language.as_ref().map_or(
+            (&self.state.language, self.state.hidden.as_ref()),
+            |(candidate, hidden)| (candidate, Some(hidden)),
+        );
+        self.admit_growth(&mel, &encoder, candidate, hidden)?;
         if let Some((state, hidden)) = language {
             self.state.language = state;
             self.state.hidden = Some(hidden);
@@ -351,6 +512,24 @@ where
         self.state.mel = mel;
         self.state.progress.samples += samples.len();
         self.state.progress.audio_tokens += count;
+        Ok(())
+    }
+
+    fn admit_growth(
+        &self,
+        mel: &PowerMelState,
+        encoder: &EncoderState<H::State, B::Tensor>,
+        language: &H::State,
+        hidden: Option<&B::Tensor>,
+    ) -> Result<(), AudioIngressError> {
+        if let Some(fork) = &self.fork {
+            let estimate = (fork.estimate)(mel, encoder, language, hidden)?;
+            let bytes = estimate
+                .retained_bytes
+                .checked_add(fork.random_bytes)
+                .ok_or(ExecutionControlError::Overflow)?;
+            fork.growth.admit(bytes)?;
+        }
         Ok(())
     }
 }

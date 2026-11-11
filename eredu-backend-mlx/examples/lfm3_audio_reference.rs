@@ -624,7 +624,7 @@ fn compare_ingress_replay(
     )?;
     let limits = SnapshotLimits {
         max_snapshots: 2,
-        max_branches: 0,
+        max_branches: 1,
         retained_bytes: 1 << 28,
         cumulative_copy_bytes: 1 << 28,
     };
@@ -632,6 +632,12 @@ fn compare_ingress_replay(
     let early = ingress.submit(&pcm[..1055], 16_000)?;
     assert_eq!((early.samples, early.audio_tokens), (1055, 0));
     let before_first = ingress.snapshot()?;
+    let mut child = ingress.fork()?;
+    let initial_fork = ingress.snapshot_usage().ok_or("missing fork usage")?;
+    assert_eq!(child.snapshot_usage(), Some(initial_fork));
+    assert!(child.fork().is_err());
+    assert!(child.restore(&before_first).is_err());
+    assert_eq!(child.snapshot_usage(), Some(initial_fork));
     let late = ingress.submit(&pcm[1055..1520], 16_000)?;
     assert_eq!((late.samples, late.audio_tokens), (1520, 1));
     let after_first = ingress.snapshot()?;
@@ -640,6 +646,15 @@ fn compare_ingress_replay(
     assert_eq!(ingress.snapshot_usage(), Some(usage));
 
     let complete = ingress.submit(&pcm[1520..], 16_000)?;
+    assert_eq!(child.progress(), early);
+    assert_eq!(child.submit(&pcm[1055..1520], 16_000)?, late);
+    assert_eq!(child.submit(&pcm[1520..], 16_000)?, complete);
+    let fork_usage = ingress.snapshot_usage().ok_or("missing grown fork usage")?;
+    assert!(fork_usage.retained_bytes > usage.retained_bytes);
+    assert_eq!(
+        fork_usage.cumulative_copy_bytes,
+        usage.cumulative_copy_bytes
+    );
     ingress.restore(&after_first)?;
     assert_eq!(ingress.progress(), late);
     assert_eq!(ingress.submit(&pcm[1520..], 16_000)?, complete);
@@ -649,7 +664,7 @@ fn compare_ingress_replay(
     assert_eq!(ingress.submit(&pcm[1520..], 16_000)?, complete);
 
     let restored_usage = ingress.snapshot_usage().ok_or("missing restored usage")?;
-    assert_eq!(restored_usage.retained_bytes, usage.retained_bytes);
+    assert_eq!(restored_usage.retained_bytes, fork_usage.retained_bytes);
     assert!(restored_usage.cumulative_copy_bytes > usage.cumulative_copy_bytes);
     let mut session = ingress.finish()?;
     assert_eq!(session.snapshot_usage(), Some(restored_usage));
@@ -658,14 +673,38 @@ fn compare_ingress_replay(
         Err(AudioSnapshotError::AlreadyConfigured)
     ));
     drop((before_first, after_first));
-    let released = session.snapshot_usage().ok_or("missing response usage")?;
-    assert_eq!(released.retained_bytes, 0);
+    let child_retained = session.snapshot_usage().ok_or("missing response usage")?;
+    assert_eq!(child_retained.snapshots, 0);
+    assert_eq!(child_retained.branches, 1);
+    assert!(child_retained.retained_bytes > 0);
     assert_eq!(
-        released.cumulative_copy_bytes,
+        child_retained.cumulative_copy_bytes,
         restored_usage.cumulative_copy_bytes
     );
     let output = session.events().collect::<Result<Vec<_>, _>>()?;
     assert_eq!(output, finite);
+    let mut child = child.finish()?;
+    let transferred = child
+        .snapshot_usage()
+        .ok_or("missing transferred fork usage")?;
+    assert_eq!(transferred.branches, 1);
+    assert_eq!(session.snapshot_usage(), Some(transferred));
+    assert_eq!(
+        transferred.cumulative_copy_bytes,
+        child_retained.cumulative_copy_bytes
+    );
+    assert!(child.fork().is_err());
+    assert_eq!(child.events().collect::<Result<Vec<_>, _>>()?, output);
+    drop(child);
+    let released = session
+        .snapshot_usage()
+        .ok_or("missing released fork usage")?;
+    assert_eq!(released.branches, 0);
+    assert_eq!(released.retained_bytes, 0);
+    assert_eq!(
+        released.cumulative_copy_bytes,
+        transferred.cumulative_copy_bytes
+    );
     let samples: usize = output
         .iter()
         .map(|event| match event {

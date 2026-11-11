@@ -16556,6 +16556,12 @@ encoder and language caches, retained readout, and input progress. The FFT
 plan, prompt policy, and unused response RNG stay with the session. Finishing
 ingress transfers the same budget to the response driver.
 
+Ingress forks share the resident graph, prompt policy, and FFT plan. A child
+owns its PCM and model continuation and its initial response RNG. Retained
+growth is admitted before advancing input progress. Finalization hands the
+same graph and branch reservation to response generation, which continues
+charging that reservation as its caches grow.
+
 The LiveASR owner reuses the streamed encoder, projector and prompt traversal.
 The architecture owns the retained-tokenizer prompt, block cadence, greedy
 text filters and closing rules. Restarting the language context preserves
