@@ -424,10 +424,20 @@ projector parameters and 65 depth and feedback parameters. Supplying the
 released Q4_K_M projector as a fourth argument verifies its publisher hash
 and decodes the twelfth codebook as a bounded read. The lease reads
 1,161,792 encoded bytes for the `[2017, 1024]` codebook, and the input scope
-rejects access to its packed source.
+rejects access to its packed source. A fifth argument supplies the pinned
+LiquidCodec config and resolves 100 canonical decoder parameters for each of
+the five encodings.
+The released Q4_K_M payload also supplies the complete 8,064-value F32 scalar
+code table for exact comparison against the codec's mixed-radix lookup. The
+retained decoder scope includes 1,280 generated Hann samples using the
+[pinned llama.cpp window construction](https://github.com/ggml-org/llama.cpp/blob/7c2653acc749258dc62067da62d07024d971ccd2/tools/mtmd/mtmd-audio.cpp#L27).
+This runner covers source admission and binding. End-to-end GGUF Audio
+execution and PCM parity remain unverified.
 
 ```sh
 cargo run -p eredu-architectures --example inspect_lfm3_audio_gguf_headers -- \
   validation/fixtures/lfm3/audio-gguf-sources.json /private/tmp/eredu-audio-gguf \
-  /private/tmp/lfm3-audio/config.json /private/tmp/eredu-audio-gguf/mmproj-LFM3-Audio-2B-Q4_K_M.gguf
+  /private/tmp/lfm3-audio/config.json \
+  /private/tmp/eredu-audio-gguf/mmproj-LFM3-Audio-2B-Q4_K_M.gguf \
+  /private/tmp/lfm3-audio/audio_tokenizer/config.json
 ```

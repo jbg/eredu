@@ -17,8 +17,10 @@ workspace = true
 [dependencies]
 eredu-core.workspace = true
 eredu-checkpoint.workspace = true
+eredu-gguf.workspace = true
 eredu-nn.workspace = true
 eredu-runtime.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+safetensors = "0.8"

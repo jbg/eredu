@@ -957,8 +957,10 @@ version = "0.5.0"
 dependencies = [
  "eredu-checkpoint",
  "eredu-core",
+ "eredu-gguf",
  "eredu-nn",
  "eredu-runtime",
+ "safetensors",
  "serde",
  "serde_json",
  "thiserror 2.0.20",

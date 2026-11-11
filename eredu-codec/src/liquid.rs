@@ -13,7 +13,9 @@ use eredu_nn::{
 };
 use serde::Deserialize;
 
+mod gguf;
 mod neural;
+pub use gguf::GgufDecoderBindings;
 pub use neural::{BackboneBlock, Declaration, DecoderState, NeuralCodec, Tokenizer, Unit};
 
 /// Released codec component geometry, independent of language-model architectures.
@@ -146,6 +148,15 @@ impl Config {
             .try_fold(1i32, |n, level| n.checked_mul(*level))
             .filter(|n| *n > 0 && *n <= 16_777_216)
             .ok_or_else(|| invalid("LiquidCodec codes exceed exact F32 integer geometry"))
+    }
+
+    fn scalar_code(&self, mut index: i32) -> impl Iterator<Item = f32> + '_ {
+        self.fsq_levels.iter().map(move |&level| {
+            let half = level / 2;
+            let value = (index % level - half) as f32 / half as f32;
+            index /= level;
+            value
+        })
     }
     fn scalar_width(&self) -> Result<i32, Error> {
         i32::try_from(self.fsq_levels.len())
@@ -394,12 +405,7 @@ impl<B: NeuralBackend> Quantizer<B> {
         table
             .try_reserve_exact(count)
             .map_err(|e| invalid(e.to_string()))?;
-        for code in 0..config.codebook_size()? {
-            for (i, level) in config.fsq_levels.iter().enumerate() {
-                let width = level / 2;
-                table.push(((code / basis[i]) % level - width) as f32 / width as f32);
-            }
-        }
+        table.extend((0..config.codebook_size()?).flat_map(|code| config.scalar_code(code)));
         Ok(Self {
             input: spec
                 .input

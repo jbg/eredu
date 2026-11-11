@@ -5,6 +5,7 @@ use eredu_checkpoint::{
     recipe::DerivedWeightRecipe,
     store::{CheckpointLease, EncodedTensorLease, ReadPolicy, TensorReadRequest},
 };
+use eredu_codec::liquid::{Config as CodecConfig, Declaration as CodecDeclaration};
 use eredu_gguf::{
     Checkpoint, CheckpointHeader, ConvertedTensor, Limits, QuantizedTensorRepresentation,
 };
@@ -45,6 +46,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         })
         .transpose()?;
     let payload = args.next();
+    let codec = args
+        .next()
+        .map(|path| -> Result<CodecDeclaration, Box<dyn Error>> {
+            Ok(CodecDeclaration::new(CodecConfig::from_json(
+                &std::fs::read(path)?,
+            )?)?)
+        })
+        .transpose()?;
+    if codec.is_some() && config.is_none() {
+        return Err("codec verification requires the pinned Audio config".into());
+    }
     let directory = Path::new(&directory);
     let manifest: Value = serde_json::from_slice(&std::fs::read(manifest)?)?;
     let variants = manifest["variants"].as_object().ok_or("missing variants")?;
@@ -70,6 +82,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                 bindings.input_recipes().len(),
                 bindings.depth_recipes().len(),
             );
+            if let Some(codec) = &codec {
+                println!(
+                    "  {} canonical LiquidCodec decoder bindings",
+                    bindings.codec_decoder_bindings(codec)?.recipes().len()
+                );
+            }
         }
     }
     AdmittedAudioGguf::from_checkpoints(
@@ -81,16 +99,23 @@ fn main() -> Result<(), Box<dyn Error>> {
         let config = config
             .as_ref()
             .ok_or("payload verification requires the pinned Audio config")?;
-        verify_codebook(directory, &variants["Q4_K_M"], config, Path::new(&path))?;
+        verify_projector(
+            directory,
+            &variants["Q4_K_M"],
+            config,
+            Path::new(&path),
+            codec.as_ref(),
+        )?;
     }
     Ok(())
 }
 
-fn verify_codebook(
+fn verify_projector(
     directory: &Path,
     record: &Value,
     config: &Value,
     path: &Path,
+    codec: Option<&CodecDeclaration>,
 ) -> Result<(), Box<dyn Error>> {
     let mut file = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();
@@ -118,12 +143,35 @@ fn verify_codebook(
             QuantizedTensorRepresentation::DecodedF32,
         )?,
     )?;
-    let sources = admitted
-        .speech_bindings(
-            &Declaration::from_config(config)?,
-            &DepthDeclaration::from_config(config)?,
-        )?
-        .retain(1)?;
+    let bindings = admitted.speech_bindings(
+        &Declaration::from_config(config)?,
+        &DepthDeclaration::from_config(config)?,
+    )?;
+    let sources = if let Some(codec) = codec {
+        let (speech, decoder) = bindings.retain_with_codec_decoder(codec, 1)?;
+        let key = "decoder.istft.window";
+        let window = decoder.source().acquire_lease(TensorReadRequest {
+            key: key.into(),
+            selection: eredu_checkpoint::store::TensorSelection::Full,
+            policy: ReadPolicy::RequireBounded,
+        })?;
+        assert_eq!(window.output_shape(), [1280]);
+        let values = window
+            .encoded_bytes()
+            .ok_or("expected synthesized window bytes")?;
+        assert_eq!(values.len(), 1280 * 4);
+        assert_eq!(&values[..4], &0f32.to_le_bytes());
+        assert_eq!(&values[640 * 4..641 * 4], &1f32.to_le_bytes());
+        assert!(speech.input.source().source_metadata(key).is_err());
+        assert!(decoder
+            .source()
+            .source_metadata("a.gen.wav.quant.first.codebook.weight")
+            .is_err());
+        println!("Q4_K_M projector: verified FSQ table and retained 1280 Hann samples");
+        speech
+    } else {
+        bindings.retain(1)?
+    };
     let recipe =
         &sources.depth.recipes()["model.depth_decoder.depth_embeddings.11.embedding.weight"];
     let DerivedWeightRecipe::Source { key, selection } = recipe else {

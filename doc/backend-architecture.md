@@ -16522,6 +16522,13 @@ The two retained source views share the original GGUF container and restrict
 reads to their own physical keys. The twelve tied codebook tables and their
 normalizers bind through contiguous selections of the packed tensors.
 
+The portable LiquidCodec crate owns the decoder's GGUF projection. Its binding
+checks learned parameter shapes and verifies the exported scalar code table
+against the same mixed-radix lookup used by the neural codec. The decoder view
+retains the learned weights from the shared projector and an in-memory periodic
+Hann synthesis window reconstructed from the published GGUF decoder geometry.
+The decoder binding is independent of a codec encoder source.
+
 `AudioPrompt` pairs token IDs with exact speech input and output row counts.
 The shared language traversal replaces the placeholder spans at the execution
 group's embedding boundary, preserving the causal cache positions. The readout
