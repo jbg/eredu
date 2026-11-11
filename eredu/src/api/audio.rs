@@ -15,6 +15,8 @@ use super::{
 };
 use eredu_backend_mlx::native::ExecutionContext;
 
+pub use super::realtime::AudioParameterResidency;
+
 type TaskResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 /// Task for one audio request.
@@ -73,6 +75,23 @@ impl<'a> PreparedAudioTask<'a> {
         task: AudioTask<'_>,
         max_slots: usize,
         seed: u64,
+    ) -> TaskResult<Self> {
+        Self::with_parameter_residency(
+            artifact,
+            task,
+            max_slots,
+            seed,
+            AudioParameterResidency::default(),
+        )
+    }
+
+    /// Prepares a turn-based task with independent component weight policies.
+    pub fn with_parameter_residency(
+        artifact: &'a PreparedRealtimeArtifact,
+        task: AudioTask<'_>,
+        max_slots: usize,
+        seed: u64,
+        residency: AudioParameterResidency,
     ) -> TaskResult<Self> {
         let PreparedRealtimeArtifact::Lfm3Audio(audio) = artifact else {
             return Err("the selected model has no turn-based audio adapter".into());
@@ -160,7 +179,10 @@ impl<'a> PreparedAudioTask<'a> {
         };
         let decoder = TextDecoder::from_shared_tokenizer(Arc::new((*tokenizer).clone()), true);
         Ok(Self {
-            selected: prepare_mlx_realtime(artifact, &RealtimeLoadOptions::Lfm3Audio)?,
+            selected: prepare_mlx_realtime(
+                artifact,
+                &RealtimeLoadOptions::Lfm3AudioWithResidency(residency),
+            )?,
             prompt,
             decoder,
             input_rate,

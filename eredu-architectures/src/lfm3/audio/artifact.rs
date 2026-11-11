@@ -2,7 +2,7 @@
 
 use super::{AdmittedAudioGguf, AudioGgufError, DepthDeclaration, ProcessorConfig};
 use eredu_checkpoint::{
-    recipe::{DerivedWeightRecipe, RecipeDtype},
+    recipe::DerivedWeightRecipe,
     safetensors::SafetensorsMetadataCatalog,
     schema::{CatalogPolicy, SafetensorsCheckpointPlan},
     store::{
@@ -131,40 +131,20 @@ impl BindingSource {
         self
     }
 
-    /// Projects the resident F32 execution profile before native materialization.
-    pub(super) fn widened_f32(&self) -> Result<(Self, u64), ArtifactError> {
-        let mut recipes = self.recipes.clone();
-        let mut bytes = 0u64;
-        for key in self.source.source_keys() {
-            let metadata = self.source.source_metadata(&key).map_err(checkpoint)?;
-            let size = metadata
-                .logical_shape
-                .iter()
-                .try_fold(4u64, |size, &dimension| {
-                    size.checked_mul(u64::try_from(dimension).ok()?)
-                })
-                .ok_or_else(|| checkpoint("resident Audio parameter size overflowed"))?;
-            bytes = bytes
-                .checked_add(size)
-                .ok_or_else(|| checkpoint("resident Audio parameter size overflowed"))?;
-            recipes
-                .entry(key.clone())
-                .or_insert_with(|| DerivedWeightRecipe::source(key, TensorSelection::Full));
-        }
-        for recipe in recipes.values_mut() {
-            *recipe = DerivedWeightRecipe::Cast {
-                input: Box::new(recipe.clone()),
-                dtype: RecipeDtype::F32,
-            };
-        }
-        Ok((
-            Self {
-                source: self.source.clone(),
-                recipes,
-                shared_source_keys: self.shared_source_keys.clone(),
-            },
-            bytes,
-        ))
+    pub(super) fn project(
+        &self,
+        scope: &str,
+        recipes: BTreeMap<String, DerivedWeightRecipe>,
+    ) -> Result<Self, ArtifactError> {
+        let mut projected =
+            Self::from_recipes(self.source.clone(), scope, recipes).map_err(checkpoint)?;
+        projected.shared_source_keys = self
+            .shared_source_keys
+            .iter()
+            .filter(|key| projected.source.source_metadata(key).is_ok())
+            .cloned()
+            .collect();
+        Ok(projected)
     }
 
     /// Exact retained source for this scope, without checkpoint rediscovery.
@@ -181,27 +161,6 @@ impl BindingSource {
     pub fn shared_source_keys(&self) -> &BTreeSet<String> {
         &self.shared_source_keys
     }
-}
-
-pub(super) fn restrict_codec_decoder(
-    declaration: &eredu_codec::liquid::Declaration,
-    binding: &BindingSource,
-) -> Result<BindingSource, ArtifactError> {
-    let recipes = declaration
-        .decoder_parameters()?
-        .into_iter()
-        .map(|parameter| {
-            let key = parameter.parameter.id.to_string();
-            let recipe = binding
-                .recipes
-                .get(&key)
-                .cloned()
-                .unwrap_or_else(|| DerivedWeightRecipe::source(&key, TensorSelection::Full));
-            (key, recipe)
-        })
-        .collect();
-    BindingSource::from_recipes(binding.source.clone(), "LiquidCodec decoder", recipes)
-        .map_err(checkpoint)
 }
 
 /// Released tokenizer and generation assets retained at preparation.
@@ -255,7 +214,7 @@ fn read(root: &Path, name: &str) -> Result<Vec<u8>, ArtifactError> {
     std::fs::read(&path).map_err(|source| ArtifactError::Read { path, source })
 }
 
-fn checkpoint(error: impl std::fmt::Display) -> ArtifactError {
+pub(super) fn checkpoint(error: impl std::fmt::Display) -> ArtifactError {
     ArtifactError::Checkpoint(error.to_string())
 }
 

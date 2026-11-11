@@ -48,6 +48,30 @@ use eredu_runtime::{ModelStateIdentity, StateLayout};
 /// Shared cold and executable declaration for validated incremental text passes.
 pub(crate) const CHUNKED_TEXT_PREFILL: bool = true;
 
+/// Input to the LFM3 language traversal, including the requested readout.
+pub enum Lfm3Input<'a, T: eredu_nn::Tensor> {
+    /// Ordinary vocabulary output from token IDs and an optional mask.
+    Text(crate::decoder::LayeredInput<'a, T>),
+    /// Speech-conditioned input and normalized hidden output for Audio.
+    Audio(&'a audio::AudioPrompt<'a, T>),
+}
+
+impl<'a, T: eredu_nn::Tensor> Lfm3Input<'a, T> {
+    fn tokens(&self) -> &'a T {
+        match self {
+            Self::Text(input) => input.tokens,
+            Self::Audio(prompt) => prompt.tokens(),
+        }
+    }
+
+    fn mask(&self) -> Option<&'a T> {
+        match self {
+            Self::Text(input) => input.mask,
+            Self::Audio(_) => None,
+        }
+    }
+}
+
 /// Architecture-owned values retained for one LFM3 forward pass.
 pub struct ForwardContext<T> {
     mask: Option<T>,

@@ -1,6 +1,6 @@
 //! Cold selection followed by native binding of a retained realtime artifact.
 
-use super::RealtimeLoadOptions;
+use super::{AudioParameterResidency, RealtimeLoadOptions};
 use crate::runtime::voicechat::{
     start_mlx_voicechat, MlxVoiceChatLoadOptions, MlxVoiceChatSession, PreparedVoiceChatSession,
     VoiceChatLoadingError, VoiceChatStartError,
@@ -83,7 +83,7 @@ struct SpeechSelection<'a> {
 enum Selection<'a> {
     Categorical(MlxPreparedRealtimeExecution),
     Speech(Box<SpeechSelection<'a>>),
-    Lfm3Audio(Box<PreparedResidentAudio>),
+    Lfm3Audio(Box<PreparedResidentAudio>, AudioParameterResidency),
 }
 
 /// Complete cold selection. Loading accepts no replacement policy or source.
@@ -138,15 +138,27 @@ impl<'a, 'o> RealtimeArtifactVisitor<'a> for Select<'o> {
         })
     }
     fn lfm3_audio(self, artifact: &'a PreparedAudio) -> Result<Self::Output, Self::Error> {
-        if !matches!(self.options, RealtimeLoadOptions::Lfm3Audio) {
-            return Err(RealtimeLoadError::Protocol {
-                required: "prepared Audio prompt",
-                requested: self.options.protocol(),
-            });
+        let residency = match self.options {
+            RealtimeLoadOptions::Lfm3Audio => AudioParameterResidency::default(),
+            RealtimeLoadOptions::Lfm3AudioWithResidency(residency) => *residency,
+            _ => {
+                return Err(RealtimeLoadError::Protocol {
+                    required: "prepared Audio prompt",
+                    requested: self.options.protocol(),
+                })
+            }
+        };
+        for policy in [
+            residency.language,
+            residency.encoder,
+            residency.depth,
+            residency.codec,
+        ] {
+            policy.offload().map_err(backend)?;
         }
         let selected = PreparedResidentAudio::select(artifact.clone())?;
         Ok(PreparedMlxRealtime {
-            selection: Selection::Lfm3Audio(Box::new(selected)),
+            selection: Selection::Lfm3Audio(Box::new(selected), residency),
         })
     }
 
@@ -221,13 +233,13 @@ impl PreparedMlxRealtime<'_> {
     pub fn speech_residency_report(&self) -> Option<VoiceChatResidencyReport> {
         match &self.selection {
             Selection::Speech(s) => Some(s.report),
-            Selection::Categorical(_) | Selection::Lfm3Audio(_) => None,
+            Selection::Categorical(_) | Selection::Lfm3Audio(..) => None,
         }
     }
     /// Selected logical F32 parameter bytes for the resident Audio protocol.
     pub fn audio_parameter_bytes(&self) -> Option<AudioResidentParameterBytes> {
         match &self.selection {
-            Selection::Lfm3Audio(audio) => Some(audio.parameter_bytes()),
+            Selection::Lfm3Audio(audio, _) => Some(audio.parameter_bytes()),
             Selection::Categorical(_) | Selection::Speech(_) => None,
         }
     }
@@ -248,8 +260,10 @@ impl PreparedMlxRealtime<'_> {
                     .map_err(backend)?;
                 Ok(LoadedMlxRealtime::Categorical { context, model })
             }
-            Selection::Lfm3Audio(audio) => Ok(LoadedMlxRealtime::Lfm3Audio(Box::new(
-                MlxAudioModel::load_prepared(*audio, weights, execution)?,
+            Selection::Lfm3Audio(audio, residency) => Ok(LoadedMlxRealtime::Lfm3Audio(Box::new(
+                MlxAudioModel::load_prepared_with_parameter_residency(
+                    *audio, residency, weights, execution,
+                )?,
             ))),
             Selection::Speech(s) => Ok(LoadedMlxRealtime::Speech(start_mlx_voicechat(
                 s.prepared,

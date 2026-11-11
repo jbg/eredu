@@ -1,4 +1,4 @@
-//! Compares decoder-only Q4_K_M execution with the pinned llama.cpp PCM runner.
+//! Compares released Audio GGUF synthesis with the pinned llama.cpp PCM runner.
 
 use eredu_architectures::lfm3::audio::{AdmittedAudioGguf, Declaration, DepthDeclaration};
 use eredu_backend_mlx::{
@@ -15,6 +15,7 @@ use eredu_backend_mlx::{
     },
     MlxTensor,
 };
+use eredu_checkpoint::recipe::{DerivedWeightRecipe, RecipeDtype};
 use eredu_codec::liquid::{Config, Declaration as CodecDeclaration, NeuralDecoder};
 use eredu_gguf::{Checkpoint, CheckpointHeader, Limits, QuantizedTensorRepresentation};
 use eredu_nn::Tensor;
@@ -32,12 +33,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         std::env::args_os().skip(1).map(PathBuf::from).collect::<Vec<_>>().try_into()
             .map_err(|_| "expected source manifest, Audio backbone header, projector, Audio config, codec config and llama.cpp PCM")?;
     let manifest: Value = serde_json::from_slice(&fs::read(manifest)?)?;
-    let record = &manifest["variants"]["Q4_K_M"];
     let header = fs::read(header)?;
     let digest = hex(&Sha256::digest(&header));
-    if record["backbone"]["header_sha256"].as_str() != Some(&digest) {
-        return Err("Audio backbone header hash differs".into());
-    }
+    let (variant, record) = manifest["variants"]
+        .as_object()
+        .ok_or("missing GGUF variants")?
+        .iter()
+        .find(|(_, record)| record["backbone"]["header_sha256"].as_str() == Some(digest.as_str()))
+        .ok_or("Audio backbone header hash does not match a pinned publisher layout")?;
     let mut hasher = Sha256::new();
     let mut file = fs::File::open(&projector)?;
     let mut buffer = [0; 65536];
@@ -81,10 +84,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = context.stream();
     let mut model = NeuralDecoder::<MlxNeuralBackend>::new(&codec, stream)?;
+    let mut recipes = decoder.recipes().clone();
+    for recipe in recipes.values_mut() {
+        *recipe = DerivedWeightRecipe::Cast {
+            input: Box::new(recipe.clone()),
+            dtype: RecipeDtype::F32,
+        };
+    }
     let bindings = build_neutral_module_bindings_with_recipes(
         &model,
         decoder.source().as_ref(),
-        &mut decoder.recipes().clone(),
+        &mut recipes,
     )?;
     let arrays = materialize_module_bindings(decoder.source().as_ref(), &bindings, stream, stream)?;
     populate_module_from_arrays_excluding(&mut model, &arrays, |_| false)?;
@@ -128,9 +138,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         squared_reference += f64::from(expected).powi(2);
     }
     let relative = (squared_error / squared_reference).sqrt();
-    println!("streamed_samples={counts:?} max_abs={maximum:.8} relative_l2={relative:.8}");
+    println!("variant={variant} streamed_samples={counts:?} max_abs={maximum:.8} relative_l2={relative:.8}");
     if maximum > 0.05 || relative > 0.08 {
-        return Err("Q4_K_M LiquidCodec PCM exceeds the reference tolerance".into());
+        return Err(format!("{variant} LiquidCodec PCM exceeds the reference tolerance").into());
     }
     Ok(())
 }

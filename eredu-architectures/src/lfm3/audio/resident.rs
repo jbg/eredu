@@ -1,4 +1,4 @@
-//! Resident Audio composition over the shared language traversal.
+//! Audio composition with selected language and speech input traversal.
 
 #[cfg(feature = "audio")]
 mod ingress;
@@ -16,33 +16,31 @@ pub use transcription::{
 };
 
 use super::{
-    AudioExecutionKernel, AudioMode, AudioPrompt, AudioSampling, AudioSchedulePolicy, AudioSession,
-    AudioSessionError, AudioTokens, BindingSource, DepthDeclaration, DepthDecoder, DepthFrame,
-    Encoder, EncoderState, Feedback, PreparedAudio, Projector,
+    AudioDepth, AudioEncoder, AudioExecutionKernel, AudioLanguage, AudioMode, AudioPrompt,
+    AudioSampling, AudioSchedulePolicy, AudioSession, AudioSessionError, AudioTokens,
+    DepthDeclaration, DepthFrame, EncoderState, PreparedAudio, PreparedAudioCodec,
+    PreparedAudioDepth, PreparedAudioEncoder, PreparedAudioLanguage,
 };
-use crate::lfm3::{CompleteLfm3Kernel, LayeredModel};
-use eredu_codec::liquid::{DecoderState, NeuralDecoder};
+use eredu_codec::liquid::{DecoderExecution, DecoderState};
 use eredu_core::{
     execution_control::SnapshotEstimate, scheduler::SemanticStateTransaction, BackendFailure,
     Completion,
 };
 use eredu_media::audio::LogMelFeatures;
-use eredu_nn::{
-    AttentionCache, DistributedNeuralBackend, GroupedNeuralBackend, Index, Parameterized, Tensor,
-};
+use eredu_nn::{AttentionCache, DistributedNeuralBackend, GroupedNeuralBackend, Index, Tensor};
 use eredu_runtime::{
     execution_control::{
         snapshot_value_estimate, ForkStateEstimate, IsolatedStateCopy, IsolatedStateFork,
         SnapshotReservation, SnapshotRetainedGrowth, SnapshotValue,
     },
-    DenseSamplingBackend, LayerRuntimeState, ResidentRuntime, RuntimeStateComponents,
-    SamplingBackend, StateLayout, SubmissionBackend,
+    DenseSamplingBackend, LayerRuntimeState, RuntimeStateComponents, SamplingBackend, StateLayout,
+    SubmissionBackend,
 };
 use std::{marker::PhantomData, sync::Arc};
 
 type Context<B> = <<B as eredu_nn::NeuralBackend>::Tensor as Tensor>::Context;
 
-/// Concrete binding and state mechanisms for one resident Audio realization.
+/// Concrete binding and state mechanisms for the Audio graph.
 pub trait ResidentAudioBinding<B>
 where
     B: GroupedNeuralBackend + DistributedNeuralBackend,
@@ -52,6 +50,31 @@ where
         B,
         LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
     >;
+    /// Language execution over the selected parameter policy.
+    type Language: AudioLanguage<B, Self::State>;
+    /// Speech encoder and projector over the selected parameter policy.
+    type Encoder: AudioEncoder<B, Self::State>;
+    /// Selected depth refinement and speech feedback execution.
+    type Depth: AudioDepth<B>;
+    /// Selected LiquidCodec synthesis.
+    type Codec: DecoderExecution<B, Self::State>;
+
+    /// Binds the exact LiquidCodec synthesis sources.
+    fn bind_codec(&self, prepared: PreparedAudioCodec) -> Result<Self::Codec, BackendFailure>;
+
+    /// Binds the retained speech output weights.
+    fn bind_depth(&self, prepared: PreparedAudioDepth) -> Result<Self::Depth, BackendFailure>;
+
+    /// Binds the retained speech encoder and projector.
+    fn bind_encoder(&self, prepared: PreparedAudioEncoder)
+        -> Result<Self::Encoder, BackendFailure>;
+
+    /// Binds the exact language component with the selected parameter policy.
+    fn bind_language(
+        &self,
+        prepared: PreparedAudioLanguage,
+    ) -> Result<Self::Language, BackendFailure>;
+
     /// Native sampling failure retained as a source.
     type SamplingError: std::error::Error + Send + Sync + 'static;
     /// Existing sampling mechanism on the same context.
@@ -64,12 +87,6 @@ where
 
     /// Selected execution context.
     fn context(&self) -> &Context<B>;
-    /// Binds one module from an already admitted restricted source.
-    fn bind<M: Parameterized<B::Tensor>>(
-        &self,
-        module: &mut M,
-        source: &BindingSource,
-    ) -> Result<(), BackendFailure>;
     /// Creates empty state with exact declared geometry.
     fn state(&self, layout: &StateLayout) -> Result<Self::State, BackendFailure>;
     /// Branches sequential state, isolating all mutable storage.
@@ -99,7 +116,7 @@ pub struct AudioRequest<'a> {
     pub max_slots: usize,
 }
 
-/// Failure to bind a resident graph or admit its initial prompt.
+/// Failure to bind an Audio graph or admit its initial prompt.
 #[derive(Debug, thiserror::Error)]
 pub enum ResidentAudioError {
     /// Prompt features or token budget disagree with the admitted geometry.
@@ -130,10 +147,14 @@ pub struct AudioResidentParameterBytes {
     pub codec: u64,
 }
 
-/// Cold selection for the fixed resident F32 Audio profile.
+/// Cold F32 Audio parameter and sampling selection.
 pub struct PreparedResidentAudio {
     artifact: PreparedAudio,
     sampling: AudioSampling,
+    language: PreparedAudioLanguage,
+    encoder: PreparedAudioEncoder,
+    depth: PreparedAudioDepth,
+    codec: PreparedAudioCodec,
     report: AudioResidentParameterBytes,
 }
 
@@ -141,19 +162,29 @@ impl PreparedResidentAudio {
     /// Retains exact binding recipes and checkpoint sampling settings.
     pub fn select(mut artifact: PreparedAudio) -> Result<Self, ResidentAudioError> {
         let sampling = AudioSampling::from_artifact(&artifact)?;
-        let (language_weights, language) = artifact.language_weights.widened_f32()?;
-        let (encoder_weights, encoder) = artifact.encoder_weights.widened_f32()?;
-        let (depth_weights, depth) = artifact.depth_weights.widened_f32()?;
-        let (codec_weights, codec) =
-            super::artifact::restrict_codec_decoder(&artifact.codec, &artifact.codec_weights)?
-                .widened_f32()?;
+        let [language_scope, encoder_scope, depth_scope, codec_scope] =
+            artifact.f32_weight_scopes()?;
+        let (language_weights, language) = language_scope.finish("LFM3 Audio language")?;
+        let (encoder_weights, encoder) = encoder_scope.finish("LFM3 Audio encoder")?;
+        let (depth_weights, depth) = depth_scope.finish("LFM3 Audio depth")?;
+        let (codec_weights, codec) = codec_scope.finish("LiquidCodec decoder")?;
+        let language_parameters =
+            PreparedAudioLanguage::new(artifact.language.clone(), &language_weights)?;
         artifact.language_weights = language_weights;
+        let encoder_parameters =
+            PreparedAudioEncoder::new(artifact.encoder.clone(), &encoder_weights)?;
         artifact.encoder_weights = encoder_weights;
+        let depth_parameters = PreparedAudioDepth::new(artifact.depth.clone(), &depth_weights)?;
         artifact.depth_weights = depth_weights;
+        let codec_parameters = PreparedAudioCodec::new(artifact.codec.clone(), &codec_weights)?;
         artifact.codec_weights = codec_weights;
         Ok(Self {
             artifact,
             sampling,
+            language: language_parameters,
+            encoder: encoder_parameters,
+            depth: depth_parameters,
+            codec: codec_parameters,
             report: AudioResidentParameterBytes {
                 language,
                 encoder,
@@ -163,31 +194,40 @@ impl PreparedResidentAudio {
         })
     }
 
+    /// Prepares one language pipeline stage without materializing checkpoint payloads.
+    pub fn language_pipeline_partition(
+        &self,
+        rank: eredu_core::ParallelRankTopology,
+    ) -> Result<super::PreparedAudioLanguagePartition, ResidentAudioError> {
+        Ok(PreparedAudioLanguage::new(
+            self.artifact.language.clone(),
+            &self.artifact.language_weights,
+        )?
+        .select_pipeline_rank(rank)?)
+    }
+
     /// Reports the selected logical F32 parameter bytes before device allocation.
     pub fn parameter_bytes(&self) -> AudioResidentParameterBytes {
         self.report
     }
 }
 
-/// Materialized resident graph with exact source binding and separate language,
-/// speech encoder, depth, feedback and codec modules.
+/// Audio graph over selected language, speech input, depth, feedback and codec policies.
 pub struct ResidentAudio<B, H>
 where
     B: GroupedNeuralBackend + DistributedNeuralBackend,
     H: ResidentAudioBinding<B>,
 {
-    language: ResidentRuntime<LayeredModel<B>, B, H::State>,
-    encoder: Encoder<B>,
-    projector: Projector<B>,
-    depth: DepthDecoder<B>,
-    feedback: Feedback<B>,
-    codec: NeuralDecoder<B>,
+    language: H::Language,
+    encoder: H::Encoder,
+    depth: H::Depth,
+    codec: H::Codec,
     binding: H,
     artifact: PreparedAudio,
     sampling: AudioSampling,
 }
 
-/// State retained on one sequential resident speech branch.
+/// State retained on one sequential speech branch.
 pub struct ResidentAudioState<B, H>
 where
     B: GroupedNeuralBackend + DistributedNeuralBackend,
@@ -304,7 +344,7 @@ where
     H: ResidentAudioBinding<B>,
     <H::Sampling as SamplingBackend>::RandomState: Clone,
 {
-    /// Constructs and binds the selected resident modules from retained sources.
+    /// Prepares and binds the selected modules from retained sources.
     pub fn new(artifact: PreparedAudio, binding: H) -> Result<Self, ResidentAudioError> {
         Self::from_prepared(PreparedResidentAudio::select(artifact)?, binding)
     }
@@ -315,43 +355,22 @@ where
         binding: H,
     ) -> Result<Self, ResidentAudioError> {
         let PreparedResidentAudio {
-            artifact, sampling, ..
+            artifact,
+            sampling,
+            language,
+            encoder,
+            depth,
+            codec,
+            ..
         } = prepared;
-        let ctx = binding.context();
-        let architecture = CompleteLfm3Kernel::<B>::from_selected_declaration(
-            artifact.language.clone(),
-            artifact.language.definition().clone(),
-            None,
-            ctx,
-        )
-        .map_err(failure)?;
-        let mut language = ResidentRuntime::new(architecture, ctx).map_err(failure)?;
-        binding.bind(
-            language
-                .architecture_mut()
-                .kernel_mut()
-                .static_modules_mut(),
-            &artifact.language_weights,
-        )?;
-        for block in language.units_mut().iter_mut().flatten() {
-            binding.bind(block, &artifact.language_weights)?;
-        }
-        let mut encoder = Encoder::new(&artifact.encoder, ctx).map_err(failure)?;
-        let mut projector = Projector::new(&artifact.encoder, ctx).map_err(failure)?;
-        binding.bind(&mut encoder, &artifact.encoder_weights)?;
-        binding.bind(&mut projector, &artifact.encoder_weights)?;
-        let mut depth = DepthDecoder::new(&artifact.depth, ctx).map_err(failure)?;
-        let mut feedback = Feedback::new(&artifact.depth, ctx).map_err(failure)?;
-        binding.bind(&mut depth, &artifact.depth_weights)?;
-        binding.bind(&mut feedback, &artifact.depth_weights)?;
-        let mut codec = NeuralDecoder::new(&artifact.codec, ctx).map_err(failure)?;
-        binding.bind(&mut codec, &artifact.codec_weights)?;
+        let language = binding.bind_language(language)?;
+        let encoder = binding.bind_encoder(encoder)?;
+        let depth = binding.bind_depth(depth)?;
+        let codec = binding.bind_codec(codec)?;
         Ok(Self {
             language,
             encoder,
-            projector,
             depth,
-            feedback,
             codec,
             binding,
             artifact,
@@ -365,76 +384,96 @@ where
         request: AudioRequest<'_>,
         random: <H::Sampling as SamplingBackend>::RandomState,
     ) -> Result<AudioSession<Self>, ResidentAudioError> {
-        let policy =
-            AudioSchedulePolicy::from_artifact(&self.artifact, request.mode, request.max_slots)
+        let preparation = (|| -> Result<_, ResidentAudioError> {
+            let policy =
+                AudioSchedulePolicy::from_artifact(&self.artifact, request.mode, request.max_slots)
+                    .map_err(AudioSessionError::from)?;
+            let sampling = self.sampling.clone();
+            let mut tokens = request.tokens.to_vec();
+            let original_last = *tokens.last().ok_or(ResidentAudioError::Prompt)?;
+            if let Some(marker) = policy.prompt_marker(original_last) {
+                tokens.push(marker);
+            }
+            let last = *tokens.last().ok_or(ResidentAudioError::Prompt)?;
+            let replayed_eos = last == self.artifact.tokens.output
+                && request
+                    .replay
+                    .last()
+                    .is_some_and(|codes| codes.contains(&self.artifact.depth.eos_code()));
+            let schedule = policy
+                .start(last, replayed_eos)
                 .map_err(AudioSessionError::from)?;
-        let sampling = self.sampling.clone();
-        let mut tokens = request.tokens.to_vec();
-        let original_last = *tokens.last().ok_or(ResidentAudioError::Prompt)?;
-        if let Some(marker) = policy.prompt_marker(original_last) {
-            tokens.push(marker);
-        }
-        let last = *tokens.last().ok_or(ResidentAudioError::Prompt)?;
-        let replayed_eos = last == self.artifact.tokens.output
-            && request
-                .replay
-                .last()
-                .is_some_and(|codes| codes.contains(&self.artifact.depth.eos_code()));
-        let schedule = policy
-            .start(last, replayed_eos)
-            .map_err(AudioSessionError::from)?;
-        let args = self.artifact.language.args();
-        if tokens
-            .len()
-            .checked_add(request.max_slots)
-            .is_none_or(|n| n > args.max_position_embeddings as usize)
-        {
-            return Err(ResidentAudioError::Prompt);
-        }
-        let ctx = self.binding.context();
-        let mut clips = Vec::with_capacity(request.features.len());
-        for features in request.features {
-            if features.frames == 0
-                || features.mel_bins != 128
-                || features.frames.checked_mul(features.mel_bins) != Some(features.values.len())
-                || features.mask.len() != features.frames
-                || features.mask.iter().any(|&valid| !valid)
-                || features.values.iter().any(|&value| !value.is_finite())
+            let args = self.artifact.language.args();
+            if tokens
+                .len()
+                .checked_add(request.max_slots)
+                .is_none_or(|n| n > args.max_position_embeddings as usize)
             {
                 return Err(ResidentAudioError::Prompt);
             }
-            let frames = i32::try_from(features.frames).map_err(failure)?;
-            let input = B::Tensor::from_f32_slice(&features.values, &[1, frames, 128], ctx)
-                .and_then(|features| features.transpose_axes(&[0, 2, 1], ctx))
-                .map_err(failure)?;
-            let mut state = self.binding.state(self.artifact.encoder.state_layout())?;
-            let encoded = self
-                .encoder
-                .forward(&input, &mut state, ctx)
-                .map_err(failure)?;
-            clips.push(
-                self.projector
-                    .forward(&encoded, ctx)
-                    .and_then(|rows| rows.squeeze_axes(&[0], ctx))
-                    .map_err(failure)?,
-            );
-        }
-        let speech_input = if clips.is_empty() {
-            None
-        } else {
-            Some(B::Tensor::concatenate(&clips, 0, ctx).map_err(failure)?)
-        };
-        let speech_output = if request.replay.is_empty() {
-            None
-        } else {
-            let count = i32::try_from(request.replay.len()).map_err(failure)?;
-            let codes = B::Tensor::from_i32_slice(request.replay.as_flattened(), &[count, 12], ctx)
-                .map_err(failure)?;
-            Some(self.feedback.embed(&codes, ctx).map_err(failure)?)
-        };
-        let mut language = self
-            .binding
-            .state(self.artifact.language.definition().state_layout())?;
+            let ctx = self.binding.context();
+            let mut clips = Vec::with_capacity(request.features.len());
+            for features in request.features {
+                if features.frames == 0
+                    || features.mel_bins != 128
+                    || features.frames.checked_mul(features.mel_bins) != Some(features.values.len())
+                    || features.mask.len() != features.frames
+                    || features.mask.iter().any(|&valid| !valid)
+                    || features.values.iter().any(|&value| !value.is_finite())
+                {
+                    return Err(ResidentAudioError::Prompt);
+                }
+                let frames = i32::try_from(features.frames).map_err(failure)?;
+                let input = B::Tensor::from_f32_slice(&features.values, &[1, frames, 128], ctx)
+                    .and_then(|features| features.transpose_axes(&[0, 2, 1], ctx))
+                    .map_err(failure)?;
+                let mut state = self.binding.state(self.artifact.encoder.state_layout())?;
+                clips.push(
+                    self.encoder
+                        .project(&input, &mut state, ctx)
+                        .and_then(|rows| rows.squeeze_axes(&[0], ctx))
+                        .map_err(failure)?,
+                );
+            }
+            let speech_input = if clips.is_empty() {
+                None
+            } else {
+                Some(B::Tensor::concatenate(&clips, 0, ctx).map_err(failure)?)
+            };
+            let speech_output = if request.replay.is_empty() {
+                None
+            } else {
+                let count = i32::try_from(request.replay.len()).map_err(failure)?;
+                let codes =
+                    B::Tensor::from_i32_slice(request.replay.as_flattened(), &[count, 12], ctx)
+                        .map_err(failure)?;
+                Some(self.depth.embed(&codes, ctx).map_err(failure)?)
+            };
+            let language = self.binding.state(self.language.state_layout())?;
+            Ok((
+                schedule,
+                sampling,
+                tokens,
+                speech_input,
+                speech_output,
+                language,
+            ))
+        })();
+        let agreement = self.language.agree_audio(
+            [
+                0x41554453544152,
+                request.max_slots as u64,
+                request.mode as u64,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
+            preparation.is_ok(),
+        );
+        let (schedule, sampling, tokens, speech_input, speech_output, mut language) = preparation?;
+        agreement?;
         let hidden = self.forward_prompt(
             &mut language,
             &tokens,
@@ -449,7 +488,13 @@ where
             fork_retention: None,
             binding: PhantomData,
         };
-        self.complete(&state)?;
+        let completion = self.complete(&state);
+        let agreement = self
+            .language
+            .agree_audio([0x41554453544143, 0, 0, 0, 0, 0, 0, 0], completion.is_ok());
+        completion?;
+        agreement?;
+        self.language.commit_audio()?;
         Ok(AudioSession::new(self, state, schedule, sampling, random)?)
     }
 }
@@ -474,7 +519,7 @@ where
         output: Option<&B::Tensor>,
     ) -> Result<B::Tensor, BackendFailure> {
         let ctx = self.binding.context();
-        AudioPrompt::new(
+        let prompt = AudioPrompt::new(
             tokens,
             self.artifact.tokens,
             self.artifact.language.args().hidden_size,
@@ -482,18 +527,27 @@ where
             output,
             ctx,
         )
-        .and_then(|input| input.forward_resident(&mut self.language, language, ctx))
-        .and_then(|hidden| last_position(&hidden, ctx))
-        .map_err(failure)
+        .map_err(failure);
+        let agreement = self
+            .language
+            .agree_audio([0x41554450524f4d, 0, 0, 0, 0, 0, 0, 0], prompt.is_ok());
+        let prompt = prompt?;
+        agreement?;
+        let position = self
+            .language
+            .forward_prompt(&prompt, language, ctx)
+            .and_then(|hidden| last_position(&hidden, ctx).map_err(failure));
+        let agreement = self
+            .language
+            .agree_audio([0x41554448494444, 0, 0, 0, 0, 0, 0, 0], position.is_ok());
+        let position = position?;
+        agreement?;
+        Ok(position)
     }
 
     fn language_logits(&mut self, hidden: &B::Tensor) -> Result<B::Tensor, BackendFailure> {
         self.language
-            .architecture_mut()
-            .kernel_mut()
-            .static_modules_mut()
             .project_normalized(hidden, self.binding.context())
-            .map_err(failure)
     }
 
     fn project_stream_chunk(
@@ -514,9 +568,8 @@ where
         if encoded.dim(1) == 0 {
             return Ok(None);
         }
-        self.projector
-            .forward(&encoded, context)
-            .and_then(|value| value.squeeze_axes(&[0], context))
+        encoded
+            .squeeze_axes(&[0], context)
             .map(Some)
             .map_err(failure)
     }
@@ -571,8 +624,19 @@ where
         eos: bool,
     ) -> Result<Vec<f32>, BackendFailure> {
         let ctx = self.binding.context();
-        let codes = B::Tensor::from_i32_slice(codes, &[1, 12], ctx).map_err(failure)?;
-        let feedback = self.feedback.embed(&codes, ctx).map_err(failure)?;
+        let local = B::Tensor::from_i32_slice(codes, &[1, 12], ctx)
+            .and_then(|codes| {
+                self.depth
+                    .embed(&codes, ctx)
+                    .map(|feedback| (codes, feedback))
+            })
+            .map_err(failure);
+        let agreement = self.language.agree_audio(
+            [0x41554446454544, u64::from(eos), 0, 0, 0, 0, 0, 0],
+            local.is_ok(),
+        );
+        let (codes, feedback) = local?;
+        agreement?;
         let AudioTokens { output, .. } = self.artifact.tokens;
         self.append(state, output, Some(&feedback))?;
         if eos {
@@ -626,6 +690,18 @@ where
         let completion = B::submit(self.binding.context(), roots).map_err(failure)?;
         completion.wait().map_err(failure)?;
         Ok(completion)
+    }
+
+    fn uses_collective_commit(&self) -> bool {
+        self.language.uses_collective_commit()
+    }
+
+    fn agree_audio(&mut self, descriptor: [u64; 8], success: bool) -> Result<(), BackendFailure> {
+        self.language.agree_audio(descriptor, success)
+    }
+
+    fn commit_audio(&mut self) -> Result<(), BackendFailure> {
+        self.language.commit_audio()
     }
 
     fn with_fork_retention<T>(

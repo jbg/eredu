@@ -3,9 +3,9 @@
 The experimental LFM3 text route admits `lfm3` SafeTensors and GGUF checkpoints.
 Its declaration owns width-seven gated convolutions, global and sliding attention,
 per-head sigmoid gates, separate rotary policies, and sandwich normalization before
-residual addition. Global rotary pairs retain full-head frequency spacing; only the
-highest-frequency half rotates. Rotary tables, products and sums use FP32 before
-the final input-dtype cast.
+residual addition. Global rotary pairs retain full-head frequency spacing and
+rotate the highest-frequency half. Rotary tables are computed in F32 and stored
+in the activation dtype. The products and sums use F32 before the final cast.
 
 Resident, host-layerwise and disk-streamed execution use independently leased decoder
 layers. TP/PP construction consumes the same declaration and local state geometry.
@@ -184,7 +184,8 @@ and output scoring. A frame containing any EOS code terminates the speech
 segment. The completed frame exposes either ordinary codec codes or EOS. The
 language feedback table embeds ordinary frames and canonical all-EOS frames.
 The resident driver uses these components for controlled speech output.
-Native BF16 numerical parity remains unvalidated.
+The [native BF16 conditional comparison](#native-bf16-conditional-comparison)
+measures them in the complete Audio model.
 
 Standalone LiquidCodec neural encoding and finite/cached decoding, CPU/Metal
 F32 reference results and integration limits are documented in
@@ -235,10 +236,49 @@ cargo run -p eredu-backend-mlx --features audio --example lfm3_audio_reference -
 MLX_ENABLE_TF32=0 cargo run -p eredu-backend-mlx --features audio,metal --example lfm3_audio_reference -- /private/tmp/lfm3-audio /private/tmp/lfm3-audio-reference /private/tmp/lfm3-audio-reference/metal.json --device gpu
 ```
 
-The retained evidence covers resident conditional execution with a fixed
-sampler. It does not compare the publisher's random sampling stream or realtime
-mode transitions. Official audio GGUF, native BF16, and selected bounded and
-distributed audio execution remain outside this path.
+The conditional case measures resident execution with fixed-order greedy
+sampling. LiveASR, bounded execution and distributed replay have separate cases
+below.
+
+### Native BF16 conditional comparison
+
+The same pinned SafeTensors case can bind the encoder, projector, backbone,
+feedback and depth decoder as BF16, keeping the mel frontend and LiquidCodec
+in F32. This is a reference-runner precision mode. The selected Audio runtime
+uses F32 widening. Depth score comparisons feed the publisher's preceding
+reveals to both implementations. The PCM and subsequent feedback comparisons
+also use the publisher's codes.
+
+The score profile requires relative L2 at most 0.02, cosine at least 0.999,
+at least four of the top five IDs in common and matching unambiguous argmax.
+The rotary operation generates its tables in F32, rounds them to the
+activation dtype, and applies the rotation in F32. The downsampler and
+projector keep their bias and normalization arithmetic in F32 before each
+corresponding BF16 output cast. Speech feedback sums codebook embeddings
+in F32 before restoring the activation dtype.
+
+CPU and precise Metal pass all 17 vocabulary rows and 36 depth rows.
+Both match all 17 text argmax IDs, all 12 greedy code IDs and all language
+hidden states exactly. The runner uses F32 codec arithmetic.
+
+| Measurement | CPU maximum relative L2 | Precise Metal maximum relative L2 |
+| --- | ---: | ---: |
+| Mixed prefill scores | 0 | 0.00003742 |
+| Eight cached vocabulary rows | 0 | 0.00002415 |
+| Depth scores | 0 | 0.00000571 |
+| Speech feedback scores | 0 | 0.00002259 |
+
+Maximum absolute PCM error is `2.02e-12` on CPU and `2.90e-12` on
+precise Metal.
+
+```sh
+HF_HOME=/private/tmp/lfm3-hf python validation/lfm3_audio_reference.py \
+  /private/tmp/lfm3-audio /private/tmp/lfm3-audio-bf16 --bfloat16
+cargo run -p eredu-backend-mlx --features audio --example lfm3_audio_reference -- \
+  /private/tmp/lfm3-audio /private/tmp/lfm3-audio-bf16 /private/tmp/lfm3-audio-bf16/cpu.json
+MLX_ENABLE_TF32=0 cargo run -p eredu-backend-mlx --features audio,metal --example lfm3_audio_reference -- \
+  /private/tmp/lfm3-audio /private/tmp/lfm3-audio-bf16 /private/tmp/lfm3-audio-bf16/metal.json --device gpu
+```
 
 
 ## Resident Audio sessions
@@ -251,7 +291,7 @@ generation and processor metadata and `audio_tokenizer/config.json`.
 The local directory can omit both SafeTensors weight files. The embedded
 GGUF vocabulary, BPE merges, task templates and sampling settings determine
 the admitted pair's text policy alongside the publisher's EOS set.
-The Rust realtime facade supplies the resident graph to the turn-based
+The Rust realtime facade supplies the selected graph to the turn-based
 `eredu audio` command. The CLI exposes transcription, translation to text,
 text-to-speech and spoken responses. The separate `eredu audio realtime` command
 drives full-duplex VoiceChat conversations.
@@ -262,9 +302,13 @@ a finalized 24-kHz WAV through the CLI synthesis task. CLI device I/O is
 build-checked.
 `prepare_mlx_realtime` with `RealtimeLoadOptions::Lfm3Audio` selects the
 resident model and reports the logical F32 parameter bytes by component.
-The report excludes session state and temporary allocations. Load consumes
-the selection with explicit weight and execution contexts. The bound model's
-`start` accepts a batch-one `AudioRequest` and sampling seed. The request supplies
+Cold preparation produces 75 parameter units for both the pinned SafeTensors
+checkpoint and the Q4_K_M backbone/projector pair. The largest unit is the
+tied language embedding at 1,048,576,000 F32 bytes. The sum of the unit
+sizes matches the resident parameter report for each layout. These are
+logical parameter sizes and exclude session state and temporary allocations.
+Load consumes the selection with explicit weight and execution contexts.
+The bound model's `start` accepts a batch-one `AudioRequest` and sampling seed. The request supplies
 token IDs with expanded speech placeholders, finite mel features in prompt
 order, optional replayed speech codes, a mode, and a slot budget. The retained
 processor transforms mono 16-kHz PCM to the input features.
@@ -273,19 +317,27 @@ The session emits text token IDs, completed codebook frames with 24-kHz
 mono PCM, and speech EOS. Both `advance` and `events` use the same controlled
 driver. Idle snapshots and restore use explicit copy limits and preserve
 unfinished refinement and codec carry. Live forks resume the settled state
-on the same resident graph, with independent restore origins and a shared
+on the same selected graph, with independent restore origins and a shared
 copy budget. The audio feature also exposes controlled mono 16-kHz PCM
 ingress for one streamed utterance. The caller supplies token spans around
-the utterance and finalizes it before generating a response. Distributed
-execution and bounded residency remain unimplemented for Audio.
+the utterance and finalizes it before generating a response. The low-level
+`AudioParameterResidency` selects independent resident, host-layerwise or
+disk-streamed policies for language blocks, speech input, depth and feedback,
+and LiquidCodec synthesis. The Rust facade retains it through
+`RealtimeLoadOptions::Lfm3AudioWithResidency` or
+`PreparedAudioTask::with_parameter_residency`. The default facade and CLI
+options select resident weights. The native tensor-cohort adapter described
+below shards the language backbone. The native pipeline adapter also supports
+pipeline-only and combined tensor/pipeline placement with replicated speech
+components. The facade and CLI select single-rank Audio sessions.
 
-A CPU loader check uses the pinned Audio checkpoint with the weight file and
-asset directory supplied separately. The selected language, encoder, depth
-and codec bindings total 6,915,206,144, 461,112,576, 533,873,408 and
-294,236,360 bytes respectively. After the configuration, processor,
-generation defaults and tokenizer paths are removed from the temporary
-asset directory, the selected model loads and commits token 13 for prompt
-IDs `[124894,5,13,21,34]` with seed 41 and a one-slot text budget.
+The selected language, encoder, depth/feedback and codec synthesis bindings
+total 6,915,206,144, 461,112,576, 533,873,408 and 145,484,296 F32 bytes
+respectively. A CPU loader check supplies the pinned Audio weight file and
+asset directory separately. After the configuration, processor, generation
+defaults and tokenizer paths are removed from the temporary asset directory,
+the selected model loads and commits token 13 for prompt IDs
+`[124894,5,13,21,34]` with seed 41 and a one-slot text budget.
 
 The released-checkpoint session check uses seed 41, a three-slot speech
 budget, and prompt IDs `[124894,5,125031,125031,13,21,34]` before marker
@@ -466,15 +518,36 @@ exact emitted codebooks and PCM between the two execution paths. It exercises
 the loaded speech input, backbone, depth, feedback and codec graph, with
 controlled budgets carried from prompt ingestion into the response. The F32
 CPU run matched all three speech frames and 5,760 PCM samples exactly, including
-the restored and forked prompt continuations. Resident execution on the other
-encodings remains unverified.
-Audio currently selects resident placement.
+the restored and forked prompt continuations. This end-to-end session replay
+uses Q4_K_M. The runner's `--language-residency host` and
+`--language-residency disk` options compare streamed prompt continuations
+using bounded language blocks against the finite resident baseline. Both
+profiles set a 2 GiB language device budget. The host profile sets a 12 GiB
+language host budget and the disk profile sets a 2 GiB language host budget.
+Both bounded profiles match three codebook frames and 5,760 PCM samples
+exactly against the resident baseline, including restore and fork. Speech
+modules are resident in the language-only comparison. The runner's
+`--encoder-residency host` and `--encoder-residency disk` options independently
+select speech input placement with a 128 MiB device budget. The host profile
+sets a 1 GiB speech input host budget, and the disk profile sets a 128 MiB
+speech input host budget. Both speech-input profiles match the resident
+baseline's three codebook frames and 5,760 PCM samples exactly through restore
+and fork on CPU, with resident language blocks.
+The `--depth-residency` and `--codec-residency` options extend this replay to
+speech output. They use 256 MiB for depth and feedback and 64 MiB for codec
+synthesis as device parameter budgets. Both profiles combine bounded speech
+input and output with resident language. Each matches all three codebook
+frames and 5,760 PCM samples exactly on CPU, including restore and fork.
+Run the command below with `--encoder-residency host --depth-residency host
+--codec-residency host` for the host profile or use `disk` for all three
+speech components for the disk profile.
+
 
 ```sh
 audio_dir=/private/tmp/eredu-audio-gguf
 cargo run -p eredu-backend-mlx --features audio --example lfm3_audio_reference -- \
   /private/tmp/lfm3-audio validation/fixtures/lfm3/audio-gguf-sources.json \
-  "$audio_dir/ingress-cpu.json" --device cpu --ingress-replay \
+  "$audio_dir/ingress-cpu.json" --device cpu --ingress-replay --language-residency resident \
   --gguf-backbone "$audio_dir/LFM3-Audio-2B-Q4_K_M.gguf" \
   --gguf-projector "$audio_dir/mmproj-LFM3-Audio-2B-Q4_K_M.gguf"
 ```
@@ -535,7 +608,8 @@ Eredu executes F32 from the same encoded weights on CPU.
 
 Both references agree on all 36 argmax IDs and each row's top-five set. The
 llama.cpp row for codebook 7 in the second pass exceeds the shared relative
-L2 limit of 0.02. The decoded-F32 result passes the additional maximum
+L2 limit of 0.02. Disabling media flash attention in the same pinned Metal
+runner produces identical score bytes. The decoded-F32 result passes the additional maximum
 absolute limit of `5e-4`. Both references and Eredu reveal
 `[296, 820, 1404, 55, 0, 622, 24, 616, 2, 620, 1302, 323]` in codebook order.
 The fixture exercises greedy reveals with a fixed order and conditioning vector.
@@ -606,3 +680,127 @@ cargo run -p eredu-backend-mlx --no-default-features \
   /private/tmp/lfm3-audio/config.json /private/tmp/lfm3-audio/audio_tokenizer/config.json \
   "$llama_dir/codec.f32"
 ```
+
+### BF16, F16, Q4_0 and Q8_0 Audio parity
+
+Each row uses the published backbone/projector pair whose payload SHA-256
+digests match the [source manifest](../validation/fixtures/lfm3/audio-gguf-sources.json).
+The pinned llama.cpp Metal runners and Eredu's CPU F32 realization of the
+same encoded weights run the mixed prefill and eight cached positions, the
+three depth refinement passes, and streaming PCM with the final flush. The
+BF16 and F16 rows measure widening from their respective published layouts.
+The Q4_0 and Q8_0 rows measure same-artifact quantized parity.
+
+| Layout | Mixed logits max relative L2 | Mixed logits max abs | Depth max relative L2 | Depth max abs | PCM max abs | PCM relative L2 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| BF16 | 0.00011841 | 0.00329494 | 0.00052404 | 0.00378788 | 0.00232878 | 0.00278818 |
+| F16 | 0.00012602 | 0.00357914 | 0.00051487 | 0.00381649 | 0.00174028 | 0.00251233 |
+| Q4_0 | 0.00011548 | 0.00247192 | 0.00060427 | 0.00377560 | 0.00097012 | 0.00215241 |
+| Q8_0 | 0.00012062 | 0.00338364 | 0.00064514 | 0.00520205 | 0.00173993 | 0.00305636 |
+
+All nine 128,000-entry language rows and all 36 2,017-entry depth rows pass
+the shared logit tolerance in each layout, with matching argmax IDs and
+5/5 top-five overlap. All twelve greedy codebook reveals match. Each PCM
+comparison passes the 0.05 maximum absolute and 0.08 relative L2 limits for
+19,200 samples with chunk counts `[1440, 5760, 11520, 480]`.
+
+Build the pinned Metal runners as above. Use the same pair for each
+comparison, with the corresponding verified Audio backbone header for the
+decoder-only Eredu runner.
+
+```sh
+assets=/private/tmp/lfm3-audio
+audio_dir=/private/tmp/eredu-audio-gguf
+llama_dir=/private/tmp/eredu-llama-audio-reference
+manifest=validation/fixtures/lfm3/audio-gguf-sources.json
+for variant in BF16 F16 Q4_0 Q8_0; do
+  backbone="$audio_dir/LFM3-Audio-2B-$variant.gguf"
+  projector="$audio_dir/mmproj-LFM3-Audio-2B-$variant.gguf"
+  "$llama_dir/audio-reference" "$backbone" "$projector" "$audio_dir/$variant-scores.f32"
+  "$llama_dir/audio-reference" "$backbone" "$projector" "$audio_dir/$variant-depth.f32" --depth
+  "$llama_dir/liquid-reference" /private/tmp/eredu-lfm3-gguf/LFM3-1.7B-Q4_K_M.gguf \
+    "$projector" "$audio_dir/$variant-pcm.f32" --metal
+  cargo run -p eredu-backend-mlx --features audio --example lfm3_audio_reference -- \
+    "$assets" "$manifest" "$audio_dir/$variant-scores.json" --device cpu \
+    --gguf-backbone "$backbone" --gguf-projector "$projector" \
+    --gguf-scores "$audio_dir/$variant-scores.f32"
+  cargo run -p eredu-backend-mlx --features audio --example lfm3_audio_reference -- \
+    "$assets" "$manifest" "$audio_dir/$variant-depth.json" --device cpu \
+    --gguf-backbone "$backbone" --gguf-projector "$projector" \
+    --gguf-depth-scores "$audio_dir/$variant-depth.f32"
+  cargo run -p eredu-backend-mlx --features audio --example lfm3_liquid_gguf_reference -- \
+    "$manifest" "$backbone.header" "$projector" "$assets/config.json" \
+    "$assets/audio_tokenizer/config.json" "$audio_dir/$variant-pcm.f32"
+done
+```
+
+### Q4_K_M tensor-cohort replay
+
+The native `MlxTensorParallelAudioModel` and `MlxPipelineAudioModel` accept
+externally initialized MLX Ring cohorts. On CPU the pinned Q4_K_M pair
+runs the same finite speech-conditioned prompt and seed on every rank,
+with rank-local language weights and caches and replicated speech input and
+output components. Each pipeline run carries the residual stream between
+stages and commits the candidate state and event across all ranks.
+
+| TP | PP | Ranks | Matching codebook IDs | Matching PCM samples | Max absolute PCM error | Relative L2 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2 | 1 | 2 | 36 | 5,760 | 0 | 0 |
+| 1 | 2 | 2 | 36 | 5,760 | 0 | 0 |
+| 2 | 2 | 4 | 36 | 5,760 | 0 | 0 |
+
+The combined TP=2/PP=2 run also matches all 36 codebook IDs and 5,760
+PCM samples exactly in both bounded replays. Each selects host-layerwise
+or disk-streamed residency for language, speech input, depth/feedback and
+codec synthesis together. All four workers exit successfully in both cases.
+
+The PCM comparison includes the final codec flush. The launcher requires
+exact codebook and peer agreement, a maximum absolute PCM error of 0.0005,
+and relative L2 of at most 0.0001. The combined topology also matches
+serial text readout with generated IDs `[13, 13, 13]` on every rank.
+In a PP=2 admission check with text mode on one rank and speech mode on
+the other, both ranks reject the request and neither publishes output.
+In a separate TP=2/PP=2 check, all ranks complete prefill before sampling
+their first depth pass with distinct seeds. All four reject the divergent
+decision and report zero committed slots. The shared runtime tests
+`partitioned_phase_agreement_propagates_execution_observation_and_completion_failures`
+and `failed_completion_rolls_back_every_component` cover injected local
+phase failures and rollback after failed completion.
+
+The TP-only adapter uses caller-managed agreement. The pipeline adapter
+uses the shared manifest, transport, and all-rank candidate commit. The
+serial side also checks cold
+language partition construction for PP=2 and combined TP=2/PP=2 from
+the same retained sources. Each pipeline stage owns twelve layers and
+the first and last stages own input and output respectively.
+
+| TP | PP | First-stage bytes per rank | Last-stage bytes per rank |
+| ---: | ---: | ---: | ---: |
+| 1 | 2 | 3,994,432,512 | 3,969,349,632 |
+| 2 | 2 | 1,997,415,424 | 1,984,878,592 |
+
+These are logical F32 parameter bytes for the language partition. They
+include the tied vocabulary storage at both ends of the pipeline and
+exclude mutable state, activations, and speech components. The PP and
+combined checks construct stage-local modules and bindings without
+materializing tensor payloads. The execution replay materializes and runs
+these same bindings.
+
+
+```sh
+audio_dir=/private/tmp/eredu-audio-gguf
+cargo build -p eredu-backend-mlx --features audio --example lfm3_audio_reference
+python3 validation/lfm3_audio_tensor_replay.py \
+  target/debug/examples/lfm3_audio_reference /private/tmp/lfm3-audio \
+  validation/fixtures/lfm3/audio-gguf-sources.json \
+  "$audio_dir/LFM3-Audio-2B-Q4_K_M.gguf" \
+  "$audio_dir/mmproj-LFM3-Audio-2B-Q4_K_M.gguf" \
+  "$audio_dir/pipeline-replay" --topology pp2 --topology tp2-pp2
+```
+
+Run the same command with a separate output directory and
+`--topology tp2-pp2 --text` in place of the speech topology options to
+check the vocabulary readout. Use `--topology tp2-pp2 --residency host`
+or `--topology tp2-pp2 --residency disk` to replay with all components
+bounded. Use `--reject-divergent-seeds` to check agreement during the first depth
+advance. Use a fresh output directory for each case.

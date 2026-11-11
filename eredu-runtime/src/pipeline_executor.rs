@@ -631,6 +631,11 @@ where
         &self.architecture
     }
 
+    /// Borrows stage modules and their selected collective for a separate readout.
+    pub fn readout_resources(&mut self) -> (&mut A, Option<&B::ParallelContext>) {
+        (&mut self.architecture, self.parallel.as_ref())
+    }
+
     /// Selects an explicitly admitted stage cohort for local preparation and lease
     /// failure agreement. Callers validate it with [`validate_pipeline_local_agreement`]
     /// before native realization; the enclosing all-rank scheduler remains unchanged.

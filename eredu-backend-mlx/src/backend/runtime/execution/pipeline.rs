@@ -85,9 +85,43 @@ where
     /// Native realization consumes an already validated portable selection.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
+        architecture: A,
+        source: SharedCheckpointSource,
+        invocations: eredu_runtime::ExecutionUnitAddressMap,
+        units: Vec<(ExecutionUnitAddress, Vec<WeightBinding>)>,
+        manifest: CommunicationManifest,
+        plan: PartitionedExecutionPlan,
+        tensor_group: Option<CollectiveGroupId>,
+        activation_dtype: PipelineActivationDtype,
+        world: &safemlx::distributed::Group,
+        residency: LayerWeightResidency,
+        weights_stream: &Stream,
+        execution_stream: &Stream,
+    ) -> Result<(Self, LayerwiseModelMetadata), BackendFailure> {
+        Self::with_pinned(
+            architecture,
+            source,
+            invocations,
+            Vec::new(),
+            units,
+            manifest,
+            plan,
+            tensor_group,
+            activation_dtype,
+            world,
+            residency,
+            weights_stream,
+            execution_stream,
+        )
+    }
+
+    /// Binds a selected pipeline that owns stage-local pinned parameters.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_pinned(
         mut architecture: A,
         source: SharedCheckpointSource,
         invocations: eredu_runtime::ExecutionUnitAddressMap,
+        pinned: Vec<WeightBinding>,
         units: Vec<(ExecutionUnitAddress, Vec<WeightBinding>)>,
         manifest: CommunicationManifest,
         plan: PartitionedExecutionPlan,
@@ -128,7 +162,7 @@ where
                     weights_stream,
                     |_| false,
                     invocations,
-                    vec![],
+                    pinned,
                     units,
                 )
                 .map_err(BackendFailure::from_error)?;
@@ -362,6 +396,98 @@ where
             Policy<A, S>,
         >>::commit_after_completion(&mut self.runtime, epoch, stream);
         Ok((prepared, outcome))
+    }
+
+    /// Agrees a local application decision before dependent transport or publication.
+    pub(crate) fn agree_descriptor(
+        &mut self,
+        descriptor: [u64; 8],
+        success: bool,
+        stream: &Stream,
+    ) -> Result<(), BackendFailure> {
+        let accepted = <Strategy<A, S> as ReplicatedTextExecutionStrategy<
+            A,
+            MlxNeuralBackend,
+            S,
+            Policy<A, S>,
+            Policy<A, S>,
+        >>::agree_distributed_descriptor(
+            &mut self.runtime,
+            DistributedExecutionPhase::InputPreparation,
+            success,
+            descriptor,
+            stream,
+        )
+        .map_err(BackendFailure::from_error)?;
+        if accepted {
+            Ok(())
+        } else {
+            Err(contract(
+                "component pipeline rank rejected the application decision",
+            ))
+        }
+    }
+
+    /// Commits an application candidate after all its local roots have completed.
+    pub(crate) fn commit(
+        &mut self,
+        epoch: DistributedCommitEpoch,
+        stream: &Stream,
+    ) -> Result<(), BackendFailure> {
+        let outcome = <Strategy<A, S> as ReplicatedTextExecutionStrategy<
+            A,
+            MlxNeuralBackend,
+            S,
+            Policy<A, S>,
+            Policy<A, S>,
+        >>::commit_after_completion(&mut self.runtime, epoch, stream);
+        if outcome == DistributedCommitOutcome::Committed(epoch) {
+            Ok(())
+        } else {
+            self.failed = true;
+            Err(contract(
+                "component pipeline application commit did not complete",
+            ))
+        }
+    }
+
+    /// Runs a stage-owned readout and publishes its output using the retained authority.
+    pub(crate) fn readout(
+        &mut self,
+        stream: &Stream,
+        input_roots: Vec<Array>,
+        project: impl FnOnce(&mut A, Option<&Group>) -> Result<MlxTensor, BackendFailure>,
+    ) -> Result<MlxTensor, BackendFailure> {
+        detached_preparation(
+            input_roots,
+            || {
+                let (architecture, parallel) = self.runtime.executor_mut().readout_resources();
+                let local = project(architecture, parallel);
+                let agreement =
+                    self.agree(DistributedExecutionPhase::Execution, local.is_ok(), stream);
+                let local = local?;
+                agreement?;
+                let output = <Strategy<A, S> as ReplicatedTextExecutionStrategy<
+                    A,
+                    MlxNeuralBackend,
+                    S,
+                    Policy<A, S>,
+                    Policy<A, S>,
+                >>::publish_observed_output(
+                    &mut self.runtime, local, stream
+                )
+                .map_err(BackendFailure::from_error);
+                let agreement = self.agree(
+                    DistributedExecutionPhase::OutputPublication,
+                    output.is_ok(),
+                    stream,
+                );
+                let output = output?;
+                agreement?;
+                Ok(output)
+            },
+            BackendFailure::from_error,
+        )
     }
 
     fn agree(

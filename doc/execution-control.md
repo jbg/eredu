@@ -275,7 +275,7 @@ conformance case covers bounded residency and controlled/uninterrupted agreement
 [released-checkpoint evidence](lfm3-validation.md) records numerical coverage and
 the family tasks without an implementation.
 
-The resident LFM3 Audio session accepts prepared SafeTensors or explicit GGUF
+The LFM3 Audio session accepts prepared SafeTensors or explicit GGUF
 backbone/projector sources. Both use the same driver for batch-one token prompts with finite
 mel features and replayed speech codes. Each advance settles one text decision
 or one depth pass. The shared realtime transaction publishes the resulting
@@ -289,8 +289,11 @@ or response termination flushes the codec tail. The event iterator drains the
 same driver. Cancellation occurs between settled advances and drops any
 unpublished speech frame.
 
-The shared realtime loader selects resident MLX execution before the caller
-starts a prompt. After configuring snapshot limits, a caller can save or restore
+The shared realtime loader retains the selected MLX parameter policies before
+the caller starts a prompt. The Rust API accepts independent resident,
+host-layerwise or disk-streamed policies for all Audio components. Each
+advance uses the same state transaction across those placements. After
+configuring snapshot limits, a caller can save or restore
 any settled boundary, including between depth passes and after generation
 finishes. A snapshot retains the language and codec state, unfinished
 refinement, sampler histories and RNG. Restore only accepts snapshots from the
@@ -298,9 +301,19 @@ same session and preserves cumulative copy charges. A caller that restores
 can receive the same token or PCM samples again and owns delivery of those
 events. Cancellation is terminal for the cancelled session.
 
+The native tensor-cohort adapter exposes the same per-rank advancement and
+event iterator for finite prompts with caller-managed agreement. The native
+pipeline adapter uses the shared manifest and supports both pipeline-only and
+combined tensor/pipeline placement. Ranks agree admission, sampled decisions,
+and completed events. The shared frame transaction validates exact completion,
+branch retention and successor state before the all-rank decision. The
+successful decision publishes that step's candidate on each rank. The
+pipeline adapter takes the same finite request and seed on every rank. The
+facade and CLI select single-rank Audio sessions.
+
 A live fork continues from the current settled boundary. The child has its
 own restore origin, slot cursor and output events. Source and child share
-the resident graph and its synchronous advancement lane. They also share
+the selected graph and its synchronous advancement lane. They also share
 the original branch, snapshot and cumulative copy limits. Each child must
 admit retained state growth before publishing a step. A refused step leaves
 its generation state and output frontier unchanged. Restoring a child does

@@ -40,7 +40,7 @@ pub struct AudioIngressProgress {
 /// Failure while preparing or advancing streamed input.
 #[derive(Debug, thiserror::Error)]
 pub enum AudioIngressError {
-    /// Another continuation is advancing on the same resident graph.
+    /// Another continuation is advancing on the same selected graph.
     #[error("the shared LFM3 Audio graph is busy")]
     Busy,
     /// A child cannot retain the proposed state under the shared budget.
@@ -340,9 +340,7 @@ where
             .encoder
             .stream(self.binding.state(self.artifact.encoder.state_layout())?, 1)
             .map_err(failure)?;
-        let language = self
-            .binding
-            .state(self.artifact.language.definition().state_layout())?;
+        let language = self.binding.state(self.language.state_layout())?;
         let mut suffix = request.suffix.to_vec();
         suffix.extend(marker);
         Ok(AudioIngress {
