@@ -280,6 +280,9 @@ backbone/projector sources. Both use the same driver for batch-one token prompts
 mel features and replayed speech codes. Each advance settles one text decision
 or one depth pass. The shared realtime transaction publishes the resulting
 language and codec state, schedule, sampler histories and RNG together.
+The turn-based `eredu audio` command drains these controlled advances.
+Spoken requests close PCM ingress before response generation. Transcription
+advances the LiveASR session while the input remains open.
 Intermediate depth advances expose progress while retaining tentative codes in
 the frame. A complete speech frame publishes its stable PCM prefix. Speech EOS
 or response termination flushes the codec tail. The event iterator drains the

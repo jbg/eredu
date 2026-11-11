@@ -251,8 +251,15 @@ generation and processor metadata and `audio_tokenizer/config.json`.
 The local directory can omit both SafeTensors weight files. The embedded
 GGUF vocabulary, BPE merges, task templates and sampling settings determine
 the admitted pair's text policy alongside the publisher's EOS set.
-This preparation is exposed through the Rust realtime facade. The CLI WAV
-conversation command requires VoiceChat.
+The Rust realtime facade supplies the resident graph to the turn-based
+`eredu audio` command. The CLI exposes transcription, translation to text,
+text-to-speech and spoken responses. The separate `eredu realtime` command
+drives full-duplex VoiceChat conversations.
+CPU smoke runs on the released SafeTensors checkpoint produce an English
+transcript, a French translation, and finalized mono 24-kHz WAV files for
+speech synthesis and spoken response. The released Q4_K_M pair also produces
+a finalized 24-kHz WAV through the CLI synthesis task. CLI device I/O is
+build-checked.
 `prepare_mlx_realtime` with `RealtimeLoadOptions::Lfm3Audio` selects the
 resident model and reports the logical F32 parameter bytes by component.
 The report excludes session state and temporary allocations. Load consumes

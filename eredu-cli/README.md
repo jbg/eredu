@@ -237,6 +237,38 @@ Ordinary text prefill defaults to chunks of 512 tokens. Set
 `--prefill-chunk-size 0` for one pass. Reports preserve unknown costs and identify
 full-prompt fallbacks. See [formulas, coverage and calibration](../doc/generation-memory.md).
 
+## Turn-based audio
+
+`eredu audio` selects a task for one request. LFM3 Audio is available through
+this command with resident MLX execution.
+
+```sh
+eredu audio transcribe --model /models/audio --input speech.wav
+eredu audio translate --model /models/audio --input speech.wav --source-language English --language French
+eredu audio speak --model /models/audio --text "Hello there." --output speech.wav
+eredu audio respond --model /models/audio --input question.wav --output answer.wav
+```
+
+Transcription streams text to stdout as blocks become available. Translation
+and spoken responses close the utterance before generating. Give source and
+target language names in English for LFM3 Audio translation. Use mono 16-kHz
+WAV with the current Audio model. Speech WAVs are mono 24 kHz. With
+`system-audio`, `--microphone-seconds` records a finite utterance and
+`--play` plays a speech response. `--input-device` and `--output-device`
+select devices. `--device cpu` or `--device gpu:0` selects model execution.
+
+For a split GGUF, supply the backbone, projector, and publisher assets:
+
+```sh
+eredu audio speak --model /models/audio-backbone.gguf \
+  --projector /models/audio-projector.gguf --assets /models/audio-assets \
+  --text "Hello there." --output speech.wav
+```
+
+`--assets` supplies the tokenizer, processor and codec configuration. GGUF
+execution uses the two GGUF payloads. Build with `mlx,realtime` for WAV-only
+operation or with `mlx,system-audio` for device I/O.
+
 ## Realtime speech
 
 Build with `realtime,system-audio` for microphone/speaker conversations; both
