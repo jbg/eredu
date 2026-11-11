@@ -320,6 +320,14 @@ ingress states releases their retention while preserving cumulative copy work.
 Run it with the same checkpoint and reference directory as the conditional
 reference case.
 
+The same runner forks at 1,055 samples and advances the source and child
+independently through finalization and speech generation. Both match all
+three finite speech frames and all 5,760 PCM samples on CPU and precise
+Metal. The check covers branch
+limits and restore origins, retained growth during input, and the transfer
+of the same branch slot and cumulative copy charges into the child's
+response. Dropping the child releases its retention.
+
 ## LiveASR
 
 The resident LiveASR route takes mono 16-kHz PCM or unpadded mel blocks and

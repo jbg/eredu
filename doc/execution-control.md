@@ -313,6 +313,10 @@ positions, and accepted input progress. Restore reopens that input boundary
 for the caller to resubmit later samples. Finishing transfers the same
 snapshot budget to the response session, including cumulative copy work and
 retention for any ingress snapshots the caller still holds.
+An ingress fork shares the resident graph and copy budget with its source.
+Each continuation accepts and finalizes its own input. The child's retained
+state must fit its shared budget before publication. Finishing the child
+carries the same branch slot and high-water retention into its response.
 
 For continuous English transcription, `MlxAudioModel::prepare_live_transcription`
 opens the publisher's LiveASR protocol. The caller supplies unpadded mel blocks
@@ -343,8 +347,8 @@ Forks share a synchronous advancement lane and the source's snapshot and
 copy budget. A child's retained model and input growth must fit that budget
 before state is published.
 
-Forks during prompt ingress, capture, and bounded or
-distributed speech sessions have no selected implementation.
+Capture and bounded or distributed speech sessions have no selected
+implementation.
 
 LiquidCodec's standalone `Tokenizer` implements finite audio-tokenizer calls and
 explicit decode-stream advancement over shared neural/spectral equations. Its

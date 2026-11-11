@@ -409,6 +409,25 @@ where
             }),
         })
     }
+
+    #[cfg(feature = "audio")]
+    pub(super) fn inherit_fork_growth(
+        &mut self,
+        growth: SnapshotRetainedGrowth,
+    ) -> Result<(), AudioSnapshotError> {
+        let estimate = self
+            .generation
+            .estimate_isolated_copy()
+            .map_err(|error| IsolatedStateError::Backend(failure(error)))?;
+        growth
+            .admit(estimate.retained_bytes)
+            .map_err(IsolatedStateError::Admission)?;
+        self.fork = Some(ForkRetention {
+            growth,
+            estimate: Generation::<K>::estimate_fork_branch,
+        });
+        Ok(())
+    }
 }
 
 impl<K: AudioExecutionKernel> AudioSession<K>
@@ -418,6 +437,22 @@ where
     /// Adopts prefetched language state and the exact initialized speech schedule.
     pub fn new(
         kernel: K,
+        state: K::State,
+        schedule: AudioSchedule,
+        sampling: AudioSampling,
+        random: Random<K>,
+    ) -> Result<Self, AudioSessionError> {
+        Self::with_transition(
+            Rc::new(RefCell::new(Transition(kernel))),
+            state,
+            schedule,
+            sampling,
+            random,
+        )
+    }
+
+    pub(super) fn with_transition(
+        transition: Rc<RefCell<Transition<K>>>,
         state: K::State,
         schedule: AudioSchedule,
         sampling: AudioSampling,
@@ -436,7 +471,7 @@ where
             Some(random),
         )?;
         Ok(Self {
-            transition: Rc::new(RefCell::new(Transition(kernel))),
+            transition,
             generation,
             cancelled: false,
             snapshot_budget: None,
@@ -517,7 +552,7 @@ where
     }
 }
 
-struct Transition<K>(K);
+pub(super) struct Transition<K>(pub(super) K);
 
 impl<K: AudioExecutionKernel>
     RealtimeFrameTransition<

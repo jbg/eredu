@@ -184,6 +184,11 @@ pub struct MlxAudioIngressSnapshot(AudioIngressSnapshot<MlxNeuralBackend, Bindin
 
 #[cfg(feature = "audio")]
 impl MlxAudioIngress {
+    /// Forks a settled streamed prompt on the same resident graph.
+    pub fn fork(&self) -> Result<Self, AudioSnapshotError> {
+        self.0.fork().map(Self)
+    }
+
     /// Configures the shared ingress and response snapshot limits.
     pub fn enable_snapshots(&mut self, limits: SnapshotLimits) -> Result<(), AudioSnapshotError> {
         self.0.enable_snapshots(limits)
