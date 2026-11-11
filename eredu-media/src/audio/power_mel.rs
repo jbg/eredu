@@ -37,6 +37,12 @@ pub struct PowerMel {
 #[derive(Debug, Clone)]
 pub struct PowerMelStream<'a> {
     transform: Cow<'a, PowerMel>,
+    state: PowerMelState,
+}
+
+/// Mutable window carry, independent of the reusable transform.
+#[derive(Debug, Clone, Default)]
+pub struct PowerMelState {
     carry: Vec<f32>,
     emitted: bool,
     finished: bool,
@@ -102,9 +108,7 @@ impl PowerMel {
     pub fn stream(&self) -> PowerMelStream<'_> {
         PowerMelStream {
             transform: Cow::Borrowed(self),
-            carry: Vec::new(),
-            emitted: false,
-            finished: false,
+            state: PowerMelState::default(),
         }
     }
 
@@ -112,9 +116,7 @@ impl PowerMel {
     pub fn into_stream(self) -> PowerMelStream<'static> {
         PowerMelStream {
             transform: Cow::Owned(self),
-            carry: Vec::new(),
-            emitted: false,
-            finished: false,
+            state: PowerMelState::default(),
         }
     }
 
@@ -127,30 +129,59 @@ impl PowerMel {
     }
 }
 
+impl PowerMelState {
+    /// Logical bytes retained by a saved window, excluding the transform.
+    pub fn snapshot_storage_bytes(&self) -> Option<u64> {
+        u64::try_from(self.carry.capacity())
+            .ok()?
+            .checked_mul(size_of::<f32>() as u64)?
+            .checked_add(size_of::<Self>() as u64)
+    }
+}
+
 impl PowerMelStream<'_> {
+    /// Maximum additional samples that emit at most the requested complete windows.
+    pub fn available_samples(&self, frames: usize) -> Option<usize> {
+        self.transform.available_samples(&self.state, frames)
+    }
+
+    /// Processes a PCM chunk with the stream's retained window.
+    pub fn advance(
+        &mut self,
+        samples: &[f32],
+        rate: u32,
+        finalize: bool,
+    ) -> Result<LogMelFeatures, MediaError> {
+        self.transform
+            .advance(&mut self.state, samples, rate, finalize)
+    }
+}
+
+impl PowerMel {
     /// Maximum additional samples that emit at most `frames` complete windows.
     /// A partial window may remain in the stream until more samples arrive.
-    pub fn available_samples(&self, frames: usize) -> Option<usize> {
-        if self.finished {
+    pub fn available_samples(&self, state: &PowerMelState, frames: usize) -> Option<usize> {
+        if state.finished {
             return Some(0);
         }
         frames
-            .checked_mul(self.transform.config.hop_length)?
-            .checked_add(self.transform.config.fft_length - 1)?
-            .checked_sub(self.carry.len())
+            .checked_mul(self.config.hop_length)?
+            .checked_add(self.config.fft_length - 1)?
+            .checked_sub(state.carry.len())
     }
 
     /// Emits complete windows and right-pads the final partial window, if any.
     /// A stream with no samples produces one zero-padded window on finalization.
     /// The continuation changes only after the entire feature chunk succeeds.
     pub fn advance(
-        &mut self,
+        &self,
+        state: &mut PowerMelState,
         samples: &[f32],
         sample_rate: u32,
         finalize: bool,
     ) -> Result<LogMelFeatures, MediaError> {
-        let config = self.transform.config;
-        if self.finished {
+        let config = self.config;
+        if state.finished {
             return Err(MediaError::invalid("power-mel stream is finalized"));
         }
         if sample_rate != config.sample_rate || samples.iter().any(|value| !value.is_finite()) {
@@ -158,7 +189,7 @@ impl PowerMelStream<'_> {
                 "power-mel input requires finite PCM at the configured sample rate",
             ));
         }
-        let sample_count = self
+        let sample_count = state
             .carry
             .len()
             .checked_add(samples.len())
@@ -172,7 +203,8 @@ impl PowerMelStream<'_> {
         let consumed = complete * config.hop_length;
         let frames = complete
             + usize::from(
-                finalize && ((!self.emitted && complete == 0) || sample_count - consumed > overlap),
+                finalize
+                    && ((!state.emitted && complete == 0) || sample_count - consumed > overlap),
             );
         let value_count = frames
             .checked_mul(config.mel_bins)
@@ -182,7 +214,7 @@ impl PowerMelStream<'_> {
             MediaError::invalid(format!("power-mel allocation failed: {error}"))
         })?;
         if frames > 0 {
-            let transform = self.transform.as_ref();
+            let transform = self;
             let mut spectrum = vec![Complex32::default(); config.fft_length];
             let mut scratch = vec![Complex32::default(); transform.fft.get_inplace_scratch_len()];
             let bins = config.fft_length / 2 + 1;
@@ -193,11 +225,11 @@ impl PowerMelStream<'_> {
                     spectrum.iter_mut().zip(transform.window.iter()).enumerate()
                 {
                     let index = start + tap;
-                    let sample = if index < self.carry.len() {
-                        self.carry[index]
+                    let sample = if index < state.carry.len() {
+                        state.carry[index]
                     } else {
                         samples
-                            .get(index - self.carry.len())
+                            .get(index - state.carry.len())
                             .copied()
                             .unwrap_or(0.0)
                     };
@@ -226,16 +258,17 @@ impl PowerMelStream<'_> {
         let carry = if finalize {
             Vec::new()
         } else {
-            self.carry
+            state
+                .carry
                 .iter()
                 .chain(samples)
                 .skip(consumed)
                 .copied()
                 .collect()
         };
-        self.carry = carry;
-        self.finished = finalize;
-        self.emitted |= frames != 0;
+        state.carry = carry;
+        state.finished = finalize;
+        state.emitted |= frames != 0;
         Ok(LogMelFeatures {
             values,
             mask: vec![true; frames],

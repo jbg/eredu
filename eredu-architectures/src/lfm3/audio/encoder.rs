@@ -497,6 +497,32 @@ pub struct EncoderState<S, T: Tensor> {
     finished: bool,
 }
 
+impl<S, T> eredu_runtime::execution_control::SnapshotValue for EncoderState<S, T>
+where
+    S: eredu_runtime::execution_control::SnapshotValue,
+    T: Tensor + eredu_runtime::execution_control::SnapshotValue,
+{
+    fn estimate_snapshot_value(
+        &self,
+    ) -> Result<eredu_core::execution_control::SnapshotEstimate, eredu_core::BackendFailure> {
+        eredu_runtime::execution_control::snapshot_value_estimate::<Self>([
+            self.backbone.estimate_snapshot_value(),
+            self.features.estimate_snapshot_value(),
+        ])
+    }
+
+    fn copy_snapshot_value(
+        &self,
+        retention: &eredu_runtime::execution_control::SnapshotReservation,
+    ) -> Result<Self, eredu_core::BackendFailure> {
+        Ok(Self {
+            backbone: self.backbone.copy_snapshot_value(retention)?,
+            features: self.features.copy_snapshot_value(retention)?,
+            ..*self
+        })
+    }
+}
+
 impl<S, T: Tensor> EncoderState<S, T> {
     pub(super) fn try_branch<E>(&self, branch: impl FnOnce(&S) -> Result<S, E>) -> Result<Self, E> {
         Ok(Self {

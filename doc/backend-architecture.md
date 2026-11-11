@@ -16563,6 +16563,12 @@ sample capacity before preprocessing and removes mel frames only after the
 shared LiveASR driver publishes a block. MLX wraps block advancement in
 native recovery. PCM admission and final-window padding are portable.
 
+LiveASR snapshots use the shared isolated state budget. The saved state
+contains encoder feature carry and caches, the language cache and position,
+and the stream lifecycle. The PCM variant also captures the mel queue and
+partial analysis window in the same reservation. Its immutable transform
+stays with the session.
+
 `eredu-codec::liquid` owns LiquidCodec configuration, complete neural encoder and
 decoder equations, reflective analysis, scalar-product alphabet ordering and
 polar synthesis. It consumes neutral neural/storage/runtime contracts without
