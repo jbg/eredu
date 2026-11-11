@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 const PLAN: &str = "LFM3 Audio speech input";
 const ROOT: &str = "model.audio_encoder";
 const PROJECTOR: &str = "model.audio_projector";
-const MEL_BINS: i32 = 128;
+pub(super) const MEL_BINS: i32 = 128;
 pub(super) const STRIDE: i32 = 8;
 
 fn invalid(message: impl Into<String>) -> Error {

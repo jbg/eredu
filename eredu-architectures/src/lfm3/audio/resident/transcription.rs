@@ -5,6 +5,11 @@ use crate::lfm3::audio::encoder::STRIDE;
 use eredu_core::TokenFilter;
 use eredu_text::tokenizer::Tokenizer;
 
+#[cfg(feature = "audio")]
+mod pcm;
+#[cfg(feature = "audio")]
+pub use pcm::AudioPcmTranscription;
+
 const PROMPT: &str =
     "<|startoftext|><|im_start|>system\nPerform live ASR.<|im_end|>\n<|im_start|>assistant\n";
 
@@ -22,6 +27,23 @@ pub struct AudioTranscriptionBlock {
 /// Failure to prepare or advance a LiveASR stream.
 #[derive(Debug, thiserror::Error)]
 pub enum AudioTranscriptionError {
+    /// Host PCM processing rejected the input.
+    #[cfg(feature = "audio")]
+    #[error(transparent)]
+    Media(#[from] eredu_media::MediaError),
+    /// The caller can drain a ready block before retrying the chunk.
+    #[cfg(feature = "audio")]
+    #[error("LiveASR input has {incoming} samples but only {available} fit before advancing")]
+    Backpressure {
+        /// Submitted samples.
+        incoming: usize,
+        /// Available sample slots.
+        available: usize,
+    },
+    /// The PCM input was already finished.
+    #[cfg(feature = "audio")]
+    #[error("LFM3 Audio LiveASR PCM input is closed")]
+    InputFinished,
     /// The retained tokenizer cannot construct the LiveASR prompt or policy.
     #[error("invalid LFM3 Audio LiveASR tokenizer or controls")]
     Policy,

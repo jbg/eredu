@@ -16557,6 +16557,12 @@ text filters and closing rules. Restarting the language context preserves
 the encoder continuation. The encoder and language candidates settle before
 a transcript block is returned.
 
+The PCM adapter frames input with the portable power-mel stream and owns a
+queue of at most two full mel blocks plus a possible flush frame. It checks
+sample capacity before preprocessing and removes mel frames only after the
+shared LiveASR driver publishes a block. MLX wraps block advancement in
+native recovery. PCM admission and final-window padding are portable.
+
 `eredu-codec::liquid` owns LiquidCodec configuration, complete neural encoder and
 decoder equations, reflective analysis, scalar-product alphabet ordering and
 polar synthesis. It consumes neutral neural/storage/runtime contracts without

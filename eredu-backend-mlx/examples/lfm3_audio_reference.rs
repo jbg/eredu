@@ -50,6 +50,9 @@ struct Args {
     /// Compare the released LiveASR block protocol.
     #[arg(long)]
     live_asr: bool,
+    /// Feed the LiveASR fixture as microphone-sized PCM chunks.
+    #[arg(long, requires = "live_asr")]
+    live_asr_pcm: bool,
 }
 
 fn sha256(path: &Path) -> Result<String, Box<dyn Error>> {
@@ -339,12 +342,35 @@ fn compare_live_asr(
         .chunks_exact(4)
         .map(|value| f32::from_le_bytes(value.try_into().expect("four bytes")))
         .collect();
+    let blocks: Vec<LiveBlock> = serde_json::from_value(metadata["blocks"].clone())?;
+    let (matched_blocks, token_count) = if args.live_asr_pcm {
+        compare_live_pcm(&pcm, &blocks, MlxAudioModel::load(model, native)?)?
+    } else {
+        compare_live_mel(&pcm, &blocks, model, native)?
+    };
+    let report = json!({
+        "device": args.device,
+        "input": if args.live_asr_pcm { "pcm" } else { "mel" },
+        "wav_sha256": metadata["wav_sha256"],
+        "matched_blocks": matched_blocks,
+        "matched_tokens": token_count,
+    });
+    std::fs::write(&args.output, serde_json::to_vec_pretty(&report)?)?;
+    println!("{report}");
+    Ok(())
+}
+
+fn compare_live_mel(
+    pcm: &[f32],
+    blocks: &[LiveBlock],
+    model: PreparedAudio,
+    native: ExecutionContext,
+) -> Result<(usize, usize), Box<dyn Error>> {
     let features = model
         .processor
         .transform()?
-        .extract(AudioWaveform::new(&pcm, 16_000)?)?;
+        .extract(AudioWaveform::new(pcm, 16_000)?)?;
     let mut session = MlxAudioModel::load(model, native)?.prepare_live_transcription()?;
-    let blocks: Vec<LiveBlock> = serde_json::from_value(metadata["blocks"].clone())?;
     let mut cursor = 0;
     let mut token_count = 0;
     for (index, block) in blocks.iter().enumerate() {
@@ -360,20 +386,78 @@ fn compare_live_asr(
             block.final_chunk,
             block.restart,
         )?;
-        assert_eq!(result.audio_tokens, block.audio_tokens, "block {index}");
-        assert_eq!(result.closed, block.closed, "block {index}");
-        assert_eq!(result.tokens, block.tokens, "block {index}");
+        compare_live_block(index, &result, block);
         token_count += result.tokens.len();
         cursor = end;
     }
     assert_eq!(cursor, features.frames);
-    let report = json!({
-        "device": args.device,
-        "wav_sha256": metadata["wav_sha256"],
-        "matched_blocks": blocks.len(),
-        "matched_tokens": token_count,
-    });
-    std::fs::write(&args.output, serde_json::to_vec_pretty(&report)?)?;
-    println!("{report}");
-    Ok(())
+    Ok((blocks.len(), token_count))
+}
+
+fn compare_live_pcm(
+    pcm: &[f32],
+    blocks: &[LiveBlock],
+    model: MlxAudioModel,
+) -> Result<(usize, usize), Box<dyn Error>> {
+    use eredu_architectures::lfm3::audio::AudioTranscriptionError;
+    let mut session = model.prepare_pcm_transcription()?;
+    let capacity = session.available_samples();
+    assert!(matches!(
+        session.submit(&vec![0.0; capacity + 1], 16_000),
+        Err(AudioTranscriptionError::Backpressure { available, .. }) if available == capacity
+    ));
+    assert_eq!(session.available_samples(), capacity);
+    assert!(session.advance(false)?.is_none());
+    let mut expected = blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, block)| block.audio_tokens != 0 || block.final_chunk)
+        .peekable();
+    let mut matched = 0;
+    let mut tokens = 0;
+    for chunk in pcm.chunks(1600) {
+        session.submit(chunk, 16_000)?;
+        while let Some(&(index, block)) = expected.peek() {
+            if block.final_chunk {
+                break;
+            }
+            let Some(result) = session.advance(block.restart)? else {
+                break;
+            };
+            compare_live_block(index, &result, block);
+            expected.next();
+            matched += 1;
+            tokens += result.tokens.len();
+        }
+    }
+    assert!(matched > 0);
+    session.finish_input()?;
+    assert!(matches!(
+        session.submit(&[], 16_000),
+        Err(AudioTranscriptionError::InputFinished)
+    ));
+    for (index, block) in expected {
+        let result = session
+            .advance(block.restart)?
+            .ok_or("missing flushed LiveASR block")?;
+        compare_live_block(index, &result, block);
+        matched += 1;
+        tokens += result.tokens.len();
+    }
+    assert!(session.is_finished());
+    assert!(matches!(
+        session.advance(false),
+        Err(AudioTranscriptionError::Finished)
+    ));
+    Ok((matched, tokens))
+}
+
+fn compare_live_block(
+    index: usize,
+    result: &eredu_architectures::lfm3::audio::AudioTranscriptionBlock,
+    block: &LiveBlock,
+) {
+    assert_eq!(result.audio_tokens, block.audio_tokens, "block {index}");
+    assert_eq!(result.closed, block.closed, "block {index}");
+    assert_eq!(result.tokens, block.tokens, "block {index}");
 }

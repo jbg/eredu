@@ -48,7 +48,7 @@ pub mod native {
     }
 
     #[cfg(feature = "audio")]
-    pub use crate::composition::lfm3_audio::MlxAudioIngress;
+    pub use crate::composition::lfm3_audio::{MlxAudioIngress, MlxAudioPcmTranscription};
     pub use crate::composition::lfm3_audio::{
         MlxAudioModel, MlxAudioSession, MlxAudioSnapshot, MlxAudioTranscription,
     };

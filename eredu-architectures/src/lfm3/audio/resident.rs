@@ -5,6 +5,8 @@ mod ingress;
 mod transcription;
 #[cfg(feature = "audio")]
 pub use ingress::{AudioIngress, AudioIngressError, AudioIngressProgress, AudioIngressRequest};
+#[cfg(feature = "audio")]
+pub use transcription::AudioPcmTranscription;
 pub use transcription::{AudioTranscription, AudioTranscriptionBlock, AudioTranscriptionError};
 
 use super::{
