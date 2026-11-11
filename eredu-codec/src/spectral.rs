@@ -370,12 +370,10 @@ pub struct PeriodicHannIstft<T: Tensor> {
     hop_length: i32,
     pad: i32,
     window: T,
-    fold_kernel: T,
 }
 impl<T: Tensor> PeriodicHannIstft<T> {
     /// Replaces the synthesis coefficients with an explicit retained F32 window.
     /// The caller's window must satisfy nonzero overlap after endpoint trimming.
-    /// The view shares its source; the fixed overlap routing kernel is reused.
     pub fn set_window(&mut self, window: &T, context: &T::Context) -> Result<(), Error> {
         if window.shape() != [self.fft_size]
             || window.element_type() != Some(TensorElementType::F32)
@@ -388,7 +386,7 @@ impl<T: Tensor> PeriodicHannIstft<T> {
         self.window = window.reshape(&[1, self.fft_size, 1], context)?;
         Ok(())
     }
-    /// Constructs the periodic window and fixed overlap-add routing kernel.
+    /// Constructs the periodic synthesis window.
     /// Trims `(fft_size-hop_length)/2` samples from each reconstructed endpoint.
     pub fn new(fft_size: i32, hop_length: i32, context: &T::Context) -> Result<Self, Error> {
         if fft_size < 4 || fft_size % 2 != 0 || hop_length <= 0 || hop_length > fft_size - 2 {
@@ -419,24 +417,11 @@ impl<T: Tensor> PeriodicHannIstft<T> {
             ));
         }
         let window = periodic_hann::<T>(fft_size, context)?.reshape(&[1, fft_size, 1], context)?;
-        let count = (fft_size as usize)
-            .checked_mul(fft_size as usize)
-            .ok_or_else(|| invalid("overlap routing extent overflows"))?;
-        let mut identity = Vec::new();
-        identity
-            .try_reserve_exact(count)
-            .map_err(|e| invalid(e.to_string()))?;
-        identity.resize(count, 0.0);
-        for i in 0..fft_size as usize {
-            identity[i * fft_size as usize + i] = 1.0;
-        }
-        let fold_kernel = T::from_f32_slice(&identity, &[1, fft_size, fft_size], context)?;
         Ok(Self {
             fft_size,
             hop_length,
             pad,
             window,
-            fold_kernel,
         })
     }
     /// Reconstructs an ordinary finite spectrogram. Clipping, when selected,
@@ -499,25 +484,13 @@ impl<T: Tensor> PeriodicHannIstft<T> {
         let windowed = inverse
             .multiply(&self.window, context)?
             .transpose_axes(&[0, 2, 1], context)?;
-        let fold = |input: &T| {
-            T::conv_transpose1d(
-                input,
-                &self.fold_kernel,
-                self.hop_length,
-                0,
-                1,
-                0,
-                1,
-                context,
-            )
-        };
-        let wave = fold(&windowed)?;
+        let wave = self.fold(&windowed, output_length, context)?;
         let envelope_frames = self
             .window
             .square(context)?
             .transpose_axes(&[0, 2, 1], context)?
             .broadcast_to(&[1, frames, self.fft_size], context)?;
-        let envelope = fold(&envelope_frames)?;
+        let envelope = self.fold(&envelope_frames, output_length, context)?;
         if wave.shape() != [real.dim(0), output_length, 1]
             || envelope.shape() != [1, output_length, 1]
         {
@@ -530,6 +503,56 @@ impl<T: Tensor> PeriodicHannIstft<T> {
             envelope,
         })
     }
+
+    fn fold(&self, frames: &T, output_length: i32, context: &T::Context) -> Result<T, Error> {
+        let batch = frames.dim(0);
+        if frames.dim(1) == 1 {
+            return Ok(frames.reshape(&[batch, output_length, 1], context)?);
+        }
+
+        let hop = self.hop_length;
+        let last_phase = (self.fft_size - 1) / hop;
+        // Frame f contributes its p-th block of taps to output block f + p.
+        let shifted = |phase: i32| {
+            let start = phase * hop;
+            let width = (self.fft_size - start).min(hop);
+            let taps = frames.index(
+                &[Index::Full, Index::Full, Index::Range(start, start + width)],
+                context,
+            )?;
+            T::pad(
+                &taps,
+                &[(0, 0), (phase, last_phase - phase), (0, hop - width)],
+                PadMode::Constant,
+                context,
+            )
+        };
+        let mut sum = shifted(last_phase)?;
+        for phase in (0..last_phase).rev() {
+            sum = sum.add(&shifted(phase)?, context)?;
+        }
+
+        let tail = output_length % hop;
+        if tail == 0 {
+            return Ok(sum.reshape(&[batch, output_length, 1], context)?);
+        }
+        // Trim the partial block before flattening so the sample axis fits i32.
+        let full_blocks = output_length / hop;
+        let prefix = sum
+            .index(
+                &[Index::Full, Index::Range(0, full_blocks), Index::Full],
+                context,
+            )?
+            .reshape(&[batch, output_length - tail, 1], context)?;
+        let suffix = sum
+            .index(
+                &[Index::Full, Index::At(full_blocks), Index::Range(0, tail)],
+                context,
+            )?
+            .reshape(&[batch, tail, 1], context)?;
+        Ok(T::concatenate(&[prefix, suffix], 1, context)?)
+    }
+
     /// Number of samples returned by an ordinary finite reconstruction.
     pub fn output_samples(&self, frames: i32) -> Result<i32, Error> {
         if frames <= 0 {
