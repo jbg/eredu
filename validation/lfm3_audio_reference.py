@@ -124,7 +124,10 @@ def main():
     parser.add_argument('output', type=Path)
     parser.add_argument('--live-asr-wav', type=Path, help='compare the publisher LiveASR protocol')
     parser.add_argument('--gguf-depth', type=Path, help='decode the pinned GGUF depth weights into the publisher model')
+    parser.add_argument('--bfloat16', action='store_true', help='run the conditional model in BF16 with F32 codec')
     args = parser.parse_args()
+    if args.bfloat16 and (args.live_asr_wav or args.gguf_depth):
+        parser.error('--bfloat16 requires the conditional SafeTensors case')
     root = args.checkpoint.resolve()
     out = args.output.resolve()
     checkout = Path(__file__).resolve().parents[1]
@@ -153,7 +156,8 @@ def main():
     def cls(module, name):
         return get_class_from_dynamic_module(module + '.' + name, root, local_files_only=True)
     model = cls('modeling_lfm3_audio', 'Lfm3AudioForConditionalGeneration').from_pretrained(
-        root, local_files_only=True, dtype=torch.float32, attn_implementation='eager'
+        root, local_files_only=True,
+        dtype=torch.bfloat16 if args.bfloat16 else torch.float32, attn_implementation='eager'
     ).eval()
     extractor = cls('feature_extraction_lfm3_audio', 'Lfm3AudioFeatureExtractor').from_pretrained(root / 'preprocessor_config.json')
     if args.live_asr_wav:
@@ -211,9 +215,11 @@ def main():
                              past_key_values=cache, use_cache=True, audio_out_codes=generated)
         trace['speech.hidden'] = result.last_hidden_state
         trace['speech.logits'] = model.lm_head(result.last_hidden_state)
-    save_file({k:v.contiguous() for k,v in trace.items()}, out/'reference.safetensors')
+    save_file({k: (v.float() if v.is_floating_point() else v).contiguous()
+               for k, v in trace.items()}, out/'reference.safetensors')
     metadata = {
         'prompt': tokens, 'decode': decode, 'order': order,
+        'model_dtype': 'bfloat16' if args.bfloat16 else 'float32',
         'model_sha256': model_hash, 'codec_sha256': codec_hash,
         'maximum_absolute_tolerance': 5e-4,
     }

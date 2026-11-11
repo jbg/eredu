@@ -8,7 +8,7 @@ use eredu_runtime::{
 
 use eredu_runtime::PartitionComponentKernel as _;
 
-use super::{ForwardContext, ModelArgs, PartitionLocalGeometry};
+use super::{ForwardContext, Lfm3Input, ModelArgs, PartitionLocalGeometry};
 use crate::decoder::{
     ComponentInstrumentation, DecoderStaticResources, LayeredInput, PartitionStaticModules,
     StaticModules,
@@ -442,6 +442,23 @@ where
         })
     }
 
+    fn finish_requested(
+        &mut self,
+        hidden: &B::Tensor,
+        forward: &ForwardContext<B::Tensor>,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
+        if forward.normalized_audio_output {
+            self.static_modules
+                .decoder_resources_mut()
+                .normalize(hidden, context, instrumentation)
+        } else {
+            self.finish_local_instrumented(hidden, parallel, context, instrumentation)
+        }
+    }
+
     fn finish_local(
         &mut self,
         hidden: &B::Tensor,
@@ -474,6 +491,21 @@ where
         )
     }
 
+    /// Projects an Audio hidden position on the stage that owns vocabulary weights.
+    pub fn project_audio_position(
+        &mut self,
+        hidden: &B::Tensor,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        self.static_modules.decoder_resources_mut().project(
+            hidden,
+            parallel,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
+    }
+
     fn local_state_ordinal(&self, global_unit: usize) -> Result<usize, Error> {
         self.geometry.state_index(global_unit)
     }
@@ -485,7 +517,7 @@ where
     G: Lfm3Geometry,
     B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
 {
-    type Input<'a> = LayeredInput<'a, B::Tensor>;
+    type Input<'a> = Lfm3Input<'a, B::Tensor>;
     type Unit = super::Block<B>;
     type ForwardContext = ForwardContext<B::Tensor>;
     type RetainedContextValues<'a>
@@ -579,8 +611,10 @@ where
             .decoder_resources_mut()
             .embedding
             .ok_or_else(|| Error::backend("LFM3 partition does not own input embedding"))?
-            .forward(input.tokens, context)?;
-        self.begin_hidden(hidden, input.mask, state, &expected, 0, context)
+            .forward(input.tokens(), context)?;
+        let mut forward = self.begin_hidden(hidden, input.mask(), state, &expected, 0, context)?;
+        condition_prompt(input, true, &mut forward, context)?;
+        Ok(forward)
     }
     fn begin_observed<'a, O>(
         &mut self,
@@ -656,14 +690,13 @@ where
         forward: &Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        if forward.normalized_audio_output {
-            return self.static_modules.decoder_resources_mut().normalize(
-                hidden,
-                context,
-                &mut ComponentInstrumentation::disabled(),
-            );
-        }
-        self.finish_local(hidden, None, context)
+        self.finish_requested(
+            hidden,
+            forward,
+            None,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
     }
     fn projects_final_text_position() -> bool {
         G::FINAL_TEXT_POSITION
@@ -698,15 +731,7 @@ where
     {
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
         let mut instrumentation = ComponentInstrumentation::new("readout", &mut observer);
-        if forward.normalized_audio_output {
-            self.static_modules.decoder_resources_mut().normalize(
-                hidden,
-                context,
-                &mut instrumentation,
-            )
-        } else {
-            self.finish_local_instrumented(hidden, None, context, &mut instrumentation)
-        }
+        self.finish_requested(hidden, forward, None, context, &mut instrumentation)
     }
 }
 
@@ -734,12 +759,14 @@ where
                 .decoder_resources_mut()
                 .embedding
                 .ok_or_else(|| Error::backend("LFM3 partition does not own input embedding"))?,
-            input.tokens,
+            input.tokens(),
             EmbeddingLookupPolicy::Strict,
             parallel,
             context,
         )?;
-        self.begin_hidden(hidden, input.mask, state, expected, 0, context)
+        let mut forward = self.begin_hidden(hidden, input.mask(), state, expected, 0, context)?;
+        condition_prompt(input, true, &mut forward, context)?;
+        Ok(forward)
     }
     fn begin_parallel_observed<'a, O>(
         &mut self,
@@ -808,17 +835,23 @@ where
         &mut self,
         hidden: &B::Tensor,
         _state: &mut S,
-        _forward: &Self::ForwardContext,
+        forward: &Self::ForwardContext,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        self.finish_local(hidden, Some(parallel), context)
+        self.finish_requested(
+            hidden,
+            forward,
+            Some(parallel),
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
     }
     fn finish_parallel_observed<O>(
         &mut self,
         hidden: &B::Tensor,
         _state: &mut S,
-        _forward: &Self::ForwardContext,
+        forward: &Self::ForwardContext,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
         observer: &mut O,
@@ -827,11 +860,13 @@ where
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
-        self.finish_local_instrumented(
+        let mut instrumentation = ComponentInstrumentation::new("readout", &mut observer);
+        self.finish_requested(
             hidden,
+            forward,
             Some(parallel),
             context,
-            &mut ComponentInstrumentation::new("readout", &mut observer),
+            &mut instrumentation,
         )
     }
 }
@@ -1104,14 +1139,20 @@ where
         &mut self,
         hidden: &B::Tensor,
         _state: &mut S,
-        _forward: &Self::ForwardContext,
+        forward: &Self::ForwardContext,
         owns_output: bool,
         parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<eredu_runtime::LayeredPartitionOutput<B::Tensor>, Self::Error> {
         if owns_output {
             Ok(eredu_runtime::LayeredPartitionOutput::Final {
-                output: self.finish_local(hidden, parallel, context)?,
+                output: self.finish_requested(
+                    hidden,
+                    forward,
+                    parallel,
+                    context,
+                    &mut ComponentInstrumentation::disabled(),
+                )?,
                 retained: None,
             })
         } else {
@@ -1140,7 +1181,7 @@ where
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
         let mut instrumentation = ComponentInstrumentation::new("readout", &mut observer);
         let output =
-            self.finish_local_instrumented(hidden, parallel, context, &mut instrumentation)?;
+            self.finish_requested(hidden, forward, parallel, context, &mut instrumentation)?;
         Ok(eredu_runtime::LayeredPartitionOutput::Final {
             output,
             retained: None,
@@ -1158,7 +1199,7 @@ where
         G::CHUNKED_PREFILL
     }
     fn text_input<'a>(tokens: &'a B::Tensor, mask: Option<&'a B::Tensor>) -> Self::Input<'a> {
-        LayeredInput { tokens, mask }
+        Lfm3Input::Text(LayeredInput { tokens, mask })
     }
 }
 
@@ -1174,11 +1215,24 @@ where
         true
     }
     fn input_dimensions(&self, input: &Self::Input<'_>) -> Result<(i32, i32), Self::Error> {
-        Ok((input.tokens.dim(0), input.tokens.dim(1)))
+        Ok((input.tokens().dim(0), input.tokens().dim(1)))
     }
     fn output_width(&self) -> i32 {
         self.args.vocab_size
     }
+    fn output_shape(
+        &self,
+        input: &Self::Input<'_>,
+        batch: i32,
+        sequence: i32,
+    ) -> Result<Vec<i32>, Self::Error> {
+        let width = match input {
+            Lfm3Input::Text(_) => self.args.vocab_size,
+            Lfm3Input::Audio(_) => self.args.hidden_size,
+        };
+        Ok(vec![batch, sequence, width])
+    }
+
     fn begin_pipeline<'a, O>(
         &mut self,
         input: Self::Input<'a>,
@@ -1190,12 +1244,35 @@ where
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
+        let embedded = incoming.is_none();
         let transported = match incoming {
             Some((hidden, auxiliary)) => LayeredPartitionInput::Hidden { hidden, auxiliary },
-            None => LayeredPartitionInput::Tokens(input.tokens),
+            None => LayeredPartitionInput::Tokens(input.tokens()),
         };
-        self.begin_partition_observed(transported, input.mask, state, selected, observer)
+        let context = selected.native;
+        let mut forward = self.begin_partition(transported, input.mask(), state, selected)?;
+        condition_prompt(input, embedded, &mut forward, context)?;
+        if embedded {
+            ComponentInstrumentation::apply_embedding(forward, observer)
+        } else {
+            Ok(forward)
+        }
     }
+}
+
+fn condition_prompt<T: Tensor>(
+    input: Lfm3Input<'_, T>,
+    embedding_owner: bool,
+    forward: &mut LayeredForwardState<T, ForwardContext<T>>,
+    context: &T::Context,
+) -> Result<(), Error> {
+    if let Lfm3Input::Audio(prompt) = input {
+        if embedding_owner {
+            forward.hidden = prompt.replace(&forward.hidden, context)?;
+        }
+        forward.context.normalized_audio_output = true;
+    }
+    Ok(())
 }
 
 impl<B, M, G> Lfm3Kernel<B, M, G>

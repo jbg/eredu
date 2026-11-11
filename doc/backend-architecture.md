@@ -4563,11 +4563,13 @@ detached batches follows ordinary Rust unwinding semantics; it does not
 intentionally abandon the remaining owners.
 MLX prefetch, cache-I/O, and host-demotion worker handles request shutdown
 without joining from recovery or teardown. Each worker owns its active inputs
-until that operation returns. Prefetch and cache-I/O workers cancel queued work
-and release its admission slots; the host-demotion worker drains queued inputs
-after its sender disconnects. Host demotion reuses one native stream per device
-for that worker's lifetime; MLX retains stream workers through process shutdown,
-so allocating a stream per cache block would accumulate unbounded threads.
+until that operation returns. The native CPU allocator has process lifetime so
+that workers can release host buffers during process shutdown. Prefetch and
+cache-I/O workers cancel queued work and release its admission slots. The
+host-demotion worker drains queued inputs after its sender disconnects. Host
+demotion reuses one native stream per device for that worker's lifetime. MLX
+retains stream workers through process shutdown, so allocating a stream per
+cache block would accumulate unbounded threads.
 Portable worker APIs retain deterministic joining by default and
 expose nonjoining shutdown as an explicit option. Final cache-state reclamation
 removes its ephemeral files. Disk commits hold a weak state reference to avoid
@@ -15597,6 +15599,9 @@ agreement before publication.
 The shared exact GELU primitive evaluates low-precision inputs in F32 and rounds
 once to the input dtype at its output, matching the pointwise activation
 contract. It preserves BF16/F16 through projector and other exact-GELU layers.
+Metal evaluates BF16 inputs by indexing a cached table of the complete BF16
+domain using the input bits. The table uses the same F32 GELU and final BF16
+cast as CPU execution.
 
 Shared-backbone activation discovery uses the ordinary target descriptor and
 producer placement. It adds no prediction parameter owner or second component
@@ -16502,11 +16507,50 @@ retained alongside the component declarations.
 
 The shared realtime loader dispatches `lfm3_audio` to SafeTensors or explicit
 GGUF backbone/projector preparation. It retains the selected payloads
-independently of the model asset directory. `PreparedResidentAudio` selects F32 binding recipes and validates
-the sampling defaults without creating native tensors. Its parameter report
-counts the selected language, speech encoder, depth and codec decoder bindings.
-The codec encoder is available through the separate full codec composition.
-MLX consumes this selection with the supplied weight and execution contexts.
+independently of the model asset directory. The Audio declaration projects
+canonical F32 recipes into independent source views for the tied language
+embedding, language blocks and output, speech encoder and projector, depth
+decoder and feedback, and LiquidCodec synthesis. Each view validates its
+logical shape and reports its materialized parameter bytes. Tied codebook
+tables have one owner across embedding and scoring, even when several
+tables come from one packed GGUF tensor. LiquidCodec declares decoder
+ownership without admitting encoder-side quantizer weights into synthesis.
+`PreparedResidentAudio` retains a shared prepared language component and
+speech-input, depth/feedback, and LiquidCodec synthesis plans. It reports
+logical bytes by component and validates sampling without creating native
+tensors. The speech replacement hook, vocabulary projection, encoder stream
+carry, and projector equations stay in the architecture. The low-level MLX
+composition binds each component through independent shared layerwise
+parameter policies. The language policy accounts for its pinned
+embedding and final normalization. The speech input policy acquires the
+downsampler, each encoder block, encoder normalization and projector
+independently. The depth policy gives each codebook one physical owner and
+two ordered invocations, for embedding and scoring. Feedback is a separate
+invocation group, so replay and committed frames acquire its table without
+executing refinement. The LiquidCodec policy acquires scalar output, latent
+projection, causal blocks, and synthesis independently. Codec neural and
+overlap-add continuation remain in caller-owned state across evictions. The codec encoder is
+available through the separate full codec composition.
+The low-level tensor-cohort adapter applies the retained language recipes to
+the selected rank layout and uses the rank-local language state declaration
+when creating caches. The architecture substitutes speech rows after the
+vocabulary collective, keeps normalized hidden states for refinement, and
+uses the existing sharded vocabulary projection for text readout. Encoder,
+depth, feedback and codec resources are replicated per rank. The caller
+owns request ordering and failure handling for the native cohort.
+The language pipeline preparation retains a separate source, parameter plan,
+and cache geometry per stage, including tensor-local geometry for combined
+placement. The typed Audio invocation substitutes speech rows on the embedding
+owner. The shared pipeline driver transports the F32 residual stream along each
+tensor lane and publishes the final normalized states from the output stage to
+the session group. Vocabulary readout uses the output stage's selected tensor
+collective and the same publication group. Encoder, depth, feedback and codec
+execution are replicated across the session ranks. The controlled generation
+driver agrees sampled decisions before feedback and agrees the completed event
+after exact local completion, retention, and state validation. Only a successful
+session commit makes the candidate state and output visible.
+
+
 Callers prepare each prompt separately from model loading. The turn-based
 audio facade renders task prompts from retained templates and adapts controlled
 generation and transcription to text fragments and mono PCM. The CLI shares

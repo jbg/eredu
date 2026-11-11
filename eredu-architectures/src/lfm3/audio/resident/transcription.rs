@@ -1,4 +1,4 @@
-//! Publisher LiveASR protocol over the resident speech encoder and language traversal.
+//! Publisher LiveASR protocol over the selected speech encoder and language traversal.
 
 use super::*;
 use crate::lfm3::audio::encoder::STRIDE;
@@ -37,7 +37,7 @@ pub struct AudioTranscriptionBlock {
 /// Failure to prepare or advance a LiveASR stream.
 #[derive(Debug, thiserror::Error)]
 pub enum AudioTranscriptionError {
-    /// Another stream is already advancing on the shared resident graph.
+    /// Another stream is already advancing on the shared selected graph.
     #[error("the shared LFM3 Audio LiveASR graph is busy")]
     Busy,
     /// A child cannot retain the proposed state under its shared budget.
@@ -274,7 +274,7 @@ where
         Ok(())
     }
 
-    /// Forks the current settled stream on the same resident graph.
+    /// Forks the current settled stream on the same selected graph.
     /// The child owns its continuation and shares the original copy budget.
     pub fn fork(&self) -> Result<Self, AudioSnapshotError> {
         self.check_snapshot_boundary()?;
@@ -352,9 +352,7 @@ where
             .encoder
             .stream(self.binding.state(self.artifact.encoder.state_layout())?, 1)
             .map_err(failure)?;
-        let language = self
-            .binding
-            .state(self.artifact.language.definition().state_layout())?;
+        let language = self.binding.state(self.language.state_layout())?;
         Ok(AudioTranscription {
             model: Rc::new(RefCell::new(self)),
             state: TranscriptionState {
@@ -453,11 +451,7 @@ where
         let mut encoder = self.state.encoder.try_branch(H::branch_state)?;
         let projected = model.project_stream_chunk(features, &mut encoder, final_chunk)?;
         let mut language = if restart {
-            Some(
-                model
-                    .binding
-                    .state(model.artifact.language.definition().state_layout())?,
-            )
+            Some(model.binding.state(model.language.state_layout())?)
         } else if generate {
             Some(H::branch_state(&self.state.language)?)
         } else {

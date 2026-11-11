@@ -54,7 +54,8 @@ pub mod native {
     };
     pub use crate::composition::lfm3_audio::{
         MlxAudioModel, MlxAudioSession, MlxAudioSnapshot, MlxAudioTranscription,
-        MlxAudioTranscriptionSnapshot,
+        MlxAudioTranscriptionSnapshot, MlxPipelineAudioModel, MlxPipelineAudioSession,
+        MlxTensorParallelAudioModel, MlxTensorParallelAudioSession,
     };
     pub use crate::composition::moshi::MlxRealtimeExecution;
     use safemlx::Stream;

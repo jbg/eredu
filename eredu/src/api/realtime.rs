@@ -57,7 +57,7 @@ pub use crate::runtime::voicechat::{
 };
 
 mod loading;
-pub use loading::{RealtimeLoadOptions, SpeechSessionOptions};
+pub use loading::{AudioParameterResidency, RealtimeLoadOptions, SpeechSessionOptions};
 #[cfg(feature = "mlx")]
 mod selected;
 #[cfg(feature = "mlx")]

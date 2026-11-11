@@ -734,6 +734,19 @@ index a800e38..99d8fa0 100644
  void CommonAllocator::free(Buffer buffer) {
    auto sz = size(buffer);
    std::unique_lock lk(mutex_);
+@@ -190,7 +329,9 @@ size_t CommonAllocator::get_buffer_size(void* buf) {
+ }
+ 
+ CommonAllocator& common_allocator() {
+-  static CommonAllocator allocator_;
+-  return allocator_;
++  // Detached host-transfer workers can release buffers during process teardown.
++  // Keep the allocator available until the operating system stops those threads.
++  static auto* const allocator_ = new CommonAllocator;
++  return *allocator_;
+ }
+ 
+ Allocator& allocator() {
 diff --git a/mlx/backend/no_gpu/primitives.cpp b/mlx/backend/no_gpu/primitives.cpp
 index 7d536cb..2aa8e1e 100644
 --- a/mlx/backend/no_gpu/primitives.cpp

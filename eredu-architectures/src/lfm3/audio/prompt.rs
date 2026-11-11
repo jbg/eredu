@@ -1,17 +1,13 @@
 //! Speech embedding replacement through the shared LFM3 decoder traversal.
 
 use super::AudioTokens;
-use crate::{
-    decoder::LayeredInput,
-    lfm3::{ForwardContext, LayeredModel},
-};
+use crate::lfm3::{LayeredModel, Lfm3Input};
 use eredu_nn::{
-    AttentionCache, DistributedNeuralBackend, Error, GroupedNeuralBackend, Index, NeuralBackend,
-    Tensor,
+    AttentionCache, DistributedNeuralBackend, Error, GroupedNeuralBackend, Index, Tensor,
 };
 use eredu_runtime::{
-    LayerRuntimeState, LayeredTraversalHook, LayerwisePolicy, LayerwiseRuntime,
-    LayerwiseRuntimeError, ResidentRuntime, RuntimeStateComponents, SubmissionBackend,
+    LayerRuntimeState, LayerwisePolicy, LayerwiseRuntime, LayerwiseRuntimeError, ResidentRuntime,
+    RuntimeStateComponents, SubmissionBackend,
 };
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -121,17 +117,7 @@ impl<'a, T: Tensor> AudioPrompt<'a, T> {
         S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<T> + RuntimeStateComponents<B>,
     {
-        runtime
-            .forward_with_traversal_hook(
-                LayeredInput {
-                    tokens: &self.tokens,
-                    mask: None,
-                },
-                state,
-                context,
-                &mut SpeechReplacement { prompt: self },
-            )
-            .map(|(output, _)| output)
+        runtime.forward(Lfm3Input::Audio(self), state, context)
     }
 
     /// Runs the same mixed input on an already configured bounded language runtime.
@@ -151,20 +137,71 @@ impl<'a, T: Tensor> AudioPrompt<'a, T> {
         P: LayerwisePolicy<B, crate::lfm3::Block<B>>,
         P::Error: std::fmt::Display,
     {
-        runtime
-            .forward_with_traversal_hook(
-                LayeredInput {
-                    tokens: &self.tokens,
-                    mask: None,
-                },
-                state,
-                context,
-                &mut SpeechReplacement { prompt: self },
-            )
-            .map(|(output, _)| output)
+        runtime.forward(Lfm3Input::Audio(self), state, context)
     }
 
-    fn replace(&self, text: &T, context: &T::Context) -> Result<T, Error> {
+    /// Substitutes speech rows after the vocabulary collective and returns normalized hidden states.
+    pub fn forward_tensor_parallel<B, S, P>(
+        &self,
+        runtime: &mut LayerwiseRuntime<LayeredModel<B>, B, S, P>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &T::Context,
+    ) -> Result<T, LayerwiseRuntimeError<Error, P::Error>>
+    where
+        B: eredu_nn::TensorParallelGroupedNeuralBackend<Tensor = T>
+            + DistributedNeuralBackend
+            + SubmissionBackend<Executor = T::Context>,
+        S: LayerRuntimeState<B>,
+        S::LayerState: AttentionCache<T> + RuntimeStateComponents<B>,
+        P: LayerwisePolicy<B, crate::lfm3::Block<B>>,
+        P::Error: std::fmt::Display,
+    {
+        runtime.forward_parallel(Lfm3Input::Audio(self), state, parallel, context)
+    }
+
+    /// Tensor roots retained through a distributed prefill or feedback invocation.
+    pub fn retained_tensors(&self) -> impl Iterator<Item = &T> {
+        [Some(&self.tokens), self.input, self.output]
+            .into_iter()
+            .flatten()
+    }
+
+    /// Describes the exact prepared input shared by the pipeline ranks.
+    pub fn collective_descriptor(&self, context: &T::Context) -> Result<[u64; 8], Error> {
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        digest.update(self.length.to_le_bytes());
+        digest.update(self.width.to_le_bytes());
+        for span in &self.spans {
+            digest.update([span.source as u8]);
+            digest.update(span.start.to_le_bytes());
+            digest.update(span.end.to_le_bytes());
+        }
+        for id in self.tokens.to_i32_vec(context)? {
+            digest.update(id.to_le_bytes());
+        }
+        for tensor in [self.input, self.output].into_iter().flatten() {
+            for value in tensor
+                .cast_float(eredu_nn::TensorElementType::F32, context)?
+                .to_f32_vec(context)?
+            {
+                digest.update(value.to_bits().to_le_bytes());
+            }
+        }
+        let digest = digest.finalize();
+        let mut descriptor = [0x4c464d3341554449, 0, 0, 0, 0, 0, 0, 0];
+        for (word, bytes) in descriptor[1..].iter_mut().zip(digest.chunks_exact(8)) {
+            *word = u64::from_le_bytes(bytes.try_into().expect("eight digest bytes"));
+        }
+        Ok(descriptor)
+    }
+
+    pub(in crate::lfm3) fn tokens(&self) -> &T {
+        &self.tokens
+    }
+
+    pub(in crate::lfm3) fn replace(&self, text: &T, context: &T::Context) -> Result<T, Error> {
         if text.shape() != [1, self.length, self.width] {
             return Err(Error::backend(
                 "LFM3 Audio prompt does not match language embedding geometry",
@@ -198,30 +235,5 @@ impl<'a, T: Tensor> AudioPrompt<'a, T> {
             })
             .collect::<Result<Vec<_>, _>>()?;
         T::concatenate(&spans, 1, context)
-    }
-}
-
-struct SpeechReplacement<'a, 'b, T: Tensor> {
-    prompt: &'a AudioPrompt<'b, T>,
-}
-
-impl<B: NeuralBackend> LayeredTraversalHook<B, ForwardContext<B::Tensor>, Error>
-    for SpeechReplacement<'_, '_, B::Tensor>
-{
-    fn after_group_begin(
-        &mut self,
-        group: usize,
-        hidden: &mut B::Tensor,
-        forward: &mut ForwardContext<B::Tensor>,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<(), Error> {
-        if group != 0 {
-            return Err(Error::backend(
-                "LFM3 Audio expects one language decoder group",
-            ));
-        }
-        *hidden = self.prompt.replace(hidden, context)?;
-        forward.normalized_audio_output = true;
-        Ok(())
     }
 }

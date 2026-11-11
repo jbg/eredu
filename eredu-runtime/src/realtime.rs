@@ -153,6 +153,22 @@ pub trait RealtimeFrameTransition<MB, Q: RealtimeScheduleState, P, S, R, C> {
     /// Architecture or mechanism failure before publication.
     type Error;
 
+    /// Agrees branch admission before ranks start dependent work.
+    fn admit_branch(&mut self, _ready: bool) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    /// Selects an external commit decision after local publication validation.
+    fn uses_collective_publication(&self) -> bool {
+        false
+    }
+
+    /// Agrees a fully validated candidate. An implementation that enables this
+    /// hook must have an infallible local publisher for validated model branches.
+    fn before_publish(&mut self, _output: &Self::Output, _ready: bool) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
     /// Consumes the portable ingress frame, mutates the unpublished branch,
     /// and returns the exact completion associated with the submitted work.
     fn execute(
@@ -366,8 +382,17 @@ where
         T: RealtimeFrameTransition<M::Branch, Q, P, S, R, C>,
         T::Error: std::error::Error + Send + Sync + 'static,
     {
-        let mut branch = SemanticStateTransaction::branch(self)
-            .map_err(RealtimeFrameExecutionError::Publication)?;
+        let branch = SemanticStateTransaction::branch(self)
+            .map_err(RealtimeFrameExecutionError::Publication);
+        let admission = transition.admit_branch(branch.is_ok());
+        let mut branch = branch?;
+        if let Err(error) = admission {
+            <Self as SemanticStateTransaction>::discard_branch(branch)
+                .map_err(RealtimeFrameExecutionError::Publication)?;
+            return Err(RealtimeFrameExecutionError::Transition(
+                BackendFailure::from_error(error),
+            ));
+        }
         let (output, completion) = match transition.execute(frame, &mut branch) {
             Ok(submission) => submission,
             Err(error) => {
@@ -379,19 +404,42 @@ where
                 ));
             }
         };
-        if let Err(error) = branch.attach_submission_completion(completion) {
-            if let Err(discard) = <Self as SemanticStateTransaction>::discard_branch(branch) {
-                return Err(RealtimeFrameExecutionError::Publication(discard));
-            }
-            return Err(RealtimeFrameExecutionError::CompletionAttachment(error));
-        }
-        if let Err(error) = check_retention(&branch) {
+        let prepared = branch
+            .attach_submission_completion(completion)
+            .map_err(RealtimeFrameExecutionError::from)
+            .and_then(|()| {
+                check_retention(&branch).map_err(RealtimeFrameExecutionError::Retention)
+            });
+        if let Err(error) = prepared {
+            let _ = transition.before_publish(&output, false);
             <Self as SemanticStateTransaction>::discard_branch(branch)
                 .map_err(RealtimeFrameExecutionError::Publication)?;
-            return Err(RealtimeFrameExecutionError::Retention(error));
+            return Err(error);
         }
-        SemanticStateTransaction::commit_branch(self, branch)
-            .map_err(RealtimeFrameExecutionError::Publication)?;
+        if transition.uses_collective_publication() {
+            let revision = self.validate_publication(&branch);
+            let agreement = transition.before_publish(&output, revision.is_ok());
+            let revision = match revision {
+                Ok(revision) => revision,
+                Err(error) => {
+                    return Err(RealtimeFrameExecutionError::Publication(
+                        Self::discard_invalid(branch.model_state, error),
+                    ))
+                }
+            };
+            if let Err(error) = agreement {
+                <Self as SemanticStateTransaction>::discard_branch(branch)
+                    .map_err(RealtimeFrameExecutionError::Publication)?;
+                return Err(RealtimeFrameExecutionError::Transition(
+                    BackendFailure::from_error(error),
+                ));
+            }
+            self.publish_validated(branch, revision)
+                .map_err(RealtimeFrameExecutionError::Publication)?;
+        } else {
+            SemanticStateTransaction::commit_branch(self, branch)
+                .map_err(RealtimeFrameExecutionError::Publication)?;
+        }
         Ok(output)
     }
 
@@ -582,6 +630,81 @@ impl<MB, Q: RealtimeScheduleState, P, S, R, C> RealtimeGenerationBranch<MB, Q, P
     }
 }
 
+impl<M, Q, P, S, R, C> RealtimeGenerationState<M, Q, P, S, R, C>
+where
+    M: SemanticStateTransaction,
+    Q: RealtimeScheduleState,
+    M::Error: Send + Sync + 'static,
+    P: Clone,
+    S: Clone,
+    R: Clone,
+    C: Completion,
+{
+    fn discard_invalid(
+        model_state: M::Branch,
+        error: RealtimeGenerationTransactionError,
+    ) -> RealtimeGenerationTransactionError {
+        match M::discard_branch(model_state) {
+            Ok(()) => error,
+            Err(error) => {
+                RealtimeGenerationTransactionError::Model(BackendFailure::from_error(error))
+            }
+        }
+    }
+
+    fn validate_publication(
+        &self,
+        branch: &RealtimeGenerationBranch<M::Branch, Q, P, S, R, C>,
+    ) -> Result<u64, RealtimeGenerationTransactionError> {
+        use RealtimeGenerationTransactionError as Error;
+        let completion = branch.completion.as_ref().ok_or(Error::MissingCompletion)?;
+        if !completion
+            .is_complete()
+            .map_err(|error| Error::Completion(BackendFailure::from_error(error)))?
+        {
+            return Err(Error::CompletionPending);
+        }
+        completion
+            .wait()
+            .map_err(|error| Error::Completion(BackendFailure::from_error(error)))?;
+        if branch.base_revision != self.revision {
+            return Err(Error::StaleRevision {
+                expected: self.revision,
+                actual: branch.base_revision,
+            });
+        }
+        if branch.contract != self.contract {
+            return Err(Error::ContractMismatch);
+        }
+        if branch.schedule_state.identity() != self.contract.identity() {
+            return Err(Error::IdentityMismatch);
+        }
+        self.schedule_state
+            .validate_successor(&branch.schedule_state)
+            .map_err(|error| Error::Schedule(Box::new(error)))?;
+        validate_sampler_cardinality(self.contract.sampler_count(), branch.samplers.len())?;
+        self.revision.checked_add(1).ok_or(Error::RevisionExhausted)
+    }
+
+    fn publish_validated(
+        &mut self,
+        branch: RealtimeGenerationBranch<M::Branch, Q, P, S, R, C>,
+        revision: u64,
+    ) -> Result<(), RealtimeGenerationTransactionError> {
+        self.model_state
+            .commit_branch(branch.model_state)
+            .map_err(|error| {
+                RealtimeGenerationTransactionError::Model(BackendFailure::from_error(error))
+            })?;
+        self.schedule_state = branch.schedule_state;
+        self.sampling = branch.sampling;
+        self.samplers = branch.samplers;
+        self.random_state = branch.random_state;
+        self.revision = revision;
+        Ok(())
+    }
+}
+
 impl<M, Q, P, S, R, C> SemanticStateTransaction for RealtimeGenerationState<M, Q, P, S, R, C>
 where
     M: SemanticStateTransaction,
@@ -612,81 +735,11 @@ where
     }
 
     fn commit_branch(&mut self, branch: Self::Branch) -> Result<(), Self::Error> {
-        let RealtimeGenerationBranch {
-            model_state,
-            contract,
-            schedule_state,
-            sampling,
-            samplers,
-            random_state,
-            base_revision,
-            completion,
-        } = branch;
-
-        let rollback = |model_state, error| match M::discard_branch(model_state) {
-            Ok(()) => error,
-            Err(error) => Self::Error::Model(BackendFailure::from_error(error)),
+        let revision = match self.validate_publication(&branch) {
+            Ok(revision) => revision,
+            Err(error) => return Err(Self::discard_invalid(branch.model_state, error)),
         };
-        let Some(completion) = completion else {
-            return Err(rollback(model_state, Self::Error::MissingCompletion));
-        };
-        let complete = match completion.is_complete() {
-            Ok(complete) => complete,
-            Err(error) => {
-                return Err(rollback(
-                    model_state,
-                    Self::Error::Completion(BackendFailure::from_error(error)),
-                ));
-            }
-        };
-        if !complete {
-            return Err(rollback(model_state, Self::Error::CompletionPending));
-        }
-        if let Err(error) = completion.wait() {
-            return Err(rollback(
-                model_state,
-                Self::Error::Completion(BackendFailure::from_error(error)),
-            ));
-        }
-        if base_revision != self.revision {
-            return Err(rollback(
-                model_state,
-                Self::Error::StaleRevision {
-                    expected: self.revision,
-                    actual: base_revision,
-                },
-            ));
-        }
-        if contract != self.contract {
-            return Err(rollback(model_state, Self::Error::ContractMismatch));
-        }
-        if schedule_state.identity() != self.contract.identity() {
-            return Err(rollback(model_state, Self::Error::IdentityMismatch));
-        }
-        if let Err(error) = self.schedule_state.validate_successor(&schedule_state) {
-            return Err(rollback(
-                model_state,
-                Self::Error::Schedule(Box::new(error)),
-            ));
-        }
-        if let Err(error) =
-            validate_sampler_cardinality(self.contract.sampler_count(), samplers.len())
-        {
-            return Err(rollback(model_state, error));
-        }
-        let Some(revision) = self.revision.checked_add(1) else {
-            return Err(rollback(model_state, Self::Error::RevisionExhausted));
-        };
-
-        self.model_state
-            .commit_branch(model_state)
-            .map_err(|error| Self::Error::Model(BackendFailure::from_error(error)))?;
-        self.schedule_state = schedule_state;
-        self.sampling = sampling;
-        self.samplers = samplers;
-        self.random_state = random_state;
-        self.revision = revision;
-        Ok(())
+        self.publish_validated(branch, revision)
     }
 
     fn discard_branch(branch: Self::Branch) -> Result<(), Self::Error> {

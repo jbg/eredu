@@ -147,6 +147,12 @@ pub fn log_sigmoid(x: impl AsRef<Array>, stream: impl AsRef<Stream>) -> MlxResul
 pub fn gelu(x: impl AsRef<Array>, stream: impl AsRef<Stream>) -> MlxResult<Array> {
     let stream = stream.as_ref();
     let dtype = x.as_ref().dtype();
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    if dtype == safemlx::Dtype::Bfloat16
+        && stream.get_device()?.get_type()? == safemlx::DeviceType::Gpu
+    {
+        return metal_bf16_gelu(x.as_ref(), stream);
+    }
     let work = match dtype {
         safemlx::Dtype::Bfloat16 | safemlx::Dtype::Float16 => {
             x.as_ref().as_dtype(safemlx::Dtype::Float32, stream)?
@@ -162,6 +168,38 @@ pub fn gelu(x: impl AsRef<Array>, stream: impl AsRef<Stream>) -> MlxResult<Array
     )?
     .divide(array!(2.0), stream)?
     .as_dtype(dtype, stream)
+}
+
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+fn metal_bf16_gelu(input: &Array, stream: &Stream) -> MlxResult<Array> {
+    use safemlx::{Device, DeviceType, Dtype};
+    use std::cell::RefCell;
+
+    thread_local! {
+        static TABLE: RefCell<Option<Array>> = const { RefCell::new(None) };
+    }
+    TABLE.with(|table| {
+        let mut table = table.borrow_mut();
+        if table.is_none() {
+            // Enumerate the complete BF16 domain once. The device erf approximation
+            // can change the rounded GELU after cancellation in its negative tail.
+            let values = (0..=u16::MAX)
+                .map(half::bf16::from_bits)
+                .collect::<Vec<_>>();
+            let cpu = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+            let values = gelu(Array::from_slice(&values, &[65_536]), &cpu)?.into_evaluated()?;
+            *table = Some(values.as_array().copy(stream)?);
+        }
+        let bits = input
+            .view_dtype(Dtype::Uint16, stream)?
+            .as_dtype(Dtype::Int32, stream)?;
+        Array::take_axis(
+            table.as_ref().expect("BF16 GELU table initialized"),
+            &bits,
+            0,
+            stream,
+        )
+    })
 }
 
 /// Applies the tanh GELU approximation.

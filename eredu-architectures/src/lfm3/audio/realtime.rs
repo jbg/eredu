@@ -272,6 +272,21 @@ pub trait AudioExecutionKernel {
         state: &<Self::State as SemanticStateTransaction>::Branch,
     ) -> Result<Self::Completion, BackendFailure>;
 
+    /// Whether this execution requires all-rank generation publication.
+    fn uses_collective_commit(&self) -> bool {
+        false
+    }
+
+    /// Agrees a local decision before dependent communication.
+    fn agree_audio(&mut self, _descriptor: [u64; 8], _success: bool) -> Result<(), BackendFailure> {
+        Ok(())
+    }
+
+    /// Commits a settled candidate with the selected session authority.
+    fn commit_audio(&mut self) -> Result<(), BackendFailure> {
+        Ok(())
+    }
+
     /// Holds the branch's reservation through all native work in an advance.
     /// Unresolved work must retain it even when the operation fails or unwinds.
     fn with_fork_retention<T>(
@@ -371,7 +386,7 @@ where
     Random<K>: Clone + SnapshotValue,
 {
     /// Copies the current settled continuation without replaying prefill.
-    /// The child shares the resident graph and copy budget, and advances independently.
+    /// The child shares the selected graph and copy budget, and advances independently.
     pub fn fork(&self) -> Result<Self, AudioSnapshotError> {
         self.check_snapshot_boundary()?;
         let budget = self
@@ -570,17 +585,94 @@ where
     type Output = AudioAdvance;
     type Error = BackendFailure;
 
+    fn admit_branch(&mut self, ready: bool) -> Result<(), BackendFailure> {
+        self.0
+            .agree_audio([0x41554441444d49, 0, 0, 0, 0, 0, 0, 0], ready)
+    }
+
+    fn uses_collective_publication(&self) -> bool {
+        self.0.uses_collective_commit()
+    }
+
+    fn before_publish(&mut self, event: &AudioAdvance, ready: bool) -> Result<(), BackendFailure> {
+        if !self.0.uses_collective_commit() {
+            return Ok(());
+        }
+        self.0.agree_audio(event_descriptor(event), ready)?;
+        self.0.commit_audio()
+    }
+
     fn execute(
         &mut self,
         _: &(),
         branch: &mut Branch<K>,
     ) -> Result<(AudioAdvance, K::Completion), BackendFailure> {
-        let event = match branch.schedule_state().phase() {
-            AudioPhase::Text => self.text(branch)?,
-            AudioPhase::Speech => self.speech(branch)?,
-            AudioPhase::Finished => return Err(failure(AudioScheduleError::OutOfPhase)),
-        };
-        Ok((event, self.0.complete(branch.model_state())?))
+        self.0.agree_audio(
+            [
+                0x41554442454749,
+                branch.schedule_state().phase() as u64,
+                branch.schedule_state().committed_slots() as u64,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
+            true,
+        )?;
+        let result = (|| {
+            let event = match branch.schedule_state().phase() {
+                AudioPhase::Text => self.text(branch)?,
+                AudioPhase::Speech => self.speech(branch)?,
+                AudioPhase::Finished => return Err(failure(AudioScheduleError::OutOfPhase)),
+            };
+            let completion = self.0.complete(branch.model_state())?;
+            Ok((event, completion))
+        })();
+        if !self.0.uses_collective_commit() {
+            return result;
+        }
+        let agreement = self
+            .0
+            .agree_audio([0x415544434f4d50, 0, 0, 0, 0, 0, 0, 0], result.is_ok());
+        let candidate = result?;
+        agreement?;
+        Ok(candidate)
+    }
+}
+
+fn audio_descriptor(tag: u64, words: impl IntoIterator<Item = u32>) -> [u64; 8] {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    for word in words {
+        digest.update(word.to_le_bytes());
+    }
+    let digest = digest.finalize();
+    let mut descriptor = [tag, 0, 0, 0, 0, 0, 0, 0];
+    for (word, bytes) in descriptor[1..].iter_mut().zip(digest.chunks_exact(8)) {
+        *word = u64::from_le_bytes(bytes.try_into().expect("eight digest bytes"));
+    }
+    descriptor
+}
+
+fn event_descriptor(event: &AudioAdvance) -> [u64; 8] {
+    match event {
+        AudioAdvance::Refining => [0x415544434f4d4d, 1, 0, 0, 0, 0, 0, 0],
+        AudioAdvance::Text { token, pcm_tail } => audio_descriptor(
+            0x415544434f4d01,
+            std::iter::once(*token as u32).chain(pcm_tail.iter().map(|v| v.to_bits())),
+        ),
+        AudioAdvance::Speech { codes, pcm } => audio_descriptor(
+            0x415544434f4d02,
+            codes
+                .iter()
+                .map(|&v| v as u32)
+                .chain(pcm.iter().map(|v| v.to_bits())),
+        ),
+        AudioAdvance::SpeechEnd(pcm) => {
+            audio_descriptor(0x415544434f4d03, pcm.iter().map(|v| v.to_bits()))
+        }
+        AudioAdvance::Finished => [0x415544434f4d, 4, 0, 0, 0, 0, 0, 0],
     }
 }
 
@@ -636,6 +728,30 @@ where
     Random<K>: Clone,
 {
     fn text(&mut self, branch: &mut Branch<K>) -> Result<AudioAdvance, BackendFailure> {
+        let decision = self.text_decision(branch);
+        let descriptor = [
+            0x41554454455854,
+            decision.as_ref().copied().unwrap_or(0) as u64,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        let agreement = self.0.agree_audio(descriptor, decision.is_ok());
+        let token = decision?;
+        agreement?;
+        self.0.append_text(branch.model_state_mut(), token)?;
+        let pcm_tail = if branch.schedule_state().phase() == AudioPhase::Finished {
+            self.0.flush_speech(branch.model_state_mut())?
+        } else {
+            Vec::new()
+        };
+        Ok(AudioAdvance::Text { token, pcm_tail })
+    }
+
+    fn text_decision(&mut self, branch: &mut Branch<K>) -> Result<i32, BackendFailure> {
         let logits = self.0.text_logits(branch.model_state())?;
         let context = self.0.context();
         let mut allowed = vec![true; logits.shape().last().copied().unwrap_or(0).max(0) as usize];
@@ -663,16 +779,49 @@ where
             .map_err(failure)?;
         let history = branch.sampling().text_history;
         record(&mut branch.samplers_mut()[0], token, history);
-        self.0.append_text(branch.model_state_mut(), token)?;
-        let pcm_tail = if branch.schedule_state().phase() == AudioPhase::Finished {
-            self.0.flush_speech(branch.model_state_mut())?
-        } else {
-            Vec::new()
-        };
-        Ok(AudioAdvance::Text { token, pcm_tail })
+        Ok(token)
     }
 
     fn speech(&mut self, branch: &mut Branch<K>) -> Result<AudioAdvance, BackendFailure> {
+        let decision = self.speech_decision(branch);
+        let descriptor = decision
+            .as_ref()
+            .map(|(_, descriptor)| *descriptor)
+            .unwrap_or([0; 8]);
+        let agreement = self.0.agree_audio(descriptor, decision.is_ok());
+        let (progress, _) = decision?;
+        agreement?;
+        match progress {
+            DepthProgress::Pending => Ok(AudioAdvance::Refining),
+            DepthProgress::End => {
+                let codes =
+                    vec![self.0.depth().eos_code(); branch.schedule_state().policy().codebooks()];
+                self.0
+                    .append_speech(branch.model_state_mut(), &codes, true)?;
+                Ok(AudioAdvance::SpeechEnd(
+                    self.0.flush_speech(branch.model_state_mut())?,
+                ))
+            }
+            DepthProgress::Audio(codes) => {
+                let limit = branch.sampling().speech_history;
+                for (sampler, &code) in branch.samplers_mut()[1..].iter_mut().zip(&codes) {
+                    record(sampler, code, limit);
+                }
+                let mut pcm = self
+                    .0
+                    .append_speech(branch.model_state_mut(), &codes, false)?;
+                if branch.schedule_state().phase() == AudioPhase::Finished {
+                    pcm.extend(self.0.flush_speech(branch.model_state_mut())?);
+                }
+                Ok(AudioAdvance::Speech { codes, pcm })
+            }
+        }
+    }
+
+    fn speech_decision(
+        &mut self,
+        branch: &mut Branch<K>,
+    ) -> Result<(DepthProgress, [u64; 8]), BackendFailure> {
         if branch.schedule_state().depth_frame().is_none() {
             let count = branch.schedule_state().policy().codebooks();
             let order = branch
@@ -709,7 +858,7 @@ where
         let sampled = branch
             .with_random_state_transaction(|random| {
                 let mut sampled = Vec::with_capacity(slots.len());
-                for (slot, sampler) in slots.into_iter().zip(&mut samplers) {
+                for (&slot, sampler) in slots.iter().zip(&mut samplers) {
                     let row = logits
                         .index(&[Index::At(0), Index::At(slot as i32)], context)
                         .and_then(|row| row.cast_float(TensorElementType::F32, context))
@@ -725,35 +874,17 @@ where
                 Ok::<_, BackendFailure>(sampled)
             })
             .map_err(failure)?;
-        match branch
+        let progress = branch
             .schedule_state_mut()
             .reveal(pass, &sampled)
-            .map_err(failure)?
-        {
-            DepthProgress::Pending => Ok(AudioAdvance::Refining),
-            DepthProgress::End => {
-                let codes =
-                    vec![self.0.depth().eos_code(); branch.schedule_state().policy().codebooks()];
-                self.0
-                    .append_speech(branch.model_state_mut(), &codes, true)?;
-                Ok(AudioAdvance::SpeechEnd(
-                    self.0.flush_speech(branch.model_state_mut())?,
-                ))
-            }
-            DepthProgress::Audio(codes) => {
-                let limit = branch.sampling().speech_history;
-                for (sampler, &code) in branch.samplers_mut()[1..].iter_mut().zip(&codes) {
-                    record(sampler, code, limit);
-                }
-                let mut pcm = self
-                    .0
-                    .append_speech(branch.model_state_mut(), &codes, false)?;
-                if branch.schedule_state().phase() == AudioPhase::Finished {
-                    pcm.extend(self.0.flush_speech(branch.model_state_mut())?);
-                }
-                Ok(AudioAdvance::Speech { codes, pcm })
-            }
-        }
+            .map_err(failure)?;
+        let descriptor = audio_descriptor(
+            0x41554444455054,
+            std::iter::once(pass as u32)
+                .chain(slots.iter().map(|&slot| slot as u32))
+                .chain(sampled.iter().map(|&code| code as u32)),
+        );
+        Ok((progress, descriptor))
     }
 }
 

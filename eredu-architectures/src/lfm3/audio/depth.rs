@@ -17,10 +17,10 @@ use eredu_checkpoint::{
 };
 use eredu_core::AttentionPolicy;
 use eredu_nn::{
-    DeclareLogicalParameters, Error, Index, LinearFormatSpec, LinearOperator, LinearSpec,
-    LogicalParameterDeclaration, LogicalParameterRole, NeuralBackend, NeuralOperatorCapabilities,
-    NormalizationConstructionSpec, NormalizationOperator, Parameter, ParameterSpec, Parameterized,
-    Tensor, TensorElementType,
+    DeclareLogicalParameters, Error, Index, LinearArithmetic, LinearFormatSpec, LinearOperator,
+    LinearSpec, LogicalParameterDeclaration, LogicalParameterRole, NeuralBackend,
+    NeuralOperatorCapabilities, NormalizationConstructionSpec, NormalizationOperator, Parameter,
+    ParameterSpec, Parameterized, Tensor, TensorElementType,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -160,7 +160,9 @@ impl DepthDeclaration {
                 .ok_or_else(|| invalid("depth projection width overflowed"))?,
             weight: parameter(format!("{ROOT}.depth_linear.weight"))?,
             bias: Some(parameter(format!("{ROOT}.depth_linear.bias"))?),
-            format: LinearFormatSpec::unscaled(LinearFormat::Dense)?,
+            // Accumulate the projection and bias before rounding to the activation dtype.
+            format: LinearFormatSpec::unscaled(LinearFormat::Dense)?
+                .with_arithmetic(LinearArithmetic::RowMajorAffine)?,
         };
         let blocks = (0..args.layer_schedule.len())
             .map(|i| BlockParameters::at(&args, i, &format!("{ROOT}.model.layers.{i}")))
@@ -481,15 +483,22 @@ struct Codebook<T: Tensor> {
     scale: Parameter<T>,
 }
 
+#[path = "depth_policy.rs"]
+mod policy;
+pub use policy::{AudioDepth, DepthModule, PolicyDepth, PreparedAudioDepth};
+
+#[derive(Debug, Clone, Parameterized)]
+#[parameterized(tensor = "B::Tensor")]
+struct Conditioning<B: NeuralBackend> {
+    projection: B::Linear,
+    mask: Parameter<B::Tensor>,
+}
+
 /// Resident speech depth decoder. Each invocation attends across all slots with no KV history.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct DepthDecoder<B: NeuralBackend> {
-    projection: B::Linear,
-    mask: Parameter<B::Tensor>,
-    blocks: Vec<ReplicatedBlock<B>>,
-    final_norm: B::Normalization,
-    codebooks: Vec<Codebook<B::Tensor>>,
+    units: Vec<DepthModule<B>>,
     #[parameter(skip)]
     declaration: DepthDeclaration,
 }
@@ -506,40 +515,9 @@ impl<B: NeuralBackend> DepthDecoder<B> {
         declaration: &DepthDeclaration,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        B::require_operator_capabilities(
-            "LFM3 speech depth",
-            lookup_capabilities()
-                .union(NeuralOperatorCapabilities::FROM_I32_SLICE)
-                .union(NeuralOperatorCapabilities::CAST_FLOAT)
-                .union(NeuralOperatorCapabilities::RMS_NORM_WITHOUT_WEIGHT)
-                .union(NeuralOperatorCapabilities::SIGMOID),
-        )?;
-        let d = declaration;
         Ok(Self {
-            projection: B::linear(d.projection.clone(), context)?,
-            mask: Parameter::unloaded(d.mask.clone(), &[d.width], context)?,
-            blocks: d
-                .blocks
-                .iter()
-                .cloned()
-                .map(|parameters| ReplicatedBlock::from_parameters(parameters, context))
-                .collect::<Result<_, _>>()?,
-            final_norm: B::normalization(d.final_norm.clone(), context)?,
-            codebooks: d
-                .codebooks
-                .iter()
-                .map(|spec| {
-                    Ok(Codebook {
-                        table: Parameter::unloaded(
-                            spec.table.clone(),
-                            &[d.vocabulary, d.width],
-                            context,
-                        )?,
-                        scale: Parameter::unloaded(spec.scale.clone(), &[d.width], context)?,
-                    })
-                })
-                .collect::<Result<_, Error>>()?,
-            declaration: d.clone(),
+            units: policy::resident_units(declaration, false, context)?,
+            declaration: declaration.clone(),
         })
     }
 
@@ -552,71 +530,14 @@ impl<B: NeuralBackend> DepthDecoder<B> {
         masked: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let d = &self.declaration;
-        let books = d.codebooks.len() as i32;
-        if hidden.shape().len() != 2
-            || hidden.dim(0) <= 0
-            || hidden.dim(1) != d.projection.input
-            || codes.shape() != [hidden.dim(0), books]
-            || masked.shape() != codes.shape()
-            || codes.element_type() != Some(TensorElementType::I32)
-            || masked.element_type() != Some(TensorElementType::Bool)
-        {
-            return Err(invalid("invalid LFM3 speech depth inputs"));
-        }
-
-        let codes = nonnegative_gather_indices(codes, d.vocabulary, context)?;
-        let embeddings = self
-            .codebooks
-            .iter()
-            .enumerate()
-            .map(|(i, book)| {
-                let ids = codes.index(&[Index::Full, Index::At(i as i32)], context)?;
-                book.table.as_ref().take_axis(&ids, 0, context)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let embeddings = B::Tensor::stack(&embeddings, 1, context)?;
-        let dtype = embeddings
-            .element_type()
-            .ok_or_else(|| invalid("unknown speech codebook dtype"))?;
-        let mask = self.mask.as_ref().cast_float(dtype, context)?;
-        let conditioning = B::Tensor::where_condition(
-            &masked.expand_dims(-1, context)?,
-            &mask,
-            &embeddings,
+        policy::scores::<B>(
+            &self.declaration,
+            hidden,
+            codes,
+            masked,
             context,
-        )?;
-        let mut depth = self
-            .projection
-            .forward(hidden, context)?
-            .reshape(&[hidden.dim(0), books, d.width], context)?
-            .add(&conditioning, context)?;
-        for block in &mut self.blocks {
-            depth = block.forward_bidirectional(&depth, context)?;
-        }
-        let depth = self.final_norm.forward(&depth, context)?;
-        let dtype = depth
-            .element_type()
-            .ok_or_else(|| invalid("unknown speech depth activation dtype"))?;
-        let logits = self
-            .codebooks
-            .iter()
-            .enumerate()
-            .map(|(i, book)| {
-                let slot = depth
-                    .index(&[Index::Full, Index::At(i as i32)], context)?
-                    .cast_float(TensorElementType::F32, context)?;
-                let scale = book
-                    .scale
-                    .as_ref()
-                    .cast_float(TensorElementType::F32, context)?;
-                // The trained heads multiply the learned scale before the single output cast.
-                let slot = B::rms_norm_with_weight(&slot, &scale, d.final_norm.epsilon, context)?
-                    .cast_float(dtype, context)?;
-                B::Tensor::linear(&slot, book.table.as_ref(), None, context)
-            })
-            .collect::<Result<Vec<_>, Error>>()?;
-        B::Tensor::stack(&logits, 1, context)
+            |owner, operation| self.units[owner].apply(&self.declaration, &operation, context),
+        )
     }
 
     /// Scores the next pass of one unfinished frame without committing any sampled codes.
@@ -626,22 +547,8 @@ impl<B: NeuralBackend> DepthDecoder<B> {
         frame: &DepthFrame,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let d = &self.declaration;
-        if frame.next_pass().is_none()
-            || frame.schedule != d.schedule
-            || frame.eos != d.eos
-            || frame.vocabulary != d.vocabulary
-            || frame.codes.len() != d.codebooks.len()
-        {
-            return Err(invalid(
-                "speech refinement frame is complete or incompatible",
-            ));
-        }
-        let shape = [1, frame.codes.len() as i32];
-        let codes = B::Tensor::from_i32_slice(&frame.codes, &shape, context)?;
-        let mask =
-            B::Tensor::from_i32_slice(&frame.masked, &shape, context)?.equal_i32(1, context)?;
-        self.scores(hidden, &codes, &mask, context)
+        let (codes, masked) = self.declaration.frame_inputs(frame, context)?;
+        self.scores(hidden, &codes, &masked, context)
     }
 
     /// Scores and commits one pass using the caller's sampling policy.
@@ -665,6 +572,29 @@ impl<B: NeuralBackend> DepthDecoder<B> {
             })
             .collect::<Result<Vec<_>, _>>()?;
         frame.reveal(pass, &codes)
+    }
+}
+
+impl DepthDeclaration {
+    fn frame_inputs<T: Tensor>(
+        &self,
+        frame: &DepthFrame,
+        context: &T::Context,
+    ) -> Result<(T, T), Error> {
+        if frame.next_pass().is_none()
+            || frame.schedule != self.schedule
+            || frame.eos != self.eos
+            || frame.vocabulary != self.vocabulary
+            || frame.codes.len() != self.codebooks.len()
+        {
+            return Err(invalid(
+                "speech refinement frame is complete or incompatible",
+            ));
+        }
+        let shape = [1, frame.codes.len() as i32];
+        let codes = T::from_i32_slice(&frame.codes, &shape, context)?;
+        let mask = T::from_i32_slice(&frame.masked, &shape, context)?.equal_i32(1, context)?;
+        Ok((codes, mask))
     }
 }
 
@@ -730,12 +660,15 @@ impl<B: NeuralBackend> Feedback<B> {
                     .take_axis(&ids, 0, context)
             })
             .collect::<Result<Vec<_>, Error>>()?;
-        B::Tensor::sum_axis(
-            &B::Tensor::stack(&embeddings, 1, context)?,
-            1,
-            false,
-            context,
-        )
+        let embeddings = B::Tensor::stack(&embeddings, 1, context)?;
+        match embeddings.element_type() {
+            Some(dtype @ (TensorElementType::Bf16 | TensorElementType::F16)) => {
+                // Accumulate every codebook contribution before rounding the sum.
+                let wide = embeddings.cast_float(TensorElementType::F32, context)?;
+                B::Tensor::sum_axis(&wide, 1, false, context)?.cast_float(dtype, context)
+            }
+            _ => B::Tensor::sum_axis(&embeddings, 1, false, context),
+        }
     }
 }
 

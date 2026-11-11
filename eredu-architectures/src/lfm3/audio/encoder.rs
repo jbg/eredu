@@ -12,13 +12,17 @@ use eredu_checkpoint::{
 use eredu_core::{AttentionPolicy, LayerSchedule};
 use eredu_nn::{
     AttentionCache, DeclareLogicalParameters, Error, Index, LayerNorm,
-    LayerNormalizationConstructionSpec, LinearFormatSpec, LinearOperator, LinearSpec,
-    LogicalParameterDeclaration, LogicalParameterRole, NeuralBackend,
+    LayerNormalizationConstructionSpec, LinearArithmetic, LinearFormatSpec, LinearOperator,
+    LinearSpec, LogicalParameterDeclaration, LogicalParameterRole, NeuralBackend,
     NormalizationConstructionSpec, NormalizationOperator, Parameter, ParameterSpec, Parameterized,
     Tensor, TensorElementType,
 };
 use eredu_runtime::{LayerRuntimeState, RuntimeStateComponents, StateLayout};
 use serde_json::Value;
+
+#[path = "encoder_policy.rs"]
+mod policy;
+pub use policy::{AudioEncoder, EncoderModule, PolicyEncoder, PreparedAudioEncoder};
 use std::collections::BTreeMap;
 
 const PLAN: &str = "LFM3 Audio speech input";
@@ -76,7 +80,8 @@ fn linear(root: &str, input: i32, output: i32) -> Result<LinearSpec, Error> {
         output,
         weight: affine.weight,
         bias: Some(affine.bias),
-        format: LinearFormatSpec::unscaled(LinearFormat::Dense)?,
+        format: LinearFormatSpec::unscaled(LinearFormat::Dense)?
+            .with_arithmetic(LinearArithmetic::RowMajorAffine)?,
     })
 }
 
@@ -356,6 +361,13 @@ struct Affine<T: Tensor> {
     bias: Parameter<T>,
 }
 
+fn affine_accumulation_dtype(dtype: TensorElementType) -> TensorElementType {
+    match dtype {
+        TensorElementType::Bf16 | TensorElementType::F16 => TensorElementType::F32,
+        _ => dtype,
+    }
+}
+
 impl<T: Tensor> Affine<T> {
     fn new(spec: &AffineSpec, context: &T::Context) -> Result<Self, Error> {
         Ok(Self {
@@ -371,13 +383,19 @@ impl<T: Tensor> Affine<T> {
         groups: i32,
         context: &T::Context,
     ) -> Result<T, Error> {
+        let dtype = input
+            .element_type()
+            .ok_or_else(|| invalid("unknown downsampler input dtype"))?;
+        let compute = affine_accumulation_dtype(dtype);
         let weight = self
             .weight
             .as_ref()
-            .transpose_axes(&[0, 2, 3, 1], context)?;
+            .transpose_axes(&[0, 2, 3, 1], context)?
+            .cast_float(compute, context)?;
         let padding = weight.dim(1) / 2;
+        // A biased convolution rounds only after adding its bias.
         T::conv2d(
-            input,
+            &input.cast_float(compute, context)?,
             &weight,
             (stride, stride),
             (padding, padding),
@@ -385,7 +403,8 @@ impl<T: Tensor> Affine<T> {
             groups,
             context,
         )?
-        .add(self.bias.as_ref(), context)
+        .add(&self.bias.as_ref().cast_float(compute, context)?, context)?
+        .cast_float(dtype, context)
     }
 }
 
@@ -454,12 +473,18 @@ impl<B: NeuralBackend> Downsampler<B> {
             context,
         )?;
         let projection = &self.stages[5];
+        let compute = affine_accumulation_dtype(weight_dtype);
         B::Tensor::linear(
-            &flattened,
-            &projection.weight.as_ref().squeeze_axes(&[2], context)?,
-            Some(projection.bias.as_ref()),
+            &flattened.cast_float(compute, context)?,
+            &projection
+                .weight
+                .as_ref()
+                .squeeze_axes(&[2], context)?
+                .cast_float(compute, context)?,
+            Some(&projection.bias.as_ref().cast_float(compute, context)?),
             context,
-        )
+        )?
+        .cast_float(weight_dtype, context)
     }
 }
 
@@ -491,7 +516,28 @@ impl<B: NeuralBackend> Projector<B> {
         encoded: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let hidden = self.norm.forward(encoded, context)?;
+        let hidden = match encoded.element_type() {
+            Some(dtype @ (TensorElementType::Bf16 | TensorElementType::F16)) => {
+                // Keep normalization and the learned affine in F32 until the output cast.
+                let widen = |parameter: &Parameter<B::Tensor>| {
+                    parameter
+                        .as_ref()
+                        .cast_float(TensorElementType::F32, context)
+                };
+                let weight = self.norm.weight.as_ref().map(widen).transpose()?;
+                let bias = self.norm.bias.as_ref().map(widen).transpose()?;
+                B::Tensor::layer_norm(
+                    &encoded.cast_float(TensorElementType::F32, context)?,
+                    weight.as_ref(),
+                    bias.as_ref(),
+                    self.norm.epsilon,
+                    self.norm.arithmetic,
+                    context,
+                )?
+                .cast_float(dtype, context)?
+            }
+            _ => self.norm.forward(encoded, context)?,
+        };
         let hidden = self.up.forward(&hidden, context)?;
         self.out
             .forward(&B::Tensor::gelu(&hidden, context)?, context)
@@ -595,24 +641,9 @@ impl<B: NeuralBackend> Encoder<B> {
         })
     }
 
-    fn validate_state<S>(&self, state: &mut S, tokens: i32) -> Result<(), Error>
-    where
-        S: LayerRuntimeState<B>,
-        S::LayerState: RuntimeStateComponents<B>,
-    {
-        if state.optional_layout() != Some(self.declaration.state_layout()) {
-            return Err(invalid("LFM3 audio state layout differs from the encoder"));
-        }
-        for i in 0..self.blocks.len() {
-            if state.layer(i).map_err(Error::backend_source)?.position() != tokens {
-                return Err(invalid("LFM3 audio state has inconsistent token frontiers"));
-            }
-        }
-        Ok(())
-    }
-
     fn run_blocks<S>(
-        &mut self,
+        blocks: &mut [ReplicatedBlock<B>],
+        norm: &mut B::Normalization,
         mut hidden: B::Tensor,
         state: &mut S,
         context: &<B::Tensor as Tensor>::Context,
@@ -621,7 +652,7 @@ impl<B: NeuralBackend> Encoder<B> {
         S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
     {
-        for (i, block) in self.blocks.iter_mut().enumerate() {
+        for (i, block) in blocks.iter_mut().enumerate() {
             hidden = block.forward(
                 &hidden,
                 None,
@@ -629,7 +660,7 @@ impl<B: NeuralBackend> Encoder<B> {
                 context,
             )?;
         }
-        self.norm.forward(&hidden, context)
+        norm.forward(&hidden, context)
     }
 
     /// Encodes equal-length clips with a fresh caller-supplied state.
@@ -643,41 +674,20 @@ impl<B: NeuralBackend> Encoder<B> {
         S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
     {
-        self.validate_state(state, 0)?;
-        if features.shape().len() != 3
-            || frame_tokens(features.dim(2), true) > self.declaration.context_length
-        {
-            return Err(invalid(
-                "LFM3 audio features exceed the encoder context or have invalid rank",
-            ));
-        }
-        let hidden = self.downsample.forward(features, context)?;
-        self.run_blocks(hidden, state, context)
+        self.declaration
+            .forward_with::<B, S>(features, state, |features, state| {
+                let hidden = self.downsample.forward(features, context)?;
+                Self::run_blocks(&mut self.blocks, &mut self.norm, hidden, state, context)
+            })
     }
 
     /// Creates a stream with an independent empty layer state and fixed batch.
-    pub fn stream<S>(
-        &self,
-        mut backbone: S,
-        batch: i32,
-    ) -> Result<EncoderState<S, B::Tensor>, Error>
+    pub fn stream<S>(&self, backbone: S, batch: i32) -> Result<EncoderState<S, B::Tensor>, Error>
     where
         S: LayerRuntimeState<B>,
         S::LayerState: RuntimeStateComponents<B>,
     {
-        if batch <= 0 {
-            return Err(invalid("LFM3 audio encoder batch must be positive"));
-        }
-        self.validate_state(&mut backbone, 0)?;
-        Ok(EncoderState {
-            backbone,
-            features: None,
-            frames: 0,
-            offset: 0,
-            tokens: 0,
-            batch,
-            finished: false,
-        })
+        self.declaration.stream::<B, S>(backbone, batch)
     }
 
     /// Advances whole stride-eight windows, using the final partial window only on flush.
@@ -693,6 +703,117 @@ impl<B: NeuralBackend> Encoder<B> {
         S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
     {
+        self.declaration.advance_with::<B, S>(
+            input,
+            state,
+            finalize,
+            context,
+            |batch| {
+                B::Tensor::full_f32(0.0, &[batch, 0, self.declaration.width], context)?
+                    .cast_float(self.downsample.weight_dtype()?, context)
+            },
+            |features, state, range| {
+                let hidden = self
+                    .downsample
+                    .forward(features, context)
+                    .and_then(|hidden| {
+                        hidden.index(
+                            &[
+                                Index::Full,
+                                Index::Range(range.start, range.end),
+                                Index::Full,
+                            ],
+                            context,
+                        )
+                    })
+                    .map_err(AdvanceError::Input)?;
+                Self::run_blocks(&mut self.blocks, &mut self.norm, hidden, state, context)
+                    .map_err(AdvanceError::State)
+            },
+        )
+    }
+}
+
+enum AdvanceError {
+    Input(Error),
+    State(Error),
+}
+
+impl Declaration {
+    fn validate_state<B, S>(&self, state: &mut S, tokens: i32) -> Result<(), Error>
+    where
+        B: NeuralBackend,
+        S: LayerRuntimeState<B>,
+        S::LayerState: RuntimeStateComponents<B>,
+    {
+        if state.optional_layout() != Some(self.state_layout()) {
+            return Err(invalid("LFM3 audio state layout differs from the encoder"));
+        }
+        for i in 0..self.blocks.len() {
+            if state.layer(i).map_err(Error::backend_source)?.position() != tokens {
+                return Err(invalid("LFM3 audio state has inconsistent token frontiers"));
+            }
+        }
+        Ok(())
+    }
+
+    fn forward_with<B, S>(
+        &self,
+        features: &B::Tensor,
+        state: &mut S,
+        run: impl FnOnce(&B::Tensor, &mut S) -> Result<B::Tensor, Error>,
+    ) -> Result<B::Tensor, Error>
+    where
+        B: NeuralBackend,
+        S: LayerRuntimeState<B>,
+        S::LayerState: RuntimeStateComponents<B>,
+    {
+        self.validate_state::<B, S>(state, 0)?;
+        if features.shape().len() != 3 || frame_tokens(features.dim(2), true) > self.context_length
+        {
+            return Err(invalid(
+                "LFM3 audio features exceed the encoder context or have invalid rank",
+            ));
+        }
+        run(features, state)
+    }
+
+    /// Creates a stream with an independent empty layer state and fixed batch.
+    fn stream<B, S>(&self, mut backbone: S, batch: i32) -> Result<EncoderState<S, B::Tensor>, Error>
+    where
+        B: NeuralBackend,
+        S: LayerRuntimeState<B>,
+        S::LayerState: RuntimeStateComponents<B>,
+    {
+        if batch <= 0 {
+            return Err(invalid("LFM3 audio encoder batch must be positive"));
+        }
+        self.validate_state::<B, S>(&mut backbone, 0)?;
+        Ok(EncoderState {
+            backbone,
+            features: None,
+            frames: 0,
+            offset: 0,
+            tokens: 0,
+            batch,
+            finished: false,
+        })
+    }
+
+    fn advance_with<B, S>(
+        &self,
+        input: &B::Tensor,
+        state: &mut EncoderState<S, B::Tensor>,
+        finalize: bool,
+        context: &<B::Tensor as Tensor>::Context,
+        empty: impl FnOnce(i32) -> Result<B::Tensor, Error>,
+        run: impl FnOnce(&B::Tensor, &mut S, std::ops::Range<i32>) -> Result<B::Tensor, AdvanceError>,
+    ) -> Result<B::Tensor, Error>
+    where
+        B: NeuralBackend,
+        S: LayerRuntimeState<B>,
+        S::LayerState: RuntimeStateComponents<B>,
+    {
         if state.finished
             || input.shape().len() != 3
             || input.dim(0) != state.batch
@@ -707,10 +828,10 @@ impl<B: NeuralBackend> Encoder<B> {
             .checked_add(input.dim(2))
             .ok_or_else(|| invalid("LFM3 audio frame count overflowed"))?;
         let tokens = frame_tokens(frames, finalize);
-        if tokens > self.declaration.context_length {
+        if tokens > self.context_length {
             return Err(invalid("LFM3 audio stream exceeds the encoder context"));
         }
-        self.validate_state(&mut state.backbone, state.tokens)?;
+        self.validate_state::<B, S>(&mut state.backbone, state.tokens)?;
         let features = match state.features.as_ref() {
             Some(carry) if input.dim(2) > 0 => {
                 B::Tensor::concatenate(&[carry.clone(), input.clone()], 2, context)?
@@ -742,17 +863,13 @@ impl<B: NeuralBackend> Encoder<B> {
         };
         let count = tokens - state.tokens;
         let output = if count == 0 {
-            B::Tensor::full_f32(0.0, &[state.batch, 0, self.declaration.width], context)?
-                .cast_float(self.downsample.weight_dtype()?, context)?
+            empty(state.batch)?
         } else {
             let start = state.tokens - state.offset / STRIDE;
-            let hidden = self.downsample.forward(&features, context)?.index(
-                &[Index::Full, Index::Range(start, start + count), Index::Full],
-                context,
-            )?;
-            match self.run_blocks(hidden, &mut state.backbone, context) {
+            match run(&features, &mut state.backbone, start..start + count) {
                 Ok(output) => output,
-                Err(error) => {
+                Err(AdvanceError::Input(error)) => return Err(error),
+                Err(AdvanceError::State(error)) => {
                     state.finished = true;
                     return Err(error);
                 }

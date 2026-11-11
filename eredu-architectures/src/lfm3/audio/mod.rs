@@ -9,14 +9,29 @@ pub use gguf::{
     AdmittedAudioGguf, AudioGgufEncoding, AudioGgufError, AudioGgufSpeechBindings,
     AudioGgufSpeechSources,
 };
+mod language;
+pub use language::{
+    AudioLanguage, PreparedAudioLanguage, PreparedAudioLanguagePartition,
+    TensorParallelAudioLanguage,
+};
+mod pipeline;
+pub use pipeline::AudioPipelineCommunication;
+mod placement;
+pub use placement::{
+    AudioParameterResidency, AudioWeightUnit, PreparedAudioCodec, PreparedAudioWeightUnit,
+};
 mod prompt;
 mod realtime;
 mod resident;
 mod schedule;
 pub use depth::{
-    CompletedSpeechFrame, DepthDeclaration, DepthDecoder, DepthFrame, DepthUnit, Feedback,
+    AudioDepth, CompletedSpeechFrame, DepthDeclaration, DepthDecoder, DepthFrame, DepthModule,
+    DepthUnit, Feedback, PolicyDepth, PreparedAudioDepth,
 };
-pub use encoder::{Declaration, Downsampler, Encoder, EncoderState, Projector, Unit};
+pub use encoder::{
+    AudioEncoder, Declaration, Downsampler, Encoder, EncoderModule, EncoderState, PolicyEncoder,
+    PreparedAudioEncoder, Projector, Unit,
+};
 pub use prompt::AudioPrompt;
 pub use realtime::{
     AudioAdvance, AudioExecutionKernel, AudioSampling, AudioSession, AudioSessionError,

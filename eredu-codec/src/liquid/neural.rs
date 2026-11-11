@@ -13,6 +13,10 @@ use eredu_nn::{
 };
 use eredu_runtime::{LayerRuntimeState, RuntimeStateComponents, StateLayout};
 
+#[path = "decoder_policy.rs"]
+mod policy;
+pub use policy::{DecoderExecution, DecoderModule, PolicyDecoder};
+
 const LAYERS: usize = 8;
 const WIDTH: i32 = 512;
 const HEADS: i32 = 8;
@@ -66,6 +70,19 @@ pub enum Unit {
     DecoderBlock(usize),
     /// Decoder normalization, polar projection and retained synthesis window.
     DecoderOutput,
+}
+
+/// Independent parameter ownership in the synthesis-only graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecoderUnit {
+    /// Codebook output projection without the encoder-side quantizer weights.
+    QuantizerOutput,
+    /// Latent-to-decoder-width projection.
+    Input,
+    /// One causal decoder backbone block.
+    Block(usize),
+    /// Final normalization, polar projection and synthesis window.
+    Output,
 }
 
 #[derive(Debug, Clone)]
@@ -339,17 +356,42 @@ impl Declaration {
         Ok(p)
     }
 
+    /// Synthesis units in execution order.
+    pub fn decoder_units(&self) -> impl Iterator<Item = DecoderUnit> {
+        self.quantizer
+            .output
+            .is_some()
+            .then_some(DecoderUnit::QuantizerOutput)
+            .into_iter()
+            .chain(std::iter::once(DecoderUnit::Input))
+            .chain((0..self.decoder.len()).map(DecoderUnit::Block))
+            .chain(std::iter::once(DecoderUnit::Output))
+    }
+
+    /// Exact parameters owned by one synthesis unit.
+    pub fn decoder_unit_parameters(
+        &self,
+        unit: DecoderUnit,
+    ) -> Result<Vec<LogicalParameterDeclaration<'_>>, Error> {
+        match unit {
+            DecoderUnit::QuantizerOutput => Ok(self
+                .quantizer
+                .output
+                .as_ref()
+                .ok_or_else(|| invalid("codec has no quantizer output projection"))?
+                .logical_parameters()?),
+            DecoderUnit::Input => self.unit_parameters(Unit::DecoderInput),
+            DecoderUnit::Block(layer) => self.unit_parameters(Unit::DecoderBlock(layer)),
+            DecoderUnit::Output => self.unit_parameters(Unit::DecoderOutput),
+        }
+    }
+
     /// Canonical learned weights and synthesis buffer required for decode.
     pub fn decoder_parameters(&self) -> Result<Vec<LogicalParameterDeclaration<'_>>, Error> {
         let mut parameters = Vec::new();
-        if let Some(output) = &self.quantizer.output {
-            parameters.extend(output.logical_parameters()?);
+        for unit in self.decoder_units() {
+            parameters.extend(self.decoder_unit_parameters(unit)?);
         }
-        parameters.extend(self.unit_parameters(Unit::DecoderInput)?);
-        for layer in 0..LAYERS {
-            parameters.extend(self.unit_parameters(Unit::DecoderBlock(layer))?);
-        }
-        parameters.extend(self.unit_parameters(Unit::DecoderOutput)?);
         Ok(parameters)
     }
     /// Exact official floating SafeTensors schema, including the F32 synthesis buffer.
@@ -1095,30 +1137,13 @@ impl<B: NeuralBackend> NeuralDecoder<B> {
         S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
     {
-        if codes.shape().len() != 3
-            || codes.dim(0) <= 0
-            || codes.dim(1) != self.config.n_q
-            || codes.dim(2) <= 0
-        {
-            return Err(invalid(
-                "LiquidCodec decoding requires complete nonempty codebooks",
-            ));
-        }
-        let time = codes
-            .dim(2)
-            .checked_mul(self.config.stft_frame_stack)
-            .ok_or_else(|| invalid("codec spectral frame count overflow"))?;
-        validate_state(state, &self.state_layout, time, false)?;
+        let time = spectrum_time::<B, S>(&self.config, &self.state_layout, codes, state)?;
         let latents = self
             .quantizer
             .decode(codes, ctx)?
             .transpose_axes(&[0, 2, 1], ctx)?;
         let h = self.from_quantizer.forward(&latents, ctx)?;
-        let stack = self.config.stft_frame_stack;
-        let mut h = h
-            .expand_dims(2, ctx)?
-            .broadcast_to(&[h.dim(0), h.dim(1), stack, WIDTH], ctx)?
-            .reshape(&[h.dim(0), time, WIDTH], ctx)?;
+        let mut h = expand_frames(&h, self.config.stft_frame_stack, time, ctx)?;
         for (i, b) in self.decoder.iter_mut().enumerate() {
             h = b.forward(&h, state.layer(i)?, ctx)?;
         }
@@ -1127,14 +1152,7 @@ impl<B: NeuralBackend> NeuralDecoder<B> {
             .polar
             .forward(&h, ctx)?
             .transpose_axes(&[0, 2, 1], ctx)?;
-        let bins = self.config.stft_n_fft / 2 + 1;
-        Ok((
-            polar.index(&[Index::Full, Index::Range(0, bins), Index::Full], ctx)?,
-            polar.index(
-                &[Index::Full, Index::Range(bins, 2 * bins), Index::Full],
-                ctx,
-            )?,
-        ))
+        polar_parts(&polar, self.config.stft_n_fft, ctx)
     }
     /// Decodes complete codebooks with a fresh decoder state and symmetric endpoints.
     pub fn decode<S>(
@@ -1165,24 +1183,14 @@ impl<B: NeuralBackend> NeuralDecoder<B> {
     /// Pairs a fresh caller-realized neural state with bounded spectral carry.
     pub fn decoder_state<S>(
         &self,
-        mut neural: S,
+        neural: S,
         batch: i32,
     ) -> Result<DecoderState<S, B::Tensor>, Error>
     where
         S: LayerRuntimeState<B>,
         S::LayerState: RuntimeStateComponents<B>,
     {
-        validate_state(&mut neural, &self.state_layout, 0, true)?;
-        Ok(DecoderState {
-            neural,
-            overlap: OverlapAddStream::new(
-                batch,
-                self.config.stft_n_fft,
-                self.config.stft_hop_length,
-            )?,
-            config: self.config.clone(),
-            batch,
-        })
+        decoder_state::<B, S>(&self.config, &self.state_layout, neural, batch)
     }
     /// Advances the shared neural decoder and overlap-add state. Empty input can
     /// flush once; it never advances convolution or KV frontiers.
@@ -1197,34 +1205,113 @@ impl<B: NeuralBackend> NeuralDecoder<B> {
         S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
     {
-        if state.phase() == StreamPhase::Finished {
-            return Err(Error::StreamFinished);
-        }
-        if state.config != self.config {
-            return Err(invalid(
-                "LiquidCodec stream belongs to a different configuration",
-            ));
-        }
-        let raw = if let Some(codes) = codes {
-            if codes.shape().len() != 3
-                || codes.dim(0) != state.batch
-                || codes.dim(1) != state.config.n_q
-                || codes.element_type() != Some(TensorElementType::I32)
-            {
-                return Err(invalid("LiquidCodec stream code geometry changed"));
-            }
-            if codes.dim(2) == 0 {
-                None
-            } else {
-                let (magnitude, angle) = self.decode_spectrum(codes, &mut state.neural, ctx)?;
-                self.synthesis.set_window(self.window.as_ref(), ctx)?;
-                Some(self.synthesis.overlap_add(&magnitude, &angle, ctx)?)
-            }
-        } else {
-            None
-        };
-        let pcm = state.overlap.push(raw, finalize, ctx)?;
-        pcm.require_finite(ctx)?;
-        Ok(pcm)
+        let config = self.config.clone();
+        advance_chunk(&config, codes, state, finalize, ctx, |codes, neural| {
+            let (magnitude, angle) = self.decode_spectrum(codes, neural, ctx)?;
+            self.synthesis.set_window(self.window.as_ref(), ctx)?;
+            self.synthesis.overlap_add(&magnitude, &angle, ctx)
+        })
     }
+}
+
+fn spectrum_time<B, S>(
+    config: &Config,
+    layout: &StateLayout,
+    codes: &B::Tensor,
+    state: &mut S,
+) -> Result<i32, Error>
+where
+    B: NeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: RuntimeStateComponents<B>,
+{
+    if codes.shape().len() != 3
+        || codes.dim(0) <= 0
+        || codes.dim(1) != config.n_q
+        || codes.dim(2) <= 0
+    {
+        return Err(invalid(
+            "LiquidCodec decoding requires complete nonempty codebooks",
+        ));
+    }
+    let time = codes
+        .dim(2)
+        .checked_mul(config.stft_frame_stack)
+        .ok_or_else(|| invalid("codec spectral frame count overflow"))?;
+    validate_state(state, layout, time, false)?;
+    Ok(time)
+}
+
+fn expand_frames<T: Tensor>(h: &T, stack: i32, time: i32, ctx: &T::Context) -> Result<T, Error> {
+    Ok(h.expand_dims(2, ctx)?
+        .broadcast_to(&[h.dim(0), h.dim(1), stack, WIDTH], ctx)?
+        .reshape(&[h.dim(0), time, WIDTH], ctx)?)
+}
+
+fn polar_parts<T: Tensor>(polar: &T, fft: i32, ctx: &T::Context) -> Result<(T, T), Error> {
+    let bins = fft / 2 + 1;
+    Ok((
+        polar.index(&[Index::Full, Index::Range(0, bins), Index::Full], ctx)?,
+        polar.index(
+            &[Index::Full, Index::Range(bins, 2 * bins), Index::Full],
+            ctx,
+        )?,
+    ))
+}
+
+fn decoder_state<B, S>(
+    config: &Config,
+    layout: &StateLayout,
+    mut neural: S,
+    batch: i32,
+) -> Result<DecoderState<S, B::Tensor>, Error>
+where
+    B: NeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: RuntimeStateComponents<B>,
+{
+    validate_state(&mut neural, layout, 0, true)?;
+    Ok(DecoderState {
+        neural,
+        overlap: OverlapAddStream::new(batch, config.stft_n_fft, config.stft_hop_length)?,
+        config: config.clone(),
+        batch,
+    })
+}
+
+fn advance_chunk<T: Tensor, S>(
+    config: &Config,
+    codes: Option<&T>,
+    state: &mut DecoderState<S, T>,
+    finalize: bool,
+    ctx: &T::Context,
+    run: impl FnOnce(&T, &mut S) -> Result<crate::spectral::OverlapAddOutput<T>, Error>,
+) -> Result<T, Error> {
+    if state.phase() == StreamPhase::Finished {
+        return Err(Error::StreamFinished);
+    }
+    if &state.config != config {
+        return Err(invalid(
+            "LiquidCodec stream belongs to a different configuration",
+        ));
+    }
+    let raw = if let Some(codes) = codes {
+        if codes.shape().len() != 3
+            || codes.dim(0) != state.batch
+            || codes.dim(1) != state.config.n_q
+            || codes.element_type() != Some(TensorElementType::I32)
+        {
+            return Err(invalid("LiquidCodec stream code geometry changed"));
+        }
+        if codes.dim(2) == 0 {
+            None
+        } else {
+            Some(run(codes, &mut state.neural)?)
+        }
+    } else {
+        None
+    };
+    let pcm = state.overlap.push(raw, finalize, ctx)?;
+    pcm.require_finite(ctx)?;
+    Ok(pcm)
 }

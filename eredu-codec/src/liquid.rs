@@ -17,7 +17,8 @@ mod gguf;
 mod neural;
 pub use gguf::GgufDecoderBindings;
 pub use neural::{
-    BackboneBlock, Declaration, DecoderState, NeuralCodec, NeuralDecoder, Tokenizer, Unit,
+    BackboneBlock, Declaration, DecoderExecution, DecoderModule, DecoderState, DecoderUnit,
+    NeuralCodec, NeuralDecoder, PolicyDecoder, Tokenizer, Unit,
 };
 
 /// Released codec component geometry, independent of language-model architectures.

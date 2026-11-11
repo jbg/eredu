@@ -2456,6 +2456,11 @@ where
         &self.executor
     }
 
+    /// Borrows the retained executor for an architecture-owned readout.
+    pub fn executor_mut(&mut self) -> &mut E {
+        &mut self.executor
+    }
+
     fn agree_phase(
         &mut self,
         phase: DistributedExecutionPhase,

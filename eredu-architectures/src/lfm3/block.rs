@@ -687,7 +687,8 @@ impl AttentionParameters {
             query_norm: norm("q_norm")?,
             key_norm: norm("k_norm")?,
             rotary: RotarySpec {
-                arithmetic: eredu_nn::RotaryArithmetic::Float32Products,
+                // The reference rounds sine and cosine to the activation dtype before the F32 rotation.
+                arithmetic: eredu_nn::RotaryArithmetic::InputTableFloat32Products,
                 dimensions: head,
                 base: if sliding {
                     args.rope.sliding_theta
