@@ -16515,6 +16515,13 @@ input encoder, depth decoder, feedback and LiquidCodec decoder layouts. Each
 container supplies its own encoding metadata. Admission retains the original
 container metadata and does not select an Audio execution graph.
 
+The Audio GGUF speech binding plan projects the admitted projector onto the
+existing input encoder, projector, depth decoder and feedback declarations.
+It checks canonical shapes and complete scope coverage before payload access.
+The two retained source views share the original GGUF container and restrict
+reads to their own physical keys. The twelve tied codebook tables and their
+normalizers bind through contiguous selections of the packed tensors.
+
 `AudioPrompt` pairs token IDs with exact speech input and output row counts.
 The shared language traversal replaces the placeholder spans at the execution
 group's embedding boundary, preserving the causal cache positions. The readout

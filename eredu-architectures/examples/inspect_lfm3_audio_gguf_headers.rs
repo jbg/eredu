@@ -1,10 +1,16 @@
 //! Validates the pinned Audio GGUF descriptor prefixes through portable admission.
 
-use eredu_architectures::lfm3::audio::AdmittedAudioGguf;
-use eredu_gguf::{Checkpoint, CheckpointHeader, Limits, QuantizedTensorRepresentation};
+use eredu_architectures::lfm3::audio::{AdmittedAudioGguf, Declaration, DepthDeclaration};
+use eredu_checkpoint::{
+    recipe::DerivedWeightRecipe,
+    store::{CheckpointLease, EncodedTensorLease, ReadPolicy, TensorReadRequest},
+};
+use eredu_gguf::{
+    Checkpoint, CheckpointHeader, ConvertedTensor, Limits, QuantizedTensorRepresentation,
+};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::{error::Error, path::Path};
+use std::{error::Error, io::Read, path::Path};
 
 fn checkpoint(directory: &Path, record: &Value) -> Result<Checkpoint, Box<dyn Error>> {
     let member = record["file"].as_str().ok_or("missing GGUF filename")?;
@@ -32,6 +38,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args_os().skip(1);
     let manifest = args.next().ok_or("expected pinned manifest path")?;
     let directory = args.next().ok_or("expected downloaded header directory")?;
+    let config = args
+        .next()
+        .map(|path| -> Result<Value, Box<dyn Error>> {
+            Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+        })
+        .transpose()?;
+    let payload = args.next();
     let directory = Path::new(&directory);
     let manifest: Value = serde_json::from_slice(&std::fs::read(manifest)?)?;
     let variants = manifest["variants"].as_object().ok_or("missing variants")?;
@@ -47,11 +60,98 @@ fn main() -> Result<(), Box<dyn Error>> {
             backbone.source_keys().len(),
             projector.source_keys().len()
         );
+        if let Some(config) = &config {
+            let bindings = admitted.speech_bindings(
+                &Declaration::from_config(config)?,
+                &DepthDeclaration::from_config(config)?,
+            )?;
+            println!(
+                "  {} canonical input and {} depth/feedback bindings",
+                bindings.input_recipes().len(),
+                bindings.depth_recipes().len(),
+            );
+        }
     }
     AdmittedAudioGguf::from_checkpoints(
         checkpoint(directory, &variants["Q4_K_M"]["backbone"])?,
         checkpoint(directory, &variants["Q8_0"]["projector"])?,
     )?;
     println!("Q4_K_M backbone + Q8_0 projector: admitted");
+    if let Some(path) = payload {
+        let config = config
+            .as_ref()
+            .ok_or("payload verification requires the pinned Audio config")?;
+        verify_codebook(directory, &variants["Q4_K_M"], config, Path::new(&path))?;
+    }
+    Ok(())
+}
+
+fn verify_codebook(
+    directory: &Path,
+    record: &Value,
+    config: &Value,
+    path: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut bytes = [0; 65536];
+    loop {
+        let read = file.read(&mut bytes)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&bytes[..read]);
+    }
+    let digest: String = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    if record["projector"]["publisher_sha256"].as_str() != Some(&digest) {
+        return Err("projector payload hash differs from the pinned release".into());
+    }
+    let admitted = AdmittedAudioGguf::from_checkpoints(
+        checkpoint(directory, &record["backbone"])?,
+        Checkpoint::open_with_representation(
+            path,
+            Limits::default(),
+            QuantizedTensorRepresentation::DecodedF32,
+        )?,
+    )?;
+    let sources = admitted
+        .speech_bindings(
+            &Declaration::from_config(config)?,
+            &DepthDeclaration::from_config(config)?,
+        )?
+        .retain(1)?;
+    let recipe =
+        &sources.depth.recipes()["model.depth_decoder.depth_embeddings.11.embedding.weight"];
+    let DerivedWeightRecipe::Source { key, selection } = recipe else {
+        return Err("packed codebook must lower to a direct bounded selection".into());
+    };
+    assert!(sources.input.source().source_metadata(key).is_err());
+    let lease = sources.depth.source().acquire_lease(TensorReadRequest {
+        key: key.clone(),
+        selection: selection.clone(),
+        policy: ReadPolicy::RequireBounded,
+    })?;
+    let CheckpointLease::Gguf(lease) = lease else {
+        return Err("expected GGUF codebook lease".into());
+    };
+    let proof = lease.bounded_read_proof();
+    assert!(proof.physically_bounded && proof.offset_bytes != 0);
+    assert_eq!(lease.output_shape(), [2017, 1024]);
+    let ConvertedTensor::IQuant(encoded) = lease.materialize_portable()?.into_converted() else {
+        return Err("expected selected GGML blocks".into());
+    };
+    assert_eq!(encoded.shape, [2017, 1024]);
+    assert_eq!(encoded.data.len() as u64, proof.length_bytes);
+    let decoded = encoded.dequantize_f32()?;
+    assert_eq!(decoded.len(), 2017 * 1024);
+    assert!(decoded.iter().all(|value| value.is_finite()));
+    println!(
+        "Q4_K_M projector: decoded codebook 11 from {} encoded bytes",
+        proof.length_bytes
+    );
     Ok(())
 }

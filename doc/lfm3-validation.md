@@ -417,3 +417,17 @@ for variant in manifest["variants"].values():
 PY
 cargo run -p eredu-architectures --example inspect_lfm3_audio_gguf_headers -- validation/fixtures/lfm3/audio-gguf-sources.json /private/tmp/eredu-audio-gguf
 ```
+
+Supplying the pinned Audio `config.json` as a third argument also checks
+canonical binding. All five projector encodings resolve 176 encoder and
+projector parameters and 65 depth and feedback parameters. Supplying the
+released Q4_K_M projector as a fourth argument verifies its publisher hash
+and decodes the twelfth codebook as a bounded read. The lease reads
+1,161,792 encoded bytes for the `[2017, 1024]` codebook, and the input scope
+rejects access to its packed source.
+
+```sh
+cargo run -p eredu-architectures --example inspect_lfm3_audio_gguf_headers -- \
+  validation/fixtures/lfm3/audio-gguf-sources.json /private/tmp/eredu-audio-gguf \
+  /private/tmp/lfm3-audio/config.json /private/tmp/eredu-audio-gguf/mmproj-LFM3-Audio-2B-Q4_K_M.gguf
+```
