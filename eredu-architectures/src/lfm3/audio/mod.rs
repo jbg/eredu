@@ -18,7 +18,10 @@ pub use realtime::{
     AudioSnapshot, AudioSnapshotError,
 };
 #[cfg(feature = "audio")]
-pub use resident::{AudioIngress, AudioIngressError, AudioIngressProgress, AudioIngressRequest};
+pub use resident::{
+    AudioIngress, AudioIngressError, AudioIngressProgress, AudioIngressRequest,
+    AudioPcmTranscription,
+};
 pub use resident::{
     AudioRequest, AudioResidentParameterBytes, AudioTranscription, AudioTranscriptionBlock,
     AudioTranscriptionError, PreparedResidentAudio, ResidentAudio, ResidentAudioBinding,

@@ -312,9 +312,9 @@ and finalizes with zero new mel frames before emitting a text token.
 
 ## LiveASR
 
-The resident LiveASR route takes unpadded mel blocks and publishes greedy
-English transcription tokens before the stream finishes. A context restart
-keeps the encoder continuation and begins a fresh language prompt. The
+The resident LiveASR route takes mono 16-kHz PCM or unpadded mel blocks and
+publishes greedy English transcription tokens before the stream finishes.
+A context restart keeps the encoder continuation and begins a fresh language prompt. The
 publisher defines the cadence and closing-token policy. [Liquid AI LiveASR](https://huggingface.co/LiquidAI/LFM3-Audio-2B#usage-examples)
 
 The LiveASR reference runner takes mono 16-kHz signed 16-bit WAV with more
@@ -333,8 +333,16 @@ The bright red boat sailed across the lake.” The WAV SHA-256 is
 The LiveASR comparison measures block and token parity. The conditional
 reference case above provides the full-vocabulary score comparisons.
 
+The native runner's `--live-asr-pcm` option feeds 100 ms PCM chunks and lets
+the session assemble its own mel blocks. It uses the same Python trace and
+compares blocks that reach the transcript driver. CPU and precise Metal match
+all six transcript blocks and all 20 generated IDs. The runner also checks
+sample backpressure, finish, and rejection of further input.
+
 ```sh
 python validation/lfm3_audio_reference.py /private/tmp/lfm3-audio /private/tmp/lfm3-live --live-asr-wav /private/tmp/speech.wav
 cargo run -p eredu-backend-mlx --features audio --example lfm3_audio_reference -- /private/tmp/lfm3-audio /private/tmp/lfm3-live /private/tmp/lfm3-live/cpu.json --live-asr --device cpu
 MLX_ENABLE_TF32=0 cargo run -p eredu-backend-mlx --features audio,metal --example lfm3_audio_reference -- /private/tmp/lfm3-audio /private/tmp/lfm3-live /private/tmp/lfm3-live/metal.json --live-asr --device gpu
 ```
+
+Add `--live-asr-pcm` to the native command to compare the PCM path.

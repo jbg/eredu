@@ -15,9 +15,10 @@ pub use eredu_architectures::lfm3::audio::{
 #[cfg(feature = "audio")]
 pub use eredu_architectures::lfm3::audio::{
     AudioIngress, AudioIngressError, AudioIngressProgress, AudioIngressRequest,
+    AudioPcmTranscription,
 };
 #[cfg(all(feature = "mlx", feature = "audio"))]
-pub use eredu_backend_mlx::native::MlxAudioIngress;
+pub use eredu_backend_mlx::native::{MlxAudioIngress, MlxAudioPcmTranscription};
 #[cfg(feature = "mlx")]
 pub use eredu_backend_mlx::native::{
     MlxAudioModel, MlxAudioSession, MlxAudioSnapshot, MlxAudioTranscription,

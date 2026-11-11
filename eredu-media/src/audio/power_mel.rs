@@ -128,6 +128,18 @@ impl PowerMel {
 }
 
 impl PowerMelStream<'_> {
+    /// Maximum additional samples that emit at most `frames` complete windows.
+    /// A partial window may remain in the stream until more samples arrive.
+    pub fn available_samples(&self, frames: usize) -> Option<usize> {
+        if self.finished {
+            return Some(0);
+        }
+        frames
+            .checked_mul(self.transform.config.hop_length)?
+            .checked_add(self.transform.config.fft_length - 1)?
+            .checked_sub(self.carry.len())
+    }
+
     /// Emits complete windows and right-pads the final partial window, if any.
     /// A stream with no samples produces one zero-padded window on finalization.
     /// The continuation changes only after the entire feature chunk succeeds.

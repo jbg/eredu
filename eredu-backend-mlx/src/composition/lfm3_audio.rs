@@ -24,6 +24,7 @@ use eredu_architectures::lfm3::audio::{
 #[cfg(feature = "audio")]
 use eredu_architectures::lfm3::audio::{
     AudioIngress, AudioIngressError, AudioIngressProgress, AudioIngressRequest,
+    AudioPcmTranscription,
 };
 use eredu_core::{
     execution_control::{SnapshotLimits, SnapshotUsage},
@@ -151,6 +152,16 @@ impl MlxAudioModel {
             .map(MlxAudioTranscription)
     }
 
+    /// Prepares LiveASR from a stream of mono 16-kHz PCM.
+    #[cfg(feature = "audio")]
+    pub fn prepare_pcm_transcription(
+        self,
+    ) -> Result<MlxAudioPcmTranscription, AudioTranscriptionError> {
+        self.0
+            .prepare_pcm_transcription()
+            .map(MlxAudioPcmTranscription)
+    }
+
     /// Prepares one streamed mono PCM utterance between the supplied token spans.
     #[cfg(feature = "audio")]
     pub fn prepare_ingress(
@@ -217,6 +228,51 @@ impl MlxAudioTranscription {
     }
 
     /// Stops between settled blocks.
+    pub fn cancel(&mut self) {
+        self.0.cancel();
+    }
+}
+
+/// Controlled LiveASR with bounded PCM input.
+#[cfg(feature = "audio")]
+pub struct MlxAudioPcmTranscription(AudioPcmTranscription<MlxNeuralBackend, Binding>);
+
+#[cfg(feature = "audio")]
+impl MlxAudioPcmTranscription {
+    /// Reports sample capacity before the next block must be advanced.
+    pub fn available_samples(&self) -> usize {
+        self.0.available_samples()
+    }
+
+    /// Accepts finite mono 16-kHz PCM.
+    pub fn submit(
+        &mut self,
+        samples: &[f32],
+        sample_rate: u32,
+    ) -> Result<(), AudioTranscriptionError> {
+        self.0.submit(samples, sample_rate)
+    }
+
+    /// Flushes PCM preprocessing and closes input.
+    pub fn finish_input(&mut self) -> Result<(), AudioTranscriptionError> {
+        self.0.finish_input()
+    }
+
+    /// Advances at most one LiveASR block.
+    pub fn advance(
+        &mut self,
+        restart: bool,
+    ) -> Result<Option<AudioTranscriptionBlock>, AudioTranscriptionError> {
+        let _scope = Recovery::begin(Vec::<safemlx::Array>::new()).map_err(failure)?;
+        self.0.advance(restart)
+    }
+
+    /// Whether the transcript is finished or cancelled.
+    pub fn is_finished(&self) -> bool {
+        self.0.is_finished()
+    }
+
+    /// Cancels the stream at the current block boundary.
     pub fn cancel(&mut self) {
         self.0.cancel();
     }

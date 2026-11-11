@@ -318,6 +318,14 @@ whether it reached a closing token. A restart resets the language context and
 keeps the encoder following the stream. Cancellation and finalization close
 the session at a block boundary.
 
+With the audio feature, `MlxAudioModel::prepare_pcm_transcription` accepts
+mono 16-kHz PCM in arbitrary chunk sizes up to the reported sample capacity.
+`submit` preprocesses input without running the model. `advance` publishes
+one block when enough features are ready, or returns `None` while it waits
+for more input. A caller can drain a block and retry a chunk rejected for
+backpressure. `finish_input` flushes the last partial window and closes
+submission. Advance until `is_finished` to receive the final transcript block.
+
 Snapshots and forks during ingress or LiveASR, capture, and bounded or
 distributed speech sessions have no selected implementation.
 
