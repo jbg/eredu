@@ -253,9 +253,11 @@ Transcription streams text to stdout as blocks become available. Translation
 and spoken responses close the utterance before generating. Give source and
 target language names in English for LFM3 Audio translation. Use mono 16-kHz
 WAV with the current Audio model. Speech WAVs are mono 24 kHz. With
-`system-audio`, `--microphone-seconds` records a finite utterance and
-`--play` plays a speech response. `--input-device` and `--output-device`
-select devices. `--device cpu` or `--device gpu:0` selects model execution.
+`system-audio`, `transcribe`, `translate`, and `respond` accept
+`--microphone-seconds` in place of `--input`. Use `--input-device` to select
+the microphone. For `speak` and `respond`, `--play` plays the speech and
+can be combined with `--output`. Use `--output-device` to select the speaker.
+`--device cpu` or `--device gpu:0` selects model execution.
 
 Add `--timing` to any `eredu audio` subcommand for wall-clock timings on
 stderr. Turn-based commands report model load time, time to the first text

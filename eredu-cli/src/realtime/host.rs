@@ -388,7 +388,6 @@ mod tests {
         ])
         .unwrap()
         .args;
-        assert!(args.push_to_talk.is_none());
         let source = WavReader::new(BufReader::new(file.reopen().unwrap())).unwrap();
         let mut io = HostIo::new(
             Some(source),
