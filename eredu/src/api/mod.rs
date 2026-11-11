@@ -19,6 +19,8 @@ mod metadata;
 mod portable;
 mod session;
 pub use session::*;
+#[cfg(all(feature = "mlx", feature = "audio"))]
+pub mod audio;
 pub mod realtime;
 mod request;
 mod tokenizer;

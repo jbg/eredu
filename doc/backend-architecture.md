@@ -16507,7 +16507,10 @@ the sampling defaults without creating native tensors. Its parameter report
 counts the selected language, speech encoder, depth and codec decoder bindings.
 The codec encoder is available through the separate full codec composition.
 MLX consumes this selection with the supplied weight and execution contexts.
-Callers prepare each prompt separately from model loading.
+Callers prepare each prompt separately from model loading. The turn-based
+audio facade renders task prompts from retained templates and adapts controlled
+generation and transcription to text fragments and mono PCM. The CLI owns WAV
+and device I/O and uses the selected task's input and output sample rates.
 
 `AdmittedAudioGguf` validates an explicit LFM3 Audio backbone and projector
 pair. The backbone uses the shared LFM3 declaration and checks its rotary

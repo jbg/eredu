@@ -8,7 +8,7 @@ mod load;
 mod ptt;
 mod run;
 
-use super::{resolve_model, CachedGgufRole, CliDevice};
+use super::{common::output_file, resolve_model, CachedGgufRole, CliDevice};
 use anyhow::{ensure, Context, Result};
 use clap::{Args as ClapArgs, ValueEnum};
 use eredu::api::realtime::RealtimeArtifactSource;
@@ -16,7 +16,7 @@ use eredu::api::realtime::RealtimeArtifactSource;
 use eredu_architectures::voicechat::quantization::SpeechQuantizationPolicy;
 use eredu_media::audio::wav::{WavReader, WavWriter};
 use std::{
-    fs::{File, OpenOptions},
+    fs::File,
     io::{BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
     sync::{atomic::AtomicUsize, Arc},
@@ -345,14 +345,6 @@ fn quantization(args: &Args) -> Result<SpeechQuantizationPolicy> {
     }
     Ok(policy)
 }
-fn output_file(path: &Path) -> Result<File> {
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .with_context(|| format!("creating {}; output paths must be new", path.display()))
-}
-
 pub fn run(args: Args) -> Result<()> {
     if args.list_audio_devices {
         #[cfg(feature = "system-audio")]

@@ -155,3 +155,13 @@ impl CommonOptions {
             .map_err(Into::into)
     }
 }
+
+#[cfg(feature = "realtime")]
+pub fn output_file(path: &std::path::Path) -> Result<std::fs::File> {
+    use anyhow::Context;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("creating {}; output paths must be new", path.display()))
+}

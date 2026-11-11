@@ -1,3 +1,5 @@
+#[cfg(feature = "realtime")]
+mod audio;
 mod common;
 mod decisions;
 mod memory;
@@ -8,7 +10,7 @@ fn cli_command() -> clap::Command {
     let command = Cli::command();
     #[cfg(feature = "realtime")]
     let command = <CliCommand as clap::Subcommand>::augment_subcommands(command)
-        .about("Local text generation and realtime speech")
+        .about("Local text, audio tasks and realtime conversation")
         .subcommand_negates_reqs(true)
         .args_conflicts_with_subcommands(true);
     command
@@ -20,6 +22,8 @@ enum CliCommand {
     /// Converse using system audio or a recorded WAV, with bounded realtime sessions.
     #[cfg(feature = "realtime")]
     Realtime(realtime::Args),
+    /// Transcribe, translate, synthesize, or answer one audio request.
+    Audio(audio::Args),
 }
 
 use std::{
@@ -2046,9 +2050,10 @@ fn main() -> Result<()> {
     let matches = cli_command().get_matches();
     #[cfg(feature = "realtime")]
     if matches.subcommand_name().is_some() {
-        let CliCommand::Realtime(args) =
-            <CliCommand as clap::FromArgMatches>::from_arg_matches(&matches)?;
-        return realtime::run(args);
+        return match CliCommand::from_arg_matches(&matches)? {
+            CliCommand::Realtime(args) => realtime::run(args),
+            CliCommand::Audio(args) => audio::run(args),
+        };
     }
     let automatic_overrides = AutomaticCliOverrides::from_matches(&matches);
     let mut args = Cli::from_arg_matches(&matches)?;

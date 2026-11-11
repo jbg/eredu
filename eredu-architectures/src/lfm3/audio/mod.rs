@@ -45,6 +45,11 @@ use serde_json::{json, Value};
 pub struct ProcessorConfig(());
 
 impl ProcessorConfig {
+    /// Mono PCM rate for the retained feature extractor.
+    pub const fn sample_rate(self) -> u32 {
+        16_000
+    }
+
     /// Admits the released feature extractor settings from preprocessor_config.json.
     pub fn from_feature_extractor(value: &Value) -> Result<Self, Error> {
         for (key, expected) in [
@@ -83,7 +88,7 @@ impl ProcessorConfig {
     ) -> Result<eredu_media::audio::power_mel::PowerMel, eredu_media::MediaError> {
         use eredu_media::audio::power_mel::{PowerMel, PowerMelConfig};
         PowerMel::new(PowerMelConfig {
-            sample_rate: 16_000,
+            sample_rate: self.sample_rate(),
             fft_length: 400,
             hop_length: 160,
             mel_bins: 128,
