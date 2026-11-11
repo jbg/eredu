@@ -1,8 +1,13 @@
 //! Streaming input for one utterance in a resident Audio prompt.
 
 use super::*;
-use crate::lfm3::audio::{encoder::STRIDE, AudioSchedule};
-use eredu_media::{audio::power_mel::PowerMelStream, MediaError};
+use crate::lfm3::audio::{encoder::STRIDE, AudioSchedule, AudioSnapshotError};
+use eredu_core::execution_control::{ExecutionControlError, SnapshotLimits, SnapshotUsage};
+use eredu_media::{
+    audio::power_mel::{PowerMel, PowerMelState},
+    MediaError,
+};
+use eredu_runtime::execution_control::{IsolatedStateSnapshot, SnapshotBudget};
 
 /// Text spans surrounding a single live utterance in checkpoint template order.
 pub struct AudioIngressRequest<'a> {
@@ -58,16 +63,115 @@ where
     H: ResidentAudioBinding<B>,
 {
     model: ResidentAudio<B, H>,
-    mel: PowerMelStream<'static>,
-    encoder: EncoderState<H::State, B::Tensor>,
-    language: H::State,
-    hidden: Option<B::Tensor>,
+    transform: PowerMel,
+    state: IngressState<H::State, B::Tensor>,
+    snapshot_budget: Option<SnapshotBudget>,
     prefix: Vec<i32>,
     suffix: Vec<i32>,
     schedule: AudioSchedule,
     random: <H::Sampling as SamplingBackend>::RandomState,
     max_samples: usize,
+}
+
+struct IngressState<S, T: Tensor> {
+    mel: PowerMelState,
+    encoder: EncoderState<S, T>,
+    language: S,
+    hidden: Option<T>,
     progress: AudioIngressProgress,
+    origin: Arc<()>,
+}
+
+impl<S: SnapshotValue, T: Tensor + SnapshotValue> IsolatedStateCopy for IngressState<S, T> {
+    type Error = BackendFailure;
+
+    fn estimate_isolated_copy(&self) -> Result<SnapshotEstimate, BackendFailure> {
+        let bytes = self
+            .mel
+            .snapshot_storage_bytes()
+            .ok_or_else(|| failure(ExecutionControlError::Overflow))?;
+        snapshot_value_estimate::<Self>([
+            Ok(SnapshotEstimate {
+                retained_bytes: bytes,
+                copy_bytes: bytes,
+            }),
+            self.encoder.estimate_snapshot_value(),
+            self.language.estimate_snapshot_value(),
+            self.hidden.estimate_snapshot_value(),
+        ])
+    }
+
+    fn copy_isolated(&self, retention: &SnapshotReservation) -> Result<Self, BackendFailure> {
+        Ok(Self {
+            mel: self.mel.clone(),
+            encoder: self.encoder.copy_snapshot_value(retention)?,
+            language: self.language.copy_snapshot_value(retention)?,
+            hidden: self.hidden.copy_snapshot_value(retention)?,
+            origin: self.origin.clone(),
+            progress: self.progress,
+        })
+    }
+
+    fn validate_isolated_restore(&self, saved: &Self) -> Result<(), BackendFailure> {
+        if Arc::ptr_eq(&self.origin, &saved.origin) {
+            Ok(())
+        } else {
+            Err(failure(AudioSnapshotError::ForeignSession))
+        }
+    }
+
+    fn restore_isolated(&mut self, saved: Self) -> Result<(), BackendFailure> {
+        self.validate_isolated_restore(&saved)?;
+        *self = saved;
+        Ok(())
+    }
+}
+
+/// Reusable snapshot of settled PCM, encoder and language prompt ingress.
+pub struct AudioIngressSnapshot<B, H>(IsolatedStateSnapshot<IngressState<H::State, B::Tensor>>)
+where
+    B: GroupedNeuralBackend + DistributedNeuralBackend,
+    H: ResidentAudioBinding<B>;
+
+impl<B, H> AudioIngress<B, H>
+where
+    B: GroupedNeuralBackend + DistributedNeuralBackend<Tensor: SnapshotValue>,
+    H: ResidentAudioBinding<B, State: SnapshotValue>,
+{
+    /// Configures the limits shared by prompt ingress and its eventual response.
+    pub fn enable_snapshots(&mut self, limits: SnapshotLimits) -> Result<(), AudioSnapshotError> {
+        if self.snapshot_budget.is_some() {
+            return Err(AudioSnapshotError::AlreadyConfigured);
+        }
+        self.snapshot_budget = Some(SnapshotBudget::new(limits));
+        Ok(())
+    }
+
+    /// Reports retention and cumulative copy work for the prompt.
+    pub fn snapshot_usage(&self) -> Option<SnapshotUsage> {
+        self.snapshot_budget.as_ref().map(SnapshotBudget::usage)
+    }
+
+    /// Saves settled input progress and its exact continuation.
+    pub fn snapshot(&self) -> Result<AudioIngressSnapshot<B, H>, AudioSnapshotError> {
+        let budget = self
+            .snapshot_budget
+            .as_ref()
+            .ok_or(AudioSnapshotError::NotConfigured)?;
+        Ok(AudioIngressSnapshot(IsolatedStateSnapshot::capture(
+            &self.state,
+            budget,
+        )?))
+    }
+
+    /// Restores prompt ingress state before further samples are submitted.
+    pub fn restore(
+        &mut self,
+        saved: &AudioIngressSnapshot<B, H>,
+    ) -> Result<(), AudioSnapshotError> {
+        saved.0.restore(&mut self.state)?;
+        Ok(())
+    }
 }
 
 impl<B, H> ResidentAudio<B, H>
@@ -124,16 +228,21 @@ where
         suffix.extend(marker);
         Ok(AudioIngress {
             model: self,
-            mel: transform.into_stream(),
-            encoder,
-            language,
-            hidden: None,
+            transform,
+            state: IngressState {
+                mel: PowerMelState::default(),
+                encoder,
+                language,
+                hidden: None,
+                progress: AudioIngressProgress::default(),
+                origin: Arc::new(()),
+            },
+            snapshot_budget: None,
             prefix: request.prefix.to_vec(),
             suffix,
             schedule,
             random,
             max_samples,
-            progress: AudioIngressProgress::default(),
         })
     }
 }
@@ -146,7 +255,7 @@ where
 {
     /// Reports committed input progress.
     pub fn progress(&self) -> AudioIngressProgress {
-        self.progress
+        self.state.progress
     }
 
     /// Submits arbitrary boundaries of mono 16-kHz PCM.
@@ -164,21 +273,18 @@ where
     pub fn finish(mut self) -> Result<AudioSession<ResidentAudio<B, H>>, AudioIngressError> {
         self.advance(&[], 16_000, true)?;
         let state = ResidentAudioState {
-            language: self.language,
-            hidden: self.hidden.ok_or(AudioIngressError::Prompt)?,
+            language: self.state.language,
+            hidden: self.state.hidden.ok_or(AudioIngressError::Prompt)?,
             codec: None,
             origin: Arc::new(()),
             fork_retention: None,
             binding: PhantomData,
         };
         let sampling = self.model.sampling.clone();
-        Ok(AudioSession::new(
-            self.model,
-            state,
-            self.schedule,
-            sampling,
-            self.random,
-        )?)
+        let mut session =
+            AudioSession::new(self.model, state, self.schedule, sampling, self.random)?;
+        session.inherit_snapshot_budget(self.snapshot_budget);
+        Ok(session)
     }
 
     /// Drops the incomplete input without starting a response.
@@ -190,27 +296,29 @@ where
         sample_rate: u32,
         final_chunk: bool,
     ) -> Result<(), AudioIngressError> {
-        let remaining = self.max_samples - self.progress.samples;
+        let remaining = self.max_samples - self.state.progress.samples;
         if samples.len() > remaining {
             return Err(AudioIngressError::Context {
                 incoming: samples.len(),
                 remaining,
             });
         }
-        let mut mel = self.mel.clone();
-        let features = mel.advance(samples, sample_rate, final_chunk)?;
+        let mut mel = self.state.mel.clone();
+        let features = self
+            .transform
+            .advance(&mut mel, samples, sample_rate, final_chunk)?;
         if features.frames == 0 && !final_chunk {
-            self.mel = mel;
-            self.progress.samples += samples.len();
+            self.state.mel = mel;
+            self.state.progress.samples += samples.len();
             return Ok(());
         }
-        let mut encoder = self.encoder.try_branch(H::branch_state)?;
+        let mut encoder = self.state.encoder.try_branch(H::branch_state)?;
         let projected = self
             .model
             .project_stream_chunk(&features, &mut encoder, final_chunk)?;
         let count = projected.as_ref().map_or(0, |rows| rows.dim(0) as usize);
         let mut tokens = Vec::new();
-        if count != 0 && self.progress.audio_tokens == 0 {
+        if count != 0 && self.state.progress.audio_tokens == 0 {
             tokens.extend_from_slice(&self.prefix);
         }
         tokens.extend(std::iter::repeat_n(self.model.artifact.tokens.input, count));
@@ -220,7 +328,7 @@ where
         let language = if tokens.is_empty() {
             None
         } else {
-            let mut candidate = H::branch_state(&self.language)?;
+            let mut candidate = H::branch_state(&self.state.language)?;
             let hidden =
                 self.model
                     .forward_prompt(&mut candidate, &tokens, projected.as_ref(), None)?;
@@ -236,13 +344,13 @@ where
             .and_then(|completion| completion.wait())
             .map_err(failure)?;
         if let Some((state, hidden)) = language {
-            self.language = state;
-            self.hidden = Some(hidden);
+            self.state.language = state;
+            self.state.hidden = Some(hidden);
         }
-        self.encoder = encoder;
-        self.mel = mel;
-        self.progress.samples += samples.len();
-        self.progress.audio_tokens += count;
+        self.state.encoder = encoder;
+        self.state.mel = mel;
+        self.state.progress.samples += samples.len();
+        self.state.progress.audio_tokens += count;
         Ok(())
     }
 }

@@ -308,7 +308,11 @@ spans. Each `submit` advances complete mel windows and appends any newly
 projected positions to the language cache. Rejected chunks leave both sample
 and model frontiers unchanged. `finish` flushes the remaining input, appends
 the suffix and enters the ordinary response session. Cancelling ingress drops
-the incomplete prompt. Snapshots and forks are available after finish.
+the incomplete prompt. Ingress snapshots save PCM and encoder carry, language
+positions, and accepted input progress. Restore reopens that input boundary
+for the caller to resubmit later samples. Finishing transfers the same
+snapshot budget to the response session, including cumulative copy work and
+retention for any ingress snapshots the caller still holds.
 
 For continuous English transcription, `MlxAudioModel::prepare_live_transcription`
 opens the publisher's LiveASR protocol. The caller supplies unpadded mel blocks
@@ -339,7 +343,7 @@ Forks share a synchronous advancement lane and the source's snapshot and
 copy budget. A child's retained model and input growth must fit that budget
 before state is published.
 
-Snapshots and forks during prompt ingress, capture, and bounded or
+Forks during prompt ingress, capture, and bounded or
 distributed speech sessions have no selected implementation.
 
 LiquidCodec's standalone `Tokenizer` implements finite audio-tokenizer calls and

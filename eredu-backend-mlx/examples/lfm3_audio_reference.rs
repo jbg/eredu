@@ -53,6 +53,9 @@ struct Args {
     /// Feed the LiveASR fixture as microphone-sized PCM chunks.
     #[arg(long, requires = "live_asr")]
     live_asr_pcm: bool,
+    /// Compare restored streamed prompts with finite resident inference.
+    #[arg(long, conflicts_with = "live_asr")]
+    ingress_replay: bool,
 }
 
 fn sha256(path: &Path) -> Result<String, Box<dyn Error>> {
@@ -123,6 +126,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let native = ExecutionContext::new(Device::new(device, 0));
     if args.live_asr {
         return compare_live_asr(&args, &metadata, model, native);
+    }
+    if args.ingress_replay {
+        return compare_ingress_replay(&args, model, native);
     }
     let tolerance = metadata["maximum_absolute_tolerance"]
         .as_f64()
@@ -557,4 +563,119 @@ fn compare_live_block(
     assert_eq!(result.audio_tokens, block.audio_tokens, "block {index}");
     assert_eq!(result.closed, block.closed, "block {index}");
     assert_eq!(result.tokens, block.tokens, "block {index}");
+}
+
+fn compare_ingress_replay(
+    args: &Args,
+    artifact: PreparedAudio,
+    execution: ExecutionContext,
+) -> Result<(), Box<dyn Error>> {
+    use eredu_architectures::lfm3::audio::{
+        AudioAdvance, AudioIngressRequest, AudioMode, AudioRequest, AudioSnapshotError,
+        PreparedResidentAudio,
+    };
+    use eredu_core::execution_control::SnapshotLimits;
+
+    let pcm = (0..2151)
+        .map(|sample| {
+            let time = sample as f32 / 16_000.0;
+            0.12 * (std::f32::consts::TAU * 413.0 * time).sin()
+                + 0.05 * (std::f32::consts::TAU * 863.0 * time).sin()
+        })
+        .collect::<Vec<_>>();
+    let prefix = [124894, 5];
+    let suffix = [13, 21, 34];
+    let finite = {
+        let features = artifact
+            .processor
+            .transform()?
+            .extract(AudioWaveform::new(&pcm, 16_000)?)?;
+        let mut tokens = prefix.to_vec();
+        tokens.extend([artifact.tokens.input; 2]);
+        tokens.extend(suffix);
+        let model = MlxAudioModel::load_prepared(
+            PreparedResidentAudio::select(artifact.clone())?,
+            &ExecutionContext::cpu()?,
+            &execution,
+        )?;
+        model
+            .start(
+                AudioRequest {
+                    tokens: &tokens,
+                    features: &[features],
+                    replay: &[],
+                    mode: AudioMode::Speech,
+                    max_slots: 3,
+                },
+                41,
+            )?
+            .events()
+            .collect::<Result<Vec<_>, _>>()?
+    };
+
+    let mut ingress = MlxAudioModel::load(artifact, execution)?.prepare_ingress(
+        AudioIngressRequest {
+            prefix: &prefix,
+            suffix: &suffix,
+            mode: AudioMode::Speech,
+            max_slots: 3,
+        },
+        41,
+    )?;
+    let limits = SnapshotLimits {
+        max_snapshots: 2,
+        max_branches: 0,
+        retained_bytes: 1 << 28,
+        cumulative_copy_bytes: 1 << 28,
+    };
+    ingress.enable_snapshots(limits)?;
+    let early = ingress.submit(&pcm[..1055], 16_000)?;
+    assert_eq!((early.samples, early.audio_tokens), (1055, 0));
+    let before_first = ingress.snapshot()?;
+    let late = ingress.submit(&pcm[1055..1520], 16_000)?;
+    assert_eq!((late.samples, late.audio_tokens), (1520, 1));
+    let after_first = ingress.snapshot()?;
+    let usage = ingress.snapshot_usage().ok_or("missing ingress usage")?;
+    assert!(ingress.snapshot().is_err());
+    assert_eq!(ingress.snapshot_usage(), Some(usage));
+
+    let complete = ingress.submit(&pcm[1520..], 16_000)?;
+    ingress.restore(&after_first)?;
+    assert_eq!(ingress.progress(), late);
+    assert_eq!(ingress.submit(&pcm[1520..], 16_000)?, complete);
+    ingress.restore(&before_first)?;
+    assert_eq!(ingress.progress(), early);
+    assert_eq!(ingress.submit(&pcm[1055..1520], 16_000)?, late);
+    assert_eq!(ingress.submit(&pcm[1520..], 16_000)?, complete);
+
+    let restored_usage = ingress.snapshot_usage().ok_or("missing restored usage")?;
+    assert_eq!(restored_usage.retained_bytes, usage.retained_bytes);
+    assert!(restored_usage.cumulative_copy_bytes > usage.cumulative_copy_bytes);
+    let mut session = ingress.finish()?;
+    assert_eq!(session.snapshot_usage(), Some(restored_usage));
+    assert!(matches!(
+        session.enable_snapshots(limits),
+        Err(AudioSnapshotError::AlreadyConfigured)
+    ));
+    drop((before_first, after_first));
+    let released = session.snapshot_usage().ok_or("missing response usage")?;
+    assert_eq!(released.retained_bytes, 0);
+    assert_eq!(
+        released.cumulative_copy_bytes,
+        restored_usage.cumulative_copy_bytes
+    );
+    let output = session.events().collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(output, finite);
+    let samples: usize = output
+        .iter()
+        .map(|event| match event {
+            AudioAdvance::Speech { pcm, .. } => pcm.len(),
+            _ => 0,
+        })
+        .sum();
+    assert_eq!((output.len(), samples), (3, 5760));
+    let report = json!({ "device": args.device, "matched_frames": output.len(), "matched_samples": samples });
+    std::fs::write(&args.output, serde_json::to_vec_pretty(&report)?)?;
+    println!("{report}");
+    Ok(())
 }

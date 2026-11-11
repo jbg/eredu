@@ -310,6 +310,16 @@ leave progress unchanged. A separate CPU check reserves one audio position,
 accepts its exactly aligned 1,520 samples, rejects an additional sample,
 and finalizes with zero new mel frames before emitting a text token.
 
+The native runner's `--ingress-replay` mode saves at 1,055 samples, before
+the first audio position, and at 1,520 samples, after that position enters
+the language cache. It restores each boundary and resubmits only the later
+samples. On CPU and precise Metal, the restored response matches all three
+speech frames and all 5,760 PCM samples from finite prompting within each
+device. The response keeps the ingress copy budget, and dropping saved
+ingress states releases their retention while preserving cumulative copy work.
+Run it with the same checkpoint and reference directory as the conditional
+reference case.
+
 ## LiveASR
 
 The resident LiveASR route takes mono 16-kHz PCM or unpadded mel blocks and
