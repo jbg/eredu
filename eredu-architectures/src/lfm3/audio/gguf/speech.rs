@@ -17,6 +17,8 @@ use std::{
 };
 
 type Recipes = BTreeMap<String, DerivedWeightRecipe>;
+const PACKED_EMBEDDINGS: &str = "a.gen.code.embd.weight";
+const PACKED_HEAD_NORMS: &str = "a.gen.code.head_norm.weight";
 
 /// Canonical speech input and depth binding recipes for an admitted projector.
 pub struct AudioGgufSpeechBindings {
@@ -44,9 +46,9 @@ impl AdmittedAudioGguf {
         input: &Declaration,
         depth: &DepthDeclaration,
     ) -> Result<AudioGgufSpeechBindings, AudioGgufError> {
-        if depth.vocabulary() != 2017 || depth.schedule().iter().sum::<usize>() != 12 {
+        if !input.matches_gguf_execution() || !depth.matches_gguf_execution() {
             return Err(invalid(
-                "speech declaration differs from the packed GGUF codebooks",
+                "speech execution geometry differs from the released GGUF projector",
             ));
         }
         let quantized = self
@@ -171,7 +173,8 @@ impl AudioGgufSpeechBindings {
                 "LFM3 Audio GGUF input",
                 self.input,
             )?,
-            depth: BindingSource::from_recipes(source, "LFM3 Audio GGUF depth", self.depth)?,
+            depth: BindingSource::from_recipes(source, "LFM3 Audio GGUF depth", self.depth)?
+                .with_shared_sources([PACKED_EMBEDDINGS, PACKED_HEAD_NORMS]),
         })
     }
 }
@@ -277,8 +280,8 @@ fn depth_recipe(parameter: &LogicalParameterDeclaration<'_>) -> Option<DerivedWe
             let (index, field) = suffix.strip_prefix("depth_embeddings.")?.split_once('.')?;
             let index = index.parse::<usize>().ok().filter(|&index| index < 12)?;
             let physical = match field {
-                "embedding.weight" => "a.gen.code.embd.weight",
-                "embedding_norm.weight" => "a.gen.code.head_norm.weight",
+                "embedding.weight" => PACKED_EMBEDDINGS,
+                "embedding_norm.weight" => PACKED_HEAD_NORMS,
                 _ => return None,
             };
             let elements = parameter

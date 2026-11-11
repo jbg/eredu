@@ -1,6 +1,6 @@
 //! Retained admission for the Audio checkpoint and its LiquidCodec companion.
 
-use super::{DepthDeclaration, ProcessorConfig};
+use super::{AdmittedAudioGguf, AudioGgufError, DepthDeclaration, ProcessorConfig};
 use eredu_checkpoint::{
     recipe::{DerivedWeightRecipe, RecipeDtype},
     safetensors::SafetensorsMetadataCatalog,
@@ -13,12 +13,12 @@ use eredu_checkpoint::{
 };
 use serde_json::Value;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::Arc,
 };
 
-/// Failure to admit a complete local LFM3 Audio SafeTensors artifact.
+/// Failure to prepare a local LFM3 Audio artifact.
 #[derive(Debug, thiserror::Error)]
 pub enum ArtifactError {
     /// A required companion file cannot be read.
@@ -38,6 +38,9 @@ pub enum ArtifactError {
     /// The LiquidCodec companion is invalid.
     #[error(transparent)]
     Codec(#[from] eredu_codec::Error),
+    /// Published GGUF pair or canonical binding is invalid.
+    #[error(transparent)]
+    Gguf(#[from] AudioGgufError),
     /// A header or retained source cannot be admitted.
     #[error("LFM3 Audio checkpoint admission failed: {0}")]
     Checkpoint(String),
@@ -99,6 +102,7 @@ impl AudioTokens {
 pub struct BindingSource {
     source: SharedCheckpointSource,
     recipes: BTreeMap<String, DerivedWeightRecipe>,
+    shared_source_keys: BTreeSet<String>,
 }
 
 impl BindingSource {
@@ -114,7 +118,17 @@ impl BindingSource {
         Ok(Self {
             source: Arc::new(RestrictedCheckpointSource::including(source, scope, keys)?),
             recipes,
+            shared_source_keys: BTreeSet::new(),
         })
+    }
+
+    pub(super) fn with_shared_sources(
+        mut self,
+        keys: impl IntoIterator<Item = &'static str>,
+    ) -> Self {
+        self.shared_source_keys
+            .extend(keys.into_iter().map(str::to_owned));
+        self
     }
 
     /// Projects the resident F32 execution profile before native materialization.
@@ -147,6 +161,7 @@ impl BindingSource {
             Self {
                 source: self.source.clone(),
                 recipes,
+                shared_source_keys: self.shared_source_keys.clone(),
             },
             bytes,
         ))
@@ -160,6 +175,11 @@ impl BindingSource {
     /// Canonical destinations whose physical identities or layout differ.
     pub fn recipes(&self) -> &BTreeMap<String, DerivedWeightRecipe> {
         &self.recipes
+    }
+
+    /// Physical keys intentionally used by more than one canonical recipe.
+    pub fn shared_source_keys(&self) -> &BTreeSet<String> {
+        &self.shared_source_keys
     }
 }
 
@@ -195,6 +215,8 @@ pub struct TextAssets {
     pub special_tokens: Arc<[u8]>,
     /// Checkpoint chat template.
     pub chat_template: Arc<str>,
+    /// Named checkpoint templates for task-specific prompt construction.
+    pub named_chat_templates: BTreeMap<String, Arc<str>>,
     /// Checkpoint sampling and termination defaults.
     pub generation: Value,
 }
@@ -208,7 +230,7 @@ pub struct PreparedAudio {
     pub encoder: super::Declaration,
     /// Speech output depth decoder and feedback declaration.
     pub depth: DepthDeclaration,
-    /// LiquidCodec companion declaration.
+    /// LiquidCodec geometry for speech synthesis.
     pub codec: eredu_codec::liquid::Declaration,
     /// Released host PCM processor policy.
     pub processor: ProcessorConfig,
@@ -224,7 +246,7 @@ pub struct PreparedAudio {
     pub encoder_weights: BindingSource,
     /// Restricted depth/feedback checkpoint binding.
     pub depth_weights: BindingSource,
-    /// Restricted codec companion binding.
+    /// Restricted codec companion or projector decoder binding.
     pub codec_weights: BindingSource,
 }
 
@@ -235,6 +257,38 @@ fn read(root: &Path, name: &str) -> Result<Vec<u8>, ArtifactError> {
 
 fn checkpoint(error: impl std::fmt::Display) -> ArtifactError {
     ArtifactError::Checkpoint(error.to_string())
+}
+
+fn cadence(config: &Value) -> Result<(usize, usize), ArtifactError> {
+    let positive = |key: &str, default: usize| match config.get(key) {
+        None => Ok(default),
+        Some(value) => value
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|n| *n > 0)
+            .ok_or_else(|| checkpoint(format!("invalid LFM3 Audio cadence {key}"))),
+    };
+    Ok((
+        positive("interleaved_n_text", 6)?,
+        positive("interleaved_n_audio", 12)?,
+    ))
+}
+
+fn processor(root: &Path) -> Result<ProcessorConfig, ArtifactError> {
+    Ok(ProcessorConfig::from_feature_extractor(
+        &serde_json::from_slice(&read(root, "preprocessor_config.json")?)?,
+    )?)
+}
+
+fn text_assets(root: &Path, chat_template: Arc<str>) -> Result<TextAssets, ArtifactError> {
+    Ok(TextAssets {
+        tokenizer: read(root, "tokenizer.json")?.into(),
+        tokenizer_config: read(root, "tokenizer_config.json")?.into(),
+        special_tokens: read(root, "special_tokens_map.json")?.into(),
+        chat_template,
+        named_chat_templates: BTreeMap::new(),
+        generation: serde_json::from_slice(&read(root, "generation_config.json")?)?,
+    })
 }
 
 fn discover(root: &Path) -> Result<SafetensorsMetadataCatalog, ArtifactError> {
@@ -278,6 +332,7 @@ fn restrict(
     Ok(BindingSource {
         source: Arc::new(source),
         recipes,
+        shared_source_keys: BTreeSet::new(),
     })
 }
 
@@ -298,6 +353,62 @@ impl PreparedAudio {
         Self::open_source(root, root, &config, max_cached_shards)
     }
 
+    /// Prepares the released GGUF backbone and projector with an explicit publisher asset directory.
+    /// Only the codec configuration is required from the audio_tokenizer directory.
+    pub fn open_gguf(
+        backbone: &Path,
+        projector: &Path,
+        root: &Path,
+        max_cached_readers: usize,
+    ) -> Result<Self, ArtifactError> {
+        let config = serde_json::from_slice(&read(root, "config.json")?)?;
+        Self::open_gguf_source(backbone, projector, root, &config, max_cached_readers)
+    }
+
+    pub(crate) fn open_gguf_source(
+        backbone: &Path,
+        projector: &Path,
+        root: &Path,
+        config: &Value,
+        max_cached_readers: usize,
+    ) -> Result<Self, ArtifactError> {
+        let admitted = AdmittedAudioGguf::open(backbone, projector)?;
+        let encoder = super::Declaration::from_config(config)?;
+        let depth = DepthDeclaration::from_config(config)?;
+        let tokens = AudioTokens::from_config(config, admitted.declaration().args().vocab_size)?;
+        let (interleaved_text_slots, interleaved_speech_slots) = cadence(config)?;
+        if (interleaved_text_slots, interleaved_speech_slots) != (6, 12) {
+            return Err(checkpoint(
+                "Audio configuration differs from the GGUF speech schedule",
+            ));
+        }
+        let mut text_assets = text_assets(root, admitted.chat_template()?.into())?;
+        admitted.bind_text_assets(&mut text_assets, tokens)?;
+        let processor = processor(root)?;
+        let codec = eredu_codec::liquid::Declaration::new(eredu_codec::liquid::Config::from_json(
+            &read(&root.join("audio_tokenizer"), "config.json")?,
+        )?)?;
+        let (speech, codec_weights) = admitted
+            .speech_bindings(&encoder, &depth)?
+            .retain_with_codec_decoder(&codec, max_cached_readers)?;
+        let (language, language_weights) = admitted.retain_backbone(max_cached_readers)?;
+        Ok(Self {
+            language,
+            encoder,
+            depth,
+            codec,
+            processor,
+            tokens,
+            interleaved_text_slots,
+            interleaved_speech_slots,
+            text_assets,
+            language_weights,
+            encoder_weights: speech.input,
+            depth_weights: speech.depth,
+            codec_weights,
+        })
+    }
+
     /// Admits an exact model payload with separately resolved Audio assets.
     /// The companion codec lives under `audio_tokenizer` in the asset root.
     pub(crate) fn open_source(
@@ -306,16 +417,7 @@ impl PreparedAudio {
         config: &Value,
         max_cached_shards: usize,
     ) -> Result<Self, ArtifactError> {
-        let cadence = |key: &str, default: usize| match config.get(key) {
-            None => Ok(default),
-            Some(value) => value
-                .as_u64()
-                .and_then(|n| usize::try_from(n).ok())
-                .filter(|n| *n > 0)
-                .ok_or_else(|| checkpoint(format!("invalid LFM3 Audio cadence {key}"))),
-        };
-        let interleaved_text_slots = cadence("interleaved_n_text", 6)?;
-        let interleaved_speech_slots = cadence("interleaved_n_audio", 12)?;
+        let (interleaved_text_slots, interleaved_speech_slots) = cadence(config)?;
         let encoder = super::Declaration::from_config(config)?;
         let depth = DepthDeclaration::from_config(config)?;
         let mut text = config.get("lfm").unwrap_or(&config["text_config"]).clone();
@@ -332,19 +434,9 @@ impl PreparedAudio {
         }
         let tokens = AudioTokens::from_config(config, language.vocab_size)?;
         let language = Arc::new(crate::lfm3::Declaration::new(language)?);
-        let processor = ProcessorConfig::from_feature_extractor(&serde_json::from_slice(&read(
-            root,
-            "preprocessor_config.json",
-        )?)?)?;
-        let text_assets = TextAssets {
-            tokenizer: read(root, "tokenizer.json")?.into(),
-            tokenizer_config: read(root, "tokenizer_config.json")?.into(),
-            special_tokens: read(root, "special_tokens_map.json")?.into(),
-            chat_template: String::from_utf8(read(root, "chat_template.jinja")?)
-                .map_err(checkpoint)?
-                .into(),
-            generation: serde_json::from_slice(&read(root, "generation_config.json")?)?,
-        };
+        let processor = processor(root)?;
+        let template = String::from_utf8(read(root, "chat_template.jinja")?).map_err(checkpoint)?;
+        let text_assets = text_assets(root, template.into())?;
 
         let mut language_plan =
             crate::lfm3::safetensors_plan(&language, false).map_err(checkpoint)?;
@@ -465,6 +557,7 @@ impl PreparedAudio {
         let codec_weights = BindingSource {
             source: open(&catalog, &codec_plan, resolution, max_cached_shards)?,
             recipes,
+            shared_source_keys: BTreeSet::new(),
         };
 
         Ok(Self {

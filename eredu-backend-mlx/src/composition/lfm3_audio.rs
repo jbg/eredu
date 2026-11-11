@@ -6,7 +6,7 @@ use crate::backend::{
     runtime::{
         cache::state::MlxHybridState,
         checkpoint::binding::{
-            build_neutral_module_bindings_with_recipes, materialize_module_bindings,
+            build_neutral_module_bindings_with_policy, materialize_module_bindings,
             populate_module_from_arrays_excluding,
         },
         generation::MlxSamplingBackend,
@@ -66,9 +66,14 @@ impl ResidentAudioBinding<MlxNeuralBackend> for Binding {
     ) -> Result<(), BackendFailure> {
         let source = weights.source();
         let mut recipes = weights.recipes().clone();
-        let bindings =
-            build_neutral_module_bindings_with_recipes(module, source.as_ref(), &mut recipes)
-                .map_err(failure)?;
+        let bindings = build_neutral_module_bindings_with_policy(
+            module,
+            source.as_ref(),
+            &mut recipes,
+            weights.shared_source_keys().clone(),
+            |_| false,
+        )
+        .map_err(failure)?;
         let arrays =
             materialize_module_bindings(source.as_ref(), &bindings, &self.weights, self.context())
                 .map_err(failure)?;
@@ -103,7 +108,7 @@ impl ResidentAudioBinding<MlxNeuralBackend> for Binding {
 
 type Model = ResidentAudio<MlxNeuralBackend, Binding>;
 
-/// Bound resident LFM3 Audio graph using exact F32 widening of floating source weights.
+/// Bound resident LFM3 Audio graph consuming the selected F32 binding recipes.
 pub struct MlxAudioModel(Model);
 
 impl MlxAudioModel {

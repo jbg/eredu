@@ -36,6 +36,13 @@ pub enum RealtimeArtifactSource {
         /// Exact complete container.
         path: PathBuf,
     },
+    /// Published LFM3 Audio GGUF pair.
+    AudioGguf {
+        /// Exact language container.
+        backbone: PathBuf,
+        /// Exact speech input, depth and codec decoder container.
+        projector: PathBuf,
+    },
     /// Published component GGUF containers and an explicit complete companion.
     SplitGguf {
         /// Perception encoder container.
@@ -79,6 +86,24 @@ impl RealtimeArtifactRequest {
             assets: RealtimeAssetDirectories::default(),
         }
     }
+
+    /// Prepares an exact Audio GGUF pair and its explicit publisher asset directory.
+    pub fn audio_gguf(
+        backbone: impl Into<PathBuf>,
+        projector: impl Into<PathBuf>,
+        model_assets: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            source: RealtimeArtifactSource::AudioGguf {
+                backbone: backbone.into(),
+                projector: projector.into(),
+            },
+            assets: RealtimeAssetDirectories {
+                model: Some(model_assets.into()),
+                text_backbone: None,
+            },
+        }
+    }
 }
 
 /// Exact architecture-owned artifacts accepted by realtime loading.
@@ -87,7 +112,7 @@ pub enum PreparedRealtimeArtifact {
     Moshi(MoshiPreparationPlan),
     /// VoiceChat component stores, preprocessing and auxiliary assets.
     VoiceChat(RetainedVoiceChatArtifacts),
-    /// LFM3 Audio model and retained LiquidCodec companion.
+    /// LFM3 Audio model and retained speech synthesis sources.
     Lfm3Audio(Box<PreparedAudio>),
 }
 impl PreparedRealtimeArtifact {
@@ -212,12 +237,17 @@ pub fn prepare_realtime_model(
             ))
         }
         ModelKind::Lfm3Audio => {
-            let RealtimeArtifactSource::SafeTensors { path } = &request.source else {
-                return Err(RealtimePreparationError::SourceLayout(family));
+            let prepared = match &request.source {
+                RealtimeArtifactSource::SafeTensors { path } => {
+                    PreparedAudio::open_source(path, model_root, &config, 2)?
+                }
+                RealtimeArtifactSource::AudioGguf {
+                    backbone,
+                    projector,
+                } => PreparedAudio::open_gguf_source(backbone, projector, model_root, &config, 2)?,
+                _ => return Err(RealtimePreparationError::SourceLayout(family)),
             };
-            Ok(PreparedRealtimeArtifact::Lfm3Audio(Box::new(
-                PreparedAudio::open_source(path, model_root, &config, 2)?,
-            )))
+            Ok(PreparedRealtimeArtifact::Lfm3Audio(Box::new(prepared)))
         }
         ModelKind::VoiceChat => {
             let architecture =
@@ -260,6 +290,9 @@ pub fn prepare_realtime_model(
                     )?],
                     None,
                 ),
+                RealtimeArtifactSource::AudioGguf { .. } => {
+                    return Err(RealtimePreparationError::SourceLayout(family));
+                }
                 RealtimeArtifactSource::SplitGguf {
                     perception,
                     backbone,
