@@ -30,12 +30,14 @@ enum QuantizedComponent {
     Tts,
 }
 
+#[cfg(feature = "system-audio")]
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum PushToTalk {
     Toggle,
     Hold,
 }
 
+#[cfg(feature = "system-audio")]
 #[derive(Debug, Default, Clone, Copy, ValueEnum)]
 enum NoiseSuppression {
     #[default]
@@ -88,10 +90,16 @@ pub struct Args {
     #[arg(long)]
     base_assets: Option<String>,
     /// List system audio devices and exit without loading a model.
+    #[cfg(feature = "system-audio")]
     #[arg(long)]
     list_audio_devices: bool,
-    /// Mono 16 kHz WAV input. Omit to use the microphone.
+    /// Mono 16 kHz WAV input.
     #[arg(long)]
+    #[cfg_attr(
+        feature = "system-audio",
+        arg(help = "Mono 16 kHz WAV input. Omit to use the microphone.")
+    )]
+    #[cfg_attr(not(feature = "system-audio"), arg(required = true))]
     input: Option<PathBuf>,
     /// Record source PCM accepted by the session as mono 16 kHz float32 WAV.
     #[arg(long)]
@@ -109,24 +117,31 @@ pub struct Args {
     #[arg(long)]
     script: Option<PathBuf>,
     /// Named microphone; omission selects the platform default.
+    #[cfg(feature = "system-audio")]
     #[arg(long, conflicts_with = "input")]
     input_device: Option<String>,
     /// Named speaker; omission selects the platform default.
+    #[cfg(feature = "system-audio")]
     #[arg(long, conflicts_with = "no_playback")]
     output_device: Option<String>,
     /// Disable system playback (useful for unattended WAV benchmarks).
     #[arg(long)]
+    #[cfg_attr(not(feature = "system-audio"), arg(required = true))]
     no_playback: bool,
     /// Disable acoustic echo cancellation for live microphone/speaker input.
+    #[cfg(feature = "system-audio")]
     #[arg(long, conflicts_with_all = ["input", "no_playback"])]
     no_echo_cancellation: bool,
     /// Optional PTT: tap the key to toggle, or hold it in a key-release-capable terminal.
+    #[cfg(feature = "system-audio")]
     #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "toggle", conflicts_with = "input")]
     push_to_talk: Option<PushToTalk>,
     /// PTT key: space, enter, or a single ASCII letter/digit.
+    #[cfg(feature = "system-audio")]
     #[arg(long, default_value = "space", requires = "push_to_talk")]
     ptt_key: String,
     /// WebRTC noise suppression strength; stronger settings can distort speech.
+    #[cfg(feature = "system-audio")]
     #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "moderate", default_value = "off", conflicts_with = "input")]
     noise_suppression: NoiseSuppression,
     /// Admit sustained microphone/WAV levels; replace rejected windows with silence.
@@ -154,6 +169,7 @@ pub struct Args {
     #[arg(long)]
     seconds: Option<f64>,
     /// Finite native input/output queue duration, in milliseconds.
+    #[cfg(feature = "system-audio")]
     #[arg(long, default_value_t = 2000, value_parser = clap::value_parser!(u32).range(160..=10000))]
     audio_buffer_ms: u32,
     /// Matrix groups affected by --quantize.
@@ -197,7 +213,7 @@ pub struct Args {
     #[arg(long, default_value_t = 100000)]
     max_steps: u64,
     #[cfg(feature = "projection-profiling")]
-    #[arg(long)]
+    #[arg(long, requires = "offline")]
     projection_profile: Option<PathBuf>,
     #[cfg(feature = "projection-profiling")]
     #[arg(long, default_value_t = 22, requires = "projection_profile")]
@@ -205,10 +221,10 @@ pub struct Args {
     #[cfg(feature = "projection-profiling")]
     #[arg(long, default_value_t = 5, requires = "projection_profile")]
     profile_samples: usize,
-    #[cfg(feature = "projection-profiling")]
+    #[cfg(all(feature = "projection-profiling", feature = "metal"))]
     #[arg(long, requires = "projection_profile")]
     profile_metal: Option<PathBuf>,
-    #[cfg(feature = "projection-profiling")]
+    #[cfg(all(feature = "projection-profiling", feature = "metal"))]
     #[arg(long, default_value_t = 0, requires = "profile_metal")]
     profile_metal_case: usize,
 }
@@ -346,19 +362,15 @@ fn quantization(args: &Args) -> Result<SpeechQuantizationPolicy> {
     Ok(policy)
 }
 pub fn run(args: Args, timing: bool, total_started: Instant) -> Result<()> {
+    #[cfg(feature = "system-audio")]
     if args.list_audio_devices {
-        #[cfg(feature = "system-audio")]
-        {
-            for device in eredu_media::audio::system::devices()? {
-                println!(
-                    "{}\tinput={}\toutput={}",
-                    device.name, device.input, device.output
-                );
-            }
-            return Ok(());
+        for device in eredu_media::audio::system::devices()? {
+            println!(
+                "{}\tinput={}\toutput={}",
+                device.name, device.input, device.output
+            );
         }
-        #[cfg(not(feature = "system-audio"))]
-        anyhow::bail!("device enumeration requires the `system-audio` feature");
+        return Ok(());
     }
     #[cfg(feature = "system-audio")]
     if let Some(mode) = args.push_to_talk {
@@ -372,11 +384,6 @@ pub fn run(args: Args, timing: bool, total_started: Instant) -> Result<()> {
     ensure!(
         args.seconds.is_none_or(|v| v.is_finite() && v > 0.0),
         "--seconds must be finite and positive"
-    );
-    #[cfg(not(feature = "system-audio"))]
-    ensure!(
-        args.input.is_some() && args.no_playback,
-        "microphone and speaker require the `system-audio` feature"
     );
     let reserved_frames = args
         .tail_frames
@@ -436,10 +443,6 @@ pub fn run(args: Args, timing: bool, total_started: Instant) -> Result<()> {
         ensure!(
             !path.try_exists()? && !paths.contains(&path),
             "profile output must be a new distinct path"
-        );
-        ensure!(
-            args.offline,
-            "diagnostic replay requires --offline to avoid interrupting live audio"
         );
     }
     args.common.configure_runtime()?;
@@ -501,11 +504,15 @@ pub fn run(args: Args, timing: bool, total_started: Instant) -> Result<()> {
         .map(|p| output_file(p).map(|f| Box::new(BufWriter::new(f)) as Box<dyn Write>))
         .transpose()?
         .unwrap_or_else(|| Box::new(std::io::sink()));
+    #[cfg(feature = "system-audio")]
+    let push_to_talk = args.push_to_talk.is_some();
+    #[cfg(not(feature = "system-audio"))]
+    let push_to_talk = false;
     let mut events = events::Events::new(
         event_file,
         config.max_frames,
         !args.no_transcription,
-        args.push_to_talk.is_some(),
+        push_to_talk,
     )?;
     let options = run::RunOptions {
         chunk_samples: args.chunk_samples,
@@ -519,8 +526,14 @@ pub fn run(args: Args, timing: bool, total_started: Instant) -> Result<()> {
                 output: p.clone(),
                 advance: args.profile_advance,
                 samples: args.profile_samples,
+                #[cfg(feature = "metal")]
                 metal: args.profile_metal.clone(),
+                #[cfg(not(feature = "metal"))]
+                metal: None,
+                #[cfg(feature = "metal")]
                 metal_case: args.profile_metal_case,
+                #[cfg(not(feature = "metal"))]
+                metal_case: 0,
             }),
     };
     eprintln!(
@@ -530,11 +543,7 @@ pub fn run(args: Args, timing: bool, total_started: Instant) -> Result<()> {
         } else {
             "WAV input ready"
         },
-        if args.push_to_talk.is_some() {
-            "\r"
-        } else {
-            ""
-        }
+        if push_to_talk { "\r" } else { "" }
     );
     let conversation_started = timing.then(Instant::now);
     let result = run::run_io(&mut session, &mut io, &mut events, options, scripts);

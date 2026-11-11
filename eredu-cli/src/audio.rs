@@ -20,14 +20,6 @@ use eredu::api::{
 
 use crate::{resolve_model, CachedGgufRole, CliDevice};
 
-#[derive(Clone, Copy, Debug)]
-enum Task {
-    Transcribe,
-    Translate,
-    Speak,
-    Respond,
-}
-
 #[derive(Debug, ClapArgs)]
 pub struct Args {
     /// Report audio timing statistics to stderr.
@@ -40,19 +32,61 @@ pub struct Args {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Stream an utterance into a transcript.
-    Transcribe(TurnArgs),
+    Transcribe(PcmTurnArgs),
     /// Translate an utterance into text.
-    Translate(TurnArgs),
+    Translate(TranslateArgs),
     /// Synthesize speech from text.
-    Speak(TurnArgs),
+    Speak(SpeakArgs),
     /// Generate a spoken response to one utterance.
-    Respond(TurnArgs),
+    Respond(RespondArgs),
     /// Run a full-duplex conversation using system audio or a WAV.
     Realtime(crate::realtime::Args),
 }
 
 #[derive(Debug, ClapArgs)]
-struct TurnArgs {
+struct PcmTurnArgs {
+    #[command(flatten)]
+    model: ModelArgs,
+    #[command(flatten)]
+    input: InputArgs,
+}
+
+#[derive(Debug, ClapArgs)]
+struct TranslateArgs {
+    #[command(flatten)]
+    audio: PcmTurnArgs,
+    /// Source language for translation.
+    #[arg(long, value_parser = nonblank)]
+    source_language: String,
+    /// Target language for translation.
+    #[arg(long, value_parser = nonblank)]
+    language: String,
+}
+
+#[derive(Debug, ClapArgs)]
+struct SpeakArgs {
+    #[command(flatten)]
+    model: ModelArgs,
+    /// Text to synthesize.
+    #[arg(long, value_parser = nonblank)]
+    text: String,
+    #[command(flatten)]
+    output: OutputArgs,
+}
+
+#[derive(Debug, ClapArgs)]
+struct RespondArgs {
+    #[command(flatten)]
+    audio: PcmTurnArgs,
+    /// Optional instruction accompanying the spoken request.
+    #[arg(long)]
+    text: Option<String>,
+    #[command(flatten)]
+    output: OutputArgs,
+}
+
+#[derive(Debug, ClapArgs)]
+struct ModelArgs {
     /// Local model path or cached Hugging Face model identifier.
     #[arg(long)]
     model: String,
@@ -65,33 +99,6 @@ struct TurnArgs {
     /// Local model asset directory, required for split GGUF.
     #[arg(long)]
     assets: Option<PathBuf>,
-    /// Input mono WAV at the model's required sample rate.
-    #[arg(long, conflicts_with = "microphone_seconds")]
-    input: Option<PathBuf>,
-    /// Capture this many seconds from a microphone.
-    #[arg(long)]
-    microphone_seconds: Option<f64>,
-    /// Microphone device name.
-    #[arg(long, requires = "microphone_seconds")]
-    input_device: Option<String>,
-    /// Text to synthesize, or an optional instruction accompanying a spoken request.
-    #[arg(long)]
-    text: Option<String>,
-    /// Source language for translation.
-    #[arg(long)]
-    source_language: Option<String>,
-    /// Target language for translation.
-    #[arg(long)]
-    language: Option<String>,
-    /// Write synthesized PCM to a new WAV file.
-    #[arg(long)]
-    output: Option<PathBuf>,
-    /// Play synthesized PCM on the system output.
-    #[arg(long)]
-    play: bool,
-    /// Speaker device name.
-    #[arg(long, requires = "play")]
-    output_device: Option<String>,
     /// Execution device: cpu or gpu:N.
     #[arg(long)]
     device: Option<CliDevice>,
@@ -103,75 +110,114 @@ struct TurnArgs {
     seed: u64,
 }
 
-pub fn run(args: Args, total_started: Instant) -> Result<()> {
-    let Args { timing, command } = args;
-    let (task, args) = match command {
-        Command::Transcribe(args) => (Task::Transcribe, args),
-        Command::Translate(args) => (Task::Translate, args),
-        Command::Speak(args) => (Task::Speak, args),
-        Command::Respond(args) => (Task::Respond, args),
-        Command::Realtime(args) => return crate::realtime::run(args, timing, total_started),
-    };
-    run_turn(task, args, timing, total_started)
+#[derive(Debug, ClapArgs)]
+#[cfg_attr(feature = "system-audio", group(skip))]
+#[cfg_attr(feature = "system-audio", command(group(
+    clap::ArgGroup::new("audio_input").args(["input", "microphone_seconds"]).required(true)
+)))]
+struct InputArgs {
+    /// Input mono WAV at the model's required sample rate.
+    #[arg(long)]
+    #[cfg_attr(not(feature = "system-audio"), arg(required = true))]
+    input: Option<PathBuf>,
+    /// Capture this many seconds from a microphone.
+    #[cfg(feature = "system-audio")]
+    #[arg(long, value_parser = positive_seconds)]
+    microphone_seconds: Option<f64>,
+    /// Microphone device name.
+    #[cfg(feature = "system-audio")]
+    #[arg(long, requires = "microphone_seconds")]
+    input_device: Option<String>,
 }
 
-fn run_turn(task_kind: Task, args: TurnArgs, timing: bool, total_started: Instant) -> Result<()> {
-    let task = match task_kind {
-        Task::Transcribe => AudioTask::Transcribe,
-        Task::Translate => AudioTask::Translate {
-            source_language: args
-                .source_language
-                .as_deref()
-                .filter(|v| !v.trim().is_empty())
-                .context("translation requires --source-language")?,
-            language: args
-                .language
-                .as_deref()
-                .filter(|v| !v.trim().is_empty())
-                .context("translation requires --language")?,
-        },
-        Task::Speak => AudioTask::Speak {
-            text: args
-                .text
-                .as_deref()
-                .filter(|v| !v.trim().is_empty())
-                .context("speech synthesis requires --text")?,
-        },
-        Task::Respond => AudioTask::Respond {
-            instruction: args.text.as_deref().unwrap_or(""),
-        },
-    };
-    ensure!(
-        (args.language.is_none() && args.source_language.is_none())
-            || matches!(task_kind, Task::Translate),
-        "language options apply to translation"
-    );
-    ensure!(
-        args.text.is_none() || matches!(task_kind, Task::Speak | Task::Respond),
-        "--text applies to speak or respond"
-    );
-    let takes_pcm = !matches!(task_kind, Task::Speak);
-    ensure!(
-        takes_pcm == (args.input.is_some() || args.microphone_seconds.is_some()),
-        "this task {}",
-        if takes_pcm {
-            "requires --input or --microphone-seconds"
-        } else {
-            "takes text input only"
-        }
-    );
-    if let Some(seconds) = args.microphone_seconds {
-        ensure!(
-            seconds.is_finite() && seconds > 0.0,
-            "--microphone-seconds must be finite and positive"
-        );
-    }
-    #[cfg(not(feature = "system-audio"))]
-    ensure!(
-        args.microphone_seconds.is_none() && !args.play,
-        "device I/O requires the system-audio feature"
-    );
+#[derive(Debug, ClapArgs)]
+#[cfg_attr(feature = "system-audio", group(skip))]
+#[cfg_attr(feature = "system-audio", command(group(
+    clap::ArgGroup::new("audio_output").args(["output", "play"]).required(true).multiple(true)
+)))]
+struct OutputArgs {
+    /// Write synthesized PCM to a new WAV file.
+    #[arg(long)]
+    #[cfg_attr(not(feature = "system-audio"), arg(required = true))]
+    output: Option<PathBuf>,
+    /// Play synthesized PCM on the system output.
+    #[cfg(feature = "system-audio")]
+    #[arg(long)]
+    play: bool,
+    /// Speaker device name.
+    #[cfg(feature = "system-audio")]
+    #[arg(long, requires = "play")]
+    output_device: Option<String>,
+}
 
+fn nonblank(value: &str) -> Result<String, &'static str> {
+    if value.trim().is_empty() {
+        Err("value must not be blank")
+    } else {
+        Ok(value.to_owned())
+    }
+}
+
+#[cfg(feature = "system-audio")]
+fn positive_seconds(value: &str) -> Result<f64, &'static str> {
+    match value.parse::<f64>() {
+        Ok(seconds) if seconds.is_finite() && seconds > 0.0 => Ok(seconds),
+        _ => Err("duration must be finite and positive"),
+    }
+}
+
+pub fn run(args: Args, total_started: Instant) -> Result<()> {
+    let Args { timing, command } = args;
+    match command {
+        Command::Transcribe(args) => run_turn(
+            AudioTask::Transcribe,
+            args.model,
+            Some(args.input),
+            None,
+            timing,
+            total_started,
+        ),
+        Command::Translate(args) => run_turn(
+            AudioTask::Translate {
+                source_language: &args.source_language,
+                language: &args.language,
+            },
+            args.audio.model,
+            Some(args.audio.input),
+            None,
+            timing,
+            total_started,
+        ),
+        Command::Speak(args) => run_turn(
+            AudioTask::Speak { text: &args.text },
+            args.model,
+            None,
+            Some(args.output),
+            timing,
+            total_started,
+        ),
+        Command::Respond(args) => run_turn(
+            AudioTask::Respond {
+                instruction: args.text.as_deref().unwrap_or(""),
+            },
+            args.audio.model,
+            Some(args.audio.input),
+            Some(args.output),
+            timing,
+            total_started,
+        ),
+        Command::Realtime(args) => crate::realtime::run(args, timing, total_started),
+    }
+}
+
+fn run_turn(
+    task: AudioTask<'_>,
+    args: ModelArgs,
+    input: Option<InputArgs>,
+    output: Option<OutputArgs>,
+    timing: bool,
+    total_started: Instant,
+) -> Result<()> {
     let load_started = timing.then(Instant::now);
     let model = resolve_model(
         &args.model,
@@ -205,18 +251,9 @@ fn run_turn(task_kind: Task, args: TurnArgs, timing: bool, total_started: Instan
         .map_err(anyhow::Error::from_boxed)?;
     let input_rate = prepared.input_sample_rate();
     let output_rate = prepared.output_sample_rate();
-    ensure!(
-        output_rate.is_some() == (args.output.is_some() || args.play),
-        "{}",
-        if output_rate.is_some() {
-            "speech output requires --output or --play"
-        } else {
-            "this task outputs text to stdout"
-        }
-    );
-    let mut wav_input = args
-        .input
-        .as_deref()
+    let mut wav_input = input
+        .as_ref()
+        .and_then(|input| input.input.as_deref())
         .map(|path| pcm::open_wav(path, input_rate.context("model has no PCM input")?))
         .transpose()?;
     if let Some(input) = &wav_input {
@@ -256,28 +293,30 @@ fn run_turn(task_kind: Task, args: TurnArgs, timing: bool, total_started: Instan
         }
     }
     #[cfg(feature = "system-audio")]
-    if let Some(seconds) = args.microphone_seconds {
-        capture(
-            &args,
-            input_rate.context("model has no microphone input")?,
-            seconds,
-            publish_input,
-        )?;
+    if let Some(input) = &input {
+        if let Some(seconds) = input.microphone_seconds {
+            capture(
+                input.input_device.as_deref(),
+                input_rate.context("model has no microphone input")?,
+                seconds,
+                publish_input,
+            )?;
+        }
     }
-    if takes_pcm {
+    if input.is_some() {
         session.finish_input().map_err(anyhow::Error::from_boxed)?;
     }
 
     let mut sink = pcm::PcmOutput {
-        wav: args
-            .output
-            .as_deref()
+        wav: output
+            .as_ref()
+            .and_then(|output| output.output.as_deref())
             .map(|path| pcm::create_wav(path, output_rate.context("model has no PCM output")?))
             .transpose()?,
         #[cfg(feature = "system-audio")]
-        speaker: if args.play {
+        speaker: if let Some(output) = output.filter(|output| output.play) {
             Some(eredu_media::audio::system::SystemAudioOutput::new(
-                args.output_device.as_deref(),
+                output.output_device.as_deref(),
                 output_rate.context("model has no speaker output")?,
                 2000,
             )?)
@@ -327,7 +366,7 @@ fn run_turn(task_kind: Task, args: TurnArgs, timing: bool, total_started: Instan
 
 #[cfg(feature = "system-audio")]
 fn capture(
-    args: &TurnArgs,
+    device: Option<&str>,
     rate: u32,
     seconds: f64,
     mut publish: impl FnMut(&[f32]) -> Result<()>,
@@ -341,12 +380,7 @@ fn capture(
         "microphone sample count is out of range"
     );
     let mut remaining = samples as usize;
-    let mut input = SystemAudioInput::new(
-        args.input_device.as_deref(),
-        rate,
-        2000,
-        NoiseSuppression::Off,
-    )?;
+    let mut input = SystemAudioInput::new(device, rate, 2000, NoiseSuppression::Off)?;
     input.start()?;
     let mut buffer = [0.0; 640];
     let mut last_sample = Instant::now();
