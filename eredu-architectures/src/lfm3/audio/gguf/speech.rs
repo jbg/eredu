@@ -8,6 +8,7 @@ use eredu_checkpoint::{
     schema::GgufCheckpointPlan,
     store::{SharedCheckpointSource, TensorSelection},
 };
+use eredu_codec::liquid::{Declaration as CodecDeclaration, GgufDecoderBindings};
 use eredu_gguf::{Checkpoint, QuantizedTensorRepresentation, TranslatedTensorLayout};
 use eredu_nn::{DeclareLogicalParameters, LogicalParameterDeclaration};
 use std::{
@@ -22,6 +23,7 @@ pub struct AudioGgufSpeechBindings {
     projector: Checkpoint,
     plan: GgufCheckpointPlan,
     mapping: Vec<TranslatedTensorLayout>,
+    catalog: GgufCatalog,
     input: Recipes,
     depth: Recipes,
 }
@@ -82,6 +84,7 @@ impl AdmittedAudioGguf {
             projector,
             plan: projector_plan(self.encodings().1)?,
             mapping,
+            catalog,
             input,
             depth,
         })
@@ -115,18 +118,53 @@ impl AudioGgufSpeechBindings {
         &self.depth
     }
 
+    /// Checks the LiquidCodec decoder projection against this projector's metadata.
+    pub fn codec_decoder_bindings(
+        &self,
+        declaration: &CodecDeclaration,
+    ) -> Result<GgufDecoderBindings, AudioGgufError> {
+        GgufDecoderBindings::compile(declaration, &self.catalog).map_err(invalid)
+    }
+
     /// Retains bounded weight leases from the admitted file-backed projector.
     /// Header-only provenance cannot grant payload access.
     pub fn retain(
         self,
         max_cached_readers: usize,
     ) -> Result<AudioGgufSpeechSources, AudioGgufError> {
-        let source: SharedCheckpointSource = Arc::new(open_prepared_gguf_source(
-            self.projector,
+        let source = self.open_source(max_cached_readers)?;
+        self.restrict_speech(source)
+    }
+
+    /// Retains the speech components and a decoder-only LiquidCodec binding from one projector.
+    pub fn retain_with_codec_decoder(
+        self,
+        declaration: &CodecDeclaration,
+        max_cached_readers: usize,
+    ) -> Result<(AudioGgufSpeechSources, BindingSource), AudioGgufError> {
+        let codec = self.codec_decoder_bindings(declaration)?;
+        let source = self.open_source(max_cached_readers)?;
+        let (codec_source, recipes) = codec.retain(source.clone()).map_err(invalid)?;
+        let codec = BindingSource::from_recipes(codec_source, "LiquidCodec GGUF decoder", recipes)?;
+        Ok((self.restrict_speech(source)?, codec))
+    }
+
+    fn open_source(
+        &self,
+        max_cached_readers: usize,
+    ) -> Result<SharedCheckpointSource, AudioGgufError> {
+        Ok(Arc::new(open_prepared_gguf_source(
+            self.projector.clone(),
             &self.plan,
             &self.mapping,
             max_cached_readers,
-        )?);
+        )?))
+    }
+
+    fn restrict_speech(
+        self,
+        source: SharedCheckpointSource,
+    ) -> Result<AudioGgufSpeechSources, AudioGgufError> {
         Ok(AudioGgufSpeechSources {
             input: BindingSource::from_recipes(
                 source.clone(),
