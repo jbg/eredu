@@ -13,11 +13,11 @@ use anyhow::{ensure, Context, Result};
 use clap::{Args as ClapArgs, ValueEnum};
 use eredu::api::realtime::RealtimeArtifactSource;
 
+use crate::audio::pcm;
 use eredu_architectures::voicechat::quantization::SpeechQuantizationPolicy;
-use eredu_media::audio::wav::{WavReader, WavWriter};
 use std::{
     fs::File,
-    io::{BufReader, BufWriter, Read, Write},
+    io::{BufWriter, Read, Write},
     path::{Path, PathBuf},
     sync::{atomic::AtomicUsize, Arc},
     time::Instant,
@@ -398,13 +398,9 @@ pub fn run(args: Args) -> Result<()> {
     let input = args
         .input
         .as_ref()
-        .map(|p| WavReader::new(BufReader::new(File::open(p)?)))
+        .map(|p| pcm::open_wav(p, 16_000))
         .transpose()?;
     if let Some(input) = &input {
-        ensure!(
-            input.sample_rate() == 16_000,
-            "input must be mono 16 kHz WAV"
-        );
         ensure!(
             input
                 .sample_count()
@@ -486,12 +482,12 @@ pub fn run(args: Args) -> Result<()> {
     let waveform = args
         .output
         .as_ref()
-        .map(|p| -> Result<_> { Ok(WavWriter::new(BufWriter::new(output_file(p)?), 22_050)?) })
+        .map(|p| pcm::create_wav(p, 22_050))
         .transpose()?;
     let input_recording = args
         .record_input
         .as_ref()
-        .map(|p| -> Result<_> { Ok(WavWriter::new(BufWriter::new(output_file(p)?), 16_000)?) })
+        .map(|p| pcm::create_wav(p, 16_000))
         .transpose()?;
     let mut io = host::HostIo::new(
         input,

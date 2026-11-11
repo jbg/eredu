@@ -1,13 +1,14 @@
-//! CLI host I/O for one audio request.
+//! CLI entry point for turn-based audio tasks and full-duplex conversation.
+
+pub(crate) mod pcm;
 
 use std::{
-    fs::File,
-    io::{self, BufReader, BufWriter, Write},
+    io::{self, Write},
     path::PathBuf,
 };
 
 use anyhow::{bail, ensure, Context, Result};
-use clap::{Args as ClapArgs, ValueEnum};
+use clap::{Args as ClapArgs, Subcommand};
 use eredu::api::{
     audio::{AudioTask, AudioTaskOutput, PreparedAudioTask},
     realtime::{
@@ -15,12 +16,10 @@ use eredu::api::{
         RealtimeAssetDirectories,
     },
 };
-use eredu_backend_mlx::native::ExecutionContext;
-use eredu_media::audio::wav::{WavReader, WavWriter};
 
-use crate::{common::output_file, resolve_model, CachedGgufRole, CliDevice};
+use crate::{resolve_model, CachedGgufRole, CliDevice};
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug)]
 enum Task {
     Transcribe,
     Translate,
@@ -30,9 +29,26 @@ enum Task {
 
 #[derive(Debug, ClapArgs)]
 pub struct Args {
-    /// Task to perform.
-    #[arg(value_enum)]
-    task: Task,
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Stream an utterance into a transcript.
+    Transcribe(TurnArgs),
+    /// Translate an utterance into text.
+    Translate(TurnArgs),
+    /// Synthesize speech from text.
+    Speak(TurnArgs),
+    /// Generate a spoken response to one utterance.
+    Respond(TurnArgs),
+    /// Run a full-duplex conversation using system audio or a WAV.
+    Realtime(crate::realtime::Args),
+}
+
+#[derive(Debug, ClapArgs)]
+struct TurnArgs {
     /// Local model path or cached Hugging Face model identifier.
     #[arg(long)]
     model: String,
@@ -84,7 +100,18 @@ pub struct Args {
 }
 
 pub fn run(args: Args) -> Result<()> {
-    let task = match args.task {
+    let (task, args) = match args.command {
+        Command::Transcribe(args) => (Task::Transcribe, args),
+        Command::Translate(args) => (Task::Translate, args),
+        Command::Speak(args) => (Task::Speak, args),
+        Command::Respond(args) => (Task::Respond, args),
+        Command::Realtime(args) => return crate::realtime::run(args),
+    };
+    run_turn(task, args)
+}
+
+fn run_turn(task_kind: Task, args: TurnArgs) -> Result<()> {
+    let task = match task_kind {
         Task::Transcribe => AudioTask::Transcribe,
         Task::Translate => AudioTask::Translate {
             source_language: args
@@ -111,14 +138,14 @@ pub fn run(args: Args) -> Result<()> {
     };
     ensure!(
         (args.language.is_none() && args.source_language.is_none())
-            || matches!(args.task, Task::Translate),
+            || matches!(task_kind, Task::Translate),
         "language options apply to translation"
     );
     ensure!(
-        args.text.is_none() || matches!(args.task, Task::Speak | Task::Respond),
+        args.text.is_none() || matches!(task_kind, Task::Speak | Task::Respond),
         "--text applies to speak or respond"
     );
-    let takes_pcm = !matches!(args.task, Task::Speak);
+    let takes_pcm = !matches!(task_kind, Task::Speak);
     ensure!(
         takes_pcm == (args.input.is_some() || args.microphone_seconds.is_some()),
         "this task {}",
@@ -183,22 +210,13 @@ pub fn run(args: Args) -> Result<()> {
     );
     let mut wav_input = args
         .input
-        .as_ref()
-        .map(|path| WavReader::new(BufReader::new(File::open(path)?)).map_err(anyhow::Error::from))
+        .as_deref()
+        .map(|path| pcm::open_wav(path, input_rate.context("model has no PCM input")?))
         .transpose()?;
     if let Some(input) = &wav_input {
-        ensure!(
-            Some(input.sample_rate()) == input_rate,
-            "expected a mono {} Hz WAV",
-            input_rate.unwrap_or_default()
-        );
         ensure!(input.sample_count() > 0, "audio input is empty");
     }
-    let weights = ExecutionContext::cpu()?;
-    let execution = match args.device.unwrap_or_default() {
-        CliDevice::Cpu => ExecutionContext::cpu()?,
-        CliDevice::Gpu(index) => ExecutionContext::accelerator(usize::try_from(index)?)?,
-    };
+    let (weights, execution) = pcm::execution_contexts(args.device.unwrap_or_default().local())?;
     let mut session = prepared
         .load(&weights, &execution)
         .map_err(anyhow::Error::from_boxed)?;
@@ -232,23 +250,22 @@ pub fn run(args: Args) -> Result<()> {
         session.finish_input().map_err(anyhow::Error::from_boxed)?;
     }
 
-    let mut wav_output = args
-        .output
-        .as_ref()
-        .map(|path| -> Result<_> {
-            let rate = output_rate.context("model has no PCM output")?;
-            Ok(WavWriter::new(BufWriter::new(output_file(path)?), rate)?)
-        })
-        .transpose()?;
-    #[cfg(feature = "system-audio")]
-    let mut speaker = if args.play {
-        Some(eredu_media::audio::system::SystemAudioOutput::new(
-            args.output_device.as_deref(),
-            output_rate.context("model has no speaker output")?,
-            2000,
-        )?)
-    } else {
-        None
+    let mut sink = pcm::PcmOutput {
+        wav: args
+            .output
+            .as_deref()
+            .map(|path| pcm::create_wav(path, output_rate.context("model has no PCM output")?))
+            .transpose()?,
+        #[cfg(feature = "system-audio")]
+        speaker: if args.play {
+            Some(eredu_media::audio::system::SystemAudioOutput::new(
+                args.output_device.as_deref(),
+                output_rate.context("model has no speaker output")?,
+                2000,
+            )?)
+        } else {
+            None
+        },
     };
     while let Some(output) = session.next_output().map_err(anyhow::Error::from_boxed)? {
         match output {
@@ -260,21 +277,15 @@ pub fn run(args: Args) -> Result<()> {
                 if output_rate.is_none() {
                     bail!("selected text task emitted PCM");
                 }
-                if let Some(wav) = &mut wav_output {
-                    wav.write_samples(&samples)?;
-                }
-                #[cfg(feature = "system-audio")]
-                if let Some(speaker) = &mut speaker {
-                    speaker.write(&samples)?;
-                }
+                sink.write(&samples)?;
             }
         }
     }
-    if let Some(wav) = wav_output {
-        wav.finish()?.flush()?;
+    if let Some(wav) = sink.wav {
+        pcm::finish_wav(wav)?;
     }
     #[cfg(feature = "system-audio")]
-    if let Some(speaker) = &mut speaker {
+    if let Some(speaker) = &mut sink.speaker {
         speaker.finish()?;
     }
     if output_rate.is_none() {
@@ -285,7 +296,7 @@ pub fn run(args: Args) -> Result<()> {
 
 #[cfg(feature = "system-audio")]
 fn capture(
-    args: &Args,
+    args: &TurnArgs,
     rate: u32,
     seconds: f64,
     mut publish: impl FnMut(&[f32]) -> Result<()>,

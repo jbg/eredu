@@ -1120,7 +1120,7 @@ remains backend-neutral; shared realtime cold selection chooses the execution
 mechanisms separately. See [VoiceChat validation](voicechat-validation.md) for the
 measured scope.
 
-The `eredu realtime` command calls `api::realtime::prepare_realtime_model`,
+The `eredu audio realtime` command calls `api::realtime::prepare_realtime_model`,
 `prepare_mlx_realtime` and the consuming `PreparedMlxRealtime::load`, then drives
 the returned `BoundVoiceChatSession`. Checkpoint naming, admission, neural equations
 and conversation policy remain in their existing owners. The CLI owns configuration, recorded tool scripts, wall-clock pacing and
@@ -16509,8 +16509,11 @@ The codec encoder is available through the separate full codec composition.
 MLX consumes this selection with the supplied weight and execution contexts.
 Callers prepare each prompt separately from model loading. The turn-based
 audio facade renders task prompts from retained templates and adapts controlled
-generation and transcription to text fragments and mono PCM. The CLI owns WAV
-and device I/O and uses the selected task's input and output sample rates.
+generation and transcription to text fragments and mono PCM. The CLI shares
+WAV admission and finalization, PCM output sinks, and device-context selection
+across audio tasks and full-duplex conversation. Each task supplies its sample
+rates. Full-duplex conversation owns pacing, echo cancellation, interruption,
+and playback acknowledgements.
 
 `AdmittedAudioGguf` validates an explicit LFM3 Audio backbone and projector
 pair. The backbone uses the shared LFM3 declaration and checks its rotary

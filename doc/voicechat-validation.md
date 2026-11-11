@@ -23,7 +23,7 @@ measurements have the explicit precision, workload and timing scope below.
 
 ## Realtime audio, WAV and recorded tool responses
 
-`eredu realtime` consumes mono 16 kHz WAV input through
+`eredu audio realtime` consumes mono 16 kHz WAV input through
 `BoundVoiceChatSession`, writes mono 22.05 kHz float32 speech and records committed
 frame, agent-text, transcription, tool and turn events as JSONL. PCM and output
 delivery are bounded. Speech sample offsets are contiguous in the output WAV;
@@ -233,7 +233,7 @@ budget, not simultaneously allocated memory. Artifacts and run outputs reside in
 
 ```sh
 CARGO_INCREMENTAL=0 cargo build -p eredu-cli --no-default-features --features mlx,realtime,metal
-/usr/bin/time -l target/debug/eredu realtime --offline --no-playback \
+/usr/bin/time -l target/debug/eredu audio realtime --offline --no-playback \
   --config /private/tmp/eredu-voicechat-reference/voicechat.json \
   --input /private/tmp/eredu-voicechat-reference/input-general.wav \
   --output /private/tmp/eredu-voicechat-reference/speech-2.wav \
@@ -363,7 +363,7 @@ hf download mlx-community/NemotronLabs-VoiceChat-11B-8bit \
   --local-dir /models/voicechat-community-8bit
 cargo build --release -p eredu-cli --no-default-features --features mlx,realtime,metal
 MLX_MAX_OPS_PER_BUFFER=25 MLX_MAX_MB_PER_BUFFER=256 \
-  target/release/eredu realtime --offline --no-playback --config voicechat-community.json \
+  target/release/eredu audio realtime --offline --no-playback --config voicechat-community.json \
   --input input-general.wav --output speech.wav --events events.jsonl \
   --chunk-samples 640 --tail-frames 800 --max-steps 2000
 ```

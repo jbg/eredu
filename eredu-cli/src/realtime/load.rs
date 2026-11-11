@@ -5,6 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::audio::pcm::execution_contexts;
 use anyhow::{ensure, Context, Result};
 use eredu::api::realtime::{
     prepare_mlx_realtime, prepare_realtime_model, LoadedMlxRealtime, MlxVoiceChatSession,
@@ -24,7 +25,6 @@ use eredu_architectures::voicechat::{
     rnnt::RnntLimits,
     schedule::ScheduleLimits,
 };
-use eredu_backend_mlx::native::ExecutionContext;
 use eredu_core::{scheduler::RequestId, ResidencyPlan};
 use eredu_runtime::{execution_plan_layer_residency, CacheResidencyPolicy, ResidencyDiagnostics};
 use serde::Deserialize;
@@ -361,13 +361,7 @@ pub fn load(
             "Conversation history and temporary computation buffers require additional memory."
         );
     }
-    let weights = ExecutionContext::cpu()?;
-    let execution = match device {
-        eredu::api::LocalDevice::Cpu => ExecutionContext::cpu()?,
-        eredu::api::LocalDevice::Accelerator(index) => {
-            ExecutionContext::accelerator(usize::try_from(index)?)?
-        }
-    };
+    let (weights, execution) = execution_contexts(device)?;
     match prepared.load(&weights, &execution)? {
         LoadedMlxRealtime::Speech(session) => Ok(session),
         LoadedMlxRealtime::Categorical { .. } | LoadedMlxRealtime::Lfm3Audio(_) => {

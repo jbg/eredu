@@ -253,7 +253,7 @@ GGUF vocabulary, BPE merges, task templates and sampling settings determine
 the admitted pair's text policy alongside the publisher's EOS set.
 The Rust realtime facade supplies the resident graph to the turn-based
 `eredu audio` command. The CLI exposes transcription, translation to text,
-text-to-speech and spoken responses. The separate `eredu realtime` command
+text-to-speech and spoken responses. The separate `eredu audio realtime` command
 drives full-duplex VoiceChat conversations.
 CPU smoke runs on the released SafeTensors checkpoint produce an English
 transcript, a French translation, and finalized mono 24-kHz WAV files for
