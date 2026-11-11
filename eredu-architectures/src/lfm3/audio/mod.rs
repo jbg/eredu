@@ -4,6 +4,8 @@ mod artifact;
 mod depth;
 pub use artifact::{ArtifactError, AudioTokens, BindingSource, PreparedAudio, TextAssets};
 mod encoder;
+mod gguf;
+pub use gguf::{AdmittedAudioGguf, AudioGgufEncoding, AudioGgufError};
 mod prompt;
 mod realtime;
 mod resident;

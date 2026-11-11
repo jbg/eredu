@@ -378,3 +378,42 @@ MLX_ENABLE_TF32=0 cargo run -p eredu-backend-mlx --features audio,metal --exampl
 ```
 
 Add `--live-asr-pcm` to the native command to compare the PCM path.
+
+## Audio GGUF admission
+
+`eredu::api::realtime::AdmittedAudioGguf` separately admits the published
+backbone and projector headers. The backbone retains tokenizer and template
+metadata. The projector contains the input encoder, depth decoder, feedback,
+and LiquidCodec decoder. A complete LiquidCodec encoder requires an additional
+source. Resident Audio execution uses the floating SafeTensors route.
+
+The [pinned source manifest](../validation/fixtures/lfm3/audio-gguf-sources.json)
+records publisher payload hashes, downloaded header hashes, and per-type tensor
+counts for all ten files. Retrieve and validate the descriptor prefixes without
+downloading the weights.
+
+The portable runner admits all five same-encoding pairs and the published
+Q4_K_M backbone with the Q8_0 projector. Each backbone has 286 parameter
+tensors and one rotary companion. Each projector has 319 tensors. A range
+read of the Q4_K_M backbone's rotary companion confirms 32 active pairs
+and 32 pairs suppressed with the published large divisor.
+
+```sh
+python3 - <<'PY'
+import json
+from pathlib import Path
+from urllib.request import Request, urlopen
+
+manifest = json.loads(Path("validation/fixtures/lfm3/audio-gguf-sources.json").read_text())
+output = Path("/private/tmp/eredu-audio-gguf")
+output.mkdir(exist_ok=True)
+base = f"https://huggingface.co/{manifest['repository']}/resolve/{manifest['revision']}"
+for variant in manifest["variants"].values():
+    for source in variant.values():
+        size = source["header_bytes"]
+        request = Request(f"{base}/{source['file']}", headers={"Range": f"bytes=0-{size - 1}"})
+        with urlopen(request) as response:
+            (output / f"{source['file']}.header").write_bytes(response.read(size))
+PY
+cargo run -p eredu-architectures --example inspect_lfm3_audio_gguf_headers -- validation/fixtures/lfm3/audio-gguf-sources.json /private/tmp/eredu-audio-gguf
+```
