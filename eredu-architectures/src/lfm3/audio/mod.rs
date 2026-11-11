@@ -20,12 +20,12 @@ pub use realtime::{
 #[cfg(feature = "audio")]
 pub use resident::{
     AudioIngress, AudioIngressError, AudioIngressProgress, AudioIngressRequest,
-    AudioPcmTranscription,
+    AudioPcmTranscription, AudioPcmTranscriptionSnapshot,
 };
 pub use resident::{
     AudioRequest, AudioResidentParameterBytes, AudioTranscription, AudioTranscriptionBlock,
-    AudioTranscriptionError, PreparedResidentAudio, ResidentAudio, ResidentAudioBinding,
-    ResidentAudioError, ResidentAudioState,
+    AudioTranscriptionError, AudioTranscriptionSnapshot, PreparedResidentAudio, ResidentAudio,
+    ResidentAudioBinding, ResidentAudioError, ResidentAudioState,
 };
 pub use schedule::{
     AudioMode, AudioPhase, AudioSchedule, AudioScheduleError, AudioSchedulePolicy, DepthProgress,

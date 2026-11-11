@@ -2,13 +2,18 @@
 
 use super::*;
 use crate::lfm3::audio::encoder::STRIDE;
-use eredu_core::TokenFilter;
+use crate::lfm3::audio::AudioSnapshotError;
+use eredu_core::{
+    execution_control::{SnapshotLimits, SnapshotUsage},
+    TokenFilter,
+};
+use eredu_runtime::execution_control::{IsolatedStateSnapshot, SnapshotBudget};
 use eredu_text::tokenizer::Tokenizer;
 
 #[cfg(feature = "audio")]
 mod pcm;
 #[cfg(feature = "audio")]
-pub use pcm::AudioPcmTranscription;
+pub use pcm::{AudioPcmTranscription, AudioPcmTranscriptionSnapshot};
 
 const PROMPT: &str =
     "<|startoftext|><|im_start|>system\nPerform live ASR.<|im_end|>\n<|im_start|>assistant\n";
@@ -128,17 +133,123 @@ impl Policy {
 
 /// Controlled, batch-one LiveASR stream. The encoder follows the audio across
 /// language-context restarts. Each advance publishes one complete transcript block.
-pub struct AudioTranscription<B, H>
+pub struct AudioTranscription<B, H, I = ()>
 where
     B: GroupedNeuralBackend + DistributedNeuralBackend,
     H: ResidentAudioBinding<B>,
 {
     model: ResidentAudio<B, H>,
-    encoder: EncoderState<H::State, B::Tensor>,
-    language: H::State,
+    state: TranscriptionState<H::State, B::Tensor, I>,
     policy: Policy,
+    snapshot_budget: Option<SnapshotBudget>,
+    cancelled: bool,
+}
+
+struct TranscriptionState<S, T: Tensor, I> {
+    encoder: EncoderState<S, T>,
+    language: S,
+    input: I,
     language_positions: usize,
     finished: bool,
+    origin: Arc<()>,
+}
+
+impl<S: SnapshotValue, T: Tensor + SnapshotValue, I: SnapshotValue> IsolatedStateCopy
+    for TranscriptionState<S, T, I>
+{
+    type Error = BackendFailure;
+
+    fn estimate_isolated_copy(&self) -> Result<SnapshotEstimate, BackendFailure> {
+        snapshot_value_estimate::<Self>([
+            self.encoder.estimate_snapshot_value(),
+            self.language.estimate_snapshot_value(),
+            self.input.estimate_snapshot_value(),
+        ])
+    }
+
+    fn copy_isolated(&self, retention: &SnapshotReservation) -> Result<Self, BackendFailure> {
+        Ok(Self {
+            encoder: self.encoder.copy_snapshot_value(retention)?,
+            language: self.language.copy_snapshot_value(retention)?,
+            input: self.input.copy_snapshot_value(retention)?,
+            origin: self.origin.clone(),
+            ..*self
+        })
+    }
+
+    fn validate_isolated_restore(&self, saved: &Self) -> Result<(), BackendFailure> {
+        if Arc::ptr_eq(&self.origin, &saved.origin) {
+            Ok(())
+        } else {
+            Err(failure(AudioSnapshotError::ForeignSession))
+        }
+    }
+
+    fn restore_isolated(&mut self, saved: Self) -> Result<(), BackendFailure> {
+        self.validate_isolated_restore(&saved)?;
+        *self = saved;
+        Ok(())
+    }
+}
+
+/// Reusable saved LiveASR continuation with independently copied mutable state.
+pub struct AudioTranscriptionSnapshot<B, H, I = ()>(
+    IsolatedStateSnapshot<TranscriptionState<H::State, B::Tensor, I>>,
+)
+where
+    B: GroupedNeuralBackend + DistributedNeuralBackend,
+    H: ResidentAudioBinding<B>;
+
+impl<B, H, I> AudioTranscription<B, H, I>
+where
+    B: GroupedNeuralBackend + DistributedNeuralBackend<Tensor: SnapshotValue>,
+    H: ResidentAudioBinding<B, State: SnapshotValue>,
+    I: SnapshotValue,
+{
+    /// Configures snapshot limits once for this stream.
+    pub fn enable_snapshots(&mut self, limits: SnapshotLimits) -> Result<(), AudioSnapshotError> {
+        self.check_snapshot_boundary()?;
+        if self.snapshot_budget.is_some() {
+            return Err(AudioSnapshotError::AlreadyConfigured);
+        }
+        self.snapshot_budget = Some(SnapshotBudget::new(limits));
+        Ok(())
+    }
+
+    /// Reports retained snapshots and cumulative copy charges.
+    pub fn snapshot_usage(&self) -> Option<SnapshotUsage> {
+        self.snapshot_budget.as_ref().map(SnapshotBudget::usage)
+    }
+
+    /// Captures the encoder, language and input state at the settled boundary.
+    pub fn snapshot(&self) -> Result<AudioTranscriptionSnapshot<B, H, I>, AudioSnapshotError> {
+        self.check_snapshot_boundary()?;
+        let budget = self
+            .snapshot_budget
+            .as_ref()
+            .ok_or(AudioSnapshotError::NotConfigured)?;
+        Ok(AudioTranscriptionSnapshot(IsolatedStateSnapshot::capture(
+            &self.state,
+            budget,
+        )?))
+    }
+
+    /// Restores a snapshot from this stream. Previously returned text belongs to the caller.
+    pub fn restore(
+        &mut self,
+        saved: &AudioTranscriptionSnapshot<B, H, I>,
+    ) -> Result<(), AudioSnapshotError> {
+        self.check_snapshot_boundary()?;
+        saved.0.restore(&mut self.state)?;
+        Ok(())
+    }
+
+    fn check_snapshot_boundary(&self) -> Result<(), AudioSnapshotError> {
+        if self.cancelled {
+            return Err(AudioSnapshotError::Cancelled);
+        }
+        Ok(())
+    }
 }
 
 impl<B, H> ResidentAudio<B, H>
@@ -151,6 +262,14 @@ where
         self,
     ) -> Result<AudioTranscription<B, H>, AudioTranscriptionError> {
         let policy = Policy::new(&self.artifact)?;
+        self.prepare_transcription(policy, ())
+    }
+
+    fn prepare_transcription<I>(
+        self,
+        policy: Policy,
+        input: I,
+    ) -> Result<AudioTranscription<B, H, I>, AudioTranscriptionError> {
         let encoder = self
             .encoder
             .stream(self.binding.state(self.artifact.encoder.state_layout())?, 1)
@@ -160,16 +279,22 @@ where
             .state(self.artifact.language.definition().state_layout())?;
         Ok(AudioTranscription {
             model: self,
-            encoder,
-            language,
+            state: TranscriptionState {
+                encoder,
+                language,
+                input,
+                language_positions: 0,
+                finished: false,
+                origin: Arc::new(()),
+            },
             policy,
-            language_positions: 0,
-            finished: false,
+            snapshot_budget: None,
+            cancelled: false,
         })
     }
 }
 
-impl<B, H> AudioTranscription<B, H>
+impl<B, H, I> AudioTranscription<B, H, I>
 where
     B: GroupedNeuralBackend + DistributedNeuralBackend + SubmissionBackend<Executor = Context<B>>,
     H: ResidentAudioBinding<B>,
@@ -187,7 +312,7 @@ where
         final_chunk: bool,
         restart: bool,
     ) -> Result<AudioTranscriptionBlock, AudioTranscriptionError> {
-        if self.finished {
+        if self.is_finished() {
             return Err(AudioTranscriptionError::Finished);
         }
         if features.frames > self.frames_per_block()
@@ -199,7 +324,11 @@ where
         {
             return Err(AudioTranscriptionError::Features);
         }
-        let mut position = if restart { 0 } else { self.language_positions };
+        let mut position = if restart {
+            0
+        } else {
+            self.state.language_positions
+        };
         let pending = if position == 0 {
             self.policy.prompt.as_slice()
         } else {
@@ -208,6 +337,7 @@ where
         let frames =
             i32::try_from(features.frames).map_err(|_| AudioTranscriptionError::Features)?;
         let count = self
+            .state
             .encoder
             .projected_positions(frames, final_chunk)
             .ok_or(AudioTranscriptionError::Features)?;
@@ -224,7 +354,7 @@ where
         {
             return Err(AudioTranscriptionError::Context);
         }
-        let mut encoder = self.encoder.try_branch(H::branch_state)?;
+        let mut encoder = self.state.encoder.try_branch(H::branch_state)?;
         let projected = self
             .model
             .project_stream_chunk(features, &mut encoder, final_chunk)?;
@@ -235,7 +365,7 @@ where
                     .state(self.model.artifact.language.definition().state_layout())?,
             )
         } else if generate {
-            Some(H::branch_state(&self.language)?)
+            Some(H::branch_state(&self.state.language)?)
         } else {
             None
         };
@@ -286,17 +416,22 @@ where
         B::submit(self.model.binding.context(), roots)
             .and_then(|completion| completion.wait())
             .map_err(failure)?;
-        self.encoder = encoder;
+        self.state.encoder = encoder;
         if let Some(language) = language {
-            self.language = language;
+            self.state.language = language;
         }
-        self.language_positions = position;
-        self.finished = final_chunk;
+        self.state.language_positions = position;
+        self.state.finished = final_chunk;
         Ok(block)
+    }
+
+    /// Whether the final block has been emitted or the stream was cancelled.
+    pub fn is_finished(&self) -> bool {
+        self.state.finished || self.cancelled
     }
 
     /// Stops between settled blocks.
     pub fn cancel(&mut self) {
-        self.finished = true;
+        self.cancelled = true;
     }
 }

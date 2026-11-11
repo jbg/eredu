@@ -326,7 +326,14 @@ for more input. A caller can drain a block and retry a chunk rejected for
 backpressure. `finish_input` flushes the last partial window and closes
 submission. Advance until `is_finished` to receive the final transcript block.
 
-Snapshots and forks during ingress or LiveASR, capture, and bounded or
+Both LiveASR input modes support snapshots and restore at settled boundaries,
+including before the first block and after the final block. The PCM route
+also saves queued input, its partial analysis window, and whether input was
+finished. After restore, callers resubmit PCM accepted after the snapshot
+and may receive the same text again. Snapshots belong to their originating
+stream and preserve cumulative copy charges. Explicit cancellation is terminal.
+
+Snapshots during prompt ingress, LiveASR forks, capture, and bounded or
 distributed speech sessions have no selected implementation.
 
 LiquidCodec's standalone `Tokenizer` implements finite audio-tokenizer calls and

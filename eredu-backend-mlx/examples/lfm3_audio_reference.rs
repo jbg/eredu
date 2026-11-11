@@ -371,22 +371,32 @@ fn compare_live_mel(
         .transform()?
         .extract(AudioWaveform::new(pcm, 16_000)?)?;
     let mut session = MlxAudioModel::load(model, native)?.prepare_live_transcription()?;
+    session.enable_snapshots(eredu_core::execution_control::SnapshotLimits {
+        max_snapshots: 1,
+        max_branches: 0,
+        retained_bytes: 1 << 28,
+        cumulative_copy_bytes: 1 << 28,
+    })?;
     let mut cursor = 0;
     let mut token_count = 0;
     for (index, block) in blocks.iter().enumerate() {
         let end = cursor + block.frames;
-        let result = session.advance(
-            &LogMelFeatures {
-                values: features.values[cursor * features.mel_bins..end * features.mel_bins]
-                    .to_vec(),
-                mask: features.mask[cursor..end].to_vec(),
-                frames: block.frames,
-                mel_bins: features.mel_bins,
-            },
-            block.final_chunk,
-            block.restart,
-        )?;
+        let features = LogMelFeatures {
+            values: features.values[cursor * features.mel_bins..end * features.mel_bins].to_vec(),
+            mask: features.mask[cursor..end].to_vec(),
+            frames: block.frames,
+            mel_bins: features.mel_bins,
+        };
+        let saved = (index == 1).then(|| session.snapshot()).transpose()?;
+        let result = session.advance(&features, block.final_chunk, block.restart)?;
         compare_live_block(index, &result, block);
+        if let Some(saved) = saved {
+            session.restore(&saved)?;
+            assert_eq!(
+                session.advance(&features, block.final_chunk, block.restart)?,
+                result
+            );
+        }
         token_count += result.tokens.len();
         cursor = end;
     }
@@ -400,7 +410,14 @@ fn compare_live_pcm(
     model: MlxAudioModel,
 ) -> Result<(usize, usize), Box<dyn Error>> {
     use eredu_architectures::lfm3::audio::AudioTranscriptionError;
+    use eredu_core::execution_control::SnapshotLimits;
     let mut session = model.prepare_pcm_transcription()?;
+    session.enable_snapshots(SnapshotLimits {
+        max_snapshots: 1,
+        max_branches: 0,
+        retained_bytes: 1 << 28,
+        cumulative_copy_bytes: 1 << 28,
+    })?;
     let capacity = session.available_samples();
     assert!(matches!(
         session.submit(&vec![0.0; capacity + 1], 16_000),
@@ -415,8 +432,11 @@ fn compare_live_pcm(
         .peekable();
     let mut matched = 0;
     let mut tokens = 0;
+    let mut samples = 0;
+    let mut saved = None;
     for chunk in pcm.chunks(1600) {
         session.submit(chunk, 16_000)?;
+        samples += chunk.len();
         while let Some(&(index, block)) = expected.peek() {
             if block.final_chunk {
                 break;
@@ -428,15 +448,49 @@ fn compare_live_pcm(
             expected.next();
             matched += 1;
             tokens += result.tokens.len();
+            if matched == 1 {
+                saved = Some((samples, session.available_samples(), session.snapshot()?));
+                let usage = session.snapshot_usage();
+                assert!(session.snapshot().is_err());
+                assert_eq!(session.snapshot_usage(), usage);
+            } else if let Some((start, capacity, snapshot)) = saved.take() {
+                let copy_bytes = session
+                    .snapshot_usage()
+                    .ok_or("missing snapshot usage")?
+                    .cumulative_copy_bytes;
+                session.restore(&snapshot)?;
+                assert_eq!(session.available_samples(), capacity);
+                for chunk in pcm[start..samples].chunks(1600) {
+                    session.submit(chunk, 16_000)?;
+                }
+                assert_eq!(session.advance(block.restart)?, Some(result));
+                assert!(
+                    session
+                        .snapshot_usage()
+                        .ok_or("missing restore usage")?
+                        .cumulative_copy_bytes
+                        > copy_bytes
+                );
+                drop(snapshot);
+                assert_eq!(
+                    session
+                        .snapshot_usage()
+                        .ok_or("missing snapshot usage")?
+                        .retained_bytes,
+                    0
+                );
+            }
         }
     }
-    assert!(matched > 0);
+    assert!(matched > 1 && saved.is_none());
+    let before_finish = session.snapshot()?;
     session.finish_input()?;
     assert!(matches!(
         session.submit(&[], 16_000),
         Err(AudioTranscriptionError::InputFinished)
     ));
-    for (index, block) in expected {
+    let pending = expected.collect::<Vec<_>>();
+    for &(index, block) in &pending {
         let result = session
             .advance(block.restart)?
             .ok_or("missing flushed LiveASR block")?;
@@ -449,6 +503,16 @@ fn compare_live_pcm(
         session.advance(false),
         Err(AudioTranscriptionError::Finished)
     ));
+    session.restore(&before_finish)?;
+    assert!(!session.is_finished());
+    session.finish_input()?;
+    for (index, block) in pending {
+        let result = session
+            .advance(block.restart)?
+            .ok_or("missing replayed LiveASR block")?;
+        compare_live_block(index, &result, block);
+    }
+    assert!(session.is_finished());
     Ok((matched, tokens))
 }
 

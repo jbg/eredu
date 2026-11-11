@@ -10,18 +10,21 @@ pub use eredu_architectures::lfm3::audio::{
     ArtifactError as AudioArtifactError, AudioAdvance, AudioMode, AudioPhase, AudioRequest,
     AudioResidentParameterBytes, AudioSession, AudioSessionError, AudioSnapshot,
     AudioSnapshotError, AudioTranscription, AudioTranscriptionBlock, AudioTranscriptionError,
-    LogMelFeatures, PreparedAudio, ResidentAudioError,
+    AudioTranscriptionSnapshot, LogMelFeatures, PreparedAudio, ResidentAudioError,
 };
 #[cfg(feature = "audio")]
 pub use eredu_architectures::lfm3::audio::{
     AudioIngress, AudioIngressError, AudioIngressProgress, AudioIngressRequest,
-    AudioPcmTranscription,
+    AudioPcmTranscription, AudioPcmTranscriptionSnapshot,
 };
 #[cfg(all(feature = "mlx", feature = "audio"))]
-pub use eredu_backend_mlx::native::{MlxAudioIngress, MlxAudioPcmTranscription};
+pub use eredu_backend_mlx::native::{
+    MlxAudioIngress, MlxAudioPcmTranscription, MlxAudioPcmTranscriptionSnapshot,
+};
 #[cfg(feature = "mlx")]
 pub use eredu_backend_mlx::native::{
     MlxAudioModel, MlxAudioSession, MlxAudioSnapshot, MlxAudioTranscription,
+    MlxAudioTranscriptionSnapshot,
 };
 
 pub use eredu_architectures::voicechat::precision::{SpeechFloat, SpeechPrecision};

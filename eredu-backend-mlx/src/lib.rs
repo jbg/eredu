@@ -48,9 +48,12 @@ pub mod native {
     }
 
     #[cfg(feature = "audio")]
-    pub use crate::composition::lfm3_audio::{MlxAudioIngress, MlxAudioPcmTranscription};
+    pub use crate::composition::lfm3_audio::{
+        MlxAudioIngress, MlxAudioPcmTranscription, MlxAudioPcmTranscriptionSnapshot,
+    };
     pub use crate::composition::lfm3_audio::{
         MlxAudioModel, MlxAudioSession, MlxAudioSnapshot, MlxAudioTranscription,
+        MlxAudioTranscriptionSnapshot,
     };
     pub use crate::composition::moshi::MlxRealtimeExecution;
     use safemlx::Stream;

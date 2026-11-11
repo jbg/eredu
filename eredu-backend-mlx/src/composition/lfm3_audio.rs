@@ -18,13 +18,13 @@ use crate::{MlxTensor, Stream};
 use eredu_architectures::lfm3::audio::{
     AudioAdvance, AudioPhase, AudioRequest, AudioSession, AudioSessionError, AudioSnapshot,
     AudioSnapshotError, AudioTranscription, AudioTranscriptionBlock, AudioTranscriptionError,
-    BindingSource, LogMelFeatures, PreparedAudio, PreparedResidentAudio, ResidentAudio,
-    ResidentAudioBinding, ResidentAudioError,
+    AudioTranscriptionSnapshot, BindingSource, LogMelFeatures, PreparedAudio,
+    PreparedResidentAudio, ResidentAudio, ResidentAudioBinding, ResidentAudioError,
 };
 #[cfg(feature = "audio")]
 use eredu_architectures::lfm3::audio::{
     AudioIngress, AudioIngressError, AudioIngressProgress, AudioIngressRequest,
-    AudioPcmTranscription,
+    AudioPcmTranscription, AudioPcmTranscriptionSnapshot,
 };
 use eredu_core::{
     execution_control::{SnapshotLimits, SnapshotUsage},
@@ -210,7 +210,33 @@ impl MlxAudioIngress {
 /// Controlled live transcription over one resident Audio graph.
 pub struct MlxAudioTranscription(AudioTranscription<MlxNeuralBackend, Binding>);
 
+/// Reusable saved continuation for this LiveASR input mode.
+pub struct MlxAudioTranscriptionSnapshot(AudioTranscriptionSnapshot<MlxNeuralBackend, Binding>);
+
 impl MlxAudioTranscription {
+    /// Configures bounded snapshot and restore.
+    pub fn enable_snapshots(&mut self, limits: SnapshotLimits) -> Result<(), AudioSnapshotError> {
+        self.0.enable_snapshots(limits)
+    }
+
+    /// Reports retained snapshots and cumulative copy work.
+    pub fn snapshot_usage(&self) -> Option<SnapshotUsage> {
+        self.0.snapshot_usage()
+    }
+
+    /// Saves the current settled continuation.
+    pub fn snapshot(&self) -> Result<MlxAudioTranscriptionSnapshot, AudioSnapshotError> {
+        self.0.snapshot().map(MlxAudioTranscriptionSnapshot)
+    }
+
+    /// Restores a saved continuation from this session.
+    pub fn restore(
+        &mut self,
+        saved: &MlxAudioTranscriptionSnapshot,
+    ) -> Result<(), AudioSnapshotError> {
+        self.0.restore(&saved.0)
+    }
+
     /// Maximum mel frames in one block, derived from the checkpoint cadence.
     pub fn frames_per_block(&self) -> usize {
         self.0.frames_per_block()
@@ -237,8 +263,37 @@ impl MlxAudioTranscription {
 #[cfg(feature = "audio")]
 pub struct MlxAudioPcmTranscription(AudioPcmTranscription<MlxNeuralBackend, Binding>);
 
+/// Reusable saved continuation for this LiveASR input mode.
+#[cfg(feature = "audio")]
+pub struct MlxAudioPcmTranscriptionSnapshot(
+    AudioPcmTranscriptionSnapshot<MlxNeuralBackend, Binding>,
+);
+
 #[cfg(feature = "audio")]
 impl MlxAudioPcmTranscription {
+    /// Configures bounded snapshot and restore.
+    pub fn enable_snapshots(&mut self, limits: SnapshotLimits) -> Result<(), AudioSnapshotError> {
+        self.0.enable_snapshots(limits)
+    }
+
+    /// Reports retained snapshots and cumulative copy work.
+    pub fn snapshot_usage(&self) -> Option<SnapshotUsage> {
+        self.0.snapshot_usage()
+    }
+
+    /// Saves the current settled continuation.
+    pub fn snapshot(&self) -> Result<MlxAudioPcmTranscriptionSnapshot, AudioSnapshotError> {
+        self.0.snapshot().map(MlxAudioPcmTranscriptionSnapshot)
+    }
+
+    /// Restores a saved continuation from this session.
+    pub fn restore(
+        &mut self,
+        saved: &MlxAudioPcmTranscriptionSnapshot,
+    ) -> Result<(), AudioSnapshotError> {
+        self.0.restore(&saved.0)
+    }
+
     /// Reports sample capacity before the next block must be advanced.
     pub fn available_samples(&self) -> usize {
         self.0.available_samples()
