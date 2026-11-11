@@ -4336,12 +4336,12 @@ retains original checkpoint and recipe failures; architecture adapters keep thei
 existing diagnostic translation. Family code owns the admission facts being
 validated, including checkpoint naming and source-format policy.
 
-SafeTensors shard-path admission belongs to `eredu-checkpoint`. Model-cache
-snapshots admit payload symlinks into repository-local blobs and the enclosing
-cache's shared `blobs` directory. The shared store does not authorize unrelated
-cache files or other repositories; symlink targets must remain within an admitted
-root after canonicalization, including links through the shared blob directory.
-Index members remain relative paths without parent traversal.
+SafeTensors shard-path admission belongs to `eredu-checkpoint`. Checkpoint
+directories nested in Hugging Face model snapshots admit payload symlinks into
+their repository's `blobs` directory and the enclosing cache's shared `blobs`
+directory. Symlink targets must remain within an admitted root after
+canonicalization, including links through either blob directory. Index members
+remain relative paths without parent traversal.
 
 SafeTensors admission resolves each distinct shard member once and retains one
 checked header, exact index membership, file identity, and tensor catalog per
@@ -5516,8 +5516,8 @@ index mappings, and symlinks outside the admitted checkpoint access root
 therefore fail before a concrete backend can publish any tensor. Neutral stores
 share its index parser and path admission but defer payload-header validation
 until a tensor in that shard is requested, preserving remote-shard skipping.
-Hugging Face snapshot symlinks remain confined to their repository, including
-its sibling `blobs` directory.
+Hugging Face snapshot payloads can also resolve through the cache's admitted
+blob directories.
 
 Portable SafeTensors schemas use released checkpoint names directly. A private
 module spelling that inserts `inner` into an architecture name, such as

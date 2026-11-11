@@ -697,29 +697,36 @@ fn admit_payload(path: &Path, access_roots: &[PathBuf]) -> Result<PathBuf, Safet
 
 fn checkpoint_access_roots(path: &Path) -> Result<Vec<PathBuf>, SafetensorsShardError> {
     let canonical_root = canonicalize(path)?;
-    let Some(snapshots) = canonical_root.parent() else {
-        return Ok(vec![canonical_root]);
-    };
-    if snapshots.file_name().and_then(|name| name.to_str()) != Some("snapshots") {
-        return Ok(vec![canonical_root]);
-    }
-    let Some(repository_root) = snapshots.parent() else {
-        return Ok(vec![canonical_root]);
-    };
-    let mut roots = vec![if repository_root.join("blobs").is_dir() {
-        repository_root.to_path_buf()
-    } else {
-        canonical_root.clone()
-    }];
-    if repository_root
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with("models--"))
-    {
-        if let Some(cache_root) = repository_root.parent() {
-            // Keep this boundary beneath the canonical cache root. Resolving a
-            // symlink at `blobs` must not authorize an unrelated directory.
-            roots.push(cache_root.join("blobs"));
+    let mut roots = vec![canonical_root.clone()];
+    for revision in canonical_root.ancestors() {
+        let Some(snapshots) = revision.parent() else {
+            break;
+        };
+        if snapshots.file_name().and_then(|name| name.to_str()) != Some("snapshots") {
+            continue;
+        }
+        let Some(repository_root) = snapshots.parent() else {
+            continue;
+        };
+        let model_cache = repository_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("models--"));
+        let repository_blobs = repository_root.join("blobs");
+        if revision == canonical_root && repository_blobs.is_dir() {
+            roots.push(repository_root.to_path_buf());
+        } else if model_cache {
+            roots.push(repository_blobs);
+        }
+        if model_cache {
+            if let Some(cache_root) = repository_root.parent() {
+                // Keep the blob roots lexical so a symlink at a blob directory
+                // cannot authorize its destination.
+                roots.push(cache_root.join("blobs"));
+            }
+        }
+        if revision == canonical_root || model_cache {
+            break;
         }
     }
     Ok(roots)
