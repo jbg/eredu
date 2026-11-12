@@ -194,14 +194,31 @@ impl<'a, T: Tensor> OmniPrompt<'a, T> {
         readout: OmniReadout,
         context: &T::Context,
     ) -> Result<Self, Error> {
-        let args = artifact.speech.language.args();
+        Self::from_declarations(
+            &artifact.speech,
+            artifact.tokens,
+            ids,
+            rows,
+            readout,
+            context,
+        )
+    }
+
+    pub(super) fn from_declarations(
+        speech: &PreparedAudio,
+        vision: MediaTokens,
+        ids: &[i32],
+        rows: OmniProjectedRows<'a, T>,
+        readout: OmniReadout,
+        context: &T::Context,
+    ) -> Result<Self, Error> {
+        let args = speech.language.args();
         if ids.iter().any(|&id| !(0..args.vocab_size).contains(&id)) {
             return Err(Error::backend(
                 "Omni prompt contains an out-of-vocabulary token",
             ));
         }
-        let vision = artifact.tokens;
-        let audio = artifact.speech.tokens;
+        let audio = speech.tokens;
         let prompt = ProjectedPrompt::new(
             ids,
             [

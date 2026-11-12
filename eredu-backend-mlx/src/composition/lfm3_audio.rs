@@ -427,6 +427,16 @@ impl MlxAudioModel {
         Ok(MlxAudioSession(self.0.start(request, random)?))
     }
 
+    /// Prefills projected Omni visual rows and speech features into a controlled session.
+    pub fn start_omni(
+        self,
+        request: eredu_architectures::lfm3::audio::OmniAudioRequest<'_, MlxTensor>,
+        seed: u64,
+    ) -> Result<MlxAudioSession, ResidentAudioError> {
+        let random = RandomState::with_seed(seed).map_err(failure)?;
+        Ok(MlxAudioSession(self.0.start_omni(request, random)?))
+    }
+
     /// Prepares the checkpoint's live English transcription session.
     pub fn prepare_live_transcription(
         self,
@@ -873,7 +883,7 @@ impl eredu_architectures::lfm3::audio::AudioLanguage<MlxNeuralBackend, MlxHybrid
 
     fn forward_prompt(
         &mut self,
-        prompt: &eredu_architectures::lfm3::audio::AudioPrompt<'_, MlxTensor>,
+        prompt: eredu_architectures::lfm3::audio::SpeechPrompt<'_, MlxTensor>,
         state: &mut MlxHybridState,
         stream: &Stream,
     ) -> Result<MlxTensor, BackendFailure> {
@@ -887,7 +897,7 @@ impl eredu_architectures::lfm3::audio::AudioLanguage<MlxNeuralBackend, MlxHybrid
         agreed?;
         let epoch = self.next_epoch()?;
         let (hidden, outcome) = self.runtime.forward(
-            lfm3::Lfm3Input::Audio(prompt),
+            prompt.input(),
             state,
             descriptor,
             epoch,

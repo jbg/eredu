@@ -11,7 +11,7 @@ pub use gguf::{
 };
 mod language;
 pub use language::{
-    AudioLanguage, PreparedAudioLanguage, PreparedAudioLanguagePartition,
+    AudioLanguage, PreparedAudioLanguage, PreparedAudioLanguagePartition, SpeechPrompt,
     TensorParallelAudioLanguage,
 };
 mod pipeline;
@@ -44,8 +44,8 @@ pub use resident::{
 };
 pub use resident::{
     AudioRequest, AudioResidentParameterBytes, AudioTranscription, AudioTranscriptionBlock,
-    AudioTranscriptionError, AudioTranscriptionSnapshot, PreparedResidentAudio, ResidentAudio,
-    ResidentAudioBinding, ResidentAudioError, ResidentAudioState,
+    AudioTranscriptionError, AudioTranscriptionSnapshot, OmniAudioRequest, PreparedResidentAudio,
+    ResidentAudio, ResidentAudioBinding, ResidentAudioError, ResidentAudioState,
 };
 pub use schedule::{
     AudioMode, AudioPhase, AudioSchedule, AudioScheduleError, AudioSchedulePolicy, DepthProgress,

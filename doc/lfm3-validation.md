@@ -1566,4 +1566,14 @@ The metadata replay calls `PreparedOmni::open` and
 `prepare_vision(RecipeDtype::BF16)`. It admits both published headers and
 prepares all 16 vision units. Its inputs retain the exact headers and file
 extents with sparse payloads. The replay establishes admission and recipe coverage.
-Mixed-media generation and numerical acceptance are still pending.
+
+The released model and codec payload SHA-256 hashes are
+`76c0ec2c3e27832fb19f886d5eb0afe37f03c5c32c4a796a7ce08cef119d2763` and
+`45984a872fdcf0b94cd0ec68822bbf26f0c6fcb580cfaba0f7fa3ee60355137f`.
+A resident CPU run with F32 materialization projects one image from a
+`(1, 2, 2)` patch grid and encodes eight mel frames. The mixed prompt starts
+the shared speech session with seed 42 and a five-slot budget. It commits
+five twelve-codebook frames and returns 9,600 finite PCM samples at 24 kHz,
+including the codec tail. This run starts from prepared patches and features.
+Raw media preparation through the facade and publisher numerical parity remain
+unverified.

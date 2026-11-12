@@ -19,7 +19,11 @@ use super::{
     AudioDepth, AudioEncoder, AudioExecutionKernel, AudioLanguage, AudioMode, AudioPrompt,
     AudioSampling, AudioSchedulePolicy, AudioSession, AudioSessionError, AudioTokens,
     DepthDeclaration, DepthFrame, EncoderState, PreparedAudio, PreparedAudioCodec,
-    PreparedAudioDepth, PreparedAudioEncoder, PreparedAudioLanguage,
+    PreparedAudioDepth, PreparedAudioEncoder, PreparedAudioLanguage, SpeechPrompt,
+};
+use crate::lfm3::{
+    omni::{OmniProjectedRows, OmniPrompt, OmniReadout, PreparedOmni},
+    vision::MediaTokens,
 };
 use eredu_codec::liquid::{DecoderExecution, DecoderState};
 use eredu_core::{
@@ -116,6 +120,16 @@ pub struct AudioRequest<'a> {
     pub max_slots: usize,
 }
 
+/// Expanded Omni prompt with already projected image and video rows.
+pub struct OmniAudioRequest<'a, T> {
+    /// Shared speech-generation inputs and limits.
+    pub audio: AudioRequest<'a>,
+    /// Image rows in placeholder order.
+    pub image: Option<&'a T>,
+    /// Video rows in placeholder order.
+    pub video: Option<&'a T>,
+}
+
 /// Failure to bind an Audio graph or admit its initial prompt.
 #[derive(Debug, thiserror::Error)]
 pub enum ResidentAudioError {
@@ -150,6 +164,7 @@ pub struct AudioResidentParameterBytes {
 /// Cold F32 Audio parameter and sampling selection.
 pub struct PreparedResidentAudio {
     artifact: PreparedAudio,
+    omni_markers: Option<MediaTokens>,
     sampling: AudioSampling,
     language: PreparedAudioLanguage,
     encoder: PreparedAudioEncoder,
@@ -160,7 +175,19 @@ pub struct PreparedResidentAudio {
 
 impl PreparedResidentAudio {
     /// Retains exact binding recipes and checkpoint sampling settings.
-    pub fn select(mut artifact: PreparedAudio) -> Result<Self, ResidentAudioError> {
+    pub fn select(artifact: PreparedAudio) -> Result<Self, ResidentAudioError> {
+        Self::select_with_markers(artifact, None)
+    }
+
+    /// Selects the Omni speech graph together with its admitted vision markers.
+    pub fn select_omni(artifact: &PreparedOmni) -> Result<Self, ResidentAudioError> {
+        Self::select_with_markers(artifact.speech().clone(), Some(artifact.media_tokens()))
+    }
+
+    fn select_with_markers(
+        mut artifact: PreparedAudio,
+        omni_markers: Option<MediaTokens>,
+    ) -> Result<Self, ResidentAudioError> {
         let sampling = AudioSampling::from_artifact(&artifact)?;
         let [language_scope, encoder_scope, depth_scope, codec_scope] =
             artifact.f32_weight_scopes()?;
@@ -180,6 +207,7 @@ impl PreparedResidentAudio {
         artifact.codec_weights = codec_weights;
         Ok(Self {
             artifact,
+            omni_markers,
             sampling,
             language: language_parameters,
             encoder: encoder_parameters,
@@ -224,6 +252,7 @@ where
     codec: H::Codec,
     binding: H,
     artifact: PreparedAudio,
+    omni_markers: Option<MediaTokens>,
     sampling: AudioSampling,
 }
 
@@ -356,6 +385,7 @@ where
     ) -> Result<Self, ResidentAudioError> {
         let PreparedResidentAudio {
             artifact,
+            omni_markers,
             sampling,
             language,
             encoder,
@@ -374,17 +404,39 @@ where
             codec,
             binding,
             artifact,
+            omni_markers,
             sampling,
         })
     }
 
     /// Prefills a single prompt before returning the shared controlled driver.
     pub fn start(
-        mut self,
+        self,
         request: AudioRequest<'_>,
         random: <H::Sampling as SamplingBackend>::RandomState,
     ) -> Result<AudioSession<Self>, ResidentAudioError> {
+        self.start_with_vision(request, None, random)
+    }
+
+    /// Prefills projected visual rows and encoded speech through the shared Audio session.
+    pub fn start_omni(
+        self,
+        request: OmniAudioRequest<'_, B::Tensor>,
+        random: <H::Sampling as SamplingBackend>::RandomState,
+    ) -> Result<AudioSession<Self>, ResidentAudioError> {
+        self.start_with_vision(request.audio, Some((request.image, request.video)), random)
+    }
+
+    fn start_with_vision(
+        mut self,
+        request: AudioRequest<'_>,
+        vision: Option<(Option<&B::Tensor>, Option<&B::Tensor>)>,
+        random: <H::Sampling as SamplingBackend>::RandomState,
+    ) -> Result<AudioSession<Self>, ResidentAudioError> {
         let preparation = (|| -> Result<_, ResidentAudioError> {
+            if vision.is_some() && self.omni_markers.is_none() {
+                return Err(ResidentAudioError::Prompt);
+            }
             let policy =
                 AudioSchedulePolicy::from_artifact(&self.artifact, request.mode, request.max_slots)
                     .map_err(AudioSessionError::from)?;
@@ -474,12 +526,35 @@ where
         );
         let (schedule, sampling, tokens, speech_input, speech_output, mut language) = preparation?;
         agreement?;
-        let hidden = self.forward_prompt(
-            &mut language,
-            &tokens,
-            speech_input.as_ref(),
-            speech_output.as_ref(),
-        )?;
+        let hidden = if let Some(markers) = self.omni_markers {
+            let (image, video) = vision.unwrap_or_default();
+            let prompt = OmniPrompt::from_declarations(
+                &self.artifact,
+                markers,
+                &tokens,
+                OmniProjectedRows {
+                    image,
+                    video,
+                    audio: speech_input.as_ref(),
+                    feedback: speech_output.as_ref(),
+                },
+                OmniReadout::NormalizedHidden,
+                self.binding.context(),
+            );
+            match prompt {
+                Ok(prompt) => {
+                    self.forward_conditioned(&mut language, Ok(SpeechPrompt::Omni(&prompt)))
+                }
+                Err(error) => self.forward_conditioned(&mut language, Err(failure(error))),
+            }
+        } else {
+            self.forward_prompt(
+                &mut language,
+                &tokens,
+                speech_input.as_ref(),
+                speech_output.as_ref(),
+            )
+        }?;
         let state = ResidentAudioState {
             language,
             hidden,
@@ -526,8 +601,19 @@ where
             input,
             output,
             ctx,
-        )
-        .map_err(failure);
+        );
+        match prompt {
+            Ok(prompt) => self.forward_conditioned(language, Ok(SpeechPrompt::Audio(&prompt))),
+            Err(error) => self.forward_conditioned(language, Err(failure(error))),
+        }
+    }
+
+    fn forward_conditioned(
+        &mut self,
+        language: &mut H::State,
+        prompt: Result<SpeechPrompt<'_, B::Tensor>, BackendFailure>,
+    ) -> Result<B::Tensor, BackendFailure> {
+        let ctx = self.binding.context();
         let agreement = self
             .language
             .agree_audio([0x41554450524f4d, 0, 0, 0, 0, 0, 0, 0], prompt.is_ok());
@@ -535,7 +621,7 @@ where
         agreement?;
         let position = self
             .language
-            .forward_prompt(&prompt, language, ctx)
+            .forward_prompt(prompt, language, ctx)
             .and_then(|hidden| last_position(&hidden, ctx).map_err(failure));
         let agreement = self
             .language
