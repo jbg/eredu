@@ -98,6 +98,14 @@ pub struct AdmittedAudioGguf {
 impl AdmittedAudioGguf {
     /// Opens the two explicitly supplied GGUF files and validates the backbone's rotary companion.
     pub fn open(backbone: &Path, projector: &Path) -> Result<Self, AudioGgufError> {
+        Self::open_multimodal(backbone, projector, None)
+    }
+
+    pub(in crate::lfm3) fn open_multimodal(
+        backbone: &Path,
+        projector: &Path,
+        vision: Option<&super::super::vision::Declaration>,
+    ) -> Result<Self, AudioGgufError> {
         let open = |path| {
             Checkpoint::open_with_representation(
                 path,
@@ -105,7 +113,8 @@ impl AdmittedAudioGguf {
                 QuantizedTensorRepresentation::DecodedF32,
             )
         };
-        let admitted = Self::from_checkpoints(open(backbone)?, open(projector)?)?;
+        let admitted =
+            Self::from_multimodal_checkpoints(open(backbone)?, open(projector)?, vision)?;
         super::super::checkpoint::validate_gguf_rope(
             admitted.backbone(),
             admitted.declaration.args(),
@@ -204,6 +213,7 @@ impl AdmittedAudioGguf {
         &self,
         assets: &mut TextAssets,
         tokens: AudioTokens,
+        omni: bool,
     ) -> Result<(), AudioGgufError> {
         let metadata = self.backbone.metadata();
         let vocabulary = metadata
@@ -276,6 +286,9 @@ impl AdmittedAudioGguf {
             ("asr", "tokenizer.chat_template.asr"),
             ("tts", "tokenizer.chat_template.tts"),
         ] {
+            if omni && name == "asr" {
+                continue;
+            }
             let template = metadata
                 .get(key)
                 .and_then(MetadataValue::as_str)
@@ -338,6 +351,10 @@ impl AdmittedAudioGguf {
                 "audio_repetition_window",
             ),
         ] {
+            if omni && target == "audio_top_k" && !source.contains_key(key) {
+                generation.insert(target.into(), serde_json::Value::Null);
+                continue;
+            }
             let value = source
                 .get(key)
                 .and_then(MetadataValue::as_i64)
