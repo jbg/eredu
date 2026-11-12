@@ -88,6 +88,7 @@ impl PreparedSourceResolutions {
 /// target or extension views therefore cannot multiply reader caches or reopen an
 /// admitted artifact.
 pub struct PreparedModelSources {
+    vl_rank: Option<crate::lfm3::vision::PreparedVlRankGraph>,
     selected: SelectedPreparation,
     inspection: eredu_core::ArtifactInspection<ArtifactArchitecturePlan>,
     graph: PreparedModelSourceGraph,
@@ -106,7 +107,8 @@ pub struct PreparedModelSourceGraph {
     complete: SharedCheckpointSource,
     target: SharedCheckpointSource,
     extension: Option<SharedCheckpointSource>,
-    media: BTreeMap<crate::artifact_preparation::ArtifactSourceRole, SharedCheckpointSource>,
+    component_sources:
+        BTreeMap<crate::artifact_preparation::ArtifactSourceRole, SharedCheckpointSource>,
     resolutions: PreparedSourceResolutions,
     source_metadata: BTreeMap<String, TensorMetadata>,
     retained_construction: Option<crate::prepared_execution::RetainedArchitectureConstruction>,
@@ -775,6 +777,7 @@ impl PreparedModelSources {
                 .selected()
                 .execution()
                 .parallel_topology()
+                .filter(|_| self.vl_rank.is_none())
                 .map(|_| self.selected().execution().clone()),
             target_static: crate::external_assistant::TargetStaticDescription::from_plan(
                 self.architecture(),
@@ -839,8 +842,9 @@ impl PreparedModelSources {
         SelectedPreparation,
         eredu_core::ArtifactInspection<ArtifactArchitecturePlan>,
         PreparedModelSourceGraph,
+        Option<crate::lfm3::vision::PreparedVlRankGraph>,
     ) {
-        (self.selected, self.inspection, self.graph)
+        (self.selected, self.inspection, self.graph, self.vl_rank)
     }
 
     /// Exact prepared source graph paired with the selection.
@@ -990,6 +994,12 @@ impl PreparedModelSourceGraph {
         self.extension.as_ref()
     }
 
+    pub(crate) fn component_sources(
+        &self,
+    ) -> &BTreeMap<crate::artifact_preparation::ArtifactSourceRole, SharedCheckpointSource> {
+        &self.component_sources
+    }
+
     /// Independently projected vision or audio parameters. A missing view does
     /// not prevent text execution and cannot authorize opening another artifact.
     pub fn media_source(
@@ -1004,7 +1014,7 @@ impl PreparedModelSourceGraph {
             eredu_core::InputModality::Audio => ArtifactSourceRole::Audio,
             _ => return None,
         };
-        self.media.get(&role)
+        self.component_sources.get(&role)
     }
 
     /// Exact resolved contracts used to build and project this source graph.
@@ -1117,6 +1127,8 @@ pub fn prepare_model_sources(
             .requirements()
             .architecture_identity()
             .to_owned()
+    } else if let Some(identity) = architecture.lfm3_vl_execution_identity() {
+        identity
     } else {
         match crate::replicated_text::replicated_text_execution_class(&execution_inspection)
             .map_err(|error| PreparedModelSourcesError::InvalidSelection(error.to_string()))?
@@ -1145,7 +1157,7 @@ pub fn prepare_model_sources(
             .and_then(|construction| construction.prediction_source()),
     )?;
 
-    let graph = if let Some(retained) = selected.qwen4_construction() {
+    let mut graph = if let Some(retained) = selected.qwen4_construction() {
         if prediction_extension.is_some() {
             return Err(PreparedModelSourcesError::InvalidSelection(
                 "target-only retained construction cannot consume prediction source roles".into(),
@@ -1170,7 +1182,37 @@ pub fn prepare_model_sources(
             media_projector,
         )
     }?;
+    let mut vl_rank = None;
+    if graph.architecture().model_kind() == crate::ModelKind::Lfm3Vl {
+        let processor = selected.execution().processor().ok_or_else(|| {
+            PreparedModelSourcesError::InvalidSelection(
+                "VL selection omitted processor authority".into(),
+            )
+        })?;
+        let realization = eredu_runtime::SelectedCompositeRealization::from_parts(
+            selected.text_realization().clone(),
+            processor.clone(),
+        );
+        let prepared = crate::lfm3::vision::PreparedVlGraph::from_source_graph(&graph, realization)
+            .map_err(|error| PreparedModelSourcesError::InvalidSelection(error.to_string()))?;
+        if let Some(placement) = &selected.execution().vl_rank {
+            vl_rank = Some(
+                prepared
+                    .bind_rank_with_load_budget(placement.clone())
+                    .map_err(|error| {
+                        PreparedModelSourcesError::InvalidSelection(error.to_string())
+                    })?,
+            );
+        } else {
+            graph.retained_construction = Some(
+                crate::prepared_execution::RetainedArchitectureConstruction::Lfm3Vl(Box::new(
+                    prepared,
+                )),
+            );
+        }
+    }
     Ok(PreparedModelSources {
+        vl_rank,
         selected,
         inspection: execution_inspection,
         graph,
@@ -1416,7 +1458,7 @@ fn prepare_retained_qwen4_sources(
         target,
         complete,
         extension,
-        media,
+        component_sources: media,
         resolutions: PreparedSourceResolutions {
             primary: resolution.clone(),
             target: target_resolution,
@@ -1574,10 +1616,7 @@ fn prepare_ordinary_sources(
             extension.clone(),
         ])?),
     };
-    let media = [ArtifactSourceRole::Vision, ArtifactSourceRole::Audio]
-        .into_iter()
-        .filter_map(|role| bound.roles.remove(&role).map(|source| (role, source)))
-        .collect();
+    let component_sources = bound.roles;
     let primary_resolution = declarations.artifacts()[&PhysicalArtifactId::Primary]
         .resolution()
         .clone();
@@ -1609,7 +1648,7 @@ fn prepare_ordinary_sources(
         complete,
         target,
         extension,
-        media,
+        component_sources,
         resolutions: PreparedSourceResolutions {
             primary: primary_resolution,
             target: target_resolution,

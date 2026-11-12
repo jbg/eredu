@@ -587,12 +587,16 @@ fn compare_logit_row(
 
 fn top_indices(values: &[f32], count: usize) -> Vec<usize> {
     let mut indexes = (0..values.len()).collect::<Vec<_>>();
-    indexes.sort_by(|left, right| {
+    let rank = |left: &usize, right: &usize| {
         values[*right]
             .total_cmp(&values[*left])
             .then_with(|| left.cmp(right))
-    });
-    indexes.truncate(count);
+    };
+    if count < indexes.len() {
+        indexes.select_nth_unstable_by(count, rank);
+        indexes.truncate(count);
+    }
+    indexes.sort_unstable_by(rank);
     indexes
 }
 

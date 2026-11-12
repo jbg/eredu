@@ -684,6 +684,11 @@ impl Checkpoint {
         })
     }
 
+    /// Whether this catalog admits reads from its local payload members.
+    pub fn has_payload_access(&self) -> bool {
+        self.payload_access
+    }
+
     fn require_payload_access(&self) -> Result<()> {
         if !self.payload_access {
             return Err(Error::InvalidHeader(

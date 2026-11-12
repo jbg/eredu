@@ -2,6 +2,8 @@
 mod audio;
 mod common;
 mod decisions;
+#[cfg(feature = "vision")]
+mod media;
 mod memory;
 #[cfg(feature = "realtime")]
 mod realtime;
@@ -430,6 +432,10 @@ struct Cli {
     /// Read choice/noul/score questions and evidence from JSON; '-' reads stdin.
     #[arg(long, value_name = "PATH", conflicts_with_all = ["prompt", "raw", "tools", "draft_model", "mirostat_v2", "temperature", "top_p", "top_k", "min_p", "repeat_penalty", "repeat_last_n", "frequency_penalty", "presence_penalty", "max_tokens", "stop_sequences", "thinking", "reasoning_effort", "expert_cache_benchmark", "memory_report", "estimate_memory_tokens", "telemetry_json", "memory_budget_bytes", "memory_policy", "memory_reserve_bytes", "speculative_draft_tokens"])]
     decisions: Option<PathBuf>,
+
+    #[cfg(feature = "vision")]
+    #[command(flatten)]
+    media: media::MediaArgs,
 
     /// Pass the prompt directly instead of applying the model's chat template.
     #[arg(long)]
@@ -2374,6 +2380,7 @@ fn main() -> Result<()> {
         .map(read_tools)
         .transpose()?
         .unwrap_or_default();
+    let mut media_input = None;
     let (prepared_chat, rendered_prompt, add_special_tokens) = if args.raw {
         (None, prompt, true)
     } else {
@@ -2400,7 +2407,18 @@ fn main() -> Result<()> {
             add_generation_prompt: true,
             ..ChatTemplateRequest::default()
         };
-        match model.prepare_chat(request) {
+        #[cfg(feature = "vision")]
+        let media_chat = args.media.prepare(&mut model, &request, &prompt)?;
+        #[cfg(not(feature = "vision"))]
+        let media_chat: Option<eredu::api::PreparedChatRequest<_>> = None;
+        let prepared = if let Some(prepared) = media_chat {
+            let (chat, payload) = prepared.into_parts();
+            media_input = Some(payload);
+            Ok(chat)
+        } else {
+            model.prepare_chat(request)
+        };
+        match prepared {
             Ok(prepared) => {
                 let semantic = use_semantic_generation(
                     prepared.semantic_support(),
@@ -2440,8 +2458,17 @@ fn main() -> Result<()> {
         }
     };
 
-    let prompt_token_ids = model.encode(&rendered_prompt, add_special_tokens)?;
-    if prompt_token_ids.is_empty() {
+    let (prompt_token_ids, prompt_positions) = if let Some(payload) = &media_input {
+        (
+            Vec::new(),
+            usize::try_from(payload.count().model_positions)?,
+        )
+    } else {
+        let ids = model.encode(&rendered_prompt, add_special_tokens)?;
+        let positions = ids.len();
+        (ids, positions)
+    };
+    if prompt_positions == 0 {
         bail!("the prompt produced no input tokens");
     }
     let settings = PreparedChatGenerationSettings {
@@ -2506,7 +2533,10 @@ fn main() -> Result<()> {
         let cancel_on_error = cancellation.clone();
         let request = GenerationRequest {
             control_handle: None,
-            input: PreparedChatInput::rendered_prompt(prepared),
+            input: match media_input.take() {
+                Some(payload) => payload.into_input(&model, prepared)?,
+                None => PreparedChatInput::rendered_prompt(prepared),
+            },
             output_mode: if semantic {
                 eredu::api::OutputMode::Semantic
             } else {
@@ -2641,9 +2671,9 @@ fn main() -> Result<()> {
             .expect("verbose execution collected allocator telemetry");
         eprintln!(
             "model_family: {}, effective_model_type: {}, prompt_tokens: {}, generated_tokens: {}",
+            model.model_family().canonical_name(),
             model.effective_model_type(),
-            model.effective_model_type(),
-            prompt_token_ids.len(),
+            prompt_positions,
             output_ids.len(),
         );
         write_timing_report(
@@ -2787,7 +2817,7 @@ fn main() -> Result<()> {
             plan_explanation: Some(plan_explanation),
             hardware: hardware_profile,
             resources: resource_profile,
-            prompt_tokens: prompt_token_ids.len(),
+            prompt_tokens: prompt_positions,
             generated_tokens: output_ids.len(),
             stop_reason: stop_reason.label().into(),
             timing: TimingTelemetry::new(
@@ -2939,6 +2969,9 @@ fn print_expert_benchmark_result(label: &str, sample: LocalExpertCacheBenchmarkS
 }
 
 fn validate_args(args: &Cli) -> Result<()> {
+    #[cfg(feature = "vision")]
+    args.media.validate(args.auto)?;
+
     if args.decisions.is_some() && matches!(args.auto, Some(AutoMode::Benchmark)) {
         bail!("--decisions supports --auto quick, --auto plan or --no-auto; generation benchmarks do not measure decision reads");
     }

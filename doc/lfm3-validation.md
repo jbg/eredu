@@ -6,6 +6,8 @@ per-head sigmoid gates, separate rotary policies, and sandwich normalization bef
 residual addition. Global rotary pairs retain full-head frequency spacing and
 rotate the highest-frequency half. Rotary tables are computed in F32 and stored
 in the activation dtype. The products and sums use F32 before the final cast.
+The causal convolution uses four-lane FP32 tap accumulation and rounds its
+affine output once. Carry stays in the activation dtype.
 
 Resident, host-layerwise and disk-streamed execution use independently leased decoder
 layers. TP/PP construction consumes the same declaration and local state geometry.
@@ -13,13 +15,10 @@ Ordinary and controlled text generation use the shared drivers. The existing tag
 tool dialect consumes the released template's function/parameter tags; the LFM2
 Python-call dialect does not describe this template.
 
-The public LFM3 route supports text. Vision has standalone neural components.
-The Audio architecture admits the complete floating checkpoint and its codec
-companion and supports resident mixed-input traversal. Both this path and
-standalone LiquidCodec have independent F32 reference acceptance. The explicit
-resident Audio session exposes controlled text and speech events. Public
-vision/video generation, omni and d1 decision execution remain unimplemented. The generic GGUF reader does not
-admit published NVFP4 encoding.
+The public LFM3 generation routes cover text and single-device VL
+SafeTensors. VL accepts images and video through the Rust facade and the
+ordinary CLI. The Audio route admits SafeTensors and GGUF with retained
+codec assets and exposes controlled text and speech events.
 
 ## Released SafeTensors evidence
 
@@ -126,10 +125,18 @@ native tool grammar activation and decoded semantic events, not model tool quali
 
 `lfm3::vision` contains the released encoder's linear patchifier, gated spatial
 depthwise-convolution blocks, frame-local bidirectional GQA blocks with axial RoPE,
-and LayerNorm/spatial-merge/GELU projector. Each encoder layer and the input/output
-units is constructible independently. The host patch-packing utility accepts
-already normalized frames; it duplicates still images across temporal slots and
-repeats the last frame when a video ends with an incomplete temporal patch.
+and LayerNorm/spatial-merge/GELU projector. The projector's two affine layers
+accumulate the dot product and add bias before rounding to the activation dtype.
+For BF16 input, projector LayerNorm runs in FP32 and rounds its affine output
+once to BF16.
+The BF16 spatial mixer accumulates convolution products in F32 and rounds the
+convolution output to BF16 before applying its output gate.
+BF16 frame attention rounds query-key products, scaled scores and softmax
+probabilities to BF16, with softmax computed in F32.
+Each encoder layer and each input/output unit is constructible independently.
+The host patch-packing utility accepts already normalized frames. It duplicates
+still images across temporal slots and repeats the last frame when a video ends
+with an incomplete temporal patch.
 
 `validation/fixtures/lfm3/vision-sources.json` pins the VL instruction checkpoint,
 its complete weight hash and the publisher source-file hashes. The reference
@@ -161,10 +168,745 @@ publisher Python code. The native runner validates source geometry and checks th
 derived F32 weight hash before comparing values. Payloads and detailed outputs
 remain outside the checkout.
 
-These components have no public VL task admission, conditional text composition,
-GGUF admission, selected memory/residency reports, TP/PP construction or controlled
-media-session integration. No corresponding support is advertised by their
-existence or by encoder/projector comparison.
+### Mixed image and video conditioning
+
+The released VL SafeTensors artifact admits its nested language weights and
+vision units together. The shared decoder replaces the expanded image and
+video markers with projected rows. Media delimiters and the tokens between
+video frame groups keep their ordinary embeddings.
+
+The CPU reference case uses the released checkpoint widened to F32. It
+combines the rectangular image and odd-length clip above in one 30-token
+prompt. All 30 prefill rows and eight cached rows cover the full 128,000-token
+vocabulary and pass the preset `5e-4` absolute tolerance. The eight greedy
+IDs match exactly and are `[334, 34, 334, 34, 334, 34, 334, 34]`.
+
+| Scores | Maximum absolute error | Relative L2 |
+| --- | ---: | ---: |
+| Prefill | `2.205e-4` | `6.140e-6` |
+| Eight cached rows, worst per measure | `4.363e-5` | `2.462e-6` |
+
+```sh
+HF_HOME=/private/tmp/lfm3-hf python validation/lfm3_vision_reference.py \
+  /private/tmp/lfm3-vl-source /private/tmp/lfm3-vl-conditional --conditional
+cargo run -p eredu-backend-mlx --no-default-features --features image --example lfm3_vision_reference -- \
+  /private/tmp/lfm3-vl-source /private/tmp/lfm3-vl-conditional \
+  /private/tmp/lfm3-vl-conditional/eredu-cpu.json --released-checkpoint
+```
+
+The 30-token fixture starts with already sized RGB frames and explicitly
+expanded token IDs. The same command also replays a raw image and a seven-frame
+video at 6 fps. That fixture uses the shared native media preparation path for
+checkpoint-default resizing, frame sampling, and timestamp tokenization. The
+runner passes the prepared media through the ordinary opaque MLX prompt and
+checks that the owned VL cursor retains its semantic cache identity. The native
+decoder prefills the expanded prompt in 17-token chunks. The runner compares
+the concatenated vocabulary rows against the publisher's full prefill, then
+compares eight cached decode steps and their greedy IDs.
+
+The raw fixture samples four frames, expands to 97 tokens, and matches the
+publisher's patch grids, normalized patch values, and token IDs exactly.
+All eight cached score rows pass, with maximum absolute error `5.627e-5` and
+greedy ID `954` at each step. The full prefill comparison exceeds the preset
+`5e-4` tolerance with maximum absolute error `2.816e-3` and relative L2
+`3.080e-5`. The rows above tolerance are inside the image span. Substituting
+the publisher's projected rows in a diagnostic run reduces the maximum prefill
+error to `4.683e-4`, isolating the gap to the decoder's sensitivity to projection
+differences. The raw fixture remains an open numerical acceptance case.
+
+The raw fixture uses resident execution with SafeTensors widened to F32.
+With `--component-graph --device gpu` and `MLX_ENABLE_TF32=0`, the same
+raw fixture matches patches, grids and tokens on Metal. Its prefill error is
+`2.238e-3` and its maximum cached-row error is `1.140e-4`. All eight greedy
+IDs match. The pre-sized prefill in the same run passes at `3.765e-4`.
+
+On CPU, the raw F32 fixture has maximum prefill error `2.820e-3` and maximum
+cached-row error `3.731e-5`. All eight greedy IDs match. With publisher media
+rows, the CPU decoder's maximum prefill error is `3.763e-4`. In the Metal
+image tower, the first numerical difference is at the patch projection
+(`5.722e-6` maximum, `6.954e-7` relative L2). The final tower output has
+relative L2 error `4.659e-6`.
+
+With publisher patchifier rows, the Metal F32 image projection has maximum
+error `2.623e-6` and the raw decoder prefill has maximum error `4.035e-3`.
+Substituting patchifier rows accumulated in FP64 and rounded to F32 gives
+`4.292e-6` and `2.880e-3`, respectively. Both replays match all eight greedy IDs.
+
+The pre-sized fixture also runs through the shared host-layerwise and
+disk-streamed weight policies for both the vision tower and the decoder. All
+three modes produce identical comparison results for vision components, all 30
+prefill rows, eight cached rows, and the greedy IDs.
+
+| Weight policy | Peak vision device parameter bytes | Peak decoder device parameter bytes |
+| --- | ---: | ---: |
+| Resident | 757,521,408 | 6,915,206,144 |
+| Host-layerwise | 100,696,064 | 1,304,526,848 |
+| Disk-streamed | 148,975,616 | 1,560,469,504 |
+
+The disk run admits 16 vision units and 24 decoder blocks from the retained
+checkpoint. Joint preparation binds those units through the portable VL
+component graph and projects them to the two executors. Decoder peak bytes
+include pinned parameters. The figures report
+logical device parameter residency and exclude activation and cache allocations.
+Cold selection reports the sum of the vision and decoder device parameter
+requirements. On this fixture that sum matches the two policy peaks in each mode.
+Adding `--controlled-vision` cancels the first tower pass after the patchifier
+and first encoder block, restarts on the same weight policy, and steps through
+each remaining tower invocation one unit at a time. The released pre-sized
+fixture yields identical comparison results to uninterrupted execution.
+
+```sh
+for mode in resident host disk; do
+  cargo run -p eredu-backend-mlx --no-default-features --example lfm3_vision_reference -- \
+    /private/tmp/lfm3-vl-source /private/tmp/lfm3-vl-conditional \
+    "/private/tmp/lfm3-vl-conditional/eredu-${mode}.json" \
+    --released-checkpoint --pre-sized-only --residency "$mode"
+done
+```
+
+Use `--component-graph` in place of `--pre-sized-only` to replay the same
+checkpoint through one shared weight policy and the portable VL kernel. This
+route projects the pre-sized image and video, then runs the conditioned
+prefill and eight cached decoder steps through the same graph. On CPU, the
+maximum absolute errors are `5.514e-7` for projected rows, `2.205e-4` for
+prefill scores, and `4.363e-5` for cached scores. All eight greedy IDs match.
+Resident, host-layerwise, and disk-streamed runs produce identical comparison
+results. The combined policy peaks at 7,672,727,552, 1,304,526,848, and
+1,560,469,504 device parameter bytes, respectively.
+With the `image` feature and the raw fixture, `--component-graph` also
+replays processor output through the retained VL cursor. Each media projection
+and decoder prefix uses the same graph and request state as cached decode.
+The combined route reproduces the raw fixture's patch, prompt, score, and
+token comparisons, including the prefill tolerance gap.
+The CPU replay also reproduces those comparisons after forks following the
+first media step and first decoder prefix.
+Pass `--pre-sized-only` to limit this route to the accepted pre-sized fixture.
+
+Cold inspection of the same SafeTensors revision resolves all 424 physical
+tensors (3,836,363,776 encoded bytes) to 40 execution units and their pinned
+resources. The 24 decoder state slots exclude the vision tower. The tied
+embedding supplies the vocabulary head. Shared processor selection accepts
+raw video with frame sampling and rejects that request when sampling is absent.
+
+The selected CPU MLX graph binds the original BF16 SafeTensors with
+host-layerwise weight residency and device state. A binding smoke check
+produces finite image projections of shape `[6, 2048]` and text logits of
+shape `[1, 2, 128000]`. The image projection is identical for F32 processor
+patches and explicitly BF16 patches after the patchifier's input cast.
+
+An explicitly prepared MLX model session uses the original BF16 SafeTensors
+on Metal with `MLX_ENABLE_TF32=0`, host-layerwise weights and device state.
+The smoke request interleaves IDs `[124894, 5]`, one 64 × 64 RGB image, a
+seven-frame 6 FPS RGB clip with all frames selected, and IDs `[25, 53]`.
+Each clip frame is uniformly filled with the value `27 * (frame_index + 1)`,
+and the image is the first frame. With decoder chunks bounded at 17 tokens,
+ordinary and controlled generation both emit greedy IDs `[24, 22]`. The
+controlled run reports eleven prefill advances. The smoke measures agreement
+between the two Eredu entry points.
+
+The Rust facade also selects the same released checkpoint through
+`LoadedModel::load_execution_plan` with host-layerwise weights and the
+`image` feature. The publisher's template renders a user turn containing
+“Describe the color in this image and video.” followed by the same decoded
+image and clip, with thinking disabled and the assistant suffix enabled.
+Typed preparation reports 54 text tokens, 80 media positions and 134 total
+decoder positions. On Metal, ordinary and controlled generation both emit
+greedy IDs `[597, 4145]` with a 17-token prefill chunk bound. Controlled
+generation reports 14 advances. A resident controlled run on Metal takes
+budgeted snapshots before ingress, after the first media advance, and after
+the first 17-position decoder prefix. It forks from the initial and decoder
+boundaries and restores the media boundary. The restored and forked runs
+both emit `[597, 4145]`. The fourth snapshot is rejected at the three-snapshot
+limit without changing usage. Releasing all handles returns retained usage to
+zero while cumulative copy usage stays at 41,535,745 bytes.
+
+A resident `LoadedModel::load` run selects
+raw image input explicitly and uses the first frame with “Describe the
+image.” It reports 17 text tokens and 64 media positions, retains the
+explicitly disabled parameter-conversion policy, and emits `[597, 4145]`.
+
+The ordinary CLI accepts the same user turn through `--image`,
+`--video-frames`, and `--video-fps 6`. The resident Metal smoke uses JPEG for
+the still and PNG for the clip frames. Checkpoint-default frame sampling
+produces a 110-position prompt. With thinking off, temperature zero, and a
+two-token limit, the CLI emits `The image` with explicit resident placement
+and with the default quick planner.
+
+The pre-sized fixture also passes with a two-rank CPU Ring decoder and a
+replicated vision tower. Both ranks produce the same comparison results and
+greedy IDs. The maximum absolute errors against the publisher are
+`2.069e-4` for prefill and `5.162e-5` over the eight cached steps. Each rank
+reports 3,458,006,016 decoder and 757,521,408 vision device parameter bytes.
+
+```sh
+cargo build -p eredu-backend-mlx --no-default-features --example lfm3_vision_reference
+printf '%s\n' '[["127.0.0.1:53101"],["127.0.0.1:53102"]]' > /private/tmp/lfm3-vl-ring.json
+for rank in 0 1; do
+  MLX_HOSTFILE=/private/tmp/lfm3-vl-ring.json MLX_RANK="$rank" \
+    target/debug/examples/lfm3_vision_reference /private/tmp/lfm3-vl-source \
+      /private/tmp/lfm3-vl-conditional "/private/tmp/lfm3-vl-tp-rank-${rank}.json" \
+      --released-checkpoint --pre-sized-only --tensor-cohort &
+done
+wait
+```
+
+The same pre-sized fixture passes with two CPU Ring pipeline stages and either
+one or two tensor ranks per stage. Three consecutive combined TP/PP replays
+pass on all four ranks with fresh loopback ports. Every rank matches the
+reference's eight greedy token IDs, and the full-vocabulary prefill and eight
+cached score comparisons pass at an absolute tolerance of `5e-4`. The
+pipeline replay limits vocabulary publication to 256 positions per pass and
+replicates the vision tower on each rank.
+
+| Decoder topology | Maximum prefill error | Maximum cached error | Device decoder parameter bytes by stage per rank |
+| --- | ---: | ---: | --- |
+| TP=1, PP=2 | `2.205e-4` | `4.363e-5` | 3,994,432,512 / 3,969,349,632 |
+| TP=2, PP=2 | `2.069e-4` | `5.162e-5` | 1,997,415,424 / 1,984,878,592 |
+
+To replay PP=2, add `--pipeline-stages 2` to the Ring command. Use two
+hostfile entries for TP=1 and four distinct loopback entries for TP=2.
+Each rank writes its own result file.
+
+The released Ring runs exercise the low-level decoder route with replicated
+vision. Public VL loading selects single-device SafeTensors execution.
+
+### Native BF16 vision-language scores
+
+The conditional reference exporter uses the pinned publisher implementation
+with the original BF16 weights. The Eredu runner selects the same precision
+from the reference manifest, binds the combined VL graph, and converts score
+values to F32 for comparison. The F32 replay remains a separate measurement.
+
+On Metal with `MLX_ENABLE_TF32=0`, all eight greedy IDs match in both fixtures.
+The raw fixture also matches grids, patches, and expanded prompt IDs exactly.
+The score differences exceed the fixture's unchanged `5e-4` threshold.
+
+| BF16 fixture | Maximum prefill error | Relative L2, prefill | Maximum cached-row error |
+| --- | ---: | ---: | ---: |
+| Pre-sized, 30 positions | 0.8125 | 0.0239272 | 0.375 |
+| Raw, 97 positions | 7.3125 | 0.0951709 | 0.296875 |
+
+The pre-sized image and video projected rows each differ by at most
+`1.953e-3`, with relative L2 of `0.0081800`. Substituting publisher BF16
+projections in the pre-sized prompt reduces the decoder prefill maximum
+to `0.28125` and the cached maximum to `0.1875`. The remaining difference
+is downstream of projection. The publisher reference uses PyTorch 2.15.0
+and Transformers 5.22.2 on CPU.
+In the raw image tower, the patchifier, first mixer input projection and gated
+convolution input match exactly. The first spatial convolution differs in two
+of 286,720 outputs, with maximum error `5.960e-8`. The first four complete
+blocks match exactly. The fifth block's Q, K and V projections match exactly,
+with one mismatch each after Q and K RMS normalization. The rotary outputs
+have five Q mismatches and three K mismatches. With Eredu's rotated Q and K
+and projected V, the publisher attention reproduces Eredu's value mix exactly.
+The tower output has relative L2 error `0.0127496`. The diagnostic uses the
+publisher's `from_pretrained` BF16 loader, which preserves the axial rotary
+frequency buffer in F32.
+
+On the raw image, the Metal rotary tables differ from the publisher tables
+by at most `1.192e-7`.
+
+The component-graph replay also compares projected rows for the raw image and
+video, including the admitted frame-pair boundaries. The publisher export
+records these rows directly from the conditional model's output. BF16 projected
+rows have maximum error `0.0126953` and relative L2 `0.0246280` for the image.
+The BF16 video projection matches exactly.
+F32 projected rows meet tolerance, with maximum error `6.109e-6` for the image
+and `5.923e-7` for the video.
+
+```sh
+HF_HOME=/private/tmp/lfm3-hf python validation/lfm3_vision_reference.py \
+  /private/tmp/lfm3-vl-source /private/tmp/lfm3-vl-bf16 --conditional --dtype bfloat16
+cargo build -p eredu-backend-mlx --no-default-features --features image,metal \
+  --example lfm3_vision_reference
+MLX_ENABLE_TF32=0 target/debug/examples/lfm3_vision_reference \
+  /private/tmp/lfm3-vl-source /private/tmp/lfm3-vl-bf16 \
+  /private/tmp/lfm3-vl-bf16/eredu-metal.json --released-checkpoint --component-graph --device gpu
+```
+
+### Matched raw prefill schedules
+
+The raw fixture can also use 17-position cached prefixes in both the publisher
+and Eredu. The publisher replay reuses its own projected rows and placeholder
+admission, then runs each prefix through its decoder with the preceding cache.
+The fixture records the chunk size, which the native runner uses for the same
+prefix boundaries.
+
+| Precision | Publisher full vs. chunked, max prefill / cached error | Eredu Metal vs. publisher, matched chunks, max prefill / cached error |
+| --- | ---: | ---: |
+| F32 | 0 / 0 | `2.238e-3` / `1.140e-4` |
+| BF16 | `0.2555542` / `0.15625` | `7.375` / `0.3203125` |
+
+All eight greedy IDs match in each comparison. The BF16 matched-chunk
+prefill relative L2 error is `0.0945140`. The score gap persists when the
+prefill schedules match.
+
+The `--publisher-raw-projections` option runs the raw decoder with publisher
+image rows, publisher video rows, and both. Each replay uses the same native
+prefix boundaries as the ordinary replay. They compare the full vocabulary and
+eight cached steps using the publisher's preceding token IDs. Eredu's greedy
+sequence advances on its own state after a divergence. The report locates each
+nonzero maximum error in tensor coordinates. Score coordinates are batch,
+prompt position and vocabulary ID.
+All eight greedy IDs match for both precisions.
+
+The replay reports the shared checkpoint logit profile for every prefill and
+cached score row. It requires relative L2 at most `0.02`, cosine at least
+`0.999`, at least four shared top-five IDs, and agreement when the reference
+argmax is unambiguous. The overall acceptance result still uses the fixture's
+`5e-4` absolute threshold and greedy sequence agreement.
+
+| Precise Metal replay | Prefill rows meeting logit profile | Cached rows meeting logit profile | Worst prefill relative L2 |
+| --- | ---: | ---: | ---: |
+| F32 raw | 97/97 | 8/8 | `2.031e-4` |
+| BF16 pre-sized | 11/30 | 2/8 | `0.047498` |
+| BF16 raw, matched chunks | 12/97 | 5/8 | `0.456681` |
+| BF16 raw with publisher media, matched chunks | 82/97 | 5/8 | `0.034560` |
+
+All F32 raw rows agree on the argmax and the full top-five set. In the BF16 raw
+replay, the prefill argmax agrees on 80 of 97 rows with Eredu media and 96 of 97
+rows with publisher media.
+
+| Precision | Eredu media, max prefill / cached error | Publisher media, max prefill / cached error |
+| --- | ---: | ---: |
+| F32 | `2.238e-3` / `1.140e-4` | `4.520e-4` / `3.219e-5` |
+| BF16, matched chunks | `7.375` / `0.3203125` | `0.3046875` / `0.25390625` |
+
+With publisher media rows, F32 decoder scores meet the `5e-4` threshold.
+Publisher image rows alone meet it with maximum prefill and cached errors
+`4.520e-4` and `3.654e-5`. With publisher video rows alone, the prefill maximum
+is `2.238e-3` at image position 8 and vocabulary ID 3118.
+In BF16, substituting the video leaves every reported score and greedy ID
+unchanged. Substituting the image alone yields the same result as substituting
+both modalities. The decoder still exceeds tolerance, with its maximum at
+image-token position 69 and vocabulary ID 1931.
+
+For the BF16 decoder, the four-lane FP32 convolution matches all 3,514,368
+convolution outputs in the publisher's matched-chunk trace. This includes the
+first output of the final chunk at position 85, where sequential FP32
+accumulation differs by one BF16 step. The convolution carry matches exactly.
+
+With publisher media rows, the first ten BF16 decoder layers match exactly on
+Metal. The first mismatch is one normalized query element at position 68 in
+the eleventh layer. Cache keys, values and mask visibility match for that chunk.
+The publisher's attention reproduces Eredu's value mix exactly when given the
+Eredu query. The next convolution propagates the difference to position 69.
+
+An isolated eight-lane FP32 reduction reproduces all 272 publisher query-head
+variances in the affected chunk. Using that reduction for BF16 query/key RMS
+on Metal gives decoder-only prefill relative L2 `0.0104584` and maximum error
+`0.375`. The ordinary Metal replay measures `0.0111874` and `0.3046875`,
+respectively.
+
+```sh
+HF_HOME=/private/tmp/lfm3-hf python validation/lfm3_vision_reference.py \
+  /private/tmp/lfm3-vl-source /private/tmp/lfm3-vl-bf16-chunk17 \
+  --conditional --dtype bfloat16 --raw-prefill-chunk 17
+MLX_ENABLE_TF32=0 target/debug/examples/lfm3_vision_reference \
+  /private/tmp/lfm3-vl-source /private/tmp/lfm3-vl-bf16-chunk17 \
+  /private/tmp/lfm3-vl-bf16-chunk17/eredu-metal.json \
+  --released-checkpoint --component-graph --device gpu --publisher-raw-projections
+```
+
+Use `--dtype float32` and a separate output directory for the F32 replay.
+
+### VL GGUF media projector
+
+The [pinned GGUF revision](https://huggingface.co/LiquidAI/LFM3-VL-2B-GGUF/tree/1add221a5ea6c047fcf1eaaf2d247939d7cf8849)
+publishes BF16, F16 and Q8_0 media projectors. The portable catalog check
+resolves all 139 descriptors in each projector. The two temporal patch
+kernels use F16 in every variant. Depthwise kernels, normalization weights and
+biases use F32. The other matrices use the named encoding.
+
+The source manifest records the exact descriptor prefix, declared file size
+and publisher payload hashes. The check verifies the prefix and declared
+tensor ranges. Public VL generation currently selects SafeTensors.
+
+The standalone vision graph accepts a retained GGUF projector through
+`PreparedVisionExecution::new_gguf`. Its 16 vision units bind 138 canonical
+weights from 139 physical tensors. The patchifier stacks the two F16 kernels
+along time inside each channel before flattening. The remaining bindings use
+the declared tensor geometry and requested floating dtype. Q8_0 matrices
+decode through bounded portable leases.
+
+```sh
+manifest=validation/fixtures/lfm3/vision-gguf-sources.json
+headers=/private/tmp/lfm3-vl-projector-headers
+mkdir -p "$headers"
+repo=$(jq -r .repository "$manifest")
+revision=$(jq -r .revision "$manifest")
+jq -r '(.projectors[], .backbones[]) | [.file, .header_bytes] | @tsv' "$manifest" |
+  while IFS="$(printf '\t')" read -r member bytes; do
+    curl -fsSL --range "0-$((bytes - 1))" --max-filesize "$bytes" \
+      "https://huggingface.co/$repo/resolve/$revision/$member?header=$bytes" \
+      -o "$headers/$member.header"
+  done
+cargo run -p eredu-architectures --example inspect_lfm3_vl_gguf_headers -- \
+  "$manifest" "$headers" /private/tmp/lfm3-vl-source/config.json
+```
+
+Supply the downloaded projector as a fourth argument to verify its full
+publisher hash, canonical binding shapes and all bounded payload reads.
+All three released payloads pass these checks.
+
+All eight published backbone headers resolve 424 VL graph bindings with
+the F16 projector. QAD-Q4_0 has its own file and publisher digest.
+The NVFP4 header contains 431 physical tensors, including 72 FFN matrices
+in GGML type 40 and 144 F32 scale companions.
+
+The Metal component replay accepts `--gguf-projector` with the same F32
+SafeTensors reference fixture shown above. With F32 execution, BF16 and F16
+GGUF projectors meet the component tolerance for all three cases. Their
+maximum projected-row errors are `1.114e-6` and `1.138e-6` respectively.
+Q8_0 resident, host-layerwise and disk-streamed runs produce identical
+comparison metrics, with maximum projected-row error `3.909e-3` against
+the widened SafeTensors reference. Controlled disk-streamed execution, including
+cancellation after the first encoder block, produces the same metrics. Q8_0
+same-artifact acceptance remains open.
+
+```sh
+MLX_ENABLE_TF32=0 target/debug/examples/lfm3_vision_reference \
+  /private/tmp/lfm3-vl-reference/f32-component /private/tmp/lfm3-vl-reference \
+  /private/tmp/lfm3-vl-reference/gguf-projector-metal.json --device gpu \
+  --gguf-projector "$headers/mmproj-LFM3-VL-2B-BF16.gguf"
+```
+
+### VL GGUF paired execution
+
+`PreparedVisionLanguage::open_gguf` admits the GGUF decoder and media projector
+with the publisher's VL configuration and processor assets. It checks the
+backbone geometry against the supplied configuration and validates the rotary
+companion before retaining the sources. Both sources feed the shared VL
+component graph. The graph decodes GGUF weights into F32 for this replay.
+
+On precise Metal, the pinned Q4_K_M backbone and Q8_0 projector run the
+pre-sized and raw image/video fixtures through prefill and eight cached steps.
+The raw grids, patches and expanded prompt IDs match the publisher fixture.
+The resident graph peaks at `7,672,727,552` device parameter bytes. Its raw
+greedy continuation is `[334, 34, 334, 34, 334, 34, 334, 34]`.
+Host-layerwise replay with `--residency host --pre-sized-only` peaks at
+`1,304,526,848` device parameter bytes across two simultaneously resident units.
+Its pre-sized prefill and cached score metrics and greedy IDs match the
+resident report.
+The comparison fixture uses widened SafeTensors, so the score comparison
+measures differences across encodings. The pre-sized same-artifact comparison
+below measures the numerical gap against llama.cpp.
+
+```sh
+MLX_ENABLE_TF32=0 target/debug/examples/lfm3_vision_reference \
+  /private/tmp/lfm3-vl-source /private/tmp/lfm3-vl-raw \
+  /private/tmp/lfm3-vl-raw/gguf-pair-metal.json --device gpu --component-graph \
+  --gguf-backbone "$headers/LFM3-VL-2B-Q4_K_M.gguf" \
+  --gguf-projector "$headers/mmproj-LFM3-VL-2B-Q8_0.gguf"
+```
+
+The first directory can contain just the pinned `config.json`,
+`processor_config.json` and `tokenizer.json` files. The replay verifies both
+GGUF payload hashes against the manifest.
+
+The public loader recognizes the VL GGUF backbone and requires its projector
+and the publisher's `config.json` and `processor_config.json`. Place those
+sidecars beside the backbone. The CLI discovers a sibling `mmproj-*.gguf`.
+The Rust facade also accepts an explicit projector through
+`ArtifactSource::with_projector`. Both select the same VL graph and media
+processor as SafeTensors. Text policy follows the shared GGUF loader, including
+the checkpoint generation defaults from `generation_config.json` when present.
+
+```sh
+eredu --no-auto --model "$pair/LFM3-VL-2B-Q4_K_M.gguf" --device gpu:0 \
+  --image "$image" --video-frames "$frames" --video-fps 2 \
+  --layerwise-host --thinking off --temperature 0 --max-tokens 8 \
+  'Describe the image and video.'
+```
+
+The Q4_K_M and Q8_0 pair completes public CLI generation on Metal with
+`--layerwise-host --thinking off`. A 96×64 image and three 96×64 frames at
+2 FPS expand to 117 model positions and generate eight tokens. The runtime
+reports `1,304,526,848` peak device parameter bytes.
+Resident facade replay of that prompt reports 82 media positions. Explicit
+advancement takes 11 steps and matches uninterrupted generation's eight
+greedy IDs `[597, 4145, 3926, 267, 46814, 657, 23266, 6424]` and token-limit
+finish.
+
+The same CLI prompt with `--dense-disk-stream` completes with eight generated
+tokens and the same decoded text as the host-layerwise run. The disk policy
+plans `6,620,997,632` parameter bytes from disk and peaks at `4,279,793,664`
+device parameter bytes under its default 4 GiB device budget.
+
+#### Same-artifact VL GGUF comparison
+
+The pre-sized replay compares the Q4_K_M backbone and Q8_0 projector against
+llama.cpp revision `7c2653acc749258dc62067da62d07024d971ccd2` on Metal.
+The reference takes a 96×64 still and a three-frame 96×64 clip. It lowers the
+image token minimum to preserve the pre-sized geometry, then captures the six
+image and twelve video projection rows. Both runners use the same 30-position
+prompt and compare all 128,000 vocabulary scores at each prefill position and
+eight cached steps. The fixture uses fixed prompt IDs and deliberately bypasses
+raw resizing and chat-template differences.
+
+| Compared output | Maximum absolute error | Relative L2 |
+| --- | ---: | ---: |
+| Image projection | 0.00120327 | 0.00352780 |
+| Video projection | 0.00120334 | 0.00352803 |
+| Full prefill scores | 0.599468 | 0.0177588 |
+| Worst cached score row | 0.443803 | 0.0218290 |
+
+Both implementations generate `[334, 4160, 302, 8426, 395, 9283, 278, 788]`.
+The score comparison exceeds the fixture's `5e-4` absolute tolerance. The
+shared logit profile passes seven of eight cached rows and fails the full
+prefill comparison. This fixture uses the same periodic RGB pattern in each
+video frame, so it provides limited coverage of temporal ordering.
+Single-rank Eredu CPU replay against the same llama.cpp Metal fixture gives
+maximum errors of `0.599621` in prefill and `0.443882` in cached scores. The
+third prefill row, before any projected media enters the decoder, has maximum
+error `0.404173`.
+
+For the three-token prefix `[124894, 5, 125009]`, the embedding rows match
+exactly. The batched llama.cpp Metal convolution input projection at layer
+zero differs from its own single-row result by up to `0.003703`. Disabling
+only the Q4_K and Q6_K MMA dispatch reproduces that single-row projection
+exactly at the original microbatch size. Against Eredu CPU, the maximum
+prefix logit error is `0.404140` with default batched Metal dispatch,
+`0.000092268` with single-row dispatch, and `0.000079334` with the diagnostic
+MMA bypass.
+
+| llama.cpp Metal comparison against Eredu CPU | Maximum prefill error | Maximum cached error |
+| --- | ---: | ---: |
+| Single-row decoder, independent projections | 0.212204 | 0.125914 |
+| Single-row decoder, identical projected inputs | 0.000186443 | 0.0000491142 |
+| Single-row decoder, Q8_0 batched projector kernels bypassed | 0.0232742 | 0.0117574 |
+
+With identical projected inputs, all 38 vocabulary rows meet the
+`5e-4` tolerance and have matching argmax IDs. Bypassing the Q8_0 batched
+projector kernels reduces the largest independent projection error to
+`0.000164144`. The unmodified single-row reference with independent
+projections matches all eight greedy continuation IDs. One intermediate
+prefill argmax differs by a reference margin of `0.005462`, so full
+same-artifact acceptance remains open.
+
+```sh
+# llama_dir contains the pinned source and a Metal mtmd build.
+pair=/private/tmp/eredu-vl-gguf-projector
+c++ -std=c++17 -O2 -I "$llama_dir/include" -I "$llama_dir/ggml/include" \
+  -I "$llama_dir/tools/mtmd" validation/lfm3_vision_gguf_reference.cpp \
+  -L "$llama_dir/build-metal/bin" -Wl,-rpath,"$llama_dir/build-metal/bin" \
+  -lmtmd -lllama -o "$pair/vision-reference"
+python validation/lfm3_vision_gguf_fixture.py "$pair/vision-reference" "$pair" \
+  /private/tmp/lfm3-vl-raw "$pair/llama-fixture"
+MLX_ENABLE_TF32=0 target/debug/examples/lfm3_vision_reference \
+  "$pair/assets" "$pair/llama-fixture" "$pair/same-pair-metal.json" \
+  --device gpu --component-graph --pre-sized-only \
+  --gguf-backbone "$pair/LFM3-VL-2B-Q4_K_M.gguf" \
+  --gguf-projector "$pair/mmproj-LFM3-VL-2B-Q8_0.gguf"
+```
+
+Pass `--single-row` to the fixture builder and choose a separate output
+directory to compare the unmodified single-row reference.
+
+#### Released F16 and BF16 GGUF pairs
+
+Eredu widens the released dense GGUF weights to F32 for the CPU replay.
+The pinned llama.cpp decoder uses Metal with a single-row microbatch.
+Each reference independently computes the still and video projections
+from the matching published projector.
+
+| Pair | llama.cpp projector | Maximum projection error | Maximum prefill error | Maximum cached error | Prefill logit profile |
+| --- | --- | ---: | ---: | ---: | --- |
+| F16 / F16 | Metal | 0.000892714 | 0.239307 | 0.0313820 | Pass |
+| F16 / F16 | CPU | 0.000306603 | 0.102447 | 0.0115485 | Pass |
+| BF16 / BF16 | Metal | 0.000939123 | 0.337467 | 0.0398035 | Outside tolerance |
+| BF16 / BF16 | CPU | 0.00205039 | 0.274311 | 0.0394001 | Outside tolerance |
+
+All four comparisons match the eight greedy IDs
+`[334, 34, 334, 34, 334, 34, 334, 34]` and pass the shared logit profile
+on each cached row. All four exceed the fixture's `5e-4` absolute score
+tolerance.
+
+```sh
+for encoding in F16 BF16; do
+  python validation/lfm3_vision_gguf_fixture.py "$pair/vision-reference" "$pair" \
+    /private/tmp/lfm3-vl-raw "$pair/llama-$encoding" \
+    --backbone "$encoding" --projector "$encoding" --single-row
+  target/debug/examples/lfm3_vision_reference \
+    "$pair/assets" "$pair/llama-$encoding" "$pair/$encoding-cpu.json" \
+    --device cpu --component-graph --pre-sized-only \
+    --gguf-backbone "$pair/LFM3-VL-2B-$encoding.gguf" \
+    --gguf-projector "$pair/mmproj-LFM3-VL-2B-$encoding.gguf"
+done
+```
+
+Pass `--projector-cpu` to the fixture builder for the CPU projector
+comparison and use a separate output directory.
+
+#### Released quantized backbones with the F16 projector
+
+The comparison pairs each backbone with the published F16 projector.
+Eredu runs widened F32 weights on CPU. The pinned llama.cpp reference uses
+a single-row Metal decoder and a CPU projector. Both
+implementations project the pre-sized media independently. The fixture
+builder verifies each backbone and projector against its publisher digest.
+
+| Backbone | Maximum prefill error | Maximum cached error | Worst prefill row relative L2 | Prefill logit profile |
+| --- | ---: | ---: | ---: | --- |
+| Q4_K_M | 0.0733948 | 0.00945330 | 0.00373467 | Pass |
+| Q5_K_M | 0.0547077 | 0.00873470 | 0.00431260 | Outside tolerance |
+| Q6_K | 0.111796 | 0.0123227 | 0.00546469 | Pass |
+| Q8_0 | 0.101429 | 0.0114520 | 0.00561313 | Pass |
+| QAD-Q4_0 | 0.113141 | 0.00687826 | 0.00745316 | Pass |
+
+All five pass the shared logit profile on all eight cached rows and
+exceed the fixture's `5e-4` absolute score tolerance. The maximum
+projection error is `0.000306603`. Q5_K_M differs on one intermediate
+prefill argmax at zero-based position 16. The reference margin is
+`0.00183439` and its top-five overlap is 5/5.
+
+Both runtimes generate `[334, 4160, 302, 8426, 395, 9283, 278, 788]`
+for Q4_K_M and `[334, 34, 334, 34, 334, 34, 334, 34]` for each of the
+other four backbones.
+
+```sh
+for encoding in Q4_K_M Q5_K_M Q6_K Q8_0 QAD-Q4_0; do
+  python validation/lfm3_vision_gguf_fixture.py "$pair/vision-reference" "$pair" \
+    /private/tmp/lfm3-vl-raw "$pair/llama-$encoding" \
+    --backbone "$encoding" --projector F16 --single-row --projector-cpu
+  target/debug/examples/lfm3_vision_reference \
+    "$pair/assets" "$pair/llama-$encoding" "$pair/$encoding-same-pair-cpu.json" \
+    --device cpu --component-graph --pre-sized-only \
+    --gguf-backbone "$pair/LFM3-VL-2B-$encoding.gguf" \
+    --gguf-projector "$pair/mmproj-LFM3-VL-2B-F16.gguf"
+done
+```
+
+#### Released NVFP4 backbone
+
+GGML type 40 stores four unsigned E4M3 block scales and 64 E2M1 weights
+per 36-byte block. The VL declaration applies the F32 matrix multiplier
+to the widened FFN weights and retains the input scale as checkpoint
+metadata. The pinned llama.cpp graph requests BF16 accumulation for the
+NVFP4 projections. Eredu realizes the decoder with F32 weights and
+arithmetic.
+
+The released NVFP4 backbone and F16 projector run the pre-sized fixture on
+Eredu CPU. The independent reference uses the same artifacts with
+single-row Metal decoding and a CPU projector. Both generate
+`[440, 1008, 4145, 3926, 267, 4309, 302, 3553]`. The shared logit profile
+passes all eight cached rows and fails prefill. Maximum absolute score
+errors are `1.318984` in prefill and `0.373202` over the cached rows. The
+largest prefill error is at the third position, before projected media.
+The public CLI also completes the 117-position mixed image/video prompt on
+CPU with `--layerwise-host --thinking off --temperature 0 --max-tokens 8`.
+Its peak parameter residency is `1,304,526,848` bytes in the execution
+window and `6,251,446,272` bytes in the host cache.
+
+```sh
+python validation/lfm3_vision_gguf_fixture.py "$pair/vision-reference" "$pair" \
+  /private/tmp/lfm3-vl-raw "$pair/llama-nvfp4" \
+  --backbone NVFP4 --projector F16 --single-row --projector-cpu
+target/debug/examples/lfm3_vision_reference \
+  "$pair/assets" "$pair/llama-nvfp4" "$pair/nvfp4-same-pair-cpu.json" \
+  --device cpu --component-graph --pre-sized-only \
+  --gguf-backbone "$pair/LFM3-VL-2B-NVFP4.gguf" \
+  --gguf-projector "$pair/mmproj-LFM3-VL-2B-F16.gguf"
+```
+
+#### Released VL GGUF CPU Ring comparison
+
+The native Ring replay uses the portable VL rank selection to retain a
+vision replica, the local decoder partition and both residency policies. A
+single-rank CPU replay records the pre-sized projection and score rows for
+the same encoded pair. Each Ring rank compares its published output against
+those rows at the fixture's `5e-4` absolute tolerance. This measures the
+effect of placement and collectives on Eredu's outputs.
+
+| Decoder topology | Maximum prefill error | Maximum cached error | Decoder parameter bytes per rank by stage |
+| --- | ---: | ---: | ---: |
+| TP=2, PP=1 | 0.000179768 | 0.0000349283 | 3,458,006,016 |
+| TP=1, PP=2 | 0 | 0 | 3,994,432,512 / 3,969,349,632 |
+| TP=2, PP=2 | 0.000179768 | 0.0000349283 | 1,997,415,424 / 1,984,878,592 |
+
+Every rank generates the single-rank baseline's eight greedy IDs. The
+replicated vision tower uses `757,521,408` parameter bytes per rank.
+
+Retained rank selection reports `4,215,527,424` device parameter bytes per
+rank for resident TP=2. With `--residency host` and combined TP=2/PP=2, it
+reports `752,971,776` bytes on stage zero and `752,979,968` on stage one.
+For each rank the selected total equals the sum of its observed vision
+and decoder parameter peaks. Both replays preserve the score errors and
+greedy IDs in the table. Resident TP=2 uses the same all-rank commit
+and output publication as the PP placements, with no inter-stage transfer.
+
+For the Q4_K_M and Q8_0 pair, cold TP=2/PP=2 selection exposes a manifest
+for each rank before source preparation. Binding the ordinary loader's
+selected recipes preserves each manifest exactly. With resident weights
+those recipes account for `754,375,680` bytes of replicated vision weights,
+with totals of `2,751,791,104` bytes per rank on stage zero and
+`2,739,254,272` on stage one. The pre-sized replay above uses F32 recipes
+for its projector comparison.
+
+The same Q4_K_M backbone and Q8_0 projector complete controlled raw image and
+video prefill on all four TP=2/PP=2 CPU Ring ranks with host residency. The
+17-position prefixes cover all 97 expanded tokens. Both media grids, packed
+patches and the expanded prompt match the raw publisher fixture. All four ranks
+report the same score metrics and generate `[334, 34, 334, 34, 334, 34, 334, 34]`.
+Against the publisher's unquantized raw fixture, the maximum absolute score
+errors are `11.1346264` for prefill and `2.5685104` across eight cached steps.
+The single-rank host replay generates the same IDs and reports errors of
+`11.1345644` and `2.5685090`. The raw numerical comparison fails its tolerance.
+Separate TP=2/PP=1 and TP=1/PP=2 replays set the prefix size to 17 on one
+rank and 19 on the other. Both ranks in each replay reject the request at
+prefill admission before returning a cursor.
+
+The shared native generation session also binds the Q4_K_M and Q8_0 pair at
+PP=2 using the ordinary loader's selected weight recipes. A four-token text
+prompt with a two-position invocation limit gives identical cached-decode
+scores after ordinary prefill and after stepped prefill with a reset between
+the runs. Only the selected output rank exposes scores. Both ranks receive
+token `334` when the sampling filter permits that token alone.
+
+The ordinary inspected-model loader binds the same released pair with
+resident weights on PP=2 and combined TP=2/PP=2 CPU Ring. Every rank
+completes a four-token text prefill with a two-position invocation limit
+and one cached decode. Only the selected rank exposes logits, and all
+exposed decode scores are finite.
+
+The same loader processes a raw RGB image and five-frame video through the
+checkpoint processor with host-layerwise TP=2/PP=2 and direct disk-streamed
+PP=2 weights. All ranks complete prefill and one cached decode, and the
+output rank exposes finite scores. With a 2 GiB device budget per rank,
+the sum of the two component peak ledgers is `752,971,776` and
+`752,979,968` bytes by stage for host-layerwise execution, and
+`1,709,436,928` and `1,684,354,048` bytes for disk streaming. The static
+device-residency observation equals the sum of the current vision and
+decoder ledgers on every rank.
+
+For the raw replay, build with `--features image`, use the raw publisher
+fixture in place of the pre-sized baseline, omit `--pre-sized-only`, and set
+`--residency host`. To isolate the raw case, set `cases` to an empty array
+and remove `conditional` in the fixture metadata. Use rank-local copies of
+`reference.json` with
+`raw_processor.prefill_chunk` set to the tested size for the disagreement case.
+Both copies use the same reference tensors.
+
+```sh
+cargo build -p eredu-backend-mlx --no-default-features --example lfm3_vision_reference
+pair=/private/tmp/eredu-vl-gguf-projector
+runner=target/debug/examples/lfm3_vision_reference
+backbone="$pair/LFM3-VL-2B-Q4_K_M.gguf"
+projector="$pair/mmproj-LFM3-VL-2B-Q8_0.gguf"
+"$runner" "$pair/assets" "$pair/llama-fixture" "$pair/ring-single.json" \
+  --pre-sized-only --record-conditional "$pair/ring-baseline" \
+  --gguf-backbone "$backbone" --gguf-projector "$projector"
+printf '%s\n' '[["127.0.0.1:53101"],["127.0.0.1:53102"],["127.0.0.1:53103"],["127.0.0.1:53104"]]' > "$pair/ring-hosts.json"
+pids=
+for rank in 0 1 2 3; do
+  MLX_HOSTFILE="$pair/ring-hosts.json" MLX_RANK="$rank" \
+    "$runner" "$pair/assets" "$pair/ring-baseline" "$pair/ring-rank-$rank.json" \
+    --pre-sized-only --tensor-cohort --pipeline-stages 2 \
+    --gguf-backbone "$backbone" --gguf-projector "$projector" &
+  pids="$pids $!"
+done
+for pid in $pids; do wait "$pid" || exit 1; done
+```
 
 The speech input path admits the released Audio SafeTensors encoder and projector
 geometry. Its host processor accepts 16-kHz mono PCM and computes 128-bin Slaney

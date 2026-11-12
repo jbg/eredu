@@ -133,6 +133,20 @@ impl GgufCompositeArtifactPlan {
     }
 }
 
+pub(crate) const LFM3_VL_INPUT_MODALITIES: InputModalities = InputModalities {
+    text: true,
+    image: true,
+    audio: false,
+    video: true,
+};
+
+pub(crate) const LFM3_VL_GGUF_COMPOSITION: GgufCompositeArtifactPlan =
+    GgufCompositeArtifactPlan::new(
+        InputModalities::TEXT,
+        Some(LFM3_VL_INPUT_MODALITIES),
+        GgufMediaProjectorRequirement::Required,
+    );
+
 /// Declares how a validated sibling projector changes one GGUF architecture's
 /// accepted input modalities.
 pub const fn gguf_composite_artifact_plan(
@@ -417,6 +431,7 @@ pub fn prepared_safetensors_floating_state_dtype_source(
                 "Realtime floating-state dtype belongs to the realtime loader contract",
             ));
         }
+        SafetensorsModelConfig::Lfm3Vl(_) => "model.language_model.embed_tokens.weight".into(),
         SafetensorsModelConfig::DeepSeekV4(_) => "embed.weight".into(),
         SafetensorsModelConfig::DeepSeekV3(_)
         | SafetensorsModelConfig::K2Horizon(_)
@@ -571,6 +586,12 @@ pub fn prepared_safetensors_capabilities(
             SafetensorsModelConfig::KimiLinear(args) => routed_text(args.has_sparse_moe_layers()),
             SafetensorsModelConfig::Lfm2(args) => routed_text(args.has_sparse_moe_layers()),
             SafetensorsModelConfig::Lfm3(_) => routed_text(false),
+            SafetensorsModelConfig::Lfm3Vl(_) => (
+                ParallelCapabilityPlan::TENSOR_PIPELINE,
+                false,
+                LFM3_VL_INPUT_MODALITIES,
+                0,
+            ),
             SafetensorsModelConfig::Nanbeige(_) => (
                 ParallelCapabilityPlan::TENSOR_PIPELINE,
                 false,
@@ -672,7 +693,9 @@ pub fn prepared_safetensors_capabilities(
         };
     let nonresident_safetensors_quantization = !matches!(
         architecture.model(),
-        SafetensorsModelConfig::Moshi(_) | SafetensorsModelConfig::VoiceChat(_)
+        SafetensorsModelConfig::Moshi(_)
+            | SafetensorsModelConfig::VoiceChat(_)
+            | SafetensorsModelConfig::Lfm3Vl(_)
     );
     Ok(ArchitectureCapabilities::new(
         parallel,
@@ -701,6 +724,15 @@ pub fn prepared_gguf_capabilities(
 ) -> ArchitectureCapabilities {
     use crate::configuration::GgufModelConfig;
 
+    if plan.model_kind() == crate::ModelKind::Lfm3Vl {
+        return ArchitectureCapabilities::new(
+            ParallelCapabilityPlan::TENSOR_PIPELINE,
+            false,
+            false,
+            LFM3_VL_INPUT_MODALITIES,
+            None,
+        );
+    }
     let architecture = plan.architecture();
     let routed = match plan.model() {
         GgufModelConfig::NemotronLabsDiffusion(_) => false,

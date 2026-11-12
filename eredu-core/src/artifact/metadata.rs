@@ -164,6 +164,7 @@ pub fn inspect_artifact_metadata<R: ModelConfigurationResolver>(
                 selected,
                 configuration,
                 plan,
+                &metadata.sidecars,
                 resolver,
                 provenance,
             )

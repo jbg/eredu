@@ -230,10 +230,24 @@ impl<'a> Request<'a> {
             height,
         )
         .map_err(mechanism_error)?;
+        let resize_peak = if transform.resample == RgbResample::AntialiasedBicubic {
+            // The shared bound assumes a vertical-first intermediate. Include
+            // the horizontal-first alternative used by antialiased cubic resize.
+            let horizontal = eredu_media::image::rgb_preparation_buffers(
+                source.height(),
+                source.width(),
+                height,
+                width,
+            )
+            .map_err(mechanism_error)?;
+            buffers.peak_bytes.max(horizontal.peak_bytes)
+        } else {
+            buffers.peak_bytes
+        };
         // All group frames coexist during packing. tensor_f32 copies the packed Vec
         // into host storage; count both, even though one is also in the final output.
         let normalized = mul(buffers.normalized_bytes, frames)?;
-        Ok(add(normalized, buffers.peak_bytes)?.max(add(normalized, mul(payload, 2)?)?))
+        Ok(add(normalized, resize_peak)?.max(add(normalized, mul(payload, 2)?)?))
     }
     pub fn execute<M: ProcessorOperations, E: std::fmt::Display>(
         &self,

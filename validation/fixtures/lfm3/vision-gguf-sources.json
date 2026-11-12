@@ -1,0 +1,85 @@
+{
+  "repository": "LiquidAI/LFM3-VL-2B-GGUF",
+  "revision": "1add221a5ea6c047fcf1eaaf2d247939d7cf8849",
+  "projectors": {
+    "BF16": {
+      "file": "mmproj-LFM3-VL-2B-BF16.gguf",
+      "bytes": 378996032,
+      "publisher_sha256": "8e75a88afc0e6a3bcd637becbe720447ea0794934b7b417a1f42d5cfe0d9c288",
+      "header_bytes": 10535,
+      "header_sha256": "ab9e9037a32e6052d417acfa272dda59b6953cc0cebb256f1228787a57dac606"
+    },
+    "F16": {
+      "file": "mmproj-LFM3-VL-2B-F16.gguf",
+      "bytes": 378996032,
+      "publisher_sha256": "1d8e6e58eefc093e09d6332f081516e1ddbd5b35cfca7f35463fb270db230b1e",
+      "header_bytes": 10535,
+      "header_sha256": "2594a1e4eba1254cb3ea51b0370339288faf42453ffcf0fd20c0708a50e20127"
+    },
+    "Q8_0": {
+      "file": "mmproj-LFM3-VL-2B-Q8_0.gguf",
+      "bytes": 203031872,
+      "publisher_sha256": "c5c5b58d544a18da919172d2d0368090ea1a4a351b6feb7f8a326a264a5918ab",
+      "header_bytes": 10535,
+      "header_sha256": "611468f23cd68ef6aa1794c6bf903a73585eb4645350dbf01a1665ad4861510f"
+    }
+  },
+  "backbones": {
+    "Q4_K_M": {
+      "file": "LFM3-VL-2B-Q4_K_M.gguf",
+      "bytes": 1099627808,
+      "publisher_sha256": "56dac2e192ff0d9ab8507f4f1aeb4aed0463449bbbefaac79497f041c95f21eb",
+      "header_bytes": 8247321,
+      "header_sha256": "ceaf79ffb5b2deb376f8b9c91ed07fedf93ebddfc3115a50bf4dd996228ffcbd"
+    },
+    "BF16": {
+      "file": "LFM3-VL-2B-BF16.gguf",
+      "bytes": 3466626336,
+      "publisher_sha256": "a7a514bd201faba4d329ec6d252253272904652576f0557ee84a106544d90298",
+      "header_bytes": 8247321,
+      "header_sha256": "919867fb53a858181f3e9990933a3b35fba1401312919b811ed6a66a4c4de6a7"
+    },
+    "F16": {
+      "file": "LFM3-VL-2B-F16.gguf",
+      "bytes": 3466626336,
+      "publisher_sha256": "a9996199a258a936b270ac70ceec9766289429fdf15c1a69050ca9f0182d569b",
+      "header_bytes": 8247321,
+      "header_sha256": "c213ed6f4e09ef3b92128cbbd161c20e3913db2fbf14893ec8dcc9ac333382f4"
+    },
+    "NVFP4": {
+      "file": "LFM3-VL-2B-NVFP4.gguf",
+      "bytes": 1280020064,
+      "publisher_sha256": "6101000cf8311ade517f4786ee906dd44f1b9834ebee6acaf37c34c264d4101c",
+      "header_bytes": 8255320,
+      "header_sha256": "1d5a59bab24fcc12c1bd24a948a753120ecbc437399bd3a5cc2a02ec4ebaa0a9"
+    },
+    "Q5_K_M": {
+      "file": "LFM3-VL-2B-Q5_K_M.gguf",
+      "bytes": 1258663200,
+      "publisher_sha256": "613496a9437bc72b09f57cb54365a9759dd639e20ce7715470bdd7ac1cf22790",
+      "header_bytes": 8247321,
+      "header_sha256": "73d50e3207fc7d08dc12d68faf5365a95cae7f555c5519f8511e333e2952afc5"
+    },
+    "Q6_K": {
+      "file": "LFM3-VL-2B-Q6_K.gguf",
+      "bytes": 1427638304,
+      "publisher_sha256": "ca44f8ccafd906c359d603b74689c50a939ea099b4f414e7ab86c02dd36c2769",
+      "header_bytes": 8247321,
+      "header_sha256": "458205c6cb73636d9129337169321e004719521395241e917e402ad65ecb7b81"
+    },
+    "Q8_0": {
+      "file": "LFM3-VL-2B-Q8_0.gguf",
+      "bytes": 1846238496,
+      "publisher_sha256": "e138e54189a751d90ea8c0b236360490613ecd465d28d68fa6094d3db7fa6727",
+      "header_bytes": 8247321,
+      "header_sha256": "dc5e0d64308dbb8108be5ad70782d3995a04490a72e5b6647a2d99d8dab89dd6"
+    },
+    "QAD-Q4_0": {
+      "file": "LFM3-VL-2B-QAD-Q4_0.gguf",
+      "bytes": 1049615648,
+      "publisher_sha256": "621c455376cb96a20891697deb9975c6fb47dd5ea98ed3ad1f3b7e8f24f0b1e6",
+      "header_bytes": 8247321,
+      "header_sha256": "c71e16c480e14e71a446cd5dfbb7f80fbeb95e09de467417cafdb35e52908f99"
+    }
+  }
+}

@@ -84,6 +84,24 @@ Unrecognized templates use literal text generation with TTFT and supported
 speculative drafting. They retain EOS and caller stop sequences; native tools
 and parsed reasoning still require a recognized protocol.
 
+### Image and video input
+
+Use `--image PATH` with any checkpoint whose selected processor accepts
+images. Repeat the flag to append several JPEG or PNG files in argument order.
+Use `--video-frames DIRECTORY --video-fps FPS` to append a clip from JPEG or
+PNG frames in filename order. Zero-pad numeric filenames to preserve temporal
+order. The checkpoint processor controls resizing, sampling and timestamps.
+
+```sh
+eredu --model /path/to/vision-language-model \
+  --image reference.png --video-frames ./frames --video-fps 6 \
+  "Compare the image with the clip."
+```
+
+The template receives text, then images, then the clip. Visual inputs use the
+ordinary chat generation command and the default-enabled `vision` feature.
+They require a chat template. Automatic quick planning remains available.
+
 ## Automatic planning
 
 Normal generation selects a single-device execution plan automatically. The

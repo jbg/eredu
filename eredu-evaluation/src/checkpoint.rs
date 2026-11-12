@@ -39,6 +39,37 @@ impl Default for CheckpointParityOptions {
     }
 }
 
+/// Compares host-materialized vocabulary rows with the shared checkpoint profile.
+pub fn compare_checkpoint_logit_rows(
+    actual: Vec<f32>,
+    reference: Vec<f32>,
+    rows: usize,
+    vocabulary: usize,
+) -> Result<ParityReport, CheckpointParityError> {
+    let observations = |values| -> Result<ObservationSet, CheckpointParityError> {
+        let mut set = ObservationSet::new();
+        set.insert(
+            "logits",
+            ObservationValue::Tensor(TensorObservation::new(
+                vec![rows, vocabulary],
+                TensorObservationData::F32(values),
+            )?),
+        )?;
+        Ok(set)
+    };
+    Ok(compare_observations(
+        &observations(actual)?,
+        &observations(reference)?,
+        &ParityPolicy {
+            default: ParityComparison::Logits {
+                tolerance: CheckpointParityOptions::default().logits,
+            },
+            rules: vec![],
+            require_same_paths: true,
+        },
+    )?)
+}
+
 /// General parity report plus source artifact identities.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CheckpointParityReport {

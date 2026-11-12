@@ -304,6 +304,7 @@ pub trait SelectedExecutionDispatcher: Sized {
 pub struct SelectedExecution {
     kind: Box<SelectedExecutionKind>,
     authored_projection: Option<Arc<SelectedQwen4Construction>>,
+    pub(crate) vl_rank: Option<crate::lfm3::vision::SelectedVlRankPlacement>,
     pub(crate) prediction_parameters:
         Option<Arc<crate::prediction_extension::SelectedPredictionParameters>>,
     pub(crate) input_score_attention_workspace:
@@ -523,6 +524,9 @@ impl SelectedExecution {
     }
     /// Exact portable rank topology of a selected partition, when present.
     pub fn parallel_topology(&self) -> Option<eredu_core::ParallelRankTopology> {
+        if let Some(rank) = &self.vl_rank {
+            return Some(rank.rank());
+        }
         match self.kind.as_ref() {
             SelectedExecutionKind::PartitionedDense(selected) => {
                 Some(selected.requirements().topology())
@@ -540,6 +544,9 @@ impl SelectedExecution {
     /// Maximum decoder batch and sequence admitted by this retained partition.
     /// Media route shapes have independent limits and do not replace these bounds.
     pub fn partitioned_invocation_limits(&self) -> Option<(i32, i32)> {
+        if let Some(rank) = &self.vl_rank {
+            return Some((1, rank.prefix().get() as i32));
+        }
         let boundary = match self.kind.as_ref() {
             SelectedExecutionKind::PartitionedDense(selected) => selected.requirements().boundary(),
             SelectedExecutionKind::PartitionedRouted(selected) => {
@@ -570,6 +577,7 @@ impl SelectedExecution {
             kind: Box::new(SelectedExecutionKind::Replicated(selected)),
             input_score_attention_workspace: None,
             authored_projection: None,
+            vl_rank: None,
             prediction_parameters: None,
         }
     }
@@ -579,6 +587,7 @@ impl SelectedExecution {
             kind: Box::new(SelectedExecutionKind::Routed(selected)),
             input_score_attention_workspace: None,
             authored_projection: None,
+            vl_rank: None,
             prediction_parameters: None,
         }
     }
@@ -588,6 +597,7 @@ impl SelectedExecution {
             kind: Box::new(SelectedExecutionKind::Composite(selected)),
             input_score_attention_workspace: None,
             authored_projection: None,
+            vl_rank: None,
             prediction_parameters: None,
         }
     }
@@ -597,6 +607,7 @@ impl SelectedExecution {
             kind: Box::new(SelectedExecutionKind::PartitionedDense(selected)),
             input_score_attention_workspace: None,
             authored_projection: None,
+            vl_rank: None,
             prediction_parameters: None,
         }
     }
@@ -606,6 +617,7 @@ impl SelectedExecution {
             kind: Box::new(SelectedExecutionKind::PartitionedRouted(selected)),
             input_score_attention_workspace: None,
             authored_projection: None,
+            vl_rank: None,
             prediction_parameters: None,
         }
     }
@@ -615,6 +627,7 @@ impl SelectedExecution {
             kind: Box::new(SelectedExecutionKind::PartitionedComposite(selected)),
             input_score_attention_workspace: None,
             authored_projection: None,
+            vl_rank: None,
             prediction_parameters: None,
         }
     }
@@ -695,6 +708,15 @@ impl SelectedExecution {
     /// Projects ordinary cache bytes from the same selected state used by construction.
     pub(crate) fn rank_attention_cache_bytes_per_position(&self) -> Result<u64, String> {
         let state = self.text_realization().state();
+        if let Some(rank) = &self.vl_rank {
+            let partition = rank
+                .state_partition()
+                .ok_or("VL rank omitted its cache geometry")?;
+            return state
+                .for_partitioned_geometry(partition)
+                .and_then(|state| state.attention_cache_bytes_per_position())
+                .map_err(|error| error.to_string());
+        }
         match self.partitioned_ownership() {
             Some((_, rank)) => match rank.state() {
                 Some(partition) => state
@@ -1141,6 +1163,9 @@ impl SelectedExecution {
 
     /// Returns the admitted communication manifest for partitioned execution.
     pub fn communication_manifest(&self) -> Option<&CommunicationManifest> {
+        if let Some(rank) = &self.vl_rank {
+            return Some(rank.communication_manifest());
+        }
         match self.kind.as_ref() {
             SelectedExecutionKind::PartitionedDense(selected) => {
                 Some(selected.requirements().communication())
@@ -1159,6 +1184,9 @@ impl SelectedExecution {
 
     /// Returns the admitted pipeline activation dtype for partitioned execution.
     pub fn partitioned_activation_dtype(&self) -> Option<PipelineActivationDtype> {
+        if self.vl_rank.is_some() {
+            return Some(PipelineActivationDtype::Float32);
+        }
         match self.kind.as_ref() {
             SelectedExecutionKind::PartitionedDense(selected) => {
                 Some(selected.requirements().activation_dtype())
@@ -1193,6 +1221,9 @@ impl SelectedExecution {
 
     /// Returns the selected session-wide publication group for partitioned execution.
     pub fn partitioned_session_group(&self) -> Option<CollectiveGroupId> {
+        if let Some(rank) = &self.vl_rank {
+            return rank.session_group();
+        }
         match self.kind.as_ref() {
             SelectedExecutionKind::PartitionedDense(selected) => {
                 selected.requirements().session_group()

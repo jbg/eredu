@@ -29,6 +29,15 @@ pub enum GgufMediaProjectorConfig {
         /// Exact n-gram reset identity declared by the primary artifact.
         reset_token_id: Option<u32>,
     },
+    /// Released LFM3 VL with its publisher-declared media geometry.
+    Lfm3Vl {
+        /// Complete generative VL declaration.
+        declaration: std::sync::Arc<crate::lfm3::vision::VisionLanguageDeclaration>,
+        /// Primary source with decoded quantized tensor representation.
+        backbone: std::sync::Arc<Checkpoint>,
+        /// Media source with decoded quantized tensor representation.
+        projector: std::sync::Arc<Checkpoint>,
+    },
     /// Gemma 4 text plus its admitted vision and/or audio projector.
     Gemma4(crate::gemma4::FamilyConfig),
     /// Inkling text plus its admitted vision/audio projector.
@@ -200,6 +209,43 @@ impl crate::qwen::vision::VisionGgufCatalog for ExactCatalog<'_> {
 }
 
 /// Resolves typed companion geometry and validates its exact physical schema.
+pub(crate) fn resolve_lfm3_vl_projector(
+    primary_plan: &GgufArchitecturePlan,
+    primary: &Checkpoint,
+    projector: &Checkpoint,
+    declaration: crate::lfm3::vision::VisionLanguageDeclaration,
+) -> Result<GgufMediaProjectorPlan, String> {
+    use crate::lfm3::vision::gguf;
+    let GgufModelConfig::Lfm3(args) = primary_plan.model() else {
+        return Err("expected an LFM3 VL GGUF backbone".into());
+    };
+    if args != declaration.language.args() {
+        return Err("LFM3 VL GGUF backbone differs from the supplied decoder configuration".into());
+    }
+    let checkpoint =
+        gguf::projector_plan(projector, &declaration.vision).map_err(|error| error.to_string())?;
+    eredu_checkpoint::validation::resolve_gguf_plan(projector, &checkpoint)
+        .map_err(|error| format!("{error:?}"))?;
+    let backbone = gguf::decoded_catalog(primary)?;
+    let projector = gguf::decoded_catalog(projector)?;
+    Ok(GgufMediaProjectorPlan {
+        primary_tensor_mapping: backbone
+            .translated_outputs(crate::lfm3::translate_gguf_weight_name)
+            .map_err(|error| error.to_string())?,
+        tensor_mapping: projector
+            .translated_outputs(str::to_owned)
+            .map_err(|error| error.to_string())?,
+        checkpoint,
+        qwen_text: None,
+        qwen_vision: None,
+        model: GgufMediaProjectorConfig::Lfm3Vl {
+            declaration: std::sync::Arc::new(declaration),
+            backbone: std::sync::Arc::new(backbone),
+            projector: std::sync::Arc::new(projector),
+        },
+    })
+}
+
 pub(crate) fn resolve_media_projector(
     primary_plan: &GgufArchitecturePlan,
     primary: &Checkpoint,
@@ -366,6 +412,9 @@ fn canonical_projector_mapping(
     model: &GgufMediaProjectorConfig,
 ) -> Result<Vec<eredu_gguf::TranslatedTensorLayout>, String> {
     let mapping = match model {
+        GgufMediaProjectorConfig::Lfm3Vl { projector, .. } => {
+            projector.translated_outputs(str::to_owned)
+        }
         GgufMediaProjectorConfig::NemotronLabsDiffusion { vision, .. } => {
             return Ok(vision.mapping().to_vec());
         }

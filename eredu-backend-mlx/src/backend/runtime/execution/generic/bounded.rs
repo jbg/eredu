@@ -54,6 +54,9 @@ where
     fn begin(&mut self, initial: &MlxTensor, _stream: &Stream) -> Result<(), Self::Error> {
         crate::backend::submission_recovery::reap();
         crate::backend::ordinary_retirement::reclaim();
+        // An aborted traversal can still own submitted consumers. Settle them
+        // before the new invocation tries to evict their weight units.
+        self.drain()?;
         let Some(dense) = &mut self.dense else {
             return Ok(());
         };
@@ -91,9 +94,8 @@ where
         _stream: &Stream,
     ) {
         drop(active);
-        // Each unit's pre-submission owner retires independently. Neither an
-        // error nor unwinding is evidence that its consumer graph has stopped.
-        self.pending.clear();
+        // Keep submitted leases until the next ordinary begin can wait on
+        // them. Dropping the policy still retires them through their owners.
         if let Some(dense) = &mut self.dense {
             dense.aborted = true;
         }

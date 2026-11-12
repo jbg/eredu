@@ -316,7 +316,17 @@ fn resolve_family(
             let declaration = std::sync::Arc::new(
                 crate::lfm3::Declaration::new(args.clone()).map_err(|e| e.to_string())?,
             );
-            let plan = crate::lfm3::gguf_plan(&declaration)?;
+            let plan = if crate::lfm3::vision::gguf::is_released_backbone(checkpoint) {
+                crate::lfm3::vision::gguf::vl_backbone_plan(checkpoint, &declaration)?
+            } else {
+                if checkpoint
+                    .tensors()
+                    .any(|tensor| tensor.descriptor().ggml_type == eredu_gguf::GgmlType::NvFp4)
+                {
+                    return Err("LFM3 NVFP4 requires the released VL scale layout".into());
+                }
+                crate::lfm3::gguf_plan(&declaration)?
+            };
             lfm3 = Some(declaration);
             Ok((GgufModelConfig::Lfm3(args), plan, None))
         }

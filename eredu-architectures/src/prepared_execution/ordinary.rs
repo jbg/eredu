@@ -144,6 +144,8 @@ where
 /// mechanisms. Backends choose typed bindings without rebuilding artifact plans.
 #[derive(Clone)]
 pub enum RetainedArchitectureConstruction {
+    /// Dense VL graph with retained component bindings and processor authority.
+    Lfm3Vl(Box<crate::lfm3::vision::PreparedVlGraph>),
     /// Routed partition with exact rank sources, placement and local state authority.
     Qwen4Partition(Box<crate::qwen4_exp::prepared::PreparedTargetPartition>),
     /// Conditional partition with exact target, projector, local state and row sources.
@@ -231,7 +233,8 @@ where
         prediction: Option<PredictionBinding>,
     ) -> Result<U::Output, PreparedExecutionError<U::Error>> {
         match retained {
-            RetainedArchitectureConstruction::Qwen4Conditional(_)
+            RetainedArchitectureConstruction::Lfm3Vl(_)
+            | RetainedArchitectureConstruction::Qwen4Conditional(_)
             | RetainedArchitectureConstruction::Qwen4Partition(_)
             | RetainedArchitectureConstruction::Qwen4ConditionalPartition(_) => {
                 Err(PreparedExecutionError::Architecture(
@@ -432,6 +435,9 @@ where
                 return Err(PreparedExecutionError::UnavailablePrediction);
             }
             return match retained {
+                RetainedArchitectureConstruction::Lfm3Vl(prepared) => {
+                    self.visitor.visit_vl(*prepared)
+                }
                 RetainedArchitectureConstruction::Qwen4Conditional(selected) => {
                     if let Some(binding) = branch.retained_prediction.take() {
                         selected.visit_composite_prediction::<B, S, V>(

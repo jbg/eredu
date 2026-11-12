@@ -5,10 +5,11 @@ pub(super) mod parameters;
 pub(super) use parameters::MlxPredictionModule;
 
 #[cfg(test)]
-pub(super) type StatePresenceSnapshot = Vec<(i32, Vec<(eredu_core::cache::StateTensorRole, bool)>)>;
+pub(in crate::composition::mlx) type StatePresenceSnapshot =
+    Vec<(i32, Vec<(eredu_core::cache::StateTensorRole, bool)>)>;
 
 #[cfg(test)]
-pub(super) type FixedNumericStateSnapshot = Vec<(
+pub(in crate::composition::mlx) type FixedNumericStateSnapshot = Vec<(
     usize,
     eredu_core::cache::StateTensorRole,
     Vec<i32>,
@@ -19,7 +20,7 @@ pub(super) type FixedNumericStateSnapshot = Vec<(
 pub(super) type RetainedNumericStateSnapshot = Vec<(Vec<i32>, Vec<f32>)>;
 
 #[cfg(test)]
-pub(super) type CheckpointRestoreProbe = (
+pub(in crate::composition::mlx) type CheckpointRestoreProbe = (
     StatePresenceSnapshot,
     StatePresenceSnapshot,
     StatePresenceSnapshot,
@@ -900,13 +901,31 @@ pub(crate) trait ErasedExternalPredictionExecutable: 'static {
 pub(crate) trait ErasedPrefillCursor {
     fn clone_box(&self) -> Box<dyn ErasedPrefillCursor>;
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
-    fn next_range(&self) -> std::ops::Range<usize>;
+    fn decoder_position(&self) -> usize;
+    /// Identifies whether this advance requires preparation or decoder execution.
+    fn next_step(&self) -> Result<eredu_runtime::prefill::PrefillStep, Error>;
+    fn cache_identity(&self) -> Option<&eredu_runtime::PreparedInputCacheIdentity> {
+        None
+    }
     fn token_count(&self) -> usize;
+    fn final_decoder_range(&self) -> Result<std::ops::Range<usize>, Error> {
+        use eredu_runtime::prefill::PrefillStep;
+        match self.next_step()? {
+            PrefillStep::Decoder(range) if range.end == self.token_count() => Ok(range),
+            _ => Err(Error::before_model_mutation(std::io::Error::other(
+                "retained prefill cursor is not ready for the final decoder step",
+            ))),
+        }
+    }
     fn retained_bytes(&self) -> Result<usize, Error>;
 }
 
 /// Backend-private erased operations for a paired architecture and mutable state.
 pub(crate) trait ErasedReplicatedTextExecutable {
+    fn realized_session_capabilities(&self) -> eredu_core::SessionCapabilities {
+        eredu_core::SessionCapabilities::new(true, true, true)
+    }
+
     fn block_refinement_geometry(
         &self,
     ) -> Option<eredu_runtime::generation::refinement::architecture::BlockRefinementGeometry> {
@@ -951,6 +970,18 @@ pub(crate) trait ErasedReplicatedTextExecutable {
         _stream: &Stream,
     ) -> Result<Option<Box<dyn ErasedPrefillCursor>>, Error> {
         Ok(None)
+    }
+
+    /// Completes one cursor ingress step without producing decoder logits.
+    fn advance_prefill_ingress(
+        &mut self,
+        _cursor: &mut dyn ErasedPrefillCursor,
+        _stream: &Stream,
+        _observer: &mut dyn eredu_runtime::ActivationObserver<Array, Error>,
+    ) -> Result<(), Error> {
+        Err(Error::ArchitectureModel(
+            "executable has no retained prefill ingress step".into(),
+        ))
     }
 
     fn advance_prefill_cursor(
@@ -1168,6 +1199,10 @@ pub(crate) trait ErasedReplicatedTextExecutable {
         eredu_core::Observed<Vec<eredu_core::residency::ParameterConversionRetentionReport>>,
         eredu_core::BackendFailure,
     >;
+    fn component_residency_reports(&self) -> Result<Vec<ResidencyReport>, Error> {
+        Ok(Vec::new())
+    }
+
     fn residency_report(&self) -> Result<Option<ResidencyReport>, Error>;
     fn dense_stream_report(&self) -> Result<Option<DenseDiskStreamReport>, Error>;
     fn materialization_report(&self) -> Option<&eredu_runtime::WeightMaterializationReport>;
@@ -1330,47 +1365,7 @@ pub(crate) trait ErasedReplicatedTextExecutable {
     ) -> Result<Array, Error>;
 }
 
-pub(crate) fn prepared_composite_input(
-    input: input::ModelInput<'_>,
-) -> Result<eredu_runtime::PreparedModelInput<MlxTensor>, Error> {
-    use eredu_runtime::{PreparedInputInspector, PreparedInputPart, PreparedInputPayload};
-
-    input::validate(input)?;
-    let parts = input
-        .parts
-        .iter()
-        .map(|part| {
-            let payload = match part.payload() {
-                input::InputPayload::TokenIds(value) => {
-                    PreparedInputPayload::TokenIds(MlxTensor::from_array(value.clone()))
-                }
-                input::InputPayload::Tensor(value) => {
-                    PreparedInputPayload::Tensor(MlxTensor::from_array(value.clone()))
-                }
-                input::InputPayload::Embeddings(value) => {
-                    PreparedInputPayload::Embeddings(MlxTensor::from_array(value.clone()))
-                }
-                _ => {
-                    return Err(eredu_core::PreparedInputError::BackendTensorIdentity(
-                        "MLX prepared input contains an unknown payload kind".into(),
-                    ))
-                }
-            };
-            PreparedInputPart::new_with_extents(
-                part.modality(),
-                payload,
-                part.metadata()
-                    .iter()
-                    .map(|(key, value)| (*key, MlxTensor::from_array(value.clone()))),
-                part.extents().iter().copied(),
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let inspector = input::MlxTensorInputInspector;
-    eredu_runtime::PreparedModelInput::new(parts, |tensor| inspector.identity(tensor))
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))
-}
+pub(crate) use input::prepared_composite_input;
 
 #[cfg(test)]
 mod completion_tests {

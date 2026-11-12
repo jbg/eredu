@@ -856,6 +856,32 @@ impl LayerWeightResidency {
         }
     }
 
+    /// Applies component budgets while retaining the selected transfer and cache controls.
+    pub fn with_component_budgets(
+        self,
+        device_bytes: u64,
+        host_bytes: Option<u64>,
+    ) -> Result<Self, WeightResidencyPolicyError> {
+        match self {
+            Self::FullyResident => Ok(self),
+            Self::LayerwiseHost(mut options) => {
+                options.offload = OffloadConfig::new(
+                    Some(device_bytes),
+                    host_bytes,
+                    options.offload.prefetch_depth(),
+                )?
+                .with_eviction_policy(options.offload.eviction_policy());
+                Ok(Self::LayerwiseHost(options))
+            }
+            Self::DenseDiskStream(mut options) => {
+                options.device_budget_bytes = device_bytes;
+                options.host_budget_bytes = host_bytes.unwrap_or(options.host_budget_bytes);
+                options.validate()?;
+                Ok(Self::DenseDiskStream(options))
+            }
+        }
+    }
+
     /// Returns whether backend allocator memory should be sampled.
     pub const fn sample_backend_memory(self) -> bool {
         match self {

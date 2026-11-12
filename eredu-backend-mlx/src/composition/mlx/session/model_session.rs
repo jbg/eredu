@@ -364,11 +364,11 @@ impl std::fmt::Debug for MlxModelInput {
             .field("parts", &self.parts)
             .field("cache_identity", &self.cache_identity)
             .field(
-                "prefill_range",
+                "prefill_step",
                 &self
                     .prefill_cursor
                     .as_ref()
-                    .map(|cursor| cursor.next_range()),
+                    .map(|cursor| cursor.next_step()),
             )
             .finish()
     }
@@ -678,7 +678,7 @@ impl MlxModelSession {
         admitted_capabilities: eredu_core::SessionCapabilities,
     ) -> Result<Self, Error> {
         ordinary_retirement::reclaim();
-        let realized_capabilities = eredu_core::SessionCapabilities::new(true, true, true);
+        let realized_capabilities = model.realized_session_capabilities();
         SessionAdmission::new(admitted_capabilities)
             .validate(realized_capabilities)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
@@ -1064,6 +1064,13 @@ impl MlxModelSession {
         self.payload.model.residency_report()
     }
 
+    /// Reports independently managed parameter residency ledgers for a composed session.
+    pub fn component_residency_reports(
+        &self,
+    ) -> Result<Vec<eredu_runtime::ResidencyReport>, Error> {
+        self.payload.model.erased().component_residency_reports()
+    }
+
     /// Returns dense checkpoint-streaming telemetry when enabled.
     pub fn dense_stream_report(
         &self,
@@ -1430,15 +1437,18 @@ impl MlxModelSession {
         let token_validation_scope = TokenValidationScope::begin()?;
         let output = match input {
             Ok(mut input) if input.prefill_cursor.is_some() => {
-                operation.model().erased_mut().advance_prefill_cursor(
-                    input.prefill_cursor.as_mut().unwrap().as_mut(),
-                    backend.stream(),
-                    &mut ArrayObserverAdapter {
-                        inner: observer,
-                        routed_path: None,
-                        routed_invocation_active: false,
-                    },
-                )
+                let cursor = input.prefill_cursor.as_deref_mut().expect("checked cursor");
+                cursor.final_decoder_range().and_then(|_| {
+                    operation.model().erased_mut().advance_prefill_cursor(
+                        cursor,
+                        backend.stream(),
+                        &mut ArrayObserverAdapter {
+                            inner: observer,
+                            routed_path: None,
+                            routed_invocation_active: false,
+                        },
+                    )
+                })
             }
             Ok(input) => input.with_borrowed(|input| {
                 operation.model().erased_mut().prefill_result_with_observer(
@@ -1511,6 +1521,31 @@ impl MlxModelSession {
             owner,
             recovery,
         ))
+    }
+
+    fn complete_prefill_ingress_with_observer(
+        &mut self,
+        backend: &MlxBackend<'_>,
+        cursor: &mut dyn crate::composition::mlx::replicated_text::ErasedPrefillCursor,
+        observer: &mut impl RuntimeActivationObserver<MlxTensor, Error>,
+    ) -> Result<(), Error> {
+        self.validate_backend(backend)?;
+        self.with_model_operation(|model| {
+            let validation = TokenValidationScope::begin()?;
+            model.erased_mut().advance_prefill_ingress(
+                cursor,
+                backend.stream(),
+                &mut ArrayObserverAdapter {
+                    inner: observer,
+                    routed_path: None,
+                    routed_invocation_active: false,
+                },
+            )?;
+            let validation = validation.finish();
+            safemlx::transforms::eval(validation.arrays())?;
+            validation.validate_completed()?;
+            observer.finish()
+        })
     }
 
     fn submit_prefill_cursor_with_observer(
@@ -2287,7 +2322,7 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
                             let capture_geometry = Some(capture.plan().request());
                             if let Ok(prompt) = &prepared {
                                 if let Some(cursor) = prompt.prefill_cursor() {
-                                    let range = cursor.next_range();
+                                    let range = cursor.final_decoder_range()?;
                                     if range.start != 0 || range.end != cursor.token_count() {
                                         capture
                                             .set_prefill_span(
@@ -2517,13 +2552,17 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
                 }
             }
             if let Some(cursor) = prompt.prefill_cursor.as_mut() {
-                let range = cursor.next_range();
-                if range.end == cursor.token_count() {
-                    return Ok(false);
+                use eredu_runtime::prefill::PrefillStep;
+
+                let step = cursor.next_step()?;
+                match &step {
+                    PrefillStep::Complete => return Ok(false),
+                    PrefillStep::Decoder(range) if range.end == cursor.token_count() => {
+                        return Ok(false);
+                    }
+                    PrefillStep::PrepareInput | PrefillStep::Decoder(_) => {}
                 }
-                let stream = runtime.backend().stream().clone();
-                let (backend, session) = runtime.parts_mut();
-                let submission = if let Some(capture) = &mut state.capture {
+                if let (Some(capture), PrefillStep::Decoder(range)) = (&mut state.capture, &step) {
                     capture
                         .set_prefill_span(eredu_core::capture::CapturePrefillSpan {
                             start: range.start as u64,
@@ -2531,28 +2570,38 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
                             total: cursor.token_count() as u64,
                         })
                         .map_err(Error::before_model_mutation)?;
-                    partition_capture::with_observer(
-                        session,
-                        capture,
-                        &stream,
-                        None,
-                        0,
-                        |session, observer| {
-                            session.submit_prefill_cursor_with_observer(
+                }
+                let stream = runtime.backend().stream().clone();
+                let (backend, session) = runtime.parts_mut();
+                let mut advance = |session: &mut MlxModelSession,
+                                   observer: &mut dyn RuntimeActivationObserver<
+                    MlxTensor,
+                    Error,
+                >| {
+                    let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
+                    match &step {
+                        PrefillStep::PrepareInput => session
+                            .complete_prefill_ingress_with_observer(
                                 backend,
                                 cursor.as_mut(),
-                                &mut eredu_runtime::BorrowedActivationObserver(observer),
-                            )
-                        },
-                    )?
-                } else {
-                    session.submit_prefill_cursor_with_observer(
-                        backend,
-                        cursor.as_mut(),
-                        &mut eredu_runtime::NoopObserver,
-                    )?
+                                &mut observer,
+                            ),
+                        PrefillStep::Decoder(_) => session
+                            .submit_prefill_cursor_with_observer(
+                                backend,
+                                cursor.as_mut(),
+                                &mut observer,
+                            )?
+                            .completion
+                            .wait(),
+                        PrefillStep::Complete => unreachable!("terminal cursors return above"),
+                    }
                 };
-                submission.completion.wait()?;
+                if let Some(capture) = &mut state.capture {
+                    partition_capture::with_observer(session, capture, &stream, None, 0, advance)?;
+                } else {
+                    advance(session, &mut eredu_runtime::NoopObserver)?;
+                }
                 return Ok(true);
             }
         }
@@ -2756,7 +2805,7 @@ fn model_array_submission(
                 _retained: retained,
                 owner,
                 recovery: RefCell::new(Some(recovery)),
-                observation_error: RefCell::new(None),
+                observation: RefCell::new(super::output_completion::ModelObservation::Unobserved),
             },
         },
     }

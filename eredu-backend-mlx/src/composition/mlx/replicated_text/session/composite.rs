@@ -29,8 +29,11 @@ where
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
     }
-    fn next_range(&self) -> std::ops::Range<usize> {
-        self.cursor.next_range()
+    fn decoder_position(&self) -> usize {
+        self.cursor.position()
+    }
+    fn next_step(&self) -> Result<eredu_runtime::prefill::PrefillStep, Error> {
+        Ok(self.cursor.next_step())
     }
     fn token_count(&self) -> usize {
         self.cursor.token_count()
@@ -180,45 +183,6 @@ where
     pub(super) processor: &'a eredu_runtime::SelectedProcessorExecution,
 }
 
-fn validate_composite_input_selection(
-    processor: &eredu_runtime::SelectedProcessorExecution,
-    input: input::ModelInput<'_>,
-) -> Result<(), Error> {
-    if let Some(modality) = input
-        .parts
-        .iter()
-        .map(|part| part.modality())
-        .find(|modality| !processor.modalities().contains(modality))
-    {
-        return Err(Error::ArchitectureModel(format!(
-            "prepared input modality {} is outside the selected composite modalities {:?}",
-            modality.as_str(),
-            processor.modalities()
-        )));
-    }
-    if !processor.prepared_tensors()
-        && input
-            .parts
-            .iter()
-            .any(|part| part.modality() != eredu_core::InputModality::Text)
-    {
-        return Err(Error::ArchitectureModel(
-            "prepared media tensors were not admitted by processor selection".into(),
-        ));
-    }
-    if let Some(modality) = input.parts.iter().find_map(|part| {
-        matches!(part.payload(), input::InputPayload::Embeddings(_))
-            .then_some(part.modality())
-            .filter(|modality| !processor.projected_modalities().contains(modality))
-    }) {
-        return Err(Error::ArchitectureModel(format!(
-            "projected {} embeddings were not admitted by processor selection",
-            modality.as_str()
-        )));
-    }
-    Ok(())
-}
-
 pub(in crate::composition::mlx::replicated_text) fn prepare_composite_prediction_input<A>(
     admission: &A::AdmissionConfig,
     processor: &eredu_runtime::SelectedProcessorExecution,
@@ -255,7 +219,7 @@ where
     A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error> + 'static,
     A::InputPartPlan: 'static,
 {
-    validate_composite_input_selection(processor, input)?;
+    input::validate_composite_input_selection(processor, input)?;
     let supplied_cache_identity = input.cache_identity().cloned();
     let text_fingerprint = if cacheable
         && supplied_cache_identity.is_none()
@@ -874,7 +838,7 @@ where
             architecture: self.effective_model_type.clone(),
             reason: error.to_string(),
         };
-        validate_composite_input_selection(&self.processor, input).map_err(invalid)?;
+        input::validate_composite_input_selection(&self.processor, input).map_err(invalid)?;
         let prepared = prepared_composite_input(input).map_err(invalid)?;
         let admitted =
             A::admit_prepared_input(&self.admission, &prepared, &input::MlxTensorInputInspector)?;

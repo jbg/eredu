@@ -505,10 +505,11 @@ where
     };
     let inspection = media_inspection.as_ref().unwrap_or(inspection);
     let validated = request.validate_model_preparation()?;
+    let kind = inspection.architecture_plan().model_kind();
     if matches!(
         request.media_execution(),
         eredu_runtime::MediaLoadRequest::Required(_)
-    ) && inspection.architecture_plan().model_kind() != crate::ModelKind::Qwen4Exp
+    ) && !matches!(kind, crate::ModelKind::Qwen4Exp | crate::ModelKind::Lfm3Vl)
     {
         return Err(PreparationSelectionError::MediaPreparationRequired);
     }
@@ -519,8 +520,14 @@ where
         return Err(PreparationSelectionError::UnresolvedGgufSpecialTokens(kind));
     }
     let policy = validated.preparation_policy();
-    let admission =
-        admit_inspected_preparation(inspection, policy, mechanisms.preparation_capabilities())?;
+    let mut facts = mechanisms.preparation_capabilities();
+    if kind == crate::ModelKind::Lfm3Vl {
+        facts = facts.with_session(
+            crate::lfm3::vision::VL_SESSION_CAPABILITIES
+                .with_output_observation(facts.session().output_observation()),
+        );
+    }
+    let admission = admit_inspected_preparation(inspection, policy, facts)?;
 
     let missing_grouped = inspection
         .architecture_plan()
@@ -540,8 +547,11 @@ where
     {
         return Err(PreparationSelectionError::PredictionSourceUnsupported);
     }
-    if inspection.architecture_plan().model_kind() == crate::ModelKind::Qwen4Exp {
+    if kind == crate::ModelKind::Qwen4Exp {
         return qwen4::select(inspection, request, mechanisms, admission);
+    }
+    if kind == crate::ModelKind::Lfm3Vl {
+        return select_lfm3_vl(inspection, request, mechanisms, admission);
     }
 
     let projection = inspection
@@ -673,6 +683,118 @@ where
         prediction_realization,
     )
     .with_retained_architecture(inspection.architecture_plan().clone()))
+}
+
+fn select_lfm3_vl(
+    inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
+    load: &NormalizedLoadRequest,
+    mechanisms: &impl PreparationMechanismProvider,
+    admission: eredu_core::PreparationAdmission,
+) -> Result<SelectedPreparation, PreparationSelectionError> {
+    use eredu_core::InputModality;
+    use eredu_runtime::{MediaLoadRequest, ProcessorSelectionRequest};
+
+    if !matches!(
+        load.drafting(),
+        DraftingLoadRequest::ArchitectureDefault | DraftingLoadRequest::Disabled
+    ) {
+        return Err(PreparationSelectionError::ExecutionClass(
+            "the retained VL session has no speculative prediction route".into(),
+        ));
+    }
+    if load.prompt_cache_persistence() {
+        return Err(PreparationSelectionError::ExecutionClass(
+            "the retained VL session has no prompt-cache persistence route".into(),
+        ));
+    }
+    let processor = match load.media_execution() {
+        MediaLoadRequest::Disabled => {
+            return Err(PreparationSelectionError::MediaDisabledForComposite)
+        }
+        MediaLoadRequest::ArchitectureDefault => ProcessorSelectionRequest::new([
+            InputModality::Text,
+            InputModality::Image,
+            InputModality::Video,
+        ])
+        .with_available_raw_media(true),
+        MediaLoadRequest::Required(media) => {
+            if media.processor_budget().is_some() {
+                return Err(PreparationSelectionError::ExecutionClass(
+                    "the VL processor has no bounded processor admission".into(),
+                ));
+            }
+            media
+                .processor()
+                .clone()
+                .with_additional_modalities([InputModality::Text])
+        }
+    };
+    let parallel = load
+        .parallel_topology()
+        .filter(|rank| !rank.is_replicated());
+    let placement = parallel
+        .map(|rank| {
+            let invalid =
+                |reason: &str| PreparationSelectionError::PartitionedAdmission(reason.into());
+            let (batch, sequence) = load
+                .partitioned_invocation_limits()
+                .expect("parallel limits are retained");
+            if batch != 1
+                || load
+                    .pipeline_wire_contract()
+                    .expect("parallel wire")
+                    .activation_dtype()
+                    != eredu_runtime::PipelineActivationDtype::Float32
+            {
+                return Err(invalid(
+                    "VL distributed generation requires batch one and an F32 wire",
+                ));
+            }
+            let prefix = std::num::NonZeroUsize::new(sequence as usize)
+                .expect("validated maximum sequence is positive");
+            let completion = load
+                .communication_completion_policy()?
+                .expect("parallel completion policy");
+            let placement = inspection
+                .architecture_plan()
+                .lfm3_vl_declaration()
+                .expect("admitted VL architecture")
+                .select_rank_placement(rank, prefix)
+                .map_err(|error| {
+                    PreparationSelectionError::PartitionedAdmission(error.to_string())
+                })?
+                .with_completion_policy(completion);
+            mechanisms
+                .communication_capabilities()
+                .validate_manifest(placement.communication_manifest())
+                .map_err(|error| {
+                    PreparationSelectionError::PartitionedAdmission(error.to_string())
+                })?;
+            Ok(placement)
+        })
+        .transpose()?;
+    let request = load
+        .validate_model_preparation()?
+        .text_selection_request(admission.session_capabilities(), parallel.is_some());
+    let graph =
+        crate::lfm3::vision::SelectedVlGraph::select(inspection, &request, &processor, mechanisms)
+            .map_err(|error| PreparationSelectionError::ExecutionClass(error.to_string()))?;
+    let graph = graph.into_realization();
+    if placement.is_some() {
+        crate::lfm3::vision::validate_rank_state(graph.execution())
+            .map_err(|error| PreparationSelectionError::PartitionedAdmission(error.to_string()))?;
+    }
+    let mut execution =
+        SelectedExecution::composite(SelectedCompositeTextRealization::Direct(graph));
+    execution.vl_rank = placement;
+    execution.input_score_attention_workspace = mechanisms.input_score_attention_workspace();
+    Ok(SelectedPreparation::new(
+        inspection.admission_token(),
+        execution,
+        admission,
+        None,
+        None,
+    ))
 }
 
 fn admit_inspected_preparation(

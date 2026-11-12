@@ -63,6 +63,16 @@ impl ModelConfigurationResolver for ModelConfigurations {
         architecture: &str,
         checkpoint: &GgufCheckpoint,
     ) -> Result<Vec<GgufCompanionRequirement>, ArtifactError> {
+        if crate::lfm3::vision::gguf::is_released_backbone(checkpoint) {
+            return GgufCompanionRequirement::new(
+                ArtifactCompanionRole::MediaProjector,
+                true,
+                "mmproj",
+                1,
+                GgufCompanionEncoding::DensePreferred,
+            )
+            .map(|requirement| vec![requirement]);
+        }
         if matches!(
             architecture,
             "dream" | "mistral3" | "nemotron_labs_diffusion"
@@ -85,6 +95,17 @@ impl ModelConfigurationResolver for ModelConfigurations {
         gguf_companion_requirements(GgufArchitecture::resolve(architecture)?)
     }
 
+    fn gguf_sidecar_names(&self, plan: &Self::ArtifactPlan) -> &[&str] {
+        if plan.model_kind() == ModelKind::Lfm3Vl {
+            &[
+                "config.json",
+                crate::processor_plan::COMBINED_PROCESSOR_CONFIG_FILENAME,
+            ]
+        } else {
+            &[]
+        }
+    }
+
     fn sidecar_names(&self, plan: &Self::ArtifactPlan) -> &[&str] {
         match plan.model_kind() {
             ModelKind::DiffusionGemma
@@ -96,8 +117,8 @@ impl ModelConfigurationResolver for ModelConfigurations {
                 crate::processor_plan::PROCESSOR_CONFIG_FILENAME,
                 crate::processor_plan::VIDEO_PROCESSOR_CONFIG_FILENAME,
             ],
-            ModelKind::MuseGlimmer | ModelKind::MuseSpark => {
-                &[crate::processor_plan::MUSE_PROCESSOR_CONFIG_FILENAME]
+            ModelKind::Lfm3Vl | ModelKind::MuseGlimmer | ModelKind::MuseSpark => {
+                &[crate::processor_plan::COMBINED_PROCESSOR_CONFIG_FILENAME]
             }
             _ => &[],
         }
@@ -148,9 +169,12 @@ impl ModelConfigurationResolver for ModelConfigurations {
                 } else {
                     (None, None)
                 };
-                let muse = if matches!(kind, ModelKind::MuseGlimmer | ModelKind::MuseSpark) {
+                let combined = if matches!(
+                    kind,
+                    ModelKind::Lfm3Vl | ModelKind::MuseGlimmer | ModelKind::MuseSpark
+                ) {
                     sidecars
-                        .get(crate::processor_plan::MUSE_PROCESSOR_CONFIG_FILENAME)
+                        .get(crate::processor_plan::COMBINED_PROCESSOR_CONFIG_FILENAME)
                         .cloned()
                 } else {
                     None
@@ -159,7 +183,7 @@ impl ModelConfigurationResolver for ModelConfigurations {
                     &model,
                     image.as_deref(),
                     video.as_deref(),
-                    muse.as_deref(),
+                    combined.as_deref(),
                 )
             }
             ArtifactFormat::Gguf => {
@@ -171,6 +195,43 @@ impl ModelConfigurationResolver for ModelConfigurations {
                 let projector = validated
                     .companion(&ArtifactCompanionRole::MediaProjector)
                     .map(|companion| companion.checkpoint());
+                if resolved_plan.model_kind() == ModelKind::Lfm3Vl {
+                    let invalid = |message: String| ArtifactError::InvalidArchitecturePlan(message);
+                    let config = sidecars.get("config.json").ok_or_else(|| {
+                        invalid(
+                            "LFM3 VL GGUF requires the publisher's config.json beside the backbone"
+                                .into(),
+                        )
+                    })?;
+                    let declaration = crate::lfm3::vision::VisionLanguageDeclaration::from_config(
+                        &serde_json::from_slice(config)?,
+                    )
+                    .map_err(|error| invalid(error.to_string()))?;
+                    let processor_bytes = sidecars
+                        .get(crate::processor_plan::COMBINED_PROCESSOR_CONFIG_FILENAME)
+                        .ok_or_else(|| {
+                            invalid(
+                                "LFM3 VL GGUF requires processor_config.json beside the backbone"
+                                    .into(),
+                            )
+                        })?;
+                    let processor = declaration
+                        .processor(processor_bytes)
+                        .map_err(|error| invalid(error.to_string()))?;
+                    let primary = resolved_plan.gguf_plan().expect("resolved GGUF backbone");
+                    let projector = crate::gguf_companion::resolve_lfm3_vl_projector(
+                        primary,
+                        validated.checkpoint(),
+                        projector.ok_or_else(|| {
+                            invalid("LFM3 VL GGUF requires a media projector".into())
+                        })?,
+                        declaration,
+                    )
+                    .map_err(invalid)?;
+                    return Ok(resolved_plan
+                        .with_gguf_media_projector(Some(projector))
+                        .with_lfm3_vl_gguf_processor(processor));
+                }
                 let media_projector = projector
                     .map(|projector| {
                         crate::gguf_companion::resolve_media_projector(
@@ -266,6 +327,8 @@ pub enum ModelKind {
     Lfm3,
     /// Liquid AI LFM3 Audio speech and text realtime architecture.
     Lfm3Audio,
+    /// Generative LFM3 vision and video family.
+    Lfm3Vl,
     /// Nemotron-H hybrid architecture.
     NemotronH,
     /// Nemotron-Labs-Diffusion shared text backbone and optional Pixtral context.
@@ -311,7 +374,7 @@ impl<'de> Deserialize<'de> for ModelKind {
 
 impl ModelKind {
     /// Every architecture family implemented by this crate.
-    pub const ALL: [Self; 27] = [
+    pub const ALL: [Self; 28] = [
         Self::DeepSeekV3,
         Self::DeepSeekV4,
         Self::DiffusionGemma,
@@ -328,6 +391,7 @@ impl ModelKind {
         Self::Lfm2,
         Self::Lfm3,
         Self::Lfm3Audio,
+        Self::Lfm3Vl,
         Self::NemotronH,
         Self::NemotronLabsDiffusion,
         Self::Moshi,
@@ -360,6 +424,7 @@ impl ModelKind {
             Self::Lfm2 => "lfm2",
             Self::Lfm3 => "lfm3",
             Self::Lfm3Audio => "lfm3_audio",
+            Self::Lfm3Vl => "lfm3_vl",
             Self::NemotronH => "nemotron_h",
             Self::NemotronLabsDiffusion => "nemotron_labs_diffusion",
             Self::Moshi => "moshi",
@@ -388,7 +453,7 @@ impl ModelKind {
             Self::Nanbeige => &["Nanbeige"],
             Self::MuseGlimmer | Self::MuseSpark => &["meta-models"],
             Self::Lfm2 => &["LiquidAI"],
-            Self::Lfm3 | Self::Lfm3Audio => &["LiquidAI"],
+            Self::Lfm3 | Self::Lfm3Audio | Self::Lfm3Vl => &["LiquidAI"],
             Self::NemotronH | Self::NemotronLabsDiffusion | Self::VoiceChat => &["nvidia"],
             Self::Moshi => &["kyutai", "nvidia"],
             Self::Qwen2
@@ -443,6 +508,7 @@ impl ModelKind {
             "lfm2" | "lfm2_moe" => Ok(Self::Lfm2),
             "lfm3" => Ok(Self::Lfm3),
             "lfm3_audio" => Ok(Self::Lfm3Audio),
+            "lfm3_vl" => Ok(Self::Lfm3Vl),
             "nemotron_h" => Ok(Self::NemotronH),
             "nemotron_labs_diffusion" | "nemotron_labs_diffusion_vlm" => {
                 Ok(Self::NemotronLabsDiffusion)
@@ -641,12 +707,12 @@ fn resolve_gguf_configuration(
     name: &str,
     checkpoint: &GgufCheckpoint,
 ) -> Result<(ModelConfiguration, GgufArchitecturePlan), ArtifactError> {
-    let (architecture, plan) = if matches!(name, "dream" | "mistral3" | "nemotron_labs_diffusion") {
+    let mut plan = if matches!(name, "dream" | "mistral3" | "nemotron_labs_diffusion") {
         let admitted =
             crate::nemotron_labs_diffusion::gguf::TextGgufPlan::from_checkpoint(checkpoint)
                 .map_err(|error| ArtifactError::InvalidArtifact(error.to_string()))?;
         let architecture = GgufArchitecture::NemotronLabsDiffusion;
-        let plan = GgufArchitecturePlan::new(
+        GgufArchitecturePlan::new(
             architecture,
             GgufModelConfig::NemotronLabsDiffusion(admitted.clone()),
             admitted.checkpoint().clone(),
@@ -659,21 +725,25 @@ fn resolve_gguf_configuration(
             None,
             None,
             None,
-        );
-        (architecture, plan)
+        )
     } else {
         let architecture = GgufArchitecture::resolve(name)?;
-        (
-            architecture,
-            resolve_gguf_architecture(architecture, checkpoint)?,
-        )
+        resolve_gguf_architecture(architecture, checkpoint)?
     };
+    if crate::lfm3::vision::gguf::is_released_backbone(checkpoint) {
+        plan.model_kind = ModelKind::Lfm3Vl;
+    }
+    let kind = plan.model_kind();
     Ok((
         ModelConfiguration::new(
             name,
-            name,
-            architecture.model_kind().canonical_name(),
-            architecture.model_kind().loading_protocol(),
+            if kind == ModelKind::Lfm3Vl {
+                kind.canonical_name()
+            } else {
+                name
+            },
+            kind.canonical_name(),
+            kind.loading_protocol(),
             None,
         )?,
         plan,
@@ -728,6 +798,18 @@ fn effective_model_type(
     metadata: &ConfigMetadata,
     declared_kind: ModelKind,
 ) -> Result<String, ArtifactError> {
+    if declared_kind == ModelKind::Lfm3Vl {
+        return match metadata
+            .text_config
+            .as_ref()
+            .and_then(|config| config.model_type.as_deref())
+        {
+            Some("lfm3") => Ok("lfm3".into()),
+            _ => Err(ArtifactError::InvalidArtifact(
+                "LFM3 VL requires nested lfm3 text geometry".into(),
+            )),
+        };
+    }
     if matches!(
         metadata.model_type.as_str(),
         "gemma4"
@@ -806,6 +888,14 @@ pub fn resolve_model_identity(json: &Value) -> Result<ResolvedModelIdentity, Art
         });
     }
     let metadata: ConfigMetadata = serde_json::from_value(json.clone())?;
+    if metadata.model_type == "lfm3_vl"
+        && json["architectures"] != serde_json::json!(["Lfm3VlForConditionalGeneration"])
+    {
+        return Err(ArtifactError::UnsupportedModelType(format!(
+            "lfm3_vl with architecture {}",
+            json["architectures"]
+        )));
+    }
     let kind = ModelKind::resolve_model_type(&metadata.model_type)?;
     let effective_model_type = effective_model_type(&metadata, kind)?;
     Ok(ResolvedModelIdentity {
@@ -868,6 +958,8 @@ pub enum SafetensorsModelConfig {
     Lfm2(crate::lfm2::ModelArgs),
     /// LFM3 text/base decoder configuration.
     Lfm3(crate::lfm3::ModelArgs),
+    /// Generative VL backbone, tower, and exact checkpoint scopes.
+    Lfm3Vl(std::sync::Arc<crate::lfm3::vision::VisionLanguageDeclaration>),
     /// Nemotron-H family geometry.
     NemotronH(crate::nemotron_h::ModelArgs),
     /// Moshi-family realtime geometry.
@@ -973,7 +1065,7 @@ impl SafetensorsModelConfig {
             | Self::VoiceChat(_) => false,
             Self::Muse(args) => args.num_experts > 0,
             Self::Lfm2(args) => args.num_experts > 0,
-            Self::Lfm3(_) => false,
+            Self::Lfm3(_) | Self::Lfm3Vl(_) => false,
             Self::NemotronH(args) => args.n_routed_experts > 0,
             Self::Qwen(args) => args.num_experts > 0,
             Self::QwenHybrid(args) => args.text.num_experts > 0,
@@ -1012,6 +1104,7 @@ impl GgufModelConfig {
 #[derive(Debug, Clone)]
 pub struct GgufArchitecturePlan {
     architecture: GgufArchitecture,
+    model_kind: ModelKind,
     model: GgufModelConfig,
     checkpoint: GgufCheckpointPlan,
     tensor_mapping: Vec<eredu_gguf::TranslatedTensorLayout>,
@@ -1074,6 +1167,7 @@ impl GgufArchitecturePlan {
     ) -> Self {
         Self {
             architecture,
+            model_kind: architecture.model_kind(),
             model,
             checkpoint,
             tensor_mapping,
@@ -1107,7 +1201,7 @@ impl GgufArchitecturePlan {
 
     /// Canonical family selected for this exact checkpoint.
     pub const fn model_kind(&self) -> ModelKind {
-        self.architecture.model_kind()
+        self.model_kind
     }
 
     /// Typed normalized family configuration.
@@ -1879,6 +1973,10 @@ fn resolve_safetensors_architecture(
         ModelKind::Lfm3Audio => Err(ArtifactError::UnsupportedLoadingProtocol(
             LoadingProtocol::Realtime,
         )),
+        ModelKind::Lfm3Vl => crate::lfm3::vision::VisionLanguageDeclaration::from_config(json)
+            .map(std::sync::Arc::new)
+            .map(SafetensorsModelConfig::Lfm3Vl)
+            .map_err(|error| invalid_configuration(kind, error)),
         ModelKind::Lfm3 => crate::lfm3::model_args_from_config_value(json)
             .map(SafetensorsModelConfig::Lfm3)
             .map_err(|error| invalid_configuration(kind, error)),
@@ -2060,6 +2158,7 @@ fn resolve_safetensors_architecture(
             crate::lfm2::safetensors_plan(lfm2.as_deref().expect("declared LFM2 family"), true)
                 .map_err(|error| invalid_configuration(kind, error))?
         }
+        SafetensorsModelConfig::Lfm3Vl(declaration) => declaration.checkpoint().clone(),
         SafetensorsModelConfig::Lfm3(_) => {
             crate::lfm3::safetensors_plan(lfm3.as_deref().expect("declared LFM3 family"), true)
                 .map_err(|error| invalid_configuration(kind, error))?

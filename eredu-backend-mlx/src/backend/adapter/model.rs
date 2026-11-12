@@ -35,6 +35,10 @@ impl MlxModel {
         }
     }
 
+    pub(crate) fn realized_session_capabilities(&self) -> eredu_core::SessionCapabilities {
+        self.executable.erased().realized_session_capabilities()
+    }
+
     pub(crate) fn executable_mut(&mut self) -> &mut Executable {
         &mut self.executable
     }

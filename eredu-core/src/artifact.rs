@@ -494,6 +494,11 @@ pub trait ModelConfigurationResolver {
         &[]
     }
 
+    /// Sidecars read beside a local GGUF primary during architecture admission.
+    fn gguf_sidecar_names(&self, _plan: &Self::ArtifactPlan) -> &[&str] {
+        &[]
+    }
+
     /// Finalizes resolved architecture state against the inspected tensor catalog
     /// and exact sidecars selected by inspection.
     fn artifact_plan(
@@ -1163,12 +1168,15 @@ fn inspect_gguf<R: ModelConfigurationResolver>(
         .into_parts();
     let requirements = resolver.gguf_companion_requirements(architecture_name, &checkpoint)?;
     let companions = resolve_selected_gguf_companions(source, &requirements)?;
+    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    let sidecars = read_artifact_sidecars(directory, resolver.gguf_sidecar_names(&resolved_plan))?;
     finish_gguf_inspection(
         path,
         checkpoint,
         companions,
         configuration,
         resolved_plan,
+        &sidecars,
         resolver,
         None,
     )
@@ -1180,6 +1188,7 @@ fn finish_gguf_inspection<R: ModelConfigurationResolver>(
     companions: BTreeMap<ArtifactCompanionRole, ValidatedGgufCompanion>,
     configuration: ModelConfiguration,
     resolved_plan: R::ArtifactPlan,
+    sidecars: &BTreeMap<String, Vec<u8>>,
     resolver: &R,
     metadata_provenance: Option<MetadataProvenance>,
 ) -> Result<ArtifactInspection<R::ArtifactPlan>, ArtifactError> {
@@ -1214,7 +1223,7 @@ fn finish_gguf_inspection<R: ModelConfigurationResolver>(
         companions,
     };
     let architecture_plan = resolver.artifact_plan(
-        &BTreeMap::new(),
+        sidecars,
         ArtifactFormat::Gguf,
         &configuration,
         &tensors,
@@ -1477,16 +1486,7 @@ fn inspect_safetensors<R: ModelConfigurationResolver>(
     let shards = catalog.admitted_shards();
     let tensors =
         safetensors_tensor_catalog(catalog.tensors(), |name| catalog.tensor_offset(name))?;
-    let mut sidecars = BTreeMap::new();
-    for name in resolver.sidecar_names(&resolved_plan) {
-        match std::fs::read(path.join(name)) {
-            Ok(bytes) => {
-                sidecars.insert((*name).to_owned(), bytes);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
+    let sidecars = read_artifact_sidecars(path, resolver.sidecar_names(&resolved_plan))?;
     finish_safetensors_inspection(
         path,
         configuration,
@@ -1497,6 +1497,23 @@ fn inspect_safetensors<R: ModelConfigurationResolver>(
         resolver,
         None,
     )
+}
+
+fn read_artifact_sidecars(
+    path: &Path,
+    names: &[&str],
+) -> Result<BTreeMap<String, Vec<u8>>, ArtifactError> {
+    let mut sidecars = BTreeMap::new();
+    for name in names {
+        match std::fs::read(path.join(name)) {
+            Ok(bytes) => {
+                sidecars.insert((*name).to_owned(), bytes);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(sidecars)
 }
 
 fn safetensors_tensor_catalog(

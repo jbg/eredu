@@ -40,11 +40,12 @@ pub(crate) fn native_recipe_workspace<C: RecipeCatalog + ?Sized>(
             .map_err(|error| error.to_string())?
             .byte_len();
         match recipe {
-            DerivedWeightRecipe::DecodeTensorFp8 { weight, scale } => add(
+            DerivedWeightRecipe::DecodeTensorFp8 { weight, scale }
+            | DerivedWeightRecipe::ScaleF32 { weight, scale } => add(
                 add(buffers(weight, source)?, buffers(scale, source)?)?,
                 output
                     .checked_mul(2)
-                    .ok_or("tensor FP8 conversion overflow")?,
+                    .ok_or("scaled tensor workspace overflow")?,
             ),
             DerivedWeightRecipe::Source { .. } => add(output, output),
             DerivedWeightRecipe::Stack { inputs, .. }
@@ -440,7 +441,8 @@ pub(crate) fn preflight_mlx_recipe_metadata<C: RecipeCatalog + ?Sized>(
         mlx_dtype(metadata.dtype())?;
 
         match recipe {
-            DerivedWeightRecipe::DecodeTensorFp8 { weight, scale } => {
+            DerivedWeightRecipe::DecodeTensorFp8 { weight, scale }
+            | DerivedWeightRecipe::ScaleF32 { weight, scale } => {
                 visit(weight, source, encoding)?;
                 visit(scale, source, encoding)?;
             }
@@ -751,7 +753,7 @@ impl MlxWeightRecipeExt for DerivedWeightRecipe {
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(array.transpose_axes(&axes, stream)?)
             }
-            Self::DecodeTensorFp8 { weight, scale } => {
+            Self::DecodeTensorFp8 { weight, scale } | Self::ScaleF32 { weight, scale } => {
                 let weight =
                     weight.materialize_inner(store, stream, sources, borrow_sources, context)?;
                 let scale =
@@ -763,11 +765,21 @@ impl MlxWeightRecipeExt for DerivedWeightRecipe {
                 let value = prepared.inputs()[1].clone().try_item::<f32>(stream)?;
                 if !value.is_finite() || value <= 0.0 {
                     prepared.finish()?;
-                    return Err(WeightRecipeError::InvalidTensorFp8Scale);
+                    return Err(if matches!(self, Self::DecodeTensorFp8 { .. }) {
+                        WeightRecipeError::InvalidTensorFp8Scale
+                    } else {
+                        WeightRecipeError::InvalidF32Scale
+                    });
                 }
-                let output = prepared.inputs()[0]
-                    .from_fp8(Dtype::Float32, stream)?
-                    .multiply(&prepared.inputs()[1], stream)?;
+                let weight = &prepared.inputs()[0];
+                let scale = &prepared.inputs()[1];
+                let output = if matches!(self, Self::DecodeTensorFp8 { .. }) {
+                    weight
+                        .from_fp8(Dtype::Float32, stream)?
+                        .multiply(scale, stream)?
+                } else {
+                    weight.multiply(scale, stream)?
+                };
                 sources.extend(prepared.finish_preparation()?);
                 Ok(output)
             }
@@ -1031,6 +1043,9 @@ pub enum WeightRecipeError {
     /// A weight-only FP8 multiplier cannot define finite, positively scaled weights.
     #[error("tensor FP8 scale must be finite and positive")]
     InvalidTensorFp8Scale,
+    /// A checkpoint multiplier is outside the admitted positive finite range.
+    #[error("F32 scaling requires a finite positive scalar")]
+    InvalidF32Scale,
     /// Backend-neutral checkpoint inspection or lease acquisition failed.
     #[error(transparent)]
     CheckpointStore(#[from] eredu_checkpoint::store::StoreError),

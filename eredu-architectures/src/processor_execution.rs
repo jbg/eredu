@@ -256,6 +256,9 @@ impl ProcessorOperations for HostProcessorMechanisms {
         })?;
         let resized = match plan.resample {
             RgbResample::Bicubic => resize_rgb8_bicubic(source, width, height)?,
+            RgbResample::AntialiasedBicubic => {
+                eredu_media::image::resize_rgb8_antialiased_bicubic(source, width, height)?
+            }
             RgbResample::Lanczos3 => resize_rgb8_lanczos3(source, width, height)?,
         };
         rescale_and_normalize_rgb8(resized.as_view(), plan.rescale_factor, plan.mean, plan.std)
@@ -388,7 +391,7 @@ pub struct PreparedProcessor {
 #[derive(Clone)]
 struct ProcessorAuthority {
     selected: eredu_runtime::SelectedProcessorExecution,
-    admission: crate::qwen4_exp::media::MediaAdmissionConfig,
+    admission: Option<crate::qwen4_exp::media::MediaAdmissionConfig>,
     budget: Option<ProcessorRequestBudget>,
 }
 impl std::fmt::Debug for ProcessorAuthority {
@@ -467,6 +470,18 @@ pub trait ProcessorInputAdmission {
 }
 
 impl PreparedProcessor {
+    pub(crate) fn with_selected_modalities(
+        mut self,
+        selected: eredu_runtime::SelectedProcessorExecution,
+    ) -> Self {
+        self.authority = Some(Box::new(ProcessorAuthority {
+            selected,
+            admission: None,
+            budget: None,
+        }));
+        self
+    }
+
     pub(crate) fn with_media_authority(
         mut self,
         selected: eredu_runtime::SelectedProcessorExecution,
@@ -475,7 +490,7 @@ impl PreparedProcessor {
     ) -> Self {
         self.authority = Some(Box::new(ProcessorAuthority {
             selected,
-            admission,
+            admission: Some(admission),
             budget,
         }));
         self
@@ -648,9 +663,12 @@ impl PreparedProcessor {
             }
         }
         .map_err(host_execution_error)?;
-        if let Some(authority) = &self.authority {
-            authority
-                .admission
+        if let Some(admission) = self
+            .authority
+            .as_ref()
+            .and_then(|authority| authority.admission.as_ref())
+        {
+            admission
                 .validate(&host, &HostProcessorMechanisms)
                 .map_err(input_admission_error)?;
         }
@@ -733,10 +751,11 @@ impl PreparedProcessor {
                     "processor intervention changed tensor shape or dtype".into(),
                 ));
             }
-            authority
-                .admission
-                .validate(&observed, mechanisms)
-                .map_err(input_admission_error)?;
+            if let Some(admission) = &authority.admission {
+                admission
+                    .validate(&observed, mechanisms)
+                    .map_err(input_admission_error)?;
+            }
         }
         Ok(observed)
     }

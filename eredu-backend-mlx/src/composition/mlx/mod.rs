@@ -12,6 +12,7 @@ mod prepared_speculative;
 mod processor;
 pub mod realtime;
 pub(crate) mod replicated_text;
+mod vl_session;
 pub(crate) use replicated_text::state_capabilities;
 mod session;
 pub mod speculative;
