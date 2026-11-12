@@ -1645,3 +1645,27 @@ jq -r '.variants[] | (.backbone, .projector) | [.file, .header_bytes] | @tsv' "$
 cargo run -p eredu-architectures --example inspect_lfm3_omni_gguf_headers -- \
   "$manifest" "$headers" /private/tmp/lfm3-omni-source
 ```
+
+### Omni pipeline replay
+
+The released Q4_K_M video-and-soundtrack fixture above also exercises the
+native `MlxPipelineAudioModel::start_omni` adapter on CPU. Each rank projects
+the decoded video with `MlxVlVision::project_prompt`, expands its soundtrack
+positions with `PreparedOmni::video_prompt`, and submits the resulting
+`OmniAudioRequest` with seed 42. Vision and speech components are replicated
+on each rank. The language layers and their state follow the selected
+pipeline and tensor placement.
+
+The replay uses the MLX Ring backend on loopback with two pipeline stages
+and one or two tensor ranks per stage. Set `MLX_HOSTFILE` to a JSON array with
+one single-address array per rank and `MLX_RANK` to the process's zero-based
+rank. Select the rank-local graph with
+`ParallelTopology::new(world.size() / 2, 2, 1, 1)` and drain
+`MlxPipelineAudioSession::events`. The resident comparison submits the same
+request through `MlxAudioModel::start_omni`.
+
+Both cohorts report five committed slots on every rank. All 60 committed
+codebook IDs and the 9,600 PCM samples match the resident run on every rank.
+The PCM SHA-256 matches the resident and disk-streamed result above. This
+replay covers the native pipeline adapter and all-rank publication on this
+fixture. It does not establish independent numerical parity.
