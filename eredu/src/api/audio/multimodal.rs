@@ -1,0 +1,247 @@
+//! Finite multimodal requests through the shared turn-based speech session.
+
+use std::sync::Arc;
+
+use eredu_architectures::lfm3::{
+    audio::{OmniAudioRequest, PreparedResidentAudio},
+    vision::PreparedVisionExecution,
+};
+use eredu_backend_mlx::{
+    native::{MlxVlMedia, MlxVlVision},
+    MlxTensor,
+};
+use eredu_checkpoint::recipe::RecipeDtype;
+use eredu_core::{
+    Media, MediaBinding, MultimodalRequest, MultimodalSegment, TokenizedMultimodalSegment,
+};
+use eredu_media::audio::AudioWaveform;
+use eredu_nn::Tensor;
+use eredu_runtime::LayerWeightResidency;
+
+use super::*;
+
+pub use eredu_architectures::lfm3::omni::PreparedOmni;
+
+/// A finite mixed-media turn prepared with the selected Omni checkpoint.
+pub struct PreparedMultimodalAudioTask {
+    speech: PreparedResidentAudio,
+    vision: PreparedVisionExecution,
+    media: MlxVlMedia,
+    prompt: eredu_core::TokenizedMultimodalRequest,
+    tokenizer: Tokenizer,
+    processor: eredu_architectures::lfm3::audio::ProcessorConfig,
+    markers: eredu_architectures::lfm3::vision::MediaTokens,
+    audio_marker: i32,
+    mode: AudioMode,
+    max_slots: usize,
+    seed: u64,
+    output_rate: u32,
+}
+
+impl PreparedMultimodalAudioTask {
+    /// Applies the checkpoint's chat template to one ordered user turn.
+    ///
+    /// Text segments carry user text. Image, video and mono PCM segments are
+    /// decoded media. The waveform must use the checkpoint's input sample rate.
+    pub fn new(
+        artifact: &PreparedOmni,
+        input: &MultimodalRequest,
+        mode: AudioMode,
+        max_slots: usize,
+        seed: u64,
+    ) -> TaskResult<Self> {
+        if max_slots == 0 {
+            return Err("audio response budget must be positive".into());
+        }
+        let assets = &artifact.speech().text_assets;
+        let mut tokenizer = Tokenizer::from_bytes(&assets.tokenizer)?;
+        let mut content = Vec::new();
+        let mut bindings = Vec::new();
+        for segment in input.segments() {
+            content.push(match segment {
+                MultimodalSegment::Text(text) => json!({"type":"text","text":text}),
+                MultimodalSegment::TokenIds(_) => {
+                    return Err(
+                        "multimodal audio chat requires user text before tokenization".into(),
+                    )
+                }
+                MultimodalSegment::Media(media) => {
+                    bindings.push(MediaBinding::new(
+                        artifact.placeholder(media),
+                        media.clone(),
+                    ));
+                    let kind = match media {
+                        Media::Image(_) => "image",
+                        Media::Video(_) => "video",
+                        Media::Audio(_) => "audio",
+                    };
+                    json!({"type":kind})
+                }
+            });
+        }
+        let rendered = tokenizer
+            .apply_chat_template_json(
+                ModelChatTemplate::Single(assets.chat_template.to_string()),
+                [vec![json!({"role":"user","content":content})]],
+                None,
+                "turn-based-multimodal-audio",
+                true,
+                None,
+            )?
+            .pop()
+            .ok_or("chat template returned no prompt")?;
+        let prompt = MultimodalRequest::from_chat(&rendered, &bindings)?
+            .tokenize(|text| encode(&tokenizer, text))?;
+        let markers = artifact.media_tokens();
+        let audio = artifact.speech().tokens;
+        for part in prompt.segments() {
+            if let TokenizedMultimodalSegment::TokenIds(ids) = part {
+                if ids.iter().any(|&id| {
+                    [
+                        markers.image_token_id,
+                        markers.video_token_id,
+                        audio.input,
+                        audio.output,
+                    ]
+                    .contains(&(id as i32))
+                }) {
+                    return Err("the prompt contains an unbound media token".into());
+                }
+            }
+        }
+        Ok(Self {
+            speech: PreparedResidentAudio::select_omni(artifact)?,
+            vision: artifact.prepare_vision(RecipeDtype::F32)?,
+            media: MlxVlMedia::for_omni(artifact)?,
+            prompt,
+            tokenizer,
+            processor: artifact.speech().processor,
+            markers,
+            audio_marker: audio.input,
+            mode,
+            max_slots,
+            seed,
+            output_rate: u32::try_from(artifact.speech().codec.config().sampling_rate)?,
+        })
+    }
+
+    /// Required sample rate for decoded PCM inputs.
+    pub fn input_sample_rate(&self) -> u32 {
+        self.processor.sample_rate()
+    }
+
+    /// Sample rate of any generated mono PCM.
+    pub fn output_sample_rate(&self) -> u32 {
+        self.output_rate
+    }
+
+    /// Binds resident weights, prepares the media and starts the shared response session.
+    pub fn load(
+        self,
+        weights: &ExecutionContext,
+        execution: &ExecutionContext,
+    ) -> TaskResult<AudioTaskSession> {
+        self.load_with_residency(
+            weights,
+            execution,
+            LayerWeightResidency::FullyResident,
+            AudioParameterResidency::default(),
+        )
+    }
+
+    /// Applies independent vision and speech parameter policies to the selected components.
+    pub fn load_with_residency(
+        self,
+        weights: &ExecutionContext,
+        execution: &ExecutionContext,
+        vision_residency: LayerWeightResidency,
+        speech_residency: AudioParameterResidency,
+    ) -> TaskResult<AudioTaskSession> {
+        let mut vision = MlxVlVision::bind(
+            self.vision,
+            vision_residency,
+            weights.stream(),
+            execution.stream(),
+        )?;
+        let transform = self.processor.transform()?;
+        let mut tokens = Vec::new();
+        let mut images = Vec::new();
+        let mut videos = Vec::new();
+        let mut features = Vec::new();
+        for part in self.prompt.segments() {
+            match part {
+                TokenizedMultimodalSegment::TokenIds(ids) => {
+                    tokens.extend(
+                        ids.iter()
+                            .copied()
+                            .map(i32::try_from)
+                            .collect::<Result<Vec<_>, _>>()?,
+                    );
+                }
+                TokenizedMultimodalSegment::Media(Media::Audio(audio)) => {
+                    let clip = transform
+                        .extract(AudioWaveform::new(audio.samples(), audio.sample_rate())?)?;
+                    let positions = self.processor.audio_positions(clip.frames)?;
+                    tokens.push(self.markers.vision_start_token_id);
+                    tokens.extend(std::iter::repeat_n(self.audio_marker, positions));
+                    tokens.push(self.markers.vision_end_token_id);
+                    features.push(clip);
+                }
+                TokenizedMultimodalSegment::Media(media) => {
+                    let input =
+                        MultimodalRequest::new(vec![MultimodalSegment::Media(media.clone())])?
+                            .tokenize(|text| encode(&self.tokenizer, text))?;
+                    let prepared = self
+                        .media
+                        .prepare(&input, &mut |text| encode(&self.tokenizer, text))?;
+                    let (ids, image, video) = vision
+                        .project_prompt(self.media.admit(&prepared)?)?
+                        .into_media_parts();
+                    tokens.extend(ids);
+                    images.extend(image);
+                    videos.extend(video);
+                }
+            }
+        }
+        let combine = |mut rows: Vec<MlxTensor>| match rows.len() {
+            0 | 1 => Ok(rows.pop()),
+            _ => MlxTensor::concatenate(&rows, 0, execution.stream()).map(Some),
+        };
+        let image = combine(images)?;
+        let video = combine(videos)?;
+        let model = MlxAudioModel::load_prepared_with_parameter_residency(
+            self.speech,
+            speech_residency,
+            weights,
+            execution,
+        )?;
+        let session = model.start_omni(
+            OmniAudioRequest {
+                audio: AudioRequest {
+                    tokens: &tokens,
+                    features: &features,
+                    replay: &[],
+                    mode: self.mode,
+                    max_slots: self.max_slots,
+                },
+                image: image.as_ref(),
+                video: video.as_ref(),
+            },
+            self.seed,
+        )?;
+        Ok(AudioTaskSession {
+            state: State::Response(session),
+            decoder: TextDecoder::from_shared_tokenizer(Arc::new((*self.tokenizer).clone()), true),
+            input_rate: None,
+            pending_text: None,
+            speech_only: false,
+        })
+    }
+}
+
+fn encode(tokenizer: &Tokenizer, text: &str) -> Result<Vec<u32>, std::io::Error> {
+    tokenizer
+        .encode(text, false)
+        .map(|encoding| encoding.get_ids().to_vec())
+        .map_err(|error| std::io::Error::other(error.to_string()))
+}

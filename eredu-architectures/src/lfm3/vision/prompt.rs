@@ -164,7 +164,7 @@ impl VisionPromptAdmission {
         Self::from_declarations(artifact.tokens, &artifact.vision, artifact.language.args())
     }
 
-    pub(super) fn from_declarations(
+    pub(in crate::lfm3) fn from_declarations(
         markers: MediaTokens,
         vision: &super::Declaration,
         language: &crate::lfm3::ModelArgs,
@@ -566,6 +566,11 @@ impl<T: Tensor> ProjectedVisionPrompt<T> {
             width: self.width,
             length: self.ids.len() as i32,
         })
+    }
+
+    /// Transfers expanded token IDs and projected rows in image and video order.
+    pub fn into_media_parts(self) -> (Vec<i32>, Option<T>, Option<T>) {
+        (self.ids, self.image, self.video)
     }
 
     /// Expanded decoder token IDs in prompt order.

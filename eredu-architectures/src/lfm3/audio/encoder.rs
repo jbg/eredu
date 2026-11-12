@@ -888,6 +888,6 @@ impl Declaration {
     }
 }
 
-fn frame_tokens(frames: i32, finalize: bool) -> i32 {
+pub(in crate::lfm3) fn frame_tokens(frames: i32, finalize: bool) -> i32 {
     frames / STRIDE + i32::from(finalize && frames % STRIDE != 0)
 }

@@ -17,6 +17,11 @@ use eredu_backend_mlx::native::ExecutionContext;
 
 pub use super::realtime::AudioParameterResidency;
 
+#[cfg(feature = "image")]
+mod multimodal;
+#[cfg(feature = "image")]
+pub use multimodal::{PreparedMultimodalAudioTask, PreparedOmni};
+
 type TaskResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 /// Task for one audio request.
