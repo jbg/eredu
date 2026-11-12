@@ -123,7 +123,7 @@ impl Declaration {
         Self::from_speech_config(config)
     }
 
-    pub(super) fn from_speech_config(config: &Value) -> Result<Self, Error> {
+    pub(in crate::lfm3) fn from_speech_config(config: &Value) -> Result<Self, Error> {
         let (encoder, text, backbone, mel_key, channels_key, width_key) =
             if let Some(encoder) = config.get("audio_encoder_config") {
                 (
