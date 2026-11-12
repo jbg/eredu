@@ -185,6 +185,17 @@ impl PreparedOmni {
         )
     }
 
+    /// Retains the checkpoint's video and soundtrack prompt policy.
+    pub fn video_prompt(&self) -> OmniVideoPrompt {
+        OmniVideoPrompt {
+            processor: self.processor.clone(),
+            tokens: self.tokens,
+            audio_token: self.speech.tokens.input,
+            seconds_per_audio_position: 160.0 * 8.0
+                / f64::from(self.speech.processor.sample_rate()),
+        }
+    }
+
     /// Prepares the same independent vision units as VL from the retained Omni source.
     pub fn prepare_vision(
         &self,
@@ -195,6 +206,94 @@ impl PreparedOmni {
             self.vision_weights.source(),
             dtype,
         )?)
+    }
+}
+
+/// Portable Omni video framing and soundtrack alignment.
+pub struct OmniVideoPrompt {
+    processor: QwenProcessorPlan,
+    tokens: MediaTokens,
+    audio_token: i32,
+    seconds_per_audio_position: f64,
+}
+
+impl OmniVideoPrompt {
+    /// Wraps shared visual groups and inserts soundtrack positions after each group.
+    ///
+    /// Soundtrack positions address the projection of the entire clip, in order.
+    pub fn expand(
+        &self,
+        video: &eredu_core::Video,
+        visual_ids: &[i32],
+        audio_positions: usize,
+    ) -> Result<Vec<i32>, Error> {
+        let fps = video
+            .source_fps()
+            .ok_or_else(|| Error::backend("Omni video requires source FPS"))?;
+        let frame = &video.frames()[0];
+        let plan = self
+            .processor
+            .video(
+                video.frames().len(),
+                frame.height() as usize,
+                frame.width() as usize,
+                Some(fps),
+                video.sampling(),
+            )
+            .map_err(Error::backend_source)?;
+        let fps = (fps * 1_000_000.0).round_ties_even() / 1_000_000.0;
+        let capacity = visual_ids
+            .len()
+            .checked_add(audio_positions)
+            .and_then(|n| n.checked_add(2))
+            .ok_or_else(|| Error::backend("Omni video prompt length overflow"))?;
+        let mut ids = Vec::new();
+        ids.try_reserve_exact(capacity)
+            .map_err(Error::backend_source)?;
+        ids.push(self.tokens.vision_start_token_id);
+        let mut visual = visual_ids;
+        let mut audio_offset = 0;
+        for index in 0..plan.groups.len() {
+            let close = visual
+                .iter()
+                .position(|&id| id == self.tokens.vision_end_token_id)
+                .ok_or_else(|| Error::backend("Omni video is missing a projected frame group"))?;
+            let (group, tail) = visual.split_at(close + 1);
+            let open = group
+                .iter()
+                .position(|&id| id == self.tokens.vision_start_token_id)
+                .ok_or_else(|| Error::backend("Omni video group is missing its opening marker"))?;
+            let positions = &group[open + 1..close];
+            if positions.is_empty() || positions.iter().any(|&id| id != self.tokens.video_token_id)
+            {
+                return Err(Error::backend(
+                    "Omni video group has invalid projected positions",
+                ));
+            }
+            ids.extend_from_slice(group);
+            visual = tail;
+            let boundary = plan
+                .groups
+                .get(index + 1)
+                .map_or(audio_positions, |next| {
+                    let seconds = next.source_indices[0] as f64 / fps;
+                    ((seconds / self.seconds_per_audio_position).round_ties_even() as usize)
+                        .min(audio_positions)
+                })
+                .max(audio_offset);
+            ids.extend(std::iter::repeat_n(
+                self.audio_token,
+                boundary - audio_offset,
+            ));
+            audio_offset = boundary;
+        }
+        if !visual.is_empty() {
+            return Err(Error::backend(
+                "Omni video has excess projected frame groups",
+            ));
+        }
+        ids.push(self.tokens.vision_end_token_id);
+        Ok(ids)
     }
 }
 
