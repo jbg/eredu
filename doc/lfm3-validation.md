@@ -1580,3 +1580,12 @@ with a 96 × 96 RGB image, 1,600 mono samples at 16 kHz and a text instruction.
 With seed 42, speech mode and a five-slot budget, the shared response session
 returns 9,600 finite PCM samples at 24 kHz. The run verifies the public raw
 image and PCM path. Publisher numerical parity remains unverified.
+
+The synchronized video replay pairs four decoded 64 × 64 frames at 4 FPS
+with 16,000 mono PCM samples at 16 kHz. The pinned Python prompt expansion
+places six audio positions after the first frame group and seven after the
+second for a 13-position soundtrack. Eredu reproduces that split and the outer
+video framing. The released resident CPU session runs the paired request through
+`PreparedMultimodalAudioTask::new_with_soundtracks` and returns 9,600 finite PCM
+samples at 24 kHz with seed 42 and a five-slot speech budget. This checks
+prompt ordering and execution. Score and PCM parity remain unverified.

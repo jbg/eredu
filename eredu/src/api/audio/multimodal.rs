@@ -1,6 +1,6 @@
 //! Finite multimodal requests through the shared turn-based speech session.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use eredu_architectures::lfm3::{
     audio::{OmniAudioRequest, PreparedResidentAudio},
@@ -12,7 +12,7 @@ use eredu_backend_mlx::{
 };
 use eredu_checkpoint::recipe::RecipeDtype;
 use eredu_core::{
-    Media, MediaBinding, MultimodalRequest, MultimodalSegment, TokenizedMultimodalSegment,
+    Audio, Media, MediaBinding, MultimodalRequest, MultimodalSegment, TokenizedMultimodalSegment,
 };
 use eredu_media::audio::AudioWaveform;
 use eredu_nn::Tensor;
@@ -28,6 +28,8 @@ pub struct PreparedMultimodalAudioTask {
     vision: PreparedVisionExecution,
     media: MlxVlMedia,
     prompt: eredu_core::TokenizedMultimodalRequest,
+    video_prompt: eredu_architectures::lfm3::omni::OmniVideoPrompt,
+    soundtracks: BTreeMap<usize, Audio>,
     tokenizer: Tokenizer,
     processor: eredu_architectures::lfm3::audio::ProcessorConfig,
     markers: eredu_architectures::lfm3::vision::MediaTokens,
@@ -50,6 +52,40 @@ impl PreparedMultimodalAudioTask {
         max_slots: usize,
         seed: u64,
     ) -> TaskResult<Self> {
+        Self::new_with_soundtracks(artifact, input, BTreeMap::new(), mode, max_slots, seed)
+    }
+
+    /// Pairs decoded PCM with videos by zero-based video order in the user turn.
+    ///
+    /// Each soundtrack starts at its video's time zero and uses the checkpoint sample rate.
+    pub fn new_with_soundtracks(
+        artifact: &PreparedOmni,
+        input: &MultimodalRequest,
+        soundtracks: BTreeMap<usize, Audio>,
+        mode: AudioMode,
+        max_slots: usize,
+        seed: u64,
+    ) -> TaskResult<Self> {
+        let videos = input.segments().iter().filter_map(|segment| match segment {
+            MultimodalSegment::Media(Media::Video(video)) => Some(video),
+            _ => None,
+        });
+        let mut video_count = 0;
+        for video in videos {
+            if video.source_fps().is_none() {
+                return Err("Omni video requires source FPS".into());
+            }
+            video_count += 1;
+        }
+        if soundtracks.keys().any(|&index| index >= video_count) {
+            return Err("Omni soundtrack refers to a missing video".into());
+        }
+        if soundtracks
+            .values()
+            .any(|clip| clip.sample_rate() != artifact.speech().processor.sample_rate())
+        {
+            return Err("Omni soundtrack must use the checkpoint sample rate".into());
+        }
         if max_slots == 0 {
             return Err("audio response budget must be positive".into());
         }
@@ -114,6 +150,8 @@ impl PreparedMultimodalAudioTask {
             vision: artifact.prepare_vision(RecipeDtype::F32)?,
             media: MlxVlMedia::for_omni(artifact)?,
             prompt,
+            video_prompt: artifact.video_prompt(),
+            soundtracks,
             tokenizer,
             processor: artifact.speech().processor,
             markers,
@@ -168,6 +206,7 @@ impl PreparedMultimodalAudioTask {
         let mut images = Vec::new();
         let mut videos = Vec::new();
         let mut features = Vec::new();
+        let mut video_index = 0;
         for part in self.prompt.segments() {
             match part {
                 TokenizedMultimodalSegment::TokenIds(ids) => {
@@ -197,7 +236,21 @@ impl PreparedMultimodalAudioTask {
                     let (ids, image, video) = vision
                         .project_prompt(self.media.admit(&prepared)?)?
                         .into_media_parts();
-                    tokens.extend(ids);
+                    if let Media::Video(clip) = media {
+                        let mut positions = 0;
+                        if let Some(soundtrack) = self.soundtracks.get(&video_index) {
+                            let audio = transform.extract(AudioWaveform::new(
+                                soundtrack.samples(),
+                                soundtrack.sample_rate(),
+                            )?)?;
+                            positions = self.processor.audio_positions(audio.frames)?;
+                            features.push(audio);
+                        }
+                        tokens.extend(self.video_prompt.expand(clip, &ids, positions)?);
+                        video_index += 1;
+                    } else {
+                        tokens.extend(ids);
+                    }
                     images.extend(image);
                     videos.extend(video);
                 }

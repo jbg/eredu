@@ -49,7 +49,9 @@ feedback, depth advancement, and LiquidCodec state as Audio generation.
 The turn-based audio facade binds decoded media to the checkpoint's framed
 chat placeholders. It dispatches visual input through the shared VL processor
 and vision executor, and finite mono PCM through the shared feature extractor.
-The prepared inputs enter the existing Audio response session.
+The prepared inputs enter the existing Audio response session. The Omni video
+prompt policy inserts each soundtrack span after its timestamped visual group
+using the sampled source frame indices and the audio encoder stride.
 
 VL cold rank selection derives the decoder ownership, cache geometry,
 communication manifest, and publication plan from the architecture
