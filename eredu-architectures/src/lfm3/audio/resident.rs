@@ -418,6 +418,12 @@ where
         self.start_with_vision(request, None, random)
     }
 
+    /// Agrees external prompt preparation before any rank enters speech prefill.
+    pub fn agree_prompt_preparation(&mut self, success: bool) -> Result<(), BackendFailure> {
+        self.language
+            .agree_audio([0x4155444d45444941, 0, 0, 0, 0, 0, 0, 0], success)
+    }
+
     /// Prefills projected visual rows and encoded speech through the shared Audio session.
     pub fn start_omni(
         self,

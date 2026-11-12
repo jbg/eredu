@@ -1672,3 +1672,30 @@ In the TP=2 failure replay, prepending token 5 on rank 1 causes both ranks
 to reject prompt admission. With matching prompts and seeds 42 and 43,
 both ranks reject the first depth advance and report zero committed slots.
 Independent numerical parity remains unverified.
+
+The public replay uses the same decoded video, soundtrack, instruction, seed,
+and slot budget through `PreparedMultimodalAudioTask::new_with_soundtracks`.
+In each Ring rank process, use the same `ParallelTopology` as the native replay
+and call:
+
+```rust,ignore
+let mut session = task.load_distributed(
+    &weights,
+    &execution,
+    topology,
+    Default::default(),
+    Default::default(),
+)?;
+while let Some(output) = session.next_output()? {
+    // Consume committed text or PCM on every rank.
+}
+```
+
+The two residency arguments select vision and speech parameter placement
+independently. The replay uses resident weights on each CPU rank.
+
+TP=2, PP=2, and combined TP=2/PP=2 each return 9,600 samples on every
+rank with the same PCM SHA-256 as the resident baseline. In a TP=2 failure
+replay, rank 1 includes an 8 kHz mono PCM segment where the selected
+processor requires 16 kHz. Rank 1 reports its media error and rank 0 reports
+collective rejection. Neither rank returns a response session.

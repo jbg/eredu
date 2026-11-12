@@ -309,6 +309,13 @@ or response termination flushes the codec tail. The event iterator drains the
 same driver. Cancellation occurs between settled advances and drops any
 unpublished speech frame.
 
+The Rust Omni facade's `PreparedMultimodalAudioTask::load_distributed`
+selects a tensor, pipeline, or combined rank. All ranks agree on media
+preparation before prefill and must drain `AudioTaskSession::next_output`
+in the same order. This uses the same output decoder as the resident
+facade. The native `MlxPipelineAudioSession::advance` exposes individual
+text decisions and depth passes for callers that drive the rank cohort.
+
 The shared realtime loader retains the selected MLX parameter policies before
 the caller starts a prompt. The Rust API accepts independent resident,
 host-layerwise or disk-streamed policies for all Audio components. Each
