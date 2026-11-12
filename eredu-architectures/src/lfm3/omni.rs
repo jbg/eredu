@@ -9,7 +9,9 @@ use serde_json::Value;
 use super::{
     audio::{ArtifactError, BindingSource, PreparedAudio, ProcessorConfig},
     projected_prompt::ProjectedPrompt,
-    vision::{Declaration, MediaTokens, PreparedVisionExecution, ProjectorConfig},
+    vision::{
+        Declaration, MediaTokens, PreparedVisionExecution, ProjectorConfig, VisionPromptAdmission,
+    },
 };
 use crate::{
     processor_execution::PreparedProcessor,
@@ -27,6 +29,7 @@ pub struct PreparedOmni {
     vision_weights: BindingSource,
     processor: QwenProcessorPlan,
     tokens: MediaTokens,
+    placeholders: [String; 3],
 }
 
 impl PreparedOmni {
@@ -121,12 +124,31 @@ impl PreparedOmni {
                 merge_size: geometry.spatial_merge_size as usize,
             })
             .map_err(checkpoint)?;
+        let framed = |key: &str| -> Result<String, ArtifactError> {
+            let token = |key: &str| {
+                source[key]
+                    .as_str()
+                    .ok_or_else(|| checkpoint(format!("missing Omni marker {key}")))
+            };
+            Ok(format!(
+                "{}{}{}",
+                token("vision_start_token")?,
+                token(key)?,
+                token("vision_end_token")?
+            ))
+        };
+        let placeholders = [
+            framed("image_token")?,
+            framed("video_token")?,
+            framed("audio_token")?,
+        ];
         Ok(Self {
             speech,
             vision,
             vision_weights: vision_weights.expect("vision plan was supplied"),
             processor,
             tokens,
+            placeholders,
         })
     }
 
@@ -143,6 +165,24 @@ impl PreparedOmni {
     /// Image and video processor policy retained from the publisher.
     pub fn vision_processor(&self) -> PreparedProcessor {
         PreparedProcessor::from_qwen(self.processor.clone())
+    }
+
+    /// Exact framed placeholder for one item in the checkpoint chat template.
+    pub fn placeholder(&self, media: &eredu_core::Media) -> &str {
+        &self.placeholders[match media {
+            eredu_core::Media::Image(_) => 0,
+            eredu_core::Media::Video(_) => 1,
+            eredu_core::Media::Audio(_) => 2,
+        }]
+    }
+
+    /// Retains vision request geometry from the shared Omni declaration.
+    pub fn vision_admission(&self) -> Result<VisionPromptAdmission, Error> {
+        VisionPromptAdmission::from_declarations(
+            self.tokens,
+            &self.vision,
+            self.speech.language.args(),
+        )
     }
 
     /// Prepares the same independent vision units as VL from the retained Omni source.

@@ -100,6 +100,12 @@ impl ProcessorConfig {
         Ok(Self(()))
     }
 
+    /// Decoder positions occupied by a finite clip after the encoder's final flush.
+    pub fn audio_positions(self, frames: usize) -> Result<usize, Error> {
+        let frames = i32::try_from(frames).map_err(Error::backend_source)?;
+        usize::try_from(encoder::frame_tokens(frames, true)).map_err(Error::backend_source)
+    }
+
     /// Builds the portable host transform for mono PCM at the checkpoint rate.
     #[cfg(feature = "audio")]
     pub fn transform(

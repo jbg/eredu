@@ -523,6 +523,19 @@ impl MlxVlVision {
         self.execution.forward(input, &self.stream).map_err(failure)
     }
 
+    /// Drains admitted visual ingress through the selected vision policy.
+    pub fn project_prompt(
+        &mut self,
+        mut input: VisionPromptPreparation<MlxTensor>,
+    ) -> Result<eredu_architectures::lfm3::vision::ProjectedVisionPrompt<MlxTensor>, BackendFailure>
+    {
+        while let Some(part) = input.next_media() {
+            let (_, rows) = self.forward(part)?;
+            input.accept_projection(rows).map_err(failure)?;
+        }
+        input.finish(&self.stream).map_err(failure)
+    }
+
     /// Starts a unit-by-unit vision invocation.
     pub fn begin(
         &mut self,
@@ -1172,6 +1185,18 @@ impl MlxVlMedia {
         Ok(Self {
             processor: crate::composition::mlx::ModelProcessor::from_prepared(artifact.processor()),
             admission: VisionPromptAdmission::new(artifact).map_err(failure)?,
+        })
+    }
+
+    /// Retains the shared visual processor for a prepared Omni checkpoint.
+    pub fn for_omni(
+        artifact: &eredu_architectures::lfm3::omni::PreparedOmni,
+    ) -> Result<Self, BackendFailure> {
+        Ok(Self {
+            processor: crate::composition::mlx::ModelProcessor::from_prepared(
+                artifact.vision_processor(),
+            ),
+            admission: artifact.vision_admission().map_err(failure)?,
         })
     }
 

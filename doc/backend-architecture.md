@@ -46,6 +46,10 @@ projections, and the Omni invocation declares vocabulary or normalized-hidden
 readout in its distributed input descriptor. The shared speech session
 uses normalized-hidden readout for Omni prefill and retains the same speech
 feedback, depth advancement, and LiquidCodec state as Audio generation.
+The turn-based audio facade binds decoded media to the checkpoint's framed
+chat placeholders. It dispatches visual input through the shared VL processor
+and vision executor, and finite mono PCM through the shared feature extractor.
+The prepared inputs enter the existing Audio response session.
 
 VL cold rank selection derives the decoder ownership, cache geometry,
 communication manifest, and publication plan from the architecture

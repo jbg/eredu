@@ -1575,5 +1575,8 @@ A resident CPU run with F32 materialization projects one image from a
 the shared speech session with seed 42 and a five-slot budget. It commits
 five twelve-codebook frames and returns 9,600 finite PCM samples at 24 kHz,
 including the codec tail. This run starts from prepared patches and features.
-Raw media preparation through the facade and publisher numerical parity remain
-unverified.
+A separate resident CPU run uses `api::audio::PreparedMultimodalAudioTask`
+with a 96 × 96 RGB image, 1,600 mono samples at 16 kHz and a text instruction.
+With seed 42, speech mode and a five-slot budget, the shared response session
+returns 9,600 finite PCM samples at 24 kHz. The run verifies the public raw
+image and PCM path. Publisher numerical parity remains unverified.
