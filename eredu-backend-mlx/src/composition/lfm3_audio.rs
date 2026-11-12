@@ -995,6 +995,24 @@ impl MlxPipelineAudioModel {
         )?))
     }
 
+    /// Initializes the TCP Ring world from the rank environment and binds this rank.
+    pub fn load_ring(
+        prepared: PreparedResidentAudio,
+        residency: AudioParameterResidency,
+        topology: ParallelTopology,
+        weights: &ExecutionContext,
+        execution: &ExecutionContext,
+    ) -> Result<Self, ResidentAudioError> {
+        let world = safemlx::distributed::Group::init(true, safemlx::distributed::Backend::Ring)
+            .map_err(failure)?;
+        Self::load(prepared, residency, topology, world, weights, execution)
+    }
+
+    /// Agrees whether each rank prepared its media before prefill.
+    pub fn agree_prompt_preparation(&mut self, success: bool) -> Result<(), BackendFailure> {
+        self.0.agree_prompt_preparation(success)
+    }
+
     /// Starts the same request and seed on every rank.
     pub fn start(
         self,

@@ -64,6 +64,10 @@ are selected, the pipeline carries the resulting hidden activations between
 them. The same protocol publishes the normalized readout to all ranks in
 both single-stage and multi-stage execution. The shared Audio driver owns
 speech refinement and publication agreement.
+The finite-turn audio facade selects the rank topology and reuses its media
+preparation and output decoding across resident and distributed sessions.
+MLX initializes the native Ring world. A shared agreement phase propagates
+rank-local media preparation failures before speech prefill.
 
 VL cold rank selection derives the decoder ownership, cache geometry,
 communication manifest, and publication plan from the architecture

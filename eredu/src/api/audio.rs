@@ -219,9 +219,12 @@ impl<'a> PreparedAudioTask<'a> {
         };
         let state = match self.prompt {
             Prompt::Transcribe => State::Transcribe(model.prepare_pcm_transcription()?),
-            Prompt::Text(tokens) => {
-                State::Response(start_text(*model, &tokens, self.max_slots, self.seed)?)
-            }
+            Prompt::Text(tokens) => State::Response(ResponseSession::Resident(start_text(
+                *model,
+                &tokens,
+                self.max_slots,
+                self.seed,
+            )?)),
             Prompt::Audio(prefix, suffix, mode) => State::Ingress(model.prepare_ingress(
                 AudioIngressRequest {
                     prefix: &prefix,
@@ -263,8 +266,24 @@ fn start_text(
 enum State {
     Transcribe(MlxAudioPcmTranscription),
     Ingress(MlxAudioIngress),
-    Response(MlxAudioSession),
+    Response(ResponseSession),
     Finished,
+}
+
+enum ResponseSession {
+    Resident(MlxAudioSession),
+    #[cfg(feature = "image")]
+    Distributed(eredu_backend_mlx::native::MlxPipelineAudioSession),
+}
+
+impl ResponseSession {
+    fn advance(&mut self) -> TaskResult<AudioAdvance> {
+        Ok(match self {
+            Self::Resident(session) => session.advance()?,
+            #[cfg(feature = "image")]
+            Self::Distributed(session) => session.advance()?,
+        })
+    }
 }
 
 /// One loaded audio request and its incremental output decoder.
@@ -315,7 +334,7 @@ impl AudioTaskSession {
                 else {
                     unreachable!()
                 };
-                self.state = State::Response(ingress.finish()?);
+                self.state = State::Response(ResponseSession::Resident(ingress.finish()?));
             }
             _ => return Err("this task has no open PCM input".into()),
         }
