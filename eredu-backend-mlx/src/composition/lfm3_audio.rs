@@ -962,11 +962,13 @@ impl eredu_architectures::lfm3::audio::AudioLanguage<MlxNeuralBackend, MlxHybrid
     }
 }
 
-/// One rank of an Audio session using the shared pipeline and commit protocol.
+/// One rank of an Audio session using the shared partition and commit protocol.
 pub struct MlxPipelineAudioModel(ResidentAudio<MlxNeuralBackend, Binding<PipelinePlacement>>);
 
 impl MlxPipelineAudioModel {
-    /// Binds retained weights for this rank of a pipeline with optional tensor parallelism.
+    /// Binds retained weights for a tensor, pipeline, or combined parallel rank.
+    ///
+    /// A single pipeline stage uses the same collective publication protocol.
     pub fn load(
         prepared: PreparedResidentAudio,
         residency: AudioParameterResidency,
@@ -975,9 +977,9 @@ impl MlxPipelineAudioModel {
         weights: &ExecutionContext,
         execution: &ExecutionContext,
     ) -> Result<Self, ResidentAudioError> {
-        if topology.pipeline() < 2 || topology.world_size() != world.size() {
+        if topology.world_size() < 2 || topology.world_size() != world.size() {
             return Err(failure(eredu_nn::Error::backend(
-                "Audio pipeline topology differs from its native world",
+                "Audio partition topology requires a matching multi-rank native world",
             ))
             .into());
         }
