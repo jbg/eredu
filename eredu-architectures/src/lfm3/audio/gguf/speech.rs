@@ -150,11 +150,27 @@ impl AudioGgufSpeechBindings {
         declaration: &CodecDeclaration,
         max_cached_readers: usize,
     ) -> Result<(AudioGgufSpeechSources, BindingSource), AudioGgufError> {
+        let (speech, codec, _) = self.retain_with_projector(declaration, max_cached_readers)?;
+        Ok((speech, codec))
+    }
+
+    pub(in crate::lfm3) fn retain_with_projector(
+        self,
+        declaration: &CodecDeclaration,
+        max_cached_readers: usize,
+    ) -> Result<
+        (
+            AudioGgufSpeechSources,
+            BindingSource,
+            SharedCheckpointSource,
+        ),
+        AudioGgufError,
+    > {
         let codec = self.codec_decoder_bindings(declaration)?;
         let source = self.open_source(max_cached_readers)?;
         let (codec_source, recipes) = codec.retain(source.clone()).map_err(invalid)?;
         let codec = BindingSource::from_recipes(codec_source, "LiquidCodec GGUF decoder", recipes)?;
-        Ok((self.restrict_speech(source)?, codec))
+        Ok((self.restrict_speech(source.clone())?, codec, source))
     }
 
     fn open_source(

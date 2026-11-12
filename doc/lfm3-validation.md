@@ -1603,8 +1603,33 @@ input, speech depth and feedback, and LiquidCodec decoder against that catalog.
 The manifest records publisher file sizes and SHA-256 values, exact header
 extents and SHA-256 values, and tensor type counts. The header replay verifies
 the ten descriptor prefixes and the component recipe geometry using the model
-and codec configs from the pinned SafeTensors revision. Public GGUF execution
-and numerical parity are unverified.
+and codec configs from the pinned SafeTensors revision.
+
+`api::audio::PreparedOmni::open_gguf(backbone, projector, assets, max_cached_readers)`
+takes the explicit GGUF pair and the matching Omni sidecar directory. The
+sidecars supply the model, processor, tokenizer, generation and LiquidCodec
+configs. The backbone supplies the chat template and vocabulary metadata.
+The combined projector supplies both the vision and speech paths, including
+LiquidCodec synthesis. `PreparedMultimodalAudioTask` accepts this artifact
+through the same finite-turn interface as SafeTensors.
+
+The released Q4_K_M pair matches the full publisher SHA-256 values in the
+manifest. The resident CPU replay opens that pair with the pinned SafeTensors
+sidecars and calls `PreparedMultimodalAudioTask::new_with_soundtracks` in speech
+mode. The input contains four constant RGB frames (64 × 64, all channels 90) at
+4 FPS with `VideoSampling::All`, 16,000 mono samples at 16 kHz
+(`(i as f32 * 0.1).sin() * 0.1`), and the instruction “Describe what you see
+and hear.” With seed 42 and five response slots, draining
+`AudioTaskSession::next_output` returns 9,600 finite F32 PCM samples at 24 kHz,
+including the codec tail. The little-endian PCM bytes hash to
+`aed453d50e086f025e0c4cdf63983c7d6054d38c40bee9bd5cf4b1d81c27e479`.
+The same turn returns byte-identical PCM with direct disk streaming for
+all components. The `load_with_residency` device budgets are 160 MiB for
+vision, 1,600 MiB for language, 100 MiB for the audio encoder, 320 MiB for
+depth and feedback, and 96 MiB for the codec. The host budget, lookahead,
+and background queue capacity are zero for each component.
+The other encodings have descriptor evidence. Independent score and PCM
+parity remain unverified.
 
 ```sh
 manifest=validation/fixtures/lfm3/omni-gguf-sources.json

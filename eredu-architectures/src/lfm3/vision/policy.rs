@@ -59,7 +59,7 @@ impl PreparedVisionExecution {
         Self::from_canonical_recipes(declaration, source, &recipes, dtype)
     }
 
-    pub(super) fn from_canonical_recipes(
+    pub(in crate::lfm3) fn from_canonical_recipes(
         declaration: Declaration,
         source: SharedCheckpointSource,
         recipes: &BTreeMap<String, DerivedWeightRecipe>,

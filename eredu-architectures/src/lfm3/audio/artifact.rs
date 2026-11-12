@@ -343,9 +343,34 @@ impl PreparedAudio {
         config: &Value,
         max_cached_readers: usize,
     ) -> Result<Self, ArtifactError> {
-        let admitted = AdmittedAudioGguf::open(backbone, projector)?;
-        let encoder = super::Declaration::from_config(config)?;
-        let depth = DepthDeclaration::from_config(config)?;
+        Self::prepare_gguf(
+            AdmittedAudioGguf::open(backbone, projector)?,
+            root,
+            config,
+            max_cached_readers,
+            None,
+        )
+        .map(|(audio, _)| audio)
+    }
+
+    pub(in crate::lfm3) fn prepare_gguf(
+        admitted: AdmittedAudioGguf,
+        root: &Path,
+        config: &Value,
+        max_cached_readers: usize,
+        omni: Option<(&super::super::vision::Declaration, ProcessorConfig)>,
+    ) -> Result<(Self, Option<BindingSource>), ArtifactError> {
+        let (encoder, depth) = if omni.is_some() {
+            (
+                super::Declaration::from_speech_config(config)?,
+                DepthDeclaration::from_speech_config(config)?,
+            )
+        } else {
+            (
+                super::Declaration::from_config(config)?,
+                DepthDeclaration::from_config(config)?,
+            )
+        };
         let tokens = AudioTokens::from_config(config, admitted.declaration().args().vocab_size)?;
         let (interleaved_text_slots, interleaved_speech_slots) = cadence(config)?;
         if (interleaved_text_slots, interleaved_speech_slots) != (6, 12) {
@@ -353,31 +378,49 @@ impl PreparedAudio {
                 "Audio configuration differs from the GGUF speech schedule",
             ));
         }
-        let mut text_assets = text_assets(root, admitted.chat_template()?.into())?;
-        admitted.bind_text_assets(&mut text_assets, tokens)?;
-        let processor = processor(root)?;
+        let template = admitted.chat_template()?.into();
+        let (processor, mut text_assets) = match omni {
+            Some((_, processor)) => (
+                processor,
+                read_text_assets(root, template, Arc::from(&b"{}"[..]))?,
+            ),
+            None => (processor(root)?, text_assets(root, template)?),
+        };
+        admitted.bind_text_assets(&mut text_assets, tokens, omni.is_some())?;
         let codec = eredu_codec::liquid::Declaration::new(eredu_codec::liquid::Config::from_json(
             &read(&root.join("audio_tokenizer"), "config.json")?,
         )?)?;
-        let (speech, codec_weights) = admitted
-            .speech_bindings(&encoder, &depth)?
-            .retain_with_codec_decoder(&codec, max_cached_readers)?;
+        let bindings = admitted.speech_bindings(&encoder, &depth)?;
+        let vision_recipes = omni
+            .map(|(vision, _)| {
+                super::super::vision::gguf::projector_recipes(bindings.projector_catalog(), vision)
+            })
+            .transpose()?;
+        let (speech, codec_weights, projector) =
+            bindings.retain_with_projector(&codec, max_cached_readers)?;
+        let vision_weights = vision_recipes
+            .map(|recipes| BindingSource::from_recipes(projector, "LFM3 Omni GGUF vision", recipes))
+            .transpose()
+            .map_err(checkpoint)?;
         let (language, language_weights) = admitted.retain_backbone(max_cached_readers)?;
-        Ok(Self {
-            language,
-            encoder,
-            depth,
-            codec,
-            processor,
-            tokens,
-            interleaved_text_slots,
-            interleaved_speech_slots,
-            text_assets,
-            language_weights,
-            encoder_weights: speech.input,
-            depth_weights: speech.depth,
-            codec_weights,
-        })
+        Ok((
+            Self {
+                language,
+                encoder,
+                depth,
+                codec,
+                processor,
+                tokens,
+                interleaved_text_slots,
+                interleaved_speech_slots,
+                text_assets,
+                language_weights,
+                encoder_weights: speech.input,
+                depth_weights: speech.depth,
+                codec_weights,
+            },
+            vision_weights,
+        ))
     }
 
     /// Admits an exact model payload with separately resolved Audio assets.

@@ -37,9 +37,13 @@ the recipe with its ordinary tensor multiplication.
 
 Omni SafeTensors admission combines the speech and vision declarations into
 one strict model schema. It restricts each component to its admitted source
-keys and validates the bundled LiquidCodec independently. The Omni declaration
-retains the publisher's nested media processor settings and resolves media
-markers through the checkpoint tokenizer. Omni and VL use the same projected
+keys and validates the bundled LiquidCodec independently. GGUF admission resolves
+the strict combined projector schema and retains separate restricted vision,
+speech input, depth and codec decoder views over one physical source. The
+architecture resolves the split temporal patch kernels and packed speech
+tables before binding. The Omni declaration retains the publisher's nested
+media processor settings and resolves media markers through the checkpoint
+tokenizer. Omni and VL use the same projected
 span mapping to replace decoder embeddings. Omni spans also admit audio encoder
 rows and speech feedback. Chunked prefill preserves offsets into the original
 projections, and the Omni invocation declares vocabulary or normalized-hidden

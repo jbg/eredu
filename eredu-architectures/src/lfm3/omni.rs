@@ -7,7 +7,7 @@ use eredu_nn::{Error, Tensor};
 use serde_json::Value;
 
 use super::{
-    audio::{ArtifactError, BindingSource, PreparedAudio, ProcessorConfig},
+    audio::{AdmittedAudioGguf, ArtifactError, BindingSource, PreparedAudio, ProcessorConfig},
     projected_prompt::ProjectedPrompt,
     vision::{
         Declaration, MediaTokens, PreparedVisionExecution, ProjectorConfig, VisionPromptAdmission,
@@ -44,6 +44,7 @@ pub struct PreparedOmni {
     speech: PreparedAudio,
     vision: Declaration,
     vision_weights: BindingSource,
+    gguf: bool,
     processor: QwenProcessorPlan,
     tokens: MediaTokens,
     placeholders: [String; 3],
@@ -52,6 +53,27 @@ pub struct PreparedOmni {
 impl PreparedOmni {
     /// Validates the released SafeTensors checkpoint and bundled LiquidCodec.
     pub fn open(root: &Path, max_cached_shards: usize) -> Result<Self, ArtifactError> {
+        Self::open_source(root, max_cached_shards, None)
+    }
+
+    /// Validates the released Omni GGUF pair and retains its exact weight sources.
+    ///
+    /// The asset directory supplies the matching Omni configuration, tokenizer,
+    /// media processor, generation defaults and LiquidCodec configuration.
+    pub fn open_gguf(
+        backbone: &Path,
+        projector: &Path,
+        assets: &Path,
+        max_cached_readers: usize,
+    ) -> Result<Self, ArtifactError> {
+        Self::open_source(assets, max_cached_readers, Some((backbone, projector)))
+    }
+
+    fn open_source(
+        root: &Path,
+        max_cached_readers: usize,
+        gguf: Option<(&Path, &Path)>,
+    ) -> Result<Self, ArtifactError> {
         fn read(root: &Path, name: &str) -> Result<Vec<u8>, ArtifactError> {
             let path = root.join(name);
             std::fs::read(&path).map_err(|source| ArtifactError::Read { path, source })
@@ -70,13 +92,22 @@ impl PreparedOmni {
             &source["feature_extractor"],
             "Lfm3OmniFeatureExtractor",
         )?;
-        let (speech, vision_weights) = PreparedAudio::open_safetensors(
-            root,
-            root,
-            &config,
-            max_cached_shards,
-            Some((&vision.safetensors_plan()?, audio_processor)),
-        )?;
+        let (speech, vision_weights) = match gguf {
+            Some((backbone, projector)) => PreparedAudio::prepare_gguf(
+                AdmittedAudioGguf::open_multimodal(backbone, projector, Some(&vision))?,
+                root,
+                &config,
+                max_cached_readers,
+                Some((&vision, audio_processor)),
+            )?,
+            None => PreparedAudio::open_safetensors(
+                root,
+                root,
+                &config,
+                max_cached_readers,
+                Some((&vision.safetensors_plan()?, audio_processor)),
+            )?,
+        };
         let tokenizer = eredu_text::tokenizer::Tokenizer::from_bytes(&speech.text_assets.tokenizer)
             .map_err(checkpoint)?;
         let marker = |key: &str| {
@@ -153,6 +184,7 @@ impl PreparedOmni {
             speech,
             vision,
             vision_weights: vision_weights.expect("vision plan was supplied"),
+            gguf: gguf.is_some(),
             processor,
             tokens,
             placeholders,
@@ -208,6 +240,14 @@ impl PreparedOmni {
         &self,
         dtype: RecipeDtype,
     ) -> Result<PreparedVisionExecution, ArtifactError> {
+        if self.gguf {
+            return Ok(PreparedVisionExecution::from_canonical_recipes(
+                self.vision.clone(),
+                self.vision_weights.source().clone(),
+                self.vision_weights.recipes(),
+                dtype,
+            )?);
+        }
         Ok(PreparedVisionExecution::new(
             self.vision.clone(),
             self.vision_weights.source(),
