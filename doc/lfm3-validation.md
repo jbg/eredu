@@ -1589,3 +1589,34 @@ video framing. The released resident CPU session runs the paired request through
 `PreparedMultimodalAudioTask::new_with_soundtracks` and returns 9,600 finite PCM
 samples at 24 kHz with seed 42 and a five-slot speech budget. This checks
 prompt ordering and execution. Score and PCM parity remain unverified.
+
+## LFM3 Omni GGUF descriptor admission
+
+The [published Omni GGUF revision
+`d508b88f08a5b4286f2d2805a6a8d69a0ff44c72`](https://huggingface.co/LiquidAI/LFM3-Omni-2B-GGUF/tree/d508b88f08a5b4286f2d2805a6a8d69a0ff44c72)
+provides BF16, F16, Q4_0, Q4_K_M, and Q8_0 backbones and projectors. Each
+backbone has 287 tensor descriptors. Each combined projector has 458, of
+which 139 are vision tensors. The combined catalog is checked as one
+physical schema. The architecture checks canonical recipes for vision, speech
+input, speech depth and feedback, and LiquidCodec decoder against that catalog.
+
+The manifest records publisher file sizes and SHA-256 values, exact header
+extents and SHA-256 values, and tensor type counts. The header replay verifies
+the ten descriptor prefixes and the component recipe geometry using the model
+and codec configs from the pinned SafeTensors revision. Public GGUF execution
+and numerical parity are unverified.
+
+```sh
+manifest=validation/fixtures/lfm3/omni-gguf-sources.json
+headers=$(mktemp -d)
+repo=$(jq -r .repository "$manifest")
+revision=$(jq -r .revision "$manifest")
+jq -r '.variants[] | (.backbone, .projector) | [.file, .header_bytes] | @tsv' "$manifest" |
+  while IFS="$(printf '\t')" read -r member bytes; do
+    curl -fsSL --range "0-$((bytes - 1))" --max-filesize "$bytes" \
+      "https://huggingface.co/$repo/resolve/$revision/$member?header=$bytes" \
+      -o "$headers/$member.header"
+  done
+cargo run -p eredu-architectures --example inspect_lfm3_omni_gguf_headers -- \
+  "$manifest" "$headers" /private/tmp/lfm3-omni-source
+```

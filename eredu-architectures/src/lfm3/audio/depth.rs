@@ -82,7 +82,7 @@ impl DepthDeclaration {
         Self::from_speech_config(config)
     }
 
-    pub(super) fn from_speech_config(config: &Value) -> Result<Self, Error> {
+    pub(in crate::lfm3) fn from_speech_config(config: &Value) -> Result<Self, Error> {
         let legacy = config.get("lfm").is_some();
         let (text, depth, books_key, vocab_key) = if legacy {
             (

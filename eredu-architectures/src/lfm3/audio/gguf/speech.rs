@@ -1,6 +1,6 @@
 //! Portable canonical projections for GGUF speech input and depth generation.
 
-use super::{projector_plan, AdmittedAudioGguf, AudioGgufError};
+use super::{AdmittedAudioGguf, AudioGgufError};
 use crate::lfm3::audio::{BindingSource, Declaration, DepthDeclaration};
 use eredu_checkpoint::{
     gguf_store::{open_prepared_gguf_source, GgufCatalog},
@@ -76,7 +76,9 @@ impl AdmittedAudioGguf {
         let physical = catalog.keys();
         require_coverage(
             &input,
-            physical.iter().filter(|key| !key.starts_with("a.gen.")),
+            physical.iter().filter(|key| {
+                key.starts_with("a.") && !key.starts_with("a.gen.") || key.starts_with("mm.a.")
+            }),
         )?;
         require_coverage(
             &depth,
@@ -84,7 +86,7 @@ impl AdmittedAudioGguf {
         )?;
         Ok(AudioGgufSpeechBindings {
             projector,
-            plan: projector_plan(self.encodings().1)?,
+            plan: self.projector_plan.clone(),
             mapping,
             catalog,
             input,
@@ -110,6 +112,10 @@ fn require_coverage<'a>(
 }
 
 impl AudioGgufSpeechBindings {
+    pub(in crate::lfm3) fn projector_catalog(&self) -> &GgufCatalog {
+        &self.catalog
+    }
+
     /// Exact input encoder and projector recipes keyed by canonical parameter name.
     pub fn input_recipes(&self) -> &BTreeMap<String, DerivedWeightRecipe> {
         &self.input

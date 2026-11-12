@@ -32,18 +32,35 @@ pub(crate) fn projector_plan(
     checkpoint: &Checkpoint,
     declaration: &Declaration,
 ) -> Result<GgufCheckpointPlan, Error> {
+    media_projector_plan(checkpoint, declaration, "LFM3-VL")
+}
+
+pub(in crate::lfm3) fn omni_projector_plan(
+    checkpoint: &Checkpoint,
+    declaration: &Declaration,
+) -> Result<GgufCheckpointPlan, Error> {
+    media_projector_plan(checkpoint, declaration, "LFM3-Omni")
+}
+
+fn media_projector_plan(
+    checkpoint: &Checkpoint,
+    declaration: &Declaration,
+    basename: &str,
+) -> Result<GgufCheckpointPlan, Error> {
     let metadata = checkpoint.metadata();
     let text = |key| metadata.get(key).and_then(MetadataValue::as_str);
     if text("general.architecture") != Some("clip")
         || text("general.type") != Some("mmproj")
-        || text("general.basename") != Some("LFM3-VL")
+        || text("general.basename") != Some(basename)
         || text("clip.vision.projector_type") != Some("lfm3vl")
         || metadata
             .get("clip.has_vision_encoder")
             .and_then(MetadataValue::as_bool)
             != Some(true)
     {
-        return Err(Error::backend("expected an LFM3 VL GGUF vision projector"));
+        return Err(Error::backend(
+            "expected the released LFM3 GGUF vision projector",
+        ));
     }
     let integer = |key| metadata.get(key).and_then(MetadataValue::as_i64);
     let vision = declaration.config();
@@ -80,13 +97,13 @@ pub(crate) fn projector_plan(
     ] {
         if integer(key) != Some(expected) {
             return Err(Error::backend(format!(
-                "LFM3 VL GGUF projector geometry differs at {key}"
+                "LFM3 GGUF vision projector geometry differs at {key}"
             )));
         }
     }
     if vision.temporal_patch_size != 2 {
         return Err(Error::backend(
-            "LFM3 VL GGUF requires two temporal patch kernels",
+            "LFM3 GGUF requires two temporal patch kernels",
         ));
     }
     if metadata
@@ -95,13 +112,16 @@ pub(crate) fn projector_plan(
         != Some(vision.norm_eps)
     {
         return Err(Error::backend(
-            "LFM3 VL GGUF vision normalization epsilon differs",
+            "LFM3 GGUF vision normalization epsilon differs",
         ));
     }
+    use GgufTypeConstraint::{Exact, OneOf};
     let matrix = match integer("general.file_type") {
-        Some(32) => GgmlType::Bf16,
-        Some(1) => GgmlType::F16,
-        Some(7) => GgmlType::Q8_0,
+        Some(32) => Exact(GgmlType::Bf16),
+        Some(1) => Exact(GgmlType::F16),
+        Some(7) => Exact(GgmlType::Q8_0),
+        Some(2) if basename == "LFM3-Omni" => Exact(GgmlType::Q4_0),
+        Some(15) if basename == "LFM3-Omni" => OneOf(vec![GgmlType::Q4K, GgmlType::Q6K]),
         _ => {
             return Err(Error::backend(
                 "unsupported LFM3 VL GGUF projector encoding",
@@ -131,15 +151,11 @@ pub(crate) fn projector_plan(
             }
             let key = physical_name(unit, id)?;
             let encoding = if shape.len() == 2 {
-                matrix
+                matrix.clone()
             } else {
-                GgmlType::F32
+                Exact(GgmlType::F32)
             };
-            tensors.push(GgufTensorConstraint::required(
-                key,
-                shape,
-                GgufTypeConstraint::Exact(encoding),
-            ));
+            tensors.push(GgufTensorConstraint::required(key, shape, encoding));
         }
     }
     GgufCheckpointPlan::new(

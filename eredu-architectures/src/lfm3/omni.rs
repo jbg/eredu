@@ -22,6 +22,23 @@ fn checkpoint(error: impl std::fmt::Display) -> ArtifactError {
     ArtifactError::Checkpoint(error.to_string())
 }
 
+mod gguf;
+pub use gguf::AdmittedOmniGguf;
+
+fn vision_declaration(config: &Value) -> Result<Declaration, ArtifactError> {
+    if config["model_type"] != "lfm3_omni"
+        || config["architectures"] != serde_json::json!(["Lfm3OmniForConditionalGeneration"])
+    {
+        return Err(checkpoint("expected an LFM3 Omni generative checkpoint"));
+    }
+    Ok(Declaration::new(
+        serde_json::from_value(config["vision_config"].clone())?,
+        ProjectorConfig::from_config_value(config)?,
+        "model.vision_tower",
+        "model.multi_modal_projector",
+    )?)
+}
+
 /// Retained Omni checkpoint with shared language, speech and vision sources.
 pub struct PreparedOmni {
     speech: PreparedAudio,
@@ -41,17 +58,7 @@ impl PreparedOmni {
         }
 
         let config: Value = serde_json::from_slice(&read(root, "config.json")?)?;
-        if config["model_type"] != "lfm3_omni"
-            || config["architectures"] != serde_json::json!(["Lfm3OmniForConditionalGeneration"])
-        {
-            return Err(checkpoint("expected an LFM3 Omni generative checkpoint"));
-        }
-        let vision = Declaration::new(
-            serde_json::from_value(config["vision_config"].clone())?,
-            ProjectorConfig::from_config_value(&config)?,
-            "model.vision_tower",
-            "model.multi_modal_projector",
-        )?;
+        let vision = vision_declaration(&config)?;
         let processor_bytes = read(root, "processor_config.json")?;
         let source: Value = serde_json::from_slice(&processor_bytes)?;
         if source["vision_markers"] != true || source["audio_markers"] != true {

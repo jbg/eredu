@@ -1,0 +1,133 @@
+{
+  "repository": "LiquidAI/LFM3-Omni-2B-GGUF",
+  "revision": "d508b88f08a5b4286f2d2805a6a8d69a0ff44c72",
+  "variants": {
+    "BF16": {
+      "backbone": {
+        "file": "LFM3-Omni-2B-BF16.gguf",
+        "bytes": 3466628608,
+        "publisher_sha256": "58a6d91f532e4685336ec90699d425f89f61bffa1b0bc685bf7ae9e09f72efff",
+        "header_bytes": 8249600,
+        "header_sha256": "c11601fbe881c74a418cc917c098fc1a4de10d67017cf968d97123ea22aac651",
+        "tensor_types": {
+          "BF16": 154,
+          "F32": 133
+        }
+      },
+      "projector": {
+        "file": "mmproj-LFM3-Omni-2B-BF16.gguf",
+        "bytes": 949841248,
+        "publisher_sha256": "76f31874557110106046f1ce94386fb9888889f0e046092f5fab66380a723b38",
+        "header_bytes": 32064,
+        "header_sha256": "37f803781a309e57d4259553472202a1b8213bba86e683f43897cd211a93586c",
+        "tensor_types": {
+          "BF16": 264,
+          "F16": 2,
+          "F32": 192
+        }
+      }
+    },
+    "F16": {
+      "backbone": {
+        "file": "LFM3-Omni-2B-F16.gguf",
+        "bytes": 3466628608,
+        "publisher_sha256": "9fde8072a7313d676591499d14ecf7f7ee2f1773cc9e4bdbdbeed4a87c5987f6",
+        "header_bytes": 8249600,
+        "header_sha256": "cebf87c88968957f49a01eeaf052846421a262fb6f80b54d8de0f8179074eaf7",
+        "tensor_types": {
+          "F16": 154,
+          "F32": 133
+        }
+      },
+      "projector": {
+        "file": "mmproj-LFM3-Omni-2B-F16.gguf",
+        "bytes": 949841248,
+        "publisher_sha256": "361bc95192c7d9156b566fcd4e48930363b78218e493fb1be607456bd51586e3",
+        "header_bytes": 32064,
+        "header_sha256": "5c7cacc4357dd38352f5766ecff9da13eb8a0c48a0042ccfa852dfdd7f42d1c0",
+        "tensor_types": {
+          "F16": 266,
+          "F32": 192
+        }
+      }
+    },
+    "Q4_0": {
+      "backbone": {
+        "file": "LFM3-Omni-2B-Q4_0.gguf",
+        "bytes": 1049617920,
+        "publisher_sha256": "6d2273a383b92dd7c5db0eb4c8dfeae13e805b485a6621c4b391ae179c2b5f28",
+        "header_bytes": 8249600,
+        "header_sha256": "0868be97e29c3f5403b659bb6cc9556bedabc4f2db6135f91beaf0922da68ee8",
+        "tensor_types": {
+          "F32": 133,
+          "Q4_0": 153,
+          "Q6_K": 1
+        }
+      },
+      "projector": {
+        "file": "mmproj-LFM3-Omni-2B-Q4_0.gguf",
+        "bytes": 270576544,
+        "publisher_sha256": "c7341273f1757b33ccd9e6f8b17007eb81307d26c90d8c36c22efb45fd3d82eb",
+        "header_bytes": 32064,
+        "header_sha256": "041f94848fc27bc61f1afb11ad087168e27a71cf76717da97d6ced21b6cc8610",
+        "tensor_types": {
+          "F16": 2,
+          "F32": 192,
+          "Q4_0": 264
+        }
+      }
+    },
+    "Q4_K_M": {
+      "backbone": {
+        "file": "LFM3-Omni-2B-Q4_K_M.gguf",
+        "bytes": 1099630080,
+        "publisher_sha256": "9f8d30e9d4fd7a9349d586e077988229b3ca0a0e4ad730897563d1eccc9893e2",
+        "header_bytes": 8249600,
+        "header_sha256": "54e03c503dfc7ead8f63968bb246d6e4a169b9199704833573cd26d4fdc56e12",
+        "tensor_types": {
+          "F32": 133,
+          "Q4_K": 136,
+          "Q6_K": 18
+        }
+      },
+      "projector": {
+        "file": "mmproj-LFM3-Omni-2B-Q4_K_M.gguf",
+        "bytes": 291586720,
+        "publisher_sha256": "0a746c0794782a16d4456b230c2a0b5888a2d94a6677211edbed7d7a4177a39a",
+        "header_bytes": 32064,
+        "header_sha256": "ca9a4a43080e934444905b0846381888e8026f921f435a15c9593b490dfa0729",
+        "tensor_types": {
+          "F16": 2,
+          "F32": 192,
+          "Q4_K": 213,
+          "Q6_K": 51
+        }
+      }
+    },
+    "Q8_0": {
+      "backbone": {
+        "file": "LFM3-Omni-2B-Q8_0.gguf",
+        "bytes": 1846240768,
+        "publisher_sha256": "59118f661eaacb93d204723d76355b53347f0940b508c11412f6290fd49158d4",
+        "header_bytes": 8249600,
+        "header_sha256": "9d60bd6b3d63ef91d65bf7ac4e815ea28d10993fb712c9412daf475726abcc5d",
+        "tensor_types": {
+          "F32": 133,
+          "Q8_0": 154
+        }
+      },
+      "projector": {
+        "file": "mmproj-LFM3-Omni-2B-Q8_0.gguf",
+        "bytes": 506842528,
+        "publisher_sha256": "8a25f9d1931244429de404fccacfb7fb933970a36aa5688d2f5069f29c6b27b1",
+        "header_bytes": 32064,
+        "header_sha256": "c752ce1b90b6fdc7efebf9a9fd494e82ed9b54855b1fab4e7d49adcf3077612f",
+        "tensor_types": {
+          "F16": 2,
+          "F32": 192,
+          "Q8_0": 264
+        }
+      }
+    }
+  }
+}

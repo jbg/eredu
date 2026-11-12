@@ -90,6 +90,7 @@ pub struct AdmittedAudioGguf {
     declaration: super::super::Declaration,
     backbone_layout: ResolvedCheckpointPlan,
     projector_layout: ResolvedCheckpointPlan,
+    projector_plan: GgufCheckpointPlan,
     backbone_encoding: AudioGgufEncoding,
     projector_encoding: AudioGgufEncoding,
 }
@@ -119,7 +120,15 @@ impl AdmittedAudioGguf {
         backbone: Checkpoint,
         projector: Checkpoint,
     ) -> Result<Self, AudioGgufError> {
-        validate_roles(&backbone, &projector)?;
+        Self::from_multimodal_checkpoints(backbone, projector, None)
+    }
+
+    pub(in crate::lfm3) fn from_multimodal_checkpoints(
+        backbone: Checkpoint,
+        projector: Checkpoint,
+        vision: Option<&super::super::vision::Declaration>,
+    ) -> Result<Self, AudioGgufError> {
+        validate_roles(&backbone, &projector, vision.is_some())?;
         let args = backbone_args(&backbone)?;
         let backbone_encoding = AudioGgufEncoding::from_checkpoint(&backbone)?;
         let projector_encoding = AudioGgufEncoding::from_checkpoint(&projector)?;
@@ -128,14 +137,31 @@ impl AdmittedAudioGguf {
         let plan = backbone_plan(&declaration, backbone_encoding)?;
         let backbone_layout =
             resolve_gguf_plan(&backbone, &plan).map_err(AudioGgufError::Schema)?;
-        let projector_layout = resolve_gguf_plan(&projector, &projector_plan(projector_encoding)?)
-            .map_err(AudioGgufError::Schema)?;
+        let mut projector_plan = projector_plan(projector_encoding)?;
+        if let Some(vision) = vision {
+            let visual = super::super::vision::gguf::omni_projector_plan(&projector, vision)
+                .map_err(|error| AudioGgufError::Declaration(error.to_string()))?;
+            projector_plan = GgufCheckpointPlan::new(
+                "LFM3 Omni GGUF projector",
+                projector_plan
+                    .common_tensors
+                    .into_iter()
+                    .chain(visual.common_tensors)
+                    .collect(),
+                Vec::new(),
+                CatalogPolicy::strict(),
+            )
+            .map_err(|error| AudioGgufError::Declaration(error.to_string()))?;
+        }
+        let projector_layout =
+            resolve_gguf_plan(&projector, &projector_plan).map_err(AudioGgufError::Schema)?;
         Ok(Self {
             backbone,
             projector,
             declaration,
             backbone_layout,
             projector_layout,
+            projector_plan,
             backbone_encoding,
             projector_encoding,
         })
@@ -411,14 +437,19 @@ fn backbone_args(checkpoint: &Checkpoint) -> Result<super::super::ModelArgs, Aud
     Ok(args)
 }
 
-fn validate_roles(backbone: &Checkpoint, projector: &Checkpoint) -> Result<(), AudioGgufError> {
+fn validate_roles(
+    backbone: &Checkpoint,
+    projector: &Checkpoint,
+    omni: bool,
+) -> Result<(), AudioGgufError> {
+    let basename = if omni { "LFM3-Omni" } else { "LFM3-Audio" };
     for (checkpoint, architecture, role) in
         [(backbone, "lfm3", "model"), (projector, "clip", "mmproj")]
     {
         for (key, value) in [
             ("general.architecture", architecture),
             ("general.type", role),
-            ("general.basename", "LFM3-Audio"),
+            ("general.basename", basename),
         ] {
             if checkpoint
                 .metadata()
@@ -430,11 +461,11 @@ fn validate_roles(backbone: &Checkpoint, projector: &Checkpoint) -> Result<(), A
             }
         }
     }
-    for key in [
-        "tokenizer.chat_template",
-        "tokenizer.chat_template.asr",
-        "tokenizer.chat_template.tts",
-    ] {
+    let mut templates = vec!["tokenizer.chat_template", "tokenizer.chat_template.tts"];
+    if !omni {
+        templates.push("tokenizer.chat_template.asr");
+    }
+    for key in templates {
         if backbone
             .metadata()
             .get(key)
