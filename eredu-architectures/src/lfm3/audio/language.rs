@@ -117,6 +117,47 @@ impl PreparedAudioLanguage {
     }
 }
 
+/// A speech-generation invocation with audio-only or joint Omni conditioning.
+pub enum SpeechPrompt<'a, T: Tensor> {
+    /// Audio input and speech feedback.
+    Audio(&'a AudioPrompt<'a, T>),
+    /// Vision and speech input with normalized hidden readout.
+    Omni(&'a crate::lfm3::omni::OmniPrompt<'a, T>),
+}
+
+impl<'a, T: Tensor> SpeechPrompt<'a, T> {
+    /// Borrows this prompt as a shared language invocation.
+    pub fn input(&self) -> crate::lfm3::Lfm3Input<'a, T> {
+        match self {
+            Self::Audio(prompt) => crate::lfm3::Lfm3Input::Audio(prompt),
+            Self::Omni(prompt) => crate::lfm3::Lfm3Input::Omni(prompt),
+        }
+    }
+
+    /// Returns the common invocation identity for rank agreement.
+    pub fn collective_descriptor(&self, context: &T::Context) -> Result<[u64; 8], eredu_nn::Error> {
+        match self {
+            Self::Audio(prompt) => prompt.collective_descriptor(context),
+            Self::Omni(prompt) => prompt.collective_descriptor(context),
+        }
+    }
+
+    /// Visits the tensor roots retained by the selected invocation.
+    pub fn retained_tensors(&self) -> impl Iterator<Item = &T> {
+        let (audio, omni) = match self {
+            Self::Audio(prompt) => (Some(*prompt), None),
+            Self::Omni(prompt) => (None, Some(*prompt)),
+        };
+        audio
+            .into_iter()
+            .flat_map(AudioPrompt::retained_tensors)
+            .chain(
+                omni.into_iter()
+                    .flat_map(crate::lfm3::omni::OmniPrompt::retained_tensors),
+            )
+    }
+}
+
 /// Language operations used by ordinary and controlled Audio execution.
 pub trait AudioLanguage<B: GroupedNeuralBackend + DistributedNeuralBackend, S> {
     /// Whether the selected language owner commits a distributed generation step.
@@ -140,7 +181,7 @@ pub trait AudioLanguage<B: GroupedNeuralBackend + DistributedNeuralBackend, S> {
     /// Runs the shared causal traversal with speech rows substituted at ingress.
     fn forward_prompt(
         &mut self,
-        prompt: &AudioPrompt<'_, B::Tensor>,
+        prompt: SpeechPrompt<'_, B::Tensor>,
         state: &mut S,
         context: &Context<B>,
     ) -> Result<B::Tensor, BackendFailure>;
@@ -167,12 +208,11 @@ where
 
     fn forward_prompt(
         &mut self,
-        prompt: &AudioPrompt<'_, B::Tensor>,
+        prompt: SpeechPrompt<'_, B::Tensor>,
         state: &mut S,
         context: &Context<B>,
     ) -> Result<B::Tensor, BackendFailure> {
-        prompt
-            .forward_layerwise(self, state, context)
+        self.forward(prompt.input(), state, context)
             .map_err(BackendFailure::from_error)
     }
 
@@ -251,12 +291,12 @@ where
 
     fn forward_prompt(
         &mut self,
-        prompt: &AudioPrompt<'_, B::Tensor>,
+        prompt: SpeechPrompt<'_, B::Tensor>,
         state: &mut S,
         context: &Context<B>,
     ) -> Result<B::Tensor, BackendFailure> {
-        prompt
-            .forward_tensor_parallel(&mut self.runtime, state, &self.collective, context)
+        self.runtime
+            .forward_parallel(prompt.input(), state, &self.collective, context)
             .map_err(BackendFailure::from_error)
     }
 

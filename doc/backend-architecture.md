@@ -43,7 +43,9 @@ markers through the checkpoint tokenizer. Omni and VL use the same projected
 span mapping to replace decoder embeddings. Omni spans also admit audio encoder
 rows and speech feedback. Chunked prefill preserves offsets into the original
 projections, and the Omni invocation declares vocabulary or normalized-hidden
-readout in its distributed input descriptor.
+readout in its distributed input descriptor. The shared speech session
+uses normalized-hidden readout for Omni prefill and retains the same speech
+feedback, depth advancement, and LiquidCodec state as Audio generation.
 
 VL cold rank selection derives the decoder ownership, cache geometry,
 communication manifest, and publication plan from the architecture
