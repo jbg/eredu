@@ -1,7 +1,7 @@
 //! Projected media ingress for the shared LFM3 decoder.
 
 use eredu_core::{CapabilityError, InputMetadataKey, InputModality};
-use eredu_nn::{Error, Index, Tensor};
+use eredu_nn::{Error, Tensor};
 use eredu_runtime::{
     PreparedInputCacheIdentity, PreparedInputInspector, PreparedInputPart, PreparedInputPayload,
     PreparedModelInput,
@@ -12,34 +12,22 @@ use crate::media_plan::{
     PreparedInputPartPlan,
 };
 
-use super::MediaTokens;
+use super::{
+    super::projected_prompt::{ProjectedPrompt, Span},
+    MediaTokens,
+};
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Source {
-    Text,
     Image,
     Video,
-}
-
-struct Span {
-    position: i32,
-    source: Source,
-    start: i32,
-    end: i32,
 }
 
 /// A batch-one prompt with preprojected image and video rows in marker order.
 ///
 /// The processor expands media markers before creating the prompt. Other tokens,
 /// including delimiters and video timestamps, retain their language embeddings.
-pub struct VisionPrompt<'a, T> {
-    tokens: T,
-    image: Option<&'a T>,
-    video: Option<&'a T>,
-    spans: std::sync::Arc<[Span]>,
-    width: i32,
-    length: i32,
-}
+pub struct VisionPrompt<'a, T>(ProjectedPrompt<'a, T, 2>);
 
 impl<'a, T: Tensor> VisionPrompt<'a, T> {
     /// Checks marker counts and projects contiguous runs onto their source rows.
@@ -51,56 +39,18 @@ impl<'a, T: Tensor> VisionPrompt<'a, T> {
         video: Option<&'a T>,
         context: &T::Context,
     ) -> Result<Self, Error> {
-        let length = i32::try_from(ids.len()).map_err(Error::backend_source)?;
-        if length == 0 || width <= 0 || markers.image_token_id == markers.video_token_id {
-            return Err(Error::backend("invalid LFM3 VL prompt geometry"));
-        }
-        let mut counts = [0; 2];
-        let mut spans: Vec<Span> = Vec::new();
-        for (index, &id) in ids.iter().enumerate() {
-            let (source, start) = if id == markers.image_token_id {
-                counts[0] += 1;
-                (Source::Image, counts[0] - 1)
-            } else if id == markers.video_token_id {
-                counts[1] += 1;
-                (Source::Video, counts[1] - 1)
-            } else {
-                (Source::Text, index as i32)
-            };
-            if let Some(span) = spans.last_mut().filter(|span| span.source == source) {
-                span.end += 1;
-            } else {
-                spans.push(Span {
-                    position: index as i32,
-                    source,
-                    start,
-                    end: start + 1,
-                });
-            }
-        }
-        for (rows, count) in [image, video].into_iter().zip(counts) {
-            match rows {
-                Some(rows) if count > 0 && rows.shape() == [count, width] => {}
-                None if count == 0 => {}
-                _ => {
-                    return Err(Error::backend(
-                        "VL markers differ from projected media rows",
-                    ))
-                }
-            }
-        }
-        Ok(Self {
-            tokens: T::from_i32_slice(ids, &[1, length], context)?,
-            image,
-            video,
-            spans: spans.into(),
+        ProjectedPrompt::new(
+            ids,
+            [markers.image_token_id, markers.video_token_id],
             width,
-            length,
-        })
+            [image, video],
+            context,
+        )
+        .map(Self)
     }
 
     pub(crate) fn tokens(&self) -> &T {
-        &self.tokens
+        self.0.tokens()
     }
 
     /// Borrows one contiguous prompt range for incremental prefill.
@@ -112,42 +62,7 @@ impl<'a, T: Tensor> VisionPrompt<'a, T> {
         range: std::ops::Range<i32>,
         context: &T::Context,
     ) -> Result<VisionPrompt<'_, T>, Error> {
-        if range.start < 0 || range.end <= range.start || range.end > self.length {
-            return Err(Error::backend("invalid LFM3 VL prompt range"));
-        }
-        let first = self
-            .spans
-            .partition_point(|span| span.position + (span.end - span.start) <= range.start);
-        let mut spans = Vec::new();
-        for span in &self.spans[first..] {
-            let position = span.position;
-            if position >= range.end {
-                break;
-            }
-            let start = position.max(range.start);
-            let end = (position + (span.end - span.start)).min(range.end);
-            let row = match span.source {
-                Source::Text => start - range.start,
-                Source::Image | Source::Video => span.start + (start - position),
-            };
-            spans.push(Span {
-                position: start - range.start,
-                source: span.source,
-                start: row,
-                end: row + (end - start),
-            });
-        }
-        Ok(VisionPrompt {
-            tokens: self.tokens.index(
-                &[Index::Full, Index::Range(range.start, range.end)],
-                context,
-            )?,
-            image: self.image,
-            video: self.video,
-            spans: spans.into(),
-            width: self.width,
-            length: range.end - range.start,
-        })
+        self.0.slice(range, context).map(VisionPrompt)
     }
 
     pub(in crate::lfm3) fn update_pipeline_digest(
@@ -155,57 +70,15 @@ impl<'a, T: Tensor> VisionPrompt<'a, T> {
         digest: &mut sha2::Sha256,
         context: &T::Context,
     ) -> Result<(), Error> {
-        use sha2::Digest;
-        digest.update((self.spans.len() as u64).to_le_bytes());
-        for span in self.spans.iter() {
-            digest.update([span.source as u8]);
-            digest.update(span.position.to_le_bytes());
-            digest.update(span.start.to_le_bytes());
-            digest.update(span.end.to_le_bytes());
-        }
-        for rows in [self.image, self.video] {
-            digest.update([u8::from(rows.is_some())]);
-            if let Some(rows) = rows {
-                super::super::update_pipeline_tensor_digest(digest, rows, context)?;
-            }
-        }
-        Ok(())
+        self.0.update_pipeline_digest(digest, context)
     }
 
     pub(in crate::lfm3) fn projected_roots(&self) -> impl Iterator<Item = &T> {
-        [self.image, self.video].into_iter().flatten()
+        self.0.projected_roots()
     }
 
     pub(crate) fn replace(&self, text: &T, context: &T::Context) -> Result<T, Error> {
-        if text.shape() != [1, self.length, self.width] {
-            return Err(Error::backend(
-                "VL prompt differs from decoder embedding shape",
-            ));
-        }
-        if self.image.is_none() && self.video.is_none() {
-            return Ok(text.clone());
-        }
-        let dtype = text
-            .element_type()
-            .ok_or_else(|| Error::backend("unknown decoder embedding dtype"))?;
-        let spans = self
-            .spans
-            .iter()
-            .map(|span| {
-                let range = Index::Range(span.start, span.end);
-                let media = match span.source {
-                    Source::Text => return text.index(&[Index::Full, range], context),
-                    Source::Image => self.image,
-                    Source::Video => self.video,
-                };
-                media
-                    .expect("prompt admission checks marker counts")
-                    .index(&[range], context)?
-                    .cast_float(dtype, context)?
-                    .expand_dims(0, context)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        T::concatenate(&spans, 1, context)
+        self.0.replace(text, context)
     }
 }
 
@@ -624,7 +497,6 @@ impl<T: Tensor> VisionPromptPreparation<T> {
         match media.source {
             Source::Image => self.images.push(rows),
             Source::Video => self.videos.push(rows),
-            Source::Text => unreachable!("only visual invocations enter the pending queue"),
         }
         self.pending.pop_front();
         Ok(())
@@ -650,8 +522,8 @@ impl<T: Tensor> VisionPromptPreparation<T> {
             context,
         )?;
         Ok(ProjectedVisionPrompt {
-            tokens: prompt.tokens,
-            spans: prompt.spans,
+            tokens: prompt.0.tokens,
+            spans: prompt.0.spans,
             ids: self.ids,
             width: self.width,
             image,
@@ -687,14 +559,13 @@ impl<T: Tensor> ProjectedVisionPrompt<T> {
 
     /// Borrows the exact media-conditioned decoder input.
     pub fn prompt(&self) -> VisionPrompt<'_, T> {
-        VisionPrompt {
+        VisionPrompt(ProjectedPrompt {
             tokens: self.tokens.clone(),
-            image: self.image.as_ref(),
-            video: self.video.as_ref(),
+            rows: [self.image.as_ref(), self.video.as_ref()],
             spans: self.spans.clone(),
             width: self.width,
             length: self.ids.len() as i32,
-        }
+        })
     }
 
     /// Expanded decoder token IDs in prompt order.

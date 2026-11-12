@@ -1229,6 +1229,10 @@ where
         let width = match input {
             Lfm3Input::Text(_) | Lfm3Input::Vision(_) => self.args.vocab_size,
             Lfm3Input::Audio(_) => self.args.hidden_size,
+            Lfm3Input::Omni(prompt) => match prompt.readout() {
+                super::omni::OmniReadout::Vocabulary => self.args.vocab_size,
+                super::omni::OmniReadout::NormalizedHidden => self.args.hidden_size,
+            },
         };
         Ok(vec![batch, sequence, width])
     }
@@ -1266,16 +1270,26 @@ fn condition_prompt<T: Tensor>(
     forward: &mut LayeredForwardState<T, ForwardContext<T>>,
     context: &T::Context,
 ) -> Result<(), Error> {
-    if let Lfm3Input::Vision(prompt) = &input {
-        if embedding_owner {
-            forward.hidden = prompt.replace(&forward.hidden, context)?;
+    match input {
+        Lfm3Input::Text(_) => {}
+        Lfm3Input::Vision(prompt) => {
+            if embedding_owner {
+                forward.hidden = prompt.replace(&forward.hidden, context)?;
+            }
         }
-    }
-    if let Lfm3Input::Audio(prompt) = input {
-        if embedding_owner {
-            forward.hidden = prompt.replace(&forward.hidden, context)?;
+        Lfm3Input::Audio(prompt) => {
+            if embedding_owner {
+                forward.hidden = prompt.replace(&forward.hidden, context)?;
+            }
+            forward.context.normalized_audio_output = true;
         }
-        forward.context.normalized_audio_output = true;
+        Lfm3Input::Omni(prompt) => {
+            if embedding_owner {
+                forward.hidden = prompt.replace(&forward.hidden, context)?;
+            }
+            forward.context.normalized_audio_output =
+                prompt.readout() == super::omni::OmniReadout::NormalizedHidden;
+        }
     }
     Ok(())
 }
