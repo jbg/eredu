@@ -27,7 +27,7 @@ use eredu_architectures::lfm3::{
         AudioAdvance, AudioParameterResidency, AudioPhase, AudioRequest, AudioSession,
         AudioSessionError, AudioSnapshot, AudioSnapshotError, AudioTranscription,
         AudioTranscriptionBlock, AudioTranscriptionError, AudioTranscriptionSnapshot, DepthModule,
-        EncoderModule, LogMelFeatures, PolicyDepth, PolicyEncoder, PreparedAudio,
+        EncoderModule, LogMelFeatures, OmniAudioRequest, PolicyDepth, PolicyEncoder, PreparedAudio,
         PreparedAudioCodec, PreparedAudioDepth, PreparedAudioEncoder, PreparedAudioLanguage,
         PreparedResidentAudio, ResidentAudio, ResidentAudioBinding, ResidentAudioError,
     },
@@ -430,7 +430,7 @@ impl MlxAudioModel {
     /// Prefills projected Omni visual rows and speech features into a controlled session.
     pub fn start_omni(
         self,
-        request: eredu_architectures::lfm3::audio::OmniAudioRequest<'_, MlxTensor>,
+        request: OmniAudioRequest<'_, MlxTensor>,
         seed: u64,
     ) -> Result<MlxAudioSession, ResidentAudioError> {
         let random = RandomState::with_seed(seed).map_err(failure)?;
@@ -1001,6 +1001,19 @@ impl MlxPipelineAudioModel {
     ) -> Result<MlxPipelineAudioSession, ResidentAudioError> {
         let random = RandomState::with_seed(seed).map_err(failure)?;
         Ok(MlxPipelineAudioSession(self.0.start(request, random)?))
+    }
+
+    /// Prefills the same projected Omni request on every rank in the pipeline cohort.
+    ///
+    /// Each rank supplies the same tokens, features, projected rows, and seed.
+    /// Advance the returned sessions in the same order across ranks.
+    pub fn start_omni(
+        self,
+        request: OmniAudioRequest<'_, MlxTensor>,
+        seed: u64,
+    ) -> Result<MlxPipelineAudioSession, ResidentAudioError> {
+        let random = RandomState::with_seed(seed).map_err(failure)?;
+        Ok(MlxPipelineAudioSession(self.0.start_omni(request, random)?))
     }
 }
 

@@ -56,6 +56,13 @@ and vision executor, and finite mono PCM through the shared feature extractor.
 The prepared inputs enter the existing Audio response session. The Omni video
 prompt policy inserts each soundtrack span after its timestamped visual group
 using the sampled source frame indices and the audio encoder stride.
+The Audio pipeline adapter accepts expanded Omni prompts with optional tensor
+parallelism inside each stage.
+Each rank supplies the same projected rows and prompt positions. The
+architecture checks their collective identity and applies the rows on the
+embedding stage. The pipeline carries the resulting hidden activations and
+returns the normalized readout to all ranks. The shared Audio driver owns
+speech refinement and publication agreement.
 
 VL cold rank selection derives the decoder ownership, cache geometry,
 communication manifest, and publication plan from the architecture
