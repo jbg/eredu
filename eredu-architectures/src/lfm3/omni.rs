@@ -3,10 +3,12 @@
 use std::path::Path;
 
 use eredu_checkpoint::recipe::RecipeDtype;
+use eredu_nn::{Error, Tensor};
 use serde_json::Value;
 
 use super::{
     audio::{ArtifactError, BindingSource, PreparedAudio, ProcessorConfig},
+    projected_prompt::ProjectedPrompt,
     vision::{Declaration, MediaTokens, PreparedVisionExecution, ProjectorConfig},
 };
 use crate::{
@@ -153,5 +155,117 @@ impl PreparedOmni {
             self.vision_weights.source(),
             dtype,
         )?)
+    }
+}
+
+/// Projected language-width rows in expanded prompt order within each modality.
+pub struct OmniProjectedRows<'a, T> {
+    /// Image projections.
+    pub image: Option<&'a T>,
+    /// Video projections.
+    pub video: Option<&'a T>,
+    /// Input audio encoder projections.
+    pub audio: Option<&'a T>,
+    /// Speech frame feedback embeddings.
+    pub feedback: Option<&'a T>,
+}
+
+/// Output required from a shared Omni decoder invocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OmniReadout {
+    /// Token vocabulary scores.
+    Vocabulary,
+    /// Normalized hidden state for speech prediction and vocabulary projection.
+    NormalizedHidden,
+}
+
+/// Validated, sliceable input for joint vision and speech conditioning.
+pub struct OmniPrompt<'a, T> {
+    prompt: ProjectedPrompt<'a, T, 4>,
+    readout: OmniReadout,
+}
+
+impl<'a, T: Tensor> OmniPrompt<'a, T> {
+    /// Admits expanded token IDs and exact projected rows using this artifact's markers.
+    pub fn new(
+        artifact: &PreparedOmni,
+        ids: &[i32],
+        rows: OmniProjectedRows<'a, T>,
+        readout: OmniReadout,
+        context: &T::Context,
+    ) -> Result<Self, Error> {
+        let args = artifact.speech.language.args();
+        if ids.iter().any(|&id| !(0..args.vocab_size).contains(&id)) {
+            return Err(Error::backend(
+                "Omni prompt contains an out-of-vocabulary token",
+            ));
+        }
+        let vision = artifact.tokens;
+        let audio = artifact.speech.tokens;
+        let prompt = ProjectedPrompt::new(
+            ids,
+            [
+                vision.image_token_id,
+                vision.video_token_id,
+                audio.input,
+                audio.output,
+            ],
+            args.hidden_size,
+            [rows.image, rows.video, rows.audio, rows.feedback],
+            context,
+        )?;
+        Ok(Self { prompt, readout })
+    }
+
+    /// Slices decoder positions without renumbering projected media rows.
+    pub fn slice(&self, range: std::ops::Range<i32>, context: &T::Context) -> Result<Self, Error> {
+        Ok(Self {
+            prompt: self.prompt.slice(range, context)?,
+            readout: self.readout,
+        })
+    }
+
+    /// Readout selected for this invocation and all of its slices.
+    pub fn readout(&self) -> OmniReadout {
+        self.readout
+    }
+
+    /// Native tensor roots retained through completion of this invocation.
+    pub fn retained_tensors(&self) -> impl Iterator<Item = &T> {
+        std::iter::once(self.tokens()).chain(self.prompt.projected_roots())
+    }
+
+    /// Describes the tokens, projected rows, and output required on every rank.
+    pub fn collective_descriptor(&self, context: &T::Context) -> Result<[u64; 8], Error> {
+        use sha2::{Digest, Sha256};
+
+        let mut digest = Sha256::new();
+        digest.update([match self.readout {
+            OmniReadout::Vocabulary => 0,
+            OmniReadout::NormalizedHidden => 1,
+        }]);
+        for dimension in self.tokens().shape() {
+            digest.update(dimension.to_le_bytes());
+        }
+        for id in self.tokens().to_i32_vec(context)? {
+            digest.update(id.to_le_bytes());
+        }
+        self.prompt.update_pipeline_digest(&mut digest, context)?;
+        let mut descriptor = [0x4c464d334f4d4e49, 0, 0, 0, 0, 0, 0, 0];
+        for (word, bytes) in descriptor[1..]
+            .iter_mut()
+            .zip(digest.finalize().chunks_exact(8))
+        {
+            *word = u64::from_le_bytes(bytes.try_into().expect("eight digest bytes"));
+        }
+        Ok(descriptor)
+    }
+
+    pub(super) fn tokens(&self) -> &T {
+        self.prompt.tokens()
+    }
+
+    pub(super) fn replace(&self, text: &T, context: &T::Context) -> Result<T, Error> {
+        self.prompt.replace(text, context)
     }
 }

@@ -39,7 +39,11 @@ Omni SafeTensors admission combines the speech and vision declarations into
 one strict model schema. It restricts each component to its admitted source
 keys and validates the bundled LiquidCodec independently. The Omni declaration
 retains the publisher's nested media processor settings and resolves media
-markers through the checkpoint tokenizer.
+markers through the checkpoint tokenizer. Omni and VL use the same projected
+span mapping to replace decoder embeddings. Omni spans also admit audio encoder
+rows and speech feedback. Chunked prefill preserves offsets into the original
+projections, and the Omni invocation declares vocabulary or normalized-hidden
+readout in its distributed input descriptor.
 
 VL cold rank selection derives the decoder ownership, cache geometry,
 communication manifest, and publication plan from the architecture

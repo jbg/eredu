@@ -4,6 +4,7 @@
 pub mod audio;
 pub mod declarations;
 pub mod omni;
+mod projected_prompt;
 pub use declarations::Declaration;
 
 /// Exact heterogeneous block equations and residual order.
@@ -62,6 +63,8 @@ pub enum Lfm3Input<'a, T: eredu_nn::Tensor> {
     Audio(&'a audio::AudioPrompt<'a, T>),
     /// Tokens conditioned on projected image and video rows.
     Vision(&'a vision::VisionPrompt<'a, T>),
+    /// Jointly conditioned image, video, and speech positions.
+    Omni(&'a omni::OmniPrompt<'a, T>),
 }
 
 impl<'a, T: eredu_nn::Tensor> Lfm3Input<'a, T> {
@@ -70,6 +73,7 @@ impl<'a, T: eredu_nn::Tensor> Lfm3Input<'a, T> {
             Self::Text(input) => input.tokens,
             Self::Audio(prompt) => prompt.tokens(),
             Self::Vision(prompt) => prompt.tokens(),
+            Self::Omni(prompt) => prompt.tokens(),
         }
     }
 
@@ -103,7 +107,7 @@ impl<'a, T: eredu_nn::Tensor> Lfm3Input<'a, T> {
         digest.update(match self {
             Self::Vision(_) => [1],
             Self::Text(_) => [0],
-            Self::Audio(_) => {
+            Self::Audio(_) | Self::Omni(_) => {
                 return Err(Error::backend("VL pipeline expects text or vision input"))
             }
         });
@@ -121,7 +125,7 @@ impl<'a, T: eredu_nn::Tensor> Lfm3Input<'a, T> {
                     update_pipeline_tensor_digest(&mut digest, mask, context)?;
                 }
             }
-            Self::Audio(_) => unreachable!("checked VL input"),
+            Self::Audio(_) | Self::Omni(_) => unreachable!("checked VL input"),
         }
         let mut descriptor = [0x4c464d335649534e, 0, 0, 0, 0, 0, 0, 0];
         for (word, bytes) in descriptor[1..]
@@ -136,7 +140,7 @@ impl<'a, T: eredu_nn::Tensor> Lfm3Input<'a, T> {
     fn mask(&self) -> Option<&'a T> {
         match self {
             Self::Text(input) => input.mask,
-            Self::Audio(_) | Self::Vision(_) => None,
+            Self::Audio(_) | Self::Vision(_) | Self::Omni(_) => None,
         }
     }
 }
