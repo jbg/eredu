@@ -240,10 +240,22 @@ fn processor(root: &Path) -> Result<ProcessorConfig, ArtifactError> {
 }
 
 fn text_assets(root: &Path, chat_template: Arc<str>) -> Result<TextAssets, ArtifactError> {
+    read_text_assets(
+        root,
+        chat_template,
+        read(root, "special_tokens_map.json")?.into(),
+    )
+}
+
+fn read_text_assets(
+    root: &Path,
+    chat_template: Arc<str>,
+    special_tokens: Arc<[u8]>,
+) -> Result<TextAssets, ArtifactError> {
     Ok(TextAssets {
         tokenizer: read(root, "tokenizer.json")?.into(),
         tokenizer_config: read(root, "tokenizer_config.json")?.into(),
-        special_tokens: read(root, "special_tokens_map.json")?.into(),
+        special_tokens,
         chat_template,
         named_chat_templates: BTreeMap::new(),
         generation: serde_json::from_slice(&read(root, "generation_config.json")?)?,
@@ -376,9 +388,29 @@ impl PreparedAudio {
         config: &Value,
         max_cached_shards: usize,
     ) -> Result<Self, ArtifactError> {
+        Self::open_safetensors(model, root, config, max_cached_shards, None).map(|(audio, _)| audio)
+    }
+
+    pub(in crate::lfm3) fn open_safetensors(
+        model: &Path,
+        root: &Path,
+        config: &Value,
+        max_cached_shards: usize,
+        omni: Option<(&SafetensorsCheckpointPlan, ProcessorConfig)>,
+    ) -> Result<(Self, Option<BindingSource>), ArtifactError> {
+        let vision = omni.map(|(plan, _)| plan);
         let (interleaved_text_slots, interleaved_speech_slots) = cadence(config)?;
-        let encoder = super::Declaration::from_config(config)?;
-        let depth = DepthDeclaration::from_config(config)?;
+        let (encoder, depth) = if vision.is_some() {
+            (
+                super::Declaration::from_speech_config(config)?,
+                DepthDeclaration::from_speech_config(config)?,
+            )
+        } else {
+            (
+                super::Declaration::from_config(config)?,
+                DepthDeclaration::from_config(config)?,
+            )
+        };
         let mut text = config.get("lfm").unwrap_or(&config["text_config"]).clone();
         if let Some(tied) = config.get("tie_word_embeddings") {
             text.as_object_mut()
@@ -393,9 +425,17 @@ impl PreparedAudio {
         }
         let tokens = AudioTokens::from_config(config, language.vocab_size)?;
         let language = Arc::new(crate::lfm3::Declaration::new(language)?);
-        let processor = processor(root)?;
-        let template = String::from_utf8(read(root, "chat_template.jinja")?).map_err(checkpoint)?;
-        let text_assets = text_assets(root, template.into())?;
+        let template: Arc<str> = String::from_utf8(read(root, "chat_template.jinja")?)
+            .map_err(checkpoint)?
+            .into();
+        let (processor, text_assets) = if let Some((_, processor)) = omni {
+            (
+                processor,
+                read_text_assets(root, template, Arc::from(&b"{}"[..]))?,
+            )
+        } else {
+            (processor(root)?, text_assets(root, template)?)
+        };
 
         let mut language_plan =
             crate::lfm3::safetensors_plan(&language, false).map_err(checkpoint)?;
@@ -414,7 +454,10 @@ impl PreparedAudio {
         let mut policy = CatalogPolicy::strict();
         let mut tensors = Vec::new();
         let mut groups = Vec::new();
-        for plan in [&language_plan, &input_plan, &depth_plan] {
+        for plan in [&language_plan, &input_plan, &depth_plan]
+            .into_iter()
+            .chain(vision)
+        {
             tensors.extend(plan.common_tensors.iter().cloned());
             groups.extend(plan.layout_groups.iter().cloned());
             policy
@@ -424,15 +467,26 @@ impl PreparedAudio {
                 .allowed_suffixes
                 .extend(plan.catalog_policy.allowed_suffixes.iter().cloned());
         }
-        let model_plan =
-            SafetensorsCheckpointPlan::new("LFM3 Audio SafeTensors", tensors, groups, policy)
-                .map_err(checkpoint)?;
+        let model_plan = SafetensorsCheckpointPlan::new(
+            if vision.is_some() {
+                "LFM3 Omni SafeTensors"
+            } else {
+                "LFM3 Audio SafeTensors"
+            },
+            tensors,
+            groups,
+            policy,
+        )
+        .map_err(checkpoint)?;
         let catalog = discover(model)?;
         let combined = resolve(&catalog, &model_plan)?;
         let language_resolution = resolve(&catalog, &language_plan)?;
         let encoder_resolution = resolve(&catalog, &input_plan)?;
         let depth_resolution = resolve(&catalog, &depth_plan)?;
         let source = open(&catalog, &model_plan, combined, max_cached_shards)?;
+        let vision_weights = vision
+            .map(|plan| restrict(&source, &resolve(&catalog, plan)?, BTreeMap::new()))
+            .transpose()?;
         let mut language_recipes = BTreeMap::new();
         for tensor in &language_plan.common_tensors {
             let physical = std::iter::once(&tensor.key)
@@ -519,20 +573,23 @@ impl PreparedAudio {
             shared_source_keys: BTreeSet::new(),
         };
 
-        Ok(Self {
-            language,
-            encoder,
-            depth,
-            codec,
-            processor,
-            tokens,
-            interleaved_text_slots,
-            interleaved_speech_slots,
-            text_assets,
-            language_weights,
-            encoder_weights,
-            depth_weights,
-            codec_weights,
-        })
+        Ok((
+            Self {
+                language,
+                encoder,
+                depth,
+                codec,
+                processor,
+                tokens,
+                interleaved_text_slots,
+                interleaved_speech_slots,
+                text_assets,
+                language_weights,
+                encoder_weights,
+                depth_weights,
+                codec_weights,
+            },
+            vision_weights,
+        ))
     }
 }

@@ -159,8 +159,8 @@ struct ModelArgsSource {
     sliding_window: Option<u32>,
     #[serde(default)]
     head_dim: Option<i32>,
-    #[serde(default = "default_true")]
-    is_causal: bool,
+    #[serde(default)]
+    is_causal: Option<bool>,
     #[serde(default)]
     quantization: Option<WeightQuantization>,
     #[serde(default)]
@@ -168,7 +168,7 @@ struct ModelArgsSource {
 }
 impl ModelArgsSource {
     fn normalize(self, causal: bool) -> Result<ModelArgs, ConfigError> {
-        if self.is_causal != causal {
+        if self.is_causal.is_some_and(|declared| declared != causal) {
             return Err(invalid(
                 "LFM3 attention direction differs from the declared task",
             ));

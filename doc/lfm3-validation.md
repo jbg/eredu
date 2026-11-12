@@ -1546,3 +1546,24 @@ check the vocabulary readout. Use `--topology tp2-pp2 --residency host`
 or `--topology tp2-pp2 --residency disk` to replay with all components
 bounded. Use `--reject-divergent-seeds` to check agreement during the first depth
 advance. Use a fresh output directory for each case.
+
+## LFM3 Omni SafeTensors admission
+
+The architecture admission uses [LFM3-Omni-2B revision
+`21d75123f86c1f7ffb4bef1ea202710c4e7ebe67`](https://huggingface.co/LiquidAI/LFM3-Omni-2B/tree/21d75123f86c1f7ffb4bef1ea202710c4e7ebe67).
+It binds the language model, audio encoder and projector, speech depth and
+feedback, and vision tower and projector as restricted views of one validated
+model source. The bundled LiquidCodec has its own source. The Omni processor
+supplies image and video framing IDs through the retained tokenizer and keeps
+the nested 16 kHz feature extractor policy.
+
+| File | SHA-256 of length prefix and SafeTensors header |
+| --- | --- |
+| `model.safetensors` | `4243cc9337ca2d03465b5d44d11f33caf7fb4a3e6cff9697dc726b239554e101` |
+| `audio_tokenizer/model.safetensors` | `b82ba4739376cf48ed9117f03a2f085987970488521b9683cffcc76a664c24d5` |
+
+The metadata replay calls `PreparedOmni::open` and
+`prepare_vision(RecipeDtype::BF16)`. It admits both published headers and
+prepares all 16 vision units. Its inputs retain the exact headers and file
+extents with sparse payloads. The replay establishes admission and recipe coverage.
+Mixed-media generation and numerical acceptance are still pending.

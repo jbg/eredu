@@ -3,6 +3,7 @@
 /// Speech input feature policy and encoder.
 pub mod audio;
 pub mod declarations;
+pub mod omni;
 pub use declarations::Declaration;
 
 /// Exact heterogeneous block equations and residual order.

@@ -35,6 +35,12 @@ The VL architecture validates each matrix's companion scales and binds the
 weight multiplier through a neutral F32 recipe. The backend materializes
 the recipe with its ordinary tensor multiplication.
 
+Omni SafeTensors admission combines the speech and vision declarations into
+one strict model schema. It restricts each component to its admitted source
+keys and validates the bundled LiquidCodec independently. The Omni declaration
+retains the publisher's nested media processor settings and resolves media
+markers through the checkpoint tokenizer.
+
 VL cold rank selection derives the decoder ownership, cache geometry,
 communication manifest, and publication plan from the architecture
 declaration. Source preparation binds that placement to the selected recipes
