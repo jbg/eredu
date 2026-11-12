@@ -44,6 +44,17 @@ pub struct PrefillRequestDescriptor {
     pub chunk_tokens: Option<usize>,
 }
 
+/// Work scheduled at a retained prefill boundary.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum PrefillStep {
+    /// Prepare ingress values without committing decoder positions or scores.
+    PrepareInput,
+    /// Commit a contiguous range of decoder positions and produce scores.
+    Decoder(Range<usize>),
+    /// Every admitted decoder position has committed.
+    Complete,
+}
+
 /// Request progress owned by a caller performing controlled or uninterrupted prefill.
 /// Clones share immutable request values; snapshot users must pair this cursor with
 /// the corresponding session state. Observation and execution budgets stay in the session.
@@ -73,6 +84,14 @@ impl<R, C> PrefillCursor<R, C> {
                 .position
                 .saturating_add(self.chunk_tokens)
                 .min(self.tokens)
+    }
+    /// Next decoder step, or completion after the final range.
+    pub fn next_step(&self) -> PrefillStep {
+        if self.is_complete() {
+            PrefillStep::Complete
+        } else {
+            PrefillStep::Decoder(self.next_range())
+        }
     }
     /// Immutable prepared request shared by cursor snapshots.
     pub fn request(&self) -> &R {

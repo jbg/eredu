@@ -192,6 +192,7 @@ impl<D: ComponentPreparationDeclaration> ComponentPreparationDeclaration for Arc
 /// Family code supplies admitted recipes, including precision policy and special
 /// transforms. This container validates global geometry, groups physical ownership,
 /// restricts source access, and applies rank-local placement at most once.
+#[derive(Clone)]
 pub struct PreparedComponent<D: ComponentPreparationDeclaration> {
     id: String,
     declaration: D,

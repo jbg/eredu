@@ -234,6 +234,9 @@ pub fn generation_memory_geometry(
                 })?
                 .as_ref(),
         )?,
+        (Some(SafetensorsModelConfig::Lfm3Vl(declaration)), None) => {
+            crate::capability::lfm3(&declaration.language)?
+        }
         (Some(SafetensorsModelConfig::NemotronH(args)), None)
         | (None, Some(GgufModelConfig::NemotronH(args))) => crate::capability::nemotron_h(
             plan.nemotron_declaration(args)

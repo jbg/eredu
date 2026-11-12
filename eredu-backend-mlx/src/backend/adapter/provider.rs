@@ -54,6 +54,10 @@ impl<'a> MlxBackend<'a> {
         &self.weights_stream
     }
 
+    pub(crate) fn native_world(&self) -> Option<&safemlx::distributed::Group> {
+        self.world.as_deref()
+    }
+
     pub(crate) fn validate_prepared_target(&self, target: &MlxPreparedTarget) -> Result<(), Error> {
         target.validate(&self.stream, self.world.as_deref())
     }

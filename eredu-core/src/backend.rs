@@ -1998,9 +1998,9 @@ pub trait TextGenerationBackend: BackendProvider {
         Err("backend retains a complete prefill pass")
     }
 
-    /// Consumes and completes one nonfinal prompt prefix without sampling.
+    /// Completes one nonfinal prefill step without sampling.
     /// Returns true after replacing `prompt` with its remaining suffix or
-    /// advancing its retained prepared-input cursor by exactly one chunk.
+    /// advancing its retained cursor by one ingress step or decoder chunk.
     /// Returning false performs no model work and retains final prefill input.
     ///
     /// Implementations must preserve cache positions and settle native work
@@ -2885,6 +2885,7 @@ mod tests {
                 distributed: None,
                 prefill_lengths: Vec::new(),
                 cancel_on_prefill: None,
+                prepare_ingress: false,
             })
         }
     }
@@ -3118,6 +3119,7 @@ mod tests {
         distributed: Option<MockDistributed>,
         prefill_lengths: Vec<usize>,
         cancel_on_prefill: Option<crate::GenerationCancellationToken>,
+        prepare_ingress: bool,
     }
     impl BackendSession<Mock> for MockSession {
         type PrefillInput = Vec<u32>;
@@ -3169,6 +3171,9 @@ mod tests {
             maximum: std::num::NonZeroUsize,
             _: &mut Self::TextGenerationState,
         ) -> Result<bool, Self::Error> {
+            if std::mem::take(&mut runtime.session_mut().prepare_ingress) {
+                return Ok(true);
+            }
             if prompt.len() <= maximum.get() {
                 return Ok(false);
             }
@@ -3914,6 +3919,7 @@ mod tests {
     #[test]
     fn detached_prefill_advances_one_completed_chunk_without_sampling() {
         let mut runtime = ModelRuntime::prepare(Mock, 10).unwrap();
+        runtime.session_mut().prepare_ingress = true;
         let mut driver = TextGenerationDriver::new(&mut runtime);
         let mut state = driver
             .start(
@@ -3928,6 +3934,11 @@ mod tests {
                 },
             )
             .unwrap();
+        assert!(driver.advance_prefill(&mut state).unwrap());
+        assert!(driver.runtime().session().tokens.is_empty());
+        assert_eq!(state.controller().queries, 0);
+        assert_eq!(state.remaining_tokens(), Some(2));
+        driver.take_completed_step(&mut state).unwrap();
         assert!(driver.advance_prefill(&mut state).unwrap());
         assert_eq!(driver.runtime().session().tokens, [1, 2]);
         assert_eq!(state.controller().queries, 0);
@@ -4301,6 +4312,7 @@ mod tests {
             distributed: Some(session.clone()),
             prefill_lengths: Vec::new(),
             cancel_on_prefill: None,
+            prepare_ingress: false,
         };
         assert_eq!(
             Mock::distributed_session(&model_session)

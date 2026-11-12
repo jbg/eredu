@@ -3,8 +3,8 @@
 use eredu_nn::{
     multimodal::multi_axis_rotary_embeddings,
     sequence_layout::{patch_positions, validate_patch_grid, PatchTraversal},
-    Error, Index, LayerNorm, LinearOperator, NeuralBackend, NormalizationOperator, Parameter,
-    Parameterized, Tensor, TensorElementType,
+    AttentionArithmetic, AttentionRequest, Error, Index, LayerNorm, LinearOperator, NeuralBackend,
+    NormalizationOperator, Parameter, Parameterized, Tensor, TensorElementType,
 };
 
 use super::{
@@ -136,7 +136,13 @@ impl<B: NeuralBackend> VisionPatchifier<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<(B::Tensor, VisionState<B::Tensor>), Error> {
         let state = VisionState::prepare(&self.config, &input, context)?;
-        let hidden = self.projection.forward(input.pixels, context)?;
+        let pixels = match self.projection.parameter_element_type() {
+            Some(dtype) if input.pixels.element_type() != Some(dtype) => {
+                input.pixels.cast_float(dtype, context)?
+            }
+            _ => input.pixels.clone(),
+        };
+        let hidden = self.projection.forward(&pixels, context)?;
         Ok((self.norm.forward(&hidden, context)?, state))
     }
 }
@@ -205,6 +211,13 @@ impl<B: NeuralBackend> Attention<B> {
             &state.sine,
             context,
         )?;
+        // Eager BF16 attention rounds the scores and softmax probabilities
+        // before the value projection.
+        let arithmetic = if query.element_type() == Some(TensorElementType::Bf16) {
+            AttentionArithmetic::InputScores
+        } else {
+            AttentionArithmetic::Fused
+        };
         let mut start = 0;
         let mut outputs = Vec::with_capacity(state.frame_shapes.len());
         for &(height, width) in &state.frame_shapes {
@@ -220,12 +233,17 @@ impl<B: NeuralBackend> Attention<B> {
             };
             // Every frame has its complete key set. There is no causal text
             // mask, sliding-window retention or cross-frame KV state here.
-            let output = B::attention(
-                slice(&query)?,
-                slice(&key)?,
-                slice(&value)?,
-                (self.head_dim as f32).powf(-0.5),
-                None,
+            let output = B::attention_with_sinks(
+                AttentionRequest {
+                    arithmetic,
+                    queries: slice(&query)?,
+                    keys: slice(&key)?,
+                    values: slice(&value)?,
+                    scale: (self.head_dim as f32).powf(-0.5),
+                    softcap: None,
+                    mask: None,
+                    sinks: None,
+                },
                 context,
             )?;
             outputs.push(
@@ -312,6 +330,14 @@ impl<B: NeuralBackend> Convolution<B> {
             .weight
             .as_ref()
             .transpose_axes(&[0, 2, 3, 1], context)?;
+        // The released BF16 mixer accumulates spatial products in F32 and
+        // rounds once before the output gate.
+        let widen = gated.element_type() == Some(TensorElementType::Bf16);
+        let weight = if widen {
+            weight.cast_float(TensorElementType::F32, context)?
+        } else {
+            weight
+        };
         let merge = state.config.spatial_merge_size;
         let mut start = 0;
         let mut outputs = Vec::with_capacity(state.frame_shapes.len());
@@ -325,6 +351,11 @@ impl<B: NeuralBackend> Convolution<B> {
                 )?
                 .transpose_axes(&[0, 2, 1, 3, 4], context)?
                 .reshape(&[1, height, width, self.channels], context)?;
+            let raster = if widen {
+                raster.cast_float(TensorElementType::F32, context)?
+            } else {
+                raster
+            };
             let output = B::Tensor::conv2d(
                 &raster,
                 &weight,
@@ -334,6 +365,11 @@ impl<B: NeuralBackend> Convolution<B> {
                 self.channels,
                 context,
             )?;
+            let output = if widen {
+                output.cast_float(TensorElementType::Bf16, context)?
+            } else {
+                output
+            };
             outputs.push(
                 output
                     .reshape(
@@ -362,6 +398,8 @@ enum Mixer<B: NeuralBackend> {
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct VisionBlock<B: NeuralBackend> {
+    #[parameter(skip)]
+    layer: usize,
     mixer: Mixer<B>,
     operator_norm: B::Normalization,
     ffn_norm: B::Normalization,
@@ -393,6 +431,7 @@ impl<B: NeuralBackend> VisionBlock<B> {
             feed_forward,
         } = spec;
         Ok(Self {
+            layer,
             mixer: match mixer {
                 MixerSpec::Attention(s) => Mixer::Attention(Attention::new(s, context)?),
                 MixerSpec::Convolution(s) => Mixer::Convolution(Convolution::new(s, context)?),
@@ -405,6 +444,10 @@ impl<B: NeuralBackend> VisionBlock<B> {
             gated_product: feed_forward.policy,
             config: declaration.config().clone(),
         })
+    }
+
+    pub(super) fn layer(&self) -> usize {
+        self.layer
     }
 
     /// Executes the exact frame-local mixer and dense SwiGLU residual equations.
@@ -468,7 +511,16 @@ impl<B: NeuralBackend> VisionProjector<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
         state.validate_hidden(hidden, &self.config)?;
-        let normalized = self.norm.forward(hidden, context)?;
+        // The publisher evaluates normalization and the learned affine in
+        // FP32 before rounding its BF16 output.
+        let normalized = if hidden.element_type() == Some(TensorElementType::Bf16) {
+            let wide = hidden.cast_float(TensorElementType::F32, context)?;
+            self.norm
+                .forward(&wide, context)?
+                .cast_float(TensorElementType::Bf16, context)?
+        } else {
+            self.norm.forward(hidden, context)?
+        };
         let merged = normalized.reshape(&[-1, self.input_width], context)?;
         self.down.forward(
             &B::Tensor::gelu(&self.up.forward(&merged, context)?, context)?,

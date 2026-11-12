@@ -24,6 +24,10 @@ pub(super) fn gguf_composite(
                 media(g, "vision");
             }
         }
+        C::Lfm3Vl { declaration, .. } => {
+            lfm3(g, &declaration.language);
+            media(g, "vision");
+        }
         C::Gemma4(c) => gemma(g, c),
         C::Inkling(c) => inkling(g, c),
         C::Muse(c) => muse(g, c),
@@ -772,6 +776,10 @@ pub(super) fn remaining_safetensors(
         SafetensorsModelConfig::Gemma4(c) => gemma(g, c),
         SafetensorsModelConfig::Muse(c) => muse(g, c),
         SafetensorsModelConfig::Inkling(c) => inkling(g, c),
+        SafetensorsModelConfig::Lfm3Vl(declaration) => {
+            lfm3(g, &declaration.language);
+            media(g, "vision");
+        }
         SafetensorsModelConfig::QwenVl(c) => {
             qwen_with_deepstack(
                 g,

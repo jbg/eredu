@@ -251,7 +251,12 @@ pub fn static_model_memory(
     let banks = session
         .parameter_bank_report()
         .map_err(|error| CapabilityError::Observation(error.to_string()))?;
-    static_memory_from_residency(residency, banks)
+    let components = session
+        .component_residency_reports()
+        .map_err(|error| CapabilityError::Observation(error.to_string()))?;
+    let mut components = components.into_iter();
+    let residency = residency.or_else(|| components.next());
+    static_memory_from_residency_and_components(residency, components, banks)
 }
 
 pub(crate) fn static_memory_from_residency(
@@ -260,14 +265,24 @@ pub(crate) fn static_memory_from_residency(
         crate::backend::runtime::residency::parameter_bank::ParameterBanksResidencyReport,
     >,
 ) -> Result<StaticMemoryReport, CapabilityError> {
+    static_memory_from_residency_and_components(residency, std::iter::empty(), banks)
+}
+
+fn static_memory_from_residency_and_components(
+    residency: Option<eredu_runtime::ResidencyReport>,
+    components: impl Iterator<Item = eredu_runtime::ResidencyReport>,
+    banks: Option<
+        crate::backend::runtime::residency::parameter_bank::ParameterBanksResidencyReport,
+    >,
+) -> Result<StaticMemoryReport, CapabilityError> {
     let retention = residency.as_ref().map_or_else(
         eredu_core::residency::unreported_parameter_conversion_retention,
         |report| report.offload().parameter_conversion_retention().clone(),
     );
-    let conversions = residency
+    let mut conversions = residency
         .as_ref()
         .map(|report| report.device_parameter_conversion_bytes());
-    let (mut logical, mut host, mut device, mut disk, cached_shards) =
+    let (mut logical, mut host, mut device, mut disk, mut cached_shards) =
         if let Some(report) = residency {
             let planned = report.offload().planned_bytes();
             let resident = report.offload().resident_bytes();
@@ -327,6 +342,24 @@ pub(crate) fn static_memory_from_residency(
                 },
             )
         };
+    for component in components {
+        let planned = component.offload().planned_bytes();
+        let resident = component.offload().resident_bytes();
+        for tier in [MemoryTier::Device, MemoryTier::Host, MemoryTier::Disk] {
+            add_parameter_observation(&mut logical, planned.get(tier))?;
+        }
+        add_parameter_observation(&mut host, resident.get(MemoryTier::Host))?;
+        add_parameter_observation(&mut device, resident.get(MemoryTier::Device))?;
+        add_parameter_observation(&mut disk, planned.get(MemoryTier::Disk))?;
+        if let Some(bytes) = conversions.as_mut() {
+            *bytes = checked_add(
+                *bytes,
+                component.device_parameter_conversion_bytes(),
+                "component conversion bytes",
+            )?;
+        }
+        cached_shards = Observed::unavailable("component checkpoint readers can share storage");
+    }
     // Independently addressable parameters are excluded from ordinary block
     // residency. Count each bank's owned entries once, even when banks share
     // the same physical pool and its aggregate telemetry.

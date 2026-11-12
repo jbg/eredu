@@ -773,6 +773,11 @@ pub enum DerivedWeightRecipe {
         weight: Box<Self>,
         scale: Box<Self>,
     },
+    /// Multiply a decoded F32 tensor by one positive F32 scalar.
+    ScaleF32 {
+        weight: Box<Self>,
+        scale: Box<Self>,
+    },
     Source {
         key: String,
         selection: TensorSelection,
@@ -896,7 +901,7 @@ impl DerivedWeightRecipe {
         source: &S,
     ) -> Result<(), RecipeError> {
         match self {
-            Self::DecodeTensorFp8 { weight, scale } => {
+            Self::DecodeTensorFp8 { weight, scale } | Self::ScaleF32 { weight, scale } => {
                 weight.preflight_bounded(source)?;
                 scale.preflight_bounded(source)?;
             }
@@ -1050,18 +1055,16 @@ impl DerivedWeightRecipe {
     ) -> Result<u64, RecipeError> {
         let output_bytes = self.infer(catalog)?.byte_len();
         match self {
-            Self::DecodeTensorFp8 { weight, scale } => {
+            Self::DecodeTensorFp8 { weight, scale } | Self::ScaleF32 { weight, scale } => {
                 let retained = weight
                     .infer(catalog)?
                     .byte_len()
                     .checked_add(scale.infer(catalog)?.byte_len())
-                    .ok_or(RecipeError::ArithmeticOverflow("tensor FP8 inputs"))?;
+                    .ok_or(RecipeError::ArithmeticOverflow("scaled tensor inputs"))?;
                 let converted = output_bytes
                     .checked_mul(2)
                     .and_then(|n| n.checked_add(retained))
-                    .ok_or(RecipeError::ArithmeticOverflow(
-                        "tensor FP8 decode workspace",
-                    ))?;
+                    .ok_or(RecipeError::ArithmeticOverflow("scaled tensor workspace"))?;
                 Ok(converted
                     .max(weight.peak_materialization_bytes(catalog)?)
                     .max(
@@ -1129,7 +1132,7 @@ impl DerivedWeightRecipe {
 
     fn collect_source_keys<'a>(&'a self, keys: &mut BTreeSet<&'a str>) {
         match self {
-            Self::DecodeTensorFp8 { weight, scale } => {
+            Self::DecodeTensorFp8 { weight, scale } | Self::ScaleF32 { weight, scale } => {
                 weight.collect_source_keys(keys);
                 scale.collect_source_keys(keys);
             }
@@ -1153,7 +1156,7 @@ impl DerivedWeightRecipe {
 
     fn collect_source_occurrences<'a>(&'a self, occurrences: &mut Vec<&'a str>) {
         match self {
-            Self::DecodeTensorFp8 { weight, scale } => {
+            Self::DecodeTensorFp8 { weight, scale } | Self::ScaleF32 { weight, scale } => {
                 weight.collect_source_occurrences(occurrences);
                 scale.collect_source_occurrences(occurrences);
             }
@@ -1189,6 +1192,17 @@ impl DerivedWeightRecipe {
         catalog: &C,
     ) -> Result<RecipeMetadata, RecipeError> {
         match self {
+            Self::ScaleF32 { weight, scale } => {
+                let weight = weight.infer(catalog)?;
+                let scale = scale.infer(catalog)?;
+                if weight.dtype != RecipeDtype::F32
+                    || scale.dtype != RecipeDtype::F32
+                    || !scale.shape.is_empty()
+                {
+                    return Err(RecipeError::InvalidF32Scale);
+                }
+                Ok(weight)
+            }
             Self::DecodeTensorFp8 { weight, scale } => {
                 let weight = weight.infer(catalog)?;
                 let scale = scale.infer(catalog)?;
@@ -1330,6 +1344,10 @@ fn expand_indexed_sources(recipe: DerivedWeightRecipe) -> DerivedWeightRecipe {
                 scale: Box::new(expand_indexed_sources(*scale)),
             }
         }
+        DerivedWeightRecipe::ScaleF32 { weight, scale } => DerivedWeightRecipe::ScaleF32 {
+            weight: Box::new(expand_indexed_sources(*weight)),
+            scale: Box::new(expand_indexed_sources(*scale)),
+        },
         DerivedWeightRecipe::Source {
             key,
             selection: TensorSelection::Indices { axis, indices },
@@ -1413,6 +1431,10 @@ fn normalize_bounded_source_ranges<C: RecipeCatalog + ?Sized>(
                 scale: Box::new(normalize_bounded_source_ranges(*scale, store)?),
             }
         }
+        DerivedWeightRecipe::ScaleF32 { weight, scale } => DerivedWeightRecipe::ScaleF32 {
+            weight: Box::new(normalize_bounded_source_ranges(*weight, store)?),
+            scale: Box::new(normalize_bounded_source_ranges(*scale, store)?),
+        },
         DerivedWeightRecipe::Source {
             key,
             selection: TensorSelection::Range { axis, start, end },
@@ -1511,6 +1533,10 @@ fn push_selection<C: RecipeCatalog + ?Sized>(
                 scale: scale.clone(),
             })
         }
+        DerivedWeightRecipe::ScaleF32 { weight, scale } => Ok(DerivedWeightRecipe::ScaleF32 {
+            weight: Box::new(push_selection(weight, store, selection)?),
+            scale: scale.clone(),
+        }),
         DerivedWeightRecipe::Source {
             key,
             selection: source_selection,
@@ -2248,6 +2274,9 @@ fn element_count(shape: &[usize], context: &'static str) -> Result<u64, RecipeEr
 pub enum RecipeError {
     #[error("tensor FP8 decoding requires E4M3 values and one F32 scalar scale")]
     InvalidTensorFp8,
+    /// A checkpoint multiplier or its input has incompatible geometry or precision.
+    #[error("F32 scaling requires an F32 tensor and one F32 scalar")]
+    InvalidF32Scale,
     #[error("derived-weight source key must not be empty")]
     EmptySourceKey,
     #[error("derived-weight output name must not be empty")]

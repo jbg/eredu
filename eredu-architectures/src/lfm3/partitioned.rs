@@ -1227,7 +1227,7 @@ where
         sequence: i32,
     ) -> Result<Vec<i32>, Self::Error> {
         let width = match input {
-            Lfm3Input::Text(_) => self.args.vocab_size,
+            Lfm3Input::Text(_) | Lfm3Input::Vision(_) => self.args.vocab_size,
             Lfm3Input::Audio(_) => self.args.hidden_size,
         };
         Ok(vec![batch, sequence, width])
@@ -1266,6 +1266,11 @@ fn condition_prompt<T: Tensor>(
     forward: &mut LayeredForwardState<T, ForwardContext<T>>,
     context: &T::Context,
 ) -> Result<(), Error> {
+    if let Lfm3Input::Vision(prompt) = &input {
+        if embedding_owner {
+            forward.hidden = prompt.replace(&forward.hidden, context)?;
+        }
+    }
     if let Lfm3Input::Audio(prompt) = input {
         if embedding_owner {
             forward.hidden = prompt.replace(&forward.hidden, context)?;

@@ -174,17 +174,28 @@ impl TextSnapshotBackend for MlxBackend<'_> {
                 u64::try_from(
                     cursor
                         .token_count()
-                        .checked_sub(cursor.next_range().start)?,
+                        .checked_sub(cursor.decoder_position())?,
                 )
                 .ok()?
                 .checked_add(predictions - 1)
             }
-            PendingTextInput::Prefill(prompt) => with_text_prompt_array(prompt, |array| {
-                u64::try_from(array.shape()[1])
-                    .ok()?
-                    .checked_add(predictions - 1)
-            })
-            .flatten(),
+            PendingTextInput::Prefill(prompt) => {
+                let positions =
+                    with_text_prompt_array(prompt, |array| u64::try_from(array.shape()[1]).ok())
+                        .unwrap_or_else(|| {
+                            prompt.with_borrowed(|input| {
+                                runtime
+                                    .session()
+                                    .prepared_input_plans(input)
+                                    .ok()?
+                                    .iter()
+                                    .try_fold(0_u64, |total, part| {
+                                        total.checked_add(part.decoder_positions())
+                                    })
+                            })
+                        })?;
+                positions.checked_add(predictions - 1)
+            }
             PendingTextInput::Continue if sampling.next_logits.is_some() => {
                 predictions.checked_sub(1)
             }

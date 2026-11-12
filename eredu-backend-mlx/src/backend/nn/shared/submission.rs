@@ -207,10 +207,20 @@ impl MlxSubmissionCompletion {
             .push(Box::new(value));
     }
 
-    /// Orders a consumer stream after this exact completion without blocking.
+    /// Orders a consumer stream after this exact completion. Cross-device
+    /// dependencies wait on the host because MLX events are device-local.
     pub fn wait_on(&self, stream: &Stream) -> Result<(), safemlx::error::Exception> {
         self.check_native_status()?;
         let owner = self.retained.retention();
+        if let Some(producer) = self.event.device()? {
+            if producer != stream.get_device()? {
+                let result = self.event.synchronize();
+                if result.is_err() {
+                    owner.failed.set(true);
+                }
+                return result;
+            }
+        }
         let mut child = Recovery::begin(ConsumerResources::new(owner, stream))?;
         let _unwind = ConsumerUnwind(&owner.failed);
         let result = self.event.wait_on(stream);

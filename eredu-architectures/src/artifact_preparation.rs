@@ -221,6 +221,11 @@ pub(crate) fn source_declarations(
                         declarations.roles.insert(role, BTreeMap::from([(PhysicalArtifactId::Primary, keys)]));
                     }
                 }
+                if let crate::configuration::SafetensorsModelConfig::Lfm3Vl(declaration) = target.model() {
+                    for (role, keys) in declaration.source_roles(target_resolution.source_keys()).map_err(|e| invalid(e.to_string()))? {
+                        declarations.roles.insert(role, BTreeMap::from([(PhysicalArtifactId::Primary, keys)]));
+                    }
+                }
                 if let Some(extension) = plan.prediction_extension() {
                     declarations.roles.insert(ArtifactSourceRole::Prediction, BTreeMap::from([(PhysicalArtifactId::Primary, extension.source_keys(target).map_err(|e| invalid(e.to_string()))?)]));
                 }
@@ -239,16 +244,25 @@ pub(crate) fn source_declarations(
                 let primary = plan.gguf_plan().ok_or_else(|| invalid("GGUF artifact omitted its architecture plan".into()))?;
                 let validated = inspection.validated_gguf().ok_or_else(|| invalid("GGUF artifact omitted its validated headers".into()))?;
                 if validated.companions().any(|(role, _)| *role != ArtifactCompanionRole::MediaProjector) { return Err(invalid("GGUF artifact retained an unsupported companion role".into())); }
-                let checkpoint = primary.prepared_checkpoint(validated.checkpoint());
+                let vl = plan.gguf_media_projector().and_then(|projector| match projector.model() {
+                    crate::gguf_companion::GgufMediaProjectorConfig::Lfm3Vl { backbone, projector, .. } => Some((backbone.as_ref(), projector.as_ref())),
+                    _ => None,
+                });
+                let checkpoint = vl.map_or_else(|| primary.prepared_checkpoint(validated.checkpoint()), |(backbone, _)| backbone);
                 let resolution = eredu_checkpoint::validation::resolve_gguf_plan(checkpoint, primary.checkpoint()).map_err(|e| invalid(format!("{e:?}")))?;
                 let mapping = plan.gguf_media_projector().map_or(primary.tensor_mapping(), |p| p.primary_tensor_mapping());
                 let catalog = eredu_checkpoint::gguf_store::GgufCatalog::from_resolved_checkpoint(checkpoint, &resolution, mapping).map_err(|e| invalid(e.to_string()))?;
-                declarations.roles.insert(ArtifactSourceRole::Target, BTreeMap::from([(PhysicalArtifactId::Primary, catalog.keys().into_iter().collect())]));
+                let keys = catalog.keys().into_iter().collect::<BTreeSet<_>>();
+                if vl.is_some() {
+                    declarations.roles.insert(ArtifactSourceRole::Component(crate::lfm3::vision::DECODER_ROLE), BTreeMap::from([(PhysicalArtifactId::Primary, keys.clone())]));
+                }
+                declarations.roles.insert(ArtifactSourceRole::Target, BTreeMap::from([(PhysicalArtifactId::Primary, keys)]));
                 declarations.artifacts.insert(PhysicalArtifactId::Primary, PhysicalArtifactPreparation::Gguf { checkpoint: checkpoint.clone(), mapping: mapping.to_vec(), resolution });
                 match (plan.gguf_media_projector(), validated.companion(&ArtifactCompanionRole::MediaProjector)) {
                     (Some(projector), Some(companion)) => {
-                        let resolution = eredu_checkpoint::validation::resolve_gguf_plan(companion.checkpoint(), projector.checkpoint()).map_err(|e| invalid(format!("{e:?}")))?;
-                        let catalog = eredu_checkpoint::gguf_store::GgufCatalog::from_resolved_checkpoint(companion.checkpoint(), &resolution, projector.tensor_mapping()).map_err(|e| invalid(e.to_string()))?;
+                        let checkpoint = vl.map_or_else(|| companion.checkpoint(), |(_, projector)| projector);
+                        let resolution = eredu_checkpoint::validation::resolve_gguf_plan(checkpoint, projector.checkpoint()).map_err(|e| invalid(format!("{e:?}")))?;
+                        let catalog = eredu_checkpoint::gguf_store::GgufCatalog::from_resolved_checkpoint(checkpoint, &resolution, projector.tensor_mapping()).map_err(|e| invalid(e.to_string()))?;
                         let keys = catalog.keys().into_iter().collect::<BTreeSet<_>>();
                         let id = PhysicalArtifactId::Companion(ArtifactCompanionRole::MediaProjector);
                         declarations.roles.get_mut(&ArtifactSourceRole::Target).expect("target role").insert(id.clone(), keys.clone());
@@ -259,7 +273,7 @@ pub(crate) fn source_declarations(
                         } else {
                             declarations.roles.insert(ArtifactSourceRole::Vision, BTreeMap::from([(id.clone(), keys)]));
                         }
-                        declarations.artifacts.insert(id, PhysicalArtifactPreparation::Gguf { checkpoint: companion.checkpoint().clone(), mapping: projector.tensor_mapping().to_vec(), resolution });
+                        declarations.artifacts.insert(id, PhysicalArtifactPreparation::Gguf { checkpoint: checkpoint.clone(), mapping: projector.tensor_mapping().to_vec(), resolution });
                     }
                     (None, None) => {}
                     _ => return Err(invalid("GGUF projector headers differ from admitted companion role".into())),

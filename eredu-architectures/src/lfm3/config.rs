@@ -529,6 +529,10 @@ pub fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String {
             ("norm_eps", format!("{:08x}", args.norm_eps.to_bits())),
             ("conv_history", args.conv_l_cache.to_string()),
             ("conv_bias", args.conv_bias.to_string()),
+            (
+                "conv_arithmetic",
+                format!("{:?}", super::block::SHORT_CONVOLUTION_ARITHMETIC),
+            ),
             ("quantization", format!("{:?}", args.weight_quantization)),
             (
                 "quantized_weights",

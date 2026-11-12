@@ -1,7 +1,9 @@
 //! Architecture-owned admission for replicated text execution.
 
 pub mod artifact;
+mod lfm3_vl;
 use artifact::{safetensors_inspection_recipe_source, safetensors_parameters};
+pub use lfm3_vl::{lfm3_vl_requirements, Lfm3VlRequirements};
 mod profiles;
 pub use profiles::{
     IdentityReplicatedTextVisitor, ReplicatedTextStateProfiles, ReplicatedTextVisitorConversion,
@@ -5969,6 +5971,7 @@ fn safetensors_eligible_config(
         SafetensorsModelConfig::Gemma4(_)
         | SafetensorsModelConfig::Inkling(_)
         | SafetensorsModelConfig::Muse(_)
+        | SafetensorsModelConfig::Lfm3Vl(_)
         | SafetensorsModelConfig::QwenVl(_) => Err(ReplicatedTextIneligibility::CompositeInput),
         SafetensorsModelConfig::Moshi(_) | SafetensorsModelConfig::VoiceChat(_) => {
             Err(ReplicatedTextIneligibility::Realtime)
@@ -7118,6 +7121,14 @@ where
     /// Records that validated dispatch is about to construct architecture modules.
     fn construction_started(&mut self);
 
+    /// Binds the retained dense vision-language graph and its cursor adapter.
+    fn visit_vl(
+        self,
+        _prepared: crate::lfm3::vision::PreparedVlGraph,
+    ) -> Result<Self::Output, crate::prepared_execution::PreparedExecutionError<Self::Error>> {
+        Err(crate::prepared_execution::PreparedExecutionError::UnavailableExecution)
+    }
+
     /// Binds a routed composite target and its independently prepared predictor.
     /// Native adaptation retains processor policy and uses the shared speculative driver.
     fn visit_prediction<A, W>(
@@ -7433,6 +7444,7 @@ pub(crate) fn composite_config(
                     .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?,
             ),
             GgufMediaProjectorConfig::Qwen35(args) => CompositeConfig::QwenHybrid(args),
+            GgufMediaProjectorConfig::Lfm3Vl { .. } => return Ok(None),
             GgufMediaProjectorConfig::Qwen4Exp(_) => {
                 return Err(ReplicatedTextRequirementsError::InvalidArtifact(
                     "Flash-Next composite requires its selected routed architecture declaration"
@@ -7718,6 +7730,9 @@ pub fn composite_processor_execution_requirements(
     plan: &ArtifactArchitecturePlan,
 ) -> Result<Option<eredu_runtime::ProcessorExecutionRequirements>, ReplicatedTextRequirementsError>
 {
+    if plan.model_kind() == crate::configuration::ModelKind::Lfm3Vl {
+        return lfm3_vl::processor_requirements(plan).map(Some);
+    }
     let Some(config) = composite_config(plan)? else {
         return Ok(None);
     };

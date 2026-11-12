@@ -1384,6 +1384,22 @@ pub fn lfm3(declaration: &crate::lfm3::Declaration) -> Result<CapabilityEstimate
     ))
 }
 
+/// Projects LFM3 VL context and decoder state for the selected input modalities.
+pub(crate) fn lfm3_vl(
+    declaration: &crate::lfm3::Declaration,
+    modalities: &std::collections::BTreeSet<eredu_core::InputModality>,
+) -> Result<CapabilityEstimate, CapabilityError> {
+    use eredu_core::InputModality;
+    let mut spec = lfm3_spec(declaration)?;
+    spec.3 = InputModalities {
+        text: modalities.contains(&InputModality::Text),
+        image: modalities.contains(&InputModality::Image),
+        video: modalities.contains(&InputModality::Video),
+        audio: false,
+    };
+    Ok(finish("lfm3_vl".into(), spec))
+}
+
 /// Derives Nemotron-H capabilities from retained construction and state declarations.
 pub fn nemotron_h(
     declaration: &crate::nemotron_h::Declaration,

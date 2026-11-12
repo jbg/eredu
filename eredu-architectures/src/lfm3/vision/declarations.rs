@@ -2,8 +2,8 @@
 
 use super::{ProjectorConfig, VisionConfig, VisionLayerKind};
 use eredu_nn::{
-    DeclareLogicalParameters, Error, LayerNormalizationConstructionSpec, LinearSpec,
-    LogicalParameterDeclaration, LogicalParameterRole, NormalizationConstructionSpec,
+    DeclareLogicalParameters, Error, LayerNormalizationConstructionSpec, LinearArithmetic,
+    LinearSpec, LogicalParameterDeclaration, LogicalParameterRole, NormalizationConstructionSpec,
     ParameterSpec, SelfAttentionProjectionSpec, SplitGatedProductSpec,
 };
 
@@ -13,6 +13,16 @@ fn parameter(name: impl Into<String>) -> Result<ParameterSpec, Error> {
 
 fn linear(root: &str, input: i32, output: i32, bias: bool) -> Result<LinearSpec, Error> {
     let weight = format!("{root}.weight");
+    let format = crate::linear_format::standard_linear_format(
+        &weight,
+        eredu_checkpoint::LinearFormat::Dense,
+    )?;
+    // The projector's biased affine layers add bias before the output rounds.
+    let format = if bias {
+        format.with_arithmetic(LinearArithmetic::RowMajorAffine)?
+    } else {
+        format
+    };
     Ok(LinearSpec {
         input,
         output,
@@ -20,10 +30,7 @@ fn linear(root: &str, input: i32, output: i32, bias: bool) -> Result<LinearSpec,
         bias: bias
             .then(|| parameter(format!("{root}.bias")))
             .transpose()?,
-        format: crate::linear_format::standard_linear_format(
-            &weight,
-            eredu_checkpoint::LinearFormat::Dense,
-        )?,
+        format,
     })
 }
 

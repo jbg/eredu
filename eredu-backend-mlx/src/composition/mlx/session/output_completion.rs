@@ -1,9 +1,9 @@
 use super::*;
 use super::{
-    model_session::{ScopeRetention, SubmissionResources},
+    model_session::{ObservationRetention, ScopeRetention, SubmissionResources},
     recovery::Recovery,
 };
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 /// Backend-owned output of one MLX model-session submission.
 ///
@@ -217,8 +217,17 @@ pub(super) enum MlxSessionCompletionKind {
         _retained: Vec<Array>,
         owner: Rc<SubmissionResources>,
         recovery: RefCell<Option<Recovery<ScopeRetention>>>,
-        observation_error: RefCell<Option<String>>,
+        observation: RefCell<ModelObservation>,
     },
+}
+
+pub(super) enum ModelObservation {
+    Unobserved,
+    Pending {
+        recovery: Recovery<ObservationRetention>,
+        validation: Result<(), Arc<Exception>>,
+    },
+    Complete(Result<(), Arc<Exception>>),
 }
 
 impl MlxSessionCompletion {
@@ -228,58 +237,70 @@ impl MlxSessionCompletion {
         }
     }
 
-    fn resolve(&self) -> Result<(), Error> {
+    fn resolve(&self) -> Result<bool, Error> {
         let MlxSessionCompletionKind::Model {
-            observation_error, ..
+            token_validations,
+            owner,
+            recovery,
+            _retained: retained,
+            observation,
         } = &self.inner;
-        if let Some(error) = observation_error.borrow().as_ref() {
-            return Err(Error::ArchitectureModel(error.clone()));
+        let mut observation = observation.borrow_mut();
+        if let ModelObservation::Complete(result) = &*observation {
+            return match result {
+                Ok(()) => owner.ensure_healthy().map(|()| true),
+                Err(error) => Err(Error::Other(Box::new(error.clone()))),
+            };
         }
-        self.owner().ensure_healthy()?;
-        match &self.inner {
-            MlxSessionCompletionKind::Model {
-                token_validations,
-                owner,
-                recovery,
-                _retained: retained,
-                ..
-            } => {
-                let status = recovery.borrow().as_ref().map(|scope| scope.progress());
-                if status.is_some_and(|status| status.failed || status.blocked) {
-                    owner.request_release();
-                    recovery.borrow_mut().take();
-                    return Err(Error::ArchitectureModel(
-                        "model submission failed or became unobservable".into(),
-                    ));
-                }
-                if status.is_some_and(|status| !status.settled) {
-                    return Err(Error::ArchitectureModel(
-                        "model submission has unresolved native work".into(),
-                    ));
-                }
-                // Host/token observations may themselves submit eager work.
-                // Arm their independent scope before releasing the first one.
-                let mut observation = owner.observation_recovery(retained.clone())?;
-                let _unwind = owner.poison_on_unwind();
-                recovery.borrow_mut().take();
-                let result = token_validations.validate_completed().map_err(Error::from);
-                observation.seal();
-                let status = observation.progress();
+        owner.ensure_healthy()?;
+        if matches!(*observation, ModelObservation::Unobserved) {
+            let status = recovery.borrow().as_ref().map(Recovery::progress);
+            if status.is_some_and(|status| status.failed || status.blocked) {
                 owner.request_release();
-                if !status.settled || status.failed || status.blocked {
-                    owner.reject_unresolved();
-                    return Err(Error::ArchitectureModel(
-                        "model output observation failed or is unresolved".into(),
-                    ));
-                }
-                drop(observation);
-                if let Err(error) = &result {
-                    observation_error.replace(Some(error.to_string()));
-                    owner.reject_unresolved();
-                }
-                result
+                recovery.borrow_mut().take();
+                return Err(Error::ArchitectureModel(
+                    "model submission failed or became unobservable".into(),
+                ));
             }
+            if status.is_some_and(|status| !status.settled) {
+                return Ok(false);
+            }
+            // Keep a separate ownership scope for work issued by host validation.
+            let mut validation_recovery = owner.observation_recovery(retained.clone())?;
+            let _unwind = owner.poison_on_unwind();
+            recovery.borrow_mut().take();
+            let validation = token_validations.validate_completed().map_err(Arc::new);
+            validation_recovery.seal();
+            *observation = ModelObservation::Pending {
+                recovery: validation_recovery,
+                validation,
+            };
+            owner.request_release();
         }
+        let ModelObservation::Pending {
+            recovery,
+            validation,
+        } = &*observation
+        else {
+            unreachable!("an incomplete model observation retains its recovery scope");
+        };
+        let status = recovery.progress();
+        if status.failed || status.blocked {
+            owner.reject_unresolved();
+            return Err(Error::ArchitectureModel(
+                "model output observation failed or became unobservable".into(),
+            ));
+        }
+        if !status.settled {
+            return Ok(false);
+        }
+        let result = validation.clone();
+        *observation = ModelObservation::Complete(result.clone());
+        if let Err(error) = result {
+            owner.reject_unresolved();
+            return Err(Error::Other(Box::new(error)));
+        }
+        Ok(true)
     }
 }
 
@@ -305,25 +326,7 @@ impl Completion for MlxSessionCompletion {
     }
 
     fn is_complete(&self) -> Result<bool, Self::Error> {
-        safemlx::try_with_submission_retirement(|| {
-            match &self.inner {
-                MlxSessionCompletionKind::Model { recovery, .. } => {
-                    if let Some(status) = recovery.borrow().as_ref().map(|scope| scope.progress()) {
-                        if status.failed || status.blocked {
-                            return Err(Error::ArchitectureModel(
-                                "model submission failed or became unobservable".into(),
-                            ));
-                        }
-                        if !status.settled {
-                            return Ok(false);
-                        }
-                    }
-                }
-            }
-            self.resolve()?;
-            Ok(true)
-        })
-        .unwrap_or(Ok(false))
+        safemlx::try_with_submission_retirement(|| self.resolve()).unwrap_or(Ok(false))
     }
 
     fn wait(&self) -> Result<(), Self::Error> {

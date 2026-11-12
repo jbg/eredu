@@ -18,8 +18,8 @@ mod parity;
 mod realtime;
 
 pub use checkpoint::{
-    compare_checkpoint_artifacts, CheckpointParityError, CheckpointParityOptions,
-    CheckpointParityReport,
+    compare_checkpoint_artifacts, compare_checkpoint_logit_rows, CheckpointParityError,
+    CheckpointParityOptions, CheckpointParityReport,
 };
 pub use distribution::{compare_distributions, DistributionError, DistributionMetrics};
 

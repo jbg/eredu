@@ -11,18 +11,29 @@ fn depends_on(value: &Array, dependency: &Array) -> Result<Array> {
 /// Independent lazy branches can otherwise evaluate in a different order on
 /// active and zero-work pipeline stages, matching unrelated native collectives.
 pub(super) fn ordered_world_sum(input: &Array, group: &Group, stream: &Stream) -> Result<Array> {
-    use eredu_core::{
-        BoundedCompletion, BoundedCompletionOutcome, BoundedCompletionWait, Completion,
-    };
     let started = std::time::Instant::now();
     let output = native::all_sum(
         input,
         &group.native,
         group.communication_stream(stream.as_ref())?,
     )?;
+    complete_logical_operation(input, &output, group, stream, started)?;
+    Ok(output)
+}
+
+fn complete_logical_operation(
+    input: &Array,
+    output: &Array,
+    group: &Group,
+    stream: &Stream,
+    started: std::time::Instant,
+) -> Result<()> {
+    use eredu_core::{
+        BoundedCompletion, BoundedCompletionOutcome, BoundedCompletionWait, Completion,
+    };
     let completion =
         crate::backend::runtime::distributed::completion::MlxCommunicationCompletion::submit(
-            [&output],
+            [output],
             vec![input.clone(), output.clone()],
             vec![],
             vec![group.clone()],
@@ -40,12 +51,14 @@ pub(super) fn ordered_world_sum(input: &Array, group: &Group, stream: &Stream) -
             completion.wait_bounded(wait)?,
             BoundedCompletionOutcome::DeadlineExceeded { .. }
         ) {
-            return Err(Exception::custom("logical world collective exceeded its deadline; native resources retained until completion"));
+            return Err(Exception::custom(
+                "logical collective exceeded its deadline; native resources retained until completion",
+            ));
         }
     } else {
         completion.wait()?;
     }
-    Ok(output)
+    Ok(())
 }
 
 pub(super) fn pack_logical_value(
@@ -92,6 +105,37 @@ fn native_recv_like(like: &Array, source: usize, group: &Group, stream: &Stream)
     )
 }
 
+// Native Ring point-to-point operations block their command queue. Give each
+// link complementary send and receive order so neither side depends on socket
+// buffering or on the evaluation order of independent lazy graph branches.
+fn ordered_ring_exchange(
+    input: &Array,
+    destination: usize,
+    source: usize,
+    send_first: bool,
+    group: &Group,
+    stream: &Stream,
+    started: std::time::Instant,
+) -> Result<Array> {
+    let send = || {
+        let sent = native_send(input, destination, group, stream)?;
+        complete_logical_operation(input, &sent, group, stream, started)
+    };
+    let receive = || {
+        let received = native_recv_like(input, source, group, stream)?;
+        complete_logical_operation(input, &received, group, stream, started)?;
+        Ok(received)
+    };
+    if send_first {
+        send()?;
+        receive()
+    } else {
+        let received = receive()?;
+        send()?;
+        Ok(received)
+    }
+}
+
 pub(super) fn logical_direct_exchange(
     input: &Array,
     group: &Group,
@@ -120,21 +164,27 @@ pub(super) fn logical_direct_exchange(
     } else {
         return Ok(None);
     };
-    let zero = zeros_dtype(&[], input.dtype(), stream)?;
+    let started = std::time::Instant::now();
     let mut exchanged = input.clone();
     for _ in 0..rounds {
-        let (destination, source) = if direct {
-            (peer, peer)
+        let (destination, source, send_first) = if direct {
+            (peer, peer, native_rank < peer)
         } else {
             (
                 (native_rank + 1) % native_size,
                 (native_rank + native_size - 1) % native_size,
+                native_rank.is_multiple_of(2),
             )
         };
-        let sent = native_send(&exchanged, destination, group, stream)?;
-        let received = native_recv_like(&exchanged, source, group, stream)?;
-        exchanged = received.add(sent.multiply(&zero, stream)?, stream)?;
-        safemlx::transforms::async_eval_with_event([&exchanged])?.synchronize()?;
+        exchanged = ordered_ring_exchange(
+            &exchanged,
+            destination,
+            source,
+            send_first,
+            group,
+            stream,
+            started,
+        )?;
     }
     Ok(Some(exchanged))
 }
@@ -169,15 +219,20 @@ fn logical_routed_values(
                 .global_ranks
         )));
     }
-    let zero = zeros_dtype(&[], input.dtype(), stream)?;
+    let started = std::time::Instant::now();
     let mut values = Vec::with_capacity(routes.len());
     for route in routes {
         let mut routed = input.clone();
         for peer in route.exchanges.iter().flatten() {
-            let sent = native_send(&routed, *peer, group, stream)?;
-            let received = native_recv_like(&routed, *peer, group, stream)?;
-            routed = received.add(sent.multiply(&zero, stream)?, stream)?;
-            safemlx::transforms::async_eval_with_event([&routed])?.synchronize()?;
+            routed = ordered_ring_exchange(
+                &routed,
+                *peer,
+                *peer,
+                group.native.rank() < *peer,
+                group,
+                stream,
+                started,
+            )?;
         }
         values.push((route.source_rank, routed));
     }

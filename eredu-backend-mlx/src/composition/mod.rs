@@ -391,3 +391,5 @@ mod expert_selection_tests {
 mod neutral_observer_tests;
 
 pub(crate) mod lfm3_audio;
+
+pub(crate) mod lfm3_vision;

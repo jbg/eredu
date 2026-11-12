@@ -57,6 +57,13 @@ pub mod native {
         MlxAudioTranscriptionSnapshot, MlxPipelineAudioModel, MlxPipelineAudioSession,
         MlxTensorParallelAudioModel, MlxTensorParallelAudioSession,
     };
+    #[cfg(feature = "image")]
+    pub use crate::composition::lfm3_vision::MlxVlMedia;
+    pub use crate::composition::lfm3_vision::{
+        bind_vl_rank, bind_vl_weights, MlxVlDecoder, MlxVlGraph, MlxVlGraphRequest, MlxVlPrefill,
+        MlxVlPrefillCursor, MlxVlVision, MlxVlVisionSession,
+    };
+
     pub use crate::composition::moshi::MlxRealtimeExecution;
     use safemlx::Stream;
 

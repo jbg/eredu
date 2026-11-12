@@ -565,6 +565,132 @@ mod tests {
     }
 }
 
+/// Resizes RGB8 with antialiased cubic interpolation and fixed-point filter weights.
+/// The horizontal pass precedes the vertical pass. Each pass rounds and
+/// clips its output to RGB8.
+pub fn resize_rgb8_antialiased_bicubic(
+    image: RgbImageView<'_>,
+    width: u32,
+    height: u32,
+) -> Result<RgbImage, MediaError> {
+    let [source_width, source_height, width, height] =
+        [image.width, image.height, width, height].map(|n| n as usize);
+    if width == 0 || height == 0 {
+        return Err(MediaError::invalid("resize dimensions must be positive"));
+    }
+    if (width, height) == (source_width, source_height) {
+        return Ok(RgbImage {
+            pixels: image.packed_pixels(),
+            width: width as u32,
+            height: height as u32,
+        });
+    }
+    let overflow = || MediaError::invalid("cubic resize storage overflow");
+    let mut horizontal = Vec::new();
+    let intermediate = source_height
+        .checked_mul(width)
+        .and_then(|n| n.checked_mul(3))
+        .ok_or_else(overflow)?;
+    horizontal
+        .try_reserve_exact(intermediate)
+        .map_err(|_| overflow())?;
+    horizontal.resize(intermediate, 0u8);
+    let mut weights = Vec::new();
+    let x_bits = cubic_weight_bits(source_width, width, &mut weights);
+    for x in 0..width {
+        let start = antialias_cubic_weights(source_width, width, x, &mut weights);
+        quantize_cubic_weights(&mut weights, x_bits);
+        for y in 0..source_height {
+            for channel in 0..3 {
+                let source = y * image.row_stride + 3 * start + channel;
+                horizontal[(y * width + x) * 3 + channel] =
+                    cubic_pixel(&weights, x_bits, |tap| image.pixels[source + tap * 3]);
+            }
+        }
+    }
+
+    let mut pixels = Vec::new();
+    let output = width
+        .checked_mul(height)
+        .and_then(|n| n.checked_mul(3))
+        .ok_or_else(overflow)?;
+    pixels.try_reserve_exact(output).map_err(|_| overflow())?;
+    let y_bits = cubic_weight_bits(source_height, height, &mut weights);
+    for y in 0..height {
+        let start = antialias_cubic_weights(source_height, height, y, &mut weights);
+        quantize_cubic_weights(&mut weights, y_bits);
+        for offset in 0..width * 3 {
+            pixels.push(cubic_pixel(&weights, y_bits, |tap| {
+                horizontal[(start + tap) * width * 3 + offset]
+            }));
+        }
+    }
+    Ok(RgbImage {
+        pixels,
+        width: width as u32,
+        height: height as u32,
+    })
+}
+
+fn antialias_cubic_weights(
+    source: usize,
+    target: usize,
+    position: usize,
+    weights: &mut Vec<f64>,
+) -> usize {
+    let scale = source as f64 / target as f64;
+    let support = 2.0 * scale.max(1.0);
+    let center = scale * (position as f64 + 0.5);
+    let start = (center - support + 0.5) as usize;
+    let end = ((center + support + 0.5) as usize).min(source);
+    let inverse = scale.max(1.0).recip();
+    weights.clear();
+    weights.extend((start..end).map(|index| {
+        let x = ((index as f64 - center + 0.5) * inverse).abs();
+        if x < 1.0 {
+            ((1.5 * x - 2.5) * x) * x + 1.0
+        } else if x < 2.0 {
+            ((-0.5 * x + 2.5) * x - 4.0) * x + 2.0
+        } else {
+            0.0
+        }
+    }));
+    let sum: f64 = weights.iter().sum();
+    for weight in weights {
+        *weight /= sum;
+    }
+    start
+}
+
+fn cubic_weight_bits(source: usize, target: usize, weights: &mut Vec<f64>) -> u32 {
+    let mut peak = 0.0f64;
+    for position in 0..target {
+        antialias_cubic_weights(source, target, position, weights);
+        peak = weights.iter().copied().fold(peak, f64::max);
+    }
+    // Use the greatest fractional precision that fits the largest signed
+    // 16-bit coefficient on this axis.
+    (0..22)
+        .find(|&bits| (peak * f64::from(1 << (bits + 1))).round() >= 32768.0)
+        .unwrap_or(22)
+}
+
+fn quantize_cubic_weights(weights: &mut [f64], bits: u32) {
+    let scale = f64::from(1 << bits);
+    for weight in weights {
+        *weight = (*weight * scale).round();
+    }
+}
+
+fn cubic_pixel(weights: &[f64], bits: u32, pixel: impl Fn(usize) -> u8) -> u8 {
+    let sum = weights
+        .iter()
+        .enumerate()
+        .map(|(tap, &weight)| i64::from(pixel(tap)) * weight as i64)
+        .sum::<i64>();
+    ((sum + (1 << (bits - 1))) >> bits).clamp(0, 255) as u8
+}
+
 #[cfg(test)]
 mod preparation_buffer_tests {
     use super::*;

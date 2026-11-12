@@ -69,6 +69,7 @@ where
 {
     runtime: Runtime<A, S>,
     policy: Policy<A, S>,
+    distributed: MlxDistributedSession,
     authority: PartitionCommunicationAuthority,
     groups: Vec<Group>,
     completion_wait: eredu_core::BoundedCompletionWait,
@@ -118,7 +119,7 @@ where
     /// Binds a selected pipeline that owns stage-local pinned parameters.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn with_pinned(
-        mut architecture: A,
+        architecture: A,
         source: SharedCheckpointSource,
         invocations: eredu_runtime::ExecutionUnitAddressMap,
         pinned: Vec<WeightBinding>,
@@ -132,19 +133,53 @@ where
         weights_stream: &Stream,
         execution_stream: &Stream,
     ) -> Result<(Self, LayerwiseModelMetadata), BackendFailure> {
+        let distributed = MlxDistributedSession::from_manifest(&manifest, world, execution_stream)
+            .map_err(BackendFailure::from_error)?;
+        Self::with_pinned_session(
+            architecture,
+            source,
+            invocations,
+            pinned,
+            units,
+            manifest,
+            plan,
+            tensor_group,
+            activation_dtype,
+            distributed,
+            residency,
+            weights_stream,
+            execution_stream,
+        )
+    }
+
+    /// Binds a stage to the communication already realized by model preparation.
+    pub(crate) fn with_pinned_session(
+        mut architecture: A,
+        source: SharedCheckpointSource,
+        invocations: eredu_runtime::ExecutionUnitAddressMap,
+        pinned: Vec<WeightBinding>,
+        units: Vec<(ExecutionUnitAddress, Vec<WeightBinding>)>,
+        manifest: CommunicationManifest,
+        plan: PartitionedExecutionPlan,
+        tensor_group: Option<CollectiveGroupId>,
+        activation_dtype: PipelineActivationDtype,
+        distributed: MlxDistributedSession,
+        residency: LayerWeightResidency,
+        weights_stream: &Stream,
+        execution_stream: &Stream,
+    ) -> Result<(Self, LayerwiseModelMetadata), BackendFailure> {
         validate_component_communication(&manifest, tensor_group)?;
         let completion_wait = manifest
             .completion_policy()
             .ok_or_else(|| contract("component pipeline requires a bounded completion policy"))?
             .bounded_wait();
-        let distributed = MlxDistributedSession::from_manifest(&manifest, world, execution_stream)
-            .map_err(BackendFailure::from_error)?;
         let groups = manifest
             .groups()
             .iter()
             .filter_map(|group| distributed.selected_group(group.id()).cloned())
             .collect();
         let (communication, parallel, communication_stream) = distributed
+            .clone()
             .into_component_communication(manifest, tensor_group)
             .map_err(BackendFailure::from_error)?;
         let authority = communication.authority();
@@ -200,6 +235,7 @@ where
                     Self {
                         runtime,
                         policy,
+                        distributed,
                         authority,
                         groups,
                         completion_wait,
@@ -214,6 +250,14 @@ where
     /// Retained architecture for parameter-free state lifecycle operations.
     pub(crate) fn architecture(&self) -> &A {
         self.runtime.executor().architecture()
+    }
+
+    pub(crate) fn distributed(&self) -> &MlxDistributedSession {
+        &self.distributed
+    }
+
+    pub(crate) fn communication_authority(&self) -> &PartitionCommunicationAuthority {
+        &self.authority
     }
 
     pub(crate) fn residency_report(&self) -> Result<ResidencyReport, BackendFailure> {

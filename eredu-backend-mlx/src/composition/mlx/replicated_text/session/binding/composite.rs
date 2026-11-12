@@ -265,6 +265,20 @@ impl CompositeTextArchitectureVisitor<MlxNeuralBackend, MlxHybridState>
         crate::tests::support::path_instrumentation::architecture_construction();
     }
 
+    fn visit_vl(
+        self,
+        prepared: eredu_architectures::lfm3::vision::PreparedVlGraph,
+    ) -> Result<Self::Output, eredu_architectures::prepared_execution::PreparedExecutionError<Error>>
+    {
+        crate::composition::mlx::vl_session::bind_vl_session(
+            prepared,
+            self.stream,
+            self.weights_stream,
+        )
+        .map(|(executable, _)| executable)
+        .map_err(eredu_architectures::prepared_execution::PreparedExecutionError::Backend)
+    }
+
     fn visit_prediction<A, W>(
         self,
         prepared: PreparedRoutedCompositeTextArchitecture<A, A::AdmissionConfig>,

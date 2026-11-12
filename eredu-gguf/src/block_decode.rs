@@ -2,6 +2,8 @@
 //! Equations: ggml-quants.c at 2145525a4081d66ff1a87cf43ef809f95a85ac0c.
 use crate::{Endian, Error, GgmlType, Result};
 
+const FP4_CODES: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+
 /// A checked block decoder writing into caller-owned F32 storage. It never expands
 /// a table, allocates conversion companions or rounds scales/biases through F16.
 #[derive(Debug, Clone, Copy)]
@@ -28,6 +30,7 @@ impl BlockDecoder {
                 | GgmlType::Q2K
                 | GgmlType::Q3K
                 | GgmlType::MxFp4
+                | GgmlType::NvFp4
         ) {
             return Err(Error::UnsupportedTensorType(encoding.code()));
         }
@@ -64,6 +67,9 @@ impl BlockDecoder {
             .chunks_exact(self.bytes)
             .zip(output.chunks_exact_mut(self.values))
         {
+            if self.encoding == GgmlType::NvFp4 && block[..4].iter().any(|&scale| scale >= 0x7f) {
+                return Err(Error::tensor("<blocks>", "invalid NVFP4 UE4M3 scale"));
+            }
             self.block(block, output);
         }
         Ok(())
@@ -187,7 +193,6 @@ impl BlockDecoder {
             GgmlType::MxFp4 => {
                 // Pinned GGML uses doubled FP4 integers and a halved E8M0
                 // scale, including exponents 0/1/255. Byte order is irrelevant.
-                const CODES: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
                 let exponent = u32::from(b[0]);
                 let d = f32::from_bits(if exponent < 2 {
                     0x0020_0000 << exponent
@@ -195,8 +200,26 @@ impl BlockDecoder {
                     (exponent - 1) << 23
                 });
                 for i in 0..16 {
-                    y[i] = f32::from(CODES[(b[i + 1] & 15) as usize]) * d;
-                    y[i + 16] = f32::from(CODES[(b[i + 1] >> 4) as usize]) * d;
+                    y[i] = f32::from(FP4_CODES[(b[i + 1] & 15) as usize]) * d;
+                    y[i + 16] = f32::from(FP4_CODES[(b[i + 1] >> 4) as usize]) * d;
+                }
+            }
+            GgmlType::NvFp4 => {
+                // Each 16-value group has its own unsigned E4M3 scale.
+                // FP4_CODES doubles the code values, so halve the scale.
+                for (group, &scale) in b[..4].iter().enumerate() {
+                    let exponent = u32::from(scale >> 3);
+                    let mantissa = f32::from(scale & 7);
+                    let d = if exponent == 0 {
+                        mantissa / 1024.0
+                    } else {
+                        let half_scale_exponent = exponent + 127 - 7 - 1;
+                        (1.0 + mantissa / 8.0) * f32::from_bits(half_scale_exponent << 23)
+                    };
+                    for (i, &codes) in b[4 + group * 8..][..8].iter().enumerate() {
+                        y[group * 16 + i] = d * f32::from(FP4_CODES[usize::from(codes & 15)]);
+                        y[group * 16 + i + 8] = d * f32::from(FP4_CODES[usize::from(codes >> 4)]);
+                    }
                 }
             }
             _ => unreachable!("checked decoder encoding"),

@@ -141,7 +141,10 @@ pub(crate) fn conversion_kind(ty: GgmlType, endian: Endian) -> Result<Conversion
     if let Some(dtype) = dense_dtype(ty) {
         return Ok(ConversionKind::Dense(dtype));
     }
-    if ty.is_iq() || (endian == Endian::Little && ty.has_native_execution()) {
+    if ty == GgmlType::NvFp4
+        || ty.is_iq()
+        || (endian == Endian::Little && ty.has_native_execution())
+    {
         return Ok(ConversionKind::IQuant);
     }
     if ty == GgmlType::MxFp4 {

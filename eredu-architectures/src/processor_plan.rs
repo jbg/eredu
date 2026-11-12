@@ -19,7 +19,8 @@ pub const PROCESSOR_CONFIG_FILENAME: &str = "preprocessor_config.json";
 /// Conventional Hugging Face video processor configuration filename.
 pub const VIDEO_PROCESSOR_CONFIG_FILENAME: &str = "video_preprocessor_config.json";
 /// Muse-Glimmer's nested Hugging Face processor configuration filename.
-pub const MUSE_PROCESSOR_CONFIG_FILENAME: &str = "processor_config.json";
+pub const MUSE_PROCESSOR_CONFIG_FILENAME: &str = COMBINED_PROCESSOR_CONFIG_FILENAME;
+pub(crate) const COMBINED_PROCESSOR_CONFIG_FILENAME: &str = "processor_config.json";
 
 /// Invalid family processor configuration or input geometry.
 #[derive(Debug, thiserror::Error)]
@@ -103,6 +104,8 @@ pub struct RgbTransformPlan {
 pub enum RgbResample {
     /// Bicubic interpolation.
     Bicubic,
+    /// Antialiased cubic interpolation with one final RGB8 rounding.
+    AntialiasedBicubic,
     /// Lanczos interpolation with a three-lobe kernel.
     Lanczos3,
 }
@@ -124,7 +127,7 @@ struct QwenVisualSource {
     #[serde(default = "default_true")]
     do_rescale: bool,
     #[serde(default = "default_rescale_factor")]
-    rescale_factor: f32,
+    rescale_factor: f64,
     #[serde(default = "default_true")]
     do_normalize: bool,
     #[serde(default = "default_bicubic_resample")]
@@ -159,7 +162,7 @@ const fn default_true() -> bool {
     true
 }
 
-fn default_rescale_factor() -> f32 {
+fn default_rescale_factor() -> f64 {
     1.0 / 255.0
 }
 
@@ -229,6 +232,13 @@ pub struct QwenProcessorPlan {
     image: Option<QwenVisualSource>,
     video: Option<QwenVisualSource>,
     framing: Option<MediaFraming>,
+    resize_policy: PatchResizePolicy,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PatchResizePolicy {
+    Qwen,
+    Lfm3 { video_token_cap: Option<usize> },
 }
 
 impl QwenProcessorPlan {
@@ -238,6 +248,7 @@ impl QwenProcessorPlan {
             image: None,
             video: None,
             framing: None,
+            resize_policy: PatchResizePolicy::Qwen,
         }
     }
 
@@ -284,7 +295,43 @@ impl QwenProcessorPlan {
             image,
             video,
             framing: Some(framing),
+            resize_policy: PatchResizePolicy::Qwen,
         }))
+    }
+
+    /// Retains the LFM3-VL checkpoint's nested image and video processor policy.
+    pub(crate) fn from_lfm3_vl(
+        framing: MediaFraming,
+        processor: &[u8],
+    ) -> Result<Self, ProcessorPlanError> {
+        #[derive(Deserialize)]
+        struct Source {
+            image_processor: QwenVisualSource,
+            video_processor: VideoSource,
+        }
+        #[derive(Deserialize)]
+        struct VideoSource {
+            #[serde(flatten)]
+            visual: QwenVisualSource,
+            cap_pixels_per_frame: bool,
+            max_video_tokens: usize,
+        }
+        let source: Source = serde_json::from_slice(processor)?;
+        parse_qwen_visual_source(&source.image_processor)?;
+        parse_qwen_visual_source(&source.video_processor.visual)?;
+        let video_token_cap = source
+            .video_processor
+            .cap_pixels_per_frame
+            .then_some(source.video_processor.max_video_tokens);
+        if video_token_cap == Some(0) {
+            return Err(invalid("LFM3 VL per-frame token cap must be positive"));
+        }
+        Ok(Self {
+            image: Some(source.image_processor),
+            video: Some(source.video_processor.visual),
+            framing: Some(framing),
+            resize_policy: PatchResizePolicy::Lfm3 { video_token_cap },
+        })
     }
 
     /// Checks every retained processor against the tower's declared packing geometry.
@@ -360,6 +407,7 @@ impl QwenProcessorPlan {
             image: Some(visual.clone()),
             video: Some(visual),
             framing: None,
+            resize_policy: PatchResizePolicy::Qwen,
         })
     }
 
@@ -393,6 +441,7 @@ impl QwenProcessorPlan {
                 factor,
                 source.size.shortest_edge as usize,
                 source.size.longest_edge as usize,
+                self.resize_policy,
             )?
         } else {
             (height, width)
@@ -401,7 +450,7 @@ impl QwenProcessorPlan {
             framing: self
                 .framing
                 .ok_or_else(|| invalid("Qwen GGUF media framing token IDs are unresolved"))?,
-            transform: qwen_transform(source, height, width),
+            transform: qwen_transform(source, height, width, self.resize_policy),
             patches: qwen_patches(source),
         })
     }
@@ -459,6 +508,22 @@ impl QwenProcessorPlan {
             .checked_mul(source.merge_size)
             .ok_or_else(|| invalid("Qwen video resize factor overflow"))?;
         let (height, width) = if source.do_resize {
+            let mut max_pixels = source.size.longest_edge as usize;
+            if let PatchResizePolicy::Lfm3 {
+                video_token_cap: Some(cap),
+            } = self.resize_policy
+            {
+                let frame_cap = cap
+                    .checked_mul(factor)
+                    .and_then(|n| n.checked_mul(factor))
+                    .ok_or_else(|| invalid("LFM3 VL per-frame pixel cap overflow"))?;
+                let floor = (source.size.shortest_edge as f64 * 1.05) as usize;
+                max_pixels = frame_cap
+                    .min(max_pixels / indices.len())
+                    .max(floor)
+                    .checked_mul(indices.len())
+                    .ok_or_else(|| invalid("LFM3 VL video pixel budget overflow"))?;
+            }
             qwen_smart_resize_video(
                 indices.len(),
                 height,
@@ -466,17 +531,25 @@ impl QwenProcessorPlan {
                 source.temporal_patch_size,
                 factor,
                 source.size.shortest_edge as usize,
-                source.size.longest_edge as usize,
+                max_pixels,
+                self.resize_policy,
             )?
         } else {
             (height, width)
+        };
+        let timestamp_fps = if matches!(self.resize_policy, PatchResizePolicy::Lfm3 { .. }) {
+            let rounded = (source_fps * 1_000_000.0).round_ties_even() / 1_000_000.0;
+            validate_fps(rounded, "LFM3 VL timestamp FPS")?;
+            rounded
+        } else {
+            source_fps
         };
         pad_frame_indices(&mut indices, source.temporal_patch_size)?;
         let groups = indices
             .chunks_exact(source.temporal_patch_size)
             .map(|chunk| {
-                let first = chunk[0] as f64 / source_fps;
-                let last = chunk[chunk.len() - 1] as f64 / source_fps;
+                let first = chunk[0] as f64 / timestamp_fps;
+                let last = chunk[chunk.len() - 1] as f64 / timestamp_fps;
                 QwenVideoGroupPlan {
                     source_indices: chunk.to_vec(),
                     timestamp_text: format!("<{:.1} seconds>", (first + last) / 2.0),
@@ -487,7 +560,7 @@ impl QwenProcessorPlan {
             framing: self
                 .framing
                 .ok_or_else(|| invalid("Qwen GGUF media framing token IDs are unresolved"))?,
-            transform: qwen_transform(source, height, width),
+            transform: qwen_transform(source, height, width, self.resize_policy),
             patches: qwen_patches(source),
             groups,
         })
@@ -848,6 +921,37 @@ impl ArtifactArchitecturePlan {
         }
     }
 
+    pub(crate) fn lfm3_vl_declaration(
+        &self,
+    ) -> Option<&crate::lfm3::vision::VisionLanguageDeclaration> {
+        use crate::{
+            configuration::SafetensorsModelConfig, gguf_companion::GgufMediaProjectorConfig,
+        };
+        if let Some(SafetensorsModelConfig::Lfm3Vl(declaration)) =
+            self.safetensors_architecture().map(|plan| plan.model())
+        {
+            return Some(declaration);
+        }
+        match self.gguf_media_projector().map(|plan| plan.model()) {
+            Some(GgufMediaProjectorConfig::Lfm3Vl { declaration, .. }) => Some(declaration),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn lfm3_vl_execution_identity(&self) -> Option<String> {
+        let identity = self.lfm3_vl_declaration()?.architecture_fingerprint();
+        Some(if self.gguf_plan().is_some() {
+            format!("{identity}:gguf")
+        } else {
+            identity.to_owned()
+        })
+    }
+
+    pub(crate) fn with_lfm3_vl_gguf_processor(mut self, processor: QwenProcessorPlan) -> Self {
+        self.processor = Some(NormalizedProcessorPlan::Qwen(processor));
+        self
+    }
+
     pub(crate) fn with_gguf_media_projector(
         mut self,
         media_projector: Option<crate::gguf_companion::GgufMediaProjectorPlan>,
@@ -945,13 +1049,25 @@ impl ArtifactArchitecturePlan {
         model: &[u8],
         image: Option<&[u8]>,
         video: Option<&[u8]>,
-        muse: Option<&[u8]>,
+        combined: Option<&[u8]>,
     ) -> Result<Self, ProcessorPlanError> {
         let architecture = self.safetensors_architecture().ok_or_else(|| {
             invalid("SafeTensors processor planning requires a validated architecture plan")
         })?;
         let kind = architecture.model_kind();
         let processor = match kind {
+            ModelKind::Lfm3Vl => {
+                let crate::configuration::SafetensorsModelConfig::Lfm3Vl(declaration) =
+                    architecture.model()
+                else {
+                    return Err(invalid(
+                        "LFM3 VL processor requires its admitted declaration",
+                    ));
+                };
+                let bytes =
+                    combined.ok_or_else(|| invalid("LFM3 VL requires processor_config.json"))?;
+                Some(NormalizedProcessorPlan::Qwen(declaration.processor(bytes)?))
+            }
             ModelKind::NemotronLabsDiffusion => {
                 let crate::configuration::SafetensorsModelConfig::NemotronLabsDiffusion(config) =
                     architecture.model()
@@ -981,7 +1097,7 @@ impl ArtifactArchitecturePlan {
             ModelKind::Inkling => {
                 InklingProcessorPlan::from_hf_json(model)?.map(NormalizedProcessorPlan::Inkling)
             }
-            ModelKind::MuseGlimmer | ModelKind::MuseSpark => muse
+            ModelKind::MuseGlimmer | ModelKind::MuseSpark => combined
                 .map(MuseProcessorPlan::from_hf_json)
                 .transpose()?
                 .map(NormalizedProcessorPlan::Muse),
@@ -1166,6 +1282,13 @@ impl ArtifactArchitecturePlan {
         self.media_projector.as_ref()
     }
 
+    pub(crate) fn qwen_patch_processor(&self) -> Option<&QwenProcessorPlan> {
+        match &self.processor {
+            Some(NormalizedProcessorPlan::Qwen(processor)) => Some(processor),
+            _ => None,
+        }
+    }
+
     /// Whether authoritative artifact inspection admitted a media processor.
     pub const fn has_processor(&self) -> bool {
         self.processor.is_some()
@@ -1273,13 +1396,21 @@ fn qwen_patches(source: &QwenVisualSource) -> QwenPatchPlan {
     }
 }
 
-fn qwen_transform(source: &QwenVisualSource, height: usize, width: usize) -> RgbTransformPlan {
-    RgbTransformPlan {
+fn qwen_transform(
+    source: &QwenVisualSource,
+    height: usize,
+    width: usize,
+    policy: PatchResizePolicy,
+) -> RgbTransformPlan {
+    let mut transform = RgbTransformPlan {
         height,
         width,
-        resample: RgbResample::Bicubic,
+        resample: match policy {
+            PatchResizePolicy::Qwen => RgbResample::Bicubic,
+            PatchResizePolicy::Lfm3 { .. } => RgbResample::AntialiasedBicubic,
+        },
         rescale_factor: if source.do_rescale {
-            source.rescale_factor
+            source.rescale_factor as f32
         } else {
             1.0
         },
@@ -1293,7 +1424,16 @@ fn qwen_transform(source: &QwenVisualSource, height: usize, width: usize) -> Rgb
         } else {
             [1.0; 3]
         },
+    };
+    if matches!(policy, PatchResizePolicy::Lfm3 { .. }) && source.do_rescale && source.do_normalize
+    {
+        // The released processor normalizes in byte units when both steps apply.
+        let input_scale = source.rescale_factor.recip() as f32;
+        transform.mean = transform.mean.map(|value| value * input_scale);
+        transform.std = transform.std.map(|value| value * input_scale);
+        transform.rescale_factor = 1.0;
     }
+    transform
 }
 
 fn qwen_smart_resize(
@@ -1302,6 +1442,7 @@ fn qwen_smart_resize(
     factor: usize,
     min_pixels: usize,
     max_pixels: usize,
+    policy: PatchResizePolicy,
 ) -> Result<(usize, usize), ProcessorPlanError> {
     if height == 0 || width == 0 || factor == 0 {
         return Err(invalid(format!(
@@ -1316,17 +1457,20 @@ fn qwen_smart_resize(
     }
     let round_to_factor =
         |value: usize| ((value as f64 / factor as f64).round_ties_even() as usize) * factor;
-    let mut resized_height = round_to_factor(height).max(factor);
-    let mut resized_width = round_to_factor(width).max(factor);
+    let (mut resized_height, mut resized_width) = (round_to_factor(height), round_to_factor(width));
+    if matches!(policy, PatchResizePolicy::Qwen) {
+        resized_height = resized_height.max(factor);
+        resized_width = resized_width.max(factor);
+    }
     let area = resized_height.saturating_mul(resized_width);
     if area > max_pixels {
-        let beta = ((height * width) as f64 / max_pixels as f64).sqrt();
+        let beta = ((height as f64 * width as f64) / max_pixels as f64).sqrt();
         resized_height =
             ((height as f64 / beta / factor as f64).floor() as usize * factor).max(factor);
         resized_width =
             ((width as f64 / beta / factor as f64).floor() as usize * factor).max(factor);
     } else if area < min_pixels {
-        let beta = (min_pixels as f64 / (height * width) as f64).sqrt();
+        let beta = (min_pixels as f64 / (height as f64 * width as f64)).sqrt();
         resized_height = (height as f64 * beta / factor as f64).ceil() as usize * factor;
         resized_width = (width as f64 * beta / factor as f64).ceil() as usize * factor;
     }
@@ -1341,17 +1485,36 @@ fn qwen_smart_resize_video(
     factor: usize,
     min_pixels: usize,
     max_pixels: usize,
+    policy: PatchResizePolicy,
 ) -> Result<(usize, usize), ProcessorPlanError> {
     if num_frames == 0 || temporal_factor == 0 || factor == 0 {
         return Err(invalid(
             "video smart resize requires frames and positive factors",
         ));
     }
-    if height < factor || width < factor {
-        return Err(invalid(format!(
-            "video dimensions {width}x{height} must be at least resize factor {factor}"
-        )));
+    if height == 0 || width == 0 {
+        return Err(invalid("video dimensions must be positive"));
     }
+    let (height, width) = match policy {
+        PatchResizePolicy::Lfm3 { .. } if num_frames < temporal_factor => {
+            return Err(invalid(
+                "LFM3 VL resizing requires at least one complete temporal patch",
+            ));
+        }
+        PatchResizePolicy::Lfm3 { .. } if height < factor || width < factor => {
+            let scale = (factor as f64 / height as f64).max(factor as f64 / width as f64);
+            (
+                (height as f64 * scale) as usize,
+                (width as f64 * scale) as usize,
+            )
+        }
+        PatchResizePolicy::Qwen if height < factor || width < factor => {
+            return Err(invalid(format!(
+                "video dimensions {width}x{height} must be at least resize factor {factor}"
+            )));
+        }
+        _ => (height, width),
+    };
     let ratio = height.max(width) as f64 / height.min(width) as f64;
     if ratio > 200.0 {
         return Err(invalid(format!(
@@ -1362,18 +1525,24 @@ fn qwen_smart_resize_video(
         |value: usize| ((value as f64 / factor as f64).round_ties_even() as usize) * factor;
     let mut resized_height = round_to_factor(height).max(factor);
     let mut resized_width = round_to_factor(width).max(factor);
-    let padded_frames = num_frames.div_ceil(temporal_factor) * temporal_factor;
+    let padded_frames = match policy {
+        PatchResizePolicy::Qwen => num_frames.div_ceil(temporal_factor) * temporal_factor,
+        PatchResizePolicy::Lfm3 { .. } => {
+            (num_frames as f64 / temporal_factor as f64).round_ties_even() as usize
+                * temporal_factor
+        }
+    };
     let volume = padded_frames
         .saturating_mul(resized_height)
         .saturating_mul(resized_width);
     if volume > max_pixels {
-        let beta = ((num_frames * height * width) as f64 / max_pixels as f64).sqrt();
+        let beta = ((num_frames as f64 * height as f64 * width as f64) / max_pixels as f64).sqrt();
         resized_height =
             ((height as f64 / beta / factor as f64).floor() as usize * factor).max(factor);
         resized_width =
             ((width as f64 / beta / factor as f64).floor() as usize * factor).max(factor);
     } else if volume < min_pixels {
-        let beta = (min_pixels as f64 / (num_frames * height * width) as f64).sqrt();
+        let beta = (min_pixels as f64 / (num_frames as f64 * height as f64 * width as f64)).sqrt();
         resized_height = (height as f64 * beta / factor as f64).ceil() as usize * factor;
         resized_width = (width as f64 * beta / factor as f64).ceil() as usize * factor;
     }

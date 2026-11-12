@@ -593,6 +593,10 @@ fn finish_feed_forward<B: NeuralBackend>(
     instrumentation.apply("feed_forward.residual", hidden.add(&feed_forward, context)?)
 }
 
+// A four-lane FP32 sum and one cast match the released BF16 CPU reference.
+pub(super) const SHORT_CONVOLUTION_ARITHMETIC: eredu_nn::ConvolutionArithmetic =
+    eredu_nn::ConvolutionArithmetic::FourLaneFloat32Affine;
+
 pub(crate) fn short_convolution_spec(
     args: &ModelArgs,
     root: &str,
@@ -624,7 +628,7 @@ pub(crate) fn short_convolution_spec(
         input_projection: linear("in_proj", args.hidden_size, fused)?,
         output_projection: linear("out_proj", channels, args.hidden_size)?,
         convolution: CausalDepthwiseConvolutionSpec {
-            arithmetic: eredu_nn::ConvolutionArithmetic::Native,
+            arithmetic: SHORT_CONVOLUTION_ARITHMETIC,
             dilation: 1,
             channels,
             kernel_size: args.conv_l_cache,
@@ -833,13 +837,16 @@ pub(crate) fn execution_topology(
                     input_scores: spec.arithmetic == eredu_nn::AttentionArithmetic::InputScores,
                     softcap: false,
                     sinks: false,
-                    projections: spec
-                        .projection
-                        .projections()
-                        .into_iter()
-                        .chain(std::iter::once(&spec.gate))
-                        .map(ProjectionTopology::from_spec)
-                        .collect::<Result<_, _>>()?,
+                    projections: [
+                        &spec.projection.query,
+                        &spec.projection.key,
+                        &spec.projection.value,
+                        &spec.gate,
+                        &spec.projection.output,
+                    ]
+                    .into_iter()
+                    .map(ProjectionTopology::from_spec)
+                    .collect::<Result<_, _>>()?,
                     output_gate: true,
                     query_key_normalization: true,
                     rotary: true,

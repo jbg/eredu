@@ -27,6 +27,7 @@ use eredu_checkpoint::{
     recipe::{DerivedWeightRecipe, RecipeDtype},
     store::TensorSelection,
 };
+use eredu_evaluation::compare_checkpoint_logit_rows;
 use eredu_media::audio::{AudioWaveform, LogMelFeatures};
 use eredu_nn::{Index, Parameterized, Tensor};
 use eredu_runtime::{LayerWeightResidency, ResidentRuntime};
@@ -320,7 +321,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         if bfloat16 && (key.ends_with(".logits") || key.starts_with("depth.")) {
             let width = *native.shape().last().ok_or("missing score row width")? as usize;
             let rows = actual.len() / width;
-            let report = score_parity(actual, expected, rows, width)?;
+            let report = compare_checkpoint_logit_rows(actual, expected, rows, width)?;
             passed &= report.passed;
             score_reports.insert(key.to_owned(), report);
         } else if !bfloat16 || matches!(key, "features" | "speech.pcm") {
@@ -845,7 +846,7 @@ fn compare_gguf_scores(
     for token in [5, 8, 13, 21, 34, 55, 3] {
         advance(std::slice::from_ref(&token), None, None)?;
     }
-    let report = score_parity(rows, expected, 9, vocabulary)?;
+    let report = compare_checkpoint_logit_rows(rows, expected, 9, vocabulary)?;
     std::fs::write(&args.output, serde_json::to_vec_pretty(&report)?)?;
     if !report.passed {
         return Err("mixed Audio GGUF score rows exceed the shared logit tolerance".into());
@@ -862,39 +863,6 @@ fn read_score_rows(path: &Path, rows: usize, width: usize) -> Result<Vec<f32>, B
         .chunks_exact(4)
         .map(|value| f32::from_le_bytes(value.try_into().expect("one F32 value")))
         .collect())
-}
-
-fn score_parity(
-    actual: Vec<f32>,
-    expected: Vec<f32>,
-    rows: usize,
-    width: usize,
-) -> Result<eredu_evaluation::ParityReport, Box<dyn Error>> {
-    use eredu_core::{ObservationSet, ObservationValue, TensorObservation, TensorObservationData};
-    use eredu_evaluation::{
-        compare_observations, CheckpointParityOptions, ParityComparison, ParityPolicy,
-    };
-    let observe = |values| -> Result<ObservationSet, Box<dyn Error>> {
-        let mut set = ObservationSet::new();
-        set.insert(
-            "logits",
-            ObservationValue::Tensor(TensorObservation::new(
-                vec![rows, width],
-                TensorObservationData::F32(values),
-            )?),
-        )?;
-        Ok(set)
-    };
-    let tolerance = CheckpointParityOptions::default().logits;
-    Ok(compare_observations(
-        &observe(actual)?,
-        &observe(expected)?,
-        &ParityPolicy {
-            default: ParityComparison::Logits { tolerance },
-            rules: vec![],
-            require_same_paths: true,
-        },
-    )?)
 }
 
 fn compare_gguf_depth(
@@ -957,7 +925,7 @@ fn compare_gguf_depth(
         .zip(&expected)
         .map(|(&actual, &expected)| (actual - expected).abs())
         .fold(0.0, f32::max);
-    let report = score_parity(rows, expected, 36, vocabulary)?;
+    let report = compare_checkpoint_logit_rows(rows, expected, 36, vocabulary)?;
     let passed = report.passed
         && codes == reference_codes
         && (!args.gguf_depth_f32 || maximum_absolute_error <= 5e-4);

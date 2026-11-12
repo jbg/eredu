@@ -259,6 +259,11 @@ cache with no committed output. Reset the model before starting a different requ
 `Unchunked` removes the caller-imposed chunk limit but still honors an architecture's
 required invocation limit.
 
+A retained cursor can also schedule input preparation before decoder prefill.
+One completed preparation step yields context progress with no sampled token or
+committed decoder positions. The driver reserves decoder prefill spans for
+steps that actually advance those positions.
+
 `LoadedModel::prefill_chunking_support()` reports the executable's support or a
 fallback reason. MLX plain-text adapters support ordinary replicated shared decoder
 architectures, including grouped-query and sliding attention, and dense/routed LFM2
@@ -274,6 +279,21 @@ KV history and absolute positions independently. The compact shared CPU and Meta
 conformance case covers bounded residency and controlled/uninterrupted agreement;
 [released-checkpoint evidence](lfm3-validation.md) records numerical coverage and
 the family tasks without an implementation.
+
+LFM3 VL's portable vision session exposes one patchifier, encoder block, or
+projector per advance. It retains the activation, rotary state, and shared
+weight-policy transaction between advances. Only projector completion publishes
+language-width rows. Dropping an incomplete session aborts the weight-policy
+transaction.
+
+The ordinary loader selects an MLX VL session for the shared text
+generation drivers, including controlled requests. Each advance projects one
+media part or prefills one contiguous range of expanded token positions.
+At a settled boundary, snapshots retain the immutable media tensors and
+copy the mutable decoder and sampling state. Forks budget remaining decoder
+positions from the prepared prompt before ingress and from the retained cursor
+during prefill. The selected session rejects prompt-cache persistence and named
+activation inspection. Speculative prediction exchange is unavailable.
 
 The LFM3 Audio session accepts prepared SafeTensors or explicit GGUF
 backbone/projector sources. Both use the same driver for batch-one token prompts with finite

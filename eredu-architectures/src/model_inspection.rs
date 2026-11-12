@@ -249,7 +249,9 @@ where
             let mut report = eredu_core::assemble_portable_model_inspection(
                 &inspection,
                 preparation.admission(),
-                if preparation.qwen4_construction().is_some() {
+                if preparation.qwen4_construction().is_some()
+                    || inspection.architecture_plan().model_kind() == crate::ModelKind::Lfm3Vl
+                {
                     match preparation.execution().processor() {
                         Some(processor) => {
                             let modalities = processor.modalities();
@@ -537,7 +539,11 @@ fn record_gguf_media(
     let Some(architecture) = inspection.architecture_plan().gguf_architecture() else {
         return;
     };
-    let plan = gguf_composite_artifact_plan(architecture);
+    let plan = if inspection.architecture_plan().model_kind() == crate::ModelKind::Lfm3Vl {
+        crate::preparation::LFM3_VL_GGUF_COMPOSITION
+    } else {
+        gguf_composite_artifact_plan(architecture)
+    };
     let requirement = match plan.media_projector_requirement() {
         GgufMediaProjectorRequirement::NotApplicable => MediaProjectorRequirement::NotApplicable,
         GgufMediaProjectorRequirement::Optional => MediaProjectorRequirement::Optional,

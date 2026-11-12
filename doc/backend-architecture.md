@@ -25,6 +25,47 @@ bypass filename discovery and have no fallback. The portable facade exposes
 canonical SafeTensors snapshot completeness from `eredu-checkpoint` independently
 of architecture support and native backend availability.
 
+The configuration resolver declares any GGUF architecture sidecars. Core reads
+them beside a local primary or consumes the supplied bytes during metadata-only
+inspection. LFM3 VL retains its publisher model and processor configuration
+alongside the admitted backbone and projector. The architecture selects the
+decoded tensor catalog and layout recipes before the native component binds.
+The GGUF reader decodes NVFP4 blocks and their unsigned E4M3 block scales.
+The VL architecture validates each matrix's companion scales and binds the
+weight multiplier through a neutral F32 recipe. The backend materializes
+the recipe with its ordinary tensor multiplication.
+
+VL cold rank selection derives the decoder ownership, cache geometry,
+communication manifest, and publication plan from the architecture
+declaration. Source preparation binds that placement to the selected recipes
+and retains a full vision replica on each rank. The prepared rank sizes and
+admits both residency windows and reports their combined device bytes.
+The ordinary loader selects this route for batch-one execution with an F32
+wire and the requested communication completion policy. Its typed visitor
+consumes the prepared rank and the already realized world. For bounded
+execution, preparation checks the sum of both device windows against the
+load budget and assigns each controller its required window. Finite host
+capacity is divided in proportion to each component's resident parameter
+bytes. Each native controller admits its own host allocations against
+that share. Static memory observations sum the independent parameter
+ledgers. Reader counts and process-global allocator counters are shared
+observations and are never added across components. TP, PP, and combined TP/PP use the same partition
+executor. TP-only has one decoder stage and no inter-stage routes. The
+portable VL prompt supplies an admission descriptor from expanded token
+IDs, the effective chunk size, and the semantic input fingerprint when
+present. The native partition binding agrees on this descriptor and local
+state allocation before returning a cursor. The prefill cursor passes input
+preparation failures to the execution callback. The binding agrees on the
+step, input readiness, and decoder cache position before execution, then
+settles retained tensors and agrees on the outcome before returning progress.
+
+The prepared VL rank graph projects the same admitted lowering recipes onto the
+vision replica and the local decoder. Its native binding feeds the same
+generation executable as replicated VL and retains the publication group,
+canonical sampling rank and communication authority from that binding. The
+executable keeps the prefill cursor separate from mutable decoder state and
+uses the rank agreement when replacing that state on reset.
+
 The facade's `PreparedTextModel` retains resolved tokenizer, template, EOS policy,
 and generation defaults once. Text probes borrow that state. Execution selection
 retains the complete plan, target admission and its compatibility/resource report,
@@ -7127,6 +7168,11 @@ recognizes successful exact completion only; native backends provide independent
 scope or fence evidence for failed submissions. This query does not make failed
 model state reusable, publish output, or transfer ownership of retained resources.
 
+MLX orders same-device graph dependencies on the consumer stream. When a
+producer completion belongs to another device, the backend waits for that
+exact completion on the host before submitting dependent work. Producer
+resources stay with their native recovery owner if the wait fails.
+
 MLX implements the query from its native submission scopes and outstanding consumer
 and observation tickets, including sampled text, realtime, speculative, and
 communication work. A settled producer cannot hide a pending child. Polling remains
@@ -8399,6 +8445,10 @@ supported floating types exactly. Routed/direct sums restore each contribution's
 logical dtype before addition; fallback world sums transport distinct per-rank
 slots before logical reduction. Gather and variable exchange restore the original
 logical dtype on return. Integer control values retain their integer encoding.
+Each Ring point-to-point exchange completes its send and receive in complementary
+order across peers. Even-sized Ring rotations alternate the order by native
+rank. This allows transfers larger than the socket buffer and preserves the
+received values without combining them with the send result.
 This transport encoding does not select model equations or change pipeline-wire
 contracts; intermediate transport buffers remain native mechanism storage.
 
@@ -16461,8 +16511,133 @@ attention and multi-axis rotary contracts; MLX contains no LFM3 vision equation.
 `eredu-media::patches` packs normalized host frames in merge-major order, repeats
 a still image across temporal slots, and pads an incomplete final temporal group
 with the last actual frame. It performs no family selection or device allocation.
-These independently constructible components do not register conditional-generation
-support, selected residency/distribution capabilities or controlled media sessions.
+The VL artifact resolves the released nested language scope and the independently
+declared vision units against one retained SafeTensors source. It retains the
+checkpoint's image and video preprocessing policies. The shared patch processor
+plans resizing, frame sampling, and timestamp framing. The media crate performs
+antialiased bicubic RGB resizing, normalization, and patch packing.
+The ordinary artifact registry admits `lfm3_vl` with the publisher's
+`Lfm3VlForConditionalGeneration` architecture and requires its processor sidecar.
+The decision checkpoint shares the outer model type and declares `D1Model`,
+which the generative admission rejects. VL execution preparation consumes the
+admitted catalog, exact shard set, and normalized processor from inspection.
+The shared source graph opens the VL checkpoint once and projects disjoint
+decoder and vision roles from its exact admitted keys. Both roles share the
+physical source and reader cache. Decoder construction and vision unit
+preparation each receive only their own role, including when they consume an
+already prepared model source graph.
+The admitted VL component declares the optional vision-to-decoder dependency,
+individual patchifier, block and projector invocations, and state ownership by
+decoder layer. Joint weight selection prepares bindings against that definition
+and projects the exact bindings to the separate vision and decoder executors.
+The decoder projection retains the language declaration's tied embedding and
+readout ownership. This preparation uses source metadata and shares the
+admitted physical checkpoint.
+The cold VL requirement report maps every canonical component parameter to
+its admitted shard and source encoding. It exposes the graph, decoder state,
+and prepared-product retention through the shared text execution contracts.
+Shared processor selection consumes the VL requirements for prepared text,
+image patches and video patches. Raw video additionally requires frame
+sampling.
+The replicated VL graph selects weight, state, and processor mechanisms before
+binding a checkpoint source. Construction validates the retained shard
+provenance and builds resources from the selected materialization tasks.
+The native adapter uses the selected residency and state placements and
+transfers the processor selection alongside the bound graph. The processor
+checks that requests use the selected modalities. The portable patchifier casts
+processor pixels to the bound patch weight's floating dtype before projection.
+The replicated VL kernel runs a media projection, a projected decoder prefix,
+or a text decode step through that same component graph. Media invocations
+lease only vision units and leave the decoder state untouched. Decoder
+invocations skip the tower and reuse the language kernel's embedding, block,
+state, and readout equations. The MLX adapter binds the retained resources to
+the shared layerwise driver. The retained VL cursor can submit its media
+and decoder steps to this single binding and continue cached decoding on the
+same request state.
+The VL graph uses the shared erased prefill-cursor contract for its owned
+requests. A settled fork copies decoder state and cursor progress while
+sharing immutable patches and projection rows. Cursor accounting includes
+host metadata and distinct native backing capacities when MLX exposes them.
+The accounting path rejects roots with unavailable capacity.
+
+Vision weight preparation derives one restricted source view per invocation from
+the retained catalog. Each view carries the canonical binding recipes and counts
+parameter bytes at the requested materialization dtype. Preparation reads
+metadata. The native reference runner binds each invocation from its view.
+Vision traversal advances a parameter-free continuation by one declared unit.
+It checks the module address before dispatch and returns the next continuation
+or the projected rows. The caller establishes native completion before adopting
+the result or releasing the current weight lease.
+The portable vision driver uses the shared layerwise policy transaction for
+acquisition, completion, and abort. It supplies the current activation and
+retained rotary tensors to completion. Ordinary vision execution drains the
+same unit-by-unit session exposed for controlled advancement. The session
+retains its continuation and policy transaction between calls, and dropping an
+unfinished pass aborts that transaction. The bounded policy settles submitted
+unit leases on the next begin before reusing the device window. The VL artifact
+also prepares the decoder component from its retained nested weight recipes,
+including the tied embedding and output resources. The portable preparation
+constructs the decoder and its state geometry. The native VL adapters bind those
+retained plans through the shared resident, host-backed, and disk-streamed policies
+and expose the resulting residency reports. The reference runner uses those
+adapters.
+
+Cold VL weight selection pairs both retained components with their residency
+policies and checks each device parameter budget before native binding. It
+counts the selected vision and decoder windows, including the decoder's pinned
+parameters, and reports their sum because the components use independent
+policies. Activations, state and native loading scratch are outside this
+parameter count. Native binding consumes the selected pair and reuses the
+bound decoder across requests with fresh decoder state.
+
+The architecture-owned VL prefill cursor sequences admitted media projections
+and decoder prefixes. It constructs the expanded token tensor and its media
+spans once. Prefixes retain absolute references to the projected rows, even
+when a prefix starts inside a media span. The native request adapter supplies
+the selected vision and decoder bindings and owns the request's mutable
+decoder state.
+Tensor-parallel VL decoder preparation selects rank-local resources and cache
+geometry using the shared LFM3 backbone layout. The native binding checks the
+rank and size of the supplied collective against that selection. Each rank
+consumes the same projected media positions and runs the shared parallel
+decoder traversal. The reference route replicates the vision tower and
+projector across ranks.
+VL and Audio share language stage placement and communication contracts.
+VL pipeline selection bounds the vocabulary rows and activation positions
+published by one decoder pass. Each rank agrees the exact request descriptor
+and commits its candidate decoder state after collective completion.
+With the image feature, the VL media adapter feeds the retained processor
+through shared MLX media preparation. The opaque MLX prompt and the other
+composite sessions use the same conversion to portable tensor roles. VL
+uses shared composite admission to validate those roles and record ordered
+token and patch plans, including decoder positions and vision workspace. It
+checks the expanded request against the checkpoint's decoder context limit.
+Cursor preparation consumes the admitted plans and checks the supplied
+semantic cache identity against the prepared input geometry.
+
+VL prompt admission validates patch grids and the expanded context length before
+dispatching any projection. The preparation cursor owns the admitted media in
+request order and advances when it accepts a projection with the expected shape.
+Decoder ingress becomes available after every media invocation completes.
+The owned native cursor keeps semantic identity, media progress, and decoder
+state between advances. Each advance borrows the same selected vision and
+decoder executors for the duration of that step.
+The portable prefill step identifies ingress preparation, a contiguous decoder
+span, or completion. The shared MLX text session settles ingress under the same
+submission authority as decoder work and assigns a decoder capture span only
+to a scored decoder step. The VL binding settles all retained cursor roots
+under that step's native ownership, including full prompt arrays when the
+decoder consumes a slice. Snapshot accounting surveys their observed allocator
+backings and charges the independently retained cursor metadata.
+The shared LFM3 decoder replaces the corresponding positions
+at embedding ingress and preserves media delimiters and video timestamp embeddings.
+Ordinary model loading selects the VL composite route from admitted
+SafeTensors headers. The source graph retains the vision and decoder views
+over the same physical checkpoint. Portable construction passes the prepared
+graph to a typed MLX binding visitor. The shared assembler installs selected
+state and processor policy in the ordinary model session. The portable graph
+owns media admission, projection and decoder ingress. MLX completion retains
+the validation observation scope across polls until its native work settles.
 
 `lfm3::audio` owns the released speech input processor policy, the convolutional
 downsampler, the causal encoder and its language-width projector. The encoder

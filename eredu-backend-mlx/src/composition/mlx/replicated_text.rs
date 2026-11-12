@@ -71,14 +71,15 @@ mod prediction;
 mod session;
 mod state;
 
-pub(crate) use capability::state_capabilities;
 pub(super) use capability::*;
+pub(crate) use capability::{state_capabilities, GROUPED_OPERATION_CAPABILITIES};
 pub(super) use lowering::*;
 use partitioned::*;
 pub(crate) use prediction::ErasedPrefillCursor;
 pub(super) use prediction::*;
 pub(super) use session::binding::*;
 use session::*;
+pub(crate) use state::selected_state_manager;
 pub(super) use state::*;
 
 #[cfg(test)]

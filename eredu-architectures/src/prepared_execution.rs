@@ -91,6 +91,17 @@ pub trait PreparedExecutableAssembler<C>: Sized {
         communication: &C,
     ) -> Result<(), Self::Error>;
 
+    /// Binds a VL rank using its already realized communication.
+    fn bind_vl_rank(
+        &mut self,
+        _prepared: crate::lfm3::vision::PreparedVlRankGraph,
+        _communication: &C,
+    ) -> Result<Self::Executable, PreparedExecutionError<Self::Error>> {
+        Err(PreparedExecutionError::Architecture(
+            "missing VL rank binding visitor".into(),
+        ))
+    }
+
     /// Publishes one outer model only after every typed construction step succeeds.
     fn finish(
         self,
@@ -392,7 +403,7 @@ where
     PT: PreparedExecutionRoute<SelectedRoutedPartitionedExecution, C, A::Executable, A::Error>,
     PX: PreparedExecutionRoute<SelectedCompositePartitionedExecution, C, A::Executable, A::Error>,
 {
-    let (selected, inspection, mut graph) = sources.into_parts();
+    let (selected, inspection, mut graph, vl_rank) = sources.into_parts();
     let retained_construction = graph.take_retained_construction();
     let topology = selected.execution().parallel_topology().unwrap_or(
         ParallelTopology::new(1, 1, 1, 1)
@@ -509,31 +520,39 @@ where
         (None, None, Some(_), Some(_)) if retained_prediction.is_some() => None,
         _ => return Err(PreparedExecutionError::PredictionSourceMismatch),
     };
-    let processor = match selected.execution().processor() {
-        Some(processor) if processor.raw_media() => Some(match selected.qwen4_construction() {
-            Some(crate::selected_execution::SelectedQwen4Construction::Conditional {
-                selected: conditional,
-                ..
-            }) => {
-                let budget = conditional.header_plan().processor_budget();
-                conditional.processor().prepared_processor(budget)
-            }
-            Some(
-                crate::selected_execution::SelectedQwen4Construction::ConditionalPartitioned {
+    let processor = if let Some(prepared) = &vl_rank {
+        prepared.processor()
+    } else {
+        match &retained_construction {
+        Some(RetainedArchitectureConstruction::Lfm3Vl(prepared)) => prepared.processor(),
+        _ => match selected.execution().processor() {
+            Some(processor) if processor.raw_media() => Some(match selected.qwen4_construction() {
+                Some(crate::selected_execution::SelectedQwen4Construction::Conditional {
                     selected: conditional,
                     ..
-                },
-            ) => {
-                let budget = conditional.header_plan().processor_budget();
-                conditional.processor().prepared_processor(budget)
-            }
-            _ => PreparedProcessor::from_artifact(graph.architecture()).ok_or_else(|| {
-                PreparedExecutionError::Architecture(
-                    "selected raw-media execution has no retained architecture processor".into(),
-                )
-            })?,
-        }),
-        _ => None,
+                }) => {
+                    let budget = conditional.header_plan().processor_budget();
+                    conditional.processor().prepared_processor(budget)
+                }
+                Some(
+                    crate::selected_execution::SelectedQwen4Construction::ConditionalPartitioned {
+                        selected: conditional,
+                        ..
+                    },
+                ) => {
+                    let budget = conditional.header_plan().processor_budget();
+                    conditional.processor().prepared_processor(budget)
+                }
+                _ => PreparedProcessor::from_artifact(graph.architecture()).ok_or_else(|| {
+                    PreparedExecutionError::Architecture(
+                        "selected raw-media execution has no retained architecture processor"
+                            .into(),
+                    )
+                })?,
+            }),
+            _ => None,
+        },
+    }
     };
     let inspection = inspection.map_architecture_plan(|_| graph.architecture().clone());
     let source = crate::preparation::prepared_floating_state_dtype_source(&inspection)
@@ -566,22 +585,31 @@ where
         communication,
         prediction,
     };
-    let (execution, _, _, _) = selected.into_parts();
-    let executable = execution.dispatch(ConstructionDispatcher::<
-        _,
-        _,
-        _,
-        _,
-        _,
-        _,
-        _,
-        A::Executable,
-        A::Error,
-    > {
-        routes,
-        context,
-        marker: std::marker::PhantomData,
-    })?;
+    let executable = if let Some(prepared) = vl_rank {
+        assembler.bind_vl_rank(
+            prepared,
+            retained_communication
+                .as_ref()
+                .ok_or(PreparedExecutionError::MissingCommunication)?,
+        )?
+    } else {
+        let (execution, _, _, _) = selected.into_parts();
+        execution.dispatch(ConstructionDispatcher::<
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            A::Executable,
+            A::Error,
+        > {
+            routes,
+            context,
+            marker: std::marker::PhantomData,
+        })?
+    };
     assembler
         .finish(PreparedExecutableParts {
             executable,

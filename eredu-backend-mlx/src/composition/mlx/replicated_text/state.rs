@@ -169,7 +169,7 @@ pub(super) fn fork_mlx_prediction_target_state<S: MlxStateMechanisms>(
         .map_err(Into::into)
 }
 
-pub(super) fn selected_state_manager(
+pub(crate) fn selected_state_manager(
     selected: &SelectedStateRealization,
 ) -> Result<Option<CacheResidencyManager>, Error> {
     let needs_paging = selected

@@ -47,6 +47,47 @@ pub(crate) fn host_token_ids(tokens: &Array) -> Result<Vec<u32>, crate::backend:
     }
 }
 
+/// Checks prepared inputs against the exact representation selected for the session.
+pub(crate) fn validate_composite_input_selection(
+    processor: &eredu_runtime::SelectedProcessorExecution,
+    input: ModelInput<'_>,
+) -> Result<(), crate::backend::error::Error> {
+    use crate::backend::error::Error;
+    if let Some(modality) = input
+        .parts
+        .iter()
+        .map(|part| part.modality())
+        .find(|modality| !processor.modalities().contains(modality))
+    {
+        return Err(Error::ArchitectureModel(format!(
+            "prepared input modality {} is outside the selected composite modalities {:?}",
+            modality.as_str(),
+            processor.modalities()
+        )));
+    }
+    if !processor.prepared_tensors()
+        && input
+            .parts
+            .iter()
+            .any(|part| part.modality() != InputModality::Text)
+    {
+        return Err(Error::ArchitectureModel(
+            "prepared media tensors were not admitted by processor selection".into(),
+        ));
+    }
+    if let Some(modality) = input.parts.iter().find_map(|part| {
+        matches!(part.payload(), InputPayload::Embeddings(_))
+            .then_some(part.modality())
+            .filter(|modality| !processor.projected_modalities().contains(modality))
+    }) {
+        return Err(Error::ArchitectureModel(format!(
+            "projected {} embeddings were not admitted by processor selection",
+            modality.as_str()
+        )));
+    }
+    Ok(())
+}
+
 /// Ordered runtime input for model prefill.
 #[derive(Debug, Clone, Copy)]
 pub struct ModelInput<'a> {
@@ -194,6 +235,50 @@ impl PreparedInputInspector<crate::MlxTensor> for MlxTensorInputInspector {
     fn bool_values(&self, tensor: &crate::MlxTensor) -> Result<Vec<bool>, CapabilityError> {
         MlxInputInspector.bool_values(tensor.as_array())
     }
+}
+
+/// Converts the common native prompt representation without copying its tensors.
+pub(crate) fn prepared_composite_input(
+    input: ModelInput<'_>,
+) -> Result<eredu_runtime::PreparedModelInput<crate::MlxTensor>, crate::backend::error::Error> {
+    use crate::{backend::error::Error, MlxTensor};
+    use eredu_runtime::{PreparedInputInspector, PreparedInputPart, PreparedInputPayload};
+
+    validate(input)?;
+    let parts = input
+        .parts
+        .iter()
+        .map(|part| {
+            let payload = match part.payload() {
+                InputPayload::TokenIds(value) => {
+                    PreparedInputPayload::TokenIds(MlxTensor::from_array(value.clone()))
+                }
+                InputPayload::Tensor(value) => {
+                    PreparedInputPayload::Tensor(MlxTensor::from_array(value.clone()))
+                }
+                InputPayload::Embeddings(value) => {
+                    PreparedInputPayload::Embeddings(MlxTensor::from_array(value.clone()))
+                }
+                _ => {
+                    return Err(eredu_core::PreparedInputError::BackendTensorIdentity(
+                        "MLX prepared input contains an unknown payload kind".into(),
+                    ))
+                }
+            };
+            PreparedInputPart::new_with_extents(
+                part.modality(),
+                payload,
+                part.metadata()
+                    .iter()
+                    .map(|(key, value)| (*key, MlxTensor::from_array(value.clone()))),
+                part.extents().iter().copied(),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let inspector = MlxTensorInputInspector;
+    eredu_runtime::PreparedModelInput::new(parts, |tensor| inspector.identity(tensor))
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))
 }
 
 /// Validates basic modality/payload compatibility.

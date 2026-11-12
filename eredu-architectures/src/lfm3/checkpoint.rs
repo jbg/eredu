@@ -35,6 +35,9 @@ pub(crate) fn validate_gguf_rope(
     {
         return Err("LFM3 GGUF rotary companion has invalid geometry or encoding".into());
     }
+    if !checkpoint.has_payload_access() {
+        return Ok(());
+    }
     let payload = checkpoint
         .materializer()
         .raw_tensor("rope_freqs.weight")
