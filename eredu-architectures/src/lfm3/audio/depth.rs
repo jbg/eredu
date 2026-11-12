@@ -79,6 +79,10 @@ impl DepthDeclaration {
         if config["model_type"] != "lfm3_audio" {
             return Err(invalid("speech depth requires an LFM3 Audio configuration"));
         }
+        Self::from_speech_config(config)
+    }
+
+    pub(super) fn from_speech_config(config: &Value) -> Result<Self, Error> {
         let legacy = config.get("lfm").is_some();
         let (text, depth, books_key, vocab_key) = if legacy {
             (

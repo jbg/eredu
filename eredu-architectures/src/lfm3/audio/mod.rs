@@ -67,8 +67,12 @@ impl ProcessorConfig {
 
     /// Admits the released feature extractor settings from preprocessor_config.json.
     pub fn from_feature_extractor(value: &Value) -> Result<Self, Error> {
+        Self::from_feature_extractor_class(value, "Lfm3AudioFeatureExtractor")
+    }
+
+    pub(super) fn from_feature_extractor_class(value: &Value, class: &str) -> Result<Self, Error> {
         for (key, expected) in [
-            ("feature_extractor_type", json!("Lfm3AudioFeatureExtractor")),
+            ("feature_extractor_type", json!(class)),
             ("feature_size", json!(128)),
             ("sampling_rate", json!(16000)),
             ("n_fft", json!(400)),
