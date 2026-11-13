@@ -161,71 +161,92 @@ compatibility and placement rules.
 
 ## Typed decision reads
 
-`--decisions PATH` reads evidence and typed questions from JSON. Use `-` for
-standard input. This mode requires a model exposing block refinement, including
-DiffusionGemma. The existing device, quantization and weight-residency options
-apply. No generated answer text is parsed: the CLI reads model scores directly
-at the compiled answer positions.
+Use `eredu --model MODEL --decisions request.json` to evaluate typed questions.
+Use `--decisions -` to read JSON from standard input. The decision task uses
+explicit device and residency settings. Use `--timing` to report elapsed decision
+time to stderr.
+
+### Read a number and date with d1
+
+Use a local d1 checkpoint or a model identifier in the Hugging Face cache.
+
+```sh
+eredu --model LiquidAI/d1-2B --device cpu --decisions - <<'JSON'
+{
+  "state": "Invoice total €1.234,50. The package arrived on March 4, 2026.",
+  "questions": [
+    {
+      "id": "total",
+      "question": {"type": "read_number", "instructions": "Read the invoice total."}
+    },
+    {
+      "id": "arrival",
+      "question": {"type": "read_date", "instructions": "Read the arrival date."}
+    }
+  ]
+}
+JSON
+```
+
+The number answer includes the value `1234.5` and unit `€`. The date answer
+includes the ISO 8601 value `2026-03-04`. Each answer also includes the
+source span and its calibrated presence probability.
+
+### Choose an option with DiffusionGemma
+
+Save the following as `request.json` and run
+`eredu --model /path/to/diffusiongemma --decisions request.json`.
 
 ```json
 {
-  "state": {"ticket": "I was charged twice; please refund the duplicate payment."},
-  "steps": 2,
+  "state": "I was charged twice. Please refund the duplicate payment.",
+  "refinement_steps": 2,
   "seed": 42,
   "questions": [
-    {"id": "department", "type": "choice", "question": "Which department should handle this?", "options": ["billing", "technical", "sales"]},
-    {"id": "refund", "type": "noul", "question": "Does the customer request a refund?"},
-    {"id": "priority", "type": "score", "question": "Rate the urgency.", "levels": [
-      {"label": "routine", "value": 0, "description": "Can wait for ordinary processing"},
-      {"label": "urgent", "value": 10, "description": "Requires immediate attention"}
-    ]}
+    {
+      "id": "department",
+      "question": {
+        "type": "single_choice",
+        "instructions": "Which department should handle this?",
+        "options": [{"label": "billing"}, {"label": "technical"}, {"label": "sales"}]
+      }
+    }
   ]
 }
 ```
 
-Save this as `request.json`, then run:
+Refinement responses include probabilities over the supplied alternatives.
+`label_mass` reports the full-vocabulary probability assigned to those
+alternatives before renormalization.
 
-```sh
-eredu --model /path/to/diffusiongemma --decisions request.json --timing
-eredu --model /path/to/diffusiongemma --decisions - < request.json
-```
+### Media and request fields
 
-Standard output contains one JSON object with `answers` keyed by question ID:
+For image evidence, include a media entry such as
+`{"type": "image", "path": "delivery.png"}` in the top-level `media` array.
+A `box` question can ask a supported model to locate the package in that image.
 
-- `choice` returns the selected option, its confidence and every option's probability.
-- `noul` returns a boolean `value` and a `probability` of yes, plus both alternatives.
-- `score` returns the expected numeric `score` over the declared levels and the
-  highest-probability `level`, plus the level distribution. Values must be finite
-  and strictly increasing; level descriptions define their meaning.
+Media entries retain their array order. Image entries take `path`, video
+entries take `frames` (a directory of images) and `fps`, and audio
+entries take a mono WAV `path`. A question's optional `spoken` WAV path
+replaces its written `instructions`. Paths in the request are relative
+to the request file or to the working directory when reading stdin.
+For split checkpoints, pass the projector with `--vision-companion`
+or `--audio-companion` and use the request's `assets` field to select
+the sidecar directory if it differs from the backbone directory.
 
-`normalization: "allowed_labels"` identifies probabilities normalized over the
-specified alternatives. `label_mass` reports how much of the original full-model
-probability those labels cover. These preferences are not calibrated correctness
-estimates. Ties choose the first declared alternative. Questions sharing a canvas
-can affect one another; their distributions are not independent joint probabilities.
+Question types are `single_choice`, `multiple_choice`, `yes_no`, `score`,
+`extract_text`, `read_number`, `read_date`, `estimate`, `box`, and `boxes`.
+Choice options contain a `label` and optional `description`. Yes/no can
+specify two `criteria`. Scores take ordered `levels`. Numeric estimates
+take a two-value `range`, optional `step`, and optional `unit`. Number
+extraction accepts an optional `unit`, and multiple boxes accept an
+optional `max`.
 
-The CLI encodes each alternative as a verified single-token letter within its
-answer template, pins the scaffold and padding, and leaves answer slots as noise.
-It executes exactly `steps` refinement passes, then reads raw position scores and
-stops without committing generated tokens. `steps` defaults to 1 and accepts
-1..=64; `seed` defaults to 0, with `--seed` overriding the request value.
-Requests are limited to 1 MiB, 1..=32 unique questions and 2..=26 alternatives
-per question. The complete template must fit the model's trained canvas. Invalid
-schemas or unsuitable label tokenization produce errors rather than repaired output.
-
-Generation sampling flags, speculative drafting, ordinary prompt/tool options,
-and generation-specific memory/telemetry reports do not apply to decision reads
-and conflict with this mode. `--auto quick`, `--auto plan`, `--no-auto`, and
-`--timing` remain available; generation benchmarks do not measure decision reads.
-Timing output separates request preparation, context encoding, refinement and
-completion. Refinement timing includes score capture and sampler processing;
-context timing includes controlled-session setup. Prompt and canvas token counts
-help identify the amount of work performed. Preparation is further divided into
-canvas tokenization, chat preparation, capture discovery and capture admission.
-Decision reads use declaration-only discovery and session-bound provenance, so
-preparation does not hash the checkpoint. Library callers explicitly select
-`CaptureProvenance::ContentExact` when their records need portable content identity;
-interventions and capture snapshot/fork validation retain their stronger checks.
+The model determines which question types and input modalities it can
+evaluate. Text refinement supports single choice, yes/no, and ordinal
+score, with optional `refinement_steps` and `seed`. Results contain
+answers in request order with the corresponding IDs, token usage, and
+the calibration digest when the checkpoint supplies one.
 
 ## Native tool calls
 
@@ -488,45 +509,3 @@ time. Execution timing excludes input pacing and output delivery; it does not me
 microphone-to-speaker latency.
 
 Run `eredu audio realtime --help` for the complete option list.
-
-### Decision requests
-
-Use `eredu --model MODEL --decisions request.json` to evaluate typed
-questions. Use `--decisions -` to read JSON from standard input. The
-decision task uses explicit device and residency settings.
-
-```json
-{
-  "state": "The image shows the delivered item.",
-  "media": [{"type": "image", "path": "delivery.png"}],
-  "questions": [
-    {
-      "id": "package",
-      "question": {"type": "box", "instructions": "Locate the package."}
-    }
-  ]
-}
-```
-
-Media entries retain their array order. Image entries take `path`, video
-entries take `frames` (a directory of images) and `fps`, and audio
-entries take a mono WAV `path`. A question's optional `spoken` WAV path
-replaces its written `instructions`. Paths in the request are relative
-to the request file or to the working directory when reading stdin.
-For split checkpoints, pass the projector with `--vision-companion`
-or `--audio-companion` and use the request's `assets` field to select
-the sidecar directory if it differs from the backbone directory.
-
-Question types are `single_choice`, `multiple_choice`, `yes_no`, `score`,
-`extract_text`, `read_number`, `read_date`, `estimate`, `box`, and `boxes`.
-Choice options contain a `label` and optional `description`. Yes/no can
-specify two `criteria`. Scores take ordered `levels`. Numeric estimates
-take a two-value `range`, optional `step`, and optional `unit`. Number
-extraction accepts an optional `unit`, and multiple boxes accept an
-optional `max`.
-
-The model determines which question types and input modalities it can
-evaluate. Text refinement supports single choice, yes/no, and ordinal
-score, with optional `refinement_steps` and `seed`. Results contain
-answers in request order with the corresponding IDs, token usage, and
-the calibration digest when the checkpoint supplies one.
