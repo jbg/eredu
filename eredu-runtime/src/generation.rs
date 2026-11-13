@@ -847,6 +847,18 @@ impl GenerationSampler {
         }
     }
 
+    /// Selects a token using the accepted history without reading or recording its ID.
+    pub fn select<B: SamplingBackend>(
+        &self,
+        logits: &B::Logits,
+        temperature: f32,
+        random: Option<&mut B::RandomState>,
+        context: &B::Context,
+    ) -> Result<B::Token, B::Error> {
+        let logits = self.process_for::<B>(logits, &self.generated_tokens, context)?;
+        B::sample_raw(&logits, temperature, random, context)
+    }
+
     fn process_for<B: SamplingBackend>(
         &self,
         logits: &B::Logits,
@@ -895,8 +907,7 @@ impl<B: SamplingBackend> Sampler<B> for GenerationSampler {
         random: Option<&mut B::RandomState>,
         context: &B::Context,
     ) -> Result<B::Token, B::Error> {
-        let logits = self.process_for::<B>(logits, &self.generated_tokens, context)?;
-        let token = B::sample_raw(&logits, temperature, random, context)?;
+        let token = self.select::<B>(logits, temperature, random, context)?;
         self.generated_tokens.push(B::token_id(&token, context)?);
         Ok(token)
     }

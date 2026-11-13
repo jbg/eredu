@@ -582,11 +582,25 @@ impl<B: NeuralBackend> DepthDecoder<B> {
         masked: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
+        let slots = (0..self.declaration.codebooks.len()).collect::<Vec<_>>();
+        self.score_slots(hidden, codes, masked, &slots, context)
+    }
+
+    fn score_slots(
+        &mut self,
+        hidden: &B::Tensor,
+        codes: &B::Tensor,
+        masked: &B::Tensor,
+        slots: &[usize],
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
         policy::scores::<B>(
             &self.declaration,
             hidden,
             codes,
             masked,
+            slots,
+            false,
             context,
             |owner, operation| self.units[owner].apply(&self.declaration, &operation, context),
         )
@@ -612,14 +626,16 @@ impl<B: NeuralBackend> DepthDecoder<B> {
         mut sample: impl FnMut(usize, &B::Tensor) -> Result<i32, Error>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<(), Error> {
-        let logits = self.score_frame(hidden, frame, context)?;
         let (pass, slots) = frame
             .next_pass()
             .ok_or_else(|| invalid("speech depth frame is complete"))?;
+        let (codes, masked) = self.declaration.frame_inputs(frame, context)?;
+        let logits = self.score_slots(hidden, &codes, &masked, slots, context)?;
         let codes = slots
             .iter()
-            .map(|&slot| {
-                let row = logits.index(&[Index::At(0), Index::At(slot as i32)], context)?;
+            .enumerate()
+            .map(|(index, &slot)| {
+                let row = logits.index(&[Index::At(0), Index::At(index as i32)], context)?;
                 sample(slot, &row)
             })
             .collect::<Result<Vec<_>, _>>()?;

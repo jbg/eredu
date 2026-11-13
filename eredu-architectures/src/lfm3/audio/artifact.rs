@@ -197,6 +197,7 @@ pub struct PreparedAudio {
     pub tokens: AudioTokens,
     interleaved_text_slots: usize,
     interleaved_speech_slots: usize,
+    pub(super) neural_weight_dtype: eredu_checkpoint::recipe::RecipeDtype,
     /// Retained tokenizer, template and generation configuration.
     pub text_assets: TextAssets,
     /// Restricted language checkpoint binding.
@@ -309,6 +310,13 @@ fn restrict(
 }
 
 impl PreparedAudio {
+    /// Selects BF16 storage for dense language, encoder, and speech depth weights.
+    /// Packed weights retain their encodings and LiquidCodec uses F32.
+    pub fn with_bf16_weights(mut self) -> Self {
+        self.neural_weight_dtype = eredu_checkpoint::recipe::RecipeDtype::BF16;
+        self
+    }
+
     /// Number of text slots per interleaved block.
     pub fn interleaved_text_slots(&self) -> usize {
         self.interleaved_text_slots
@@ -428,6 +436,7 @@ impl PreparedAudio {
                 tokens,
                 interleaved_text_slots,
                 interleaved_speech_slots,
+                neural_weight_dtype: eredu_checkpoint::recipe::RecipeDtype::F32,
                 text_assets,
                 language_weights,
                 encoder_weights: speech.input,
@@ -641,6 +650,7 @@ impl PreparedAudio {
                 tokens,
                 interleaved_text_slots,
                 interleaved_speech_slots,
+                neural_weight_dtype: eredu_checkpoint::recipe::RecipeDtype::F32,
                 text_assets,
                 language_weights,
                 encoder_weights,

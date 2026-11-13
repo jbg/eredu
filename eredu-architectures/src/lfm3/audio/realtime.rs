@@ -18,7 +18,7 @@ use eredu_runtime::{
     },
     DenseSamplingBackend, GenerationSampler, RealtimeFrameExecutionError, RealtimeFrameTransition,
     RealtimeGenerationBranch, RealtimeGenerationContract, RealtimeGenerationState,
-    RealtimeGenerationTransactionError, Sampler, SamplingBackend,
+    RealtimeGenerationTransactionError, SamplingBackend,
 };
 use std::{cell::RefCell, rc::Rc};
 
@@ -241,7 +241,7 @@ pub trait AudioExecutionKernel {
         &mut self,
         state: &<Self::State as SemanticStateTransaction>::Branch,
     ) -> Result<Self::Tensor, BackendFailure>;
-    /// Scores one full bidirectional depth pass.
+    /// Scores the next pass's reveal slots, in reveal order, over full bidirectional context.
     fn depth_logits(
         &mut self,
         state: &<Self::State as SemanticStateTransaction>::Branch,
@@ -680,13 +680,13 @@ fn failure(error: impl std::error::Error + Send + Sync + 'static) -> BackendFail
     BackendFailure::from_error(error)
 }
 
-fn sample<K: AudioExecutionKernel>(
-    sampler: &mut GenerationSampler,
+fn select<K: AudioExecutionKernel>(
+    sampler: &GenerationSampler,
     logits: &K::Tensor,
     temperature: f32,
     random: Option<&mut Random<K>>,
     context: &<K::Tensor as Tensor>::Context,
-) -> Result<i32, BackendFailure> {
+) -> Result<K::Tensor, BackendFailure> {
     let scaled;
     let (logits, temperature) = if temperature > 0.0 && temperature != 1.0 {
         scaled =
@@ -695,15 +695,9 @@ fn sample<K: AudioExecutionKernel>(
     } else {
         (logits, temperature)
     };
-    let token = <GenerationSampler as Sampler<K::SamplerBackend>>::sample(
-        sampler,
-        logits,
-        temperature,
-        random,
-        context,
-    )
-    .map_err(failure)?;
-    i32::try_from(K::SamplerBackend::token_id(&token, context).map_err(failure)?).map_err(failure)
+    sampler
+        .select::<K::SamplerBackend>(logits, temperature, random, context)
+        .map_err(failure)
 }
 
 fn record(sampler: &mut GenerationSampler, id: i32, limit: usize) {
@@ -766,11 +760,13 @@ where
             .map_err(failure)?;
         let logits =
             K::SamplerBackend::apply_token_filter(&logits, &filter, context).map_err(failure)?;
-        let mut sampler = branch.samplers()[0].clone();
+        let sampler = branch.samplers()[0].clone();
         let temperature = branch.sampling().text_temperature;
         let token = branch
             .with_random_state_transaction(|random| {
-                sample::<K>(&mut sampler, &logits, temperature, random.as_mut(), context)
+                let token = select::<K>(&sampler, &logits, temperature, random.as_mut(), context)?;
+                i32::try_from(K::SamplerBackend::token_id(&token, context).map_err(failure)?)
+                    .map_err(failure)
             })
             .map_err(failure)?;
         branch
@@ -851,19 +847,19 @@ where
         let logits = self.0.depth_logits(branch.model_state(), frame)?;
         let context = self.0.context();
         let temperature = branch.sampling().speech_temperature;
-        let mut samplers = slots
+        let samplers = slots
             .iter()
             .map(|&slot| branch.samplers()[slot + 1].clone())
             .collect::<Vec<_>>();
         let sampled = branch
             .with_random_state_transaction(|random| {
-                let mut sampled = Vec::with_capacity(slots.len());
-                for (&slot, sampler) in slots.iter().zip(&mut samplers) {
+                let mut selected = Vec::with_capacity(slots.len());
+                for (index, sampler) in samplers.iter().enumerate() {
                     let row = logits
-                        .index(&[Index::At(0), Index::At(slot as i32)], context)
+                        .index(&[Index::At(0), Index::At(index as i32)], context)
                         .and_then(|row| row.cast_float(TensorElementType::F32, context))
                         .map_err(failure)?;
-                    sampled.push(sample::<K>(
+                    selected.push(select::<K>(
                         sampler,
                         &row,
                         temperature,
@@ -871,7 +867,19 @@ where
                         context,
                     )?);
                 }
-                Ok::<_, BackendFailure>(sampled)
+                let ids = match selected.as_slice() {
+                    [a, b, c, d] => {
+                        K::SamplerBackend::token_ids([a, b, c, d], context).map(Vec::from)
+                    }
+                    tokens => tokens
+                        .iter()
+                        .map(|token| K::SamplerBackend::token_id(token, context))
+                        .collect(),
+                }
+                .map_err(failure)?;
+                ids.into_iter()
+                    .map(|id| i32::try_from(id).map_err(failure))
+                    .collect::<Result<Vec<_>, _>>()
             })
             .map_err(failure)?;
         let progress = branch
