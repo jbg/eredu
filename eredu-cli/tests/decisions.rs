@@ -125,7 +125,15 @@ fn cli_reads_choice_noul_and_score_with_resident_and_bounded_weights() {
             String::from_utf8_lossy(&output.stderr)
         );
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("decision_seconds="), "{stderr}");
+        for field in ["load_seconds=", "decision_seconds="] {
+            let seconds = stderr
+                .lines()
+                .find_map(|line| line.strip_prefix(field))
+                .unwrap_or_else(|| panic!("missing {field} in {stderr}"))
+                .parse::<f64>()
+                .unwrap();
+            assert!(seconds.is_finite() && seconds >= 0.0, "{stderr}");
+        }
         let result: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(result["generated_tokens"], 0);
         assert!(result["input_tokens"].as_u64().unwrap() > 0);

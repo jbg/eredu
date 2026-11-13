@@ -104,6 +104,15 @@ impl PreparedDecisionTask {
         device: LocalDevice,
         residency: &ResidencyPlan,
     ) -> Result<DecisionResponse> {
+        self.evaluate_with_load_callback(device, residency, None)
+    }
+
+    fn evaluate_with_load_callback(
+        self,
+        device: LocalDevice,
+        residency: &ResidencyPlan,
+        on_loaded: Option<&mut dyn FnMut()>,
+    ) -> Result<DecisionResponse> {
         let residency = execution_plan_layer_residency(
             residency,
             self.max_cached_shards,
@@ -116,6 +125,20 @@ impl PreparedDecisionTask {
             LocalDevice::Accelerator(index) => ExecutionContext::accelerator(index as usize),
         }
         .map_err(eredu_core::BackendFailure::from_error)?;
+        let report_loaded = || -> Result<()> {
+            if let Some(callback) = on_loaded {
+                weights
+                    .stream()
+                    .synchronize()
+                    .map_err(eredu_core::BackendFailure::from_error)?;
+                execution
+                    .stream()
+                    .synchronize()
+                    .map_err(eredu_core::BackendFailure::from_error)?;
+                callback();
+            }
+            Ok(())
+        };
         let request = self.request;
         let questions: Vec<_> = request
             .questions
@@ -134,6 +157,7 @@ impl PreparedDecisionTask {
                 let mut model = TextChoiceModel::load_with_omni(
                     self.model, residency, residency, residency, &weights, &execution,
                 )?;
+                report_loaded()?;
                 let spoken = request
                     .questions
                     .iter()
@@ -149,12 +173,14 @@ impl PreparedDecisionTask {
                 let mut model = TextChoiceModel::load_with_vision(
                     self.model, residency, residency, &weights, &execution,
                 )?;
+                report_loaded()?;
                 model.evaluate_with_visuals(state, &request.media, &questions)?
             }
             #[cfg(not(feature = "image"))]
             anyhow::bail!("visual decisions require the image feature");
         } else {
             let mut model = TextChoiceModel::load(self.model, residency, &weights, &execution)?;
+            report_loaded()?;
             model.evaluate_decisions(state, &questions)?
         };
         Ok(DecisionResponse {
@@ -189,6 +215,20 @@ pub fn evaluate_local_decisions(
     device: LocalDevice,
     plan: &eredu_core::ExecutionPlan,
 ) -> Result<DecisionResponse> {
+    evaluate_local_decisions_with_load_callback(path, assets, request, device, plan, None)
+}
+
+/// Evaluates a local decision request, optionally reporting load completion before inference.
+/// The callback runs after checkpoint preparation, model binding, and synchronization.
+/// Layer transfers performed on demand are part of inference.
+pub fn evaluate_local_decisions_with_load_callback(
+    path: &Path,
+    assets: Option<&Path>,
+    request: &DecisionRequest,
+    device: LocalDevice,
+    plan: &eredu_core::ExecutionPlan,
+    on_loaded: Option<&mut dyn FnMut()>,
+) -> Result<DecisionResponse> {
     ensure!(
         plan.device() == &crate::api::local_device_plan(device)?,
         "decision execution plan and device must match"
@@ -218,7 +258,7 @@ pub fn evaluate_local_decisions(
                 == eredu_core::WeightTransformationPlan::PreserveCheckpoint,
             "native decision evaluation requires checkpoint weight encodings"
         );
-        return task.evaluate(device, plan.residency());
+        return task.evaluate_with_load_callback(device, plan.residency(), on_loaded);
     }
     ensure!(
         assets.is_none(),
@@ -226,5 +266,9 @@ pub fn evaluate_local_decisions(
     );
     let factory = eredu_backend_mlx::MlxBackendFactory::default();
     let mut loaded = crate::api::LoadedModel::load_execution_plan(&factory, path, plan)?;
+    if let Some(callback) = on_loaded {
+        loaded.model_mut().synchronize()?;
+        callback();
+    }
     super::evaluate_refinement(&mut loaded.model_mut(), request)
 }
