@@ -154,6 +154,8 @@ pub(crate) fn text_with_scopes(
                     value_width: positive(geometry.value_dimensions())?,
                     input_scores: config.attention_arithmetic()
                         == eredu_nn::AttentionArithmetic::InputScores,
+                    float32_attention: config.attention_arithmetic()
+                        == eredu_nn::AttentionArithmetic::Float32,
                     softcap: config.attention_softcap().is_some(),
                     sinks: config.learned_attention_sinks(),
                     projections: attention

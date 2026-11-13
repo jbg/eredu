@@ -1,0 +1,13 @@
+{
+  "media": [
+    {"audio": {"sample_rate": 22050, "samples": 3209}},
+    {"image": {"width": 128, "height": 128, "rgb": [230, 20, 10]}},
+    {"audio": {"sample_rate": 16000, "samples": 319}}
+  ],
+  "pcm_formula": "((i * 37) % 997 - 498) / 1024",
+  "state": "The image appears between two audio clips.",
+  "questions": [
+    {"instructions": "What color dominates the image?", "options": ["red", "green", "blue"]},
+    {"instructions": "How many audio clips are present?", "options": ["one", "two", "three"]}
+  ]
+}

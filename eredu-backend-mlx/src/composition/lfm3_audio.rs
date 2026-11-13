@@ -328,6 +328,52 @@ impl<L: LanguagePlacement> ResidentAudioBinding<MlxNeuralBackend> for Binding<L>
     }
 }
 
+/// Independently bound speech input projection.
+#[cfg(feature = "audio")]
+pub struct MlxAudioEncoder {
+    execution: Encoder,
+    layout: StateLayout,
+    stream: Stream,
+}
+
+#[cfg(feature = "audio")]
+impl MlxAudioEncoder {
+    /// Binds the retained encoder invocations using the selected residency.
+    pub fn bind(
+        prepared: PreparedAudioEncoder,
+        residency: LayerWeightResidency,
+        weights: &Stream,
+        stream: &Stream,
+    ) -> Result<Self, BackendFailure> {
+        let layout = prepared.state_layout().clone();
+        let binding = Binding {
+            execution: stream.clone(),
+            weights: weights.clone(),
+            residency: AudioParameterResidency {
+                encoder: residency,
+                ..Default::default()
+            },
+            placement: (),
+        };
+        let execution = binding.bind_encoder(prepared)?;
+        Ok(Self {
+            execution,
+            layout,
+            stream: stream.clone(),
+        })
+    }
+
+    /// Projects a finite mel input with fresh encoder state.
+    pub fn project(&mut self, features: &MlxTensor) -> Result<MlxTensor, BackendFailure> {
+        use eredu_architectures::lfm3::audio::AudioEncoder;
+
+        let mut state = MlxHybridState::device(self.layout.clone(), &[]).map_err(failure)?;
+        self.execution
+            .project(features, &mut state, &self.stream)
+            .map_err(failure)
+    }
+}
+
 type Model = ResidentAudio<MlxNeuralBackend, Binding>;
 
 /// Bound LFM3 Audio graph consuming the selected F32 binding recipes.

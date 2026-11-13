@@ -1,0 +1,8 @@
+{
+  "image": {"width": 256, "height": 256, "rgb": [230, 20, 10]},
+  "state": "This is a color sample. The label is Sunset.",
+  "questions": [
+    {"kind": "single", "instructions": "What color is the sample?", "options": ["red", "green", "blue"]},
+    {"kind": "yesno", "instructions": "Is the sample red?"}
+  ]
+}

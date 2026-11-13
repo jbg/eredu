@@ -69,6 +69,73 @@ preparation and output decoding across resident and distributed sessions.
 MLX initializes the native Ring world. A shared agreement phase propagates
 rank-local media preparation failures before speech prefill.
 
+The d1 text preparation uses portable decision input and answer
+contracts from core. The LFM3 architecture owns tokenizer-based question
+packing, slot positions, global query visibility, and calibrated vocabulary
+readouts. One question can own several slots without changing its attention
+boundary. It validates the d1 VL and d1 Omni SafeTensors catalogs and restricts the
+decoder to its exact weight source. For d1 Omni, the architecture checks the
+audio encoder and depth-decoder tensor schemas during admission. Text and visual
+decisions bind only decoder and vision parameters. Global attention rotates
+queries and keys at their packed positions before selecting each query
+block's visible key ranges. Sliding attention and convolution retain
+their causal policies. The d1 declaration selects FP32 attention
+intermediates through the neutral attention contract. Its RMSNorm
+declarations select an eight-lane FP32 cascade with a cast to the
+activation dtype before applying the gain. MLX supplies this reduction
+through the shared normalization operator. Workspace planning
+accounts for the widened operands and tiled attention scratch.
+The shared layerwise driver traverses the row with
+fresh state. The architecture gathers answer positions before projecting
+vocabulary scores. Text extraction slots instead score normalized source
+positions and the BOS absence position. The architecture maps token offsets
+back to the caller's UTF-8 text and applies span and presence calibration.
+Numeric and date reads interpret the selected span in its source context
+and retain the span when the written value is ambiguous. Image-conditioned
+decisions retain separate decoder and vision source views. The d1 architecture
+applies the publisher's image pixel cap before shared VL processing. The
+shared processor supplies paired video frames and timestamped markup.
+Image and video projections replace their respective marker embeddings in
+the packed state. A box question reads
+one presence slot and four edge slots per requested instance. The architecture
+interprets edge distributions in normalized image coordinates and calibrates
+presence and overlap confidence. The facade publishes calibrated answers
+after all rows complete.
+
+The LFM3 tensor-parallel decoder partitions global decision attention by
+query and KV heads. Each rank uses the same packed query and key ranges
+and reduces the output projection before the residual. Sliding attention
+and convolution use their causal rank-local state. Every rank receives
+the complete vocabulary rows and computes pointer scores against the
+replicated normalized state. Pipeline stages agree the packed row, slot geometry,
+and projected media before the first stage conditions its embeddings.
+The F32 boundary carries the full hidden sequence. The final stage
+gathers answer slots and publishes the scores through the shared
+all-rank commit.
+
+The decision facade coordinates request preparation, cancellation, and
+calibrated publication through the generic application agreement seam
+of the pipeline transport. The MLX adapter binds rank resources and
+collectives. Prompt and readout policy remain in the architecture and facade.
+
+The d1 GGUF loader checks the embedded decision task, tokenizer and
+calibration metadata against the retained sidecars. It binds the decoded
+backbone and optional projector through the shared decision components.
+The Omni projector combines the shared vision and speech input schemas
+and retains independently bound sources for both encoders.
+Ordinary generation admission rejects decision-marked GGUF backbones.
+Header-only inspection resolves the same strict decoder and projector
+schemas and checks media recipes without opening tensor payloads.
+
+The d1 Omni preparation API can also retain an independent speech input
+source. The facade reuses the generative audio graph’s MLX encoder binding
+and per-unit residency policy. The architecture validates the audio marker
+and feature extractor and uses portable PCM resampling and log-mel
+extraction. Its packed decision input associates projected audio rows with the audio
+marker alongside the image and video rows. Spoken instructions expand within their own question
+suffix. The facade supplies each packed row with the shared state audio
+followed by the spoken clips for that row in question order.
+
 VL cold rank selection derives the decoder ownership, cache geometry,
 communication manifest, and publication plan from the architecture
 declaration. Source preparation binds that placement to the selected recipes

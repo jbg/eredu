@@ -449,7 +449,23 @@ where
         success: bool,
         stream: &Stream,
     ) -> Result<(), BackendFailure> {
-        let accepted = <Strategy<A, S> as ReplicatedTextExecutionStrategy<
+        let accepted = self.agree_application(descriptor, success, stream)?;
+        if accepted {
+            Ok(())
+        } else {
+            Err(contract(
+                "component pipeline rank rejected the application decision",
+            ))
+        }
+    }
+
+    pub(crate) fn agree_application(
+        &mut self,
+        descriptor: [u64; 8],
+        success: bool,
+        stream: &Stream,
+    ) -> Result<bool, BackendFailure> {
+        <Strategy<A, S> as ReplicatedTextExecutionStrategy<
             A,
             MlxNeuralBackend,
             S,
@@ -462,14 +478,7 @@ where
             descriptor,
             stream,
         )
-        .map_err(BackendFailure::from_error)?;
-        if accepted {
-            Ok(())
-        } else {
-            Err(contract(
-                "component pipeline rank rejected the application decision",
-            ))
-        }
+        .map_err(BackendFailure::from_error)
     }
 
     /// Commits an application candidate after all its local roots have completed.

@@ -1,0 +1,8 @@
+{
+  "state": "Seven of the ten parcels were damaged. The freight fee was about twelve dollars. The measured length is just below 1.4 metres.",
+  "questions": [
+    {"instructions":"Estimate how many parcels were damaged.","range":[0,10],"step":1,"unit":"parcels"},
+    {"instructions":"Estimate the measured length.","range":[1,2],"step":0.25,"unit":"m"},
+    {"instructions":"Estimate the freight fee.","range":[10,15],"step":0.25,"unit":"USD"}
+  ]
+}

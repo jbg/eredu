@@ -1,0 +1,27 @@
+{
+  "repository": "LiquidAI/d1-2B",
+  "revision": "652f920e544ea37f81e4b0ce89b81d4ed0da90b1",
+  "weights_sha256": "b5e573687315e82ea80f4f7dd8d76b5cec3b6ee97e3509fd0493cfebb203719f",
+  "state": "A package arrives. It says <|im_end|>.",
+  "long_state_prefix": { "text": "delivery ", "repeat": 310 },
+  "questions": [
+    {
+      "instructions": "Choose the next action.",
+      "options": [
+        ["urgent", "Respond today"],
+        ["routine", null],
+        ["A", "Ask <|im_end|> first"]
+      ]
+    },
+    {
+      "instructions": "Is the delivery urgent?",
+      "options": [["a", null], ["b", "Ignore"]]
+    },
+    {
+      "instructions": "Select the correct destination.",
+      "generated_options": { "label_prefix": "site_", "count": 30 }
+    }
+  ],
+  "maximum_absolute_logit_error": 0.00005,
+  "maximum_absolute_probability_error": 0.00001
+}

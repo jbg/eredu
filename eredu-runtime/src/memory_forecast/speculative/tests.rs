@@ -844,6 +844,7 @@ fn use_generic_topology(request: &mut GenerationMemoryRequest) {
                         key_width: 8,
                         value_width: 8,
                         input_scores: false,
+                        float32_attention: false,
                         softcap: false,
                         sinks: false,
                         output_gate: false,

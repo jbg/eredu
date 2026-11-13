@@ -14,6 +14,7 @@ use std::{collections::BTreeMap, path::Path, sync::Arc};
 use super::{AudioTokens, BindingSource, TextAssets};
 
 mod speech;
+pub(in crate::lfm3) use speech::input_encoder_recipes;
 pub use speech::{AudioGgufSpeechBindings, AudioGgufSpeechSources};
 
 /// Physical layouts published for either part of LFM3 Audio.
@@ -32,7 +33,9 @@ pub enum AudioGgufEncoding {
 }
 
 impl AudioGgufEncoding {
-    fn from_checkpoint(checkpoint: &Checkpoint) -> Result<Self, AudioGgufError> {
+    pub(in crate::lfm3) fn from_checkpoint(
+        checkpoint: &Checkpoint,
+    ) -> Result<Self, AudioGgufError> {
         let value = checkpoint
             .metadata()
             .get("general.file_type")
@@ -146,7 +149,7 @@ impl AdmittedAudioGguf {
         let plan = backbone_plan(&declaration, backbone_encoding)?;
         let backbone_layout =
             resolve_gguf_plan(&backbone, &plan).map_err(AudioGgufError::Schema)?;
-        let mut projector_plan = projector_plan(projector_encoding)?;
+        let mut projector_plan = projector_plan(projector_encoding, true)?;
         if let Some(vision) = vision {
             let visual = super::super::vision::gguf::omni_projector_plan(&projector, vision)
                 .map_err(|error| AudioGgufError::Declaration(error.to_string()))?;
@@ -417,7 +420,7 @@ impl AdmittedAudioGguf {
     }
 }
 
-fn backbone_plan(
+pub(in crate::lfm3) fn backbone_plan(
     declaration: &super::super::Declaration,
     encoding: AudioGgufEncoding,
 ) -> Result<GgufCheckpointPlan, AudioGgufError> {
@@ -501,28 +504,19 @@ fn validate_roles(
         return Err(AudioGgufError::Metadata("tokenizer.ggml.tokens"));
     }
     let meta = projector.metadata();
-    for key in ["clip.has_audio_encoder", "clip.has_gen_audio_encoder"] {
-        if meta.get(key).and_then(MetadataValue::as_bool) != Some(true) {
-            return Err(AudioGgufError::Metadata(key));
-        }
+    validate_input_metadata(projector)?;
+    if meta
+        .get("clip.has_gen_audio_encoder")
+        .and_then(MetadataValue::as_bool)
+        != Some(true)
+    {
+        return Err(AudioGgufError::Metadata("clip.has_gen_audio_encoder"));
+    }
+    let kind = "clip.gen.audio.projector_type";
+    if meta.get(kind).and_then(MetadataValue::as_str) != Some("lfm3a_gen") {
+        return Err(AudioGgufError::Metadata(kind));
     }
     for (key, value) in [
-        ("clip.audio.projector_type", "lfm3a"),
-        ("clip.gen.audio.projector_type", "lfm3a_gen"),
-    ] {
-        if meta.get(key).and_then(MetadataValue::as_str) != Some(value) {
-            return Err(AudioGgufError::Metadata(key));
-        }
-    }
-    for (key, value) in [
-        ("clip.audio.projection_dim", 2048),
-        ("clip.audio.embedding_length", 768),
-        ("clip.audio.feed_forward_length", 1792),
-        ("clip.audio.block_count", 17),
-        ("clip.audio.attention.head_count", 8),
-        ("clip.audio.attention.head_count_kv", 4),
-        ("clip.audio.num_mel_bins", 128),
-        ("clip.audio.window_size", 32),
         ("clip.gen.audio.projection_dim", 2048),
         ("clip.gen.audio.embedding_length", 1024),
         ("clip.gen.audio.feed_forward_length", 2816),
@@ -534,21 +528,68 @@ fn validate_roles(
             return Err(AudioGgufError::Metadata(key));
         }
     }
-    for key in [
-        "clip.audio.attention.layer_norm_epsilon",
-        "clip.gen.audio.attention.layer_norm_epsilon",
-    ] {
-        if meta.get(key).and_then(MetadataValue::as_f32) != Some(1e-5) {
-            return Err(AudioGgufError::Metadata(key));
-        }
+    let epsilon = "clip.gen.audio.attention.layer_norm_epsilon";
+    if meta.get(epsilon).and_then(MetadataValue::as_f32) != Some(1e-5) {
+        return Err(AudioGgufError::Metadata(epsilon));
     }
     Ok(())
 }
 
+fn validate_input_metadata(projector: &Checkpoint) -> Result<(), AudioGgufError> {
+    let meta = projector.metadata();
+    if meta
+        .get("clip.has_audio_encoder")
+        .and_then(MetadataValue::as_bool)
+        != Some(true)
+    {
+        return Err(AudioGgufError::Metadata("clip.has_audio_encoder"));
+    }
+    if meta
+        .get("clip.audio.projector_type")
+        .and_then(MetadataValue::as_str)
+        != Some("lfm3a")
+    {
+        return Err(AudioGgufError::Metadata("clip.audio.projector_type"));
+    }
+    for (key, value) in [
+        ("clip.audio.projection_dim", 2048),
+        ("clip.audio.embedding_length", 768),
+        ("clip.audio.feed_forward_length", 1792),
+        ("clip.audio.block_count", 17),
+        ("clip.audio.attention.head_count", 8),
+        ("clip.audio.attention.head_count_kv", 4),
+        ("clip.audio.num_mel_bins", 128),
+        ("clip.audio.window_size", 32),
+    ] {
+        if meta.get(key).and_then(MetadataValue::as_i64) != Some(value) {
+            return Err(AudioGgufError::Metadata(key));
+        }
+    }
+    let epsilon = "clip.audio.attention.layer_norm_epsilon";
+    if meta.get(epsilon).and_then(MetadataValue::as_f32) != Some(1e-5) {
+        return Err(AudioGgufError::Metadata(epsilon));
+    }
+    Ok(())
+}
+
+pub(in crate::lfm3) fn input_projector_tensors(
+    projector: &Checkpoint,
+) -> Result<Vec<GgufTensorConstraint>, AudioGgufError> {
+    validate_input_metadata(projector)?;
+    let encoding = AudioGgufEncoding::from_checkpoint(projector)?;
+    Ok(projector_plan(encoding, false)?.common_tensors)
+}
+
 /// Physical shapes below follow GGUF axis order, fastest first.
-fn projector_plan(encoding: AudioGgufEncoding) -> Result<GgufCheckpointPlan, AudioGgufError> {
+fn projector_plan(
+    encoding: AudioGgufEncoding,
+    include_generation: bool,
+) -> Result<GgufCheckpointPlan, AudioGgufError> {
     let mut tensors = Vec::new();
     let mut add = |name: String, shape: &[usize], matrix: bool| {
+        if !include_generation && name.starts_with("a.gen.") {
+            return;
+        }
         let shape = shape.iter().rev().copied().collect::<Vec<_>>();
         let dtype = if matrix {
             encoding.matrix(false)

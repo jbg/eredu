@@ -1,0 +1,8 @@
+{
+  "state": "Invoice total €1.234,50. The package arrived on March 4, 2026. The inspection date is 05/06/2026.",
+  "questions": [
+    {"kind": "number", "instructions": "Read the invoice total."},
+    {"kind": "date", "instructions": "Read the arrival date."},
+    {"kind": "date", "instructions": "Read the inspection date."}
+  ]
+}

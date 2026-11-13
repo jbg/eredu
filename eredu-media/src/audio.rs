@@ -6,6 +6,8 @@ pub mod power_mel;
 
 #[cfg(feature = "audio-processing")]
 pub mod processing;
+mod resample;
+pub use resample::resample_hann_sinc;
 pub mod streaming;
 #[cfg(feature = "system-audio")]
 pub mod system;

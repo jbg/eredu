@@ -1,0 +1,15 @@
+{
+  "video": {
+    "width": 96,
+    "height": 96,
+    "fps": 2,
+    "sampling": "processor_default",
+    "frame_rgb": [[20, 50, 210], [20, 60, 210], [20, 70, 210], [20, 80, 210], [20, 90, 210]]
+  },
+  "image": {"width": 128, "height": 128, "rgb": [230, 20, 10]},
+  "state": "The video comes first. The still image follows.",
+  "questions": [
+    {"instructions": "What color dominates the video?", "options": ["red", "green", "blue"]},
+    {"instructions": "What color dominates the still image?", "options": ["red", "green", "blue"]}
+  ]
+}

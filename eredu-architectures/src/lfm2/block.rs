@@ -730,6 +730,7 @@ pub(crate) fn execution_topology(
                     key_width: positive(spec.projection.geometry.key_dimensions())?,
                     value_width: positive(spec.projection.geometry.value_dimensions())?,
                     input_scores: spec.arithmetic == eredu_nn::AttentionArithmetic::InputScores,
+                    float32_attention: spec.arithmetic == eredu_nn::AttentionArithmetic::Float32,
                     softcap: false,
                     sinks: false,
                     projections: spec

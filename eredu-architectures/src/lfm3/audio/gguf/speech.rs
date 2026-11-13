@@ -4,7 +4,7 @@ use super::{AdmittedAudioGguf, AudioGgufError};
 use crate::lfm3::audio::{BindingSource, Declaration, DepthDeclaration};
 use eredu_checkpoint::{
     gguf_store::{open_prepared_gguf_source, GgufCatalog},
-    recipe::DerivedWeightRecipe,
+    recipe::{DerivedWeightRecipe, RecipeCatalog},
     schema::GgufCheckpointPlan,
     store::{SharedCheckpointSource, TensorSelection},
 };
@@ -46,7 +46,7 @@ impl AdmittedAudioGguf {
         input: &Declaration,
         depth: &DepthDeclaration,
     ) -> Result<AudioGgufSpeechBindings, AudioGgufError> {
-        if !input.matches_gguf_execution() || !depth.matches_gguf_execution() {
+        if !depth.matches_gguf_execution() {
             return Err(invalid(
                 "speech execution geometry differs from the released GGUF projector",
             ));
@@ -71,7 +71,7 @@ impl AdmittedAudioGguf {
         let mapping = projector.translated_outputs(str::to_owned)?;
         let catalog =
             GgufCatalog::from_resolved_checkpoint(&projector, self.layouts().1, &mapping)?;
-        let input = compile(input, &catalog, input_recipe)?;
+        let input = input_encoder_recipes(input, &catalog)?;
         let depth = compile(depth, &catalog, depth_recipe)?;
         let physical = catalog.keys();
         require_coverage(
@@ -201,9 +201,21 @@ impl AudioGgufSpeechBindings {
     }
 }
 
+pub(in crate::lfm3) fn input_encoder_recipes(
+    declaration: &Declaration,
+    catalog: &(impl RecipeCatalog + ?Sized),
+) -> Result<Recipes, AudioGgufError> {
+    if !declaration.matches_gguf_execution() {
+        return Err(invalid(
+            "speech input geometry differs from the released GGUF projector",
+        ));
+    }
+    compile(declaration, catalog, input_recipe)
+}
+
 fn compile(
     declaration: &impl DeclareLogicalParameters,
-    catalog: &GgufCatalog,
+    catalog: &(impl RecipeCatalog + ?Sized),
     recipe: fn(&LogicalParameterDeclaration<'_>) -> Option<DerivedWeightRecipe>,
 ) -> Result<Recipes, AudioGgufError> {
     let mut recipes = BTreeMap::new();

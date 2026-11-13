@@ -39,6 +39,44 @@ fn vision_declaration(config: &Value) -> Result<Declaration, ArtifactError> {
     )?)
 }
 
+pub(super) fn marker_id(
+    processor: &Value,
+    tokenizer: &eredu_text::tokenizer::Tokenizer,
+    key: &str,
+) -> Result<i32, Error> {
+    processor[key]
+        .as_str()
+        .and_then(|token| tokenizer.token_to_id(token))
+        .and_then(|id| i32::try_from(id).ok())
+        .ok_or_else(|| Error::backend(format!("invalid Omni processor marker {key}")))
+}
+
+pub(super) fn vision_tokens(
+    config: &Value,
+    processor: &Value,
+    tokenizer: &eredu_text::tokenizer::Tokenizer,
+) -> Result<MediaTokens, Error> {
+    let tokens = MediaTokens {
+        image_token_id: marker_id(processor, tokenizer, "image_token")?,
+        video_token_id: marker_id(processor, tokenizer, "video_token")?,
+        vision_start_token_id: marker_id(processor, tokenizer, "vision_start_token")?,
+        vision_end_token_id: marker_id(processor, tokenizer, "vision_end_token")?,
+    };
+    let vocab = config["text_config"]["vocab_size"].as_i64();
+    if processor["vision_markers"] != true
+        || config["image_token_id"] != tokens.image_token_id
+        || config["video_token_id"] != tokens.video_token_id
+        || [tokens.vision_start_token_id, tokens.vision_end_token_id]
+            .into_iter()
+            .any(|id| vocab.is_none_or(|vocab| i64::from(id) >= vocab))
+    {
+        return Err(Error::backend(
+            "Omni model and processor vision markers disagree",
+        ));
+    }
+    Ok(tokens)
+}
+
 /// Retained Omni checkpoint with shared language, speech and vision sources.
 pub struct PreparedOmni {
     speech: PreparedAudio,
@@ -110,20 +148,7 @@ impl PreparedOmni {
         };
         let tokenizer = eredu_text::tokenizer::Tokenizer::from_bytes(&speech.text_assets.tokenizer)
             .map_err(checkpoint)?;
-        let marker = |key: &str| {
-            source[key]
-                .as_str()
-                .and_then(|token| tokenizer.token_to_id(token))
-                .and_then(|id| i32::try_from(id).ok())
-                .filter(|id| *id < speech.language.args().vocab_size)
-                .ok_or_else(|| checkpoint(format!("invalid Omni processor marker {key}")))
-        };
-        let tokens = MediaTokens {
-            image_token_id: marker("image_token")?,
-            video_token_id: marker("video_token")?,
-            vision_start_token_id: marker("vision_start_token")?,
-            vision_end_token_id: marker("vision_end_token")?,
-        };
+        let tokens = vision_tokens(&config, &source, &tokenizer)?;
         let mut ids = [
             tokens.image_token_id,
             tokens.video_token_id,
@@ -136,10 +161,8 @@ impl PreparedOmni {
             speech.tokens.mixed_start,
         ];
         ids.sort_unstable();
-        if config["image_token_id"] != tokens.image_token_id
-            || config["video_token_id"] != tokens.video_token_id
-            || marker("audio_token")? != speech.tokens.input
-            || marker("audio_out_token")? != speech.tokens.output
+        if marker_id(&source, &tokenizer, "audio_token")? != speech.tokens.input
+            || marker_id(&source, &tokenizer, "audio_out_token")? != speech.tokens.output
             || ids.windows(2).any(|pair| pair[0] == pair[1])
         {
             return Err(checkpoint(

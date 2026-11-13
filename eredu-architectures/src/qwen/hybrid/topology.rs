@@ -16,6 +16,7 @@ fn layer(
             key_width: spec.projection.geometry.key_dimensions() as u64,
             value_width: spec.projection.geometry.value_dimensions() as u64,
             input_scores: false,
+            float32_attention: false,
             softcap: false,
             sinks: false,
             output_gate: true,

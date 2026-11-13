@@ -2,6 +2,8 @@
 
 /// Speech input feature policy and encoder.
 pub mod audio;
+/// d1 question-set packing and answer readout.
+pub mod decision;
 pub mod declarations;
 pub mod omni;
 mod projected_prompt;
@@ -65,6 +67,8 @@ pub enum Lfm3Input<'a, T: eredu_nn::Tensor> {
     Vision(&'a vision::VisionPrompt<'a, T>),
     /// Jointly conditioned image, video, and speech positions.
     Omni(&'a omni::OmniPrompt<'a, T>),
+    /// One complete non-autoregressive decision row with answer slots.
+    Decision(&'a decision::DecisionPrompt<'a, T>),
 }
 
 impl<'a, T: eredu_nn::Tensor> Lfm3Input<'a, T> {
@@ -74,6 +78,7 @@ impl<'a, T: eredu_nn::Tensor> Lfm3Input<'a, T> {
             Self::Audio(prompt) => prompt.tokens(),
             Self::Vision(prompt) => prompt.tokens(),
             Self::Omni(prompt) => prompt.tokens(),
+            Self::Decision(prompt) => &prompt.tokens,
         }
     }
 
@@ -93,11 +98,22 @@ impl<'a, T: eredu_nn::Tensor> Lfm3Input<'a, T> {
             Self::Vision(prompt) => Some(*prompt),
             _ => None,
         };
-        std::iter::once(self.tokens()).chain(self.mask()).chain(
-            vision
-                .into_iter()
-                .flat_map(|prompt| prompt.projected_roots()),
-        )
+        let decision = match self {
+            Self::Decision(prompt) => Some(*prompt),
+            _ => None,
+        };
+        std::iter::once(self.tokens())
+            .chain(self.mask())
+            .chain(
+                vision
+                    .into_iter()
+                    .flat_map(|prompt| prompt.projected_roots()),
+            )
+            .chain(
+                decision
+                    .into_iter()
+                    .flat_map(|prompt| prompt.projected_roots()),
+            )
     }
 
     /// Describes VL pipeline inputs for all-rank agreement before execution.
@@ -107,8 +123,11 @@ impl<'a, T: eredu_nn::Tensor> Lfm3Input<'a, T> {
         digest.update(match self {
             Self::Vision(_) => [1],
             Self::Text(_) => [0],
+            Self::Decision(_) => [2],
             Self::Audio(_) | Self::Omni(_) => {
-                return Err(Error::backend("VL pipeline expects text or vision input"))
+                return Err(Error::backend(
+                    "VL pipeline expects text, vision or decision input",
+                ))
             }
         });
         for dimension in self.tokens().shape() {
@@ -125,6 +144,7 @@ impl<'a, T: eredu_nn::Tensor> Lfm3Input<'a, T> {
                     update_pipeline_tensor_digest(&mut digest, mask, context)?;
                 }
             }
+            Self::Decision(prompt) => prompt.update_pipeline_digest(&mut digest, context)?,
             Self::Audio(_) | Self::Omni(_) => unreachable!("checked VL input"),
         }
         let mut descriptor = [0x4c464d335649534e, 0, 0, 0, 0, 0, 0, 0];
@@ -140,7 +160,7 @@ impl<'a, T: eredu_nn::Tensor> Lfm3Input<'a, T> {
     fn mask(&self) -> Option<&'a T> {
         match self {
             Self::Text(input) => input.mask,
-            Self::Audio(_) | Self::Vision(_) | Self::Omni(_) => None,
+            Self::Audio(_) | Self::Vision(_) | Self::Omni(_) | Self::Decision(_) => None,
         }
     }
 }
@@ -168,6 +188,7 @@ fn update_pipeline_tensor_digest<T: eredu_nn::Tensor>(
 pub struct ForwardContext<T> {
     mask: Option<T>,
     normalized_audio_output: bool,
+    decision: Option<decision::QuestionSetLayout>,
 }
 
 /// Complete LFM3 execution through the shared typed component adapter.

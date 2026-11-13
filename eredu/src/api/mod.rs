@@ -109,3 +109,6 @@ impl ConstraintError {
 
 #[cfg(test)]
 mod tests;
+
+/// Finite, non-autoregressive model decisions.
+pub mod decision;

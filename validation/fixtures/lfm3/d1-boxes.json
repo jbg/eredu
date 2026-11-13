@@ -1,0 +1,14 @@
+{
+  "image": {
+    "width": 256,
+    "height": 256,
+    "background_rgb": [255, 255, 255],
+    "rectangle_rgb": [230, 20, 10],
+    "inclusive_rectangles": [[32, 36, 95, 105], [150, 140, 218, 208]]
+  },
+  "questions": [
+    {"kind": "box", "instructions": "Locate the upper left red rectangle."},
+    {"kind": "boxes", "instructions": "Locate all red rectangles.", "max": 3},
+    {"kind": "box", "instructions": "Locate a blue circle."}
+  ]
+}

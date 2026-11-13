@@ -438,6 +438,73 @@ where
             context: ForwardContext {
                 mask,
                 normalized_audio_output: false,
+                decision: None,
+            },
+        })
+    }
+
+    fn partition_hidden(
+        &mut self,
+        input: LayeredPartitionInput<'_, B::Tensor>,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        Ok(match input {
+            LayeredPartitionInput::Tokens(tokens) => {
+                let embedding = self
+                    .static_modules
+                    .decoder_resources_mut()
+                    .embedding
+                    .ok_or_else(|| Error::backend("LFM3 partition does not own input embedding"))?;
+                match parallel {
+                    Some(parallel) => B::vocabulary_parallel_lookup(
+                        embedding,
+                        tokens,
+                        EmbeddingLookupPolicy::Strict,
+                        parallel,
+                        context,
+                    )?,
+                    None => embedding.forward(tokens, context)?,
+                }
+            }
+            LayeredPartitionInput::Hidden { hidden, .. } => hidden,
+        })
+    }
+
+    fn begin_decision<S>(
+        hidden: B::Tensor,
+        prompt: &super::decision::DecisionPrompt<'_, B::Tensor>,
+        embedding_owner: bool,
+        state: &mut S,
+        expected: &StateLayout,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: RuntimeStateComponents<B>,
+    {
+        if state.layout() != expected {
+            return Err(Error::backend(
+                "LFM3 decision state does not match its admitted layout",
+            ));
+        }
+        for ordinal in 0..expected.len() {
+            if state.layer(ordinal).map_err(Error::backend)?.position() != 0 {
+                return Err(Error::backend(
+                    "decision execution requires fresh row state",
+                ));
+            }
+        }
+        Ok(LayeredForwardState {
+            hidden: if embedding_owner {
+                prompt.condition(hidden, context)?
+            } else {
+                hidden
+            },
+            context: ForwardContext {
+                mask: None,
+                normalized_audio_output: false,
+                decision: Some(prompt.layout.clone()),
             },
         })
     }
@@ -450,6 +517,54 @@ where
         context: &<B::Tensor as Tensor>::Context,
         instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error> {
+        if let Some(layout) = &forward.decision {
+            if layout.pointer_slots.iter().any(|&slot| slot) {
+                use eredu_nn::{Index, PadMode, TensorElementType};
+
+                let mut resources = self.static_modules.decoder_resources_mut();
+                let normalized = resources.normalize(hidden, context, instrumentation)?;
+                let slots = layout.gather(&normalized, context)?;
+                let keys = normalized
+                    .index(
+                        &[Index::Full, Index::Range(0, layout.pointer_width)],
+                        context,
+                    )?
+                    .cast_float(TensorElementType::F32, context)?
+                    .transpose_axes(&[0, 2, 1], context)?;
+                let vocab = self.args.vocab_size;
+                let mut rows = Vec::new();
+                let mut begin = 0;
+                for chunk in layout.pointer_slots.chunk_by(|a, b| a == b) {
+                    let end = begin + chunk.len() as i32;
+                    let queries = slots.index(&[Index::Full, Index::Range(begin, end)], context)?;
+                    let resources = self.static_modules.decoder_resources_mut();
+                    let scores = if chunk[0] {
+                        let queries = queries.cast_float(TensorElementType::F32, context)?;
+                        let scores = B::Tensor::matmul(&queries, &keys, context)?
+                            .multiply_scalar((queries.dim(2) as f32).sqrt().recip(), context)?;
+                        B::Tensor::pad(
+                            &scores,
+                            &[(0, 0), (0, 0), (0, vocab - layout.pointer_width)],
+                            PadMode::Constant,
+                            context,
+                        )?
+                    } else {
+                        resources
+                            .project(&queries, parallel, context, instrumentation)?
+                            .cast_float(TensorElementType::F32, context)?
+                    };
+                    rows.push(scores);
+                    begin = end;
+                }
+                return B::Tensor::concatenate(&rows, 1, context);
+            }
+            return self.finish_local_instrumented(
+                &layout.gather(hidden, context)?,
+                parallel,
+                context,
+                instrumentation,
+            );
+        }
         if forward.normalized_audio_output {
             self.static_modules
                 .decoder_resources_mut()
@@ -612,6 +727,9 @@ where
             .embedding
             .ok_or_else(|| Error::backend("LFM3 partition does not own input embedding"))?
             .forward(input.tokens(), context)?;
+        if let Lfm3Input::Decision(prompt) = input {
+            return Self::begin_decision(hidden, prompt, true, state, &expected, context);
+        }
         let mut forward = self.begin_hidden(hidden, input.mask(), state, &expected, 0, context)?;
         condition_prompt(input, true, &mut forward, context)?;
         Ok(forward)
@@ -655,6 +773,16 @@ where
         let index = address.index();
         let path = format!("model.layers.{}", address.index());
         let ordinal = self.local_state_ordinal(index)?;
+        if let Some(layout) = &forward.decision {
+            let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
+            return unit.forward_decision_observed(
+                hidden,
+                layout,
+                state.layer(ordinal).map_err(Error::backend)?,
+                context,
+                &mut ComponentInstrumentation::new(&path, &mut observer),
+            );
+        }
         let points = G::ROUTING_POINTS
             .then(|| self.declaration.routed_observation_points(&path, index))
             .flatten();
@@ -708,7 +836,8 @@ where
         forward: &Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        if G::FINAL_TEXT_POSITION && !forward.normalized_audio_output {
+        if G::FINAL_TEXT_POSITION && !forward.normalized_audio_output && forward.decision.is_none()
+        {
             self.finish_local(
                 &crate::decoder::final_hidden_position(hidden, context)?,
                 None,
@@ -764,6 +893,9 @@ where
             parallel,
             context,
         )?;
+        if let Lfm3Input::Decision(prompt) = input {
+            return Self::begin_decision(hidden, prompt, true, state, expected, context);
+        }
         let mut forward = self.begin_hidden(hidden, input.mask(), state, expected, 0, context)?;
         condition_prompt(input, true, &mut forward, context)?;
         Ok(forward)
@@ -822,6 +954,16 @@ where
         let path = format!("model.layers.{}", address.index());
         let ordinal = self.local_state_ordinal(index)?;
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
+        if let Some(layout) = &forward.decision {
+            return unit.forward_decision_parallel_observed(
+                hidden,
+                layout,
+                state.layer(ordinal).map_err(Error::backend)?,
+                parallel,
+                context,
+                &mut ComponentInstrumentation::new(&path, &mut observer),
+            );
+        }
         unit.forward_parallel_observed(
             hidden,
             forward.mask.as_ref(),
@@ -1088,26 +1230,7 @@ where
             .expected
             .ok_or_else(|| Error::backend("LFM3 partition requires selected state geometry"))?;
         let context = selected.native;
-        let hidden = match input {
-            LayeredPartitionInput::Tokens(tokens) => {
-                let embedding = self
-                    .static_modules
-                    .decoder_resources_mut()
-                    .embedding
-                    .ok_or_else(|| Error::backend("LFM3 partition does not own input embedding"))?;
-                match selected.parallel {
-                    Some(parallel) => B::vocabulary_parallel_lookup(
-                        embedding,
-                        tokens,
-                        EmbeddingLookupPolicy::Strict,
-                        parallel,
-                        context,
-                    )?,
-                    None => embedding.forward(tokens, context)?,
-                }
-            }
-            LayeredPartitionInput::Hidden { hidden, .. } => hidden,
-        };
+        let hidden = self.partition_hidden(input, selected.parallel, context)?;
         self.begin_hidden(
             hidden,
             mask,
@@ -1227,6 +1350,13 @@ where
         sequence: i32,
     ) -> Result<Vec<i32>, Self::Error> {
         let width = match input {
+            Lfm3Input::Decision(prompt) => {
+                return Ok(vec![
+                    batch,
+                    prompt.layout.slot_count(),
+                    self.args.vocab_size,
+                ]);
+            }
             Lfm3Input::Text(_) | Lfm3Input::Vision(_) => self.args.vocab_size,
             Lfm3Input::Audio(_) => self.args.hidden_size,
             Lfm3Input::Omni(prompt) => match prompt.readout() {
@@ -1254,8 +1384,17 @@ where
             None => LayeredPartitionInput::Tokens(input.tokens()),
         };
         let context = selected.native;
-        let mut forward = self.begin_partition(transported, input.mask(), state, selected)?;
-        condition_prompt(input, embedded, &mut forward, context)?;
+        let forward = if let Lfm3Input::Decision(prompt) = input {
+            let expected = selected
+                .expected
+                .ok_or_else(|| Error::backend("LFM3 partition requires selected state geometry"))?;
+            let hidden = self.partition_hidden(transported, selected.parallel, context)?;
+            Self::begin_decision(hidden, prompt, embedded, state, expected, context)?
+        } else {
+            let mut forward = self.begin_partition(transported, input.mask(), state, selected)?;
+            condition_prompt(input, embedded, &mut forward, context)?;
+            forward
+        };
         if embedded {
             ComponentInstrumentation::apply_embedding(forward, observer)
         } else {
@@ -1271,6 +1410,11 @@ fn condition_prompt<T: Tensor>(
     context: &T::Context,
 ) -> Result<(), Error> {
     match input {
+        Lfm3Input::Decision(_) => {
+            return Err(Error::backend(
+                "decision execution requires explicit question-set context",
+            ));
+        }
         Lfm3Input::Text(_) => {}
         Lfm3Input::Vision(prompt) => {
             if embedding_owner {
@@ -1330,6 +1474,14 @@ where
         S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
     {
         let ordinal = self.geometry.state_index(index)?;
+        if let Some(layout) = &forward.decision {
+            return block.forward_decision(
+                hidden,
+                layout,
+                state.layer(ordinal).map_err(Error::backend)?,
+                context,
+            );
+        }
         block.forward(
             hidden,
             forward.mask.as_ref(),
@@ -1383,6 +1535,15 @@ where
         B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     {
         let ordinal = self.geometry.state_index(index)?;
+        if let Some(layout) = &forward.decision {
+            return block.forward_decision_parallel(
+                hidden,
+                layout,
+                state.layer(ordinal).map_err(Error::backend)?,
+                parallel,
+                context,
+            );
+        }
         block.forward_parallel(
             hidden,
             forward.mask.as_ref(),

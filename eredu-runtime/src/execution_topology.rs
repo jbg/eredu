@@ -73,6 +73,9 @@ pub enum TokenMixerTopology {
         value_width: u64,
         /// Preserve the input-dtype score/probability rounding boundaries.
         input_scores: bool,
+        /// Widen projected operands and attention intermediates to FP32.
+        #[serde(default)]
+        float32_attention: bool,
         /// Scores require a tanh cap.
         softcap: bool,
         /// Learned sink logits are present.

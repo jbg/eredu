@@ -29,6 +29,8 @@ pub mod checkpoint;
 pub mod component;
 /// Backend-neutral distributed scheduler consensus.
 pub mod consensus;
+/// Portable question and result types for decision models.
+pub mod decision;
 /// Immutable attention, cache, adapter and score semantics for each invocation.
 pub mod decoding;
 /// Logical architecture and capture discovery contracts.

@@ -180,6 +180,54 @@ pub(super) fn retain_projector(
 > {
     let checkpoint = open_decoded(path)?;
     let plan = projector_plan(&checkpoint, declaration)?;
+    retain_vision(checkpoint, declaration, plan, max_cached_readers)
+}
+
+pub(in crate::lfm3) fn decision_projector_plan(
+    checkpoint: &Checkpoint,
+    declaration: &Declaration,
+    omni: bool,
+) -> Result<GgufCheckpointPlan, Error> {
+    let mut plan =
+        media_projector_plan(checkpoint, declaration, if omni { "d1-omni" } else { "d1" })?;
+    if omni {
+        plan.common_tensors.extend(
+            crate::lfm3::audio::gguf::input_projector_tensors(checkpoint)
+                .map_err(Error::backend_source)?,
+        );
+    }
+    Ok(plan)
+}
+
+pub(super) fn retain_decision_projector(
+    path: &Path,
+    declaration: &Declaration,
+    omni: bool,
+    max_cached_readers: usize,
+) -> Result<
+    (
+        SharedCheckpointSource,
+        BTreeMap<String, DerivedWeightRecipe>,
+    ),
+    Error,
+> {
+    let checkpoint = open_decoded(path)?;
+    let plan = decision_projector_plan(&checkpoint, declaration, omni)?;
+    retain_vision(checkpoint, declaration, plan, max_cached_readers)
+}
+
+fn retain_vision(
+    checkpoint: Checkpoint,
+    declaration: &Declaration,
+    plan: GgufCheckpointPlan,
+    max_cached_readers: usize,
+) -> Result<
+    (
+        SharedCheckpointSource,
+        BTreeMap<String, DerivedWeightRecipe>,
+    ),
+    Error,
+> {
     let source = retain(checkpoint, &plan, str::to_owned, max_cached_readers)?;
     let recipes = projector_recipes(source.as_ref(), declaration)?;
     Ok((source, recipes))
@@ -274,23 +322,79 @@ pub(super) fn retain_backbone(
     if !is_released_backbone(&checkpoint) {
         return Err(Error::backend("expected an LFM3 VL GGUF backbone"));
     }
+    validate_backbone_geometry(&checkpoint, declaration)?;
+    crate::lfm3::checkpoint::validate_gguf_rope(&checkpoint, declaration.args())
+        .map_err(Error::backend)?;
+    let plan = vl_backbone_plan(&checkpoint, declaration).map_err(Error::backend)?;
+    retain_language(checkpoint, declaration, &plan, max_cached_readers)
+}
+
+fn validate_backbone_geometry(
+    checkpoint: &Checkpoint,
+    declaration: &crate::lfm3::Declaration,
+) -> Result<(), Error> {
     let metadata = checkpoint.metadata();
     let metadata = metadata
         .iter()
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
-    let args = crate::lfm3::model_args_from_gguf_catalog(&checkpoint, &metadata)
+    let args = crate::lfm3::model_args_from_gguf_catalog(checkpoint, &metadata)
         .map_err(Error::backend_source)?;
     if &args != declaration.args() {
         return Err(Error::backend(
             "LFM3 VL GGUF backbone differs from the supplied decoder configuration",
         ));
     }
-    crate::lfm3::checkpoint::validate_gguf_rope(&checkpoint, &args).map_err(Error::backend)?;
-    let plan = vl_backbone_plan(&checkpoint, declaration).map_err(Error::backend)?;
+    Ok(())
+}
+
+pub(in crate::lfm3) fn decision_backbone_plan(
+    checkpoint: &Checkpoint,
+    declaration: &crate::lfm3::Declaration,
+    omni: bool,
+) -> Result<GgufCheckpointPlan, Error> {
+    use crate::lfm3::audio::gguf::{backbone_plan, AudioGgufEncoding};
+    validate_backbone_geometry(checkpoint, declaration)?;
+    let encoding = AudioGgufEncoding::from_checkpoint(checkpoint).map_err(Error::backend_source)?;
+    if omni && matches!(encoding, AudioGgufEncoding::Q4_0 | AudioGgufEncoding::Q4KM) {
+        return Err(Error::backend("unpublished d1 Omni GGUF backbone encoding"));
+    }
+    backbone_plan(declaration, encoding).map_err(Error::backend_source)
+}
+
+pub(super) fn retain_decision_backbone(
+    checkpoint: Checkpoint,
+    declaration: &crate::lfm3::Declaration,
+    omni: bool,
+    max_cached_readers: usize,
+) -> Result<
+    (
+        SharedCheckpointSource,
+        BTreeMap<String, DerivedWeightRecipe>,
+    ),
+    Error,
+> {
+    let plan = decision_backbone_plan(&checkpoint, declaration, omni)?;
+    crate::lfm3::checkpoint::validate_gguf_rope(&checkpoint, declaration.args())
+        .map_err(Error::backend)?;
+    retain_language(checkpoint, declaration, &plan, max_cached_readers)
+}
+
+fn retain_language(
+    checkpoint: Checkpoint,
+    declaration: &crate::lfm3::Declaration,
+    plan: &GgufCheckpointPlan,
+    max_cached_readers: usize,
+) -> Result<
+    (
+        SharedCheckpointSource,
+        BTreeMap<String, DerivedWeightRecipe>,
+    ),
+    Error,
+> {
     let source = retain(
         checkpoint,
-        &plan,
+        plan,
         crate::lfm3::translate_gguf_weight_name,
         max_cached_readers,
     )?;
@@ -370,7 +474,7 @@ pub(crate) fn decoded_catalog(checkpoint: &Checkpoint) -> Result<Checkpoint, Str
         .map_err(|error| error.to_string())
 }
 
-fn open_decoded(path: &Path) -> Result<Checkpoint, Error> {
+pub(in crate::lfm3) fn open_decoded(path: &Path) -> Result<Checkpoint, Error> {
     Checkpoint::open_with_representation(
         path,
         Limits::default(),

@@ -1473,6 +1473,8 @@ pub enum NormalizationReduction {
     Native,
     /// Four-lane, four-chain FP32 cascaded reduction on each final-axis row.
     Cascaded,
+    /// Eight-lane FP32 cascade with rounding before the learned gain.
+    EightLaneInputPrecision,
     /// Channel-major `[batch, time, channel]` traversal. Complete sixteen-row
     /// blocks use one cascaded sum per row; remaining rows use four interleaved
     /// cascaded sums. Singleton axes retain contiguous reduction.
@@ -1542,6 +1544,8 @@ impl NormalizationConstructionSpec {
             NormalizationScale::Learned(_) | NormalizationScale::Unit => None,
         };
         if self.dimensions <= 0
+            || (self.reduction == NormalizationReduction::EightLaneInputPrecision
+                && (self.groups.is_some() || offset.is_some()))
             || (matches!(
                 self.reduction,
                 NormalizationReduction::ChannelMajor | NormalizationReduction::Cascaded
