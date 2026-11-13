@@ -527,7 +527,7 @@ fn render_failure(rank: usize, output: &Output) -> String {
 }
 
 /// Run with:
-/// `cargo test -p eredu-backend-mlx tests::distributed_realtime_ring::moshi_ring_tp2_collective_order_and_vocab -- --ignored --exact --nocapture`
+/// `cargo test -p eredu-backend-mlx --features distributed tests::distributed_realtime_ring::moshi_ring_tp2_collective_order_and_vocab -- --ignored --exact --nocapture`
 #[test]
 #[ignore = "spawns two local Ring ranks and opens loopback sockets; run explicitly"]
 fn moshi_ring_tp2_collective_order_and_vocab() {
