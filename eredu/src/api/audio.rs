@@ -2,8 +2,8 @@
 
 use std::{error::Error, sync::Arc};
 
+use eredu_architectures::lfm3::audio::AudioTurn;
 use eredu_text::tokenizer::{ModelChatTemplate, Tokenizer};
-use serde_json::json;
 
 use super::{
     realtime::{
@@ -57,7 +57,7 @@ pub enum AudioTaskOutput {
 
 enum Prompt {
     Transcribe,
-    Text(Vec<i32>),
+    Text(Vec<i32>, AudioMode),
     Audio(Vec<i32>, Vec<i32>, AudioMode),
 }
 
@@ -110,50 +110,27 @@ impl<'a> PreparedAudioTask<'a> {
         let input_rate = (!speech_only).then_some(audio.processor.sample_rate());
         let output_rate = matches!(task, AudioTask::Speak { .. } | AudioTask::Respond { .. })
             .then_some(u32::try_from(audio.codec.config().sampling_rate)?);
-        let (content, system, mode) = match task {
-            AudioTask::Transcribe => (None, None, AudioMode::Text),
-            AudioTask::Respond { instruction } => {
-                let mut content = vec![json!({"type":"audio"})];
-                if !instruction.trim().is_empty() {
-                    content.push(json!({"type":"text","text":instruction}));
-                }
-                (
-                    Some(json!(content)),
-                    Some("Respond with interleaved text and audio.".into()),
-                    AudioMode::Interleaved,
-                )
-            }
-            AudioTask::Translate { source_language, language } => (
-                Some(json!([{"type":"audio"}])),
-                Some(format!(
-                    "Translate the following speech from {source_language} to {language} in text form."
-                )),
-                AudioMode::Text,
-            ),
-            AudioTask::Speak { text } => (
-                Some(json!(text)),
-                Some("Perform TTS in American English using a female voice.".into()),
-                AudioMode::Speech,
-            ),
+        let turn = match task {
+            AudioTask::Transcribe => None,
+            AudioTask::Respond { instruction } => Some(AudioTurn::Respond { instruction }),
+            AudioTask::Translate {
+                source_language,
+                language,
+            } => Some(AudioTurn::Translate {
+                source_language,
+                language,
+            }),
+            AudioTask::Speak { text } => Some(AudioTurn::Speak { text }),
         };
-        let prompt = if let Some(content) = content {
-            let mut messages = Vec::new();
-            let named_tts = speech_only
-                .then(|| assets.named_chat_templates.get("tts"))
-                .flatten();
-            if let Some(system) = system.filter(|_| named_tts.is_none()) {
-                messages.push(json!({"role":"system","content":system}));
-            }
-            messages.push(json!({"role":"user","content":content}));
+        let prompt = if let Some(turn) = turn {
+            let request = turn.prompt(assets);
             let mut kwargs: serde_json::Map<String, serde_json::Value> =
                 serde_json::from_slice(&assets.special_tokens)?;
             kwargs.retain(|key, _| key.ends_with("_token"));
             let rendered = tokenizer
                 .apply_chat_template_json(
-                    ModelChatTemplate::Single(
-                        named_tts.unwrap_or(&assets.chat_template).to_string(),
-                    ),
-                    [messages],
+                    ModelChatTemplate::Single(request.template.to_string()),
+                    [request.messages],
                     None,
                     "turn-based-audio",
                     true,
@@ -174,9 +151,9 @@ impl<'a> PreparedAudioTask<'a> {
             let mut spans = ids.split(|id| *id == audio.tokens.input);
             let prefix = spans.next().expect("split yields at least one span");
             match (input_rate, spans.next(), spans.next()) {
-                (None, None, None) => Prompt::Text(ids),
+                (None, None, None) => Prompt::Text(ids, request.mode),
                 (Some(_), Some(suffix), None) => {
-                    Prompt::Audio(prefix.to_vec(), suffix.to_vec(), mode)
+                    Prompt::Audio(prefix.to_vec(), suffix.to_vec(), request.mode)
                 }
                 _ => {
                     return Err(
@@ -223,24 +200,22 @@ impl<'a> PreparedAudioTask<'a> {
         let LoadedMlxRealtime::Lfm3Audio(model) = self.selected.load(weights, execution)? else {
             return Err("loaded audio task differs from its selection".into());
         };
-        let state = match self.prompt {
-            Prompt::Transcribe => State::Transcribe(model.prepare_pcm_transcription()?),
-            Prompt::Text(tokens) => State::Response(ResponseSession::Resident(start_text(
-                *model,
-                &tokens,
-                self.max_slots,
-                self.seed,
-            )?)),
-            Prompt::Audio(prefix, suffix, mode) => State::Ingress(model.prepare_ingress(
-                AudioIngressRequest {
-                    prefix: &prefix,
-                    suffix: &suffix,
-                    mode,
-                    max_slots: self.max_slots,
-                },
-                self.seed,
-            )?),
-        };
+        let state =
+            match self.prompt {
+                Prompt::Transcribe => State::Transcribe(model.prepare_pcm_transcription()?),
+                Prompt::Text(tokens, mode) => State::Response(ResponseSession::Resident(
+                    start_text(*model, &tokens, mode, self.max_slots, self.seed)?,
+                )),
+                Prompt::Audio(prefix, suffix, mode) => State::Ingress(model.prepare_ingress(
+                    AudioIngressRequest {
+                        prefix: &prefix,
+                        suffix: &suffix,
+                        mode,
+                        max_slots: self.max_slots,
+                    },
+                    self.seed,
+                )?),
+            };
         Ok(AudioTaskSession {
             state,
             decoder: self.decoder,
@@ -254,6 +229,7 @@ impl<'a> PreparedAudioTask<'a> {
 fn start_text(
     model: MlxAudioModel,
     tokens: &[i32],
+    mode: AudioMode,
     max_slots: usize,
     seed: u64,
 ) -> TaskResult<MlxAudioSession> {
@@ -262,7 +238,7 @@ fn start_text(
             tokens,
             features: &[],
             replay: &[],
-            mode: AudioMode::Speech,
+            mode,
             max_slots,
         },
         seed,

@@ -24,6 +24,7 @@ mod prompt;
 mod realtime;
 mod resident;
 mod schedule;
+mod turn;
 pub use depth::{
     AudioDepth, CompletedSpeechFrame, DepthDeclaration, DepthDecoder, DepthFrame, DepthModule,
     DepthUnit, Feedback, PolicyDepth, PreparedAudioDepth,
@@ -50,6 +51,8 @@ pub use resident::{
 pub use schedule::{
     AudioMode, AudioPhase, AudioSchedule, AudioScheduleError, AudioSchedulePolicy, DepthProgress,
 };
+
+pub use turn::{AudioTurn, AudioTurnPrompt};
 
 pub use eredu_media::audio::LogMelFeatures;
 use eredu_nn::Error;
