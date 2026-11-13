@@ -172,8 +172,9 @@ compatibility and placement rules.
 
 Use `eredu --model MODEL --decisions request.json` to evaluate typed questions.
 Use `--decisions -` to read JSON from standard input. The decision task uses
-explicit device and residency settings. Use `--timing` to report elapsed decision
-time to stderr.
+explicit device and residency settings. Use `--timing` to report model loading
+(`load_seconds`) and decision generation (`decision_seconds`) separately on
+stderr. Decision generation includes any on-demand weight transfers.
 
 ### Read a number and date with d1
 

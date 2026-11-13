@@ -2100,15 +2100,21 @@ fn main() -> Result<()> {
         request.seed = args.common.seed.or(request.seed);
         args.common.configure_runtime()?;
         let plan = cli_execution_plan(&args, None, false)?;
-        let started = Instant::now();
-        let result = eredu::api::decision::evaluate_local_decisions(
+        let load_started = Instant::now();
+        let mut decision_started = None;
+        let mut on_loaded = || {
+            eprintln!("load_seconds={:.3}", load_started.elapsed().as_secs_f64());
+            decision_started = Some(Instant::now());
+        };
+        let result = eredu::api::decision::evaluate_local_decisions_with_load_callback(
             &model_path,
             assets.as_deref(),
             &request,
             args.common.device.unwrap_or_default().local(),
             &plan,
+            (args.timing || args.verbose).then_some(&mut on_loaded as &mut dyn FnMut()),
         )?;
-        if args.timing || args.verbose {
+        if let Some(started) = decision_started {
             eprintln!("decision_seconds={:.3}", started.elapsed().as_secs_f64());
         }
         serde_json::to_writer_pretty(io::stdout().lock(), &result)?;

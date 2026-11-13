@@ -101,4 +101,6 @@ pub struct DecisionResponse {
 #[cfg(feature = "mlx")]
 mod task;
 #[cfg(feature = "mlx")]
-pub use task::{evaluate_local_decisions, PreparedDecisionTask};
+pub use task::{
+    evaluate_local_decisions, evaluate_local_decisions_with_load_callback, PreparedDecisionTask,
+};
