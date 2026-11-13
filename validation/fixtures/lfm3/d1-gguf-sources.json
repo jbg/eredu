@@ -1,0 +1,188 @@
+{
+  "vl": {
+    "repository": "LiquidAI/d1-2B-GGUF",
+    "revision": "4a181094d1b6addfaa3a0956f78e7ab2aa406a0c",
+    "files": [
+      {
+        "file": "d1-2B-BF16.gguf",
+        "bytes": 3466628416,
+        "sha256": "f785c92583aa83ad2ecccd88d222a5b6b81ba1e66cb1465e7747eb9f857c67c2",
+        "header_bytes": 8249382,
+        "header_sha256": "9d07f864fa0c42fd06a8e6c76c274f77046b350cba03342cf319b1a6cf20f8cc",
+        "tensor_count": 287,
+        "types": {
+          "F32": 133,
+          "BF16": 154
+        }
+      },
+      {
+        "file": "d1-2B-F16.gguf",
+        "bytes": 3466628416,
+        "sha256": "1a2dd38813021e76036e8f3a3f45c9f7a793d7997d6d7e89bf00f9d77e2e52dc",
+        "header_bytes": 8249382,
+        "header_sha256": "4889c0b6305ea6a040fb140c1eed698d60cd18749591d76c63b0819206e5ba7d",
+        "tensor_count": 287,
+        "types": {
+          "F32": 133,
+          "F16": 154
+        }
+      },
+      {
+        "file": "d1-2B-Q4_0.gguf",
+        "bytes": 1049617728,
+        "sha256": "ba3f4f437746636dfd51e3b68d5a7858b56de44b54299a189f91c246db0a08ea",
+        "header_bytes": 8249382,
+        "header_sha256": "f0d0f4c8283c58a2d2df9ccb9b6add75976ab53cbf04a717f3dfb2391b4e625b",
+        "tensor_count": 287,
+        "types": {
+          "F32": 133,
+          "Q4_0": 153,
+          "Q6_K": 1
+        }
+      },
+      {
+        "file": "d1-2B-Q4_K_M.gguf",
+        "bytes": 1099629888,
+        "sha256": "adca5789ad30ae6027e8e936749bb9f19673097492ab26fa1c5b69643ca50b4b",
+        "header_bytes": 8249382,
+        "header_sha256": "c24f873add49663b93ddd3bac0abb3add461a435b343aff9ca600ba5ef22f809",
+        "tensor_count": 287,
+        "types": {
+          "F32": 133,
+          "Q4_K": 136,
+          "Q6_K": 18
+        }
+      },
+      {
+        "file": "d1-2B-Q8_0.gguf",
+        "bytes": 1846240576,
+        "sha256": "073313d92b53b0ac8193db6e906cb3c78a98183d244b15b7b8f5426115c6738c",
+        "header_bytes": 8249382,
+        "header_sha256": "67b53db82607e9c7d532ff24b1e491bf99016024263ee4aa32060d7e301cf85a",
+        "tensor_count": 287,
+        "types": {
+          "F32": 133,
+          "Q8_0": 154
+        }
+      },
+      {
+        "file": "mmproj-d1-2B-BF16.gguf",
+        "bytes": 378995744,
+        "sha256": "67478334d694f13fd04f51ca708dd2410953c499b0201a7482f449eb471b88f3",
+        "header_bytes": 10259,
+        "header_sha256": "ebdcc4d16f1bcfe7fb11cf84e5d3365c63b9f62972c284b31a7f6fd15f369740",
+        "tensor_count": 139,
+        "types": {
+          "F32": 53,
+          "F16": 2,
+          "BF16": 84
+        }
+      },
+      {
+        "file": "mmproj-d1-2B-F16.gguf",
+        "bytes": 378995744,
+        "sha256": "c54d0c0cc66c7e5b6b516204cab556e41d1da9e9cd970245a57d7b509af68ab3",
+        "header_bytes": 10259,
+        "header_sha256": "be86e92778699ad4f13ab433f497a26c83ecaf17c9fb0043e5ac7ce7bf892e0f",
+        "tensor_count": 139,
+        "types": {
+          "F32": 53,
+          "F16": 86
+        }
+      },
+      {
+        "file": "mmproj-d1-2B-Q8_0.gguf",
+        "bytes": 203031584,
+        "sha256": "62cc6d74fd1e5b1d6b48518566bf4c0cfd2468079a0c096ea323b74eed01e0d1",
+        "header_bytes": 10259,
+        "header_sha256": "8d36aa52511ff3a973f2b7cae988337f7695d3cc7f430ee474fbb86150559797",
+        "tensor_count": 139,
+        "types": {
+          "F32": 53,
+          "F16": 2,
+          "Q8_0": 84
+        }
+      }
+    ]
+  },
+  "omni": {
+    "repository": "LiquidAI/d1-Omni-2B-GGUF",
+    "revision": "36707287af55fc9ab03e34bda6a6cc82075499b1",
+    "files": [
+      {
+        "file": "d1-Omni-2B-BF16.gguf",
+        "bytes": 3466629024,
+        "sha256": "d5a08888081ab5f9cf8bdf862f6a420657613a82acb0c2a05d4d729fb027dcc3",
+        "header_bytes": 8250011,
+        "header_sha256": "37a64ff4c1610b86ada5c92546729ac70b47a29c4cef4552e57bd5f13eaa8386",
+        "tensor_count": 287,
+        "types": {
+          "F32": 133,
+          "BF16": 154
+        }
+      },
+      {
+        "file": "d1-Omni-2B-F16.gguf",
+        "bytes": 3466629024,
+        "sha256": "887728ee0180b60abfcf6d4370d6bc6a609cd92a58e33a20b5333e0e2438bf4f",
+        "header_bytes": 8250011,
+        "header_sha256": "f193aa42ee9ad9b5ecbdf51f8b0b56a882ad6ab079f0d1f5ce55436d204ee408",
+        "tensor_count": 287,
+        "types": {
+          "F32": 133,
+          "F16": 154
+        }
+      },
+      {
+        "file": "d1-Omni-2B-Q8_0.gguf",
+        "bytes": 1846241184,
+        "sha256": "aedf1a7c341b4281979423dbc39e9c3d3ad1da8834156c8e75af5399ca3b0861",
+        "header_bytes": 8250011,
+        "header_sha256": "cf7c51c2ea6e6699a459fc21a8202d3d44940dc2024a50df4ac183b41daac415",
+        "tensor_count": 287,
+        "types": {
+          "F32": 133,
+          "Q8_0": 154
+        }
+      },
+      {
+        "file": "mmproj-d1-Omni-2B-BF16.gguf",
+        "bytes": 609956896,
+        "sha256": "52dbb25ce1b6f6302654cd0636d3171d6605022eb2fafab8477bad0dfc3687c6",
+        "header_bytes": 21273,
+        "header_sha256": "89708e1d5e9545e6216bb3bb6763412dea1c31fd44c11a85901734533d94cb3b",
+        "tensor_count": 315,
+        "types": {
+          "F32": 127,
+          "F16": 2,
+          "BF16": 186
+        }
+      },
+      {
+        "file": "mmproj-d1-Omni-2B-F16.gguf",
+        "bytes": 609956896,
+        "sha256": "b22f8d7d5538dbc09897b214e940240be5fe0aee429ec55c83bd9fdd62d8af62",
+        "header_bytes": 21273,
+        "header_sha256": "e760043533df067fb1fe75f3a6a9a945a1cfd4cf723e04a0a724a6d530fe9f1f",
+        "tensor_count": 315,
+        "types": {
+          "F32": 127,
+          "F16": 188
+        }
+      },
+      {
+        "file": "mmproj-d1-Omni-2B-Q8_0.gguf",
+        "bytes": 326104096,
+        "sha256": "31778160ac0ec70f9b59f296aa1c8e70cbd1eb7e3a3ff873d695aaa4c7b8d674",
+        "header_bytes": 21273,
+        "header_sha256": "9b57cdca06a69254a060b5362af220523a15bffc62a9051c198cbb7529bbecab",
+        "tensor_count": 315,
+        "types": {
+          "F32": 127,
+          "F16": 2,
+          "Q8_0": 186
+        }
+      }
+    ]
+  }
+}

@@ -204,6 +204,7 @@ fn generic_topology_credits_resident_conversions_without_losing_promotion() {
                         key_width: 4,
                         value_width: 4,
                         input_scores: false,
+                        float32_attention: false,
                         softcap: false,
                         sinks: false,
                         projections: vec![

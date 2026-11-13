@@ -144,6 +144,37 @@ impl PreparedVlTensorDecoder {
 }
 
 impl PreparedVlDecoder {
+    fn prepare(
+        identity: &str,
+        declaration: Arc<crate::lfm3::Declaration>,
+        source: SharedCheckpointSource,
+        recipes: &BTreeMap<String, DerivedWeightRecipe>,
+        dtype: RecipeDtype,
+    ) -> Result<Self, Error> {
+        let parameters = eredu_runtime::PreparedComponent::prepare(
+            identity,
+            declaration.definition().clone(),
+            source,
+            |member| -> Result<_, eredu_runtime::ComponentPreparationError> {
+                let recipe = recipes.get(member.target()).cloned().ok_or_else(|| {
+                    eredu_runtime::ComponentPreparationError::ArchitectureMismatch(format!(
+                        "missing LFM3 conditional decoder parameter {}",
+                        member.target()
+                    ))
+                })?;
+                Ok(DerivedWeightRecipe::Cast {
+                    input: Box::new(recipe),
+                    dtype: dtype.clone(),
+                })
+            },
+        )
+        .map_err(Error::backend_source)?;
+        Ok(Self {
+            declaration,
+            parameters,
+        })
+    }
+
     /// Exact retained bindings and addresses for residency sizing.
     pub fn parameters(
         &self,
@@ -252,6 +283,13 @@ impl PreparedVlDecoder {
 
 pub(crate) const DECODER_ROLE: &str = "lfm3.vl.decoder";
 
+fn decision_pixel_cap(config: &Value) -> Result<u64, Error> {
+    config["d1_vision_max_pixels"]
+        .as_u64()
+        .filter(|&n| n > 0)
+        .ok_or_else(|| Error::backend("invalid d1 image pixel cap"))
+}
+
 /// Backend-neutral released VL declaration and retained checkpoint source.
 #[derive(Clone)]
 pub struct PreparedVisionLanguage {
@@ -291,14 +329,225 @@ impl VisionLanguageDeclaration {
         {
             return Err(Error::backend("expected an LFM3 VL conditional checkpoint"));
         }
+        Self::from_checkpoint_config(config, "LFM3 VL conditional SafeTensors", None)
+    }
+
+    pub(in crate::lfm3) fn prepare_decision(
+        root: &Path,
+        config: &Value,
+        dtype: RecipeDtype,
+        max_cached_shards: usize,
+        processor: Option<&[u8]>,
+        omni_tokens: Option<MediaTokens>,
+        audio_processor: Option<crate::lfm3::decision::DecisionAudioProcessor>,
+    ) -> Result<
+        (
+            PreparedVlDecoder,
+            Option<crate::lfm3::decision::PreparedDecisionVision>,
+            Option<crate::lfm3::decision::PreparedDecisionAudio>,
+        ),
+        Error,
+    > {
+        use eredu_checkpoint::{
+            safetensors::SafetensorsMetadataCatalog, store::open_validated_safetensors_source,
+            validation::resolve_safetensors_plan,
+        };
+
+        if !crate::lfm3::decision::is_d1_config(config) {
+            return Err(Error::backend("expected a d1 decision checkpoint"));
+        }
+        let declaration =
+            Self::from_checkpoint_config(config, "d1 vision SafeTensors", omni_tokens)?;
+        let catalog = SafetensorsMetadataCatalog::discover(root).map_err(Error::backend_source)?;
+        let resolve = |plan: &SafetensorsCheckpointPlan| {
+            resolve_safetensors_plan(&catalog, plan).map_err(|report| {
+                Error::backend(format!("d1 checkpoint schema differs: {report:?}"))
+            })
+        };
+        let mut plan = declaration.checkpoint().clone();
+        let mut speech_keys = BTreeSet::new();
+        let audio = if omni_tokens.is_some() {
+            use crate::lfm3::audio::{Declaration as AudioEncoder, DepthDeclaration};
+            let encoder = AudioEncoder::from_speech_config(config)?;
+            let input = encoder.safetensors_plan()?;
+            let input_resolution = resolve(&input)?;
+            speech_keys.extend(input_resolution.source_keys().iter().cloned());
+            let depth = DepthDeclaration::from_speech_config(config)?.safetensors_plan()?;
+            speech_keys.extend(resolve(&depth)?.source_keys().iter().cloned());
+            let mut tensors = plan.common_tensors;
+            tensors.extend(input.common_tensors);
+            tensors.extend(depth.common_tensors);
+            let mut policy = plan.catalog_policy;
+            policy
+                .explicitly_allowed_keys
+                .extend(depth.catalog_policy.explicitly_allowed_keys);
+            plan = SafetensorsCheckpointPlan::new(
+                "d1 Omni SafeTensors",
+                tensors,
+                plan.layout_groups,
+                policy,
+            )
+            .map_err(Error::backend_source)?;
+            audio_processor.map(|processor| (encoder, input_resolution, processor))
+        } else {
+            None
+        };
+        let resolution = resolve(&plan)?;
+        let roles = declaration.source_roles(
+            &resolution
+                .source_keys()
+                .difference(&speech_keys)
+                .cloned()
+                .collect(),
+        )?;
+        let source = open_validated_safetensors_source(
+            catalog.admitted_shards(),
+            catalog.tensors().clone(),
+            &plan,
+            resolution,
+            max_cached_shards,
+        )
+        .map_err(Error::backend_source)?;
+        let audio = audio
+            .map(|(encoder, resolution, processor)| {
+                crate::lfm3::decision::PreparedDecisionAudio::new(
+                    encoder,
+                    &resolution,
+                    source.clone(),
+                    processor,
+                    dtype.clone(),
+                )
+            })
+            .transpose()?;
+        let [(_, decoder_keys), (_, vision_keys)] = roles;
+        let vision = processor
+            .map(|bytes| {
+                let admission = declaration.prompt_admission()?;
+                let processor = declaration
+                    .processor(bytes)
+                    .map_err(Error::backend_source)?;
+                let vision_source = Arc::new(
+                    RestrictedCheckpointSource::including(source.clone(), "d1 vision", vision_keys)
+                        .map_err(Error::backend_source)?,
+                );
+                let vision_source: SharedCheckpointSource = vision_source;
+                let vision = super::PreparedVisionExecution::new(
+                    declaration.vision.clone(),
+                    &vision_source,
+                    dtype.clone(),
+                )?;
+                Ok::<_, Error>(crate::lfm3::decision::PreparedDecisionVision {
+                    vision,
+                    processor: PreparedProcessor::from_qwen(processor),
+                    admission,
+                    max_pixels: decision_pixel_cap(config)?,
+                    tokens: declaration.tokens,
+                    width: declaration.language.args().hidden_size,
+                })
+            })
+            .transpose()?;
+        let source = RestrictedCheckpointSource::including(source, "d1 decoder", decoder_keys)
+            .map_err(Error::backend_source)?;
+        let decoder = PreparedVlDecoder::prepare(
+            "lfm3/decision/decoder",
+            declaration.language,
+            Arc::new(source),
+            &declaration.language_recipes,
+            dtype,
+        )?;
+        Ok((decoder, vision, audio))
+    }
+
+    pub(in crate::lfm3) fn prepare_decision_gguf(
+        checkpoint: eredu_gguf::Checkpoint,
+        projector: Option<(&Path, &[u8])>,
+        config: &Value,
+        omni_tokens: Option<MediaTokens>,
+        audio_processor: Option<crate::lfm3::decision::DecisionAudioProcessor>,
+        dtype: RecipeDtype,
+        max_cached_readers: usize,
+    ) -> Result<
+        (
+            PreparedVlDecoder,
+            Option<crate::lfm3::decision::PreparedDecisionVision>,
+            Option<crate::lfm3::decision::PreparedDecisionAudio>,
+        ),
+        Error,
+    > {
+        let declaration = Self::from_checkpoint_config(config, "d1 GGUF", omni_tokens)?;
+        let (source, recipes) = super::gguf::retain_decision_backbone(
+            checkpoint,
+            &declaration.language,
+            omni_tokens.is_some(),
+            max_cached_readers,
+        )?;
+        let media = projector
+            .map(|(path, processor)| {
+                let admission = declaration.prompt_admission()?;
+                let processor = declaration
+                    .processor(processor)
+                    .map_err(Error::backend_source)?;
+                let (source, recipes) = super::gguf::retain_decision_projector(
+                    path,
+                    &declaration.vision,
+                    omni_tokens.is_some(),
+                    max_cached_readers,
+                )?;
+                let audio = audio_processor
+                    .map(|processor| {
+                        crate::lfm3::decision::PreparedDecisionAudio::from_gguf(
+                            crate::lfm3::audio::Declaration::from_speech_config(config)?,
+                            source.clone(),
+                            processor,
+                            dtype.clone(),
+                        )
+                    })
+                    .transpose()?;
+                let vision = super::PreparedVisionExecution::from_canonical_recipes(
+                    declaration.vision.clone(),
+                    source,
+                    &recipes,
+                    dtype.clone(),
+                )?;
+                Ok::<_, Error>((
+                    crate::lfm3::decision::PreparedDecisionVision {
+                        vision,
+                        processor: PreparedProcessor::from_qwen(processor),
+                        admission,
+                        max_pixels: decision_pixel_cap(config)?,
+                        tokens: declaration.tokens,
+                        width: declaration.language.args().hidden_size,
+                    },
+                    audio,
+                ))
+            })
+            .transpose()?;
+        let decoder = PreparedVlDecoder::prepare(
+            "lfm3/decision/decoder",
+            declaration.language,
+            source,
+            &recipes,
+            dtype,
+        )?;
+        let (vision, audio) = media.map_or((None, None), |(vision, audio)| (Some(vision), audio));
+        Ok((decoder, vision, audio))
+    }
+
+    pub(in crate::lfm3) fn from_checkpoint_config(
+        config: &Value,
+        identity: &str,
+        tokens: Option<MediaTokens>,
+    ) -> Result<Self, Error> {
         let args = crate::lfm3::model_args_from_config_value(&config["text_config"])
             .map_err(Error::backend_source)?;
-        let projector = ProjectorConfig::from_config_value(&config)?;
+        let projector = ProjectorConfig::from_config_value(config)?;
         if projector.text_hidden_size != args.hidden_size {
             return Err(Error::backend("vision projector and decoder widths differ"));
         }
-        let tokens: MediaTokens =
-            serde_json::from_value(config.clone()).map_err(Error::backend_source)?;
+        let tokens = match tokens {
+            Some(tokens) => tokens,
+            None => serde_json::from_value(config.clone()).map_err(Error::backend_source)?,
+        };
         let mut ids = [
             tokens.image_token_id,
             tokens.video_token_id,
@@ -311,7 +560,10 @@ impl VisionLanguageDeclaration {
             return Err(Error::backend("invalid LFM3 VL media token IDs"));
         }
 
-        let language = Arc::new(crate::lfm3::Declaration::new(args)?);
+        let language = Arc::new(crate::lfm3::Declaration::with_decision_policy(
+            args,
+            crate::lfm3::decision::is_d1_config(config),
+        )?);
         let vision = Declaration::new(
             serde_json::from_value(config["vision_config"].clone())
                 .map_err(Error::backend_source)?,
@@ -343,7 +595,7 @@ impl VisionLanguageDeclaration {
             .common_tensors
             .extend(vision_plan.common_tensors);
         let plan = SafetensorsCheckpointPlan::new(
-            "LFM3 VL conditional SafeTensors",
+            identity,
             language_plan.common_tensors,
             language_plan.layout_groups,
             CatalogPolicy::strict(),
@@ -699,32 +951,13 @@ impl PreparedVisionLanguage {
         &self,
         dtype: RecipeDtype,
     ) -> Result<PreparedVlDecoder, Error> {
-        let parameters = eredu_runtime::PreparedComponent::prepare(
+        PreparedVlDecoder::prepare(
             "lfm3/vision-language/decoder",
-            self.language.definition().clone(),
+            self.language.clone(),
             self.decoder_source.clone(),
-            |member| -> Result<_, eredu_runtime::ComponentPreparationError> {
-                let recipe = self
-                    .language_recipes
-                    .get(member.target())
-                    .cloned()
-                    .ok_or_else(|| {
-                        eredu_runtime::ComponentPreparationError::ArchitectureMismatch(format!(
-                            "missing LFM3 VL decoder parameter {}",
-                            member.target()
-                        ))
-                    })?;
-                Ok(DerivedWeightRecipe::Cast {
-                    input: Box::new(recipe),
-                    dtype: dtype.clone(),
-                })
-            },
+            &self.language_recipes,
+            dtype,
         )
-        .map_err(Error::backend_source)?;
-        Ok(PreparedVlDecoder {
-            declaration: self.language.clone(),
-            parameters,
-        })
     }
 
     /// Retained image/video transforms, sampling and timestamp framing.

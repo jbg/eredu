@@ -72,6 +72,7 @@ pub(super) fn profile(runtime: &ModelRuntime<MockBackend>) -> LoadedMemoryProfil
                 key_width: 2,
                 value_width: 2,
                 input_scores: false,
+                float32_attention: false,
                 softcap: false,
                 sinks: false,
                 output_gate: false,

@@ -900,6 +900,7 @@ pub(crate) fn memory_uncertainties(
                             layer.mixer,
                             crate::execution_topology::TokenMixerTopology::Attention {
                                 input_scores: false,
+                                float32_attention: false,
                                 softcap: false,
                                 ..
                             }

@@ -2048,32 +2048,15 @@ impl<B: NeuralBackend> Attention<B> {
         })
     }
 
-    fn attend<C: AttentionCache<B::Tensor>>(
+    fn position_projections(
         &mut self,
-        hidden: &B::Tensor,
-        mask: Option<&B::Tensor>,
-        mut cache: Option<&mut C>,
-        allow_sliding_prefill: bool,
+        queries: B::Tensor,
+        keys: B::Tensor,
+        offset: i32,
+        sequence: i32,
         rotary_position: Option<RotaryPosition<'_, B::Tensor>>,
-        external_value: Option<B::Tensor>,
-        selected_positions: Option<&B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        if selected_positions.is_some() && (self.softcap.is_some() || self.sliding_window.is_some())
-        {
-            return Err(Error::backend(
-                "indexed selection requires uncapped full-history attention",
-            ));
-        }
-        let ProjectedAttention {
-            queries,
-            keys,
-            values,
-            output_gate,
-            batch,
-            sequence,
-        } = self.projections(hidden, external_value, context)?;
-        let offset = cache.as_ref().map_or(0, |cache| cache.offset());
+    ) -> Result<(B::Tensor, B::Tensor), Error> {
         let (queries, keys) = match &mut self.rotary {
             Some(rotary) => {
                 let position = rotary_position.unwrap_or(RotaryPosition::Offset(offset));
@@ -2108,6 +2091,37 @@ impl<B: NeuralBackend> Attention<B> {
             )?,
             None => queries,
         };
+        Ok((queries, keys))
+    }
+
+    fn attend<C: AttentionCache<B::Tensor>>(
+        &mut self,
+        hidden: &B::Tensor,
+        mask: Option<&B::Tensor>,
+        mut cache: Option<&mut C>,
+        allow_sliding_prefill: bool,
+        rotary_position: Option<RotaryPosition<'_, B::Tensor>>,
+        external_value: Option<B::Tensor>,
+        selected_positions: Option<&B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        if selected_positions.is_some() && (self.softcap.is_some() || self.sliding_window.is_some())
+        {
+            return Err(Error::backend(
+                "indexed selection requires uncapped full-history attention",
+            ));
+        }
+        let ProjectedAttention {
+            queries,
+            keys,
+            values,
+            output_gate,
+            batch,
+            sequence,
+        } = self.projections(hidden, external_value, context)?;
+        let offset = cache.as_ref().map_or(0, |cache| cache.offset());
+        let (queries, keys) =
+            self.position_projections(queries, keys, offset, sequence, rotary_position, context)?;
         let (keys, values) = match cache.as_mut() {
             Some(cache) => cache.update_for_attention(keys, values, context)?,
             None => (keys, values),
@@ -2207,6 +2221,99 @@ impl<B: NeuralBackend> Attention<B> {
             },
             context,
         )
+    }
+
+    /// Computes uncached attention channels over ordered query spans and shared key ranges.
+    pub(crate) fn attend_query_blocks(
+        &mut self,
+        hidden: &B::Tensor,
+        query_block_size: i32,
+        spans: impl IntoIterator<Item = (std::ops::Range<i32>, Vec<std::ops::Range<i32>>)>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        if query_block_size <= 0 || self.sliding_window.is_some() || hidden.dim(1) <= 0 {
+            return Err(Error::backend(
+                "query blocks require nonempty full attention",
+            ));
+        }
+        let ProjectedAttention {
+            queries,
+            keys,
+            values,
+            output_gate,
+            batch,
+            sequence,
+        } = self.projections(hidden, None, context)?;
+        let (queries, keys) =
+            self.position_projections(queries, keys, 0, sequence, None, context)?;
+        let sinks = self.sinks.as_ref().map(Parameter::as_ref);
+        let slice = |tensor: &B::Tensor, range: std::ops::Range<i32>| {
+            if range == (0..sequence) {
+                Ok(tensor.clone())
+            } else {
+                tensor.index(
+                    &[
+                        Index::Full,
+                        Index::Full,
+                        Index::Range(range.start, range.end),
+                    ],
+                    context,
+                )
+            }
+        };
+        let select = |tensor: &B::Tensor, ranges: &[std::ops::Range<i32>]| match ranges {
+            [range] => slice(tensor, range.clone()),
+            _ => {
+                let parts = ranges
+                    .iter()
+                    .cloned()
+                    .map(|range| slice(tensor, range))
+                    .collect::<Result<Vec<_>, _>>()?;
+                B::Tensor::concatenate(&parts, 2, context)
+            }
+        };
+        let mut blocks = Vec::new();
+        let mut next = 0;
+        for (queries_range, keys_range) in spans {
+            if queries_range.start != next
+                || queries_range.is_empty()
+                || queries_range.end > sequence
+                || keys_range.is_empty()
+                || keys_range
+                    .iter()
+                    .any(|range| range.is_empty() || range.start < 0 || range.end > sequence)
+            {
+                return Err(Error::backend("invalid full attention query or key span"));
+            }
+            next = queries_range.end;
+            let keys = select(&keys, &keys_range)?;
+            let values = select(&values, &keys_range)?;
+            for start in queries_range.step_by(query_block_size as usize) {
+                let end = start.saturating_add(query_block_size).min(next);
+                blocks.push(B::attention_with_sinks(
+                    AttentionRequest {
+                        arithmetic: self.arithmetic,
+                        softcap: self.softcap,
+                        queries: slice(&queries, start..end)?,
+                        keys: keys.clone(),
+                        values: values.clone(),
+                        scale: self.scale,
+                        mask: None,
+                        sinks,
+                    },
+                    context,
+                )?);
+            }
+        }
+        if next != sequence {
+            return Err(Error::backend(
+                "full attention query spans do not cover the row",
+            ));
+        }
+        let attended = B::Tensor::concatenate(&blocks, 2, context)?
+            .transpose_axes(&[0, 2, 1, 3], context)?
+            .reshape(&[batch, sequence, -1], context)?;
+        self.gate_attended(attended, output_gate, context)
     }
 
     /// Executes the actual post-aggregation channel boundary before projection.

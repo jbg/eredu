@@ -1,0 +1,14 @@
+{
+  "state": "There is a picture and a short audio clip.",
+  "state_media": [
+    {"audio": {"sample_rate": 16000, "samples": 319}},
+    {"image": {"width": 128, "height": 128, "rgb": [230, 20, 10]}}
+  ],
+  "pcm_formula": "((i * 37) % 997 - 498) / 1024",
+  "question_count": 17,
+  "written_instructions": "What color dominates the image? ({zero_based_index})",
+  "options": ["red", "green", "blue"],
+  "spoken_instructions": {
+    "16": {"sample_rate": 22050, "samples": 3209}
+  }
+}

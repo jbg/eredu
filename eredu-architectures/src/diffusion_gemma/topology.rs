@@ -50,6 +50,8 @@ pub(crate) fn text(config: &FamilyConfig) -> Result<TextExecutionTopology, Error
                 key_width: attention_spec.geometry.key_dimensions() as u64,
                 value_width: attention_spec.geometry.value_dimensions() as u64,
                 input_scores: args.attention_arithmetic == AttentionArithmetic::InputScores,
+                float32_attention: args.attention_arithmetic
+                    == eredu_nn::AttentionArithmetic::Float32,
                 softcap: false,
                 sinks: false,
                 projections: attention,

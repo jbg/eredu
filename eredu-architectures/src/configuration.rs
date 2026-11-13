@@ -707,6 +707,11 @@ fn resolve_gguf_configuration(
     name: &str,
     checkpoint: &GgufCheckpoint,
 ) -> Result<(ModelConfiguration, GgufArchitecturePlan), ArtifactError> {
+    if crate::lfm3::decision::gguf::declares_decision(checkpoint) {
+        return Err(ArtifactError::UnsupportedModelType(
+            "d1 GGUF checkpoint requires decision execution".into(),
+        ));
+    }
     let mut plan = if matches!(name, "dream" | "mistral3" | "nemotron_labs_diffusion") {
         let admitted =
             crate::nemotron_labs_diffusion::gguf::TextGgufPlan::from_checkpoint(checkpoint)
@@ -886,6 +891,11 @@ pub fn resolve_model_identity(json: &Value) -> Result<ResolvedModelIdentity, Art
             model_type: name.clone(),
             effective_model_type: name,
         });
+    }
+    if crate::lfm3::decision::is_d1_config(json) {
+        return Err(ArtifactError::UnsupportedModelType(
+            "d1 decision checkpoint (D1Model) requires decision execution".into(),
+        ));
     }
     let metadata: ConfigMetadata = serde_json::from_value(json.clone())?;
     if metadata.model_type == "lfm3_vl"

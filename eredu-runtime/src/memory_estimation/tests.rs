@@ -904,6 +904,7 @@ fn generic_topology() -> crate::execution_topology::TextExecutionTopology {
             key_width: 8,
             value_width: 8,
             input_scores: false,
+            float32_attention: false,
             softcap: false,
             sinks: false,
             projections: vec![

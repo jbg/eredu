@@ -246,6 +246,10 @@ pub fn describe_text_workspace(
                         ..
                     }
                     | TokenMixerTopology::Attention { softcap: true, .. }
+                    | TokenMixerTopology::Attention {
+                        float32_attention: true,
+                        ..
+                    }
             )
         });
     let upper_scalar = if widened {
@@ -392,6 +396,7 @@ pub fn describe_text_workspace(
                 key_width,
                 value_width,
                 input_scores,
+                float32_attention,
                 softcap,
                 sinks,
                 query_key_normalization,
@@ -416,7 +421,9 @@ pub fn describe_text_workspace(
                     key_width: *key_width,
                     value_width: *value_width,
                     element: scalar,
-                    arithmetic: if *input_scores {
+                    arithmetic: if *float32_attention {
+                        AttentionArithmetic::Float32
+                    } else if *input_scores {
                         AttentionArithmetic::InputScores
                     } else {
                         AttentionArithmetic::Fused
@@ -448,7 +455,18 @@ pub fn describe_text_workspace(
                         product(&[rows, qk_width, upper_scalar])?,
                     )?;
                 }
-                if *input_scores || *softcap {
+                if *float32_attention && scalar_bytes < 4 {
+                    let query_width = mul(*query_heads, add(*key_width, *value_width)?)?;
+                    let kv_width = mul(*kv_heads, add(*key_width, *value_width)?)?;
+                    let kv_rows = mul(request.batch_size, positions)?;
+                    charge(
+                        &mut schedule,
+                        "attention-fp32-operands",
+                        0,
+                        mul(add(mul(rows, query_width)?, mul(kv_rows, kv_width)?)?, 4)?,
+                    )?;
+                }
+                if *input_scores || *float32_attention || *softcap {
                     let bytes = explicit_attention(
                         execution.input_score_attention_mechanism,
                         ExplicitAttentionGeometry {
@@ -457,7 +475,7 @@ pub fn describe_text_workspace(
                             expanded_width: mul(*query_heads, (*key_width).max(*value_width))?,
                             queries: query,
                             keys: positions,
-                            arithmetic: if *input_scores {
+                            arithmetic: if *input_scores || *float32_attention {
                                 AttentionArithmetic::InputScores
                             } else {
                                 AttentionArithmetic::Fused
@@ -470,6 +488,7 @@ pub fn describe_text_workspace(
                         },
                     )?;
                     let completes = *input_scores
+                        && !*float32_attention
                         && input_score_evaluates_dependencies(
                             execution.input_score_attention_mechanism,
                             query,

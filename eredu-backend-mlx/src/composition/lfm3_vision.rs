@@ -701,6 +701,68 @@ impl MlxVlDecoder {
         )
     }
 
+    /// Binds a prepared language partition with its retained communication contract.
+    pub fn bind_pipeline(
+        prepared: PreparedLanguagePartition,
+        residency: LayerWeightResidency,
+        world: &safemlx::distributed::Group,
+        weights: &Stream,
+        stream: &Stream,
+    ) -> Result<Self, BackendFailure> {
+        let communication = prepared.pipeline_communication()?;
+        let distributed = crate::backend::MlxDistributedSession::from_manifest(
+            &communication.manifest,
+            world,
+            stream,
+        )
+        .map_err(failure)?;
+        Self::bind_partition(
+            prepared,
+            residency,
+            communication,
+            distributed,
+            weights,
+            stream,
+        )
+    }
+
+    /// Initializes the Ring world and binds the selected language rank.
+    pub fn bind_ring(
+        prepared: PreparedVlDecoder,
+        residency: LayerWeightResidency,
+        topology: eredu_core::ParallelTopology,
+        maximum_positions: NonZeroUsize,
+        weights: &Stream,
+        stream: &Stream,
+    ) -> Result<Self, BackendFailure> {
+        let world = safemlx::distributed::Group::init(true, safemlx::distributed::Backend::Ring)
+            .map_err(failure)?;
+        if topology.world_size() < 2 || topology.world_size() != world.size() {
+            return Err(failure(eredu_nn::Error::backend(
+                "language partition requires a matching multi-rank native world",
+            )));
+        }
+        let rank =
+            eredu_core::ParallelRankTopology::new(topology, world.rank()).map_err(failure)?;
+        let partition = prepared.select_pipeline_rank(rank, maximum_positions)?;
+        Self::bind_pipeline(partition, residency, &world, weights, stream)
+    }
+
+    /// Agrees a local application status using the retained partition transport.
+    /// A binding without a partition session returns its local status.
+    pub fn agree_application(
+        &mut self,
+        descriptor: [u64; 8],
+        ready: bool,
+    ) -> Result<bool, BackendFailure> {
+        match &mut self.execution {
+            DecoderExecution::Pipeline { runtime, .. } => {
+                runtime.agree_application(descriptor, ready, &self.stream)
+            }
+            DecoderExecution::Layerwise { .. } => Ok(ready),
+        }
+    }
+
     fn bind_partition(
         prepared: PreparedLanguagePartition,
         residency: LayerWeightResidency,
@@ -1182,22 +1244,31 @@ impl MlxVlMedia {
         artifact: &eredu_architectures::lfm3::vision::PreparedVisionLanguage,
     ) -> Result<Self, BackendFailure> {
         use eredu_architectures::lfm3::vision::VisionPromptAdmission;
-        Ok(Self {
-            processor: crate::composition::mlx::ModelProcessor::from_prepared(artifact.processor()),
-            admission: VisionPromptAdmission::new(artifact).map_err(failure)?,
-        })
+        Ok(Self::from_prepared(
+            artifact.processor(),
+            VisionPromptAdmission::new(artifact).map_err(failure)?,
+        ))
     }
 
     /// Retains the shared visual processor for a prepared Omni checkpoint.
     pub fn for_omni(
         artifact: &eredu_architectures::lfm3::omni::PreparedOmni,
     ) -> Result<Self, BackendFailure> {
-        Ok(Self {
-            processor: crate::composition::mlx::ModelProcessor::from_prepared(
-                artifact.vision_processor(),
-            ),
-            admission: artifact.vision_admission().map_err(failure)?,
-        })
+        Ok(Self::from_prepared(
+            artifact.vision_processor(),
+            artifact.vision_admission().map_err(failure)?,
+        ))
+    }
+
+    /// Binds retained portable visual processor and prompt-admission contracts.
+    pub fn from_prepared(
+        processor: eredu_architectures::processor_execution::PreparedProcessor,
+        admission: eredu_architectures::lfm3::vision::VisionPromptAdmission,
+    ) -> Self {
+        Self {
+            processor: crate::composition::mlx::ModelProcessor::from_prepared(processor),
+            admission,
+        }
     }
 
     /// Prepares decoded media and retains the shared request's semantic cache identity.

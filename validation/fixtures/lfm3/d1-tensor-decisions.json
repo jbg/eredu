@@ -1,0 +1,14 @@
+{
+  "state_prefix": "The office processes a report every morning. ",
+  "state_prefix_repetitions": 38,
+  "state_suffix": "Invoice total €1.234,50. The package arrived on March 4, 2026.",
+  "questions": [
+    {"kind": "number", "instructions": "Read the invoice total."},
+    {
+      "kind": "single",
+      "instructions": "What kind of document mentions a total?",
+      "options": ["invoice", "calendar", "itinerary"]
+    },
+    {"kind": "date", "instructions": "Read the arrival date."}
+  ]
+}

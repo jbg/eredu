@@ -267,6 +267,167 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
         })
     }
 
+    pub(super) fn forward_decision<C>(
+        &mut self,
+        hidden: &B::Tensor,
+        layout: &super::decision::QuestionSetLayout,
+        state: &mut C,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error>
+    where
+        C: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+    {
+        self.forward_decision_observed(
+            hidden,
+            layout,
+            state,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
+    }
+
+    pub(super) fn forward_decision_observed<C>(
+        &mut self,
+        hidden: &B::Tensor,
+        layout: &super::decision::QuestionSetLayout,
+        state: &mut C,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error>
+    where
+        C: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+    {
+        let feed_forward =
+            |policy: &mut FeedForward<B>,
+             normalized: &B::Tensor,
+             context: &<B::Tensor as Tensor>::Context,
+             instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>| {
+                policy.forward_feed_forward_observed(normalized, context, instrumentation)
+            };
+        if !self.has_global_attention() {
+            return self.forward_partition_instrumented_with_feed_forward(
+                hidden,
+                None,
+                state,
+                None,
+                context,
+                instrumentation,
+                feed_forward,
+            );
+        }
+        self.forward_decision_global(hidden, layout, None, context, instrumentation, feed_forward)
+    }
+
+    pub(super) fn forward_decision_parallel<C>(
+        &mut self,
+        hidden: &B::Tensor,
+        layout: &super::decision::QuestionSetLayout,
+        state: &mut C,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error>
+    where
+        C: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+        B: eredu_nn::TensorParallelGroupedNeuralBackend,
+    {
+        self.forward_decision_parallel_observed(
+            hidden,
+            layout,
+            state,
+            parallel,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
+    }
+
+    pub(super) fn forward_decision_parallel_observed<C>(
+        &mut self,
+        hidden: &B::Tensor,
+        layout: &super::decision::QuestionSetLayout,
+        state: &mut C,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error>
+    where
+        C: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+        B: eredu_nn::TensorParallelGroupedNeuralBackend,
+    {
+        if !self.has_global_attention() {
+            return self.forward_parallel_observed(
+                hidden,
+                None,
+                state,
+                parallel,
+                context,
+                instrumentation,
+            );
+        }
+        self.forward_decision_global(
+            hidden,
+            layout,
+            Some(parallel),
+            context,
+            instrumentation,
+            |policy, normalized, context, instrumentation| {
+                policy.forward_feed_forward_parallel_observed(
+                    normalized,
+                    parallel,
+                    context,
+                    instrumentation,
+                )
+            },
+        )
+    }
+
+    fn has_global_attention(&self) -> bool {
+        matches!(&self.mixer, TokenMixer::Attention(attention) if attention.sliding_window.is_none())
+    }
+
+    fn forward_decision_global<F>(
+        &mut self,
+        hidden: &B::Tensor,
+        layout: &super::decision::QuestionSetLayout,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+        feed_forward: F,
+    ) -> Result<B::Tensor, Error>
+    where
+        F: FnOnce(
+            &mut FeedForward<B>,
+            &B::Tensor,
+            &<B::Tensor as Tensor>::Context,
+            &mut ComponentInstrumentation<'_, B::Tensor>,
+        ) -> Result<B::Tensor, Error>,
+    {
+        let TokenMixer::Attention(attention) = &mut self.mixer else {
+            return Err(Error::backend(
+                "decision query sets require global attention",
+            ));
+        };
+        let normalized = self.operator_norm.forward(hidden, context)?;
+        let normalized = instrumentation.apply("attention.input", normalized)?;
+        let attended =
+            attention.attend_query_blocks(&normalized, 256, layout.attention_spans(), context)?;
+        let attended = instrumentation.apply("attention.channels", attended)?;
+        let mixed = instrumentation.project::<B>(
+            "attention.write_input",
+            &mut attention.output,
+            &attended,
+            parallel,
+            context,
+        )?;
+        let mixed = instrumentation.apply("attention.write", mixed)?;
+        let mixed = match &mut self.post_operator_norm {
+            Some(norm) => norm.forward(&mixed, context)?,
+            None => mixed,
+        };
+        let mixed = instrumentation.apply("attention.output", mixed)?;
+        let hidden = instrumentation.apply("attention.residual", hidden.add(&mixed, context)?)?;
+        self.finish_mixed(&hidden, context, instrumentation, feed_forward)
+    }
+
     /// Executes one replicated heterogeneous block.
     pub fn forward<C>(
         &mut self,
@@ -378,7 +539,25 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
             context,
             instrumentation,
         )?;
-        let normalized = self.feed_forward_norm.forward(&hidden, context)?;
+        self.finish_mixed(&hidden, context, instrumentation, feed_forward)
+    }
+
+    fn finish_mixed<F>(
+        &mut self,
+        hidden: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+        feed_forward: F,
+    ) -> Result<B::Tensor, Error>
+    where
+        F: FnOnce(
+            &mut FeedForward<B>,
+            &B::Tensor,
+            &<B::Tensor as Tensor>::Context,
+            &mut ComponentInstrumentation<'_, B::Tensor>,
+        ) -> Result<B::Tensor, Error>,
+    {
+        let normalized = self.feed_forward_norm.forward(hidden, context)?;
         let normalized = instrumentation.apply("feed_forward.input", normalized)?;
         let feed_forward = feed_forward(
             &mut self.feed_forward,
@@ -388,7 +567,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
         )?;
         let output_path = "feed_forward.output";
         finish_feed_forward::<B>(
-            &hidden,
+            hidden,
             feed_forward,
             &mut self.post_ffn_norm,
             output_path,
@@ -835,6 +1014,7 @@ pub(crate) fn execution_topology(
                     key_width: positive(spec.projection.geometry.key_dimensions())?,
                     value_width: positive(spec.projection.geometry.value_dimensions())?,
                     input_scores: spec.arithmetic == eredu_nn::AttentionArithmetic::InputScores,
+                    float32_attention: spec.arithmetic == eredu_nn::AttentionArithmetic::Float32,
                     softcap: false,
                     sinks: false,
                     projections: [

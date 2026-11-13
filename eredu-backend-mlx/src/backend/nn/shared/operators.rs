@@ -427,6 +427,14 @@ impl NormalizationOperator<MlxTensor> for MlxRmsNorm {
                 input.shape()
             )));
         }
+        if self.reduction == eredu_nn::NormalizationReduction::EightLaneInputPrecision {
+            return compute_tensor(super::super::normalization::eight_lane_rms(
+                input,
+                self.module.as_ref().map(|module| module.weight.as_ref()),
+                self.epsilon,
+                context,
+            ));
+        }
         if self.reduction == eredu_nn::NormalizationReduction::Cascaded {
             return compute_tensor(super::super::normalization::cascaded_rms(
                 input,

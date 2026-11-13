@@ -1,0 +1,9 @@
+{
+  "state": "The shipment contains apples, pears, and coffee. The pears are bruised. There are no bananas.",
+  "questions": [
+    {"kind":"yesno","instructions":"Are there pears?","criteria":["Pears are present","Pears are absent"]},
+    {"kind":"multiple","instructions":"Select items mentioned as present.","options":[["pommes 🍎","Apples"],["pear","Pears"],["banana",null],["coffee",null]]},
+    {"kind":"score","instructions":"How damaged are the pears?","levels":["undamaged","minor damage","badly damaged"]},
+    {"kind":"single","instructions":"Which fruit is explicitly absent?","options":[["apple",null],["banana",null],["pear",null]]}
+  ]
+}

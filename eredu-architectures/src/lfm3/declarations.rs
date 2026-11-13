@@ -260,10 +260,48 @@ pub struct Declaration {
 impl Declaration {
     /// Declares family parameters without artifact values or backend allocation.
     pub fn new(args: ModelArgs) -> Result<Self, Error> {
+        Self::with_decision_policy(args, false)
+    }
+
+    pub(super) fn with_decision_policy(args: ModelArgs, decision: bool) -> Result<Self, Error> {
         args.validate().map_err(Error::backend_source)?;
-        let statics = super::static_spec(&args).construction_specs()?;
+        let mut statics = super::static_spec(&args).construction_specs()?;
+        if decision {
+            let mut norm = statics.normalization_spec().clone();
+            norm.reduction = eredu_nn::NormalizationReduction::EightLaneInputPrecision;
+            statics = crate::decoder::StaticModuleConstruction::new(
+                statics.embedding_spec().clone(),
+                statics.head_spec().cloned(),
+                norm,
+            )?;
+        }
         let blocks = (0..args.num_hidden_layers as usize)
-            .map(|i| BlockParameters::new(&args, i))
+            .map(|i| -> Result<_, Error> {
+                let mut block = BlockParameters::new(&args, i)?;
+                if let MixerParameters::Attention(spec, _) = &mut block.mixer {
+                    if decision {
+                        spec.arithmetic = eredu_nn::AttentionArithmetic::Float32;
+                        spec.query_norm.reduction =
+                            eredu_nn::NormalizationReduction::EightLaneInputPrecision;
+                        spec.key_norm.reduction =
+                            eredu_nn::NormalizationReduction::EightLaneInputPrecision;
+                    }
+                }
+                if decision {
+                    for norm in [
+                        Some(&mut block.operator_norm),
+                        Some(&mut block.feed_forward_norm),
+                        block.post_operator_norm.as_mut(),
+                        block.post_ffn_norm.as_mut(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        norm.reduction = eredu_nn::NormalizationReduction::EightLaneInputPrecision;
+                    }
+                }
+                Ok(block)
+            })
             .collect::<Result<_, _>>()?;
         Self::from_parts(args, statics, blocks)
     }

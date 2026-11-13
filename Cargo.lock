@@ -872,6 +872,7 @@ dependencies = [
 name = "eredu-architectures"
 version = "0.5.0"
 dependencies = [
+ "chrono",
  "eredu-checkpoint",
  "eredu-codec",
  "eredu-core",
@@ -881,10 +882,12 @@ dependencies = [
  "eredu-runtime",
  "eredu-text",
  "half",
+ "regex",
  "serde",
  "serde_json",
  "sha2",
  "thiserror 2.0.20",
+ "unicode-normalization",
 ]
 
 [[package]]
@@ -3665,6 +3668,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "43f613e4fa046e69818dd287fdc4bc78175ff20331479dab6e1b0f98d57062de"
 dependencies = [
  "smallvec",
+]
+
+[[package]]
+name = "unicode-normalization"
+version = "0.1.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75cd3fb03d5288b3ba9a1ee103ac7e9cbb59f0b03d64f8ddfcc04dd42758a85d"
+dependencies = [
+ "tinyvec",
 ]
 
 [[package]]

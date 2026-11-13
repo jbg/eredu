@@ -1699,3 +1699,875 @@ rank with the same PCM SHA-256 as the resident baseline. In a TP=2 failure
 replay, rank 1 includes an 8 kHz mono PCM segment where the selected
 processor requires 16 kHz. Rank 1 reports its media error and rank 0 reports
 collective rejection. Neither rank returns a response session.
+
+## d1-2B text choice preparation
+
+The [pinned d1-2B revision
+`652f920e544ea37f81e4b0ce89b81d4ed0da90b1`](https://huggingface.co/LiquidAI/d1-2B/tree/652f920e544ea37f81e4b0ce89b81d4ed0da90b1)
+declares `D1Model` with `model_type=lfm3_vl`, question-set attention, a
+16-question packing limit, and option code scheme 2. The generic generation
+resolver rejects this task identity. The portable d1 preparation reads the
+following exact sidecars:
+
+| File | SHA-256 |
+| --- | --- |
+| `config.json` | `ffdc4c996152d23dbe8a2659a8c6aabe2992aa3fa3a41601dd0fca8771d6f332` |
+| `tokenizer.json` | `a39eed58008cbcbc09e5b629b81338a654269c64cd13348aaa6090f4db75c7e7` |
+| `tokenizer_config.json` | `594a96e4caedd07536a595b48f5dc84655bd672b715b6ac891ca3d503d439f76` |
+| `calibration.json` | `e534464458f485d800fe6cc896ac241590bbc8cd54f5af08f7b3064b0d884d69` |
+
+Compare `TextChoicePreparation::pack` with `prompt.prefix_text`,
+`prompt.suffix_text` with the LFM3 lead `<think></think>`, and
+`attention.pack_set`. Compare visibility at position zero, the first
+question token, and every slot with `attention.Sees.rows`. The checked rows
+contain 261 tokens and three questions about shared text, then 580 and 40
+tokens for 17 questions with no state split at the set limit. The first
+case includes literal control-token text, native letter labels and a
+30-option question. Token IDs, state lengths, slots, and visibility rows
+match exactly.
+
+For the readout comparison, supply vocabulary scores
+`((id * 19 % 113) - 56) / 8` in every answer row. Compare
+`PackedChoiceSet::choices` with `prompt.readout` and the pinned
+`calibration.Calibration`. The largest absolute probability difference is
+`5.56e-17` against a tolerance of `1e-12`. This comparison exercises
+packing and interpretation with synthetic scores.
+
+### Released d1-2B slot execution
+
+The [text choice fixture](../validation/fixtures/lfm3/d1-text-choice.json)
+records the publisher weight digest, the two states, and the three questions.
+Load the pinned publisher `D1Model` with `dtype=torch.float32` and use
+`slots.slot_logits` with `attention.pack_set` token IDs, state length,
+question groups, and answer positions. Read each slot through
+`prompt.readout` with the pinned calibration sidecar. On the Rust side
+admit the same source with `PreparedTextChoiceModel::open` and
+`RecipeDtype::F32`. The native slot comparison binds the retained decoder
+with `MlxVlDecoder::bind` and forwards `Lfm3Input::Decision` with fresh state.
+The public comparison calls `TextChoiceModel::evaluate` on the same
+fixture and checks the calibrated answers and usage.
+
+The two cases compare every vocabulary score in three answer rows. The
+longer state crosses the global query block size and the sliding window.
+
+| State | Maximum absolute slot-logit error | Maximum absolute calibrated-probability error |
+| --- | ---: | ---: |
+| Shared text | `1.43e-5` | `2.43e-6` |
+| Long shared text | `1.91e-5` | `1.64e-6` |
+
+Both cases match the vocabulary argmax and the calibrated winning option
+at every slot. The comparison tolerances are `5e-5` for logits and `1e-5`
+for probabilities. The public evaluation reports zero generated tokens.
+
+The short case returns identical logits and probabilities with resident,
+host-layerwise, and direct disk-streamed weights on MLX CPU. Both bounded
+policies use a 1,600 MiB device budget. Host-layerwise uses a 9 GiB host
+budget and prefetch depth two. Direct disk streaming uses a zero host
+budget, lookahead, and background queue capacity. A 17-question disk
+session is cancelled after its first packed row and publishes no answers.
+
+This evidence covers F32 execution from the released SafeTensors source.
+[Native BF16](#d1-native-bf16-decision-rows) and
+[distributed execution](#d1-distributed-controlled-facade) have separate comparisons.
+
+### Mixed text decisions
+
+The [mixed text fixture](../validation/fixtures/lfm3/d1-text-decisions.json)
+uses the same pinned SafeTensors weights and calibration. It places a binary
+noul question, a four-option multiple choice, a three-level score, and a
+single choice in one row. The multiple-choice labels include Unicode to
+exercise the tokenizer offsets used to find each colon marker.
+
+Compare `TextChoicePreparation::pack_decisions` with `prompt.suffix_layout`
+and `attention.pack_set`, and use `slots.slot_logits` for the ordered Python
+slot rows. For the public answers compare `TextChoiceModel::evaluate_decisions`
+with `prompt.readout` and `api.answer`. Binary and ordinal probabilities use
+the checkpoint's temperature buckets. Multiple choice reads an untempered
+yes/no slot per option, applies the publisher's piecewise-linear calibration,
+and selects each option at or above 0.5. The ordinal result uses the calibrated
+median level.
+
+All 204 token IDs and the seven slot positions match exactly. F32 MLX CPU
+slot logits match the pinned Python model with a maximum absolute error of
+`4.10e-5` across all 896,000 logits. All vocabulary argmax IDs match. The
+maximum calibrated probability error is `2.01e-7`. The selected labels and
+ordinal level match. The comparison uses the same `5e-5` logit and `1e-5`
+probability tolerances as the single-choice fixture. Advancing the public
+controlled session yields the same result as the convenience call.
+
+### Text span extraction
+
+For the pointer replay, prefix the mixed text fixture's state with
+`Café <|im_end|>. `, insert “Which fruit is described as bruised? Return its
+name.” after the binary question, and append “Read the shipment tracking
+number.” Both additions are text reads. The pinned Python reference uses
+`pointer.state_positions`, `pointer.query_plan`, `slots.slot_logits`,
+`pointer.spans`, and `api.answer`. Convert Python character offsets to
+UTF-8 byte offsets before comparing the public Rust result.
+
+The released F32 CPU replay matches all 287 input tokens and eleven slot
+positions. Across four pointer slots and 34 valid positions, the maximum
+absolute score error is `2.96e-5` and every argmax matches. Both references
+extract `pears` at bytes `71..76` and return no span for the tracking number.
+The maximum calibrated presence-probability error is `7.64e-7`. The
+controlled and convenience calls return the same results.
+
+### Written number and date extraction
+
+The [number and date fixture](../validation/fixtures/lfm3/d1-number-date.json)
+uses the pinned d1-2B weights and the same pointer comparison entry points as
+text extraction. The publisher's `api.answer` applies the question-specific
+presence table and calls `parsing.parse_number` or `parsing.parse_date` on the
+source span. The public Rust comparison uses `DecisionQuestion::ReadNumber`
+and `DecisionQuestion::ReadDate` in a single controlled row.
+
+The released F32 CPU replay matches all 134 token IDs and six slot positions.
+The maximum absolute score error over 32 valid positions per slot is
+`2.58e-5`, and every slot argmax matches. Both implementations return
+`1234.5` with unit `€`, normalize the written arrival date to `2026-03-04`,
+and preserve `05/06/2026` with an empty typed value because the state does
+not resolve the date order. Spans and calibrated presence match exactly.
+Controlled and convenience execution return identical results. This replay
+covers these written formats.
+
+### Numeric estimates and intervals
+
+The [estimate fixture](../validation/fixtures/lfm3/d1-estimates.json) exercises
+a grid read directly through integer tokens, a fractional grid read through
+digits, and a larger fractional grid read through option aliases. The same
+pinned d1-2B source supplies the tokenizer, weights, and estimate calibration
+table. Compare `DecisionQuestion::Estimate` with `prompt.Estimate`,
+`prompt.suffix_layout`, `slots.slot_logits`, and `api.answer`. The reference
+uses untempered grid scores and reads the median and interval at the levels
+obtained by inverting its estimate calibration table.
+
+The F32 CPU replay compares all vocabulary scores at each of the three
+slots. Maximum absolute logit error is `4.72e-5`, within the `5e-5` tolerance.
+All vocabulary argmax IDs match.
+All 186 packed token IDs, three slot positions, and calibrated medians and
+intervals match exactly. The controlled session returns the same results as
+the convenience call.
+
+### Image-conditioned decision state
+
+The [image state fixture](../validation/fixtures/lfm3/d1-image-state.json)
+uses one decoded RGB image with the same pinned d1-2B SafeTensors checkpoint.
+The reference uses `media.Reader.encode` and `media.Reader.inputs` before
+`prompt.prefix_text`, `attention.pack_set`, and `slots.slot_logits`. The
+public Rust replay uses `PreparedTextChoiceModel::open_with_images`,
+`TextChoiceModel::load_with_images`, and `evaluate_with_images`. Decoder and
+vision residency are independently selected.
+
+The F32 CPU replay projects 64 image rows and matches all 136 packed tokens
+and both slot positions. Full-vocabulary slot logits match with maximum
+absolute error `1.63e-5`, and both argmax IDs match. The maximum calibrated
+probability error is `1.63e-8`. The controlled image session returns the
+same answers as the convenience call. The image fits within the publisher's
+pixel cap, so this fixture exercises projection and conditioning.
+
+### Image boxes
+
+The [box fixture](../validation/fixtures/lfm3/d1-boxes.json) uses the pinned
+d1-2B weights and the same image-state ingress as the color fixture. Render
+the two rectangles at the fixture's inclusive pixel bounds, then run one
+single-box question, a three-instance read, and an absent-object question.
+The Python reference uses `prompt.Box`, `prompt.Boxes`,
+`prompt.suffix_layout`, `slots.slot_logits`, and `api.answer`. The public Rust
+replay uses `DecisionQuestion::Box` and `DecisionQuestion::Boxes` through
+`evaluate_with_images`.
+
+The checkpoint reads edges in thousandths of the image. The confidence
+calculation measures overlap against 512 deterministic draws from the four
+edge distributions. Multiple-box presence is a nonincreasing probability of
+at least each requested count. The reply orders present boxes by left edge,
+then top edge.
+
+The released F32 CPU replay matches all 403 packed tokens and 25 answer
+positions. Over 3.2 million slot logits the maximum absolute difference
+is `3.57e-5`, and all argmax IDs match. Coordinates and calibrated overlap
+confidence match exactly. Maximum presence error is `7.18e-8`. Both
+implementations return two red rectangles, mark the three-instance read
+as complete, and return no box for the blue circle. Controlled and
+convenience calls match. The public text-only request rejects box questions
+when the state has no image.
+
+### Video and still-image decision state
+
+The [mixed visual fixture](../validation/fixtures/lfm3/d1-video-state.json)
+supplies a decoded five-frame clip at 2 FPS followed by a still image.
+The reference uses `media.Reader.encode` and `media.Reader.inputs` with
+the pinned VL processor and the same slot-logit path as image decisions.
+The clip uses the checkpoint's sampling policy and pads the last frame
+to complete its temporal pair. Its timestamped groups are enclosed by
+the outer video markers from the publisher's template.
+
+The Rust replay opens the checkpoint with
+`PreparedTextChoiceModel::open_with_vision`, loads the independently
+selected decoder and vision policies with `TextChoiceModel::load_with_vision`,
+and evaluates the ordered media with `evaluate_with_visuals`.
+
+The F32 CPU replay projects 27 video rows and 64 still-image rows. All 200
+packed tokens and both answer positions match the pinned Python reference.
+The maximum full-vocabulary logit error is `1.53e-5`, and both argmax IDs
+match. Maximum calibrated probability error is `3.35e-7`. Both paths choose
+blue for the video and red for the image. Controlled and convenience
+execution return identical results.
+
+## d1 Omni visual decision execution
+
+The [d1-Omni-2B SafeTensors release](https://huggingface.co/LiquidAI/d1-Omni-2B/tree/81222dae8bf8bdd7f903643b5b2a8803bf2e3176)
+declares `D1Model` with an `lfm3_omni` backbone. The decision loader uses
+the nested text BOS ID and resolves the visual framing IDs from the
+processor and tokenizer. Admission checks the decoder, vision tower and
+projector, audio encoder and projector, depth decoder, and codebook
+embedding in the same catalog. The decoder and vision bindings use separate
+restricted views. Text and visual decisions require no LiquidCodec asset.
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `model.safetensors` | `1553fff04c54377ff527d2016fc479425ef60a0b3bc7a2e61d32f80a75c32aaf` |
+| `config.json` | `cebf53b6bb8835cefe9b415d9619c23398ab8326d6385ee80f98fef0caad7169` |
+| `processor_config.json` | `2288d34b7c0579593258b1c083de4ab8328a842fdb0190977363e573dbdcd0e5` |
+| `calibration.json` | `182270f679ee9b8ead5d2d3f37ea5f297839126baaced22e4cd57d48cfaf1772` |
+| `tokenizer.json` | `41927bd314d17d7d7fadb44e10cd0919f7b71528d7741596d8cbd15c6945ec44` |
+| `tokenizer_config.json` | `3cff70d801d7c2086ffa2979046051b2727f160acb2eaeb3a77512be41c6a29e` |
+
+Replay the [mixed visual fixture](../validation/fixtures/lfm3/d1-video-state.json)
+using the pinned `modeling_d1_lfm3_omni.D1Model` and
+`processing_lfm3_omni.Lfm3OmniProcessor`. Use the same
+`media.Reader`, `attention.pack_set`, `slots.slot_logits`, and
+`prompt.readout` entry points as d1-2B. The Rust replay uses
+`PreparedTextChoiceModel::open_with_vision` and
+`TextChoiceModel::load_with_vision` with resident weights. Both replays
+widen the stored weights to F32 on CPU. The comparison requires exact
+packed IDs, answer positions and slot argmax IDs, full-vocabulary absolute
+error at most `5e-5`, and calibrated probability error at most `1e-6`.
+
+All 200 packed IDs and both slot positions match. The video and still
+image produce 27 and 64 projected rows, respectively. Across 256,000
+logits, the maximum absolute difference is `4.01e-5`. Both slot argmax
+IDs match, and the maximum calibrated probability difference is `9.76e-7`.
+Both implementations select blue for the video and red for the still
+image. The Rust controlled session and convenience evaluation agree
+exactly and report zero generated tokens.
+
+### d1 Omni speech input preparation
+
+`PreparedTextChoiceModel::open_with_omni` retains the 20 independently
+bindable speech input units. The portable `audio` feature enables
+`DecisionAudioProcessor::prepare`, which converts decoded mono PCM to
+16 kHz, computes the checkpoint's mel frames, and returns their framed
+placeholder IDs. `TextChoicePreparation::pack_media_decisions` packs
+the expanded placeholders with the rest of the shared state.
+
+To reproduce input parity on the pinned checkpoint, generate four mono
+clips with (rate, sample count) equal to (16000, 319), (16000, 1681),
+(22050, 3209), and (48000, 5001). Sample `i` is
+`((i * 37) % 997 - 498) / 1024`. Pass them in this order to
+`media.Reader.encode`, then use `prompt.prefix_text` and
+`attention.pack_set` with state `There are four audio clips.` and the
+single-choice question `Is there audio?` with options `yes` and `no`.
+Eredu and the pinned processor produce 1, 10, 14, and 9 mel frames
+respectively and identical framed IDs. All 53 packed IDs and the
+answer slot at position 52 match. The maximum absolute mel feature
+difference across the four clips is `4.30e-5`.
+
+### d1 Omni audio state execution
+
+The [mixed state fixture](../validation/fixtures/lfm3/d1-omni-mixed-state.json)
+places an image between two PCM clips at different sample rates. The
+pinned Python replay uses `media.Reader.encode` and `media.Reader.inputs`
+to prepare the mixed state and `slots.slot_logits` to score both questions
+in one packed set. The replay also reads the valid rows from
+`D1Model.get_audio_features` before the decoder.
+
+With the Rust `mlx`, `image`, and `audio` features, open the same
+checkpoint through `PreparedTextChoiceModel::open_with_omni` with F32
+recipes. Bind it with `TextChoiceModel::load_with_omni` and call
+`evaluate_with_media` or advance `start_with_media`. Both paths use the
+same decision session and report zero generated tokens.
+
+On CPU, the replays match all 152 packed IDs and both answer positions
+(117 and 151). The three projected audio rows have maximum absolute
+error `1.14e-6`. Across 256,000 vocabulary logits the maximum error is
+`4.30e-5`, within `5e-5`, and the two argmax IDs match. Calibrated
+probability error is `9.28e-7`, within `1e-6`. Both runs choose red
+for the image and one for the audio count despite the two input clips.
+Controlled and convenience evaluation agree exactly.
+With the decoder and vision resident, the host-layerwise and disk-streamed
+speech encoder selections produce the same calibrated probabilities and
+usage as the fully resident run. Both use a 128 MiB device weight budget.
+Host-layerwise execution uses a 1 GiB host budget and a two-unit device window.
+Disk-streamed execution uses direct materialization.
+
+### d1 Omni spoken question execution
+
+The [spoken question fixture](../validation/fixtures/lfm3/d1-omni-spoken-questions.json)
+uses two different question clips on opposite sides of the checkpoint's
+16-question set boundary. Each row sees the shared state clip and the
+spoken instructions for its own questions. The clips are synthetic PCM
+signals that exercise instruction placement and encoder conditioning.
+
+The pinned Python replay expands the shared state with `media.Reader.encode`
+and replaces each spoken question's instruction marker with
+`media.Reader.place`. It packs each set with `attention.pack_set` and
+compares the complete answer-slot vocabulary from `slots.slot_logits`.
+The Rust F32 CPU replay uses `start_with_spoken_questions` and
+`evaluate_with_spoken_questions`. The optional clip at each question index
+replaces the written instructions and preserves the question's typed readout.
+
+The rows contain 478 and 43 tokens. All 521 packed token IDs and all 17
+answer positions match. All full-vocabulary argmax IDs and calibrated
+top choices agree. The maximum absolute logit and probability
+differences are `7.25e-5` and `1.97e-6`, above the `5e-5` and `1e-6`
+thresholds used for the visual and mixed-state fixtures. Giving Python
+Eredu's mel features still leaves a `7.44e-5` logit difference on the
+first row. Controlled and convenience evaluation agree exactly. The
+controlled session publishes after the second row, and cancellation
+after the first row publishes no answer.
+
+With the selected FP32 attention contract, replay the packed rows with
+resident weights on CPU and Metal, setting `MLX_ENABLE_TF32=0` on Metal.
+Both devices match all packed IDs, answer positions, and the five
+highest-scoring vocabulary IDs at each of the 17 slots.
+
+| Eredu device | Maximum absolute logit difference | Worst slot relative L2 | Maximum calibrated probability difference |
+| --- | ---: | ---: | ---: |
+| CPU, four-lane RMSNorm | 7.25e-5 | 4.18e-6 | 1.97e-6 |
+| CPU, eight-lane RMSNorm | 1.11e-4 | 5.51e-6 | 1.48e-6 |
+| Metal, four-lane RMSNorm | 7.44e-5 | 3.14e-6 | 1.62e-6 |
+
+Both devices exceed the recorded absolute logit and probability
+thresholds. The Metal replay uses the same pinned Python CPU reference.
+
+The identical-audio decoder comparison injects Python's projected audio
+into the same Rust rows without changing their packed IDs. The first row
+still differs by `1.02e-4`. Python's audio projections differ from
+Eredu's by at most `1.14e-6` across these inputs. Python's own F32 head
+differs from the same head accumulated in F64 by up to `4.20e-5`.
+These measurements leave the decoder arithmetic gap open.
+
+The default Python reference and Eredu agree on all five top IDs at
+each slot. The largest per-slot relative L2 difference is `4.18e-6`.
+The pinned Python model also shows sensitivity to the CPU attention
+kernel with the same weights, inputs and masks. In `Sees.attend`, force
+`torch.nn.attention.SDPBackend.MATH` for global layers only (where
+`window is None`), then run separately with it forced for sliding
+layers only. Both replays keep the publisher's default audio encoder
+and all packed IDs and answer positions.
+
+| Python attention forced to math | Maximum absolute logit difference from default Python | Worst slot relative L2 | Maximum calibrated probability difference |
+| --- | ---: | ---: | ---: |
+| Global layers | 8.77e-5 | 3.69e-6 | 1.20e-6 |
+| Sliding layers | 7.63e-5 | 3.22e-6 | 9.16e-7 |
+
+Changing either group of attention kernels alone moves the Python
+scores beyond the fixture's absolute logit threshold. The default
+Python replay remains the acceptance reference. These comparisons
+measure arithmetic sensitivity and leave the threshold unchanged.
+
+The same Python fixture also measures sensitivity to attention layout.
+For global attention, retain all keys for state queries and concatenate
+the state and question keys for each question, with at most 256 queries
+per call. For a separate sliding-attention replay, use the complete key
+row with a Boolean causal window mask. Both substitutions preserve the
+visible keys, packed IDs, answer positions, and all five top vocabulary
+IDs per slot. The 478-token row gives the following differences from
+the default Python execution. The 43-token row has identical scores.
+
+| Python attention layout | Maximum absolute logit difference | Worst slot relative L2 | Maximum calibrated probability difference |
+| --- | ---: | ---: | ---: |
+| Global attention over visible key ranges | 8.01e-5 | 3.03e-6 | 1.13e-6 |
+| Sliding attention with a full-row window mask | 5.72e-5 | 2.05e-6 | 1.76e-6 |
+
+Using the same global key ranges in Python and Eredu still leaves a
+maximum logit difference of `7.25e-5` on CPU. The two layouts show
+that changing the matrix shapes alone can exceed the recorded absolute
+thresholds on the longer row.
+
+## d1-2B GGUF decision admission
+
+The [d1-2B GGUF release](https://huggingface.co/LiquidAI/d1-2B-GGUF/tree/4a181094d1b6addfaa3a0956f78e7ab2aa406a0c)
+marks the backbone with `lfm3.decision.type=lfm3-d1`. The decision loader
+checks the task marker, noncausal global attention declaration, decoder
+geometry, vocabulary IDs, and embedded temperatures. It retains the
+published d1-2B configuration, tokenizer, and full calibration sidecar
+for question-set packing and typed readouts. The optional vision
+projector uses the companion processor sidecar and d1 image cap.
+
+Open the backbone and optional projector through
+`PreparedTextChoiceModel::open_gguf`, with the
+[d1-2B SafeTensors sidecar revision](https://huggingface.co/LiquidAI/d1-2B/tree/652f920e544ea37f81e4b0ce89b81d4ed0da90b1)
+as the asset directory. The selected decoder and vision bindings are
+the same public adapters used by SafeTensors.
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `d1-2B-Q4_K_M.gguf` | `adca5789ad30ae6027e8e936749bb9f19673097492ab26fa1c5b69643ca50b4b` |
+| `mmproj-d1-2B-Q8_0.gguf` | `62cc6d74fd1e5b1d6b48518566bf4c0cfd2468079a0c096ea323b74eed01e0d1` |
+
+The text replay uses the release README's billing-team question with
+its state and three described options. Export the 63 packed IDs from
+Eredu, then pass the same IDs to the repository's
+`validation/gguf_reference.cpp` against llama.cpp
+`7c2653acc749258dc62067da62d07024d971ccd2`. Use the Q4_K_M file in both
+runners, CPU execution, and an empty decode-ID argument. The single
+answer slot is at position 62. The pinned Python `prompt.readout`
+applies the calibration sidecar to the reference logits.
+
+Across 128,000 logits, relative L2 is `0.00651`, cosine is `0.999986`,
+and all top-five IDs overlap. Both runs have argmax ID 41 and select
+billing. Maximum absolute logit and calibrated probability differences
+are `0.184` and `0.00321`. The logit comparison meets the shared
+quantized profile.
+
+The Q4_K_M and Q8_0 pair runs the mixed video and still-image fixture on
+CPU with resident weights. It produces 27 video rows, 64 image rows,
+and the same 200 packed IDs and two answer positions as the SafeTensors
+replay. Both controlled and convenience calls select blue for the
+video and red for the image, with identical calibrated probabilities
+and usage. This is a paired execution check. The same-artifact numerical
+comparison above covers the text fixture.
+
+## d1 Omni GGUF decision admission
+
+The [d1-Omni-2B GGUF release](https://huggingface.co/LiquidAI/d1-Omni-2B-GGUF/tree/36707287af55fc9ab03e34bda6a6cc82075499b1)
+declares `lfm3.decision.type=lfm3-d1-omni`. Its combined projector
+supplies the vision tower, visual projector, speech encoder, and
+speech projector. The tensor schema covers these input components.
+The Rust route uses the same audio state and spoken question drivers
+as the SafeTensors decision checkpoint.
+
+Use `PreparedTextChoiceModel::open_gguf` with the
+[d1 Omni SafeTensors sidecar revision](https://huggingface.co/LiquidAI/d1-Omni-2B/tree/81222dae8bf8bdd7f903643b5b2a8803bf2e3176)
+as the asset directory. Use `TextChoiceModel::load` for the standalone
+backbone or `TextChoiceModel::load_with_omni` for the paired artifact.
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `d1-Omni-2B-Q8_0.gguf` | `aedf1a7c341b4281979423dbc39e9c3d3ad1da8834156c8e75af5399ca3b0861` |
+| `mmproj-d1-Omni-2B-Q8_0.gguf` | `31778160ac0ec70f9b59f296aa1c8e70cbd1eb7e3a3ff873d695aaa4c7b8d674` |
+
+The standalone and paired files pass decision admission. Ordinary
+generation admission rejects the backbone. The billing-team text
+fixture uses the same 63 packed IDs as the d1-2B GGUF replay and
+compares answer position 62 against the same pinned llama.cpp CPU
+runner. Across 128,000 logits, relative L2 is `0.00344`, cosine is
+`0.999996`, and all five top IDs overlap. Both runs have argmax ID 41
+and select billing. Maximum absolute logit and calibrated probability
+differences are `0.159` and `0.000638`. The logit comparison meets the
+shared quantized profile.
+
+The Q8_0 pair runs the mixed audio and image fixture on CPU with
+resident weights widened to F32. It projects three audio rows and
+matches the SafeTensors replay's 152 packed IDs and answer positions
+117 and 151. The controlled and convenience APIs return identical
+calibrated probabilities and usage. Both select red for the image
+and one for the count of the two clips. This paired execution check
+covers the public mixed-state path. The same-artifact numerical
+comparison covers the text fixture.
+
+## d1 tensor-parallel decision rows
+
+The [mixed readout fixture](../validation/fixtures/lfm3/d1-tensor-decisions.json)
+packs a state longer than the sliding window and interleaves numeric,
+vocabulary and date readouts in one question set. Use the pinned d1-2B
+SafeTensors checkpoint and F32 weight recipes on CPU. On each Ring
+rank, call `PreparedVlDecoder::select_tensor_rank` and
+`MlxVlDecoder::bind_tensor_parallel`, then run `Lfm3Input::Decision`
+with fresh state. The same packed row on `MlxVlDecoder::bind` supplies
+the unpartitioned comparison. Apply `PackedChoiceSet::decisions` to
+the full slot rows to compare typed outputs.
+
+The row has 430 tokens, including 332 shared-state positions. Both
+ranks return byte-identical scores for all five slots. All five slot
+argmax IDs match the unpartitioned run. The maximum absolute
+difference is `2.10e-5` for the vocabulary row and `1.59e-4` for
+the pointer rows. Both placements extract €1234.50 and 2026-03-04
+with identical spans and presence scores, and choose invoice.
+The maximum calibrated choice probability difference is `7.24e-9`.
+
+## d1 pipeline decision rows
+
+The native pipeline replay uses the same pinned d1-2B checkpoint,
+CPU F32 recipes, and [mixed readout fixture](../validation/fixtures/lfm3/d1-tensor-decisions.json).
+Use `PreparedVlDecoder::select_pipeline_rank` with a 512-token bound
+and `MlxVlDecoder::bind_pipeline` on each Ring rank. Pass the complete
+row with fresh state to `MlxVlDecoder::forward`. The last stage
+publishes the five score rows after all ranks agree completion.
+An injected local preparation failure on the last rank through
+`forward_checked` is rejected by every rank. A retry with the same
+valid input reproduces its first successful scores exactly.
+
+PP=2 produces byte-identical scores to single-rank execution for all
+five slots. Combined TP=2/PP=2 matches the TP=2 scores byte for byte.
+All ranks within each run return identical scores. Compared with the
+single-rank run, the combined run has maximum errors of `2.10e-5`
+for the vocabulary row and `1.59e-4` for pointer rows, with the same
+typed answers and all five argmax IDs.
+
+A PP=2 visual replay uses a 128×128 RGB image filled with (230, 20, 10),
+no text state, and the question `What color dominates the image?`
+with red, green, and blue options. Its 101-token row produces
+byte-identical scores to the single-rank run and chooses red. Scaling
+the projected image rows by 0.5 on one rank causes both ranks to
+reject the invocation. A retry with identical projections reproduces
+the original scores.
+
+## d1 distributed controlled facade
+
+The [distributed Omni fixture](../validation/fixtures/lfm3/d1-omni-distributed-decisions.json)
+uses a released d1 Omni SafeTensors checkpoint, an image and PCM
+state, and 17 questions in two packed rows. The last question uses
+synthetic PCM as its instruction. Use CPU F32 recipes and
+`PreparedTextChoiceModel::open_with_omni`. On each process, set
+`MLX_HOSTFILE` and `MLX_RANK`, then call
+`TextChoiceModel::load_distributed` with the same Ring topology,
+a 1024-token row bound, and resident decoder, vision, and speech weights.
+
+Compare `evaluate_with_spoken_questions` with repeated
+`start_with_spoken_questions` advancement. Run all ranks in lockstep.
+To test preparation agreement, omit the last entry in the spoken clip
+array on one rank. To test answer publication, change one choice's
+label on one rank while preserving its explicit description and
+packed prompt. To test cancellation, advance one row, call `cancel`
+on one rank, and advance the cohort again.
+
+TP=2, PP=2, and combined TP=2/PP=2 each return identical results across
+their ranks and between controlled and convenience calls. All 17 top
+choices are red. The evaluations account for 774 input tokens and zero
+generated tokens. TP=2 and combined results match exactly. PP=2 differs
+by at most `2.31e-7` in calibrated probabilities. Every placement rejects
+the malformed preparation and the mismatched answer publication.
+Cancellation after the first row publishes no answers on any rank.
+Retrying the valid request reproduces the original result.
+
+## d1 native BF16 decision rows
+
+Use the pinned d1-2B and d1 Omni SafeTensors artifacts with
+`RecipeDtype::BF16`, a CPU weight stream, and a Metal execution stream.
+Set `MLX_ENABLE_TF32=0` for F32 arithmetic, including pointer score
+accumulation. In the pinned Python replay, load `D1Model` with
+`dtype=torch.bfloat16` and run `slots.slot_logits` on CPU. Use
+`pointer.query_plan` for the mixed readouts and compare only the
+valid source positions for pointer scores. The Rust runner uses
+`DecisionPrompt` with fresh state, then applies the typed readouts.
+The same artifacts widened to F32 have separate comparisons above.
+
+The text replay uses the 430-token
+[mixed readout fixture](../validation/fixtures/lfm3/d1-tensor-decisions.json).
+The d1-2B image replay uses the 101-token red image from the pipeline
+comparison. The Omni replay uses the 152-token
+[mixed state fixture](../validation/fixtures/lfm3/d1-omni-mixed-state.json)
+and compares its three projected audio rows as well as its answer slots.
+
+| Comparison | Maximum absolute score difference | Maximum relative L2 |
+| --- | ---: | ---: |
+| d1-2B text vocabulary slot | 0.06689 | 0.00340 |
+| d1-2B image vocabulary slot | 0.078125 | 0.00338 |
+| d1 Omni mixed-media vocabulary slots | 0.3125 | 0.00439 |
+| d1-2B text pointer slots | 0.26918 | 0.02097 |
+
+All decoder rows use the selected FP32 attention contract.
+The image replay matches all 101 packed IDs and the answer position
+(100). Both runtimes select red with argmax ID 41. The vocabulary row
+has cosine 0.9999944 and calibrated probabilities differ by at most
+`1.87e-5`.
+All recorded vocabulary slots pass the shared profile of relative L2 at most
+0.02, cosine at least 0.999, four or more shared top-five IDs, and matching
+unambiguous argmax. The d1-2B vocabulary slots match all five top IDs.
+The Omni replay matches all 152 packed IDs and both answer positions
+(117 and 151), shares four and five top IDs respectively, and reaches
+cosine of at least 0.9999944. Calibrated probabilities differ by at
+most `3.94e-4`. Both runtimes select red for the image and one for
+the two-clip count question.
+
+The Omni audio projections have maximum absolute difference 0.00391
+and maximum relative L2 0.00737. The independent encoder comparison
+uses the same speech path as the mixed-media score replay.
+
+One of four pointer slots exceeds relative L2 of 0.02. All pointer
+argmax positions match on valid state tokens. Both paths extract
+€1234.50 and 2026-03-04 with identical source spans and presence
+scores. In the F32 replay of this same row, all pointer rows have
+relative L2 below `4.12e-6`. Replacing Python's Boolean global mask
+with explicit key ranges in a diagnostic BF16 run still leaves a
+maximum relative L2 of 0.02643 against Metal with input-dtype attention. The native BF16 pointer
+score comparison remains outside the shared profile.
+
+In the pinned Python replay, keep the BF16 decoder and compare three
+arithmetic substitutions with the default Python outputs. To isolate
+the pointer reduction, pass the same queries and state tensors to
+`pointer.position_logits` in F64 and cast its result back to F32.
+To isolate attention, force `torch.nn.attention.SDPBackend.MATH` in
+`Sees.attend` for global layers only (`window is None`) or for sliding
+layers only. Compare the same valid source positions in all cases.
+
+| Python arithmetic substitution | Maximum absolute pointer score difference | Worst pointer relative L2 |
+| --- | ---: | ---: |
+| F64 pointer dot product | 2.00e-5 | 7.06e-7 |
+| Math attention in global layers | 0.35497 | 0.02140 |
+| Math attention in sliding layers | 0.21538 | 0.01978 |
+
+All three substitutions preserve the pointer argmax positions, extracted
+values, source spans and presence scores. The global-attention substitution
+alone exceeds the shared relative L2 threshold within Python. The F64
+dot product leaves the Metal comparison with input-dtype attention at 0.02664
+relative L2 on its worst row. These results establish sensitivity to
+the BF16 decoder's attention arithmetic with the acceptance reference
+and threshold held fixed.
+
+The selected FP32 attention contract keeps scores and probabilities in
+FP32 in both attention layer kinds. All five text rows retain their
+top-five IDs and argmax against the default Python reference.
+
+The same pinned Python fixture also measures how rounding outside the
+attention reduction affects the four pointer rows. Apply each change
+independently to the BF16 reference. Compare only valid source positions.
+
+| Python arithmetic substitution | Maximum absolute pointer score difference | Worst pointer relative L2 |
+| --- | ---: | ---: |
+| Multiply the RMSNorm weight before casting the normalized activation to BF16 | 0.47817 | 0.02301 |
+| Keep rotary sine and cosine in FP32 | 0.42778 | 0.02582 |
+| Evaluate depthwise convolution in F64 and cast its result to BF16 | 0.11294 | 0.01618 |
+| Widen linear operands to FP32 and cast the result to BF16 | 0.47663 | 0.02971 |
+
+All four substitutions preserve every pointer argmax. The normalization,
+rotary, and linear substitutions each exceed the 0.02 threshold within
+the publisher's decoder. The measured reference uses the publisher's
+original rounding boundaries.
+
+To distinguish final normalization from changes that accumulate through
+the decoder, apply the same RMSNorm substitution only to
+`language_model(model).embedding_norm`, then separately to all RMSNorms
+inside the decoder blocks. Final normalization alone changes the
+pointer rows by at most 0.02847 absolute and 0.00442 relative L2.
+Changing the block norms alone raises those differences to 0.47470
+and 0.02361. Both replays preserve all four pointer argmax positions.
+
+Capture the input, gain and output of each of the 119 language RMSNorm
+calls in the pinned BF16 reference. Replay each call independently
+on Metal through the weighted RMS primitive, using the captured BF16
+input and gain with epsilon `1e-5`. Of 97,530,880 output values,
+636 differ across 35 calls, with maximum absolute error 0.015625.
+The final normalization matches exactly. The first differing call is
+the feed-forward normalization in decoder block 1 (zero-based).
+Using ordinary Metal mean and reciprocal square root with the same
+cast before applying the gain yields 723 differences across 42 calls.
+The selected eight-lane cascade reproduces every captured PyTorch
+variance at widths 128 and 2,048. On Metal, 223 outputs differ in
+two calls, all by less than `1.17e-38`. The text replay above uses
+this reduction for all language decoder norms. The BF16 media rows
+use the four-lane reduction.
+
+For the 430-token pointer fixture, form the Metal rotary tables with
+the declared full-head denominator spacing and zeroed global tail.
+Compare all 64 inverse frequencies per attention kind and the BF16
+sine and cosine tables for positions 0 through 429 against the pinned
+Python decoder. All 128 inverse frequencies and all 110,080 table
+entries match exactly.
+
+Capture the inputs, weights and outputs of the five projections in
+decoder block 2 (zero-based). Run Metal BF16 matrix multiplication
+with TF32 disabled on these exact operands. The gate matches exactly.
+The query, key, value and output projections differ in 202, 42, 84
+and 240 elements, respectively. The largest absolute difference is
+0.000977. Widening the same operands to F64 within Python and casting
+the results back to BF16 still differs from the publisher's native
+BF16 projection at 57, 4, 82 and 91 elements, respectively.
+
+Selecting the existing ordered row-major affine implementation for
+the decoder attention projections yields byte-identical final scores
+to the ordinary projection path in this replay. The projection
+comparison establishes a separate arithmetic difference on identical
+inputs. Its contribution to the remaining pointer error is unmeasured.
+
+With the eight-lane RMSNorm fixed, two released-checkpoint Metal replays
+vary global attention while preserving each query's visible keys. Using
+fused attention on FP32 operands raises the worst pointer relative L2 to
+0.02529. Keeping masked key columns in the explicit attention product
+raises it to 0.02815. The selected explicit products over visible key
+ranges measure 0.02097. All three runs return the same pointer argmax
+positions and extracted values.
+
+For the same 430-token row, replace the loaded Python short convolutions'
+`_conv` calls with the declared Eredu reduction. In FP32, put taps 0–3
+in separate lanes, accumulate taps 4–6 into lane 0, then add lanes 1–3
+to lane 0 in order and cast to BF16. Compare each result against the
+publisher's bound `_causal_depthwise` on the same input before passing
+it on. All 11,448,320 output values across 13 convolutions match
+exactly. The vocabulary and pointer score files are byte-identical
+to the default Python replay.
+
+To isolate scaling order, replace Python SDPA with explicit FP32
+query-key products, masked softmax, and value products, then cast
+the attention result to BF16. Apply the same scale either by
+multiplying both operands by its square root before the query-key
+product or by multiplying the completed product. These two executions
+use identical weights, masks, and tensor shapes. Their final pointer
+scores differ by up to 0.26043 absolute and 0.02207 relative L2.
+Against default Python SDPA, the respective worst relative L2 errors
+are 0.03006 and 0.02670. All four pointer argmax positions agree.
+
+## Published d1 GGUF header inventory
+
+The [pinned d1 GGUF inventory](../validation/fixtures/lfm3/d1-gguf-sources.json)
+records file sizes, publisher payload hashes, measured header hashes,
+and tensor counts by storage encoding. The decoder schema checks
+`general.file_type` against the matrix encoding and the F32 norm,
+convolution, and rotary tensors. The Q4_0 backbone uses a Q6_K
+embedding. The combined Omni projector checks its visual and speech
+input scopes against one strict catalog.
+
+Fetch each file's first `header_bytes` bytes from its pinned revision
+using an HTTP Range request. Save each exact prefix as
+`<file>.header`. With the two pinned SafeTensors sidecar directories,
+run the portable inventory checker.
+
+```sh
+cargo run -p eredu-architectures --example inspect_lfm3_decision_gguf_headers -- \
+  validation/fixtures/lfm3/d1-gguf-sources.json "$headers" "$d1_assets" "$omni_assets"
+```
+
+This validates container and tensor metadata and infers the canonical
+media bindings without granting access to weights. A file-size or
+header match does not establish payload integrity or numerical parity.
+
+All 14 headers pass. The checker admits all 15 d1-2B and all nine
+d1 Omni backbone/projector combinations. Each backbone resolves 286
+weight sources plus the rotary metadata tensor. The visual projector
+resolves 139 sources and the combined Omni projector resolves 315.
+
+### d1-2B Q4_0 and BF16 projector replay
+
+Both downloaded payload hashes match the inventory. The Q4_0 decoder's
+63-token billing-team replay compares all 128,000 logits at answer
+position 62 with the same pinned llama.cpp CPU runner. Relative L2 is
+`0.00386`, cosine is `0.999994`, and all five top IDs match. Both
+select billing with argmax ID 41. Maximum absolute logit and calibrated
+probability differences are `0.08074` and `0.000701`. The result meets
+the shared quantized logit profile.
+
+The same backbone with the published BF16 visual projector widened to
+F32 runs the 200-token mixed video and still-image fixture. Controlled
+and convenience evaluation agree exactly and choose blue and red,
+respectively. This validates paired execution. The same-artifact
+numerical comparison covers the text fixture.
+
+### Additional published d1 GGUF payload replays
+
+For each row below, verify both payloads against the inventory and open
+the backbone with its same-encoding projector using
+`PreparedTextChoiceModel::open_gguf`. Use resident CPU execution and
+`RecipeDtype::F32`. This widens the dense GGUF weights and uses a
+separate arithmetic path from the native BF16 replay.
+
+Use the text state “I was charged twice this month, please refund one of
+them.” and the question “Which team should handle this?” with the options
+`billing` (“Charges, refunds, invoices”), `technical` (“App or site faults”),
+and `fraud` (“Suspected unauthorised use”). Export the packed IDs from
+`TextChoicePreparation::pack` and run a fresh `Lfm3Input::Decision`.
+Compare all 128,000 logits at position 62 using the same backbone file and
+the pinned CPU reference described above. Apply the publisher's
+`prompt.readout` to the reference row with the matching calibration
+sidecar.
+
+```sh
+"$gguf_reference" "$backbone" "$scores" "$packed_ids_csv" '' cpu
+```
+
+| Checkpoint | Encoding | Maximum absolute logit difference | Relative L2 | Maximum probability difference |
+| --- | --- | ---: | ---: | ---: |
+| d1 Omni | F16 | 2.26e-5 | 3.40e-7 | 3.00e-7 |
+| d1 Omni | BF16 | 0.02371 | 0.000855 | 0.000118 |
+| d1-2B | F16 | 1.10e-5 | 3.72e-7 | 4.95e-8 |
+| d1-2B | BF16 | 0.009262 | 0.000907 | 0.000108 |
+| d1-2B | Q8_0 | 0.05542 | 0.003819 | 0.000406 |
+
+All five text comparisons pass the shared logit profile. Cosine is at
+least 0.999997, all five top IDs overlap, and both runners select
+billing with argmax ID 41. Together with the three replays above,
+the comparisons cover all eight published decision backbones. Payload
+hashes match the inventory for all eight backbones and six projectors.
+
+For the paired media replay, use the
+[d1-2B video and image fixture](../validation/fixtures/lfm3/d1-video-state.json)
+or the [d1 Omni mixed-state fixture](../validation/fixtures/lfm3/d1-omni-mixed-state.json).
+Project the media with the paired GGUF weights and evaluate both answer
+slots in a fresh decision row. The d1-2B pairs match the SafeTensors
+reference's 200 packed IDs and positions 165 and 199, and select blue
+and red. The d1 Omni pairs match the reference's 152 packed IDs and
+positions 117 and 151, and select red and one. These paired checks cover
+media projection, packing, and typed readout. The same-artifact score
+comparisons use the single-question text fixture.
+
+### Same-artifact d1 GGUF still-image scores
+
+Use the state and first question from the
+[d1 image fixture](../validation/fixtures/lfm3/d1-image-state.json).
+The fixture's solid RGB image remains 256×256 after processing and
+expands to 64 image rows. Use resident CPU execution with
+`RecipeDtype::F32` and the published Q8_0 projector for each backbone.
+On the Eredu side, export the IDs and answer position from
+`TextChoicePreparation::pack_media_decisions` and evaluate
+`Lfm3Input::Decision` with the projected image rows. The reference
+uses the same packed IDs and substitutes its own projected rows at
+image token ID 125030. Run the whole decision row in one
+`llama_process` encode call so the global layers can see the complete
+single-question set. Apply the matching publisher calibration with
+`prompt.readout` to the reference vocabulary row.
+
+Build the reference against the pinned llama.cpp CPU libraries used
+for the text replay. Pass the packed IDs as a comma-separated string.
+
+```sh
+c++ -std=c++17 -O2 -I "$llama_dir/include" -I "$llama_dir/ggml/include" \
+  -I "$llama_dir/tools/mtmd" validation/d1_media_gguf_reference.cpp \
+  -L "$llama_dir/build/bin" -Wl,-rpath,"$llama_dir/build/bin" \
+  -lmtmd -lllama -o "$d1_media_reference"
+"$d1_media_reference" "$backbone" "$projector" "$packed_ids_csv" \
+  125030 image "$output_prefix"
+```
+
+| Checkpoint | Backbone | Projection relative L2 | Slot maximum absolute error | Slot relative L2 | Maximum probability difference |
+| --- | --- | ---: | ---: | ---: | ---: |
+| d1-2B | Q4_K_M | 0.071278 | 0.124764 | 0.0060315 | 0.00021286 |
+| d1 Omni | Q8_0 | 0.067095 | 0.202198 | 0.0069086 | 0.00055187 |
+
+Both 115-token rows pass the shared logit profile at answer position
+114. Cosine is at least 0.999988, all five top IDs overlap, and both
+runtimes select red with argmax ID 41. The image projections differ
+more than the final slot scores. Projected-row cosine is 0.997457
+for d1-2B and 0.997764 for d1 Omni. The comparison covers one still
+image and one choice question per checkpoint.
+
+### Same-artifact d1 GGUF video and audio scores
+
+Use the same CPU execution, weight pairs, and reference build as the
+still-image replays. For video, use the five 96×96 frames at 2 fps
+from the [video fixture](../validation/fixtures/lfm3/d1-video-state.json),
+with the state text “This is a video.” and the first choice question.
+The reference receives the same frames in order and merges consecutive
+pairs. For audio, use 2,151 mono samples at 16 kHz with sample `i`
+equal to `((37 * i) % 997 - 498) / 1024`, starting at zero. The
+state text is “This is an audio sample.” and the question is “Which
+kind of audio is present?” with choices speech, music, and noise.
+The synthetic waveform exercises conditioning and readout.
+
+```sh
+"$d1_media_reference" "$d1_backbone" "$d1_projector" "$video_ids_csv" \
+  125029 video "$video_output_prefix"
+"$d1_media_reference" "$omni_backbone" "$omni_projector" "$audio_ids_csv" \
+  125031 audio "$audio_output_prefix"
+```
+
+| Checkpoint and input | Packed tokens / answer position | Projected rows | Projection relative L2 | Slot maximum absolute error | Slot relative L2 | Maximum probability difference |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| d1-2B Q4_K_M video | 95 / 94 | 27 | 0.023495 | 0.150856 | 0.007836 | 0.00000304 |
+| d1 Omni Q8_0 audio | 48 / 47 | 2 | 0.014610 | 0.249479 | 0.004907 | 0.008623 |
+
+Both full-vocabulary answer rows pass the shared logit profile.
+Cosine is at least 0.999969, and all five top IDs overlap. Both
+runtimes have argmax ID 43 and select blue for video and noise for
+audio. The five-frame clip yields three groups of nine projected
+rows, including the incomplete final pair.

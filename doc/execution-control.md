@@ -316,6 +316,34 @@ in the same order. This uses the same output decoder as the resident
 facade. The native `MlxPipelineAudioSession::advance` exposes individual
 text decisions and depth passes for callers that drive the rank cohort.
 
+The Rust d1 decision facade advances one complete packed question row
+per `DecisionSession::advance` call. The model uses fresh language state for
+each row and returns calibrated answers only after every row completes.
+Cancelling between rows drops the unpublished answers and remaining inputs.
+The session exposes no autoregressive decode, and its generated-token
+usage is zero.
+For d1 Omni, `start_with_media` prepares ordered visual and audio inputs
+before the first row. The session owns and reuses their projected rows
+across packed question sets. With `start_with_spoken_questions`, each
+row also retains the audio projections for its own spoken instructions.
+Cancelling the session releases shared and question-local projections.
+
+`TextChoiceModel::load_distributed` uses `DecisionDistribution` to
+select the Ring topology, maximum packed row length, and per-component
+weight residency. Retained media encoders are replicated. All ranks
+submit the same request and advance in lockstep. The controlled driver
+agrees request preparation, row preparation, and readout status before
+continuing. It agrees the complete calibrated answer set before
+publishing it. A cancellation requested by any rank settles at the
+next collective `advance`, after which every session is finished and
+no answers are delivered.
+
+The native pipeline adapter processes each d1 row as one invocation.
+Ranks agree token IDs, question boundaries, slot geometry, and projected
+media before the first stage runs. A rejected preparation publishes no
+scores and keeps the prior state. The final stage returns only the
+answer-slot scores after the shared all-rank commit.
+
 The shared realtime loader retains the selected MLX parameter policies before
 the caller starts a prompt. The Rust API accepts independent resident,
 host-layerwise or disk-streamed policies for all Audio components. Each

@@ -344,7 +344,7 @@ pub(crate) fn weightless_rms(
     } else {
         input.clone()
     };
-    let normalized = match f32_weightless_rms(&wide, epsilon, stream)? {
+    let normalized = match f32_weightless_rms(&wide, epsilon, 4, stream)? {
         Some(output) => output,
         None => {
             let variance = wide.square(stream)?.mean_axis(-1, true, stream)?;
@@ -379,9 +379,10 @@ pub(crate) fn input_precision_rms(
     safemlx::fast::rms_norm(input, weight, epsilon, stream)
 }
 
-pub(crate) fn f32_weightless_rms(
+fn f32_weightless_rms(
     input: &Array,
     epsilon: f32,
+    lanes: i32,
     stream: &Stream,
 ) -> Result<Option<Array>, Exception> {
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
@@ -405,6 +406,7 @@ pub(crate) fn f32_weightless_rms(
         let epsilon = Array::from_slice(&[epsilon], &[1]);
         let config = CustomKernelConfig::new()
             .with_template_arg_int("WIDTH", width)
+            .with_template_arg_int("LANES", lanes)
             .with_grid([rows, 1, 1])
             .with_thread_group([32, 1, 1])
             .with_template_arg_int("ROWS", rows)
@@ -418,7 +420,7 @@ pub(crate) fn f32_weightless_rms(
                         ["output"],
                         concat!("uint row = thread_position_in_grid.x; if (row >= ROWS) return;",
                         "size_t base = size_t(row) * WIDTH;",
-                        "float variance = cascade_sum_f32(squared + base, WIDTH) / float(WIDTH);",
+                        "float variance = cascade_sum_f32<LANES,4>(squared + base, WIDTH) / float(WIDTH);",
                         "float inverse = 1.0f / metal::precise::sqrt(variance + epsilon[0]);",
                         "for (uint i=0; i<WIDTH; ++i) output[base+i] = input[base+i] * inverse;"),
                         include_str!("rms_cascade.metal"),
@@ -435,7 +437,7 @@ pub(crate) fn f32_weightless_rms(
     }
     #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
     {
-        let _ = (input, epsilon, stream);
+        let _ = (input, epsilon, lanes, stream);
         Ok(None)
     }
 }
@@ -581,20 +583,20 @@ pub(crate) fn f32_sum_last(input: &Array, stream: &Stream) -> Result<Option<Arra
 
 // Four vector lanes and four independent accumulation chains, with the same
 // four-level carry and scalar-tail merge as rms_cascade.metal.
-fn contiguous_sum_squares(values: &[f32]) -> f32 {
-    let vectors = values.len() / 4;
+fn contiguous_sum_squares<const LANES: usize>(values: &[f32]) -> f32 {
+    let vectors = values.len() / LANES;
     let steps = vectors / 4;
     let log = usize::BITS as usize - steps.saturating_sub(1).leading_zeros() as usize;
     let power = 4.max(log / 4);
     let chunk = 1usize << power;
-    let mut sums = [[[0.0_f32; 4]; 4]; 4];
+    let mut sums = [[[0.0_f32; LANES]; 4]; 4];
     let mut index = 0;
     while index + chunk <= steps {
         let end = index + chunk;
         while index < end {
             for p in 0..4 {
-                for lane in 0..4 {
-                    let value = values[(index * 4 + p) * 4 + lane];
+                for lane in 0..LANES {
+                    let value = values[(index * 4 + p) * LANES + lane];
                     sums[0][p][lane] += value * value;
                 }
             }
@@ -602,7 +604,7 @@ fn contiguous_sum_squares(values: &[f32]) -> f32 {
         }
         for level in 1..4 {
             for p in 0..4 {
-                for lane in 0..4 {
+                for lane in 0..LANES {
                     sums[level][p][lane] += sums[level - 1][p][lane];
                     sums[level - 1][p][lane] = 0.0;
                 }
@@ -614,8 +616,8 @@ fn contiguous_sum_squares(values: &[f32]) -> f32 {
     }
     while index < steps {
         for p in 0..4 {
-            for lane in 0..4 {
-                let value = values[(index * 4 + p) * 4 + lane];
+            for lane in 0..LANES {
+                let value = values[(index * 4 + p) * LANES + lane];
                 sums[0][p][lane] += value * value;
             }
         }
@@ -623,27 +625,27 @@ fn contiguous_sum_squares(values: &[f32]) -> f32 {
     }
     for level in 1..4 {
         for p in 0..4 {
-            for lane in 0..4 {
+            for lane in 0..LANES {
                 sums[0][p][lane] += sums[level][p][lane];
             }
         }
     }
     for vector in steps * 4..vectors {
-        for lane in 0..4 {
-            let value = values[vector * 4 + lane];
+        for lane in 0..LANES {
+            let value = values[vector * LANES + lane];
             sums[0][0][lane] += value * value;
         }
     }
     for p in 1..4 {
-        for lane in 0..4 {
+        for lane in 0..LANES {
             sums[0][0][lane] += sums[0][p][lane];
         }
     }
     let mut sum = 0.0_f32;
-    for &value in &values[vectors * 4..] {
+    for &value in &values[vectors * LANES..] {
         sum += value * value;
     }
-    for lane in 0..4 {
+    for lane in 0..LANES {
         sum += sums[0][0][lane];
     }
     sum
@@ -692,7 +694,7 @@ pub(crate) fn cascaded_rms(
     let weight = weight.as_ref().map(|value| value.as_slice::<f32>());
     let mut output = Vec::with_capacity(input.size());
     for row in wide.as_slice::<f32>().chunks_exact(width as usize) {
-        let variance = contiguous_sum_squares(row) / width as f32;
+        let variance = contiguous_sum_squares::<4>(row) / width as f32;
         let inverse = 1.0_f32 / (variance + epsilon).sqrt();
         for (column, &value) in row.iter().enumerate() {
             let normalized = value * inverse;
@@ -703,4 +705,34 @@ pub(crate) fn cascaded_rms(
         }
     }
     Array::from_slice(&output, input.shape()).as_dtype(input.dtype(), stream)
+}
+
+pub(crate) fn eight_lane_rms(
+    input: &Array,
+    weight: Option<&Array>,
+    epsilon: f32,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    use safemlx::{Device, DeviceType, Dtype};
+
+    let wide = input.as_dtype(Dtype::Float32, stream)?;
+    let normalized = if let Some(output) = f32_weightless_rms(&wide, epsilon, 8, stream)? {
+        output
+    } else {
+        let cpu = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        let values = wide.copy(&cpu)?.contiguous(false, &cpu)?.into_evaluated()?;
+        let width = input.dim(-1) as usize;
+        let mut output = Vec::with_capacity(input.size());
+        for row in values.as_slice::<f32>().chunks_exact(width) {
+            let variance = contiguous_sum_squares::<8>(row) / width as f32;
+            let inverse = 1.0_f32 / (variance + epsilon).sqrt();
+            output.extend(row.iter().map(|value| value * inverse));
+        }
+        Array::from_slice(&output, input.shape())
+    };
+    let normalized = normalized.as_dtype(input.dtype(), stream)?;
+    match weight {
+        Some(gain) => normalized.multiply(gain, stream),
+        None => Ok(normalized),
+    }
 }

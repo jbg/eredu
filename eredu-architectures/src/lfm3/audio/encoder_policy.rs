@@ -74,6 +74,60 @@ impl PreparedAudioEncoder {
         })
     }
 
+    pub(in crate::lfm3) fn from_safetensors(
+        declaration: Declaration,
+        resolution: &eredu_checkpoint::validation::ResolvedCheckpointPlan,
+        source: SharedCheckpointSource,
+        dtype: eredu_checkpoint::recipe::RecipeDtype,
+    ) -> Result<Self, Error> {
+        use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::TensorSelection};
+
+        let mut aliases = declaration.safetensors_recipes(resolution)?;
+        let recipes = declaration
+            .logical_parameters()?
+            .into_iter()
+            .map(|parameter| {
+                let name = parameter.parameter.id.to_string();
+                let input = aliases
+                    .remove(&name)
+                    .unwrap_or_else(|| DerivedWeightRecipe::source(&name, TensorSelection::Full));
+                (name, input)
+            })
+            .collect();
+        Self::from_recipes(declaration, source, resolution.identity(), recipes, dtype)
+    }
+
+    pub(in crate::lfm3) fn from_recipes(
+        declaration: Declaration,
+        source: SharedCheckpointSource,
+        scope: &str,
+        recipes: std::collections::BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
+        dtype: eredu_checkpoint::recipe::RecipeDtype,
+    ) -> Result<Self, Error> {
+        use eredu_checkpoint::recipe::DerivedWeightRecipe;
+
+        let recipes = recipes
+            .into_iter()
+            .map(|(name, input)| {
+                (
+                    name,
+                    DerivedWeightRecipe::Cast {
+                        input: Box::new(input),
+                        dtype: dtype.clone(),
+                    },
+                )
+            })
+            .collect();
+        let weights =
+            BindingSource::from_recipes(source, scope, recipes).map_err(Error::backend_source)?;
+        Self::new(declaration, &weights).map_err(Error::backend_source)
+    }
+
+    /// Cache layout for one independent clip.
+    pub fn state_layout(&self) -> &eredu_runtime::StateLayout {
+        self.declaration.state_layout()
+    }
+
     /// Returns the neutral unit constructor and exact retained policy inputs.
     pub fn into_parts(
         self,
