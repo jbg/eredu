@@ -70,6 +70,7 @@ fn prepare_unit(
     source: &BindingSource,
     unit: AudioWeightUnit,
     parameters: Vec<LogicalParameterDeclaration<'_>>,
+    dtype: RecipeDtype,
 ) -> Result<PreparedAudioWeightUnit, ArtifactError> {
     let mut recipes = BTreeMap::new();
     let mut bytes = 0;
@@ -91,7 +92,7 @@ fn prepare_unit(
                 .cloned()
                 .unwrap_or_else(|| DerivedWeightRecipe::source(name, TensorSelection::Full));
             let recipe =
-                crate::lfm3::checkpoint::language_storage_recipe(&member, input, RecipeDtype::F32);
+                crate::lfm3::checkpoint::language_storage_recipe(&member, input, dtype.clone());
             let metadata = recipe.infer(source.source().as_ref()).map_err(checkpoint)?;
             if metadata.shape() != member.global_shape() {
                 return Err(checkpoint(format!(
@@ -128,16 +129,19 @@ impl PreparedAudio {
     pub(super) fn weight_scopes(&self) -> Result<[WeightScope<'_>; 4], ArtifactError> {
         let statics = &self.language.statics;
         let language = &self.language_weights;
+        let dtype = &self.neural_weight_dtype;
         let mut language_units = vec![prepare_unit(
             language,
             AudioWeightUnit::LanguageEmbedding,
             statics.embedding_spec().logical_parameters()?,
+            dtype.clone(),
         )?];
         for (layer, block) in self.language.blocks.iter().enumerate() {
             language_units.push(prepare_unit(
                 language,
                 AudioWeightUnit::LanguageBlock(layer),
                 block.logical_parameters()?,
+                dtype.clone(),
             )?);
         }
         let mut output = statics.normalization_spec().logical_parameters()?;
@@ -148,6 +152,7 @@ impl PreparedAudio {
             language,
             AudioWeightUnit::LanguageOutput,
             output,
+            dtype.clone(),
         )?);
         Ok([
             WeightScope {
@@ -164,6 +169,7 @@ impl PreparedAudio {
                             &self.encoder_weights,
                             AudioWeightUnit::Encoder(unit),
                             self.encoder.unit_parameters(unit)?,
+                            dtype.clone(),
                         )
                     })
                     .collect::<Result<_, _>>()?,
@@ -178,6 +184,7 @@ impl PreparedAudio {
                             &self.depth_weights,
                             AudioWeightUnit::Depth(unit),
                             self.depth.unit_parameters(unit)?,
+                            dtype.clone(),
                         )
                     })
                     .collect::<Result<_, _>>()?,
@@ -192,6 +199,7 @@ impl PreparedAudio {
                             &self.codec_weights,
                             AudioWeightUnit::Codec(unit),
                             self.codec.decoder_unit_parameters(unit)?,
+                            RecipeDtype::F32,
                         )
                     })
                     .collect::<Result<_, _>>()?,

@@ -30,6 +30,7 @@ pub(super) enum Operation<'a, T> {
     Block(&'a T),
     Normalize(&'a T),
     Score(&'a T, usize),
+    SkipScore(&'a T),
     Feedback(&'a T),
 }
 
@@ -43,6 +44,7 @@ impl<'a, T> Operation<'a, T> {
             | Self::Block(value)
             | Self::Normalize(value)
             | Self::Score(value, _)
+            | Self::SkipScore(value)
             | Self::Feedback(value) => [Some(value), None, None],
         }
         .into_iter()
@@ -129,6 +131,7 @@ impl<B: NeuralBackend> DepthModule<B> {
                     .cast_float(dtype, context)?;
                 book.table.as_linear(&slot, context)
             }
+            (Module::Codebook(_), Operation::SkipScore(depth)) => Ok((*depth).clone()),
             (Module::Feedback(module), Operation::Feedback(codes)) => module.embed(codes, context),
             _ => Err(invalid("speech output module differs from its invocation")),
         }
@@ -163,6 +166,8 @@ pub(super) fn scores<B: NeuralBackend>(
     hidden: &B::Tensor,
     codes: &B::Tensor,
     masked: &B::Tensor,
+    slots: &[usize],
+    retain_score_traversal: bool,
     context: &<B::Tensor as Tensor>::Context,
     mut apply: impl FnMut(usize, Operation<'_, B::Tensor>) -> Result<B::Tensor, Error>,
 ) -> Result<B::Tensor, Error> {
@@ -188,9 +193,18 @@ pub(super) fn scores<B: NeuralBackend>(
         depth = apply(i, Operation::Block(&depth))?;
     }
     let depth = apply(norm, Operation::Normalize(&depth))?;
-    let logits = (0..books)
-        .map(|i| apply(norm + 1 + i, Operation::Score(&depth, i)))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut logits = vec![None; slots.len()];
+    for i in 0..books {
+        if let Some(row) = slots.iter().position(|&slot| slot == i) {
+            logits[row] = Some(apply(norm + 1 + i, Operation::Score(&depth, i))?);
+        } else if retain_score_traversal {
+            apply(norm + 1 + i, Operation::SkipScore(&depth))?;
+        }
+    }
+    let logits = logits
+        .into_iter()
+        .map(|row| row.expect("declared codebook was projected"))
+        .collect::<Vec<_>>();
     B::Tensor::stack(&logits, 1, context)
 }
 
@@ -272,7 +286,7 @@ impl PreparedAudioDepth {
 
 /// Speech output operations used by the controlled Audio driver.
 pub trait AudioDepth<B: NeuralBackend> {
-    /// Scores the next complete bidirectional refinement pass.
+    /// Scores the next pass's reveal slots, in reveal order, over full bidirectional context.
     fn score_frame(
         &mut self,
         hidden: &B::Tensor,
@@ -366,22 +380,39 @@ where
     ) -> Result<B::Tensor, Error> {
         let d = &self.declaration;
         let (codes, masked) = d.frame_inputs(frame, context)?;
+        let (_, slots) = frame.next_pass().expect("validated depth frame");
         let units = d.units().collect::<Vec<_>>();
-        let mut addresses = self.invocations.logical_addresses().enumerate();
+        let addresses = self.invocations.logical_addresses().collect::<Vec<_>>();
+        let trunk = d.blocks.len() + 2;
+        let books = d.codebooks.len();
+        // Bounded policies consume the retained transfer sequence in order.
+        let retain_score_traversal = !self.policy.resident_parameters_available();
         let mut execution = LayerwisePolicyForward::begin(&mut self.policy, hidden, context)
             .map_err(Error::backend_source)?;
-        let output = scores::<B>(d, hidden, &codes, &masked, context, |owner, operation| {
-            let (ordinal, address) = addresses.next().expect("declared depth invocation");
-            invoke(
-                d,
-                &mut execution,
-                ordinal,
-                address,
-                units[owner],
-                operation,
-                context,
-            )
-        })?;
+        let output = scores::<B>(
+            d,
+            hidden,
+            &codes,
+            &masked,
+            slots,
+            retain_score_traversal,
+            context,
+            |owner, operation| {
+                let ordinal = match operation {
+                    Operation::Embed(..) => owner - trunk,
+                    _ => books + owner,
+                };
+                invoke(
+                    d,
+                    &mut execution,
+                    ordinal,
+                    addresses[ordinal],
+                    units[owner],
+                    operation,
+                    context,
+                )
+            },
+        )?;
         execution.finish(&output).map_err(Error::backend_source)?;
         Ok(output)
     }

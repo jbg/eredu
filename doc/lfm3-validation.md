@@ -1017,8 +1017,10 @@ below.
 
 The same pinned SafeTensors case can bind the encoder, projector, backbone,
 feedback and depth decoder as BF16, keeping the mel frontend and LiquidCodec
-in F32. This is a reference-runner precision mode. The selected Audio runtime
-uses F32 widening. Depth score comparisons feed the publisher's preceding
+in F32. The Audio runtime uses F32 by default. Call
+`PreparedAudio::with_bf16_weights()` before runtime selection to use BF16 for
+dense neural weights while keeping LiquidCodec in F32. Depth score
+comparisons feed the publisher's preceding
 reveals to both implementations. The PCM and subsequent feedback comparisons
 also use the publisher's codes.
 

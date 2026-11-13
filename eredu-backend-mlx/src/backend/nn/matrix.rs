@@ -154,6 +154,7 @@ pub(crate) fn bf16_row_projection(
         BatchedDotReduction::Native,
         None,
         stream,
+        groups.is_none(),
     )
 }
 
@@ -209,6 +210,7 @@ fn ordered_bf16_affine(
             BatchedDotReduction::Native,
             contiguous_bias.as_ref(),
             stream,
+            false,
         )? {
             return Ok(Some(output));
         }
@@ -301,6 +303,7 @@ fn bf16_projection(
     reduction: BatchedDotReduction,
     bias: Option<&Array>,
     stream: &Stream,
+    tile_rows: bool,
 ) -> Result<Option<Array>, Exception> {
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
     {
@@ -322,6 +325,7 @@ fn bf16_projection(
             return Ok(None);
         }
         let rows = input.size() / width as usize;
+        let tile_rows = tile_rows && rows > 1;
         let outputs = weight.dim(-2);
         if rows == 0 {
             return Ok(None);
@@ -371,10 +375,14 @@ fn bf16_projection(
             )
             .with_template_arg_int("OUTPUTS", outputs)
             .with_template_arg_int("GROUPED", i32::from(groups.is_some()))
-            // Schedule adjacent input rows against the same weight row. This
-            // reuses weights across prefill rows without changing any dot's
-            // accumulation order or output layout.
-            .with_grid([32, rows, outputs])
+            // Each lane reuses one weight load across four independent dots.
+            .with_template_arg_int("TILE_ROWS", i32::from(tile_rows))
+            .with_template_arg_int("ROWS", if tile_rows { rows } else { 0 })
+            .with_grid([
+                32,
+                if tile_rows { (rows - 1) / 4 + 1 } else { rows },
+                outputs,
+            ])
             .with_thread_group([32, 1, 1])
             .with_output_arg([rows, outputs], Dtype::Bfloat16);
         let mut output = KERNEL.with(|cell| -> Result<Vec<Array>, Exception> {
@@ -387,6 +395,39 @@ fn bf16_projection(
                         "uint row = thread_position_in_grid.y;",
                         "uint group = GROUPED ? uint(groups[row]) : 0;",
                         "size_t base = (size_t(group) * OUTPUTS + col) * WIDTH;",
+                        "if (TILE_ROWS) {",
+                        " row *= 4;",
+                        " float a=0.0f, b=0.0f, c=0.0f, d=0.0f;",
+                        " for (uint k=lane; k<WIDTH; k+=32) {",
+                        "   float w=float(weight[base+k]);",
+                        "   a += float(input[size_t(row+0)*WIDTH+k])*w;",
+                        "   if(row+1<ROWS) b += float(input[size_t(row+1)*WIDTH+k])*w;",
+                        "   if(row+2<ROWS) c += float(input[size_t(row+2)*WIDTH+k])*w;",
+                        "   if(row+3<ROWS) d += float(input[size_t(row+3)*WIDTH+k])*w;",
+                        " }",
+                        " a += simd_shuffle_down(a,16);",
+                        " a += simd_shuffle_down(a,8);",
+                        " a += simd_shuffle_down(a,4);",
+                        " float a1=simd_shuffle(a,1), a2=simd_shuffle(a,2), a3=simd_shuffle(a,3);",
+                        " b += simd_shuffle_down(b,16);",
+                        " b += simd_shuffle_down(b,8);",
+                        " b += simd_shuffle_down(b,4);",
+                        " float b1=simd_shuffle(b,1), b2=simd_shuffle(b,2), b3=simd_shuffle(b,3);",
+                        " c += simd_shuffle_down(c,16);",
+                        " c += simd_shuffle_down(c,8);",
+                        " c += simd_shuffle_down(c,4);",
+                        " float c1=simd_shuffle(c,1), c2=simd_shuffle(c,2), c3=simd_shuffle(c,3);",
+                        " d += simd_shuffle_down(d,16);",
+                        " d += simd_shuffle_down(d,8);",
+                        " d += simd_shuffle_down(d,4);",
+                        " float d1=simd_shuffle(d,1), d2=simd_shuffle(d,2), d3=simd_shuffle(d,3);",
+                        " if(lane==0) {",
+                        "   output[size_t(row+0)*OUTPUTS+col]=bfloat16_t((a+a1)+(a2+a3));",
+                        "   if(row+1<ROWS) output[size_t(row+1)*OUTPUTS+col]=bfloat16_t((b+b1)+(b2+b3));",
+                        "   if(row+2<ROWS) output[size_t(row+2)*OUTPUTS+col]=bfloat16_t((c+c1)+(c2+c3));",
+                        "   if(row+3<ROWS) output[size_t(row+3)*OUTPUTS+col]=bfloat16_t((d+d1)+(d2+d3));",
+                        " } return;",
+                        "}",
                         "float sum = 0.0f;",
                         "if (SEQUENTIAL) { if(lane==0) { for(uint k=0;k<WIDTH;++k) sum+=float(input[size_t(row)*WIDTH+k])*float(weight[base+k]); output[size_t(row)*OUTPUTS+col]=bfloat16_t(BIAS ? sum + float(bias[col]) : sum); } return; }",
                         "if (COLUMNS) {",
@@ -421,7 +462,9 @@ fn bf16_projection(
     }
     #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
     {
-        let _ = (input, weight, groups, columns, reduction, bias, stream);
+        let _ = (
+            input, weight, groups, columns, reduction, bias, stream, tile_rows,
+        );
         Ok(None)
     }
 }
@@ -509,6 +552,7 @@ impl PreparedBf16BatchedProduct {
             self.reduction,
             None,
             stream,
+            false,
         )?
         .map(|output| output.reshape(&[self.batch, heads, rows, self.outputs], stream))
         .transpose()
