@@ -1,7 +1,5 @@
 //! MLX checkpoint materialization after backend-neutral planning.
 
-use std::sync::Arc;
-
 use eredu_architectures::{
     prepared_sources::{prepare_model_sources, PreparedModelSources},
     processor_plan::ArtifactArchitecturePlan,

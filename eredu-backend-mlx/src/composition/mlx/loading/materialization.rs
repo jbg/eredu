@@ -1,3 +1,6 @@
+#[cfg(feature = "distributed")]
+use std::sync::Arc;
+
 use super::super::replicated_text as binding;
 use super::*;
 use crate::backend::{
@@ -5,10 +8,14 @@ use crate::backend::{
     runtime::cache::state::{MlxHybridState, MlxPoolingAttentionState},
 };
 use eredu_architectures::prepared_execution::{
-    construct_prepared_execution, CompositeRoute, PartitionedCompositeRoute, PartitionedDenseRoute,
-    PartitionedRoutedRoute, PredictionBinding, PreparedExecutableAssembler,
-    PreparedExecutableParts, PreparedExecutionError, PreparedExecutionRoutes,
-    PreparedPartitionPredictionResources, PreparedPartitionResources, ReplicatedRoute, RoutedRoute,
+    construct_prepared_execution, CompositeRoute, PredictionBinding, PreparedExecutableAssembler,
+    PreparedExecutableParts, PreparedExecutionError, PreparedExecutionRoutes, ReplicatedRoute,
+    RoutedRoute,
+};
+#[cfg(feature = "distributed")]
+use eredu_architectures::prepared_execution::{
+    PartitionedCompositeRoute, PartitionedDenseRoute, PartitionedRoutedRoute,
+    PreparedPartitionPredictionResources, PreparedPartitionResources,
 };
 
 pub(crate) fn materialize_model_plan(
@@ -37,6 +44,7 @@ pub(crate) fn materialize_model_plan(
         selected: facts.selected().clone(),
         capability: facts.capability().clone(),
     };
+    #[cfg(feature = "distributed")]
     let partition_prediction_visitor =
         |facts: PreparedPartitionPredictionResources<MlxDistributedSession>| {
             binding::PartitionedPredictionBindingVisitor {
@@ -114,7 +122,9 @@ pub(crate) fn materialize_model_plan(
                 materialize,
                 prediction_visitor,
             ),
-        )
+        );
+    #[cfg(feature = "distributed")]
+    let routes = routes
         .with_partitioned_dense(
             PartitionedDenseRoute::<MlxNeuralBackend, MlxHybridState, _>::new(
                 stream,

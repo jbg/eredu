@@ -1,3 +1,4 @@
+use super::super::composite::CompositeExecutableFinalizer;
 use super::super::*;
 
 pub(crate) struct PartitionedCompositeBindingVisitor<'a> {
@@ -5,105 +6,6 @@ pub(crate) struct PartitionedCompositeBindingVisitor<'a> {
     pub(in crate::composition::mlx) distributed: crate::backend::distributed::MlxDistributedSession,
     pub(in crate::composition::mlx) stream: &'a Stream,
     pub(in crate::composition::mlx) weights_stream: &'a Stream,
-}
-
-pub(crate) trait CompositeExecutableFinalizer<A>
-where
-    A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error> + 'static,
-    A::InputPartPlan: 'static,
-    A::AdmissionConfig: 'static,
-    A::Error: std::fmt::Display,
-{
-    fn prediction_residency(
-        &mut self,
-    ) -> Result<
-        crate::composition::mlx::replicated_text::prediction::parameters::PredictionResidency,
-        Error,
-    > {
-        Ok(Default::default())
-    }
-
-    fn finish<D>(
-        self,
-        completed: CompletedComposite<A, D>,
-    ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
-    where
-        D: eredu_runtime::ReplicatedTextExecutionStrategy<
-                A,
-                MlxNeuralBackend,
-                MlxHybridState,
-                MlxArchitectureLayerwisePolicy<A, MlxHybridState>,
-                MlxArchitectureLayerwisePolicy<A, MlxHybridState>,
-            > + MlxParameterBankTelemetry
-            + 'static;
-}
-
-impl<A> CompositeExecutableFinalizer<A> for OrdinaryReplicatedFinalizer
-where
-    A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error> + 'static,
-    A::InputPartPlan: 'static,
-    A::AdmissionConfig: 'static,
-    A::Error: std::fmt::Display,
-{
-    fn finish<D>(
-        self,
-        completed: CompletedComposite<A, D>,
-    ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
-    where
-        D: eredu_runtime::ReplicatedTextExecutionStrategy<
-                A,
-                MlxNeuralBackend,
-                MlxHybridState,
-                MlxArchitectureLayerwisePolicy<A, MlxHybridState>,
-                MlxArchitectureLayerwisePolicy<A, MlxHybridState>,
-            > + MlxParameterBankTelemetry
-            + 'static,
-    {
-        Ok(Box::new(completed))
-    }
-}
-
-impl<A, P> CompositeExecutableFinalizer<A> for PredictionReplicatedFinalizer<P>
-where
-    A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error> + 'static,
-    A::InputPartPlan: 'static,
-    A::AdmissionConfig: 'static,
-    A::Error: std::fmt::Display,
-    P: eredu_architectures::prediction_extension::MaterializedPredictionExecutor<
-            A,
-            MlxNeuralBackend,
-            MlxEmbeddedPredictionMaterializer,
-        > + 'static,
-{
-    fn prediction_residency(
-        &mut self,
-    ) -> Result<
-        crate::composition::mlx::replicated_text::prediction::parameters::PredictionResidency,
-        Error,
-    > {
-        crate::composition::mlx::replicated_text::prediction::parameters::residency::<A, P>(
-            &mut self.prediction.extension,
-        )
-    }
-
-    fn finish<D>(
-        self,
-        completed: CompletedComposite<A, D>,
-    ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
-    where
-        D: eredu_runtime::ReplicatedTextExecutionStrategy<
-                A,
-                MlxNeuralBackend,
-                MlxHybridState,
-                MlxArchitectureLayerwisePolicy<A, MlxHybridState>,
-                MlxArchitectureLayerwisePolicy<A, MlxHybridState>,
-            > + MlxParameterBankTelemetry
-            + 'static,
-    {
-        completed
-            .with_prediction(self.prediction, self.capability)
-            .map(|completed| Box::new(completed) as Box<dyn ErasedReplicatedTextExecutable>)
-    }
 }
 
 impl

@@ -1,15 +1,18 @@
 use super::*;
 
 mod composite;
+#[cfg(feature = "distributed")]
 mod partitioned;
 mod routed;
 
 pub(crate) use composite::CompositeBindingVisitor;
+#[cfg(feature = "distributed")]
 pub(crate) use partitioned::{
     PartitionedCompositeBindingVisitor, PartitionedCompositePredictionBindingVisitor,
     PartitionedDenseDecoderBindingVisitor, PartitionedPoolingRoutedDecoderBindingVisitor,
     PartitionedPredictionBindingVisitor, PartitionedRoutedDecoderBindingVisitor,
 };
+#[cfg(feature = "distributed")]
 use routed::selected_addressable_partition_bank;
 pub(in crate::composition::mlx) use routed::{
     PoolingRoutedBindingVisitor, Relu2RoutedBindingVisitor, RoutedBindingVisitor,
