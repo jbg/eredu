@@ -27,7 +27,7 @@ pub enum AudioWeightUnit {
     Codec(DecoderUnit),
 }
 
-/// One F32 parameter unit prepared from its retained checkpoint source.
+/// One parameter unit prepared from its retained checkpoint source.
 pub struct PreparedAudioWeightUnit {
     /// Semantic parameter owner.
     pub unit: AudioWeightUnit,
@@ -74,29 +74,39 @@ fn prepare_unit(
     let mut recipes = BTreeMap::new();
     let mut bytes = 0;
     for parameter in parameters {
-        let name = parameter.parameter.id.to_string();
-        let input = source
-            .recipes()
-            .get(&name)
-            .cloned()
-            .unwrap_or_else(|| DerivedWeightRecipe::source(&name, TensorSelection::Full));
-        let recipe = DerivedWeightRecipe::Cast {
-            input: Box::new(input),
-            dtype: RecipeDtype::F32,
+        let member = eredu_runtime::ParameterMemberSpec::from_logical_declaration(
+            &parameter,
+            eredu_runtime::MemberSharding::Replicated,
+        );
+        let members = if let Some(format) = parameter.linear_format {
+            eredu_runtime::expand_linear_format_parameter(&member, format).map_err(checkpoint)?
+        } else {
+            vec![member]
         };
-        let metadata = recipe.infer(source.source().as_ref()).map_err(checkpoint)?;
-        if metadata.shape != parameter.shape {
-            return Err(checkpoint(format!(
-                "Audio parameter {name} has shape {:?}, expected {:?}",
-                metadata.shape, parameter.shape,
-            )));
+        for member in members {
+            let name = member.target();
+            let input = source
+                .recipes()
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| DerivedWeightRecipe::source(name, TensorSelection::Full));
+            let recipe =
+                crate::lfm3::checkpoint::language_storage_recipe(&member, input, RecipeDtype::F32);
+            let metadata = recipe.infer(source.source().as_ref()).map_err(checkpoint)?;
+            if metadata.shape() != member.global_shape() {
+                return Err(checkpoint(format!(
+                    "Audio parameter {name} has shape {:?}, expected {:?}",
+                    metadata.shape(),
+                    member.global_shape(),
+                )));
+            }
+            if recipes.insert(name.to_owned(), recipe).is_some() {
+                return Err(checkpoint(format!(
+                    "Audio parameter {name} is duplicated in {unit:?}"
+                )));
+            }
+            bytes = add_bytes(bytes, metadata.byte_len())?;
         }
-        if recipes.insert(name.clone(), recipe).is_some() {
-            return Err(checkpoint(format!(
-                "Audio parameter {name} is duplicated in {unit:?}"
-            )));
-        }
-        bytes = add_bytes(bytes, metadata.byte_len)?;
     }
     Ok(PreparedAudioWeightUnit {
         unit,
@@ -107,15 +117,15 @@ fn prepare_unit(
 
 impl PreparedAudio {
     /// Prepares exact independent parameter sources without reading tensor payloads.
-    pub fn prepare_f32_weight_units(&self) -> Result<Vec<PreparedAudioWeightUnit>, ArtifactError> {
+    pub fn prepare_weight_units(&self) -> Result<Vec<PreparedAudioWeightUnit>, ArtifactError> {
         Ok(self
-            .f32_weight_scopes()?
+            .weight_scopes()?
             .into_iter()
             .flat_map(|scope| scope.units)
             .collect())
     }
 
-    pub(super) fn f32_weight_scopes(&self) -> Result<[WeightScope<'_>; 4], ArtifactError> {
+    pub(super) fn weight_scopes(&self) -> Result<[WeightScope<'_>; 4], ArtifactError> {
         let statics = &self.language.statics;
         let language = &self.language_weights;
         let mut language_units = vec![prepare_unit(
@@ -264,8 +274,17 @@ pub(super) fn prepare_audio_units<'a>(
         .map(|(ordinal, parameters)| {
             let outputs = parameters?
                 .into_iter()
+                .flat_map(|parameter| {
+                    std::iter::once(parameter.parameter).chain(
+                        parameter.linear_format.into_iter().flat_map(|format| {
+                            [format.scale(), format.affine_bias(), format.global_scale()]
+                                .into_iter()
+                                .flatten()
+                        }),
+                    )
+                })
                 .map(|parameter| {
-                    let name = parameter.parameter.id.to_string();
+                    let name = parameter.id.to_string();
                     let recipe = weights.recipes().get(&name).cloned().ok_or_else(|| {
                         checkpoint(format!("missing prepared {scope} parameter {name}"))
                     })?;

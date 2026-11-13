@@ -174,6 +174,9 @@ impl NormalizedLoadRequest {
             .with_prompt_cache_persistence(plan.prompt_cache_persistence())
             .with_drafting_plan(plan.drafting())?
             .with_media_companions(plan.media_companions().clone());
+        if let Some(policy) = plan.prepared_checkpoint_cache() {
+            request = request.with_prepared_checkpoint_cache(policy.clone());
+        }
         if let Some(state) = plan.paged_state() {
             let options = crate::PagedCacheOptions::new(
                 state.block_size_tokens as i32,

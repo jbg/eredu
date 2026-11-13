@@ -98,19 +98,29 @@ impl PreparedOmni {
     ///
     /// The asset directory supplies the matching Omni configuration, tokenizer,
     /// media processor, generation defaults and LiquidCodec configuration.
+    /// A projector with decoded outputs requires a prepared cache policy.
     pub fn open_gguf(
         backbone: &Path,
         projector: &Path,
         assets: &Path,
         max_cached_readers: usize,
+        prepared_cache: Option<&eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy>,
     ) -> Result<Self, ArtifactError> {
-        Self::open_source(assets, max_cached_readers, Some((backbone, projector)))
+        Self::open_source(
+            assets,
+            max_cached_readers,
+            Some((backbone, projector, prepared_cache)),
+        )
     }
 
     fn open_source(
         root: &Path,
         max_cached_readers: usize,
-        gguf: Option<(&Path, &Path)>,
+        gguf: Option<(
+            &Path,
+            &Path,
+            Option<&eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy>,
+        )>,
     ) -> Result<Self, ArtifactError> {
         fn read(root: &Path, name: &str) -> Result<Vec<u8>, ArtifactError> {
             let path = root.join(name);
@@ -118,7 +128,7 @@ impl PreparedOmni {
         }
 
         let config: Value = serde_json::from_slice(&read(root, "config.json")?)?;
-        let vision = vision_declaration(&config)?;
+        let mut vision = vision_declaration(&config)?;
         let processor_bytes = read(root, "processor_config.json")?;
         let source: Value = serde_json::from_slice(&processor_bytes)?;
         if source["vision_markers"] != true || source["audio_markers"] != true {
@@ -131,13 +141,19 @@ impl PreparedOmni {
             "Lfm3OmniFeatureExtractor",
         )?;
         let (speech, vision_weights) = match gguf {
-            Some((backbone, projector)) => PreparedAudio::prepare_gguf(
-                AdmittedAudioGguf::open_multimodal(backbone, projector, Some(&vision))?,
-                root,
-                &config,
-                max_cached_readers,
-                Some((&vision, audio_processor)),
-            )?,
+            Some((backbone, projector, prepared_cache)) => {
+                let admitted =
+                    AdmittedAudioGguf::open_multimodal(backbone, projector, Some(&vision))?;
+                super::vision::gguf::select_projector_formats(admitted.projector(), &mut vision)?;
+                PreparedAudio::prepare_gguf(
+                    admitted,
+                    root,
+                    &config,
+                    max_cached_readers,
+                    prepared_cache,
+                    Some((&vision, audio_processor)),
+                )?
+            }
             None => PreparedAudio::open_safetensors(
                 root,
                 root,

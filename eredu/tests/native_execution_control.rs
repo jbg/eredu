@@ -356,7 +356,13 @@ fn text_matches_ordinary_sampling_with_policy(
     std::fs::write(root.0.join("chat_template.jinja"), "{% for m in messages %}{{ m.content }}{% endfor %}{% if add_generation_prompt %} word3 word7{% endif %}").unwrap();
     let execution = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Cpu).unwrap())
         .with_residency(residency)
-        .with_weight_transformation(transformation);
+        .with_weight_transformation(transformation)
+        .with_prepared_checkpoint_cache(
+            eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy {
+                directory: root.0.join("prepared"),
+                max_bytes: 64 * 1024 * 1024,
+            },
+        );
     let (mut model, _) =
         LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &root.0, &execution)
             .unwrap()

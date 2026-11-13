@@ -448,13 +448,21 @@ impl PhysicalLinear {
             dense_projection(input, self.weight.as_ref(), stream)?
         } else if let Some(quantization) = self.gguf {
             let (ggml_type, endian) = quantization.gguf_iquant().expect("GGUF format");
-            NativeQuantizedTensor::from_iq_array(
+            let native = NativeQuantizedTensor::from_iq_array(
                 self.weight.value.clone(),
                 &[self.output_dimensions, self.input_dimensions],
                 ggml_type,
                 endian,
-            )?
-            .linear(input, true, stream)?
+            )?;
+            if let Some(scale) = self.global_scale.as_ref() {
+                let input_dtype = input.dtype();
+                native
+                    .linear(&input.as_dtype(Dtype::Float32, stream)?, true, stream)?
+                    .multiply(scale, stream)?
+                    .as_dtype(input_dtype, stream)?
+            } else {
+                native.linear(input, true, stream)?
+            }
         } else if let Some(global) = self.global_scale.as_ref() {
             super::nvfp4::linear(
                 input,

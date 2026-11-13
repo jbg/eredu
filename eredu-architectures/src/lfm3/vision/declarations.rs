@@ -236,6 +236,65 @@ impl Declaration {
         Ok(declaration)
     }
 
+    pub(super) fn select_formats(
+        &mut self,
+        formats: &std::collections::BTreeMap<String, eredu_checkpoint::LinearFormat>,
+    ) -> Result<(), Error> {
+        let project = |spec: &mut LinearSpec| -> Result<(), Error> {
+            if let Some(&format) = formats.get(spec.weight.id.as_str()) {
+                spec.format = crate::linear_format::project_matrix_format(
+                    &spec.weight,
+                    &spec.format,
+                    format,
+                )?;
+            }
+            Ok(())
+        };
+        project(&mut self.projector_up)?;
+        project(&mut self.projector_down)?;
+        for block in &mut self.blocks {
+            match &mut block.mixer {
+                MixerSpec::Attention(spec) => {
+                    project(&mut spec.projections.query)?;
+                    project(&mut spec.projections.key)?;
+                    project(&mut spec.projections.value)?;
+                    project(&mut spec.projections.output)?;
+                }
+                MixerSpec::Convolution(spec) => {
+                    project(&mut spec.input)?;
+                    project(&mut spec.output)?;
+                }
+            }
+            project(&mut block.feed_forward.gate)?;
+            project(&mut block.feed_forward.up)?;
+            project(&mut block.feed_forward.down)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn unit_members(
+        &self,
+        unit: VisionUnit,
+    ) -> Result<Vec<eredu_runtime::ParameterMemberSpec>, Error> {
+        self.unit_parameters(unit)?
+            .iter()
+            .try_fold(Vec::new(), |mut members, parameter| {
+                let member = eredu_runtime::ParameterMemberSpec::from_logical_declaration(
+                    parameter,
+                    eredu_runtime::MemberSharding::Replicated,
+                );
+                if let Some(format) = parameter.linear_format {
+                    members.extend(
+                        eredu_runtime::expand_linear_format_parameter(&member, format)
+                            .map_err(Error::backend_source)?,
+                    );
+                } else {
+                    members.push(member);
+                }
+                Ok(members)
+            })
+    }
+
     /// Retained encoder invocation geometry.
     pub fn config(&self) -> &VisionConfig {
         &self.config

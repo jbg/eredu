@@ -24,7 +24,7 @@ impl AdmittedOmniGguf {
         config: &Value,
         codec: &eredu_codec::liquid::Declaration,
     ) -> Result<Self, ArtifactError> {
-        let vision = vision_declaration(config)?;
+        let mut vision = vision_declaration(config)?;
         let pair =
             AdmittedAudioGguf::from_multimodal_checkpoints(backbone, projector, Some(&vision))?;
         let speech = pair.speech_bindings(
@@ -33,6 +33,7 @@ impl AdmittedOmniGguf {
         )?;
         speech.codec_decoder_bindings(codec)?;
 
+        vision::gguf::select_projector_formats(pair.projector(), &mut vision)?;
         vision::gguf::projector_recipes(speech.projector_catalog(), &vision)?;
         Ok(Self { pair })
     }

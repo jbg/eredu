@@ -2758,6 +2758,12 @@ impl ReplicatedTextMaterializationTask {
             Vec::new()
         } else {
             match self.executable {
+                LinearFormat::GgufIQuant {
+                    ggml_type: eredu_gguf::GgmlType::NvFp4,
+                    ..
+                } => {
+                    vec![eredu_nn::LinearCompanionRole::GlobalScale]
+                }
                 LinearFormat::Dense | LinearFormat::GgufIQuant { .. } => Vec::new(),
                 LinearFormat::MxFp4 | LinearFormat::E4M3BlockFp8(_) => {
                     vec![eredu_nn::LinearCompanionRole::Scale]

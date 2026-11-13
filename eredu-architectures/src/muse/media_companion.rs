@@ -323,6 +323,7 @@ impl Bf16MediaCompanion {
             self.catalog.tensors().clone(),
             self.resolution.clone(),
             readers,
+            None,
         )?;
         self.verify_unchanged()?;
         Ok(source)

@@ -455,6 +455,7 @@ impl VoiceChatArtifactPlan {
         self,
         assets: PreparedVoiceChatAssets,
         max_cached_readers: usize,
+        prepared_cache: Option<&eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy>,
     ) -> Result<RetainedVoiceChatArtifacts, AdmissionError> {
         let mut asset_config = VoiceChatConfig::from_value(assets.configuration())?;
         asset_config.linear_formats = self.config.linear_formats.clone();
@@ -472,7 +473,7 @@ impl VoiceChatArtifactPlan {
                 }
             }
         }
-        let sources = self.declarations.bind(max_cached_readers)?;
+        let sources = self.declarations.bind(max_cached_readers, prepared_cache)?;
         let controls = super::controls::VOICECHAT_INTEGER_BUFFERS
             .iter()
             .filter(|c| self.parameters.contains_key(c.key))

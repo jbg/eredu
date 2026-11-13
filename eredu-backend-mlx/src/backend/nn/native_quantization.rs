@@ -67,6 +67,8 @@ thread_local! {
     static Q8_0_BATCH_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q8_0_GROUPED_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q8_0_EMBEDDING_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
+    static NVFP4_DOT_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
+    static NVFP4_ACTIVATION_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static IQ_LINEAR_KERNEL: RefCell<HashMap<(NativeQuantizationFormat, bool), MetalKernel>> =
         RefCell::new(HashMap::new());
     static IQ_BATCH_KERNEL: RefCell<HashMap<(NativeQuantizationFormat, bool), MetalKernel>> =

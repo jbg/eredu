@@ -261,6 +261,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             catalog.tensors().clone(),
             resolution,
             2,
+            None,
         )?;
         (config, source)
     };
@@ -315,6 +316,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             catalog.tensors().clone(),
             resolution,
             2,
+            None,
         )?;
         source = std::sync::Arc::new(CompositeCheckpointSource::new([source, adapter_source])?);
         Some(configured)

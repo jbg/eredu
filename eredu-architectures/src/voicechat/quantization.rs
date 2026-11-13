@@ -72,11 +72,10 @@ pub(crate) fn project_parameters(
     }
     let plan = BoundedQuantizationPlan::new(quantization, 64 * 1024 * 1024, targets)?;
     let outputs = plan.output_metadata(source.as_ref())?;
-    let cache = source.prepared_cache_policy().cloned().unwrap_or_default();
-    let source: SharedCheckpointSource = Arc::new(PreparedQuantizedSource::new(
-        source,
-        plan.with_prepared_cache(cache),
-    )?);
+    if source.prepared_cache_policy().is_none() {
+        return Err(StoreError::PreparedCacheRequired);
+    }
+    let source: SharedCheckpointSource = Arc::new(PreparedQuantizedSource::new(source, plan)?);
     let mut result = parameters.clone();
     for weight in eligible {
         let primary = parameters[weight].clone();

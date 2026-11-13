@@ -541,9 +541,14 @@ pub fn open_prepared_safetensors_source(
     catalog: BTreeMap<String, TensorMetadata>,
     resolution: crate::validation::ResolvedCheckpointPlan,
     max_cached_shards: usize,
+    cache: Option<&crate::prepared_cache::PreparedCheckpointCachePolicy>,
 ) -> Result<SharedCheckpointSource, StoreError> {
     let prepared =
         PreparedCheckpointSource::open_admitted_safetensors(shards, catalog, max_cached_shards)?;
+    let prepared = match cache {
+        Some(policy) => prepared.with_prepared_cache(policy.clone()),
+        None => prepared,
+    };
     Ok(Arc::new(ResolvedCheckpointSource::new(
         Arc::new(prepared),
         resolution,
@@ -560,6 +565,7 @@ pub fn open_validated_safetensors_source(
     checkpoint_plan: &crate::schema::SafetensorsCheckpointPlan,
     admitted_resolution: crate::validation::ResolvedCheckpointPlan,
     max_cached_shards: usize,
+    cache: Option<&crate::prepared_cache::PreparedCheckpointCachePolicy>,
 ) -> Result<SharedCheckpointSource, StoreError> {
     let prepared =
         PreparedCheckpointSource::open_admitted_safetensors(shards, catalog, max_cached_shards)?;
@@ -577,6 +583,10 @@ pub fn open_validated_safetensors_source(
             "admitted SafeTensors checkpoint resolution changed during source preparation".into(),
         ));
     }
+    let prepared = match cache {
+        Some(policy) => prepared.with_prepared_cache(policy.clone()),
+        None => prepared,
+    };
     Ok(Arc::new(ResolvedCheckpointSource::new(
         Arc::new(prepared),
         current,
@@ -602,6 +612,7 @@ pub struct PreparedCheckpointSource {
     recipes: RecipeInferenceCache,
     source: SharedCheckpointSource,
     catalog: BTreeMap<String, PreparedTensorSource>,
+    prepared_cache: Option<crate::prepared_cache::PreparedCheckpointCachePolicy>,
 }
 
 impl PreparedCheckpointSource {
@@ -680,6 +691,7 @@ impl PreparedCheckpointSource {
             source,
             catalog,
             recipes: RecipeInferenceCache::default(),
+            prepared_cache: None,
         })
     }
 
@@ -692,6 +704,7 @@ impl PreparedCheckpointSource {
             source,
             catalog,
             recipes: RecipeInferenceCache::default(),
+            prepared_cache: None,
         };
         let mut source_keys = prepared.source.source_keys();
         source_keys.sort();
@@ -704,6 +717,15 @@ impl PreparedCheckpointSource {
             prepared.validate_current(key)?;
         }
         Ok(prepared)
+    }
+
+    /// Sets the application-owned policy for prepared transformations of this source.
+    pub fn with_prepared_cache(
+        mut self,
+        policy: crate::prepared_cache::PreparedCheckpointCachePolicy,
+    ) -> Self {
+        self.prepared_cache = Some(policy);
+        self
     }
 
     fn expected(&self, key: &str) -> Result<&PreparedTensorSource, StoreError> {
@@ -766,7 +788,9 @@ impl CheckpointSource for PreparedCheckpointSource {
     fn prepared_cache_policy(
         &self,
     ) -> Option<&crate::prepared_cache::PreparedCheckpointCachePolicy> {
-        self.source.prepared_cache_policy()
+        self.prepared_cache
+            .as_ref()
+            .or_else(|| self.source.prepared_cache_policy())
     }
 
     fn recipe_cache(&self) -> Option<&RecipeInferenceCache> {
@@ -894,6 +918,16 @@ impl CompositeCheckpointSource {
 }
 
 impl CheckpointSource for CompositeCheckpointSource {
+    fn prepared_cache_policy(
+        &self,
+    ) -> Option<&crate::prepared_cache::PreparedCheckpointCachePolicy> {
+        let policy = self.sources.first()?.prepared_cache_policy()?;
+        self.sources
+            .iter()
+            .all(|source| source.prepared_cache_policy() == Some(policy))
+            .then_some(policy)
+    }
+
     fn has_direct_encoded_leases(&self) -> bool {
         self.sources
             .iter()
@@ -1467,6 +1501,10 @@ pub struct WeightStoreDiagnostics {
 /// Structured neutral checkpoint store failures.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum StoreError {
+    /// Preparing file-backed weights requires an application-provided cache policy.
+    #[error("prepared weights require an explicit cache directory and byte budget")]
+    PreparedCacheRequired,
+
     /// A retained preparation recipe, geometry or publication is invalid.
     #[error("invalid checkpoint preparation: {0}")]
     InvalidPreparation(String),

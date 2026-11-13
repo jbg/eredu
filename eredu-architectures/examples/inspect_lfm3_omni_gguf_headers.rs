@@ -2,7 +2,7 @@
 
 use eredu_architectures::lfm3::omni::AdmittedOmniGguf;
 use eredu_codec::liquid::{Config, Declaration};
-use eredu_gguf::{Checkpoint, CheckpointHeader, Limits, QuantizedTensorRepresentation};
+use eredu_gguf::{Checkpoint, CheckpointHeader, Limits};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{error::Error, path::Path};
@@ -17,14 +17,13 @@ fn checkpoint(directory: &Path, record: &Value) -> Result<Checkpoint, Box<dyn Er
     if record["header_sha256"].as_str() != Some(&sha256) {
         return Err(format!("header digest differs for {member}").into());
     }
-    Ok(Checkpoint::from_headers_with_representation(
+    Ok(Checkpoint::from_headers(
         &[CheckpointHeader {
             member: member.into(),
             bytes,
             file_len: record["bytes"].as_u64().ok_or("missing published size")?,
         }],
         Limits::default(),
-        QuantizedTensorRepresentation::DecodedF32,
     )?)
 }
 

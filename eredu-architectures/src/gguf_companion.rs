@@ -213,7 +213,7 @@ pub(crate) fn resolve_lfm3_vl_projector(
     primary_plan: &GgufArchitecturePlan,
     primary: &Checkpoint,
     projector: &Checkpoint,
-    declaration: crate::lfm3::vision::VisionLanguageDeclaration,
+    mut declaration: crate::lfm3::vision::VisionLanguageDeclaration,
 ) -> Result<GgufMediaProjectorPlan, String> {
     use crate::lfm3::vision::gguf;
     let GgufModelConfig::Lfm3(args) = primary_plan.model() else {
@@ -226,8 +226,13 @@ pub(crate) fn resolve_lfm3_vl_projector(
         gguf::projector_plan(projector, &declaration.vision).map_err(|error| error.to_string())?;
     eredu_checkpoint::validation::resolve_gguf_plan(projector, &checkpoint)
         .map_err(|error| format!("{error:?}"))?;
-    let backbone = gguf::decoded_catalog(primary)?;
-    let projector = gguf::decoded_catalog(projector)?;
+    let backbone = crate::lfm3::checkpoint::packed_gguf_catalog(primary.clone())
+        .map_err(|error| error.to_string())?;
+    let projector = crate::lfm3::checkpoint::packed_gguf_catalog(projector.clone())
+        .map_err(|error| error.to_string())?;
+    declaration
+        .select_gguf_formats(&backbone, &projector)
+        .map_err(|error| error.to_string())?;
     Ok(GgufMediaProjectorPlan {
         primary_tensor_mapping: backbone
             .translated_outputs(crate::lfm3::translate_gguf_weight_name)

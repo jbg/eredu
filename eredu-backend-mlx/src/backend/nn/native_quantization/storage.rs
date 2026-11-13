@@ -5,6 +5,10 @@ use super::*;
 /// Physical quantization encoding retained from a checkpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NativeQuantizationFormat {
+    /// GGUF NVFP4 blocks with four interleaved UE4M3 scales per 64 values.
+    GgufNvFp4,
+    /// GGUF Q4_0 blocks with one FP16 scale per 32 signed values.
+    GgufQ4_0,
     /// GGUF/GGML Q4_K blocks: 256 weights in 144 bytes.
     GgufQ4K,
     /// GGUF/GGML Q5_K blocks: 256 weights in 176 bytes.
@@ -39,6 +43,8 @@ impl NativeQuantizationFormat {
     /// Maps a native-executable GGML type to its execution metadata.
     pub fn from_ggml_type(ty: GgmlType) -> Option<Self> {
         Some(match ty {
+            GgmlType::NvFp4 => Self::GgufNvFp4,
+            GgmlType::Q4_0 => Self::GgufQ4_0,
             GgmlType::Q4K => Self::GgufQ4K,
             GgmlType::Q5K => Self::GgufQ5K,
             GgmlType::Q6K => Self::GgufQ6K,
@@ -60,6 +66,8 @@ impl NativeQuantizationFormat {
     /// Returns the GGML type for this native format.
     pub fn ggml_type(self) -> Option<GgmlType> {
         Some(match self {
+            Self::GgufNvFp4 => GgmlType::NvFp4,
+            Self::GgufQ4_0 => GgmlType::Q4_0,
             Self::GgufQ4K => GgmlType::Q4K,
             Self::GgufQ5K => GgmlType::Q5K,
             Self::GgufQ6K => GgmlType::Q6K,
@@ -233,6 +241,7 @@ impl NativeQuantizedTensor {
         }
         if native_execution_backend(stream)? == NativeExecutionBackend::Metal && transpose {
             return match self.format() {
+                NativeQuantizationFormat::GgufNvFp4 => nvfp4_linear_metal(input, self, stream),
                 NativeQuantizationFormat::GgufQ4K if self.storage.endian == GgufEndian::Little => {
                     q4k_linear_metal(input, self, stream)
                 }

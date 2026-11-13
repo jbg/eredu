@@ -18,7 +18,7 @@ pub struct DepthModule<B: NeuralBackend>(Module<B>);
 #[parameterized(tensor = "B::Tensor")]
 enum Module<B: NeuralBackend> {
     Conditioning(Conditioning<B>),
-    Codebook(Codebook<B::Tensor>),
+    Codebook(Codebook<B>),
     Block(ReplicatedBlock<B>),
     Normalization(B::Normalization),
     Feedback(Feedback<B>),
@@ -64,11 +64,7 @@ impl<B: NeuralBackend> DepthModule<B> {
             DepthUnit::Codebook(index) => {
                 let spec = &d.codebooks[index];
                 Module::Codebook(Codebook {
-                    table: Parameter::unloaded(
-                        spec.table.clone(),
-                        &[d.vocabulary, d.width],
-                        context,
-                    )?,
+                    table: B::embedding(spec.table.clone(), context)?,
                     scale: Parameter::unloaded(spec.scale.clone(), &[d.width], context)?,
                 })
             }
@@ -92,7 +88,7 @@ impl<B: NeuralBackend> DepthModule<B> {
         match (&mut self.0, operation) {
             (Module::Codebook(book), Operation::Embed(codes, i)) => {
                 let ids = codes.index(&[Index::Full, Index::At(*i as i32)], context)?;
-                book.table.as_ref().take_axis(&ids, 0, context)
+                book.table.forward(&ids, context)
             }
             (Module::Conditioning(module), Operation::Condition(hidden, masked, embeddings)) => {
                 let dtype = embeddings
@@ -131,7 +127,7 @@ impl<B: NeuralBackend> DepthModule<B> {
                 // The trained heads apply the learned scale before the single output cast.
                 let slot = B::rms_norm_with_weight(&slot, &scale, d.final_norm.epsilon, context)?
                     .cast_float(dtype, context)?;
-                B::Tensor::linear(&slot, book.table.as_ref(), None, context)
+                book.table.as_linear(&slot, context)
             }
             (Module::Feedback(module), Operation::Feedback(codes)) => module.embed(codes, context),
             _ => Err(invalid("speech output module differs from its invocation")),

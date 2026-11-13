@@ -9,6 +9,64 @@ use safemlx::{
     DeviceType, Dtype,
 };
 
+/// Applies the sigmoid to the rounded gate/up product.
+pub(crate) fn silu_product_first(
+    gate: &Array,
+    up: &Array,
+    stream: &Stream,
+) -> Result<Option<Array>, Exception> {
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    {
+        use std::cell::RefCell;
+        thread_local! {
+            static KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
+        }
+        if gate.dtype() != Dtype::Float32
+            || up.dtype() != Dtype::Float32
+            || gate.shape() != up.shape()
+            || gate.size() == 0
+            || stream.get_device()?.get_type()? != DeviceType::Gpu
+        {
+            return Ok(None);
+        }
+        let size = i32::try_from(gate.size())
+            .map_err(|_| Exception::custom("gated product size overflow"))?;
+        let config = CustomKernelConfig::new()
+            .with_grid([size, 1, 1])
+            .with_thread_group([256, 1, 1])
+            .with_output_arg(gate.shape(), Dtype::Float32);
+        return KERNEL.with(|cell| {
+            let mut kernel = cell.borrow_mut();
+            if kernel.is_none() {
+                *kernel = Some(MetalKernel::new(
+                    "f32_swiglu_product_first",
+                    ["gate", "up"],
+                    ["out"],
+                    r#"
+                    uint i = thread_position_in_grid.x;
+                    float x = gate[i];
+                    float probability = metal::fast::divide(1.0f, 1.0f + metal::fast::exp(-x));
+                    out[i] = (x * up[i]) * probability;
+                    "#,
+                    "",
+                    true,
+                    false,
+                )?);
+            }
+            kernel
+                .as_ref()
+                .expect("SwiGLU kernel initialized")
+                .apply_one_device([gate, up], &config, stream)
+                .map(Some)
+        });
+    }
+    #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
+    {
+        let _ = (gate, up, stream);
+        Ok(None)
+    }
+}
+
 /// Fuses the pointwise sides of grouped RMS without changing its sum reduction.
 pub(crate) fn grouped_rms(
     input: &Array,

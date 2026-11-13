@@ -135,6 +135,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         catalog.tensors().clone(),
         resolution,
         2,
+        None,
     )?;
     let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = context.stream();

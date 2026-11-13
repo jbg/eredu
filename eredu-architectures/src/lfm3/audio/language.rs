@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 type Context<B> = <<B as eredu_nn::NeuralBackend>::Tensor as Tensor>::Context;
 
-/// Exact language resources for the Audio checkpoint's F32 profile.
+/// Exact language resources for the Audio checkpoint's selected formats.
 pub struct PreparedAudioLanguage {
     declaration: Arc<Declaration>,
     parameters: PreparedComponent<Arc<ComponentDefinition>>,

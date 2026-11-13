@@ -6,10 +6,7 @@ use eredu_checkpoint::{
     store::{CheckpointLease, EncodedTensorLease, ReadPolicy, TensorReadRequest},
 };
 use eredu_codec::liquid::{Config as CodecConfig, Declaration as CodecDeclaration};
-use eredu_gguf::{
-    Checkpoint, CheckpointHeader, ConvertedTensor, DenseDtype, Limits,
-    QuantizedTensorRepresentation,
-};
+use eredu_gguf::{Checkpoint, CheckpointHeader, ConvertedTensor, GgmlType, Limits};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{error::Error, io::Read, path::Path};
@@ -24,14 +21,13 @@ fn checkpoint(directory: &Path, record: &Value) -> Result<Checkpoint, Box<dyn Er
     if record["header_sha256"].as_str() != Some(sha256.as_str()) {
         return Err(format!("header digest differs for {member}").into());
     }
-    let checkpoint = Checkpoint::from_headers_with_representation(
+    let checkpoint = Checkpoint::from_headers(
         &[CheckpointHeader {
             member: member.into(),
             bytes,
             file_len: record["bytes"].as_u64().ok_or("missing published size")?,
         }],
         Limits::default(),
-        QuantizedTensorRepresentation::DecodedF32,
     )?;
     Ok(checkpoint)
 }
@@ -138,18 +134,14 @@ fn verify_projector(
     }
     let admitted = AdmittedAudioGguf::from_checkpoints(
         checkpoint(directory, &record["backbone"])?,
-        Checkpoint::open_with_representation(
-            path,
-            Limits::default(),
-            QuantizedTensorRepresentation::DecodedF32,
-        )?,
+        Checkpoint::open(path)?,
     )?;
     let bindings = admitted.speech_bindings(
         &Declaration::from_config(config)?,
         &DepthDeclaration::from_config(config)?,
     )?;
     let sources = if let Some(codec) = codec {
-        let (speech, decoder) = bindings.retain_with_codec_decoder(codec, 1)?;
+        let (speech, _, decoder) = bindings.retain_with_codec_decoder(codec, 1, None)?;
         let key = "decoder.istft.window";
         let window = decoder.source().acquire_lease(TensorReadRequest {
             key: key.into(),
@@ -171,7 +163,7 @@ fn verify_projector(
         println!("Q4_K_M projector: verified FSQ table and retained 1280 Hann samples");
         speech
     } else {
-        bindings.retain(1)?
+        bindings.retain(1, None)?
     };
     let recipe =
         &sources.depth.recipes()["model.depth_decoder.depth_embeddings.11.embedding.weight"];
@@ -189,18 +181,14 @@ fn verify_projector(
     };
     let proof = lease.bounded_read_proof();
     assert!(proof.physically_bounded && proof.offset_bytes != 0);
-    assert_eq!(lease.output_shape(), [2017, 1024]);
-    let ConvertedTensor::Dense(decoded) = lease.materialize_portable()?.into_converted() else {
-        return Err("expected the bounded GGML selection decoded to F32".into());
+    let ConvertedTensor::IQuant(packed) = lease.materialize_portable()?.into_converted() else {
+        return Err("expected the bounded GGML selection to stay packed".into());
     };
-    assert_eq!(decoded.shape, [2017, 1024]);
-    assert_eq!(decoded.dtype, DenseDtype::F32);
-    assert_eq!(decoded.data.len(), 2017 * 1024 * 4);
-    assert!(decoded.data.chunks_exact(4).all(|bytes| {
-        f32::from_ne_bytes(bytes.try_into().expect("one F32 sample")).is_finite()
-    }));
+    assert_eq!(packed.shape, [2017, 1024]);
+    assert!(matches!(packed.ggml_type, GgmlType::Q4K | GgmlType::Q6K));
+    assert_eq!(packed.data.len() as u64, proof.length_bytes);
     println!(
-        "Q4_K_M projector: decoded codebook 11 from {} encoded bytes",
+        "Q4_K_M projector: retained codebook 11 in {} encoded bytes",
         proof.length_bytes
     );
     Ok(())

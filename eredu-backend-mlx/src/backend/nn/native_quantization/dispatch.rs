@@ -491,6 +491,62 @@ pub(super) fn q5_1_config(
         .with_output_arg([output_rows, output_cols], dtype)
 }
 
+// A Q8_0 activation block shares one half-precision scale across 32 values.
+pub(super) fn nvfp4_linear_metal(
+    input: &Array,
+    view: &NativeQuantizedTensor,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    let dtype = validate_activation_dtype(input)?;
+    if input.dim(-1) != view.columns {
+        return Err(Exception::custom(
+            "NVFP4 activation width differs from packed weight columns",
+        ));
+    }
+    let rows = input.size() as i32 / view.columns;
+    let flat = input.reshape(&[rows, view.columns], stream)?;
+    let activation_config = CustomKernelConfig::new()
+        .with_template_arg_int("IN_DIM", view.columns)
+        .with_grid([view.columns, rows, 1])
+        .with_thread_group([32, 1, 1])
+        .with_output_arg(flat.shape(), Dtype::Int8)
+        .with_output_arg([rows, view.columns / 32], Dtype::Float16);
+    let activations = NVFP4_ACTIVATION_KERNEL.with(|cell| {
+        let mut kernel = cell.borrow_mut();
+        if kernel.is_none() {
+            *kernel = Some(nvfp4_activation_kernel()?);
+        }
+        kernel
+            .as_ref()
+            .expect("NVFP4 activation kernel initialized")
+            .apply_device([&flat], &activation_config, stream)
+    })?;
+    let [quants, scales]: [Array; 2] = activations
+        .try_into()
+        .map_err(|_| Exception::custom("NVFP4 activation kernel output count mismatch"))?;
+    let config = CustomKernelConfig::new()
+        .with_template_arg_dtype("T", dtype)
+        .with_template_arg_int("OUT_DIM", view.rows)
+        .with_template_arg_int("BLOCKS", view.columns / 64)
+        .with_template_arg_int("ROW_START", view.row_start)
+        .with_grid([32, view.rows, rows])
+        .with_thread_group([32, 1, 1])
+        .with_output_arg([rows, view.rows], dtype);
+    let output = NVFP4_DOT_KERNEL.with(|cell| {
+        let mut kernel = cell.borrow_mut();
+        if kernel.is_none() {
+            *kernel = Some(nvfp4_dot_kernel()?);
+        }
+        kernel
+            .as_ref()
+            .expect("NVFP4 dot kernel initialized")
+            .apply_one_device([&quants, &scales, view.storage.bytes()], &config, stream)
+    })?;
+    let mut shape = input.shape()[..input.ndim() - 1].to_vec();
+    shape.push(view.rows);
+    output.reshape(&shape, stream)
+}
+
 pub(super) fn iq_linear_metal(
     input: &Array,
     view: &NativeQuantizedTensor,

@@ -1,20 +1,18 @@
 //! Physical admission for the released LFM3 Audio GGUF backbone and projector.
 
 use eredu_checkpoint::{
-    gguf_store::{open_prepared_gguf_source, GgufCatalog},
-    recipe::DerivedWeightRecipe,
     schema::{CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint, GgufTypeConstraint},
-    store::TensorSelection,
     validation::{resolve_gguf_plan, CheckpointValidation, ResolvedCheckpointPlan},
 };
-use eredu_gguf::{Checkpoint, GgmlType, Limits, MetadataValue, QuantizedTensorRepresentation};
-use eredu_nn::DeclareLogicalParameters;
-use std::{collections::BTreeMap, path::Path, sync::Arc};
+use eredu_gguf::{Checkpoint, GgmlType, MetadataValue};
+use std::{path::Path, sync::Arc};
 
 use super::{AudioTokens, BindingSource, TextAssets};
 
 mod speech;
-pub(in crate::lfm3) use speech::input_encoder_recipes;
+pub(in crate::lfm3) use speech::{
+    input_encoder_recipes, input_projector_catalog, select_input_formats,
+};
 pub use speech::{AudioGgufSpeechBindings, AudioGgufSpeechSources};
 
 /// Physical layouts published for either part of LFM3 Audio.
@@ -109,15 +107,11 @@ impl AdmittedAudioGguf {
         projector: &Path,
         vision: Option<&super::super::vision::Declaration>,
     ) -> Result<Self, AudioGgufError> {
-        let open = |path| {
-            Checkpoint::open_with_representation(
-                path,
-                Limits::default(),
-                QuantizedTensorRepresentation::DecodedF32,
-            )
-        };
-        let admitted =
-            Self::from_multimodal_checkpoints(open(backbone)?, open(projector)?, vision)?;
+        let admitted = Self::from_multimodal_checkpoints(
+            Checkpoint::open(backbone)?,
+            Checkpoint::open(projector)?,
+            vision,
+        )?;
         super::super::checkpoint::validate_gguf_rope(
             admitted.backbone(),
             admitted.declaration.args(),
@@ -140,6 +134,7 @@ impl AdmittedAudioGguf {
         projector: Checkpoint,
         vision: Option<&super::super::vision::Declaration>,
     ) -> Result<Self, AudioGgufError> {
+        let projector = super::super::checkpoint::packed_gguf_catalog(projector)?;
         validate_roles(&backbone, &projector, vision.is_some())?;
         let args = backbone_args(&backbone)?;
         let backbone_encoding = AudioGgufEncoding::from_checkpoint(&backbone)?;
@@ -377,46 +372,15 @@ impl AdmittedAudioGguf {
         max_cached_readers: usize,
     ) -> Result<(Arc<super::super::Declaration>, BindingSource), AudioGgufError> {
         let plan = backbone_plan(&self.declaration, self.backbone_encoding)?;
-        let mapping = self
-            .backbone
-            .translated_outputs(super::super::translate_gguf_weight_name)?;
-        let catalog =
-            GgufCatalog::from_resolved_checkpoint(&self.backbone, &self.backbone_layout, &mapping)?;
-        let mut recipes = BTreeMap::new();
-        for parameter in self
-            .declaration
-            .logical_parameters()
-            .map_err(|e| AudioGgufError::Declaration(e.to_string()))?
-        {
-            let key = parameter.parameter.id.as_str();
-            let source = DerivedWeightRecipe::source(key, TensorSelection::Full);
-            let recipe = if key.ends_with(".conv.conv.weight") {
-                DerivedWeightRecipe::Reshape {
-                    input: Box::new(source),
-                    shape: parameter.shape.clone(),
-                }
-            } else {
-                source
-            };
-            let inferred = recipe
-                .infer(&catalog)
-                .map_err(|e| AudioGgufError::Declaration(e.to_string()))?;
-            if inferred.shape != parameter.shape {
-                return Err(AudioGgufError::Declaration(format!(
-                    "{key}: projected shape {:?}, expected {:?}",
-                    inferred.shape, parameter.shape,
-                )));
-            }
-            recipes.insert(key.to_owned(), recipe);
-        }
-        let source = Arc::new(open_prepared_gguf_source(
+        let (declaration, source, recipes) = super::super::checkpoint::gguf_language_bindings(
             self.backbone,
             &plan,
-            &mapping,
+            &self.declaration,
             max_cached_readers,
-        )?);
+        )
+        .map_err(|error| AudioGgufError::Declaration(error.to_string()))?;
         let binding = BindingSource::from_recipes(source, "LFM3 Audio GGUF backbone", recipes)?;
-        Ok((Arc::new(self.declaration), binding))
+        Ok((declaration, binding))
     }
 }
 

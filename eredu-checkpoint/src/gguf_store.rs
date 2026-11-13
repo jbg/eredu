@@ -20,9 +20,9 @@ use eredu_gguf::{
 use crate::{
     store::{
         validate_selection, BoundedReadProof, CheckpointLease, CheckpointSource,
-        EncodedTensorLease, ReadPolicy, StoreError, TensorMetadata, TensorReadRequest,
-        TensorSelection, WeightStore, WeightStoreBackend, WeightStoreDiagnostics,
-        DEFAULT_MAX_CACHED_SHARDS,
+        EncodedTensorLease, ReadPolicy, SharedCheckpointSource, StoreError, TensorMetadata,
+        TensorReadRequest, TensorSelection, WeightStore, WeightStoreBackend,
+        WeightStoreDiagnostics, DEFAULT_MAX_CACHED_SHARDS,
     },
     validation::{resolve_gguf_plan, ResolvedCheckpointPlan},
     StoredDtype,
@@ -36,6 +36,7 @@ struct CatalogEntry {
     metadata: TensorMetadata,
     physical_descriptor: TensorDescriptor,
     logical_last_units_per_block: Option<usize>,
+    decoded_f32: bool,
     source_encoding: crate::SourceTensorEncoding,
 }
 
@@ -208,6 +209,7 @@ fn project_catalog(
                         metadata,
                         physical_descriptor: descriptor.clone(),
                         logical_last_units_per_block,
+                        decoded_f32: tensor.is_decoded_f32(),
                         source_encoding: crate::SourceTensorEncoding::Gguf {
                             ggml_type: descriptor.ggml_type,
                             endian: shard.endian(),
@@ -274,6 +276,21 @@ struct StoreInner {
     max_cached_readers: usize,
     statistics: StoreStatistics,
     files: BTreeMap<PathBuf, Arc<AdmittedFile>>,
+    decoded_cache: Option<DecodedCache>,
+}
+
+struct DecodedCache {
+    policy: crate::prepared_cache::PreparedCheckpointCachePolicy,
+    sources: Mutex<BTreeMap<String, SharedCheckpointSource>>,
+}
+
+impl std::fmt::Debug for DecodedCache {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DecodedCache")
+            .field("policy", &self.policy)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Builder for a logical store backed by one or more validated GGUF checkpoints.
@@ -283,6 +300,8 @@ pub struct GgufWeightStoreBuilder {
     catalog: BTreeMap<String, CatalogEntry>,
     unclaimed_keys: BTreeSet<String>,
     max_cached_readers: usize,
+    decoded_cache: Option<crate::prepared_cache::PreparedCheckpointCachePolicy>,
+    require_prepared_decoding: bool,
 }
 
 impl GgufWeightStoreBuilder {
@@ -293,6 +312,26 @@ impl GgufWeightStoreBuilder {
         }
         self.max_cached_readers = maximum;
         Ok(self)
+    }
+
+    /// Persists selected dense FP32 GGUF outputs on their first payload lease.
+    /// Later leases page the prepared scalar bytes, including after eviction.
+    pub fn cache_decoded_outputs(
+        mut self,
+        policy: crate::prepared_cache::PreparedCheckpointCachePolicy,
+    ) -> Self {
+        self.decoded_cache = Some(policy);
+        self
+    }
+
+    /// Requires file-backed preparation for decoded outputs, if the catalog contains any.
+    pub fn require_prepared_decoding(
+        mut self,
+        policy: Option<&crate::prepared_cache::PreparedCheckpointCachePolicy>,
+    ) -> Self {
+        self.require_prepared_decoding = true;
+        self.decoded_cache = policy.cloned();
+        self
     }
 
     /// Resolves an architecture contract and adds only its selected layout
@@ -349,6 +388,12 @@ impl GgufWeightStoreBuilder {
         if self.catalog.is_empty() {
             return Err(gguf_error("", "GGUF logical catalog is empty"));
         }
+        if self.require_prepared_decoding
+            && self.decoded_cache.is_none()
+            && self.catalog.values().any(|entry| entry.decoded_f32)
+        {
+            return Err(StoreError::PreparedCacheRequired);
+        }
         let materializers = self
             .checkpoints
             .iter()
@@ -370,6 +415,10 @@ impl GgufWeightStoreBuilder {
             inner: Arc::new(StoreInner {
                 recipes: Default::default(),
                 files,
+                decoded_cache: self.decoded_cache.map(|policy| DecodedCache {
+                    policy,
+                    sources: Mutex::new(BTreeMap::new()),
+                }),
                 catalog: self.catalog,
                 unclaimed_keys: self.unclaimed_keys,
                 readers: Mutex::new(ReaderCache {
@@ -633,7 +682,130 @@ impl WeightStore for GgufWeightStore {
     }
 }
 
+impl GgufWeightStore {
+    fn prepared_decoded_source(
+        &self,
+        request: &TensorReadRequest,
+    ) -> Result<Option<SharedCheckpointSource>, StoreError> {
+        let Some(cache) = &self.inner.decoded_cache else {
+            return Ok(None);
+        };
+        let Some(entry) = self
+            .inner
+            .catalog
+            .get(&request.key)
+            .filter(|entry| entry.decoded_f32)
+        else {
+            return Ok(None);
+        };
+        validate_selection(
+            &request.key,
+            &entry.metadata.logical_shape,
+            &request.selection,
+        )?;
+        let mut sources = cache
+            .sources
+            .lock()
+            .map_err(|_| StoreError::Internal("GGUF prepared sources are poisoned".into()))?;
+        if let Some(source) = sources.get(&request.key) {
+            return Ok(Some(source.clone()));
+        }
+
+        use crate::prepared_cache::{PreparedCheckpointEntry, PreparedTensorLayout};
+        use sha2::{Digest, Sha256};
+
+        const TILE_BYTES: usize = 4 * 1024 * 1024;
+        let descriptor = &entry.physical_descriptor;
+        let crate::SourceTensorEncoding::Gguf { ggml_type, endian } = entry.source_encoding else {
+            unreachable!("GGUF catalog entry");
+        };
+        let (values, bytes) = ggml_type
+            .block_and_bytes()
+            .map_err(|error| gguf_error(&request.key, error))?;
+        let bytes = bytes as usize;
+        let values = values as usize;
+        let blocks_per_tile = TILE_BYTES / (values * 4);
+        let encoded_tile = blocks_per_tile * bytes;
+        let length = usize::try_from(descriptor.byte_len)
+            .map_err(|error| gguf_error(&request.key, error))?;
+        let path = entry
+            .metadata
+            .backing_shard
+            .as_ref()
+            .ok_or_else(|| gguf_error(&request.key, "missing backing shard"))?;
+        let admitted = self
+            .inner
+            .files
+            .get(path)
+            .ok_or_else(|| gguf_error(&request.key, "missing admitted file"))?;
+        let read = |offset: usize, buffer: &mut [u8]| {
+            let mut batch = EncodedReadBatch::empty(self.inner.statistics.reads.clone());
+            let mut metadata = entry.metadata.clone();
+            metadata.encoded_byte_len = descriptor.byte_len;
+            batch.append_file(
+                metadata,
+                path.clone(),
+                admitted.clone(),
+                descriptor.data_offset,
+                vec![offset..offset + buffer.len()],
+            )?;
+            batch.read_into(buffer)
+        };
+        let mut encoded = vec![0; encoded_tile.min(length)];
+        let mut hash = Sha256::new();
+        hash.update(b"eredu-gguf-decoded-f32-v1\0");
+        hash.update(format!(
+            "{ggml_type:?}:{endian:?}:{:?}:{:?}",
+            request.key, entry.metadata.logical_shape,
+        ));
+        for offset in (0..length).step_by(encoded_tile) {
+            let size = (length - offset).min(encoded_tile);
+            read(offset, &mut encoded[..size])?;
+            hash.update(&encoded[..size]);
+        }
+        let key = hash
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let layout = PreparedTensorLayout {
+            name: request.key.clone(),
+            dtype: safetensors::Dtype::F32,
+            shape: entry.metadata.logical_shape.clone(),
+        };
+        let source = match cache.policy.prepare(&key, &[layout], TILE_BYTES as u64)? {
+            PreparedCheckpointEntry::Cached(source) => source,
+            PreparedCheckpointEntry::Vacant(mut writer) => {
+                for offset in (0..length).step_by(encoded_tile) {
+                    let size = (length - offset).min(encoded_tile);
+                    read(offset, &mut encoded[..size])?;
+                    let tensor = eredu_gguf::IQuantTensor {
+                        shape: vec![(size / bytes * values) as u64],
+                        ggml_type,
+                        endian,
+                        data: encoded[..size].to_vec(),
+                    };
+                    let decoded = tensor
+                        .dequantize_f32()
+                        .map_err(|error| gguf_error(&request.key, error))?;
+                    let output: Vec<_> = decoded.into_iter().flat_map(f32::to_le_bytes).collect();
+                    writer.write(&request.key, (offset / bytes * values * 4) as u64, &output)?;
+                }
+                writer.finish()?
+            }
+        };
+        sources.insert(request.key.clone(), source.clone());
+        Ok(Some(source))
+    }
+}
+
 impl CheckpointSource for GgufWeightStore {
+    fn prepared_cache_policy(
+        &self,
+    ) -> Option<&crate::prepared_cache::PreparedCheckpointCachePolicy> {
+        self.inner.decoded_cache.as_ref().map(|cache| &cache.policy)
+    }
+
     fn retained_payload_bytes_upper_bound(&self) -> Option<u64> {
         // Materializers cache readers, not converted tensor payloads.
         Some(0)
@@ -643,6 +815,11 @@ impl CheckpointSource for GgufWeightStore {
         &self,
         requests: &[TensorReadRequest],
     ) -> Result<Option<EncodedReadBatch>, StoreError> {
+        if let [request] = requests {
+            if let Some(prepared) = self.prepared_decoded_source(request)? {
+                return prepared.prepare_encoded_read(requests);
+            }
+        }
         let mut batch = EncodedReadBatch::empty(self.inner.statistics.reads.clone());
         for request in requests {
             let entry =
@@ -723,6 +900,9 @@ impl CheckpointSource for GgufWeightStore {
     }
 
     fn acquire_lease(&self, request: TensorReadRequest) -> Result<CheckpointLease, StoreError> {
+        if let Some(prepared) = self.prepared_decoded_source(&request)? {
+            return prepared.acquire_lease(request);
+        }
         WeightStore::acquire(self, request).map(|lease| CheckpointLease::Gguf(Box::new(lease)))
     }
 

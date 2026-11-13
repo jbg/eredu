@@ -165,6 +165,13 @@ pub(crate) fn matrix_linear_format(
     format: LinearFormat,
 ) -> Result<LinearFormatSpec, Error> {
     match format {
+        LinearFormat::GgufIQuant {
+            ggml_type: eredu_gguf::GgmlType::NvFp4,
+            endian,
+        } => LinearFormatSpec::gguf_nvfp4(
+            endian,
+            companion(weight_name, format!("{prefix}.scale"), "global-scale")?,
+        ),
         LinearFormat::Dense | LinearFormat::GgufIQuant { .. } => LinearFormatSpec::unscaled(format),
         LinearFormat::E4M3BlockFp8(_) => LinearFormatSpec::scaled(
             format,

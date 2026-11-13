@@ -197,12 +197,19 @@ impl BlockParameters {
             .map_err(Error::backend_source)?;
         Ok(self)
     }
-    fn with_formats(mut self, args: &ModelArgs) -> Result<Self, Error> {
+    fn with_formats(self, args: &ModelArgs) -> Result<Self, Error> {
+        self.select_formats(|name| args.weight_quantization_for(name).into())
+    }
+
+    pub(super) fn select_formats(
+        mut self,
+        format: impl Fn(&str) -> eredu_checkpoint::LinearFormat,
+    ) -> Result<Self, Error> {
         let project = |spec: &mut eredu_nn::LinearSpec| -> Result<(), Error> {
             spec.format = crate::linear_format::project_matrix_format(
                 &spec.weight,
                 &spec.format,
-                args.weight_quantization_for(spec.weight.id.as_str()).into(),
+                format(spec.weight.id.as_str()),
             )?;
             Ok(())
         };
@@ -224,6 +231,15 @@ impl BlockParameters {
                 project(&mut spec.gate)?;
                 project(&mut spec.up)?;
                 project(&mut spec.down)?;
+                if matches!(
+                    spec.down.format.encoding(),
+                    eredu_checkpoint::LinearFormat::GgufIQuant {
+                        ggml_type: eredu_gguf::GgmlType::NvFp4,
+                        ..
+                    }
+                ) {
+                    spec.policy = eredu_nn::GatedProductPolicy::product_first_silu();
+                }
             }
         }
         Ok(self)

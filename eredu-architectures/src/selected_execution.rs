@@ -1255,6 +1255,8 @@ impl SelectedExecution {
 /// completion object, or backend-private token.
 #[derive(Debug, Clone)]
 pub struct SelectedPreparation {
+    pub(crate) prepared_checkpoint_cache:
+        Option<eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy>,
     qwen4_construction: Option<Arc<SelectedQwen4Construction>>,
     retained_architecture: Option<crate::processor_plan::ArtifactArchitecturePlan>,
     admission_token: ArtifactAdmissionToken,
@@ -1313,6 +1315,7 @@ impl SelectedPreparation {
             execution.authored_projection = Some(target.clone());
         }
         Self {
+            prepared_checkpoint_cache: None,
             qwen4_construction: Some(target),
             retained_architecture: None,
             admission_token,
@@ -1359,6 +1362,7 @@ impl SelectedPreparation {
         prediction_realization: Option<SelectedSpeculativeRealization>,
     ) -> Self {
         Self {
+            prepared_checkpoint_cache: None,
             qwen4_construction: None,
             retained_architecture: None,
             admission_token,

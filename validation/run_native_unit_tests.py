@@ -95,41 +95,38 @@ def run_batches(executable: str, batch_size: int, *, suite: str = "unit",
             break
         began = time.monotonic()
         timed_out = False
-        # Native stream workers, allocator state and prepared caches are isolated.
         # Ring workers inherit the process group, so timeout kills the whole tree.
-        with tempfile.TemporaryDirectory(prefix="eredu-native-test-") as cache:
-            environment["EREDU_PREPARED_CHECKPOINT_CACHE"] = cache
-            command = [executable, "--test-threads=1", "--exact", "--nocapture", *batch]
-            if suite != "unit":
-                command.append("--ignored")
-            log_path = results_dir / f"{start:04d}.log" if results_dir else None
-            output = log_path.open("w") if log_path else tempfile.TemporaryFile(mode="w+")
-            with output:
-                process = subprocess.Popen(command, env=environment, stdout=subprocess.PIPE,
-                                           stderr=subprocess.STDOUT, text=True,
-                                           start_new_session=True)
+        command = [executable, "--test-threads=1", "--exact", "--nocapture", *batch]
+        if suite != "unit":
+            command.append("--ignored")
+        log_path = results_dir / f"{start:04d}.log" if results_dir else None
+        output = log_path.open("w") if log_path else tempfile.TemporaryFile(mode="w+")
+        with output:
+            process = subprocess.Popen(command, env=environment, stdout=subprocess.PIPE,
+                                       stderr=subprocess.STDOUT, text=True,
+                                       start_new_session=True)
 
-                def relay():
-                    for line in process.stdout:
-                        output.write(line)
-                        output.flush()
-                        print(line, end="", flush=True)
+            def relay():
+                for line in process.stdout:
+                    output.write(line)
+                    output.flush()
+                    print(line, end="", flush=True)
 
-                reader = threading.Thread(target=relay)
-                reader.start()
+            reader = threading.Thread(target=relay)
+            reader.start()
+            try:
+                process.wait(timeout=min(test_timeout, remaining))
+            except subprocess.TimeoutExpired:
+                timed_out = True
+            finally:
+                # Also reap worker descendants left by a panicking parent.
                 try:
-                    process.wait(timeout=min(test_timeout, remaining))
-                except subprocess.TimeoutExpired:
-                    timed_out = True
-                finally:
-                    # Also reap worker descendants left by a panicking parent.
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    process.wait()
-                    reader.join()
-                    process.stdout.close()
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+                reader.join()
+                process.stdout.close()
         elapsed = time.monotonic() - began
         bad = timed_out or process.returncode != 0
         records.append(dict(tests=batch, seconds=round(elapsed, 3),

@@ -18,6 +18,15 @@ eredu --model /path/to/model \
 From a workspace checkout, use `cargo run --release -p eredu-cli --` in place
 of `eredu`.
 
+The CLI budgets 32 GiB for prepared weights and uses
+`eredu/prepared-checkpoints-v1` under the user cache directory. It uses
+`XDG_CACHE_HOME` when set to an absolute path on Unix, otherwise
+`~/Library/Caches` on macOS or `~/.cache` on other Unix systems. On Windows
+it uses `LOCALAPPDATA`. If the user cache directory cannot be determined,
+the CLI uses the system temporary directory. The loader creates the cache
+directory when it first needs a prepared file. Set both
+`--prepared-cache-dir` and `--prepared-cache-bytes` to override the policy.
+
 The default device is `gpu:0` when the executable is built with CUDA or Apple
 MLX, and `cpu` for CPU-only MLX builds on Linux and Windows. Pin a device and
 select a sampling policy with command-line options:

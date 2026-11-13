@@ -3,13 +3,13 @@
 use std::{collections::BTreeMap, path::Path, sync::Arc};
 
 use eredu_checkpoint::{
-    gguf_store::open_prepared_gguf_source,
-    recipe::{ArtifactCatalog, DerivedWeightRecipe, RecipeCatalog},
+    gguf_store::GgufWeightStore,
+    recipe::{DerivedWeightRecipe, RecipeCatalog},
     schema::{CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint, GgufTypeConstraint},
     store::{SharedCheckpointSource, TensorSelection},
     validation::{resolve_gguf_plan, ResolvedCheckpointPlan},
 };
-use eredu_gguf::{Checkpoint, GgmlType, Limits, MetadataValue, QuantizedTensorRepresentation};
+use eredu_gguf::{Checkpoint, GgmlType, MetadataValue};
 use eredu_nn::Error;
 
 use super::{Declaration, VisionUnit};
@@ -173,14 +173,15 @@ pub(super) fn retain_projector(
     max_cached_readers: usize,
 ) -> Result<
     (
+        Declaration,
         SharedCheckpointSource,
         BTreeMap<String, DerivedWeightRecipe>,
     ),
     Error,
 > {
-    let checkpoint = open_decoded(path)?;
+    let checkpoint = Checkpoint::open(path).map_err(Error::backend_source)?;
     let plan = projector_plan(&checkpoint, declaration)?;
-    retain_vision(checkpoint, declaration, plan, max_cached_readers)
+    retain_vision(checkpoint, declaration, plan, max_cached_readers, None)
 }
 
 pub(in crate::lfm3) fn decision_projector_plan(
@@ -202,18 +203,45 @@ pub(in crate::lfm3) fn decision_projector_plan(
 pub(super) fn retain_decision_projector(
     path: &Path,
     declaration: &Declaration,
+    audio: Option<&crate::lfm3::audio::Declaration>,
     omni: bool,
     max_cached_readers: usize,
+    prepared_cache: Option<&eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy>,
 ) -> Result<
     (
+        Declaration,
+        Option<crate::lfm3::audio::Declaration>,
         SharedCheckpointSource,
         BTreeMap<String, DerivedWeightRecipe>,
     ),
     Error,
 > {
-    let checkpoint = open_decoded(path)?;
+    let checkpoint = crate::lfm3::checkpoint::packed_gguf_catalog(
+        Checkpoint::open(path).map_err(Error::backend_source)?,
+    )
+    .map_err(Error::backend_source)?;
+    let audio = audio
+        .map(|declaration| {
+            crate::lfm3::audio::gguf::select_input_formats(&checkpoint, declaration)
+                .map(|(declaration, _)| declaration)
+                .map_err(Error::backend_source)
+        })
+        .transpose()?;
+    let checkpoint = if let Some(declaration) = &audio {
+        crate::lfm3::audio::gguf::input_projector_catalog(checkpoint, declaration)
+            .map_err(Error::backend_source)?
+    } else {
+        checkpoint
+    };
     let plan = decision_projector_plan(&checkpoint, declaration, omni)?;
-    retain_vision(checkpoint, declaration, plan, max_cached_readers)
+    let (vision, source, recipes) = retain_vision(
+        checkpoint,
+        declaration,
+        plan,
+        max_cached_readers,
+        prepared_cache,
+    )?;
+    Ok((vision, audio, source, recipes))
 }
 
 fn retain_vision(
@@ -221,16 +249,59 @@ fn retain_vision(
     declaration: &Declaration,
     plan: GgufCheckpointPlan,
     max_cached_readers: usize,
+    prepared_cache: Option<&eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy>,
 ) -> Result<
     (
+        Declaration,
         SharedCheckpointSource,
         BTreeMap<String, DerivedWeightRecipe>,
     ),
     Error,
 > {
-    let source = retain(checkpoint, &plan, str::to_owned, max_cached_readers)?;
-    let recipes = projector_recipes(source.as_ref(), declaration)?;
-    Ok((source, recipes))
+    let mut declaration = declaration.clone();
+    select_projector_formats(&checkpoint, &mut declaration)?;
+    let source = retain(
+        checkpoint,
+        &plan,
+        str::to_owned,
+        max_cached_readers,
+        prepared_cache,
+    )?;
+    let recipes = projector_recipes(source.as_ref(), &declaration)?;
+    Ok((declaration, source, recipes))
+}
+
+pub(crate) fn select_projector_formats(
+    checkpoint: &Checkpoint,
+    declaration: &mut Declaration,
+) -> Result<(), Error> {
+    let physical = checkpoint
+        .shards()
+        .iter()
+        .flat_map(|shard| {
+            shard
+                .tensors()
+                .iter()
+                .map(move |tensor| (tensor.descriptor().name.as_str(), (tensor, shard.endian())))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut formats = BTreeMap::new();
+    for unit in declaration.units() {
+        for parameter in declaration.unit_parameters(unit)? {
+            let target = parameter.parameter.id.as_str();
+            if parameter.linear_format.is_none() || is_patch_weight(unit, target) {
+                continue;
+            }
+            let key = physical_name(unit, target)?;
+            let (tensor, endian) = physical.get(key.as_str()).copied().ok_or_else(|| {
+                Error::backend(format!("missing LFM3 GGUF projector tensor {key}"))
+            })?;
+            let format =
+                crate::linear_format::gguf_tensor_format(tensor, endian).map_err(Error::backend)?;
+            formats.insert(target.to_owned(), format);
+        }
+    }
+    declaration.select_formats(&formats)
 }
 
 pub(crate) fn projector_recipes(
@@ -240,8 +311,8 @@ pub(crate) fn projector_recipes(
     let tensor = |key: &str| DerivedWeightRecipe::source(key, TensorSelection::Full);
     let mut recipes = BTreeMap::new();
     for unit in declaration.units() {
-        for parameter in declaration.unit_parameters(unit)? {
-            let id = parameter.parameter.id.as_str();
+        for member in declaration.unit_members(unit)? {
+            let id = member.target();
             let recipe = if is_patch_weight(unit, id) {
                 // The patch vector is channel-major with time inside each channel.
                 DerivedWeightRecipe::Reshape {
@@ -249,12 +320,12 @@ pub(crate) fn projector_recipes(
                         axis: 2,
                         inputs: TEMPORAL_KERNELS.into_iter().map(tensor).collect(),
                     }),
-                    shape: parameter.shape.clone(),
+                    shape: member.global_shape().to_vec(),
                 }
             } else {
                 tensor(&physical_name(unit, id)?)
             };
-            check_shape(&recipe, source, id, &parameter.shape)?;
+            check_shape(&recipe, source, id, member.global_shape())?;
             recipes.insert(id.to_owned(), recipe);
         }
     }
@@ -288,8 +359,8 @@ pub(crate) fn vl_backbone_plan(
                 [1],
                 GgufTypeConstraint::Exact(GgmlType::F32),
             ));
-            // The released FFN graph applies its weight scale. The input scale
-            // is retained as checkpoint metadata for the widened realization.
+            // The FFN graph applies the weight multiplier. The input scale
+            // remains checkpoint metadata.
             let mut input = GgufTensorConstraint::required(
                 format!("{root}.input_scale"),
                 [1],
@@ -313,12 +384,13 @@ pub(super) fn retain_backbone(
     max_cached_readers: usize,
 ) -> Result<
     (
+        Arc<crate::lfm3::Declaration>,
         SharedCheckpointSource,
         BTreeMap<String, DerivedWeightRecipe>,
     ),
     Error,
 > {
-    let checkpoint = open_decoded(path)?;
+    let checkpoint = Checkpoint::open(path).map_err(Error::backend_source)?;
     if !is_released_backbone(&checkpoint) {
         return Err(Error::backend("expected an LFM3 VL GGUF backbone"));
     }
@@ -326,7 +398,12 @@ pub(super) fn retain_backbone(
     crate::lfm3::checkpoint::validate_gguf_rope(&checkpoint, declaration.args())
         .map_err(Error::backend)?;
     let plan = vl_backbone_plan(&checkpoint, declaration).map_err(Error::backend)?;
-    retain_language(checkpoint, declaration, &plan, max_cached_readers)
+    crate::lfm3::checkpoint::gguf_language_bindings(
+        checkpoint,
+        &plan,
+        declaration,
+        max_cached_readers,
+    )
 }
 
 fn validate_backbone_geometry(
@@ -369,6 +446,7 @@ pub(super) fn retain_decision_backbone(
     max_cached_readers: usize,
 ) -> Result<
     (
+        Arc<crate::lfm3::Declaration>,
         SharedCheckpointSource,
         BTreeMap<String, DerivedWeightRecipe>,
     ),
@@ -377,75 +455,15 @@ pub(super) fn retain_decision_backbone(
     let plan = decision_backbone_plan(&checkpoint, declaration, omni)?;
     crate::lfm3::checkpoint::validate_gguf_rope(&checkpoint, declaration.args())
         .map_err(Error::backend)?;
-    retain_language(checkpoint, declaration, &plan, max_cached_readers)
-}
-
-fn retain_language(
-    checkpoint: Checkpoint,
-    declaration: &crate::lfm3::Declaration,
-    plan: &GgufCheckpointPlan,
-    max_cached_readers: usize,
-) -> Result<
-    (
-        SharedCheckpointSource,
-        BTreeMap<String, DerivedWeightRecipe>,
-    ),
-    Error,
-> {
-    let source = retain(
+    crate::lfm3::checkpoint::gguf_language_bindings(
         checkpoint,
-        plan,
-        crate::lfm3::translate_gguf_weight_name,
+        &plan,
+        declaration,
         max_cached_readers,
-    )?;
-    let recipes = backbone_recipes(source.as_ref(), declaration)?;
-    Ok((source, recipes))
+    )
 }
 
-pub(crate) fn backbone_recipes(
-    source: &(impl ArtifactCatalog + ?Sized),
-    declaration: &crate::lfm3::Declaration,
-) -> Result<BTreeMap<String, DerivedWeightRecipe>, Error> {
-    use eredu_nn::DeclareLogicalParameters;
-
-    let mut recipes = BTreeMap::new();
-    for layer in 0..declaration.args().num_hidden_layers as usize {
-        recipes
-            .extend(crate::lfm3::unit_recipes(source, declaration, layer).map_err(Error::backend)?);
-    }
-    for parameter in declaration.logical_parameters()? {
-        let id = parameter.parameter.id.as_str();
-        let recipe = recipes
-            .entry(id.to_owned())
-            .or_insert_with(|| DerivedWeightRecipe::source(id, TensorSelection::Full));
-        if matches!(
-            source
-                .source_provenance(id)
-                .map_err(Error::backend_source)?
-                .source_encoding,
-            eredu_checkpoint::SourceTensorEncoding::Gguf {
-                ggml_type: GgmlType::NvFp4,
-                ..
-            }
-        ) {
-            let root = id
-                .strip_suffix(".weight")
-                .ok_or_else(|| Error::backend("NVFP4 matrix requires a weight slot"))?;
-            *recipe = DerivedWeightRecipe::ScaleF32 {
-                weight: Box::new(recipe.clone()),
-                scale: Box::new(DerivedWeightRecipe::Reshape {
-                    input: Box::new(DerivedWeightRecipe::source(
-                        format!("{root}.scale"),
-                        TensorSelection::Full,
-                    )),
-                    shape: Vec::new(),
-                }),
-            };
-        }
-        check_shape(recipe, source, id, &parameter.shape)?;
-    }
-    Ok(recipes)
-}
+pub(crate) use crate::lfm3::checkpoint::gguf_language_recipes as backbone_recipes;
 
 pub(crate) fn is_released_backbone(checkpoint: &Checkpoint) -> bool {
     let text = |key| {
@@ -459,41 +477,22 @@ pub(crate) fn is_released_backbone(checkpoint: &Checkpoint) -> bool {
         && text("general.basename") == Some("LFM3-VL")
 }
 
-pub(crate) fn decoded_catalog(checkpoint: &Checkpoint) -> Result<Checkpoint, String> {
-    let quantized = checkpoint.tensors().filter_map(|tensor| {
-        let descriptor = tensor.descriptor();
-        descriptor
-            .ggml_type
-            .block_and_bytes()
-            .is_ok_and(|(block, _)| block > 1)
-            .then(|| descriptor.name.clone())
-    });
-    checkpoint
-        .clone()
-        .into_tensor_representation(quantized, QuantizedTensorRepresentation::DecodedF32)
-        .map_err(|error| error.to_string())
-}
-
-pub(in crate::lfm3) fn open_decoded(path: &Path) -> Result<Checkpoint, Error> {
-    Checkpoint::open_with_representation(
-        path,
-        Limits::default(),
-        QuantizedTensorRepresentation::DecodedF32,
-    )
-    .map_err(Error::backend_source)
-}
-
 fn retain(
     checkpoint: Checkpoint,
     plan: &GgufCheckpointPlan,
     translate: impl FnMut(&str) -> String,
     max_cached_readers: usize,
+    prepared_cache: Option<&eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy>,
 ) -> Result<SharedCheckpointSource, Error> {
     let mapping = checkpoint
         .translated_outputs(translate)
         .map_err(Error::backend_source)?;
     Ok(Arc::new(
-        open_prepared_gguf_source(checkpoint, plan, &mapping, max_cached_readers)
+        GgufWeightStore::builder()
+            .require_prepared_decoding(prepared_cache)
+            .max_cached_readers(max_cached_readers)
+            .and_then(|builder| builder.add_checkpoint(checkpoint, plan, &mapping))
+            .and_then(|builder| builder.build())
             .map_err(Error::backend_source)?,
     ))
 }

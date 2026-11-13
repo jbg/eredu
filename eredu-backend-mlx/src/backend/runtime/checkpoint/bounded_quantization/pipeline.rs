@@ -51,6 +51,11 @@ impl BoundedQuantizedWeightStore {
         plan: BoundedQuantizationPlan,
         conversion_stream: &Stream,
     ) -> Result<Self, Error> {
+        let cache = plan
+            .prepared_cache()
+            .or_else(|| source.prepared_cache_policy())
+            .cloned()
+            .ok_or(StoreError::PreparedCacheRequired)?;
         if !cfg!(target_endian = "little") {
             return Err(quantization_error(
                 "bounded SafeTensors quantization requires a little-endian host",
@@ -116,9 +121,7 @@ impl BoundedQuantizedWeightStore {
             identity.as_bytes(),
             fingerprint_bound,
         )?;
-        let entry =
-            plan.prepared_cache()
-                .prepare(&key, &prepared_layouts, plan.max_working_set_bytes())?;
+        let entry = cache.prepare(&key, &prepared_layouts, plan.max_working_set_bytes())?;
         let writer = match entry {
             PreparedCheckpointEntry::Cached(transformed) => {
                 let transformed_keys = transformed.source_keys().into_iter().collect();
@@ -136,7 +139,7 @@ impl BoundedQuantizedWeightStore {
                     transformed_keys,
                     materialized_source_keys,
                     materialized_source_shards,
-                    cache: plan.prepared_cache().clone(),
+                    cache,
                     report: WeightMaterializationReport {
                         admitted_working_set_bytes: plan.max_working_set_bytes(),
                         transformed_weights: plan.targets().len(),
@@ -194,7 +197,7 @@ impl BoundedQuantizedWeightStore {
             materialized_source_keys,
             materialized_source_shards,
             report,
-            cache: plan.prepared_cache().clone(),
+            cache,
         })
     }
 

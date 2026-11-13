@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
 use eredu_checkpoint::{
+    prepared_cache::PreparedCheckpointCachePolicy,
     recipe::DerivedWeightRecipe,
-    store::{CheckpointSource, SafetensorsWeightStore},
+    store::{CheckpointSource, PreparedCheckpointSource, SafetensorsWeightStore},
 };
 use safemlx::{
     host_transfer_capacity_upper_bound, Device, DeviceType, HostTransferPolicy,
@@ -20,6 +21,19 @@ use eredu_runtime::{
 
 fn stream() -> Stream {
     Stream::new_with_device(&Device::new(DeviceType::Cpu, 0))
+}
+
+fn quantization_fixture_source(directory: &std::path::Path) -> Arc<dyn CheckpointSource> {
+    let source = Arc::new(SafetensorsWeightStore::open(directory).unwrap());
+    let keys = source.source_keys().into_iter().collect();
+    Arc::new(
+        PreparedCheckpointSource::retain(source, "parameter bank test", keys)
+            .unwrap()
+            .with_prepared_cache(PreparedCheckpointCachePolicy {
+                directory: directory.join("prepared"),
+                max_bytes: 1 << 20,
+            }),
+    )
 }
 
 fn fixture() -> (tempfile::TempDir, Arc<SafetensorsWeightStore>) {
@@ -394,8 +408,7 @@ fn quantized_cache_materializes_only_rank_local_entry_and_tp_recipes() {
         &dir.path().join("model.safetensors"),
     )
     .unwrap();
-    let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> =
-        Arc::new(SafetensorsWeightStore::open(dir.path()).unwrap());
+    let store = quantization_fixture_source(dir.path());
     let entries = (0..2)
         .map(|entry| {
             let identity = ParameterBankKey::new(0, 3, entry);
@@ -521,8 +534,7 @@ fn entry_quantization_uses_only_declared_roles_and_companion_names() {
         &dir.path().join("model.safetensors"),
     )
     .unwrap();
-    let store: Arc<dyn CheckpointSource> =
-        Arc::new(SafetensorsWeightStore::open(dir.path()).unwrap());
+    let store = quantization_fixture_source(dir.path());
     let identity = ParameterBankKey::new(0, 0, 0);
     let quantized = WeightBinding::from_recipe(
         "legitimate.bias_scale_blocks",

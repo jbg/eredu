@@ -40,7 +40,10 @@ the same path without `--quantize`; implicit re-quantization is rejected.
 `--speech-weights f16 --speech-compute f16` selects narrow floating execution
 for eligible unquantized speech/perception work. Quantized causal projections
 retain F32 companions and arithmetic. The bounded prepared-checkpoint cache
-persists encoded weights; reuse checks source identity and exact recipes.
+persists encoded weights and verifies source identity and exact recipes on reuse.
+The CLI defaults to 32 GiB under the user cache directory. Override it with
+both `--prepared-cache-dir` and `--prepared-cache-bytes`, or set
+`prepared_checkpoint_cache` with `directory` and `max_bytes` in the realtime JSON.
 
 System audio uses optional CPAL devices and bounded lock-free queues. Native
 sample formats convert to mono and band-limited streaming resampling supplies

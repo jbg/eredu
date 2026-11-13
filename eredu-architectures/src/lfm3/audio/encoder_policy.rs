@@ -106,18 +106,22 @@ impl PreparedAudioEncoder {
     ) -> Result<Self, Error> {
         use eredu_checkpoint::recipe::DerivedWeightRecipe;
 
-        let recipes = recipes
-            .into_iter()
-            .map(|(name, input)| {
-                (
-                    name,
-                    DerivedWeightRecipe::Cast {
-                        input: Box::new(input),
+        let mut recipes = recipes;
+        for unit in declaration.units() {
+            for parameter in declaration.unit_parameters(unit)? {
+                if parameter.linear_format.is_some_and(|format| {
+                    format.encoding() != eredu_checkpoint::LinearFormat::Dense
+                }) {
+                    continue;
+                }
+                if let Some(recipe) = recipes.get_mut(parameter.parameter.id.as_str()) {
+                    *recipe = DerivedWeightRecipe::Cast {
+                        input: Box::new(recipe.clone()),
                         dtype: dtype.clone(),
-                    },
-                )
-            })
-            .collect();
+                    };
+                }
+            }
+        }
         let weights =
             BindingSource::from_recipes(source, scope, recipes).map_err(Error::backend_source)?;
         Self::new(declaration, &weights).map_err(Error::backend_source)

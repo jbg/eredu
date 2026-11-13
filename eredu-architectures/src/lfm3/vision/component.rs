@@ -4,9 +4,8 @@ use eredu_nn::Error;
 use eredu_runtime::{
     ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitectureGroupTransport,
     ArchitectureMergeDestination, ArchitectureParameterDescription, ComponentDefinition,
-    ComponentUnit, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitLayout, MemberSharding,
-    OwnedParameterGroupSpec, ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec,
-    ParameterRole,
+    ComponentUnit, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitLayout,
+    OwnedParameterGroupSpec, ParameterGroupOwner, ParameterGroupSpec, ParameterRole,
 };
 
 use super::{Declaration, VisionUnit};
@@ -38,13 +37,7 @@ pub(super) fn definition(
             VisionUnit::Block(layer) => format!("model.vision_tower.layers.{layer}"),
             VisionUnit::Projector => "model.multi_modal_projector".to_owned(),
         };
-        let members = vision
-            .unit_parameters(unit)?
-            .iter()
-            .map(|parameter| {
-                ParameterMemberSpec::from_logical_declaration(parameter, MemberSharding::Replicated)
-            })
-            .collect::<Vec<_>>();
+        let members = vision.unit_members(unit)?;
         let group = ParameterGroupSpec::new(&path, ParameterRole::Replicated, members)
             .map_err(Error::backend_source)?;
         groups.push(OwnedParameterGroupSpec::new(

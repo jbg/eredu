@@ -572,6 +572,7 @@ fn derive_recipe_source(
                 checkpoint,
                 mapping,
                 resolution,
+                ..
             } => Arc::new(GgufInspectionCatalog(
                 eredu_checkpoint::gguf_store::GgufCatalog::from_resolved_checkpoint(
                     checkpoint, resolution, mapping,

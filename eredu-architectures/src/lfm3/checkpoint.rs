@@ -136,6 +136,144 @@ pub fn unit_recipes(
     Ok(recipes)
 }
 
+/// Keeps Q4_0 blocks in their original byte layout instead of expanding
+/// them into three affine outputs on every GGUF page-in.
+pub(crate) fn packed_gguf_catalog(
+    checkpoint: eredu_gguf::Checkpoint,
+) -> Result<eredu_gguf::Checkpoint, eredu_gguf::Error> {
+    let q4 = checkpoint
+        .tensors()
+        .filter(|tensor| tensor.descriptor().ggml_type == eredu_gguf::GgmlType::Q4_0)
+        .map(|tensor| tensor.descriptor().name.clone())
+        .collect::<Vec<_>>();
+    checkpoint.into_tensor_representation(q4, eredu_gguf::QuantizedTensorRepresentation::Encoded)
+}
+
+/// Selects the packed formats of an admitted GGUF language backbone and binds
+/// its physical outputs to the resulting parameter declaration.
+pub(super) fn gguf_language_bindings(
+    checkpoint: eredu_gguf::Checkpoint,
+    plan: &GgufCheckpointPlan,
+    declaration: &Declaration,
+    max_cached_readers: usize,
+) -> Result<
+    (
+        std::sync::Arc<Declaration>,
+        eredu_checkpoint::store::SharedCheckpointSource,
+        BTreeMap<String, DerivedWeightRecipe>,
+    ),
+    eredu_nn::Error,
+> {
+    use eredu_nn::Error;
+
+    let checkpoint = packed_gguf_catalog(checkpoint).map_err(Error::backend_source)?;
+    let declaration = gguf_language_declaration(&checkpoint, declaration)?;
+    let mapping = checkpoint
+        .translated_outputs(translate_gguf_weight_name)
+        .map_err(Error::backend_source)?;
+    let source: eredu_checkpoint::store::SharedCheckpointSource = std::sync::Arc::new(
+        eredu_checkpoint::gguf_store::GgufWeightStore::builder()
+            .max_cached_readers(max_cached_readers)
+            .and_then(|builder| builder.add_checkpoint(checkpoint, plan, &mapping))
+            .and_then(|builder| builder.build())
+            .map_err(Error::backend_source)?,
+    );
+    let recipes = gguf_language_recipes(source.as_ref(), &declaration)?;
+    Ok((declaration, source, recipes))
+}
+
+pub(crate) fn gguf_language_declaration(
+    checkpoint: &eredu_gguf::Checkpoint,
+    declaration: &Declaration,
+) -> Result<std::sync::Arc<Declaration>, eredu_nn::Error> {
+    use eredu_nn::Error;
+
+    let formats = checkpoint
+        .shards()
+        .iter()
+        .flat_map(|shard| {
+            shard.tensors().iter().map(move |tensor| {
+                Ok((
+                    translate_gguf_weight_name(&tensor.descriptor().name),
+                    crate::linear_format::gguf_tensor_format(tensor, shard.endian())?
+                        .weight_quantization(),
+                ))
+            })
+        })
+        .collect::<Result<HashMap<_, _>, String>>()
+        .map_err(Error::backend)?;
+    let formats = declaration
+        .logical_parameters()?
+        .into_iter()
+        .filter(|parameter| parameter.linear_format.is_some())
+        .filter_map(|parameter| {
+            let name = parameter.parameter.id.as_str();
+            formats
+                .get(name)
+                .copied()
+                .flatten()
+                .map(|format| (name.to_owned(), format))
+        })
+        .collect();
+    let args = with_checkpoint_formats(declaration.args(), formats).map_err(Error::backend)?;
+    Ok(std::sync::Arc::new(declaration.with_formats(args)?))
+}
+
+pub(crate) fn gguf_language_recipes(
+    source: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
+    declaration: &Declaration,
+) -> Result<BTreeMap<String, DerivedWeightRecipe>, eredu_nn::Error> {
+    use eredu_nn::Error;
+
+    let mut recipes = BTreeMap::new();
+    for layer in 0..declaration.blocks.len() {
+        recipes.extend(unit_recipes(source, declaration, layer).map_err(Error::backend)?);
+    }
+    for group in declaration.definition().parameters().groups() {
+        for member in group.members() {
+            let target = member.target();
+            let recipe = recipes
+                .entry(target.to_owned())
+                .or_insert_with(|| DerivedWeightRecipe::source(target, TensorSelection::Full));
+            if member.linear_companion() == Some(eredu_nn::LinearCompanionRole::GlobalScale) {
+                *recipe = DerivedWeightRecipe::Reshape {
+                    input: Box::new(recipe.clone()),
+                    shape: Vec::new(),
+                };
+            }
+            let output = recipe.infer(source).map_err(Error::backend_source)?;
+            if output.shape() != member.global_shape() {
+                return Err(Error::backend(format!(
+                    "LFM3 GGUF binding {target} has shape {:?}, expected {:?}",
+                    output.shape(),
+                    member.global_shape(),
+                )));
+            }
+        }
+    }
+    Ok(recipes)
+}
+
+/// Applies a floating storage policy only to dense neural parameters.
+pub(super) fn language_storage_recipe(
+    member: &eredu_runtime::ParameterMemberSpec,
+    recipe: DerivedWeightRecipe,
+    dtype: eredu_checkpoint::recipe::RecipeDtype,
+) -> DerivedWeightRecipe {
+    if member.linear_companion().is_some()
+        || member
+            .logical_linear_format()
+            .is_some_and(|format| format.encoding() != eredu_checkpoint::LinearFormat::Dense)
+    {
+        recipe
+    } else {
+        DerivedWeightRecipe::Cast {
+            input: Box::new(recipe),
+            dtype,
+        }
+    }
+}
+
 /// Builds the complete alternative-layout SafeTensors contract.
 pub fn safetensors_plan(
     declaration: &Declaration,

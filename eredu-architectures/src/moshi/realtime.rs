@@ -705,6 +705,8 @@ pub fn moshi_realtime_request_from_normalized(
 /// Architecture-owned result selected before backend construction.
 #[derive(Debug)]
 pub struct PreparedMoshiRealtime {
+    prepared_checkpoint_cache:
+        Option<eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy>,
     preparation: MoshiPreparationPlan,
     execution_config: MoshiConfig,
     source_parameters: MoshiParameterContract,
@@ -1162,6 +1164,7 @@ pub fn select_inspected_moshi_realtime(
     let contract = PreparedRealtimeModelContract::new(selected, tasks)
         .map_err(|error| MoshiRealtimeSelectionError::InvalidArchitecture(error.to_string()))?;
     Ok(PreparedMoshiRealtime {
+        prepared_checkpoint_cache: candidate.prepared_checkpoint_cache,
         preparation: candidate.preparation,
         execution_config: candidate.execution_config,
         source_parameters: candidate.source_parameters,
@@ -1202,6 +1205,7 @@ pub fn prepare_selected_moshi_realtime_source(
         selected.checkpoint_plan(),
         selected.resolved_checkpoint_plan().clone(),
         selected.selected().max_cached_shards(),
+        selected.prepared_checkpoint_cache.as_ref(),
     )?;
     validate_store_metadata(&selected, source.as_ref())
         .map_err(MoshiRealtimeSourceError::Source)?;
@@ -1467,6 +1471,8 @@ fn materialization_tasks(
 
 #[derive(Debug)]
 struct Candidate {
+    prepared_checkpoint_cache:
+        Option<eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy>,
     preparation: MoshiPreparationPlan,
     execution_config: MoshiConfig,
     source_parameters: MoshiParameterContract,
@@ -1641,6 +1647,7 @@ fn build_candidate(
     .with_max_cached_shards(max_cached_shards)
     .with_required_session_capabilities(required_session_capabilities);
     Ok(Candidate {
+        prepared_checkpoint_cache: request.normalized.prepared_checkpoint_cache().cloned(),
         preparation,
         execution_config,
         source_parameters,

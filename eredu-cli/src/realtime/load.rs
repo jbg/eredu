@@ -34,6 +34,8 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    pub prepared_checkpoint_cache:
+        Option<eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy>,
     #[serde(default)]
     pub speech_weights: SpeechFloatChoice,
     #[serde(default)]
@@ -145,6 +147,9 @@ impl Config {
             if path.is_relative() {
                 *path = directory.join(&*path);
             }
+        }
+        if let Some(cache) = &mut self.prepared_checkpoint_cache {
+            resolve(&mut cache.directory, directory);
         }
         resolve(&mut self.official_assets, directory);
         resolve(&mut self.base_assets, directory);
@@ -336,6 +341,7 @@ pub fn load(
             model: Some(config.official_assets.clone()),
             text_backbone: Some(config.base_assets.clone()),
         },
+        prepared_checkpoint_cache: config.prepared_checkpoint_cache.clone(),
     })?;
     let prepared = prepare_mlx_realtime(
         &artifact,

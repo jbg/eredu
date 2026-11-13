@@ -51,6 +51,14 @@ struct Args {
     #[arg(long)]
     quantization_bits: Option<i32>,
 
+    /// Directory for file-backed prepared weights.
+    #[arg(long, requires = "prepared_cache_bytes")]
+    prepared_cache_dir: Option<PathBuf>,
+
+    /// Maximum bytes for file-backed prepared weights.
+    #[arg(long, requires = "prepared_cache_dir")]
+    prepared_cache_bytes: Option<u64>,
+
     /// Group size for affine load-time quantization.
     #[arg(long, default_value_t = 64)]
     quantization_group_size: i32,
@@ -258,12 +266,25 @@ fn main() -> Result<()> {
             group_size: args.quantization_group_size,
         },
     );
-    let execution_plan = eredu_core::ExecutionPlan::fully_resident(eredu_core::DevicePlan::new(
-        "mlx",
-        format!("{}:{}", args.device.label(), args.device_index),
-    )?)
-    .with_residency(residency)
-    .with_weight_transformation(transformation);
+    let mut execution_plan =
+        eredu_core::ExecutionPlan::fully_resident(eredu_core::DevicePlan::new(
+            "mlx",
+            format!("{}:{}", args.device.label(), args.device_index),
+        )?)
+        .with_residency(residency)
+        .with_weight_transformation(transformation);
+    if let Some((directory, max_bytes)) = args
+        .prepared_cache_dir
+        .clone()
+        .zip(args.prepared_cache_bytes)
+    {
+        execution_plan = execution_plan.with_prepared_checkpoint_cache(
+            eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy {
+                directory,
+                max_bytes,
+            },
+        );
+    }
     let normalized = eredu_runtime::NormalizedLoadRequest::from_execution_plan(
         &execution_plan,
         eredu_runtime::ResidencyDiagnostics::default(),

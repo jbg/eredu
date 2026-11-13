@@ -162,10 +162,11 @@ impl PreparedVlDecoder {
                         member.target()
                     ))
                 })?;
-                Ok(DerivedWeightRecipe::Cast {
-                    input: Box::new(recipe),
-                    dtype: dtype.clone(),
-                })
+                Ok(crate::lfm3::checkpoint::language_storage_recipe(
+                    member,
+                    recipe,
+                    dtype.clone(),
+                ))
             },
         )
         .map_err(Error::backend_source)?;
@@ -406,6 +407,7 @@ impl VisionLanguageDeclaration {
             &plan,
             resolution,
             max_cached_shards,
+            None,
         )
         .map_err(Error::backend_source)?;
         let audio = audio
@@ -466,6 +468,7 @@ impl VisionLanguageDeclaration {
         audio_processor: Option<crate::lfm3::decision::DecisionAudioProcessor>,
         dtype: RecipeDtype,
         max_cached_readers: usize,
+        prepared_cache: Option<&eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy>,
     ) -> Result<
         (
             PreparedVlDecoder,
@@ -475,7 +478,7 @@ impl VisionLanguageDeclaration {
         Error,
     > {
         let declaration = Self::from_checkpoint_config(config, "d1 GGUF", omni_tokens)?;
-        let (source, recipes) = super::gguf::retain_decision_backbone(
+        let (language, source, recipes) = super::gguf::retain_decision_backbone(
             checkpoint,
             &declaration.language,
             omni_tokens.is_some(),
@@ -487,16 +490,24 @@ impl VisionLanguageDeclaration {
                 let processor = declaration
                     .processor(processor)
                     .map_err(Error::backend_source)?;
-                let (source, recipes) = super::gguf::retain_decision_projector(
-                    path,
-                    &declaration.vision,
-                    omni_tokens.is_some(),
-                    max_cached_readers,
-                )?;
+                let encoder = audio_processor
+                    .as_ref()
+                    .map(|_| crate::lfm3::audio::Declaration::from_speech_config(config))
+                    .transpose()?;
+                let (vision_declaration, encoder, source, recipes) =
+                    super::gguf::retain_decision_projector(
+                        path,
+                        &declaration.vision,
+                        encoder.as_ref(),
+                        omni_tokens.is_some(),
+                        max_cached_readers,
+                        prepared_cache,
+                    )?;
                 let audio = audio_processor
-                    .map(|processor| {
+                    .zip(encoder)
+                    .map(|(processor, encoder)| {
                         crate::lfm3::decision::PreparedDecisionAudio::from_gguf(
-                            crate::lfm3::audio::Declaration::from_speech_config(config)?,
+                            encoder,
                             source.clone(),
                             processor,
                             dtype.clone(),
@@ -504,7 +515,7 @@ impl VisionLanguageDeclaration {
                     })
                     .transpose()?;
                 let vision = super::PreparedVisionExecution::from_canonical_recipes(
-                    declaration.vision.clone(),
+                    vision_declaration,
                     source,
                     &recipes,
                     dtype.clone(),
@@ -522,13 +533,8 @@ impl VisionLanguageDeclaration {
                 ))
             })
             .transpose()?;
-        let decoder = PreparedVlDecoder::prepare(
-            "lfm3/decision/decoder",
-            declaration.language,
-            source,
-            &recipes,
-            dtype,
-        )?;
+        let decoder =
+            PreparedVlDecoder::prepare("lfm3/decision/decoder", language, source, &recipes, dtype)?;
         let (vision, audio) = media.map_or((None, None), |(vision, audio)| (Some(vision), audio));
         Ok((decoder, vision, audio))
     }
@@ -617,6 +623,18 @@ impl VisionLanguageDeclaration {
             component,
             architecture_fingerprint,
         })
+    }
+
+    pub(crate) fn select_gguf_formats(
+        &mut self,
+        backbone: &eredu_gguf::Checkpoint,
+        projector: &eredu_gguf::Checkpoint,
+    ) -> Result<(), Error> {
+        self.language =
+            crate::lfm3::checkpoint::gguf_language_declaration(backbone, &self.language)?;
+        super::gguf::select_projector_formats(projector, &mut self.vision)?;
+        self.component = Arc::new(super::component::definition(&self.language, &self.vision)?);
+        Ok(())
     }
 
     /// Combined logical graph, storage ownership and decoder state layout.
@@ -728,20 +746,21 @@ impl PreparedVisionLanguage {
         let processor = declaration
             .processor(&processor)
             .map_err(Error::backend_source)?;
-        let (decoder_source, language_recipes) =
+        let (language, decoder_source, language_recipes) =
             super::gguf::retain_backbone(backbone, &declaration.language, max_cached_readers)?;
-        let (vision_source, vision_recipes) =
+        let (vision, vision_source, vision_recipes) =
             super::gguf::retain_projector(projector, &declaration.vision, max_cached_readers)?;
+        let component = Arc::new(super::component::definition(&language, &vision)?);
         Ok(Self {
-            language: declaration.language,
-            vision: declaration.vision,
+            language,
+            vision,
             tokens: declaration.tokens,
             decoder_source,
             vision_source,
             vision_recipes,
             language_recipes,
             processor,
-            component: declaration.component,
+            component,
             architecture_fingerprint: format!("{}:gguf", declaration.architecture_fingerprint),
         })
     }
@@ -759,7 +778,7 @@ impl PreparedVisionLanguage {
         let declarations = crate::artifact_preparation::source_declarations(inspection)
             .map_err(Error::backend_source)?;
         let bound = declarations
-            .bind(max_cached_shards)
+            .bind(max_cached_shards, None)
             .map_err(Error::backend_source)?;
         Self::from_roles(inspection.architecture_plan(), &bound.roles)
     }
@@ -837,10 +856,11 @@ impl PreparedVisionLanguage {
                     .or_else(|| self.vision_recipes.get(target))
                     .cloned()
                     .unwrap_or_else(|| DerivedWeightRecipe::source(target, TensorSelection::Full));
-                Ok(DerivedWeightRecipe::Cast {
-                    input: Box::new(recipe),
-                    dtype: dtype.clone(),
-                })
+                Ok(crate::lfm3::checkpoint::language_storage_recipe(
+                    member,
+                    recipe,
+                    dtype.clone(),
+                ))
             },
         )
         .map_err(Error::backend_source)

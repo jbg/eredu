@@ -1,5 +1,66 @@
 use super::*;
 
+pub(super) fn nvfp4_activation_kernel() -> Result<MetalKernel, Exception> {
+    MetalKernel::new(
+        "native_nvfp4_q8_0_activation",
+        ["input"],
+        ["quants", "scales"],
+        r#"
+        uint col = thread_position_in_grid.x;
+        uint row = thread_position_in_grid.y;
+        uint i = row * IN_DIM + col;
+        float value = float(input[i]);
+        float scale = metal::precise::divide(simd_max(abs(value)), 127.0f);
+        // Round with the F32 reciprocal before narrowing the stored scale.
+        float inverse = scale == 0.0f ? 0.0f : metal::precise::divide(1.0f, scale);
+        quants[i] = char(rint(value * inverse));
+        if (col % 32 == 0) scales[i / 32] = half(scale);
+        "#,
+        "",
+        true,
+        false,
+    )
+}
+
+pub(super) fn nvfp4_dot_kernel() -> Result<MetalKernel, Exception> {
+    MetalKernel::new(
+        "native_nvfp4_q8_0_dot",
+        ["quants", "scales", "weight"],
+        ["out"],
+        r#"
+        const int codes[16] = {0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12};
+        uint lane = thread_position_in_grid.x;
+        uint col = thread_position_in_grid.y;
+        uint row = thread_position_in_grid.z;
+        // Eight lanes form each 16-value integer dot. Keep four separate
+        // F32 accumulators across superblocks before the final reduction.
+        uint group = lane / 8;
+        uint pair = lane % 8;
+        uint w = (ROW_START + col) * BLOCKS * 36;
+        uint x = row * BLOCKS * 64;
+        float acc = 0.0f;
+        for (uint block = 0; block < BLOCKS; ++block) {
+            uint base = w + block * 36;
+            uint packed = weight[base + 4 + group * 8 + pair];
+            uint i = x + block * 64 + group * 16 + pair;
+            int dot = int(quants[i]) * codes[packed & 15] + int(quants[i + 8]) * codes[packed >> 4];
+            dot += simd_shuffle_xor(dot, 4);
+            dot += simd_shuffle_xor(dot, 2);
+            dot += simd_shuffle_xor(dot, 1);
+            uint s = weight[base + group];
+            float d = s < 8 ? float(s) / 1024.0f : ldexp(1.0f + float(s & 7) / 8.0f, int(s >> 3) - 8);
+            acc = fma(float(dot), (s < 127 ? d : NAN) * float(scales[i / 32]), acc);
+        }
+        float sum = acc + simd_shuffle_xor(acc, 8);
+        sum += simd_shuffle_xor(sum, 16);
+        if (lane == 0) out[row * OUT_DIM + col] = T(sum);
+        "#,
+        "",
+        true,
+        false,
+    )
+}
+
 pub(super) fn iq_linear_kernel(
     format: NativeQuantizationFormat,
     big_endian: bool,
@@ -1136,6 +1197,26 @@ pub(super) fn iq_metal_header(format: NativeQuantizationFormat, big_endian: bool
     ));
 
     match format {
+        NativeQuantizationFormat::GgufQ4_0 => {
+            header.push_str(concat!(
+                "float iq_value(const device uint8_t* w,uint r,uint c){",
+                "uint x=c%32u;uint p=r+(c/32u)*18u;",
+                "uint q=uint(w[p+2u+x%16u]);",
+                "return iq_half(w,p)*float(int(x<16u?q&15u:q>>4u)-8);}\n"
+            ));
+        }
+        NativeQuantizationFormat::GgufNvFp4 => {
+            header.push_str(concat!(
+                "float iq_value(const device uint8_t* w,uint r,uint c){",
+                "const int values[16]={0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12};",
+                "uint x=c%64u;uint g=x/16u;uint i=x%16u;uint p=r+(c/64u)*36u;",
+                "uint s=uint(w[p+g]);uint e=s>>3u;uint m=s&7u;",
+                "float d=e==0u?float(m)/1024.0f:ldexp(1.0f+float(m)/8.0f,int(e)-8);",
+                "uint q=uint(w[p+4u+g*8u+i%8u]);",
+                "return s<127u?d*float(values[i<8u?q&15u:q>>4u]):NAN;}\n"
+            ));
+        }
+
         NativeQuantizationFormat::GgufQ4K => {
             header.push_str(concat!(
                 "float iq_value(const device uint8_t* w,uint r,uint c){",

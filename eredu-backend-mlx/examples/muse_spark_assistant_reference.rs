@@ -229,6 +229,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         catalog.tensors().clone(),
         resolution,
         1,
+        None,
     )?;
     let device = Device::new(DeviceType::Cpu, 0);
     let stream = Stream::new_with_device(&device);
@@ -298,6 +299,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             catalog.tensors().clone(),
             resolution,
             1,
+            None,
         )?;
         let linear = Linear::<MlxTensor>::unloaded(
             LinearSpec {

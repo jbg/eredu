@@ -20,37 +20,13 @@ use std::{
 const HASH_BUFFER_BYTES: usize = 1024 * 1024;
 
 /// Filesystem and retention policy for reusable prepared tensors.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PreparedCheckpointCachePolicy {
     /// Cache directory, separate from original checkpoint artifacts.
     pub directory: PathBuf,
-    /// Maximum total published and in-progress payload bytes.
+    /// Maximum total published and in-progress SafeTensors file bytes.
     pub max_bytes: u64,
-}
-
-impl Default for PreparedCheckpointCachePolicy {
-    fn default() -> Self {
-        Self {
-            directory: std::env::var_os("EREDU_PREPARED_CHECKPOINT_CACHE")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| {
-                    let root = std::env::var_os("XDG_CACHE_HOME")
-                        .map(PathBuf::from)
-                        .or_else(|| {
-                            std::env::var_os("HOME").map(|home| {
-                                PathBuf::from(home).join(if cfg!(target_os = "macos") {
-                                    "Library/Caches"
-                                } else {
-                                    ".cache"
-                                })
-                            })
-                        })
-                        .unwrap_or_else(std::env::temp_dir);
-                    root.join("eredu/prepared-checkpoints-v1")
-                }),
-            max_bytes: 32 * 1024 * 1024 * 1024,
-        }
-    }
 }
 
 /// Exact encoded geometry declared before a producer writes payloads.
@@ -340,12 +316,9 @@ impl PreparedCheckpointCachePolicy {
                 "invalid prepared-cache identity, layouts or write bound",
             ));
         }
-        fs::create_dir_all(&self.directory).map_err(|e| io(&self.directory, e))?;
-        let guard = open_lock(&self.directory.join("cache.lock"))?;
-        guard.lock().map_err(|e| io(&self.directory, e))?;
-        let path = self.directory.join(format!("{key}.safetensors"));
-        let checksum = self.directory.join(format!("{key}.sha256"));
-        let pin = open_lock(&self.directory.join(format!("{key}.lock")))?;
+        if self.directory.as_os_str().is_empty() {
+            return Err(invalid("prepared cache directory is empty"));
+        }
         let (header, spans, payload_len) = encode_header(layouts)?;
         let file_len = payload_len
             .checked_add(header.len() as u64)
@@ -357,6 +330,12 @@ impl PreparedCheckpointCachePolicy {
                 limit_bytes: self.max_bytes,
             });
         }
+        fs::create_dir_all(&self.directory).map_err(|e| io(&self.directory, e))?;
+        let guard = open_lock(&self.directory.join("cache.lock"))?;
+        guard.lock().map_err(|e| io(&self.directory, e))?;
+        let path = self.directory.join(format!("{key}.safetensors"));
+        let checksum = self.directory.join(format!("{key}.sha256"));
+        let pin = open_lock(&self.directory.join(format!("{key}.lock")))?;
         if path.exists() {
             let valid = fs::metadata(&path).map_err(|e| io(&path, e))?.len() == file_len
                 && read_checksum(&checksum).ok().is_some_and(|expected| {
