@@ -3,7 +3,7 @@
 use super::*;
 
 use eredu_checkpoint::{
-    recipe::{ArtifactCatalog, DerivedWeightRecipe},
+    recipe::{ArtifactCatalog, DerivedWeightRecipe, RecipeDtype},
     store::TensorSelection,
 };
 use eredu_runtime::{
@@ -91,6 +91,12 @@ pub fn lfm3_vl_requirements(
     } else {
         BTreeMap::new()
     };
+    let physical_shapes = description
+        .groups()
+        .iter()
+        .flat_map(|group| group.members())
+        .map(|member| (member.target(), member.global_shape()))
+        .collect::<BTreeMap<_, _>>();
     let mut derived = BTreeMap::new();
     let mut outputs = BTreeMap::new();
     let parameters = logical
@@ -119,7 +125,7 @@ pub fn lfm3_vl_requirements(
                 .collect::<Result<Vec<_>, _>>()?;
             let logical_shape = parameter.shape.expect("declared component shape");
             let output = recipe.infer(catalog.as_ref()).map_err(invalid)?;
-            if logical_shape != output.shape {
+            if physical_shapes[target.as_str()] != output.shape {
                 return Err(invalid(format!(
                     "VL parameter {target:?} differs from the admitted shape"
                 )));
@@ -127,7 +133,9 @@ pub fn lfm3_vl_requirements(
             let first = &sources[0];
             let metadata = catalog.source_metadata(first).map_err(invalid)?;
             let physical_encoding = physical[0].source_encoding();
-            let decoded = gguf && physical_encoding.scalar_dtype().is_none();
+            let decoded = gguf
+                && physical_encoding.scalar_dtype().is_none()
+                && output.dtype == RecipeDtype::F32;
             let direct = !decoded
                 && matches!(
                     recipe,
@@ -136,7 +144,7 @@ pub fn lfm3_vl_requirements(
                         ..
                     }
                 );
-            let (encoding, physical_shape) = if direct {
+            let (encoding, physical_shape) = if direct && parameter.companion.is_none() {
                 (physical_encoding.clone(), metadata.physical_shape)
             } else {
                 (
@@ -144,6 +152,7 @@ pub fn lfm3_vl_requirements(
                     output.shape.clone(),
                 )
             };
+            let output_dtype = output.dtype.clone();
             let aliases = if direct {
                 (first != &target)
                     .then(|| first.clone())
@@ -154,7 +163,7 @@ pub fn lfm3_vl_requirements(
                 outputs.insert(target.clone(), output);
                 Vec::new()
             };
-            parameter_requirement(
+            let requirement = parameter_requirement(
                 target,
                 sources,
                 physical,
@@ -167,7 +176,17 @@ pub fn lfm3_vl_requirements(
                 parameter.role,
                 parameter.owner.expect("declared component owner"),
                 ReplicatedTextParameterPresence::Required,
-            )
+            )?;
+            if let Some((role, primary)) = parameter.companion {
+                requirement
+                    .with_linear_companion(role, primary.as_str())
+                    .map(|requirement| {
+                        requirement.with_permitted_native_source_dtypes(vec![output_dtype])
+                    })
+                    .map_err(invalid)
+            } else {
+                Ok(requirement)
+            }
         })
         .collect::<Result<Vec<_>, _>>()?;
     let transports = (0..description.graph().groups().len())
@@ -182,7 +201,9 @@ pub fn lfm3_vl_requirements(
         match dtype {
             eredu_checkpoint::StoredDtype::F16 => eredu_core::checkpoint::TensorDtype::F16,
             eredu_checkpoint::StoredDtype::BF16 => eredu_core::checkpoint::TensorDtype::Bf16,
-            eredu_checkpoint::StoredDtype::F32 => eredu_core::checkpoint::TensorDtype::F32,
+            eredu_checkpoint::StoredDtype::F32
+            | eredu_checkpoint::StoredDtype::U8
+            | eredu_checkpoint::StoredDtype::U32 => eredu_core::checkpoint::TensorDtype::F32,
             _ => {
                 return Err(invalid(
                     "VL GGUF embedding has no floating-point representation",

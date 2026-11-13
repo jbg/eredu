@@ -376,7 +376,7 @@ impl MlxAudioEncoder {
 
 type Model = ResidentAudio<MlxNeuralBackend, Binding>;
 
-/// Bound LFM3 Audio graph consuming the selected F32 binding recipes.
+/// Bound LFM3 Audio graph consuming the selected parameter recipes.
 pub struct MlxAudioModel(Model);
 
 impl MlxAudioModel {

@@ -13406,14 +13406,20 @@ native platform, execution-device class, quantization policy, source recipes and
 precision. Source identity hashes exact bounded leases, including scalar geometry
 and source encoding; filenames and timestamps do not authorize reuse. The generic
 MLX bounded quantizer writes each completed encoded tile directly to this neutral
-sink, with no complete packed payload retained in host vectors. The default cache
-uses the user cache directory under `eredu/prepared-checkpoints-v1` (with the
-operating-system temporary directory as a fallback) and retains at most 32 GiB
-of prepared files. `EREDU_PREPARED_CHECKPOINT_CACHE`
-selects its directory; `BoundedQuantizationPlan::with_prepared_cache` accepts an
-explicit neutral location and byte budget. External cache cleanup can remove
-unused entries between processes; misses reconstruct them from the original
-prepared source.
+sink, with no complete packed payload retained in host vectors. Applications
+supply a directory and maximum prepared tensor file bytes through
+`PreparedCheckpointCachePolicy`. Ordinary loads accept the policy through
+`ExecutionPlan::with_prepared_checkpoint_cache` or
+`LocalLoadOptions::with_prepared_checkpoint_cache`. Realtime loads take it on
+`RealtimeArtifactRequest`, and direct bounded quantization takes it through
+`BoundedQuantizationPlan::with_prepared_cache` or from its source. A load that
+requires a prepared file fails if the policy is absent. Optional prepared
+transposes use the ordinary materialization path in that case. The checkpoint
+store manages file publication, leases and eviction within the supplied
+directory. The budget covers published SafeTensors and in-progress reservations,
+including SafeTensors headers. Applications control the location and budget. External cleanup can
+remove unused entries between processes. Cache misses reconstruct them from the
+original source.
 
 Exact-zero projection inputs are an optional architecture-declared hint in
 `LinearFormatSpec`; the hint permits neither pruning nor approximate arithmetic.
@@ -16787,11 +16793,11 @@ retained alongside the component declarations.
 
 The shared realtime loader dispatches `lfm3_audio` to SafeTensors or explicit
 GGUF backbone/projector preparation. It retains the selected payloads
-independently of the model asset directory. The Audio declaration projects
-canonical F32 recipes into independent source views for the tied language
-embedding, language blocks and output, speech encoder and projector, depth
-decoder and feedback, and LiquidCodec synthesis. Each view validates its
-logical shape and reports its materialized parameter bytes. Tied codebook
+independently of the model asset directory. The Audio declaration projects the
+selected packed formats and dense parameters into independent source views for
+the tied language embedding, language blocks and output, speech encoder and
+projector, depth decoder and feedback, and LiquidCodec synthesis. Each view
+retains logical geometry and reports its physical parameter bytes. Tied codebook
 tables have one owner across embedding and scoring, even when several
 tables come from one packed GGUF tensor. LiquidCodec declares decoder
 ownership without admitting encoder-side quantizer weights into synthesis.
@@ -16860,8 +16866,17 @@ architecture declares those physical keys as shared across their logical
 destinations and the native visitor forwards that declaration to the neutral
 binding plan.
 The GGUF reader applies the selected tensor representation to contiguous reads
-as well as full and axis-selected reads. A decoded F32 slice reads only its
-aligned encoded blocks before conversion.
+as well as full and axis-selected reads. For a selected dense GGUF output, the
+application supplies a prepared cache policy. The checkpoint store decodes the
+tensor in bounded blocks on first access and pins the
+content-addressed file while the source is live. Device and host evictions leave
+that file available for scalar reads. Packed projections and table lookups use
+the original encoded bytes. VL GGUF NVFP4 projections keep their interleaved
+blocks and bind the checkpoint's matrix multiplier as a separate scalar.
+The MLX Metal projection computes integer dots against transient Q8_0
+activation blocks and accumulates the scaled partials in F32. LFM3 selects
+SwiGLU arithmetic that rounds the gate-times-up product before applying the
+sigmoid when the down projection consumes GGUF NVFP4.
 
 The portable LiquidCodec crate owns the decoder's GGUF projection. Its binding
 checks learned parameter shapes and verifies the exported scalar code table

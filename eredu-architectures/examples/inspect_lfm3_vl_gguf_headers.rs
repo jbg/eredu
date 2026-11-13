@@ -14,9 +14,7 @@ use eredu_core::artifact::{
     inspect_artifact_metadata, ArtifactCompanionRole, ArtifactMetadata, CheckpointMetadata,
     GgufCompanionMetadata, MetadataProvenance,
 };
-use eredu_gguf::{
-    Checkpoint, CheckpointHeader, ConvertedTensor, Limits, QuantizedTensorRepresentation,
-};
+use eredu_gguf::{Checkpoint, CheckpointHeader, ConvertedTensor, Limits};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, error::Error, io::Read, path::Path};
@@ -42,10 +40,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         .as_object()
         .ok_or("missing projector manifest entries")?;
     for (variant, record) in projectors {
-        let checkpoint = Checkpoint::from_headers_with_representation(
+        let checkpoint = Checkpoint::from_headers(
             &[read_header(Path::new(&directory), record)?],
             Limits::default(),
-            QuantizedTensorRepresentation::DecodedF32,
         )?;
         resolve_gguf_projector(&checkpoint, &declaration)?;
         println!(
@@ -172,11 +169,13 @@ fn verify_payload(
             .iter()
             .map(|&dimension| dimension as u64)
             .collect::<Vec<_>>();
-        let ConvertedTensor::Dense(decoded) = lease.materialize_portable()?.into_converted() else {
-            return Err(format!("expected a dense projector tensor for {key}").into());
+        let shape = match lease.materialize_portable()?.into_converted() {
+            ConvertedTensor::Dense(tensor) => tensor.shape,
+            ConvertedTensor::IQuant(tensor) => tensor.packed_shape()?,
+            _ => return Err(format!("unexpected projector encoding for {key}").into()),
         };
-        if decoded.shape != expected {
-            return Err(format!("decoded projector shape differs for {key}").into());
+        if shape != expected {
+            return Err(format!("projector storage shape differs for {key}").into());
         }
     }
     println!(

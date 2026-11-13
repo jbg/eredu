@@ -147,7 +147,7 @@ pub enum ResidentAudioError {
     Backend(#[from] BackendFailure),
 }
 
-/// Logical F32 parameter bytes for the resident Audio graph.
+/// Physical parameter bytes for the resident Audio graph.
 /// Cache state, native temporary arrays, and allocator overhead are separate.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct AudioResidentParameterBytes {
@@ -161,7 +161,7 @@ pub struct AudioResidentParameterBytes {
     pub codec: u64,
 }
 
-/// Cold F32 Audio parameter and sampling selection.
+/// Cold Audio parameter and sampling selection.
 pub struct PreparedResidentAudio {
     artifact: PreparedAudio,
     omni_markers: Option<MediaTokens>,
@@ -189,8 +189,7 @@ impl PreparedResidentAudio {
         omni_markers: Option<MediaTokens>,
     ) -> Result<Self, ResidentAudioError> {
         let sampling = AudioSampling::from_artifact(&artifact)?;
-        let [language_scope, encoder_scope, depth_scope, codec_scope] =
-            artifact.f32_weight_scopes()?;
+        let [language_scope, encoder_scope, depth_scope, codec_scope] = artifact.weight_scopes()?;
         let (language_weights, language) = language_scope.finish("LFM3 Audio language")?;
         let (encoder_weights, encoder) = encoder_scope.finish("LFM3 Audio encoder")?;
         let (depth_weights, depth) = depth_scope.finish("LFM3 Audio depth")?;
@@ -234,7 +233,7 @@ impl PreparedResidentAudio {
         .select_pipeline_rank(rank)?)
     }
 
-    /// Reports the selected logical F32 parameter bytes before device allocation.
+    /// Reports the selected physical parameter bytes before device allocation.
     pub fn parameter_bytes(&self) -> AudioResidentParameterBytes {
         self.report
     }

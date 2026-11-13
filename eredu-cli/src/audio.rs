@@ -87,6 +87,8 @@ struct RespondArgs {
 
 #[derive(Debug, ClapArgs)]
 struct ModelArgs {
+    #[command(flatten)]
+    prepared_cache: crate::common::PreparedCacheArgs,
     /// Local model path or cached Hugging Face model identifier.
     #[arg(long)]
     model: String,
@@ -246,6 +248,7 @@ fn run_turn(
             model: args.assets.clone(),
             text_backbone: None,
         },
+        prepared_checkpoint_cache: Some(args.prepared_cache.policy()),
     })?;
     let prepared = PreparedAudioTask::new(&artifact, task, args.max_slots as usize, args.seed)
         .map_err(anyhow::Error::from_boxed)?;

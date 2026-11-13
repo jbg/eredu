@@ -91,7 +91,11 @@ impl PhysicalArtifactPreparation {
             | Self::MetadataOnly { resolution } => resolution,
         }
     }
-    pub(crate) fn open(&self, cache: usize) -> Result<SharedCheckpointSource, ArtifactError> {
+    pub(crate) fn open(
+        &self,
+        cache: usize,
+        prepared_cache: Option<&eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy>,
+    ) -> Result<SharedCheckpointSource, ArtifactError> {
         match self {
             Self::MetadataOnly { .. } => Err(ArtifactError::MetadataOnly),
             Self::Safetensors {
@@ -103,18 +107,25 @@ impl PhysicalArtifactPreparation {
                 catalog.clone(),
                 resolution.clone(),
                 cache,
+                prepared_cache,
             )
             .map_err(Into::into),
             Self::Gguf {
                 checkpoint,
                 mapping,
                 resolution,
-            } => Ok(Arc::new(
-                eredu_checkpoint::gguf_store::GgufWeightStore::builder()
-                    .max_cached_readers(cache)?
-                    .add_resolved_checkpoint(checkpoint.clone(), resolution, mapping)?
-                    .build()?,
-            )),
+            } => {
+                let mut builder = eredu_checkpoint::gguf_store::GgufWeightStore::builder()
+                    .max_cached_readers(cache)?;
+                if let Some(policy) = prepared_cache {
+                    builder = builder.cache_decoded_outputs(policy.clone());
+                }
+                Ok(Arc::new(
+                    builder
+                        .add_resolved_checkpoint(checkpoint.clone(), resolution, mapping)?
+                        .build()?,
+                ))
+            }
         }
     }
 }
@@ -159,11 +170,15 @@ impl ArtifactSourceDeclarations {
     ) -> Option<&BTreeMap<PhysicalArtifactId, BTreeSet<String>>> {
         self.roles.get(&role)
     }
-    pub(crate) fn bind(&self, cache: usize) -> Result<BoundArtifactSources, ArtifactError> {
+    pub(crate) fn bind(
+        &self,
+        cache: usize,
+        prepared_cache: Option<&eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy>,
+    ) -> Result<BoundArtifactSources, ArtifactError> {
         let physical = self
             .artifacts
             .iter()
-            .map(|(id, artifact)| Ok((id.clone(), artifact.open(cache)?)))
+            .map(|(id, artifact)| Ok((id.clone(), artifact.open(cache, prepared_cache)?)))
             .collect::<Result<BTreeMap<_, _>, ArtifactError>>()?;
         let mut roles = BTreeMap::new();
         for (role, declarations) in &self.roles {

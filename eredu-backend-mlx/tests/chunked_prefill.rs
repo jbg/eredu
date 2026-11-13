@@ -196,6 +196,12 @@ fn run_cases(device: DeviceType, families: Vec<(&str, tempfile::TempDir)>) {
                         group_size: 32,
                         bits: 4,
                     },
+                )
+                .with_prepared_checkpoint_cache(
+                    eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy {
+                        directory: root.path().join("prepared"),
+                        max_bytes: 64 * 1024 * 1024,
+                    },
                 ),
             };
             let inspected = native::inspect_model_preparation(

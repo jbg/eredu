@@ -101,7 +101,8 @@ pub enum Unit {
 /// Retained speech input geometry, parameter scopes and state layout.
 #[derive(Debug, Clone)]
 pub struct Declaration {
-    downsample: [AffineSpec; 6],
+    downsample: [AffineSpec; 5],
+    downsample_projection: LinearSpec,
     blocks: Vec<BlockParameters>,
     final_norm: NormalizationConstructionSpec,
     projector_norm: LayerNormalizationConstructionSpec,
@@ -113,6 +114,36 @@ pub struct Declaration {
 }
 
 impl Declaration {
+    pub(in crate::lfm3) fn select_formats(
+        &mut self,
+        formats: &std::collections::BTreeMap<String, eredu_checkpoint::LinearFormat>,
+    ) -> Result<(), Error> {
+        let format = |name: &str| {
+            formats
+                .get(name)
+                .copied()
+                .unwrap_or(eredu_checkpoint::LinearFormat::Dense)
+        };
+        for spec in [
+            &mut self.downsample_projection,
+            &mut self.projector_up,
+            &mut self.projector_out,
+        ] {
+            spec.format = crate::linear_format::project_matrix_format(
+                &spec.weight,
+                &spec.format,
+                format(spec.weight.id.as_str()),
+            )?;
+        }
+        self.blocks = self
+            .blocks
+            .iter()
+            .cloned()
+            .map(|block| block.select_formats(format))
+            .collect::<Result<_, _>>()?;
+        Ok(())
+    }
+
     /// Normalizes the released Audio config and its typed speech encoder subconfig.
     pub fn from_config(config: &Value) -> Result<Self, Error> {
         if config["model_type"] != "lfm3_audio" {
@@ -208,8 +239,8 @@ impl Declaration {
                 affine("lin_mid", &[channels, channels, 1, 1])?,
                 affine("conv_end", &[channels, 1, 3, 3])?,
                 affine("lin_end", &[channels, channels, 1, 1])?,
-                affine("lin_out", &[width, flattened, 1])?,
             ],
+            downsample_projection: linear(&format!("{ROOT}.downsample.lin_out"), flattened, width)?,
             blocks,
             final_norm: lfm2::block::normalization_spec(
                 &args,
@@ -270,7 +301,11 @@ impl Declaration {
         unit: Unit,
     ) -> Result<Vec<LogicalParameterDeclaration<'_>>, Error> {
         match unit {
-            Unit::Downsampler => self.downsample.as_slice().logical_parameters(),
+            Unit::Downsampler => {
+                let mut parameters = self.downsample.as_slice().logical_parameters()?;
+                parameters.extend(self.downsample_projection.logical_parameters()?);
+                Ok(parameters)
+            }
             Unit::Block(i) => self
                 .blocks
                 .get(i)
@@ -293,12 +328,18 @@ impl Declaration {
             .into_iter()
             .map(|p| {
                 let name = p.parameter.id.to_string();
+                let alternate = name.ends_with(".downsample.lin_out.weight").then(|| {
+                    let mut shape = p.shape.clone();
+                    shape.push(1);
+                    shape
+                });
                 SafetensorsTensorConstraint::required(
                     name.clone(),
                     p.shape,
                     StoredDtypeConstraint::Floating,
                 )
                 .with_aliases(released_alias(&name))
+                .with_alternate_shapes(alternate)
             })
             .collect();
         SafetensorsCheckpointPlan::new(PLAN, tensors, vec![], CatalogPolicy::non_strict())
@@ -318,16 +359,26 @@ impl Declaration {
         let mut recipes = BTreeMap::new();
         for parameter in self.logical_parameters()? {
             let name = parameter.parameter.id.to_string();
-            if resolution.source_keys().contains(&name) {
-                continue;
+            let canonical = resolution.source_keys().contains(&name);
+            let source = if canonical {
+                name.clone()
+            } else {
+                released_alias(&name)
+                    .filter(|alias| resolution.source_keys().contains(alias))
+                    .ok_or_else(|| invalid(format!("no admitted LFM3 audio source for {name}")))?
+            };
+            let recipe = DerivedWeightRecipe::source(source, TensorSelection::Full);
+            if name.ends_with(".downsample.lin_out.weight") {
+                recipes.insert(
+                    name,
+                    DerivedWeightRecipe::Reshape {
+                        input: Box::new(recipe),
+                        shape: parameter.shape,
+                    },
+                );
+            } else if !canonical {
+                recipes.insert(name, recipe);
             }
-            let source = released_alias(&name)
-                .filter(|alias| resolution.source_keys().contains(alias))
-                .ok_or_else(|| invalid(format!("no admitted LFM3 audio source for {name}")))?;
-            recipes.insert(
-                name,
-                DerivedWeightRecipe::source(source, TensorSelection::Full),
-            );
         }
         Ok(recipes)
     }
@@ -417,6 +468,7 @@ impl<T: Tensor> Affine<T> {
 #[parameterized(tensor = "B::Tensor")]
 pub struct Downsampler<B: NeuralBackend> {
     stages: Vec<Affine<B::Tensor>>,
+    projection: B::Linear,
 }
 
 impl<B: NeuralBackend> Downsampler<B> {
@@ -435,6 +487,7 @@ impl<B: NeuralBackend> Downsampler<B> {
                 .iter()
                 .map(|s| Affine::new(s, context))
                 .collect::<Result<_, _>>()?,
+            projection: B::linear(declaration.downsample_projection.clone(), context)?,
         })
     }
 
@@ -448,7 +501,7 @@ impl<B: NeuralBackend> Downsampler<B> {
 
     /// Reduces equal-length, unpadded clips from [batch, mel, frames] to [batch, tokens, width].
     pub fn forward(
-        &self,
+        &mut self,
         features: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
@@ -476,19 +529,7 @@ impl<B: NeuralBackend> Downsampler<B> {
             &[hidden.dim(0), hidden.dim(2), channels * hidden.dim(1)],
             context,
         )?;
-        let projection = &self.stages[5];
-        let compute = affine_accumulation_dtype(weight_dtype);
-        B::Tensor::linear(
-            &flattened.cast_float(compute, context)?,
-            &projection
-                .weight
-                .as_ref()
-                .squeeze_axes(&[2], context)?
-                .cast_float(compute, context)?,
-            Some(&projection.bias.as_ref().cast_float(compute, context)?),
-            context,
-        )?
-        .cast_float(weight_dtype, context)
+        self.projection.forward(&flattened, context)
     }
 }
 
@@ -707,6 +748,7 @@ impl<B: NeuralBackend> Encoder<B> {
         S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
     {
+        let weight_dtype = self.downsample.weight_dtype()?;
         self.declaration.advance_with::<B, S>(
             input,
             state,
@@ -714,7 +756,7 @@ impl<B: NeuralBackend> Encoder<B> {
             context,
             |batch| {
                 B::Tensor::full_f32(0.0, &[batch, 0, self.declaration.width], context)?
-                    .cast_float(self.downsample.weight_dtype()?, context)
+                    .cast_float(weight_dtype, context)
             },
             |features, state, range| {
                 let hidden = self

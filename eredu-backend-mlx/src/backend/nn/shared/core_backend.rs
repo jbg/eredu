@@ -173,6 +173,14 @@ impl NeuralBackend for MlxNeuralBackend {
             spec.format.encoding(),
             context,
         ))?;
+        if spec.format.global_scale().is_some() && module.global_scale.as_ref().is_none() {
+            module.global_scale = crate::backend::nn::module::PhysicalParam::unloaded_some(
+                &[],
+                safemlx::Dtype::Float32,
+                context,
+            )
+            .map_err(ComputeError::backend_source)?;
+        }
         module.exact_zero_inputs = spec.format.exact_zero_inputs()
             && spec
                 .format

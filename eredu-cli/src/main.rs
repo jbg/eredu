@@ -544,6 +544,8 @@ const AUTOMATIC_OVERRIDE_ARGUMENTS: &[&str] = &[
     "expert_cache_eviction",
     "expert_cache_benchmark",
     "cached_shards",
+    "prepared_cache_dir",
+    "prepared_cache_bytes",
 ];
 
 #[derive(Debug, Default)]
@@ -578,7 +580,12 @@ impl AutomaticCliOverrides {
         resources: &ModelResourceProfile,
     ) -> Result<ExecutionPlan> {
         if self.is_empty() {
-            return Ok(plan.clone());
+            return Ok(if plan.prepared_checkpoint_cache().is_some() {
+                plan.clone()
+            } else {
+                plan.clone()
+                    .with_prepared_checkpoint_cache(original.common.prepared_cache.policy())
+            });
         }
         let mut args = original.clone();
         apply_automatic_plan(&mut args, plan)?;
@@ -593,6 +600,9 @@ impl AutomaticCliOverrides {
     }
 
     fn restore(&self, args: &mut Cli, original: &Cli) {
+        if self.contains("prepared_cache_dir") {
+            args.common.prepared_cache = original.common.prepared_cache.clone();
+        }
         if self.contains("vision_companion") {
             args.vision_companion = original.vision_companion.clone();
         }
@@ -1548,7 +1558,10 @@ fn automatic_benchmark_candidates(
             .into_iter()
             .enumerate()
     {
-        let plan = plan.with_media_companions(heuristic.plan.media_companions().clone());
+        let mut plan = plan.with_media_companions(heuristic.plan.media_companions().clone());
+        if let Some(policy) = heuristic.plan.prepared_checkpoint_cache() {
+            plan = plan.with_prepared_checkpoint_cache(policy.clone());
+        }
         if (index == 0 && !resident_fits) || (index == 1 && !layerwise_fits) {
             continue;
         }
@@ -1871,6 +1884,8 @@ fn exact_automatic_report(model_path: &Path, plan: ExecutionPlan) -> Result<Exec
 
 fn apply_automatic_plan(args: &mut Cli, plan: &ExecutionPlan) -> Result<()> {
     args.common.device = Some(cli_device_for_plan(plan.device())?);
+    args.common.prepared_cache =
+        crate::common::PreparedCacheArgs::from_policy(plan.prepared_checkpoint_cache());
     args.vision_companion = plan.media_companions().vision().map(Path::to_path_buf);
     args.audio_companion = plan.media_companions().audio().map(Path::to_path_buf);
     match plan.weight_transformation() {
@@ -2119,7 +2134,11 @@ fn main() -> Result<()> {
                 );
             }
             let plan = if automatic_overrides.is_empty() {
-                plan
+                if plan.prepared_checkpoint_cache().is_some() {
+                    plan
+                } else {
+                    plan.with_prepared_checkpoint_cache(args.common.prepared_cache.policy())
+                }
             } else {
                 let observations =
                     automatic_observations(&model_path, args.common.device.unwrap_or_default())?;
@@ -2144,16 +2163,23 @@ fn main() -> Result<()> {
         match args.auto {
             Some(mode) => match mode {
                 AutoMode::Benchmark => {
-                    if !automatic_overrides.is_empty() {
+                    if automatic_overrides
+                        .explicit
+                        .iter()
+                        .any(|id| !matches!(*id, "prepared_cache_dir" | "prepared_cache_bytes"))
+                    {
                         bail!(
                             "performance overrides are supported by automatic quick execution and plan reporting, not --auto benchmark"
                         );
                     }
-                    let heuristic = automatic_plan(
+                    let mut heuristic = automatic_plan(
                         &model_path,
                         args.common.device.unwrap_or_default(),
                         &automatic_feedback,
                     )?;
+                    heuristic.plan = heuristic
+                        .plan
+                        .with_prepared_checkpoint_cache(args.common.prepared_cache.policy());
                     let benchmark = benchmark_automatic_plans(
                         &model_path,
                         heuristic,
@@ -2907,21 +2933,20 @@ fn cli_execution_plan(
         args.expert_cache_prefill_bank_bytes,
         args.expert_cache_eviction.into(),
     ));
-    Ok(
-        ExecutionPlan::fully_resident(device_plan(args.common.device.unwrap_or_default())?)
-            .with_topology(
-                eredu_core::topology::ParallelTopology::new(1, 1, 1, 1)
-                    .expect("the singleton topology is valid"),
-            )
-            .with_residency(residency)
-            .with_media_companions(args.media_companions())
-            .with_weight_transformation(transformation)
-            .with_max_cached_shards(args.common.cached_shards)
-            .with_expert_cache(expert_cache)
-            .with_drafting(drafting)
-            .with_required_device_capabilities(DeviceCapabilities::new(true, false, false))
-            .with_required_session_capabilities(SessionCapabilities::default()),
-    )
+    let plan = ExecutionPlan::fully_resident(device_plan(args.common.device.unwrap_or_default())?)
+        .with_topology(
+            eredu_core::topology::ParallelTopology::new(1, 1, 1, 1)
+                .expect("the singleton topology is valid"),
+        )
+        .with_residency(residency)
+        .with_media_companions(args.media_companions())
+        .with_weight_transformation(transformation)
+        .with_max_cached_shards(args.common.cached_shards)
+        .with_expert_cache(expert_cache)
+        .with_drafting(drafting)
+        .with_required_device_capabilities(DeviceCapabilities::new(true, false, false))
+        .with_required_session_capabilities(SessionCapabilities::default());
+    Ok(plan.with_prepared_checkpoint_cache(args.common.prepared_cache.policy()))
 }
 
 fn format_bytes(bytes: usize) -> String {
@@ -4150,7 +4175,8 @@ mod tests {
         apply_automatic_plan(&mut replay, &plan).unwrap();
         assert_eq!(
             cli_execution_plan(&replay, Some(Path::new("assistant")), false).unwrap(),
-            plan
+            plan.clone()
+                .with_prepared_checkpoint_cache(replay.common.prepared_cache.policy())
         );
         let resources = ModelResourceProfile::unmeasured(
             "target".into(),

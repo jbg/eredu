@@ -87,6 +87,13 @@ pub(crate) fn gated_product(
             .add(Array::from_f32(policy.up_offset()), stream)?
             .as_dtype(up_dtype, stream)?;
     }
+    if policy.multiply_before_sigmoid() {
+        if let Some(output) = super::gated_arithmetic::silu_product_first(&gate, &up, stream)? {
+            return Ok(output);
+        }
+        let product = gate.multiply(&up, stream)?;
+        return product.multiply(sigmoid(gate, stream)?, stream);
+    }
     let gate = match policy.activation() {
         GatedProductActivation::Silu if policy.sigmoid_multiplier() == 1.0 => silu(gate, stream)?,
         GatedProductActivation::Silu => {

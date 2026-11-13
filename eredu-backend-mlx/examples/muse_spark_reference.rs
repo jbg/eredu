@@ -191,6 +191,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         catalog.tensors().clone(),
         resolution,
         SOURCE_READER_BOUND,
+        None,
     )?;
 
     let mut config = full;

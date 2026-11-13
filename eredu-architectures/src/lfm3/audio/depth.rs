@@ -16,6 +16,7 @@ use eredu_checkpoint::{
     LinearFormat,
 };
 use eredu_core::AttentionPolicy;
+use eredu_nn::EmbeddingOperator;
 use eredu_nn::{
     DeclareLogicalParameters, Error, Index, LinearArithmetic, LinearFormatSpec, LinearOperator,
     LinearSpec, LogicalParameterDeclaration, LogicalParameterRole, NeuralBackend,
@@ -54,7 +55,7 @@ pub enum DepthUnit {
 
 #[derive(Debug, Clone)]
 struct CodebookSpec {
-    table: ParameterSpec,
+    table: eredu_nn::EmbeddingSpec,
     scale: ParameterSpec,
 }
 
@@ -66,7 +67,7 @@ pub struct DepthDeclaration {
     blocks: Vec<BlockParameters>,
     final_norm: NormalizationConstructionSpec,
     codebooks: Vec<CodebookSpec>,
-    feedback: ParameterSpec,
+    feedback: eredu_nn::EmbeddingSpec,
     vocabulary: i32,
     width: i32,
     eos: i32,
@@ -74,6 +75,44 @@ pub struct DepthDeclaration {
 }
 
 impl DepthDeclaration {
+    pub(in crate::lfm3) fn select_formats(
+        &mut self,
+        formats: &std::collections::BTreeMap<String, eredu_checkpoint::LinearFormat>,
+    ) -> Result<(), Error> {
+        let format = |name: &str| {
+            formats
+                .get(name)
+                .copied()
+                .unwrap_or(eredu_checkpoint::LinearFormat::Dense)
+        };
+        for spec in [&mut self.projection] {
+            spec.format = crate::linear_format::project_matrix_format(
+                &spec.weight,
+                &spec.format,
+                format(spec.weight.id.as_str()),
+            )?;
+        }
+        for table in self
+            .codebooks
+            .iter_mut()
+            .map(|book| &mut book.table)
+            .chain(std::iter::once(&mut self.feedback))
+        {
+            table.format = crate::linear_format::project_matrix_format(
+                &table.weight,
+                &table.format,
+                format(table.weight.id.as_str()),
+            )?;
+        }
+        self.blocks = self
+            .blocks
+            .iter()
+            .cloned()
+            .map(|block| block.select_formats(format))
+            .collect::<Result<_, _>>()?;
+        Ok(())
+    }
+
     /// Normalizes the released training-export or typed Audio configuration.
     pub fn from_config(config: &Value) -> Result<Self, Error> {
         if config["model_type"] != "lfm3_audio" {
@@ -175,7 +214,12 @@ impl DepthDeclaration {
             .map(|i| {
                 let root = format!("{ROOT}.depth_embeddings.{i}");
                 Ok(CodebookSpec {
-                    table: parameter(format!("{root}.embedding.weight"))?,
+                    table: eredu_nn::EmbeddingSpec {
+                        vocabulary,
+                        dimensions: width,
+                        weight: parameter(format!("{root}.embedding.weight"))?,
+                        format: LinearFormatSpec::unscaled(LinearFormat::Dense)?,
+                    },
                     scale: parameter(format!("{root}.embedding_norm.weight"))?,
                 })
             })
@@ -190,7 +234,12 @@ impl DepthDeclaration {
             )?,
             blocks,
             codebooks,
-            feedback: parameter(FEEDBACK)?,
+            feedback: eredu_nn::EmbeddingSpec {
+                vocabulary: books * vocabulary,
+                dimensions: input,
+                weight: parameter(FEEDBACK)?,
+                format: LinearFormatSpec::unscaled(LinearFormat::Dense)?,
+            },
             vocabulary,
             width,
             eos,
@@ -260,10 +309,11 @@ impl DepthDeclaration {
                     .ok_or_else(|| invalid("unknown speech codebook"))?;
                 Ok(vec![
                     LogicalParameterDeclaration::new(
-                        &spec.table,
+                        &spec.table.weight,
                         &[self.vocabulary, self.width],
                         LogicalParameterRole::Codebook,
-                    )?,
+                    )?
+                    .with_linear_format(&spec.table.format)?,
                     LogicalParameterDeclaration::new(
                         &spec.scale,
                         &[self.width],
@@ -278,13 +328,11 @@ impl DepthDeclaration {
                 .logical_parameters(),
             DepthUnit::Normalization => self.final_norm.logical_parameters(),
             DepthUnit::Feedback => Ok(vec![LogicalParameterDeclaration::new(
-                &self.feedback,
-                &[
-                    self.codebooks.len() as i32 * self.vocabulary,
-                    self.projection.input,
-                ],
+                &self.feedback.weight,
+                &[self.feedback.vocabulary, self.feedback.dimensions],
                 LogicalParameterRole::Codebook,
-            )?]),
+            )?
+            .with_linear_format(&self.feedback.format)?]),
         }
     }
 
@@ -481,10 +529,10 @@ impl DepthFrame {
 }
 
 #[derive(Debug, Clone, Parameterized)]
-#[parameterized(tensor = "T")]
-struct Codebook<T: Tensor> {
-    table: Parameter<T>,
-    scale: Parameter<T>,
+#[parameterized(tensor = "B::Tensor")]
+struct Codebook<B: NeuralBackend> {
+    table: B::Embedding,
+    scale: Parameter<B::Tensor>,
 }
 
 #[path = "depth_policy.rs"]
@@ -606,13 +654,11 @@ impl DepthDeclaration {
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct Feedback<B: NeuralBackend> {
-    weight: Parameter<B::Tensor>,
+    weight: B::Embedding,
     #[parameter(skip)]
     codebooks: i32,
     #[parameter(skip)]
     vocabulary: i32,
-    #[parameter(skip)]
-    width: i32,
 }
 
 impl<B: NeuralBackend> Feedback<B> {
@@ -624,22 +670,16 @@ impl<B: NeuralBackend> Feedback<B> {
         B::require_operator_capabilities("LFM3 speech feedback", lookup_capabilities())?;
         let codebooks = declaration.codebooks.len() as i32;
         let vocabulary = declaration.vocabulary;
-        let width = declaration.projection.input;
         Ok(Self {
-            weight: Parameter::unloaded(
-                declaration.feedback.clone(),
-                &[codebooks * vocabulary, width],
-                context,
-            )?,
+            weight: B::embedding(declaration.feedback.clone(), context)?,
             codebooks,
             vocabulary,
-            width,
         })
     }
 
     /// Sums language-width codebook embeddings in each complete I32 frame.
     pub fn embed(
-        &self,
+        &mut self,
         codes: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
@@ -650,18 +690,32 @@ impl<B: NeuralBackend> Feedback<B> {
         {
             return Err(invalid("invalid LFM3 speech feedback codes"));
         }
-        // Index each table independently so an invalid code cannot select a neighbor table.
         let codes = nonnegative_gather_indices(codes, self.vocabulary, context)?;
-        let table = self
-            .weight
-            .as_ref()
-            .reshape(&[self.codebooks, self.vocabulary, self.width], context)?;
+        let limit = B::Tensor::full_i32(self.vocabulary - 1, &[], context)?;
+        let invalid = B::Tensor::full_i32(self.codebooks * self.vocabulary, &[], context)?;
         let embeddings = (0..self.codebooks)
             .map(|slot| {
                 let ids = codes.index(&[Index::Full, Index::At(slot)], context)?;
-                table
-                    .index(&[Index::At(slot)], context)?
-                    .take_axis(&ids, 0, context)
+                // Saturation to the upper bound is used only to validate each
+                // local code before adding its table's row offset.
+                let excess = limit.subtract(&ids, context)?.maximum_i32(0, context)?;
+                let valid = ids
+                    .add(&excess, context)?
+                    .equal_i32(self.vocabulary - 1, context)?;
+                let offset = B::Tensor::full_i32(slot * self.vocabulary, &[], context)?;
+                let rows = B::Tensor::where_condition(
+                    &valid,
+                    &B::Tensor::where_condition(
+                        &valid,
+                        &ids,
+                        &B::Tensor::full_i32(0, &[], context)?,
+                        context,
+                    )?
+                    .add(&offset, context)?,
+                    &invalid,
+                    context,
+                )?;
+                self.weight.forward(&rows, context)
             })
             .collect::<Result<Vec<_>, Error>>()?;
         let embeddings = B::Tensor::stack(&embeddings, 1, context)?;

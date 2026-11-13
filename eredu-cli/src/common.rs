@@ -6,6 +6,8 @@ use eredu_runtime::NormalizedLoadRequest;
 
 #[derive(Debug, Clone, PartialEq, clap::Args)]
 pub struct CommonOptions {
+    #[command(flatten)]
+    pub(crate) prepared_cache: PreparedCacheArgs,
     /// Model directory, GGUF file, or cached Hugging Face model identifier.
     /// Append `:QUANT` to select a cached GGUF quantization.
     #[arg(short, long, value_name = "PATH_OR_ID")]
@@ -164,4 +166,62 @@ pub fn output_file(path: &std::path::Path) -> Result<std::fs::File> {
         .create_new(true)
         .open(path)
         .with_context(|| format!("creating {}; output paths must be new", path.display()))
+}
+
+/// Explicit storage for weights prepared by the loader.
+#[derive(Debug, Clone, Default, PartialEq, clap::Args)]
+pub(crate) struct PreparedCacheArgs {
+    /// Directory for file-backed prepared weights (defaults to the user cache directory).
+    #[arg(long, requires = "prepared_cache_bytes")]
+    prepared_cache_dir: Option<std::path::PathBuf>,
+    /// Maximum bytes for prepared weight files (defaults to 32 GiB).
+    #[arg(long, requires = "prepared_cache_dir")]
+    prepared_cache_bytes: Option<u64>,
+}
+
+impl PreparedCacheArgs {
+    pub(crate) fn from_policy(
+        policy: Option<&eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy>,
+    ) -> Self {
+        Self {
+            prepared_cache_dir: policy.map(|policy| policy.directory.clone()),
+            prepared_cache_bytes: policy.map(|policy| policy.max_bytes),
+        }
+    }
+
+    pub(crate) fn policy(&self) -> eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy {
+        use std::{env, path::PathBuf};
+
+        let directory = self.prepared_cache_dir.clone().unwrap_or_else(|| {
+            let root = if cfg!(target_os = "windows") {
+                env::var_os("LOCALAPPDATA").map(PathBuf::from)
+            } else {
+                env::var_os("XDG_CACHE_HOME")
+                    .map(PathBuf::from)
+                    .filter(|path| path.is_absolute())
+                    .or_else(|| {
+                        env::var_os("HOME")
+                            .map(PathBuf::from)
+                            .filter(|path| path.is_absolute())
+                            .map(|home| {
+                                home.join(if cfg!(target_os = "macos") {
+                                    "Library/Caches"
+                                } else {
+                                    ".cache"
+                                })
+                            })
+                    })
+            };
+            root.unwrap_or_else(env::temp_dir)
+                .join("eredu/prepared-checkpoints-v1")
+        });
+        eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy {
+            directory,
+            max_bytes: self.prepared_cache_bytes.unwrap_or(32 * 1024 * 1024 * 1024),
+        }
+    }
+
+    pub(crate) fn is_explicit(&self) -> bool {
+        self.prepared_cache_dir.is_some()
+    }
 }

@@ -14,10 +14,7 @@ use super::{
     is_d1_config, read, DecisionAudioProcessor, DecisionError, PreparedTextChoiceModel,
     TextChoicePreparation,
 };
-use crate::lfm3::vision::{
-    gguf::{self, open_decoded},
-    MediaTokens, VisionLanguageDeclaration,
-};
+use crate::lfm3::vision::{gguf, MediaTokens, VisionLanguageDeclaration};
 use eredu_nn::Error;
 
 const DECISION_TYPE: &str = "lfm3.decision.type";
@@ -124,18 +121,36 @@ impl DecisionGgufLayouts {
                 let resolved = resolve_gguf_plan(checkpoint, &plan).map_err(|report| {
                     Error::backend(format!("d1 GGUF projector schema differs: {report:?}"))
                 })?;
-                let checkpoint = gguf::decoded_catalog(checkpoint).map_err(Error::backend)?;
+                let checkpoint = crate::lfm3::checkpoint::packed_gguf_catalog(checkpoint.clone())
+                    .map_err(Error::backend_source)?;
+                let mut vision = declaration.vision.clone();
+                gguf::select_projector_formats(&checkpoint, &mut vision)?;
+                let audio = sidecars
+                    .audio
+                    .as_ref()
+                    .map(|_| {
+                        let encoder =
+                            crate::lfm3::audio::Declaration::from_speech_config(&sidecars.config)?;
+                        crate::lfm3::audio::gguf::select_input_formats(&checkpoint, &encoder)
+                            .map(|(encoder, _)| encoder)
+                            .map_err(Error::backend_source)
+                    })
+                    .transpose()?;
+                let checkpoint = if let Some(encoder) = &audio {
+                    crate::lfm3::audio::gguf::input_projector_catalog(checkpoint.clone(), encoder)
+                        .map_err(Error::backend_source)?
+                } else {
+                    checkpoint
+                };
                 let mapping = checkpoint
                     .translated_outputs(str::to_owned)
                     .map_err(Error::backend_source)?;
                 let catalog =
                     GgufCatalog::from_resolved_checkpoint(&checkpoint, &resolved, &mapping)
                         .map_err(Error::backend_source)?;
-                gguf::projector_recipes(&catalog, &declaration.vision)?;
-                if sidecars.audio.is_some() {
-                    let encoder =
-                        crate::lfm3::audio::Declaration::from_speech_config(&sidecars.config)?;
-                    crate::lfm3::audio::gguf::input_encoder_recipes(&encoder, &catalog)
+                gguf::projector_recipes(&catalog, &vision)?;
+                if let Some(encoder) = &audio {
+                    crate::lfm3::audio::gguf::input_encoder_recipes(encoder, &catalog)
                         .map_err(Error::backend_source)?;
                 }
                 Ok::<_, DecisionError>(resolved)
@@ -154,15 +169,24 @@ impl PreparedTextChoiceModel {
     /// The assets directory contains the matching decision configuration, tokenizer,
     /// and calibration. The processor sidecar is required with a projector and for
     /// Omni marker admission. A supplied projector retains all input encoders.
+    /// A projector with decoded outputs requires a prepared cache policy.
     pub fn open_gguf(
         backbone: &Path,
         projector: Option<&Path>,
         assets: &Path,
         dtype: RecipeDtype,
         max_cached_readers: usize,
+        prepared_cache: Option<&eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy>,
     ) -> Result<Self, DecisionError> {
-        let checkpoint = open_decoded(backbone)?;
-        Self::from_gguf_checkpoint(checkpoint, projector, assets, dtype, max_cached_readers)
+        let checkpoint = Checkpoint::open(backbone).map_err(Error::backend_source)?;
+        Self::from_gguf_checkpoint(
+            checkpoint,
+            projector,
+            assets,
+            dtype,
+            max_cached_readers,
+            prepared_cache,
+        )
     }
 
     /// Prepares a GGUF only when its metadata declares a native decision task.
@@ -172,13 +196,21 @@ impl PreparedTextChoiceModel {
         assets: &Path,
         dtype: RecipeDtype,
         max_cached_readers: usize,
+        prepared_cache: Option<&eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy>,
     ) -> Result<Option<Self>, DecisionError> {
-        let checkpoint = open_decoded(backbone)?;
+        let checkpoint = Checkpoint::open(backbone).map_err(Error::backend_source)?;
         if !declares_decision(&checkpoint) {
             return Ok(None);
         }
-        Self::from_gguf_checkpoint(checkpoint, projector, assets, dtype, max_cached_readers)
-            .map(Some)
+        Self::from_gguf_checkpoint(
+            checkpoint,
+            projector,
+            assets,
+            dtype,
+            max_cached_readers,
+            prepared_cache,
+        )
+        .map(Some)
     }
 
     fn from_gguf_checkpoint(
@@ -187,6 +219,7 @@ impl PreparedTextChoiceModel {
         assets: &Path,
         dtype: RecipeDtype,
         max_cached_readers: usize,
+        prepared_cache: Option<&eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy>,
     ) -> Result<Self, DecisionError> {
         let sidecars = Sidecars::read(&checkpoint, projector.is_some(), assets)?;
         let (decoder, vision, audio) = VisionLanguageDeclaration::prepare_decision_gguf(
@@ -197,6 +230,7 @@ impl PreparedTextChoiceModel {
             sidecars.audio,
             dtype,
             max_cached_readers,
+            prepared_cache,
         )?;
         Ok(Self {
             preparation: sidecars.preparation,

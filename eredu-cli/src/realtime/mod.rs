@@ -292,6 +292,9 @@ fn configuration(args: &Args) -> Result<load::Config> {
     if let Some(base) = &args.base_assets {
         config.base_assets = resolve_model(base, None, CachedGgufRole::Target)?.path;
     }
+    if args.common.prepared_cache.is_explicit() || config.prepared_checkpoint_cache.is_none() {
+        config.prepared_checkpoint_cache = Some(args.common.prepared_cache.policy());
+    }
     if let Some(seed) = args.common.seed {
         config.seed = seed;
     }

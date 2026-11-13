@@ -387,6 +387,10 @@ pub struct ExecutionPlan {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) parameter_conversion_retention:
         Option<crate::residency::ParameterConversionRetentionPolicy>,
+    /// Explicit storage policy for file-backed prepared weights.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) prepared_checkpoint_cache:
+        Option<eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy>,
     /// Optional transformation applied while checkpoint weights are loaded.
     pub(crate) weight_transformation: WeightTransformationPlan,
     /// Maximum number of checkpoint shards or readers retained simultaneously.
@@ -429,6 +433,7 @@ impl ExecutionPlan {
             topology: ParallelTopology::new(1, 1, 1, 1).expect("the singleton topology is valid"),
             residency: ResidencyPlan::FullyResident,
             parameter_conversion_retention: None,
+            prepared_checkpoint_cache: None,
             weight_transformation: WeightTransformationPlan::PreserveCheckpoint,
             max_cached_shards: DEFAULT_MAX_CACHED_SHARDS,
             expert_cache: None,
@@ -459,6 +464,22 @@ impl ExecutionPlan {
     pub const fn residency(&self) -> &ResidencyPlan {
         &self.residency
     }
+    /// Application-provided directory and byte budget for prepared checkpoint files.
+    pub const fn prepared_checkpoint_cache(
+        &self,
+    ) -> Option<&eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy> {
+        self.prepared_checkpoint_cache.as_ref()
+    }
+
+    /// Enables persistent prepared weights using the supplied directory and byte budget.
+    pub fn with_prepared_checkpoint_cache(
+        mut self,
+        policy: eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy,
+    ) -> Self {
+        self.prepared_checkpoint_cache = Some(policy);
+        self
+    }
+
     /// Requested conversion-retention policy. `None` selects the finite managed default.
     pub const fn parameter_conversion_retention(
         &self,

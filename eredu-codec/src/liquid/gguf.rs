@@ -1,6 +1,6 @@
 //! Published LiquidCodec decoder layout in the speech projector GGUF.
 
-use super::{invalid, Config, Declaration};
+use super::{invalid, Declaration};
 use crate::Error;
 use eredu_checkpoint::{
     gguf_store::GgufCatalog,
@@ -19,7 +19,7 @@ const WINDOW: &str = "decoder.istft.window";
 
 /// Canonical decoder-only projection of a published speech GGUF.
 pub struct GgufDecoderBindings {
-    config: Config,
+    declaration: Declaration,
     recipes: BTreeMap<String, DerivedWeightRecipe>,
 }
 
@@ -27,6 +27,7 @@ impl GgufDecoderBindings {
     /// Checks the canonical projection and full decoder tensor coverage from metadata.
     pub fn compile(declaration: &Declaration, catalog: &GgufCatalog) -> Result<Self, Error> {
         let config = declaration.config();
+        let mut selected = declaration.clone();
         if config.fsq_levels != [8, 7, 6, 6]
             || config.n_q != 12
             || config.quantizer_dim != 256
@@ -48,23 +49,89 @@ impl GgufDecoderBindings {
         if table.shape != [2016, 4] || table.dtype != StoredDtype::F32.into() {
             return Err(invalid("invalid LiquidCodec GGUF scalar code table layout"));
         }
-        let mut recipes = BTreeMap::new();
+        use eredu_checkpoint::LinearFormat;
+        let mut formats = BTreeMap::new();
         for parameter in declaration.decoder_parameters()? {
+            let key = parameter.parameter.id.as_str();
+            let Some(DerivedWeightRecipe::Source { key: physical, .. }) =
+                decoder_recipe(key, &parameter.shape)
+            else {
+                continue;
+            };
+            if parameter.linear_format.is_none() {
+                continue;
+            }
+            let metadata = catalog
+                .metadata(&physical)
+                .map_err(|error| invalid(error.to_string()))?;
+            let provenance = catalog
+                .source_provenance(&physical)
+                .map_err(|error| invalid(error.to_string()))?;
+            let eredu_checkpoint::SourceTensorEncoding::Gguf { ggml_type, endian } =
+                provenance.source_encoding
+            else {
+                return Err(invalid("LiquidCodec matrix must originate from GGUF"));
+            };
+            let format = match metadata.stored_dtype {
+                StoredDtype::U8 => LinearFormat::GgufIQuant { ggml_type, endian },
+                StoredDtype::U32 if ggml_type == eredu_gguf::GgmlType::Q4_0 => {
+                    LinearFormat::Affine(
+                        eredu_checkpoint::AffineQuantization::new(32, 4)
+                            .map_err(|error| invalid(error.to_string()))?,
+                    )
+                }
+                _ => LinearFormat::Dense,
+            };
+            formats.insert(key.to_owned(), format);
+        }
+        selected.select_decoder_formats(&formats)?;
+
+        let mut recipes = BTreeMap::new();
+        for parameter in selected.decoder_parameters()? {
             let key = parameter.parameter.id.as_str();
             let recipe = decoder_recipe(key, &parameter.shape)
                 .ok_or_else(|| invalid(format!("no LiquidCodec GGUF projection for {key}")))?;
-            if key != WINDOW {
-                let inferred = recipe
-                    .infer(catalog)
-                    .map_err(|error| invalid(error.to_string()))?;
-                if inferred.shape != parameter.shape {
-                    return Err(invalid(format!(
-                        "{key}: projected shape {:?}, expected {:?}",
-                        inferred.shape, parameter.shape,
-                    )));
+            let member = eredu_runtime::ParameterMemberSpec::from_logical_declaration(
+                &parameter,
+                eredu_runtime::MemberSharding::Replicated,
+            );
+            let members = if let Some(format) = parameter.linear_format {
+                eredu_runtime::expand_linear_format_parameter(&member, format)
+                    .map_err(|error| invalid(error.to_string()))?
+            } else {
+                vec![member]
+            };
+            for member in members {
+                let recipe = if let Some(companion) = member.linear_companion() {
+                    let DerivedWeightRecipe::Source { key, .. } = &recipe else {
+                        return Err(invalid("LiquidCodec companion requires a direct matrix"));
+                    };
+                    let prefix = key
+                        .strip_suffix(".weight")
+                        .ok_or_else(|| invalid("invalid codec weight name"))?;
+                    let suffix = match companion {
+                        eredu_nn::LinearCompanionRole::Scale => "scales",
+                        eredu_nn::LinearCompanionRole::AffineBias => "biases",
+                        _ => return Err(invalid("unsupported LiquidCodec GGUF companion")),
+                    };
+                    source(format!("{prefix}.{suffix}"))
+                } else {
+                    recipe.clone()
+                };
+                if key != WINDOW {
+                    let inferred = recipe
+                        .infer(catalog)
+                        .map_err(|error| invalid(error.to_string()))?;
+                    if inferred.shape != member.global_shape() {
+                        return Err(invalid(format!(
+                            "{key}: projected shape {:?}, expected {:?}",
+                            inferred.shape,
+                            member.global_shape(),
+                        )));
+                    }
                 }
+                recipes.insert(member.target().to_owned(), recipe);
             }
-            recipes.insert(key.to_owned(), recipe);
         }
         let covered = recipes
             .values()
@@ -85,9 +152,14 @@ impl GgufDecoderBindings {
             ));
         }
         Ok(Self {
-            config: config.clone(),
+            declaration: selected,
             recipes,
         })
+    }
+
+    /// Codec construction with the formats selected by the retained GGUF catalog.
+    pub fn declaration(&self) -> &Declaration {
+        &self.declaration
     }
 
     /// Decoder recipes keyed by their canonical parameter names.
@@ -124,8 +196,8 @@ impl GgufDecoderBindings {
         else {
             return Err(invalid("expected a dense LiquidCodec scalar code table"));
         };
-        let expected = (0..self.config.codebook_size()?)
-            .flat_map(|index| self.config.scalar_code(index))
+        let expected = (0..self.declaration.config().codebook_size()?)
+            .flat_map(|index| self.declaration.config().scalar_code(index))
             .flat_map(f32::to_ne_bytes);
         if table.dtype != DenseDtype::F32 || !table.data.into_iter().eq(expected) {
             return Err(invalid(
@@ -133,7 +205,7 @@ impl GgufDecoderBindings {
             ));
         }
 
-        let length = self.config.stft_win_length as usize;
+        let length = self.declaration.config().stft_win_length as usize;
         // mtmd uses a periodic Hann with a double-precision angle passed to cosf.
         let bytes = (0..length)
             .flat_map(|index| {

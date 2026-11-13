@@ -1016,6 +1016,22 @@ impl LinearFormatSpec {
         Ok(spec)
     }
 
+    /// Declares GGUF NVFP4 blocks with one separately stored matrix multiplier.
+    pub fn gguf_nvfp4(
+        endian: eredu_checkpoint::Endian,
+        mut global_scale: ParameterSpec,
+    ) -> Result<Self, Error> {
+        let mut spec = Self::unscaled(LinearFormat::GgufIQuant {
+            ggml_type: eredu_checkpoint::GgmlType::NvFp4,
+            endian,
+        })?;
+        global_scale.linear_companion = Some(LinearCompanionRole::GlobalScale);
+        global_scale.linear_companion_of = None;
+        spec.global_scale = Some(global_scale);
+        spec.validate()?;
+        Ok(spec)
+    }
+
     /// Declares an encoding with one exact scale companion.
     pub fn scaled(format: LinearFormat, scale: ParameterSpec) -> Result<Self, Error> {
         let mut scale = scale;
@@ -1140,10 +1156,17 @@ impl LinearFormatSpec {
                 (self.scale.is_some(), self.affine_bias.is_some())
             )));
         }
-        if self.global_scale.is_some() != (self.format == LinearFormat::NvFp4) {
-            return Err(Error::backend(
-                "only NVFP4 requires a global scale companion",
-            ));
+        let gguf_nvfp4 = matches!(
+            self.format,
+            LinearFormat::GgufIQuant {
+                ggml_type: eredu_checkpoint::GgmlType::NvFp4,
+                ..
+            }
+        );
+        if (self.format == LinearFormat::NvFp4 && self.global_scale.is_none())
+            || (self.global_scale.is_some() && self.format != LinearFormat::NvFp4 && !gguf_nvfp4)
+        {
+            return Err(Error::backend("invalid NVFP4 global scale companion"));
         }
         if let Some(global) = &self.global_scale {
             if global.linear_companion != Some(LinearCompanionRole::GlobalScale)
@@ -2754,6 +2777,7 @@ pub struct GatedProductPolicy {
     up_absolute_bound: Option<f32>,
     sigmoid_multiplier: f32,
     up_offset: f32,
+    multiply_before_sigmoid: bool,
 }
 
 impl GatedProductPolicy {
@@ -2771,6 +2795,7 @@ impl GatedProductPolicy {
             up_absolute_bound,
             sigmoid_multiplier,
             up_offset,
+            multiply_before_sigmoid: false,
         };
         policy.validate()?;
         Ok(policy)
@@ -2784,7 +2809,21 @@ impl GatedProductPolicy {
             up_absolute_bound: None,
             sigmoid_multiplier: 1.0,
             up_offset: 0.0,
+            multiply_before_sigmoid: false,
         }
+    }
+
+    /// SwiGLU that rounds the gate-times-up product before applying the sigmoid.
+    pub const fn product_first_silu() -> Self {
+        Self {
+            multiply_before_sigmoid: true,
+            ..Self::ordinary_silu()
+        }
+    }
+
+    /// Whether to multiply the gate and up projections before the sigmoid.
+    pub const fn multiply_before_sigmoid(self) -> bool {
+        self.multiply_before_sigmoid
     }
 
     /// Ordinary unbounded exact-GELU gating.

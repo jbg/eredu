@@ -158,23 +158,22 @@ impl DirectRecipeRead {
         layout: eredu_nn::ParameterStorageLayout,
     ) -> Result<Option<Self>, WeightRecipeError> {
         if layout == eredu_nn::ParameterStorageLayout::TransposedMatrix && !cfg!(feature = "cuda") {
-            let default_policy =
-                eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy::default();
-            let policy = source.prepared_cache_policy().unwrap_or(&default_policy);
-            if let Some(prepared) = eredu_checkpoint::prepared_cache::prepare_transposed_matrix(
-                source,
-                recipe,
-                policy,
-                64 * 1024 * 1024,
-            )? {
-                let storage = DerivedWeightRecipe::source(
-                    "matrix",
-                    eredu_checkpoint::store::TensorSelection::Full,
-                );
-                if let Some(mut read) = Self::prepare(&storage, prepared.as_ref())? {
-                    read.transposed = true;
-                    read._prepared_source = Some(prepared);
-                    return Ok(Some(read));
+            if let Some(policy) = source.prepared_cache_policy() {
+                if let Some(prepared) = eredu_checkpoint::prepared_cache::prepare_transposed_matrix(
+                    source,
+                    recipe,
+                    policy,
+                    64 * 1024 * 1024,
+                )? {
+                    let storage = DerivedWeightRecipe::source(
+                        "matrix",
+                        eredu_checkpoint::store::TensorSelection::Full,
+                    );
+                    if let Some(mut read) = Self::prepare(&storage, prepared.as_ref())? {
+                        read.transposed = true;
+                        read._prepared_source = Some(prepared);
+                        return Ok(Some(read));
+                    }
                 }
             }
         }

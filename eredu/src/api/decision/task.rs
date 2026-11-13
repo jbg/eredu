@@ -27,6 +27,7 @@ impl PreparedDecisionTask {
         assets: Option<&Path>,
         request: &DecisionRequest,
         max_cached_shards: usize,
+        prepared_cache: Option<&eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy>,
     ) -> Result<Option<Self>> {
         request.validate()?;
         let audio = request
@@ -49,6 +50,7 @@ impl PreparedDecisionTask {
                 assets,
                 dtype,
                 max_cached_shards,
+                prepared_cache,
             )?
             else {
                 return Ok(None);
@@ -198,6 +200,7 @@ pub fn evaluate_local_decisions(
         assets,
         request,
         plan.max_cached_shards(),
+        plan.prepared_checkpoint_cache(),
     )? {
         ensure!(
             companions

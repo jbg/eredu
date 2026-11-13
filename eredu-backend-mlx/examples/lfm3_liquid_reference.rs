@@ -121,6 +121,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         catalog.tensors().clone(),
         resolution,
         2,
+        None,
     )?;
     let io = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let context = ExecutionContext::new(Device::new(

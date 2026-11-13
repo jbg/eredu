@@ -59,10 +59,10 @@ static void write_tokens(std::ostream & output, const std::vector<llama_token> &
 
 int main(int argc, char ** argv) {
     try {
-        if (argc != 5 && argc != 6) {
-            throw std::runtime_error("usage: gguf_reference MODEL OUTPUT.safetensors PROMPT_IDS DECODE_IDS [cpu|gpu]");
+        if (argc < 5 || argc > 7 || (argc == 7 && std::string(argv[6]) != "--single-row")) {
+            throw std::runtime_error("usage: gguf_reference MODEL OUTPUT.safetensors PROMPT_IDS DECODE_IDS [cpu|gpu] [--single-row]");
         }
-        const std::string device = argc == 6 ? argv[5] : "cpu";
+        const std::string device = argc >= 6 ? argv[5] : "cpu";
         if (device != "cpu" && device != "gpu") throw std::runtime_error("device must be cpu or gpu");
         auto prompt = tokens(argv[3]);
         const auto decode = tokens(argv[4]);
@@ -82,7 +82,7 @@ int main(int argc, char ** argv) {
         auto context_params = llama_context_default_params();
         context_params.n_ctx = static_cast<uint32_t>(prompt.size() + decode.size() + 8);
         context_params.n_batch = static_cast<uint32_t>(prompt.size());
-        context_params.n_ubatch = context_params.n_batch;
+        context_params.n_ubatch = argc == 7 ? 1 : context_params.n_batch;
         context_params.n_threads = 8;
         context_params.n_threads_batch = 8;
         context_params.type_k = GGML_TYPE_F32;

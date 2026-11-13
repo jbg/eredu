@@ -3,13 +3,13 @@
 use super::{AdmittedAudioGguf, AudioGgufError};
 use crate::lfm3::audio::{BindingSource, Declaration, DepthDeclaration};
 use eredu_checkpoint::{
-    gguf_store::{open_prepared_gguf_source, GgufCatalog},
+    gguf_store::{GgufCatalog, GgufWeightStore},
     recipe::{DerivedWeightRecipe, RecipeCatalog},
     schema::GgufCheckpointPlan,
     store::{SharedCheckpointSource, TensorSelection},
 };
 use eredu_codec::liquid::{Declaration as CodecDeclaration, GgufDecoderBindings};
-use eredu_gguf::{Checkpoint, QuantizedTensorRepresentation, TranslatedTensorLayout};
+use eredu_gguf::{Checkpoint, TranslatedTensorLayout};
 use eredu_nn::{DeclareLogicalParameters, LogicalParameterDeclaration};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -28,6 +28,8 @@ pub struct AudioGgufSpeechBindings {
     catalog: GgufCatalog,
     input: Recipes,
     depth: Recipes,
+    pub(in crate::lfm3) input_declaration: Declaration,
+    pub(in crate::lfm3) depth_declaration: DepthDeclaration,
 }
 
 /// Restricted retained speech component sources, backed by the same GGUF projector.
@@ -51,28 +53,34 @@ impl AdmittedAudioGguf {
                 "speech execution geometry differs from the released GGUF projector",
             ));
         }
-        let quantized = self
-            .projector()
-            .tensors()
-            .filter_map(|tensor| {
-                let descriptor = tensor.descriptor();
-                descriptor
-                    .ggml_type
-                    .block_and_bytes()
-                    .ok()
-                    .filter(|(block, _)| *block > 1)
-                    .map(|_| descriptor.name.clone())
-            })
-            .collect::<Vec<_>>();
-        let projector = self
-            .projector()
-            .clone()
-            .into_tensor_representation(quantized, QuantizedTensorRepresentation::DecodedF32)?;
+        let (input_declaration, input_formats) = select_input_formats(self.projector(), input)?;
+        let mut depth_declaration = depth.clone();
+        let depth_formats = select_formats(self.projector(), depth, depth_recipe)?;
+        depth_declaration
+            .select_formats(&depth_formats)
+            .map_err(invalid)?;
+        let projector = speech_projector_catalog(
+            self.projector().clone(),
+            input_declaration
+                .logical_parameters()
+                .map_err(invalid)?
+                .iter()
+                .filter(|parameter| parameter.linear_format.is_some())
+                .filter_map(input_recipe)
+                .chain(
+                    depth_declaration
+                        .logical_parameters()
+                        .map_err(invalid)?
+                        .iter()
+                        .filter(|parameter| parameter.linear_format.is_some())
+                        .filter_map(depth_recipe),
+                ),
+        )?;
         let mapping = projector.translated_outputs(str::to_owned)?;
         let catalog =
             GgufCatalog::from_resolved_checkpoint(&projector, self.layouts().1, &mapping)?;
-        let input = input_encoder_recipes(input, &catalog)?;
-        let depth = compile(depth, &catalog, depth_recipe)?;
+        let input = compile(&input_declaration, &catalog, input_recipe, &input_formats)?;
+        let depth = compile(&depth_declaration, &catalog, depth_recipe, &depth_formats)?;
         let physical = catalog.keys();
         require_coverage(
             &input,
@@ -91,6 +99,8 @@ impl AdmittedAudioGguf {
             catalog,
             input,
             depth,
+            input_declaration,
+            depth_declaration,
         })
     }
 }
@@ -139,8 +149,9 @@ impl AudioGgufSpeechBindings {
     pub fn retain(
         self,
         max_cached_readers: usize,
+        prepared_cache: Option<&eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy>,
     ) -> Result<AudioGgufSpeechSources, AudioGgufError> {
-        let source = self.open_source(max_cached_readers)?;
+        let source = self.open_source(max_cached_readers, prepared_cache)?;
         self.restrict_speech(source)
     }
 
@@ -149,40 +160,52 @@ impl AudioGgufSpeechBindings {
         self,
         declaration: &CodecDeclaration,
         max_cached_readers: usize,
-    ) -> Result<(AudioGgufSpeechSources, BindingSource), AudioGgufError> {
-        let (speech, codec, _) = self.retain_with_projector(declaration, max_cached_readers)?;
-        Ok((speech, codec))
+        prepared_cache: Option<&eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy>,
+    ) -> Result<(AudioGgufSpeechSources, CodecDeclaration, BindingSource), AudioGgufError> {
+        let (speech, declaration, codec, _) =
+            self.retain_with_projector(declaration, max_cached_readers, prepared_cache)?;
+        Ok((speech, declaration, codec))
     }
 
     pub(in crate::lfm3) fn retain_with_projector(
         self,
         declaration: &CodecDeclaration,
         max_cached_readers: usize,
+        prepared_cache: Option<&eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy>,
     ) -> Result<
         (
             AudioGgufSpeechSources,
+            CodecDeclaration,
             BindingSource,
             SharedCheckpointSource,
         ),
         AudioGgufError,
     > {
         let codec = self.codec_decoder_bindings(declaration)?;
-        let source = self.open_source(max_cached_readers)?;
+        let declaration = codec.declaration().clone();
+        let source = self.open_source(max_cached_readers, prepared_cache)?;
         let (codec_source, recipes) = codec.retain(source.clone()).map_err(invalid)?;
         let codec = BindingSource::from_recipes(codec_source, "LiquidCodec GGUF decoder", recipes)?;
-        Ok((self.restrict_speech(source.clone())?, codec, source))
+        Ok((
+            self.restrict_speech(source.clone())?,
+            declaration,
+            codec,
+            source,
+        ))
     }
 
     fn open_source(
         &self,
         max_cached_readers: usize,
+        prepared_cache: Option<&eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy>,
     ) -> Result<SharedCheckpointSource, AudioGgufError> {
-        Ok(Arc::new(open_prepared_gguf_source(
-            self.projector.clone(),
-            &self.plan,
-            &self.mapping,
-            max_cached_readers,
-        )?))
+        Ok(Arc::new(
+            GgufWeightStore::builder()
+                .require_prepared_decoding(prepared_cache)
+                .max_cached_readers(max_cached_readers)?
+                .add_checkpoint(self.projector.clone(), &self.plan, &self.mapping)?
+                .build()?,
+        ))
     }
 
     fn restrict_speech(
@@ -201,38 +224,195 @@ impl AudioGgufSpeechBindings {
     }
 }
 
-pub(in crate::lfm3) fn input_encoder_recipes(
+pub(in crate::lfm3) fn select_input_formats(
+    checkpoint: &Checkpoint,
     declaration: &Declaration,
-    catalog: &(impl RecipeCatalog + ?Sized),
-) -> Result<Recipes, AudioGgufError> {
+) -> Result<
+    (
+        Declaration,
+        BTreeMap<String, eredu_checkpoint::LinearFormat>,
+    ),
+    AudioGgufError,
+> {
     if !declaration.matches_gguf_execution() {
         return Err(invalid(
             "speech input geometry differs from the released GGUF projector",
         ));
     }
-    compile(declaration, catalog, input_recipe)
+    let formats = select_formats(checkpoint, declaration, input_recipe)?;
+    let mut declaration = declaration.clone();
+    declaration.select_formats(&formats).map_err(invalid)?;
+    Ok((declaration, formats))
+}
+
+pub(in crate::lfm3) fn input_projector_catalog(
+    checkpoint: Checkpoint,
+    declaration: &Declaration,
+) -> Result<Checkpoint, AudioGgufError> {
+    let parameters = declaration.logical_parameters().map_err(invalid)?;
+    speech_projector_catalog(
+        checkpoint,
+        parameters
+            .iter()
+            .filter(|parameter| parameter.linear_format.is_some())
+            .filter_map(input_recipe),
+    )
+}
+
+pub(in crate::lfm3) fn input_encoder_recipes(
+    declaration: &Declaration,
+    catalog: &(impl RecipeCatalog + ?Sized),
+) -> Result<Recipes, AudioGgufError> {
+    let formats = declaration
+        .logical_parameters()
+        .map_err(invalid)?
+        .into_iter()
+        .filter_map(|parameter| {
+            parameter
+                .linear_format
+                .map(|format| (parameter.parameter.id.to_string(), format.encoding()))
+        })
+        .collect();
+    compile(declaration, catalog, input_recipe, &formats)
+}
+
+fn select_formats(
+    checkpoint: &Checkpoint,
+    declaration: &impl DeclareLogicalParameters,
+    recipe: fn(&LogicalParameterDeclaration<'_>) -> Option<DerivedWeightRecipe>,
+) -> Result<BTreeMap<String, eredu_checkpoint::LinearFormat>, AudioGgufError> {
+    let physical = checkpoint
+        .shards()
+        .iter()
+        .flat_map(|shard| {
+            shard
+                .tensors()
+                .iter()
+                .map(move |tensor| (tensor.descriptor().name.as_str(), (tensor, shard.endian())))
+        })
+        .collect::<BTreeMap<_, _>>();
+    declaration
+        .logical_parameters()
+        .map_err(invalid)?
+        .into_iter()
+        .filter(|parameter| parameter.linear_format.is_some())
+        .map(|parameter| {
+            let name = parameter.parameter.id.to_string();
+            let Some(DerivedWeightRecipe::Source { key, .. }) = recipe(&parameter) else {
+                return Err(invalid(format!(
+                    "missing direct speech matrix recipe for {name}"
+                )));
+            };
+            let (tensor, endian) = physical
+                .get(key.as_str())
+                .copied()
+                .ok_or_else(|| invalid(format!("missing speech tensor {key}")))?;
+            Ok((
+                name,
+                crate::linear_format::gguf_tensor_format(tensor, endian).map_err(invalid)?,
+            ))
+        })
+        .collect()
+}
+
+fn speech_projector_catalog(
+    checkpoint: Checkpoint,
+    packed: impl IntoIterator<Item = DerivedWeightRecipe>,
+) -> Result<Checkpoint, AudioGgufError> {
+    let packed = packed
+        .into_iter()
+        .filter_map(|recipe| match recipe {
+            DerivedWeightRecipe::Source { key, .. } => Some(key),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let dense = checkpoint
+        .tensors()
+        .filter_map(|tensor| {
+            let descriptor = tensor.descriptor();
+            ((descriptor.name.starts_with("a.") || descriptor.name.starts_with("mm.a."))
+                && !descriptor.name.starts_with("a.gen.wav.")
+                && !packed.contains(&descriptor.name)
+                && descriptor
+                    .ggml_type
+                    .block_and_bytes()
+                    .is_ok_and(|(block, _)| block > 1))
+            .then(|| descriptor.name.clone())
+        })
+        .collect::<Vec<_>>();
+    Ok(checkpoint
+        .into_tensor_representation(dense, eredu_gguf::QuantizedTensorRepresentation::DecodedF32)?)
 }
 
 fn compile(
     declaration: &impl DeclareLogicalParameters,
     catalog: &(impl RecipeCatalog + ?Sized),
     recipe: fn(&LogicalParameterDeclaration<'_>) -> Option<DerivedWeightRecipe>,
+    formats: &BTreeMap<String, eredu_checkpoint::LinearFormat>,
 ) -> Result<Recipes, AudioGgufError> {
     let mut recipes = BTreeMap::new();
     for parameter in declaration.logical_parameters().map_err(invalid)? {
         let key = parameter.parameter.id.as_str();
         let recipe =
             recipe(&parameter).ok_or_else(|| invalid(format!("no GGUF projection for {key}")))?;
-        let inferred = recipe
-            .infer(catalog)
-            .map_err(|error| invalid(format!("{key}: {error}")))?;
-        if inferred.shape != parameter.shape {
-            return Err(invalid(format!(
-                "{key}: projected shape {:?}, expected {:?}",
-                inferred.shape, parameter.shape,
-            )));
+        let member = eredu_runtime::ParameterMemberSpec::from_logical_declaration(
+            &parameter,
+            eredu_runtime::MemberSharding::Replicated,
+        );
+        let members = if let Some(format) = parameter.linear_format {
+            eredu_runtime::expand_linear_format_parameter(&member, format).map_err(invalid)?
+        } else {
+            vec![member]
+        };
+        let packed = formats
+            .get(key)
+            .is_some_and(|&format| format != eredu_checkpoint::LinearFormat::Dense);
+        for member in members {
+            let mut selected = if let Some(companion) = member.linear_companion() {
+                let DerivedWeightRecipe::Source { key, selection } = &recipe else {
+                    return Err(invalid(
+                        "speech format companion requires a direct GGUF matrix",
+                    ));
+                };
+                let prefix = key
+                    .strip_suffix(".weight")
+                    .ok_or_else(|| invalid("invalid GGUF weight key"))?;
+                let suffix = match companion {
+                    eredu_nn::LinearCompanionRole::Scale => "scales",
+                    eredu_nn::LinearCompanionRole::AffineBias => "biases",
+                    _ => return Err(invalid("unsupported GGUF speech companion")),
+                };
+                DerivedWeightRecipe::source(format!("{prefix}.{suffix}"), selection.clone())
+            } else {
+                recipe.clone()
+            };
+            if let DerivedWeightRecipe::Source { selection, .. } = &mut selected {
+                if let TensorSelection::Contiguous {
+                    offset_elements,
+                    shape,
+                } = selection
+                {
+                    let index = *offset_elements / parameter.shape.iter().product::<usize>();
+                    *shape = member.global_shape().to_vec();
+                    *offset_elements = index * shape.iter().product::<usize>();
+                }
+            }
+            let inferred = selected
+                .infer(catalog)
+                .map_err(|error| invalid(format!("{key}: {error}")))?;
+            if inferred.shape != member.global_shape()
+                || (packed
+                    && member.linear_companion().is_none()
+                    && inferred.dtype == eredu_checkpoint::recipe::RecipeDtype::F32)
+            {
+                return Err(invalid(format!(
+                    "{key}: projected shape {:?}, expected {:?}",
+                    inferred.shape,
+                    member.global_shape()
+                )));
+            }
+            recipes.insert(member.target().to_owned(), selected);
         }
-        recipes.insert(key.into(), recipe);
     }
     Ok(recipes)
 }
@@ -257,10 +437,7 @@ fn input_recipe(parameter: &LogicalParameterDeclaration<'_>) -> Option<DerivedWe
     if let Some(suffix) = key.strip_prefix("model.audio_encoder.downsample.") {
         let (layer, field) = suffix.split_once('.')?;
         return match layer {
-            "lin_out" if field == "weight" => {
-                Some(reshape("a.pre_encode.out.weight", &parameter.shape))
-            }
-            "lin_out" => Some(source("a.pre_encode.out.bias")),
+            "lin_out" => Some(source(format!("a.pre_encode.out.{field}"))),
             _ => {
                 let index = match layer {
                     "conv_in" => 0,

@@ -285,6 +285,7 @@ fn open(
         plan,
         resolution,
         max_cached_shards,
+        None,
     )
     .map_err(checkpoint)
 }
@@ -326,14 +327,23 @@ impl PreparedAudio {
 
     /// Prepares the released GGUF backbone and projector with an explicit publisher asset directory.
     /// Only the codec configuration is required from the audio_tokenizer directory.
+    /// A projector with decoded outputs requires a prepared cache policy.
     pub fn open_gguf(
         backbone: &Path,
         projector: &Path,
         root: &Path,
         max_cached_readers: usize,
+        prepared_cache: Option<&eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy>,
     ) -> Result<Self, ArtifactError> {
         let config = serde_json::from_slice(&read(root, "config.json")?)?;
-        Self::open_gguf_source(backbone, projector, root, &config, max_cached_readers)
+        Self::open_gguf_source(
+            backbone,
+            projector,
+            root,
+            &config,
+            max_cached_readers,
+            prepared_cache,
+        )
     }
 
     pub(crate) fn open_gguf_source(
@@ -342,12 +352,14 @@ impl PreparedAudio {
         root: &Path,
         config: &Value,
         max_cached_readers: usize,
+        prepared_cache: Option<&eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy>,
     ) -> Result<Self, ArtifactError> {
         Self::prepare_gguf(
             AdmittedAudioGguf::open(backbone, projector)?,
             root,
             config,
             max_cached_readers,
+            prepared_cache,
             None,
         )
         .map(|(audio, _)| audio)
@@ -358,6 +370,7 @@ impl PreparedAudio {
         root: &Path,
         config: &Value,
         max_cached_readers: usize,
+        prepared_cache: Option<&eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy>,
         omni: Option<(&super::super::vision::Declaration, ProcessorConfig)>,
     ) -> Result<(Self, Option<BindingSource>), ArtifactError> {
         let (encoder, depth) = if omni.is_some() {
@@ -391,13 +404,15 @@ impl PreparedAudio {
             &read(&root.join("audio_tokenizer"), "config.json")?,
         )?)?;
         let bindings = admitted.speech_bindings(&encoder, &depth)?;
+        let encoder = bindings.input_declaration.clone();
+        let depth = bindings.depth_declaration.clone();
         let vision_recipes = omni
             .map(|(vision, _)| {
                 super::super::vision::gguf::projector_recipes(bindings.projector_catalog(), vision)
             })
             .transpose()?;
-        let (speech, codec_weights, projector) =
-            bindings.retain_with_projector(&codec, max_cached_readers)?;
+        let (speech, codec, codec_weights, projector) =
+            bindings.retain_with_projector(&codec, max_cached_readers, prepared_cache)?;
         let vision_weights = vision_recipes
             .map(|recipes| BindingSource::from_recipes(projector, "LFM3 Omni GGUF vision", recipes))
             .transpose()

@@ -17,14 +17,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let quantize_on_load = args.iter().any(|value| value == "--quantize-on-load");
     let positional = args
-        .iter()
-        .filter(|value| value.as_str() != "--quantize-on-load")
-        .collect::<Vec<_>>();
+        .split(|value| value == "--quantize-on-load")
+        .next()
+        .unwrap_or_default();
     let model_dir = positional
         .first()
         .map(|value| PathBuf::from(value.as_str()))
         .or_else(|| std::env::var_os("EREDU_PERSONAPLEX_DIR").map(PathBuf::from))
-        .expect("usage: personaplex_step_bench <model-dir> [frames] [--quantize-on-load]");
+        .expect("usage: personaplex_step_bench <model-dir> [frames] [--quantize-on-load <cache-dir> <cache-bytes>]");
     let frames = positional
         .get(1)
         .and_then(|value| value.parse::<i32>().ok())
@@ -40,6 +40,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weights_stream = weights_ctx.stream();
 
     if quantize_on_load {
+        let index = args
+            .iter()
+            .position(|value| value == "--quantize-on-load")
+            .unwrap();
+        let directory = args
+            .get(index + 1)
+            .ok_or("quantization requires a prepared cache directory")?
+            .into();
+        let max_bytes = args
+            .get(index + 2)
+            .ok_or("quantization requires a prepared cache byte budget")?
+            .parse()?;
+        let cache = eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy {
+            directory,
+            max_bytes,
+        };
         safemlx::memory::reset_peak_memory()?;
         let load_start = Instant::now();
         let backend = MlxRealtimeExecutionContext::new(stream, weights_stream);
@@ -59,7 +75,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         group_size: 64,
                         bits: 4,
                     },
-                ),
+                )
+                .with_prepared_checkpoint_cache(cache),
             ),
         )?;
         stream.synchronize()?;

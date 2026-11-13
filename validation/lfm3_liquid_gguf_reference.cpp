@@ -16,6 +16,7 @@ int main(int argc, char ** argv) {
         return 2;
     }
 
+    llama_backend_init();
     auto text_params = llama_model_default_params();
     text_params.vocab_only = true;
     std::unique_ptr<llama_model, decltype(&llama_model_free)> text(

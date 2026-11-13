@@ -464,7 +464,10 @@ where
         provider: mechanisms,
         observations: Default::default(),
     };
-    let selected = select_preparation_once(inspection, request, &recording);
+    let selected = select_preparation_once(inspection, request, &recording).map(|mut selected| {
+        selected.prepared_checkpoint_cache = request.prepared_checkpoint_cache().cloned();
+        selected
+    });
     selections.push(ValidatedSelection {
         request: request.clone(),
         mechanisms: recording.observations.into_inner(),

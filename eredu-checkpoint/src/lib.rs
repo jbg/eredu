@@ -5,7 +5,7 @@
 
 #![warn(missing_docs)]
 
-use eredu_gguf::{Endian, GgmlType};
+pub use eredu_gguf::{Endian, GgmlType};
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
 /// Filesystem-backed exact artifact fingerprinting.

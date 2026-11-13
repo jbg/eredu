@@ -239,6 +239,55 @@ pub struct Declaration {
     decoder_state: StateLayout,
 }
 impl Declaration {
+    pub(super) fn select_decoder_formats(
+        &mut self,
+        formats: &std::collections::BTreeMap<String, eredu_checkpoint::LinearFormat>,
+    ) -> Result<(), Error> {
+        use eredu_checkpoint::LinearFormat;
+        use eredu_nn::LinearFormatSpec;
+        let project = |spec: &mut LinearSpec| -> Result<(), Error> {
+            let name = spec.weight.id.as_str();
+            let format = formats.get(name).copied().unwrap_or(LinearFormat::Dense);
+            let root = name
+                .strip_suffix(".weight")
+                .ok_or_else(|| invalid("invalid matrix name"))?;
+            spec.format = match format {
+                LinearFormat::Dense | LinearFormat::GgufIQuant { .. } => {
+                    LinearFormatSpec::unscaled(format)?
+                }
+                LinearFormat::Affine(_) => LinearFormatSpec::affine(
+                    format,
+                    parameter(format!("{root}.scales"))?,
+                    parameter(format!("{root}.biases"))?,
+                )?,
+                _ => return Err(invalid("unsupported LiquidCodec GGUF matrix format")),
+            }
+            .with_arithmetic(spec.format.arithmetic())?;
+            Ok(())
+        };
+        project(&mut self.from_quantizer)?;
+        project(&mut self.polar)?;
+        for block in &mut self.decoder {
+            match &mut block.mixer {
+                MixerSpec::Attention(spec) => {
+                    project(&mut spec.projections.query)?;
+                    project(&mut spec.projections.key)?;
+                    project(&mut spec.projections.value)?;
+                    project(&mut spec.projections.output)?;
+                    project(&mut spec.gate)?;
+                }
+                MixerSpec::Convolution(spec) => {
+                    project(&mut spec.input_projection)?;
+                    project(&mut spec.output_projection)?;
+                }
+            }
+            project(&mut block.feed_forward.gate)?;
+            project(&mut block.feed_forward.up)?;
+            project(&mut block.feed_forward.down)?;
+        }
+        Ok(())
+    }
+
     /// Declares the neural codec without selecting a device or reopening an artifact.
     pub fn new(config: Config) -> Result<Self, Error> {
         config.validate()?;

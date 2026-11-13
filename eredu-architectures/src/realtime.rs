@@ -75,6 +75,9 @@ pub struct RealtimeArtifactRequest {
     pub source: RealtimeArtifactSource,
     /// Auxiliary asset roots.
     pub assets: RealtimeAssetDirectories,
+    /// Explicit directory and byte budget for file-backed prepared weights.
+    pub prepared_checkpoint_cache:
+        Option<eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy>,
 }
 impl RealtimeArtifactRequest {
     /// Prepares assets colocated with a SafeTensors model directory or file.
@@ -84,6 +87,7 @@ impl RealtimeArtifactRequest {
                 path: path.as_ref().to_owned(),
             },
             assets: RealtimeAssetDirectories::default(),
+            prepared_checkpoint_cache: None,
         }
     }
 
@@ -102,6 +106,7 @@ impl RealtimeArtifactRequest {
                 model: Some(model_assets.into()),
                 text_backbone: None,
             },
+            prepared_checkpoint_cache: None,
         }
     }
 }
@@ -244,7 +249,14 @@ pub fn prepare_realtime_model(
                 RealtimeArtifactSource::AudioGguf {
                     backbone,
                     projector,
-                } => PreparedAudio::open_gguf_source(backbone, projector, model_root, &config, 2)?,
+                } => PreparedAudio::open_gguf_source(
+                    backbone,
+                    projector,
+                    model_root,
+                    &config,
+                    2,
+                    request.prepared_checkpoint_cache.as_ref(),
+                )?,
                 _ => return Err(RealtimePreparationError::SourceLayout(family)),
             };
             Ok(PreparedRealtimeArtifact::Lfm3Audio(Box::new(prepared)))
@@ -326,8 +338,11 @@ pub fn prepare_realtime_model(
                 Component::Controls,
             ]);
             let artifacts =
-                VoiceChatArtifactPlan::new(&architecture, sources, companion, required)?
-                    .retain(assets, 2)?;
+                VoiceChatArtifactPlan::new(&architecture, sources, companion, required)?.retain(
+                    assets,
+                    2,
+                    request.prepared_checkpoint_cache.as_ref(),
+                )?;
             Ok(PreparedRealtimeArtifact::VoiceChat(artifacts))
         }
         other => Err(RealtimePreparationError::NotRealtime(other)),

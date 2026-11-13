@@ -39,13 +39,31 @@ pub(crate) fn f32_pointwise(
             .with_grid([size, 1, 1])
             .with_thread_group([256, 1, 1])
             .with_output_arg(input.shape(), Dtype::Float32);
-        let mut output=KERNEL.with(|cell| -> Result<Vec<Array>,Exception> {
+        let mut output = KERNEL.with(|cell| -> Result<Vec<Array>, Exception> {
             if cell.borrow().is_none() {
-                *cell.borrow_mut()=Some(MetalKernel::new("f32_pointwise",["input"],["output"],
-                    "uint i=thread_position_in_grid.x; if(i>=SIZE) return; float x=input[i]; float denominator=1.0f+stable_exp_f32(-x); output[i]=(OP==1 ? 1.0f : x)/denominator;",
-                    include_str!("exp_f32.metal"),true,false)?);
+                *cell.borrow_mut() = Some(MetalKernel::new(
+                    "f32_pointwise",
+                    ["input"],
+                    ["output"],
+                    r#"
+                    uint i = thread_position_in_grid.x;
+                    if (i >= SIZE) return;
+                    float x = input[i];
+                    if (OP == 1) {
+                        output[i] = metal::fast::divide(1.0f, 1.0f + metal::fast::exp(-x));
+                    } else {
+                        output[i] = x / (1.0f + stable_exp_f32(-x));
+                    }
+                    "#,
+                    include_str!("exp_f32.metal"),
+                    true,
+                    false,
+                )?);
             }
-            cell.borrow().as_ref().expect("pointwise kernel initialized").apply_device([kernel_input],&config,stream)
+            cell.borrow()
+                .as_ref()
+                .expect("pointwise kernel initialized")
+                .apply_device([kernel_input], &config, stream)
         })?;
         Ok(output.pop())
     }
@@ -56,7 +74,7 @@ pub(crate) fn f32_pointwise(
     }
 }
 
-/// Cooperative last-axis softmax preserving four ordered FP32 sum chains.
+/// Cooperative last-axis softmax with four FP32 sum chains merged left to right.
 pub(crate) fn softmax_last(input: &Array, stream: &Stream) -> Result<Option<Array>, Exception> {
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
     {
@@ -89,7 +107,7 @@ pub(crate) fn softmax_last(input: &Array, stream: &Stream) -> Result<Option<Arra
                     ["input", "dimensions"],
                     ["output"],
                     include_str!("softmax_f32.metal"),
-                    include_str!("exp_f32.metal"),
+                    "",
                     true,
                     false,
                 )?);

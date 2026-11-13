@@ -157,6 +157,15 @@ pub struct LocalLoadOptions {
 }
 
 impl LocalLoadOptions {
+    /// Enables file-backed prepared weights with the supplied directory and byte budget.
+    pub fn with_prepared_checkpoint_cache(
+        mut self,
+        policy: eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy,
+    ) -> Self {
+        self.normalized = self.normalized.with_prepared_checkpoint_cache(policy);
+        self
+    }
+
     /// Selects model-scoped retained conversion payload at load time. `None`
     /// uses the finite 256 MiB managed default for eligible resident executions.
     /// This is independent of allocator caching and does not limit temporary casts.

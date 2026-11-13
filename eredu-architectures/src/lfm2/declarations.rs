@@ -236,12 +236,19 @@ impl BlockParameters {
             .map_err(Error::backend_source)?;
         Ok(self)
     }
-    fn with_formats(mut self, args: &ModelArgs) -> Result<Self, Error> {
+    fn with_formats(self, args: &ModelArgs) -> Result<Self, Error> {
+        self.select_formats(|name| args.weight_quantization_for(name).into())
+    }
+
+    pub(crate) fn select_formats(
+        mut self,
+        format: impl Fn(&str) -> eredu_checkpoint::LinearFormat,
+    ) -> Result<Self, Error> {
         let project = |spec: &mut eredu_nn::LinearSpec| -> Result<(), Error> {
             spec.format = crate::linear_format::project_matrix_format(
                 &spec.weight,
                 &spec.format,
-                args.weight_quantization_for(spec.weight.id.as_str()).into(),
+                format(spec.weight.id.as_str()),
             )?;
             Ok(())
         };
@@ -269,12 +276,12 @@ impl BlockParameters {
                     crate::linear_format::project_matrix_format(
                         spec.selector.weight(),
                         spec.selector.format(),
-                        args.weight_quantization_for(weight).into(),
+                        format(weight),
                     )?,
                 )?;
                 spec.experts =
                     crate::linear_format::project_packed_gated_formats(&spec.experts, |name| {
-                        args.weight_quantization_for(name).into()
+                        format(name)
                     })?;
             }
         }

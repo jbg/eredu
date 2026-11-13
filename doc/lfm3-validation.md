@@ -92,7 +92,7 @@ the checkout. Custom Python code is fetched from the same immutable revision.
 python eredu-evaluation/scripts/download_component_fixture.py /private/tmp/lfm3-source --model lfm3
 python eredu-evaluation/scripts/prefill_reference.py /private/tmp/lfm3-source/provenance.json /private/tmp/lfm3-reference.json --f32-checkpoint /private/tmp/lfm3-f32 --trust-remote-code --decode 5,8,13,21,34,55,3,2
 cargo run -p eredu-backend-mlx --no-default-features --example checkpoint_probe -- --model /private/tmp/lfm3-f32 --device cpu --input-ids 1,3,2,5,8,13,21,34,55 --teacher-forced-ids 5,8,13,21,34,55,3,2 --warmup-runs 0 --output /private/tmp/lfm3-actual
-EREDU_PREPARED_CHECKPOINT_CACHE=/private/tmp/lfm3-prepared-cache cargo test -p eredu-backend-mlx --no-default-features --test chunked_prefill cpu_chunked_prefill_matches_full_observed_logits_and_controlled_generation -- --exact
+cargo test -p eredu-backend-mlx --no-default-features --test chunked_prefill cpu_chunked_prefill_matches_full_observed_logits_and_controlled_generation -- --exact
 ```
 
 `validation/reference_runner.py` also produces the ordinary shared comparison
@@ -571,13 +571,42 @@ MLX_ENABLE_TF32=0 target/debug/examples/lfm3_vision_reference \
   --gguf-projector "$headers/mmproj-LFM3-VL-2B-BF16.gguf"
 ```
 
+### Packed VL decoder score and eviction replay
+
+The pinned Q4_K_M and NVFP4 backbones use the published Q8_0 projector
+for admission. This replay exercises text prefill and eight teacher-forced
+cached decode steps. It compares all 128,000 scores per row against
+llama.cpp `cd959bae99ff4bed22bef2604f45241c09bbb8c8` on Metal with F32
+KV, flash attention disabled, and a one-row reference microbatch.
+
+| Backbone | Worst relative L2 | Minimum cosine | Minimum top-five overlap | Matching argmax IDs | Peak streamed device weight bytes | Device evictions |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Q4_K_M | 0.00428658 | 0.99999127 | 4/5 | 9/9 | 295,297,024 | 214 |
+| NVFP4 | 0.01607360 | 0.99987081 | 4/5 | 9/9 | 367,452,184 | 214 |
+
+Both backbones pass the shared logit profile. NVFP4 resident and disk-streamed
+runs produce identical row metrics. Relative L2 for prefill and cached steps
+1 through 8 is 0.01291919, 0.01268070, 0.01079037, 0.01338079, 0.01182207,
+0.01132421, 0.01016949, 0.01607360 and 0.01462092, respectively. The streamed
+runs disable the host weight cache. The NVFP4 weight bytes stay packed through
+eviction and reload.
+
+```sh
+"$gguf_reference" "$backbone" "$scores" 1,3,2,5,8,13,21,34,55 5,8,13,21,34,55,3,2 gpu --single-row
+MLX_ENABLE_TF32=0 cargo run -p eredu-backend-mlx --features metal \
+  --example lfm3_vision_reference -- "$assets" "${scores%.safetensors}.json" "$report" \
+  --decoder-rows --device gpu --residency disk \
+  --gguf-backbone "$backbone" --gguf-projector "$projector"
+```
+
 ### VL GGUF paired execution
 
 `PreparedVisionLanguage::open_gguf` admits the GGUF decoder and media projector
 with the publisher's VL configuration and processor assets. It checks the
 backbone geometry against the supplied configuration and validates the rotary
 companion before retaining the sources. Both sources feed the shared VL
-component graph. The graph decodes GGUF weights into F32 for this replay.
+component graph. The score and residency figures below are from the dense
+F32 reference realization. Packed decoder measurements are above.
 
 On precise Metal, the pinned Q4_K_M backbone and Q8_0 projector run the
 pre-sized and raw image/video fixtures through prefill and eight cached steps.
@@ -780,11 +809,13 @@ done
 #### Released NVFP4 backbone
 
 GGML type 40 stores four unsigned E4M3 block scales and 64 E2M1 weights
-per 36-byte block. The VL declaration applies the F32 matrix multiplier
-to the widened FFN weights and retains the input scale as checkpoint
-metadata. The pinned llama.cpp graph requests BF16 accumulation for the
-NVFP4 projections. Eredu realizes the decoder with F32 weights and
-arithmetic.
+per 36-byte block. The VL declaration binds the F32 matrix multiplier
+and retains the input scale as checkpoint metadata. MLX consumes the
+packed blocks and applies the multiplier to the F32 projection. On Metal,
+the NVFP4 dot quantizes each 32-value activation group to Q8_0 and accumulates
+integer products with the block scales in F32. The pinned llama.cpp graph
+dispatches these projections to its CPU Q8_0 dot implementation, including
+when the rest of the graph uses Metal.
 
 The released NVFP4 backbone and F16 projector run the pre-sized fixture on
 Eredu CPU. The independent reference uses the same artifacts with
@@ -1043,12 +1074,11 @@ speech synthesis and spoken response. The released Q4_K_M pair also produces
 a finalized 24-kHz WAV through the CLI synthesis task. CLI device I/O is
 build-checked.
 `prepare_mlx_realtime` with `RealtimeLoadOptions::Lfm3Audio` selects the
-resident model and reports the logical F32 parameter bytes by component.
-Cold preparation produces 75 parameter units for both the pinned SafeTensors
-checkpoint and the Q4_K_M backbone/projector pair. The largest unit is the
-tied language embedding at 1,048,576,000 F32 bytes. The sum of the unit
-sizes matches the resident parameter report for each layout. These are
-logical parameter sizes and exclude session state and temporary allocations.
+resident model and reports physical parameter bytes by component. Cold
+preparation produces 75 parameter units for both the pinned SafeTensors
+checkpoint and the Q4_K_M backbone/projector pair. The tied language embedding
+is one unit. Its physical byte count depends on the selected encoding.
+Parameter sizes exclude session state and temporary allocations.
 Load consumes the selection with explicit weight and execution contexts.
 The bound model's `start` accepts a batch-one `AudioRequest` and sampling seed. The request supplies
 token IDs with expanded speech placeholders, finite mel features in prompt
@@ -1388,6 +1418,10 @@ execution. The pinned llama.cpp revision is
 | --- | ---: | ---: | --- |
 | Metal | 0.02080601 | 0.02159048 | Pass |
 | CPU | 0.16601064 | 0.16216959 | Outside tolerance |
+
+The packed CPU decoder replay with the same Q4_K_M projector and a Metal
+reference at `cd959bae99ff4bed22bef2604f45241c09bbb8c8` reports maximum
+absolute error 0.02216788 and relative L2 0.02342966.
 
 The tolerance is 0.05 maximum absolute error and 0.08 relative L2. Both runs
 agree on the per-chunk sample counts `[1440, 5760, 11520, 480]`. The llama.cpp

@@ -12,6 +12,27 @@ fn parameter(name: &str) -> ParameterSpec {
     ParameterSpec::trainable(name).unwrap()
 }
 
+fn with_cache(
+    source: SharedCheckpointSource,
+    directory: &std::path::Path,
+) -> SharedCheckpointSource {
+    use eredu_checkpoint::{
+        prepared_cache::PreparedCheckpointCachePolicy, store::PreparedCheckpointSource,
+    };
+    Arc::new(
+        PreparedCheckpointSource::retain(
+            source.clone(),
+            "quantization test",
+            source.source_keys().into_iter().collect(),
+        )
+        .unwrap()
+        .with_prepared_cache(PreparedCheckpointCachePolicy {
+            directory: directory.join("prepared"),
+            max_bytes: 1 << 20,
+        }),
+    )
+}
+
 #[test]
 fn quantized_store_preserves_nonconventional_architecture_companion_names() {
     let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
@@ -72,8 +93,9 @@ fn quantized_store_preserves_nonconventional_architecture_companion_names() {
         )])
         .unwrap(),
     );
+    let cache = tempfile::tempdir().unwrap();
     let (quantized, _) = quantize_parameterized_module_store(
-        store,
+        with_cache(store, cache.path()),
         &source,
         &linear,
         WeightQuantization::Affine(AffineQuantization::default()),
@@ -225,6 +247,8 @@ fn exact_affine_tasks_preserve_source_precision_through_unloaded_f32_slots() {
             )])
             .unwrap(),
         );
+        let cache = tempfile::tempdir().unwrap();
+        let store = with_cache(store, cache.path());
         let empty: Vec<eredu_nn::Parameter<crate::MlxTensor>> = vec![];
         let (transformed, _) = quantize_exact_replicated_text_tasks(
             Arc::clone(&store),
@@ -421,6 +445,7 @@ fn exact_affine_tp_input_slices_convert_before_binding_without_double_placement(
         let store: SharedCheckpointSource = Arc::new(
             SafetensorsWeightStore::open_with_max_cached_shards(directory.path(), 1).unwrap(),
         );
+        let store = with_cache(store, directory.path());
         let provenance = store.source_provenance("projection.kernel").unwrap();
         let owner = ReplicatedTextParameterOwner::ExecutionUnit {
             group: "decoder".into(),

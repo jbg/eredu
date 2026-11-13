@@ -17,7 +17,7 @@ use eredu_backend_mlx::{
 };
 use eredu_checkpoint::recipe::{DerivedWeightRecipe, RecipeDtype};
 use eredu_codec::liquid::{Config, Declaration as CodecDeclaration, NeuralDecoder};
-use eredu_gguf::{Checkpoint, CheckpointHeader, Limits, QuantizedTensorRepresentation};
+use eredu_gguf::{Checkpoint, CheckpointHeader, Limits};
 use eredu_nn::Tensor;
 use safemlx::{Device, DeviceType};
 use serde_json::Value;
@@ -54,8 +54,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     if record["projector"]["publisher_sha256"].as_str() != Some(&hex(&hasher.finalize())) {
         return Err("Audio projector payload hash differs".into());
     }
-    let representation = QuantizedTensorRepresentation::DecodedF32;
-    let backbone = Checkpoint::from_headers_with_representation(
+    let backbone = Checkpoint::from_headers(
         &[CheckpointHeader {
             member: record["backbone"]["file"]
                 .as_str()
@@ -67,25 +66,27 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .ok_or("missing file size")?,
         }],
         Limits::default(),
-        representation,
     )?;
-    let projector =
-        Checkpoint::open_with_representation(&projector, Limits::default(), representation)?;
+    let projector = Checkpoint::open(projector)?;
     let admitted = AdmittedAudioGguf::from_checkpoints(backbone, projector)?;
     let audio: Value = serde_json::from_slice(&fs::read(audio_config)?)?;
     let codec = CodecDeclaration::new(Config::from_json(&fs::read(codec_config)?)?)?;
-    let (_, decoder) = admitted
+    let (_, codec, decoder) = admitted
         .speech_bindings(
             &Declaration::from_config(&audio)?,
             &DepthDeclaration::from_config(&audio)?,
         )?
-        .retain_with_codec_decoder(&codec, 2)?;
+        .retain_with_codec_decoder(&codec, 2, None)?;
 
     let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = context.stream();
     let mut model = NeuralDecoder::<MlxNeuralBackend>::new(&codec, stream)?;
     let mut recipes = decoder.recipes().clone();
     for recipe in recipes.values_mut() {
+        let dtype = recipe.infer(decoder.source().as_ref())?.dtype;
+        if !matches!(dtype, RecipeDtype::F16 | RecipeDtype::BF16) {
+            continue;
+        }
         *recipe = DerivedWeightRecipe::Cast {
             input: Box::new(recipe.clone()),
             dtype: RecipeDtype::F32,

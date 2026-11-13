@@ -1170,6 +1170,7 @@ pub fn prepare_model_sources(
             plan.into_artifact(),
             retained.clone(),
             max_cached_sources,
+            selected.prepared_checkpoint_cache.as_ref(),
         )
     } else {
         prepare_ordinary_sources(
@@ -1180,6 +1181,7 @@ pub fn prepare_model_sources(
             &execution_inspection,
             max_cached_sources,
             media_projector,
+            selected.prepared_checkpoint_cache.as_ref(),
         )
     }?;
     let mut vl_rank = None;
@@ -1272,10 +1274,11 @@ fn prepare_retained_qwen4_sources(
     artifact: ModelArtifact,
     selected: crate::selected_execution::SelectedQwen4Construction,
     max_cached_sources: usize,
+    prepared_cache: Option<&eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy>,
 ) -> Result<PreparedModelSourceGraph, PreparedModelSourcesError> {
     let invalid = |message: &str| PreparedModelSourcesError::InvalidSelection(message.into());
     let declarations = retained_source_declarations(&artifact, &selected)?;
-    let mut bound = declarations.bind(max_cached_sources)?;
+    let mut bound = declarations.bind(max_cached_sources, prepared_cache)?;
     use crate::artifact_preparation::{ArtifactSourceRole, PhysicalArtifactId};
     let primary = bound
         .physical
@@ -1561,6 +1564,7 @@ fn prepare_ordinary_sources(
     inspection: &eredu_core::ArtifactInspection<ArtifactArchitecturePlan>,
     cache: usize,
     media: MediaProjectorSourcePolicy,
+    prepared_cache: Option<&eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy>,
 ) -> Result<PreparedModelSourceGraph, PreparedModelSourcesError> {
     use crate::artifact_preparation::{ArtifactSourceRole, PhysicalArtifactId};
     let declarations = crate::artifact_preparation::source_declarations(inspection)
@@ -1581,7 +1585,7 @@ fn prepare_ordinary_sources(
             .verify_unchanged()
             .map_err(|e| ArtifactError::InvalidArtifact(e.to_string()))?;
     }
-    let mut bound = declarations.bind(cache)?;
+    let mut bound = declarations.bind(cache, prepared_cache)?;
     if let Some(adapter) = architecture.draft_adapter() {
         adapter
             .verify_configuration()

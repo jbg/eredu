@@ -1152,10 +1152,22 @@ pub fn expand_linear_format_parameter(
                 }
                 other => other,
             };
-            Ok(vec![source
-                .clone()
-                .with_shape(packed)
-                .with_sharding(sharding)])
+            let mut members = vec![source.clone().with_shape(packed).with_sharding(sharding)];
+            if let Some(global) = declaration.global_scale() {
+                members.push(
+                    ParameterMemberSpec::new(
+                        global.id.as_str(),
+                        Vec::new(),
+                        MemberSharding::Replicated,
+                    )
+                    .with_parameter_metadata(&ParameterMetadata::from_spec(
+                        global,
+                        global.trainable,
+                    ))
+                    .with_linear_companion(eredu_nn::LinearCompanionRole::GlobalScale, &primary)?,
+                );
+            }
+            Ok(members)
         }
         LinearFormat::Affine(_) | LinearFormat::MxFp4 | LinearFormat::NvFp4 => {
             let quantization = format.weight_quantization().expect("packed format");

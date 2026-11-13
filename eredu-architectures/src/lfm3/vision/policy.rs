@@ -47,14 +47,14 @@ impl PreparedVisionExecution {
         Self::from_resources(declaration, Arc::clone(source), recipes)
     }
 
-    /// Opens a released GGUF media projector and retains its decoded vision bindings.
+    /// Opens a released GGUF media projector and retains its selected vision bindings.
     pub fn new_gguf(
         declaration: Declaration,
         projector: &Path,
         dtype: RecipeDtype,
         max_cached_readers: usize,
     ) -> Result<Self, Error> {
-        let (source, recipes) =
+        let (declaration, source, recipes) =
             super::gguf::retain_projector(projector, &declaration, max_cached_readers)?;
         Self::from_canonical_recipes(declaration, source, &recipes, dtype)
     }
@@ -70,19 +70,20 @@ impl PreparedVisionExecution {
             .enumerate()
             .map(|(ordinal, unit)| {
                 let outputs = declaration
-                    .unit_parameters(unit)?
+                    .unit_members(unit)?
                     .into_iter()
-                    .map(|parameter| {
-                        let key = parameter.parameter.id.as_str();
+                    .map(|member| {
+                        let key = member.target();
                         let input = recipes.get(key).ok_or_else(|| {
                             Error::backend(format!("missing GGUF projector binding for {key}"))
                         })?;
                         Ok((
                             key.to_owned(),
-                            DerivedWeightRecipe::Cast {
-                                input: Box::new(input.clone()),
-                                dtype: dtype.clone(),
-                            },
+                            crate::lfm3::checkpoint::language_storage_recipe(
+                                &member,
+                                input.clone(),
+                                dtype.clone(),
+                            ),
                         ))
                     })
                     .collect::<Result<_, Error>>()?;

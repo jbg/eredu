@@ -173,6 +173,8 @@ pub struct NormalizedLoadRequest {
     weight_residency: WeightResidency,
     parameter_conversion_retention:
         Option<eredu_core::residency::ParameterConversionRetentionPolicy>,
+    prepared_checkpoint_cache:
+        Option<eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy>,
     state_residency: CacheResidencyPolicy,
     required_session_capabilities: SessionCapabilities,
     prompt_cache_persistence: bool,
@@ -333,6 +335,22 @@ impl NormalizedLoadRequest {
     /// Selects fully resident or bounded checkpoint-weight execution.
     pub fn with_weight_residency(mut self, residency: WeightResidency) -> Self {
         self.weight_residency = residency;
+        self
+    }
+
+    /// Application-provided directory and byte budget for prepared checkpoint files.
+    pub const fn prepared_checkpoint_cache(
+        &self,
+    ) -> Option<&eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy> {
+        self.prepared_checkpoint_cache.as_ref()
+    }
+
+    /// Enables persistent prepared weights using the supplied directory and byte budget.
+    pub fn with_prepared_checkpoint_cache(
+        mut self,
+        policy: eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy,
+    ) -> Self {
+        self.prepared_checkpoint_cache = Some(policy);
         self
     }
 

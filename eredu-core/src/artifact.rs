@@ -1024,6 +1024,7 @@ pub fn open_prepared_safetensors_artifact(
         catalog,
         resolution,
         max_cached_shards,
+        None,
     )
     .map_err(Into::into)
 }

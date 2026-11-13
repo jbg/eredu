@@ -108,13 +108,13 @@ pub struct BoundedQuantizationPlan {
     pub(crate) quantization: WeightQuantization,
     pub(crate) max_working_set_bytes: u64,
     pub(crate) targets: Vec<BoundedQuantizationTarget>,
-    pub(crate) cache: crate::prepared_cache::PreparedCheckpointCachePolicy,
+    pub(crate) cache: Option<crate::prepared_cache::PreparedCheckpointCachePolicy>,
 }
 
 impl BoundedQuantizationPlan {
     /// Bounded persistent cache policy for these encoded outputs.
-    pub fn prepared_cache(&self) -> &crate::prepared_cache::PreparedCheckpointCachePolicy {
-        &self.cache
+    pub fn prepared_cache(&self) -> Option<&crate::prepared_cache::PreparedCheckpointCachePolicy> {
+        self.cache.as_ref()
     }
 
     /// Creates a non-empty plan with an explicit conversion working-set bound.
@@ -167,7 +167,7 @@ impl BoundedQuantizationPlan {
             quantization,
             max_working_set_bytes,
             targets,
-            cache: Default::default(),
+            cache: None,
         })
     }
 
@@ -176,7 +176,7 @@ impl BoundedQuantizationPlan {
         mut self,
         policy: crate::prepared_cache::PreparedCheckpointCachePolicy,
     ) -> Self {
-        self.cache = policy;
+        self.cache = Some(policy);
         self
     }
 
@@ -453,7 +453,9 @@ impl CheckpointSource for PreparedQuantizedSource {
     fn prepared_cache_policy(
         &self,
     ) -> Option<&crate::prepared_cache::PreparedCheckpointCachePolicy> {
-        Some(&self.plan.cache)
+        self.plan
+            .prepared_cache()
+            .or_else(|| self.source.prepared_cache_policy())
     }
     fn recipe_cache(&self) -> Option<&crate::recipe::RecipeInferenceCache> {
         Some(&self.recipes)
