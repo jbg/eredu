@@ -1,6 +1,5 @@
 //! MLX checkpoint materialization after backend-neutral planning.
 
-
 use eredu_architectures::{
     prepared_sources::{prepare_model_sources, PreparedModelSources},
     processor_plan::ArtifactArchitecturePlan,
