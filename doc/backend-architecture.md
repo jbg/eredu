@@ -117,6 +117,10 @@ The decision facade coordinates request preparation, cancellation, and
 calibrated publication through the generic application agreement seam
 of the pipeline transport. The MLX adapter binds rank resources and
 collectives. Prompt and readout policy remain in the architecture and facade.
+The facade accepts one decoded decision request and selects native decisions
+from checkpoint declarations or evaluates a pinned text refinement canvas.
+It owns refinement prompt construction, score capture, and typed readout.
+The CLI decodes request files and media and serializes the typed response.
 
 The d1 GGUF loader checks the embedded decision task, tokenizer and
 calibration metadata against the retained sidecars. It binds the decoded

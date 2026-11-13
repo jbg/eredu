@@ -709,7 +709,7 @@ where
                 Telemetry = crate::composition::mlx::speculative::scheduler::SpeculativeComponentTimings,
                 Error = Exception,
             > + 'run,
-    {
+{
         run_speculative_batch(
             backend,
             self.lanes,

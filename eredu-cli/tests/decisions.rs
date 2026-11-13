@@ -78,7 +78,15 @@ fn fixture(root: &Path) {
 fn cli_reads_choice_noul_and_score_with_resident_and_bounded_weights() {
     let root = tempfile::tempdir().unwrap();
     fixture(root.path());
-    let request = json!({"state":{"ticket":"duplicate charge"},"steps":2,"questions":[{"id":"route","type":"choice","question":"Choose the department","options":["billing","technical"]},{"id":"urgent","type":"noul","question":"Is it urgent?"},{"id":"priority","type":"score","question":"Rate the priority","levels":[{"label":"low","value":10,"description":"routine"},{"label":"high","value":30,"description":"urgent"}]}]});
+    let request = json!({
+        "state": "duplicate charge",
+        "refinement_steps": 2,
+        "questions": [
+            {"id":"route","question":{"type":"single_choice","instructions":"Choose the department","options":[{"label":"billing"},{"label":"technical"}]}},
+            {"id":"urgent","question":{"type":"yes_no","instructions":"Is it urgent?"}},
+            {"id":"priority","question":{"type":"score","instructions":"Rate the priority","levels":["routine","urgent"]}}
+        ]
+    });
     let path = root.path().join("request.json");
     std::fs::write(&path, serde_json::to_vec(&request).unwrap()).unwrap();
     for residency in [None, Some("--layerwise-host"), Some("--dense-disk-stream")] {
@@ -117,47 +125,27 @@ fn cli_reads_choice_noul_and_score_with_resident_and_bounded_weights() {
             String::from_utf8_lossy(&output.stderr)
         );
         let stderr = String::from_utf8_lossy(&output.stderr);
-        for field in [
-            "canvas_prepare_seconds=",
-            "chat_prepare_seconds=",
-            "discovery_seconds=",
-            "admission_seconds=",
-            "prepare_seconds=",
-            "context_seconds=",
-            "refinement_seconds=",
-            "finish_seconds=",
-            "prompt_tokens=",
-            "canvas_tokens=32",
-        ] {
-            assert!(
-                stderr.contains(field),
-                "missing timing field {field}: {stderr}"
-            );
-        }
+        assert!(stderr.contains("decision_seconds="), "{stderr}");
         let result: Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(result["steps"], 2);
-        assert_eq!(result["seed"], 42);
-        assert_eq!(result["normalization"], "allowed_labels");
-        let answers = result["answers"].as_object().unwrap();
+        assert_eq!(result["generated_tokens"], 0);
+        assert!(result["input_tokens"].as_u64().unwrap() > 0);
+        let answers = result["answers"].as_array().unwrap();
         assert_eq!(answers.len(), 3);
-        for row in answers.values() {
-            let total: f64 = row["probabilities"]
-                .as_object()
-                .unwrap()
-                .values()
-                .map(|p| p.as_f64().unwrap())
-                .sum();
-            assert!((total - 1.0).abs() < 1e-12);
-            assert!(row["confidence"].as_f64().unwrap() >= 0.5);
-            assert!((0.0..=1.0).contains(&row["label_mass"].as_f64().unwrap()));
-        }
-        assert!(matches!(
-            answers["route"]["choice"].as_str(),
-            Some("billing" | "technical")
-        ));
-        assert!(answers["urgent"]["value"].is_boolean());
-        let score = answers["priority"]["score"].as_f64().unwrap();
-        assert!((10.0..=30.0).contains(&score));
+        assert_eq!(answers[0]["id"], "route");
+        let options = answers[0]["answer"]["SingleChoice"]["options"]
+            .as_array()
+            .unwrap();
+        assert_eq!(options[0]["label"], "billing");
+        assert_eq!(options[1]["label"], "technical");
+        let total: f64 = options
+            .iter()
+            .map(|o| o["probability"].as_f64().unwrap())
+            .sum();
+        assert!((total - 1.0).abs() < 1e-12);
+        assert_eq!(answers[1]["id"], "urgent");
+        assert!(answers[1]["answer"]["YesNo"]["probability_yes"].is_number());
+        assert_eq!(answers[2]["id"], "priority");
+        assert!(answers[2]["answer"]["Score"]["level"].as_u64().unwrap() < 2);
     }
 }
 
