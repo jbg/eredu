@@ -1,7 +1,7 @@
 //! Portable inputs and results for non-autoregressive decisions.
 
 /// An ordered single-choice question about the input state.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ChoiceQuestion {
     /// Instructions supplied to the decision model.
     pub instructions: String,
@@ -10,7 +10,7 @@ pub struct ChoiceQuestion {
 }
 
 /// One choice option with a stable label.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ChoiceOption {
     /// Label returned alongside the option probability.
     pub label: String,
@@ -51,7 +51,8 @@ pub struct DecisionEvaluation<A = DecisionAnswer> {
 pub type ChoiceEvaluation = DecisionEvaluation<ChoiceAnswer>;
 
 /// A text question with an explicit decision readout.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DecisionQuestion {
     /// Locate one instance in the supplied image.
     Box {

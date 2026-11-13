@@ -64,3 +64,17 @@ pub fn execution_contexts(device: LocalDevice) -> Result<(ExecutionContext, Exec
     };
     Ok((weights, execution))
 }
+
+pub(crate) fn decode_wav(path: &Path) -> Result<eredu_core::Audio> {
+    let mut wav = WavReader::new(BufReader::new(File::open(path)?))?;
+    let mut samples = Vec::new();
+    let mut block = [0.0; 4096];
+    loop {
+        let count = wav.read_samples(&mut block)?;
+        if count == 0 {
+            break;
+        }
+        samples.extend_from_slice(&block[..count]);
+    }
+    Ok(eredu_core::Audio::new(samples, wav.sample_rate())?)
+}

@@ -162,6 +162,32 @@ impl PreparedTextChoiceModel {
         max_cached_readers: usize,
     ) -> Result<Self, DecisionError> {
         let checkpoint = open_decoded(backbone)?;
+        Self::from_gguf_checkpoint(checkpoint, projector, assets, dtype, max_cached_readers)
+    }
+
+    /// Prepares a GGUF only when its metadata declares a native decision task.
+    pub fn discover_gguf(
+        backbone: &Path,
+        projector: Option<&Path>,
+        assets: &Path,
+        dtype: RecipeDtype,
+        max_cached_readers: usize,
+    ) -> Result<Option<Self>, DecisionError> {
+        let checkpoint = open_decoded(backbone)?;
+        if !declares_decision(&checkpoint) {
+            return Ok(None);
+        }
+        Self::from_gguf_checkpoint(checkpoint, projector, assets, dtype, max_cached_readers)
+            .map(Some)
+    }
+
+    fn from_gguf_checkpoint(
+        checkpoint: Checkpoint,
+        projector: Option<&Path>,
+        assets: &Path,
+        dtype: RecipeDtype,
+        max_cached_readers: usize,
+    ) -> Result<Self, DecisionError> {
         let sidecars = Sidecars::read(&checkpoint, projector.is_some(), assets)?;
         let (decoder, vision, audio) = VisionLanguageDeclaration::prepare_decision_gguf(
             checkpoint,

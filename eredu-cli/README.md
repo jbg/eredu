@@ -488,3 +488,45 @@ time. Execution timing excludes input pacing and output delivery; it does not me
 microphone-to-speaker latency.
 
 Run `eredu audio realtime --help` for the complete option list.
+
+### Decision requests
+
+Use `eredu --model MODEL --decisions request.json` to evaluate typed
+questions. Use `--decisions -` to read JSON from standard input. The
+decision task uses explicit device and residency settings.
+
+```json
+{
+  "state": "The image shows the delivered item.",
+  "media": [{"type": "image", "path": "delivery.png"}],
+  "questions": [
+    {
+      "id": "package",
+      "question": {"type": "box", "instructions": "Locate the package."}
+    }
+  ]
+}
+```
+
+Media entries retain their array order. Image entries take `path`, video
+entries take `frames` (a directory of images) and `fps`, and audio
+entries take a mono WAV `path`. A question's optional `spoken` WAV path
+replaces its written `instructions`. Paths in the request are relative
+to the request file or to the working directory when reading stdin.
+For split checkpoints, pass the projector with `--vision-companion`
+or `--audio-companion` and use the request's `assets` field to select
+the sidecar directory if it differs from the backbone directory.
+
+Question types are `single_choice`, `multiple_choice`, `yes_no`, `score`,
+`extract_text`, `read_number`, `read_date`, `estimate`, `box`, and `boxes`.
+Choice options contain a `label` and optional `description`. Yes/no can
+specify two `criteria`. Scores take ordered `levels`. Numeric estimates
+take a two-value `range`, optional `step`, and optional `unit`. Number
+extraction accepts an optional `unit`, and multiple boxes accept an
+optional `max`.
+
+The model determines which question types and input modalities it can
+evaluate. Text refinement supports single choice, yes/no, and ordinal
+score, with optional `refinement_steps` and `seed`. Results contain
+answers in request order with the corresponding IDs, token usage, and
+the calibration digest when the checkpoint supplies one.

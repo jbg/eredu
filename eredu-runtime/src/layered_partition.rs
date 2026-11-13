@@ -204,7 +204,7 @@ where
             LayeredForwardState<B::Tensor, <A as LayeredArchitecture<B, S2>>::ForwardContext>,
             <A as LayeredArchitecture<B, S>>::Error,
         >,
-    {
+{
         let first = &self.drivers[0];
         let mut forward = first.begin_with_preparation::<B, S2, A, _>(
             &mut self.architecture,

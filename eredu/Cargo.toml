@@ -194,7 +194,8 @@ sha2.workspace = true
 llguidance = { version = "1.8.0", default-features = false, features = ["ahash", "lark"] }
 jsonschema = { version = "0.52.0", default-features = false }
 
+anyhow = "1"
+
 [dev-dependencies]
 tempfile.workspace = true
-anyhow = "1"
 eredu-evaluation.workspace = true

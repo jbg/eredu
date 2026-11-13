@@ -429,8 +429,8 @@ struct Cli {
     #[arg(long)]
     expert_cache_benchmark: bool,
 
-    /// Read choice/noul/score questions and evidence from JSON; '-' reads stdin.
-    #[arg(long, value_name = "PATH", conflicts_with_all = ["prompt", "raw", "tools", "draft_model", "mirostat_v2", "temperature", "top_p", "top_k", "min_p", "repeat_penalty", "repeat_last_n", "frequency_penalty", "presence_penalty", "max_tokens", "stop_sequences", "thinking", "reasoning_effort", "expert_cache_benchmark", "memory_report", "estimate_memory_tokens", "telemetry_json", "memory_budget_bytes", "memory_policy", "memory_reserve_bytes", "speculative_draft_tokens"])]
+    /// Evaluate typed questions and evidence from JSON; '-' reads stdin.
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["prompt", "auto", "auto_feedback", "auto_trial_plan", "raw", "tools", "draft_model", "mirostat_v2", "temperature", "top_p", "top_k", "min_p", "repeat_penalty", "repeat_last_n", "frequency_penalty", "presence_penalty", "max_tokens", "stop_sequences", "thinking", "reasoning_effort", "expert_cache_benchmark", "memory_report", "estimate_memory_tokens", "telemetry_json", "memory_budget_bytes", "memory_policy", "memory_reserve_bytes", "speculative_draft_tokens"])]
     decisions: Option<PathBuf>,
 
     #[cfg(feature = "vision")]
@@ -2081,6 +2081,25 @@ fn main() -> Result<()> {
     }
     let model_path = resolved_model.path;
     let draft_model_path = resolved_draft.map(|artifact| artifact.path);
+    if let Some((mut request, assets)) = decision_request {
+        request.seed = args.common.seed.or(request.seed);
+        args.common.configure_runtime()?;
+        let plan = cli_execution_plan(&args, None, false)?;
+        let started = Instant::now();
+        let result = eredu::api::decision::evaluate_local_decisions(
+            &model_path,
+            assets.as_deref(),
+            &request,
+            args.common.device.unwrap_or_default().local(),
+            &plan,
+        )?;
+        if args.timing || args.verbose {
+            eprintln!("decision_seconds={:.3}", started.elapsed().as_secs_f64());
+        }
+        serde_json::to_writer_pretty(io::stdout().lock(), &result)?;
+        println!();
+        return Ok(());
+    }
     let automatic_feedback = read_automatic_feedback(&args.auto_feedback)?;
     let mut retained_automatic_inspection = None;
     let exact_trial_report = args
@@ -2222,7 +2241,7 @@ fn main() -> Result<()> {
     if args.estimate_memory_tokens.is_none() {
         args.common.configure_runtime()?;
     }
-    let prompt = if args.estimate_memory_tokens.is_some() || decision_request.is_some() {
+    let prompt = if args.estimate_memory_tokens.is_some() {
         String::new()
     } else {
         read_prompt(args.prompt.as_deref())?
@@ -2317,25 +2336,6 @@ fn main() -> Result<()> {
     let drafting_enabled = planned.drafting().is_enabled();
     let mut session = planned;
     let mut model = session.model_mut();
-    if let Some(request) = decision_request {
-        let load_seconds = load_started.elapsed().as_secs_f64();
-        let read_started = Instant::now();
-        let result = decisions::run(
-            &mut model,
-            request,
-            args.common.seed,
-            args.timing || args.verbose,
-        )?;
-        if args.timing || args.verbose {
-            eprintln!(
-                "load_seconds={load_seconds:.3} read_seconds={:.3}",
-                read_started.elapsed().as_secs_f64()
-            );
-        }
-        serde_json::to_writer_pretty(io::stdout().lock(), &result)?;
-        println!();
-        return Ok(());
-    }
     if args.prefill_chunk_size > 0 && (args.verbose || memory::requested(&args)) {
         if let Err(reason) = model.prefill_chunking_support() {
             eprintln!("prefill uses one complete pass: {reason}");
@@ -2972,9 +2972,6 @@ fn validate_args(args: &Cli) -> Result<()> {
     #[cfg(feature = "vision")]
     args.media.validate(args.auto)?;
 
-    if args.decisions.is_some() && matches!(args.auto, Some(AutoMode::Benchmark)) {
-        bail!("--decisions supports --auto quick, --auto plan or --no-auto; generation benchmarks do not measure decision reads");
-    }
     if args.estimate_memory_tokens.is_some()
         && matches!(args.auto, Some(AutoMode::Plan | AutoMode::Benchmark))
     {

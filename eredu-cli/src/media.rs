@@ -109,7 +109,7 @@ struct Function {
     parameters: serde_json::Value,
 }
 
-fn decode_image(path: &Path) -> Result<RgbImage> {
+pub(crate) fn decode_image(path: &Path) -> Result<RgbImage> {
     let image = ImageReader::open(path)
         .with_context(|| format!("failed to open image {}", path.display()))?
         .with_guessed_format()
@@ -121,7 +121,7 @@ fn decode_image(path: &Path) -> Result<RgbImage> {
     RgbImage::new(image.into_raw(), width, height).map_err(Into::into)
 }
 
-fn decode_video(directory: &Path, fps: Option<f64>) -> Result<Video> {
+pub(crate) fn decode_video(directory: &Path, fps: Option<f64>) -> Result<Video> {
     let entries = std::fs::read_dir(directory)
         .with_context(|| format!("failed to list video frames in {}", directory.display()))?;
     let mut paths = Vec::new();
