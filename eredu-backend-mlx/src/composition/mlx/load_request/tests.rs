@@ -88,6 +88,7 @@ fn portable_drafting_plan_is_fixed_before_payload_selection() {
         .is_err());
 }
 
+#[cfg(feature = "distributed")]
 #[test]
 fn native_device_is_not_part_of_normalized_request_equality() {
     let topology = topology(0, 2, 1, 1);

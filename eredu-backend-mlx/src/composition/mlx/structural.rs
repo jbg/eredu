@@ -3,6 +3,7 @@
 /// Cold MLX facts supplied to the portable admission selector.
 pub(crate) const fn preparation_mechanism_capabilities(
 ) -> eredu_core::PreparationMechanismCapabilities {
+    let distributed = cfg!(feature = "distributed");
     let modalities = eredu_core::InputModalities {
         text: true,
         image: cfg!(feature = "image"),
@@ -19,10 +20,10 @@ pub(crate) const fn preparation_mechanism_capabilities(
             eredu_core::ResidencyRequest::AddressableParameterBanks,
             true,
         )
-        .with_parallel_axis(eredu_core::ParallelAxis::Tensor, true)
-        .with_parallel_axis(eredu_core::ParallelAxis::Pipeline, true)
-        .with_parallel_axis(eredu_core::ParallelAxis::Expert, true)
-        .with_parallel_axis(eredu_core::ParallelAxis::Data, true)
+        .with_parallel_axis(eredu_core::ParallelAxis::Tensor, distributed)
+        .with_parallel_axis(eredu_core::ParallelAxis::Pipeline, distributed)
+        .with_parallel_axis(eredu_core::ParallelAxis::Expert, distributed)
+        .with_parallel_axis(eredu_core::ParallelAxis::Data, distributed)
         .with_input_modalities(modalities)
         .with_exact_completion(true)
         .with_session(eredu_core::SessionCapabilities::new(true, true, true))

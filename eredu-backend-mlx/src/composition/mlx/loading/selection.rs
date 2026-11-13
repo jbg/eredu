@@ -28,6 +28,9 @@ pub(crate) fn prepare_selected_sources(
         rank_context,
         world_backend: _,
     } = selected;
+    if !cfg!(feature = "distributed") && rank_context.is_some() {
+        return Err(Error::DistributedModelExecutionDisabled);
+    }
     let sources = prepare_model_sources(plan, selected)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     #[cfg(test)]

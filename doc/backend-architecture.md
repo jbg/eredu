@@ -25,6 +25,16 @@ bypass filename discovery and have no fallback. The portable facade exposes
 canonical SafeTensors snapshot completeness from `eredu-checkpoint` independently
 of architecture support and native backend availability.
 
+The MLX `distributed` feature enables multi-rank model construction for
+tensor, pipeline, expert and data parallelism, including combined topologies.
+The Eredu facade enables it by default. The CLI exposes it as an opt-in feature,
+and `nccl` implies it. The default CLI build and explicit facade builds such as
+`default-features = false, features = ["mlx", "metal", "image"]` omit the
+partitioned text construction routes. Cold admission reports the
+available parallel axes, and MLX load requests reject a rank topology when the
+feature is disabled. Single-device model families, checkpoint formats, residency
+policies, speculative decoding and native kernels use their ordinary routes.
+
 The configuration resolver declares any GGUF architecture sidecars. Core reads
 them beside a local primary or consumes the supplied bytes during metadata-only
 inspection. LFM3 VL retains its publisher model and processor configuration
