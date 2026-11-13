@@ -299,7 +299,8 @@ eredu audio respond --model /models/audio --input question.wav --output answer.w
 ```
 
 Transcription streams text to stdout as blocks become available. Translation
-and spoken responses close the utterance before generating. Give source and
+and spoken responses close the utterance before generating. Spoken responses
+stream answer text to stdout alongside the speech output. Give source and
 target language names in English for LFM3 Audio translation. Use mono 16-kHz
 WAV with the current Audio model. Speech WAVs are mono 24 kHz. With
 `system-audio`, `transcribe`, `translate`, and `respond` accept

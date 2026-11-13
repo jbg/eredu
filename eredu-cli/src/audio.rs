@@ -327,9 +327,11 @@ fn run_turn(
             None
         },
     };
+    let mut wrote_response_text = false;
     while let Some(output) = session.next_output().map_err(anyhow::Error::from_boxed)? {
         match output {
             AudioTaskOutput::Text(text) => {
+                wrote_response_text |= !text.is_empty();
                 observe_output(!text.is_empty());
                 stdout.write_all(text.as_bytes())?;
                 stdout.flush()?;
@@ -350,7 +352,7 @@ fn run_turn(
     if let Some(speaker) = &mut sink.speaker {
         speaker.finish()?;
     }
-    if output_rate.is_none() {
+    if output_rate.is_none() || wrote_response_text {
         writeln!(stdout)?;
     }
     if let (Some(load), Some(task)) = (load_elapsed, task_started) {

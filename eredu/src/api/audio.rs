@@ -112,11 +112,17 @@ impl<'a> PreparedAudioTask<'a> {
             .then_some(u32::try_from(audio.codec.config().sampling_rate)?);
         let (content, system, mode) = match task {
             AudioTask::Transcribe => (None, None, AudioMode::Text),
-            AudioTask::Respond { instruction } => (
-                Some(json!([{"type":"audio"}, {"type":"text","text":instruction}])),
-                None,
-                AudioMode::Speech,
-            ),
+            AudioTask::Respond { instruction } => {
+                let mut content = vec![json!({"type":"audio"})];
+                if !instruction.trim().is_empty() {
+                    content.push(json!({"type":"text","text":instruction}));
+                }
+                (
+                    Some(json!(content)),
+                    Some("Respond with interleaved text and audio.".into()),
+                    AudioMode::Interleaved,
+                )
+            }
             AudioTask::Translate { source_language, language } => (
                 Some(json!([{"type":"audio"}])),
                 Some(format!(
