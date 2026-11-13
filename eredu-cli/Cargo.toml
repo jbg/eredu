@@ -13,6 +13,7 @@ readme = "README.md"
 
 [features]
 default = ["mlx", "metal", "realtime", "system-audio", "vision"]
+distributed = ["eredu/distributed"]
 vision = ["eredu/image", "dep:image"]
 realtime = ["eredu/audio", "dep:eredu-media"]
 system-audio = ["realtime", "eredu-media/system-audio", "dep:ctrlc", "dep:crossterm"]

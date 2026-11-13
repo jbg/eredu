@@ -53,7 +53,9 @@ use crate::backend::{
 };
 
 use super::MlxModelInput;
-use crate::composition::mlx::{distributed, prepared_speculative};
+#[cfg(feature = "distributed")]
+use crate::composition::mlx::distributed;
+use crate::composition::mlx::prepared_speculative;
 use eredu_architectures::composite_execution::{
     CompositeArchitecture, ExternalPredictionCaptureRequest, ExternalPredictionTargetCapture,
     ExternalPredictionTargetOperation, PreparedCompositeInput,

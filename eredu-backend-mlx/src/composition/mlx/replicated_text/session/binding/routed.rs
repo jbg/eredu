@@ -141,6 +141,7 @@ pub(super) fn selected_parameter_providers(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "distributed")]
 pub(super) fn selected_addressable_partition_bank(
     members: &[eredu_runtime::AddressableBankMember],
     store: Arc<dyn CheckpointSource>,

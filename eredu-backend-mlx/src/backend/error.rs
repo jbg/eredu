@@ -206,6 +206,10 @@ pub enum Error {
         #[from] crate::backend::runtime::residency::parameter_bank::AddressableParameterBankError,
     ),
 
+    /// The MLX build omits distributed model execution.
+    #[error("distributed MLX model execution requires the Cargo feature `distributed`")]
+    DistributedModelExecutionDisabled,
+
     /// Invalid runtime parallel topology, tensor placement, or partition request.
     #[error("parallel placement error: {0}")]
     Parallel(String),

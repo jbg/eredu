@@ -104,6 +104,9 @@ impl MlxLoadRequest {
         ),
         Error,
     > {
+        if !cfg!(feature = "distributed") && self.normalized.parallel_topology().is_some() {
+            return Err(Error::DistributedModelExecutionDisabled);
+        }
         match (self.normalized.parallel_topology(), self.parallel_device) {
             (Some(topology), Some(device)) => crate::backend::MlxRankContext::new(
                 topology.world_size(),

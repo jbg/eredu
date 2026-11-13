@@ -155,7 +155,9 @@ no-default-features = true
 features = ["mlx", "metal", "image", "audio"]
 
 [features]
-default = ["mlx", "metal", "onig", "esaxx_fast"]
+default = ["mlx", "metal", "distributed", "onig", "esaxx_fast"]
+
+distributed = ["eredu-backend-mlx?/distributed"]
 
 mlx = ["dep:eredu-backend-mlx"]
 projection-profiling = ["mlx", "eredu-backend-mlx/projection-profiling"]
@@ -166,7 +168,7 @@ metal = [
 cuda = ["eredu-backend-mlx?/cuda"]
 esaxx_fast = ["tokenizers/esaxx_fast", "eredu-text/esaxx_fast"]
 onig = ["tokenizers/onig", "eredu-text/onig"]
-nccl = ["cuda", "eredu-backend-mlx?/nccl"]
+nccl = ["cuda", "distributed", "eredu-backend-mlx?/nccl"]
 image = ["eredu-architectures/image", "eredu-backend-mlx?/image"]
 audio = ["eredu-architectures/audio", "eredu-backend-mlx?/audio"]
 

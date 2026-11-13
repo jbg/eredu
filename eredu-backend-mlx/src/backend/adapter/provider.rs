@@ -141,7 +141,11 @@ impl<'a> BackendProvider for MlxBackend<'a> {
     ) -> Result<PreparedModel<Self::Model>, Self::Error> {
         let capabilities = config.sources.selected().session_capabilities();
         let rank = config.rank_context;
-        let manifest = config.sources.selected().communication_manifest().cloned();
+        let manifest = config.sources.selected().communication_manifest();
+        if !cfg!(feature = "distributed") && manifest.is_some() {
+            return Err(Error::DistributedModelExecutionDisabled);
+        }
+        let manifest = manifest.cloned();
         self.materialize_after_communication(capabilities, manifest.as_ref(), rank, |distributed| {
             crate::composition::mlx::loading::materialize_model_plan(
                 config.sources,
