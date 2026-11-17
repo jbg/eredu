@@ -27,6 +27,5 @@ pub mod runtime;
 // aliases for contracts owned by dependency crates.
 #[cfg(feature = "mlx")]
 use eredu_core::{
-    AllocatorTelemetry, AutomaticPlanningError, DevicePlan, ExecutionPlan, ExpertCacheTelemetry,
-    ModelInspectionReport, QuantizationRequest, ResidencyTelemetry, SessionCapabilities,
+    AllocatorTelemetry, DevicePlan, ExecutionPlan, ExpertCacheTelemetry, ResidencyTelemetry,
 };

@@ -1,79 +1,137 @@
-//! Native binding of a retained realtime selection.
+//! Backend-selected binding of a retained realtime plan.
+
+use eredu_core::DevicePlan;
+use eredu_runtime::RealtimeLoadSupport;
 
 use super::{
-    prepare_realtime_selection, PreparedRealtimeSelection, RealtimeLoadError, RealtimeLoadOptions,
+    prepare_realtime_selection, CategoricalRealtimeModel, PreparedRealtimeArtifact,
+    PreparedRealtimeSelection, PreparedSpeechSelection, RealtimeLoadError, RealtimeLoadOptions,
+    SpeechRealtimeSession,
 };
-use crate::runtime::voicechat::{start_mlx_voicechat, MlxVoiceChatSession};
-use eredu_architectures::{
-    moshi::MoshiRealtimeExecution, realtime::PreparedRealtimeArtifact,
-    voicechat::component_residency::VoiceChatResidencyReport,
-};
-use eredu_backend_mlx::native::{
-    ExecutionContext, MlxRealtimeExecution, MlxRealtimeExecutionContext, MlxRealtimeSupport,
-};
-use eredu_core::BackendFailure;
+use eredu_architectures::moshi::PreparedMoshiRealtimeSource;
 
-fn backend(error: impl std::error::Error + Send + Sync + 'static) -> RealtimeLoadError {
-    RealtimeLoadError::Backend(BackendFailure::from_error(error))
+/// Supplies cold capability facts and binds the protocol selected by the artifact.
+pub trait RealtimeBackendFactory {
+    /// Capability predicates used before sources or devices are bound.
+    type Support: RealtimeLoadSupport;
+
+    /// Reports exact, side-effect-free support for local realtime loading.
+    fn realtime_support(&self) -> Self::Support;
+
+    /// Binds a retained categorical execution on the selected device.
+    fn bind_categorical(
+        &self,
+        selected: PreparedMoshiRealtimeSource,
+        device: &DevicePlan,
+    ) -> Result<Box<dyn CategoricalRealtimeModel>, RealtimeLoadError>;
+
+    /// Binds a retained PCM speech execution on the selected device.
+    fn bind_speech(
+        &self,
+        selected: PreparedSpeechSelection<'_>,
+        device: &DevicePlan,
+    ) -> Result<Box<dyn SpeechRealtimeSession>, RealtimeLoadError>;
 }
 
-/// Complete cold selection for local MLX binding.
-pub struct PreparedMlxRealtime<'a> {
-    selection: PreparedRealtimeSelection<'a>,
-}
-
-/// Bound execution retaining the architecture's declared input protocol.
-pub enum LoadedMlxRealtime {
+/// Bound execution retaining the artifact's declared host input protocol.
+pub enum RealtimeSession {
     /// Categorical frames use the shared realtime scheduler and model state.
-    Categorical {
-        /// Native stream mechanisms retained for submissions and state creation.
-        context: MlxRealtimeExecutionContext,
-        /// Architecture-owned selected categorical execution.
-        model: MoshiRealtimeExecution<MlxRealtimeExecution>,
-    },
-    /// PCM speech uses the shared controlled/iterator conversation session.
-    Speech(MlxVoiceChatSession),
+    Categorical(Box<dyn CategoricalRealtimeModel>),
+    /// PCM speech uses the shared controlled conversation session.
+    Speech(Box<dyn SpeechRealtimeSession>),
 }
 
-/// Selects from a discovered artifact without creating a native device or tensor.
-pub fn prepare_mlx_realtime<'a>(
+/// A retained protocol selection tied to the factory that admitted it.
+pub struct PreparedRealtime<'a, F> {
+    factory: &'a F,
+    selected: PreparedRealtimeSelection<'a>,
+}
+
+impl<F> PreparedRealtime<'_, F> {
+    /// Admitted speech parameter pools for a PCM conversation.
+    pub fn speech_residency_report(
+        &self,
+    ) -> Option<eredu_architectures::voicechat::component_residency::VoiceChatResidencyReport> {
+        self.selected.speech_residency_report()
+    }
+}
+
+/// Selects a realtime protocol using the chosen backend's cold support predicates.
+pub fn prepare_realtime<'a, F: RealtimeBackendFactory>(
+    factory: &'a F,
     artifact: &'a PreparedRealtimeArtifact,
     options: &RealtimeLoadOptions,
-) -> Result<PreparedMlxRealtime<'a>, RealtimeLoadError> {
-    let selection = prepare_realtime_selection(artifact, options, &MlxRealtimeSupport::new(false))?;
-    Ok(PreparedMlxRealtime { selection })
+) -> Result<PreparedRealtime<'a, F>, RealtimeLoadError> {
+    let selected = prepare_realtime_selection(artifact, options, &factory.realtime_support())?;
+    Ok(PreparedRealtime { factory, selected })
 }
 
-impl PreparedMlxRealtime<'_> {
-    /// Exact aggregate speech parameter admission, when the protocol uses PCM.
-    pub fn speech_residency_report(&self) -> Option<VoiceChatResidencyReport> {
-        self.selection.speech_residency_report()
+/// Binds a retained selection through the factory that admitted it.
+pub fn bind_realtime<F: RealtimeBackendFactory>(
+    prepared: PreparedRealtime<'_, F>,
+    device: &DevicePlan,
+) -> Result<RealtimeSession, RealtimeLoadError> {
+    match prepared.selected {
+        PreparedRealtimeSelection::Categorical(selected) => prepared
+            .factory
+            .bind_categorical(selected, device)
+            .map(RealtimeSession::Categorical),
+        PreparedRealtimeSelection::Speech(selected) => prepared
+            .factory
+            .bind_speech(*selected, device)
+            .map(RealtimeSession::Speech),
+    }
+}
+
+#[cfg(feature = "mlx")]
+mod mlx {
+    use super::*;
+    use eredu_backend_mlx::{
+        native::{ExecutionContext, MlxRealtimeExecutionContext, MlxRealtimeSupport},
+        MlxBackendFactory,
+    };
+    use eredu_core::BackendFailure;
+
+    fn backend(error: impl std::error::Error + Send + Sync + 'static) -> RealtimeLoadError {
+        RealtimeLoadError::Backend(BackendFailure::from_error(error))
     }
 
-    /// Materializes the retained selection through the existing submission owners.
-    /// Sources and host policy cannot change between selection and this binding.
-    pub fn load(
-        self,
-        weights: &ExecutionContext,
-        execution: &ExecutionContext,
-    ) -> Result<LoadedMlxRealtime, RealtimeLoadError> {
-        match self.selection {
-            PreparedRealtimeSelection::Categorical(selected) => {
-                let context =
-                    MlxRealtimeExecutionContext::new(execution.stream(), weights.stream());
-                let model = context.bind_realtime(selected, None).map_err(backend)?;
-                Ok(LoadedMlxRealtime::Categorical { context, model })
-            }
-            PreparedRealtimeSelection::Speech(selected) => {
-                let (prepared, resources) = selected.into_startup();
-                Ok(LoadedMlxRealtime::Speech(start_mlx_voicechat(
-                    prepared,
-                    resources.parameters(),
-                    resources.startup(),
-                    weights,
-                    execution,
-                )?))
-            }
+    impl RealtimeBackendFactory for MlxBackendFactory {
+        type Support = MlxRealtimeSupport;
+
+        fn realtime_support(&self) -> Self::Support {
+            MlxRealtimeSupport::new(false)
+        }
+
+        fn bind_categorical(
+            &self,
+            selected: PreparedMoshiRealtimeSource,
+            device: &DevicePlan,
+        ) -> Result<Box<dyn CategoricalRealtimeModel>, RealtimeLoadError> {
+            let weights = ExecutionContext::cpu().map_err(backend)?;
+            let execution = self.execution_context(device).map_err(backend)?;
+            let context = MlxRealtimeExecutionContext::new(execution.stream(), weights.stream());
+            let model = context.bind_realtime(selected, None).map_err(backend)?;
+            Ok(Box::new(std::rc::Rc::new(
+                super::super::selected_categorical_mlx::MlxCategoricalModel::new(context, model),
+            )))
+        }
+
+        fn bind_speech(
+            &self,
+            selected: PreparedSpeechSelection<'_>,
+            device: &DevicePlan,
+        ) -> Result<Box<dyn SpeechRealtimeSession>, RealtimeLoadError> {
+            let weights = ExecutionContext::cpu().map_err(backend)?;
+            let execution = self.execution_context(device).map_err(backend)?;
+            let (prepared, resources) = selected.into_startup();
+            Ok(crate::runtime::voicechat::start_mlx_voicechat(
+                prepared,
+                resources.parameters(),
+                resources.startup(),
+                &weights,
+                &execution,
+            )?)
         }
     }
 }

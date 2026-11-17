@@ -116,8 +116,8 @@ base generic checkpoint and parameter-materialization mechanisms.
 
 Application clients pass `eredu_core::ExecutionPlan` and this crate's
 `MlxBackendFactory` to `eredu::api::LoadedModel::load_execution_plan`. Models,
-requests, and controls retain their backend parameters. `LocalLoadOptions` and
-`LocalInspectionOptions` in `eredu::api` provide portable inspection policy.
+requests, and controls retain their backend parameters. `ExecutionPlan`
+provides portable policy for `eredu::api::inspect_execution`.
 Backend tooling may
 instead pass a checked neutral `ParallelRankTopology` and a process-local
 `native::DeviceAssignment` through the root `MlxLoadRequest` adapter. Selection

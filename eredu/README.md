@@ -168,11 +168,11 @@ declarations and required calls are rejected, and explicit thinking requires
 
 Realtime models use `eredu::api::realtime::prepare_realtime_model` for shared
 Moshi/PersonaPlex and VoiceChat artifact discovery and retained preparation.
-`prepare_mlx_realtime` checks the requested categorical or PCM protocol and selects
-resources before native allocation; `PreparedMlxRealtime::load` binds that exact
+`prepare_realtime` checks the requested categorical or PCM protocol and selects
+resources before native allocation; `bind_realtime` binds that exact
 selection. Categorical execution uses `RealtimeSessionScheduler`; PCM speech
-returns a bound session with controlled advancement and an iterator over the same
-scheduler. Completed transitions commit before host output is delivered.
+returns a host-only session with controlled advancement and an iterator over the
+same scheduler. Completed transitions commit before host output is delivered.
 
 ## Cargo features
 

@@ -123,10 +123,10 @@ The F32 boundary carries the full hidden sequence. The final stage
 gathers answer slots and publishes the scores through the shared
 all-rank commit.
 
-The decision facade coordinates request preparation, cancellation, and
-calibrated publication through the generic application agreement seam
-of the pipeline transport. The MLX adapter binds rank resources and
-collectives. Prompt and readout policy remain in the architecture and facade.
+The architecture’s decision driver coordinates request preparation, cancellation,
+and calibrated publication through the pipeline transport’s generic agreement
+contract. It owns packing, host media projection and calibrated readout. The
+MLX adapter binds rank resources and collectives.
 The facade accepts one decoded decision request and selects native decisions
 from checkpoint declarations or evaluates a pinned text refinement canvas.
 It owns refinement prompt construction, score capture, and typed readout.
@@ -1358,8 +1358,8 @@ mechanisms separately. See [VoiceChat validation](voicechat-validation.md) for t
 measured scope.
 
 The `eredu audio realtime` command calls `api::realtime::prepare_realtime_model`,
-`prepare_mlx_realtime` and the consuming `PreparedMlxRealtime::load`, then drives
-the returned `BoundVoiceChatSession`. Checkpoint naming, admission, neural equations
+`prepare_realtime` and the consuming `bind_realtime`, then drives
+the returned `SpeechRealtimeSession`. Checkpoint naming, admission, neural equations
 and conversation policy remain in their existing owners. The CLI owns configuration, recorded tool scripts, wall-clock pacing and
 file/device delivery.
 `eredu-media::audio::wav` supplies bounded, standard-library-only mono WAV processing
@@ -2989,8 +2989,8 @@ resources; all neural, random and conversational state stays in the transaction.
 Both controlled and iterator advancement use the same submission fence and session.
 A busy shared executor allows polling and PCM ingress but rejects new admission
 with retryable `Busy`. The iterator can expose its endpoints for bounded delivery
-between ticks. Fork binding is explicit; the MLX `fork_shared` method retains the
-same model and startup tensors while the ordinary session copies accounted state.
+between ticks. `SpeechRealtimeSession::fork` retains the same model and startup tensors
+while the ordinary session copies accounted state.
 
 The portable `api::realtime::prepare_realtime_model` accepts a
 `RealtimeArtifactRequest` and returns an architecture-owned
@@ -3002,18 +3002,18 @@ retains explicit component roles and the complete companion that supplies RNNT a
 codec-encoder weights. The prepared artifact retains exact auxiliary assets,
 restricted component sources, canonical recipes and conversion bounds.
 
-With the MLX feature, `prepare_mlx_realtime` applies `RealtimeLoadOptions` to this
-retained artifact before native device or tensor creation. Architecture dispatch
+`prepare_realtime` applies `RealtimeLoadOptions` to this retained artifact using
+the selected factory’s cold support predicates, before native device or tensor creation. Architecture dispatch
 selects the categorical-frame or PCM-speech protocol; a mismatch is a typed error.
 For speech, cold selection uses `PreparedVoiceChatSession` to validate recorded
 startup time, queue reservations, matching PCM precision, text/tool policy,
 RNNT/turn configuration and prompt capacities. It also selects both neural cache
 layouts and validates the complete parameter-residency allowances.
-`PreparedMlxRealtime::load` consumes that selection and explicit execution and
-weight contexts, binds components, prepares fixed-Aria and silence inputs, and
+`bind_realtime` consumes that selection and a portable device plan, binds
+components, prepares fixed-Aria and silence inputs, and
 registers the existing session. Loading accepts no replacement sources or policy.
-Prefill runs only on advancement. `LoadedMlxRealtime::Speech` exposes the same
-bound controlled/iterator session. The facade consumes the neutral `eredu-nn` dtype
+Prefill runs only on advancement. `RealtimeSession::Speech` exposes a
+`SpeechRealtimeSession` with controlled advancement, snapshots and forks. The facade consumes the neutral `eredu-nn` dtype
 contract; native realization stays behind its MLX feature and no accelerator
 dependency enters portable definitions.
 
@@ -4204,11 +4204,11 @@ for operations it does not own. In particular, the facade exposes no
 prompt-cache types because it exposes no prompt-cache operation.
 
 Realtime applications prepare sources with `prepare_realtime_model` and select
-MLX realization with `prepare_mlx_realtime`. Consuming `PreparedMlxRealtime::load`
-returns categorical execution or a bound PCM speech session. Categorical clients
-compose `PreparedRealtimeModel<M>`, `RealtimeSessionScheduler` and
-`ReleasedRealtimeSession`; PCM clients use controlled advancement or the bound
-session iterator. Runtime scheduling retains admission, transactions, completion
+execution through their chosen factory with `prepare_realtime`. `bind_realtime`
+uses the selecting factory and returns a host-facing categorical model or PCM
+speech session. Categorical clients submit host frames and advance through
+`CategoricalRealtimeSession`. PCM clients use controlled advancement or recorded
+ticks through `SpeechRealtimeSession`. Runtime scheduling retains admission, transactions, completion
 and host-publication policy for both protocols.
 Realtime `resume` takes a mutable optional released-session slot. Failure leaves
 the slot untouched and returns a portable `RealtimeSessionError`; success takes
@@ -4253,7 +4253,7 @@ portable reuse/eviction protocol.
 Backend adapters own native resources and outer type erasure, while shared
 replicated-text execution and stateful lifecycle orchestration remain in the
 neutral runtime.
-`LocalLoadOptions` and `LocalInspectionOptions` contain only neutral
+`ExecutionPlan` contains only neutral
 quantization, residency, and session-capability policy, while native
 device-bound contexts are selected only by backend tooling. `BackendFailure`
 retains operation context and the original typed source without exporting native
@@ -13221,7 +13221,7 @@ Cold options can derive physical placement and available capacities through the
 portable facade's `GenerationMemoryOptions::for_hardware_device`. It matches
 backend/device identities exactly, takes a backend-supplied host-execution fact,
 and maps hardware observations into execution and host budgets without substituting
-installed capacity or application policy. `for_local_device` composes that helper
+installed capacity or application policy. `for_backend_device` composes that helper
 with local hardware discovery and allocator observations. MLX classifies canonical
 device IDs using the same parser as realization, without creating a native device
 or stream. The CLI supplies its selected plan device and retains ownership of
@@ -13511,7 +13511,7 @@ Allocator-cache policy is also observed at the native boundary. A vendored MLX
 getter reads the CPU, Metal or CUDA allocator's limit under its allocator lock;
 the C API and `safemlx` expose it without temporary mutations or cache eviction.
 The MLX adapter and selected facade expose both the getter and a setter returning
-the previous value. `GenerationMemoryOptions::for_local_backend` composes this
+the previous value. `GenerationMemoryOptions::for_backend` composes this
 snapshot with retained cache and a labeled graph/driver allowance; the CLI uses
 it when no proposed cold cache limit is supplied. This explicit local diagnostic
 may initialize the native allocator. The generic options constructor, portable
@@ -13556,8 +13556,7 @@ MLX bounded quantizer writes each completed encoded tile directly to this neutra
 sink, with no complete packed payload retained in host vectors. Applications
 supply a directory and maximum prepared tensor file bytes through
 `PreparedCheckpointCachePolicy`. Ordinary loads accept the policy through
-`ExecutionPlan::with_prepared_checkpoint_cache` or
-`LocalLoadOptions::with_prepared_checkpoint_cache`. Realtime loads take it on
+`ExecutionPlan::with_prepared_checkpoint_cache`. Realtime loads take it on
 `RealtimeArtifactRequest`, and direct bounded quantization takes it through
 `BoundedQuantizationPlan::with_prepared_cache` or from its source. A load that
 requires a prepared file fails if the policy is absent. Optional prepared
@@ -16798,7 +16797,15 @@ antialiased bicubic RGB resizing, normalization, and patch packing.
 The ordinary artifact registry admits `lfm3_vl` with the publisher's
 `Lfm3VlForConditionalGeneration` architecture and requires its processor sidecar.
 The decision checkpoint shares the outer model type and declares `D1Model`,
-which the generative admission rejects. VL execution preparation consumes the
+which the generative admission rejects. The architecture layer owns native
+decision discovery, companion admission, media projection, packed question
+execution and calibrated readout. `evaluate_decisions` takes the caller’s
+selected factory and execution plan. The factory supplies component binding,
+native contexts and optional load synchronization. The facade advances the
+host-only decision session, associates results with caller IDs and uses the
+ordinary text loader for refinement artifacts.
+
+VL execution preparation consumes the
 admitted catalog, exact shard set, and normalized processor from inspection.
 The shared source graph opens the VL checkpoint once and projects disjoint
 decoder and vision roles from its exact admitted keys. Both roles share the

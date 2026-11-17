@@ -1,195 +1,124 @@
 use std::path::Path;
 
-use anyhow::{ensure, Context, Result};
-use eredu_backend_mlx::native::ExecutionContext;
-use eredu_checkpoint::recipe::RecipeDtype;
-use eredu_core::{Media, ResidencyPlan};
+use anyhow::{ensure, Result};
+use eredu_architectures::{
+    decision_task::{
+        BoundDecisionModel, DecisionInput, DecisionMedia, DecisionTaskError, PreparedDecisionModel,
+    },
+    processor_plan::ArtifactArchitecturePlan,
+    ExternalDraftPreparation,
+};
+use eredu_core::{
+    ExecutionPlan, ExecutionPlanBackendFactory, Media, ModelConfigurationResolver,
+    ModelLoadingBackend, TextGenerationBackend, WeightTransformationPlan,
+};
 use eredu_runtime::{execution_plan_layer_residency, LayerWeightResidency, ResidencyDiagnostics};
 
 use super::*;
-use crate::api::LocalDevice;
 
-/// A prepared native decision operation with its decoded input.
-pub struct PreparedDecisionTask {
-    model: PreparedTextChoiceModel,
-    request: DecisionRequest,
-    max_cached_shards: usize,
+/// Binds a retained decision artifact using a configured backend factory.
+pub trait DecisionBackendFactory: ExecutionPlanBackendFactory {
+    /// Realizes the retained artifact on the plan's selected device.
+    /// Synchronizes native load work when completion must be observed.
+    fn bind_decision(
+        &self,
+        model: PreparedDecisionModel,
+        plan: &ExecutionPlan,
+        residency: LayerWeightResidency,
+        synchronize_load: bool,
+    ) -> Result<Box<dyn BoundDecisionModel>, DecisionTaskError>;
 }
 
-impl PreparedDecisionTask {
-    /// Discovers and prepares a native decision artifact. A checkpoint without a
-    /// native decision declaration can be evaluated through text refinement.
-    ///
-    /// A split artifact uses its explicit media projector and local sidecars.
-    pub fn discover(
-        path: &Path,
-        projector: Option<&Path>,
-        assets: Option<&Path>,
-        request: &DecisionRequest,
-        max_cached_shards: usize,
-        prepared_cache: Option<&eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy>,
-    ) -> Result<Option<Self>> {
-        request.validate()?;
-        let audio = request
+/// Evaluates a request using the artifact's declared decision or refinement capability.
+/// The optional callback runs after binding and synchronization.
+pub fn evaluate_decisions<F>(
+    factory: &F,
+    path: &Path,
+    assets: Option<&Path>,
+    request: &DecisionRequest,
+    plan: &ExecutionPlan,
+    on_loaded: Option<&mut dyn FnMut()>,
+) -> Result<DecisionResponse>
+where
+    F: DecisionBackendFactory<DrafterPreparation = ExternalDraftPreparation>,
+    F::Backend: TextGenerationBackend + ModelLoadingBackend,
+    <F::Backend as ModelLoadingBackend>::ConfigurationResolver:
+        ModelConfigurationResolver<ArtifactPlan = ArtifactArchitecturePlan>,
+{
+    request.validate()?;
+    let media = DecisionMedia {
+        audio: request
             .media
             .iter()
-            .any(|media| matches!(media, Media::Audio(_)))
-            || request.questions.iter().any(|q| q.spoken.is_some());
-        let visual = request
+            .any(|item| matches!(item, Media::Audio(_)))
+            || request.questions.iter().any(|item| item.spoken.is_some()),
+        visual: request
             .media
             .iter()
-            .any(|media| matches!(media, Media::Image(_) | Media::Video(_)));
-        let dtype = RecipeDtype::F32;
-        let model = if path.extension().is_some_and(|ext| ext == "gguf") {
-            let assets = assets
-                .or_else(|| path.parent())
-                .context("decision sidecar directory is required")?;
-            let Some(model) = PreparedTextChoiceModel::discover_gguf(
-                path,
-                projector,
-                assets,
-                dtype,
-                max_cached_shards,
-                prepared_cache,
-            )?
-            else {
-                return Ok(None);
-            };
-            ensure!(
-                !(visual || audio) || projector.is_some(),
-                "media requires a projector companion"
-            );
-            model
-        } else {
-            let root = if path.is_dir() {
-                path
-            } else {
-                path.parent().context("model directory is required")?
-            };
-            let config: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(root.join("config.json"))?)?;
-            if !eredu_architectures::lfm3::decision::is_d1_config(&config) {
-                return Ok(None);
-            }
-            ensure!(
-                projector.is_none() && assets.is_none(),
-                "native SafeTensors decisions use bundled companions"
-            );
-            ensure!(
-                path.is_dir(),
-                "native SafeTensors decisions require the checkpoint directory"
-            );
-            if audio {
-                PreparedTextChoiceModel::open_with_omni(root, dtype, max_cached_shards)?
-            } else if visual {
-                PreparedTextChoiceModel::open_with_vision(root, dtype, max_cached_shards)?
-            } else {
-                PreparedTextChoiceModel::open(root, dtype, max_cached_shards)?
-            }
-        };
+            .any(|item| matches!(item, Media::Image(_) | Media::Video(_))),
+    };
+    if let Some(prepared) = PreparedDecisionModel::discover(
+        path,
+        plan.media_companions(),
+        assets,
+        media,
+        plan.max_cached_shards(),
+        plan.prepared_checkpoint_cache(),
+    )? {
+        ensure!(
+            plan.topology().is_replicated(),
+            "local decision evaluation requires a single rank"
+        );
+        ensure!(
+            plan.weight_transformation() == WeightTransformationPlan::PreserveCheckpoint,
+            "native decision evaluation requires checkpoint weight encodings"
+        );
         ensure!(
             request.refinement_steps.is_none() && request.seed.is_none(),
             "native decisions do not use refinement_steps or seed"
         );
-        Ok(Some(Self {
-            model,
-            request: request.clone(),
-            max_cached_shards,
-        }))
-    }
-
-    /// Loads the prepared graph and drains its controlled decision session.
-    pub fn evaluate(
-        self,
-        device: LocalDevice,
-        residency: &ResidencyPlan,
-    ) -> Result<DecisionResponse> {
-        self.evaluate_with_load_callback(device, residency, None)
-    }
-
-    fn evaluate_with_load_callback(
-        self,
-        device: LocalDevice,
-        residency: &ResidencyPlan,
-        on_loaded: Option<&mut dyn FnMut()>,
-    ) -> Result<DecisionResponse> {
         let residency = execution_plan_layer_residency(
-            residency,
-            self.max_cached_shards,
+            plan.residency(),
+            plan.max_cached_shards(),
             ResidencyDiagnostics::default(),
         )?;
-        let residency: LayerWeightResidency = residency.into();
-        let weights = ExecutionContext::cpu().map_err(eredu_core::BackendFailure::from_error)?;
-        let execution = match device {
-            LocalDevice::Cpu => ExecutionContext::cpu(),
-            LocalDevice::Accelerator(index) => ExecutionContext::accelerator(index as usize),
+        let mut model =
+            factory.bind_decision(prepared, plan, residency.into(), on_loaded.is_some())?;
+        if let Some(callback) = on_loaded {
+            callback();
         }
-        .map_err(eredu_core::BackendFailure::from_error)?;
-        let report_loaded = || -> Result<()> {
-            if let Some(callback) = on_loaded {
-                weights
-                    .stream()
-                    .synchronize()
-                    .map_err(eredu_core::BackendFailure::from_error)?;
-                execution
-                    .stream()
-                    .synchronize()
-                    .map_err(eredu_core::BackendFailure::from_error)?;
-                callback();
-            }
-            Ok(())
-        };
-        let request = self.request;
-        let questions: Vec<_> = request
+        let questions = request
             .questions
             .iter()
-            .map(|q| q.question.clone())
-            .collect();
-        let state = request.state.as_deref();
-        let audio = request
-            .media
+            .map(|item| item.question.clone())
+            .collect::<Vec<_>>();
+        let spoken = request
+            .questions
             .iter()
-            .any(|media| matches!(media, Media::Audio(_)))
-            || request.questions.iter().any(|q| q.spoken.is_some());
-        let evaluation = if audio {
-            #[cfg(all(feature = "audio", feature = "image"))]
-            {
-                let mut model = TextChoiceModel::load_with_omni(
-                    self.model, residency, residency, residency, &weights, &execution,
-                )?;
-                report_loaded()?;
-                let spoken = request
-                    .questions
-                    .iter()
-                    .map(|q| q.spoken.as_ref())
-                    .collect::<Vec<_>>();
-                model.evaluate_with_spoken_questions(state, &request.media, &questions, &spoken)?
+            .map(|item| item.spoken.as_ref())
+            .collect::<Vec<_>>();
+        let mut progress = model.start(DecisionInput {
+            state: request.state.as_deref(),
+            media: &request.media,
+            questions: &questions,
+            spoken: &spoken,
+        })?;
+        let evaluation = loop {
+            if let Some(result) = progress.advance()? {
+                break result;
             }
-            #[cfg(not(all(feature = "audio", feature = "image")))]
-            anyhow::bail!("decision audio requires the audio and image features");
-        } else if !request.media.is_empty() {
-            #[cfg(feature = "image")]
-            {
-                let mut model = TextChoiceModel::load_with_vision(
-                    self.model, residency, residency, &weights, &execution,
-                )?;
-                report_loaded()?;
-                model.evaluate_with_visuals(state, &request.media, &questions)?
-            }
-            #[cfg(not(feature = "image"))]
-            anyhow::bail!("visual decisions require the image feature");
-        } else {
-            let mut model = TextChoiceModel::load(self.model, residency, &weights, &execution)?;
-            report_loaded()?;
-            model.evaluate_decisions(state, &questions)?
+            ensure!(
+                !progress.is_finished(),
+                "decision finished without publishing a result"
+            );
         };
-        Ok(DecisionResponse {
+        return Ok(DecisionResponse {
             answers: request
                 .questions
-                .into_iter()
+                .iter()
                 .zip(evaluation.answers)
-                .map(|(q, answer)| DecisionResult {
-                    id: q.id,
+                .map(|(item, answer)| DecisionResult {
+                    id: item.id.clone(),
                     answer,
                     label_mass: None,
                 })
@@ -203,72 +132,29 @@ impl PreparedDecisionTask {
                     .map(|byte| format!("{byte:02x}"))
                     .collect(),
             ),
-        })
-    }
-}
-
-/// Evaluates a local artifact through its native decision or refinement capability.
-pub fn evaluate_local_decisions(
-    path: &Path,
-    assets: Option<&Path>,
-    request: &DecisionRequest,
-    device: LocalDevice,
-    plan: &eredu_core::ExecutionPlan,
-) -> Result<DecisionResponse> {
-    evaluate_local_decisions_with_load_callback(path, assets, request, device, plan, None)
-}
-
-/// Evaluates a local decision request, optionally reporting load completion before inference.
-/// The callback runs after checkpoint preparation, model binding, and synchronization.
-/// Layer transfers performed on demand are part of inference.
-pub fn evaluate_local_decisions_with_load_callback(
-    path: &Path,
-    assets: Option<&Path>,
-    request: &DecisionRequest,
-    device: LocalDevice,
-    plan: &eredu_core::ExecutionPlan,
-    on_loaded: Option<&mut dyn FnMut()>,
-) -> Result<DecisionResponse> {
-    ensure!(
-        plan.device() == &crate::api::local_device_plan(device)?,
-        "decision execution plan and device must match"
-    );
-    let companions = plan.media_companions();
-    if let Some(task) = PreparedDecisionTask::discover(
-        path,
-        companions.vision().or(companions.audio()),
-        assets,
-        request,
-        plan.max_cached_shards(),
-        plan.prepared_checkpoint_cache(),
-    )? {
-        ensure!(
-            companions
-                .vision()
-                .zip(companions.audio())
-                .is_none_or(|(a, b)| a == b),
-            "native decisions require one shared media projector"
-        );
-        ensure!(
-            plan.topology().is_replicated(),
-            "local decision evaluation requires a single rank"
-        );
-        ensure!(
-            plan.weight_transformation()
-                == eredu_core::WeightTransformationPlan::PreserveCheckpoint,
-            "native decision evaluation requires checkpoint weight encodings"
-        );
-        return task.evaluate_with_load_callback(device, plan.residency(), on_loaded);
+        });
     }
     ensure!(
         assets.is_none(),
         "decision sidecars require a native decision artifact"
     );
-    let factory = eredu_backend_mlx::MlxBackendFactory::default();
-    let mut loaded = crate::api::LoadedModel::load_execution_plan(&factory, path, plan)?;
+    let mut loaded = crate::api::LoadedModel::load_execution_plan(factory, path, plan)?;
     if let Some(callback) = on_loaded {
         loaded.model_mut().synchronize()?;
         callback();
     }
-    super::evaluate_refinement(&mut loaded.model_mut(), request)
+    evaluate_refinement(loaded.model_mut(), request)
+}
+
+#[cfg(feature = "mlx")]
+impl DecisionBackendFactory for eredu_backend_mlx::MlxBackendFactory {
+    fn bind_decision(
+        &self,
+        model: PreparedDecisionModel,
+        plan: &ExecutionPlan,
+        residency: LayerWeightResidency,
+        synchronize_load: bool,
+    ) -> Result<Box<dyn BoundDecisionModel>, DecisionTaskError> {
+        self.bind_prepared_decision(model, plan.device(), residency, synchronize_load)
+    }
 }

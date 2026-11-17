@@ -41,6 +41,8 @@ mod capability;
 mod control;
 mod controlled_speculative;
 pub use controlled_speculative::*;
+mod backend_inspection;
+pub use backend_inspection::*;
 mod inspection;
 mod prepared;
 pub use prepared::*;

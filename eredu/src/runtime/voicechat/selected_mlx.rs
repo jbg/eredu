@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use eredu_architectures::voicechat::{
-    component_residency::{VoiceChatResidencyPolicy, VoiceChatResidencyReport},
+    component_residency::VoiceChatResidencyPolicy,
     components::{BoundVoiceChatComponents, LocalInvocationBranch},
     observation::VoiceChatHostObserver,
     preparation::Generation,
@@ -26,10 +26,9 @@ use eredu_backend_mlx::{
 use eredu_core::RealtimeDecisionDiagnostics;
 
 use super::{
-    BoundVoiceChatFork, BoundVoiceChatSession, PreparedVoiceChatSession, VoiceChatExecutionError,
-    VoiceChatExecutionInputs, VoiceChatExecutor, VoiceChatLoadSelection,
-    VoiceChatPublicationBranch, VoiceChatSessionError, VoiceChatStartError, VoiceChatStartupInputs,
-    VoiceChatSubmittedWork, VoiceChatWork,
+    PreparedVoiceChatSession, VoiceChatExecutionError, VoiceChatExecutionInputs, VoiceChatExecutor,
+    VoiceChatLoadSelection, VoiceChatPublicationBranch, VoiceChatStartError,
+    VoiceChatStartupInputs, VoiceChatSubmittedWork, VoiceChatWork,
 };
 
 type MlxVoiceChatComponents = BoundVoiceChatComponents<
@@ -46,26 +45,17 @@ type MlxVoiceChatBranch =
 /// Native execution resources and immutable startup inputs for a bound session.
 /// Neural caches, RNG, conversation policy and delivered events live in the
 /// ordinary session transaction and are never copied by this executor.
-pub struct MlxVoiceChatExecutor {
+struct MlxVoiceChatExecutor {
     execution: SharedRealtimeExecution<MlxVoiceChatComponents>,
     inputs: Arc<VoiceChatStartupInputs<MlxTensor>>,
 }
 
-impl MlxVoiceChatExecutor {
-    /// Shares immutable startup inputs and the same admitted parameter pools.
-    /// Use with `fork_with_executor`; pending sibling work causes retryable
-    /// admission backpressure rather than creating another parameter allocation.
-    pub fn share(&self) -> Self {
+impl crate::api::realtime::ShareSpeechExecution for MlxVoiceChatExecutor {
+    fn share_for_fork(&self) -> Self {
         Self {
             execution: self.execution.share(),
             inputs: Arc::clone(&self.inputs),
         }
-    }
-
-    /// Complete admitted parameter pools; cache and activation storage is separate.
-    pub fn residency_report(&self) -> VoiceChatResidencyReport {
-        self.execution
-            .inspect(|components| *components.residency_report())
     }
 }
 
@@ -133,33 +123,6 @@ impl VoiceChatExecutor<MlxVoiceChatGeneration, RealtimeDecisionDiagnostics>
     }
 }
 
-/// Selected MLX session using the portable controlled and iterator API.
-pub type MlxVoiceChatSession = BoundVoiceChatSession<
-    MlxVoiceChatGeneration,
-    RealtimeDecisionDiagnostics,
-    MlxVoiceChatExecutor,
->;
-
-impl MlxVoiceChatSession {
-    /// Forks mutable session state while sharing the same prepared execution.
-    /// Sibling invocations use ordinary completion backpressure; weights and
-    /// startup tensors are retained once, and cache copies keep their budgets.
-    pub fn fork_shared(
-        &mut self,
-        request: eredu_core::scheduler::RequestId,
-    ) -> Result<
-        BoundVoiceChatFork<
-            MlxVoiceChatGeneration,
-            RealtimeDecisionDiagnostics,
-            MlxVoiceChatExecutor,
-        >,
-        VoiceChatSessionError,
-    > {
-        let executor = self.executor().share();
-        self.fork_with_executor(request, executor)
-    }
-}
-
 /// Binds an admitted request without reopening artifacts or advancing live conversation.
 /// Fixed-Aria and silence preparation establish native completion before their
 /// tensors are exposed. Prompt prefill is queued on the ordinary session and
@@ -170,9 +133,9 @@ pub(crate) fn start_mlx_voicechat(
     options: VoiceChatLoadSelection<'_>,
     weights: &ExecutionContext,
     execution: &ExecutionContext,
-) -> Result<MlxVoiceChatSession, VoiceChatStartError> {
+) -> Result<Box<dyn crate::api::realtime::SpeechRealtimeSession>, VoiceChatStartError> {
     let mechanisms = MlxRealtimeExecutionContext::new(execution.stream(), weights.stream());
-    prepared.start(
+    let session = prepared.start(
         residency,
         options,
         &mechanisms,
@@ -188,5 +151,6 @@ pub(crate) fn start_mlx_voicechat(
             execution,
             inputs: Arc::new(inputs),
         },
-    )
+    )?;
+    Ok(Box::new(session))
 }

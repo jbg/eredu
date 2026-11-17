@@ -4,14 +4,14 @@ use std::{collections::BTreeMap, io::Write, time::Duration};
 
 use anyhow::{bail, ensure, Context, Result};
 use eredu::api::realtime::{
-    BoundVoiceChatSession, FinalPcmFrame, PcmFinishPolicy, VoiceChatAdvance, VoiceChatBlocked,
-    VoiceChatConversationError, VoiceChatConversationOutput, VoiceChatExecutor,
-    VoiceChatInitialReminder, VoiceChatInputError, VoiceChatInputStatus, VoiceChatPublicationError,
+    FinalPcmFrame, PcmFinishPolicy, SpeechRealtimeSession, VoiceChatAdvance, VoiceChatBlocked,
+    VoiceChatConversationError, VoiceChatConversationOutput, VoiceChatInitialReminder,
+    VoiceChatInputError, VoiceChatInputStatus, VoiceChatPublicationError,
     VoiceChatReminderPlayback, VoiceChatSessionError, VoiceChatSessionProgress,
     VoiceChatSessionStatus, VoiceChatToolError, VoiceChatToolTicket, VoiceChatToolWaitMessages,
     VoiceChatToolWaitPolicy, VoiceChatTurnEvent,
 };
-use eredu_core::scheduler::SemanticStateTransaction;
+use eredu_core::RealtimeDecisionDiagnostics;
 use eredu_media::audio::streaming::AudioStreamError;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -56,7 +56,7 @@ pub struct RunOptions {
 // transactional publication and tool policy remain inside that session.
 trait Session {
     type Diagnostics;
-    fn input_status(&self) -> VoiceChatInputStatus;
+    fn input_status(&mut self) -> VoiceChatInputStatus;
     fn submit_pcm(&mut self, samples: &[f32]) -> Result<usize>;
     fn finish(&mut self, policy: PcmFinishPolicy) -> Result<()>;
     fn status(&self) -> VoiceChatSessionStatus;
@@ -75,24 +75,19 @@ trait Session {
     fn cancel(&mut self, at: Duration) -> Result<()>;
 }
 
-impl<S, D, E> Session for BoundVoiceChatSession<S, D, E>
-where
-    S: SemanticStateTransaction,
-    S::Error: Send + Sync + 'static,
-    E: VoiceChatExecutor<S, D>,
-{
-    type Diagnostics = D;
-    fn input_status(&self) -> VoiceChatInputStatus {
+impl Session for dyn SpeechRealtimeSession + '_ {
+    type Diagnostics = RealtimeDecisionDiagnostics;
+    fn input_status(&mut self) -> VoiceChatInputStatus {
         self.input().status()
     }
     fn submit_pcm(&mut self, samples: &[f32]) -> Result<usize> {
-        match self.input_mut().submit(samples, 16_000) {
+        match self.input().submit(samples, 16_000) {
             Ok(()) => Ok(samples.len()),
             Err(VoiceChatInputError::Audio(AudioStreamError::Backpressure {
                 available, ..
             })) => {
                 if available != 0 {
-                    self.input_mut().submit(&samples[..available], 16_000)?;
+                    self.input().submit(&samples[..available], 16_000)?;
                 }
                 Ok(available)
             }
@@ -100,25 +95,28 @@ where
         }
     }
     fn finish(&mut self, policy: PcmFinishPolicy) -> Result<()> {
-        Ok(self.input_mut().finish(policy)?)
+        Ok(self.input().finish(policy)?)
     }
     fn status(&self) -> VoiceChatSessionStatus {
-        self.status()
+        SpeechRealtimeSession::status(self)
     }
     fn has_tool_work(&self) -> bool {
-        self.session().has_tool_work()
+        SpeechRealtimeSession::has_tool_work(self)
     }
     fn advance(&mut self, at: Duration) -> Result<VoiceChatSessionProgress> {
-        Ok(self.advance(VoiceChatAdvance {
-            at,
-            ..Default::default()
-        })?)
+        Ok(SpeechRealtimeSession::advance(
+            self,
+            VoiceChatAdvance {
+                at,
+                ..Default::default()
+            },
+        )?)
     }
     fn poll(&mut self, at: Duration) -> Result<VoiceChatSessionProgress> {
-        Ok(self.poll(at)?)
+        Ok(SpeechRealtimeSession::poll(self, at)?)
     }
-    fn output(&mut self) -> Result<Option<VoiceChatConversationOutput<D>>> {
-        Ok(self.output_mut().try_pop_output()?)
+    fn output(&mut self) -> Result<Option<VoiceChatConversationOutput<Self::Diagnostics>>> {
+        Ok(SpeechRealtimeSession::output(self).try_pop_output()?)
     }
     fn start_wait(
         &mut self,
@@ -126,7 +124,8 @@ where
         at: Duration,
         messages: VoiceChatToolWaitMessages<'_>,
     ) -> Result<()> {
-        Ok(self.session_mut().start_wait(
+        Ok(SpeechRealtimeSession::start_wait(
+            self,
             ticket,
             at,
             VoiceChatToolWaitPolicy::default(),
@@ -134,7 +133,7 @@ where
         )?)
     }
     fn response(&mut self, ticket: VoiceChatToolTicket, text: &str) -> Result<bool> {
-        match self.session_mut().submit_response(ticket, text) {
+        match self.submit_response(ticket, text) {
             Ok(()) => Ok(true),
             Err(VoiceChatSessionError::Publication(VoiceChatPublicationError::Conversation(
                 VoiceChatConversationError::Tool(VoiceChatToolError::StaleResult),
@@ -143,10 +142,10 @@ where
         }
     }
     fn finish_playback(&mut self, receipt: VoiceChatReminderPlayback, at: Duration) -> Result<()> {
-        Ok(self.session_mut().finish_playback(receipt, at)?)
+        Ok(SpeechRealtimeSession::finish_playback(self, receipt, at)?)
     }
     fn cancel(&mut self, at: Duration) -> Result<()> {
-        self.cancel(at)?;
+        SpeechRealtimeSession::cancel(self, at)?;
         Ok(())
     }
 }
@@ -223,21 +222,16 @@ fn drive<S: Session>(
     )
 }
 /// Drives WAV and system audio through the same controlled session and tool driver.
-pub fn run_io<S, D, E, H: AudioIo>(
-    session: &mut BoundVoiceChatSession<S, D, E>,
+pub fn run_io<H: AudioIo>(
+    session: &mut dyn SpeechRealtimeSession,
     io: &mut H,
     events: &mut impl Write,
     options: RunOptions,
     scripts: Vec<ScriptedToolResponse>,
-) -> Result<()>
-where
-    S: SemanticStateTransaction,
-    S::Error: Send + Sync + 'static,
-    E: VoiceChatExecutor<S, D>,
-{
+) -> Result<()> {
     drive_with_io(session, io, events, options, scripts)
 }
-fn drive_with_io<S: Session, H: AudioIo>(
+fn drive_with_io<S: Session + ?Sized, H: AudioIo>(
     session: &mut S,
     io: &mut H,
     events: &mut impl Write,
@@ -716,7 +710,7 @@ mod tests {
         fn has_tool_work(&self) -> bool {
             self.tool_active
         }
-        fn input_status(&self) -> VoiceChatInputStatus {
+        fn input_status(&mut self) -> VoiceChatInputStatus {
             VoiceChatInputStatus {
                 accepted_samples: self.accepted,
                 committed_samples: self.consumed.len() as u64,

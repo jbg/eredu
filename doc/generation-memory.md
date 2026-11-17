@@ -223,7 +223,7 @@ the current policy; they do not apply runtime configuration. To forecast with th
 managed default before loading, call `configure_local_runtime(&Default::default())`
 first. `--mlx-cache-limit-bytes 0` disables allocator-cache retention when desired.
 
-On macOS, `discover_local_hardware()` observes available host memory from Mach
+On macOS, the MLX factory’s `discover_hardware` observes available host memory from Mach
 host VM statistics: free pages (which already include speculative pages) plus
 inactive pages, multiplied by the host page size. Apple Silicon shares this
 observation between host and Metal in one unified capacity pool. This estimated,
@@ -566,10 +566,10 @@ cold backend mechanism facts. Neither function creates a native device or tensor
 `inspected_generation_memory_request` exposes the descriptive request for
 recomputing supported alternatives.
 
-With the `mlx` feature, use the selected plan device to construct cold options:
+Use the selected backend factory and plan device to construct cold options:
 
 ```rust,ignore
-let mut options = GenerationMemoryOptions::for_local_device(input, plan.device())?;
+let mut options = GenerationMemoryOptions::for_backend_device(&factory, input, plan.device())?;
 options.max_output_tokens = Some(32);
 options.budget.application_limit_bytes = Some(2 * 1024 * 1024 * 1024);
 options.budget.reserve_bytes = 256 * 1024 * 1024;
@@ -577,7 +577,7 @@ options.host_budget.reserve_bytes = 256 * 1024 * 1024;
 let forecast = forecast_inspected_generation(&inspection, &options, &Default::default())?;
 ```
 
-`for_local_device` validates the selected backend/device, observes hardware once,
+`for_backend_device` validates the selected backend/device, observes hardware once,
 and derives placement and availability. CPU execution uses host capacity; unified
 accelerator execution uses the shared host observation; separate accelerators use
 the matching device observation plus an independent host budget. Unknown physical
@@ -599,8 +599,8 @@ zero availability, unknown physical relationships and invalid selections in seve
 portable tests. Native policy tests verify the constructor does not change the
 allocator policy. Cold CLI smoke coverage includes CPU host and Metal unified placement.
 
-`for_local_device` and the existing explicit-placement constructor
-`GenerationMemoryOptions::for_local_backend(input, placement)` both sample the
+`for_backend_device` and the existing explicit-placement constructor
+`GenerationMemoryOptions::for_backend(&factory, input, placement)` both sample the
 current cache limit and retained bytes and default
 `backend_overhead` to their maximum plus the 64 MiB graph/driver planning allowance.
 This is an estimated allowance, not a measured upper bound on all graph or driver
@@ -617,7 +617,7 @@ for restoration; the backend adapter preserves that result:
 
 ```rust,ignore
 let previous = eredu::api::set_local_allocator_cache_limit(32 * 1024 * 1024)?;
-let options = eredu::api::GenerationMemoryOptions::for_local_backend(input, placement);
+let options = eredu::api::GenerationMemoryOptions::for_backend(&factory, input, placement);
 // Inspect or run the request, then restore policy when appropriate.
 eredu::api::set_local_allocator_cache_limit(previous)?;
 ```

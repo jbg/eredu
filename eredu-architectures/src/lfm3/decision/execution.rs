@@ -1,45 +1,51 @@
-//! MLX realization of portable text decision requests.
+//! Architecture-owned decision execution through portable component mechanisms.
 
-use eredu_architectures::lfm3::{
-    decision::{DecisionAudioProcessor, DecisionPrompt, PackedChoiceSet, TextChoicePreparation},
-    vision::VlDecoder,
-    LayeredModel, Lfm3Input, PartitionedLayeredModel,
-};
-use eredu_backend_mlx::{
-    backend::{
-        distributed::initialize_ring_world, nn::shared::MlxNeuralBackend,
-        runtime::cache::state::MlxHybridState,
+use crate::lfm3::{vision::VlDecoder, LayeredModel, Lfm3Input, PartitionedLayeredModel};
+use eredu_core::{
+    decision::{
+        ChoiceAnswer, ChoiceEvaluation, ChoiceQuestion, DecisionAnswer, DecisionEvaluation,
+        DecisionQuestion,
     },
-    native::{ExecutionContext, MlxComponentBinder, MlxComponentPipeline, MlxLocalComponent},
-    MlxTensor,
+    BackendFailure,
 };
-use eredu_core::BackendFailure;
-use eredu_nn::Tensor;
-use eredu_runtime::{ComponentRankMechanisms, LayerWeightResidency};
+use eredu_nn::{
+    AttentionCache, DistributedNeuralBackend, Tensor, TensorParallelGroupedNeuralBackend,
+};
+use eredu_runtime::{
+    ComponentRankMechanisms, DecoderPipelineState, LayerWeightResidency, LocalComponentMechanisms,
+    RuntimeStateComponents,
+};
 
 use super::{
-    ChoiceAnswer, ChoiceEvaluation, ChoiceQuestion, DecisionAnswer, DecisionDistribution,
-    DecisionError, DecisionEvaluation, DecisionQuestion, PreparedTextChoiceModel,
+    DecisionAudioProcessor, DecisionError, DecisionPrompt, PackedChoiceSet,
+    PreparedTextChoiceModel, TextChoicePreparation,
 };
-
 #[cfg(feature = "image")]
 mod visuals;
 
-struct MediaProjection {
-    rows: [Option<MlxTensor>; 3],
+struct MediaProjection<T> {
+    rows: [Option<T>; 3],
     audio: Option<DecisionAudioProcessor>,
-    markers: eredu_architectures::lfm3::vision::MediaTokens,
+    markers: crate::lfm3::vision::MediaTokens,
     width: i32,
 }
 
-#[derive(Default)]
-struct PreparedDecisionRows {
+struct PreparedDecisionRows<T> {
     rows: Vec<PackedChoiceSet>,
-    media: Option<MediaProjection>,
-    spoken_rows: Vec<Option<MlxTensor>>,
+    media: Option<MediaProjection<T>>,
+    spoken_rows: Vec<Option<T>>,
 }
 
-impl From<Vec<PackedChoiceSet>> for PreparedDecisionRows {
+impl<T> Default for PreparedDecisionRows<T> {
+    fn default() -> Self {
+        Self {
+            rows: Vec::new(),
+            media: None,
+            spoken_rows: Vec::new(),
+        }
+    }
+}
+impl<T> From<Vec<PackedChoiceSet>> for PreparedDecisionRows<T> {
     fn from(rows: Vec<PackedChoiceSet>) -> Self {
         Self {
             rows,
@@ -65,113 +71,149 @@ pub enum DecisionExecutionError {
     Cancelled,
 }
 
-type DecisionDecoder = VlDecoder<
-    MlxNeuralBackend,
-    MlxHybridState,
-    MlxLocalComponent<LayeredModel<MlxNeuralBackend>>,
-    MlxComponentPipeline<PartitionedLayeredModel<MlxNeuralBackend>, MlxHybridState>,
->;
-
-/// A loaded d1 text decision model.
-pub struct TextChoiceModel {
-    preparation: TextChoicePreparation,
-    decoder: DecisionDecoder,
-    stream: <MlxTensor as Tensor>::Context,
-    distributed: bool,
-    #[cfg(feature = "image")]
-    vision: Option<visuals::VisualRuntime>,
+/// Placement and per-component residency for a distributed decision model.
+#[derive(Debug, Clone, Copy)]
+pub struct DecisionDistribution {
+    /// Exact rank topology.
+    pub rank: eredu_core::ParallelRankTopology,
+    /// Maximum positions in one complete packed question row.
+    pub maximum_positions: std::num::NonZeroUsize,
+    /// Residency of each rank's decoder parameters.
+    pub decoder_residency: LayerWeightResidency,
+    /// Residency of the replicated vision encoder.
+    pub vision_residency: LayerWeightResidency,
+    /// Residency of the replicated speech input encoder.
+    pub speech_residency: LayerWeightResidency,
 }
 
-impl TextChoiceModel {
-    /// Binds the retained d1 decoder using the selected weight residency.
+type DecisionDecoder<B, S, M, C> = VlDecoder<
+    B,
+    S,
+    <M as LocalComponentMechanisms<B, S>>::Local<LayeredModel<B>>,
+    <M as ComponentRankMechanisms<B, S, C>>::Pipeline<PartitionedLayeredModel<B>>,
+>;
+
+/// A bound decision model with its selected component policies.
+pub struct TextChoiceModel<B, S, M, C, I>
+where
+    B: TensorParallelGroupedNeuralBackend + DistributedNeuralBackend + 'static,
+    B::Tensor: 'static,
+    S: DecoderPipelineState<B>,
+    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+    M: LocalComponentMechanisms<B, S> + ComponentRankMechanisms<B, S, C>,
+    <B::Tensor as Tensor>::Context: Clone,
+{
+    preparation: TextChoicePreparation,
+    decoder: DecisionDecoder<B, S, M, C>,
+    stream: <B::Tensor as Tensor>::Context,
+    distributed: bool,
+    #[cfg_attr(not(feature = "image"), allow(dead_code))]
+    input_lowering: I,
+    #[cfg(feature = "image")]
+    vision: Option<visuals::VisualRuntime<B, M>>,
+}
+
+impl<B, S, M, C, I> TextChoiceModel<B, S, M, C, I>
+where
+    B: TensorParallelGroupedNeuralBackend + DistributedNeuralBackend + 'static,
+    B::Tensor: 'static,
+    S: DecoderPipelineState<B>,
+    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+    M: LocalComponentMechanisms<B, S> + ComponentRankMechanisms<B, S, C>,
+    <B::Tensor as Tensor>::Context: Clone,
+{
+    /// Binds the retained decoder through ordinary local component execution.
     pub fn load(
         prepared: PreparedTextChoiceModel,
         residency: LayerWeightResidency,
-        weights: &ExecutionContext,
-        execution: &ExecutionContext,
+        mechanisms: &M,
+        context: &<B::Tensor as Tensor>::Context,
+        input_lowering: I,
     ) -> Result<Self, DecisionExecutionError> {
         let (preparation, decoder) = prepared.into_parts();
-        Self::bind_decoder(preparation, decoder, residency, weights, execution)
+        Self::bind_decoder(
+            preparation,
+            decoder,
+            residency,
+            mechanisms,
+            context,
+            input_lowering,
+        )
     }
 
     fn bind_decoder(
         preparation: TextChoicePreparation,
-        decoder: eredu_architectures::lfm3::vision::PreparedVlDecoder,
+        decoder: crate::lfm3::vision::PreparedVlDecoder,
         residency: LayerWeightResidency,
-        weights: &ExecutionContext,
-        execution: &ExecutionContext,
+        mechanisms: &M,
+        context: &<B::Tensor as Tensor>::Context,
+        input_lowering: I,
     ) -> Result<Self, DecisionExecutionError> {
-        let decoder = DecisionDecoder::local(MlxLocalComponent::bind(
-            || decoder.prepare_local(residency, execution.stream()),
-            weights.stream(),
-            execution.stream(),
-        )?);
-        Ok(Self::from_decoder(preparation, decoder, execution, false))
+        let decoder = DecisionDecoder::<B, S, M, C>::local(
+            mechanisms.bind_local(|| decoder.prepare_local(residency, context))?,
+        );
+        Ok(Self::from_decoder(
+            preparation,
+            decoder,
+            context,
+            input_lowering,
+            false,
+        ))
     }
 
     fn from_decoder(
         preparation: TextChoicePreparation,
-        decoder: DecisionDecoder,
-        execution: &ExecutionContext,
+        decoder: DecisionDecoder<B, S, M, C>,
+        context: &<B::Tensor as Tensor>::Context,
+        input_lowering: I,
         distributed: bool,
     ) -> Self {
         Self {
             preparation,
             decoder,
-            stream: execution.stream().clone(),
+            stream: context.clone(),
+            input_lowering,
             distributed,
             #[cfg(feature = "image")]
             vision: None,
         }
     }
 
-    /// Loads one rank of a tensor, pipeline, or combined Ring decision model.
-    ///
-    /// Set `MLX_HOSTFILE` and `MLX_RANK` for every process. Supply the same
-    /// prepared checkpoint, settings and request on all ranks, and drive their
-    /// controlled sessions in lockstep. Retained media encoders are replicated.
+    /// Loads a rank from retained geometry and the caller's native communication world.
     pub fn load_distributed(
         prepared: PreparedTextChoiceModel,
         distribution: DecisionDistribution,
-        weights: &ExecutionContext,
-        execution: &ExecutionContext,
+        mechanisms: &M,
+        world: &C,
+        context: &<B::Tensor as Tensor>::Context,
+        input_lowering: I,
     ) -> Result<Self, DecisionExecutionError> {
         let (preparation, decoder, vision, audio) = prepared.into_execution_parts();
-        let world = initialize_ring_world()?;
-        if distribution.topology.world_size() < 2
-            || distribution.topology.world_size() != world.size()
-        {
-            return Err(BackendFailure::from_error(eredu_nn::Error::backend(
-                "language partition requires a matching multi-rank native world",
-            ))
-            .into());
-        }
-        let rank = eredu_core::ParallelRankTopology::new(distribution.topology, world.rank())
-            .map_err(BackendFailure::from_error)?;
-        let partition = decoder.select_pipeline_rank(rank, distribution.maximum_positions)?;
+        let partition =
+            decoder.select_pipeline_rank(distribution.rank, distribution.maximum_positions)?;
         let communication = partition
             .pipeline_communication()
             .map_err(BackendFailure::from_error)?;
-        let decoder = DecisionDecoder::bind_rank(
+        let decoder = DecisionDecoder::<B, S, M, C>::bind_rank(
             partition,
             distribution.decoder_residency,
             communication,
-            execution.stream(),
+            context,
             |pipeline| {
-                MlxComponentBinder::new(weights.stream(), execution.stream())
-                    .bind_pipeline(pipeline, &world)
+                mechanisms
+                    .bind_pipeline(pipeline, world)
                     .map(|(execution, _)| execution)
             },
         )?;
-        let mut model = Self::from_decoder(preparation, decoder, execution, true);
+        let mut model = Self::from_decoder(preparation, decoder, context, input_lowering, true);
         #[cfg(feature = "image")]
         {
             let media = visuals::VisualRuntime::bind_optional(
                 vision,
                 audio,
                 distribution,
-                weights,
-                execution,
+                mechanisms,
+                context,
             );
             model.vision = model.agree_result(
                 [0x4445434c4f414400, 0, 0, 0, 0, 0, 0, 0],
@@ -219,7 +261,7 @@ impl TextChoiceModel {
         &mut self,
         state: Option<&str>,
         questions: &[ChoiceQuestion],
-    ) -> Result<ChoiceSession<'_>, DecisionExecutionError> {
+    ) -> Result<ChoiceSession<'_, B, S, M, C, I>, DecisionExecutionError> {
         let rows = self
             .preparation
             .pack(state, questions)
@@ -233,7 +275,7 @@ impl TextChoiceModel {
         &mut self,
         state: Option<&str>,
         questions: &[DecisionQuestion],
-    ) -> Result<DecisionSession<'_>, DecisionExecutionError> {
+    ) -> Result<DecisionSession<'_, B, S, M, C, I>, DecisionExecutionError> {
         let rows = self
             .preparation
             .pack_decisions(state, questions)
@@ -244,10 +286,10 @@ impl TextChoiceModel {
 
     fn start_prepared<A>(
         &mut self,
-        prepared: Result<PreparedDecisionRows, DecisionExecutionError>,
+        prepared: Result<PreparedDecisionRows<B::Tensor>, DecisionExecutionError>,
         questions: usize,
         readout: Readout<A>,
-    ) -> Result<DecisionSession<'_, A>, DecisionExecutionError> {
+    ) -> Result<DecisionSession<'_, B, S, M, C, I, A>, DecisionExecutionError> {
         let mut descriptor = [0x4445435052455000, questions as u64, 0, 0, 0, 0, 0, 0];
         let input_tokens = prepared.as_ref().map_or(0, |p| {
             p.rows.iter().map(|row| row.tokens().len()).sum::<usize>()
@@ -299,13 +341,13 @@ impl TextChoiceModel {
         &mut self,
         row: &PackedChoiceSet,
         readout: Readout<A>,
-        media: Option<&MediaProjection>,
-        spoken: Option<&MlxTensor>,
+        media: Option<&MediaProjection<B::Tensor>>,
+        spoken: Option<&B::Tensor>,
     ) -> Result<Vec<A>, DecisionExecutionError> {
         let stream = self.stream.clone();
         let context = &stream;
         let prompt = match media {
-            Some(media) => DecisionPrompt::<MlxTensor>::new_with_media(
+            Some(media) => DecisionPrompt::<B::Tensor>::new_with_media(
                 row,
                 media.markers,
                 media.audio,
@@ -317,7 +359,7 @@ impl TextChoiceModel {
                 ],
                 context,
             ),
-            None => DecisionPrompt::<MlxTensor>::new(row, context),
+            None => DecisionPrompt::<B::Tensor>::new(row, context),
         }
         .map_err(BackendFailure::from_error);
         let local = prompt.and_then(|prompt| self.decoder.new_state().map(|state| (prompt, state)));
@@ -354,11 +396,19 @@ impl TextChoiceModel {
 type Readout<A> = fn(&PackedChoiceSet, &[&[f32]]) -> Result<Vec<A>, DecisionError>;
 
 /// A controlled single-choice evaluation.
-pub type ChoiceSession<'a> = DecisionSession<'a, ChoiceAnswer>;
+pub type ChoiceSession<'a, B, S, M, C, I> = DecisionSession<'a, B, S, M, C, I, ChoiceAnswer>;
 
 /// A controlled evaluation that advances one complete packed row at a time.
-pub struct DecisionSession<'a, A = DecisionAnswer> {
-    model: &'a mut TextChoiceModel,
+pub struct DecisionSession<'a, B, S, M, C, I, A = DecisionAnswer>
+where
+    B: TensorParallelGroupedNeuralBackend + DistributedNeuralBackend + 'static,
+    B::Tensor: 'static,
+    S: DecoderPipelineState<B>,
+    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+    M: LocalComponentMechanisms<B, S> + ComponentRankMechanisms<B, S, C>,
+    <B::Tensor as Tensor>::Context: Clone,
+{
+    model: &'a mut TextChoiceModel<B, S, M, C, I>,
     rows: std::vec::IntoIter<PackedChoiceSet>,
     answers: Vec<A>,
     readout: Readout<A>,
@@ -366,11 +416,19 @@ pub struct DecisionSession<'a, A = DecisionAnswer> {
     finished: bool,
     cancelled: bool,
     next_row: usize,
-    media: Option<MediaProjection>,
-    spoken_rows: std::vec::IntoIter<Option<MlxTensor>>,
+    media: Option<MediaProjection<B::Tensor>>,
+    spoken_rows: std::vec::IntoIter<Option<B::Tensor>>,
 }
 
-impl<A: serde::Serialize> DecisionSession<'_, A> {
+impl<B, S, M, C, I, A: serde::Serialize> DecisionSession<'_, B, S, M, C, I, A>
+where
+    B: TensorParallelGroupedNeuralBackend + DistributedNeuralBackend + 'static,
+    B::Tensor: 'static,
+    S: DecoderPipelineState<B>,
+    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+    M: LocalComponentMechanisms<B, S> + ComponentRankMechanisms<B, S, C>,
+    <B::Tensor as Tensor>::Context: Clone,
+{
     fn run(mut self) -> Result<DecisionEvaluation<A>, DecisionExecutionError> {
         loop {
             if let Some(evaluation) = self.advance()? {

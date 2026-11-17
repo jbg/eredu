@@ -139,10 +139,8 @@ impl GenerationMemoryOptions {
 
     /// Creates an estimate with explicit unknown backend mechanisms and overhead.
     /// `Self::for_hardware_device` derives placement and available capacities
-    /// from supplied observations. With `mlx`, `Self::for_local_device` also
-    /// performs local discovery and samples allocator overhead.
-    /// With the `mlx` feature, `Self::for_local_backend` instead samples the
-    /// current local allocator-cache policy for its overhead allowance.
+    /// from supplied observations. `Self::for_backend_device` also observes
+    /// the selected backend and samples allocator overhead.
     #[allow(deprecated)]
     pub fn new(input: InputTokenCount, placement: GenerationMemoryPlacement) -> Self {
         Self {

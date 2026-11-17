@@ -173,9 +173,9 @@ entry points for pinned official SafeTensors, complete GGUF and split GGUF artif
 `inspect_architecture` recognizes the nested NeMo configuration without requiring
 an invented Hugging Face `model_type` and describes the coupled component graph.
 `api::realtime::prepare_realtime_model` discovers the family and retains its exact
-sources and auxiliary assets. `prepare_mlx_realtime` admits protocol, host policy,
+sources and auxiliary assets. `prepare_realtime` admits protocol, host policy,
 parameter residency and cache realization before native binding;
-`PreparedMlxRealtime::load` returns categorical execution or a bound speech session.
+`bind_realtime` returns categorical execution or a bound speech session.
 Speech requires `RealtimeLoadOptions::Speech`; categorical Moshi/PersonaPlex
 execution uses `RealtimeLoadOptions::Categorical`. A mismatched input protocol is a
 typed error. These realtime capabilities do not imply ordinary text generation,
@@ -554,9 +554,9 @@ streams, pending PCM, backpressure, drain and failure-source retention. Session
 construction consumes already prepared publication state and execution bindings.
 Shared realtime cold selection validates system/tool text, queues and startup
 limits through `PreparedVoiceChatSession::from_retained`, without native work.
-`PreparedMlxRealtime::load` binds the retained components and cache selections,
-prepares Aria/silence, and returns `LoadedMlxRealtime::Speech` containing a
-`BoundVoiceChatSession` with PCM ingress and committed output. Its recorded-tick iterator and controlled
+`bind_realtime` binds the retained components and cache selections,
+prepares Aria/silence, and returns `RealtimeSession::Speech` containing a
+`SpeechRealtimeSession` with PCM ingress and committed output. Its recorded-tick iterator and controlled
 advancement share the same session. Shared-model forks retain one parameter
 owner and apply retryable backpressure while a sibling invocation is pending.
 Prepared work can submit through a portable invocation bridge and an MLX binding

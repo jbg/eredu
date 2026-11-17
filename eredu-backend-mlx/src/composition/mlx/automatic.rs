@@ -38,6 +38,60 @@ pub struct MlxBackendFactory {
 }
 
 impl MlxBackendFactory {
+    /// Realizes an execution context from a canonical MLX device plan.
+    pub fn execution_context(
+        &self,
+        plan: &DevicePlan,
+    ) -> Result<crate::native::ExecutionContext, eredu_core::BackendFailure> {
+        let device = mlx_device(plan).map_err(eredu_core::BackendFailure::from_error)?;
+        crate::native::ExecutionContext::try_new(device.device)
+            .map_err(eredu_core::BackendFailure::from_error)
+    }
+
+    /// Binds an architecture-selected decision through native component mechanisms.
+    pub fn bind_prepared_decision(
+        &self,
+        model: eredu_architectures::decision_task::PreparedDecisionModel,
+        device: &DevicePlan,
+        residency: eredu_runtime::LayerWeightResidency,
+        synchronize_load: bool,
+    ) -> Result<
+        Box<dyn eredu_architectures::decision_task::BoundDecisionModel>,
+        eredu_architectures::decision_task::DecisionTaskError,
+    > {
+        use super::component_binding::MlxComponentBinder;
+        use crate::backend::{
+            distributed::MlxDistributedSession, nn::shared::MlxNeuralBackend,
+            runtime::cache::state::MlxHybridState, ExecutionContext,
+        };
+        use eredu_core::BackendFailure;
+
+        let weights = ExecutionContext::cpu().map_err(BackendFailure::from_error)?;
+        let execution = self.execution_context(device)?;
+        let mechanisms = MlxComponentBinder::new(weights.stream(), execution.stream());
+        #[cfg(feature = "image")]
+        let input = super::MlxMediaInputLowering;
+        #[cfg(not(feature = "image"))]
+        let input = ();
+        let bound = model.bind::<MlxNeuralBackend, MlxHybridState, _, MlxDistributedSession, _>(
+            residency,
+            &mechanisms,
+            execution.stream(),
+            input,
+        )?;
+        if synchronize_load {
+            weights
+                .stream()
+                .synchronize()
+                .map_err(BackendFailure::from_error)?;
+            execution
+                .stream()
+                .synchronize()
+                .map_err(BackendFailure::from_error)?;
+        }
+        Ok(bound)
+    }
+
     /// Classifies a canonical plan device without realizing native resources.
     /// Hardware discovery must separately confirm that the device is available.
     pub fn device_uses_host_memory(

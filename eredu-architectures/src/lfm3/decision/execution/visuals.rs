@@ -1,91 +1,80 @@
 //! Visual ingress for the existing d1 decision session.
 
 #[cfg(feature = "audio")]
-use eredu_architectures::lfm3::{
+use crate::lfm3::{
     audio::{AudioEncoder, EncoderModule, PolicyEncoder},
     decision::DecisionAudioProcessor,
 };
-use eredu_architectures::lfm3::{
+use crate::lfm3::{
     decision::{PreparedDecisionAudio, PreparedDecisionVision},
     vision::{MediaTokens, PolicyVision, VisionModule, VisionPromptAdmission},
 };
-#[cfg(feature = "audio")]
-use eredu_backend_mlx::backend::runtime::cache::state::MlxHybridState;
-use eredu_backend_mlx::{
-    backend::{
-        nn::shared::MlxNeuralBackend,
-        runtime::{
-            execution::generic::{bind_parameter_units, MlxSelectedLayerwisePolicy},
-            media::input::MlxTensorInputInspector,
-        },
-    },
-    native::MlxMediaProcessor,
-    MlxTensor,
-};
+use crate::processor_execution::{MediaInputLowering, PreparedProcessor};
 use eredu_core::{Media, MultimodalRequest, MultimodalSegment, RgbImage};
 use eredu_nn::Tensor;
+use eredu_runtime::ParameterUnitMechanisms;
 
 use super::{
-    BackendFailure, DecisionDistribution, DecisionError, DecisionEvaluation,
-    DecisionExecutionError, DecisionQuestion, DecisionSession, ExecutionContext,
-    LayerWeightResidency, MediaProjection, PackedChoiceSet, PreparedDecisionRows,
-    PreparedTextChoiceModel, TextChoiceModel,
+    AttentionCache, BackendFailure, ComponentRankMechanisms, DecisionDistribution, DecisionError,
+    DecisionEvaluation, DecisionExecutionError, DecisionQuestion, DecisionSession,
+    DecoderPipelineState, DistributedNeuralBackend, LayerWeightResidency, LocalComponentMechanisms,
+    MediaProjection, PackedChoiceSet, PreparedDecisionRows, PreparedTextChoiceModel,
+    RuntimeStateComponents, TensorParallelGroupedNeuralBackend, TextChoiceModel,
 };
 
 #[cfg(feature = "audio")]
-type SpeechEncoder = PolicyEncoder<
-    MlxNeuralBackend,
-    MlxSelectedLayerwisePolicy<EncoderModule<MlxNeuralBackend>, ()>,
->;
+type SpeechEncoder<B, M> =
+    PolicyEncoder<B, <M as ParameterUnitMechanisms<B>>::UnitPolicy<EncoderModule<B>>>;
 
-pub(super) struct VisualRuntime {
-    vision: PolicyVision<
-        MlxNeuralBackend,
-        MlxSelectedLayerwisePolicy<VisionModule<MlxNeuralBackend>, ()>,
-    >,
-    processor: MlxMediaProcessor,
+pub(super) struct VisualRuntime<B, M>
+where
+    B: eredu_nn::NeuralBackend + 'static,
+    B::Tensor: 'static,
+    M: ParameterUnitMechanisms<B>,
+{
+    vision: PolicyVision<B, M::UnitPolicy<VisionModule<B>>>,
+    processor: PreparedProcessor,
     admission: VisionPromptAdmission,
     markers: MediaTokens,
     max_pixels: u64,
     width: i32,
     #[cfg(feature = "audio")]
-    audio: Option<(SpeechEncoder, DecisionAudioProcessor)>,
+    audio: Option<(SpeechEncoder<B, M>, DecisionAudioProcessor)>,
 }
 
-impl TextChoiceModel {
-    /// Binds the independently retained decoder and vision components.
-    pub fn load_with_images(
-        prepared: PreparedTextChoiceModel,
-        decoder_residency: LayerWeightResidency,
-        vision_residency: LayerWeightResidency,
-        weights: &ExecutionContext,
-        execution: &ExecutionContext,
-    ) -> Result<Self, DecisionExecutionError> {
-        Self::load_with_vision(
-            prepared,
-            decoder_residency,
-            vision_residency,
-            weights,
-            execution,
-        )
-    }
-
+impl<B, S, M, C, I> TextChoiceModel<B, S, M, C, I>
+where
+    B: TensorParallelGroupedNeuralBackend + DistributedNeuralBackend + 'static,
+    B::Tensor: 'static,
+    S: DecoderPipelineState<B>,
+    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+    M: LocalComponentMechanisms<B, S> + ComponentRankMechanisms<B, S, C>,
+    <B::Tensor as Tensor>::Context: Clone,
+    I: MediaInputLowering<B::Tensor>,
+{
     /// Binds independently retained decoder and image/video encoder components.
     pub fn load_with_vision(
         prepared: PreparedTextChoiceModel,
         decoder_residency: LayerWeightResidency,
         vision_residency: LayerWeightResidency,
-        weights: &ExecutionContext,
-        execution: &ExecutionContext,
+        mechanisms: &M,
+        context: &<B::Tensor as Tensor>::Context,
+        input_lowering: I,
     ) -> Result<Self, DecisionExecutionError> {
         let (preparation, decoder, vision) = prepared.into_image_parts()?;
-        let mut model =
-            Self::bind_decoder(preparation, decoder, decoder_residency, weights, execution)?;
+        let mut model = Self::bind_decoder(
+            preparation,
+            decoder,
+            decoder_residency,
+            mechanisms,
+            context,
+            input_lowering,
+        )?;
         model.vision = Some(VisualRuntime::bind(
             vision,
             vision_residency,
-            weights,
-            execution,
+            mechanisms,
+            context,
         )?);
         Ok(model)
     }
@@ -97,14 +86,21 @@ impl TextChoiceModel {
         decoder_residency: LayerWeightResidency,
         vision_residency: LayerWeightResidency,
         encoder_residency: LayerWeightResidency,
-        weights: &ExecutionContext,
-        execution: &ExecutionContext,
+        mechanisms: &M,
+        context: &<B::Tensor as Tensor>::Context,
+        input_lowering: I,
     ) -> Result<Self, DecisionExecutionError> {
         let (preparation, decoder, vision, audio) = prepared.into_omni_parts()?;
-        let mut model =
-            Self::bind_decoder(preparation, decoder, decoder_residency, weights, execution)?;
-        let mut vision = VisualRuntime::bind(vision, vision_residency, weights, execution)?;
-        vision.bind_audio(audio, encoder_residency, weights, execution)?;
+        let mut model = Self::bind_decoder(
+            preparation,
+            decoder,
+            decoder_residency,
+            mechanisms,
+            context,
+            input_lowering,
+        )?;
+        let mut vision = VisualRuntime::bind(vision, vision_residency, mechanisms, context)?;
+        vision.bind_audio(audio, encoder_residency, mechanisms, context)?;
         model.vision = Some(vision);
         Ok(model)
     }
@@ -115,7 +111,7 @@ impl TextChoiceModel {
         state: Option<&str>,
         images: &[RgbImage],
         questions: &[DecisionQuestion],
-    ) -> Result<DecisionSession<'_>, DecisionExecutionError> {
+    ) -> Result<DecisionSession<'_, B, S, M, C, I>, DecisionExecutionError> {
         let visuals = images.iter().cloned().map(Media::Image).collect::<Vec<_>>();
         self.start_with_visuals(state, &visuals, questions)
     }
@@ -126,7 +122,7 @@ impl TextChoiceModel {
         state: Option<&str>,
         visuals: &[Media],
         questions: &[DecisionQuestion],
-    ) -> Result<DecisionSession<'_>, DecisionExecutionError> {
+    ) -> Result<DecisionSession<'_, B, S, M, C, I>, DecisionExecutionError> {
         if visuals.is_empty() {
             return self.start_decisions(state, questions);
         }
@@ -141,7 +137,7 @@ impl TextChoiceModel {
         state: Option<&str>,
         media: &[Media],
         questions: &[DecisionQuestion],
-    ) -> Result<DecisionSession<'_>, DecisionExecutionError> {
+    ) -> Result<DecisionSession<'_, B, S, M, C, I>, DecisionExecutionError> {
         if media.iter().all(|item| !matches!(item, Media::Audio(_))) {
             return self.start_with_visuals(state, media, questions);
         }
@@ -157,7 +153,7 @@ impl TextChoiceModel {
         media: &[Media],
         questions: &[DecisionQuestion],
         spoken: &[Option<&eredu_core::Audio>],
-    ) -> Result<DecisionSession<'_>, DecisionExecutionError> {
+    ) -> Result<DecisionSession<'_, B, S, M, C, I>, DecisionExecutionError> {
         if spoken.len() != questions.len() {
             return self.start_prepared(
                 Err(DecisionError::Request("spoken instructions must align with questions").into()),
@@ -191,7 +187,7 @@ impl TextChoiceModel {
         media: &[Media],
         questions: &[DecisionQuestion],
         spoken: &[Option<&eredu_core::Audio>],
-    ) -> Result<DecisionSession<'_>, DecisionExecutionError> {
+    ) -> Result<DecisionSession<'_, B, S, M, C, I>, DecisionExecutionError> {
         let prepared = self.prepare_omni(state, media, questions, spoken);
         self.start_prepared(prepared, questions.len(), PackedChoiceSet::decisions)
     }
@@ -203,7 +199,7 @@ impl TextChoiceModel {
         media: &[Media],
         questions: &[DecisionQuestion],
         spoken: &[Option<&eredu_core::Audio>],
-    ) -> Result<PreparedDecisionRows, DecisionExecutionError> {
+    ) -> Result<PreparedDecisionRows<B::Tensor>, DecisionExecutionError> {
         let runtime = self.vision.as_mut().ok_or(DecisionError::Request(
             "decision model has no media binding",
         ))?;
@@ -215,7 +211,7 @@ impl TextChoiceModel {
         let mut projected = Vec::new();
         for item in media {
             if let Media::Audio(clip) = item {
-                let (ids, rows) = project_clip(encoder, processor, clip, &self.stream)?;
+                let (ids, rows) = project_clip::<B, S, M>(encoder, processor, clip, &self.stream)?;
                 projected.push(rows);
                 segments.push(MultimodalSegment::TokenIds(
                     ids.into_iter().map(|id| id as u32).collect(),
@@ -228,18 +224,23 @@ impl TextChoiceModel {
                 )?);
             }
         }
-        let shared_audio = join_audio(&projected, &self.stream)?;
+        let shared_audio = join_audio::<B::Tensor>(&projected, &self.stream)?;
         let voices = spoken
             .iter()
             .map(|clip| {
-                clip.map(|clip| project_clip(encoder, processor, clip, &self.stream))
+                clip.map(|clip| project_clip::<B, S, M>(encoder, processor, clip, &self.stream))
                     .transpose()
             })
             .collect::<Result<Vec<_>, _>>()?;
         let (tokens, image, video) = if segments.is_empty() {
             (Vec::new(), None, None)
         } else {
-            runtime.project(segments, &self.preparation, &self.stream)?
+            runtime.project(
+                segments,
+                &self.preparation,
+                &self.stream,
+                &self.input_lowering,
+            )?
         };
         let rows = if voices.is_empty() {
             self.preparation.pack_media_decisions(
@@ -278,7 +279,7 @@ impl TextChoiceModel {
                         .flatten()
                         .map(|(_, rows)| rows),
                 );
-                spoken_rows.push(join_audio(&clips, &self.stream)?);
+                spoken_rows.push(join_audio::<B::Tensor>(&clips, &self.stream)?);
             }
         }
         let projection = MediaProjection {
@@ -310,14 +311,19 @@ impl TextChoiceModel {
         state: Option<&str>,
         questions: &[DecisionQuestion],
         visuals: &[Media],
-    ) -> Result<PreparedDecisionRows, DecisionExecutionError> {
+    ) -> Result<PreparedDecisionRows<B::Tensor>, DecisionExecutionError> {
         let runtime = self.vision.as_mut().ok_or(DecisionError::Request(
             "decision model has no media binding",
         ))?;
         let segments =
             self.preparation
                 .visual_segments(visuals, runtime.markers, runtime.max_pixels)?;
-        let (tokens, image, video) = runtime.project(segments, &self.preparation, &self.stream)?;
+        let (tokens, image, video) = runtime.project(
+            segments,
+            &self.preparation,
+            &self.stream,
+            &self.input_lowering,
+        )?;
         let rows =
             self.preparation
                 .pack_visual_decisions(state, questions, &tokens, runtime.markers)?;
@@ -355,16 +361,21 @@ impl TextChoiceModel {
     }
 }
 
-impl VisualRuntime {
+impl<B, M> VisualRuntime<B, M>
+where
+    B: eredu_nn::NeuralBackend + 'static,
+    B::Tensor: 'static,
+    M: ParameterUnitMechanisms<B>,
+{
     pub(super) fn bind_optional(
         vision: Option<PreparedDecisionVision>,
         audio: Option<PreparedDecisionAudio>,
         distribution: DecisionDistribution,
-        weights: &ExecutionContext,
-        execution: &ExecutionContext,
+        mechanisms: &M,
+        context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Option<Self>, DecisionExecutionError> {
         let vision = vision
-            .map(|vision| Self::bind(vision, distribution.vision_residency, weights, execution))
+            .map(|vision| Self::bind(vision, distribution.vision_residency, mechanisms, context))
             .transpose()?;
         #[cfg(feature = "audio")]
         let mut vision = vision;
@@ -375,7 +386,7 @@ impl VisualRuntime {
                 .ok_or(DecisionError::Request(
                     "decision audio requires a media binding",
                 ))?
-                .bind_audio(audio, distribution.speech_residency, weights, execution)?;
+                .bind_audio(audio, distribution.speech_residency, mechanisms, context)?;
             #[cfg(not(feature = "audio"))]
             {
                 drop(audio);
@@ -393,21 +404,14 @@ impl VisualRuntime {
         &mut self,
         audio: PreparedDecisionAudio,
         residency: LayerWeightResidency,
-        weights: &ExecutionContext,
-        execution: &ExecutionContext,
+        mechanisms: &M,
+        context: &<B::Tensor as Tensor>::Context,
     ) -> Result<(), DecisionExecutionError> {
         let (audio, processor) = audio.into_parts();
-        let encoder = audio.bind(execution.stream(), |source, addresses, units, build| {
-            bind_parameter_units(
-                source,
-                addresses,
-                units,
-                residency,
-                execution.stream(),
-                weights.stream(),
-                build,
-            )
-            .map(|(policy, _)| policy)
+        let encoder = audio.bind(context, |source, addresses, units, build| {
+            mechanisms
+                .bind_units(source, addresses, units, residency, build)
+                .map(|(policy, _)| policy)
         })?;
         self.audio = Some((encoder, processor));
         Ok(())
@@ -416,25 +420,18 @@ impl VisualRuntime {
     fn bind(
         prepared: PreparedDecisionVision,
         residency: LayerWeightResidency,
-        weights: &ExecutionContext,
-        execution: &ExecutionContext,
+        mechanisms: &M,
+        context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, DecisionExecutionError> {
         let (vision, processor, admission, max_pixels, markers, width) = prepared.into_parts();
-        let vision = vision.bind(execution.stream(), |source, addresses, units, build| {
-            bind_parameter_units(
-                source,
-                addresses,
-                units,
-                residency,
-                execution.stream(),
-                weights.stream(),
-                build,
-            )
-            .map(|(policy, _)| policy)
+        let vision = vision.bind(context, |source, addresses, units, build| {
+            mechanisms
+                .bind_units(source, addresses, units, residency, build)
+                .map(|(policy, _)| policy)
         })?;
         Ok(Self {
             vision,
-            processor: MlxMediaProcessor::from_prepared(processor),
+            processor,
             admission,
             markers,
             max_pixels,
@@ -447,32 +444,20 @@ impl VisualRuntime {
     fn project(
         &mut self,
         segments: Vec<MultimodalSegment>,
-        preparation: &eredu_architectures::lfm3::decision::TextChoicePreparation,
-        stream: &<MlxTensor as Tensor>::Context,
-    ) -> Result<
-        (
-            Vec<i32>,
-            Option<eredu_backend_mlx::MlxTensor>,
-            Option<eredu_backend_mlx::MlxTensor>,
-        ),
-        DecisionExecutionError,
-    > {
+        preparation: &crate::lfm3::decision::TextChoicePreparation,
+        stream: &<B::Tensor as Tensor>::Context,
+        input_lowering: &impl MediaInputLowering<B::Tensor>,
+    ) -> Result<(Vec<i32>, Option<B::Tensor>, Option<B::Tensor>), DecisionExecutionError> {
         let request = MultimodalRequest::new(segments).map_err(BackendFailure::from_error)?;
         let mut encode = |text: &str| preparation.encode_visual_text(text);
         let request = request
             .tokenize(&mut encode)
             .map_err(BackendFailure::from_error)?;
-        let prepared = self
-            .processor
-            .prepare(&request, &mut encode)
-            .map_err(BackendFailure::from_error)?;
+        let (prepared, identity) =
+            input_lowering.prepare_input(&self.processor, &request, &mut encode)?;
         let prompt = self
             .admission
-            .admit_with_identity(
-                &prepared.to_runtime_input()?,
-                &MlxTensorInputInspector,
-                prepared.cache_identity(),
-            )
+            .admit_with_identity(&prepared, input_lowering.inspector(), identity.as_ref())
             .map_err(BackendFailure::from_error)?;
         Ok(self
             .vision
@@ -483,30 +468,34 @@ impl VisualRuntime {
 }
 
 #[cfg(feature = "audio")]
-fn project_clip(
-    encoder: &mut SpeechEncoder,
+fn project_clip<B, S, M>(
+    encoder: &mut SpeechEncoder<B, M>,
     processor: DecisionAudioProcessor,
     clip: &eredu_core::Audio,
-    stream: &<MlxTensor as Tensor>::Context,
-) -> Result<(Vec<i32>, MlxTensor), DecisionExecutionError> {
+    stream: &<B::Tensor as Tensor>::Context,
+) -> Result<(Vec<i32>, B::Tensor), DecisionExecutionError>
+where
+    B: eredu_nn::NeuralBackend + 'static,
+    B::Tensor: 'static,
+    S: DecoderPipelineState<B>,
+    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+    M: ParameterUnitMechanisms<B>,
+{
     let (features, ids) = processor
         .prepare(clip)
         .map_err(BackendFailure::from_error)?;
     let rows = encoder.project_clip(&features, stream, |layout| {
-        MlxHybridState::device(layout.clone(), &[]).map_err(BackendFailure::from_error)
+        S::allocate_pipeline_state(layout.clone(), 0)
     })?;
     Ok((ids, rows))
 }
 
 #[cfg(feature = "audio")]
-fn join_audio(
-    clips: &[MlxTensor],
-    stream: &<MlxTensor as Tensor>::Context,
-) -> Result<Option<MlxTensor>, BackendFailure> {
+fn join_audio<T: Tensor>(clips: &[T], stream: &T::Context) -> Result<Option<T>, BackendFailure> {
     match clips {
         [] => Ok(None),
         [clip] => Ok(Some(clip.clone())),
-        _ => MlxTensor::concatenate(clips, 0, stream)
+        _ => T::concatenate(clips, 0, stream)
             .map(Some)
             .map_err(BackendFailure::from_error),
     }

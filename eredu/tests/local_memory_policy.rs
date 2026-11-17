@@ -45,11 +45,20 @@ fn runtime_default_policy_and_forecast_observation() {
     };
     assert_eq!(initial.source, Source::NativeDefault);
     let input = InputTokenCount::text(16);
-    let before = GenerationMemoryOptions::for_local_backend(input, GenerationMemoryPlacement::Host);
+    let before = GenerationMemoryOptions::for_backend(
+        &eredu_backend_mlx::MlxBackendFactory::default(),
+        input,
+        GenerationMemoryPlacement::Host,
+    );
     assert_eq!(local_allocator_cache_policy().unwrap(), initial);
     assert!(before.backend_overhead.detail.contains("NativeDefault"));
     let cpu = eredu::api::local_device_plan(eredu::api::LocalDevice::Cpu).unwrap();
-    let device_options = GenerationMemoryOptions::for_local_device(input, &cpu).unwrap();
+    let device_options = GenerationMemoryOptions::for_backend_device(
+        &eredu_backend_mlx::MlxBackendFactory::default(),
+        input,
+        &cpu,
+    )
+    .unwrap();
     assert!(matches!(
         device_options.placement,
         GenerationMemoryPlacement::Host
@@ -103,8 +112,11 @@ fn runtime_default_policy_and_forecast_observation() {
     }
     configure_local_runtime(&LocalRuntimeConfiguration::default()).unwrap();
     assert_eq!(local_allocator_cache_policy().unwrap(), configured);
-    let forecast =
-        GenerationMemoryOptions::for_local_backend(input, GenerationMemoryPlacement::Host);
+    let forecast = GenerationMemoryOptions::for_backend(
+        &eredu_backend_mlx::MlxBackendFactory::default(),
+        input,
+        GenerationMemoryPlacement::Host,
+    );
     assert_eq!(
         forecast.backend_overhead.upper_bytes,
         Some(configured.limit_bytes + 64 * 1024 * 1024)
@@ -120,7 +132,8 @@ fn local_forecast_rejects_invalid_or_undiscovered_devices() {
         ("mlx", "gpu:0"),
         ("mlx", "cpu:1234"),
     ] {
-        let error = GenerationMemoryOptions::for_local_device(
+        let error = GenerationMemoryOptions::for_backend_device(
+            &eredu_backend_mlx::MlxBackendFactory::default(),
             InputTokenCount::text(16),
             &eredu_core::DevicePlan::new(backend, device).unwrap(),
         )
@@ -154,16 +167,26 @@ fn local_forecast_observes_and_restores_allocator_cache_policy() {
     }
     let _restore = Restore(original);
     let input = InputTokenCount::text(16);
-    let initial =
-        GenerationMemoryOptions::for_local_backend(input, GenerationMemoryPlacement::Host);
+    let initial = GenerationMemoryOptions::for_backend(
+        &eredu_backend_mlx::MlxBackendFactory::default(),
+        input,
+        GenerationMemoryPlacement::Host,
+    );
     assert!(initial.backend_overhead.upper_bytes.is_some());
     assert_eq!(local_allocator_cache_limit().unwrap(), original);
     assert_eq!(set_local_allocator_cache_limit(0).unwrap(), original);
-    let zero = GenerationMemoryOptions::for_local_backend(input, GenerationMemoryPlacement::Host);
+    let zero = GenerationMemoryOptions::for_backend(
+        &eredu_backend_mlx::MlxBackendFactory::default(),
+        input,
+        GenerationMemoryPlacement::Host,
+    );
     assert_eq!(zero.backend_overhead.upper_bytes, Some(64 * 1024 * 1024));
     assert_eq!(set_local_allocator_cache_limit(1024 * 1024).unwrap(), 0);
-    let changed =
-        GenerationMemoryOptions::for_local_backend(input, GenerationMemoryPlacement::Host);
+    let changed = GenerationMemoryOptions::for_backend(
+        &eredu_backend_mlx::MlxBackendFactory::default(),
+        input,
+        GenerationMemoryPlacement::Host,
+    );
     assert_eq!(changed.backend_overhead.upper_bytes, Some(65 * 1024 * 1024));
     assert_eq!(local_allocator_cache_limit().unwrap(), 1024 * 1024);
     // Backend-neutral construction remains independent of native observations.

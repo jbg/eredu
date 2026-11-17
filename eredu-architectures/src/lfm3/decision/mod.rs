@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 mod audio;
 pub use audio::{DecisionAudioProcessor, PreparedDecisionAudio};
 mod boxes;
+pub mod execution;
 pub(crate) mod gguf;
 pub use gguf::DecisionGgufLayouts;
 mod parsing;
@@ -52,7 +53,7 @@ pub enum DecisionError {
     Tokenizer(String),
 }
 
-fn read(root: &Path, name: &str) -> Result<Vec<u8>, DecisionError> {
+pub(crate) fn read(root: &Path, name: &str) -> Result<Vec<u8>, DecisionError> {
     let path = root.join(name);
     std::fs::read(&path).map_err(|source| DecisionError::Read { path, source })
 }

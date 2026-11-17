@@ -467,9 +467,10 @@ pub fn run(args: Args, timing: bool, total_started: Instant) -> Result<()> {
         usize::try_from(config.max_model_steps)?,
     )?;
     let mut session = load::load(
+        &eredu_backend_mlx::MlxBackendFactory::default(),
         &config,
         policy,
-        device.local(),
+        &crate::device_plan(device)?,
         args.common.cached_shards,
         sampling,
     )?;
@@ -549,7 +550,7 @@ pub fn run(args: Args, timing: bool, total_started: Instant) -> Result<()> {
         if push_to_talk { "\r" } else { "" }
     );
     let conversation_started = timing.then(Instant::now);
-    let result = run::run_io(&mut session, &mut io, &mut events, options, scripts);
+    let result = run::run_io(session.as_mut(), &mut io, &mut events, options, scripts);
     let event_finish = events.flush();
     let finalize = io.finish(result.is_ok());
     let conversation_elapsed = conversation_started.map(|start| start.elapsed());

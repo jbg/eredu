@@ -5,15 +5,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::audio::pcm::execution_contexts;
 use anyhow::{ensure, Context, Result};
 use eredu::api::realtime::{
-    prepare_mlx_realtime, prepare_realtime_model, LoadedMlxRealtime, MlxVoiceChatSession,
-    RealtimeArtifactRequest, RealtimeArtifactSource as Source, RealtimeAssetDirectories,
-    RealtimeLoadOptions, SpeechSessionOptions, VoiceChatDecodeLimits, VoiceChatInputConfig,
-    VoiceChatPhrasePolicy, VoiceChatPublicationCapacity, VoiceChatPublicationLimits,
-    VoiceChatSpeechOptions, VoiceChatStartOptions, VoiceChatTextLimits, VoiceChatToolLimits,
-    VoiceChatTurnLimits, VoiceChatTurnPolicy,
+    bind_realtime, prepare_realtime, prepare_realtime_model, RealtimeArtifactRequest,
+    RealtimeArtifactSource as Source, RealtimeAssetDirectories, RealtimeBackendFactory,
+    RealtimeLoadOptions, RealtimeSession, SpeechRealtimeSession, SpeechSessionOptions,
+    VoiceChatDecodeLimits, VoiceChatInputConfig, VoiceChatPhrasePolicy,
+    VoiceChatPublicationCapacity, VoiceChatPublicationLimits, VoiceChatSpeechOptions,
+    VoiceChatStartOptions, VoiceChatTextLimits, VoiceChatToolLimits, VoiceChatTurnLimits,
+    VoiceChatTurnPolicy,
 };
 use eredu_architectures::voicechat::{
     agent_sampling::AgentSamplingPolicy,
@@ -328,12 +328,13 @@ impl Config {
 }
 
 pub fn load(
+    factory: &impl RealtimeBackendFactory,
     config: &Config,
     quantization: eredu_architectures::voicechat::quantization::SpeechQuantizationPolicy,
-    device: eredu::api::LocalDevice,
+    device: &eredu_core::DevicePlan,
     cached_shards: usize,
     sampling: AgentSamplingPolicy,
-) -> Result<MlxVoiceChatSession> {
+) -> Result<Box<dyn SpeechRealtimeSession>> {
     config.validate()?;
     let artifact = prepare_realtime_model(&RealtimeArtifactRequest {
         source: config.source.clone(),
@@ -343,7 +344,8 @@ pub fn load(
         },
         prepared_checkpoint_cache: config.prepared_checkpoint_cache.clone(),
     })?;
-    let prepared = prepare_mlx_realtime(
+    let prepared = prepare_realtime(
+        factory,
         &artifact,
         &RealtimeLoadOptions::Speech(SpeechSessionOptions {
             quantization,
@@ -367,10 +369,9 @@ pub fn load(
             "Conversation history and temporary computation buffers require additional memory."
         );
     }
-    let (weights, execution) = execution_contexts(device)?;
-    match prepared.load(&weights, &execution)? {
-        LoadedMlxRealtime::Speech(session) => Ok(session),
-        LoadedMlxRealtime::Categorical { .. } => {
+    match bind_realtime(prepared, device)? {
+        RealtimeSession::Speech(session) => Ok(session),
+        RealtimeSession::Categorical(_) => {
             anyhow::bail!("this WAV conversation command requires a VoiceChat artifact")
         }
     }
