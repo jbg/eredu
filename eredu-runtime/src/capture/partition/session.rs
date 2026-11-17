@@ -361,6 +361,7 @@ impl<T: PartitionCaptureTransport> SessionPartitionCapture<'_, T> {
     }
 }
 
+#[cfg(feature = "tensor-capture")]
 impl CaptureSession {
     /// Checks this run against the actual loaded setup without replacing its
     /// first forward epoch. Fresh runs may be bound; an already-bound parent or

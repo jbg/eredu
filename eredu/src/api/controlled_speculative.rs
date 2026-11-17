@@ -3,13 +3,15 @@
 use super::request::OutputMode;
 use super::request::SourceRequest;
 use super::{LoadedModel, PreparedChatError};
+#[cfg(feature = "tensor-capture")]
 pub use eredu_core::speculative::{
     AdmittedSpeculativeActivations, SpeculativeActivationCapture, SpeculativeActivationDiscovery,
     SpeculativeActivationOrigin, SpeculativeActivationPhase, SpeculativeActivationPlan,
     SpeculativeCaptureBinding, SpeculativeCaptureRole, SpeculativeCaptureScope,
-    SpeculativeControlError, SpeculativeInterventionPlan, SpeculativePredictionCapture,
-    SpeculativeProposalView, SPECULATIVE_ACTIVATION_SCHEMA_VERSION,
+    SpeculativeInterventionPlan, SpeculativePredictionCapture,
+    SPECULATIVE_ACTIVATION_SCHEMA_VERSION,
 };
+pub use eredu_core::speculative::{SpeculativeControlError, SpeculativeProposalView};
 use eredu_core::{
     generation::SemanticEvent, SpeculativeGenerationBackend, SpeculativeGenerationOutput,
 };
@@ -17,11 +19,13 @@ pub use eredu_runtime::memory_forecast::{
     EmbeddedContinuationMemoryPlan, SpeculativeContinuationForecast,
     SpeculativeContinuationMemoryPlan,
 };
+#[cfg(feature = "tensor-capture")]
+pub use eredu_runtime::speculative::ControlledSpeculativeActivation;
 use eredu_runtime::speculative::ControlledSpeculativeOptions;
 pub use eredu_runtime::speculative::{
-    ControlledSpeculativeActivation, ControlledSpeculativeSession, ControlledSpeculativeStep,
-    SpeculativeBranchHandle, SpeculativeBranchInfo, SpeculativeProposalDisposition,
-    SpeculativeSnapshotHandle, SpeculativeVerificationRecord,
+    ControlledSpeculativeSession, ControlledSpeculativeStep, SpeculativeBranchHandle,
+    SpeculativeBranchInfo, SpeculativeProposalDisposition, SpeculativeSnapshotHandle,
+    SpeculativeVerificationRecord,
 };
 
 /// Preparation or controlled speculative execution failure, with neutral causes.
@@ -35,6 +39,7 @@ pub(super) enum ControlledSpeculativeGenerationError {
     Control(#[from] SpeculativeControlError),
 }
 
+#[cfg(feature = "tensor-capture")]
 impl<B: SpeculativeGenerationBackend> LoadedModel<B> {
     /// Internal forward capture and edit support for the actually loaded
     /// speculative executor. Ordinary sampler capture uses a separate report.
@@ -118,6 +123,7 @@ where
         D: FnOnce(&mut dyn ControlledSpeculativeSession) -> Result<(), SpeculativeControlError>,
     {
         let validation = (|| -> Result<(), ControlledSpeculativeGenerationError> {
+            #[cfg(feature = "tensor-capture")]
             if let Some(plan) = options.activations.as_ref() {
                 B::validate_speculative_activations(&self.runtime, plan)
                     .map_err(SpeculativeControlError::from)?;
@@ -136,6 +142,7 @@ where
                     .into());
                 }
             }
+            #[cfg(feature = "tensor-capture")]
             if let Some(plan) = options.capture.as_ref() {
                 if plan.request().prompt_tokens != 1 || plan.request().batch != 1 {
                     return Err(SpeculativeControlError::Capture(eredu_core::capture::CaptureError::Invalid(
@@ -190,9 +197,11 @@ where
                 .copied()
                 .max()
                 .map_or(0, |id| id as usize + 1),
-        )
-        .with_intervention_discovery(B::speculative_intervention_discovery(&self.runtime).ok())
-        .with_activation_discovery(B::speculative_activation_discovery(&self.runtime).ok());
+        );
+        #[cfg(feature = "tensor-capture")]
+        let driver = driver
+            .with_intervention_discovery(B::speculative_intervention_discovery(&self.runtime).ok())
+            .with_activation_discovery(B::speculative_activation_discovery(&self.runtime).ok());
         let result = self.generate_prepared_speculative_with(request, mode, driver);
         if let Some(error) = failure {
             return Err(error.into());

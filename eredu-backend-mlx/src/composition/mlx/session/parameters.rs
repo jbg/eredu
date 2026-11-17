@@ -316,7 +316,9 @@ impl MlxModelSession {
             .as_ref()
             .ok_or_else(|| ParameterError::Unsupported("no retained prepared identity".into()))?;
         identity.binding(
-            &prepared.capture()?.artifact_identity,
+            &prepared
+                .artifact_identity()
+                .map_err(|error| ParameterError::Invalid(error.to_string()))?,
             prepared.execution_identity(),
             self.payload.parameter_state.epoch,
         )
@@ -370,8 +372,8 @@ impl MlxModelSession {
             .capture_discovery
             .as_ref()
             .ok_or_else(|| ParameterError::Unsupported("no retained prepared identity".into()))?
-            .capture()?
-            .artifact_identity;
+            .artifact_identity()
+            .map_err(|error| ParameterError::Invalid(error.to_string()))?;
         let payload = Rc::get_mut(&mut self.payload)
             .ok_or_else(|| ParameterError::Unsupported("native payload still retained".into()))?;
         let layouts = payload

@@ -704,6 +704,7 @@ fn axes(name: &str, width: usize) -> Vec<TensorAxis> {
 
 /// Joins retained prediction invocations to ordinary target discovery without
 /// changing the target graph's public node identities or boundary catalog.
+#[cfg(feature = "tensor-capture")]
 pub(crate) fn join_prediction_descriptor(
     mut target: ArchitectureDescriptor,
     prediction: ArchitectureDescriptor,

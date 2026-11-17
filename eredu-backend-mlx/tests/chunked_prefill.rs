@@ -1,8 +1,8 @@
 //! Small native harness for causal prefill boundaries and the ordinary shared driver.
 use eredu_backend_mlx::{backend::MlxBackend, native, MlxLoadRequest, MlxTensor};
 use eredu_core::{
-    Completion, ControlledTextGeneration, GenerationConfigOverrides, ModelRuntime,
-    PrefillChunkPolicy, TextGeneration, TextGenerationBackend, TextGenerationConfig, TokenFilter,
+    ControlledTextGeneration, GenerationConfigOverrides, ModelRuntime, PrefillChunkPolicy,
+    TextGeneration, TextGenerationBackend, TextGenerationConfig, TokenFilter,
     TokenFilterController, TokenOutput,
 };
 use eredu_runtime::{NormalizedLoadRequest, WeightResidency};
@@ -115,23 +115,6 @@ fn values(tensor: &MlxTensor) -> Vec<f32> {
         .unwrap()
         .as_slice::<f32>()
         .to_vec()
-}
-
-#[derive(Default)]
-struct FullLogits(Option<MlxTensor>);
-impl eredu_runtime::ActivationObserver<MlxTensor, eredu_backend_mlx::backend::error::Error>
-    for FullLogits
-{
-    fn observe(
-        &mut self,
-        path: &str,
-        value: &MlxTensor,
-    ) -> Result<(), eredu_backend_mlx::backend::error::Error> {
-        if path == eredu_core::MODEL_LOGITS_OBSERVATION_PATH {
-            self.0 = Some(value.clone());
-        }
-        Ok(())
-    }
 }
 
 fn assert_close(actual: &[f32], expected: &[f32]) {
@@ -247,22 +230,8 @@ fn run_cases(device: DeviceType, families: Vec<(&str, tempfile::TempDir)>) {
                 runtime.reset().unwrap();
                 let prompt =
                     MlxBackend::prepare_text_prompt(runtime.backend(), ids.clone()).unwrap();
-                let mut observed = FullLogits::default();
-                let (backend, session) = runtime.parts_mut();
-                let submission = session
-                    .submit_prefill_with_observer(backend, prompt, &mut observed)
-                    .unwrap();
-                submission.completion.wait().unwrap();
-                let reference = submission
-                    .output
-                    .evaluated()
-                    .unwrap()
-                    .as_slice::<f32>()
-                    .to_vec();
-                assert_eq!(
-                    observed.0.unwrap().as_array().shape(),
-                    &[1, length as i32, 64]
-                );
+                let submission = runtime.prefill(prompt).unwrap().wait().unwrap();
+                let reference = values(submission.logits().unwrap());
                 drop(submission);
                 assert!(MlxBackend::loaded_memory_profile(&runtime)
                     .unwrap()
@@ -358,13 +327,13 @@ fn run(device: DeviceType) {
 }
 
 #[test]
-fn cpu_chunked_prefill_matches_full_observed_logits_and_controlled_generation() {
+fn cpu_chunked_prefill_matches_unchunked_logits_and_controlled_generation() {
     run(DeviceType::Cpu);
 }
 
 #[cfg(feature = "metal")]
 #[test]
-fn metal_chunked_prefill_matches_full_observed_logits_and_controlled_generation() {
+fn metal_chunked_prefill_matches_unchunked_logits_and_controlled_generation() {
     run(DeviceType::Gpu);
 }
 

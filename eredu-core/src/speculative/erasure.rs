@@ -135,6 +135,7 @@ pub trait ErasedGenerationExecutor<T: GenerationExecutorTypes> {
     where
         Self: 'a;
     /// Installs validated prospective internal edits through the typed collector.
+    #[cfg(feature = "tensor-capture")]
     fn readmit_activation_interventions(
         &mut self,
         plan: AdmittedSpeculativeActivations,
@@ -185,6 +186,7 @@ pub trait ErasedGenerationExecutor<T: GenerationExecutorTypes> {
     where
         Self: 'a;
     /// Installs one request's admitted collector for the borrowed executor scope.
+    #[cfg(feature = "tensor-capture")]
     fn configure_activation_capture<'a>(
         &mut self,
         plan: AdmittedSpeculativeActivations,
@@ -198,6 +200,7 @@ pub trait ErasedGenerationExecutor<T: GenerationExecutorTypes> {
     /// Forwards the shared scheduler's bounded operation scope.
     fn set_activation_origin(&mut self, origin: Option<SpeculativeActivationOrigin>);
     /// Moves one already charged internal record through erasure.
+    #[cfg(feature = "tensor-capture")]
     fn take_activation_capture(&mut self) -> Option<SpeculativeActivationCapture>;
     /// Drains the original portable capture failure.
     fn take_activation_error(&mut self) -> Option<crate::speculative::SpeculativeControlError>;
@@ -379,6 +382,7 @@ where
     ) -> Option<crate::execution_control::SnapshotEstimate> {
         SpeculativeExecutor::logits_snapshot_estimate(self, logits)
     }
+    #[cfg(feature = "tensor-capture")]
     fn readmit_activation_interventions(
         &mut self,
         plan: AdmittedSpeculativeActivations,
@@ -531,6 +535,7 @@ where
         )
     }
 
+    #[cfg(feature = "tensor-capture")]
     fn configure_activation_capture<'a>(
         &mut self,
         plan: AdmittedSpeculativeActivations,
@@ -552,6 +557,7 @@ where
         SpeculativeExecutor::set_activation_origin(self, origin);
     }
 
+    #[cfg(feature = "tensor-capture")]
     fn take_activation_capture(&mut self) -> Option<SpeculativeActivationCapture> {
         SpeculativeExecutor::take_activation_capture(self)
     }
@@ -826,6 +832,7 @@ impl<T: GenerationExecutorTypes> SpeculativeExecutor for DynGenerationExecutor<'
     type Telemetry = T::Telemetry;
     type Error = T::Error;
 
+    #[cfg(feature = "tensor-capture")]
     fn readmit_activation_interventions(
         &mut self,
         plan: AdmittedSpeculativeActivations,
@@ -916,6 +923,7 @@ impl<T: GenerationExecutorTypes> SpeculativeExecutor for DynGenerationExecutor<'
         self.inner.agree_text_preparation(stage, status, context)
     }
 
+    #[cfg(feature = "tensor-capture")]
     fn configure_activation_capture<'a>(
         &mut self,
         plan: AdmittedSpeculativeActivations,
@@ -937,6 +945,7 @@ impl<T: GenerationExecutorTypes> SpeculativeExecutor for DynGenerationExecutor<'
         self.inner.set_activation_origin(origin);
     }
 
+    #[cfg(feature = "tensor-capture")]
     fn take_activation_capture(&mut self) -> Option<SpeculativeActivationCapture> {
         self.inner.take_activation_capture()
     }

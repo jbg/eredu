@@ -6,72 +6,11 @@ pub(in crate::composition::mlx) struct ArrayObserverAdapter<'a, O: ?Sized> {
     pub(in crate::composition::mlx) routed_invocation_active: bool,
 }
 
-pub(super) struct InspectionCollector<'a> {
-    request: &'a ObservationRequest,
-    values: Vec<(String, MlxTensor)>,
-}
-
-impl<'a> InspectionCollector<'a> {
-    pub(super) fn new(request: &'a ObservationRequest) -> Self {
-        Self {
-            request,
-            values: Vec::new(),
-        }
-    }
-
-    pub(super) fn capture(&mut self, path: &str, value: &MlxTensor) {
-        if self.request.matches(path) {
-            self.values.push((path.into(), value.clone()));
-        }
-    }
-
-    pub(super) fn materialize(self, stream: &Stream) -> Result<ObservationSet, Error> {
-        let mut observations = ObservationSet::new();
-        for (path, value) in self.values {
-            observations
-                .insert(
-                    path,
-                    ObservationValue::Tensor(observe_tensor(&value, stream)?),
-                )
-                .map_err(Error::observation)?;
-        }
-        Ok(observations)
-    }
-}
-
-impl RuntimeActivationObserver<MlxTensor, Error> for InspectionCollector<'_> {
-    fn observe(&mut self, path: &str, value: &MlxTensor) -> Result<(), Error> {
-        self.capture(path, value);
-        Ok(())
-    }
-
-    fn observe_generated(
-        &mut self,
-        path: &str,
-        _: &MlxTensor,
-        _: &eredu_core::capture::GeneratedCaptureSource,
-        generate: &mut dyn FnMut() -> Result<MlxTensor, Error>,
-    ) -> Result<(), Error> {
-        if self.request.matches(path) {
-            self.capture(path, &generate()?);
-        }
-        Ok(())
-    }
-
-    fn observe_routing(
-        &mut self,
-        routing: eredu_runtime::RoutingObservation<'_, MlxTensor>,
-    ) -> Result<(), Error> {
-        routing.for_each_tensor(|path, value| self.capture(&path, value));
-        Ok(())
-    }
-}
-
 pub(super) fn observe_tensor(
     value: &MlxTensor,
     stream: &Stream,
 ) -> Result<TensorObservation, Error> {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "tensor-capture"))]
     super::bounded_capture::record_host_read(value.as_array().size());
     let shape = value
         .shape()
@@ -405,6 +344,6 @@ impl<O: RuntimeActivationObserver<MlxTensor, Error> + ?Sized>
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tensor-capture"))]
 #[path = "observation/tests.rs"]
 mod tests;

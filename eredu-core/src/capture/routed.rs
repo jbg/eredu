@@ -54,6 +54,7 @@ impl RoutedUnitCaptureOwnership {
 /// Native chunk evidence retained with a distributed producer's contribution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg(feature = "tensor-capture")]
 pub struct RoutedUnitCaptureProvenance {
     /// Admission's expected expert, unit and source-peer placement.
     pub ownership: RoutedUnitCaptureOwnership,
@@ -61,23 +62,12 @@ pub struct RoutedUnitCaptureProvenance {
     pub source_token_ranges: Vec<[u64; 2]>,
 }
 
-/// Global bank geometry, independent of compact native bank indices.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RoutedUnitGeometry {
-    /// Checkpoint-global expert count.
-    pub experts: u64,
-    /// Scalar units per expert.
-    pub units_per_expert: u64,
-    /// Original selected route slots per token; duplicate experts retain their slots.
-    pub routes_per_token: u64,
-}
+pub use crate::routing::RoutedUnitGeometry;
+
 impl RoutedUnitGeometry {
-    /// Number of virtual components. This does not allocate an expert-dense tensor.
+    /// Number of virtual components available to capture.
     pub fn components(self) -> Result<u64, CaptureError> {
-        if self.experts == 0 || self.units_per_expert == 0 || self.routes_per_token == 0 {
-            return Err(CaptureError::Invalid("empty routed-unit geometry".into()));
-        }
-        mul(self.experts, self.units_per_expert)
+        self.component_extent().map_err(Into::into)
     }
 
     /// Selection in original `[token, route, component]` order. Native sorting
@@ -113,6 +103,7 @@ impl RoutedUnitGeometry {
 /// One selected route. Expert identity is retained alongside its selected units;
 /// no row is fabricated for an expert that did not participate.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg(feature = "tensor-capture")]
 pub struct RoutedUnitCaptureRow {
     /// Source peer in the retained expert-exchange group, absent for ordinary work.
     pub source_peer: Option<u64>,
@@ -136,6 +127,7 @@ pub struct RoutedUnitCaptureRow {
 /// Complete sparse evidence for the selected token rows. Rows are ordered by
 /// `(source_peer, token, slot)` after receipt validation, not native sorting order.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg(feature = "tensor-capture")]
 pub struct RoutedUnitCapture {
     /// Actual global expert/unit/route geometry.
     pub geometry: RoutedUnitGeometry,
@@ -148,6 +140,7 @@ pub struct RoutedUnitCapture {
     pub rows: Vec<RoutedUnitCaptureRow>,
 }
 
+#[cfg(feature = "tensor-capture")]
 impl RoutedUnitCapture {
     /// Checks selected-unit geometry and route uniqueness. Completeness is checked
     /// separately so independently bounded native chunks can be accumulated.

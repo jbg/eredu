@@ -3,6 +3,46 @@
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroU32;
 
+/// One canvas position and its selected token IDs in delivery order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefinementScoreSelection {
+    /// Zero-based position in the admitted canvas.
+    pub position: u32,
+    /// Canonical model token IDs, in request order.
+    pub token_ids: Vec<u32>,
+}
+
+/// Raw score and full-vocabulary log probability for one selected token.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RefinementSelectedScore {
+    /// Canonical model token ID.
+    pub token_id: u32,
+    /// Raw score at the refinement boundary.
+    pub score: f32,
+    /// Log probability normalized over the entire model vocabulary.
+    pub log_probability: f64,
+}
+
+/// Rows in the order requested, with scores in each row's token-ID order.
+pub type RefinementScoreRows = Vec<Vec<RefinementSelectedScore>>;
+
+/// A selected-score operation rejected before submission.
+#[derive(Debug, thiserror::Error)]
+pub enum RefinementReadoutError {
+    /// The selected backend or execution provides no readout.
+    #[error("the backend does not support selected refinement scores")]
+    Unsupported,
+    /// A requested canvas position or token ID is invalid.
+    #[error("selected refinement scores require a valid position and vocabulary IDs")]
+    Geometry,
+    /// The continuation has unfinished execution or delivery.
+    #[error("selected refinement scores require a quiescent continuation")]
+    Boundary,
+    /// The requested step produced no refinement scores.
+    #[error("the requested refinement operation did not complete")]
+    Incomplete,
+}
+
 /// Initial token positions and immutable positions of an iterative canvas.
 /// Missing seed tokens receive ordinary full-domain noise. Pins require a seed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

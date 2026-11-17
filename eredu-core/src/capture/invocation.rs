@@ -363,26 +363,29 @@ mod tests {
         }
         .validate()
         .is_err());
-        let schedule = CaptureSchedule {
-            first_prediction: 3,
-            every: 2,
-            ..Default::default()
-        };
-        assert_eq!(
-            schedule
-                .count_coordinates(CapturePhase::Prefill, 0, 8)
-                .unwrap(),
-            Some((3, 7))
-        );
-        assert_eq!(
-            schedule.count_and_last(CapturePhase::Prefill, 8).unwrap(),
-            None
-        );
-        assert_eq!(
-            CaptureSchedule::default()
-                .count_coordinates(CapturePhase::Decode, 0, 1)
-                .unwrap(),
-            Some((1, 0))
-        );
+        #[cfg(feature = "tensor-capture")]
+        {
+            let schedule = CaptureSchedule {
+                first_prediction: 3,
+                every: 2,
+                ..Default::default()
+            };
+            assert_eq!(
+                schedule
+                    .count_coordinates(CapturePhase::Prefill, 0, 8)
+                    .unwrap(),
+                Some((3, 7))
+            );
+            assert_eq!(
+                schedule.count_and_last(CapturePhase::Prefill, 8).unwrap(),
+                None
+            );
+            assert_eq!(
+                CaptureSchedule::default()
+                    .count_coordinates(CapturePhase::Decode, 0, 1)
+                    .unwrap(),
+                Some((1, 0))
+            );
+        }
     }
 }

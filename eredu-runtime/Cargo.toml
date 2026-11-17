@@ -9,6 +9,9 @@ rust-version.workspace = true
 description = "Backend-neutral model execution runtime for Eredu"
 readme = "README.md"
 
+[features]
+tensor-capture = ["eredu-core/tensor-capture"]
+
 [lints]
 workspace = true
 

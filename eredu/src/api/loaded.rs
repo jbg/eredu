@@ -130,6 +130,15 @@ where
     }
 }
 
+pub(super) struct GenerationStepDelivery<'a> {
+    #[cfg(feature = "tensor-capture")]
+    pub plan: eredu_core::capture::AdmittedCapturePlan,
+    #[cfg(feature = "tensor-capture")]
+    pub intervention: Option<eredu_core::intervention::AdmittedInterventionPlan>,
+    pub on_step: &'a mut super::request::GenerationStepCallback<'a>,
+    pub failure: &'a dyn Fn() -> Option<eredu_core::capture::CaptureError>,
+}
+
 impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
     pub(super) fn validate_refinement_canvas(
         &self,
@@ -213,16 +222,7 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
     pub(super) fn generate_prepared<'a, F>(
         &'a mut self,
         request: GenerationRequest<'_, B, F>,
-        capture: Option<(
-            eredu_core::capture::AdmittedCapturePlan,
-            Option<eredu_core::intervention::AdmittedInterventionPlan>,
-            &'a mut dyn FnMut(
-                super::request::GenerationStepKind,
-                Option<eredu_core::capture::CapturedStep>,
-                f64,
-            ),
-            &'a dyn Fn() -> Option<eredu_core::capture::CaptureError>,
-        )>,
+        delivery: Option<GenerationStepDelivery<'a>>,
         generation_started: std::time::Instant,
         mode: OutputMode,
         canvas: Option<std::sync::Arc<eredu_core::refinement::RefinementCanvas>>,
@@ -327,22 +327,29 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
                 .bind_control_handle(handle)
                 .map_err(eredu_core::TextOperationPolicyError::DecodingMode)?;
         }
-        let (on_token, delivery_failure) =
-            if let Some((plan, intervention, on_token, delivery_failure)) = capture {
-                if let Some(intervention) = intervention {
-                    generator.enable_interventions(plan, intervention)?;
-                } else {
-                    generator.enable_capture(plan)?;
+        #[cfg(feature = "tensor-capture")]
+        let instrumented = delivery.is_some();
+        let (on_token, delivery_failure) = if let Some(delivery) = delivery {
+            #[cfg(feature = "tensor-capture")]
+            match delivery.intervention {
+                Some(intervention) => {
+                    generator.enable_interventions(delivery.plan, intervention)?
                 }
-                (Some(on_token), Some(delivery_failure))
-            } else {
-                generator.finish_text_preparation(
-                    Stage::Instrumentation,
-                    Ok(()),
-                    PreparedChatError::Backend,
-                )?;
-                (None, None)
-            };
+                None => generator.enable_capture(delivery.plan)?,
+            }
+            (Some(delivery.on_step), Some(delivery.failure))
+        } else {
+            (None, None)
+        };
+        #[cfg(not(feature = "tensor-capture"))]
+        let instrumented = false;
+        if !instrumented {
+            generator.finish_text_preparation(
+                Stage::Instrumentation,
+                Ok(()),
+                PreparedChatError::Backend,
+            )?;
+        }
         let ready = generator.finish_text_preparation_cancellable(
             Stage::Delivery,
             Ok(if cancellation.is_cancelled() {

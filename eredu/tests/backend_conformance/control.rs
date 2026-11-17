@@ -1,6 +1,8 @@
 use super::*;
 use eredu::api::{ControlledGenerationRecord, ObservedGenerationEvent, TraceLimits};
-use eredu_core::{capture::CapturePlan, execution_control::*};
+#[cfg(feature = "tensor-capture")]
+use eredu_core::capture::CapturePlan;
+use eredu_core::execution_control::*;
 use std::ops::ControlFlow;
 
 #[path = "control/flash_next.rs"]
@@ -70,9 +72,7 @@ impl eredu_runtime::execution_control::TextSamplingControlBackend for MockBacken
 fn prospective_sampling_changes_preserve_position_and_emit_bounded_provenance() {
     use eredu::api::SamplingOverride;
     let (mut model, chat, settings, first) = setup();
-    let prepared = model
-        .prepare_observed_chat(&chat, settings, CapturePlan::none(), limits())
-        .unwrap();
+    let prepared = model.prepare_controlled_chat(&chat, settings).unwrap();
     let mut records = vec![];
     let mut session = model
         .start_controlled(
@@ -172,6 +172,7 @@ fn decoder_forks_preserve_pending_unicode_without_replaying_tokens() {
     assert_eq!(right.step(first + 1).unwrap().as_deref(), Some("é"));
 }
 
+#[cfg(feature = "tensor-capture")]
 #[test]
 fn forced_canonical_tokens_use_ordinary_commitment_decoding_and_termination() {
     let (mut model, chat, settings, first) = setup();
@@ -252,9 +253,7 @@ fn forced_canonical_tokens_use_ordinary_commitment_decoding_and_termination() {
 #[test]
 fn forced_alternative_changes_canonical_history_and_semantic_text_once() {
     let (mut model, chat, settings, first) = setup();
-    let prepared = model
-        .prepare_observed_chat(&chat, settings, CapturePlan::none(), limits())
-        .unwrap();
+    let prepared = model.prepare_controlled_chat(&chat, settings).unwrap();
     let alternative = first + 3;
     let expected_text = model.decode(&[alternative], true).unwrap();
     let mut records = vec![];
@@ -308,6 +307,7 @@ fn semantic(records: &[ControlledGenerationRecord]) -> Vec<SemanticEvent> {
         .collect()
 }
 
+#[cfg(feature = "tensor-capture")]
 #[test]
 fn controlled_facade_pauses_unicode_and_resumes_the_ordinary_pipeline_in_all_modes() {
     for mode in 0..4 {
@@ -449,9 +449,7 @@ fn controlled_facade_pauses_unicode_and_resumes_the_ordinary_pipeline_in_all_mod
 fn controlled_facade_stop_and_cancellation_do_not_flush_partial_unicode_or_advance_again() {
     for cancel_at in [None, Some(0), Some(1)] {
         let (mut model, chat, settings, first) = setup();
-        let prepared = model
-            .prepare_observed_chat(&chat, settings, CapturePlan::none(), limits())
-            .unwrap();
+        let prepared = model.prepare_controlled_chat(&chat, settings).unwrap();
         let control = GenerationControlHandle::default();
         let mut records = vec![];
         let mut session = model
@@ -506,6 +504,7 @@ fn controlled_facade_stop_and_cancellation_do_not_flush_partial_unicode_or_advan
     }
 }
 
+#[cfg(feature = "tensor-capture")]
 #[test]
 fn controlled_facade_closes_broken_consumers_and_fences_panics_and_transport_failures() {
     for failure in ["break", "panic", "limit"] {
@@ -567,6 +566,7 @@ fn controlled_facade_closes_broken_consumers_and_fences_panics_and_transport_fai
     }
 }
 
+#[cfg(feature = "tensor-capture")]
 #[test]
 fn controlled_choices_use_sparse_tokenizer_ids_instead_of_entry_count() {
     let base = unicode_model(None);
@@ -632,9 +632,7 @@ fn controlled_choices_use_sparse_tokenizer_ids_instead_of_entry_count() {
 fn ttft_counts_active_work_excludes_pauses_and_is_visible_before_token_delivery() {
     use std::time::{Duration, Instant};
     let (mut model, chat, settings, _) = setup();
-    let prepared = model
-        .prepare_observed_chat(&chat, settings, CapturePlan::none(), limits())
-        .unwrap();
+    let prepared = model.prepare_controlled_chat(&chat, settings).unwrap();
     let wall = Instant::now();
     let mut session = model
         .start_controlled(
@@ -676,9 +674,7 @@ fn ttft_counts_active_work_excludes_pauses_and_is_visible_before_token_delivery(
 #[test]
 fn cancelled_controlled_session_has_no_ttft() {
     let (mut model, chat, settings, _) = setup();
-    let prepared = model
-        .prepare_observed_chat(&chat, settings, CapturePlan::none(), limits())
-        .unwrap();
+    let prepared = model.prepare_controlled_chat(&chat, settings).unwrap();
     let mut session = model
         .start_controlled(
             prepared,
@@ -692,6 +688,7 @@ fn cancelled_controlled_session_has_no_ttft() {
     assert_eq!(session.timing().time_to_first_token(), None);
 }
 
+#[cfg(feature = "tensor-capture")]
 #[test]
 fn exact_token_prefix_admission_preserves_ids_and_rejects_unknown_vocabulary_before_execution() {
     let (mut model, chat, mut settings, _) = setup();
@@ -746,9 +743,7 @@ fn exact_token_prefix_admission_preserves_ids_and_rejects_unknown_vocabulary_bef
 fn conversion_retention_observation_preserves_controlled_state_and_output() {
     let (mut model, chat, settings, _) = setup();
     let before = model.parameter_conversion_retention().unwrap();
-    let prepared = model
-        .prepare_observed_chat(&chat, settings, CapturePlan::none(), limits())
-        .unwrap();
+    let prepared = model.prepare_controlled_chat(&chat, settings).unwrap();
     let mut session = model
         .start_controlled(
             prepared,

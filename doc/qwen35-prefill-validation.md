@@ -174,7 +174,7 @@ Run native commands outside the sandbox. The shared Cargo cache is project-scope
 ```sh
 export CARGO_BUILD_BUILD_DIR="$HOME/Library/Caches/cargo-build/eredu"
 export QWEN35_CHECKPOINT=/Users/jbg/dev/pico/Build/ModelValidation/qwen35-2b-4bit
-cargo build -p eredu --example prefill_memory_probe --features metal
+cargo build -p eredu --example prefill_memory_probe --features metal,tensor-capture
 python3 - <<'PYTHON'
 import json
 from pathlib import Path

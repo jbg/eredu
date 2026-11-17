@@ -1,21 +1,31 @@
 //! Speculative phase composition over the ordinary capture/intervention owner.
 use super::*;
+#[cfg(feature = "tensor-capture")]
 use crate::inspection::SpeculativeActivationObserver;
+#[cfg(feature = "tensor-capture")]
 use eredu_core::intervention::InterventionBackend;
+#[cfg(feature = "tensor-capture")]
 use eredu_core::speculative::{
     SpeculativeActivationCapture, SpeculativeActivationOrigin, SpeculativeActivationPhase,
     SpeculativeControlError,
 };
+#[cfg(feature = "tensor-capture")]
 use std::{cell::RefCell, collections::VecDeque};
 
+#[cfg(feature = "tensor-capture")]
 mod control;
+#[cfg(feature = "tensor-capture")]
 mod observer;
+#[cfg(feature = "tensor-capture")]
 mod provider;
+#[cfg(feature = "tensor-capture")]
 pub use control::{PreparedSpeculativeActivationRestore, SpeculativeActivationCheckpoint};
+#[cfg(feature = "tensor-capture")]
 pub use provider::PartitionCaptureBackendProvider;
 
 /// Lends native capture primitives for the duration of a synchronous callback.
 /// The provider owns its context; model completion remains with the executor.
+#[cfg(feature = "tensor-capture")]
 pub trait CaptureBackendProvider {
     /// Native value borrowed at the observation boundary.
     type Tensor;
@@ -63,6 +73,7 @@ pub use eredu_core::speculative::SpeculativeCaptureScope;
 /// One explicitly admitted scheduler request. Every internal invocation shares
 /// its capture/intervention ledger. A bounded queue bridges multiple forwards
 /// within one scheduler action; all envelopes are reserved before native work.
+#[cfg(feature = "tensor-capture")]
 pub struct SpeculativeCaptureObserver<P: CaptureBackendProvider, F> {
     control_owner: std::sync::Arc<()>,
     admitted: Option<eredu_core::speculative::AdmittedSpeculativeActivations>,
@@ -82,6 +93,7 @@ pub struct SpeculativeCaptureObserver<P: CaptureBackendProvider, F> {
     routed_path: Option<String>,
 }
 
+#[cfg(feature = "tensor-capture")]
 impl<P: CaptureBackendProvider, F> SpeculativeCaptureObserver<P, F> {
     /// Constructs a fresh request collector from immutable loaded authority.
     /// Empty authority preserves an absent observer. Existing native estimators
@@ -282,6 +294,7 @@ impl<P: CaptureBackendProvider, F> SpeculativeCaptureObserver<P, F> {
     }
 }
 
+#[cfg(feature = "tensor-capture")]
 fn signal<E: std::error::Error + Send + Sync + 'static, X>(
     failure: &RefCell<Option<SpeculativeControlError>>,
     map: &impl Fn(&CaptureExecutionError<E>) -> X,
@@ -298,6 +311,7 @@ fn signal<E: std::error::Error + Send + Sync + 'static, X>(
     signal
 }
 
+#[cfg(feature = "tensor-capture")]
 impl<P, F, E> SpeculativeActivationObserver<P::Tensor, E> for SpeculativeCaptureObserver<P, F>
 where
     P: CaptureBackendProvider,

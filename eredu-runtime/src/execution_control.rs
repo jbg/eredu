@@ -109,6 +109,7 @@ pub struct ForeignSessionSnapshot;
 
 /// Logical owned storage of the audited serialized intervention request DTO.
 /// Native estimators and admitted handles are deliberately excluded.
+#[cfg(feature = "tensor-capture")]
 pub fn intervention_plan_storage_bytes(
     plan: &eredu_core::intervention::InterventionPlan,
 ) -> Option<u64> {
@@ -473,6 +474,7 @@ mod trace;
 pub use trace::{TraceBudget, TraceLimits};
 
 /// Complete logical host storage of the supported immutable intervention DTO.
+#[cfg(feature = "tensor-capture")]
 pub fn admitted_intervention_storage_bytes(
     plan: &eredu_core::intervention::AdmittedInterventionPlan,
 ) -> Option<u64> {

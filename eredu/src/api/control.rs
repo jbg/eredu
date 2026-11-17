@@ -68,6 +68,9 @@ pub enum ControlledGenerationError {
     /// Complete native or host snapshot preparation/compatibility failure.
     #[error(transparent)]
     Snapshot(eredu_runtime::execution_control::TextSnapshotError<BackendFailure>),
+    /// Selected score admission or delivery failed.
+    #[error(transparent)]
+    RefinementReadout(#[from] eredu_core::refinement::RefinementReadoutError),
     /// Invalid lifecycle transition or resource arithmetic.
     #[error(transparent)]
     Control(#[from] ExecutionControlError),
@@ -76,6 +79,7 @@ pub enum ControlledGenerationError {
     Capture(#[from] CaptureError),
 }
 
+#[cfg(feature = "tensor-capture")]
 impl From<eredu_core::run_preparation::TextCaptureSetupError> for ControlledGenerationError {
     fn from(error: eredu_core::run_preparation::TextCaptureSetupError) -> Self {
         PreparedChatError::from(error).into()
@@ -135,6 +139,7 @@ impl<E: std::error::Error + Send + Sync + 'static>
             S::Host(reason) => S::Host(reason),
             S::Controller(reason) => S::Controller(reason),
             S::Backend(error) => S::Backend(BackendFailure::from_error(error)),
+            #[cfg(feature = "tensor-capture")]
             S::Capture(error) => S::Capture(error),
             S::Control(error) => S::Control(error),
             S::IncompatibleRun => S::IncompatibleRun,
@@ -210,7 +215,7 @@ impl Delivery {
             eredu_core::refinement::GenerationPosition,
         )>,
         forced: bool,
-        captures: Option<CapturedStep>,
+        #[cfg(feature = "tensor-capture")] captures: Option<CapturedStep>,
         seconds: f64,
         emit: &mut impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
     ) {
@@ -245,18 +250,22 @@ impl Delivery {
                         input_range,
                         committed: true,
                         rank: 0,
+                        #[cfg(feature = "tensor-capture")]
                         captures,
                         step_seconds: seconds,
                     },
                     emit,
                 );
             }
-            None => {
+            None =>
+            {
+                #[cfg(feature = "tensor-capture")]
                 if let Some(captures) = captures {
                     self.send(
                         ObservedGenerationEvent::CaptureFailure {
                             prediction_index,
                             input_range,
+                            #[cfg(feature = "tensor-capture")]
                             captures,
                             step_seconds: seconds,
                         },
@@ -299,6 +308,7 @@ impl<B: TextGenerationBackend, F: FnMut(ControlledGenerationRecord) -> ControlFl
         let advancement = match result {
             Ok(advancement) => advancement,
             Err(error) => {
+                #[cfg(feature = "tensor-capture")]
                 if let Ok(captures) = captures {
                     let mut delivery = self.delivery.borrow_mut();
                     let (delivery, emit) = &mut *delivery;
@@ -307,7 +317,10 @@ impl<B: TextGenerationBackend, F: FnMut(ControlledGenerationRecord) -> ControlFl
                 return Err(error);
             }
         };
+        #[cfg(feature = "tensor-capture")]
         let captures = captures?;
+        #[cfg(not(feature = "tensor-capture"))]
+        captures?;
         let mut delivery = self.delivery.borrow_mut();
         let (delivery, emit) = &mut *delivery;
         match advancement {
@@ -325,6 +338,7 @@ impl<B: TextGenerationBackend, F: FnMut(ControlledGenerationRecord) -> ControlFl
                     ObservedGenerationEvent::ModeChanged {
                         acknowledgement,
                         position: self.state.position(),
+                        #[cfg(feature = "tensor-capture")]
                         captures,
                         step_seconds: started.elapsed().as_secs_f64(),
                     },
@@ -344,6 +358,7 @@ impl<B: TextGenerationBackend, F: FnMut(ControlledGenerationRecord) -> ControlFl
                     ObservedGenerationEvent::Progress {
                         progress,
                         position: self.state.position(),
+                        #[cfg(feature = "tensor-capture")]
                         captures,
                         step_seconds: started.elapsed().as_secs_f64(),
                     },
@@ -360,6 +375,7 @@ impl<B: TextGenerationBackend, F: FnMut(ControlledGenerationRecord) -> ControlFl
                 delivery.token(
                     Some((token.token_id(), token.score_kind(), token.position())),
                     self.state.controller().last_committed_was_forced(),
+                    #[cfg(feature = "tensor-capture")]
                     captures,
                     started.elapsed().as_secs_f64(),
                     emit,
@@ -394,6 +410,21 @@ pub struct ControlledGenerationSession<'a, B: TextGenerationBackend> {
 }
 
 impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
+    pub(super) fn step_with_refinement_readout(
+        &mut self,
+        selections: Vec<eredu_core::refinement::RefinementScoreSelection>,
+        emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
+    ) -> Result<eredu_core::refinement::RefinementScoreRows, ControlledGenerationError> {
+        use eredu_core::refinement::RefinementReadoutError;
+        self.state
+            .configure_refinement_readout(&self.driver, selections)?;
+        self.step(emit)?;
+        Ok(self
+            .state
+            .take_refinement_readout(&self.driver)?
+            .ok_or(RefinementReadoutError::Incomplete)?)
+    }
+
     /// Active preparation and execution through first commitment, before capture
     /// delivery. Pauses and inspections are excluded; restoration never rewinds it.
     pub fn timing(&self) -> GenerationTiming {
@@ -1008,7 +1039,13 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
                     artifact_identity: prepared.artifact_identity,
                     parameter_overlay_id: prepared.parameter_overlay_id,
                     session_id: self.session_identity.clone(),
+                    #[cfg(feature = "tensor-capture")]
                     capture_plan_id: prepared.plan.identity().into(),
+                    #[cfg(not(feature = "tensor-capture"))]
+                    capture_plan_id: String::new(),
+                    #[cfg(not(feature = "tensor-capture"))]
+                    intervention_plan_id: None,
+                    #[cfg(feature = "tensor-capture")]
                     intervention_plan_id: prepared
                         .intervention
                         .as_ref()
@@ -1075,10 +1112,17 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
             .map_err(TextContinuationError::Generation)?;
         state.set_cancellation_token(delivery.cancellation.clone());
         state.bind_control_handle(&delivery.control)?;
+        #[cfg(feature = "tensor-capture")]
         match prepared.intervention {
             Some(plan) => driver.enable_interventions(&mut state, prepared.plan, plan)?,
             None => driver.enable_capture(&mut state, prepared.plan)?,
         }
+        #[cfg(not(feature = "tensor-capture"))]
+        driver.runtime().finish_text_preparation(
+            Stage::Instrumentation,
+            Ok(()),
+            PreparedChatError::Backend,
+        )?;
         delivery.preparation_elapsed = prepared.preparation_elapsed + preparation_started.elapsed();
         delivery.send(started, &mut emit);
         let delivered = match delivery.failure.take() {

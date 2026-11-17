@@ -168,6 +168,7 @@ impl GenerationForecastBackend for MlxBackend<'_> {
         ))
     }
 
+    #[cfg(feature = "tensor-capture")]
     fn capture_memory_projection(
         runtime: &ModelRuntime<Self>,
         capture: &eredu_core::capture::AdmittedCapturePlan,
@@ -196,6 +197,7 @@ impl GenerationForecastBackend for MlxBackend<'_> {
         .map_err(|e| CapabilityError::Observation(e.to_string()).into())
     }
 
+    #[cfg(feature = "tensor-capture")]
     fn capture_transforms_complete_per_step(_: &ModelRuntime<Self>) -> bool {
         // Bounded capture evaluates and transfers synchronously; no lazy capture
         // graphs or native views survive delivery of a completed prediction.

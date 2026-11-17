@@ -1,5 +1,11 @@
 # Execution control
 
+Use `LoadedModel::prepare_controlled_chat` followed by `start_controlled` for
+plain controlled generation. With `tensor-capture`, use
+`prepare_observed_chat` or `prepare_intervened_chat` to admit a bounded plan
+before starting the same controlled driver. Pinned-canvas decisions use a
+selected-score readout on the requested refinement step in either build.
+
 Tool-name normalization is prepared-request policy shared by JSON and typed chat.
 Controlled semantic events expose original application names just like ordinary
 and speculative execution. Grammar and schema validation retain wire aliases.

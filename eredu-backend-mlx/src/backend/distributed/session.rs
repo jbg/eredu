@@ -24,6 +24,7 @@ impl MlxDistributedSession {
     /// tensor copy. The retained world also fences every logical group sharing
     /// that native communicator. The nested recovery scope keeps the enclosing
     /// model submission live until this source reaches native terminal evidence.
+    #[cfg(feature = "tensor-capture")]
     pub(crate) fn prepare_capture_source(
         &self,
         tensor: &MlxTensor,
@@ -676,6 +677,7 @@ impl eredu_core::consensus::BoundedConsensusTransport for MlxDistributedSession 
     }
 }
 
+#[cfg(feature = "tensor-capture")]
 impl eredu_runtime::capture::partition::PartitionCaptureTransport for MlxDistributedSession {
     fn capture_rank(&self) -> usize {
         self.manifest.rank()
@@ -812,6 +814,7 @@ impl eredu_runtime::run_preparation::TextPreparationTransport for MlxDistributed
 }
 
 impl MlxDistributedSession {
+    #[cfg(feature = "tensor-capture")]
     fn capture_hook_descriptor(
         &self,
         members: &[usize],
@@ -836,6 +839,7 @@ impl MlxDistributedSession {
     }
 }
 
+#[cfg(feature = "tensor-capture")]
 impl eredu_runtime::capture::partition::PartitionCaptureHookTransport for MlxDistributedSession {
     type HookOutput = crate::backend::runtime::distributed::completion::MlxFailureAgreement;
 

@@ -1,5 +1,10 @@
 # Bounded capture during ordinary generation
 
+Enable `tensor-capture` for bounded capture and interventions. The facade
+forwards it to MLX when `mlx` is selected. Portable backends can use
+`--no-default-features --features tensor-capture`, and MLX capture examples
+require `--features mlx,tensor-capture` when built through the facade.
+
 `LoadedModel::capture_discovery()` returns the loaded session's retained catalog,
 selected support, bounded transformations, and exact prepared-source identity.
 MLX applications use the same generic model API. Cold
@@ -25,8 +30,7 @@ unverified sites remain inadmissible.
 The implementation composes `ControlledTextGeneration` and the existing
 committed-token driver. It does not resample tokens or create a second EOS,
 tokenizer, or text-decoding loop. `CapturePlan::none()` means none; an empty
-selection list also means none. The older `ObservationRequest` retains its
-capture-all interpretation of empty selectors for compatibility.
+selection list also means none.
 
 Use `intervention_discovery` and `prepare_intervened_chat` to admit prospective
 activation/routing controls together with capture, then call the same
@@ -41,7 +45,7 @@ Run the complete facade example, with an artifact containing tokenizer and chat
 metadata:
 
 ```sh
-cargo run -p eredu --no-default-features --features mlx --example observed_generate -- /path/to/artifact "Explain gravity" 8
+cargo run -p eredu --no-default-features --features mlx,tensor-capture --example observed_generate -- /path/to/artifact "Explain gravity" 8
 ```
 
 The example discovers a supported activation, captures a summary and a 16-value

@@ -6,14 +6,14 @@ struct IndependentMechanisms;
 
 impl eredu_architectures::PreparationMechanismProvider for IndependentMechanisms {
     fn capture_capabilities(&self) -> eredu_core::capture::CaptureCapabilities {
-        super::super::session::bounded_capture::capabilities()
+        super::super::session::capture_capabilities()
     }
     fn observation_mechanisms(&self) -> eredu_core::ObservationMechanisms {
         eredu_core::ObservationMechanisms {
-            activation_tensors: true,
-            routing_tensors: true,
+            activation_tensors: cfg!(feature = "tensor-capture"),
+            routing_tensors: cfg!(feature = "tensor-capture"),
             routed_unit_tensors: false,
-            floating_to_f32: true,
+            floating_to_f32: cfg!(feature = "tensor-capture"),
         }
     }
 
@@ -170,6 +170,16 @@ fn retained_inspection_selection_is_consumed_by_source_preparation() {
     let diagnostics = sources.complete().source_diagnostics().unwrap();
     assert_eq!(diagnostics.physical_reads, 0);
     assert_eq!(diagnostics.physical_read_bytes, 0);
+
+    let expected_identity = sources.source_identity().unwrap().to_string();
+    let stream = crate::test_stream();
+    let backend = crate::native::backend(stream, stream);
+    let prepared =
+        eredu_core::load_model(&backend, root.path(), MlxLoadRequest::default()).unwrap();
+    let mut runtime = eredu_core::ModelRuntime::from_prepared(backend, prepared).unwrap();
+    let parameters =
+        eredu_core::parameters::ParameterBackend::parameter_discovery(&mut runtime).unwrap();
+    assert_eq!(parameters.artifact_identity, expected_identity);
 }
 
 #[test]
@@ -216,54 +226,7 @@ fn missing_artifact_is_returned_as_a_total_report() {
     );
 }
 
-#[test]
-fn discovery_supported_paths_match_native_prefill_and_decode_captures() {
-    use crate::backend::runtime::media::input::{token_ids_part, ModelInput};
-    use eredu_core::{
-        ModelRuntime, ObservationRequest, ObservationSelector, ObservationSupportStatus,
-    };
-    use safemlx::Array;
-    let root = tempfile::tempdir().unwrap();
-    write_safetensors_fixture(root.path());
-    let options = MlxInspectionOptions::default();
-    let report = inspect_model(root.path(), options).unwrap();
-    let descriptor = report.architecture_descriptor.as_ref().unwrap();
-    let support = report.observation_support.as_ref().unwrap();
-    let selectors = support
-        .points
-        .iter()
-        .filter(|p| {
-            p.prefill == ObservationSupportStatus::Supported
-                && p.decode == ObservationSupportStatus::Supported
-        })
-        .map(|p| ObservationSelector::Exact(p.path.clone()))
-        .collect::<Vec<_>>();
-    assert_eq!(selectors.len(), descriptor.observations.points.len());
-    assert!(!selectors.is_empty());
-    let request = ObservationRequest::selected(selectors);
-    let stream = crate::test_stream();
-    let backend = crate::native::backend(stream, stream);
-    let model = eredu_core::load_model(&backend, root.path(), MlxLoadRequest::default()).unwrap();
-    let mut runtime = ModelRuntime::from_prepared(backend, model).unwrap();
-    let tokens = Array::from_slice(&[1_u32, 2], &[1, 2]);
-    let parts = [token_ids_part(&tokens).unwrap()];
-    let first = runtime
-        .inspect_prefill(ModelInput::new(&parts).into(), &request)
-        .unwrap();
-    let next = runtime
-        .inspect_decode(Array::from_slice(&[3_u32], &[1, 1]), &request)
-        .unwrap();
-    for observations in [first.observations, next.observations] {
-        for point in &descriptor.observations.points {
-            assert!(
-                observations.get(&point.path).is_some(),
-                "missing native capture {}",
-                point.path
-            );
-        }
-    }
-}
-
+#[cfg(feature = "tensor-capture")]
 #[test]
 fn bounded_capture_preserves_native_generation_tokens_and_rng_progression() {
     use eredu_core::{
@@ -344,11 +307,15 @@ fn bounded_capture_preserves_native_generation_tokens_and_rng_progression() {
                     .iter()
                     .enumerate()
                     .map(|(i, p)| CaptureSelection {
-                        id: format!("summary-{i}"),
+                        id: format!("activation-{i}"),
                         path: p.path.clone(),
-                        schedule: CaptureSchedule::default(),
+                        schedule: CaptureSchedule {
+                            prefill: true,
+                            decode: true,
+                            ..Default::default()
+                        },
                         slices: vec![],
-                        transform: CaptureTransform::Summary,
+                        transform: CaptureTransform::FullTensor,
                     })
                     .collect(),
                 limits: CaptureLimits {
@@ -389,9 +356,29 @@ fn bounded_capture_preserves_native_generation_tokens_and_rng_progression() {
             if captured {
                 let step = generator.take_captured_step().unwrap().unwrap();
                 assert_eq!(step.prediction_index, tokens.len() as u64 - 1);
-                for record in &step.records {
+                let plan = plan.as_ref().unwrap();
+                assert_eq!(step.records.len(), plan.plan().selections.len());
+                let phase = if tokens.len() == 1 {
+                    CapturePhase::Prefill
+                } else {
+                    CapturePhase::Decode
+                };
+                for selection in &plan.plan().selections {
+                    let record = step
+                        .records
+                        .iter()
+                        .find(|record| record.selection_id == selection.id)
+                        .unwrap();
+                    assert_eq!(record.path, selection.path);
+                    assert_eq!(step.phase, phase);
                     assert_eq!(record.outcome, CaptureOutcome::Captured, "{}", record.path);
-                    assert!(matches!(record.payload, Some(CapturePayload::Summary(_))));
+                    let Some(CapturePayload::Tensor(tensor)) = &record.payload else {
+                        panic!("missing full tensor at {}", record.path);
+                    };
+                    if record.path == eredu_core::MODEL_LOGITS_OBSERVATION_PATH {
+                        let positions = if phase == CapturePhase::Prefill { 2 } else { 1 };
+                        assert_eq!(tensor.shape(), &[1, positions, 64]);
+                    }
                 }
             }
         }
@@ -432,6 +419,8 @@ fn bounded_capture_preserves_native_generation_tokens_and_rng_progression() {
     assert_eq!(results[0], results[2]);
 }
 
+#[cfg(feature = "tensor-capture")]
+#[cfg(feature = "tensor-capture")]
 #[test]
 fn bounded_capture_native_failure_respects_recovery_and_retirement() {
     use eredu_core::{capture::*, ModelRuntime, TextGenerationBackend, TextGenerationConfig};
@@ -573,6 +562,7 @@ fn invalid_configuration_is_returned_as_a_total_report() {
     assert!(!report.issues.is_empty());
 }
 
+#[cfg(feature = "tensor-capture")]
 #[test]
 fn native_intervention_loaded_dense_preserves_rng_and_returns_effective_logits() {
     use eredu_core::{

@@ -66,6 +66,7 @@ impl GenerationForecastBackend for MockBackend {
         ))
     }
 
+    #[cfg(feature = "tensor-capture")]
     fn capture_memory_projection(
         _: &ModelRuntime<Self>,
         capture: &eredu_core::capture::AdmittedCapturePlan,
@@ -505,6 +506,7 @@ fn budgets_and_specialized_requests_do_not_hide_uncertainty() {
     assert!(forecast.request.domains[0].staging.upper_bytes.is_none());
 }
 
+#[cfg(feature = "tensor-capture")]
 #[test]
 fn controlled_preparation_forecast_matches_ordinary_and_capture_uses_every_row() {
     use eredu::api::TraceLimits;
@@ -513,14 +515,7 @@ fn controlled_preparation_forecast_matches_ordinary_and_capture_uses_every_row()
         per_record_bytes: 65536,
         total_bytes: 1024 * 1024,
     };
-    let prepared = model
-        .prepare_observed_chat(
-            &chat,
-            settings,
-            eredu_core::capture::CapturePlan::none(),
-            limits,
-        )
-        .unwrap();
+    let prepared = model.prepare_controlled_chat(&chat, settings).unwrap();
     let forecast = model
         .forecast_observed_generation(&prepared, &Default::default())
         .unwrap();
@@ -565,6 +560,7 @@ fn controlled_preparation_forecast_matches_ordinary_and_capture_uses_every_row()
         .is_err());
 }
 
+#[cfg(feature = "tensor-capture")]
 #[test]
 fn captures_use_geometry_and_interventions_keep_limits_without_consuming_them() {
     use eredu::api::TraceLimits;

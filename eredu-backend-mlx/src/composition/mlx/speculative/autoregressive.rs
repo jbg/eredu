@@ -284,6 +284,7 @@ impl eredu_runtime::speculative::shared_backbone::SharedBackboneMechanisms
     for MlxAutoregressiveMechanisms
 {
     type ActivationTensor = MlxTensor;
+    #[cfg(feature = "tensor-capture")]
     fn activation_observer(
         plan: &eredu_core::speculative::AdmittedSpeculativeActivations,
         request: eredu_core::SpeculativeRequestId,

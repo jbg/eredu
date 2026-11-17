@@ -60,7 +60,7 @@ Reproduce on macOS with Metal access:
 export CARGO_BUILD_BUILD_DIR="$HOME/Library/Caches/cargo-build/eredu"
 export QWEN35_CHECKPOINT="$HOME/.cache/huggingface/hub/models--mlx-community--Qwen3.5-0.8B-8bit/snapshots/87e768fbfa03994095f3d14527c80c5ae70c5758"
 shasum -a 256 "$QWEN35_CHECKPOINT/model.safetensors"
-cargo run -p eredu --example chat_probe --features metal -- \
+cargo run -p eredu --example chat_probe --features metal,tensor-capture -- \
   "$QWEN35_CHECKPOINT" /private/tmp/eredu-qwen35 32 0 metal
 python3 -m venv /private/tmp/eredu-qwen35-reference
 /private/tmp/eredu-qwen35-reference/bin/pip install \

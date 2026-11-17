@@ -82,31 +82,6 @@ fn completed_model_submission_validates_tokens_and_releases_its_gate() {
 }
 
 #[test]
-fn inspection_collector_filters_and_materializes_portable_values() {
-    let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-    let stream = context.stream();
-    let requested = ObservationRequest::selected([eredu_core::ObservationSelector::Exact(
-        "model.layers.1.output".into(),
-    )]);
-    let mut collector = InspectionCollector::new(&requested);
-    collector.capture(
-        "model.layers.0.output",
-        &MlxTensor::from_array(Array::from_slice(&[1.0f32], &[1])),
-    );
-    collector.capture(
-        "model.layers.1.output",
-        &MlxTensor::from_array(Array::from_slice(&[2.0f32, 3.0], &[1, 2])),
-    );
-    let observations = collector.materialize(stream).unwrap();
-    assert_eq!(observations.len(), 1);
-    let Some(ObservationValue::Tensor(tensor)) = observations.get("model.layers.1.output") else {
-        panic!("selected activation must be a tensor");
-    };
-    assert_eq!(tensor.shape(), [1, 2]);
-    assert_eq!(tensor.data(), &TensorObservationData::F32(vec![2.0, 3.0]));
-}
-
-#[test]
 fn text_completion_keeps_authority_through_pending_and_failed_native_observation() {
     use std::cell::Cell;
 

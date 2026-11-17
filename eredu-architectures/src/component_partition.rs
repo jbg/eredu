@@ -108,6 +108,7 @@ impl ComponentPartitionLayout {
     /// Projects an immutable global activation operation onto this invocation.
     /// Nonexporting replicas still participate; absence means this rank does not
     /// execute the invocation. This grants no distributed execution authority.
+    #[cfg(feature = "tensor-capture")]
     pub fn project_intervention<'a>(
         &'a self,
         plan: &'a eredu_core::intervention::AdmittedInterventionPlan,
@@ -123,6 +124,7 @@ impl ComponentPartitionLayout {
     }
 
     /// Projects an explicitly shaped forward without changing the admitted operation.
+    #[cfg(feature = "tensor-capture")]
     pub fn project_intervention_at<'a>(
         &'a self,
         plan: &'a eredu_core::intervention::AdmittedInterventionPlan,
@@ -227,6 +229,7 @@ impl ComponentPartitionLayout {
     /// invocation/partition layout. `None` means the invocation is not local;
     /// a local projection may separately have no overlap with the selected slice.
     /// This grants no peer-publication or transport authority.
+    #[cfg(feature = "tensor-capture")]
     pub fn project_capture(
         &self,
         plan: &eredu_core::capture::AdmittedCapturePlan,
@@ -246,6 +249,7 @@ impl ComponentPartitionLayout {
     }
 
     /// Projects explicit invocation axes through this retained local ownership.
+    #[cfg(feature = "tensor-capture")]
     pub fn project_capture_at(
         &self,
         plan: &eredu_core::capture::AdmittedCapturePlan,
@@ -963,6 +967,7 @@ impl ComponentPartitionLayout {
     }
 }
 
+#[cfg(feature = "tensor-capture")]
 impl eredu_runtime::intervention::PartitionActivationLayout for ComponentPartitionLayouts {
     fn routed_activation_members<'a>(
         &'a self,
@@ -1491,6 +1496,7 @@ impl ComponentPartitionLayouts {
 
     /// Combines semantic placement with hook coverage from the actual executor.
     /// Native collector checks remain separate and must follow this declaration.
+    #[cfg(feature = "tensor-capture")]
     pub fn capture_hook_support(
         &self,
         path: &str,
@@ -1511,6 +1517,7 @@ impl ComponentPartitionLayouts {
 
     /// All ranks that execute a declared component observation, including
     /// replicas. Unknown observation axes have no component placement.
+    #[cfg(feature = "tensor-capture")]
     pub fn capture_hook_members(&self, path: &str) -> Option<Vec<usize>> {
         self.observation_site(path)?;
         Some(
@@ -1536,6 +1543,7 @@ impl ComponentPartitionLayouts {
     /// producer per TP coordinate, eliminating only true replicas. Distinct shards
     /// with no selected overlap remain producers of explicit acknowledgments.
     /// Runtime receipt admission validates coverage and binds live work authority.
+    #[cfg(feature = "tensor-capture")]
     pub fn capture_producers(
         &self,
         request: ComponentCaptureProjectionRequest<'_>,
@@ -1625,6 +1633,7 @@ impl ComponentPartitionLayouts {
 
 /// One original global selection whose producer geometry is being compiled.
 /// This is cold descriptive input; it grants no native work or delivery authority.
+#[cfg(feature = "tensor-capture")]
 pub struct ComponentCaptureProjectionRequest<'a> {
     /// Original admitted capture plan, shared across every rank.
     pub plan: &'a eredu_core::capture::AdmittedCapturePlan,
@@ -1642,6 +1651,7 @@ pub struct ComponentCaptureProjectionRequest<'a> {
     pub max_fragments: usize,
 }
 
+#[cfg(feature = "tensor-capture")]
 impl eredu_runtime::capture::partition::PartitionCaptureLayout for ComponentPartitionLayouts {
     fn capture_combination(
         &self,

@@ -118,7 +118,6 @@ fn pending(request: &eredu::api::GenerationMemoryRequest) -> u64 {
 
 #[test]
 fn controlled_forecasts_refresh_trimmed_claims_without_changing_request_or_budgets() {
-    use eredu::api::TraceLimits;
     use eredu_core::execution_control::SnapshotLimits;
     use std::ops::ControlFlow;
 
@@ -153,17 +152,7 @@ fn controlled_forecasts_refresh_trimmed_claims_without_changing_request_or_budge
         loaded.request.domains[0].resident_parameters.lower_bytes,
         4112
     );
-    let prepared = model
-        .prepare_observed_chat(
-            &chat,
-            settings,
-            eredu_core::capture::CapturePlan::none(),
-            TraceLimits {
-                per_record_bytes: 65536,
-                total_bytes: 1 << 20,
-            },
-        )
-        .unwrap();
+    let prepared = model.prepare_controlled_chat(&chat, settings).unwrap();
     let mut run = model
         .start_controlled(
             prepared,

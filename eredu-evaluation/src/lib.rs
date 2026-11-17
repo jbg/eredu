@@ -12,6 +12,7 @@ mod distribution;
 mod evidence;
 pub mod execution_control;
 pub mod gguf;
+#[cfg(feature = "tensor-capture")]
 pub mod intervention;
 pub mod nemotron_labs_diffusion;
 mod parity;

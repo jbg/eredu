@@ -5,7 +5,10 @@ use eredu_runtime::{SamplingConfigurationError, SpeculativeSampler};
 
 /// MLX sampling and randomness state for backend-generic text generation.
 pub struct MlxTextGenerationState {
+    pub(super) readout_selection: Option<Vec<eredu_core::refinement::RefinementScoreSelection>>,
+    pub(super) readout_rows: Option<eredu_core::refinement::RefinementScoreRows>,
     pub(super) sampling: MlxTextSamplingState,
+    #[cfg(feature = "tensor-capture")]
     pub(super) capture: Option<eredu_runtime::capture::CaptureSession>,
 }
 
@@ -249,6 +252,7 @@ pub(super) fn sample_text_submission(
         .next_prediction
         .checked_add(1)
         .ok_or_else(|| Error::ArchitectureModel("text prediction overflow".into()))?;
+    #[cfg(feature = "tensor-capture")]
     if let Some(capture) = &mut state.capture {
         capture
             .set_commitment_boundary(state.sampling.next_prediction)

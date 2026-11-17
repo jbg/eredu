@@ -3,8 +3,8 @@ use super::*;
 use eredu_core::{CapabilityError, InputTokenCount};
 use eredu_runtime::memory_forecast::LoadedMemoryProfile;
 pub use eredu_runtime::memory_forecast::{
-    CaptureMemoryPlan, ConditionedAssistantMemoryPlan, ConditionedBlockConvolution,
-    ConditionedPredictionBody, ConditionedPredictionScoring, ConditionedPredictionTopology,
+    ConditionedAssistantMemoryPlan, ConditionedBlockConvolution, ConditionedPredictionBody,
+    ConditionedPredictionScoring, ConditionedPredictionTopology,
     ConversionRetentionGroupMemoryPlan, ConversionRetentionMemoryPlan,
     DecodingContinuationMemoryPlan, EmbeddedPredictionMemoryPlan, ForecastCalibration,
     ForecastExecutionContract, GenerationForecastBackend, GenerationForecastError,
@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 mod continuation;
 pub use continuation::*;
 
+#[cfg(feature = "tensor-capture")]
+use eredu_runtime::memory_forecast::CaptureMemoryPlan;
 pub use eredu_runtime::memory_forecast::GenerationForecastOptions;
 
 /// Estimate plus the exact descriptive request and execution contract used for it.
@@ -25,6 +27,7 @@ pub struct GenerationForecast {
     pub refinement: Option<eredu_runtime::memory_forecast::RefinementMemoryPlan>,
     /// Selection geometry and admitted ceilings for capture horizon recomputation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg(feature = "tensor-capture")]
     pub capture: Option<CaptureMemoryPlan>,
     /// Selected speculative resource facts for reproducible phase recomputation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -77,6 +80,7 @@ impl GenerationForecast {
     }
 
     fn reestimate(&mut self) -> Result<(), GenerationForecastError> {
+        #[cfg(feature = "tensor-capture")]
         if let Some(plan) = &self.capture {
             let tokens = self
                 .request
@@ -380,6 +384,7 @@ impl<B: GenerationForecastBackend> LoadedModel<B> {
     /// retained record history and one compact JSON trace. Extra application
     /// copies, snapshots and branches need separate allowances; unrelated unknown
     /// costs remain unknown. Forecasting does not consume capture/trace budgets.
+    #[cfg(feature = "tensor-capture")]
     pub fn forecast_observed_generation(
         &self,
         prepared: &PreparedObservedGeneration<B>,
@@ -390,7 +395,7 @@ impl<B: GenerationForecastBackend> LoadedModel<B> {
                 "prepared forecast request belongs to a different loaded session",
             ));
         }
-        let instrumented = !prepared.plan.is_empty() || prepared.intervention.is_some();
+        let instrumented = !prepared.capture_plan().is_empty() || prepared.intervention.is_some();
         let mut result = self.forecast_count(
             match prepared.prompt.as_ref() {
                 Some(prompt) => self.count_prepared_input(prompt)?,
@@ -404,13 +409,13 @@ impl<B: GenerationForecastBackend> LoadedModel<B> {
         if instrumented {
             let projection = B::capture_memory_projection(
                 &self.runtime,
-                &prepared.plan,
+                prepared.capture_plan(),
                 prepared.intervention.as_ref(),
                 0,
             )?;
             result.capture = Some(CaptureMemoryPlan::new(
                 &result.request,
-                &prepared.plan,
+                prepared.capture_plan(),
                 prepared.intervention.as_ref(),
                 prepared.trace_limits,
                 B::capture_transforms_complete_per_step(&self.runtime),
@@ -530,6 +535,7 @@ pub(super) fn loaded_forecast(
     estimate.assumptions.push("Loaded request: loading is excluded; only declared resident parameter bytes are deducted, never process-global active allocation counters.".into());
     Ok(GenerationForecast {
         refinement: None,
+        #[cfg(feature = "tensor-capture")]
         capture: None,
         speculative: None,
         request,
@@ -602,6 +608,7 @@ pub fn forecast_inspected_generation(
         .assumptions,
     );
     Ok(GenerationForecast {
+        #[cfg(feature = "tensor-capture")]
         capture: None,
         speculative: None,
         refinement: None,

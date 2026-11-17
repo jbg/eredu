@@ -3,7 +3,9 @@ use eredu::api::{
     ChatContentFormat, ChatInputPreparationError, ChatInputRequest, ChatMessage, ChatPart,
     ChatPreparationOptions, ChatToolArgumentFormat, ChatToolCall, TraceLimits,
 };
-use eredu_core::{capture::CapturePlan, MediaRequestError};
+#[cfg(feature = "tensor-capture")]
+use eredu_core::capture::CapturePlan;
+use eredu_core::MediaRequestError;
 use serde_json::json;
 use std::ops::ControlFlow;
 
@@ -85,6 +87,7 @@ fn typed_chat_input_preserves_text_whitespace_and_explicit_joining() {
     assert_eq!(output.token_ids, vec![2, 3]);
 }
 
+#[cfg(feature = "tensor-capture")]
 #[test]
 fn typed_chat_input_media_alignment_and_controlled_output_match_ordinary() {
     let mut expected = None;

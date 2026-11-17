@@ -126,9 +126,7 @@ fn forbidden_tool_candidates_match_ordinary_and_controlled_domains_before_forcin
     let prepared = model
         .prepare_observed_chat(&chat, settings, capture, trace)
         .unwrap();
-    let uncaptured = model
-        .prepare_observed_chat(&chat, settings, CapturePlan::none(), trace)
-        .unwrap();
+    let uncaptured = model.prepare_controlled_chat(&chat, settings).unwrap();
     let expected = model
         .generate_observed(
             uncaptured,

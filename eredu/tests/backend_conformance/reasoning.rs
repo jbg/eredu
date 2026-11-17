@@ -1,6 +1,6 @@
 use super::*;
-use eredu::api::{ObservedGenerationEvent, OutputMode, TraceLimits};
-use eredu_core::{capture::CapturePlan, execution_control::SnapshotLimits};
+use eredu::api::{ObservedGenerationEvent, OutputMode};
+use eredu_core::execution_control::SnapshotLimits;
 use std::ops::ControlFlow;
 
 const TEMPLATE: &str =
@@ -120,17 +120,7 @@ fn reasoning_only_generation_matches_controlled_and_speculative_delivery() {
 #[test]
 fn reasoning_only_snapshot_restores_a_partial_closing_marker() {
     let (mut model, chat, ids) = setup(0);
-    let prepared = model
-        .prepare_observed_chat(
-            &chat,
-            settings(),
-            CapturePlan::none(),
-            TraceLimits {
-                per_record_bytes: 65536,
-                total_bytes: 1024 * 1024,
-            },
-        )
-        .unwrap();
+    let prepared = model.prepare_controlled_chat(&chat, settings()).unwrap();
     let mut events = vec![];
     let mut collect = |record: eredu::api::ControlledGenerationRecord| {
         if let ObservedGenerationEvent::Semantic { event, .. } = record.generation.event {

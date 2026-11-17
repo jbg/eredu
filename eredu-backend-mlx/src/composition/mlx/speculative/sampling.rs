@@ -4,7 +4,9 @@ use super::*;
 #[derive(Clone)]
 pub struct MlxSpeculativeSampling<S> {
     inner: S,
+    #[cfg(feature = "tensor-capture")]
     capture: Option<std::rc::Rc<std::cell::RefCell<LogitCapture>>>,
+    #[cfg(feature = "tensor-capture")]
     interventions: Vec<eredu_core::speculative::SpeculativeInterventionPlan>,
 }
 
@@ -13,7 +15,9 @@ impl<S> MlxSpeculativeSampling<S> {
     pub const fn new(inner: S) -> Self {
         Self {
             inner,
+            #[cfg(feature = "tensor-capture")]
             capture: None,
+            #[cfg(feature = "tensor-capture")]
             interventions: Vec::new(),
         }
     }
@@ -85,6 +89,7 @@ where
                 .checked_add(array.nbytes() as u64)?
                 .checked_add(4096)?;
         }
+        #[cfg(feature = "tensor-capture")]
         for plan in &self.interventions {
             bytes = bytes.checked_add(
                 eredu_runtime::execution_control::admitted_intervention_storage_bytes(&plan.plan)?,
@@ -106,6 +111,7 @@ where
             .checked_add(2 * (4096 + 32))
     }
 
+    #[cfg(feature = "tensor-capture")]
     fn enable_control_capture(
         &mut self,
         plan: eredu_core::capture::AdmittedCapturePlan,
@@ -118,6 +124,7 @@ where
         Ok(())
     }
 
+    #[cfg(feature = "tensor-capture")]
     fn take_control_captures(
         &mut self,
     ) -> Vec<eredu_core::speculative::SpeculativePredictionCapture> {
@@ -126,6 +133,7 @@ where
         })
     }
 
+    #[cfg(feature = "tensor-capture")]
     fn control_intervene(
         &mut self,
         plans: Vec<eredu_core::speculative::SpeculativeInterventionPlan>,
@@ -249,6 +257,7 @@ where
     where
         Self: 'a,
     {
+        #[cfg(feature = "tensor-capture")]
         let role = match placement {
             SamplingPlacement::Target => eredu_core::speculative::SpeculativeCaptureRole::Target,
             SamplingPlacement::Draft => eredu_core::speculative::SpeculativeCaptureRole::Draft,
@@ -256,6 +265,7 @@ where
         };
         let stream = sampling_stream(placement, context)?;
         let logits = MlxTensor::from_array(logits.clone());
+        #[cfg(feature = "tensor-capture")]
         if let Some(capture) = &self.capture {
             return SpeculativeSampler::<MlxSamplingBackend>::process_logits_with_capture(
                 &mut self.inner,
@@ -308,6 +318,7 @@ where
             finalize_refinement_position, RefinementSelection,
         };
         let stream = context.target();
+        #[cfg(feature = "tensor-capture")]
         let scores = SpeculativeSampler::<MlxSamplingBackend>::refinement_scores_with_capture(
             &mut self.inner,
             &MlxTensor::from_array(logits.clone()),
@@ -339,6 +350,14 @@ where
                     .map(MlxTensor::from_array)
                     .unwrap_or_else(|| scores.clone()))
             },
+        )?;
+        #[cfg(not(feature = "tensor-capture"))]
+        let scores = SpeculativeSampler::<MlxSamplingBackend>::refinement_scores_with_capture(
+            &mut self.inner,
+            &MlxTensor::from_array(logits.clone()),
+            history,
+            stream,
+            |scores, _| Ok(scores.clone()),
         )?;
         let domain =
             eredu_runtime::TokenDomain::new(logits.shape().last().copied().unwrap_or(0) as usize);
@@ -531,10 +550,12 @@ fn uniform(state: Option<&mut RandomState>, stream: &Stream) -> Result<f32, Exce
     Ok(random::uniform::<_, f32>(0.0, 1.0, &[1], &key, stream)?.item::<f32>(stream))
 }
 
+#[cfg(feature = "tensor-capture")]
 struct LogitCapture {
     session: eredu_runtime::capture::CaptureSession,
     records: Vec<eredu_core::speculative::SpeculativePredictionCapture>,
 }
+#[cfg(feature = "tensor-capture")]
 impl LogitCapture {
     fn observe(
         &mut self,
@@ -550,6 +571,7 @@ impl LogitCapture {
             capture::CapturePhase,
             speculative::{SpeculativeCaptureRole, SpeculativePredictionCapture},
         };
+        #[cfg(feature = "tensor-capture")]
         let role = match placement {
             SamplingPlacement::Target => SpeculativeCaptureRole::Target,
             SamplingPlacement::Draft => SpeculativeCaptureRole::Draft,
@@ -619,6 +641,7 @@ impl LogitCapture {
     }
 }
 
+#[cfg(feature = "tensor-capture")]
 pub(crate) fn validate_control_capture(
     plan: &eredu_core::capture::AdmittedCapturePlan,
 ) -> Result<(), eredu_core::capture::CaptureError> {

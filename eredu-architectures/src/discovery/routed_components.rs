@@ -32,18 +32,16 @@ pub(super) fn declare_captures(g: &mut Builder) {
             g.partial("routed-unit capture has no declared route cardinality");
             continue;
         }
-        let geometry = eredu_core::capture::RoutedUnitGeometry {
+        let geometry = eredu_core::routing::RoutedUnitGeometry {
             experts: group.expert_count as u64,
             units_per_expert: group.units_per_expert as u64,
             routes_per_token: routes as u64,
         };
-        if let Ok(components) = geometry.components().and_then(|n| {
-            usize::try_from(n).map_err(|_| {
-                eredu_core::capture::CaptureError::Invalid(
-                    "sparse component extent overflow".into(),
-                )
-            })
-        }) {
+        if let Some(components) = geometry
+            .component_extent()
+            .ok()
+            .and_then(|n| usize::try_from(n).ok())
+        {
             use eredu_core::intervention::*;
             g.interventions.push(InterventionPoint {
                 path: group.activation.clone(), node_id: group.node_id.clone(),

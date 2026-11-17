@@ -50,6 +50,7 @@ pub(in crate::composition::mlx) use execution_streams::BorrowedTargetObserver;
 pub use execution_streams::SpeculativeExecutionStreams;
 #[cfg(test)]
 use sampling::array_probability_at;
+#[cfg(feature = "tensor-capture")]
 pub(crate) use sampling::validate_control_capture;
 pub use sampling::MlxSpeculativeSampling;
 

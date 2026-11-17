@@ -487,6 +487,7 @@ impl<B: MultimodalPreparationBackend + ModelCapabilityBackend> LoadedModel<B> {
 
 impl<B: ModelCapabilityBackend> LoadedModel<B> {
     /// Admits the same typed input with prospective interventions for ordinary or controlled runs.
+    #[cfg(feature = "tensor-capture")]
     pub fn prepare_intervened_chat_input(
         &self,
         prepared: PreparedChatRequest<B>,
@@ -502,6 +503,7 @@ impl<B: ModelCapabilityBackend> LoadedModel<B> {
 
     /// Admits counted typed input for observed or controlled execution using its actual decoder IDs.
     /// Media IDs come from architecture-declared alignment, never from rendered sentinels or embeddings.
+    #[cfg(feature = "tensor-capture")]
     pub fn prepare_observed_chat_input(
         &self,
         prepared: PreparedChatRequest<B>,

@@ -223,7 +223,7 @@ fn session_validation_rechecks_loaded_capture_capabilities_before_estimating() {
 }
 
 #[test]
-fn none_is_not_legacy_capture_all() {
+fn empty_capture_plan_performs_no_host_copies() {
     let (_, catalog, support, capabilities) = fixture(CaptureTransform::Summary);
     let admitted = admit(CapturePlan::none(), &catalog, &support, &capabilities).unwrap();
     let mut session = CaptureSession::new(admitted);
@@ -236,7 +236,6 @@ fn none_is_not_legacy_capture_all() {
         .unwrap();
     assert!(session.take_step().unwrap().records.is_empty());
     assert_eq!(backend.copies.get(), 0);
-    assert!(ObservationRequest::selected([]).matches("block.output"));
 }
 
 #[test]

@@ -4347,16 +4347,19 @@ creation. The retained result contains every exact
 physical source, executable format, lowering descriptor, and reader-cache
 mechanism setting consumed later by assistant materialization. Target or draft
 streams therefore cannot exist when assistant selection fails.
-Backends may additionally implement `InspectableBackendSession` by binding the
-named activation and routed-expert points already emitted by
-`eredu-runtime::ActivationObserver`. These are general diagnostics contracts
-used by telemetry, inspection, observability, and evaluation rather than an
-evaluation-specific backend surface. `ActivationObserver` is also an
-intervention contract: every named activation returned by instrumented
-execution must include any replacement it supplies. Family adapters and
-topology executors finalize logits through
-`eredu_runtime::observe_model_logits`; pipeline execution does so on the
-logits-owning rank before submitting its completion. Realtime applications
+`tensor-capture` enables MLX activation collectors, interventions and partition
+receipts at architecture-declared observation points. The facade admits and
+delivers records on the same generation driver used by `prepare_controlled_chat`.
+The portable contracts describe requests and host records, runtime capture
+owns reservations and delivery accounting, and MLX implements transformations
+and transport. Cold catalogs and observation of completed outputs remain
+available in plain builds. Parameter inspection resolves the retained artifact
+identity directly from prepared sources. MLX exposes named activation collection
+through bounded capture. Family and topology executors retain their internal
+state taps and finalize logits through `eredu_runtime::observe_model_logits` on
+the logits-owning rank. The neutral selected refinement-score contract uses
+that refinement operation's full-vocabulary normalization and returns only
+the requested token IDs and scores. Realtime applications
 likewise exchange portable host token frames through the facade. Runtime ingress
 validates their exact batch and token geometry before a backend conversion
 mechanism can create native tensors. Runtime prepublication waits for the exact

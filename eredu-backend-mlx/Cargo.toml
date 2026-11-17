@@ -48,7 +48,18 @@ name = "lfm3_audio_reference"
 path = "examples/lfm3_audio_reference.rs"
 required-features = ["audio"]
 
+[[example]]
+name = "capture_discovery"
+path = "examples/capture_discovery.rs"
+required-features = ["tensor-capture"]
+
 [features]
+tensor-capture = [
+    "eredu-core/tensor-capture",
+    "eredu-runtime/tensor-capture",
+    "eredu-architectures/tensor-capture",
+    "eredu-evaluation/tensor-capture",
+]
 default = []
 accelerate = ["safemlx/accelerate"]
 metal = ["safemlx/metal"]

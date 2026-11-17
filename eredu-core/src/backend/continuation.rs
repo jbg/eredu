@@ -317,9 +317,60 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
             .map_err(|error| ControlledTextGenerationError::Backend(error).into())
     }
 
+    /// Requests selected scores for the next refinement operation.
+    pub fn configure_refinement_readout<C: TokenFilterController>(
+        &self,
+        state: &mut TextGenerationContinuation<B, C>,
+        selections: Vec<crate::refinement::RefinementScoreSelection>,
+    ) -> Result<(), crate::refinement::RefinementReadoutError> {
+        use crate::refinement::RefinementReadoutError;
+        self.validate(state)
+            .map_err(|_| RefinementReadoutError::Boundary)?;
+        state
+            .require_quiescent()
+            .map_err(|_| RefinementReadoutError::Boundary)?;
+        B::configure_refinement_readout(self.runtime, &mut state.inner.backend_state, selections)
+    }
+
+    /// Drains selected scores after exact completion.
+    pub fn take_refinement_readout<C: TokenFilterController>(
+        &self,
+        state: &mut TextGenerationContinuation<B, C>,
+    ) -> Result<
+        Option<crate::refinement::RefinementScoreRows>,
+        crate::refinement::RefinementReadoutError,
+    > {
+        use crate::refinement::RefinementReadoutError;
+        self.validate(state)
+            .map_err(|_| RefinementReadoutError::Boundary)?;
+        state
+            .require_quiescent()
+            .map_err(|_| RefinementReadoutError::Boundary)?;
+        Ok(B::take_refinement_readout(&mut state.inner.backend_state))
+    }
+
+    /// Establishes exact native completion at the current operation boundary.
+    #[cfg(not(feature = "tensor-capture"))]
+    pub fn take_completed_step<C: TokenFilterController>(
+        &mut self,
+        state: &mut TextGenerationContinuation<B, C>,
+    ) -> Result<(), TextContinuationError<B::Error, C::Error>> {
+        self.validate(state)?;
+        let was_failed = state.failed;
+        state.failed = true;
+        state
+            .inner
+            .resolve_completions_before_decode()
+            .map_err(ControlledTextGenerationError::Backend)?;
+        state.records_drained = true;
+        state.failed = was_failed;
+        Ok(())
+    }
+
     /// Settles exact native completion and moves out the single bounded record
     /// batch. It remains available after failure for attributed error evidence;
     /// draining never turns a failed continuation into a resumable one.
+    #[cfg(feature = "tensor-capture")]
     pub fn take_completed_step<C: TokenFilterController>(
         &mut self,
         state: &mut TextGenerationContinuation<B, C>,
@@ -338,6 +389,7 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
     }
 
     /// Installs observations before the first model prediction.
+    #[cfg(feature = "tensor-capture")]
     pub fn enable_capture<C: TokenFilterController>(
         &mut self,
         state: &mut TextGenerationContinuation<B, C>,
@@ -354,6 +406,7 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
     }
 
     /// Installs immutable observation/intervention admissions before execution.
+    #[cfg(feature = "tensor-capture")]
     pub fn enable_interventions<C: TokenFilterController>(
         &mut self,
         state: &mut TextGenerationContinuation<B, C>,

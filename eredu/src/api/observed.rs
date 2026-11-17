@@ -5,12 +5,13 @@ use super::{
     PreparedChatGenerationSettings, PreparedChatInput, TextDecoderError,
 };
 use crate::runtime::chat::PreparedChat;
+#[cfg(feature = "tensor-capture")]
+use eredu_core::intervention::{AdmittedInterventionPlan, InterventionDiscovery, InterventionPlan};
 use eredu_core::{
     capture::*,
     generation::{
         FinishReason, GenerationCancellationToken, ResolvedGenerationConfig, SemanticEvent,
     },
-    intervention::{AdmittedInterventionPlan, InterventionDiscovery, InterventionPlan},
     TextGenerationBackend,
 };
 use serde::{Deserialize, Serialize};
@@ -57,7 +58,9 @@ pub struct PreparedObservedGeneration<B: TextGenerationBackend> {
     pub(super) settings: PreparedChatGenerationSettings,
     pub(super) canvas: Option<std::sync::Arc<eredu_core::refinement::RefinementCanvas>>,
     pub(super) resolved: ResolvedGenerationConfig,
+    #[cfg(feature = "tensor-capture")]
     pub(super) plan: AdmittedCapturePlan,
+    #[cfg(feature = "tensor-capture")]
     pub(super) intervention: Option<AdmittedInterventionPlan>,
     pub(super) session_identity: String,
     pub(super) artifact_identity: Option<String>,
@@ -88,10 +91,12 @@ impl<B: TextGenerationBackend> PreparedObservedGeneration<B> {
         &self.prompt_token_ids
     }
     /// Immutable admitted capture selections and request geometry.
+    #[cfg(feature = "tensor-capture")]
     pub fn capture_plan(&self) -> &AdmittedCapturePlan {
         &self.plan
     }
     /// Immutable prospective intervention admission, absent for an ordinary run.
+    #[cfg(feature = "tensor-capture")]
     pub fn intervention_plan(&self) -> Option<&AdmittedInterventionPlan> {
         self.intervention.as_ref()
     }
@@ -136,6 +141,7 @@ pub enum ObservedGenerationEvent {
         /// Physical handoff and authoritative commitment coordinates.
         position: eredu_core::refinement::GenerationPosition,
         /// Bounded records from settling the committed causal suffix.
+        #[cfg(feature = "tensor-capture")]
         captures: Option<CapturedStep>,
         /// Cache settlement, observation and completion elapsed time.
         step_seconds: f64,
@@ -192,6 +198,7 @@ pub enum ObservedGenerationEvent {
         /// Independent completed-work and authoritative-output coordinates.
         position: eredu_core::refinement::GenerationPosition,
         /// Physical chunk geometry and captures, if observation was requested.
+        #[cfg(feature = "tensor-capture")]
         captures: Option<CapturedStep>,
         /// Wall time of this completed prefix and capture settlement.
         step_seconds: f64,
@@ -205,6 +212,7 @@ pub enum ObservedGenerationEvent {
         position: eredu_core::refinement::GenerationPosition,
     },
     /// Captures from an operation that failed before a token was committed.
+    #[cfg(feature = "tensor-capture")]
     CaptureFailure {
         /// Index of the unsuccessful prediction attempt.
         prediction_index: u64,
@@ -247,6 +255,7 @@ pub enum ObservedGenerationEvent {
         /// Rank owning these complete values. Partitioned capture is rejected.
         rank: u32,
         /// Bounded records, absent when both capture and intervention plans are empty.
+        #[cfg(feature = "tensor-capture")]
         captures: Option<CapturedStep>,
         /// Submission, capture, sampling, token read and exact completion elapsed time.
         step_seconds: f64,
@@ -313,6 +322,7 @@ impl<F: FnMut(ObservedGenerationRecord) -> ControlFlow<()>> Delivery<F> {
 
 impl<B: TextGenerationBackend> LoadedModel<B> {
     /// Returns genuine mutable points and actual loaded-session support.
+    #[cfg(feature = "tensor-capture")]
     pub fn intervention_discovery(&self) -> Result<InterventionDiscovery, CaptureError> {
         B::intervention_discovery(&self.runtime)
     }
@@ -322,6 +332,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
     /// session before preparing an independent experiment. Controlled entry points
     /// support pausing, snapshots and prospective branch changes when the backend
     /// and complete continuation storage estimates support them.
+    #[cfg(feature = "tensor-capture")]
     pub fn prepare_intervened_chat(
         &self,
         chat: &PreparedChat,
@@ -337,6 +348,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
     /// Admits an exact token-ID prefix with prospective interventions. The chat
     /// supplies the output/termination contract only; the prefix is never decoded
     /// or re-tokenized. Start from reset state or a prepared-boundary snapshot.
+    #[cfg(feature = "tensor-capture")]
     pub fn prepare_intervened_token_ids(
         &self,
         chat: &PreparedChat,
@@ -351,6 +363,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         self.admit_prepared_interventions(prepared, intervention)
     }
 
+    #[cfg(feature = "tensor-capture")]
     pub(super) fn admit_prepared_interventions(
         &self,
         mut prepared: PreparedObservedGeneration<B>,
@@ -373,15 +386,19 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
             )
             .into());
         }
-        let admitted =
-            intervention.admit(&discovery, prepared.plan.request(), &self.session_identity)?;
-        B::validate_text_interventions(&self.runtime, &prepared.plan, &admitted)?;
+        let admitted = intervention.admit(
+            &discovery,
+            prepared.capture_plan().request(),
+            &self.session_identity,
+        )?;
+        B::validate_text_interventions(&self.runtime, prepared.capture_plan(), &admitted)?;
         prepared.artifact_identity = Some(discovery.artifact_identity);
         prepared.intervention = Some(admitted);
         Ok(prepared)
     }
 
     /// Returns loaded observation and collector facts without resolving source contents.
+    #[cfg(feature = "tensor-capture")]
     pub fn capture_declarations(
         &self,
     ) -> Result<eredu_core::capture::CaptureDeclarations, CaptureError> {
@@ -389,10 +406,12 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
     }
 
     /// Resolves content-exact provenance together with loaded observation facts.
+    #[cfg(feature = "tensor-capture")]
     pub fn capture_discovery(&self) -> Result<CaptureDiscovery, CaptureError> {
         B::capture_discovery(&self.runtime)
     }
 
+    #[cfg(feature = "tensor-capture")]
     pub(super) fn admit_capture(
         &self,
         plan: CapturePlan,
@@ -440,8 +459,46 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         Ok((admitted, artifact_identity))
     }
 
+    /// Prepares a plain controlled chat run without a tensor collection plan.
+    pub fn prepare_controlled_chat(
+        &self,
+        chat: &PreparedChat,
+        settings: PreparedChatGenerationSettings,
+    ) -> Result<PreparedObservedGeneration<B>, PreparedChatError> {
+        let prompt_token_ids = self
+            .tokenizer
+            .encode(chat.rendered_prompt(), false)
+            .map_err(TextDecoderError::Tokenizer)?
+            .get_ids()
+            .to_vec();
+        self.prepare_controlled_token_ids(
+            chat,
+            prompt_token_ids,
+            settings,
+            super::GenerationControlOptions::default().trace_limits,
+        )
+    }
+
+    pub(super) fn prepare_controlled_token_ids(
+        &self,
+        chat: &PreparedChat,
+        prompt_token_ids: Vec<u32>,
+        settings: PreparedChatGenerationSettings,
+        trace_limits: TraceLimits,
+    ) -> Result<PreparedObservedGeneration<B>, PreparedChatError> {
+        self.prepare_generation(
+            chat,
+            prompt_token_ids,
+            settings,
+            trace_limits,
+            #[cfg(feature = "tensor-capture")]
+            CapturePlan::none(),
+        )
+    }
+
     /// Tokenizes with this model, resolves ordinary settings/EOS semantics, and
     /// admits capture against the loaded session before any execution is submitted.
+    #[cfg(feature = "tensor-capture")]
     pub fn prepare_observed_chat(
         &self,
         chat: &PreparedChat,
@@ -462,6 +519,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
     /// IDs must belong to this loaded tokenizer. `chat` retains the output contract
     /// (EOS, stop/semantic policy); its rendered prompt is not submitted. Captures
     /// are planned before replay. No output token is forced by this operation.
+    #[cfg(feature = "tensor-capture")]
     pub fn prepare_observed_token_ids(
         &self,
         chat: &PreparedChat,
@@ -469,6 +527,17 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         settings: PreparedChatGenerationSettings,
         plan: CapturePlan,
         trace_limits: TraceLimits,
+    ) -> Result<PreparedObservedGeneration<B>, PreparedChatError> {
+        self.prepare_generation(chat, prompt_token_ids, settings, trace_limits, plan)
+    }
+
+    fn prepare_generation(
+        &self,
+        chat: &PreparedChat,
+        prompt_token_ids: Vec<u32>,
+        settings: PreparedChatGenerationSettings,
+        trace_limits: TraceLimits,
+        #[cfg(feature = "tensor-capture")] plan: CapturePlan,
     ) -> Result<PreparedObservedGeneration<B>, PreparedChatError> {
         if self.prompt_cache_store.is_some() {
             return Err(CaptureError::Unsupported("automatic prompt-cache store publication is outside controlled snapshot and observation budgets; remove the configured store for observed execution".into()).into());
@@ -483,13 +552,17 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
             )
             .into());
         }
-        let (config, max_tokens) = self.resolve_text_generation_settings(settings)?;
+        let (config, _max_tokens) = self.resolve_text_generation_settings(settings)?;
+        #[cfg(feature = "tensor-capture")]
         let request = CaptureRequestShape {
             batch: 1,
             prompt_tokens: prompt_token_ids.len() as u64,
-            max_predictions: max_tokens.get() as u64,
+            max_predictions: _max_tokens.get() as u64,
         };
-        let (admitted, artifact_identity) = self.admit_capture(plan, request)?;
+        #[cfg(feature = "tensor-capture")]
+        let (plan, artifact_identity) = self.admit_capture(plan, request)?;
+        #[cfg(not(feature = "tensor-capture"))]
+        let artifact_identity = None;
         if trace_limits.per_record_bytes == 0 || trace_limits.total_bytes == 0 {
             return Err(CaptureError::Invalid("trace byte limits must be positive".into()).into());
         }
@@ -503,7 +576,9 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
             settings,
             canvas: None,
             resolved: config.sampling(),
-            plan: admitted,
+            #[cfg(feature = "tensor-capture")]
+            plan,
+            #[cfg(feature = "tensor-capture")]
             intervention: None,
             session_identity: self.session_identity.clone(),
             artifact_identity,
@@ -517,6 +592,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
     /// `prompt`, including media placeholders. They provide capture and trace alignment;
     /// embeddings are never used to reconstruct IDs. The backend still validates the
     /// prepared input and its full decoder geometry before executing any chunk.
+    #[cfg(feature = "tensor-capture")]
     pub fn prepare_observed_input(
         &self,
         chat: &PreparedChat,
@@ -530,6 +606,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
             chat,
             original_token_ids,
             settings,
+            #[cfg(feature = "tensor-capture")]
             plan,
             trace_limits,
         )?;
@@ -573,7 +650,13 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
             artifact_identity: prepared.artifact_identity,
             parameter_overlay_id: prepared.parameter_overlay_id,
             session_id: self.session_identity.clone(),
+            #[cfg(feature = "tensor-capture")]
             capture_plan_id: prepared.plan.identity().into(),
+            #[cfg(not(feature = "tensor-capture"))]
+            capture_plan_id: String::new(),
+            #[cfg(not(feature = "tensor-capture"))]
+            intervention_plan_id: None,
+            #[cfg(feature = "tensor-capture")]
             intervention_plan_id: prepared
                 .intervention
                 .as_ref()
@@ -603,7 +686,9 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
                 generation: prepared.resolved,
                 seed: prepared.settings.seed,
             });
-        let mut on_token = |kind: super::request::GenerationStepKind, captures, step_seconds| {
+        let mut on_token = |kind: super::request::GenerationStepKind,
+                            #[cfg(feature = "tensor-capture")] captures,
+                            step_seconds| {
             let mut delivery = delivery.borrow_mut();
             let index = delivery.prediction;
             let input_range = (!delivery.iterative).then(|| {
@@ -630,6 +715,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
                     delivery.send(ObservedGenerationEvent::ModeChanged {
                         acknowledgement,
                         position,
+                        #[cfg(feature = "tensor-capture")]
                         captures,
                         step_seconds,
                     });
@@ -651,12 +737,15 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
                     delivery.send(ObservedGenerationEvent::Progress {
                         progress,
                         position,
+                        #[cfg(feature = "tensor-capture")]
                         captures,
                         step_seconds,
                     });
                     return;
                 }
+                #[cfg(feature = "tensor-capture")]
                 super::request::GenerationStepKind::Failed => {
+                    #[cfg(feature = "tensor-capture")]
                     if let Some(captures) = captures {
                         delivery.send(ObservedGenerationEvent::CaptureFailure {
                             prediction_index: index,
@@ -682,6 +771,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
                 input_range,
                 committed: true,
                 rank: 0,
+                #[cfg(feature = "tensor-capture")]
                 captures,
                 step_seconds,
             });
@@ -712,12 +802,14 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
                 cancellation,
                 on_event,
             },
-            Some((
-                prepared.plan,
-                prepared.intervention,
-                &mut on_token,
-                &delivery_failure,
-            )),
+            Some(super::loaded::GenerationStepDelivery {
+                #[cfg(feature = "tensor-capture")]
+                plan: prepared.plan,
+                #[cfg(feature = "tensor-capture")]
+                intervention: prepared.intervention,
+                on_step: &mut on_token,
+                failure: &delivery_failure,
+            }),
             started,
             mode,
             prepared.canvas,

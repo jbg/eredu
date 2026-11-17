@@ -17,6 +17,7 @@ pub(super) fn content_discovery_calls() -> usize {
 #[derive(Default)]
 pub(super) struct State {
     pub sampling: Sampling,
+    #[cfg(feature = "tensor-capture")]
     pub capture: Option<eredu_runtime::capture::CaptureSession>,
 }
 
@@ -100,15 +101,19 @@ pub(super) fn cost(shape: &[u64]) -> Result<CaptureUsage, CaptureError> {
     })
 }
 
+#[cfg(feature = "tensor-capture")]
 pub(super) fn validate(plan: &AdmittedCapturePlan) -> Result<(), CaptureError> {
     eredu_runtime::capture::validate_session(plan, &discovery().declarations(), |shape, _, _| {
         cost(shape)
     })
 }
 
+#[cfg(feature = "tensor-capture")]
 struct Mechanism;
 
+#[cfg(feature = "tensor-capture")]
 struct SpeculativeProvider;
+#[cfg(feature = "tensor-capture")]
 impl eredu_runtime::capture::CaptureBackendProvider for SpeculativeProvider {
     type Tensor = Value;
     type Error = MockError;
@@ -118,12 +123,15 @@ impl eredu_runtime::capture::CaptureBackendProvider for SpeculativeProvider {
     }
 }
 
+#[cfg(feature = "tensor-capture")]
 type InternalObserver = eredu_runtime::capture::SpeculativeCaptureObserver<
     SpeculativeProvider,
     fn(&eredu_runtime::capture::CaptureExecutionError<MockError>) -> MockError,
 >;
 
+#[cfg(feature = "tensor-capture")]
 pub(super) struct InternalCapture(InternalObserver);
+#[cfg(feature = "tensor-capture")]
 impl InternalCapture {
     pub fn new(
         plan: &eredu_core::speculative::AdmittedSpeculativeActivations,
@@ -180,10 +188,12 @@ impl InternalCapture {
     }
 }
 #[derive(Clone)]
+#[cfg(feature = "tensor-capture")]
 struct Value {
     shape: Vec<u64>,
     scale: f32,
 }
+#[cfg(feature = "tensor-capture")]
 impl CaptureBackend for Mechanism {
     type Tensor = Value;
     type Error = MockError;
@@ -242,10 +252,12 @@ impl State {
         sequence: usize,
         token: u32,
     ) -> Result<u32, MockError> {
+        #[cfg(feature = "tensor-capture")]
         let mut value = Value {
             shape: vec![1, sequence as u64, 1],
             scale: 1.0,
         };
+        #[cfg(feature = "tensor-capture")]
         if let Some(capture) = &mut self.capture {
             capture
                 .begin_step(phase, self.sampling.prediction)
@@ -267,10 +279,17 @@ impl State {
             observer.finish()?;
         }
         self.sampling.prediction += 1;
-        Ok((token as f32 * value.scale) as u32)
+        #[cfg(feature = "tensor-capture")]
+        return Ok((token as f32 * value.scale) as u32);
+        #[cfg(not(feature = "tensor-capture"))]
+        {
+            let _ = (phase, sequence);
+            Ok(token)
+        }
     }
 }
 
+#[cfg(feature = "tensor-capture")]
 impl InterventionBackend for Mechanism {
     fn mask_components(&mut self, _: &Value, _: &[u32], _: bool) -> Result<Value, MockError> {
         Err(MockError::Capture(
@@ -338,7 +357,9 @@ impl InterventionBackend for Mechanism {
     }
 }
 
+#[cfg(feature = "tensor-capture")]
 pub(super) struct Estimates;
+#[cfg(feature = "tensor-capture")]
 impl InterventionEstimator for Estimates {
     fn activation_usage(
         &self,
@@ -412,6 +433,7 @@ pub(super) fn intervention_discovery(session: &str) -> InterventionDiscovery {
     }
 }
 
+#[cfg(feature = "tensor-capture")]
 pub(super) fn plan() -> CapturePlan {
     let usage = CaptureUsage {
         captures: 100,
@@ -438,6 +460,7 @@ pub(super) fn plan() -> CapturePlan {
     }
 }
 
+#[cfg(feature = "tensor-capture")]
 pub(super) fn intervention_plan(factor: f32) -> InterventionPlan {
     InterventionPlan {
         schema_version: eredu_core::intervention::INTERVENTION_SCHEMA_VERSION,
@@ -455,6 +478,7 @@ pub(super) fn intervention_plan(factor: f32) -> InterventionPlan {
     }
 }
 
+#[cfg(feature = "tensor-capture")]
 #[test]
 fn intervened_facade_keeps_outcomes_cancellation_failure_and_consumer_lifetimes() {
     use eredu::api::{ObservedGenerationEvent as Event, TraceLimits};
@@ -702,6 +726,7 @@ fn intervened_facade_keeps_outcomes_cancellation_failure_and_consumer_lifetimes(
 }
 
 #[test]
+#[cfg(feature = "tensor-capture")]
 fn intervention_admission_cannot_transfer_between_identical_artifact_sessions() {
     let runtime = ModelRuntime::prepare(MockBackend, Default::default()).unwrap();
     let other = ModelRuntime::prepare(MockBackend, Default::default()).unwrap();

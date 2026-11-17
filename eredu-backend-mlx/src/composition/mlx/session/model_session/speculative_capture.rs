@@ -1,24 +1,36 @@
 //! Native resources bound to architecture-selected internal capture placement.
 use super::*;
+use eredu_architectures::prepared_sources::PreparedModelDiscovery;
+#[cfg(feature = "tensor-capture")]
 use eredu_architectures::{
-    component_partition::ComponentPartitionLayouts, prepared_sources::PreparedModelDiscovery,
+    component_partition::ComponentPartitionLayouts,
     speculative_execution::SpeculativeActivationExecution,
 };
-use eredu_core::{capture::*, speculative::*};
+use eredu_core::capture::CaptureError;
+#[cfg(feature = "tensor-capture")]
+use eredu_core::speculative::*;
+#[cfg(feature = "tensor-capture")]
 use eredu_runtime::capture::{
     partition::*, CaptureExecutionError, PartitionCaptureBackendProvider,
     SpeculativeCaptureObserver,
 };
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+#[cfg(feature = "tensor-capture")]
+use std::sync::OnceLock;
 
+#[cfg(feature = "tensor-capture")]
 pub(super) type LayoutsCell = Arc<OnceLock<Result<Arc<ComponentPartitionLayouts>, CaptureError>>>;
 
 pub(in crate::composition::mlx) struct SpeculativePartitionBinding {
     prepared: Option<Arc<PreparedModelDiscovery>>,
     transport: Arc<MlxDistributedSession>,
+    #[cfg(feature = "tensor-capture")]
     execution: Option<SpeculativeActivationExecution>,
+    #[cfg(feature = "tensor-capture")]
     session_identity: String,
+    #[cfg(feature = "tensor-capture")]
     overlay: Option<String>,
+    #[cfg(feature = "tensor-capture")]
     layouts: LayoutsCell,
 }
 impl std::fmt::Debug for SpeculativePartitionBinding {
@@ -37,13 +49,17 @@ impl MlxModelSession {
         Some(SpeculativePartitionBinding {
             prepared: self.capture_discovery.clone(),
             transport: Arc::new(self.payload.distributed.as_ref()?.clone()),
+            #[cfg(feature = "tensor-capture")]
             execution: self
                 .payload
                 .model
                 .erased()
                 .speculative_activation_execution(),
+            #[cfg(feature = "tensor-capture")]
             session_identity: self.intervention_session_identity.clone(),
+            #[cfg(feature = "tensor-capture")]
             overlay: self.payload.parameter_state.active.clone(),
+            #[cfg(feature = "tensor-capture")]
             layouts: Arc::clone(&self.speculative_capture_layouts),
         })
     }
@@ -129,6 +145,7 @@ impl SpeculativePartitionBinding {
             CaptureError::Unsupported("session has no retained activation catalog".into())
         })
     }
+    #[cfg(feature = "tensor-capture")]
     fn execution(&self) -> Result<&SpeculativeActivationExecution, CaptureError> {
         self.execution.as_ref().ok_or_else(|| {
             CaptureError::Unsupported(
@@ -136,6 +153,7 @@ impl SpeculativePartitionBinding {
             )
         })
     }
+    #[cfg(feature = "tensor-capture")]
     fn layouts(&self) -> Result<Arc<ComponentPartitionLayouts>, CaptureError> {
         self.layouts
             .get_or_init(|| {
@@ -159,6 +177,7 @@ impl SpeculativePartitionBinding {
             })
             .clone()
     }
+    #[cfg(feature = "tensor-capture")]
     pub(in crate::composition::mlx) fn discovery(
         &self,
     ) -> Result<SpeculativeActivationDiscovery, CaptureError> {
@@ -190,6 +209,7 @@ impl SpeculativePartitionBinding {
         discovery.captures.support.capture.conditions.push("Every model rank participates in the same invocation plan; committed receipts retain independent prediction and physical sequence coordinates".into());
         Ok(discovery)
     }
+    #[cfg(feature = "tensor-capture")]
     pub(in crate::composition::mlx) fn observer(
         &self,
         plan: &AdmittedSpeculativeActivations,

@@ -2,11 +2,13 @@ use super::*;
 
 mod block_refinement;
 mod memory_forecast;
+#[cfg(feature = "tensor-capture")]
 mod partition_capture;
 pub(super) mod shared_speculation;
 mod speculative_capture;
 pub(in crate::composition::mlx) use speculative_capture::SpeculativePartitionBinding;
 #[cfg(test)]
+#[cfg(feature = "tensor-capture")]
 mod partition_capture_tests;
 use eredu_core::{BackendFailure, BackendFailureKind};
 use std::{
@@ -624,7 +626,9 @@ pub struct MlxModelSession {
     capabilities: eredu_core::SessionCapabilities,
     capture_discovery:
         Option<std::sync::Arc<eredu_architectures::prepared_sources::PreparedModelDiscovery>>,
+    #[cfg(feature = "tensor-capture")]
     speculative_capture_layouts: speculative_capture::LayoutsCell,
+    #[cfg(feature = "tensor-capture")]
     partition_capture: std::cell::OnceCell<
         Result<
             std::sync::Arc<partition_capture::LoadedPartitionCapture>,
@@ -721,7 +725,9 @@ impl MlxModelSession {
             floating_state_dtype_bytes,
             capabilities: realized_capabilities,
             capture_discovery,
+            #[cfg(feature = "tensor-capture")]
             speculative_capture_layouts: Default::default(),
+            #[cfg(feature = "tensor-capture")]
             partition_capture: std::cell::OnceCell::new(),
             intervention_session_identity,
             state_residency,
@@ -922,6 +928,7 @@ impl MlxModelSession {
         self.payload.model.speculative_capability()
     }
 
+    #[cfg(feature = "tensor-capture")]
     pub(in crate::composition::mlx) fn speculative_activation_discovery(
         &self,
     ) -> Result<
@@ -953,54 +960,10 @@ impl MlxModelSession {
         )
     }
 
-    /// Installs causal observers on this session's selected embedded-prediction executor.
-    pub fn install_embedded_prediction_observers<TensorObserver, LogitsObserver>(
-        &mut self,
-        tensors: TensorObserver,
-        logits: LogitsObserver,
-    ) -> Result<(), Error>
-    where
-        TensorObserver: RuntimeActivationObserver<MlxTensor, Exception> + 'static,
-        LogitsObserver: RuntimeActivationObserver<Array, Exception> + 'static,
-    {
-        self.install_embedded_prediction_observer_set(
-            eredu_architectures::speculative_execution::EmbeddedPredictionObservers::new(
-                tensors, logits,
-            ),
-        )
-    }
-
-    /// Installs outer observers and optional phase-aware internal observation authority.
-    /// This native binding consumes the architecture-owned observer set; portable
-    /// capture admission and record delivery remain the caller's responsibility.
-    pub fn install_embedded_prediction_observer_set(
-        &mut self,
-        observers: eredu_architectures::speculative_execution::EmbeddedPredictionObservers<
-            MlxTensor,
-            Array,
-            Exception,
-        >,
-    ) -> Result<(), Error> {
-        self.ensure_no_submission_in_flight()?;
-        if !self.payload.model.erased().has_embedded_prediction() {
-            return Err(Error::ArchitectureModel(
-                "session has no selected embedded-prediction executor".into(),
-            ));
-        }
-        self.with_model_operation(|model| {
-            if model.install_embedded_prediction_observers(observers) {
-                Ok(())
-            } else {
-                Err(Error::ArchitectureModel(
-                    "session has no selected embedded-prediction executor".into(),
-                ))
-            }
-        })
-    }
-
     /// Moves one already charged internal speculative record after execution.
     /// This performs no native work and does not imply proposal acceptance.
     /// A live completion retaining the payload returns a neutral busy failure.
+    #[cfg(feature = "tensor-capture")]
     pub fn take_speculative_activation_capture(
         &mut self,
     ) -> Result<
@@ -1416,17 +1379,7 @@ impl MlxModelSession {
         )
     }
 
-    /// Submits instrumented prefill through this selected MLX session.
-    pub fn submit_prefill_with_observer(
-        &mut self,
-        backend: &MlxBackend<'_>,
-        input: MlxModelInput,
-        observer: &mut impl RuntimeActivationObserver<MlxTensor, Error>,
-    ) -> Result<Submission<Array, MlxSessionCompletion>, Error> {
-        self.submit_prefill_result_with_observer(backend, Ok(input), None, observer)
-    }
-
-    fn submit_prefill_result_with_observer(
+    pub(super) fn submit_prefill_result_with_observer(
         &mut self,
         backend: &MlxBackend<'_>,
         input: Result<MlxModelInput, Error>,
@@ -1656,52 +1609,6 @@ impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession {
     }
 }
 
-impl<'a> InspectableBackendSession<MlxBackend<'a>> for MlxModelSession {
-    fn inspect_prefill(
-        &mut self,
-        backend: &MlxBackend<'a>,
-        input: Self::PrefillInput,
-        request: &ObservationRequest,
-    ) -> Result<InspectedOutput<Self::Output>, Error> {
-        let mut collector = InspectionCollector::new(request);
-        let submission = self.submit_prefill_with_observer(backend, input, &mut collector)?;
-        let logits = submission.wait()?;
-        let output = if self.payload.model.erased().partition_public_output() {
-            MlxModelOutput::new(Some(MlxTensor::from_array(logits)))
-        } else {
-            MlxModelOutput::new(None)
-        };
-        let observations =
-            self.with_shared_operation(|| collector.materialize(backend.stream()))?;
-        Ok(InspectedOutput {
-            output,
-            observations,
-        })
-    }
-
-    fn inspect_decode(
-        &mut self,
-        backend: &MlxBackend<'a>,
-        input: Self::DecodeInput,
-        request: &ObservationRequest,
-    ) -> Result<InspectedOutput<Self::Output>, Error> {
-        let mut collector = InspectionCollector::new(request);
-        let submission = self.submit_decode_with_observer(backend, || Ok(input), &mut collector)?;
-        let logits = submission.wait()?;
-        let output = if self.payload.model.erased().partition_public_output() {
-            MlxModelOutput::new(Some(MlxTensor::from_array(logits)))
-        } else {
-            MlxModelOutput::new(None)
-        };
-        let observations =
-            self.with_shared_operation(|| collector.materialize(backend.stream()))?;
-        Ok(InspectedOutput {
-            output,
-            observations,
-        })
-    }
-}
-
 impl<'a> TextGenerationBackend for MlxBackend<'a> {
     fn residency_telemetry(
         runtime: &ModelRuntime<Self>,
@@ -1829,6 +1736,7 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         )
     }
 
+    #[cfg(feature = "tensor-capture")]
     fn intervention_discovery(
         runtime: &ModelRuntime<Self>,
     ) -> Result<eredu_core::intervention::InterventionDiscovery, eredu_core::capture::CaptureError>
@@ -1856,6 +1764,7 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         runtime.session().payload.parameter_state.active.as_deref()
     }
 
+    #[cfg(feature = "tensor-capture")]
     fn validate_text_interventions(
         runtime: &ModelRuntime<Self>,
         capture: &eredu_core::capture::AdmittedCapturePlan,
@@ -1873,6 +1782,7 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         )
     }
 
+    #[cfg(feature = "tensor-capture")]
     fn configure_text_interventions(
         runtime: &ModelRuntime<Self>,
         state: &mut Self::TextGenerationState,
@@ -1900,6 +1810,7 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         Ok(())
     }
 
+    #[cfg(feature = "tensor-capture")]
     fn capture_declarations(
         runtime: &ModelRuntime<Self>,
     ) -> Result<eredu_core::capture::CaptureDeclarations, eredu_core::capture::CaptureError> {
@@ -1918,6 +1829,7 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
             })
     }
 
+    #[cfg(feature = "tensor-capture")]
     fn capture_discovery(
         runtime: &ModelRuntime<Self>,
     ) -> Result<eredu_core::capture::CaptureDiscovery, eredu_core::capture::CaptureError> {
@@ -1936,6 +1848,7 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
             .capture()
     }
 
+    #[cfg(feature = "tensor-capture")]
     fn text_capture_invocation_bounds(
         runtime: &ModelRuntime<Self>,
         request: eredu_core::capture::CaptureRequestShape,
@@ -1974,6 +1887,7 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         }))
     }
 
+    #[cfg(feature = "tensor-capture")]
     fn configure_text_capture(
         runtime: &ModelRuntime<Self>,
         state: &mut Self::TextGenerationState,
@@ -1996,6 +1910,7 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         Ok(())
     }
 
+    #[cfg(feature = "tensor-capture")]
     fn validate_text_capture(
         runtime: &ModelRuntime<Self>,
         plan: &eredu_core::capture::AdmittedCapturePlan,
@@ -2016,6 +1931,7 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         )
     }
 
+    #[cfg(feature = "tensor-capture")]
     fn take_text_capture(
         state: &mut Self::TextGenerationState,
     ) -> Option<eredu_core::capture::CapturedStep> {
@@ -2023,6 +1939,41 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
             .capture
             .as_mut()
             .and_then(eredu_runtime::capture::CaptureSession::take_step)
+    }
+
+    fn configure_refinement_readout(
+        runtime: &ModelRuntime<Self>,
+        state: &mut Self::TextGenerationState,
+        selections: Vec<eredu_core::refinement::RefinementScoreSelection>,
+    ) -> Result<(), eredu_core::refinement::RefinementReadoutError> {
+        use eredu_core::refinement::RefinementReadoutError;
+        let geometry = runtime
+            .session()
+            .block_refinement_geometry()
+            .filter(|_| Self::supports_block_refinement(runtime))
+            .ok_or(RefinementReadoutError::Unsupported)?;
+        if selections.is_empty()
+            || selections.iter().any(|selection| {
+                selection.position >= geometry.canvas_length.get()
+                    || selection.token_ids.is_empty()
+                    || selection
+                        .token_ids
+                        .iter()
+                        .any(|&id| id >= geometry.vocabulary_size.get())
+            })
+        {
+            return Err(RefinementReadoutError::Geometry);
+        }
+        state.readout_selection = Some(selections);
+        state.readout_rows = None;
+        Ok(())
+    }
+
+    fn take_refinement_readout(
+        state: &mut Self::TextGenerationState,
+    ) -> Option<eredu_core::refinement::RefinementScoreRows> {
+        state.readout_selection = None;
+        state.readout_rows.take()
     }
 
     fn refinement_vocabulary_size(runtime: &ModelRuntime<Self>) -> Option<std::num::NonZeroU32> {
@@ -2062,6 +2013,8 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
                 }
             })?;
             Ok(MlxTextGenerationState {
+                readout_selection: None,
+                readout_rows: None,
                 sampling: super::generation::MlxTextSamplingState {
                     mode: config.decoding_mode().unwrap_or_default(),
                     temperature: sampling.temperature,
@@ -2080,6 +2033,7 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
                     canvas: config.refinement_canvas().cloned(),
                     refinement: None,
                 },
+                #[cfg(feature = "tensor-capture")]
                 capture: None,
             })
         })
@@ -2353,6 +2307,7 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
                             .validate_parameter_epoch(&mut state.sampling.parameter_epoch);
                         let stream = runtime.backend().stream().clone();
                         let prepared = prepared.map(|()| prompt);
+                        #[cfg(feature = "tensor-capture")]
                         if let Some(capture) = &mut state.capture {
                             let capture_geometry = Some(capture.plan().request());
                             if let Ok(prompt) = &prepared {
@@ -2468,6 +2423,7 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
                             .session()
                             .validate_parameter_epoch(&mut state.sampling.parameter_epoch);
                         let stream = runtime.backend().stream().clone();
+                        #[cfg(feature = "tensor-capture")]
                         if let Some(capture) = &mut state.capture {
                             let (backend, session) = runtime.parts_mut();
                             let public_output =
@@ -2560,10 +2516,13 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
                 .session()
                 .validate_parameter_epoch(&mut state.sampling.parameter_epoch)?;
             if prompt.prefill_cursor.is_none() {
+                #[cfg(feature = "tensor-capture")]
                 let geometry = state
                     .capture
                     .as_ref()
                     .map(|capture| capture.plan().request());
+                #[cfg(not(feature = "tensor-capture"))]
+                let geometry = None;
                 let (backend, session) = runtime.parts_mut();
                 session.validate_backend(backend)?;
                 let cursor = session.with_model_operation(|model| {
@@ -2597,6 +2556,7 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
                     }
                     PrefillStep::PrepareInput | PrefillStep::Decoder(_) => {}
                 }
+                #[cfg(feature = "tensor-capture")]
                 if let (Some(capture), PrefillStep::Decoder(range)) = (&mut state.capture, &step) {
                     capture
                         .set_prefill_span(eredu_core::capture::CapturePrefillSpan {
@@ -2632,17 +2592,22 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
                         PrefillStep::Complete => unreachable!("terminal cursors return above"),
                     }
                 };
+                #[cfg(feature = "tensor-capture")]
                 if let Some(capture) = &mut state.capture {
                     partition_capture::with_observer(session, capture, &stream, None, 0, advance)?;
-                } else {
-                    advance(session, &mut eredu_runtime::NoopObserver)?;
+                    return Ok(true);
                 }
+                advance(session, &mut eredu_runtime::NoopObserver)?;
                 return Ok(true);
             }
         }
         // Adapters without a retained request can split only plain text and
         // keep capture in their existing complete-forward path.
-        if state.capture.is_some() || Self::text_prefill_chunking_support(runtime).is_err() {
+        #[cfg(feature = "tensor-capture")]
+        if state.capture.is_some() {
+            return Ok(false);
+        }
+        if Self::text_prefill_chunking_support(runtime).is_err() {
             return Ok(false);
         }
         let Some(tokens) = prompt.chunkable_text_tokens() else {

@@ -3,7 +3,7 @@
 use eredu::api::*;
 use eredu::runtime::chat::ChatTemplateRequest;
 use eredu_backend_mlx::MlxBackendFactory;
-use eredu_core::{capture::CapturePlan, refinement::*, ExecutionPlan, GenerationConfigOverrides};
+use eredu_core::{refinement::*, ExecutionPlan, GenerationConfigOverrides};
 use serde_json::{json, Value};
 use std::{
     io::Write,
@@ -199,15 +199,11 @@ fn ordinary_and_controlled_facade_preserve_pins_and_canonical_commitment() {
         seed_tokens: seed,
         pinned_positions: vec![0, 2],
     };
-    let trace = TraceLimits {
-        per_record_bytes: 1 << 20,
-        total_bytes: 16 << 20,
-    };
     // A model-domain token absent from the tokenizer is rejected before execution.
     let mut invalid = layout.clone();
     invalid.seed_tokens[0] = Some(63);
     let rejected = model
-        .prepare_observed_chat(&chat, settings, CapturePlan::none(), trace)
+        .prepare_controlled_chat(&chat, settings)
         .unwrap()
         .with_refinement_canvas(invalid);
     assert!(matches!(
@@ -223,7 +219,7 @@ fn ordinary_and_controlled_facade_preserve_pins_and_canonical_commitment() {
         ))
     ));
     let prepared = model
-        .prepare_observed_chat(&chat, settings, CapturePlan::none(), trace)
+        .prepare_controlled_chat(&chat, settings)
         .unwrap()
         .with_refinement_canvas(layout.clone());
     let ordinary = model
@@ -238,7 +234,7 @@ fn ordinary_and_controlled_facade_preserve_pins_and_canonical_commitment() {
     assert_eq!((ordinary.token_ids[0], ordinary.token_ids[2]), (2, 3));
     model.reset().unwrap();
     let prepared = model
-        .prepare_observed_chat(&chat, settings, CapturePlan::none(), trace)
+        .prepare_controlled_chat(&chat, settings)
         .unwrap()
         .with_refinement_canvas(layout);
     let mut controlled = model

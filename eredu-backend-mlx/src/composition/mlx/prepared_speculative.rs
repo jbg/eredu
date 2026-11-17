@@ -322,6 +322,7 @@ impl SpeculativeTensorMechanisms for MlxEmbeddedPredictionMechanisms {
         context.agree_text_preparation(stage, status)
     }
 
+    #[cfg(feature = "tensor-capture")]
     fn activation_observer<'a>(
         plan: &eredu_core::speculative::AdmittedSpeculativeActivations,
         request: eredu_core::SpeculativeRequestId,
@@ -491,6 +492,7 @@ impl<'world> SpeculativeGenerationBackend for MlxBackend<'world> {
         runtime.session().speculative_capability()
     }
 
+    #[cfg(feature = "tensor-capture")]
     fn speculative_activation_discovery(
         runtime: &ModelRuntime<Self>,
     ) -> Result<
@@ -500,6 +502,7 @@ impl<'world> SpeculativeGenerationBackend for MlxBackend<'world> {
         runtime.session().speculative_activation_discovery()
     }
 
+    #[cfg(feature = "tensor-capture")]
     fn validate_speculative_activations(
         runtime: &ModelRuntime<Self>,
         plan: &eredu_core::speculative::AdmittedSpeculativeActivations,
@@ -512,6 +515,7 @@ impl<'world> SpeculativeGenerationBackend for MlxBackend<'world> {
         )
     }
 
+    #[cfg(feature = "tensor-capture")]
     fn validate_speculative_capture(
         runtime: &ModelRuntime<Self>,
         plan: &eredu_core::capture::AdmittedCapturePlan,
@@ -520,6 +524,7 @@ impl<'world> SpeculativeGenerationBackend for MlxBackend<'world> {
         <Self as eredu_core::TextGenerationBackend>::validate_text_capture(runtime, plan)
     }
 
+    #[cfg(feature = "tensor-capture")]
     fn speculative_intervention_discovery(
         runtime: &ModelRuntime<Self>,
     ) -> Result<eredu_core::intervention::InterventionDiscovery, eredu_core::capture::CaptureError>
@@ -531,6 +536,7 @@ impl<'world> SpeculativeGenerationBackend for MlxBackend<'world> {
             .retain(|point| point.path == eredu_core::MODEL_LOGITS_OBSERVATION_PATH);
         Ok(discovery)
     }
+    #[cfg(feature = "tensor-capture")]
     fn validate_speculative_interventions(
         runtime: &ModelRuntime<Self>,
         capture: &eredu_core::capture::AdmittedCapturePlan,

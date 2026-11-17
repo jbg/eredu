@@ -284,6 +284,7 @@ pub trait SpeculativeGenerationBackend: TextGenerationBackend {
 
     /// Exact internal activation/edit support for the selected speculative path.
     /// Ordinary sampler-logit capture has a separate admission contract.
+    #[cfg(feature = "tensor-capture")]
     fn speculative_activation_discovery(
         _runtime: &ModelRuntime<Self>,
     ) -> Result<SpeculativeActivationDiscovery, crate::capture::CaptureError> {
@@ -293,6 +294,7 @@ pub trait SpeculativeGenerationBackend: TextGenerationBackend {
     }
 
     /// Rechecks immutable internal authority against the actual loaded session.
+    #[cfg(feature = "tensor-capture")]
     fn validate_speculative_activations(
         runtime: &ModelRuntime<Self>,
         plan: &AdmittedSpeculativeActivations,
@@ -301,6 +303,7 @@ pub trait SpeculativeGenerationBackend: TextGenerationBackend {
     }
 
     /// Genuine mutable hooks with explicit speculative attribution.
+    #[cfg(feature = "tensor-capture")]
     fn speculative_intervention_discovery(
         _runtime: &ModelRuntime<Self>,
     ) -> Result<crate::intervention::InterventionDiscovery, crate::capture::CaptureError> {
@@ -309,6 +312,7 @@ pub trait SpeculativeGenerationBackend: TextGenerationBackend {
         ))
     }
     /// Validates edit geometry, exact loaded capabilities and evidence budgets.
+    #[cfg(feature = "tensor-capture")]
     fn validate_speculative_interventions(
         _runtime: &ModelRuntime<Self>,
         _capture: &crate::capture::AdmittedCapturePlan,
@@ -321,6 +325,7 @@ pub trait SpeculativeGenerationBackend: TextGenerationBackend {
 
     /// Validates speculative observation support without allocating or executing.
     /// Ordinary capture support does not imply attribution for speculative phases.
+    #[cfg(feature = "tensor-capture")]
     fn validate_speculative_capture(
         _runtime: &ModelRuntime<Self>,
         plan: &crate::capture::AdmittedCapturePlan,
@@ -1083,6 +1088,7 @@ pub trait SpeculativeExecutor {
     fn set_activation_origin(&mut self, _origin: Option<SpeculativeActivationOrigin>) {}
 
     /// Moves one previously charged internal activation record to its consumer.
+    #[cfg(feature = "tensor-capture")]
     fn take_activation_capture(&mut self) -> Option<SpeculativeActivationCapture> {
         None
     }
@@ -1094,6 +1100,7 @@ pub trait SpeculativeExecutor {
 
     /// Replaces prospective internal edits at a drained canonical boundary.
     /// The loaded controller must validate authority against current discovery.
+    #[cfg(feature = "tensor-capture")]
     fn readmit_activation_interventions(
         &mut self,
         _plan: AdmittedSpeculativeActivations,
@@ -1106,6 +1113,7 @@ pub trait SpeculativeExecutor {
     /// Installs internal capture authority for this borrowed executor scope.
     /// Implementations restore prior observer ownership when the scope ends;
     /// the next ordinary run must not inherit this plan or a fresh allowance.
+    #[cfg(feature = "tensor-capture")]
     fn configure_activation_capture<'a>(
         &mut self,
         plan: AdmittedSpeculativeActivations,
@@ -1526,6 +1534,7 @@ pub trait SpeculativeGenerationVisitor {
 /// token is selected, and when tentative sampler state is promoted.
 pub trait SpeculativeSampling: Clone {
     /// Installs immutable role-specific plans, preserving the shared capture ledger.
+    #[cfg(feature = "tensor-capture")]
     fn control_intervene(
         &mut self,
         plans: Vec<SpeculativeInterventionPlan>,
@@ -1594,6 +1603,7 @@ pub trait SpeculativeSampling: Clone {
 
     /// Installs explicitly admitted raw-logit capture before any generation. Clones
     /// must share non-rewindable capture accounting, never duplicate its allowance.
+    #[cfg(feature = "tensor-capture")]
     fn enable_control_capture(
         &mut self,
         plan: crate::capture::AdmittedCapturePlan,
@@ -1609,6 +1619,7 @@ pub trait SpeculativeSampling: Clone {
 
     /// Drains completed captures from the last scheduler action, including
     /// tentative target rows and failed draft proposals. No native values escape.
+    #[cfg(feature = "tensor-capture")]
     fn take_control_captures(&mut self) -> Vec<SpeculativePredictionCapture> {
         Vec::new()
     }

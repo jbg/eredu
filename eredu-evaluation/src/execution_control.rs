@@ -29,24 +29,33 @@ pub struct ContinuationFixtureLimits {
     pub capture: Option<CaptureLimits>,
 }
 
+#[cfg(feature = "tensor-capture")]
+type ContinuationEvidence = Option<CapturedStep>;
+#[cfg(not(feature = "tensor-capture"))]
+type ContinuationEvidence = ();
+
 fn step<B: TextSnapshotBackend, C: TokenFilterController>(
     driver: &mut TextGenerationDriver<'_, B>,
     state: &mut ManagedTextContinuation<B, C>,
-) -> (u32, Option<CapturedStep>) {
+) -> (u32, ContinuationEvidence) {
     let token = state.advance(driver).unwrap().expect("fixture ended early");
     assert!(matches!(
         state.boundary(driver),
         Err(eredu_core::TextContinuationError::NotQuiescent)
     ));
+    #[cfg(feature = "tensor-capture")]
     let records = state.take_completed_step(driver).unwrap().map(|mut step| {
         step.capture_seconds = 0.0;
         step.cumulative_usage = Default::default();
         step
     });
+    #[cfg(not(feature = "tensor-capture"))]
+    let records = state.take_completed_step(driver).unwrap();
     (token.token_id(), records)
 }
 
-fn branch_values(mut value: (u32, Option<CapturedStep>)) -> (u32, Option<CapturedStep>) {
+fn branch_values(mut value: (u32, ContinuationEvidence)) -> (u32, ContinuationEvidence) {
+    #[cfg(feature = "tensor-capture")]
     if let Some(step) = &mut value.1 {
         for record in &mut step.interventions {
             // Child plans are intentionally re-admitted with fresh identities.
@@ -134,7 +143,9 @@ pub fn sampling_override_conformance<B, C, P>(
             TextBranchRequest {
                 session_id: "conformance-sampling-child",
                 max_predictions: limits.max_predictions,
+                #[cfg(feature = "tensor-capture")]
                 capture_limits: limits.capture.clone(),
+                #[cfg(feature = "tensor-capture")]
                 intervention: None,
                 host_bytes: Some(limits.host_bytes),
                 continuation_growth_bytes: Some(limits.growth_bytes),
@@ -235,7 +246,9 @@ pub fn forced_choice_conformance<B, C, P>(
             TextBranchRequest {
                 session_id: "conformance-forced-child",
                 max_predictions: limits.max_predictions,
+                #[cfg(feature = "tensor-capture")]
                 capture_limits: limits.capture.clone(),
+                #[cfg(feature = "tensor-capture")]
                 intervention: None,
                 host_bytes: Some(limits.host_bytes),
                 continuation_growth_bytes: Some(limits.growth_bytes),
@@ -356,7 +369,9 @@ pub fn continuation_conformance<B, C, P>(
     let child = |session_id| TextBranchRequest {
         session_id,
         max_predictions: limits.max_predictions,
+        #[cfg(feature = "tensor-capture")]
         capture_limits: limits.capture.clone(),
+        #[cfg(feature = "tensor-capture")]
         intervention: None,
         host_bytes: Some(limits.host_bytes),
         continuation_growth_bytes: Some(limits.growth_bytes.checked_add(native_growth).unwrap()),
@@ -390,6 +405,7 @@ pub fn continuation_conformance<B, C, P>(
         saved.restore(&mut state.boundary(driver).unwrap(), &budget),
         Err(TextSnapshotError::IncompatibleRun)
     ));
+    #[cfg(feature = "tensor-capture")]
     if let Some(checkpoint) = saved.capture_checkpoint() {
         let boundary = state.boundary(driver).unwrap();
         assert_eq!(
@@ -400,6 +416,7 @@ pub fn continuation_conformance<B, C, P>(
         );
     }
     let first_left = step(driver, &mut state);
+    #[cfg(feature = "tensor-capture")]
     if let (Some(child), Some(parent)) = (&first_left.1, &baseline[0].1) {
         for (child, parent) in child.interventions.iter().zip(&parent.interventions) {
             assert_ne!(
@@ -439,6 +456,7 @@ pub fn continuation_conformance<B, C, P>(
             .collect::<Vec<_>>()
     );
     left.exchange(driver, &mut state).unwrap();
+    #[cfg(feature = "tensor-capture")]
     let capture_usage = {
         let boundary = state.boundary(driver).unwrap();
         B::capture_run(boundary.parts().1).map(|run| run.cumulative_usage())
@@ -453,6 +471,7 @@ pub fn continuation_conformance<B, C, P>(
         let actual: Vec<_> = (0..5).map(|_| step(driver, &mut state)).collect();
         assert_eq!(actual, baseline);
     }
+    #[cfg(feature = "tensor-capture")]
     if let Some(before) = capture_usage {
         let boundary = state.boundary(driver).unwrap();
         let after = B::capture_run(boundary.parts().1)

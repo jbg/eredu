@@ -1,9 +1,10 @@
 //! Sparse invocation placement from retained bank policy and logical parameters.
 use super::*;
-use eredu_core::capture::{
-    AdmittedCapturePlan, CaptureError, CapturePhase, CaptureSlicePartition,
-    RoutedUnitCaptureOwnership, RoutedUnitGeometry,
-};
+#[cfg(feature = "tensor-capture")]
+use eredu_core::capture::{AdmittedCapturePlan, CapturePhase, CaptureSlicePartition};
+use eredu_core::capture::{CaptureError, RoutedUnitCaptureOwnership};
+use eredu_core::routing::RoutedUnitGeometry;
+#[cfg(feature = "tensor-capture")]
 use eredu_runtime::capture::partition::{
     PartitionCaptureReceiptLimits, PartitionRoutedCapturePlacement, PartitionRoutedCaptureProducer,
     PartitionRoutedCaptureSource,
@@ -141,7 +142,7 @@ pub(in crate::component_partition) fn derive_observations(
             units_per_expert: component.units_per_expert as u64,
             routes_per_token: routes as u64,
         };
-        geometry.components()?;
+        geometry.component_extent().map_err(CaptureError::from)?;
         let local = owned_groups
             .iter()
             .any(|owned| owned.group() == group && owned.units().contains(global_unit));
@@ -308,7 +309,7 @@ pub(in crate::component_partition) fn prediction_observations(
             {
                 return Err(invalid());
             }
-            geometry.components()?;
+            geometry.component_extent().map_err(CaptureError::from)?;
             if observations
                 .insert(
                     path.clone(),
@@ -330,6 +331,7 @@ pub(in crate::component_partition) fn prediction_observations(
 }
 
 impl ComponentPartitionLayouts {
+    #[cfg(feature = "tensor-capture")]
     pub(in crate::component_partition) fn routed_placement(
         &self,
         plan: &AdmittedCapturePlan,

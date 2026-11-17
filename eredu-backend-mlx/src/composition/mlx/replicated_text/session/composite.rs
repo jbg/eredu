@@ -1233,18 +1233,7 @@ where
         })
     }
 
-    fn install_embedded_prediction_observers(
-        &mut self,
-        observers: MlxEmbeddedPredictionObservers,
-    ) -> bool {
-        if P::present() {
-            self.embedded_prediction_observers = observers;
-            true
-        } else {
-            false
-        }
-    }
-
+    #[cfg(feature = "tensor-capture")]
     fn take_speculative_activation_capture(
         &mut self,
     ) -> Option<eredu_core::speculative::SpeculativeActivationCapture> {

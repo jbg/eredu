@@ -27,12 +27,12 @@ pub(crate) fn materialize_model_plan(
     crate::initialize_allocator_cache_policy(false)?;
     let capture_discovery = sources.prepare_discovery(
         eredu_core::ObservationMechanisms {
-            activation_tensors: true,
-            routing_tensors: true,
-            routed_unit_tensors: true,
-            floating_to_f32: true,
+            activation_tensors: cfg!(feature = "tensor-capture"),
+            routing_tensors: cfg!(feature = "tensor-capture"),
+            routed_unit_tensors: cfg!(feature = "tensor-capture"),
+            floating_to_f32: cfg!(feature = "tensor-capture"),
         },
-        super::super::session::bounded_capture::capabilities(),
+        super::super::session::capture_capabilities(),
     );
     let target = crate::backend::MlxPreparedTarget::new(stream, distributed.as_ref())?;
     let materialize = |prepared, source: eredu_checkpoint::store::SharedCheckpointSource| {

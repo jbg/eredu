@@ -126,9 +126,12 @@ pub struct PreparedModelDiscovery {
     target_static: Result<Option<crate::external_assistant::TargetStaticDescription>, String>,
     partition_parameters: Option<Arc<eredu_runtime::ArchitectureParameterDescription>>,
     partition_parameter_index: Option<Arc<eredu_runtime::ParameterMemberIndex>>,
+    #[cfg(feature = "tensor-capture")]
     partition_hooks: Option<eredu_runtime::inspection::ObservationHookSupport>,
     support: eredu_core::ObservationSupportReport,
+    #[cfg(feature = "tensor-capture")]
     observation_context: eredu_runtime::inspection::ObservationExecutionContext,
+    #[cfg(feature = "tensor-capture")]
     intervention_points: Vec<eredu_core::intervention::InterventionPoint>,
     prediction: Option<PreparedPredictionDiscovery>,
 }
@@ -137,7 +140,9 @@ pub struct PreparedModelDiscovery {
 struct PreparedPredictionDiscovery {
     resources: Result<eredu_runtime::prediction_resources::EmbeddedPredictionTopology, String>,
     placement: crate::prediction_extension::PredictionPlacementSlot,
+    #[cfg(feature = "tensor-capture")]
     descriptor: Result<eredu_core::ArchitectureDescriptor, String>,
+    #[cfg(feature = "tensor-capture")]
     intervention_points: Vec<eredu_core::intervention::InterventionPoint>,
 }
 
@@ -168,6 +173,7 @@ impl PreparedModelDiscovery {
     }
     /// Retains hook facts projected from the actual constructed executor and
     /// architecture. Backend collectors cannot infer these from parameter shapes.
+    #[cfg(feature = "tensor-capture")]
     pub fn bind_partition_observation_hooks(
         mut self,
         hooks: Option<eredu_runtime::inspection::ObservationHookSupport>,
@@ -429,6 +435,7 @@ impl PreparedModelDiscovery {
     /// Combines target ownership with the actual prepared prediction modules.
     /// Each prediction scope keeps its independent head and invocation geometry;
     /// this projection performs no native work and grants no capture authority.
+    #[cfg(feature = "tensor-capture")]
     pub fn speculative_component_partition_layouts(
         &self,
         execution: &crate::speculative_execution::SpeculativeActivationExecution,
@@ -466,6 +473,7 @@ impl PreparedModelDiscovery {
     }
 
     /// Projects retained architecture and collector facts without hashing sources.
+    #[cfg(feature = "tensor-capture")]
     pub fn capture_declarations(&self) -> eredu_core::capture::CaptureDeclarations {
         eredu_core::capture::CaptureDeclarations {
             catalog: self.descriptor.observations.clone(),
@@ -473,16 +481,20 @@ impl PreparedModelDiscovery {
         }
     }
 
+    /// Resolves the exact identity of the retained artifact.
+    pub fn artifact_identity(&self) -> Result<String, Arc<ArtifactError>> {
+        self.identity.resolve().map(|identity| identity.to_string())
+    }
+
     /// Resolves the exact content identity for a caller using capture features.
+    #[cfg(feature = "tensor-capture")]
     pub fn capture(
         &self,
     ) -> Result<eredu_core::capture::CaptureDiscovery, eredu_core::capture::CaptureError> {
         Ok(eredu_core::capture::CaptureDiscovery {
             artifact_identity: self
-                .identity
-                .resolve()
-                .map_err(|error| eredu_core::capture::CaptureError::Invalid(error.to_string()))?
-                .to_string(),
+                .artifact_identity()
+                .map_err(|error| eredu_core::capture::CaptureError::Invalid(error.to_string()))?,
             catalog: self.descriptor.observations.clone(),
             support: self.support.clone(),
         })
@@ -491,6 +503,7 @@ impl PreparedModelDiscovery {
     /// Refines partition support using retained architecture placement and exact
     /// native collector facts. Existing selection/phase/mechanism gates still
     /// apply; a callback cannot enable a disabled instrumented execution route.
+    #[cfg(feature = "tensor-capture")]
     pub fn capture_with_partition_support(
         &self,
         layouts: &crate::component_partition::ComponentPartitionLayouts,
@@ -504,6 +517,7 @@ impl PreparedModelDiscovery {
     }
 
     /// Projects partition support using retained layouts and collector facts only.
+    #[cfg(feature = "tensor-capture")]
     pub fn capture_declarations_with_partition_support(
         &self,
         layouts: &crate::component_partition::ComponentPartitionLayouts,
@@ -526,6 +540,7 @@ impl PreparedModelDiscovery {
     }
 
     /// Combines retained semantic points with current native intervention facts.
+    #[cfg(feature = "tensor-capture")]
     pub fn intervention(
         &self,
         mechanisms: &eredu_core::intervention::InterventionMechanisms,
@@ -541,6 +556,7 @@ impl PreparedModelDiscovery {
     /// Projects invocation-scoped support from actual typed prediction hooks.
     /// Only the declared prediction condition is discharged; media, collector,
     /// phase and partition requirements retain their own admission gates.
+    #[cfg(feature = "tensor-capture")]
     pub fn speculative_activations(
         &self,
         execution: &crate::speculative_execution::SpeculativeActivationExecution,
@@ -569,6 +585,7 @@ impl PreparedModelDiscovery {
     /// native collector facts. Prediction hooks come from the sealed execution
     /// contract; target hooks retain their ordinary constructed-executor gate.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(feature = "tensor-capture")]
     pub fn speculative_activations_with_partition_support(
         &self,
         execution: &crate::speculative_execution::SpeculativeActivationExecution,
@@ -592,6 +609,7 @@ impl PreparedModelDiscovery {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(feature = "tensor-capture")]
     fn speculative_activations_inner(
         &self,
         execution: &crate::speculative_execution::SpeculativeActivationExecution,
@@ -723,6 +741,7 @@ impl PreparedModelDiscovery {
 
 impl PreparedModelSources {
     /// Retains architecture-owned mutable hooks with actual selected-session facts.
+    #[cfg(feature = "tensor-capture")]
     pub fn intervention_discovery(
         &self,
         capture: &eredu_core::capture::CaptureDiscovery,
@@ -784,11 +803,15 @@ impl PreparedModelSources {
             ),
             partition_parameters: None,
             partition_parameter_index: None,
+            #[cfg(feature = "tensor-capture")]
             partition_hooks: None,
             support,
+            #[cfg(feature = "tensor-capture")]
             observation_context,
+            #[cfg(feature = "tensor-capture")]
             intervention_points: self.architecture().intervention_points(),
             prediction: self.selected().prediction_realization().map(|_| {
+                #[cfg(feature = "tensor-capture")]
                 let complete = self
                     .selected()
                     .retained_architecture()
@@ -803,6 +826,7 @@ impl PreparedModelSources {
                                 .ok_or_else(|| "selected prediction topology is missing".to_owned())
                         }),
                     placement: Arc::clone(&self.graph.prediction_placement),
+                    #[cfg(feature = "tensor-capture")]
                     descriptor: match self.selected().qwen4_construction() {
                         Some(construction) => construction
                             .prediction_discovery()
@@ -820,6 +844,7 @@ impl PreparedModelSources {
                             }),
                         None => Ok(complete.architecture_descriptor()),
                     },
+                    #[cfg(feature = "tensor-capture")]
                     intervention_points: complete.intervention_points(),
                 }
             }),
@@ -827,6 +852,7 @@ impl PreparedModelSources {
     }
 
     /// Resolves exact model identity for explicitly requested capture discovery.
+    #[cfg(feature = "tensor-capture")]
     pub fn capture_discovery(
         &self,
         mechanisms: eredu_core::ObservationMechanisms,

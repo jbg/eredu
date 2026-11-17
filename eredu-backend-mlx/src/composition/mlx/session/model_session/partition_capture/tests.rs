@@ -27,9 +27,10 @@ fn submit(
             observer,
         )
     } else {
-        session.submit_prefill_with_observer(
+        session.submit_prefill_result_with_observer(
             backend,
-            MlxBackend::prepare_text_prompt(backend, vec![1, 2])?,
+            Ok(MlxBackend::prepare_text_prompt(backend, vec![1, 2])?),
+            None,
             observer,
         )
     }
@@ -265,20 +266,4 @@ fn native_capture_failure_causes_and_retry_cpu() {
 fn native_capture_failure_causes_and_retry_metal() {
     assert!(safemlx::metal::is_available().unwrap());
     verify_capture_failures(safemlx::DeviceType::Gpu);
-}
-
-#[test]
-fn native_duplicate_observation_retains_portable_error() {
-    let stream = crate::test_stream();
-    let value = MlxTensor::from_array(Array::from_slice(&[1.25f32, -2.5], &[1, 2]));
-    let request = eredu_core::ObservationRequest::all();
-    let mut collector = super::super::super::observation::InspectionCollector::new(&request);
-    collector.capture("duplicate", &value);
-    collector.capture("duplicate", &value);
-    let failure =
-        eredu_core::BackendFailure::from_error(collector.materialize(stream).unwrap_err());
-    assert!(
-        matches!(find_source::<eredu_core::ObservationError>(&failure),
-        Some(eredu_core::ObservationError::DuplicatePath(path)) if path == "duplicate")
-    );
 }

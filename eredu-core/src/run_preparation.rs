@@ -78,6 +78,7 @@ pub struct TextPreparationCancelled {
 
 /// Capture installation retains portable policy errors and agreement failures.
 #[derive(Debug, thiserror::Error)]
+#[cfg(feature = "tensor-capture")]
 pub enum TextCaptureSetupError {
     /// Local immutable-plan or accounting rejection.
     #[error(transparent)]

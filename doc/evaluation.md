@@ -14,8 +14,8 @@ backend object names. Host materialization is always explicit:
 
 - `BackendSession::observe_output` observes an already completed prefill or
   decode output;
-- `InspectableBackendSession` runs an explicitly instrumented prefill or
-  decode pass and returns selected named activations;
+- With `tensor-capture`, a bounded `CapturePlan` selects named prefill and
+  decode activations for an ordinary generation run;
 - realtime architecture observers intervene at declared temporal, layer,
   decision-logit, and final-output seams, while runtime prepublication converts
   completed tokens and diagnostics to the portable output frame; and

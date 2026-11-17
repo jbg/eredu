@@ -176,8 +176,10 @@ pub fn run_example(
     );
     let options = || GenerationBranchOptions {
         trace_limits: trace,
+        #[cfg(feature = "tensor-capture")]
         capture_limits: Some(capture_limits.clone()),
         sampling: None,
+        #[cfg(feature = "tensor-capture")]
         intervention: None,
     };
     let mut branch = run.fork(&snapshot, options(), output(&mut Vec::new()))?;

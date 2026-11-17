@@ -209,15 +209,7 @@ fn run(
     settings: PreparedChatGenerationSettings,
     controlled: bool,
 ) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
-    let prepared = model.prepare_observed_chat(
-        chat,
-        settings,
-        eredu_core::capture::CapturePlan::none(),
-        TraceLimits {
-            per_record_bytes: 65536,
-            total_bytes: 1 << 20,
-        },
-    )?;
+    let prepared = model.prepare_controlled_chat(chat, settings)?;
     let mut events: Vec<ObservedGenerationRecord> = vec![];
     if controlled {
         let mut run = model.start_controlled(
@@ -271,7 +263,12 @@ fn has_source<T: std::error::Error + 'static>(
 #[test]
 fn public_local_preparation_failure_votes_before_return_and_retry_matches_baseline() {
     for controlled in [false, true] {
-        for stage in [Stage::Prompt, Stage::Sampling, Stage::Instrumentation] {
+        for stage in [
+            Stage::Prompt,
+            Stage::Sampling,
+            #[cfg(feature = "tensor-capture")]
+            Stage::Instrumentation,
+        ] {
             let (mut model, chat, settings) = setup();
             let baseline = run(&mut model, &chat, settings, controlled).unwrap();
             assert!(!baseline.is_empty());
@@ -534,6 +531,7 @@ fn speculative_batch_host_failure_in_later_lane_votes_once_before_any_prompt() {
     assert_eq!(snapshot().forwards, 0);
 }
 
+#[cfg(feature = "tensor-capture")]
 #[test]
 fn controlled_speculative_invalid_capture_votes_before_returning_local_policy_error() {
     let (mut model, chat, mut settings) = setup();
@@ -703,6 +701,7 @@ fn peer_delivery_failure_after_a_committed_token_preserves_the_completed_prefix(
     }
 }
 
+#[cfg(feature = "tensor-capture")]
 #[test]
 fn local_token_record_budget_failure_votes_failed_and_keeps_its_typed_cause() {
     for controlled in [false, true] {
@@ -839,6 +838,7 @@ fn terminal_record_peer_failure_is_reported_after_the_completed_prediction() {
     }
 }
 
+#[cfg(feature = "tensor-capture")]
 #[test]
 fn boundary_record_budget_failure_votes_failed_with_the_original_cause() {
     for controlled in [false, true] {
@@ -978,6 +978,7 @@ fn speculative_executor_and_scheduler_readiness_reject_before_prefill() {
     }
 }
 
+#[cfg(feature = "tensor-capture")]
 #[test]
 fn speculative_collector_preparation_preserves_local_failure_before_prefill() {
     let (mut model, chat, mut settings) = setup();
