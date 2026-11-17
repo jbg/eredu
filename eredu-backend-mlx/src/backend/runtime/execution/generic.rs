@@ -39,6 +39,53 @@ use crate::backend::{
 use crate::MlxTensor;
 use eredu_core::residency::{MemoryTier, OffloadUnitId};
 
+/// Binds an independently materialized unit sequence with no pinned modules.
+pub fn bind_parameter_units<U: Parameterized<MlxTensor> + 'static>(
+    source: SharedCheckpointSource,
+    invocations: eredu_runtime::ExecutionUnitAddressMap,
+    units: Vec<Vec<WeightBinding>>,
+    residency: LayerWeightResidency,
+    execution: &Stream,
+    weights: &Stream,
+    resident_units: impl FnOnce() -> Result<Vec<U>, eredu_core::BackendFailure>,
+) -> Result<(MlxSelectedLayerwisePolicy<U, ()>, LayerwiseModelMetadata), eredu_core::BackendFailure>
+{
+    use eredu_core::BackendFailure;
+
+    crate::backend::submission_recovery::detached_preparation(
+        Vec::<safemlx::Array>::new(),
+        || {
+            let (policy, metadata) = prepare_parameter_unit_policy(
+                source,
+                &mut eredu_runtime::EmptyParameterModule,
+                (),
+                residency,
+                execution,
+                weights,
+                |_| false,
+                invocations,
+                Vec::new(),
+                units,
+                Vec::new(),
+            )
+            .map_err(BackendFailure::from_error)?;
+            let policy = if residency.is_fully_resident() {
+                MlxSelectedLayerwisePolicy::resident(
+                    policy
+                        .into_resident_units(resident_units()?, execution)
+                        .map_err(BackendFailure::from_error)?,
+                )
+                .certify_immutable(execution)
+                .map_err(BackendFailure::from_error)?
+            } else {
+                MlxSelectedLayerwisePolicy::bounded(policy)
+            };
+            Ok((policy, metadata))
+        },
+        BackendFailure::from_error,
+    )
+}
+
 /// One populated MLX unit retained with its residency transfer.
 enum MlxUnitTransfer {
     Ordinary { _transfer: ResidentTransfer },
@@ -533,4 +580,5 @@ pub use preparation::{
 mod bounded;
 
 mod selected;
-pub(crate) use selected::{MlxSelectedLayerwisePolicy, MlxSelectedUnitLease};
+pub use selected::MlxSelectedLayerwisePolicy;
+pub use selected::MlxSelectedUnitLease;

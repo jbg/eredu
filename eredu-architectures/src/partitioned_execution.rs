@@ -633,8 +633,7 @@ where
     pipeline_stages: usize,
     allocator: F,
     activation_dtype: PipelineActivationDtype,
-    route_schemas: std::collections::BTreeMap<CommunicationRouteId, ResolvedBoundaryWireSchema>,
-    route_source_units: std::collections::BTreeMap<CommunicationRouteId, usize>,
+    routes: std::collections::BTreeMap<CommunicationRouteId, SelectedPartitionBoundaryRoute>,
     publication: PublicationValueDescriptor,
     unit_strategy: U,
     marker: PhantomData<fn() -> S>,
@@ -654,8 +653,7 @@ pub(crate) struct PreparedCompositeExecutorStructure {
     tensor_partitions: usize,
     pipeline_stages: usize,
     activation_dtype: PipelineActivationDtype,
-    route_schemas: std::collections::BTreeMap<CommunicationRouteId, ResolvedBoundaryWireSchema>,
-    route_source_units: std::collections::BTreeMap<CommunicationRouteId, usize>,
+    routes: std::collections::BTreeMap<CommunicationRouteId, SelectedPartitionBoundaryRoute>,
     publication: PublicationValueDescriptor,
 }
 
@@ -664,11 +662,8 @@ impl PreparedCompositeExecutorStructure {
     pub(crate) fn prepare<A, B, S, G, W>(
         architecture: &A,
         partition: &ArchitecturePartition<G, W>,
-        group_kinds: Vec<ArchitectureGroupKind>,
         activation_dtype: PipelineActivationDtype,
-        route_schemas: impl IntoIterator<
-            Item = (CommunicationRouteId, ResolvedBoundaryWireSchema, usize),
-        >,
+        routes: &[SelectedPartitionBoundaryRoute],
         publication: PublicationValueDescriptor,
         tensor_group: Option<eredu_core::CollectiveGroupId>,
         topology: eredu_core::ParallelRankTopology,
@@ -678,9 +673,6 @@ impl PreparedCompositeExecutorStructure {
         S: eredu_runtime::RuntimeState<B>,
         A: crate::composite_execution::CompositeArchitecture<B, S>,
     {
-        if group_kinds.len() != partition.graph().groups().len() {
-            return Err("composite executor group contracts differ from the selected graph".into());
-        }
         let primary_group = partition
             .graph()
             .groups()
@@ -695,11 +687,10 @@ impl PreparedCompositeExecutorStructure {
         for (storage_ordinal, address) in partition.units().enumerate() {
             units[address.group()].push((storage_ordinal, address));
         }
-        let routes = route_schemas.into_iter().collect::<Vec<_>>();
-        let route_source_units = routes.iter().map(|(id, _, end)| (*id, *end)).collect();
-        let route_schemas = routes
-            .into_iter()
-            .map(|(id, schema, _)| (id, schema))
+        let routes = routes
+            .iter()
+            .cloned()
+            .map(|route| (route.route().route, route))
             .collect();
         let pipeline_stages = topology.pipeline_parallel_size();
         if pipeline_stages == 0 {
@@ -719,52 +710,9 @@ impl PreparedCompositeExecutorStructure {
             tensor_partitions: topology.tensor_parallel_size(),
             pipeline_stages,
             activation_dtype,
-            route_schemas,
-            route_source_units,
+            routes,
             publication,
         })
-    }
-}
-
-impl<A, B, S, P, F> CompositePartitionExecutor<A, B, S, P, F>
-where
-    B: eredu_runtime::SubmissionBackend<
-            Executor = <<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
-        > + eredu_runtime::CommunicationBackend
-        + eredu_nn::TensorParallelGroupedNeuralBackend,
-    S: eredu_runtime::RuntimeState<B>,
-    A: crate::composite_execution::CompositeArchitecture<B, S>,
-    P: eredu_runtime::LayerwisePolicy<B, A::Unit>,
-    F: PartitionTensorAllocator<B>,
-    B::ParallelContext: Sized,
-{
-    /// Binds one typed architecture to its exact selected local partition.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new<G, W>(
-        architecture: A,
-        policy: P,
-        partition: &ArchitecturePartition<G, W>,
-        group_kinds: Vec<ArchitectureGroupKind>,
-        parallel: Option<B::ParallelContext>,
-        allocator: F,
-        activation_dtype: PipelineActivationDtype,
-        route_schemas: impl IntoIterator<
-            Item = (CommunicationRouteId, ResolvedBoundaryWireSchema, usize),
-        >,
-        publication: PublicationValueDescriptor,
-    ) -> Result<Self, eredu_nn::Error> {
-        Self::new_with_unit_strategy(
-            architecture,
-            policy,
-            partition,
-            group_kinds,
-            parallel,
-            allocator,
-            activation_dtype,
-            route_schemas,
-            publication,
-            DirectCompositePartitionUnitStrategy,
-        )
     }
 }
 
@@ -813,101 +761,99 @@ where
             pipeline_stages: prepared.pipeline_stages,
             allocator,
             activation_dtype: prepared.activation_dtype,
-            route_schemas: prepared.route_schemas,
-            route_source_units: prepared.route_source_units,
+            routes: prepared.routes,
             publication: prepared.publication,
             unit_strategy,
             marker: PhantomData,
         })
     }
 
-    /// Binds an architecture-selected unit strategy to an exact composite partition.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_with_unit_strategy<G, W>(
-        architecture: A,
-        policy: P,
-        partition: &ArchitecturePartition<G, W>,
-        group_kinds: Vec<ArchitectureGroupKind>,
-        parallel: Option<B::ParallelContext>,
-        allocator: F,
-        activation_dtype: PipelineActivationDtype,
-        route_schemas: impl IntoIterator<
-            Item = (CommunicationRouteId, ResolvedBoundaryWireSchema, usize),
-        >,
-        publication: PublicationValueDescriptor,
-        unit_strategy: U,
-    ) -> Result<Self, eredu_nn::Error> {
-        if group_kinds.len() != partition.graph().groups().len() {
-            return Err(eredu_nn::Error::backend(
-                "composite executor group contracts differ from the selected graph",
-            ));
-        }
-        let primary_group = partition
-            .graph()
-            .groups()
-            .iter()
-            .position(|group| group.id() == architecture.primary_execution_group())
+    fn resolve_invocation_boundary(
+        &self,
+        pass: &CompositePartitionPass<'_, A, B, S>,
+        selected_route: &SelectedPartitionBoundaryRoute,
+    ) -> Result<ResolvedBoundaryWireSchema, eredu_nn::Error>
+    where
+        A: crate::composite_execution::ParallelCompositeArchitecture<B, S>
+            + eredu_runtime::PartitionedLayeredArchitecture<B, S>,
+    {
+        let route = selected_route.route();
+        let selected = selected_route.schema();
+        let decoder_continuation = route.source_group == self.primary_group
+            && route.source_group == route.destination_group;
+        let source_sequence = pass
+            .groups
+            .get(route.source_group)
+            .map(|group| group.boundary_sequence)
             .ok_or_else(|| {
-                eredu_nn::Error::backend(
-                    "composite architecture primary group is absent from its partition",
-                )
+                eredu_nn::Error::backend("composite route source has no prepared boundary sequence")
             })?;
-        let mut units = (0..partition.graph().groups().len())
-            .map(|_| Vec::new())
-            .collect::<Vec<_>>();
-        for (storage_ordinal, address) in partition.units().enumerate() {
-            units[address.group()].push((storage_ordinal, address));
+        let continuation = if route.source_group == route.destination_group {
+            let end = selected_route.source_unit_end();
+            pass.groups[route.source_group]
+                .continuation
+                .as_ref()
+                .map(|geometry| geometry.after_unit_end(end))
+                .transpose()
+                .map_err(eredu_nn::Error::backend)?
+        } else {
+            None
+        };
+        let family_schema = self
+            .architecture
+            .partition_boundary_schema(
+                route.source_group,
+                route.destination_group,
+                selected,
+                pass.batch_size,
+                source_sequence,
+                &pass.groups,
+                continuation,
+            )
+            .map_err(eredu_nn::Error::backend_source)?;
+        let actual = if let Some(schema) = family_schema {
+            schema
+        } else if decoder_continuation {
+            self.architecture
+                .boundary_schema()
+                .map_err(eredu_nn::Error::backend_source)?
+                .wire_schema()
+                .and_then(|schema| schema.resolve(pass.batch_size, pass.sequence_length))
+                .map_err(eredu_nn::Error::backend_source)?
+        } else {
+            let hidden = *selected.primary().shape().last().ok_or_else(|| {
+                eredu_nn::Error::backend("composite route primary activation has no hidden extent")
+            })?;
+            let (sequence, hidden) = if route.source_group == route.destination_group {
+                continuation.unwrap_or((source_sequence, hidden))
+            } else {
+                (source_sequence, hidden)
+            };
+            BoundaryWireSchema::new(
+                selected.identity(),
+                eredu_runtime::BoundaryTensorSpec::new(
+                    selected.primary().role(),
+                    [
+                        eredu_runtime::BoundaryTensorDimension::Batch,
+                        eredu_runtime::BoundaryTensorDimension::Sequence,
+                        eredu_runtime::BoundaryTensorDimension::Fixed(hidden),
+                    ],
+                    selected.primary().dtype(),
+                ),
+                [],
+            )
+            .and_then(|schema| schema.resolve(pass.batch_size, sequence))
+            .map_err(eredu_nn::Error::backend_source)?
+        };
+        if let Some((sequence, width)) = continuation {
+            if actual.primary().shape() != [1, sequence, width] {
+                return Err(eredu_nn::Error::backend(
+                    "composite route wire shape differs from packed continuation geometry",
+                ));
+            }
         }
-        let routes = route_schemas.into_iter().collect::<Vec<_>>();
-        let route_source_units = routes.iter().map(|(id, _, end)| (*id, *end)).collect();
-        let route_schemas = routes
-            .into_iter()
-            .map(|(id, schema, _)| (id, schema))
-            .collect::<std::collections::BTreeMap<_, _>>();
-        let global_state_offset = partition
-            .state()
-            .map_or(0, eredu_runtime::PartitionState::global_layer_offset);
-        Ok(Self {
-            architecture,
-            policy,
-            units,
-            primary_group,
-            global_state_offset,
-            parallel: parallel.filter(|parallel| B::parallel_size(parallel) > 1),
-            tensor_group: None,
-            pipeline_stages: 1,
-            allocator,
-            activation_dtype,
-            route_schemas,
-            route_source_units,
-            publication,
-            unit_strategy,
-            marker: PhantomData,
-        })
-    }
-
-    /// Selects the active TP reduction group and PP stage count used by
-    /// request-bounded composite collective schedules. Singleton transport
-    /// groups for parameter providers are bound separately, not as TP waves.
-    pub fn with_collective_topology(
-        mut self,
-        tensor_group: Option<eredu_core::CollectiveGroupId>,
-        pipeline_stages: usize,
-    ) -> Result<Self, eredu_nn::Error> {
-        if pipeline_stages == 0 {
-            return Err(eredu_nn::Error::backend(
-                "composite collective topology has no pipeline stages",
-            ));
-        }
-        let tensor_partitions = self.parallel.as_ref().map_or(1, B::parallel_size);
-        if (tensor_partitions > 1) != tensor_group.is_some() {
-            return Err(eredu_nn::Error::backend(
-                "composite TP context and opaque tensor group differ",
-            ));
-        }
-        self.tensor_group = tensor_group;
-        self.pipeline_stages = pipeline_stages;
-        Ok(self)
+        validate_composite_invocation_schema(selected, &actual)?;
+        Ok(actual)
     }
 }
 
@@ -921,25 +867,17 @@ where
 {
     input:
         Option<crate::composite_execution::PreparedCompositeInput<'a, B::Tensor, A::InputPartPlan>>,
-    group_activity: Vec<bool>,
-    group_boundary_sequences: Vec<i32>,
-    group_continuation_geometry:
-        Vec<Option<crate::composite_execution::CompositeContinuationGeometry>>,
+    groups: Vec<crate::composite_execution::CompositeGroupInvocation>,
+    boundary_schemas: std::collections::BTreeMap<CommunicationRouteId, ResolvedBoundaryWireSchema>,
     group_wave_stages: Vec<Vec<usize>>,
-    group_collective_waves:
-        Vec<Option<Vec<Vec<crate::composite_execution::CompositeTensorCollective>>>>,
     primary_ingress_collectives: Option<Vec<crate::composite_execution::CompositeTensorCollective>>,
     batch_size: i32,
     sequence_length: i32,
     publication_shape: [i32; 3],
     forward: Option<eredu_runtime::LayeredForwardState<B::Tensor, A::ForwardContext>>,
     group_outputs: Vec<Option<B::Tensor>>,
-    pending_group_boundaries: Vec<Option<(usize, ResolvedBoundaryWireSchema, Vec<B::Tensor>)>>,
-    incoming_decoder: Option<(
-        B::Tensor,
-        <A::Boundary as ArchitectureBoundary>::Boundary<B::Tensor>,
-    )>,
-    decoder_boundary_resumed: bool,
+    received_boundaries:
+        Vec<std::collections::BTreeMap<usize, eredu_runtime::ReceivedPartitionBoundary<B::Tensor>>>,
     partition_output: Option<
         eredu_runtime::LayeredPartitionOutput<
             B::Tensor,
@@ -1035,29 +973,6 @@ where
                 .ok_or_else(|| {
                 eredu_nn::Error::backend("composite partition requires admitted prepared input")
             })?;
-        let group_activity: Vec<bool> = (0..self.units.len())
-            .map(|group| {
-                self.architecture
-                    .should_execute_prepared_group(group, input)
-            })
-            .collect();
-        let group_boundary_sequences = (0..self.units.len())
-            .map(|group| {
-                self.architecture
-                    .prepared_group_boundary_sequence(group, input)
-                    .map_err(eredu_nn::Error::backend)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let group_continuation_geometry = (0..self.units.len())
-            .map(|group| {
-                if !group_activity[group] {
-                    return Ok(None);
-                }
-                self.architecture
-                    .prepared_group_continuation_geometry(group, input)
-                    .map_err(eredu_nn::Error::backend)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
         let tensor_partitions = self.parallel.as_ref().map_or(1, B::parallel_size);
         let graph = eredu_runtime::LayeredArchitecture::execution_graph(&self.architecture)
             .map_err(eredu_nn::Error::backend_source)?;
@@ -1067,13 +982,6 @@ where
             })
             .collect::<Result<Vec<_>, _>>()
             .map_err(eredu_nn::Error::backend_source)?;
-        for (geometry, &count) in group_continuation_geometry.iter().zip(&counts) {
-            if let Some(geometry) = geometry {
-                geometry
-                    .validate_units(count)
-                    .map_err(eredu_nn::Error::backend)?;
-            }
-        }
         let layout = eredu_runtime::ExecutionUnitLayout::new(&graph, counts)
             .map_err(eredu_nn::Error::backend_source)?;
         let transports = (0..self.units.len())
@@ -1089,26 +997,28 @@ where
         )
         .map_err(eredu_nn::Error::backend_source)?;
         let owners = placement.owners();
-        let group_collective_waves = (0..self.units.len())
+        let groups = (0..self.units.len())
             .map(|group| {
-                let waves = self
+                let stage_units = (0..self.pipeline_stages)
+                    .map(|stage| {
+                        owners[group]
+                            .iter()
+                            .find(|(owner, _)| *owner == stage)
+                            .map_or(0..0, |(_, range)| range.clone())
+                    })
+                    .collect::<Vec<_>>();
+                let invocation = self
                     .architecture
-                    .prepared_group_collective_waves(
-                        group,
-                        input,
-                        tensor_partitions,
-                        &(0..self.pipeline_stages)
-                            .map(|stage| {
-                                owners[group]
-                                    .iter()
-                                    .find(|(owner, _)| *owner == stage)
-                                    .map_or(0..0, |(_, range)| range.clone())
-                            })
-                            .collect::<Vec<_>>(),
-                    )
+                    .prepared_group_invocation(group, input, tensor_partitions, &stage_units)
                     .map_err(eredu_nn::Error::backend)?;
+                if let Some(geometry) = &invocation.continuation {
+                    let count = layout.group_range(group).expect("validated group").len();
+                    geometry
+                        .validate_units(count)
+                        .map_err(eredu_nn::Error::backend)?;
+                }
                 let requires_schedule = group != self.primary_group
-                    && group_activity[group]
+                    && invocation.mode.is_active()
                     && tensor_partitions > 1
                     && self.pipeline_stages > 1
                     && eredu_runtime::LayeredArchitecture::group_transport(
@@ -1117,12 +1027,12 @@ where
                     )
                     .parallel_subgroup
                         == Some(eredu_runtime::ArchitectureParallelSubgroup::TensorSharded);
-                if requires_schedule && waves.is_none() {
+                if requires_schedule && invocation.collective_waves.is_none() {
                     return Err(eredu_nn::Error::backend(
                         "active tensor-sharded composite group has no exact collective-wave schema",
                     ));
                 }
-                if let Some(waves) = &waves {
+                if let Some(waves) = &invocation.collective_waves {
                     if waves.len() != self.pipeline_stages
                         || waves.iter().flatten().any(|operation| {
                             operation.shape().is_empty()
@@ -1134,7 +1044,7 @@ where
                         ));
                     }
                 }
-                Ok(waves)
+                Ok(invocation)
             })
             .collect::<Result<Vec<_>, _>>()?;
         let primary_ingress_collectives = self
@@ -1154,17 +1064,14 @@ where
                 "composite primary ingress collective schema is malformed",
             ));
         }
-        let batch_size = input
-            .prepared()
-            .parts()
-            .first()
-            .ok_or_else(|| eredu_nn::Error::backend("composite request has no prepared parts"))?
-            .payload()
-            .value()
-            .dim(0);
-        let sequence_length = *group_boundary_sequences
+        let batch_size = self
+            .architecture
+            .prepared_decoder_batch_size(input)
+            .map_err(eredu_nn::Error::backend)?;
+        let sequence_length = groups
             .get(self.primary_group)
-            .filter(|length| **length > 0)
+            .filter(|group| group.mode.is_active() && group.boundary_sequence > 0)
+            .map(|group| group.boundary_sequence)
             .ok_or_else(|| {
                 eredu_nn::Error::backend("composite primary invocation length is invalid")
             })?;
@@ -1175,30 +1082,34 @@ where
             .unwrap_or(self.publication.output_width());
         let publication_shape =
             PublicationValueDescriptor::new(width)?.shape(batch_size, sequence_length)?;
-        Ok(CompositePartitionPass {
+        let mut pass = CompositePartitionPass {
             input: Some(input),
-            group_activity,
-            group_boundary_sequences,
-            group_continuation_geometry,
+            boundary_schemas: Default::default(),
+            groups,
             group_wave_stages: owners
                 .iter()
                 .map(|owners| owners.iter().map(|(stage, _)| *stage).collect())
                 .collect(),
-            group_collective_waves,
             primary_ingress_collectives,
             batch_size,
             sequence_length,
             publication_shape,
             forward: None,
             group_outputs: (0..self.units.len()).map(|_| None).collect(),
-            pending_group_boundaries: (0..self.units.len()).map(|_| None).collect(),
-            incoming_decoder: None,
-            decoder_boundary_resumed: false,
+            received_boundaries: (0..self.units.len()).map(|_| Default::default()).collect(),
             partition_output: None,
             final_output: None,
             expert_pass,
             marker: PhantomData,
-        })
+        };
+        for selected in self.routes.values() {
+            let route = selected.route();
+            if pass.groups[route.source_group].mode.is_active() {
+                let schema = self.resolve_invocation_boundary(&pass, selected)?;
+                pass.boundary_schemas.insert(route.route, schema);
+            }
+        }
+        Ok(pass)
     }
 
     fn request_group_active(
@@ -1206,11 +1117,14 @@ where
         pass: &Self::Pass<'_>,
         group: usize,
     ) -> Result<bool, eredu_nn::Error> {
-        pass.group_activity.get(group).copied().ok_or_else(|| {
-            eredu_nn::Error::backend(
-                "composite request has no activity decision for the execution group",
-            )
-        })
+        pass.groups
+            .get(group)
+            .map(|group| group.mode.is_active())
+            .ok_or_else(|| {
+                eredu_nn::Error::backend(
+                    "composite request has no activity decision for the execution group",
+                )
+            })
     }
 
     fn has_cross_stage_collective_waves(&self) -> bool {
@@ -1248,9 +1162,9 @@ where
             || (!active
                 && !self.unit_strategy.has_cross_stage_collective_waves()
                 && pass
-                    .group_collective_waves
+                    .groups
                     .get(group)
-                    .is_some_and(Option::is_some))
+                    .is_some_and(|group| group.collective_waves.is_some()))
         {
             if active {
                 let driver =
@@ -1289,9 +1203,9 @@ where
                 return Ok(());
             }
             let Some(waves) = pass
-                .group_collective_waves
+                .groups
                 .get(group)
-                .and_then(Option::as_ref)
+                .and_then(|group| group.collective_waves.as_ref())
             else {
                 return Ok(());
             };
@@ -1471,43 +1385,46 @@ where
         let owns_group_input = actual_range.start == 0;
         let owns_group_output = actual_range.end == group_unit_count;
 
-        let mut resumed =
-            group == self.primary_group && std::mem::take(&mut pass.decoder_boundary_resumed);
-        if group == self.primary_group {
-            if let Some((hidden, auxiliary)) = pass.incoming_decoder.take() {
-                if pass.forward.is_some() {
-                    return Err(eredu_nn::Error::backend(
-                        "composite decoder boundary was not installed into retained context",
-                    ));
-                } else {
-                    let expected = driver.optional_state_layout().ok_or_else(|| {
-                        eredu_nn::Error::backend("decoder partition has no selected state layout")
-                    })?;
-                    // Composite adapters receive the global origin of this local
-                    // state view to retain ownership and unit-to-state identities.
-                    let forward = match self.parallel.as_ref() {
-                        Some(parallel) => self.architecture.begin_partition_parallel(
-                            eredu_runtime::LayeredPartitionInput::Hidden { hidden, auxiliary },
-                            None,
-                            state,
-                            expected,
-                            self.global_state_offset,
-                            parallel,
-                            context,
-                        ),
-                        None => self.architecture.begin_partition(
-                            eredu_runtime::LayeredPartitionInput::Hidden { hidden, auxiliary },
-                            None,
-                            state,
-                            expected,
-                            self.global_state_offset,
-                            context,
-                        ),
-                    }
+        let mut boundaries = std::mem::take(&mut pass.received_boundaries[group]);
+        let mut resumed = false;
+        if group == self.primary_group && pass.forward.is_none() {
+            if let Some(boundary) = boundaries.remove(&group) {
+                let (_, _, values) = boundary.into_parts();
+                let mut values = values.into_iter();
+                let hidden = values.next().ok_or_else(|| {
+                    eredu_nn::Error::backend("composite decoder boundary has no primary activation")
+                })?;
+                let auxiliary = self
+                    .architecture
+                    .boundary_schema()
+                    .map_err(eredu_nn::Error::backend_source)?
+                    .decode(values.collect())
                     .map_err(eredu_nn::Error::backend_source)?;
-                    pass.forward = Some(forward);
-                    resumed = true;
+                let expected = driver.optional_state_layout().ok_or_else(|| {
+                    eredu_nn::Error::backend("decoder partition has no selected state layout")
+                })?;
+                let forward = match self.parallel.as_ref() {
+                    Some(parallel) => self.architecture.begin_partition_parallel(
+                        eredu_runtime::LayeredPartitionInput::Hidden { hidden, auxiliary },
+                        None,
+                        state,
+                        expected,
+                        self.global_state_offset,
+                        parallel,
+                        context,
+                    ),
+                    None => self.architecture.begin_partition(
+                        eredu_runtime::LayeredPartitionInput::Hidden { hidden, auxiliary },
+                        None,
+                        state,
+                        expected,
+                        self.global_state_offset,
+                        context,
+                    ),
                 }
+                .map_err(eredu_nn::Error::backend_source)?;
+                pass.forward = Some(forward);
+                resumed = true;
             }
         }
         if pass.forward.is_none() {
@@ -1535,66 +1452,55 @@ where
             pass.forward = Some(forward);
         }
 
-        {
-            let forward = pass.forward.as_mut().expect("composite forward installed");
-            for source_group in 0..pass.pending_group_boundaries.len() {
-                // Independent roots can return their results before another
-                // root executes. Preserve each boundary until its declared
-                // destination starts; an intervening group cannot consume it.
-                if !pass.pending_group_boundaries[source_group]
-                    .as_ref()
-                    .is_some_and(|(destination, _, _)| *destination == group)
-                {
-                    continue;
-                }
-                let Some((destination, schema, auxiliary)) =
-                    pass.pending_group_boundaries[source_group].take()
-                else {
-                    continue;
-                };
-                let primary = pass.group_outputs[source_group].take().ok_or_else(|| {
-                    eredu_nn::Error::backend("composite pending boundary has no primary activation")
-                })?;
-                let fallback = primary.clone();
-                let mut values = vec![primary];
-                values.extend(auxiliary);
-                let installed = self
-                    .architecture
-                    .accept_partition_boundary(
-                        source_group,
-                        destination,
-                        &schema,
-                        values,
-                        &mut forward.context,
-                        context,
+        let forward = pass.forward.as_mut().expect("composite forward installed");
+        for boundary in boundaries.into_values() {
+            let (route, schema, values) = boundary.into_parts();
+            let source = route.source_group;
+            let decoder_continuation = source == group && group == self.primary_group;
+            let fallback = if !decoder_continuation || schema.auxiliary().is_empty() {
+                values.first().cloned()
+            } else {
+                None
+            };
+            let hidden = self
+                .architecture
+                .accept_partition_boundary(
+                    source,
+                    group,
+                    &schema,
+                    values,
+                    &mut forward.context,
+                    context,
+                )
+                .map_err(eredu_nn::Error::backend_source)?
+                .or(fallback)
+                .ok_or_else(|| {
+                    eredu_nn::Error::backend(
+                        "composite boundary did not install a primary activation",
                     )
-                    .map_err(eredu_nn::Error::backend_source)?;
-                pass.group_outputs[source_group] = Some(installed.unwrap_or(fallback));
+                })?;
+            if decoder_continuation {
+                forward.hidden = hidden;
+                resumed = true;
+            } else {
+                pass.group_outputs[source] = Some(hidden);
             }
         }
         let incoming_group = (group != self.primary_group && !owns_group_input)
             .then(|| pass.group_outputs[group].take())
             .flatten()
             .map(|hidden| {
-                let hidden = if pass.group_continuation_geometry[group].is_some()
-                    && self.architecture.prepared_group_continuation_batched(group)
-                {
-                    hidden.squeeze_axes(&[0], context)?
-                } else {
-                    hidden
+                let Some(geometry) = &pass.groups[group].continuation else {
+                    return Ok(hidden);
                 };
-                self.architecture
-                    .decode_group_continuation(
-                        group,
-                        hidden,
-                        &pass
-                            .forward
-                            .as_ref()
-                            .expect("composite forward installed")
-                            .context,
-                        context,
-                    )
-                    .map_err(eredu_nn::Error::backend_source)
+                let shape = geometry
+                    .native_shape(actual_range.start)
+                    .map_err(eredu_nn::Error::backend)?;
+                if hidden.shape() == shape {
+                    Ok(hidden)
+                } else {
+                    hidden.reshape(shape, context)
+                }
             })
             .transpose()?;
         let forward = pass.forward.as_mut().expect("composite forward installed");
@@ -1622,7 +1528,11 @@ where
                 .copied()
                 .collect::<Vec<_>>();
             for dependency in dependency_groups.iter().copied() {
-                let active = pass.group_activity.get(dependency).copied().unwrap_or(true);
+                let active = pass
+                    .groups
+                    .get(dependency)
+                    .map(|group| group.mode.is_active())
+                    .unwrap_or(true);
                 if active
                     && self.units.get(dependency).is_some_and(Vec::is_empty)
                     && pass.group_outputs[dependency].is_none()
@@ -1631,7 +1541,7 @@ where
                         Some(parallel) => self.architecture.begin_execution_group_parallel(
                             dependency,
                             &forward.hidden,
-                            &[],
+                            &eredu_runtime::GroupDependencies::empty(),
                             state,
                             &mut forward.context,
                             parallel,
@@ -1640,7 +1550,7 @@ where
                         None => self.architecture.begin_execution_group(
                             dependency,
                             &forward.hidden,
-                            &[],
+                            &eredu_runtime::GroupDependencies::empty(),
                             state,
                             &mut forward.context,
                             context,
@@ -1690,23 +1600,22 @@ where
                     pass.group_outputs[dependency] = Some(dependency_hidden);
                 }
             }
-            let dependencies = dependency_groups
-                .into_iter()
-                .filter_map(|dependency| {
-                    let output = pass.group_outputs[dependency].as_ref();
-                    // Invocation activity is architecture-owned for every
-                    // group, including a separate media projector. An inactive
-                    // producer contributes no new value during cached text
-                    // continuation or when features are already prepared.
-                    let required = pass.group_activity.get(dependency).copied().unwrap_or(true);
-                    if required && output.is_none() {
-                        return Some(Err(eredu_nn::Error::backend(
-                            "composite group executed before its active dependency arrived",
-                        )));
-                    }
-                    output.map(Ok)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            for &producer in &dependency_groups {
+                if pass.groups[producer].mode.is_active() && pass.group_outputs[producer].is_none()
+                {
+                    return Err(eredu_nn::Error::backend(
+                        "composite group executed before its active dependency arrived",
+                    ));
+                }
+            }
+            let dependencies =
+                eredu_runtime::GroupDependencies::new(&dependency_groups, |producer| {
+                    pass.groups[producer]
+                        .mode
+                        .is_active()
+                        .then(|| pass.group_outputs[producer].as_ref())
+                        .flatten()
+                });
             match self.parallel.as_ref() {
                 Some(parallel) => self.architecture.begin_execution_group_parallel(
                     group,
@@ -1785,26 +1694,20 @@ where
                     .observe_output(observer, &hidden)?
                     .unwrap_or(hidden);
             }
-            let state_values = if driver.optional_state_layout().is_some() {
-                let global = self.architecture.state_ordinal(
+            let mut state_values = Vec::new();
+            if driver.optional_state_layout().is_some() {
+                for slot in self.architecture.retained_state_ordinals(
                     address.group(),
                     address.index(),
                     storage_ordinal,
-                );
-                let local = global
-                    .checked_sub(self.global_state_offset)
-                    .ok_or_else(|| {
-                        eredu_nn::Error::backend(
-                            "composite state ordinal precedes selected local state",
-                        )
-                    })?;
-                state
-                    .retained_values(local, address.with_index(global))
-                    .map_err(eredu_nn::Error::backend_source)?
-                    .collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            };
+                ) {
+                    state_values.extend(
+                        state
+                            .retained_values(slot, address.with_index(slot))
+                            .map_err(eredu_nn::Error::backend_source)?,
+                    );
+                }
+            }
             let context_values = self.architecture.retained_context_values(
                 &forward.context,
                 address.group(),
@@ -1902,10 +1805,6 @@ where
         source: bool,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<Vec<eredu_runtime::ArchitectureBoundaryValue<B::Tensor>>, eredu_nn::Error> {
-        let selected = self.route_schemas.get(&route.route).ok_or_else(|| {
-            eredu_nn::Error::backend("composite route has no selected architecture schema")
-        })?;
-        validate_composite_invocation_schema(selected, schema)?;
         if !source {
             return schema
                 .tensors()
@@ -1951,19 +1850,27 @@ where
                     eredu_nn::Error::backend("composite boundary requested before group completion")
                 })?
                 .clone();
-            if route.source_group == route.destination_group
-                && pass.group_continuation_geometry[route.source_group].is_some()
-                && self
-                    .architecture
-                    .prepared_group_continuation_batched(route.source_group)
-            {
-                hidden = hidden.expand_dims(0, context)?;
-            }
             if route.source_group == route.destination_group {
-                hidden = self
-                    .architecture
-                    .encode_group_continuation(route.source_group, hidden, context)
-                    .map_err(eredu_nn::Error::backend_source)?;
+                if let Some(geometry) = &pass.groups[route.source_group].continuation {
+                    let end = self
+                        .routes
+                        .get(&route.route)
+                        .ok_or_else(|| {
+                            eredu_nn::Error::backend("composite continuation route is missing")
+                        })?
+                        .source_unit_end();
+                    let shape = geometry
+                        .native_shape(end)
+                        .map_err(eredu_nn::Error::backend)?;
+                    if hidden.shape() != shape {
+                        return Err(eredu_nn::Error::backend(
+                            "native activation differs from its continuation geometry",
+                        ));
+                    }
+                    if shape != schema.primary().shape() {
+                        hidden = hidden.reshape(schema.primary().shape(), context)?;
+                    }
+                }
             }
             let forward = pass.forward.as_ref().ok_or_else(|| {
                 eredu_nn::Error::backend("composite boundary has no architecture context")
@@ -2024,152 +1931,33 @@ where
         pass: &Self::Pass<'_>,
         route: &eredu_runtime::PartitionBoundaryRoute,
     ) -> Result<ResolvedBoundaryWireSchema, eredu_nn::Error> {
-        let selected = self.route_schemas.get(&route.route).ok_or_else(|| {
-            eredu_nn::Error::backend("composite route has no selected architecture schema")
-        })?;
-        let decoder_continuation = route.source_group == self.primary_group
-            && route.source_group == route.destination_group;
-        let source_sequence = *pass
-            .group_boundary_sequences
-            .get(route.source_group)
+        pass.boundary_schemas
+            .get(&route.route)
+            .cloned()
             .ok_or_else(|| {
-                eredu_nn::Error::backend("composite route source has no prepared boundary sequence")
-            })?;
-        let continuation = if route.source_group == route.destination_group {
-            let end = self
-                .route_source_units
-                .get(&route.route)
-                .copied()
-                .ok_or_else(|| {
-                    eredu_nn::Error::backend(
-                        "composite route omitted its selected source-unit frontier",
-                    )
-                })?;
-            pass.group_continuation_geometry[route.source_group]
-                .as_ref()
-                .map(|geometry| geometry.after_unit_end(end))
-                .transpose()
-                .map_err(eredu_nn::Error::backend)?
-        } else {
-            None
-        };
-        let family_schema = self
-            .architecture
-            .partition_boundary_schema(
-                route.source_group,
-                route.destination_group,
-                selected,
-                pass.batch_size,
-                source_sequence,
-                &pass.group_boundary_sequences,
-                continuation,
-            )
-            .map_err(eredu_nn::Error::backend_source)?;
-        let actual = if let Some(schema) = family_schema {
-            schema
-        } else if decoder_continuation {
-            self.architecture
-                .boundary_schema()
-                .map_err(eredu_nn::Error::backend_source)?
-                .wire_schema()
-                .and_then(|schema| schema.resolve(pass.batch_size, pass.sequence_length))
-                .map_err(eredu_nn::Error::backend_source)?
-        } else {
-            let hidden = *selected.primary().shape().last().ok_or_else(|| {
-                eredu_nn::Error::backend("composite route primary activation has no hidden extent")
-            })?;
-            let (sequence, hidden) = if route.source_group == route.destination_group {
-                continuation.unwrap_or((source_sequence, hidden))
-            } else {
-                (source_sequence, hidden)
-            };
-            BoundaryWireSchema::new(
-                selected.identity(),
-                eredu_runtime::BoundaryTensorSpec::new(
-                    selected.primary().role(),
-                    [
-                        eredu_runtime::BoundaryTensorDimension::Batch,
-                        eredu_runtime::BoundaryTensorDimension::Sequence,
-                        eredu_runtime::BoundaryTensorDimension::Fixed(hidden),
-                    ],
-                    selected.primary().dtype(),
-                ),
-                [],
-            )
-            .and_then(|schema| schema.resolve(pass.batch_size, sequence))
-            .map_err(eredu_nn::Error::backend_source)?
-        };
-        validate_composite_invocation_schema(selected, &actual)?;
-        Ok(actual)
+                eredu_nn::Error::backend("composite route has no active invocation schema")
+            })
     }
 
     fn accept_boundary(
         &mut self,
         pass: &mut Self::Pass<'_>,
-        route: &eredu_runtime::PartitionBoundaryRoute,
-        values: Vec<B::Tensor>,
-        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        boundary: eredu_runtime::ReceivedPartitionBoundary<B::Tensor>,
     ) -> Result<(), eredu_nn::Error> {
-        let schema = self.route_schemas.get(&route.route).ok_or_else(|| {
-            eredu_nn::Error::backend("composite route has no selected architecture schema")
-        })?;
-        let mut values = values.into_iter();
-        let hidden = values.next().ok_or_else(|| {
-            eredu_nn::Error::backend("composite boundary has no primary activation")
-        })?;
-        if route.destination_group == self.primary_group
-            && route.source_group == route.destination_group
-        {
-            if let Some(forward) = pass.forward.as_mut() {
-                let installed = self
-                    .architecture
-                    .accept_partition_boundary(
-                        route.source_group,
-                        route.destination_group,
-                        schema,
-                        std::iter::once(hidden).chain(values).collect(),
-                        &mut forward.context,
-                        context,
-                    )
-                    .map_err(eredu_nn::Error::backend_source)?
-                    .ok_or_else(|| {
-                        eredu_nn::Error::backend(
-                            "composite architecture did not resume its decoder boundary",
-                        )
-                    })?;
-                forward.hidden = installed;
-                pass.decoder_boundary_resumed = true;
-            } else {
-                let auxiliary = self
-                    .architecture
-                    .boundary_schema()
-                    .map_err(eredu_nn::Error::backend_source)?
-                    .decode(values.collect())
-                    .map_err(eredu_nn::Error::backend_source)?;
-                pass.incoming_decoder = Some((hidden, auxiliary));
+        let route = boundary.route();
+        let incoming = pass
+            .received_boundaries
+            .get_mut(route.destination_group)
+            .ok_or_else(|| eredu_nn::Error::backend("composite boundary destination is unknown"))?;
+        match incoming.entry(route.source_group) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(boundary);
+                Ok(())
             }
-        } else {
-            let auxiliary = values.collect::<Vec<_>>();
-            let pending = pass
-                .pending_group_boundaries
-                .get_mut(route.source_group)
-                .ok_or_else(|| {
-                    eredu_nn::Error::backend(
-                        "composite boundary references an unknown source group",
-                    )
-                })?;
-            if pending.is_some() {
-                return Err(eredu_nn::Error::backend(
-                    "composite source group received duplicate pending boundaries",
-                ));
-            }
-            // A primary-only dependency can still carry architecture state:
-            // the destination must enter the same typed acceptance hook even
-            // when the selected edge has zero auxiliary tensors.
-            *pending = Some((route.destination_group, schema.clone(), auxiliary));
-            pass.group_outputs[route.source_group] = Some(hidden);
+            std::collections::btree_map::Entry::Occupied(_) => Err(eredu_nn::Error::backend(
+                "composite destination received duplicate boundaries from a producer",
+            )),
         }
-        Ok(())
     }
 
     fn finish(
@@ -2182,7 +1970,12 @@ where
             Some(forward) => forward,
             None => {
                 if self.units.iter().enumerate().any(|(group, units)| {
-                    !units.is_empty() && pass.group_activity.get(group).copied().unwrap_or(true)
+                    !units.is_empty()
+                        && pass
+                            .groups
+                            .get(group)
+                            .map(|group| group.mode.is_active())
+                            .unwrap_or(true)
                 }) {
                     return Err(eredu_nn::Error::backend(
                         "active composite partition executed no local group",
@@ -2504,9 +2297,7 @@ where
     fn accept_boundary(
         &mut self,
         _pass: &mut Self::Pass<'_>,
-        _route: &eredu_runtime::PartitionBoundaryRoute,
-        _values: Vec<B::Tensor>,
-        _context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        _boundary: eredu_runtime::ReceivedPartitionBoundary<B::Tensor>,
     ) -> Result<(), eredu_nn::Error> {
         Err(eredu_nn::Error::backend(
             "direct resident executor has no pipeline boundary",
@@ -4309,9 +4100,7 @@ where
     fn accept_boundary(
         &mut self,
         _pass: &mut Self::Pass<'_>,
-        _route: &eredu_runtime::PartitionBoundaryRoute,
-        _values: Vec<B::Tensor>,
-        _context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        _boundary: eredu_runtime::ReceivedPartitionBoundary<B::Tensor>,
     ) -> Result<(), eredu_nn::Error> {
         Err(eredu_nn::Error::backend(
             "routed direct partition has no pipeline boundary",

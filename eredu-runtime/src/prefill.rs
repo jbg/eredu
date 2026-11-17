@@ -55,6 +55,46 @@ pub enum PrefillStep {
     Complete,
 }
 
+/// Backend-neutral progress and retained storage of a resumable prefill request.
+pub trait RetainedPrefillCursor: Clone {
+    /// Tensor roots shared by cursor snapshots.
+    type Tensor: eredu_nn::Tensor;
+    /// Failure when the cursor can no longer advance.
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Number of committed decoder positions.
+    fn decoder_position(&self) -> usize;
+    /// Total number of admitted decoder positions.
+    fn token_count(&self) -> usize;
+    /// Next ingress, decoder, or terminal boundary.
+    fn next_step(&self) -> Result<PrefillStep, Self::Error>;
+    /// Host metadata bytes, excluding the native backing allocations.
+    fn retained_metadata_bytes(&self) -> Option<usize>;
+    /// Visits immutable tensor roots whose backing allocations must remain live.
+    fn visit_retained_values<'a>(&'a self, visit: impl FnMut(&'a Self::Tensor));
+}
+
+/// Drains the same retained request steps used by controlled advancement.
+pub fn drain_retained_prefill<T, E>(
+    mut advance: impl FnMut() -> Result<Option<RetainedPrefillAdvance<T>>, E>,
+) -> Result<Option<T>, E> {
+    let mut output = None;
+    while let Some(progress) = advance()? {
+        if let RetainedPrefillAdvance::Decoder(scores) = progress {
+            output = Some(scores);
+        }
+    }
+    Ok(output)
+}
+
+/// Progress from one step of a retained prefill request.
+pub enum RetainedPrefillAdvance<T> {
+    /// One ingress step completed without a decoder output.
+    Ingress,
+    /// One decoder prefix completed with its score rows.
+    Decoder(T),
+}
+
 /// Request progress owned by a caller performing controlled or uninterrupted prefill.
 /// Clones share immutable request values; snapshot users must pair this cursor with
 /// the corresponding session state. Observation and execution budgets stay in the session.

@@ -37,6 +37,8 @@ pub mod perception_rnnt;
 pub mod perception_rnnt_pipeline;
 pub mod perception_rnnt_preparation;
 pub mod perception_specs;
+/// Portable perception execution for bound pipelines.
+pub mod perception_stage;
 pub mod precision;
 pub mod preparation;
 pub mod preprocessing;
@@ -52,6 +54,7 @@ pub mod rnnt_predictor;
 pub mod rnnt_predictor_distribution;
 pub mod rnnt_predictor_partition;
 pub mod rnnt_predictor_preparation;
+pub mod rnnt_predictor_stage;
 pub mod rnnt_preparation;
 pub mod rnnt_projection_layered;
 pub mod rnnt_projection_preparation;
@@ -85,3 +88,5 @@ pub mod tts_transformer_distribution;
 pub mod tts_transformer_layered;
 pub mod tts_transformer_preparation;
 pub mod tts_transformer_specs;
+/// Portable tts transformer execution for bound pipelines.
+pub mod tts_transformer_stage;

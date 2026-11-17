@@ -7,20 +7,27 @@ mod artifact;
 mod component;
 mod config;
 mod declarations;
+mod decoder;
 mod execution;
 pub(crate) mod gguf;
+pub use decoder::VlDecoder;
 mod kernel;
+mod local_session;
+pub(crate) use local_session::local_vl_session;
 mod model;
 mod policy;
 mod prefill;
 mod preparation;
 pub(crate) use preparation::validate_rank_state;
 mod prompt;
+pub(crate) mod rank_session;
+mod session;
+pub use session::{prepare_vl_prefill_request, VlSessionDriver, VlSessionPolicyError};
 
 pub(crate) use artifact::DECODER_ROLE;
 pub use artifact::{
     MediaTokens, PreparedVisionLanguage, PreparedVisionWeights, PreparedVlDecoder,
-    PreparedVlTensorDecoder, VisionLanguageDeclaration,
+    VisionLanguageDeclaration,
 };
 pub use config::{AxialRope, ProjectorConfig, VisionConfig, VisionLayerKind};
 pub use declarations::{Declaration, VisionUnit};
@@ -32,10 +39,13 @@ pub use model::{VisionBlock, VisionInput, VisionPatchifier, VisionProjector, Vis
 pub use policy::{
     PolicyVision, PolicyVisionProgress, PolicyVisionSession, PreparedVisionExecution,
 };
-pub use prefill::{VlPrefill, VlPrefillProgress};
+pub use prefill::{
+    admit_partitioned_vl_prefill, reset_partitioned_vl_state, run_partitioned_vl_decoder,
+    VlPrefill, VlPrefillProgress,
+};
 pub use preparation::{
-    PreparedVlGraph, PreparedVlRankGraph, SelectedVlGraph, SelectedVlRankGraph,
-    VL_SESSION_CAPABILITIES,
+    prepare_vl_decoder_stage, BoundVlRankSession, PreparedVlDecoderStage, PreparedVlGraph,
+    PreparedVlRankGraph, SelectedVlGraph, SelectedVlRankGraph, VL_SESSION_CAPABILITIES,
 };
 pub use prompt::{
     ProjectedVisionPrompt, VisionPrompt, VisionPromptAdmission, VisionPromptPreparation,

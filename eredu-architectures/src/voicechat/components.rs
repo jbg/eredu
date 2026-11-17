@@ -9,17 +9,21 @@ use eredu_codec::{
     ear_decoder_layered::DecoderExecution, ear_encoder_layered::EncoderExecution,
     prvq_layered::QuantizerExecution,
 };
+use eredu_core::BackendFailure;
 use eredu_nn::{
-    AttentionCache, DistributedNeuralBackend, GroupedNeuralBackend, Tensor, TensorElementType,
+    AttentionCache, DistributedNeuralBackend, GroupedNeuralBackend, NeuralBackend, Tensor,
+    TensorElementType,
 };
 use eredu_runtime::{
-    LayerRuntimeState, LayerWeightResidency, LayeredInvocation, RuntimeStateComponents,
+    ComponentPreparation, DenseSamplingBackend, LayerRuntimeState, LayeredInvocation,
+    LayeredTensorCohort, LocalComponentMechanisms, ParameterUnitMechanisms,
+    RealtimeGenerationBranch, RealtimeJointStateParts, RuntimeStateComponents, SubmissionBackend,
 };
 
 use crate::nemotron_h;
 
 use super::{
-    agent_sampling::AgentSamplingPolicy,
+    agent_sampling::{AgentSampler, AgentSamplingPolicy},
     artifact::RetainedVoiceChatArtifacts,
     assembly::LearnedSpeechComponents,
     backbone::{BackboneConstructionError, PreparedBackboneParameters},
@@ -27,7 +31,7 @@ use super::{
     component_residency::{
         VoiceChatResidencyError, VoiceChatResidencyPolicy, VoiceChatResidencyReport,
     },
-    execution::Components,
+    execution::{Components, ExecutionOutput, Invocation},
     frontend::FrontendOptions,
     function_head_layered::FunctionHeadExecution,
     host::{HostPreparationError, PreparedHostConditioning},
@@ -36,9 +40,11 @@ use super::{
     perception_rnnt::PerceptionRnntLimits,
     preparation::{GenerationPreparationError, PreparedGeneration},
     provider_construction::{
-        PreparedSpeechProviders, ProviderConstructionError, SpeechProviderBinder,
+        PreparedSpeechProviders, ProviderConstructionError, SpeechConditioning, SpeechDecoder,
+        SpeechEncoder, SpeechFunctionHead, SpeechMog, SpeechPerception, SpeechQuantizer,
+        SpeechRnnt, SpeechRvq, SpeechTransformer,
     },
-    schedule::ScheduleLimits,
+    schedule::{ScheduleLimits, ScheduleState},
     silence::{PreparedSilenceConditioning, SilenceConditioningError},
     state::{NeuralStateGeometry, NeuralStateGeometryError},
     tts_conditioning_layered::ConditioningExecution,
@@ -46,7 +52,7 @@ use super::{
     tts_mog_layered::MogExecution,
     tts_prompt::PreparedTtsPrompt,
     tts_rvq_layered::RvqExecution,
-    tts_transformer_layered::TransformerExecution,
+    tts_transformer_layered::{CausalTransformerExecution, TransformerExecution},
 };
 
 /// Retained-source construction failure; no partially loaded aggregate is returned.
@@ -60,7 +66,7 @@ pub enum VoiceChatConstructionError {
     StateGeometry(#[from] NeuralStateGeometryError),
     /// Native submission or completion failed, preserving the original source.
     #[error("VoiceChat component materialization failed: {0}")]
-    Backend(#[source] eredu_core::BackendFailure),
+    Backend(#[from] eredu_core::BackendFailure),
     /// The selected artifact task did not retain a required companion component.
     #[error("coupled VoiceChat construction requires retained component {0:?}")]
     MissingComponent(Component),
@@ -79,25 +85,6 @@ pub enum VoiceChatConstructionError {
     /// Speech component construction or binding failed.
     #[error(transparent)]
     Speech(#[from] ProviderConstructionError),
-}
-
-/// Binds the selected backbone through the same layered invocation used by the executor.
-/// The architecture retains artifact interpretation and component composition.
-pub trait BackboneProviderBinder<B, S>: SpeechProviderBinder<B>
-where
-    B: GroupedNeuralBackend + DistributedNeuralBackend,
-    S: LayerRuntimeState<B>,
-    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
-{
-    /// Ordinary Nemotron runtime with the selected parameter provider.
-    type Backbone: LayeredInvocation<B, S, Architecture = nemotron_h::LayeredModel<B>>;
-
-    /// Materializes exact retained recipes under the admitted residency policy.
-    fn backbone(
-        &mut self,
-        prepared: &PreparedBackboneParameters,
-        residency: &LayerWeightResidency,
-    ) -> Result<Self::Backbone, eredu_core::BackendFailure>;
 }
 
 /// Cold authority for complete coupled component construction from retained stores.
@@ -224,60 +211,78 @@ impl<'a> PreparedVoiceChatConstruction<'a> {
     /// allocated, and no scheduler is created. The selected backbone and every
     /// independent speech pool pass aggregate budget admission before any binding.
     /// The enclosing native owner protects submission lifetime on every path.
-    pub fn materialize<B, S, V>(
+    pub fn materialize<B, S, H, C>(
         self,
         options: FrontendOptions,
         policy: &VoiceChatResidencyPolicy,
-        visitor: &mut V,
-        context: &<B::Tensor as Tensor>::Context,
+        mechanisms: &H,
     ) -> Result<
-        (BoundVoiceChatComponents<B, S, V>, InputState<B::Tensor>),
+        (BoundVoiceChatComponents<B, S, H, C>, InputState<B::Tensor>),
         VoiceChatConstructionError,
     >
     where
-        B: GroupedNeuralBackend + DistributedNeuralBackend,
+        B: GroupedNeuralBackend
+            + DistributedNeuralBackend
+            + SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>
+            + 'static,
         S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
-        V: BackboneProviderBinder<B, S>,
+        H: ParameterUnitMechanisms<B>
+            + LocalComponentMechanisms<B, S>
+            + ComponentPreparation<Context = <B::Tensor as Tensor>::Context>,
+        C: LayeredTensorCohort<B>,
     {
-        let residency_report = policy.validate(&self.backbone, &self.speech)?;
-        let input = InputState::from_retained(self.artifacts, options)?;
-        let (speech, _) = self
-            .speech
-            .materialize::<B, V>(policy.speech(), visitor, context)?;
-        let backbone = visitor
-            .backbone(&self.backbone, &policy.backbone())
-            .map_err(VoiceChatConstructionError::Backend)?;
-        Ok((
-            VoiceChatComponents {
-                backbone,
-                state: std::marker::PhantomData,
-                speech,
-                host: self.host,
-                silence: self.silence,
-                neural_state_geometry: self.neural_state_geometry,
-                residency_report,
-            },
-            input,
-        ))
+        mechanisms.prepare_components(move |mechanisms, context| {
+            let residency_report = policy.validate(&self.backbone, &self.speech)?;
+            let input = InputState::from_retained(self.artifacts, options)?;
+            let (speech, _) =
+                self.speech
+                    .materialize::<B, H, C>(policy.speech(), mechanisms, context)?;
+            let backbone = mechanisms.bind_local(|| {
+                self.backbone
+                    .prepare_local::<B, S>(policy.backbone(), context)
+                    .map_err(eredu_core::BackendFailure::from_error)
+            })?;
+            Ok((
+                VoiceChatComponents {
+                    backbone,
+                    state: std::marker::PhantomData,
+                    speech,
+                    host: self.host,
+                    silence: self.silence,
+                    residency_report,
+                },
+                input,
+            ))
+        })
     }
 }
 
+/// Unpublished local VoiceChat generation candidate.
+pub type LocalInvocationBranch<T, N, R, C> = RealtimeGenerationBranch<
+    super::state::StateBranch<T, N>,
+    ScheduleState,
+    AgentSamplingPolicy,
+    AgentSampler,
+    R,
+    C,
+>;
+
 /// Selected provider types assembled through a native binding visitor.
-pub type BoundVoiceChatComponents<B, S, V> = VoiceChatComponents<
+pub type BoundVoiceChatComponents<B, S, H, C> = VoiceChatComponents<
     B,
     S,
-    <V as BackboneProviderBinder<B, S>>::Backbone,
-    <V as SpeechProviderBinder<B>>::Perception,
-    <V as SpeechProviderBinder<B>>::Transformer,
-    <V as SpeechProviderBinder<B>>::Mog,
-    <V as SpeechProviderBinder<B>>::Rvq,
-    <V as SpeechProviderBinder<B>>::Conditioning,
-    <V as SpeechProviderBinder<B>>::Decoder,
-    <V as SpeechProviderBinder<B>>::Quantizer,
-    <V as SpeechProviderBinder<B>>::Encoder,
-    <V as SpeechProviderBinder<B>>::Function,
-    <V as SpeechProviderBinder<B>>::Rnnt,
+    <H as LocalComponentMechanisms<B, S>>::Local<nemotron_h::LayeredModel<B>>,
+    SpeechPerception<B, H, C>,
+    SpeechTransformer<B, H, C>,
+    SpeechMog<B, H, C>,
+    SpeechRvq<B, H, C>,
+    SpeechConditioning<B, H, C>,
+    SpeechDecoder<B, H, C>,
+    SpeechQuantizer<B, H, C>,
+    SpeechEncoder<B, H, C>,
+    SpeechFunctionHead<B, H, C>,
+    SpeechRnnt<B, H, C>,
 >;
 
 /// Bound components for the existing coupled executor, with exact retained host assets.
@@ -298,8 +303,65 @@ where
     /// Exact tokenizer, character mapping and channel controls.
     host: PreparedHostConditioning,
     silence: PreparedSilenceConditioning,
-    neural_state_geometry: NeuralStateGeometry,
     residency_report: VoiceChatResidencyReport,
+}
+
+/// Architecture operations which prepare immutable VoiceChat startup tensors.
+pub trait VoiceChatStartupComponents<T: Tensor> {
+    /// Prepares fixed-Aria startup with the admitted codec and codebooks.
+    fn prepare_prompt(
+        &mut self,
+        batch: i32,
+        max_token_positions: usize,
+        context: &T::Context,
+    ) -> Result<PreparedTtsPrompt<T>, TtsError>;
+    /// Prepares tool silence without mutating live conversation state.
+    fn prepare_silence(
+        &mut self,
+        dtype: TensorElementType,
+        context: &T::Context,
+    ) -> Result<T, SilenceConditioningError>;
+}
+
+impl<B, S, R, P, X, Y, Z, W, D, Q, H, F, J> VoiceChatStartupComponents<B::Tensor>
+    for VoiceChatComponents<B, S, R, P, X, Y, Z, W, D, Q, H, F, J>
+where
+    B: GroupedNeuralBackend + DistributedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+    R: LayeredInvocation<B, S, Architecture = nemotron_h::LayeredModel<B>>,
+    P: PerceptionExecution<B>,
+    X: TransformerExecution<B>,
+    Y: MogExecution<B>,
+    Z: RvqExecution<B>,
+    W: ConditioningExecution<B>,
+    D: DecoderExecution<B>,
+    Q: QuantizerExecution<B>,
+    H: EncoderExecution<B>,
+    F: FunctionHeadExecution<B>,
+    J: RnntExecution<B>,
+{
+    /// Prepares fixed-Aria startup using the admitted encoder and shared codebooks.
+    /// Cache ownership and prompt execution remain with the enclosing session.
+    fn prepare_prompt(
+        &mut self,
+        batch: i32,
+        max_token_positions: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<PreparedTtsPrompt<B::Tensor>, TtsError> {
+        self.speech
+            .prepare_prompt(batch, max_token_positions, context)
+    }
+
+    /// Prepares tool conditioning without touching live input, RNNT or neural caches.
+    /// The enclosing native owner establishes completion before exposing the tensor.
+    fn prepare_silence(
+        &mut self,
+        dtype: TensorElementType,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, SilenceConditioningError> {
+        self.speech.prepare_silence(&self.silence, dtype, context)
+    }
 }
 
 impl<B, S, R, P, X, Y, Z, W, D, Q, H, F, J>
@@ -325,41 +387,41 @@ where
         &self.residency_report
     }
 
-    /// Exact geometry retained from cold construction, including both TTS rows.
-    pub fn neural_state_geometry(&self) -> &NeuralStateGeometry {
-        &self.neural_state_geometry
-    }
-
-    /// Exact tokenizer, character mapping and channel controls.
-    pub fn host_conditioning(&self) -> &PreparedHostConditioning {
-        &self.host
-    }
-
-    /// Prepares fixed-Aria startup using the admitted encoder and shared codebooks.
-    /// Cache ownership and prompt execution remain with the enclosing session.
-    pub fn prepare_prompt(
+    /// Runs local preflight and then enters the caller's submission scope before execution.
+    #[allow(clippy::too_many_arguments)]
+    pub fn invoke_local<Sampling, N, C>(
         &mut self,
-        batch: i32,
-        max_token_positions: usize,
+        invocation: &Invocation<'_, B::Tensor>,
+        branch: &mut LocalInvocationBranch<B::Tensor, N, Sampling::RandomState, C>,
+        input_limits: PerceptionRnntLimits,
+        max_character_cells: usize,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<PreparedTtsPrompt<B::Tensor>, TtsError> {
-        self.speech
-            .prepare_prompt(batch, max_token_positions, context)
-    }
-
-    /// Immutable host policy and exact coefficients for one-second tool silence.
-    pub fn silence_conditioning(&self) -> &PreparedSilenceConditioning {
-        &self.silence
-    }
-
-    /// Prepares tool conditioning without touching live input, RNNT or neural caches.
-    /// The enclosing native owner establishes completion before exposing the tensor.
-    pub fn prepare_silence(
-        &mut self,
-        dtype: TensorElementType,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, SilenceConditioningError> {
-        self.speech.prepare_silence(&self.silence, dtype, context)
+        begin: impl FnOnce(
+            &LocalInvocationBranch<B::Tensor, N, Sampling::RandomState, C>,
+        ) -> Result<(), BackendFailure>,
+    ) -> Result<ExecutionOutput<B::Tensor>, BackendFailure>
+    where
+        Sampling: DenseSamplingBackend<
+            Logits = B::Tensor,
+            Token = B::Tensor,
+            Context = <B::Tensor as Tensor>::Context,
+        >,
+        Sampling::RandomState: Clone,
+        Sampling::Error: std::error::Error + Send + Sync + 'static,
+        R::Error: std::error::Error + Send + Sync + 'static,
+        N: RealtimeJointStateParts<Left = S>,
+        X: CausalTransformerExecution<B, N::Right>,
+    {
+        let mut execution = self
+            .execution(input_limits, max_character_cells)
+            .map_err(BackendFailure::from_error)?;
+        execution
+            .preflight::<Sampling, _, _, _>(invocation, branch, None)
+            .map_err(BackendFailure::from_error)?;
+        begin(branch)?;
+        execution
+            .execute::<Sampling, _, _, _>(invocation, branch, None, context)
+            .map_err(BackendFailure::from_error)
     }
 
     /// Borrows the existing coupled transition; no independent engine is created.

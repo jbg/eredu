@@ -40,8 +40,9 @@ impl BackboneResources {
     pub fn from_prepared(
         prepared: &PreparedBackboneParameters,
     ) -> Result<Self, VoiceChatResidencyError> {
-        let bindings = prepared.prepare_bindings()?;
-        let (source, _, statics, units) = bindings.into_parts();
+        let (_, _, source, units, pinned) = prepared.prepare_bindings()?.into_parts();
+        let mut statics = pinned.into_values().flatten().collect::<Vec<_>>();
+        statics.sort_by(|left, right| left.name().cmp(right.name()));
         let statics =
             SpeechProviderResources::from_bindings(&source, &[statics], prepared.parameters())?;
         let layers =

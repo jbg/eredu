@@ -310,13 +310,6 @@ impl<B: NeuralBackend> RnntPredictorKernel<B> {
         value.partition = Some((range, cuts.clone()));
         Ok(ComponentAdapter::new(definition, value)?.select_partition(partition)?)
     }
-    /// Logical F32 tensor payload of the completed prediction: local hidden/cell
-    /// pairs plus a separately retained readout on every non-final stage.
-    /// The phase state layout describes only hidden/cell carry; the returned
-    /// prediction owns the readout after shared output publication.
-    pub fn prediction_state_bytes(&self) -> Result<u64, RnntError> {
-        rnnt_predictor_prediction_state_bytes(self.dimensions, self.range())
-    }
     /// Exact whole predictor geometry.
     pub fn dimensions(&self) -> RnntDimensions {
         self.dimensions

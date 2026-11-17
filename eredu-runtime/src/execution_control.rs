@@ -21,6 +21,92 @@ pub use sampling::{
     ValidatedSamplingOverride,
 };
 
+/// Installed native state paired with the identity used to validate saved copies.
+///
+/// The caller owns admission and resource accounting. This slot checks ownership
+/// and installs an isolated copy only after the caller prepares it.
+pub struct SessionState<S> {
+    state: S,
+    identity: Rc<()>,
+}
+
+impl<S> SessionState<S> {
+    /// Creates the installed state for a new session.
+    pub fn new(state: S) -> Self {
+        Self {
+            state,
+            identity: Rc::new(()),
+        }
+    }
+
+    /// Borrows installed state.
+    pub fn get(&self) -> &S {
+        &self.state
+    }
+
+    /// Lends installed state to execution.
+    pub fn get_mut(&mut self) -> &mut S {
+        &mut self.state
+    }
+
+    /// Captures an independent copy tagged with this session's ownership.
+    pub fn capture_state<E>(
+        &self,
+        copy: impl FnOnce(&S) -> Result<S, E>,
+    ) -> Result<SessionStateSnapshot<S>, E> {
+        Ok(SessionStateSnapshot {
+            state: copy(&self.state)?,
+            identity: self.identity.clone(),
+        })
+    }
+
+    /// Borrows saved state after checking the session that created it.
+    pub fn saved_state<'a>(
+        &self,
+        saved: &'a SessionStateSnapshot<S>,
+    ) -> Result<&'a S, ForeignSessionSnapshot> {
+        if Rc::ptr_eq(&self.identity, &saved.identity) {
+            Ok(&saved.state)
+        } else {
+            Err(ForeignSessionSnapshot)
+        }
+    }
+
+    /// Copies a previously captured state for the same session.
+    pub fn copy_state<E>(
+        &self,
+        saved: &SessionStateSnapshot<S>,
+        copy: impl FnOnce(&S) -> Result<S, E>,
+        policy_error: impl FnOnce(ForeignSessionSnapshot) -> E,
+    ) -> Result<SessionStateSnapshot<S>, E> {
+        Ok(SessionStateSnapshot {
+            state: copy(self.saved_state(saved).map_err(policy_error)?)?,
+            identity: self.identity.clone(),
+        })
+    }
+
+    /// Exchanges installed and saved state after checking ownership.
+    pub fn exchange_state(
+        &mut self,
+        saved: &mut SessionStateSnapshot<S>,
+    ) -> Result<(), ForeignSessionSnapshot> {
+        self.saved_state(saved)?;
+        std::mem::swap(&mut self.state, &mut saved.state);
+        Ok(())
+    }
+}
+
+/// One isolated state paired with its original session.
+pub struct SessionStateSnapshot<S> {
+    state: S,
+    identity: Rc<()>,
+}
+
+/// A saved state belongs to another session.
+#[derive(Debug, thiserror::Error)]
+#[error("snapshot belongs to a different session")]
+pub struct ForeignSessionSnapshot;
+
 /// Logical owned storage of the audited serialized intervention request DTO.
 /// Native estimators and admitted handles are deliberately excluded.
 pub fn intervention_plan_storage_bytes(

@@ -21,7 +21,7 @@ use eredu_nn::{
     LinearOperator, LinearSpec, NeuralBackend, NormalizationConstructionSpec,
     NormalizationOperator, NormalizationScale, ParameterMetadata, ParameterSpec, ParameterVisitor,
     ParameterVisitorMut, Parameterized, PooledAttentionInput, PooledPositionInput,
-    RelativeAttentionInput, RotaryOperator, RotaryPosition, RotarySpec, SegmentedAttentionInput,
+    RelativeAttentionInput, RotaryOperator, RotaryPosition, SegmentedAttentionInput,
     SelectiveStateSpaceScanInput, SelectiveStateSpaceScanOutput, Tensor,
     TensorParallelGroupedGatedProductOperator, TensorParallelGroupedOutput,
     TensorParallelGroupedRelu2Operator, TopKGroupSelectorSpec, VocabularyParallelRange,

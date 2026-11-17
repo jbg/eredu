@@ -153,12 +153,12 @@ impl ComponentEquations<FakeBackend, StatelessComponentState> for Kernel {
         &mut self,
         _: usize,
         initial: &FakeTensor,
-        dependencies: &[&FakeTensor],
+        dependencies: &eredu_runtime::GroupDependencies<'_, FakeTensor>,
         _: &mut StatelessComponentState,
         _: &mut bool,
         _: &(),
     ) -> Result<FakeTensor, Failure> {
-        Ok(dependencies.first().copied().unwrap_or(initial).clone())
+        Ok(dependencies.only().unwrap_or(initial).clone())
     }
     fn execute(
         &mut self,
@@ -735,12 +735,12 @@ impl ComponentEquations<FakeBackend, CarryState> for CarryKernel {
         &mut self,
         _: usize,
         input: &FakeTensor,
-        dependencies: &[&FakeTensor],
+        dependencies: &eredu_runtime::GroupDependencies<'_, FakeTensor>,
         _: &mut CarryState,
         _: &mut (),
         _: &(),
     ) -> Result<FakeTensor, Failure> {
-        Ok(dependencies.first().copied().unwrap_or(input).clone())
+        Ok(dependencies.only().unwrap_or(input).clone())
     }
     fn execute(
         &mut self,
@@ -783,7 +783,7 @@ impl eredu_runtime::ParallelComponentKernel<FakeBackend, CarryState> for CarryKe
         &mut self,
         group: usize,
         input: &FakeTensor,
-        dependencies: &[&FakeTensor],
+        dependencies: &eredu_runtime::GroupDependencies<'_, FakeTensor>,
         state: &mut CarryState,
         forward: &mut (),
         _: &(),
@@ -1258,12 +1258,12 @@ impl ComponentEquations<FakeBackend, StatelessComponentState> for CaptureKernel 
         &mut self,
         _: usize,
         initial: &FakeTensor,
-        dependencies: &[&FakeTensor],
+        dependencies: &eredu_runtime::GroupDependencies<'_, FakeTensor>,
         _: &mut StatelessComponentState,
         _: &mut Self::ForwardContext,
         _: &(),
     ) -> Result<FakeTensor, Failure> {
-        Ok(dependencies.first().copied().unwrap_or(initial).clone())
+        Ok(dependencies.only().unwrap_or(initial).clone())
     }
     fn execute(
         &mut self,

@@ -484,47 +484,52 @@ where
     }
 }
 
-/// Tensor-parallel finite encoding over the selected rank-local parameter geometry.
-/// Implementors provide the complete transition through ordinary unit completion.
-pub trait ParallelEncoderExecution<B: DistributedNeuralBackend>: EncoderExecution<B> {
-    /// Executes selected shards and publishes complete frame-major latent vectors.
-    fn forward_parallel(
-        &mut self,
-        spectrum: &B::Tensor,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error>;
-}
+/// Bound finite encoder units and their optional tensor cohort.
+pub type BoundEarEncoder<B, P, C> = eredu_runtime::BoundStatelessComponent<
+    ComponentAdapter<ComponentDefinition, EncoderKernel<B>>,
+    B,
+    P,
+    C,
+>;
 
-impl<B, P> ParallelEncoderExecution<B>
-    for LayerwiseRuntime<
-        ComponentAdapter<ComponentDefinition, EncoderKernel<B>>,
-        B,
-        StatelessComponentState,
-        P,
-    >
+impl<B, P, C> EncoderExecution<B> for BoundEarEncoder<B, P, C>
 where
     B: DistributedNeuralBackend
         + SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     P: LayerwisePolicy<B, EncoderUnit<B::Tensor>>,
     P::Error: std::error::Error + Send + Sync + 'static,
+    C: eredu_runtime::LayeredTensorCohort<B>,
 {
-    /// Executes the finite transition with rank-local parameters and full boundary activations.
-    fn forward_parallel(
+    fn config(&self) -> &EncoderConfig {
+        self.architecture().kernel().config()
+    }
+
+    fn forward(
         &mut self,
         spectrum: &B::Tensor,
-        parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let mut state = StatelessComponentState::new()?;
-        self.forward_parallel_with_context_hook(
-            spectrum,
-            &mut state,
-            parallel,
-            context,
-            |_, _, _| Ok(()),
-        )
-        .map(|(output, _)| output)
-        .map_err(runtime_error)
+        if let Some(cohort) = self.cohort() {
+            let [batch, channels, frames] = spectrum.shape().try_into().unwrap_or([-1; 3]);
+            if !cohort.agree(
+                [
+                    0x454152454e434f44,
+                    batch as u64,
+                    channels as u64,
+                    frames as u64,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+                true,
+                context,
+            )? {
+                return Err(invalid("EAR encoder cohort input geometry differs"));
+            }
+        }
+        self.invoke(spectrum, context)
+            .map(|(output, _)| output)
+            .map_err(runtime_error)
     }
 }

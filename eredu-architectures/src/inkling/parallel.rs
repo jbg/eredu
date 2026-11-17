@@ -124,8 +124,16 @@ impl PartitionLocalGeometry {
             .validate_global_rows(args.text_config.vocab_size)
             .map_err(|error| invalid(error.to_string()))?;
         let mut expected_roles = Vec::<String>::new();
-        if self.owns_input {
+        if self
+            .vision_units
+            .as_ref()
+            .map_or(vision_count == 0 && self.owns_input, |range| {
+                range.end == vision_count
+            })
+        {
             expected_roles.push("vision".into());
+        }
+        if self.owns_input {
             expected_roles.push("audio".into());
         }
         if self.text_units.start == 0 {

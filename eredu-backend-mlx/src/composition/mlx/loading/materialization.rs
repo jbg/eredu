@@ -215,26 +215,21 @@ pub(crate) fn materialize_model_plan(
         sources,
         distributed,
         routes,
-        MlxExecutableAssembler {
-            target,
-            stream,
-            weights_stream,
-        },
+        MlxExecutableAssembler { target },
     )
     .map_err(|error| match error {
         PreparedExecutionError::Backend(error) => error,
+        PreparedExecutionError::Binding(error) => Error::Other(Box::new(error)),
         error => Error::ArchitectureModel(error.to_string()),
     })
     .and_then(|model| model.with_target_discovery(capture_discovery))
 }
 
-struct MlxExecutableAssembler<'a> {
+struct MlxExecutableAssembler {
     target: crate::backend::MlxPreparedTarget,
-    stream: &'a Stream,
-    weights_stream: &'a Stream,
 }
 
-impl PreparedExecutableAssembler<MlxDistributedSession> for MlxExecutableAssembler<'_> {
+impl PreparedExecutableAssembler<MlxDistributedSession> for MlxExecutableAssembler {
     type Executable = Box<dyn binding::ErasedReplicatedTextExecutable>;
     type Output = MlxModel;
     type Error = Error;
@@ -260,21 +255,6 @@ impl PreparedExecutableAssembler<MlxDistributedSession> for MlxExecutableAssembl
         communication: &MlxDistributedSession,
     ) -> Result<(), Error> {
         communication.validate_selected_manifest(manifest)
-    }
-
-    fn bind_vl_rank(
-        &mut self,
-        prepared: eredu_architectures::lfm3::vision::PreparedVlRankGraph,
-        communication: &MlxDistributedSession,
-    ) -> Result<Self::Executable, PreparedExecutionError<Error>> {
-        super::super::vl_session::bind_vl_rank_session(
-            prepared,
-            communication,
-            self.stream,
-            self.weights_stream,
-        )
-        .map(|(executable, _, _, _)| executable)
-        .map_err(PreparedExecutionError::Backend)
     }
 
     fn finish(

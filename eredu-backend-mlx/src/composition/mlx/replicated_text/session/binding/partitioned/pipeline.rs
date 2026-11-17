@@ -38,86 +38,53 @@ where
         .and_then(super::routed::MlxPartitionRows::reporting_pool);
     let facts = prepared.session_facts().map_err(Error::ArchitectureModel)?;
     let activation_dtype = facts.activation_dtype();
-    let (text, prompt_cache_topology, execution_plan, publication_authority) = facts.into_parts();
-    let (prompt_cache_identity, capability_estimate, effective_model_type, selected_residency) =
-        text.into_parts();
     let mut ignored_expert_sources = prepared.unowned_expert_checkpoint_sources();
     ignored_expert_sources.extend(additional_claimed_sources);
     let addressable_parameters = prepared
         .addressable_logical_targets()
         .into_iter()
         .collect::<Vec<_>>();
-    let mut mechanisms = MlxReplicatedTextMechanisms::new(store, stream, weights_stream);
-    mechanisms.set_prediction_residency(finalizer.prediction_residency()?);
-    mechanisms.set_ignored_checkpoint_sources(ignored_expert_sources);
-    let mut distributed = Some(distributed);
-    let mut partition_sampling_group = None;
-    let mut partition_communication_authority = None;
-    let mut provider = Some(provider);
-    #[cfg(test)]
-    {
-        crate::tests::support::path_instrumentation::constructor();
-        crate::tests::support::path_instrumentation::neutral_partitioned_construction();
-    }
+    let mut rank = super::rank_preparation::PartitionRankPreparation::new(
+        facts,
+        store,
+        distributed,
+        ignored_expert_sources,
+        stream,
+        weights_stream,
+        finalizer.prediction_residency()?,
+    );
     let binding = prepared
         .prepare_session_runtime(
-            prompt_cache_topology.clone(),
+            rank.topology(),
             stream,
-            |input, source_architecture, physical_layout, selected, execution, context| {
-                let (source_architecture, source_layout) = source_architecture
-                    .map(|(architecture, layout)| (Some(architecture), Some(layout)))
-                    .unwrap_or((None, None));
-                let prepared = eredu_runtime::prepare_default_partitioned_runtime(
+            |input, source, layout, selected, execution, context| {
+                let bound = rank.prepare(
                     input,
-                    source_architecture,
-                    physical_layout,
-                    source_layout,
+                    source,
+                    layout,
                     selected,
-                    &prompt_cache_topology,
-                    eredu_runtime::PartitionedUnitScope::Owned,
                     &addressable_parameters,
-                    &mut mechanisms,
-                    context,
-                )
-                .map_err(Error::from)?;
-                let (architecture, partition, manifest, execution_policy, bounded_policy, state) =
-                    prepared.into_parts();
-                let addresses = partition.units().collect::<Vec<_>>();
-                let distributed = distributed.take().ok_or_else(|| {
-                    Error::Parallel("routed pipeline communication was already consumed".into())
-                })?;
-                let row_status = execution
-                    .row_lookup_status_group()
-                    .map(|id| {
-                        distributed.selected_group(id).cloned().ok_or_else(|| {
-                            Error::Parallel("selected row status group is not bound".into())
-                        })
-                    })
-                    .transpose()?;
-                let (communication, parallel, sampling, communication_executor) = distributed
-                    .into_partition_communication(
-                        manifest,
+                    (
                         execution.communication_tensor_group(),
                         execution.sampling_group(),
-                    )?;
+                        execution.row_lookup_status_group(),
+                    ),
+                    context,
+                )?;
+                let addresses = bound.partition.units().collect::<Vec<_>>();
                 let rows = row_binding
                     .map(|rows| {
                         rows.bind(
-                            parallel.as_ref(),
-                            row_status.as_ref(),
+                            bound.parallel.as_ref(),
+                            bound.row_status.as_ref(),
                             weights_stream,
                             stream,
                         )
                     })
                     .transpose()?;
                 let parallel = execution
-                    .select_parallel(parallel)
+                    .select_parallel(bound.parallel)
                     .map_err(Error::ArchitectureModel)?;
-                partition_communication_authority = Some(communication.authority());
-                partition_sampling_group = Some(sampling);
-                let provider = provider.take().ok_or_else(|| {
-                    Error::ArchitectureModel("routed provider was already consumed".into())
-                })?;
                 let movement =
                     super::super::distributed::expert::MlxExpertRouteTensorMovement::new(context);
                 let unit_strategy = execution
@@ -130,8 +97,8 @@ where
                     )
                     .map_err(Error::ArchitectureModel)?;
                 let executor = eredu_runtime::PipelinePartitionExecutor::new_with_unit_strategy(
-                    architecture,
-                    execution_policy,
+                    bound.architecture,
+                    bound.policy,
                     addresses,
                     parallel,
                     MlxPartitionTensorAllocator,
@@ -140,46 +107,30 @@ where
                 )
                 .map_err(|error| Error::Other(Box::new(error)))?;
                 let runtime = eredu_runtime::PartitionedTextRuntime::new(
-                    execution_plan,
+                    rank.execution_plan(),
                     executor,
-                    communication,
-                    communication_executor,
+                    bound.communication,
+                    bound.communication_executor,
                     eredu_runtime::OpaqueBoundaryTransport,
                     eredu_runtime::OpaqueOutputPublisher,
                     eredu_runtime::OpaqueFailureAgreement,
-                    selected_residency.execution_residency(),
-                    bounded_policy,
+                    rank.execution_residency(),
+                    bound.bounded_policy,
                 )
                 .map_err(|error| Error::Other(Box::new(error)))?;
-                Ok::<_, Error>((runtime, state))
+                Ok::<_, Error>((runtime, bound.state))
             },
         )
         .map_err(Error::from)?;
-    let session = eredu_runtime::construct_replicated_text_session_with_runtime(
-        binding,
-        mechanisms,
-        eredu_runtime::PartitionedTextExecution::new(),
-    )
-    .map_err(|error| Error::Other(Box::new(error)))?;
-    let mut completed = CompletedReplicatedText::from_session(
-        session,
-        prompt_cache_identity,
-        capability_estimate,
-        effective_model_type,
-        selected_residency,
-        partition_sampling_group,
-        partition_communication_authority,
-        Some(publication_authority.owner_group_rank()),
-        publication_authority.local_public_output(),
-        stream,
-    );
-    completed = completed
+    let completed = rank
+        .finish(binding, eredu_runtime::PartitionedTextExecution::new())?
+        .into_text()
         .with_parameter_banks(parameter_bank)?
         .with_partition_row_pool(row_pool);
     finalizer.finish(completed)
 }
 
-pub(crate) fn bind_partitioned_pipeline<A, G, F>(
+pub(super) fn bind_partitioned_pipeline<A, G, F>(
     prepared: eredu_architectures::partitioned_execution::PreparedPartitionedArchitecture<
         MlxNeuralBackend,
         A,
@@ -205,93 +156,53 @@ where
     let activation_dtype = facts.activation_dtype();
     let tensor_group = facts.tensor_group();
     let session_group = facts.session_group();
-    let (text, prompt_cache_topology, execution_plan, publication_authority) = facts.into_parts();
-    let (prompt_cache_identity, capability_estimate, effective_model_type, selected_residency) =
-        text.into_parts();
-    let mut mechanisms = MlxReplicatedTextMechanisms::new(store, stream, weights_stream);
-    mechanisms.set_prediction_residency(finalizer.prediction_residency()?);
-    mechanisms.set_ignored_checkpoint_sources(additional_claimed_sources);
-    let mut distributed = Some(distributed);
-    let mut partition_sampling_group = None;
-    let mut partition_communication_authority = None;
-    #[cfg(test)]
-    {
-        crate::tests::support::path_instrumentation::constructor();
-        crate::tests::support::path_instrumentation::neutral_partitioned_construction();
-    }
+    let mut rank = super::rank_preparation::PartitionRankPreparation::new(
+        facts,
+        store,
+        distributed,
+        additional_claimed_sources,
+        stream,
+        weights_stream,
+        finalizer.prediction_residency()?,
+    );
     let binding = prepared
         .prepare_session_runtime(
-            prompt_cache_topology.clone(),
+            rank.topology(),
             stream,
-            |input, source_architecture, physical_layout, selected, context| {
-                let (source_architecture, source_layout) = source_architecture
-                    .map_or((None, None), |(architecture, layout)| {
-                        (Some(architecture), Some(layout))
-                    });
-                let prepared = eredu_runtime::prepare_default_partitioned_runtime(
+            |input, source, layout, selected, context| {
+                let bound = rank.prepare(
                     input,
-                    source_architecture,
-                    physical_layout,
-                    source_layout,
+                    source,
+                    layout,
                     selected,
-                    &prompt_cache_topology,
-                    eredu_runtime::PartitionedUnitScope::Owned,
                     &[],
-                    &mut mechanisms,
+                    (tensor_group, session_group, None),
                     context,
-                )
-                .map_err(Error::from)?;
-                let (architecture, partition, manifest, execution_policy, bounded_policy, state) =
-                    prepared.into_parts();
-                let addresses = partition.units().collect::<Vec<_>>();
-                let distributed = distributed.take().ok_or_else(|| {
-                    Error::Parallel("pipeline partition communication was already consumed".into())
-                })?;
-                let (communication, parallel, sampling, communication_executor) = distributed
-                    .into_partition_communication(manifest, tensor_group, session_group)?;
-                partition_communication_authority = Some(communication.authority());
-                partition_sampling_group = Some(sampling);
-                let executor = eredu_runtime::PipelinePartitionExecutor::new(
-                    architecture,
-                    execution_policy,
+                )?;
+                let addresses = bound.partition.units().collect::<Vec<_>>();
+                let runtime = crate::backend::runtime::execution::pipeline::bind_pipeline_runtime(
+                    bound.architecture,
+                    bound.policy,
                     addresses,
-                    parallel,
-                    MlxPartitionTensorAllocator,
+                    rank.execution_plan(),
                     activation_dtype,
+                    bound.communication,
+                    bound.parallel,
+                    bound.communication_executor,
+                    None,
+                    rank.execution_residency(),
+                    bound.bounded_policy,
                 )
                 .map_err(|error| Error::Other(Box::new(error)))?;
-                let runtime = eredu_runtime::PartitionedTextRuntime::new(
-                    execution_plan,
-                    executor,
-                    communication,
-                    communication_executor,
-                    eredu_runtime::OpaqueBoundaryTransport,
-                    eredu_runtime::OpaqueOutputPublisher,
-                    eredu_runtime::OpaqueFailureAgreement,
-                    selected_residency.execution_residency(),
-                    bounded_policy,
-                )
-                .map_err(|error| Error::Other(Box::new(error)))?;
-                Ok::<_, Error>((runtime, state))
+                Ok::<_, Error>((runtime, bound.state))
             },
         )
         .map_err(Error::from)?;
-    let session = eredu_runtime::construct_replicated_text_session_with_runtime(
-        binding,
-        mechanisms,
-        MlxPipelinePartitionStrategy::<A, MlxHybridState>::new(),
+    finalizer.finish(
+        rank.finish(
+            binding,
+            MlxPipelinePartitionStrategy::<A, MlxHybridState>::new(),
+        )?
+        .into_text(),
     )
-    .map_err(|error| Error::Other(Box::new(error)))?;
-    finalizer.finish(CompletedReplicatedText::from_session(
-        session,
-        prompt_cache_identity,
-        capability_estimate,
-        effective_model_type,
-        selected_residency,
-        partition_sampling_group,
-        partition_communication_authority,
-        Some(publication_authority.owner_group_rank()),
-        publication_authority.local_public_output(),
-        stream,
-    ))
 }

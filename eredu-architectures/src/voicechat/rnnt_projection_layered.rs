@@ -1,213 +1,134 @@
-//! RNNT embedding and joint affines without recurrent parameter ownership.
+//! Bound RNNT execution through shared parameter and traversal mechanisms.
+
 use super::{
-    rnnt::{RnntDimensions, RnntError, RnntProjectionExecution},
-    rnnt_layered::{runtime_error, RnntForward, RnntInput, RnntKernel, RnntUnit},
+    rnnt::{
+        RnntDimensions, RnntError, RnntExecution, RnntPredictionState, RnntProjectionExecution,
+    },
+    rnnt_layered::{runtime_error, RnntInput, RnntKernel, RnntUnit},
 };
 use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Tensor};
-use eredu_runtime::*;
+use eredu_runtime::{
+    BoundStatelessComponent, ComponentAdapter, ComponentDefinition, LayeredTensorCohort,
+    LayerwisePolicy, SubmissionBackend,
+};
 
-/// One nonrecurrent phase; no predictor request can enter this graph.
-pub enum RnntProjectionInput<'a, T> {
-    /// Global vocabulary token, including blank.
-    Embed(usize),
-    /// Unprojected perception row.
-    Encode(&'a T),
-    /// Published final predictor readout.
-    Prediction(&'a T),
-    /// Rectified joint hidden row.
-    Output(&'a T),
-}
-impl<'a, T> RnntProjectionInput<'a, T> {
-    fn into_full(self) -> RnntInput<'a, T> {
-        match self {
-            Self::Embed(token) => RnntInput::Embed(token),
-            Self::Encode(input) => RnntInput::Encode(input),
-            Self::Prediction(input) => RnntInput::Prediction(input),
-            Self::Output(input) => RnntInput::Output(input),
-        }
-    }
-}
-impl<B, P> RnntProjectionExecution<B>
-    for LayerwiseRuntime<
-        ComponentAdapter<ComponentDefinition, RnntKernel<B, false>>,
-        B,
-        StatelessComponentState,
-        P,
-    >
-where
-    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
-    P: LayerwisePolicy<B, RnntUnit<B>>,
-    P::Error: std::error::Error + Send + Sync + 'static,
-{
-    fn dimensions(&self) -> RnntDimensions {
-        self.architecture().kernel().dimensions()
-    }
-    fn embed_token(
-        &mut self,
-        token: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, RnntError> {
-        self.invoke(
-            RnntProjectionInput::Embed(token).into_full(),
-            &mut StatelessComponentState::new()?,
-            context,
-        )
-        .map_err(runtime_error)
-    }
-    fn encode_frame(
-        &mut self,
-        input: &B::Tensor,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, RnntError> {
-        self.invoke(
-            RnntProjectionInput::Encode(input).into_full(),
-            &mut StatelessComponentState::new()?,
-            context,
-        )
-        .map_err(runtime_error)
-    }
-    fn project_prediction(
-        &mut self,
-        input: &B::Tensor,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, RnntError> {
-        self.invoke(
-            RnntProjectionInput::Prediction(input).into_full(),
-            &mut StatelessComponentState::new()?,
-            context,
-        )
-        .map_err(runtime_error)
-    }
-    fn project_output(
-        &mut self,
-        input: &B::Tensor,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, RnntError> {
-        self.invoke(
-            RnntProjectionInput::Output(input).into_full(),
-            &mut StatelessComponentState::new()?,
-            context,
-        )
-        .map_err(runtime_error)
-    }
-}
-/// Tensor-parallel projection phases over the shared component runtime lifecycle.
-/// Implementors supply typed invocation and explicit cohort traversal participation.
-pub trait ParallelRnntProjectionExecution<B: DistributedNeuralBackend>:
-    RnntProjectionExecution<B>
-{
-    /// Executes a projection using the selected tensor cohort.
-    fn invoke_parallel(
-        &mut self,
-        input: RnntProjectionInput<'_, B::Tensor>,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, RnntError>;
+/// Bound RNNT phases with optional recurrent parameter ownership.
+pub type BoundRnnt<B, P, C, const RECURRENT: bool = true> = BoundStatelessComponent<
+    ComponentAdapter<ComponentDefinition, RnntKernel<B, RECURRENT>>,
+    B,
+    P,
+    C,
+>;
 
-    /// Runs a projection through shared traversal with cohort failure agreement.
-    /// The hook participates before parameter acquisition and collective execution.
-    fn invoke_parallel_with_hook<H>(
-        &mut self,
-        input: RnntProjectionInput<'_, B::Tensor>,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-        hook: &mut H,
-    ) -> Result<B::Tensor, RnntError>
-    where
-        H: LayeredTraversalHook<B, RnntForward<B::Tensor>, RnntError> + ?Sized;
+/// Bound projection-only RNNT phases.
+pub type RnntProjection<B, P, C> = BoundRnnt<B, P, C, false>;
 
-    /// Vocabulary-sharded lookup with complete output on every cohort participant.
-    fn embed_token_parallel(
-        &mut self,
-        token: usize,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, RnntError> {
-        self.invoke_parallel(RnntProjectionInput::Embed(token), parallel, context)
-    }
-    /// Replicated perception projection using the selected cohort's exact authority.
-    fn encode_frame_parallel(
-        &mut self,
-        input: &B::Tensor,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, RnntError> {
-        self.invoke_parallel(RnntProjectionInput::Encode(input), parallel, context)
-    }
-    /// Replicated predictor affine over the authoritative published readout.
-    fn project_prediction_parallel(
-        &mut self,
-        input: &B::Tensor,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, RnntError> {
-        self.invoke_parallel(RnntProjectionInput::Prediction(input), parallel, context)
-    }
-    /// Vocabulary-sharded affine and exact row-order gather.
-    fn project_output_parallel(
-        &mut self,
-        input: &B::Tensor,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, RnntError> {
-        self.invoke_parallel(RnntProjectionInput::Output(input), parallel, context)
-    }
-}
-
-impl<B, P> ParallelRnntProjectionExecution<B>
-    for LayerwiseRuntime<
-        ComponentAdapter<ComponentDefinition, RnntKernel<B, false>>,
-        B,
-        StatelessComponentState,
-        P,
-    >
+impl<B, P, C, const RECURRENT: bool> RnntProjectionExecution<B> for BoundRnnt<B, P, C, RECURRENT>
 where
     B: DistributedNeuralBackend
         + SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     P: LayerwisePolicy<B, RnntUnit<B>>,
     P::Error: std::error::Error + Send + Sync + 'static,
+    C: LayeredTensorCohort<B>,
 {
-    fn invoke_parallel(
+    fn dimensions(&self) -> RnntDimensions {
+        self.architecture().kernel().dimensions()
+    }
+
+    fn embed_token(
         &mut self,
-        input: RnntProjectionInput<'_, B::Tensor>,
-        parallel: &B::ParallelContext,
+        token: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, RnntError> {
-        self.forward_parallel_with_context_hook(
-            input.into_full(),
-            &mut StatelessComponentState::new()?,
-            parallel,
-            context,
-            |_, _, _| Ok(()),
-        )
-        .map(|value| value.0)
-        .map_err(runtime_error)
+        self.invoke(RnntInput::Embed(token), context)
+            .map(|(output, _)| output)
+            .map_err(runtime_error)
     }
-    /// Runs a projection through shared traversal with cohort failure agreement.
-    /// The hook participates before parameter acquisition and collective execution.
-    fn invoke_parallel_with_hook<H>(
+
+    fn encode_frame(
         &mut self,
-        input: RnntProjectionInput<'_, B::Tensor>,
-        parallel: &B::ParallelContext,
+        encoder: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
-        hook: &mut H,
-    ) -> Result<B::Tensor, RnntError>
-    where
-        H: LayeredTraversalHook<B, RnntForward<B::Tensor>, RnntError> + ?Sized,
-    {
-        self.forward_parallel_with_unit_executor_and_traversal_hook(
-            input.into_full(),
-            &mut StatelessComponentState::new()?,
-            parallel,
-            context,
-            |architecture, group, index, unit, hidden, state, forward, parallel, context| {
-                architecture.forward_unit_parallel(
-                    group, index, unit, hidden, state, forward, parallel, context,
-                )
-            },
-            hook,
-        )
-        .map(|value| value.0)
-        .map_err(runtime_error)
+    ) -> Result<B::Tensor, RnntError> {
+        self.invoke(RnntInput::Encode(encoder), context)
+            .map(|(output, _)| output)
+            .map_err(runtime_error)
+    }
+
+    fn project_prediction(
+        &mut self,
+        prediction: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, RnntError> {
+        self.invoke(RnntInput::Prediction(prediction), context)
+            .map(|(output, _)| output)
+            .map_err(runtime_error)
+    }
+
+    fn project_output(
+        &mut self,
+        hidden: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, RnntError> {
+        self.invoke(RnntInput::Output(hidden), context)
+            .map(|(output, _)| output)
+            .map_err(runtime_error)
+    }
+}
+
+impl<B, P, C> RnntExecution<B> for BoundRnnt<B, P, C>
+where
+    B: DistributedNeuralBackend
+        + SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    P: LayerwisePolicy<B, RnntUnit<B>>,
+    P::Error: std::error::Error + Send + Sync + 'static,
+    C: LayeredTensorCohort<B>,
+{
+    fn dimensions(&self) -> RnntDimensions {
+        RnntProjectionExecution::dimensions(self)
+    }
+
+    fn embed_token(
+        &mut self,
+        token: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, RnntError> {
+        RnntProjectionExecution::embed_token(self, token, context)
+    }
+
+    fn predictor_step(
+        &mut self,
+        input: &B::Tensor,
+        previous: Option<&RnntPredictionState<B::Tensor>>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<RnntPredictionState<B::Tensor>, RnntError> {
+        self.invoke(RnntInput::Predict { input, previous }, context)
+            .map_err(runtime_error)?
+            .1
+            .into_predictor()
+    }
+
+    fn encode_frame(
+        &mut self,
+        encoder: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, RnntError> {
+        RnntProjectionExecution::encode_frame(self, encoder, context)
+    }
+
+    fn project_prediction(
+        &mut self,
+        prediction: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, RnntError> {
+        RnntProjectionExecution::project_prediction(self, prediction, context)
+    }
+
+    fn project_output(
+        &mut self,
+        hidden: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, RnntError> {
+        RnntProjectionExecution::project_output(self, hidden, context)
     }
 }

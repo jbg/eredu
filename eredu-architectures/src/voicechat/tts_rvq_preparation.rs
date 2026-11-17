@@ -1,5 +1,8 @@
 //! Cold exact binding plans for independently leased TTS RVQ units.
 
+use eredu_core::BackendFailure;
+use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Tensor};
+use eredu_runtime::{LayeredTensorCohort, ParameterUnitMechanisms, SubmissionBackend};
 use std::collections::BTreeMap;
 
 use eredu_checkpoint::{
@@ -16,6 +19,7 @@ use super::{
     parameters::{admitted_member, execution_parameter, SpeechParameterError},
     tts_mog::TtsError,
     tts_rvq::RvqDimensions,
+    tts_rvq_layered::{BoundRvq, RvqKernel, RvqUnit},
     tts_rvq_specs::{released_declaration, RvqDeclaration},
 };
 
@@ -98,6 +102,63 @@ impl PreparedRvqBindings {
         Ok(Self { prepared })
     }
 
+    /// Binds prepared units locally or to an explicitly selected tensor cohort.
+    pub fn bind<B, H, C>(
+        self,
+        residency: eredu_runtime::LayerWeightResidency,
+        context: &<B::Tensor as Tensor>::Context,
+        mechanisms: &H,
+        cohort: Option<C>,
+    ) -> Result<
+        (
+            BoundRvq<B, H::UnitPolicy<RvqUnit<B>>, C>,
+            eredu_runtime::LayerwiseModelMetadata,
+        ),
+        BackendFailure,
+    >
+    where
+        B: DistributedNeuralBackend
+            + SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>
+            + 'static,
+        H: ParameterUnitMechanisms<B>,
+        C: LayeredTensorCohort<B>,
+    {
+        let selected = if let Some(cohort) = &cohort {
+            let (manifest, group) = cohort.selection();
+            validate_parallel_communication(self.dimensions(), manifest, group)
+                .map_err(BackendFailure::from_error)?;
+            self.select_parallel(cohort.tensor_topology()?)
+                .map_err(BackendFailure::from_error)?
+                .0
+        } else {
+            if self.local_layout().is_some() {
+                return Err(BackendFailure::from_error(TtsError::Configuration(
+                    "tensor-local parameter placement requires its selected cohort",
+                )));
+            }
+            self
+        };
+        let (declaration, local, invocations, source, units) = selected.into_parts();
+        let definition = declaration.definition().clone();
+        let kernel = match local.as_ref() {
+            Some(layout) => RvqKernel::<B>::new_parallel(declaration, layout),
+            None => RvqKernel::<B>::new(declaration),
+        }
+        .map_err(BackendFailure::from_error)?;
+        let architecture = eredu_runtime::ComponentAdapter::new(definition, kernel)
+            .map_err(BackendFailure::from_error)?;
+        BoundRvq::bind(
+            architecture,
+            source,
+            invocations,
+            units,
+            residency,
+            context,
+            mechanisms,
+            cohort,
+        )
+    }
+
     /// Selects exact tensor placement or validates a retained selection without
     /// applying its recipes a second time. Source authority remains unchanged.
     pub fn select_parallel(
@@ -130,18 +191,13 @@ impl PreparedRvqBindings {
         self.prepared.unit_bindings()
     }
 
-    /// Restricted retained source used by these exact bindings.
-    pub fn source(&self) -> &SharedCheckpointSource {
+    /// Restricted source used for cold residency accounting.
+    pub(super) fn source(&self) -> &SharedCheckpointSource {
         self.prepared.source()
     }
 
-    /// Validated semantic declaration retained by this exact preparation.
-    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
-        self.prepared.declaration().definition()
-    }
-
     /// Consumes exact source authority and the canonical ordered binding plan.
-    pub fn into_parts(
+    fn into_parts(
         self,
     ) -> (
         RvqDeclaration,

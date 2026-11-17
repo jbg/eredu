@@ -3,6 +3,7 @@
 use super::*;
 use crate::lfm3::audio::{placement::prepare_audio_units, ArtifactError, BindingSource};
 use eredu_checkpoint::store::SharedCheckpointSource;
+use eredu_core::BackendFailure;
 use eredu_runtime::{
     ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddressMap, ExecutionUnitLayout,
     LayerwiseAcquireError, LayerwisePolicy, LayerwisePolicyForward, RuntimeLayerState,
@@ -52,13 +53,28 @@ pub struct PreparedAudioEncoder {
 }
 
 impl PreparedAudioEncoder {
+    pub(in crate::lfm3::audio) fn parameter_bytes(
+        &self,
+        residency: eredu_runtime::LayerWeightResidency,
+    ) -> Result<u64, crate::lfm3::audio::ResidentAudioError> {
+        crate::lfm3::audio::placement::admit_audio_weights(
+            "encoder",
+            &self.invocations,
+            &self.units,
+            0,
+            residency,
+        )
+    }
+
     pub(in crate::lfm3::audio) fn new(
         declaration: Declaration,
         weights: &BindingSource,
+        dtype: &eredu_checkpoint::recipe::RecipeDtype,
     ) -> Result<Self, ArtifactError> {
         let (source, units) = prepare_audio_units(
             weights,
             "lfm3/audio/encoder",
+            dtype,
             declaration.units().map(|unit| {
                 declaration
                     .unit_parameters(unit)
@@ -104,44 +120,45 @@ impl PreparedAudioEncoder {
         recipes: std::collections::BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
         dtype: eredu_checkpoint::recipe::RecipeDtype,
     ) -> Result<Self, Error> {
-        use eredu_checkpoint::recipe::DerivedWeightRecipe;
-
-        let mut recipes = recipes;
-        for unit in declaration.units() {
-            for parameter in declaration.unit_parameters(unit)? {
-                if parameter.linear_format.is_some_and(|format| {
-                    format.encoding() != eredu_checkpoint::LinearFormat::Dense
-                }) {
-                    continue;
-                }
-                if let Some(recipe) = recipes.get_mut(parameter.parameter.id.as_str()) {
-                    *recipe = DerivedWeightRecipe::Cast {
-                        input: Box::new(recipe.clone()),
-                        dtype: dtype.clone(),
-                    };
-                }
-            }
-        }
         let weights =
             BindingSource::from_recipes(source, scope, recipes).map_err(Error::backend_source)?;
-        Self::new(declaration, &weights).map_err(Error::backend_source)
+        Self::new(declaration, &weights, &dtype).map_err(Error::backend_source)
     }
 
-    /// Cache layout for one independent clip.
-    pub fn state_layout(&self) -> &eredu_runtime::StateLayout {
-        self.declaration.state_layout()
-    }
-
-    /// Returns the neutral unit constructor and exact retained policy inputs.
-    pub fn into_parts(
+    /// Connects the retained encoder units to a generic parameter materializer.
+    pub fn bind<B, P>(
         self,
-    ) -> (
-        Declaration,
-        SharedCheckpointSource,
-        ExecutionUnitAddressMap,
-        Vec<Vec<WeightBinding>>,
-    ) {
-        (self.declaration, self.source, self.invocations, self.units)
+        context: &<B::Tensor as Tensor>::Context,
+        bind_units: impl FnOnce(
+            SharedCheckpointSource,
+            ExecutionUnitAddressMap,
+            Vec<Vec<WeightBinding>>,
+            &dyn Fn() -> Result<Vec<EncoderModule<B>>, BackendFailure>,
+        ) -> Result<P, BackendFailure>,
+    ) -> Result<PolicyEncoder<B, P>, BackendFailure>
+    where
+        B: NeuralBackend,
+        P: LayerwisePolicy<B, EncoderModule<B>>,
+    {
+        let Self {
+            declaration,
+            source,
+            invocations,
+            units,
+        } = self;
+        let policy = bind_units(source, invocations.clone(), units, &|| {
+            declaration
+                .units()
+                .map(|unit| build(&declaration, unit, context))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(BackendFailure::from_error)
+        })?;
+        Ok(PolicyEncoder {
+            declaration,
+            invocations,
+            policy,
+            backend: PhantomData,
+        })
     }
 }
 
@@ -165,6 +182,27 @@ pub trait AudioEncoder<B: NeuralBackend, S> {
         state: &mut S,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error>;
+    /// Cache geometry for one independently projected clip.
+    fn state_layout(&self) -> &eredu_runtime::StateLayout;
+
+    /// Projects one complete clip into decoder-width rows with fresh encoder state.
+    fn project_clip(
+        &mut self,
+        features: &eredu_media::audio::LogMelFeatures,
+        context: &<B::Tensor as Tensor>::Context,
+        allocate: impl FnOnce(&eredu_runtime::StateLayout) -> Result<S, BackendFailure>,
+    ) -> Result<B::Tensor, BackendFailure> {
+        let frames = i32::try_from(features.frames).map_err(BackendFailure::from_error)?;
+        let bins = i32::try_from(features.mel_bins).map_err(BackendFailure::from_error)?;
+        let input = B::Tensor::from_f32_slice(&features.values, &[1, frames, bins], context)
+            .and_then(|features| features.transpose_axes(&[0, 2, 1], context))
+            .map_err(BackendFailure::from_error)?;
+        let mut state = allocate(self.state_layout())?;
+        self.project(&input, &mut state, context)
+            .and_then(|rows| rows.squeeze_axes(&[0], context))
+            .map_err(BackendFailure::from_error)
+    }
+
     /// Encodes and projects newly available positions in one stream.
     fn advance(
         &mut self,
@@ -181,38 +219,6 @@ pub struct PolicyEncoder<B: NeuralBackend, P> {
     invocations: ExecutionUnitAddressMap,
     policy: P,
     backend: PhantomData<fn() -> B>,
-}
-
-impl<B: NeuralBackend, P> PolicyEncoder<B, P> {
-    /// Builds unloaded resident modules in canonical order.
-    pub fn resident_units(
-        declaration: &Declaration,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Vec<EncoderModule<B>>, Error> {
-        declaration
-            .units()
-            .map(|unit| build(declaration, unit, context))
-            .collect()
-    }
-
-    /// Connects the retained architecture and shared parameter policy.
-    pub fn new(
-        declaration: Declaration,
-        invocations: ExecutionUnitAddressMap,
-        policy: P,
-    ) -> Result<Self, Error> {
-        if invocations != encoder_invocations(&declaration)? {
-            return Err(invalid(
-                "speech input invocations differ from the retained declaration",
-            ));
-        }
-        Ok(Self {
-            declaration,
-            invocations,
-            policy,
-            backend: PhantomData,
-        })
-    }
 }
 
 impl<B, P> PolicyEncoder<B, P>
@@ -303,6 +309,10 @@ where
     P: LayerwisePolicy<B, EncoderModule<B>>,
     P::Error: std::error::Error + Send + Sync + 'static,
 {
+    fn state_layout(&self) -> &eredu_runtime::StateLayout {
+        self.declaration.state_layout()
+    }
+
     fn stream(&self, state: S, batch: i32) -> Result<EncoderState<S, B::Tensor>, Error> {
         self.declaration.stream::<B, S>(state, batch)
     }

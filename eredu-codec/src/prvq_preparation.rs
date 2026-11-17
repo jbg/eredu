@@ -1,12 +1,19 @@
 //! Cold exact binding plans for independently leased PRVQ codebook units.
 
+use eredu_core::BackendFailure;
+use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Tensor};
+use eredu_runtime::{LayeredTensorCohort, ParameterUnitMechanisms, SubmissionBackend};
+
 use eredu_checkpoint::{recipe::RecipeDtype, store::SharedCheckpointSource};
 use eredu_runtime::{
     ComponentPreparationError, ComponentRecipeConversion, LocalModelLayout, PreparedComponent,
     WeightBinding,
 };
 
-use crate::prvq::Geometry;
+use crate::{
+    prvq::{Codebook, Geometry},
+    prvq_layered::{BoundQuantizer, QuantizerKernel},
+};
 
 /// Invalid component geometry or exact retained parameter contract.
 #[derive(Debug, thiserror::Error)]
@@ -65,9 +72,67 @@ impl PreparedQuantizerBindings {
         Ok(Self { prepared })
     }
 
+    /// Binds prepared units locally or to an explicitly selected tensor cohort.
+    pub fn bind<B, H, C>(
+        self,
+        residency: eredu_runtime::LayerWeightResidency,
+        context: &<B::Tensor as Tensor>::Context,
+        mechanisms: &H,
+        cohort: Option<C>,
+    ) -> Result<
+        (
+            BoundQuantizer<B, H::UnitPolicy<Codebook<B::Tensor>>, C>,
+            eredu_runtime::LayerwiseModelMetadata,
+        ),
+        BackendFailure,
+    >
+    where
+        B: DistributedNeuralBackend
+            + SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>
+            + 'static,
+        H: ParameterUnitMechanisms<B>,
+        C: LayeredTensorCohort<B>,
+    {
+        let selected = if let Some(cohort) = &cohort {
+            let (manifest, group) = cohort.selection();
+            validate_parallel_communication(self.geometry(), manifest, group)
+                .map_err(BackendFailure::from_error)?;
+            self.select_parallel(cohort.tensor_topology()?)
+                .map_err(BackendFailure::from_error)?
+                .0
+        } else {
+            if self.local_layout().is_some() {
+                return Err(BackendFailure::from_error(crate::Error::InvalidShape(
+                    "tensor-local parameter placement requires its selected cohort".into(),
+                )));
+            }
+            self
+        };
+        let (declaration, local, invocations, source, units) = selected.into_parts();
+        let definition = declaration.definition().clone();
+        let kernel = match local.as_ref() {
+            Some(layout) => QuantizerKernel::<B>::new_parallel(declaration, layout),
+            None => QuantizerKernel::<B>::new(declaration),
+        }
+        .map_err(BackendFailure::from_error)?;
+        let architecture = eredu_runtime::ComponentAdapter::new(definition, kernel)
+            .map_err(BackendFailure::from_error)?;
+        let (units, metadata) = eredu_runtime::BoundStatelessComponent::bind(
+            architecture,
+            source,
+            invocations,
+            units,
+            residency,
+            context,
+            mechanisms,
+            cohort,
+        )?;
+        Ok((BoundQuantizer::new(units), metadata))
+    }
+
     /// Selects exact tensor placement or validates a retained selection without
     /// applying its recipes a second time. Source authority remains unchanged.
-    pub fn select_parallel(
+    fn select_parallel(
         self,
         topology: eredu_core::ParallelRankTopology,
     ) -> Result<(Self, LocalModelLayout), QuantizerPreparationError> {
@@ -76,7 +141,7 @@ impl PreparedQuantizerBindings {
     }
 
     /// Lowers each canonical binding through the selected shared physical layout.
-    pub fn into_parallel(
+    fn into_parallel(
         mut self,
         layout: &LocalModelLayout,
     ) -> Result<Self, QuantizerPreparationError> {
@@ -86,17 +151,13 @@ impl PreparedQuantizerBindings {
     }
 
     /// Exact retained tensor placement, when selected.
-    pub fn local_layout(&self) -> Option<&LocalModelLayout> {
+    fn local_layout(&self) -> Option<&LocalModelLayout> {
         self.prepared.local_layout()
     }
 
     /// Validated neural quantizer geometry.
     pub fn geometry(&self) -> Geometry {
         *self.prepared.declaration().config()
-    }
-    /// Canonical parameter namespace retained from preparation.
-    pub fn prefix(&self) -> &str {
-        self.prepared.declaration().prefix()
     }
 
     /// Exact prepared unit bindings for cold resource accounting.
@@ -109,13 +170,8 @@ impl PreparedQuantizerBindings {
         self.prepared.source()
     }
 
-    /// Validated semantic definition retained through source and placement selection.
-    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
-        self.prepared.declaration().definition()
-    }
-
     /// Consumes exact source authority and the canonical ordered binding plan.
-    pub fn into_parts(
+    fn into_parts(
         self,
     ) -> (
         crate::declarations::QuantizerDeclaration,

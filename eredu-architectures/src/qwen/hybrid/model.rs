@@ -950,12 +950,12 @@ where
         &mut self,
         _group: usize,
         initial: &B::Tensor,
-        dependencies: &[&B::Tensor],
+        dependencies: &eredu_runtime::GroupDependencies<'_, B::Tensor>,
         _state: &mut S,
         _forward: &mut Self::ForwardContext,
         _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        Ok(dependencies.first().copied().unwrap_or(initial).clone())
+        Ok(dependencies.only().unwrap_or(initial).clone())
     }
     fn execute(
         &mut self,

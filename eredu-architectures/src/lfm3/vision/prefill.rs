@@ -20,6 +20,199 @@ pub enum VlPrefillProgress<T> {
     },
 }
 
+/// Admits a rank-local cursor after all ranks agree on its prompt and chunk size.
+pub fn admit_partitioned_vl_prefill<T: Tensor, S>(
+    prepared: Result<((VisionPromptPreparation<T>, NonZeroUsize), S), eredu_core::BackendFailure>,
+    maximum_prefix: Option<NonZeroUsize>,
+    agree: impl FnOnce([u64; 8], bool) -> Result<(), eredu_core::BackendFailure>,
+) -> Result<(VlPrefill<T>, S), eredu_core::BackendFailure> {
+    let prepared = prepared.map(|((prompt, chunk), state)| {
+        (
+            prompt,
+            maximum_prefix.map_or(chunk, |limit| chunk.min(limit)),
+            state,
+        )
+    });
+    let descriptor = prepared.as_ref().map_or([0; 8], |(prompt, chunk, _)| {
+        prompt.prefill_descriptor(*chunk)
+    });
+    let agreed = agree(descriptor, prepared.is_ok());
+    let (prompt, chunk, state) = prepared?;
+    agreed?;
+    Ok((VlPrefill::new(prompt, chunk), state))
+}
+
+/// Advances the selected rank's media or decoder phase and agrees its completion.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn advance_partitioned_vl_prefill<B, P, M>(
+    cursor: &mut VlPrefill<B::Tensor>,
+    context: &<B::Tensor as Tensor>::Context,
+    vision: &mut super::PolicyVision<B, P>,
+    mechanisms: &mut M,
+    distributed: bool,
+    mut agree: impl FnMut(&mut M, [u64; 8], bool) -> Result<(), eredu_core::BackendFailure>,
+    decode: impl FnOnce(
+        &mut M,
+        &VisionPrompt<'_, B::Tensor>,
+    ) -> Result<B::Tensor, eredu_core::BackendFailure>,
+    settle: impl FnOnce(&mut VlPrefill<B::Tensor>) -> Result<(), eredu_core::BackendFailure>,
+) -> Result<Option<VlPrefillProgress<B::Tensor>>, eredu_core::BackendFailure>
+where
+    B: eredu_nn::NeuralBackend,
+    P: eredu_runtime::LayerwisePolicy<B, super::VisionModule<B>>,
+    P::Error: std::error::Error + Send + Sync + 'static,
+{
+    use eredu_core::BackendFailure;
+
+    let step = cursor.next_step().map_err(BackendFailure::from_error);
+    let (phase, start, end) = match &step {
+        Ok(PrefillStep::PrepareInput) => (1, 0, 0),
+        Ok(PrefillStep::Decoder(range)) => (2, range.start as u64, range.end as u64),
+        Ok(PrefillStep::Complete) => (3, 0, 0),
+        Err(_) => (0, 0, 0),
+    };
+    let agreed = agree(
+        mechanisms,
+        [
+            0x564c505246535445,
+            phase,
+            start,
+            end,
+            cursor.token_count() as u64,
+            0,
+            0,
+            0,
+        ],
+        step.is_ok(),
+    );
+    if let Err(error) = step.and(agreed) {
+        if distributed {
+            cursor.invalidate();
+        }
+        return Err(error);
+    }
+    let progress = cursor
+        .advance_input_checked(context, |input| {
+            let ready = agree(
+                mechanisms,
+                [0x564c505246494e50, phase, start, end, 0, 0, 0, 0],
+                input.is_ok(),
+            );
+            let input = input?;
+            ready.map_err(Error::backend_source)?;
+            match input {
+                VlInput::Media(media) => vision.forward(media, context).map(|(_, rows)| rows),
+                VlInput::Projected(prompt) => {
+                    decode(mechanisms, prompt).map_err(Error::backend_source)
+                }
+                VlInput::Text(_) => unreachable!("VL prefill uses a projected prompt"),
+            }
+        })
+        .map_err(BackendFailure::from_error)
+        .and_then(|progress| {
+            settle(cursor)?;
+            Ok(progress)
+        });
+    let agreed = agree(
+        mechanisms,
+        [0x564c505246444f4e, phase, start, end, 0, 0, 0, 0],
+        progress.is_ok(),
+    );
+    if progress.is_err() || agreed.is_err() {
+        cursor.invalidate();
+    }
+    let progress = progress?;
+    agreed?;
+    Ok(progress)
+}
+
+/// Replaces the installed state after rank agreement on allocation.
+pub fn reset_partitioned_vl_state<S>(
+    installed: &mut S,
+    replacement: Result<S, eredu_core::BackendFailure>,
+    agree: impl FnOnce([u64; 8], bool) -> Result<(), eredu_core::BackendFailure>,
+) -> Result<(), eredu_core::BackendFailure> {
+    let agreed = agree(
+        [0x564c524553455400, 0, 0, 0, 0, 0, 0, 0],
+        replacement.is_ok(),
+    );
+    let replacement = replacement?;
+    agreed?;
+    *installed = replacement;
+    Ok(())
+}
+
+/// Drives one rank-local decoder invocation and installs only a committed candidate.
+#[allow(clippy::too_many_arguments)]
+pub fn run_partitioned_vl_decoder<T: Tensor, S, M>(
+    input: Result<crate::lfm3::Lfm3Input<'_, T>, eredu_core::BackendFailure>,
+    state_offset: i32,
+    state: &mut S,
+    epoch: &mut eredu_core::DistributedCommitEpoch,
+    maximum_prefix: NonZeroUsize,
+    context: &T::Context,
+    mechanisms: &mut M,
+    fork_state: impl FnOnce(&S) -> Result<S, eredu_core::BackendFailure>,
+    agree: impl FnOnce(&mut M, [u64; 8], bool) -> Result<(), eredu_core::BackendFailure>,
+    execute: impl FnOnce(
+        &mut M,
+        crate::lfm3::Lfm3Input<'_, T>,
+        &mut S,
+        [u64; 8],
+        eredu_core::DistributedCommitEpoch,
+    ) -> Result<
+        (T, eredu_core::DistributedCommitOutcome),
+        eredu_core::BackendFailure,
+    >,
+) -> Result<T, eredu_core::BackendFailure> {
+    use eredu_core::{BackendFailure, DistributedCommitOutcome};
+
+    let contract = |message| BackendFailure::from_error(Error::backend(message));
+    let prepared = input.and_then(|input| {
+        if input
+            .vl_pipeline_sequence_len()
+            .map_err(BackendFailure::from_error)?
+            > maximum_prefix.get()
+        {
+            return Err(contract(
+                "VL input exceeds the retained pipeline prefix limit",
+            ));
+        }
+        let descriptor = input
+            .vl_pipeline_descriptor(context)
+            .map_err(BackendFailure::from_error)?;
+        let candidate = fork_state(state)?;
+        let next = epoch
+            .next()
+            .ok_or_else(|| contract("VL pipeline epoch exhausted"))?;
+        Ok((input, descriptor, candidate, next))
+    });
+    let agreed = agree(
+        mechanisms,
+        [
+            0x564c505245504152,
+            epoch.value(),
+            state_offset as u64,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ],
+        prepared.is_ok(),
+    );
+    let (input, descriptor, mut candidate, next) = prepared?;
+    agreed?;
+    let current = *epoch;
+    *epoch = next;
+    let (scores, outcome) = execute(mechanisms, input, &mut candidate, descriptor, current)?;
+    if outcome != DistributedCommitOutcome::Committed(current) {
+        return Err(contract("VL pipeline did not commit its decoder pass"));
+    }
+    *state = candidate;
+    Ok(scores)
+}
+
 /// Owns the admitted media, projected rows, and decoder prefix position.
 #[derive(Clone)]
 pub struct VlPrefill<T> {
@@ -36,6 +229,31 @@ enum Phase<T> {
     Decoder(ProjectedVisionPrompt<T>),
     Complete,
     Failed,
+}
+
+impl<T: Tensor> eredu_runtime::prefill::RetainedPrefillCursor for VlPrefill<T> {
+    type Tensor = T;
+    type Error = Error;
+
+    fn decoder_position(&self) -> usize {
+        self.decoder_position()
+    }
+
+    fn token_count(&self) -> usize {
+        self.token_count()
+    }
+
+    fn next_step(&self) -> Result<PrefillStep, Self::Error> {
+        self.next_step()
+    }
+
+    fn retained_metadata_bytes(&self) -> Option<usize> {
+        self.retained_metadata_bytes()
+    }
+
+    fn visit_retained_values<'a>(&'a self, visit: impl FnMut(&'a T)) {
+        self.retained_values().for_each(visit);
+    }
 }
 
 impl<T: Tensor> VlPrefill<T> {

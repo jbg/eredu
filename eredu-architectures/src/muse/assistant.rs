@@ -447,7 +447,8 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DFlashAttention<B> {
                     base: config.rope_theta,
                     traditional: false,
                     algorithm: eredu_nn::RotaryAlgorithm::Default,
-                },
+                }
+                .prepare()?,
                 context,
             )?,
             query_heads: heads.query_heads(),

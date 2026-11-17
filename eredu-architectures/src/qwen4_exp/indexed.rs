@@ -174,7 +174,7 @@ impl<B: NeuralBackend> IndexedSublayer<B> {
             B::linear(o, context)?,
             Some(B::normalization(parameters.query_norm, context)?),
             Some(B::normalization(parameters.key_norm, context)?),
-            Some(B::rotary(spec.rotary, context)?),
+            Some(B::rotary(spec.rotary.prepare()?, context)?),
             None,
         )?;
         attention.arithmetic = spec.arithmetic;

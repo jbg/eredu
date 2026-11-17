@@ -792,7 +792,7 @@ where
         &mut self,
         group: usize,
         initial: &B::Tensor,
-        dependencies: &[&B::Tensor],
+        dependencies: &eredu_runtime::GroupDependencies<'_, B::Tensor>,
         state: &mut S,
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
@@ -801,7 +801,7 @@ where
             return Ok(forward.initial.as_ref().unwrap_or(initial).clone());
         }
         if let Some(media) = &forward.media {
-            let projected = dependencies.first().copied().or(forward.projected.as_ref());
+            let projected = dependencies.only().or(forward.projected.as_ref());
             let input = media
                 .assemble(
                     forward

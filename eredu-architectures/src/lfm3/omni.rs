@@ -2,21 +2,21 @@
 
 use std::path::Path;
 
+#[cfg(feature = "audio")]
 use eredu_checkpoint::recipe::RecipeDtype;
 use eredu_nn::{Error, Tensor};
 use serde_json::Value;
 
+#[cfg(feature = "audio")]
+use super::vision::{PreparedVisionExecution, VisionPromptAdmission};
 use super::{
     audio::{AdmittedAudioGguf, ArtifactError, BindingSource, PreparedAudio, ProcessorConfig},
     projected_prompt::ProjectedPrompt,
-    vision::{
-        Declaration, MediaTokens, PreparedVisionExecution, ProjectorConfig, VisionPromptAdmission,
-    },
+    vision::{Declaration, MediaTokens, ProjectorConfig},
 };
-use crate::{
-    processor_execution::PreparedProcessor,
-    processor_plan::{MediaFraming, QwenPatchPlan, QwenProcessorPlan},
-};
+#[cfg(feature = "audio")]
+use crate::processor_execution::PreparedProcessor;
+use crate::processor_plan::{MediaFraming, QwenPatchPlan, QwenProcessorPlan};
 
 fn checkpoint(error: impl std::fmt::Display) -> ArtifactError {
     ArtifactError::Checkpoint(error.to_string())
@@ -24,6 +24,11 @@ fn checkpoint(error: impl std::fmt::Display) -> ArtifactError {
 
 mod gguf;
 pub use gguf::AdmittedOmniGguf;
+
+#[cfg(feature = "audio")]
+mod turn;
+#[cfg(feature = "audio")]
+pub use turn::{OmniAudioSelection, OmniTurnError, PreparedOmniTurn};
 
 fn vision_declaration(config: &Value) -> Result<Declaration, ArtifactError> {
     if config["model_type"] != "lfm3_omni"
@@ -236,12 +241,14 @@ impl PreparedOmni {
     }
 
     /// Image and video token identities from the admitted tokenizer.
-    pub fn media_tokens(&self) -> MediaTokens {
+    #[cfg(feature = "audio")]
+    pub(in crate::lfm3) fn media_tokens(&self) -> MediaTokens {
         self.tokens
     }
 
     /// Image and video processor policy retained from the publisher.
-    pub fn vision_processor(&self) -> PreparedProcessor {
+    #[cfg(feature = "audio")]
+    fn vision_processor(&self) -> PreparedProcessor {
         PreparedProcessor::from_qwen(self.processor.clone())
     }
 
@@ -255,7 +262,8 @@ impl PreparedOmni {
     }
 
     /// Retains vision request geometry from the shared Omni declaration.
-    pub fn vision_admission(&self) -> Result<VisionPromptAdmission, Error> {
+    #[cfg(feature = "audio")]
+    fn vision_admission(&self) -> Result<VisionPromptAdmission, Error> {
         VisionPromptAdmission::from_declarations(
             self.tokens,
             &self.vision,
@@ -264,7 +272,8 @@ impl PreparedOmni {
     }
 
     /// Retains the checkpoint's video and soundtrack prompt policy.
-    pub fn video_prompt(&self) -> OmniVideoPrompt {
+    #[cfg(feature = "audio")]
+    fn video_prompt(&self) -> OmniVideoPrompt {
         OmniVideoPrompt {
             processor: self.processor.clone(),
             tokens: self.tokens,
@@ -275,10 +284,8 @@ impl PreparedOmni {
     }
 
     /// Prepares the same independent vision units as VL from the retained Omni source.
-    pub fn prepare_vision(
-        &self,
-        dtype: RecipeDtype,
-    ) -> Result<PreparedVisionExecution, ArtifactError> {
+    #[cfg(feature = "audio")]
+    fn prepare_vision(&self, dtype: RecipeDtype) -> Result<PreparedVisionExecution, ArtifactError> {
         if self.gguf {
             return Ok(PreparedVisionExecution::from_canonical_recipes(
                 self.vision.clone(),
@@ -296,18 +303,20 @@ impl PreparedOmni {
 }
 
 /// Portable Omni video framing and soundtrack alignment.
-pub struct OmniVideoPrompt {
+#[cfg(feature = "audio")]
+struct OmniVideoPrompt {
     processor: QwenProcessorPlan,
     tokens: MediaTokens,
     audio_token: i32,
     seconds_per_audio_position: f64,
 }
 
+#[cfg(feature = "audio")]
 impl OmniVideoPrompt {
     /// Wraps shared visual groups and inserts soundtrack positions after each group.
     ///
     /// Soundtrack positions address the projection of the entire clip, in order.
-    pub fn expand(
+    fn expand(
         &self,
         video: &eredu_core::Video,
         visual_ids: &[i32],

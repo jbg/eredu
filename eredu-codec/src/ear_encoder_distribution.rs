@@ -1,16 +1,23 @@
 //! Cold finite encoder stage, source and transport authority.
+use crate::ear_encoder_layered::EncoderKernel;
 use crate::{
     ear_encoder_partition::{
         validate_encoder_partition, EncoderBoundarySchema, EncoderPipelineCuts,
     },
     ear_encoder_preparation::PreparedEncoderPartitionBindings,
 };
-use eredu_core::CollectiveGroupId;
+use eredu_core::{BackendFailure, CollectiveGroupId};
+use eredu_nn::{DistributedNeuralBackend, NeuralBackend};
 use eredu_runtime::{
     ArchitectureBoundary, ArchitectureGroupKind, ArchitecturePartition, CommunicationManifest,
-    ComponentPipelinePreparationError, PartitionedExecutionPlan, PipelineActivationDtype,
+    ComponentPipelinePreparationError, ComponentRankMechanisms, LayerWeightResidency,
+    LayerwiseModelMetadata, PartitionedExecutionPlan, PipelineActivationDtype,
     PipelineBindingError,
 };
+
+use crate::ear_encoder_stage::{EarEncoderPipeline, EarEncoderPipelineArchitecture};
+
+type Pipeline<B> = eredu_runtime::PreparedComponentPipeline<EarEncoderPipelineArchitecture<B>>;
 
 /// Exact source recipes, global cuts and distributed authority for one finite stage.
 /// This does not select the surrounding waveform preparation or conversational scheduler.
@@ -99,26 +106,54 @@ impl PreparedEncoderPipelineBindings {
     pub fn tensor_group(&self) -> Option<CollectiveGroupId> {
         self.tensor_group
     }
-    /// Consumes the complete validated authority without reconstructing topology or sources.
-    pub fn into_parts(
+    /// Binds the retained plan and constructs the portable stage.
+    pub fn bind<B, C, H>(
         self,
-    ) -> (
-        PreparedEncoderPartitionBindings,
-        ArchitecturePartition<(), EncoderBoundarySchema>,
-        EncoderPipelineCuts,
-        CommunicationManifest,
-        PartitionedExecutionPlan,
-        Option<CollectiveGroupId>,
-        PipelineActivationDtype,
-    ) {
+        residency: LayerWeightResidency,
+        communication: &C,
+        mechanisms: &H,
+    ) -> Result<
         (
-            self.bindings,
-            self.partition,
-            self.cuts,
-            self.manifest,
-            self.plan,
-            self.tensor_group,
-            self.activation_dtype,
+            EarEncoderPipeline<H::Pipeline<EarEncoderPipelineArchitecture<B>>>,
+            LayerwiseModelMetadata,
+        ),
+        BackendFailure,
+    >
+    where
+        B: DistributedNeuralBackend + 'static,
+        B::Tensor: 'static,
+        H: ComponentRankMechanisms<B, eredu_runtime::StatelessComponentState, C>,
+    {
+        let pipeline = self.into_pipeline::<B>(residency)?;
+        let (execution, metadata) = mechanisms.bind_pipeline(pipeline, communication)?;
+        Ok((EarEncoderPipeline::new(execution), metadata))
+    }
+
+    /// Builds the typed stage from its retained source, ownership and communication plan.
+    fn into_pipeline<B: NeuralBackend>(
+        self,
+        residency: eredu_runtime::LayerWeightResidency,
+    ) -> Result<Pipeline<B>, BackendFailure> {
+        let (declaration, local_layout, invocations, source, units) = self.bindings.into_parts();
+        let architecture = EncoderKernel::<B>::new_partition(
+            declaration,
+            local_layout.as_ref(),
+            &self.partition,
+            &self.cuts,
         )
+        .map_err(BackendFailure::from_error)?;
+        let pipeline = eredu_runtime::PreparedComponentPipeline {
+            architecture,
+            source,
+            invocations,
+            pinned: Vec::new(),
+            units,
+            manifest: self.manifest,
+            plan: self.plan,
+            tensor_group: self.tensor_group,
+            activation_dtype: self.activation_dtype,
+            residency,
+        };
+        Ok(pipeline)
     }
 }

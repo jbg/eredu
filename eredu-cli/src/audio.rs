@@ -2,6 +2,9 @@
 
 pub(crate) mod pcm;
 
+use eredu_backend_mlx::native::{
+    MlxComponentBinder, MlxMediaInputLowering, MlxRealtimeSupport, MlxRingTransport,
+};
 use std::{
     io::{self, Write},
     path::PathBuf,
@@ -11,7 +14,7 @@ use std::{
 use anyhow::{bail, ensure, Context, Result};
 use clap::{Args as ClapArgs, Subcommand};
 use eredu::api::{
-    audio::{AudioTask, AudioTaskOutput, PreparedAudioTask},
+    audio::{AudioTask, AudioTaskBinder, AudioTaskOutput, PreparedAudioTask},
     realtime::{
         prepare_realtime_model, RealtimeArtifactRequest, RealtimeArtifactSource,
         RealtimeAssetDirectories,
@@ -250,8 +253,14 @@ fn run_turn(
         },
         prepared_checkpoint_cache: Some(args.prepared_cache.policy()),
     })?;
-    let prepared = PreparedAudioTask::new(&artifact, task, args.max_slots as usize, args.seed)
-        .map_err(anyhow::Error::from_boxed)?;
+    let prepared = PreparedAudioTask::new(
+        &artifact,
+        task,
+        args.max_slots as usize,
+        args.seed,
+        &MlxRealtimeSupport::new(false),
+    )
+    .map_err(anyhow::Error::from_boxed)?;
     let input_rate = prepared.input_sample_rate();
     let output_rate = prepared.output_sample_rate();
     let mut wav_input = input
@@ -263,9 +272,12 @@ fn run_turn(
         ensure!(input.sample_count() > 0, "audio input is empty");
     }
     let (weights, execution) = pcm::execution_contexts(args.device.unwrap_or_default().local())?;
-    let mut session = prepared
-        .load(&weights, &execution)
-        .map_err(anyhow::Error::from_boxed)?;
+    let binding = AudioTaskBinder::new(
+        MlxComponentBinder::new(weights.stream(), execution.stream()),
+        MlxMediaInputLowering,
+        MlxRingTransport,
+    );
+    let mut session = prepared.load(&binding).map_err(anyhow::Error::from_boxed)?;
     let load_elapsed = load_started.map(|start| start.elapsed());
     if let Some(elapsed) = load_elapsed {
         eprintln!("model loaded in {:.3} s", elapsed.as_secs_f64());

@@ -2,11 +2,15 @@
 
 use std::collections::BTreeMap;
 
+use super::perception_layered::{BoundPerception, PerceptionKernel, PerceptionUnit};
 use eredu_checkpoint::{recipe::RecipeError, store::SharedCheckpointSource};
+use eredu_core::BackendFailure;
+use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Tensor};
 use eredu_runtime::{
     ComponentPreparationError, LocalModelLayout, PreparedComponent, RecipeBindingError,
     WeightBinding,
 };
+use eredu_runtime::{LayeredTensorCohort, ParameterUnitMechanisms, SubmissionBackend};
 
 use super::{
     artifact::{ParameterAdmission, RetainedVoiceChatArtifacts},
@@ -120,6 +124,76 @@ impl PreparedPerceptionBindings {
         result.with_precision(precision)
     }
 
+    /// Binds prepared units locally or to an explicitly selected tensor cohort.
+    pub fn bind<B, H, C>(
+        self,
+        residency: eredu_runtime::LayerWeightResidency,
+        context: &<B::Tensor as Tensor>::Context,
+        mechanisms: &H,
+        cohort: Option<C>,
+    ) -> Result<
+        (
+            BoundPerception<B, H::UnitPolicy<PerceptionUnit<B>>, C>,
+            eredu_runtime::LayerwiseModelMetadata,
+        ),
+        BackendFailure,
+    >
+    where
+        B: DistributedNeuralBackend
+            + SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>
+            + 'static,
+        H: ParameterUnitMechanisms<B>,
+        C: LayeredTensorCohort<B>,
+    {
+        let selected = if let Some(cohort) = &cohort {
+            let (manifest, group) = cohort.selection();
+            let width = self.dimensions().block.width as usize;
+            let sum = eredu_runtime::CommunicationOperationRequirement::tensors(
+                eredu_runtime::CommunicationOperation::AllReduceSum,
+                [eredu_core::checkpoint::TensorDtype::F32],
+                eredu_runtime::CommunicationTensorLimits::new(1, 3, width, None)
+                    .map_err(BackendFailure::from_error)?,
+                true,
+            )
+            .map_err(BackendFailure::from_error)?;
+            eredu_runtime::replicated_execution::validate_collective_coordination(
+                manifest,
+                group,
+                [sum],
+            )
+            .map_err(BackendFailure::from_error)?;
+            self.select_parallel(cohort.tensor_topology()?)
+                .map_err(BackendFailure::from_error)?
+                .0
+        } else {
+            if self.local_layout().is_some() {
+                return Err(BackendFailure::from_error(PerceptionError::State(
+                    "tensor-local parameter placement requires its selected cohort",
+                )));
+            }
+            self
+        };
+        let (declaration, local, invocations, source, units) = selected.into_parts();
+        let definition = declaration.definition().clone();
+        let kernel = match local.as_ref() {
+            Some(layout) => PerceptionKernel::<B>::new_parallel(declaration, layout),
+            None => PerceptionKernel::<B>::new(declaration),
+        }
+        .map_err(BackendFailure::from_error)?;
+        let architecture = eredu_runtime::ComponentAdapter::new(definition, kernel)
+            .map_err(BackendFailure::from_error)?;
+        eredu_runtime::BoundLayerwiseComponent::bind(
+            architecture,
+            source,
+            invocations,
+            units,
+            residency,
+            context,
+            mechanisms,
+            cohort,
+        )
+    }
+
     /// Selects complete-stack tensor placement through the shared physical planner.
     pub fn select_parallel(
         self,
@@ -190,7 +264,7 @@ impl PreparedPerceptionBindings {
     }
 
     /// Consumes exact source authority and the canonical ordered binding plan.
-    pub fn into_parts(
+    fn into_parts(
         self,
     ) -> (
         PerceptionDeclaration,

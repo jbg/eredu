@@ -2,25 +2,24 @@
 
 use std::{error::Error, sync::Arc};
 
-use eredu_architectures::lfm3::audio::AudioTurn;
+use eredu_architectures::lfm3::audio::{
+    AudioAdvance, AudioIngressRequest, AudioMode, AudioPlacement, AudioRequest, AudioTurn,
+    PreparedResidentAudio,
+};
+use eredu_runtime::RealtimeMechanismSupport;
 use eredu_text::tokenizer::{ModelChatTemplate, Tokenizer};
 
-use super::{
-    realtime::{
-        prepare_mlx_realtime, AudioAdvance, AudioIngressRequest, AudioMode, AudioRequest,
-        LoadedMlxRealtime, MlxAudioIngress, MlxAudioModel, MlxAudioPcmTranscription,
-        MlxAudioSession, PreparedMlxRealtime, PreparedRealtimeArtifact, RealtimeLoadOptions,
-    },
-    TextDecoder,
-};
-use eredu_backend_mlx::native::ExecutionContext;
+use super::{realtime::PreparedRealtimeArtifact, TextDecoder};
 
-pub use super::realtime::AudioParameterResidency;
+pub use eredu_architectures::lfm3::audio::{
+    AudioParameterResidency, AudioTaskBinder, AudioTaskBinding, AudioTaskError, AudioTaskExecution,
+    AudioTaskIngress, AudioTaskResponse, AudioTaskTranscription, BoundAudioTask, LocalAudioTask,
+};
 
 #[cfg(feature = "image")]
 mod multimodal;
 #[cfg(feature = "image")]
-pub use multimodal::{PreparedMultimodalAudioTask, PreparedOmni};
+pub use multimodal::{OmniAudioSelection, PreparedMultimodalAudioTask, PreparedOmni};
 
 type TaskResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -62,8 +61,8 @@ enum Prompt {
 }
 
 /// Cold task selection and prompt preparation.
-pub struct PreparedAudioTask<'a> {
-    selected: PreparedMlxRealtime<'a>,
+pub struct PreparedAudioTask {
+    selected: PreparedResidentAudio,
     prompt: Prompt,
     decoder: TextDecoder,
     input_rate: Option<u32>,
@@ -73,13 +72,14 @@ pub struct PreparedAudioTask<'a> {
     speech_only: bool,
 }
 
-impl<'a> PreparedAudioTask<'a> {
+impl PreparedAudioTask {
     /// Resolves a task using the retained model assets and selected backend.
     pub fn new(
-        artifact: &'a PreparedRealtimeArtifact,
+        artifact: &PreparedRealtimeArtifact,
         task: AudioTask<'_>,
         max_slots: usize,
         seed: u64,
+        support: &impl RealtimeMechanismSupport,
     ) -> TaskResult<Self> {
         Self::with_parameter_residency(
             artifact,
@@ -87,16 +87,18 @@ impl<'a> PreparedAudioTask<'a> {
             max_slots,
             seed,
             AudioParameterResidency::default(),
+            support,
         )
     }
 
     /// Prepares a turn-based task with independent component weight policies.
     pub fn with_parameter_residency(
-        artifact: &'a PreparedRealtimeArtifact,
+        artifact: &PreparedRealtimeArtifact,
         task: AudioTask<'_>,
         max_slots: usize,
         seed: u64,
         residency: AudioParameterResidency,
+        support: &impl RealtimeMechanismSupport,
     ) -> TaskResult<Self> {
         let PreparedRealtimeArtifact::Lfm3Audio(audio) = artifact else {
             return Err("the selected model has no turn-based audio adapter".into());
@@ -167,9 +169,11 @@ impl<'a> PreparedAudioTask<'a> {
         };
         let decoder = TextDecoder::from_shared_tokenizer(Arc::new((*tokenizer).clone()), true);
         Ok(Self {
-            selected: prepare_mlx_realtime(
-                artifact,
-                &RealtimeLoadOptions::Lfm3AudioWithResidency(residency),
+            selected: PreparedResidentAudio::select(
+                (**audio).clone(),
+                residency,
+                AudioPlacement::Local,
+                support,
             )?,
             prompt,
             decoder,
@@ -192,85 +196,45 @@ impl<'a> PreparedAudioTask<'a> {
     }
 
     /// Binds the selected model and starts the task.
-    pub fn load(
-        self,
-        weights: &ExecutionContext,
-        execution: &ExecutionContext,
-    ) -> TaskResult<AudioTaskSession> {
-        let LoadedMlxRealtime::Lfm3Audio(model) = self.selected.load(weights, execution)? else {
-            return Err("loaded audio task differs from its selection".into());
+    pub fn load(self, binding: &dyn AudioTaskBinding) -> TaskResult<AudioTaskSession> {
+        let task = match &self.prompt {
+            Prompt::Transcribe => LocalAudioTask::Transcribe,
+            Prompt::Text(tokens, mode) => LocalAudioTask::Respond(
+                AudioRequest {
+                    tokens,
+                    features: &[],
+                    replay: &[],
+                    mode: *mode,
+                    max_slots: self.max_slots,
+                },
+                self.seed,
+            ),
+            Prompt::Audio(prefix, suffix, mode) => LocalAudioTask::Ingress(
+                AudioIngressRequest {
+                    prefix,
+                    suffix,
+                    mode: *mode,
+                    max_slots: self.max_slots,
+                },
+                self.seed,
+            ),
         };
-        let state =
-            match self.prompt {
-                Prompt::Transcribe => State::Transcribe(model.prepare_pcm_transcription()?),
-                Prompt::Text(tokens, mode) => State::Response(ResponseSession::Resident(
-                    start_text(*model, &tokens, mode, self.max_slots, self.seed)?,
-                )),
-                Prompt::Audio(prefix, suffix, mode) => State::Ingress(model.prepare_ingress(
-                    AudioIngressRequest {
-                        prefix: &prefix,
-                        suffix: &suffix,
-                        mode,
-                        max_slots: self.max_slots,
-                    },
-                    self.seed,
-                )?),
-            };
-        Ok(AudioTaskSession {
-            state,
-            decoder: self.decoder,
-            input_rate: self.input_rate,
-            pending_text: None,
-            speech_only: self.speech_only,
-        })
-    }
-}
-
-fn start_text(
-    model: MlxAudioModel,
-    tokens: &[i32],
-    mode: AudioMode,
-    max_slots: usize,
-    seed: u64,
-) -> TaskResult<MlxAudioSession> {
-    Ok(model.start(
-        AudioRequest {
-            tokens,
-            features: &[],
-            replay: &[],
-            mode,
-            max_slots,
-        },
-        seed,
-    )?)
-}
-
-enum State {
-    Transcribe(MlxAudioPcmTranscription),
-    Ingress(MlxAudioIngress),
-    Response(ResponseSession),
-    Finished,
-}
-
-enum ResponseSession {
-    Resident(MlxAudioSession),
-    #[cfg(feature = "image")]
-    Distributed(eredu_backend_mlx::native::MlxPipelineAudioSession),
-}
-
-impl ResponseSession {
-    fn advance(&mut self) -> TaskResult<AudioAdvance> {
-        Ok(match self {
-            Self::Resident(session) => session.advance()?,
-            #[cfg(feature = "image")]
-            Self::Distributed(session) => session.advance()?,
-        })
+        let session = binding.bind(AudioTaskExecution::Local {
+            selected: Box::new(self.selected),
+            task,
+        })?;
+        Ok(AudioTaskSession::from_bound(
+            session,
+            self.decoder,
+            self.input_rate,
+            self.speech_only,
+        ))
     }
 }
 
 /// One loaded audio request and its incremental output decoder.
 pub struct AudioTaskSession {
-    state: State,
+    state: Option<BoundAudioTask>,
     decoder: TextDecoder,
     input_rate: Option<u32>,
     pending_text: Option<String>,
@@ -278,27 +242,42 @@ pub struct AudioTaskSession {
 }
 
 impl AudioTaskSession {
+    fn from_bound(
+        state: BoundAudioTask,
+        decoder: TextDecoder,
+        input_rate: Option<u32>,
+        speech_only: bool,
+    ) -> Self {
+        Self {
+            state: Some(state),
+            decoder,
+            input_rate,
+            pending_text: None,
+            speech_only,
+        }
+    }
+
     /// Submits mono PCM at the selected rate and returns any ready transcript.
     pub fn push(&mut self, mut samples: &[f32]) -> TaskResult<String> {
         let rate = self.input_rate.ok_or("this task takes no PCM input")?;
         let mut text = String::new();
-        match &mut self.state {
-            State::Ingress(ingress) => {
+        match self.state.as_mut() {
+            Some(BoundAudioTask::Ingress(ingress)) => {
                 ingress.submit(samples, rate)?;
             }
-            State::Transcribe(session) => {
+            Some(BoundAudioTask::Transcribe(session)) => {
                 while !samples.is_empty() {
                     let count = samples.len().min(session.available_samples());
                     if count != 0 {
                         session.submit(&samples[..count], rate)?;
                         samples = &samples[count..];
                     }
-                    let block = session.advance(false)?;
+                    let block = session.advance()?;
                     if count == 0 && block.is_none() {
                         return Err("transcription cannot accept more PCM".into());
                     }
                     if let Some(block) = block {
-                        append_text(&mut self.decoder, block.tokens, &mut text)?;
+                        append_text(&mut self.decoder, block, &mut text)?;
                     }
                 }
             }
@@ -309,14 +288,13 @@ impl AudioTaskSession {
 
     /// Closes a PCM utterance and prepares the final transcript or response.
     pub fn finish_input(&mut self) -> TaskResult<()> {
-        match &mut self.state {
-            State::Transcribe(session) => session.finish_input()?,
-            State::Ingress(_) => {
-                let State::Ingress(ingress) = std::mem::replace(&mut self.state, State::Finished)
-                else {
+        match self.state.as_mut() {
+            Some(BoundAudioTask::Transcribe(session)) => session.finish_input()?,
+            Some(BoundAudioTask::Ingress(_)) => {
+                let Some(BoundAudioTask::Ingress(ingress)) = self.state.take() else {
                     unreachable!()
                 };
-                self.state = State::Response(ResponseSession::Resident(ingress.finish()?));
+                self.state = Some(BoundAudioTask::Response(ingress.finish()?));
             }
             _ => return Err("this task has no open PCM input".into()),
         }
@@ -329,31 +307,31 @@ impl AudioTaskSession {
             return Ok(Some(AudioTaskOutput::Text(text)));
         }
         loop {
-            match &mut self.state {
-                State::Transcribe(session) => {
+            match self.state.as_mut() {
+                Some(BoundAudioTask::Transcribe(session)) => {
                     if session.is_finished() {
-                        self.state = State::Finished;
+                        self.state = None;
                         continue;
                     }
-                    let Some(block) = session.advance(false)? else {
+                    let Some(block) = session.advance()? else {
                         if session.is_finished() {
-                            self.state = State::Finished;
+                            self.state = None;
                             continue;
                         }
                         return Err("transcription requires more input or closure".into());
                     };
                     let mut text = String::new();
-                    append_text(&mut self.decoder, block.tokens, &mut text)?;
+                    append_text(&mut self.decoder, block, &mut text)?;
                     if !text.is_empty() {
                         return Ok(Some(AudioTaskOutput::Text(text)));
                     }
                 }
-                State::Response(session) => match session.advance()? {
+                Some(BoundAudioTask::Response(session)) => match session.advance()? {
                     AudioAdvance::Refining => {}
-                    AudioAdvance::Finished => self.state = State::Finished,
+                    AudioAdvance::Finished => self.state = None,
                     AudioAdvance::SpeechEnd(pcm) => {
                         if self.speech_only {
-                            self.state = State::Finished;
+                            self.state = None;
                         }
                         if !pcm.is_empty() {
                             return Ok(Some(AudioTaskOutput::Pcm(pcm)));
@@ -380,10 +358,10 @@ impl AudioTaskSession {
                         }
                     }
                 },
-                State::Ingress(_) => {
+                Some(BoundAudioTask::Ingress(_)) => {
                     return Err("close the audio input before advancing the response".into())
                 }
-                State::Finished => {
+                None => {
                     self.decoder.finish()?;
                     return Ok(None);
                 }

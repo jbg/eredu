@@ -1,7 +1,10 @@
 use std::marker::PhantomData;
 
 use eredu_nn::{NeuralBackend, Tensor};
-use eredu_runtime::{LayerRuntimeState, SelectedReplicatedTextRealization};
+use eredu_runtime::{
+    ComponentRankMechanisms, DecoderPipelineState, LayerRuntimeState, LocalComponentMechanisms,
+    SelectedReplicatedTextRealization,
+};
 
 use super::*;
 use crate::{replicated_text::*, routed_text::*};
@@ -367,6 +370,84 @@ where
     }
 }
 
+/// Constructed VL rank with portable vision traversal and bound native mechanisms.
+type RealizedVlRank<B, S, C, M> = crate::lfm3::vision::BoundVlRankSession<
+    crate::lfm3::vision::PolicyVision<
+        B,
+        <M as eredu_runtime::ParameterUnitMechanisms<B>>::UnitPolicy<
+            crate::lfm3::vision::VisionModule<B>,
+        >,
+    >,
+    crate::lfm3::vision::PreparedVlDecoderStage<
+        <M as ComponentRankMechanisms<B, S, C>>::Pipeline<crate::lfm3::PartitionedLayeredModel<B>>,
+    >,
+    S,
+>;
+
+/// Final executable adaptation after portable composite construction.
+pub trait RetainedCompositeVisitor<B, S, C, E, F>: Sized
+where
+    B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + 'static,
+    S: LayerRuntimeState<B>,
+    S::LayerState: eredu_nn::AttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
+{
+    /// Shared component realization for local and partitioned execution.
+    type Components: ComponentRankMechanisms<B, S, C> + LocalComponentMechanisms<B, S>;
+
+    /// Creates the binder for the retained native streams.
+    fn components(&self) -> Self::Components;
+
+    /// Erases a fully bound retained-prefill session through the portable invocation contract.
+    fn finish_retained<R>(
+        self,
+        session: R,
+        communication: Option<C>,
+    ) -> Result<E, PreparedExecutionError<F>>
+    where
+        R: super::PreparedRetainedTextSession<B::Tensor, S> + 'static;
+}
+
+/// Constructs the retained rank using generic native mechanisms.
+pub fn construct_vl_rank<B, S, C, M>(
+    prepared: crate::lfm3::vision::PreparedVlRankGraph,
+    context: &<B::Tensor as Tensor>::Context,
+    communication: &C,
+    mechanisms: &M,
+) -> Result<
+    super::RealizedRank<impl super::PreparedRetainedTextSession<B::Tensor, S> + 'static>,
+    eredu_core::BackendFailure,
+>
+where
+    B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + 'static,
+    B::Tensor: 'static,
+    S: DecoderPipelineState<B> + 'static,
+    S::LayerState: eredu_nn::AttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
+    M: ComponentRankMechanisms<B, S, C>,
+{
+    let mut bound: RealizedVlRank<B, S, C, M> = prepared.construct_session::<B, S, _, _>(
+        context,
+        |pipeline| {
+            mechanisms
+                .bind_pipeline(pipeline, communication)
+                .map(|(execution, _)| execution)
+        },
+        |vision, residency| {
+            vision.bind(context, |source, addresses, units, build| {
+                mechanisms
+                    .bind_units(source, addresses, units, residency, build)
+                    .map(|(policy, _)| policy)
+            })
+        },
+        S::allocate_pipeline_state,
+    )?;
+    Ok(super::RealizedRank {
+        raw_processor: bound.raw_processor.take(),
+        capabilities: bound.session,
+        floating_state_bytes: bound.dtype,
+        session: crate::lfm3::vision::rank_session::VlRankSession::new(bound),
+    })
+}
+
 /// Composite text construction with one selected processor and ingress contract.
 pub struct CompositeRoute<'a, B: NeuralBackend, S, V, P = WithoutPrediction> {
     context: &'a <B::Tensor as Tensor>::Context,
@@ -412,31 +493,99 @@ impl<B: NeuralBackend, S, V, P> sealed::Sealed for CompositeRoute<'_, B, S, V, P
 impl<B, S, V, P, C, E, F> PreparedExecutionRoute<SelectedCompositeTextRealization, C, E, F>
     for CompositeRoute<'_, B, S, V, P>
 where
-    B: eredu_nn::GroupedNeuralBackend
+    B: eredu_nn::TensorParallelGroupedNeuralBackend
         + eredu_nn::DistributedNeuralBackend
         + eredu_nn::BlockwiseAttentionBackend
         + eredu_nn::HyperNeuralBackend
         + Clone
         + 'static,
-    S: LayerRuntimeState<B>,
+    S: DecoderPipelineState<B>,
     S::LayerState: eredu_nn::ReadOnlyAttentionCache<B::Tensor>
         + eredu_runtime::RuntimeStateComponents<B>
         + eredu_runtime::RuntimeAppendStreams<B>
         + eredu_nn::AuxiliaryConvolutionState<B::Tensor>,
-    V: CompositeTextArchitectureVisitor<B, S, Output = E, Error = F>,
+    B::Tensor: 'static,
+    S: 'static,
+    C: 'static,
+    V: CompositeTextArchitectureVisitor<B, S, Output = E, Error = F>
+        + RetainedCompositeVisitor<B, S, C, E, F>,
     P: PredictionConstruction<B, SelectedCompositeTextRealization, C, E, F>,
 {
     fn construct(
         self,
         mut branch: PreparedConstructionBranch<SelectedCompositeTextRealization, C>,
     ) -> Result<E, PreparedExecutionError<F>> {
+        if let Some(prepared) = branch.retained_composite_rank.take() {
+            if branch.prediction.is_some() || branch.retained_prediction.is_some() {
+                return Err(PreparedExecutionError::UnavailablePrediction);
+            }
+            let communication = branch
+                .communication
+                .take()
+                .ok_or(PreparedExecutionError::MissingCommunication)?;
+            let session = construct_vl_rank::<B, S, _, _>(
+                prepared,
+                self.context,
+                &communication,
+                &self.visitor.components(),
+            )
+            .map_err(PreparedExecutionError::Binding)?;
+            return self
+                .visitor
+                .finish_retained(session.session, Some(communication));
+        }
         if let Some(retained) = branch.retained_construction.take() {
             if branch.prediction.is_some() {
                 return Err(PreparedExecutionError::UnavailablePrediction);
             }
             return match retained {
                 RetainedArchitectureConstruction::Lfm3Vl(prepared) => {
-                    self.visitor.visit_vl(*prepared)
+                    let admission = prepared
+                        .prompt_admission()
+                        .map_err(eredu_core::BackendFailure::from_error)
+                        .map_err(PreparedExecutionError::Binding)?;
+                    let capabilities = prepared
+                        .capabilities()
+                        .map_err(eredu_core::BackendFailure::from_error)
+                        .map_err(PreparedExecutionError::Binding)?;
+                    let execution = prepared.selected().execution();
+                    if execution.prompt_cache() {
+                        return Err(PreparedExecutionError::UnavailableExecution);
+                    }
+                    eredu_core::SessionAdmission::new(execution.session())
+                        .validate(crate::lfm3::vision::VL_SESSION_CAPABILITIES)
+                        .map_err(eredu_core::BackendFailure::from_error)
+                        .map_err(PreparedExecutionError::Binding)?;
+                    let processor = prepared.selected().processor().clone();
+                    let residency = execution.residency();
+                    let state = execution.state().clone();
+                    let conversion_retention = execution.parameter_conversion_retention();
+                    let components = self.visitor.components();
+                    let graph = components.bind_local(|| {
+                        let (architecture, component, _, _) = prepared.into_layerwise::<B>(self.context)
+                            .map_err(eredu_core::BackendFailure::from_error)?;
+                        eredu_runtime::PreparedLocalComponent::new(
+                            architecture,
+                            component,
+                            eredu_runtime::LocalComponentPolicy {
+                                residency,
+                                state: Some(state),
+                                conversion_retention,
+                                conversion_eligibility: eredu_core::residency::ParameterConversionRetentionEligibility::Eligible,
+                            },
+                        )
+                        .map_err(eredu_core::BackendFailure::from_error)
+                    })
+                    .map_err(PreparedExecutionError::Binding)?;
+                    let session = crate::lfm3::vision::local_vl_session::<B, S, _>(
+                        graph,
+                        admission,
+                        capabilities,
+                        processor,
+                        residency,
+                    )
+                    .map_err(PreparedExecutionError::Binding)?;
+                    self.visitor.finish_retained(session, None)
                 }
                 RetainedArchitectureConstruction::Qwen4Conditional(selected) => {
                     if let Some(binding) = branch.retained_prediction.take() {

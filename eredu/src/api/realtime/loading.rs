@@ -1,6 +1,5 @@
 //! Protocol-specific options for architecture-dispatched realtime loading.
 
-pub use eredu_architectures::lfm3::audio::AudioParameterResidency;
 use eredu_architectures::voicechat::component_residency::VoiceChatResidencyPolicy;
 use eredu_runtime::{CacheResidencyPolicy, NormalizedLoadRequest};
 
@@ -33,19 +32,13 @@ pub enum RealtimeLoadOptions {
     Categorical(NormalizedLoadRequest),
     /// PCM input with speech, transcription, text and conversational tool events.
     Speech(SpeechSessionOptions),
-    /// Batch-one prepared prompts with text and streaming speech output.
-    Lfm3Audio,
-    /// Prepared Audio prompts with explicit component weight policies.
-    Lfm3AudioWithResidency(AudioParameterResidency),
 }
 
-#[cfg(feature = "mlx")]
 impl RealtimeLoadOptions {
     pub(super) fn protocol(&self) -> &'static str {
         match self {
             Self::Categorical(_) => "categorical",
             Self::Speech(_) => "PCM conversation",
-            Self::Lfm3Audio | Self::Lfm3AudioWithResidency(_) => "prepared Audio prompt",
         }
     }
 }

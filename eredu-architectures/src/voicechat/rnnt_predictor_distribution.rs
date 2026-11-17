@@ -1,4 +1,5 @@
 //! Cold recurrent stage, source and communication authority.
+use super::rnnt_predictor::{RnntPredictorKernel, RnntPredictorRuntimeState};
 use super::{
     rnnt::RnntError,
     rnnt_predictor_partition::{
@@ -6,12 +7,18 @@ use super::{
     },
     rnnt_predictor_preparation::PreparedRnntPredictorBindings,
 };
-use eredu_core::CollectiveGroupId;
+use eredu_core::{BackendFailure, CollectiveGroupId};
+use eredu_nn::{DistributedNeuralBackend, NeuralBackend};
 use eredu_runtime::{
     ArchitectureBoundary, ArchitectureGroupKind, ArchitecturePartition, CommunicationManifest,
-    ComponentPipelinePreparationError, PartitionedExecutionPlan, PipelineActivationDtype,
+    ComponentPipelinePreparationError, ComponentRankMechanisms, LayerWeightResidency,
+    LayerwiseModelMetadata, PartitionedExecutionPlan, PipelineActivationDtype,
     PipelineBindingError,
 };
+
+use super::rnnt_predictor_stage::{RnntPredictorPipeline, RnntPredictorPipelineArchitecture};
+
+type Pipeline<B> = eredu_runtime::PreparedComponentPipeline<RnntPredictorPipelineArchitecture<B>>;
 
 /// Exact source recipes, global cuts and distributed authority for one streaming stage.
 /// This does not select the surrounding transcription policy or conversational scheduler.
@@ -130,26 +137,60 @@ impl PreparedRnntPredictorPipelineBindings {
     pub fn tensor_group(&self) -> Option<CollectiveGroupId> {
         self.tensor_group
     }
-    /// Consumes the complete validated authority without reconstructing topology or sources.
-    pub fn into_parts(
+    /// Binds the retained plan and constructs the portable stage.
+    pub fn bind<B, C, H>(
         self,
-    ) -> (
-        PreparedRnntPredictorBindings,
-        ArchitecturePartition<(), RnntPredictorBoundarySchema>,
-        RnntPredictorPipelineCuts,
-        CommunicationManifest,
-        PartitionedExecutionPlan,
-        Option<CollectiveGroupId>,
-        PipelineActivationDtype,
-    ) {
+        residency: LayerWeightResidency,
+        communication: &C,
+        mechanisms: &H,
+    ) -> Result<
         (
-            self.bindings,
-            self.partition,
-            self.cuts,
-            self.manifest,
-            self.plan,
-            self.tensor_group,
-            self.activation_dtype,
-        )
+            RnntPredictorPipeline<H::Pipeline<RnntPredictorPipelineArchitecture<B>>>,
+            LayerwiseModelMetadata,
+        ),
+        BackendFailure,
+    >
+    where
+        B: DistributedNeuralBackend + 'static,
+        B::Tensor: 'static,
+        H: ComponentRankMechanisms<B, RnntPredictorRuntimeState<B::Tensor>, C>,
+    {
+        let (pipeline, layout) = self.into_pipeline::<B>(residency)?;
+        let (execution, metadata) = mechanisms.bind_pipeline(pipeline, communication)?;
+        Ok((RnntPredictorPipeline::new(execution, layout), metadata))
+    }
+
+    /// Builds the typed stage from its retained source, ownership and communication plan.
+    fn into_pipeline<B: NeuralBackend>(
+        self,
+        residency: eredu_runtime::LayerWeightResidency,
+    ) -> Result<(Pipeline<B>, eredu_runtime::StateLayout), BackendFailure> {
+        let layout = self
+            .partition
+            .state()
+            .ok_or_else(|| {
+                BackendFailure::from_error(eredu_nn::Error::backend(
+                    "pipeline stage has no retained state layout",
+                ))
+            })?
+            .layout()
+            .clone();
+        let (declaration, invocations, source, units) = self.bindings.into_parts();
+        let architecture =
+            RnntPredictorKernel::<B>::new_partition(declaration, &self.partition, &self.cuts)
+                .map_err(BackendFailure::from_error)?;
+        let pipeline = eredu_runtime::PreparedComponentPipeline {
+            architecture,
+            source,
+            invocations,
+            pinned: Vec::new(),
+            units,
+            manifest: self.manifest,
+            plan: self.plan,
+            tensor_group: self.tensor_group,
+            activation_dtype: self.activation_dtype,
+            residency,
+        };
+        Ok((pipeline, layout))
     }
 }

@@ -145,7 +145,7 @@ impl
     }
 }
 
-pub(crate) fn bind_prepared_partitioned_composite<A, G, W, F>(
+fn bind_prepared_partitioned_composite<A, G, W, F>(
     prepared: eredu_architectures::composite_partitioned::PreparedCompositePartition<A, G, W>,
     store: Arc<dyn CheckpointSource>,
     distributed: crate::backend::distributed::MlxDistributedSession,
@@ -304,13 +304,13 @@ where
     Ok((provider, parameter_banks))
 }
 
-pub(crate) fn bind_prepared_partitioned_composite_with_provider<A, G, W, F>(
+fn bind_prepared_partitioned_composite_with_provider<A, G, W, F>(
     prepared: eredu_architectures::composite_partitioned::PreparedCompositePartition<A, G, W>,
     store: Arc<dyn CheckpointSource>,
     distributed: crate::backend::distributed::MlxDistributedSession,
     stream: &Stream,
     weights_stream: &Stream,
-    mut provider: Option<
+    provider: Option<
         eredu_architectures::prepared_execution::PartitionBankProviders<MlxNeuralBackend>,
     >,
     parameter_banks: std::collections::BTreeMap<
@@ -338,9 +338,6 @@ where
         .session_facts::<MlxNeuralBackend>()
         .map_err(Error::ArchitectureModel)?;
     let session_group = facts.session_group();
-    let (text, prompt_topology, execution_plan, publication_authority) = facts.into_parts();
-    let (prompt_cache_identity, capability_estimate, effective_model_type, selected_residency) =
-        text.into_parts();
     let admission = prepared.prepared().architecture().admission_config();
     let processor = prepared.prepared().selected().base().processor().clone();
     let addressable_parameters = prepared
@@ -369,64 +366,39 @@ where
     let row_pool = row_binding
         .as_ref()
         .and_then(super::routed::MlxPartitionRows::reporting_pool);
-    let mut mechanisms: MlxReplicatedTextMechanisms<A, MlxHybridState> =
-        MlxReplicatedTextMechanisms::new(store, stream, weights_stream);
-    mechanisms.set_prediction_residency(finalizer.prediction_residency()?);
-    mechanisms.set_ignored_checkpoint_sources(prepared.unowned_expert_checkpoint_sources());
-    let mut distributed = Some(distributed);
-    let mut partition_sampling_group = None;
-    let mut partition_communication_authority = None;
-    #[cfg(test)]
-    {
-        crate::tests::support::path_instrumentation::constructor();
-        crate::tests::support::path_instrumentation::neutral_partitioned_construction();
-    }
+    let claimed_sources = prepared.unowned_expert_checkpoint_sources();
+    let mut rank = super::rank_preparation::PartitionRankPreparation::new(
+        facts,
+        store,
+        distributed,
+        claimed_sources,
+        stream,
+        weights_stream,
+        finalizer.prediction_residency()?,
+    );
     let binding = prepared
         .prepare_session_runtime::<MlxNeuralBackend, _, _, _, _>(
-            prompt_topology.clone(),
+            rank.topology(),
             stream,
-            |input, source_architecture, physical_layout, executor_plan, selected, context| {
-                let (source_architecture, source_layout) = source_architecture
-                    .map(|(source, layout)| (Some(source), Some(layout)))
-                    .unwrap_or((None, None));
-                let tensor_group = executor_plan.communication_tensor_group();
-                let prepared = eredu_runtime::prepare_default_partitioned_runtime(
+            |input, source, layout, executor_plan, selected, context| {
+                let bound = rank.prepare(
                     input,
-                    source_architecture.map(|source| *source),
-                    physical_layout,
-                    source_layout,
+                    source.map(|(architecture, layout)| (*architecture, layout)),
+                    layout,
                     selected,
-                    &prompt_topology,
-                    eredu_runtime::PartitionedUnitScope::Owned,
                     &addressable_parameters,
-                    &mut mechanisms,
+                    (
+                        executor_plan.communication_tensor_group(),
+                        session_group,
+                        executor_plan.row_lookup_status_group(),
+                    ),
                     context,
-                )
-                .map_err(Error::from)?;
-                let (architecture, _partition, manifest, execution_policy, bounded_policy, state) =
-                    prepared.into_parts();
-                let distributed = distributed.take().ok_or_else(|| {
-                    Error::Parallel("composite communication was already consumed".into())
-                })?;
-                let row_status = executor_plan
-                    .row_lookup_status_group()
-                    .map(|id| {
-                        distributed.selected_group(id).cloned().ok_or_else(|| {
-                            Error::Parallel(
-                                "selected composite row status group is not bound".into(),
-                            )
-                        })
-                    })
-                    .transpose()?;
-                let (communication, parallel, sampling, communication_executor) = distributed
-                    .into_partition_communication(manifest, tensor_group, session_group)?;
-                partition_communication_authority = Some(communication.authority());
-                partition_sampling_group = Some(sampling);
+                )?;
                 let rows = row_binding
                     .map(|rows| {
                         rows.bind(
-                            parallel.as_ref(),
-                            row_status.as_ref(),
+                            bound.parallel.as_ref(),
+                            bound.row_status.as_ref(),
                             weights_stream,
                             stream,
                         )
@@ -437,53 +409,48 @@ where
                         "row lookup requires a selected composite parameter provider".into(),
                     ));
                 }
-                let provider = provider
-                    .take()
-                    .map(|grouped| eredu_runtime::ParameterProviders { grouped, rows });
+                let provider =
+                    provider.map(|grouped| eredu_runtime::ParameterProviders { grouped, rows });
                 let executor = executor_plan.bind_with_provider(
-                    architecture,
-                    execution_policy,
-                    parallel,
+                    bound.architecture,
+                    bound.policy,
+                    bound.parallel,
                     MlxPartitionTensorAllocator,
                     super::super::distributed::expert::MlxExpertRouteTensorMovement::new(stream),
                     provider,
                 )?;
                 let runtime = eredu_runtime::PartitionedTextRuntime::new(
-                    execution_plan,
+                    rank.execution_plan(),
                     executor,
-                    communication,
-                    communication_executor,
+                    bound.communication,
+                    bound.communication_executor,
                     eredu_runtime::OpaqueBoundaryTransport,
                     eredu_runtime::OpaqueOutputPublisher,
                     eredu_runtime::OpaqueFailureAgreement,
-                    selected_residency.execution_residency(),
-                    bounded_policy,
+                    rank.execution_residency(),
+                    bound.bounded_policy,
                 )
                 .map_err(|error| Error::Other(Box::new(error)))?;
-                Ok::<_, Error>((runtime, state))
+                Ok::<_, Error>((runtime, bound.state))
             },
         )
         .map_err(Error::from)?;
-    let session = eredu_runtime::construct_replicated_text_session_with_runtime(
-        binding,
-        mechanisms,
-        eredu_runtime::PartitionedTextExecution::new(),
-    )
-    .map_err(|error| Error::Other(Box::new(error)))?;
+    let bound = rank.finish(binding, eredu_runtime::PartitionedTextExecution::new())?;
+    let (identity, capability, model_type, residency) = bound.text.into_parts();
     finalizer.finish(
         CompletedComposite::<A, _, NoSelectedPrediction>::from_session(
-            session,
+            bound.session,
             admission,
             processor,
-            prompt_cache_identity,
-            capability_estimate,
-            effective_model_type,
-            selected_residency,
-            partition_sampling_group,
-            partition_communication_authority,
-            Some(publication_authority.owner_group_rank()),
-            publication_authority.local_public_output(),
-            stream,
+            identity,
+            capability,
+            model_type,
+            residency,
+            bound.sampling,
+            bound.authority,
+            Some(bound.publication.owner_group_rank()),
+            bound.publication.local_public_output(),
+            bound.stream,
         )
         .with_parameter_banks(parameter_banks)?
         .with_partition_row_pool(row_pool),

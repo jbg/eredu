@@ -82,6 +82,12 @@ pub enum AudioSnapshotError {
     /// Explicit cancellation is terminal.
     #[error("LFM3 Audio session is cancelled")]
     Cancelled,
+    /// The selected placement requires a coordinated cohort snapshot.
+    #[error("LFM3 Audio distributed snapshots require coordinated rank state and communication")]
+    RequiresCohort,
+    /// A sibling continuation currently holds the execution owner.
+    #[error("LFM3 Audio execution owner is busy")]
+    Busy,
     /// A saved model state originated in a different session.
     #[error("LFM3 Audio snapshot belongs to another session")]
     ForeignSession,
@@ -272,6 +278,11 @@ pub trait AudioExecutionKernel {
         state: &<Self::State as SemanticStateTransaction>::Branch,
     ) -> Result<Self::Completion, BackendFailure>;
 
+    /// Whether snapshots can be captured, restored and forked on this session alone.
+    fn supports_independent_snapshots(&self) -> bool {
+        true
+    }
+
     /// Whether this execution requires all-rank generation publication.
     fn uses_collective_commit(&self) -> bool {
         false
@@ -375,6 +386,15 @@ where
     fn check_snapshot_boundary(&self) -> Result<(), AudioSnapshotError> {
         if self.cancelled {
             return Err(AudioSnapshotError::Cancelled);
+        }
+        if !self
+            .transition
+            .try_borrow()
+            .map_err(|_| AudioSnapshotError::Busy)?
+            .0
+            .supports_independent_snapshots()
+        {
+            return Err(AudioSnapshotError::RequiresCohort);
         }
         Ok(())
     }

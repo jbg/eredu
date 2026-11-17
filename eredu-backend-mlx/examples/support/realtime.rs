@@ -4,16 +4,14 @@ use std::time::{Duration, Instant};
 
 use eredu_architectures::moshi::MoshiRealtimeExecution;
 use eredu_backend_mlx::native::{
-    MlxRealtimeCompletion, MlxRealtimeExecution, MlxRealtimeExecutionContext,
-    MlxRealtimeHostObserver, RandomState,
+    MlxPrepublicationFrame, MlxRealtimeCompletion, MlxRealtimeExecution,
+    MlxRealtimeExecutionContext, RandomState,
 };
 use eredu_core::{
     scheduler::{RequestId, SchedulerLimits},
     RealtimeInputFrame, RealtimeOutputFrame, RealtimeSampling,
 };
-use eredu_runtime::{
-    GenerationSampler, RealtimeGenerationState, RealtimePayloadState, RealtimeSessionScheduler,
-};
+use eredu_runtime::{GenerationSampler, RealtimeSessionScheduler};
 use safemlx::Array;
 
 pub type PreparedRealtime = MoshiRealtimeExecution<MlxRealtimeExecution>;
@@ -44,14 +42,7 @@ pub type Scheduler = RealtimeSessionScheduler<
     GenerationSampler,
     RandomState,
     MlxRealtimeCompletion,
-    eredu_runtime::PrepublicationRealtimeFrame<
-        eredu_runtime::CompletedRealtimeFrame<
-            eredu_backend_mlx::MlxTensor,
-            eredu_backend_mlx::MlxTensor,
-        >,
-        MlxRealtimeCompletion,
-        MlxRealtimeHostObserver,
-    >,
+    MlxPrepublicationFrame<eredu_architectures::moshi::MoshiRealtimeOutputProjection>,
 >;
 
 pub fn load(
@@ -59,12 +50,13 @@ pub fn load(
     preparation: eredu_architectures::moshi::MoshiPreparationPlan,
     options: eredu_backend_mlx::MlxLoadRequest,
 ) -> Result<PreparedRealtime, DriverError> {
-    let selected =
-        MlxRealtimeExecutionContext::select_realtime_execution(preparation, &options, false)
-            .map_err(driver_error)?;
-    backend
-        .materialize_realtime_execution(selected)
-        .map_err(driver_error)
+    let selected = eredu_architectures::moshi::prepare_moshi_realtime_with_support(
+        preparation,
+        options.normalized(),
+        &eredu_backend_mlx::native::MlxRealtimeSupport::new(false),
+    )
+    .map_err(driver_error)?;
+    backend.bind_realtime(selected, None).map_err(driver_error)
 }
 
 pub fn scheduler(
@@ -78,34 +70,14 @@ pub fn scheduler(
         SchedulerLimits::new(1, 1).map_err(driver_error)?,
     )
     .map_err(driver_error)?;
-    let schedule = model.execution_config().frame_schedule().clone();
-    let samplers = eredu_architectures::moshi::realtime_generation_samplers(&schedule, sampling)
+    backend
+        .validate_execution(model.executor())
         .map_err(driver_error)?;
-    let model_state = RealtimePayloadState::fresh(
-        backend
-            .new_realtime_model_state(model)
-            .map_err(driver_error)?,
-        eredu_architectures::moshi::realtime_ingress_contract(model.execution_config())
-            .map_err(driver_error)?
-            .channels()
-            .clone(),
-    );
-    let random = backend
-        .realize_random_state(sampling.is_stochastic().then_some(sampling.seed()))
+    let generation = model
+        .initialize_generation(backend, sampling)
         .map_err(driver_error)?;
     scheduler
-        .register(
-            request,
-            RealtimeGenerationState::new(
-                model_state,
-                eredu_architectures::moshi::realtime_generation_contract(&schedule),
-                eredu_core::RealtimeFrameScheduleState::new(schedule),
-                sampling,
-                samplers,
-                random,
-            )
-            .map_err(driver_error)?,
-        )
+        .register(request, generation)
         .map_err(driver_error)?;
     Ok(scheduler)
 }
@@ -134,7 +106,10 @@ pub fn run_frame(
     loop {
         let mut progress = scheduler
             .run_local_turn(Instant::now(), |_, frame, branch| {
-                backend.submit_realtime_frame(model, frame, branch)
+                let plan = model.prepare_frame().map_err(driver_error)?;
+                backend
+                    .submit_realtime(model.executor(), plan, frame, branch)
+                    .map_err(driver_error)
             })
             .map_err(driver_error)?;
         if let Some((_, _, output)) = progress.committed.pop() {

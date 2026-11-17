@@ -4,6 +4,7 @@ mod artifact;
 mod block;
 mod checkpoint;
 mod config;
+mod construction;
 mod declarations;
 mod depth;
 mod model;
@@ -35,17 +36,11 @@ pub use parallel::{
     MoshiCollectiveCount, MoshiMatrixContract, MoshiParallelSelection, MoshiParameterContract,
 };
 pub use realtime::{
-    execute_detached_partitioned_moshi_realtime, execute_detached_replicated_moshi_realtime,
-    execute_replicated_moshi_realtime, inspect_moshi_realtime,
-    moshi_realtime_request_from_normalized, prepare_selected_moshi_realtime_source,
-    realtime_decision_execution, realtime_frame_contract, realtime_generation_contract,
-    realtime_generation_samplers, realtime_ingress_contract, select_inspected_moshi_realtime,
-    select_moshi_realtime, selected_moshi_lowering_summary,
-    visit_selected_moshi_realtime_architecture, InspectedMoshiRealtime,
-    MoshiPreparedRealtimeFrameExecutor, MoshiRealtimeArchitectureVisitor,
-    MoshiRealtimeDispatchError, MoshiRealtimeExecution, MoshiRealtimeExecutionArchitecture,
-    MoshiRealtimeExecutionDescriptor, MoshiRealtimeExecutionError, MoshiRealtimeRequest,
-    MoshiRealtimeSamplingError, MoshiRealtimeSelectionError, MoshiRealtimeSourceError,
-    MoshiWeightLoweringSummary, PreparedMoshiRealtime, PreparedMoshiRealtimeArchitecture,
-    PreparedMoshiRealtimeSource,
+    inspect_moshi_realtime, moshi_realtime_request_from_normalized,
+    prepare_moshi_realtime_with_support, realtime_frame_contract, select_inspected_moshi_realtime,
+    select_moshi_realtime_with_support, InspectedMoshiRealtime, MoshiRealtimeDispatchError,
+    MoshiRealtimeExecution, MoshiRealtimeExecutionDescriptor, MoshiRealtimeGeneration,
+    MoshiRealtimePreparationError, MoshiRealtimeRequest, MoshiRealtimeSamplingError,
+    MoshiRealtimeSelectionError, MoshiRealtimeSourceError, MoshiRealtimeStartupError,
+    PreparedMoshiRealtime, PreparedMoshiRealtimeSource,
 };

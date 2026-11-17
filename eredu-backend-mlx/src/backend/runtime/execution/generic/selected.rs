@@ -7,17 +7,42 @@ use std::{
     sync::Mutex,
 };
 
+struct MlxImmutableParameters {
+    stream_index: i32,
+    identity: eredu_core::resources::ResourceIdentity,
+}
+
+impl MlxImmutableParameters {
+    fn new(stream: &Stream) -> safemlx::error::Result<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Ok(Self {
+            stream_index: stream.get_index()?,
+            identity: eredu_core::resources::ResourceIdentity {
+                scope: "mlx.immutable.parameters".into(),
+                key: NEXT.fetch_add(1, Ordering::Relaxed).to_string(),
+            },
+        })
+    }
+
+    fn identity(&self, stream: &Stream) -> Option<&eredu_core::resources::ResourceIdentity> {
+        (stream.get_index().ok() == Some(self.stream_index)).then_some(&self.identity)
+    }
+}
+
 pub(crate) enum MlxSelectedLayerwisePolicyInner<U: 'static, P> {
     Resident(MlxResidentPolicy<U>),
     Bounded(MlxLayerwisePolicy<U, P>),
 }
 
-pub(crate) struct MlxSelectedLayerwisePolicy<U: 'static, P> {
+/// Native storage policy for resident or bounded prepared parameter units.
+pub struct MlxSelectedLayerwisePolicy<U: 'static, P> {
     inner: Arc<Mutex<MlxSelectedLayerwisePolicyInner<U, P>>>,
     /// Exact architecture addresses paired with policy-local residency addresses.
     /// Pipeline cuts may retain a nonzero global unit index at local ordinal zero.
     addresses: ExecutionUnitAddressMap,
     identity: Arc<()>,
+    immutable: Option<Arc<MlxImmutableParameters>>,
 }
 
 impl<U: 'static, P> Clone for MlxSelectedLayerwisePolicy<U, P> {
@@ -26,6 +51,7 @@ impl<U: 'static, P> Clone for MlxSelectedLayerwisePolicy<U, P> {
             inner: Arc::clone(&self.inner),
             addresses: self.addresses.clone(),
             identity: Arc::clone(&self.identity),
+            immutable: self.immutable.clone(),
         }
     }
 }
@@ -35,6 +61,7 @@ impl<U: 'static, P> MlxSelectedLayerwisePolicy<U, P> {
         Self {
             addresses: policy.invocations.clone(),
             identity: Arc::new(()),
+            immutable: None,
             inner: Arc::new(Mutex::new(MlxSelectedLayerwisePolicyInner::Resident(
                 policy,
             ))),
@@ -45,8 +72,14 @@ impl<U: 'static, P> MlxSelectedLayerwisePolicy<U, P> {
         Self {
             addresses: policy.invocation_map().clone(),
             identity: Arc::new(()),
+            immutable: None,
             inner: Arc::new(Mutex::new(MlxSelectedLayerwisePolicyInner::Bounded(policy))),
         }
+    }
+
+    pub(super) fn certify_immutable(mut self, stream: &Stream) -> safemlx::error::Result<Self> {
+        self.immutable = Some(Arc::new(MlxImmutableParameters::new(stream)?));
+        Ok(self)
     }
 
     pub(crate) fn trim_parameter_conversions(
@@ -70,7 +103,8 @@ impl<U: 'static, P> MlxSelectedLayerwisePolicy<U, P> {
         }
     }
 
-    pub(crate) fn residency_report(&self) -> Result<ResidencyReport, Error> {
+    /// Reports the current residency of the selected parameter units.
+    pub fn residency_report(&self) -> Result<ResidencyReport, Error> {
         let policy = self.inner.lock().map_err(|_| {
             Error::ArchitectureModel("selected layerwise policy lock was poisoned".into())
         })?;
@@ -80,7 +114,8 @@ impl<U: 'static, P> MlxSelectedLayerwisePolicy<U, P> {
         }
     }
 
-    pub(crate) fn dense_stream_report(&self) -> Result<Option<DenseDiskStreamReport>, Error> {
+    /// Reports disk streaming activity when the selected policy streams from disk.
+    pub fn dense_stream_report(&self) -> Result<Option<DenseDiskStreamReport>, Error> {
         let policy = self.inner.lock().map_err(|_| {
             Error::ArchitectureModel("selected layerwise policy lock was poisoned".into())
         })?;
@@ -91,7 +126,8 @@ impl<U: 'static, P> MlxSelectedLayerwisePolicy<U, P> {
     }
 }
 
-pub(crate) struct MlxSelectedUnitLease<U: 'static> {
+/// Holds a materialized unit for the duration of its execution.
+pub struct MlxSelectedUnitLease<U: 'static> {
     address: eredu_runtime::ExecutionUnitLeaseAddress,
     identity: Arc<()>,
     inner: MlxSelectedUnitLeaseInner<U>,
@@ -361,5 +397,30 @@ where
             MlxSelectedLayerwisePolicyInner::Resident(policy) => policy.finish(output, context),
             MlxSelectedLayerwisePolicyInner::Bounded(policy) => policy.finish(output, context),
         }
+    }
+}
+
+impl<U: 'static, P> eredu_runtime::UnitPolicyResidency for MlxSelectedLayerwisePolicy<U, P> {
+    fn residency(&self) -> Result<eredu_runtime::ResidencyReport, eredu_core::BackendFailure> {
+        self.residency_report()
+            .map_err(eredu_core::BackendFailure::from_error)
+    }
+
+    fn dense_stream_report(
+        &self,
+    ) -> Result<Option<DenseDiskStreamReport>, eredu_core::BackendFailure> {
+        self.dense_stream_report()
+            .map_err(eredu_core::BackendFailure::from_error)
+    }
+}
+
+impl<U: 'static, P> eredu_runtime::ImmutableParameterPolicy<MlxNeuralBackend>
+    for MlxSelectedLayerwisePolicy<U, P>
+{
+    fn immutable_parameters_identity(
+        &self,
+        context: &Stream,
+    ) -> Option<&eredu_core::resources::ResourceIdentity> {
+        self.immutable.as_ref()?.identity(context)
     }
 }

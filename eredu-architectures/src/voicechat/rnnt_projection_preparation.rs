@@ -1,16 +1,24 @@
 //! Restricted RNNT embedding and joint recipes without recurrent allocation.
 use super::{
-    rnnt::RnntDimensions,
+    rnnt::{RnntDimensions, RnntError},
+    rnnt_layered::{RnntKernel, RnntUnit},
     rnnt_preparation::{PreparedRnntBindings, RnntPreparationError},
+    rnnt_projection_layered::RnntProjection,
     rnnt_specs::RnntDeclaration,
 };
-use eredu_checkpoint::store::SharedCheckpointSource;
-use eredu_runtime::{LocalModelLayout, PreparedComponent, WeightBinding};
+use eredu_core::{BackendFailure, CollectiveGroupId, ParallelRankTopology, ParallelTopology};
+use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Tensor};
+use eredu_runtime::{
+    CommunicationManifest, ComponentAdapter, LayerWeightResidency, LayeredTensorCohort,
+    LayerwiseModelMetadata, LocalModelLayout, ParameterUnitMechanisms, PreparedComponent,
+    SubmissionBackend, WeightBinding,
+};
 
 /// Exact four-unit source authority, including vocabulary placement when selected.
 /// Recurrent recipes and replica declarations are excluded from this owner.
 pub struct PreparedRnntProjectionBindings {
     prepared: PreparedComponent<RnntDeclaration<false>>,
+    selection: Option<(CommunicationManifest, CollectiveGroupId)>,
 }
 impl PreparedRnntProjectionBindings {
     /// Projects existing retained RNNT recipes without reading parameter payloads.
@@ -23,24 +31,41 @@ impl PreparedRnntProjectionBindings {
         if let Some(layout) = prepared.local_layout() {
             prepared.declaration().local_dimensions(layout)?;
         }
-        Ok(Self { prepared })
+        Ok(Self {
+            prepared,
+            selection: None,
+        })
     }
 
     /// Selects vocabulary shards and exact encoder/prediction replicas for one cohort.
     pub fn select_parallel(
-        self,
-        topology: eredu_core::ParallelRankTopology,
-    ) -> Result<(Self, LocalModelLayout), RnntPreparationError> {
-        let layout = self.prepared.tensor_parallel_layout(topology)?;
-        Ok((self.into_parallel(&layout)?, layout))
-    }
-    /// Applies architecture-owned vocabulary transforms without widening source access.
-    pub fn into_parallel(
         mut self,
-        layout: &LocalModelLayout,
+        manifest: &CommunicationManifest,
+        group: CollectiveGroupId,
     ) -> Result<Self, RnntPreparationError> {
-        self.prepared.declaration().local_dimensions(layout)?;
-        self.prepared = self.prepared.select(layout)?;
+        super::rnnt_preparation::validate_neural_communication(
+            self.dimensions(),
+            manifest,
+            group,
+            true,
+        )?;
+        let cohort = manifest
+            .groups()
+            .iter()
+            .find(|cohort| cohort.id() == group)
+            .expect("validated projection cohort");
+        let topology = ParallelTopology::new(cohort.members().len(), 1, 1, 1)
+            .and_then(|topology| {
+                ParallelRankTopology::new(
+                    topology,
+                    cohort.local_index().expect("validated local membership"),
+                )
+            })
+            .map_err(|error| RnntPreparationError::Parallel(error.to_string()))?;
+        let layout = self.prepared.tensor_parallel_layout(topology)?;
+        self.prepared.declaration().local_dimensions(&layout)?;
+        self.prepared = self.prepared.select(&layout)?;
+        self.selection = Some((manifest.clone(), group));
         Ok(self)
     }
     /// Global geometry used by projection equations and the shared greedy driver.
@@ -55,38 +80,59 @@ impl PreparedRnntProjectionBindings {
     pub fn unit_bindings(&self) -> &[Vec<WeightBinding>] {
         self.prepared.unit_bindings()
     }
-    /// Retained source restricted to the selected nonrecurrent parameters.
-    pub fn source(&self) -> &SharedCheckpointSource {
-        self.prepared.source()
-    }
-    /// Projection semantic declaration retained independently of excluded recurrent resources.
-    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
-        self.prepared.declaration().definition()
-    }
-    /// Transfers compact layout and exactly the authority needed by its four units.
-    pub fn into_parts(
+    /// Binds the retained recipes with the shared parameter unit mechanism.
+    pub fn bind<B, H, C>(
         self,
-    ) -> (
-        RnntDeclaration<false>,
-        Option<LocalModelLayout>,
-        eredu_runtime::ExecutionUnitAddressMap,
-        SharedCheckpointSource,
-        Vec<Vec<WeightBinding>>,
-    ) {
-        let (declaration, local, layout, source, units) = self
+        residency: LayerWeightResidency,
+        context: &<B::Tensor as Tensor>::Context,
+        mechanisms: &H,
+        cohort: Option<C>,
+    ) -> Result<
+        (
+            RnntProjection<B, H::UnitPolicy<RnntUnit<B>>, C>,
+            LayerwiseModelMetadata,
+        ),
+        BackendFailure,
+    >
+    where
+        B: DistributedNeuralBackend
+            + SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>
+            + 'static,
+        H: ParameterUnitMechanisms<B>,
+        C: LayeredTensorCohort<B>,
+    {
+        let selection = self
+            .selection
+            .as_ref()
+            .map(|(manifest, group)| (manifest, *group));
+        if selection != cohort.as_ref().map(LayeredTensorCohort::selection)
+            || self.prepared.local_layout().is_some() != selection.is_some()
+        {
+            return Err(BackendFailure::from_error(RnntError::InvalidConfiguration(
+                "RNNT projection parameter placement differs from its tensor cohort",
+            )));
+        }
+        let (declaration, local, invocations, source, units) = self
             .prepared
             .into_declared_unit_parts()
-            .expect("RNNT projection declares only independently leased units");
-        (declaration, local, layout, source, units)
+            .map_err(BackendFailure::from_error)?;
+        let definition = declaration.definition().clone();
+        let kernel = match local.as_ref() {
+            Some(layout) => RnntKernel::<B, false>::new_parallel(declaration, layout),
+            None => RnntKernel::<B, false>::new(declaration),
+        }
+        .map_err(BackendFailure::from_error)?;
+        let architecture =
+            ComponentAdapter::new(definition, kernel).map_err(BackendFailure::from_error)?;
+        RnntProjection::bind(
+            architecture,
+            source,
+            invocations,
+            units,
+            residency,
+            context,
+            mechanisms,
+            cohort,
+        )
     }
-}
-
-/// Validates only projection tensor collectives. Decision and failure agreement
-/// are admitted separately by the shared greedy driver's selected coordinators.
-pub fn validate_projection_parallel_communication(
-    dimensions: RnntDimensions,
-    manifest: &eredu_runtime::CommunicationManifest,
-    group: eredu_core::CollectiveGroupId,
-) -> Result<(), RnntPreparationError> {
-    super::rnnt_preparation::validate_neural_communication(dimensions, manifest, group, false)
 }

@@ -126,6 +126,20 @@ impl Parameters {
             .get(index)
             .ok_or_else(|| Error::backend(format!("Inkling vision layer {index} is out of range")))
     }
+    pub(crate) fn continuation_shapes(&self, patches: i32) -> Vec<Vec<i32>> {
+        let mut shape = vec![patches, 2, 40, 40, 3];
+        self.layers
+            .iter()
+            .map(|layer| {
+                shape[1] /= layer.temporal_fold;
+                shape[2] /= layer.spatial_fold;
+                shape[3] /= layer.spatial_fold;
+                shape[4] = layer.projection.output;
+                shape.clone()
+            })
+            .collect()
+    }
+
     fn validate_formats(&self, config: &VisionPolicy) -> Result<(), Error> {
         crate::format_references::validate_matrices(
             self.logical_parameters()?,

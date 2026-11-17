@@ -15,22 +15,27 @@ pub struct MoshiRealtimeOutputProjection {
 
 impl MoshiRealtimeOutputProjection {
     /// Retains the exact admitted schedule and channel declarations.
-    pub fn new(contract: &RealtimeIngressContract) -> Self {
+    pub(super) fn new(contract: &RealtimeIngressContract) -> Self {
         Self {
             schedule: contract.schedule().clone(),
             channels: contract.channels().clone(),
         }
     }
+}
 
-    /// Collects host columns in batch-major text/depth/generated-audio order.
-    /// An unready delayed frame has no aligned audio. Warmup frames carry
-    /// padding values but no model decisions or decision diagnostics.
-    /// Shared host validation runs before any architecture output is collected.
-    pub fn project(
-        &self,
-        frame: &CompletedRealtimeFrame<RealtimeHostChannelValues, RealtimeDecisionDiagnostics>,
-    ) -> Result<RealtimeOutputFrame, MoshiRealtimeOutputError> {
-        eredu_runtime::validate_completed_realtime_host_frame(frame)
+impl
+    eredu_runtime::RealtimeHostOutputProjection<
+        CompletedRealtimeFrame<RealtimeHostChannelValues, RealtimeDecisionDiagnostics>,
+    > for MoshiRealtimeOutputProjection
+{
+    type Output = RealtimeOutputFrame;
+    type Error = MoshiRealtimeOutputError;
+
+    fn project(
+        self,
+        frame: CompletedRealtimeFrame<RealtimeHostChannelValues, RealtimeDecisionDiagnostics>,
+    ) -> Result<Self::Output, Self::Error> {
+        eredu_runtime::validate_completed_realtime_host_frame(&frame)
             .map_err(MoshiRealtimeOutputError::HostValues)?;
         if frame.channels() != &self.channels {
             return Err(MoshiRealtimeOutputError::LayoutMismatch);

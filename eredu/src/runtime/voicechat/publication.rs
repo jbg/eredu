@@ -482,7 +482,7 @@ impl<D> VoiceChatPublicationAdmission<D> {
         H: RealtimeFrameHostObserver<T, Output = OwnedHostOutput<D>>,
     {
         let staged = self.staged;
-        gate.map_host_output(move |frame| {
+        gate.project_host_output(move |frame: OwnedHostOutput<D>| {
             let output = self.transition.stage(frame)?;
             let mut slot = staged.borrow_mut();
             if slot.is_some() {

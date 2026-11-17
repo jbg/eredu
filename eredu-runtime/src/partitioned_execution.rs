@@ -1447,6 +1447,25 @@ pub struct PartitionBoundaryRoute {
     pub route: CommunicationRouteId,
 }
 
+/// A complete tensor bundle delivered by a validated partition transfer.
+pub struct ReceivedPartitionBoundary<T> {
+    route: PartitionBoundaryRoute,
+    schema: ResolvedBoundaryWireSchema,
+    values: Vec<T>,
+}
+
+impl<T> ReceivedPartitionBoundary<T> {
+    /// The selected directed route and its endpoints.
+    pub const fn route(&self) -> &PartitionBoundaryRoute {
+        &self.route
+    }
+
+    /// Consumes the received bundle at destination ingress.
+    pub fn into_parts(self) -> (PartitionBoundaryRoute, ResolvedBoundaryWireSchema, Vec<T>) {
+        (self.route, self.schema, self.values)
+    }
+}
+
 /// Authoritative output owner and opaque publication group.
 #[derive(Debug, Clone, Copy)]
 pub struct PartitionOutputPublication {
@@ -1855,9 +1874,7 @@ where
     fn accept_boundary(
         &mut self,
         pass: &mut Self::Pass<'_>,
-        route: &PartitionBoundaryRoute,
-        values: Vec<B::Tensor>,
-        context: &<B::Tensor as Tensor>::Context,
+        boundary: ReceivedPartitionBoundary<B::Tensor>,
     ) -> Result<(), A::Error>;
 
     /// Returns projected output on the owner and matching destination storage elsewhere.
@@ -3021,7 +3038,6 @@ where
                                     route,
                                     runtime.plan.wire,
                                     runtime.communication_executor.borrow(),
-                                    context,
                                     prepared,
                                 )
                                 .map_err(map_partition_route_error)?;
@@ -3284,7 +3300,6 @@ where
                                 route,
                                 runtime.plan.wire,
                                 runtime.communication_executor.borrow(),
-                                context,
                                 prepared,
                             )
                             .map_err(map_partition_route_error)?;
@@ -3661,7 +3676,6 @@ fn transfer_prepared_partition_boundary<'a, A, B, S, E, G, R, I, T>(
     route: &PartitionBoundaryRoute,
     wire: PipelineWireContract,
     communication_executor: &B::Executor,
-    context: &<B::Tensor as Tensor>::Context,
     prepared: PreparedPartitionBoundary<B::Tensor>,
 ) -> Result<(), PartitionRouteTransferError<A::Error>>
 where
@@ -3686,7 +3700,14 @@ where
         .map_err(PartitionRouteTransferError::Contract)?;
     if prepared.destination {
         executor
-            .accept_boundary(pass, route, values, context)
+            .accept_boundary(
+                pass,
+                ReceivedPartitionBoundary {
+                    route: route.clone(),
+                    schema: prepared.schema,
+                    values,
+                },
+            )
             .map_err(PartitionRouteTransferError::Architecture)?;
     }
     Ok(())
@@ -3739,7 +3760,6 @@ where
         route,
         wire,
         communication_executor,
-        context,
         prepared,
     )
 }

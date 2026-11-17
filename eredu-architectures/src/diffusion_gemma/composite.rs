@@ -633,26 +633,23 @@ where
         forward: &mut Self::ForwardContext,
         _context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<Option<B::Tensor>, Error> {
+        if (source, destination) != (1, 1) {
+            return Ok(None);
+        }
         if values.len() != 1 + schema.auxiliary().len() {
             return Err(Error::backend(
                 "composite boundary has incomplete typed context",
             ));
         }
         let mut values = values.into_iter();
-        let hidden = values.next().unwrap();
-        match (source, destination) {
-            (0, 0) | (0, 1) => {}
-            (1, 1) => {
-                forward.pending_text_boundary = Some(
-                    eredu_runtime::ArchitectureBoundary::decode(
-                        &BoundarySchema::new(self.kernel().config.text.hidden_size),
-                        values.collect(),
-                    )
-                    .map_err(Error::backend)?,
-                );
-            }
-            _ => return Ok(None),
-        }
+        let hidden = values.next().expect("validated boundary primary");
+        forward.pending_text_boundary = Some(
+            eredu_runtime::ArchitectureBoundary::decode(
+                &BoundarySchema::new(self.kernel().config.text.hidden_size),
+                values.collect(),
+            )
+            .map_err(Error::backend)?,
+        );
         Ok(Some(hidden))
     }
     fn routed_tensor_reductions(
@@ -688,110 +685,7 @@ where
                 copies
             ]))
     }
-    fn prepared_group_collective_waves(
-        &self,
-        group: usize,
-        _input: PreparedCompositeInput<'_, B::Tensor, Gemma4InputPartPlan>,
-        _tensor_partitions: usize,
-        stage_units: &[std::ops::Range<usize>],
-    ) -> Result<Option<Vec<Vec<crate::composite_execution::CompositeTensorCollective>>>, String>
-    {
-        let pipeline_stages = stage_units.len();
-        Ok((group == 0).then(|| vec![Vec::new(); pipeline_stages]))
-    }
-    fn prepared_group_boundary_sequence(
-        &self,
-        group: usize,
-        input: PreparedCompositeInput<'_, B::Tensor, Gemma4InputPartPlan>,
-    ) -> Result<i32, String> {
-        let positions = if group == 0 {
-            input
-                .admitted()
-                .parts()
-                .iter()
-                .filter_map(|part| match part {
-                    Gemma4InputPartPlan::Vision { shape, .. } => Some(shape.decoder_positions),
-                    _ => None,
-                })
-                .try_fold(0u64, |total, count| total.checked_add(count))
-                .ok_or("vision boundary extent overflow")?
-        } else {
-            input.admitted().decoder_positions()
-        };
-        i32::try_from(positions).map_err(|_| "group boundary extent exceeds i32".into())
-    }
-    fn prepared_group_continuation_geometry(
-        &self,
-        group: usize,
-        input: PreparedCompositeInput<'_, B::Tensor, Gemma4InputPartPlan>,
-    ) -> Result<Option<crate::composite_execution::CompositeContinuationGeometry>, String> {
-        if group != 0 {
-            return Ok(None);
-        }
-        let patches = input
-            .admitted()
-            .parts()
-            .iter()
-            .filter_map(|part| match part {
-                Gemma4InputPartPlan::Vision { ingress, .. } => Some(ingress.padded_patches),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        patches
-            .iter()
-            .max()
-            .map(|maximum| {
-                i32::try_from(patches.len())
-                    .ok()
-                    .and_then(|count| maximum.checked_mul(count))
-                    .map(|extent| {
-                        (
-                            extent,
-                            self.kernel().config.vision.as_ref().unwrap().hidden_size,
-                        )
-                            .into()
-                    })
-                    .ok_or_else(|| "batched image continuation extent exceeds i32".into())
-            })
-            .transpose()
-    }
-    fn prepared_group_continuation_batched(&self, _group: usize) -> bool {
-        false
-    }
-    fn encode_group_continuation(
-        &self,
-        group: usize,
-        hidden: B::Tensor,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        if group == 0 {
-            hidden.reshape(&[1, -1, hidden.dim(2)], context)
-        } else {
-            Ok(hidden)
-        }
-    }
-    fn decode_group_continuation(
-        &self,
-        group: usize,
-        hidden: B::Tensor,
-        forward: &Self::ForwardContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        if group == 0 {
-            hidden.reshape(
-                forward
-                    .vision_initial
-                    .as_ref()
-                    .ok_or_else(|| {
-                        Error::backend("image continuation has no admitted batch geometry")
-                    })?
-                    .shape(),
-                context,
-            )
-        } else {
-            Ok(hidden)
-        }
-    }
+
     fn supports_chunked_text_prefill() -> bool {
         true
     }
@@ -838,19 +732,87 @@ where
     ) -> Result<AdmittedCompositeInput<Gemma4InputPartPlan>, eredu_core::CapabilityError> {
         crate::media_plan::admit_gemma4_input(&ingress_config(config), input, inspector)
     }
-    fn should_execute_prepared_group(
+    fn prepared_group_invocation(
         &self,
         group: usize,
-        input: PreparedCompositeInput<'_, B::Tensor, Gemma4InputPartPlan>,
-    ) -> bool {
-        group == 1
-            || (group == 0
-                && input.refinement().is_none()
-                && input
+        input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
+        _tensor_partitions: usize,
+        stage_units: &[std::ops::Range<usize>],
+    ) -> Result<crate::composite_execution::CompositeGroupInvocation, String> {
+        use crate::composite_execution::{
+            CompositeContinuationGeometry, CompositeGroupInvocation, CompositeGroupUse,
+            CompositeTensorCollective,
+        };
+        let active = {
+            group == 1
+                || (group == 0
+                    && input.refinement().is_none()
+                    && input
+                        .admitted()
+                        .parts()
+                        .iter()
+                        .any(|part| matches!(part, Gemma4InputPartPlan::Vision { .. })))
+        };
+        let mode = if active {
+            CompositeGroupUse::Execute
+        } else {
+            CompositeGroupUse::Bypassed
+        };
+        let boundary_sequence = (|| -> Result<i32, String> {
+            let positions = if group == 0 {
+                input
                     .admitted()
                     .parts()
                     .iter()
-                    .any(|part| matches!(part, Gemma4InputPartPlan::Vision { .. })))
+                    .filter_map(|part| match part {
+                        Gemma4InputPartPlan::Vision { shape, .. } => Some(shape.decoder_positions),
+                        _ => None,
+                    })
+                    .try_fold(0u64, |total, count| total.checked_add(count))
+                    .ok_or("vision boundary extent overflow")?
+            } else {
+                input.admitted().decoder_positions()
+            };
+            i32::try_from(positions).map_err(|_| "group boundary extent exceeds i32".into())
+        })()?;
+        let continuation = if active {
+            (|| -> Result<Option<CompositeContinuationGeometry>, String> {
+                if group != 0 {
+                    return Ok(None);
+                }
+                let patches = input
+                    .admitted()
+                    .parts()
+                    .iter()
+                    .filter_map(|part| match part {
+                        Gemma4InputPartPlan::Vision { ingress, .. } => Some(ingress.padded_patches),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                let count = i32::try_from(patches.len())
+                    .map_err(|_| "image continuation batch exceeds i32")?;
+                Ok(patches.into_iter().max().map(|sequence| {
+                    CompositeContinuationGeometry::Uniform(vec![
+                        count,
+                        sequence,
+                        self.kernel().config.vision.as_ref().unwrap().hidden_size,
+                    ])
+                }))
+            })()?
+        } else {
+            None
+        };
+        let collective_waves =
+            (|| -> Result<Option<Vec<Vec<CompositeTensorCollective>>>, String> {
+                let pipeline_stages = stage_units.len();
+                Ok((group == 0).then(|| vec![Vec::new(); pipeline_stages]))
+            })()?;
+        Ok(CompositeGroupInvocation {
+            mode,
+            boundary_sequence,
+            continuation,
+            collective_waves,
+        })
     }
 }
 
@@ -1001,14 +963,14 @@ where
         &mut self,
         group: usize,
         initial: &B::Tensor,
-        dependencies: &[&B::Tensor],
+        dependencies: &eredu_runtime::GroupDependencies<'_, B::Tensor>,
         state: &mut S,
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
         if group == 1 {
-            if let Some(output) = dependencies.first() {
-                forward.vision_output = Some((*output).clone());
+            if let Some(output) = dependencies.get(0) {
+                forward.vision_output = Some(output.clone());
             }
             if forward.deferred {
                 forward.deferred = false;
@@ -1237,7 +1199,7 @@ where
         &mut self,
         group: usize,
         initial: &B::Tensor,
-        dependencies: &[&B::Tensor],
+        dependencies: &eredu_runtime::GroupDependencies<'_, B::Tensor>,
         state: &mut S,
         forward: &mut Self::ForwardContext,
         parallel: &B::ParallelContext,
@@ -1246,8 +1208,8 @@ where
         if group != 1 {
             return self.begin_group(group, initial, dependencies, state, forward, context);
         }
-        if let Some(output) = dependencies.first() {
-            forward.vision_output = Some((*output).clone());
+        if let Some(output) = dependencies.get(0) {
+            forward.vision_output = Some(output.clone());
         }
         if !forward.deferred {
             return Ok(initial.clone());

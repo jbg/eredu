@@ -11,3 +11,16 @@ pub trait RetainedTensorRoots<T> {
     /// Visits all retained tensor roots without reading their values.
     fn visit_retained_tensors<'a>(&'a self, visitor: &mut dyn FnMut(&'a T));
 }
+
+impl<T, R: RetainedTensorRoots<T> + ?Sized> RetainedTensorRoots<T> for Box<R> {
+    fn visit_retained_tensors<'a>(&'a self, visitor: &mut dyn FnMut(&'a T)) {
+        (**self).visit_retained_tensors(visitor);
+    }
+}
+
+impl<T, R: RetainedTensorRoots<T>> RetainedTensorRoots<T> for (T, R) {
+    fn visit_retained_tensors<'a>(&'a self, visitor: &mut dyn FnMut(&'a T)) {
+        visitor(&self.0);
+        self.1.visit_retained_tensors(visitor);
+    }
+}

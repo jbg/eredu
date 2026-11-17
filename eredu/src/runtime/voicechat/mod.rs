@@ -12,6 +12,7 @@ mod prompt;
 mod publication;
 mod publication_queue;
 mod session;
+mod startup;
 mod submission;
 mod text;
 mod tools;
@@ -19,10 +20,7 @@ mod turn;
 mod wait;
 
 pub use bound::{BoundVoiceChatFork, BoundVoiceChatSession, VoiceChatExecutor};
-pub use loading::{
-    PreparedVoiceChatSession, PreparedVoiceChatSessionParts, VoiceChatLoadingError,
-    VoiceChatStartOptions,
-};
+pub use loading::{PreparedVoiceChatSession, VoiceChatLoadingError, VoiceChatStartOptions};
 pub use phrase_selection::VoiceChatPhrasePolicy;
 
 pub use ingress::{
@@ -45,8 +43,6 @@ pub use session::{
     VoiceChatSessionFailure, VoiceChatSessionProgress, VoiceChatSessionSnapshot,
     VoiceChatSessionStatus, VoiceChatSnapshotError,
 };
-#[cfg(feature = "mlx")]
-pub use submission::submit_mlx_voicechat;
 pub use submission::{
     VoiceChatExecutionError, VoiceChatExecutionInputs, VoiceChatSpeechOptions,
     VoiceChatSubmittedWork,
@@ -85,6 +81,7 @@ pub use tools::{
 #[cfg(feature = "mlx")]
 mod selected_mlx;
 #[cfg(feature = "mlx")]
-pub(crate) use selected_mlx::{start_mlx_voicechat, MlxVoiceChatLoadOptions};
+pub(crate) use selected_mlx::start_mlx_voicechat;
 #[cfg(feature = "mlx")]
-pub use selected_mlx::{MlxVoiceChatExecutor, MlxVoiceChatSession, VoiceChatStartError};
+pub use selected_mlx::{MlxVoiceChatExecutor, MlxVoiceChatSession};
+pub use startup::{VoiceChatLoadSelection, VoiceChatStartError, VoiceChatStartupInputs};

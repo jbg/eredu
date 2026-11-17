@@ -3,6 +3,256 @@ use crate::{ArchitectureBoundary, PipelineActivationDtype, RoutedTensorReduction
 use eredu_nn::Tensor as _;
 use std::{borrow::Borrow, marker::PhantomData, ops::Range};
 
+/// Exact portable inputs for materializing a component pipeline on one rank.
+pub struct PreparedComponentPipeline<A> {
+    /// Architecture component with its selected rank-local modules.
+    pub architecture: A,
+    /// Retained source restricted to the component's admitted tensors.
+    pub source: eredu_checkpoint::store::SharedCheckpointSource,
+    /// Logical invocations and physical storage owners.
+    pub invocations: crate::ExecutionUnitAddressMap,
+    /// Bindings retained across invocations.
+    pub pinned: Vec<crate::WeightBinding>,
+    /// Bindings addressed by physical storage owner.
+    pub units: Vec<(crate::ExecutionUnitAddress, Vec<crate::WeightBinding>)>,
+    /// Exact selected communication.
+    pub manifest: crate::CommunicationManifest,
+    /// Selected execution and publication plan.
+    pub plan: crate::PartitionedExecutionPlan,
+    /// Optional collective within the pipeline stage.
+    pub tensor_group: Option<eredu_core::CollectiveGroupId>,
+    /// Floating-point wire representation.
+    pub activation_dtype: PipelineActivationDtype,
+    /// Selected parameter residency.
+    pub residency: crate::LayerWeightResidency,
+}
+
+/// Execution mechanisms for an already bound component pipeline.
+pub trait BoundComponentPipeline<A, B, S>
+where
+    B: eredu_nn::NeuralBackend,
+    S: crate::RuntimeState<B>,
+    A: PipelinePartitionArchitecture<B, S>,
+{
+    /// Borrows the bound architecture for stage-owned state and geometry checks.
+    fn architecture(&self) -> &A;
+
+    /// Agrees a portable descriptor before a rank enters execution.
+    fn agree(
+        &mut self,
+        descriptor: [u64; 8],
+        ready: bool,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<(), eredu_core::BackendFailure>;
+
+    /// Reports whether all ranks accepted a caller-owned decision.
+    fn agree_application(
+        &mut self,
+        descriptor: [u64; 8],
+        ready: bool,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<bool, eredu_core::BackendFailure>;
+
+    /// Publishes an invocation and settles its candidate state and typed output before commit.
+    /// The projection returns any additional tensor roots retained by its result.
+    fn invoke<R>(
+        &mut self,
+        input: A::Input<'_>,
+        roots: Vec<B::Tensor>,
+        state: &mut S,
+        descriptor: [u64; 8],
+        epoch: eredu_core::DistributedCommitEpoch,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        project: impl FnOnce(B::Tensor) -> Result<(R, Vec<B::Tensor>), eredu_core::BackendFailure>,
+    ) -> Result<(R, eredu_core::DistributedCommitOutcome), eredu_core::BackendFailure>
+    where
+        S: eredu_nn::RetainedTensorRoots<B::Tensor>;
+
+    /// Executes an invocation whose result is the published tensor itself.
+    fn execute(
+        &mut self,
+        input: A::Input<'_>,
+        roots: Vec<B::Tensor>,
+        state: &mut S,
+        descriptor: [u64; 8],
+        epoch: eredu_core::DistributedCommitEpoch,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<(B::Tensor, eredu_core::DistributedCommitOutcome), eredu_core::BackendFailure>
+    where
+        S: eredu_nn::RetainedTensorRoots<B::Tensor>,
+    {
+        self.invoke(input, roots, state, descriptor, epoch, context, |output| {
+            Ok((output, Vec::new()))
+        })
+    }
+
+    /// Runs stage-local projection and publishes its output through the retained authority.
+    fn publish_readout(
+        &mut self,
+        roots: Vec<B::Tensor>,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        project: impl FnOnce(
+            &mut A,
+            Option<&B::ParallelContext>,
+        ) -> Result<B::Tensor, eredu_core::BackendFailure>,
+    ) -> Result<B::Tensor, eredu_core::BackendFailure>;
+
+    /// Commits a caller-owned candidate after local completion.
+    fn commit_candidate(
+        &mut self,
+        epoch: eredu_core::DistributedCommitEpoch,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<(), eredu_core::BackendFailure>;
+
+    /// Completes native storage retained by an advanced cursor.
+    fn settle_values<'a>(
+        values: impl Iterator<Item = &'a B::Tensor>,
+    ) -> Result<(), eredu_core::BackendFailure>
+    where
+        B::Tensor: 'a;
+
+    /// Reports the realized parameter residency.
+    fn residency(&self) -> Result<crate::ResidencyReport, eredu_core::BackendFailure>;
+
+    /// Reports disk activity when the retained residency streams from disk.
+    fn dense_stream_report(
+        &self,
+    ) -> Result<Option<crate::DenseDiskStreamReport>, eredu_core::BackendFailure>;
+}
+
+/// Native state operations needed by a decoder that owns the committed frontier.
+pub trait DecoderPipelineState<B: eredu_nn::NeuralBackend>:
+    crate::LayerRuntimeState<B> + eredu_nn::RetainedTensorRoots<B::Tensor> + Sized
+{
+    /// Allocates fresh state for the retained layout.
+    fn allocate_pipeline_state(
+        layout: crate::StateLayout,
+        first_global_layer: usize,
+    ) -> Result<Self, eredu_core::BackendFailure>;
+
+    /// Forks the installed state for an unpublished invocation.
+    fn fork_pipeline_state(
+        &self,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<Self, eredu_core::BackendFailure>;
+
+    /// Reads the committed decoder position.
+    fn pipeline_offset(&self) -> i32;
+}
+
+/// Native residency observations for bound parameter units.
+pub trait UnitPolicyResidency {
+    /// Reports the realized parameter residency.
+    fn residency(&self) -> Result<crate::ResidencyReport, eredu_core::BackendFailure>;
+
+    /// Reports disk activity when the selected residency streams from disk.
+    fn dense_stream_report(
+        &self,
+    ) -> Result<Option<crate::DenseDiskStreamReport>, eredu_core::BackendFailure>;
+}
+
+/// Native tensor cohort and its failure-agreement hook for layered traversal.
+pub trait LayeredTensorCohort<B: eredu_nn::NeuralBackend> {
+    /// Exact manifest and group realized by this cohort.
+    fn selection(&self) -> (&crate::CommunicationManifest, eredu_core::CollectiveGroupId);
+
+    /// Derives the tensor-only rank coordinates from the retained manifest.
+    fn tensor_topology(
+        &self,
+    ) -> Result<eredu_core::ParallelRankTopology, eredu_core::BackendFailure> {
+        let (manifest, group) = self.selection();
+        let cohort =
+            crate::replicated_execution::validate_collective_coordination(manifest, group, [])
+                .map_err(eredu_core::BackendFailure::from_error)?;
+        eredu_core::ParallelTopology::new(cohort.members().len(), 1, 1, 1)
+            .and_then(|topology| {
+                eredu_core::ParallelRankTopology::new(
+                    topology,
+                    cohort.local_index().expect("validated local cohort"),
+                )
+            })
+            .map_err(eredu_core::BackendFailure::from_error)
+    }
+
+    /// The retained context used for tensor collectives.
+    fn parallel_context(&self) -> &B::ParallelContext;
+
+    /// Agrees an architecture operation before its tensor collective.
+    fn agree(
+        &self,
+        descriptor: [u64; 8],
+        ready: bool,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<bool, eredu_core::BackendFailure>;
+
+    /// Agrees local traversal results using the same authority as the collectives.
+    fn traversal_hook<C, E: From<eredu_core::BackendFailure>>(
+        &self,
+    ) -> impl crate::LayeredTraversalHook<B, C, E> + '_;
+}
+
+/// Certifies immutable parameter bindings in a matching execution context.
+pub trait ImmutableParameterPolicy<B: eredu_nn::NeuralBackend> {
+    /// Identifies parameters eligible for reusing deterministic results.
+    fn immutable_parameters_identity(
+        &self,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Option<&eredu_core::resources::ResourceIdentity>;
+}
+
+/// Native materialization of independently addressable learned parameter units.
+pub trait ParameterUnitMechanisms<B: eredu_nn::NeuralBackend> {
+    /// Selected residency policy for a sequence of parameterized units.
+    type UnitPolicy<U>: crate::LayerwisePolicy<B, U, Error: std::error::Error + Send + Sync + 'static>
+        + UnitPolicyResidency
+        + ImmutableParameterPolicy<B>
+        + 'static
+    where
+        U: eredu_nn::Parameterized<B::Tensor> + 'static;
+
+    /// Binds a unit sequence and returns its parameter materialization metadata.
+    fn bind_units<U>(
+        &self,
+        source: eredu_checkpoint::store::SharedCheckpointSource,
+        invocations: crate::ExecutionUnitAddressMap,
+        units: Vec<Vec<crate::WeightBinding>>,
+        residency: crate::LayerWeightResidency,
+        build: &dyn Fn() -> Result<Vec<U>, eredu_core::BackendFailure>,
+    ) -> Result<(Self::UnitPolicy<U>, crate::LayerwiseModelMetadata), eredu_core::BackendFailure>
+    where
+        U: eredu_nn::Parameterized<B::Tensor> + 'static;
+}
+
+/// Native realization of prepared composite rank components.
+pub trait ComponentRankMechanisms<B: eredu_nn::NeuralBackend, S: crate::RuntimeState<B>, C>:
+    ParameterUnitMechanisms<B>
+{
+    /// Bound pipeline execution for a portable layer architecture.
+    type Pipeline<A>: BoundComponentPipeline<A, B, S> + 'static
+    where
+        A: crate::PipelinePartitionArchitecture<B, S> + 'static,
+        A::Error: From<eredu_nn::Error>,
+        A::Unit: 'static;
+
+    /// Validates native communication capabilities before allocating rank resources.
+    fn validate_pipeline_communication(
+        &self,
+        manifest: &crate::CommunicationManifest,
+        tensor_group: Option<eredu_core::CollectiveGroupId>,
+    ) -> Result<(), eredu_core::BackendFailure>;
+
+    /// Realizes an admitted pipeline and returns its parameter materialization metadata.
+    fn bind_pipeline<A>(
+        &self,
+        prepared: crate::PreparedComponentPipeline<A>,
+        communication: &C,
+    ) -> Result<(Self::Pipeline<A>, crate::LayerwiseModelMetadata), eredu_core::BackendFailure>
+    where
+        A: crate::PipelinePartitionArchitecture<B, S> + 'static,
+        A::Error: From<eredu_nn::Error>,
+        A::Unit: eredu_nn::Parameterized<B::Tensor> + 'static;
+}
+
 /// Architecture-owned ingress and output geometry for the shared pipeline executor.
 ///
 /// Token and supplied-embedding families retain their input, state and output
@@ -725,8 +975,7 @@ where
     batch: i32,
     tokens: i32,
     output_shape: Vec<i32>,
-    incoming_hidden: Option<B::Tensor>,
-    incoming_auxiliary: Option<<A::Boundary as crate::ArchitectureBoundary>::Boundary<B::Tensor>>,
+    incoming: Option<crate::ReceivedPartitionBoundary<B::Tensor>>,
     result: Option<
         crate::LayeredPartitionOutput<
             B::Tensor,
@@ -799,8 +1048,7 @@ where
             batch,
             tokens,
             output_shape,
-            incoming_hidden: None,
-            incoming_auxiliary: None,
+            incoming: None,
             result: None,
             forward: None,
             local_hidden: None,
@@ -894,23 +1142,30 @@ where
             }
             let forward = if start == 0 {
                 let incoming = if driver.owns_input() {
-                    if pass.incoming_hidden.is_some() || pass.incoming_auxiliary.is_some() {
+                    if pass.incoming.is_some() {
                         return Err(pipeline_backend_error::<A::Error>(
                             "input-owning pipeline partition received an upstream boundary",
                         ));
                     }
                     None
                 } else {
-                    let hidden = pass.incoming_hidden.take().ok_or_else(|| {
+                    let boundary = pass.incoming.take().ok_or_else(|| {
                         pipeline_backend_error::<A::Error>(
                             "non-input pipeline partition executed before boundary receipt",
                         )
                     })?;
-                    let auxiliary = pass.incoming_auxiliary.take().ok_or_else(|| {
+                    let (route, _, values) = boundary.into_parts();
+                    let mut values = values.into_iter();
+                    let hidden = values.next().ok_or_else(|| {
                         pipeline_backend_error::<A::Error>(
-                            "non-input pipeline partition has no typed auxiliary boundary",
+                            "pipeline boundary destination received no primary tensor",
                         )
                     })?;
+                    let auxiliary = self
+                        .architecture
+                        .partition_boundary_schema(&route)?
+                        .decode(values.collect())
+                        .map_err(pipeline_backend_source::<A::Error>)?;
                     Some((hidden, auxiliary))
                 };
                 let input = pass.input.take().ok_or_else(|| {
@@ -1323,33 +1578,19 @@ where
     fn accept_boundary(
         &mut self,
         pass: &mut Self::Pass<'_>,
-        route: &crate::PartitionBoundaryRoute,
-        mut values: Vec<B::Tensor>,
-        _context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        boundary: crate::ReceivedPartitionBoundary<B::Tensor>,
     ) -> Result<(), A::Error> {
-        if route.destination_group != self.addresses[0].group() || pass.next_unit != 0 {
+        if boundary.route().destination_group != self.addresses[0].group() || pass.next_unit != 0 {
             return Err(pipeline_backend_error::<A::Error>(
                 "pipeline boundary does not target the pending local stage ingress",
             ));
         }
-        if pass.incoming_hidden.is_some() || pass.incoming_auxiliary.is_some() {
+        if pass.incoming.is_some() {
             return Err(pipeline_backend_error::<A::Error>(
-                "pipeline boundary destination received an invalid tensor bundle",
+                "pipeline destination received a duplicate boundary",
             ));
         }
-        if values.is_empty() {
-            return Err(pipeline_backend_error::<A::Error>(
-                "pipeline boundary destination received no primary tensor",
-            ));
-        }
-        let hidden = values.remove(0);
-        let auxiliary = self
-            .architecture
-            .partition_boundary_schema(route)?
-            .decode(values)
-            .map_err(pipeline_backend_source::<A::Error>)?;
-        pass.incoming_hidden = Some(hidden);
-        pass.incoming_auxiliary = Some(auxiliary);
+        pass.incoming = Some(boundary);
         Ok(())
     }
 

@@ -1764,40 +1764,19 @@ fn inkling(
                 ));
             }
             let patches = input.payload_shape[0];
-            let text_hidden = positive(config.text_hidden_size, "Inkling vision output size")?;
-            let layer_outputs = [
-                checked_mul(
-                    checked_mul(
-                        checked_mul(patches, 2, "Inkling vision time")?,
-                        8 * 8,
-                        "Inkling vision grid",
-                    )?,
-                    128,
-                    "Inkling vision layer 1",
-                )?,
-                checked_mul(
-                    checked_mul(
-                        checked_mul(patches, 2, "Inkling vision time")?,
-                        4 * 4,
-                        "Inkling vision grid",
-                    )?,
-                    512,
-                    "Inkling vision layer 2",
-                )?,
-                checked_mul(
-                    checked_mul(patches, 2, "Inkling vision time")?,
-                    4_800,
-                    "Inkling vision layer 3",
-                )?,
-                checked_mul(patches, text_hidden, "Inkling vision layer 4")?,
-            ];
-            let graph_scalars = layer_outputs.iter().try_fold(0u64, |total, value| {
-                checked_add(
-                    total,
-                    checked_mul(12, *value, "Inkling vision layer workspace")?,
-                    "Inkling vision graph workspace",
-                )
-            })?;
+            let graph_scalars = config.parameters().continuation_shapes(1).iter().try_fold(
+                0u64,
+                |total, shape| {
+                    let elements = shape.iter().try_fold(patches, |product, &extent| {
+                        checked_mul(product, extent as u64, "Inkling vision layer elements")
+                    })?;
+                    checked_add(
+                        total,
+                        checked_mul(12, elements, "Inkling vision layer workspace")?,
+                        "Inkling vision graph workspace",
+                    )
+                },
+            )?;
             Ok(MediaShapePlan {
                 capture_media: None,
                 decoder_positions: patches,

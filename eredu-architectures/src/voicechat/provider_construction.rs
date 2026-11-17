@@ -6,45 +6,50 @@
 use std::collections::BTreeMap;
 
 use eredu_codec::{
-    ear_decoder_layered::DecoderExecution,
+    ear_decoder::DecoderUnit,
+    ear_decoder_layered::BoundEarDecoder,
     ear_decoder_preparation::{DecoderPreparationError, PreparedDecoderBindings},
-    ear_encoder_layered::EncoderExecution,
+    ear_encoder::EncoderUnit,
+    ear_encoder_layered::BoundEarEncoder,
     ear_encoder_preparation::{EncoderPreparationError, PreparedEncoderBindings},
-    prvq_layered::QuantizerExecution,
+    prvq::Codebook,
+    prvq_layered::BoundQuantizer,
     prvq_preparation::{PreparedQuantizerBindings, QuantizerPreparationError},
 };
 use eredu_core::BackendFailure;
-use eredu_nn::{NeuralBackend, Tensor};
-use eredu_runtime::LayerWeightResidency;
+use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Tensor};
+use eredu_runtime::{LayeredTensorCohort, ParameterUnitMechanisms, SubmissionBackend};
 
 use super::{
     artifact::{ParameterAdmission, RetainedVoiceChatArtifacts},
     assembly::{AssemblyError, LearnedSpeechComponents, SpeechProviderParts},
+    channels::FunctionHead,
     checkpoint::Component,
     codec_preparation::{
         prepare_neural_decoder, prepare_neural_encoder, prepare_quantizer, CodecPreparationError,
     },
     construction::{ConstructionError, SpeechConstructionPlan},
-    function_head_layered::FunctionHeadExecution,
+    function_head_layered::BoundFunctionHead,
     function_head_preparation::{FunctionHeadPreparationError, PreparedFunctionHeadBindings},
     parameters::SpeechParameterError,
-    perception_layered::PerceptionExecution,
+    perception_layered::{BoundPerception, PerceptionUnit},
     perception_preparation::{PerceptionPreparationError, PreparedPerceptionBindings},
     provider_residency::{
         SpeechProvider, SpeechProviderResources, SpeechResidencyError, SpeechResidencyPolicy,
         SpeechResidencyReport,
     },
-    rnnt::RnntExecution,
+    rnnt_layered::RnntUnit,
     rnnt_preparation::{PreparedRnntBindings, RnntPreparationError},
-    tts_conditioning_layered::ConditioningExecution,
+    rnnt_projection_layered::BoundRnnt,
+    tts_conditioning_layered::{BoundConditioning, ConditioningUnit},
     tts_conditioning_preparation::{ConditioningPreparationError, PreparedConditioningBindings},
     tts_generator::{TtsGenerator, TtsGeneratorParts},
     tts_mog::TtsError,
-    tts_mog_layered::MogExecution,
+    tts_mog_layered::{BoundMog, MogUnit},
     tts_mog_preparation::{MogPreparationError, PreparedMogBindings},
-    tts_rvq_layered::RvqExecution,
+    tts_rvq_layered::{BoundRvq, RvqUnit},
     tts_rvq_preparation::{PreparedRvqBindings, RvqPreparationError},
-    tts_transformer_layered::TransformerExecution,
+    tts_transformer_layered::{BoundTransformer, TransformerUnit},
     tts_transformer_preparation::{
         PreparedTtsTransformerBindings, TtsTransformerKind, TtsTransformerPreparationError,
     },
@@ -103,109 +108,68 @@ pub enum ProviderConstructionError {
     Speech(#[from] TtsError),
 }
 
-/// Native binding mechanisms supplied to the architecture-owned construction order.
-///
-/// Every method consumes a cold exact source plan. Successful callbacks establish
-/// safe materialization completion; errors preserve native failures through the
-/// neutral wrapper. No callback resolves artifacts or chooses family equations.
-pub trait SpeechProviderBinder<B: NeuralBackend> {
-    /// Recurrent transcription realization.
-    type Rnnt: RnntExecution<B>;
-    /// Streaming perception realization.
-    type Perception: PerceptionExecution<B>;
-    /// Shared provider type for the causal and character transformers.
-    type Transformer: TransformerExecution<B>;
-    /// Gaussian-mixture realization.
-    type Mog: MogExecution<B>;
-    /// Iterative residual quantization realization.
-    type Rvq: RvqExecution<B>;
-    /// Character, ingress and fusion realization.
-    type Conditioning: ConditioningExecution<B>;
-    /// Finite startup encoder realization.
-    type Encoder: EncoderExecution<B>;
-    /// Streaming decoder realization.
-    type Decoder: DecoderExecution<B>;
-    /// Single shared codec quantizer realization.
-    type Quantizer: QuantizerExecution<B>;
-    /// Function-channel readout realization.
-    type Function: FunctionHeadExecution<B>;
+/// Function head bound by the shared unit mechanisms.
+pub type SpeechFunctionHead<B, H, C> =
+    BoundFunctionHead<B, <H as ParameterUnitMechanisms<B>>::UnitPolicy<FunctionHead<B>>, C>;
 
-    /// Binds the shared perception invocation.
-    fn perception(
-        &mut self,
-        prepared: PreparedPerceptionBindings,
-        residency: LayerWeightResidency,
-    ) -> Result<Self::Perception, BackendFailure>;
-    /// Binds the function-channel readout.
-    fn function(
-        &mut self,
-        prepared: PreparedFunctionHeadBindings,
-        residency: LayerWeightResidency,
-    ) -> Result<Self::Function, BackendFailure>;
-    /// Binds one explicitly selected transformer role.
-    fn transformer(
-        &mut self,
-        kind: TtsTransformerKind,
-        prepared: PreparedTtsTransformerBindings,
-        residency: LayerWeightResidency,
-    ) -> Result<Self::Transformer, BackendFailure>;
-    /// Binds the iterative mixture stack.
-    fn mog(
-        &mut self,
-        prepared: PreparedMogBindings,
-        residency: LayerWeightResidency,
-    ) -> Result<Self::Mog, BackendFailure>;
-    /// Binds the refinement bank and projection.
-    fn rvq(
-        &mut self,
-        prepared: PreparedRvqBindings,
-        residency: LayerWeightResidency,
-    ) -> Result<Self::Rvq, BackendFailure>;
-    /// Binds character/ingress/fusion parameters.
-    fn conditioning(
-        &mut self,
-        prepared: PreparedConditioningBindings,
-        residency: LayerWeightResidency,
-    ) -> Result<Self::Conditioning, BackendFailure>;
-    /// Binds the finite carrier encoder.
-    fn encoder(
-        &mut self,
-        prepared: PreparedEncoderBindings,
-        residency: LayerWeightResidency,
-    ) -> Result<Self::Encoder, BackendFailure>;
-    /// Binds the streaming waveform decoder.
-    fn decoder(
-        &mut self,
-        prepared: PreparedDecoderBindings,
-        residency: LayerWeightResidency,
-    ) -> Result<Self::Decoder, BackendFailure>;
-    /// Binds the one shared codec quantizer.
-    fn quantizer(
-        &mut self,
-        prepared: PreparedQuantizerBindings,
-        residency: LayerWeightResidency,
-    ) -> Result<Self::Quantizer, BackendFailure>;
-    /// Binds independently leased recurrent transcription parameters.
-    fn rnnt(
-        &mut self,
-        prepared: PreparedRnntBindings,
-        residency: LayerWeightResidency,
-    ) -> Result<Self::Rnnt, BackendFailure>;
-}
+/// RNNT bound by the shared unit mechanisms.
+pub type SpeechRnnt<B, H, C> =
+    BoundRnnt<B, <H as ParameterUnitMechanisms<B>>::UnitPolicy<RnntUnit<B>>, C>;
+
+/// Mog bound by the shared unit mechanisms.
+pub type SpeechMog<B, H, C> =
+    BoundMog<B, <H as ParameterUnitMechanisms<B>>::UnitPolicy<MogUnit<B>>, C>;
+
+/// Rvq bound by the shared unit mechanisms.
+pub type SpeechRvq<B, H, C> =
+    BoundRvq<B, <H as ParameterUnitMechanisms<B>>::UnitPolicy<RvqUnit<B>>, C>;
+
+/// Conditioning bound by the shared unit mechanisms.
+pub type SpeechConditioning<B, H, C> =
+    BoundConditioning<B, <H as ParameterUnitMechanisms<B>>::UnitPolicy<ConditioningUnit<B>>, C>;
+
+/// Quantizer bound by the shared unit mechanisms.
+pub type SpeechQuantizer<B, H, C> = BoundQuantizer<
+    B,
+    <H as ParameterUnitMechanisms<B>>::UnitPolicy<Codebook<<B as NeuralBackend>::Tensor>>,
+    C,
+>;
+
+/// Encoder bound by the shared unit mechanisms.
+pub type SpeechEncoder<B, H, C> = BoundEarEncoder<
+    B,
+    <H as ParameterUnitMechanisms<B>>::UnitPolicy<EncoderUnit<<B as NeuralBackend>::Tensor>>,
+    C,
+>;
+
+/// Transformer bound by the shared unit mechanisms.
+pub type SpeechTransformer<B, H, C> =
+    BoundTransformer<B, <H as ParameterUnitMechanisms<B>>::UnitPolicy<TransformerUnit<B>>, C>;
+
+/// Perception bound by the shared parameter unit mechanisms.
+pub type SpeechPerception<B, H, C> =
+    BoundPerception<B, <H as ParameterUnitMechanisms<B>>::UnitPolicy<PerceptionUnit<B>>, C>;
+
+/// EAR decoder bound by the shared parameter unit mechanisms.
+pub type SpeechDecoder<B, H, C> = BoundEarDecoder<
+    B,
+    <H as ParameterUnitMechanisms<B>>::UnitPolicy<DecoderUnit<<B as NeuralBackend>::Tensor>>,
+    C,
+>;
 
 /// Bound provider types assembled by the architecture driver.
-pub type BoundSpeechProviders<B, V> = LearnedSpeechComponents<
+pub type BoundSpeechProviders<B, H, C> = LearnedSpeechComponents<
     B,
-    <V as SpeechProviderBinder<B>>::Perception,
-    <V as SpeechProviderBinder<B>>::Transformer,
-    <V as SpeechProviderBinder<B>>::Mog,
-    <V as SpeechProviderBinder<B>>::Rvq,
-    <V as SpeechProviderBinder<B>>::Conditioning,
-    <V as SpeechProviderBinder<B>>::Decoder,
-    <V as SpeechProviderBinder<B>>::Quantizer,
-    <V as SpeechProviderBinder<B>>::Encoder,
-    <V as SpeechProviderBinder<B>>::Function,
-    <V as SpeechProviderBinder<B>>::Rnnt,
+    SpeechPerception<B, H, C>,
+    SpeechTransformer<B, H, C>,
+    SpeechMog<B, H, C>,
+    SpeechRvq<B, H, C>,
+    SpeechConditioning<B, H, C>,
+    SpeechDecoder<B, H, C>,
+    SpeechQuantizer<B, H, C>,
+    SpeechEncoder<B, H, C>,
+    SpeechFunctionHead<B, H, C>,
+    SpeechRnnt<B, H, C>,
 >;
 
 /// Complete cold authority for speech providers; the Nemotron target remains separate.
@@ -447,50 +411,93 @@ impl PreparedSpeechProviders {
 
     /// Binds selected providers and consumes them into the existing coupled executor.
     /// No backbone or session is constructed here.
-    pub fn materialize<B: NeuralBackend, V: SpeechProviderBinder<B>>(
+    pub fn materialize<B, H, C>(
         self,
         policy: &SpeechResidencyPolicy,
-        visitor: &mut V,
+        mechanisms: &H,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<(BoundSpeechProviders<B, V>, SpeechResidencyReport), ProviderConstructionError>
+    ) -> Result<(BoundSpeechProviders<B, H, C>, SpeechResidencyReport), ProviderConstructionError>
+    where
+        B: DistributedNeuralBackend
+            + SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>
+            + 'static,
+        H: ParameterUnitMechanisms<B>,
+        C: LayeredTensorCohort<B>,
     {
         let report = self.validate_residency(policy)?;
         self.plan.validate_spectral_capabilities::<B>()?;
         let dimensions = self.conditioning.dimensions();
-        let perception = visitor
-            .perception(self.perception, policy.provider(SpeechProvider::Perception))
+        let (perception, _) = self
+            .perception
+            .bind::<B, _, C>(
+                policy.provider(SpeechProvider::Perception),
+                context,
+                mechanisms,
+                None,
+            )
             .map_err(ProviderConstructionError::Backend)?;
-        let rnnt = visitor
-            .rnnt(self.rnnt, policy.provider(SpeechProvider::Rnnt))
+        let (rnnt, _) = self
+            .rnnt
+            .bind::<B, _, C>(
+                policy.provider(SpeechProvider::Rnnt),
+                context,
+                mechanisms,
+                None,
+            )
             .map_err(ProviderConstructionError::Backend)?;
-        let function = visitor
-            .function(self.function, policy.provider(SpeechProvider::FunctionHead))
+        let (function, _) = self
+            .function
+            .bind::<B, _, C>(
+                policy.provider(SpeechProvider::FunctionHead),
+                context,
+                mechanisms,
+                None,
+            )
             .map_err(ProviderConstructionError::Backend)?;
-        let conditioning = visitor
-            .conditioning(
-                self.conditioning,
+        let (conditioning, _) = self
+            .conditioning
+            .bind::<B, _, C>(
                 policy.provider(SpeechProvider::Conditioning),
+                context,
+                mechanisms,
+                None,
             )
             .map_err(ProviderConstructionError::Backend)?;
-        let character = visitor
-            .transformer(
-                TtsTransformerKind::CharacterEncoder,
-                self.character,
+        let (character, _) = self
+            .character
+            .bind::<B, _, C>(
                 policy.provider(SpeechProvider::CharacterEncoder),
+                context,
+                mechanisms,
+                None,
             )
             .map_err(ProviderConstructionError::Backend)?;
-        let transformer = visitor
-            .transformer(
-                TtsTransformerKind::Causal,
-                self.transformer,
+        let (transformer, _) = self
+            .transformer
+            .bind::<B, _, C>(
                 policy.provider(SpeechProvider::TtsTransformer),
+                context,
+                mechanisms,
+                None,
             )
             .map_err(ProviderConstructionError::Backend)?;
-        let mog = visitor
-            .mog(self.mog, policy.provider(SpeechProvider::Mog))
+        let (mog, _) = self
+            .mog
+            .bind::<B, _, C>(
+                policy.provider(SpeechProvider::Mog),
+                context,
+                mechanisms,
+                None,
+            )
             .map_err(ProviderConstructionError::Backend)?;
-        let rvq = visitor
-            .rvq(self.rvq, policy.provider(SpeechProvider::Rvq))
+        let (rvq, _) = self
+            .rvq
+            .bind::<B, _, C>(
+                policy.provider(SpeechProvider::Rvq),
+                context,
+                mechanisms,
+                None,
+            )
             .map_err(ProviderConstructionError::Backend)?;
         let generator = TtsGenerator::from_parts(
             &self.plan.config().tts,
@@ -498,16 +505,31 @@ impl PreparedSpeechProviders {
             dimensions.speaker_frames,
             TtsGeneratorParts::new(conditioning, character, transformer, rvq, mog),
         )?;
-        let encoder = visitor
-            .encoder(self.encoder, policy.provider(SpeechProvider::CodecEncoder))
+        let (encoder, _) = self
+            .encoder
+            .bind::<B, _, C>(
+                policy.provider(SpeechProvider::CodecEncoder),
+                context,
+                mechanisms,
+                None,
+            )
             .map_err(ProviderConstructionError::Backend)?;
-        let decoder = visitor
-            .decoder(self.decoder, policy.provider(SpeechProvider::CodecDecoder))
+        let (decoder, _) = self
+            .decoder
+            .bind::<B, _, C>(
+                policy.provider(SpeechProvider::CodecDecoder),
+                context,
+                mechanisms,
+                None,
+            )
             .map_err(ProviderConstructionError::Backend)?;
-        let quantizer = visitor
-            .quantizer(
-                self.quantizer,
+        let (quantizer, _) = self
+            .quantizer
+            .bind::<B, _, C>(
                 policy.provider(SpeechProvider::CodecQuantizer),
+                context,
+                mechanisms,
+                None,
             )
             .map_err(ProviderConstructionError::Backend)?;
         Ok((

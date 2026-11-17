@@ -1075,14 +1075,15 @@ transcript, a French translation, and finalized mono 24-kHz WAV files for
 speech synthesis and spoken response. The released Q4_K_M pair also produces
 a finalized 24-kHz WAV through the CLI synthesis task. CLI device I/O is
 build-checked.
-`prepare_mlx_realtime` with `RealtimeLoadOptions::Lfm3Audio` selects the
-resident model and reports physical parameter bytes by component. Cold
+`PreparedResidentAudio::select` retains the selected Audio graph and reports
+physical parameter bytes by component. Cold
 preparation produces 75 parameter units for both the pinned SafeTensors
 checkpoint and the Q4_K_M backbone/projector pair. The tied language embedding
 is one unit. Its physical byte count depends on the selected encoding.
 Parameter sizes exclude session state and temporary allocations.
-Load consumes the selection with explicit weight and execution contexts.
-The bound model's `start` accepts a batch-one `AudioRequest` and sampling seed. The request supplies
+Binding consumes the selection through the supplied graph mechanisms.
+The bound model's `start` accepts a batch-one `AudioRequest` and seeded sampling
+state. The request supplies
 token IDs with expanded speech placeholders, finite mel features in prompt
 order, optional replayed speech codes, a mode, and a slot budget. The retained
 processor transforms mono 16-kHz PCM to the input features.
@@ -1098,7 +1099,6 @@ the utterance and finalizes it before generating a response. The low-level
 `AudioParameterResidency` selects independent resident, host-layerwise or
 disk-streamed policies for language blocks, speech input, depth and feedback,
 and LiquidCodec synthesis. The Rust facade retains it through
-`RealtimeLoadOptions::Lfm3AudioWithResidency` or
 `PreparedAudioTask::with_parameter_residency`. The default facade and CLI
 options select resident weights. The native tensor-cohort adapter described
 below shards the language backbone. The native pipeline adapter also supports
@@ -1514,8 +1514,8 @@ done
 
 ### Q4_K_M tensor-cohort replay
 
-The native `MlxTensorParallelAudioModel` and `MlxPipelineAudioModel` accept
-externally initialized MLX Ring cohorts. On CPU the pinned Q4_K_M pair
+`PreparedResidentAudio::bind_tensor` and `bind_pipeline` consume the
+retained rank selection and the externally initialized MLX Ring transport. On CPU the pinned Q4_K_M pair
 runs the same finite speech-conditioned prompt and seed on every rank,
 with rank-local language weights and caches and replicated speech input and
 output components. Each pipeline run carries the residual stream between
@@ -1652,15 +1652,22 @@ through the same finite-turn interface as SafeTensors.
 The released Q4_K_M pair matches the full publisher SHA-256 values in the
 manifest. The resident CPU replay opens that pair with the pinned SafeTensors
 sidecars and calls `PreparedMultimodalAudioTask::new_with_soundtracks` in speech
-mode. The input contains four constant RGB frames (64 × 64, all channels 90) at
-4 FPS with `VideoSampling::All`, 16,000 mono samples at 16 kHz
-(`(i as f32 * 0.1).sin() * 0.1`), and the instruction “Describe what you see
-and hear.” With seed 42 and five response slots, draining
-`AudioTaskSession::next_output` returns 9,600 finite F32 PCM samples at 24 kHz,
-including the codec tail. The little-endian PCM bytes hash to
+mode. The first segment is a video with four constant RGB frames (64 × 64,
+all channels 90) at 4 FPS with `VideoSampling::All`. The video at index zero
+has 16,000 mono samples at 16 kHz (`(i as f32 * 0.1).sin() * 0.1`). The
+second segment is the instruction “Describe what you see and hear.” With seed
+42 and five response slots, draining `AudioTaskSession::next_output` returns
+9,600 finite F32 PCM samples at 24 kHz, including the codec tail. The
+little-endian PCM bytes hash to
+`afd3d935321221dc0107ce05a46f10f3c5c285f67173ee952bdd8dd5d8bc2961`.
+The packed-weight replay pinned at `2cdb6cc1a` produces the same checksum.
+The CPU replays with decoded projector weights pinned at `1aa05aa18` and
+`569c67a53` both produce
 `aed453d50e086f025e0c4cdf63983c7d6054d38c40bee9bd5cf4b1d81c27e479`.
+Between the decoded and packed replays, the maximum absolute PCM difference
+is `3.03e-9` and the relative L2 difference is `7.89e-7`.
 The same turn returns byte-identical PCM with direct disk streaming for
-all components. The `load_with_residency` device budgets are 160 MiB for
+all components. The selected device budgets are 160 MiB for
 vision, 1,600 MiB for language, 100 MiB for the audio encoder, 320 MiB for
 depth and feedback, and 96 MiB for the codec. The host budget, lookahead,
 and background queue capacity are zero for each component.
@@ -1684,56 +1691,43 @@ cargo run -p eredu-architectures --example inspect_lfm3_omni_gguf_headers -- \
 
 ### Omni distributed replay
 
-The released Q4_K_M video-and-soundtrack fixture above also exercises the
-native `MlxPipelineAudioModel::start_omni` adapter on CPU. Each rank projects
-the decoded video with `MlxVlVision::project_prompt`, expands its soundtrack
-positions with `PreparedOmni::video_prompt`, and submits the resulting
-`OmniAudioRequest` with seed 42. Vision and speech components are replicated
-on each rank. The language layers and their state follow the selected
-pipeline and tensor placement.
-
 The replay uses the MLX Ring backend on loopback. Set `MLX_HOSTFILE` to a
 JSON array with one single-address array per rank and `MLX_RANK` to the
-process's zero-based rank. Select the rank-local graph with
-`ParallelTopology::new(tensor_ranks, pipeline_stages, 1, 1)` and drain
-`MlxPipelineAudioSession::events`. The resident comparison submits the same
-request through `MlxAudioModel::start_omni`.
-
-TP=2, PP=2, and combined TP=2/PP=2 each report five committed slots on every
-rank. All 60 committed codebook IDs and the 9,600 PCM samples match the
-resident run on every rank. The PCM SHA-256 matches the resident and
-disk-streamed result above.
-
-In the TP=2 failure replay, prepending token 5 on rank 1 causes both ranks
-to reject prompt admission. With matching prompts and seeds 42 and 43,
-both ranks reject the first depth advance and report zero committed slots.
-Independent numerical parity remains unverified.
+process’s zero-based rank. Vision and speech components are replicated on
+each rank. The language layers and their state follow the selected placement.
 
 The public replay uses the same decoded video, soundtrack, instruction, seed,
 and slot budget through `PreparedMultimodalAudioTask::new_with_soundtracks`.
-In each Ring rank process, use the same `ParallelTopology` as the native replay
-and call:
+In each Ring rank process, retain the rank and residency before loading:
 
 ```rust,ignore
-let mut session = task.load_distributed(
-    &weights,
-    &execution,
-    topology,
-    Default::default(),
-    Default::default(),
+let rank = ParallelRankTopology::new(topology, global_rank)?;
+let selection = OmniAudioSelection {
+    language: AudioPlacement::Pipeline(rank),
+    ..Default::default()
+};
+let task = PreparedMultimodalAudioTask::new_with_soundtracks(
+    &artifact, &input, soundtracks, AudioMode::Speech, 5, 42, selection,
+    &MlxRealtimeSupport::new(MlxRingTransport::is_available()),
 )?;
+let binding = AudioTaskBinder::new(
+    MlxComponentBinder::new(weights.stream(), execution.stream()),
+    MlxMediaInputLowering,
+    MlxRingTransport,
+);
+let mut session = task.load(&binding)?;
 while let Some(output) = session.next_output()? {
     // Consume committed text or PCM on every rank.
 }
 ```
 
-The two residency arguments select vision and speech parameter placement
-independently. The replay uses resident weights on each CPU rank.
+The selection carries independent vision and speech weight policies. The replay
+uses resident weights on each CPU rank.
 
-TP=2, PP=2, and combined TP=2/PP=2 each return 9,600 samples on every
-rank with the same PCM SHA-256 as the resident baseline. In a TP=2 failure
-replay, rank 1 includes an 8 kHz mono PCM segment where the selected
-processor requires 16 kHz. Rank 1 reports its media error and rank 0 reports
+The combined TP=2/PP=2 replay returns 9,600 samples on every rank with
+the same PCM SHA-256 as the resident baseline. In a PP=2 failure replay,
+rank 1 includes an 8 kHz mono PCM segment where the selected processor
+requires 16 kHz. Rank 1 reports its media error and rank 0 reports
 collective rejection. Neither rank returns a response session.
 
 ## d1-2B text choice preparation

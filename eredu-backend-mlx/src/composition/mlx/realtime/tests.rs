@@ -1,13 +1,17 @@
 use super::*;
-use eredu_architectures::moshi::EffectiveModelType;
+use crate::MlxLoadRequest;
+use eredu_architectures::moshi::{
+    prepare_moshi_realtime_with_support, EffectiveModelType, MoshiPreparationPlan,
+    MoshiRealtimeExecution,
+};
 use eredu_checkpoint::{schema::StoredDtypeConstraint, StoredDtype, WeightQuantization};
 use eredu_core::{
     scheduler::{RequestId, SchedulerLimits},
-    RealtimeInputFrame, RealtimeSampling,
+    RealtimeInputFrame, RealtimeOutputFrame, RealtimeSampling,
 };
 use eredu_runtime::{
-    DenseDiskStreamLoadOptions, LayerwiseLoadOptions, RealtimeGenerationState,
-    RealtimeModelSessionIdentity, RealtimePayloadState, RealtimeSessionScheduler, WeightResidency,
+    DenseDiskStreamLoadOptions, LayerwiseLoadOptions, RealtimeModelSessionIdentity,
+    RealtimePayloadState, RealtimeSessionScheduler, WeightResidency,
 };
 use safetensors::tensor::{serialize_to_file, Dtype as SafeDtype, TensorView};
 use std::path::Path;
@@ -36,7 +40,7 @@ type TestScheduler = RealtimeSessionScheduler<
     GenerationSampler,
     RandomState,
     MlxRealtimeCompletion,
-    MlxPrepublicationFrame,
+    MlxPrepublicationFrame<eredu_architectures::moshi::MoshiRealtimeOutputProjection>,
 >;
 
 fn load_selected_test_model(
@@ -44,11 +48,12 @@ fn load_selected_test_model(
     preparation: MoshiPreparationPlan,
     options: MlxLoadRequest,
 ) -> SelectedTestModel {
+    let (request, rank) = options.checked_normalized().unwrap();
     let selected =
-        MlxRealtimeExecutionContext::select_realtime_execution(preparation, &options, false)
+        prepare_moshi_realtime_with_support(preparation, request, &MlxRealtimeSupport::new(false))
             .expect("select realtime model");
     let model = backend
-        .materialize_realtime_execution(selected)
+        .bind_realtime(selected, rank)
         .expect("load selected realtime model");
     SelectedTestModel { backend, model }
 }
@@ -63,37 +68,15 @@ fn selected_scheduler(
         SchedulerLimits::new(1, 1).unwrap(),
     )
     .unwrap();
-    let schedule = model.model.execution_config().frame_schedule().clone();
-    let samplers =
-        eredu_architectures::moshi::realtime_generation_samplers(&schedule, sampling).unwrap();
-    let model_state = RealtimePayloadState::fresh(
-        model
-            .backend
-            .new_realtime_model_state(&model.model)
-            .unwrap(),
-        eredu_architectures::moshi::realtime_ingress_contract(model.model.execution_config())
-            .unwrap()
-            .channels()
-            .clone(),
-    );
-    let random = model
+    model
         .backend
-        .realize_random_state(sampling.is_stochastic().then_some(sampling.seed()))
+        .validate_execution(model.model.executor())
         .unwrap();
-    scheduler
-        .register(
-            request,
-            RealtimeGenerationState::new(
-                model_state,
-                eredu_architectures::moshi::realtime_generation_contract(&schedule),
-                eredu_core::RealtimeFrameScheduleState::new(schedule),
-                sampling,
-                samplers,
-                random,
-            )
-            .unwrap(),
-        )
+    let generation = model
+        .model
+        .initialize_generation(&model.backend, sampling)
         .unwrap();
+    scheduler.register(request, generation).unwrap();
     scheduler
 }
 
@@ -108,9 +91,13 @@ fn drive_selected_frame(
     loop {
         let mut progress = scheduler
             .run_local_turn(std::time::Instant::now(), |_, frame, branch| {
+                let plan = model
+                    .model
+                    .prepare_frame()
+                    .map_err(Error::ArchitectureModel)?;
                 model
                     .backend
-                    .submit_realtime_frame(&mut model.model, frame, branch)
+                    .submit_realtime(model.model.executor(), plan, frame, branch)
             })
             .unwrap();
         if let Some((_, _, output)) = progress.committed.pop() {

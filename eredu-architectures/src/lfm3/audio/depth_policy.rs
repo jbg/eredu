@@ -3,6 +3,7 @@
 use super::*;
 use crate::lfm3::audio::{placement::prepare_audio_units, ArtifactError, BindingSource};
 use eredu_checkpoint::store::SharedCheckpointSource;
+use eredu_core::BackendFailure;
 use eredu_runtime::{
     ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddressMap, ExecutionUnitLayout,
     LayerwiseAcquireError, LayerwisePolicy, LayerwisePolicyForward, WeightBinding,
@@ -249,13 +250,28 @@ pub struct PreparedAudioDepth {
 }
 
 impl PreparedAudioDepth {
+    pub(in crate::lfm3::audio) fn parameter_bytes(
+        &self,
+        residency: eredu_runtime::LayerWeightResidency,
+    ) -> Result<u64, crate::lfm3::audio::ResidentAudioError> {
+        crate::lfm3::audio::placement::admit_audio_weights(
+            "depth",
+            &self.invocations,
+            &self.units,
+            0,
+            residency,
+        )
+    }
+
     pub(in crate::lfm3::audio) fn new(
         declaration: DepthDeclaration,
         weights: &BindingSource,
+        dtype: &eredu_checkpoint::recipe::RecipeDtype,
     ) -> Result<Self, ArtifactError> {
         let (source, units) = prepare_audio_units(
             weights,
             "lfm3/audio/depth",
+            dtype,
             declaration.units().map(|unit| {
                 declaration
                     .unit_parameters(unit)
@@ -271,16 +287,37 @@ impl PreparedAudioDepth {
         })
     }
 
-    /// Transfers retained placement inputs and semantic declaration to the adapter.
-    pub fn into_parts(
+    /// Materializes retained physical owners and constructs the depth traversal.
+    pub fn bind<B, P>(
         self,
-    ) -> (
-        DepthDeclaration,
-        SharedCheckpointSource,
-        ExecutionUnitAddressMap,
-        Vec<Vec<WeightBinding>>,
-    ) {
-        (self.declaration, self.source, self.invocations, self.units)
+        context: &<B::Tensor as Tensor>::Context,
+        bind_units: impl FnOnce(
+            SharedCheckpointSource,
+            ExecutionUnitAddressMap,
+            Vec<Vec<WeightBinding>>,
+            &dyn Fn() -> Result<Vec<DepthModule<B>>, BackendFailure>,
+        ) -> Result<P, BackendFailure>,
+    ) -> Result<PolicyDepth<B, P>, BackendFailure>
+    where
+        B: NeuralBackend,
+        P: LayerwisePolicy<B, DepthModule<B>>,
+    {
+        let Self {
+            declaration,
+            source,
+            invocations,
+            units,
+        } = self;
+        require_capabilities::<B>().map_err(BackendFailure::from_error)?;
+        let policy = bind_units(source, invocations.clone(), units, &|| {
+            resident_units(&declaration, true, context).map_err(BackendFailure::from_error)
+        })?;
+        Ok(PolicyDepth {
+            declaration,
+            invocations,
+            policy,
+            backend: PhantomData,
+        })
     }
 }
 
@@ -307,36 +344,6 @@ pub struct PolicyDepth<B: NeuralBackend, P> {
     invocations: ExecutionUnitAddressMap,
     policy: P,
     backend: PhantomData<fn() -> B>,
-}
-
-impl<B: NeuralBackend, P> PolicyDepth<B, P> {
-    /// Constructs one unloaded module per physical owner.
-    pub fn resident_units(
-        d: &DepthDeclaration,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Vec<DepthModule<B>>, Error> {
-        resident_units(d, true, context)
-    }
-
-    /// Attaches the shared policy to the retained semantic invocation map.
-    pub fn new(
-        declaration: DepthDeclaration,
-        map: ExecutionUnitAddressMap,
-        policy: P,
-    ) -> Result<Self, Error> {
-        require_capabilities::<B>()?;
-        if map != invocations(&declaration)? {
-            return Err(invalid(
-                "speech output invocations differ from the retained declaration",
-            ));
-        }
-        Ok(Self {
-            declaration,
-            invocations: map,
-            policy,
-            backend: PhantomData,
-        })
-    }
 }
 
 fn invoke<B, P>(

@@ -4,81 +4,51 @@ use std::sync::Arc;
 
 use eredu_architectures::voicechat::{
     component_residency::{VoiceChatResidencyPolicy, VoiceChatResidencyReport},
-    components::VoiceChatConstructionError,
-    perception_rnnt::PerceptionRnntLimits,
-    preparation::GenerationPreparationError,
-    state::NeuralStateGeometryError,
-    tts_prompt::PreparedTtsPrompt,
+    components::{BoundVoiceChatComponents, LocalInvocationBranch},
+    observation::VoiceChatHostObserver,
+    preparation::Generation,
 };
 use eredu_backend_mlx::{
-    backend::runtime::cache::state::JointCopyLimits,
+    backend::{
+        nn::shared::MlxNeuralBackend,
+        runtime::{
+            cache::state::{MlxHybridState, MlxJointState, MlxJointStateBranch},
+            generation::MlxSamplingBackend,
+            realtime::MlxRealtimeChannelObserver,
+        },
+    },
     native::{
-        initialize_voicechat_neural_state, materialize_voicechat_components, ExecutionContext,
-        MlxVoiceChatBranch, MlxVoiceChatExecution, MlxVoiceChatGeneration, RandomState,
+        ExecutionContext, MlxComponentBinder, MlxRealtimeCompletion, MlxRealtimeExecutionContext,
+        MlxReplicatedCoordinator, RandomState, SharedRealtimeExecution,
     },
     MlxTensor,
 };
-use eredu_core::{BackendFailure, RealtimeDecisionDiagnostics};
-use eredu_nn::TensorElementType;
-use eredu_runtime::SelectedStateRealization;
+use eredu_core::RealtimeDecisionDiagnostics;
 
 use super::{
-    submit_mlx_voicechat, BoundVoiceChatFork, BoundVoiceChatSession, PreparedVoiceChatPrompt,
-    PreparedVoiceChatSession, VoiceChatExecutionError, VoiceChatExecutionInputs, VoiceChatExecutor,
-    VoiceChatPublicationBranch, VoiceChatSessionError, VoiceChatSpeechOptions,
+    BoundVoiceChatFork, BoundVoiceChatSession, PreparedVoiceChatSession, VoiceChatExecutionError,
+    VoiceChatExecutionInputs, VoiceChatExecutor, VoiceChatLoadSelection,
+    VoiceChatPublicationBranch, VoiceChatSessionError, VoiceChatStartError, VoiceChatStartupInputs,
     VoiceChatSubmittedWork, VoiceChatWork,
 };
 
-/// Selected cache storage and finite copy budgets for native startup.
-/// Both layouts are checked against the prepared architecture before binding.
-pub(crate) struct MlxVoiceChatLoadOptions<'a> {
-    /// Selected Nemotron hybrid cache realization for one conversation lane.
-    pub backbone: &'a SelectedStateRealization,
-    /// Selected TTS attention realization, including both guidance rows.
-    pub tts: &'a SelectedStateRealization,
-    /// Maximum retained storage and temporary bytes for one neural branch.
-    pub max_branch_bytes: u64,
-    /// Cumulative copy allowance, shared by isolated descendants.
-    pub max_total_copy_bytes: u64,
-    /// Explicit initial RNG seed; replay state belongs to the session.
-    pub seed: u64,
-}
-
-/// Failure while adopting a cold request into the ordinary native session.
-#[derive(Debug, thiserror::Error)]
-pub enum VoiceChatStartError {
-    /// Selected cache layouts disagree with the retained architecture.
-    #[error(transparent)]
-    Geometry(#[from] NeuralStateGeometryError),
-    /// Exact parameter admission or component construction failed.
-    #[error(transparent)]
-    Construction(#[from] VoiceChatConstructionError),
-    /// Shared generation-state initialization failed.
-    #[error(transparent)]
-    Generation(#[from] GenerationPreparationError),
-    /// Session registration or bounded queue admission failed.
-    #[error(transparent)]
-    Session(#[from] VoiceChatSessionError),
-    /// Native preparation failure, preserving its original source.
-    #[error("VoiceChat native startup failed: {0}")]
-    Backend(#[source] BackendFailure),
-}
-
-struct Inputs {
-    prompt: PreparedVoiceChatPrompt,
-    speaker: PreparedTtsPrompt<MlxTensor>,
-    silence: MlxTensor,
-}
+type MlxVoiceChatComponents = BoundVoiceChatComponents<
+    MlxNeuralBackend,
+    MlxHybridState,
+    MlxComponentBinder,
+    MlxReplicatedCoordinator,
+>;
+type MlxVoiceChatGeneration =
+    Generation<MlxTensor, MlxJointState, RandomState, MlxRealtimeCompletion>;
+type MlxVoiceChatBranch =
+    LocalInvocationBranch<MlxTensor, MlxJointStateBranch, RandomState, MlxRealtimeCompletion>;
 
 /// Native execution resources and immutable startup inputs for a bound session.
 /// Neural caches, RNG, conversation policy and delivered events live in the
 /// ordinary session transaction and are never copied by this executor.
 pub struct MlxVoiceChatExecutor {
-    execution: MlxVoiceChatExecution,
-    inputs: Arc<Inputs>,
-    input_limits: PerceptionRnntLimits,
-    max_character_cells: usize,
-    speech: VoiceChatSpeechOptions,
+    execution: SharedRealtimeExecution<MlxVoiceChatComponents>,
+    inputs: Arc<VoiceChatStartupInputs<MlxTensor>>,
 }
 
 impl MlxVoiceChatExecutor {
@@ -89,15 +59,13 @@ impl MlxVoiceChatExecutor {
         Self {
             execution: self.execution.share(),
             inputs: Arc::clone(&self.inputs),
-            input_limits: self.input_limits,
-            max_character_cells: self.max_character_cells,
-            speech: self.speech,
         }
     }
 
     /// Complete admitted parameter pools; cache and activation storage is separate.
     pub fn residency_report(&self) -> VoiceChatResidencyReport {
-        self.execution.residency_report()
+        self.execution
+            .inspect(|components| *components.residency_report())
     }
 }
 
@@ -119,16 +87,49 @@ impl VoiceChatExecutor<MlxVoiceChatGeneration, RealtimeDecisionDiagnostics>
             speaker_layout: self.inputs.speaker.layout(),
             speaker_conditioning: None,
             silence: Some(&self.inputs.silence),
-            speech: self.speech,
+            speech: self.inputs.speech,
         };
-        submit_mlx_voicechat(
-            work,
-            branch,
-            &mut self.execution,
-            &inputs,
-            self.input_limits,
-            self.max_character_cells,
-        )
+        work.submit(branch, &inputs, |branch, invocation| {
+            let observer = VoiceChatHostObserver::new(MlxRealtimeChannelObserver::new(
+                self.execution.stream(),
+            ));
+            self.execution
+                .submit(
+                    branch,
+                    invocation,
+                    |branch| {
+                        let mut roots = branch
+                            .model_state()
+                            .neural
+                            .retained_arrays()
+                            .into_iter()
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        branch.model_state().visit_component_tensors(&mut |tensor| {
+                            roots.push(tensor.as_array().clone());
+                        });
+                        roots.extend(
+                            branch
+                                .random_state()
+                                .map(|random| random.as_array().clone()),
+                        );
+                        roots
+                    },
+                    |branch| branch.model_state().neural.retention(),
+                    observer,
+                    |components, branch, context, begin| {
+                        components.invoke_local::<MlxSamplingBackend, _, _>(
+                            invocation,
+                            branch,
+                            self.inputs.input_limits,
+                            self.inputs.max_character_cells,
+                            context,
+                            begin,
+                        )
+                    },
+                )
+                .map_err(|error| error.with_operation("MLX VoiceChat submission"))
+        })
     }
 }
 
@@ -166,60 +167,26 @@ impl MlxVoiceChatSession {
 pub(crate) fn start_mlx_voicechat(
     prepared: PreparedVoiceChatSession<'_>,
     residency: &VoiceChatResidencyPolicy,
-    options: MlxVoiceChatLoadOptions<'_>,
+    options: VoiceChatLoadSelection<'_>,
     weights: &ExecutionContext,
     execution: &ExecutionContext,
 ) -> Result<MlxVoiceChatSession, VoiceChatStartError> {
-    let parts = prepared.into_parts();
-    let geometry = parts.construction.neural_state_geometry().clone();
-    geometry.validate_layouts(options.backbone.layout(), options.tts.layout())?;
-    let (components, input) = materialize_voicechat_components(
-        parts.construction,
-        parts.frontend,
+    let mechanisms = MlxRealtimeExecutionContext::new(execution.stream(), weights.stream());
+    prepared.start(
         residency,
-        weights.stream(),
-        execution.stream(),
-    )?;
-    let mut native = MlxVoiceChatExecution::new(components, execution.stream());
-    let map_native = |error| VoiceChatStartError::Backend(BackendFailure::from_error(error));
-    let speaker = native
-        .prepare_prompt(1, parts.max_prompt_positions)
-        .map_err(map_native)?;
-    // Host feature extraction produces F32 tensors after the admitted PCM rounding.
-    let silence = native
-        .prepare_silence(TensorElementType::F32)
-        .map_err(map_native)?;
-    let neural = initialize_voicechat_neural_state(
-        &geometry,
-        options.backbone,
-        options.tts,
-        JointCopyLimits {
-            max_branch_bytes: options.max_branch_bytes,
-            max_total_copy_bytes: options.max_total_copy_bytes,
+        options,
+        &mechanisms,
+        |construction, frontend, residency| {
+            let binder = MlxComponentBinder::new(weights.stream(), execution.stream());
+            let (components, input) = construction.materialize(frontend, residency, &binder)?;
+            Ok((
+                SharedRealtimeExecution::new(components, execution.stream()),
+                input,
+            ))
         },
-        execution.stream(),
+        |execution, inputs| MlxVoiceChatExecutor {
+            execution,
+            inputs: Arc::new(inputs),
+        },
     )
-    .map_err(|error| VoiceChatStartError::Backend(BackendFailure::from_error(error)))?;
-    let random = RandomState::with_seed(options.seed)
-        .map_err(|error| VoiceChatStartError::Backend(BackendFailure::from_error(error)))?;
-    let state = parts.generation.initialize(input, neural, random)?;
-    let executor = MlxVoiceChatExecutor {
-        execution: native,
-        inputs: Arc::new(Inputs {
-            prompt: parts.prompt,
-            speaker,
-            silence,
-        }),
-        input_limits: parts.input_limits,
-        max_character_cells: parts.max_character_cells,
-        speech: parts.speech,
-    };
-    Ok(BoundVoiceChatSession::start(
-        state,
-        parts.conversation,
-        parts.input_config,
-        parts.publication_limits,
-        parts.session_config,
-        executor,
-    )?)
 }

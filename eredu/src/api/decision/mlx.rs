@@ -2,15 +2,20 @@
 
 use eredu_architectures::lfm3::{
     decision::{DecisionAudioProcessor, DecisionPrompt, PackedChoiceSet, TextChoicePreparation},
-    Lfm3Input,
+    vision::VlDecoder,
+    LayeredModel, Lfm3Input, PartitionedLayeredModel,
 };
 use eredu_backend_mlx::{
-    native::{ExecutionContext, MlxVlDecoder},
+    backend::{
+        distributed::initialize_ring_world, nn::shared::MlxNeuralBackend,
+        runtime::cache::state::MlxHybridState,
+    },
+    native::{ExecutionContext, MlxComponentBinder, MlxComponentPipeline, MlxLocalComponent},
     MlxTensor,
 };
 use eredu_core::BackendFailure;
 use eredu_nn::Tensor;
-use eredu_runtime::LayerWeightResidency;
+use eredu_runtime::{ComponentRankMechanisms, LayerWeightResidency};
 
 use super::{
     ChoiceAnswer, ChoiceEvaluation, ChoiceQuestion, DecisionAnswer, DecisionDistribution,
@@ -60,10 +65,17 @@ pub enum DecisionExecutionError {
     Cancelled,
 }
 
+type DecisionDecoder = VlDecoder<
+    MlxNeuralBackend,
+    MlxHybridState,
+    MlxLocalComponent<LayeredModel<MlxNeuralBackend>>,
+    MlxComponentPipeline<PartitionedLayeredModel<MlxNeuralBackend>, MlxHybridState>,
+>;
+
 /// A loaded d1 text decision model.
 pub struct TextChoiceModel {
     preparation: TextChoicePreparation,
-    decoder: MlxVlDecoder,
+    decoder: DecisionDecoder,
     stream: <MlxTensor as Tensor>::Context,
     distributed: bool,
     #[cfg(feature = "image")]
@@ -89,13 +101,17 @@ impl TextChoiceModel {
         weights: &ExecutionContext,
         execution: &ExecutionContext,
     ) -> Result<Self, DecisionExecutionError> {
-        let decoder = MlxVlDecoder::bind(decoder, residency, weights.stream(), execution.stream())?;
+        let decoder = DecisionDecoder::local(MlxLocalComponent::bind(
+            || decoder.prepare_local(residency, execution.stream()),
+            weights.stream(),
+            execution.stream(),
+        )?);
         Ok(Self::from_decoder(preparation, decoder, execution, false))
     }
 
     fn from_decoder(
         preparation: TextChoicePreparation,
-        decoder: MlxVlDecoder,
+        decoder: DecisionDecoder,
         execution: &ExecutionContext,
         distributed: bool,
     ) -> Self {
@@ -121,13 +137,31 @@ impl TextChoiceModel {
         execution: &ExecutionContext,
     ) -> Result<Self, DecisionExecutionError> {
         let (preparation, decoder, vision, audio) = prepared.into_execution_parts();
-        let decoder = MlxVlDecoder::bind_ring(
-            decoder,
+        let world = initialize_ring_world()?;
+        if distribution.topology.world_size() < 2
+            || distribution.topology.world_size() != world.size()
+        {
+            return Err(BackendFailure::from_error(eredu_nn::Error::backend(
+                "language partition requires a matching multi-rank native world",
+            ))
+            .into());
+        }
+        let rank = eredu_core::ParallelRankTopology::new(distribution.topology, world.rank())
+            .map_err(BackendFailure::from_error)?;
+        let partition = decoder.select_pipeline_rank(rank, distribution.maximum_positions)?;
+        let communication = partition
+            .pipeline_communication()
+            .map_err(BackendFailure::from_error)?;
+        let decoder = DecisionDecoder::bind_rank(
+            partition,
             distribution.decoder_residency,
-            distribution.topology,
-            distribution.maximum_positions,
-            weights.stream(),
+            communication,
             execution.stream(),
+            |pipeline| {
+                MlxComponentBinder::new(weights.stream(), execution.stream())
+                    .bind_pipeline(pipeline, &world)
+                    .map(|(execution, _)| execution)
+            },
         )?;
         let mut model = Self::from_decoder(preparation, decoder, execution, true);
         #[cfg(feature = "image")]
@@ -170,7 +204,9 @@ impl TextChoiceModel {
         if !self.distributed {
             return local;
         }
-        let agreed = self.decoder.agree_application(descriptor, local.is_ok());
+        let agreed = self
+            .decoder
+            .agree_application(descriptor, local.is_ok(), &self.stream);
         let value = local?;
         if !agreed? {
             return Err(DecisionExecutionError::Agreement(phase));
@@ -290,9 +326,9 @@ impl TextChoiceModel {
             local.map_err(Into::into),
             "row preparation",
         )?;
-        let output = self
-            .decoder
-            .forward(Lfm3Input::Decision(&prompt), &mut state)?;
+        let output =
+            self.decoder
+                .forward(Lfm3Input::Decision(&prompt), &mut state, &self.stream)?;
         let result = (|| {
             let shape = output.shape();
             let [1, slots, width] = shape else {
@@ -362,6 +398,7 @@ impl<A: serde::Serialize> DecisionSession<'_, A> {
             match self.model.decoder.agree_application(
                 [0x44454343414e4300, self.next_row as u64, 0, 0, 0, 0, 0, 0],
                 !self.cancelled,
+                &self.model.stream,
             ) {
                 Ok(true) => {}
                 Ok(false) => {

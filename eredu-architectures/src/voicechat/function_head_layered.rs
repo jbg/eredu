@@ -625,7 +625,7 @@ impl<B: NeuralBackend> ComponentEquations<B, StatelessComponentState> for Functi
         &mut self,
         group: usize,
         initial: &B::Tensor,
-        dependencies: &[&B::Tensor],
+        dependencies: &eredu_runtime::GroupDependencies<'_, B::Tensor>,
         _: &mut StatelessComponentState,
         _: &mut (),
         _: &<B::Tensor as Tensor>::Context,
@@ -863,5 +863,47 @@ where
         let mut state = StatelessComponentState::new()?;
         self.invoke_parallel(normalized, &mut state, parallel, context)
             .map_err(runtime_error)
+    }
+}
+
+/// Bound function vocabulary readout with an optional tensor cohort.
+pub type BoundFunctionHead<B, P, C> = eredu_runtime::BoundStatelessComponent<
+    ComponentAdapter<ComponentDefinition, FunctionHeadKernel<B>>,
+    B,
+    P,
+    C,
+>;
+
+impl<B, P, C> FunctionHeadExecution<B> for BoundFunctionHead<B, P, C>
+where
+    B: DistributedNeuralBackend
+        + SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    P: LayerwisePolicy<B, FunctionHead<B>>,
+    P::Error: std::error::Error + Send + Sync + 'static,
+    C: eredu_runtime::LayeredTensorCohort<B>,
+{
+    fn dimensions(&self) -> FunctionHeadDimensions {
+        self.architecture().kernel().dimensions()
+    }
+
+    fn project(
+        &mut self,
+        normalized: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, ChannelError> {
+        let (runtime, cohort) = self.parts_mut();
+        if let Some(cohort) = cohort {
+            runtime.project_parallel_guarded(
+                normalized,
+                cohort.parallel_context(),
+                context,
+                &mut cohort.traversal_hook(),
+                |descriptor, ready, context| {
+                    cohort.agree(descriptor, ready, context).map_err(Into::into)
+                },
+            )
+        } else {
+            runtime.project(normalized, context)
+        }
     }
 }

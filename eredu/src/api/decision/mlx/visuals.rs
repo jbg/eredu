@@ -1,16 +1,28 @@
 //! Visual ingress for the existing d1 decision session.
 
 #[cfg(feature = "audio")]
-use eredu_architectures::lfm3::decision::DecisionAudioProcessor;
+use eredu_architectures::lfm3::{
+    audio::{AudioEncoder, EncoderModule, PolicyEncoder},
+    decision::DecisionAudioProcessor,
+};
 use eredu_architectures::lfm3::{
     decision::{PreparedDecisionAudio, PreparedDecisionVision},
-    vision::MediaTokens,
+    vision::{MediaTokens, PolicyVision, VisionModule, VisionPromptAdmission},
 };
-use eredu_backend_mlx::native::{MlxVlMedia, MlxVlVision};
 #[cfg(feature = "audio")]
-use eredu_backend_mlx::{native::MlxAudioEncoder, MlxTensor};
+use eredu_backend_mlx::backend::runtime::cache::state::MlxHybridState;
+use eredu_backend_mlx::{
+    backend::{
+        nn::shared::MlxNeuralBackend,
+        runtime::{
+            execution::generic::{bind_parameter_units, MlxSelectedLayerwisePolicy},
+            media::input::MlxTensorInputInspector,
+        },
+    },
+    native::MlxMediaProcessor,
+    MlxTensor,
+};
 use eredu_core::{Media, MultimodalRequest, MultimodalSegment, RgbImage};
-#[cfg(feature = "audio")]
 use eredu_nn::Tensor;
 
 use super::{
@@ -20,14 +32,24 @@ use super::{
     PreparedTextChoiceModel, TextChoiceModel,
 };
 
+#[cfg(feature = "audio")]
+type SpeechEncoder = PolicyEncoder<
+    MlxNeuralBackend,
+    MlxSelectedLayerwisePolicy<EncoderModule<MlxNeuralBackend>, ()>,
+>;
+
 pub(super) struct VisualRuntime {
-    vision: MlxVlVision,
-    processor: MlxVlMedia,
+    vision: PolicyVision<
+        MlxNeuralBackend,
+        MlxSelectedLayerwisePolicy<VisionModule<MlxNeuralBackend>, ()>,
+    >,
+    processor: MlxMediaProcessor,
+    admission: VisionPromptAdmission,
     markers: MediaTokens,
     max_pixels: u64,
     width: i32,
     #[cfg(feature = "audio")]
-    audio: Option<(MlxAudioEncoder, DecisionAudioProcessor)>,
+    audio: Option<(SpeechEncoder, DecisionAudioProcessor)>,
 }
 
 impl TextChoiceModel {
@@ -217,7 +239,7 @@ impl TextChoiceModel {
         let (tokens, image, video) = if segments.is_empty() {
             (Vec::new(), None, None)
         } else {
-            runtime.project(segments, &self.preparation)?
+            runtime.project(segments, &self.preparation, &self.stream)?
         };
         let rows = if voices.is_empty() {
             self.preparation.pack_media_decisions(
@@ -295,7 +317,7 @@ impl TextChoiceModel {
         let segments =
             self.preparation
                 .visual_segments(visuals, runtime.markers, runtime.max_pixels)?;
-        let (tokens, image, video) = runtime.project(segments, &self.preparation)?;
+        let (tokens, image, video) = runtime.project(segments, &self.preparation, &self.stream)?;
         let rows =
             self.preparation
                 .pack_visual_decisions(state, questions, &tokens, runtime.markers)?;
@@ -375,10 +397,19 @@ impl VisualRuntime {
         execution: &ExecutionContext,
     ) -> Result<(), DecisionExecutionError> {
         let (audio, processor) = audio.into_parts();
-        self.audio = Some((
-            MlxAudioEncoder::bind(audio, residency, weights.stream(), execution.stream())?,
-            processor,
-        ));
+        let encoder = audio.bind(execution.stream(), |source, addresses, units, build| {
+            bind_parameter_units(
+                source,
+                addresses,
+                units,
+                residency,
+                execution.stream(),
+                weights.stream(),
+                build,
+            )
+            .map(|(policy, _)| policy)
+        })?;
+        self.audio = Some((encoder, processor));
         Ok(())
     }
 
@@ -389,10 +420,22 @@ impl VisualRuntime {
         execution: &ExecutionContext,
     ) -> Result<Self, DecisionExecutionError> {
         let (vision, processor, admission, max_pixels, markers, width) = prepared.into_parts();
-        let vision = MlxVlVision::bind(vision, residency, weights.stream(), execution.stream())?;
+        let vision = vision.bind(execution.stream(), |source, addresses, units, build| {
+            bind_parameter_units(
+                source,
+                addresses,
+                units,
+                residency,
+                execution.stream(),
+                weights.stream(),
+                build,
+            )
+            .map(|(policy, _)| policy)
+        })?;
         Ok(Self {
             vision,
-            processor: MlxVlMedia::from_prepared(processor, admission),
+            processor: MlxMediaProcessor::from_prepared(processor),
+            admission,
             markers,
             max_pixels,
             width,
@@ -405,6 +448,7 @@ impl VisualRuntime {
         &mut self,
         segments: Vec<MultimodalSegment>,
         preparation: &eredu_architectures::lfm3::decision::TextChoicePreparation,
+        stream: &<MlxTensor as Tensor>::Context,
     ) -> Result<
         (
             Vec<i32>,
@@ -422,16 +466,25 @@ impl VisualRuntime {
             .processor
             .prepare(&request, &mut encode)
             .map_err(BackendFailure::from_error)?;
+        let prompt = self
+            .admission
+            .admit_with_identity(
+                &prepared.to_runtime_input()?,
+                &MlxTensorInputInspector,
+                prepared.cache_identity(),
+            )
+            .map_err(BackendFailure::from_error)?;
         Ok(self
             .vision
-            .project_prompt(self.processor.admit(&prepared)?)?
+            .project_prompt(prompt, stream)
+            .map_err(BackendFailure::from_error)?
             .into_media_parts())
     }
 }
 
 #[cfg(feature = "audio")]
 fn project_clip(
-    encoder: &mut MlxAudioEncoder,
+    encoder: &mut SpeechEncoder,
     processor: DecisionAudioProcessor,
     clip: &eredu_core::Audio,
     stream: &<MlxTensor as Tensor>::Context,
@@ -439,15 +492,9 @@ fn project_clip(
     let (features, ids) = processor
         .prepare(clip)
         .map_err(BackendFailure::from_error)?;
-    let frames = i32::try_from(features.frames).map_err(BackendFailure::from_error)?;
-    let bins = i32::try_from(features.mel_bins).map_err(BackendFailure::from_error)?;
-    let tensor = MlxTensor::from_f32_slice(&features.values, &[1, frames, bins], stream)
-        .and_then(|features| features.transpose_axes(&[0, 2, 1], stream))
-        .map_err(BackendFailure::from_error)?;
-    let rows = encoder
-        .project(&tensor)?
-        .squeeze_axes(&[0], stream)
-        .map_err(BackendFailure::from_error)?;
+    let rows = encoder.project_clip(&features, stream, |layout| {
+        MlxHybridState::device(layout.clone(), &[]).map_err(BackendFailure::from_error)
+    })?;
     Ok((ids, rows))
 }
 

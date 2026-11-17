@@ -230,14 +230,14 @@ where
         &mut self,
         group: usize,
         initial: &B::Tensor,
-        dependencies: &[&B::Tensor],
+        dependencies: &eredu_runtime::GroupDependencies<'_, B::Tensor>,
         _state: &mut S,
         forward: &mut Self::ForwardContext,
         _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        match (group, &forward.phase, dependencies) {
-            (0, _, []) | (1, Phase::Decoder(_), [_]) => Ok(initial.clone()),
-            (1, Phase::Projected, [projected]) => Ok((*projected).clone()),
+        match (group, &forward.phase, dependencies.get(0)) {
+            (0, _, None) | (1, Phase::Decoder(_), _) => Ok(initial.clone()),
+            (1, Phase::Projected, Some(projected)) => Ok(projected.clone()),
             _ => Err(Error::backend("VL group input differs from its invocation")),
         }
     }

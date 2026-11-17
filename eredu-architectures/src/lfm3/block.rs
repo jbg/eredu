@@ -912,7 +912,7 @@ impl AttentionParameters {
             B::linear(self.projection.output, context)?,
             Some(B::normalization(self.query_norm, context)?),
             Some(B::normalization(self.key_norm, context)?),
-            Some(B::rotary(self.rotary, context)?),
+            Some(B::rotary(self.rotary.prepare()?, context)?),
             window,
         )?;
         attention.output_gate = Some(B::linear(self.gate, context)?);

@@ -1,12 +1,19 @@
 //! Cold exact binding plans for independently leased EAR neural encoder units.
 
 use eredu_checkpoint::{recipe::RecipeDtype, store::SharedCheckpointSource};
+use eredu_core::BackendFailure;
+use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Tensor};
 use eredu_runtime::{
     ComponentPreparationError, ComponentRecipeConversion, LocalModelLayout, PreparedComponent,
     WeightBinding,
 };
+use eredu_runtime::{LayeredTensorCohort, ParameterUnitMechanisms, SubmissionBackend};
 
 use crate::ear_encoder::EncoderConfig;
+use crate::{
+    ear_encoder::EncoderUnit,
+    ear_encoder_layered::{BoundEarEncoder, EncoderKernel},
+};
 
 /// Invalid component geometry or exact retained parameter contract.
 #[derive(Debug, thiserror::Error)]
@@ -55,9 +62,90 @@ impl PreparedEncoderBindings {
         Ok(Self { prepared })
     }
 
+    /// Binds prepared units locally or to an explicitly selected tensor cohort.
+    pub fn bind<B, H, C>(
+        self,
+        residency: eredu_runtime::LayerWeightResidency,
+        context: &<B::Tensor as Tensor>::Context,
+        mechanisms: &H,
+        cohort: Option<C>,
+    ) -> Result<
+        (
+            BoundEarEncoder<B, H::UnitPolicy<EncoderUnit<B::Tensor>>, C>,
+            eredu_runtime::LayerwiseModelMetadata,
+        ),
+        BackendFailure,
+    >
+    where
+        B: DistributedNeuralBackend
+            + SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>
+            + 'static,
+        H: ParameterUnitMechanisms<B>,
+        C: LayeredTensorCohort<B>,
+    {
+        let selected = if let Some(cohort) = &cohort {
+            let (manifest, group) = cohort.selection();
+            let width = self
+                .config()
+                .unit_specs()
+                .map_err(BackendFailure::from_error)?
+                .iter()
+                .map(|spec| match spec {
+                    crate::ear_encoder::EncoderUnitSpec::Input { output, .. }
+                    | crate::ear_encoder::EncoderUnitSpec::Downsample { output, .. } => *output,
+                    crate::ear_encoder::EncoderUnitSpec::Block { width, .. } => *width,
+                })
+                .max()
+                .expect("validated nonempty encoder") as usize;
+            let sum = eredu_runtime::CommunicationOperationRequirement::tensors(
+                eredu_runtime::CommunicationOperation::AllReduceSum,
+                [eredu_core::checkpoint::TensorDtype::F32],
+                eredu_runtime::CommunicationTensorLimits::new(1, 3, width, None)
+                    .map_err(BackendFailure::from_error)?,
+                true,
+            )
+            .map_err(BackendFailure::from_error)?;
+            eredu_runtime::replicated_execution::validate_collective_coordination(
+                manifest,
+                group,
+                [sum],
+            )
+            .map_err(BackendFailure::from_error)?;
+            self.select_parallel(cohort.tensor_topology()?)
+                .map_err(BackendFailure::from_error)?
+                .0
+        } else {
+            if self.local_layout().is_some() {
+                return Err(BackendFailure::from_error(crate::Error::InvalidShape(
+                    "tensor-local parameter placement requires its selected cohort".into(),
+                )));
+            }
+            self
+        };
+        let (declaration, local, invocations, source, units) = selected.into_parts();
+        let definition = declaration.definition().clone();
+        let kernel = match local.as_ref() {
+            Some(layout) => EncoderKernel::<B>::new_parallel(declaration, layout),
+            None => EncoderKernel::<B>::new(declaration),
+        }
+        .map_err(BackendFailure::from_error)?;
+        let architecture = eredu_runtime::ComponentAdapter::new(definition, kernel)
+            .map_err(BackendFailure::from_error)?;
+        BoundEarEncoder::bind(
+            architecture,
+            source,
+            invocations,
+            units,
+            residency,
+            context,
+            mechanisms,
+            cohort,
+        )
+    }
+
     /// Selects exact tensor placement or validates a retained selection without
     /// applying its recipes a second time. Source authority remains unchanged.
-    pub fn select_parallel(
+    fn select_parallel(
         self,
         topology: eredu_core::ParallelRankTopology,
     ) -> Result<(Self, LocalModelLayout), EncoderPreparationError> {
@@ -66,10 +154,7 @@ impl PreparedEncoderBindings {
     }
 
     /// Lowers each canonical binding through the selected shared physical layout.
-    pub fn into_parallel(
-        mut self,
-        layout: &LocalModelLayout,
-    ) -> Result<Self, EncoderPreparationError> {
+    fn into_parallel(mut self, layout: &LocalModelLayout) -> Result<Self, EncoderPreparationError> {
         crate::ear_encoder_layered::declared_local_dimensions(
             self.prepared.declaration().spec(),
             layout,
@@ -79,13 +164,18 @@ impl PreparedEncoderBindings {
     }
 
     /// Retains only the exact sources and canonical units owned by one pipeline stage.
+    /// Applies the optional tensor layout before narrowing the stage bindings.
     pub fn into_partition<G>(
-        self,
+        mut self,
+        tensor_layout: Option<&LocalModelLayout>,
         partition: &eredu_runtime::ArchitecturePartition<
             G,
             crate::ear_encoder_partition::EncoderBoundarySchema,
         >,
     ) -> Result<PreparedEncoderPartitionBindings, EncoderPreparationError> {
+        if let Some(layout) = tensor_layout {
+            self = self.into_parallel(layout)?;
+        }
         crate::ear_encoder_partition::validate_encoder_partition(
             self.prepared.declaration(),
             self.prepared.local_layout(),
@@ -96,17 +186,13 @@ impl PreparedEncoderBindings {
     }
 
     /// Exact retained tensor placement, when selected.
-    pub fn local_layout(&self) -> Option<&LocalModelLayout> {
+    fn local_layout(&self) -> Option<&LocalModelLayout> {
         self.prepared.local_layout()
     }
 
     /// Validated neural encoder geometry.
     pub fn config(&self) -> &EncoderConfig {
         self.prepared.declaration().config()
-    }
-    /// Canonical parameter namespace retained from preparation.
-    pub fn prefix(&self) -> &str {
-        self.prepared.declaration().prefix()
     }
 
     /// Exact prepared unit bindings for cold resource accounting.
@@ -119,13 +205,8 @@ impl PreparedEncoderBindings {
         self.prepared.source()
     }
 
-    /// Validated semantic definition retained through source and placement selection.
-    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
-        self.prepared.declaration().definition()
-    }
-
     /// Consumes exact source authority and the canonical ordered binding plan.
-    pub fn into_parts(
+    fn into_parts(
         self,
     ) -> (
         crate::declarations::EncoderDeclaration,

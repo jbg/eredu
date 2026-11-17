@@ -6,7 +6,7 @@ use super::{
 };
 use crate::nemotron_h::{self, ModelArgs};
 use eredu_checkpoint::{
-    recipe::{DerivedWeightRecipe, RecipeDtype, RecipeError},
+    recipe::{RecipeDtype, RecipeError},
     store::{RestrictedCheckpointSource, SharedCheckpointSource, StoreError},
     validation::{validate_safetensors_plan, CatalogTensorMetadata, StrictLoadFailure},
     StoredDtype,
@@ -15,7 +15,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 #[path = "backbone_construction.rs"]
 mod construction;
-pub use construction::{BackboneConstructionError, BackboneUnit, PreparedBackboneBindings};
+pub use construction::BackboneConstructionError;
 
 /// A missing component or incompatible retained architecture configuration.
 #[derive(Debug, thiserror::Error)]
@@ -218,39 +218,9 @@ impl PreparedBackboneParameters {
     pub fn args(&self) -> &ModelArgs {
         self.declaration.args()
     }
-    /// The exact restricted source retained during artifact preparation.
-    pub fn source(&self) -> &SharedCheckpointSource {
-        &self.source
-    }
     /// Runtime parameter names mapped to original admitted identities and bounds.
     pub fn parameters(&self) -> &BTreeMap<String, ParameterAdmission> {
         &self.parameters
-    }
-    /// Static embedding, final normalization and agent-head recipes.
-    pub fn static_recipes(&self) -> BTreeMap<String, DerivedWeightRecipe> {
-        self.parameters
-            .iter()
-            .filter(|(name, _)| !name.starts_with("model.layers."))
-            .map(|(name, value)| (name.clone(), value.recipe.clone()))
-            .collect()
-    }
-    /// Recipes for one existing independently materializable Nemotron-H block.
-    pub fn layer_recipes(
-        &self,
-        index: usize,
-    ) -> Result<BTreeMap<String, DerivedWeightRecipe>, BackbonePreparationError> {
-        if index >= self.args().num_hidden_layers as usize {
-            return Err(BackbonePreparationError::Configuration(
-                "backbone layer is outside its schedule".into(),
-            ));
-        }
-        let prefix = format!("model.layers.{index}.");
-        Ok(self
-            .parameters
-            .iter()
-            .filter(|(name, _)| name.starts_with(&prefix))
-            .map(|(name, value)| (name.clone(), value.recipe.clone()))
-            .collect())
     }
 }
 

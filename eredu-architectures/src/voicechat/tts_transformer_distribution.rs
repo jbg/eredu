@@ -1,15 +1,22 @@
 //! Cold authority for a retained transformer component pipeline.
+use super::tts_transformer_layered::{OwnedTransformerRuntimeState, TransformerKernel};
 use super::{
     tts_transformer_layered::{
         validate_transformer_partition, TransformerBoundarySchema, TransformerError,
     },
     tts_transformer_preparation::PreparedTtsTransformerPartitionBindings,
 };
-use eredu_core::CollectiveGroupId;
+use eredu_core::{BackendFailure, CollectiveGroupId};
+use eredu_nn::{DistributedNeuralBackend, NeuralBackend};
 use eredu_runtime::{
     ArchitectureBoundary, ArchitectureGroupKind, ArchitecturePartition, CommunicationManifest,
-    ComponentPipelinePreparationError, PartitionedExecutionPlan, PipelineActivationDtype,
+    ComponentPipelinePreparationError, ComponentRankMechanisms, LayerWeightResidency,
+    LayerwiseModelMetadata, PartitionedExecutionPlan, PipelineActivationDtype,
 };
+
+use super::tts_transformer_stage::{TtsTransformerPipeline, TtsTransformerPipelineArchitecture};
+
+type Pipeline<B> = eredu_runtime::PreparedComponentPipeline<TtsTransformerPipelineArchitecture<B>>;
 
 /// Exact component sources, stage ownership and transport selection.
 ///
@@ -96,24 +103,81 @@ impl PreparedTtsTransformerPipelineBindings {
     pub fn bindings(&self) -> &PreparedTtsTransformerPartitionBindings {
         &self.bindings
     }
-    /// Consumes the validated selection without reopening artifacts.
-    pub fn into_parts(
+    /// Binds the retained plan and constructs the portable stage.
+    pub fn bind<B, Cache, C, H>(
         self,
-    ) -> (
-        PreparedTtsTransformerPartitionBindings,
-        ArchitecturePartition<(), TransformerBoundarySchema>,
-        CommunicationManifest,
-        PartitionedExecutionPlan,
-        Option<CollectiveGroupId>,
-        PipelineActivationDtype,
-    ) {
+        residency: LayerWeightResidency,
+        communication: &C,
+        mechanisms: &H,
+        allocate_caches: impl FnOnce(&eredu_runtime::StateLayout) -> Result<Vec<Cache>, BackendFailure>,
+    ) -> Result<
         (
-            self.bindings,
-            self.partition,
-            self.manifest,
-            self.plan,
-            self.tensor_group,
-            self.activation_dtype,
+            TtsTransformerPipeline<H::Pipeline<TtsTransformerPipelineArchitecture<B>>, Cache>,
+            OwnedTransformerRuntimeState<B, Cache>,
+            LayerwiseModelMetadata,
+        ),
+        BackendFailure,
+    >
+    where
+        B: DistributedNeuralBackend + 'static,
+        B::Tensor: 'static,
+        Cache: eredu_runtime::RuntimeLayerState<B> + eredu_nn::AttentionCache<B::Tensor> + 'static,
+        H: ComponentRankMechanisms<B, OwnedTransformerRuntimeState<B, Cache>, C>,
+    {
+        let (pipeline, layout, state) =
+            self.into_pipeline::<B, Cache>(residency, allocate_caches)?;
+        let (execution, metadata) = mechanisms.bind_pipeline(pipeline, communication)?;
+        Ok((
+            TtsTransformerPipeline::new(execution, layout),
+            state,
+            metadata,
+        ))
+    }
+
+    /// Builds the typed stage from its retained source, ownership and communication plan.
+    fn into_pipeline<B: NeuralBackend, C>(
+        self,
+        residency: eredu_runtime::LayerWeightResidency,
+        allocate_caches: impl FnOnce(&eredu_runtime::StateLayout) -> Result<Vec<C>, BackendFailure>,
+    ) -> Result<
+        (
+            Pipeline<B>,
+            Option<eredu_runtime::StateLayout>,
+            OwnedTransformerRuntimeState<B, C>,
+        ),
+        BackendFailure,
+    >
+    where
+        C: eredu_runtime::RuntimeLayerState<B> + eredu_nn::AttentionCache<B::Tensor>,
+    {
+        let (declaration, local_layout, invocations, source, units, layout) =
+            self.bindings.into_parts();
+        let architecture = TransformerKernel::<B>::from_partition(
+            declaration,
+            local_layout.as_ref(),
+            &self.partition,
         )
+        .map_err(BackendFailure::from_error)?;
+        let caches = architecture
+            .kernel()
+            .attention_cache_layout()
+            .map(allocate_caches)
+            .transpose()?
+            .unwrap_or_default();
+        let state = OwnedTransformerRuntimeState::for_partition(architecture.kernel(), caches)
+            .map_err(BackendFailure::from_error)?;
+        let pipeline = eredu_runtime::PreparedComponentPipeline {
+            architecture,
+            source,
+            invocations,
+            pinned: Vec::new(),
+            units,
+            manifest: self.manifest,
+            plan: self.plan,
+            tensor_group: self.tensor_group,
+            activation_dtype: self.activation_dtype,
+            residency,
+        };
+        Ok((pipeline, layout, state))
     }
 }

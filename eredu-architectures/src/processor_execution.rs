@@ -25,6 +25,26 @@ use eredu_runtime::processor_resources::{
     ProcessorRequestBudget, ProcessorRequestResources, ProcessorResourceError,
 };
 
+/// Native input lowering and inspection for an already selected portable processor.
+pub trait MediaInputLowering<T> {
+    /// Inspects native tensors during portable prompt admission.
+    fn inspector(&self) -> &impl PreparedInputInspector<T>;
+
+    /// Lowers the request and preserves its optional semantic cache identity.
+    fn prepare_input<E: std::error::Error + Send + Sync + 'static>(
+        &self,
+        processor: &PreparedProcessor,
+        input: &TokenizedMultimodalRequest,
+        encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
+    ) -> Result<
+        (
+            PreparedModelInput<T>,
+            Option<eredu_runtime::PreparedInputCacheIdentity>,
+        ),
+        eredu_core::BackendFailure,
+    >;
+}
+
 /// Prepared inputs with optional coarse request preparation limits.
 #[derive(Debug)]
 pub struct BudgetedProcessorInput<T> {

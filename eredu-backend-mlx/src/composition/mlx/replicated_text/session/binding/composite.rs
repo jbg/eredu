@@ -355,6 +355,40 @@ impl
     }
 }
 
+impl
+    eredu_architectures::prepared_execution::RetainedCompositeVisitor<
+        MlxNeuralBackend,
+        MlxHybridState,
+        crate::backend::MlxDistributedSession,
+        Box<dyn ErasedReplicatedTextExecutable>,
+        Error,
+    > for CompositeBindingVisitor<'_>
+{
+    type Components = crate::composition::mlx::component_binding::MlxComponentBinder;
+
+    fn components(&self) -> Self::Components {
+        Self::Components::new(self.weights_stream, self.stream)
+    }
+
+    fn finish_retained<R>(
+        self,
+        session: R,
+        communication: Option<crate::backend::MlxDistributedSession>,
+    ) -> Result<
+        Box<dyn ErasedReplicatedTextExecutable>,
+        eredu_architectures::prepared_execution::PreparedExecutionError<Error>,
+    >
+    where
+        R: eredu_architectures::prepared_execution::PreparedRetainedTextSession<
+                MlxTensor,
+                MlxHybridState,
+            > + 'static,
+    {
+        super::super::retained_session::erase_retained_session(session, communication, self.stream)
+            .map_err(eredu_architectures::prepared_execution::PreparedExecutionError::Backend)
+    }
+}
+
 impl CompositeTextArchitectureVisitor<MlxNeuralBackend, MlxHybridState>
     for CompositeBindingVisitor<'_>
 {
@@ -364,20 +398,6 @@ impl CompositeTextArchitectureVisitor<MlxNeuralBackend, MlxHybridState>
     fn construction_started(&mut self) {
         #[cfg(test)]
         crate::tests::support::path_instrumentation::architecture_construction();
-    }
-
-    fn visit_vl(
-        self,
-        prepared: eredu_architectures::lfm3::vision::PreparedVlGraph,
-    ) -> Result<Self::Output, eredu_architectures::prepared_execution::PreparedExecutionError<Error>>
-    {
-        crate::composition::mlx::vl_session::bind_vl_session(
-            prepared,
-            self.stream,
-            self.weights_stream,
-        )
-        .map(|(executable, _)| executable)
-        .map_err(eredu_architectures::prepared_execution::PreparedExecutionError::Backend)
     }
 
     fn visit_prediction<A, W>(

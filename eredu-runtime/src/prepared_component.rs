@@ -14,6 +14,20 @@ use eredu_checkpoint::{
 };
 use std::{collections::BTreeMap, sync::Arc};
 
+/// Native preparation scope for a retained component plan.
+pub trait ComponentPreparation: Sized {
+    /// Execution context used by the bound components.
+    type Context: ?Sized;
+
+    /// Applies the native preparation and recovery lifecycle around portable binding.
+    fn prepare_components<T, E>(
+        &self,
+        bind: impl FnOnce(&Self, &Self::Context) -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<eredu_core::BackendFailure>;
+}
+
 /// Failure preparing exact component resources without allocating native values.
 #[derive(Debug, thiserror::Error)]
 pub enum ComponentPreparationError {
@@ -211,6 +225,17 @@ impl PreparedComponent<crate::ComponentDefinition> {
         state: crate::StateLayout,
     ) -> Result<Self, crate::ComponentDefinitionError> {
         self.declaration = self.declaration.with_state_layout(state)?;
+        Ok(self)
+    }
+}
+
+impl PreparedComponent<std::sync::Arc<crate::ComponentDefinition>> {
+    /// Selects state geometry on the retained declaration without changing parameter bindings.
+    pub fn select_state_layout(
+        mut self,
+        state: &crate::StateLayout,
+    ) -> Result<Self, crate::ComponentDefinitionError> {
+        self.declaration = self.declaration.select_state_layout(state)?;
         Ok(self)
     }
 }

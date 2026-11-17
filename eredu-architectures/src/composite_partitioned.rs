@@ -486,22 +486,6 @@ impl PreparedCompositeExecutorPlan {
             + eredu_runtime::PartitionedLayeredArchitecture<B, S, Boundary = W>,
     {
         let selected = prepared.selected();
-        let group_count = selected.partition().graph().groups().len();
-        let group_kinds = (0..group_count)
-            .map(|group| prepared.architecture().group_transport(group).kind)
-            .collect::<Vec<_>>();
-        let route_schemas = selected
-            .boundary_routes()
-            .iter()
-            .map(|route| {
-                (
-                    route.route().route,
-                    route.schema().clone(),
-                    route.source_unit_end(),
-                )
-            })
-            .collect::<Vec<_>>();
-        validate_executor_routes(selected.boundary_routes(), &route_schemas)?;
         let topology = selected.topology();
         let tensor_group = selected.tensor_group();
         // A singleton selected tensor group may still own row lookup transport.
@@ -586,9 +570,8 @@ impl PreparedCompositeExecutorPlan {
         >(
             prepared.architecture(),
             selected.partition(),
-            group_kinds,
             selected.activation_dtype(),
-            route_schemas,
+            selected.boundary_routes(),
             publication,
             active_tensor_group,
             topology,
@@ -773,50 +756,6 @@ impl PreparedCompositeExecutorPlan {
             strategy,
             self.structure,
         )
-    }
-}
-
-fn validate_executor_routes(
-    expected: &[crate::partitioned_execution::SelectedPartitionBoundaryRoute],
-    actual: &[(
-        eredu_runtime::CommunicationRouteId,
-        eredu_runtime::ResolvedBoundaryWireSchema,
-        usize,
-    )],
-) -> Result<(), String> {
-    let expected = expected.iter().map(|route| {
-        (
-            route.route().route,
-            (route.schema().clone(), route.source_unit_end()),
-        )
-    });
-    let actual = actual
-        .iter()
-        .map(|(id, schema, end)| (*id, (schema.clone(), *end)));
-    validate_exact_executor_contract(expected, actual)
-}
-
-fn validate_exact_executor_contract<K, V>(
-    expected: impl IntoIterator<Item = (K, V)>,
-    actual: impl IntoIterator<Item = (K, V)>,
-) -> Result<(), String>
-where
-    K: Ord,
-    V: Eq,
-{
-    let expected = expected.into_iter().collect::<Vec<_>>();
-    let actual = actual.into_iter().collect::<Vec<_>>();
-    let exact_cardinality = expected.len() == actual.len();
-    let expected = expected
-        .into_iter()
-        .collect::<std::collections::BTreeMap<_, _>>();
-    let actual = actual
-        .into_iter()
-        .collect::<std::collections::BTreeMap<_, _>>();
-    if exact_cardinality && expected.len() == actual.len() && expected == actual {
-        Ok(())
-    } else {
-        Err("composite executor boundary routes differ from selected schemas".into())
     }
 }
 

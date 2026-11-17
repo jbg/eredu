@@ -13,17 +13,15 @@ use std::{
 use crate::{
     backend::DeviceAssignment,
     native::{
-        MlxRealtimeCompletion, MlxRealtimeConsensusTransport, MlxRealtimeExecutionContext,
-        MlxRealtimeHostObserver, RandomState,
+        MlxPrepublicationFrame, MlxRealtimeCompletion, MlxRealtimeConsensusTransport,
+        MlxRealtimeExecutionContext, RandomState,
     },
     MlxLoadRequest,
 };
 use eredu_architectures::moshi::{MoshiCollectiveCount, MoshiConfig};
 use eredu_core::scheduler::{RequestId, SchedulerLimits};
 use eredu_core::{RealtimeInputFrame, RealtimeSampling};
-use eredu_runtime::{
-    GenerationSampler, RealtimeGenerationState, RealtimePayloadState, RealtimeSessionScheduler,
-};
+use eredu_runtime::{GenerationSampler, RealtimeSessionScheduler};
 use safemlx::{
     distributed::{self, Backend},
     Array, Device, DeviceType, Stream,
@@ -38,7 +36,7 @@ const NATIVE_FIXTURE: &str = "EREDU_MOSHI_NATIVE_FIXTURE";
 const PERSONAPLEX_FIXTURE: &str = "EREDU_MOSHI_PERSONAPLEX_FIXTURE";
 
 type PreparedRingRealtime = eredu_architectures::moshi::MoshiRealtimeExecution<
-    crate::composition::moshi::MlxRealtimeExecution,
+    crate::composition::mlx::realtime::MlxRealtimeExecution,
 >;
 
 fn balanced_widths(total: usize) -> [usize; 2] {
@@ -146,12 +144,23 @@ type NativeScheduler = RealtimeSessionScheduler<
     GenerationSampler,
     RandomState,
     MlxRealtimeCompletion,
-    eredu_runtime::PrepublicationRealtimeFrame<
-        eredu_runtime::CompletedRealtimeFrame<crate::MlxTensor, crate::MlxTensor>,
-        MlxRealtimeCompletion,
-        MlxRealtimeHostObserver,
-    >,
+    MlxPrepublicationFrame<eredu_architectures::moshi::MoshiRealtimeOutputProjection>,
 >;
+
+fn submit_frame(
+    backend: &MlxRealtimeExecutionContext,
+    model: &PreparedRingRealtime,
+    frame: &RealtimeInputFrame,
+    branch: &mut crate::composition::mlx::realtime::MlxFrameSessionBranch,
+) -> Result<
+    MlxPrepublicationFrame<eredu_architectures::moshi::MoshiRealtimeOutputProjection>,
+    crate::backend::error::Error,
+> {
+    let plan = model
+        .prepare_frame()
+        .map_err(crate::backend::error::Error::ArchitectureModel)?;
+    backend.submit_realtime(model.executor(), plan, frame, branch)
+}
 
 fn run_forced_and_greedy_sequence(
     backend: &MlxRealtimeExecutionContext,
@@ -169,30 +178,9 @@ fn run_forced_and_greedy_sequence(
     )
     .unwrap();
     let sampling = RealtimeSampling::greedy();
-    let samplers =
-        eredu_architectures::moshi::realtime_generation_samplers(&schedule, sampling).unwrap();
-    let model_state = RealtimePayloadState::fresh(
-        backend.new_realtime_model_state(model).unwrap(),
-        eredu_architectures::moshi::realtime_ingress_contract(model.execution_config())
-            .unwrap()
-            .channels()
-            .clone(),
-    );
-    let random = backend.realize_random_state(None).unwrap();
-    scheduler
-        .register(
-            request,
-            RealtimeGenerationState::new(
-                model_state,
-                eredu_architectures::moshi::realtime_generation_contract(&schedule),
-                eredu_core::RealtimeFrameScheduleState::new(schedule.clone()),
-                sampling,
-                samplers,
-                random,
-            )
-            .unwrap(),
-        )
-        .unwrap();
+    backend.validate_execution(model.executor()).unwrap();
+    let generation = model.initialize_generation(backend, sampling).unwrap();
+    scheduler.register(request, generation).unwrap();
 
     let forced_audio = Array::from_slice(
         &(0..generated_codebooks)
@@ -230,10 +218,10 @@ fn run_forced_and_greedy_sequence(
                     0x4d4f_5348_4954_5032,
                     transport,
                     Instant::now(),
-                    |_, frame, branch| backend.submit_realtime_frame(model, frame, branch),
+                    |_, frame, branch| submit_frame(backend, model, frame, branch),
                 ),
                 None => scheduler.run_local_turn(Instant::now(), |_, frame, branch| {
-                    backend.submit_realtime_frame(model, frame, branch)
+                    submit_frame(backend, model, frame, branch)
                 }),
             }
             .unwrap();
@@ -299,35 +287,15 @@ fn assert_schedule_disagreement_submits_nothing(
 ) {
     let schedule = model.execution_config().frame_schedule().clone();
     let sampling = RealtimeSampling::greedy();
-    let samplers =
-        eredu_architectures::moshi::realtime_generation_samplers(&schedule, sampling).unwrap();
-    let model_state = RealtimePayloadState::fresh(
-        backend.new_realtime_model_state(model).unwrap(),
-        eredu_architectures::moshi::realtime_ingress_contract(model.execution_config())
-            .unwrap()
-            .channels()
-            .clone(),
-    );
     let mut scheduler = NativeScheduler::new(
         eredu_runtime::RealtimeModelSessionIdentity::from_selected(model.selected()),
         SchedulerLimits::new(1, 1).unwrap(),
     )
     .unwrap();
     let request = RequestId::new(99);
-    scheduler
-        .register(
-            request,
-            RealtimeGenerationState::new(
-                model_state,
-                eredu_architectures::moshi::realtime_generation_contract(&schedule),
-                eredu_core::RealtimeFrameScheduleState::new(schedule.clone()),
-                sampling,
-                samplers,
-                None,
-            )
-            .unwrap(),
-        )
-        .unwrap();
+    backend.validate_execution(model.executor()).unwrap();
+    let generation = model.initialize_generation(backend, sampling).unwrap();
+    scheduler.register(request, generation).unwrap();
     let mut input = vec![0; schedule.input_audio_codebooks()];
     input[0] = i32::try_from(rank).unwrap();
     scheduler
@@ -341,7 +309,7 @@ fn assert_schedule_disagreement_submits_nothing(
         Instant::now(),
         |_, frame, branch| {
             submissions.set(submissions.get() + 1);
-            backend.submit_realtime_frame(model, frame, branch)
+            submit_frame(backend, model, frame, branch)
         },
     );
     let error = match result {
@@ -369,22 +337,18 @@ fn moshi_ring_model_parity_worker() {
     let fixture = std::env::var_os(MODEL_WORKER_FIXTURE).unwrap();
     let expected_profile = std::env::var(MODEL_WORKER_PROFILE).unwrap();
     let device = DeviceAssignment::new(DeviceType::Cpu, 0);
-    let replicated_options = MlxLoadRequest::default();
-    let replicated_selected = MlxRealtimeExecutionContext::select_realtime_execution(
-        eredu_architectures::realtime::prepare_realtime_model(
-            &eredu_architectures::realtime::RealtimeArtifactRequest::safetensors(Path::new(
-                &fixture,
-            )),
-        )
-        .map(|artifact| match artifact {
-            eredu_architectures::realtime::PreparedRealtimeArtifact::Moshi(preparation) => {
-                preparation
-            }
-            _ => panic!("fixture must be a Moshi-family realtime artifact"),
-        })
-        .unwrap(),
-        &replicated_options,
-        false,
+    let preparation = eredu_architectures::realtime::prepare_realtime_model(
+        &eredu_architectures::realtime::RealtimeArtifactRequest::safetensors(Path::new(&fixture)),
+    )
+    .map(|artifact| match artifact {
+        eredu_architectures::realtime::PreparedRealtimeArtifact::Moshi(preparation) => preparation,
+        _ => panic!("fixture must be a Moshi-family realtime artifact"),
+    })
+    .unwrap();
+    let replicated_selected = eredu_architectures::moshi::prepare_moshi_realtime_with_support(
+        preparation.clone(),
+        &eredu_runtime::NormalizedLoadRequest::default(),
+        &crate::native::MlxRealtimeSupport::new(false),
     )
     .unwrap();
     let topology = eredu_core::ParallelRankTopology::new(
@@ -401,21 +365,11 @@ fn moshi_ring_model_parity_worker() {
         MlxLoadRequest::test_communication_completion_policy(),
     )
     .unwrap();
-    let parallel_selected = MlxRealtimeExecutionContext::select_realtime_execution(
-        eredu_architectures::realtime::prepare_realtime_model(
-            &eredu_architectures::realtime::RealtimeArtifactRequest::safetensors(Path::new(
-                &fixture,
-            )),
-        )
-        .map(|artifact| match artifact {
-            eredu_architectures::realtime::PreparedRealtimeArtifact::Moshi(preparation) => {
-                preparation
-            }
-            _ => panic!("fixture must be a Moshi-family realtime artifact"),
-        })
-        .unwrap(),
-        &parallel_options,
-        true,
+    let (request, native_rank) = parallel_options.checked_normalized().unwrap();
+    let parallel_selected = eredu_architectures::moshi::prepare_moshi_realtime_with_support(
+        preparation,
+        request,
+        &crate::native::MlxRealtimeSupport::new(true),
     )
     .unwrap();
 
@@ -430,7 +384,7 @@ fn moshi_ring_model_parity_worker() {
 
     let replicated_backend = MlxRealtimeExecutionContext::new(&stream, &weights_stream);
     let mut replicated = replicated_backend
-        .materialize_realtime_execution(replicated_selected)
+        .bind_realtime(replicated_selected, None)
         .unwrap();
     assert_eq!(
         replicated
@@ -446,7 +400,7 @@ fn moshi_ring_model_parity_worker() {
     let backend = MlxRealtimeExecutionContext::new(&stream, &weights_stream)
         .with_tensor_parallel_group(Arc::clone(&group));
     let mut parallel = backend
-        .materialize_realtime_execution(parallel_selected)
+        .bind_realtime(parallel_selected, native_rank)
         .unwrap();
     assert_eq!(
         parallel.execution_config().effective_model_type().as_str(),

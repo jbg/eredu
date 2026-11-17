@@ -18,56 +18,46 @@ pub use eredu_architectures::lfm3::audio::{
     AudioIngress, AudioIngressError, AudioIngressProgress, AudioIngressRequest,
     AudioIngressSnapshot, AudioPcmTranscription, AudioPcmTranscriptionSnapshot,
 };
-#[cfg(all(feature = "mlx", feature = "audio"))]
-pub use eredu_backend_mlx::native::{
-    MlxAudioIngress, MlxAudioIngressSnapshot, MlxAudioPcmTranscription,
-    MlxAudioPcmTranscriptionSnapshot,
-};
-#[cfg(feature = "mlx")]
-pub use eredu_backend_mlx::native::{
-    MlxAudioModel, MlxAudioSession, MlxAudioSnapshot, MlxAudioTranscription,
-    MlxAudioTranscriptionSnapshot,
-};
-
 pub use eredu_architectures::voicechat::precision::{SpeechFloat, SpeechPrecision};
 
 pub use crate::runtime::voicechat::{
     BoundVoiceChatFork, BoundVoiceChatSession, PreparedVoiceChatPhrase, PreparedVoiceChatPrompt,
-    PreparedVoiceChatSession, PreparedVoiceChatSessionParts, PreparedVoiceChatToolResponse,
-    VoiceChatAdvance, VoiceChatAgentText, VoiceChatBlocked, VoiceChatConversation,
-    VoiceChatConversationError, VoiceChatConversationOutput, VoiceChatDecodeError,
-    VoiceChatDecodeLimits, VoiceChatExecutionError, VoiceChatExecutionInputs, VoiceChatExecutor,
-    VoiceChatFork, VoiceChatInitialReminder, VoiceChatInputConfig, VoiceChatInputError,
-    VoiceChatInputPermit, VoiceChatInputSender, VoiceChatInputStatus, VoiceChatLoadingError,
+    PreparedVoiceChatSession, PreparedVoiceChatToolResponse, VoiceChatAdvance, VoiceChatAgentText,
+    VoiceChatBlocked, VoiceChatConversation, VoiceChatConversationError,
+    VoiceChatConversationOutput, VoiceChatDecodeError, VoiceChatDecodeLimits,
+    VoiceChatExecutionError, VoiceChatExecutionInputs, VoiceChatExecutor, VoiceChatFork,
+    VoiceChatInitialReminder, VoiceChatInputConfig, VoiceChatInputError, VoiceChatInputPermit,
+    VoiceChatInputSender, VoiceChatInputStatus, VoiceChatLoadSelection, VoiceChatLoadingError,
     VoiceChatPhrasePolicy, VoiceChatPreparation, VoiceChatPublicationAdmission,
     VoiceChatPublicationBranch, VoiceChatPublicationCapacity, VoiceChatPublicationError,
     VoiceChatPublicationLimits, VoiceChatPublicationPermit, VoiceChatPublicationReceiver,
     VoiceChatPublicationState, VoiceChatPublicationUsage, VoiceChatReminderPlayback,
     VoiceChatReminderStep, VoiceChatSession, VoiceChatSessionConfig, VoiceChatSessionError,
     VoiceChatSessionFailure, VoiceChatSessionProgress, VoiceChatSessionSnapshot,
-    VoiceChatSessionStatus, VoiceChatSnapshotError, VoiceChatSpeechOptions, VoiceChatStartOptions,
-    VoiceChatSubmittedWork, VoiceChatTextError, VoiceChatTextKind, VoiceChatTextLimits,
-    VoiceChatTextPreparation, VoiceChatToolAudioPolicy, VoiceChatToolBatch, VoiceChatToolChannel,
-    VoiceChatToolError, VoiceChatToolLimits, VoiceChatToolTicket, VoiceChatToolWait,
-    VoiceChatToolWaitAction, VoiceChatToolWaitError, VoiceChatToolWaitMessages,
-    VoiceChatToolWaitPolicy, VoiceChatTranscriptionText, VoiceChatTurnAdmission,
-    VoiceChatTurnError, VoiceChatTurnEvent, VoiceChatTurnIdentity, VoiceChatTurnLimits,
-    VoiceChatTurnPolicy, VoiceChatTurnResolver, VoiceChatTurnTaking, VoiceChatWork,
-    VoiceChatWorkKind,
+    VoiceChatSessionStatus, VoiceChatSnapshotError, VoiceChatSpeechOptions, VoiceChatStartError,
+    VoiceChatStartOptions, VoiceChatStartupInputs, VoiceChatSubmittedWork, VoiceChatTextError,
+    VoiceChatTextKind, VoiceChatTextLimits, VoiceChatTextPreparation, VoiceChatToolAudioPolicy,
+    VoiceChatToolBatch, VoiceChatToolChannel, VoiceChatToolError, VoiceChatToolLimits,
+    VoiceChatToolTicket, VoiceChatToolWait, VoiceChatToolWaitAction, VoiceChatToolWaitError,
+    VoiceChatToolWaitMessages, VoiceChatToolWaitPolicy, VoiceChatTranscriptionText,
+    VoiceChatTurnAdmission, VoiceChatTurnError, VoiceChatTurnEvent, VoiceChatTurnIdentity,
+    VoiceChatTurnLimits, VoiceChatTurnPolicy, VoiceChatTurnResolver, VoiceChatTurnTaking,
+    VoiceChatWork, VoiceChatWorkKind,
 };
 
 mod loading;
-pub use loading::{AudioParameterResidency, RealtimeLoadOptions, SpeechSessionOptions};
+mod selection;
+pub use loading::{RealtimeLoadOptions, SpeechSessionOptions};
+pub use selection::{
+    prepare_realtime_selection, PreparedRealtimeSelection, PreparedSpeechResources,
+    PreparedSpeechSelection, RealtimeLoadError,
+};
 #[cfg(feature = "mlx")]
 mod selected;
 #[cfg(feature = "mlx")]
-pub use crate::runtime::voicechat::{
-    submit_mlx_voicechat, MlxVoiceChatExecutor, MlxVoiceChatSession, VoiceChatStartError,
-};
+pub use crate::runtime::voicechat::{MlxVoiceChatExecutor, MlxVoiceChatSession};
 #[cfg(feature = "mlx")]
-pub use selected::{
-    prepare_mlx_realtime, LoadedMlxRealtime, PreparedMlxRealtime, RealtimeLoadError,
-};
+pub use selected::{prepare_mlx_realtime, LoadedMlxRealtime, PreparedMlxRealtime};
 
 pub use eredu_architectures::realtime::{
     prepare_realtime_model, PreparedRealtimeArtifact, RealtimeArtifactRequest,

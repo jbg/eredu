@@ -1744,3 +1744,34 @@ mod integer_history_tests;
 #[cfg(test)]
 #[path = "tests/qsa_partial.rs"]
 mod qsa_partial_tests;
+
+impl eredu_nn::RetainedTensorRoots<MlxTensor> for MlxHybridState {
+    fn visit_retained_tensors<'a>(&'a self, visitor: &mut dyn FnMut(&'a MlxTensor)) {
+        self.layers
+            .iter()
+            .flat_map(RuntimeLayerState::<MlxNeuralBackend>::retained_values)
+            .for_each(visitor);
+    }
+}
+
+impl eredu_runtime::DecoderPipelineState<MlxNeuralBackend> for MlxHybridState {
+    fn allocate_pipeline_state(
+        layout: StateLayout,
+        first_global_layer: usize,
+    ) -> Result<Self, eredu_core::BackendFailure> {
+        Self::device_with_global_layer_start(layout, first_global_layer, &[])
+            .map_err(eredu_core::BackendFailure::from_error)
+    }
+
+    fn fork_pipeline_state(
+        &self,
+        context: &safemlx::Stream,
+    ) -> Result<Self, eredu_core::BackendFailure> {
+        self.fork_prediction_target_state(context)
+            .map_err(eredu_core::BackendFailure::from_error)
+    }
+
+    fn pipeline_offset(&self) -> i32 {
+        self.offset()
+    }
+}

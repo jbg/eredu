@@ -329,6 +329,17 @@ pub(super) fn transformer_component_definition_with_state(
     )?)
 }
 
+impl<B: NeuralBackend, C: RuntimeLayerState<B>, D: DerefMut<Target = [C]>>
+    eredu_nn::RetainedTensorRoots<B::Tensor> for TransformerRuntimeState<'_, B, C, D>
+{
+    fn visit_retained_tensors<'a>(&'a self, visitor: &mut dyn FnMut(&'a B::Tensor)) {
+        self.caches
+            .iter()
+            .flat_map(RuntimeLayerState::<B>::retained_values)
+            .for_each(visitor);
+    }
+}
+
 /// Embedded input for either transformer invocation, with explicit key visibility.
 pub struct TransformerInput<'a, T> {
     /// Embedded batch, sequence and hidden features.
@@ -861,12 +872,12 @@ where
         &mut self,
         _: usize,
         initial: &B::Tensor,
-        dependencies: &[&B::Tensor],
+        dependencies: &eredu_runtime::GroupDependencies<'_, B::Tensor>,
         _: &mut TransformerRuntimeState<'_, B, C, D>,
         _: &mut Self::ForwardContext,
         _: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, TransformerError> {
-        Ok(dependencies.first().copied().unwrap_or(initial).clone())
+        Ok(dependencies.only().unwrap_or(initial).clone())
     }
     fn execute(
         &mut self,
@@ -1177,83 +1188,159 @@ where
     }
 }
 
-/// Selected rank-local transformer operations over explicit caller-owned caches.
-pub trait ParallelTransformerExecution<B: NeuralBackend>: TransformerExecution<B> {
-    /// Advances the selected causal stack using its local cache geometry.
-    fn forward_causal_parallel<C: AttentionCache<B::Tensor> + RuntimeLayerState<B>>(
-        &mut self,
-        embedded: &B::Tensor,
-        caches: &mut [C],
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, TransformerError>;
-    /// Runs character attention with the retained padding and local masks.
-    fn forward_encoder_parallel(
-        &mut self,
-        embedded: &B::Tensor,
-        key_mask: &B::Tensor,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, TransformerError>;
-}
-
-impl<B, P> ParallelTransformerExecution<B>
-    for LayerwiseRuntime<
+/// Bound TTS transformer weights with externally owned attention caches.
+pub struct BoundTransformer<B, P, C>
+where
+    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    P: LayerwisePolicy<B, TransformerUnit<B>>,
+{
+    units: eredu_runtime::BoundLayerwiseComponent<
         ComponentAdapter<ComponentDefinition, TransformerKernel<B>>,
         B,
-        TransformerStateMarker<B>,
         P,
-    >
+        C,
+        TransformerStateMarker<B>,
+    >,
+}
+
+impl<B, P, C> BoundTransformer<B, P, C>
 where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     P: LayerwisePolicy<B, TransformerUnit<B>>,
     P::Error: std::error::Error + Send + Sync + 'static,
 {
-    /// Runs the selected rank-local causal stack through shared bounded traversal.
-    fn forward_causal_parallel<C: AttentionCache<B::Tensor> + RuntimeLayerState<B>>(
+    pub(super) fn new(
+        units: eredu_runtime::BoundLayerwiseComponent<
+            ComponentAdapter<ComponentDefinition, TransformerKernel<B>>,
+            B,
+            P,
+            C,
+            TransformerStateMarker<B>,
+        >,
+    ) -> Self {
+        Self { units }
+    }
+
+    /// Selected cache geometry for allocating caller-owned state.
+    pub fn state_layout(&self) -> &StateLayout {
+        self.units.architecture().kernel().definition.state_layout()
+    }
+}
+
+impl<B, P, C> BoundTransformer<B, P, C>
+where
+    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    P: LayerwisePolicy<B, TransformerUnit<B>>,
+    P::Error: std::error::Error + Send + Sync + 'static,
+    C: eredu_runtime::LayeredTensorCohort<B>,
+{
+    fn execute<Cache>(
         &mut self,
         embedded: &B::Tensor,
-        caches: &mut [C],
-        parallel: &B::ParallelContext,
+        key_mask: Option<&B::Tensor>,
+        caches: &mut [Cache],
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, TransformerError> {
-        let mut state = TransformerRuntimeState::<B, C>::for_architecture(
-            self.architecture().kernel(),
+    ) -> Result<B::Tensor, TransformerError>
+    where
+        Cache: AttentionCache<B::Tensor> + RuntimeLayerState<B>,
+    {
+        let mut state = TransformerRuntimeState::<B, Cache>::for_architecture(
+            self.units.architecture().kernel(),
             caches,
         )?;
-        self.forward_parallel_with_state(
-            TransformerInput {
-                embedded,
-                key_mask: None,
-            },
-            &mut state,
-            parallel,
-            context,
-        )
-        .map_err(runtime_error)
+        if let Some(cohort) = self.units.cohort() {
+            let [batch, positions, width] = embedded.shape().try_into().unwrap_or([-1; 3]);
+            let offset = state.causal_position();
+            let accepted = cohort.agree(
+                [
+                    0x5454535452414e53,
+                    batch as u64,
+                    positions as u64,
+                    width as u64,
+                    u64::from(key_mask.is_some()),
+                    offset.as_ref().copied().unwrap_or(-1) as u64,
+                    0,
+                    0,
+                ],
+                offset.is_ok(),
+                context,
+            );
+            offset?;
+            if !accepted? {
+                return Err(TransformerError::Configuration(
+                    "TTS transformer cohort input or cache frontier differs",
+                ));
+            }
+        }
+        self.units
+            .forward_with_state(TransformerInput { embedded, key_mask }, &mut state, context)
+            .map_err(runtime_error)
     }
-    /// Runs rank-local character attention with the same padding and local masks.
-    fn forward_encoder_parallel(
+}
+
+impl<B, P, C> eredu_runtime::UnitPolicyResidency for BoundTransformer<B, P, C>
+where
+    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    P: LayerwisePolicy<B, TransformerUnit<B>> + eredu_runtime::UnitPolicyResidency,
+    P::Error: std::fmt::Display,
+{
+    fn residency(&self) -> Result<eredu_runtime::ResidencyReport, BackendFailure> {
+        self.units.residency()
+    }
+
+    fn dense_stream_report(
+        &self,
+    ) -> Result<Option<eredu_runtime::DenseDiskStreamReport>, BackendFailure> {
+        self.units.dense_stream_report()
+    }
+}
+
+impl<B, P, C> TransformerExecution<B> for BoundTransformer<B, P, C>
+where
+    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    P: LayerwisePolicy<B, TransformerUnit<B>> + eredu_runtime::ImmutableParameterPolicy<B>,
+    P::Error: std::error::Error + Send + Sync + 'static,
+    C: eredu_runtime::LayeredTensorCohort<B>,
+{
+    fn immutable_parameters_identity(
+        &self,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Option<&eredu_core::resources::ResourceIdentity> {
+        self.units.immutable_parameters_identity(context)
+    }
+
+    fn config(&self) -> &TransformerConfig {
+        self.units.architecture().kernel().config()
+    }
+
+    fn forward_encoder(
         &mut self,
         embedded: &B::Tensor,
         key_mask: &B::Tensor,
-        parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, TransformerError> {
-        let mut empty = [];
-        let mut state = TransformerRuntimeState::<B, NoTransformerCache<B>>::for_architecture(
-            self.architecture().kernel(),
-            &mut empty,
-        )?;
-        self.forward_parallel_with_state(
-            TransformerInput {
-                embedded,
-                key_mask: Some(key_mask),
-            },
-            &mut state,
-            parallel,
-            context,
-        )
-        .map_err(runtime_error)
+        self.execute::<NoTransformerCache<B>>(embedded, Some(key_mask), &mut [], context)
+    }
+}
+
+impl<B, P, C, Cache> CausalTransformerExecution<B, [Cache]> for BoundTransformer<B, P, C>
+where
+    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    P: LayerwisePolicy<B, TransformerUnit<B>> + eredu_runtime::ImmutableParameterPolicy<B>,
+    P::Error: std::error::Error + Send + Sync + 'static,
+    C: eredu_runtime::LayeredTensorCohort<B>,
+    Cache: AttentionCache<B::Tensor> + RuntimeLayerState<B>,
+{
+    fn causal_position(&self, caches: &[Cache]) -> Result<i32, TransformerError> {
+        validate_causal_caches::<B, Cache>(self.config(), caches)
+    }
+
+    fn forward_causal(
+        &mut self,
+        embedded: &B::Tensor,
+        caches: &mut [Cache],
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, TransformerError> {
+        self.execute(embedded, None, caches, context)
     }
 }

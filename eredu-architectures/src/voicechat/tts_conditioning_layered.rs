@@ -701,14 +701,14 @@ impl<B: NeuralBackend> ComponentEquations<B, StatelessComponentState> for Condit
         &mut self,
         group: usize,
         initial: &B::Tensor,
-        dependencies: &[&B::Tensor],
+        dependencies: &eredu_runtime::GroupDependencies<'_, B::Tensor>,
         _: &mut StatelessComponentState,
         _: &mut Self::ForwardContext,
         _: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, TtsError> {
-        match (group, dependencies) {
-            (0, []) => Ok(initial.clone()),
-            (1 | 2, [one]) => Ok((*one).clone()),
+        match (group, dependencies.only()) {
+            (0, None) => Ok(initial.clone()),
+            (1 | 2, Some(one)) => Ok(one.clone()),
             _ => Err(TtsError::Configuration(
                 "conditioning graph dependency mismatch",
             )),
@@ -1029,37 +1029,45 @@ impl<B: DistributedNeuralBackend> ConditioningKernel<B> {
 }
 
 fn gather_features<B: DistributedNeuralBackend>(
-    local: B::Tensor,
+    local: Result<B::Tensor, TtsError>,
     start: i32,
     width: i32,
     parallel: &B::ParallelContext,
     context: &<B::Tensor as Tensor>::Context,
+    agree: impl FnOnce(bool) -> Result<bool, TtsError>,
 ) -> Result<B::Tensor, TtsError> {
-    let mut shape = local.shape().to_vec();
-    let axis = shape.len().checked_sub(1).ok_or(TtsError::Shape(
-        "conditioning projection must have feature axis",
-    ))?;
-    let end = start + shape[axis];
-    if start < 0 || end > width {
-        return Err(TtsError::Shape(
-            "conditioning projection exceeds feature partition",
+    let padded = (|| {
+        let local = local?;
+        let mut shape = local.shape().to_vec();
+        let axis = shape.len().checked_sub(1).ok_or(TtsError::Shape(
+            "conditioning projection must have feature axis",
+        ))?;
+        let end = start + shape[axis];
+        if start < 0 || end > width {
+            return Err(TtsError::Shape(
+                "conditioning projection exceeds feature partition",
+            ));
+        }
+        let mut pieces = Vec::with_capacity(3);
+        if start > 0 {
+            shape[axis] = start;
+            pieces.push(B::Tensor::full_f32(0.0, &shape, context)?);
+        }
+        pieces.push(local);
+        if end < width {
+            shape[axis] = width - end;
+            pieces.push(B::Tensor::full_f32(0.0, &shape, context)?);
+        }
+        Ok::<_, TtsError>(B::Tensor::concatenate(&pieces, -1, context)?)
+    })();
+    let accepted = agree(padded.is_ok());
+    let padded = padded?;
+    if !accepted? {
+        return Err(TtsError::Configuration(
+            "conditioning peer rejected collective preparation",
         ));
     }
-    let mut pieces = Vec::with_capacity(3);
-    if start > 0 {
-        shape[axis] = start;
-        pieces.push(B::Tensor::full_f32(0.0, &shape, context)?);
-    }
-    pieces.push(local);
-    if end < width {
-        shape[axis] = width - end;
-        pieces.push(B::Tensor::full_f32(0.0, &shape, context)?);
-    }
-    Ok(B::sum_parallel(
-        B::Tensor::concatenate(&pieces, -1, context)?,
-        parallel,
-        context,
-    )?)
+    Ok(B::sum_parallel(padded, parallel, context)?)
 }
 
 impl<B: DistributedNeuralBackend> ParallelComponentKernel<B, eredu_runtime::StatelessComponentState>
@@ -1085,7 +1093,26 @@ impl<B: DistributedNeuralBackend> ParallelComponentKernel<B, eredu_runtime::Stat
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, TtsError> {
+        self.execute_coordinated(unit, forward, parallel, context, |_, ready| Ok(ready))
+    }
+}
+
+impl<B: DistributedNeuralBackend> ConditioningKernel<B> {
+    fn execute_coordinated(
+        &mut self,
+        unit: &mut ConditioningUnit<B>,
+        forward: &mut ConditioningForward<B::Tensor>,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        mut agree: impl FnMut([u64; 8], bool) -> Result<bool, TtsError>,
+    ) -> Result<B::Tensor, TtsError> {
         let local = self.local();
+        let mut ordinal = 0;
+        let mut agree_next = |ready| {
+            let current = ordinal;
+            ordinal += 1;
+            agree([0x434f4e4447415448, current, 0, 0, 0, 0, 0, 0], ready)
+        };
         let gather = |value| {
             gather_features::<B>(
                 value,
@@ -1093,16 +1120,18 @@ impl<B: DistributedNeuralBackend> ParallelComponentKernel<B, eredu_runtime::Stat
                 self.dimensions.character.output_width,
                 parallel,
                 context,
+                &mut agree_next,
             )
         };
         match (&forward.input, unit) {
             (ConditioningInput::CharacterEmbed(batch), ConditioningUnit::Character(character)) => {
                 gather_features::<B>(
-                    character.embed(batch, context)?,
+                    character.embed(batch, context),
                     local.character_start,
                     self.dimensions.character.width,
                     parallel,
                     context,
+                    &mut agree_next,
                 )
             }
             (
@@ -1160,62 +1189,195 @@ impl<B: DistributedNeuralBackend> ParallelComponentKernel<B, eredu_runtime::Stat
     }
 }
 
-/// Tensor-parallel conditioning phases over independently leased learned units.
-/// Implementors supply typed invocation; phase conveniences retain inputs and lanes
-/// through that same ordinary completion lifecycle.
-pub trait ParallelConditioningExecution<B: DistributedNeuralBackend>:
-    ConditioningExecution<B>
+/// Bound character, ingress and fusion units with an optional tensor cohort.
+pub struct BoundConditioning<B, P, C>
+where
+    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    P: LayerwisePolicy<B, ConditioningUnit<B>>,
 {
-    /// Executes a selected phase with the retained rank-local geometry and communicator.
-    fn invoke_parallel(
+    units: eredu_runtime::BoundStatelessComponent<
+        ComponentAdapter<ComponentDefinition, ConditioningKernel<B>>,
+        B,
+        P,
+        C,
+    >,
+}
+
+impl<B, P, C> BoundConditioning<B, P, C>
+where
+    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    P: LayerwisePolicy<B, ConditioningUnit<B>>,
+{
+    pub(super) fn new(
+        units: eredu_runtime::BoundStatelessComponent<
+            ComponentAdapter<ComponentDefinition, ConditioningKernel<B>>,
+            B,
+            P,
+            C,
+        >,
+    ) -> Self {
+        Self { units }
+    }
+}
+
+impl<B, P, C> eredu_runtime::UnitPolicyResidency for BoundConditioning<B, P, C>
+where
+    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    P: LayerwisePolicy<B, ConditioningUnit<B>> + eredu_runtime::UnitPolicyResidency,
+    P::Error: std::fmt::Display,
+{
+    fn residency(&self) -> Result<eredu_runtime::ResidencyReport, BackendFailure> {
+        self.units.residency()
+    }
+
+    fn dense_stream_report(
+        &self,
+    ) -> Result<Option<eredu_runtime::DenseDiskStreamReport>, BackendFailure> {
+        self.units.dense_stream_report()
+    }
+}
+
+impl<B, P, C> BoundConditioning<B, P, C>
+where
+    B: DistributedNeuralBackend
+        + SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    P: LayerwisePolicy<B, ConditioningUnit<B>>,
+    P::Error: std::error::Error + Send + Sync + 'static,
+    C: eredu_runtime::LayeredTensorCohort<B>,
+{
+    fn execute(
         &mut self,
         input: ConditioningInput<B::Tensor>,
-        parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<(B::Tensor, ConditioningForward<B::Tensor>), TtsError>;
+    ) -> Result<(B::Tensor, ConditioningForward<B::Tensor>), TtsError> {
+        let (runtime, cohort) = self.units.parts_mut();
+        let mut state = StatelessComponentState::new()?;
+        if let Some(cohort) = cohort {
+            let (phase, shape, guidance) = match &input {
+                ConditioningInput::CharacterEmbed(batch) => {
+                    (0, [batch.shape()[0], batch.shape()[1], 0], false)
+                }
+                ConditioningInput::CharacterFinish(_, hidden) => {
+                    (1, agreement_shape(hidden), false)
+                }
+                ConditioningInput::Prefill {
+                    embedded,
+                    speaker,
+                    guidance,
+                    ..
+                } => {
+                    let phase = match speaker {
+                        SpeakerPrompt::Aria => 2,
+                        SpeakerPrompt::ProjectedCodes => 3,
+                    };
+                    (phase, agreement_shape(embedded), *guidance)
+                }
+                ConditioningInput::Decode {
+                    embedded, guidance, ..
+                } => (4, agreement_shape(embedded), *guidance),
+                ConditioningInput::Fuse(audio, _) => (5, agreement_shape(audio), false),
+            };
+            if !cohort.agree(
+                [
+                    0x434f4e44494e5054,
+                    phase,
+                    shape[0] as u64,
+                    shape[1] as u64,
+                    shape[2] as u64,
+                    u64::from(guidance),
+                    0,
+                    0,
+                ],
+                true,
+                context,
+            )? {
+                return Err(TtsError::Configuration(
+                    "conditioning cohort invocation differs",
+                ));
+            }
+            runtime
+                .forward_parallel_with_unit_executor_and_traversal_hook(
+                    input,
+                    &mut state,
+                    cohort.parallel_context(),
+                    context,
+                    |architecture, _, _, unit, _, _, forward, parallel, context| {
+                        architecture.kernel_mut().execute_coordinated(
+                            unit,
+                            forward,
+                            parallel,
+                            context,
+                            |descriptor, ready| {
+                                cohort.agree(descriptor, ready, context).map_err(Into::into)
+                            },
+                        )
+                    },
+                    &mut cohort.traversal_hook(),
+                )
+                .map_err(runtime_error)
+        } else {
+            runtime
+                .invoke_with_context(input, &mut state, context)
+                .map_err(runtime_error)
+        }
+    }
+}
 
-    /// Looks up and gathers the complete character backbone input.
-    fn character_embed_parallel(
+fn agreement_shape<T: Tensor>(tensor: &T) -> [i32; 3] {
+    tensor.shape().try_into().unwrap_or([-1; 3])
+}
+
+impl<B, P, C> ConditioningExecution<B> for BoundConditioning<B, P, C>
+where
+    B: DistributedNeuralBackend
+        + SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    P: LayerwisePolicy<B, ConditioningUnit<B>> + eredu_runtime::ImmutableParameterPolicy<B>,
+    P::Error: std::error::Error + Send + Sync + 'static,
+    C: eredu_runtime::LayeredTensorCohort<B>,
+{
+    fn immutable_parameters_identity(
+        &self,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Option<&eredu_core::resources::ResourceIdentity> {
+        self.units.immutable_parameters_identity(context)
+    }
+
+    fn dimensions(&self) -> ConditioningDimensions {
+        self.units.architecture().kernel().dimensions()
+    }
+
+    fn character_embed(
         &mut self,
         batch: &CharacterBatch,
-        parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, TtsError> {
-        self.invoke_parallel(
-            ConditioningInput::CharacterEmbed(batch.clone()),
-            parallel,
-            context,
-        )
-        .map(|(output, _)| output)
+        self.execute(ConditioningInput::CharacterEmbed(batch.clone()), context)
+            .map(|(output, _)| output)
     }
-    /// Gathers pooled projections before scatter and replicated flag additions.
-    fn character_finish_parallel(
+
+    fn character_finish(
         &mut self,
         batch: &CharacterBatch,
         hidden: &B::Tensor,
-        parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, TtsError> {
-        self.invoke_parallel(
+        self.execute(
             ConditioningInput::CharacterFinish(batch.clone(), hidden.clone()),
-            parallel,
             context,
         )
         .map(|(output, _)| output)
     }
-    /// Gathers projected speaker codes before BOS substitution and guidance duplication.
-    #[allow(clippy::too_many_arguments)]
-    fn prefill_embedded_parallel(
+
+    fn prefill_embedded(
         &mut self,
         embedded: &B::Tensor,
         layout: &PromptLayout,
         speaker: SpeakerPrompt,
         conditioning: Option<&B::Tensor>,
         guidance: bool,
-        parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ConditioningLanes<B::Tensor>, TtsError> {
-        self.invoke_parallel(
+        self.execute(
             ConditioningInput::Prefill {
                 embedded: embedded.clone(),
                 layout: layout.clone(),
@@ -1223,73 +1385,41 @@ pub trait ParallelConditioningExecution<B: DistributedNeuralBackend>:
                 conditioning: conditioning.cloned(),
                 guidance,
             },
-            parallel,
             context,
         )?
         .1
         .into_lanes()
     }
-    /// Creates replicated decode guidance lanes under the selected rank-local lifecycle.
-    fn decode_embedded_parallel(
+
+    fn decode_embedded(
         &mut self,
         embedded: &B::Tensor,
         conditioning: Option<&B::Tensor>,
         guidance: bool,
-        parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ConditioningLanes<B::Tensor>, TtsError> {
-        self.invoke_parallel(
+        self.execute(
             ConditioningInput::Decode {
                 embedded: embedded.clone(),
                 conditioning: conditioning.cloned(),
                 guidance,
             },
-            parallel,
             context,
         )?
         .1
         .into_lanes()
     }
-    /// Gathers both affine projections before the feature gate and global RMSNorm.
-    fn fuse_parallel(
+
+    fn fuse(
         &mut self,
         audio: &B::Tensor,
         text: &B::Tensor,
-        parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, TtsError> {
-        self.invoke_parallel(
+        self.execute(
             ConditioningInput::Fuse(audio.clone(), text.clone()),
-            parallel,
             context,
         )
         .map(|(output, _)| output)
-    }
-}
-
-impl<B, P> ParallelConditioningExecution<B>
-    for LayerwiseRuntime<
-        ComponentAdapter<ComponentDefinition, ConditioningKernel<B>>,
-        B,
-        StatelessComponentState,
-        P,
-    >
-where
-    B: DistributedNeuralBackend
-        + SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
-    P: LayerwisePolicy<B, ConditioningUnit<B>>,
-    P::Error: std::error::Error + Send + Sync + 'static,
-{
-    fn invoke_parallel(
-        &mut self,
-        input: ConditioningInput<B::Tensor>,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<(B::Tensor, ConditioningForward<B::Tensor>), TtsError> {
-        let mut state = StatelessComponentState::new()?;
-        self.forward_parallel_with_context_hook(input, &mut state, parallel, context, |_, _, _| {
-            Ok(())
-        })
-        .map_err(runtime_error)
     }
 }

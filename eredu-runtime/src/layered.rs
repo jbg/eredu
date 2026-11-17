@@ -886,6 +886,64 @@ where
     }
 }
 
+/// Declared group input slots in graph order, keyed by producer. An inactive
+/// producer retains its slot without contributing a tensor to this invocation.
+pub struct GroupDependencies<'a, T> {
+    slots: Vec<(usize, Option<&'a T>)>,
+}
+
+impl<'a, T> GroupDependencies<'a, T> {
+    /// Captures values against the canonical declaration for a consumer.
+    pub fn new(producers: &[usize], mut output: impl FnMut(usize) -> Option<&'a T>) -> Self {
+        Self {
+            slots: producers
+                .iter()
+                .map(|&producer| (producer, output(producer)))
+                .collect(),
+        }
+    }
+
+    /// Input for a root group.
+    pub const fn empty() -> Self {
+        Self { slots: Vec::new() }
+    }
+
+    /// Looks up the value produced by a graph group for this invocation.
+    pub fn get(&self, producer: usize) -> Option<&'a T> {
+        self.slots
+            .iter()
+            .find(|(group, _)| *group == producer)
+            .and_then(|(_, value)| *value)
+    }
+
+    /// Producer identities, including inactive slots.
+    pub fn producers(&self) -> impl Iterator<Item = usize> + '_ {
+        self.slots.iter().map(|(group, _)| *group)
+    }
+
+    /// Values of active producers in graph order.
+    pub fn values(&self) -> impl Iterator<Item = &'a T> + '_ {
+        self.slots.iter().filter_map(|(_, value)| *value)
+    }
+
+    /// Returns the only active dependency when exactly one is present.
+    pub fn only(&self) -> Option<&'a T> {
+        let mut values = self.values();
+        let first = values.next()?;
+        values.next().is_none().then_some(first)
+    }
+
+    /// Number of active dependency values.
+    pub fn len(&self) -> usize {
+        self.values().count()
+    }
+
+    /// Whether there are no active dependency values.
+    pub fn is_empty(&self) -> bool {
+        self.values().next().is_none()
+    }
+}
+
 /// Backend-neutral lifecycle implemented once by a layered architecture.
 ///
 /// All hot values remain concrete associated types. Resident and bounded
@@ -1074,7 +1132,7 @@ where
         &mut self,
         group: usize,
         initial: &B::Tensor,
-        dependencies: &[&B::Tensor],
+        dependencies: &crate::GroupDependencies<'_, B::Tensor>,
         state: &mut S,
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
@@ -1085,28 +1143,17 @@ where
         true
     }
 
-    /// Maps one execution unit to its architecture-global mutable-state slot.
+    /// Returns the slots retained by one unit in the supplied runtime state.
     ///
-    /// The default matches a single flattened decoder schedule. Composite
-    /// architectures can keep parameter-only groups outside their state layout
-    /// and remap later groups onto their semantic decoder or predictor layers.
-    fn state_ordinal(&self, _group: usize, _index: usize, ordinal: usize) -> usize {
-        ordinal
-    }
-
-    /// Returns every architecture-global state slot retained by one unit.
-    ///
-    /// The default retains the single slot returned by [`Self::state_ordinal`].
-    /// Composite units can return a contiguous range when one residency unit
-    /// internally executes several stateful layers.
+    /// A partition returns rank-local slots. Composite units can retain several
+    /// slots or an empty range for a parameter-only unit.
     fn retained_state_ordinals(
         &self,
-        group: usize,
-        index: usize,
+        _group: usize,
+        _index: usize,
         ordinal: usize,
     ) -> std::ops::Range<usize> {
-        let state = self.state_ordinal(group, index, ordinal);
-        state..state + 1
+        ordinal..ordinal + 1
     }
 
     /// Executes one ordered unit against its concrete mutable layer state.
@@ -1291,7 +1338,7 @@ where
         &mut self,
         group_index: usize,
         initial: &B::Tensor,
-        dependencies: &[&B::Tensor],
+        dependencies: &crate::GroupDependencies<'_, B::Tensor>,
         state: &mut S,
         forward: &mut Self::ForwardContext,
         _parallel: &B::ParallelContext,
@@ -1491,13 +1538,20 @@ where
             Some(parallel) => self.begin_execution_group_parallel(
                 group,
                 initial,
-                &[],
+                &GroupDependencies::empty(),
                 state,
                 forward,
                 parallel,
                 context,
             ),
-            None => self.begin_execution_group(group, initial, &[], state, forward, context),
+            None => self.begin_execution_group(
+                group,
+                initial,
+                &GroupDependencies::empty(),
+                state,
+                forward,
+                context,
+            ),
         }
     }
 
@@ -2135,18 +2189,12 @@ where
         let mut schedule = ExecutionGroupSchedule::new(&self.graph);
         let mut outputs: Vec<Option<B::Tensor>> = vec![None; self.graph.groups().len()];
         for &group in self.graph.execution_order() {
-            let dependencies = schedule
-                .dependencies(group)
-                .expect("validated execution order contains a known group")
-                .iter()
-                .map(|&dependency| {
-                    outputs[dependency]
-                        .as_ref()
-                        .expect("topological dependency has completed")
-                        .clone()
-                })
-                .collect::<Vec<_>>();
-            let dependency_refs = dependencies.iter().collect::<Vec<_>>();
+            let dependency_refs = GroupDependencies::new(
+                schedule
+                    .dependencies(group)
+                    .expect("validated execution group"),
+                |producer| outputs[producer].as_ref(),
+            );
             let mut hidden = <A as LayeredArchitecture<B, S2>>::begin_execution_group(
                 &mut self.architecture,
                 group,
@@ -2163,11 +2211,12 @@ where
             {
                 outputs[dependency] = None;
             }
-            if <A as LayeredArchitecture<B, S2>>::should_execute_group(
+            let executes = <A as LayeredArchitecture<B, S2>>::should_execute_group(
                 &self.architecture,
                 group,
                 &forward_context,
-            ) {
+            );
+            if executes {
                 let range = self
                     .layout
                     .group_range(group)
@@ -2237,7 +2286,11 @@ where
                 context,
             )?;
             hook.after_group(group, &mut hidden, &mut forward_context, context)?;
-            outputs[group] = Some(hidden);
+            outputs[group] = (executes
+                || !<A as LayeredArchitecture<B, S2>>::group_transport(&self.architecture, group)
+                    .request_optional
+                || group == self.graph.output())
+            .then_some(hidden);
             schedule
                 .ordered(group)
                 .expect("started group can be ordered exactly once");
@@ -3306,18 +3359,12 @@ where
                 )
                 .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
             }
-            let dependencies = schedule
-                .dependencies(group)
-                .expect("validated execution order contains a known group")
-                .iter()
-                .map(|&dependency| {
-                    outputs[dependency]
-                        .as_ref()
-                        .expect("topological dependency has completed")
-                        .clone()
-                })
-                .collect::<Vec<_>>();
-            let dependency_refs = dependencies.iter().collect::<Vec<_>>();
+            let dependency_refs = GroupDependencies::new(
+                schedule
+                    .dependencies(group)
+                    .expect("validated execution group"),
+                |producer| outputs[producer].as_ref(),
+            );
             let mut hidden = <A as LayeredArchitecture<B, S2>>::begin_execution_group(
                 &mut self.architecture,
                 group,
@@ -3336,11 +3383,12 @@ where
             {
                 outputs[dependency] = None;
             }
-            if <A as LayeredArchitecture<B, S2>>::should_execute_group(
+            let executes = <A as LayeredArchitecture<B, S2>>::should_execute_group(
                 &self.architecture,
                 group,
                 &forward_context,
-            ) {
+            );
+            if executes {
                 let range = layout
                     .group_range(group)
                     .expect("layout covers every graph group");
@@ -3444,18 +3492,18 @@ where
             .map_err(LayerwiseRuntimeError::Architecture)?;
             hook.after_group(group, &mut hidden, &mut forward_context, executor)
                 .map_err(LayerwiseRuntimeError::Architecture)?;
-            outputs[group] = Some(hidden);
+
             if !deferred_serial && graph.groups().len() > 1 {
                 completions[group] = Some(
-                    B::submit(
-                        executor,
-                        [outputs[group]
-                            .as_ref()
-                            .expect("group output was stored before submission")],
-                    )
-                    .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?,
+                    B::submit(executor, [&hidden])
+                        .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?,
                 );
             }
+            outputs[group] = (executes
+                || !<A as LayeredArchitecture<B, S2>>::group_transport(&self.architecture, group)
+                    .request_optional
+                || group == graph.output())
+            .then_some(hidden);
             schedule
                 .ordered(group)
                 .expect("started group can be ordered exactly once");
@@ -3875,15 +3923,14 @@ where
         )
     }
 
-    /// Runs the shared parallel traversal against a caller-borrowed compatible
-    /// state owner. Parameter units, leases, observations and completion use the
-    /// same lifecycle as `forward_parallel`; only the mutable state borrow differs.
-    pub fn forward_parallel_with_state<'a, S2>(
+    /// Runs with a caller-borrowed state and explicit cohort traversal agreement.
+    pub(crate) fn forward_parallel_with_state_hook<'a, S2, H>(
         &mut self,
         input: <A as LayeredArchitecture<B, S2>>::Input<'a>,
         state: &mut S2,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        hook: &mut H,
     ) -> Result<B::Tensor, LayerwiseRuntimeError<<A as LayeredArchitecture<B, S>>::Error, P::Error>>
     where
         S2: RuntimeState<B>,
@@ -3894,6 +3941,11 @@ where
                 Unit = <A as LayeredArchitecture<B, S>>::Unit,
                 Error = <A as LayeredArchitecture<B, S>>::Error,
             >,
+        H: LayeredTraversalHook<
+                B,
+                <A as LayeredArchitecture<B, S2>>::ForwardContext,
+                <A as LayeredArchitecture<B, S2>>::Error,
+            > + ?Sized,
     {
         self.forward_parallel_with_unit_executor_and_traversal_hook_impl(
             input,
@@ -3913,7 +3965,7 @@ where
                     context,
                 )
             },
-            &mut NoopLayeredTraversalHook,
+            hook,
             false,
         )
         .map(|(output, _)| output)
@@ -4039,18 +4091,12 @@ where
                     )
                     .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
                 }
-                let dependencies = schedule
-                    .dependencies(group)
-                    .expect("validated execution order contains a known group")
-                    .iter()
-                    .map(|&dependency| {
-                        outputs[dependency]
-                            .as_ref()
-                            .expect("topological dependency has completed")
-                            .clone()
-                    })
-                    .collect::<Vec<_>>();
-                let dependency_refs = dependencies.iter().collect::<Vec<_>>();
+                let dependency_refs = GroupDependencies::new(
+                    schedule
+                        .dependencies(group)
+                        .expect("validated execution group"),
+                    |producer| outputs[producer].as_ref(),
+                );
                 let mut hidden =
                     <A as ParallelLayeredArchitecture<B, S2>>::begin_execution_group_parallel(
                         &mut self.architecture,
@@ -4079,11 +4125,12 @@ where
             {
                 outputs[dependency] = None;
             }
-            if <A as LayeredArchitecture<B, S2>>::should_execute_group(
+            let executes = <A as LayeredArchitecture<B, S2>>::should_execute_group(
                 &self.architecture,
                 group,
                 &forward_context,
-            ) {
+            );
+            if executes {
                 let range = layout
                     .group_range(group)
                     .expect("layout covers every graph group");
@@ -4224,18 +4271,21 @@ where
                     .map_err(LayerwiseRuntimeError::Architecture)?;
                 hook.after_group(group, &mut hidden, &mut forward_context, executor)
                     .map_err(LayerwiseRuntimeError::Architecture)?;
-                outputs[group] = Some(hidden);
+
                 if graph.groups().len() > 1 {
-                    completions[group] = Some(
-                        B::submit(
-                            executor,
-                            [outputs[group]
-                                .as_ref()
-                                .expect("group output was stored before submission")],
-                        )
-                        .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?,
-                    );
+                    completions[group] =
+                        Some(B::submit(executor, [&hidden]).map_err(|error| {
+                            LayerwiseRuntimeError::Submission(error.to_string())
+                        })?);
                 }
+                outputs[group] = (executes
+                    || !<A as LayeredArchitecture<B, S2>>::group_transport(
+                        &self.architecture,
+                        group,
+                    )
+                    .request_optional
+                    || group == graph.output())
+                .then_some(hidden);
                 Ok(())
             })();
             agree_layered_local(
