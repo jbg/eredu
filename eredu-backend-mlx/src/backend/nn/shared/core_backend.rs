@@ -258,17 +258,14 @@ impl NeuralBackend for MlxNeuralBackend {
         })
     }
 
-    fn rotary(spec: RotarySpec, context: &Stream) -> Result<MlxRotary, ComputeError> {
-        let native = compute(rope::initialize_rope(
-            spec.dimensions,
-            spec.base,
-            spec.traditional,
-            spec.algorithm,
-            context,
-        ))?;
+    fn rotary(
+        spec: eredu_nn::PreparedRotarySpec,
+        context: &Stream,
+    ) -> Result<MlxRotary, ComputeError> {
+        let native = compute(rope::initialize_rope(&spec, context))?;
         let explicit = if spec.arithmetic != eredu_nn::RotaryArithmetic::Native {
             Some(compute(rope::ElementwiseRotary::new(
-                spec, &native, context,
+                &spec, &native, context,
             ))?)
         } else {
             None

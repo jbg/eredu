@@ -19,7 +19,7 @@ use crate::backend::runtime::media::{PreparedModelInput, ProcessorPreparationErr
 /// Architecture-erased media processor selected during model composition.
 #[derive(Debug, Clone)]
 #[cfg(any(feature = "image", feature = "audio"))]
-pub(crate) struct ModelProcessor {
+pub struct ModelProcessor {
     processor: PreparedProcessor,
 }
 
@@ -352,7 +352,7 @@ mod processor_tests {
 #[cfg(any(feature = "image", feature = "audio"))]
 impl ModelProcessor {
     /// Wraps a processor already prepared by the architecture construction driver.
-    pub(crate) fn from_prepared(processor: PreparedProcessor) -> Self {
+    pub fn from_prepared(processor: PreparedProcessor) -> Self {
         Self { processor }
     }
 
@@ -364,9 +364,33 @@ impl ModelProcessor {
         PreparedProcessor::from_artifact(plan).map(|processor| Self { processor })
     }
 
+    /// Prepares a portable request with the retained processor and semantic identity.
+    pub fn prepare<E>(
+        &self,
+        request: &TokenizedMultimodalRequest,
+        encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
+    ) -> Result<
+        PreparedModelInput,
+        eredu_core::MultimodalPreparationFailure<eredu_core::BackendFailure, E>,
+    >
+    where
+        E: std::error::Error + 'static,
+    {
+        use eredu_core::MultimodalPreparationFailure as Failure;
+
+        self.prepare_portable_input(request, encode_text)
+            .map_err(|error| match error {
+                ProcessorPreparationError::Capability(error) => Failure::Capability(error),
+                ProcessorPreparationError::Backend(error) => {
+                    Failure::Backend(eredu_core::BackendFailure::from_error(error))
+                }
+                ProcessorPreparationError::Text(error) => Failure::Text(error),
+            })
+    }
+
     /// Converts a portable ordered request into owned MLX model input.
     #[cfg(any(feature = "image", feature = "audio"))]
-    pub fn prepare_portable_input<E>(
+    pub(crate) fn prepare_portable_input<E>(
         &self,
         request: &TokenizedMultimodalRequest,
         encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
@@ -383,7 +407,7 @@ impl ModelProcessor {
     }
 
     /// Converts a portable request while exposing processor output before admission.
-    pub fn prepare_portable_input_with_observer<E>(
+    pub(crate) fn prepare_portable_input_with_observer<E>(
         &self,
         request: &TokenizedMultimodalRequest,
         encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
@@ -488,5 +512,39 @@ where
             .intervene(path, value)
             .map(|replacement| replacement.map(|tensor| self.roots.retain(tensor)))
             .map_err(|error| ProcessorExecutionError::Mechanism(Error::from(error)))
+    }
+}
+
+/// Lowers an independently selected portable media processor through MLX.
+#[cfg(any(feature = "image", feature = "audio"))]
+pub struct MlxMediaInputLowering;
+
+#[cfg(any(feature = "image", feature = "audio"))]
+impl eredu_architectures::processor_execution::MediaInputLowering<crate::MlxTensor>
+    for MlxMediaInputLowering
+{
+    fn inspector(&self) -> &impl PreparedInputInspector<crate::MlxTensor> {
+        &crate::backend::runtime::media::input::MlxTensorInputInspector
+    }
+
+    fn prepare_input<E: std::error::Error + Send + Sync + 'static>(
+        &self,
+        processor: &PreparedProcessor,
+        input: &TokenizedMultimodalRequest,
+        encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
+    ) -> Result<
+        (
+            eredu_runtime::PreparedModelInput<crate::MlxTensor>,
+            Option<eredu_runtime::PreparedInputCacheIdentity>,
+        ),
+        eredu_core::BackendFailure,
+    > {
+        let prepared = ModelProcessor::from_prepared(processor.clone())
+            .prepare(input, encode_text)
+            .map_err(eredu_core::BackendFailure::from_error)?;
+        Ok((
+            prepared.to_runtime_input()?,
+            prepared.cache_identity().cloned(),
+        ))
     }
 }

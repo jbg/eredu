@@ -58,6 +58,116 @@ impl SelectedVlRankGraph {
     }
 }
 
+/// Portable construction and session geometry for a VL decoder rank.
+pub struct PreparedVlDecoderStage<A> {
+    /// Generic inputs to the native pipeline binder.
+    pub pipeline: A,
+    /// Maximum prefill width admitted for vocabulary publication.
+    pub prefix: std::num::NonZeroUsize,
+    /// Rank-local mutable state layout.
+    pub state_layout: eredu_runtime::StateLayout,
+    /// Global ordinal of the first state-owning layer.
+    pub global_layer_start: usize,
+    /// Output publication selected for this stage.
+    pub publication: eredu_runtime::PartitionOutputPublication,
+    /// Rank-local output authority.
+    pub output: eredu_runtime::PartitionOutputAuthority,
+}
+
+impl<A> PreparedVlDecoderStage<A> {
+    /// Binds the pipeline while retaining the portable session geometry.
+    pub fn bind<D, E>(
+        self,
+        bind: impl FnOnce(A) -> Result<D, E>,
+    ) -> Result<PreparedVlDecoderStage<D>, E> {
+        Ok(PreparedVlDecoderStage {
+            pipeline: bind(self.pipeline)?,
+            prefix: self.prefix,
+            state_layout: self.state_layout,
+            global_layer_start: self.global_layer_start,
+            publication: self.publication,
+            output: self.output,
+        })
+    }
+}
+
+/// Constructs the language component and retains VL-specific session geometry.
+pub fn prepare_vl_decoder_stage<B, S>(
+    prepared: crate::lfm3::PreparedLanguagePartition,
+    residency: eredu_runtime::LayerWeightResidency,
+    communication: crate::lfm3::LanguagePipelineCommunication,
+    context: &<B::Tensor as Tensor>::Context,
+) -> Result<
+    PreparedVlDecoderStage<
+        eredu_runtime::PreparedComponentPipeline<crate::lfm3::PartitionedLayeredModel<B>>,
+    >,
+    eredu_core::BackendFailure,
+>
+where
+    B: GroupedNeuralBackend + DistributedNeuralBackend,
+    S: eredu_runtime::LayerRuntimeState<B>,
+    S::LayerState: eredu_nn::AttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
+{
+    use eredu_core::BackendFailure;
+
+    let contract = |message| BackendFailure::from_error(Error::backend(message));
+    let prefix = prepared
+        .vocabulary_prefix()
+        .ok_or_else(|| contract("LFM3 VL pipeline requires a vocabulary prefix limit"))?;
+    let state_layout = prepared
+        .partition()
+        .state()
+        .ok_or_else(|| contract("LFM3 VL stage has no cache layout"))?
+        .layout()
+        .clone();
+    let global_layer_start = prepared
+        .rank()
+        .layer_range(prepared.complete_layer_count())
+        .map_err(BackendFailure::from_error)?
+        .start;
+    let publication = communication
+        .plan
+        .publication()
+        .ok_or_else(|| contract("VL partition omitted output publication"))?;
+    let output = communication
+        .plan
+        .publication_authority(&communication.manifest)
+        .map_err(BackendFailure::from_error)?
+        .ok_or_else(|| contract("VL partition omitted output authority"))?;
+    let (architecture, source, invocations, pinned, units) =
+        prepared.into_layerwise::<B, S>(context)?;
+    let units = units
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, bindings)| {
+            let address = invocations
+                .storage_layout()
+                .address(ordinal)
+                .ok_or_else(|| contract("VL decoder binding has no retained storage owner"))?;
+            Ok((address, bindings))
+        })
+        .collect::<Result<_, BackendFailure>>()?;
+    Ok(PreparedVlDecoderStage {
+        pipeline: eredu_runtime::PreparedComponentPipeline {
+            architecture,
+            source,
+            invocations,
+            pinned,
+            units,
+            manifest: communication.manifest,
+            plan: communication.plan,
+            tensor_group: communication.tensor_group,
+            activation_dtype: eredu_runtime::PipelineActivationDtype::Float32,
+            residency,
+        },
+        prefix,
+        state_layout,
+        global_layer_start,
+        publication,
+        output,
+    })
+}
+
 /// Exact rank bindings with the processor and request admission for the generation session.
 pub struct PreparedVlRankGraph {
     weights: SelectedVlRankWeights,
@@ -75,6 +185,58 @@ impl PreparedVlRankGraph {
 
     pub(crate) fn processor(&self) -> Option<PreparedProcessor> {
         self.raw_processor.clone()
+    }
+
+    /// Constructs the selected session with caller-supplied component and state mechanisms.
+    ///
+    /// The portable graph owns admission and binding order. The mechanisms
+    /// consume the retained resources and return the local session components.
+    pub fn construct_session<B, S, V, D>(
+        self,
+        context: &<B::Tensor as Tensor>::Context,
+        bind_pipeline: impl FnOnce(
+            eredu_runtime::PreparedComponentPipeline<crate::lfm3::PartitionedLayeredModel<B>>,
+        ) -> Result<D, eredu_core::BackendFailure>,
+        bind_vision: impl FnOnce(
+            super::PreparedVisionExecution,
+            eredu_runtime::LayerWeightResidency,
+        ) -> Result<V, eredu_core::BackendFailure>,
+        allocate_state: impl FnOnce(
+            eredu_runtime::StateLayout,
+            usize,
+        ) -> Result<S, eredu_core::BackendFailure>,
+    ) -> Result<BoundVlRankSession<V, PreparedVlDecoderStage<D>, S>, eredu_core::BackendFailure>
+    where
+        B: GroupedNeuralBackend + DistributedNeuralBackend,
+        S: eredu_runtime::LayerRuntimeState<B>,
+        S::LayerState: eredu_nn::AttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
+    {
+        let decoder_residency = self.weights.decoder_residency();
+        let (weights, admission, capabilities, processor, raw_processor, session, dtype) =
+            self.into_parts();
+        eredu_core::SessionAdmission::new(session)
+            .validate(super::VL_SESSION_CAPABILITIES)
+            .map_err(eredu_core::BackendFailure::from_error)?;
+        let (vision, decoder) = weights.bind_components(
+            |decoder, residency, communication| {
+                prepare_vl_decoder_stage::<B, S>(decoder, residency, communication, context)?
+                    .bind(bind_pipeline)
+            },
+            bind_vision,
+        )?;
+        let state = allocate_state(decoder.state_layout.clone(), decoder.global_layer_start)?;
+        Ok(BoundVlRankSession {
+            vision,
+            decoder,
+            state,
+            admission,
+            capabilities,
+            processor,
+            raw_processor,
+            session,
+            dtype,
+            decoder_residency,
+        })
     }
 
     /// Transfers the rank binding and the retained request and processor policies.
@@ -107,6 +269,30 @@ impl PreparedVlRankGraph {
             dtype,
         )
     }
+}
+
+/// Bound components and retained admission for one selected VL rank.
+pub struct BoundVlRankSession<V, D, S> {
+    /// Replicated vision execution.
+    pub vision: V,
+    /// Rank-local language execution.
+    pub decoder: D,
+    /// Initial decoder state.
+    pub state: S,
+    /// VL prompt admission for the selected execution.
+    pub admission: super::VisionPromptAdmission,
+    /// Retained capability estimate.
+    pub capabilities: crate::capability::CapabilityEstimate,
+    /// Selected processor execution.
+    pub processor: eredu_runtime::SelectedProcessorExecution,
+    /// Prepared raw-media processor, when selected.
+    pub raw_processor: Option<PreparedProcessor>,
+    /// Admitted session capabilities.
+    pub session: SessionCapabilities,
+    /// Physical floating-state width in bytes.
+    pub dtype: std::num::NonZeroU8,
+    /// Selected rank-local decoder weight residency.
+    pub decoder_residency: eredu_runtime::LayerWeightResidency,
 }
 
 impl SelectedVlGraph {

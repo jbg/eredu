@@ -648,7 +648,7 @@ fn bind_attention<B: NeuralBackend>(
         B::linear(spec.projection.output, context)?,
         Some(B::normalization(spec.query_norm, context)?),
         Some(B::normalization(spec.key_norm, context)?),
-        Some(B::rotary(spec.rotary, context)?),
+        Some(B::rotary(spec.rotary.prepare()?, context)?),
         None,
     )
 }

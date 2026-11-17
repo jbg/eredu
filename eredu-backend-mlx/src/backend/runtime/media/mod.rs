@@ -114,6 +114,16 @@ impl PreparedModelInput {
         function(ModelInput::new(self.input_parts()))
     }
 
+    /// Exposes portable typed input parts by cloning native tensor handles.
+    /// Semantic cache identity is available through [Self::cache_identity].
+    pub fn to_runtime_input(
+        &self,
+    ) -> Result<eredu_runtime::PreparedModelInput<crate::MlxTensor>, eredu_core::BackendFailure>
+    {
+        self.with_model_input(input::prepared_composite_input)
+            .map_err(eredu_core::BackendFailure::from_error)
+    }
+
     /// Clones payload and metadata arrays in the identity's deterministic wire order.
     pub fn wire_arrays(&self) -> Vec<Array> {
         let mut arrays = Vec::new();

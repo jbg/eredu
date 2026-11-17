@@ -2,6 +2,7 @@
 
 pub mod automatic;
 mod capability;
+pub(crate) mod component_binding;
 pub mod distributed;
 mod execution;
 mod inspection;
@@ -12,12 +13,9 @@ mod prepared_speculative;
 mod processor;
 pub mod realtime;
 pub(crate) mod replicated_text;
-mod vl_session;
-pub(crate) use replicated_text::state_capabilities;
 mod session;
 pub mod speculative;
 pub mod structural;
-pub(crate) mod voicechat;
 
 pub use inspection::{
     inspect_model, inspect_model_preparation, inspection_mechanisms, MlxInspectionOptions,
@@ -26,7 +24,7 @@ pub use load_request::MlxLoadRequest;
 pub use loading::{MlxModelConfig, MlxSelectedPreparation};
 pub(crate) use model::Executable;
 #[cfg(any(feature = "image", feature = "audio"))]
-pub(crate) use processor::ModelProcessor;
+pub use processor::{MlxMediaInputLowering, ModelProcessor};
 pub use session::{
     MlxModelInput, MlxModelOutput, MlxModelSession, MlxNativeTextState, MlxSessionCompletion,
     MlxTextSamplingState,

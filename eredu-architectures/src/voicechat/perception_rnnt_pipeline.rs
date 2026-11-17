@@ -6,17 +6,120 @@
 
 use super::{
     perception::{PerceptionDimensions, PerceptionError},
-    perception_layered::PerceptionInput,
+    perception_layered::{PerceptionInput, PerceptionRuntimeState},
     perception_rnnt::{
         self, PerceptionCacheState, PerceptionRnntError, PerceptionRnntFrame, PerceptionRnntLimits,
         PerceptionRnntState,
     },
+    perception_rnnt_preparation::PerceptionRnntPipelineResources,
+    perception_stage::{PerceptionPipeline, PerceptionPipelineArchitecture},
     rnnt::RnntProjectionExecution,
     rnnt_pipeline::{self, RnntPipelineCursor, RnntPredictorExecution},
+    rnnt_predictor::RnntPredictorRuntimeState,
+    rnnt_predictor_stage::{RnntPredictorPipeline, RnntPredictorPipelineArchitecture},
 };
-use eredu_core::{DistributedCommitEpoch, DistributedCommitOutcome};
+use eredu_core::{BackendFailure, DistributedCommitEpoch, DistributedCommitOutcome};
 use eredu_nn::{NeuralBackend, Tensor, TensorElementType};
-use eredu_runtime::replicated_execution::ReplicatedCoordinator;
+use eredu_runtime::{
+    replicated_execution::ReplicatedCoordinator, BoundComponentPipeline, LayerWeightResidency,
+    LayerwiseModelMetadata, ResidencyReport, UnitPolicyResidency,
+};
+
+/// Independent parameter residency selections for the three learned components.
+pub struct PerceptionRnntResidency {
+    /// Learned perception units.
+    pub perception: LayerWeightResidency,
+    /// Recurrent predictor layers.
+    pub predictor: LayerWeightResidency,
+    /// Embedding and joint projections.
+    pub projections: LayerWeightResidency,
+}
+
+/// Materialization evidence from the three independently selected policies.
+pub struct PerceptionRnntMetadata {
+    /// Perception materialization and selected residency.
+    pub perception: LayerwiseModelMetadata,
+    /// Predictor materialization and selected residency.
+    pub predictor: LayerwiseModelMetadata,
+    /// Projection materialization and selected residency.
+    pub projections: LayerwiseModelMetadata,
+}
+
+/// Current physical residency of each independently budgeted provider.
+pub struct PerceptionRnntResidencyReports {
+    /// Perception residency.
+    pub perception: ResidencyReport,
+    /// Predictor residency.
+    pub predictor: ResidencyReport,
+    /// Projection residency.
+    pub projections: ResidencyReport,
+}
+
+/// Bound components and decision authority for the portable paired-input driver.
+pub struct PerceptionRnntPipeline<B: NeuralBackend, P, R, J, D> {
+    pub(super) perception: PerceptionPipeline<B, P>,
+    pub(super) predictor: RnntPredictorPipeline<R>,
+    pub(super) projections: J,
+    pub(super) decision: D,
+    pub(super) resources: PerceptionRnntPipelineResources,
+}
+
+impl<B: NeuralBackend, P, R, J, D> PerceptionRnntPipeline<B, P, R, J, D> {
+    /// Exact prepared rank-local parameter and initialized cache payload census.
+    pub fn resources(&self) -> PerceptionRnntPipelineResources {
+        self.resources
+    }
+
+    /// Borrows the learned components and decision authority for paired execution.
+    pub fn parts_mut(
+        &mut self,
+    ) -> (
+        &mut PerceptionPipeline<B, P>,
+        &mut J,
+        &mut RnntPredictorPipeline<R>,
+        &mut D,
+    ) {
+        (
+            &mut self.perception,
+            &mut self.projections,
+            &mut self.predictor,
+            &mut self.decision,
+        )
+    }
+
+    /// Creates an empty pair with exact local perception ownership.
+    pub fn initial_state(
+        &self,
+    ) -> Result<
+        PerceptionRnntState<B::Tensor, PerceptionRuntimeState<B::Tensor>>,
+        PerceptionRnntError,
+    > {
+        PerceptionRnntState::from_perception(self.perception.initial_state())
+    }
+
+    /// Reads the three independently configured physical reports.
+    pub fn residency_reports(&self) -> Result<PerceptionRnntResidencyReports, BackendFailure>
+    where
+        B: eredu_nn::DistributedNeuralBackend,
+        P: BoundComponentPipeline<
+            PerceptionPipelineArchitecture<B>,
+            B,
+            PerceptionRuntimeState<B::Tensor>,
+        >,
+        R: BoundComponentPipeline<
+            RnntPredictorPipelineArchitecture<B>,
+            B,
+            RnntPredictorRuntimeState<B::Tensor>,
+        >,
+        J: UnitPolicyResidency,
+    {
+        Ok(PerceptionRnntResidencyReports {
+            perception: self.perception.pipeline().residency()?,
+            predictor: self.predictor.pipeline().residency()?,
+            projections: self.projections.residency()?,
+        })
+    }
+}
 
 const PROTOCOL: u64 = 0x50455243524e0001;
 

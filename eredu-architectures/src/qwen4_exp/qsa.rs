@@ -372,7 +372,7 @@ impl<B: NeuralBackend> QsaIndexer<B> {
             query_key: B::linear(spec.query_key, context)?,
             query_norm: B::normalization(spec.query_norm, context)?,
             key_norm: B::normalization(spec.key_norm, context)?,
-            rotary: B::rotary(spec.rotary, context)?,
+            rotary: B::rotary(spec.rotary.prepare()?, context)?,
         })
     }
     /// Produces normalized/rotated queries `[batch,heads,tokens,index_dim]`

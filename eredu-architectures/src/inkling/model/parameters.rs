@@ -83,8 +83,8 @@ pub(super) fn group_transport(group: usize) -> eredu_runtime::ArchitectureGroupT
         0 => eredu_runtime::ArchitectureGroupTransport {
             placement: eredu_runtime::ArchitectureGroupPlacement::Pipeline,
             kind: eredu_runtime::ArchitectureGroupKind::VisionEncoder,
-            first_owner_static_roles: vec!["vision".into()],
-            last_owner_static_roles: Vec::new(),
+            first_owner_static_roles: Vec::new(),
+            last_owner_static_roles: vec!["vision".into()],
             merge_destination: eredu_runtime::ArchitectureMergeDestination::FirstPipelineOwner,
             parallel_subgroup: Some(eredu_runtime::ArchitectureParallelSubgroup::TensorSharded),
             request_optional: true,

@@ -1903,7 +1903,7 @@ impl<B: NeuralBackend> Attention<B> {
                 .transpose()?,
             rotary: config
                 .rotary_enabled()
-                .then(|| B::rotary(config.layer_rotary_spec(layer, head), context))
+                .then(|| B::rotary(config.layer_rotary_spec(layer, head).prepare()?, context))
                 .transpose()?,
             sliding_window: policy
                 .window()
@@ -4705,14 +4705,14 @@ impl SequentialPredictionGroups {
         &self,
         group: usize,
         initial: &T,
-        dependencies: &[&T],
+        dependencies: &eredu_runtime::GroupDependencies<'_, T>,
     ) -> Result<T, Error> {
         self.unit_count(group)?;
         if group == 0 {
             return self.target.begin(0, initial, dependencies);
         }
-        match dependencies {
-            [dependency] => Ok((*dependency).clone()),
+        match dependencies.only() {
+            Some(dependency) => Ok(dependency.clone()),
             _ => Err(Error::backend(format!(
                 "prediction group {group} expected one dependency, received {}",
                 dependencies.len()
@@ -4778,7 +4778,7 @@ impl SequentialGroup {
         &self,
         group: usize,
         initial: &T,
-        dependencies: &[&T],
+        dependencies: &eredu_runtime::GroupDependencies<'_, T>,
     ) -> Result<T, Error> {
         self.unit_count(group)?;
         if !dependencies.is_empty() {

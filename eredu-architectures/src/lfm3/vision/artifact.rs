@@ -102,47 +102,6 @@ pub struct PreparedVlDecoder {
     parameters: eredu_runtime::PreparedComponent<Arc<eredu_runtime::ComponentDefinition>>,
 }
 
-/// Decoder resources restricted to one rank of an LFM3 VL tensor cohort.
-pub struct PreparedVlTensorDecoder {
-    prepared: PreparedVlDecoder,
-    geometry: crate::lfm3::LocalGeometry,
-    rank: eredu_core::ParallelRankTopology,
-}
-
-impl PreparedVlTensorDecoder {
-    /// Exact rank-local resources used for residency sizing.
-    pub fn parameters(
-        &self,
-    ) -> &eredu_runtime::PreparedComponent<Arc<eredu_runtime::ComponentDefinition>> {
-        self.prepared.parameters()
-    }
-
-    /// Rank identity retained before native collectives are bound.
-    pub fn rank(&self) -> eredu_core::ParallelRankTopology {
-        self.rank
-    }
-
-    /// Constructs the rank-local language equations and retained state layout.
-    pub fn into_layerwise<B>(
-        self,
-        context: &<B::Tensor as eredu_nn::Tensor>::Context,
-    ) -> Result<
-        (
-            crate::lfm3::LayeredModel<B>,
-            eredu_runtime::PreparedComponent<Arc<eredu_runtime::ComponentDefinition>>,
-            eredu_runtime::StateLayout,
-        ),
-        Error,
-    >
-    where
-        B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
-    {
-        let state = self.geometry.state_layout().clone();
-        let (model, parameters) = self.prepared.construct(Some(self.geometry), context)?;
-        Ok((model, parameters, state))
-    }
-}
-
 impl PreparedVlDecoder {
     fn prepare(
         identity: &str,
@@ -219,28 +178,6 @@ impl PreparedVlDecoder {
             .map_err(Error::backend_source)
     }
 
-    /// Retains exact tensor-parallel parameter and cache geometry for one rank.
-    pub fn select_tensor_rank(
-        mut self,
-        rank: eredu_core::ParallelRankTopology,
-    ) -> Result<PreparedVlTensorDecoder, Error> {
-        let layout = self
-            .parameters
-            .tensor_parallel_layout(rank)
-            .map_err(Error::backend_source)?;
-        let geometry = crate::lfm3::local_geometry(&self.declaration, &layout)
-            .map_err(Error::backend_source)?;
-        self.parameters = self
-            .parameters
-            .select(&layout)
-            .map_err(Error::backend_source)?;
-        Ok(PreparedVlTensorDecoder {
-            prepared: self,
-            geometry,
-            rank,
-        })
-    }
-
     /// Constructs the architecture with its retained resource and state geometry.
     pub fn into_layerwise<B>(
         self,
@@ -255,27 +192,10 @@ impl PreparedVlDecoder {
     where
         B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     {
-        self.construct(None, context)
-    }
-
-    fn construct<B>(
-        self,
-        local: Option<crate::lfm3::LocalGeometry>,
-        context: &<B::Tensor as eredu_nn::Tensor>::Context,
-    ) -> Result<
-        (
-            crate::lfm3::LayeredModel<B>,
-            eredu_runtime::PreparedComponent<Arc<eredu_runtime::ComponentDefinition>>,
-        ),
-        Error,
-    >
-    where
-        B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
-    {
         let architecture = crate::lfm3::CompleteLfm3Kernel::<B>::from_selected_declaration(
             self.declaration,
             self.parameters.declaration().clone(),
-            local,
+            None,
             context,
         )?;
         Ok((architecture, self.parameters))

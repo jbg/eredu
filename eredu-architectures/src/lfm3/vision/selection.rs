@@ -329,6 +329,22 @@ impl SelectedVlRankWeights {
         &self.prepared.communication.manifest
     }
 
+    /// Binds the selected decoder and vision components in rank preparation order.
+    pub fn bind_components<V, D, E>(
+        self,
+        bind_decoder: impl FnOnce(
+            PreparedLanguagePartition,
+            LayerWeightResidency,
+            LanguagePipelineCommunication,
+        ) -> Result<D, E>,
+        bind_vision: impl FnOnce(PreparedVisionExecution, LayerWeightResidency) -> Result<V, E>,
+    ) -> Result<(V, D), E> {
+        let ((vision, vision_policy), (decoder, decoder_policy), communication) = self.into_parts();
+        let decoder = bind_decoder(decoder, decoder_policy, communication)?;
+        let vision = bind_vision(vision, vision_policy)?;
+        Ok((vision, decoder))
+    }
+
     /// Transfers the retained placement, policies and communication to a native binder.
     pub fn into_parts(
         self,
@@ -385,7 +401,7 @@ fn validate_budgets(policies: VlWeightPolicies, bytes: VlDeviceWeightBytes) -> R
     Ok(())
 }
 
-fn window(
+pub(super) fn window(
     invocations: &ExecutionUnitAddressMap,
     bindings: &[Vec<WeightBinding>],
     policy: LayerWeightResidency,

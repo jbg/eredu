@@ -141,9 +141,16 @@ Ordinary generation admission rejects decision-marked GGUF backbones.
 Header-only inspection resolves the same strict decoder and projector
 schemas and checks media recipes without opening tensor payloads.
 
+Decision and finite Audio prompts bind speech encoder units through the shared
+parameter-unit materializer. The portable encoder shapes the log-mel tensor,
+selects the clip state layout, and projects decoder-width rows. The caller
+supplies state allocation for that layout. The Audio graph also constructs depth
+refinement and LiquidCodec synthesis through the same parameter-unit contract
+used by VL ranks. Audio selects the component residency and owns binding order.
+LiquidCodec supplies its decoder module factory and quantizer construction.
+
 The d1 Omni preparation API can also retain an independent speech input
-source. The facade reuses the generative audio graph’s MLX encoder binding
-and per-unit residency policy. The architecture validates the audio marker
+source. The architecture validates the audio marker
 and feature extractor and uses portable PCM resampling and log-mel
 extraction. Its packed decision input associates projected audio rows with the audio
 marker alongside the image and video rows. Spoken instructions expand within their own question
@@ -180,6 +187,80 @@ generation executable as replicated VL and retains the publication group,
 canonical sampling rank and communication authority from that binding. The
 executable keeps the prefill cursor separate from mutable decoder state and
 uses the rank agreement when replacing that state on reset.
+
+MLX uses a common pipeline runtime binder for component pipelines and ordinary
+dense decoder pipelines. It consumes a portable pipeline architecture, an admitted
+execution plan, a layerwise policy, and realized communication. VL supplies its
+partitioned language component through this binder. Dense decoders, including
+Llama pipeline ranks, supply their own architecture and policy through the same
+binder. The binder realizes the shared partition executor and retains the caller's
+selected local agreement and residency policies.
+
+The prepared VL rank graph validates session admission, constructs the decoder
+stage, and selects its state layout and output authority before native binding.
+It passes the retained source, addressed parameter bindings, residency and
+communication plan as a portable `PreparedComponentPipeline`. The MLX binder
+realizes that plan through the shared pipeline executor. The VL constructor
+requests state allocation using the selected layout and first global layer.
+The portable vision traversal supplies its unit factory to the same MLX
+unit-policy binder used by Audio. Image projection for Decision and Audio/Omni
+uses that traversal directly, including prompt expansion and controlled
+advancement. Decision, Audio/Omni, and VL reference replay prepare media through
+the shared MLX processor. They pass the typed tensor handles and retained
+semantic cache identity to the portable VL prompt admission contract. The prepared
+composite route constructs the rank through the portable component binding contract. The architecture combines
+the completed vision traversal, decoder binding, and initial state into a typed
+rank text session. The architecture constructs replicated VL equations and supplies
+the retained source, residency, conversion retention, and state selection to the
+generic local component binder. Replicated and distributed VL use the same
+retained-prefill executable adapter for cursor, snapshot, and tensor erasure. Replicated VL
+reports the combined graph's residency and conversion retention. Distributed VL
+reports component residency and its selected publication authority. The adapter admits output
+observation according to the session report and fails closed for persistent
+prompt caches and named activation inspection.
+
+Decision and VL reference replay drive a portable language backbone with
+caller-owned state. Replicated replay uses the generic local component binder.
+TP and PP replay use the generic component pipeline binder and share the
+generation rank's decoder-state commit driver. The application supplies the
+request and rank identity, and the backend supplies agreement, tensor completion,
+and residency observations.
+
+The portable VL driver owns rank agreement for prefill admission and advancement,
+candidate decoder-state commitment, and coordinated reset. Production and
+reference replay share the partitioned prefill dispatch for media projection and
+decoder prefixes. Its callbacks supply
+native agreement, state allocation and fork, component execution, and completion.
+The VL session driver owns expanded-prompt admission, capture extent checks,
+uninterrupted prefill drainage, and the installed decoder state. Session state
+validates snapshot ownership before an exchange, while the backend supplies
+isolated native copies and retention estimates. The portable rank execution driver
+routes prefill admission, cursor advancement, cached decoding and reset through
+the bound component mechanisms. MLX converts native request tensors and supplies
+native execution, retention, and erasure.
+
+A retained prefill cursor declares its phase, committed position,
+host metadata and live tensor roots through the portable cursor contract. MLX
+erases compatible cursors and counts distinct native backing allocations through
+one adapter. Uninterrupted VL prefill drains the typed cursor through the same
+advancement used by controlled prefill.
+
+The ordinary MLX loader has a CPU Ring placement comparison with two pipeline
+stages, one tensor rank per stage, and F32 activation transport. It uses the
+released LFM3 VL Q4_K_M backbone and Q8_0 projector and the SafeTensors
+`trl-internal-testing/tiny-random-LlamaForCausalLM` fixture at revision
+`2c542e4731d42d3bb68324c4eca16df9f93b8b33`. With prompt tokens
+`[1, 3, 2, 5]` and cached inputs `[7, 9, 11]`, the final prefill row and
+three decode rows have maximum absolute differences from single-rank execution
+of 0 for VL and `5.96e-8` for Llama. All four score argmax IDs match for
+both models, and only rank 1 publishes scores. With a two-token prefill chunk,
+the same distributed VL invocation has a maximum score difference of
+`6.56e-5` from the uninterrupted single-rank baseline and the same argmax
+IDs. Capturing and copying the native state after stepped prefill, advancing
+one decode, and exchanging the saved state reproduces the first cached score
+row byte for byte on the output rank. Both ranks complete reset after replay.
+These comparisons cover text invocation on the VL session and use the same
+checkpoint encoding on both placements.
 
 The facade's `PreparedTextModel` retains resolved tokenizer, template, EOS policy,
 and generation defaults once. Text probes borrow that state. Execution selection
@@ -1650,10 +1731,10 @@ to the selected backbone precision. RNNT and live session state are not supplied
 to this preparation. The retained coefficient
 copy contains 133,184 payload bytes; temporary PCM and mel payloads occupy 64,000
 and 51,712 bytes, respectively, in addition to media tables and neural workspace.
-MLX's `MlxVoiceChatExecution::prepare_silence` invokes this architecture method
-under the existing submission/completion owner and waits before exposing the
-tensor. Failed or unwinding preparation retains unresolved work and poisons its
-execution owner. This is startup preparation, not another session engine.
+VoiceChat startup invokes this architecture method through
+`RealtimeStartupPreparation`. The MLX owner waits for completion before
+exposing the tensor. Failed or unwinding preparation retains unresolved work
+and poisons the execution owner.
 
 `eredu-nn::recurrent::Lstm` composes ordinary parameterized affine projections,
 sigmoid, tanh and tensor operations. It preserves independent input/recurrent
@@ -2348,7 +2429,20 @@ to the same resident, host-layerwise or disk-streamed traversal. It returns both
 encoder and projected features from one invocation; it does not allocate RNNT
 state or select a coupled distributed VoiceChat session.
 
-Perception stages also bind to the shared pipeline executor. The architecture
+The portable EAR encoder, EAR decoder, VoiceChat perception, RNNT prediction,
+and TTS constructors bind their prepared pipelines through
+`ComponentRankMechanisms`. Each plan retains its selected sources, addressed
+units, and communication authority. The binder accepts the runtime state type
+of each plan and returns parameter materialization metadata alongside the bound
+pipeline. MLX uses one binder implementation for these stages and the composite
+text decoder. TTS accepts a cache allocator for its selected portable layout.
+Stage adapters own request descriptors, state validation and output projection.
+They use the bound pipeline for residency and disk telemetry. State owners visit
+their retained tensors, and output projections supply any additional roots
+that must settle before commit. Decoder frontier and state allocation use a
+separate decoder-state contract.
+
+Perception stages bind to the shared pipeline executor. The architecture
 owns cuts after subsampling, within the Conformer stack and before modality
 projection. Transport dimensions use the subsampled count after overlap removal;
 raw mel-row counts remain part of ingress. Boundaries carry encoder-width F32
@@ -2360,10 +2454,9 @@ Prepared stage sources expose only the canonical recipes used by those units.
 The final perception stage publishes a packed encoder/projected tensor through
 the existing shared output publisher. Architecture code unpacks the two feature
 branches without repeating perception. `MlxComponentPipeline` supplies native
-binding, transport, phase agreement, completion and commit for both perception
-and TTS wrappers. Output preparation participates in all-rank failure agreement;
-its exposed tensors and candidate caches remain retained through exact completion
-before commitment. Cold component constructors return runtime's
+binding, transport, phase agreement, completion and commit for these stages.
+Output preparation participates in all-rank failure agreement. Exposed tensors
+and candidate caches remain retained through exact completion before commitment. Cold component constructors return runtime's
 `ComponentPipelinePreparationError<E>`, preserving the typed family geometry error
 and the original communication, local-agreement, capability and manifest errors.
 `PipelineBindingError::into_preparation` applies the family-authored diagnostic label
@@ -2462,13 +2555,19 @@ selection is rejected before payload reads. These component entry points do not
 select a complete distributed VoiceChat session.
 Resident speech construction and bounded providers consume the same retained
 matrix format and companion bindings.
-`PreparedSpeechProviders` retains exact plans for all eleven speech providers before
-binding. Its architecture-owned visitor orders construction and consumes providers
-through `SpeechConstructionPlan::assemble_providers`, also used by resident unit
-assembly. Provider geometry and spectral mechanisms are validated; no second
-execution engine or mutable conversation state belongs to construction. The MLX
-visitor delegates to the existing resident, host-layerwise and disk-streamed
-component loaders, including RNNT's independently leased units.
+`PreparedSpeechProviders` retains exact plans for all eleven speech providers
+before binding. Its portable constructor binds every provider through the shared
+parameter-unit mechanism, then assembles the components through
+`SpeechConstructionPlan::assemble_providers`. The Nemotron backbone binds
+separately. Each speech provider consumes its independent resident,
+host-layerwise or disk-streamed policy. Finite EAR encode and both TTS
+transformers use the same binder as RNNT, the function head, MoG, RVQ,
+conditioning and PRVQ. Streaming EAR decode and perception construct a private
+candidate from the caller's committed parent, agree input and parent admission
+for tensor-parallel execution, and return outputs and candidate carry after
+traversal completion. Causal TTS execution borrows caller-owned KV caches.
+Conditioning and the character transformer certify prompt-reuse identity for
+resident, unsharded weights on the matching native stream.
 
 RNNT tensor-parallel preparation partitions embedding and output-vocabulary rows,
 including output bias and the blank row, through shared vocabulary mechanisms.
@@ -2538,9 +2637,8 @@ before the first perception lease. Exactly one perception traversal supplies the
 raw RNNT features and projected Nemotron features. Its exact committed outcome is
 required before recurrent execution; either component's failure leaves the paired
 parent unchanged. Stage-owned perception caches implement the same retained-root
-and bounded snapshot contracts as recurrent carry. The MLX adapter clones the
-borrowed stage state and delegates execution to `MlxComponentPipeline`; it owns no
-frame scheduling or RNNT decisions.
+and bounded snapshot contracts as recurrent carry. The portable perception stage
+clones the borrowed state and delegates execution to the bound component pipeline.
 
 `PreparedPerceptionRnntPipelineBindings` consumes the three retained component
 selections before native binding. It checks connected widths, world and rank,
@@ -2560,12 +2658,15 @@ the adapter's explicit epoch. Fresh adapters supply replay authority independent
 of snapshotted PCM and neural state. Coupled live, perception-only and fresh-audio
 tool invocations use this contract through their existing execution branches.
 
-The MLX paired materializer consumes retained perception, predictor and projection
-bindings and their declared coordinator owners. Coordinator selections share one
-native group realization and retained communication authority. The resulting
-component bundle exposes initial local state and independent residency reports;
-it retains no sampling, PCM scheduling, epoch allocation or conversational policy.
-Its three residency arguments describe separate parameter pools, while full-owner
+The portable paired constructor binds perception and prediction through
+`ComponentRankMechanisms`. It checks native communication capabilities before
+building coordinator handles. The portable RNNT projection builds its four units
+through the same parameter-unit binder as the LFM3 vision tower. Tensor-parallel
+projection binds the manifest and cohort selected during preparation and uses
+that cohort for both numerical collectives and local traversal agreement.
+MLX realizes both coordinator selections from one retained manifest and shares
+their native communication resources. The portable component bundle exposes initial local state,
+materialization metadata and three independent residency reports. Full-owner
 budgeting remains the enclosing construction driver's responsibility.
 
 Parallel layered traversal exposes local-result agreement hooks at initialization,
@@ -2608,8 +2709,9 @@ prepublication, discard and conversational commit use the ordinary shared path.
 backbone blocks together with independent speech pools before any binding.
 The backbone device allowance includes pinned static weights exactly once and
 must fit the largest consecutive block window selected by the shared policy.
-Host pools and materialization reservations are accounted for separately. The selected report remains with the components and is available after
-adoption by `MlxVoiceChatExecution`. These logical parameter bounds exclude live
+Host pools and materialization reservations are accounted for separately.
+The shared MLX execution owner exposes the selected report from the retained
+VoiceChat components. These logical parameter bounds exclude live
 state, activation/spectral workspaces, source caches and allocator overhead.
 Nemotron embedding, final normalization and agent-head matrices remain pinned.
 The two official vocabulary matrices require 4,480 MiB of logical device storage.
@@ -2625,12 +2727,14 @@ into `PreparedComponent`, retaining canonical pinned storage and independently
 leased blocks. Residency inspection consumes those same bindings. The shared
 storage-preference pass checks invocation geometry and applies native immutable
 layout choices without changing checkpoint recipes, source authority or charges.
-Resident binding borrows preferences from its existing modules. Pinned and unit
-source views expose only their actual physical inputs; selected unit views use
-global addresses even when local storage ordinals are compact. The native adapter
-supplies the shared `LayerwiseRuntime` and parameter policy for all three residency
-selections. Parameter selection precedes materialization, and each binding receives only the physical
-inputs named by its retained recipe. The shared realtime loader supplies the
+Pinned and per-unit source views expose only their physical inputs. Selected unit
+views use global addresses even when local storage ordinals are compact. VoiceChat
+passes the constructed Nemotron model and exact pinned and leased bindings to
+`LocalComponentMechanisms`, the same local binding contract used by the VL decoder.
+The backend realizes the selected residency through its shared layerwise runtime.
+The bound component exposes generic layered invocation so VoiceChat can fuse
+channel inputs, advance caller-owned state, and project the agent and function
+readouts in the portable executor. The shared realtime loader supplies the
 complete speech-graph residency selection.
 `voicechat::components::PreparedVoiceChatConstruction` admits the full retained
 component set and host conditioning together. It constructs exact host input
@@ -2646,11 +2750,18 @@ The retained construction also owns `NeuralStateGeometry`. It projects
 Nemotron and TTS state from the exact backbone and causal transformer declarations
 used for materialization, preserving every local/global attention window. Batch
 geometry declares one conversation row and two classifier-free guidance rows.
-Native cache initialization validates both exact selected layouts before
-allocating either owner. The shared selector requires checkpoint and
-rollback support. Initialization uses the ordinary
-MLX selected-state realization driver for device and paged placements, then
-adopts both caches into the joint transaction.
+Portable VoiceChat startup validates both layouts before binding learned
+components or allocating state. The retained VoiceChat plan supplies frontend
+options and independent residency policies to its portable component driver.
+`ComponentPreparation` lets that driver use the ordinary component binder's
+native allocation, detached recovery, and post-binding cache cleanup. Startup
+completes the fixed speaker prompt and tool silence, realizes the selected caches
+and explicit RNG, then registers the generation transaction with prefill queued.
+The backend supplies state materialization for device and paged placements.
+`RealtimeStateGroup` groups the caches under one finite copy budget.
+`RealtimeJointStateParts` gives portable execution disjoint access to the
+unpublished cache parts under that same transaction. The shared selector
+requires checkpoint and rollback support.
 
 `voicechat::preparation::PreparedGeneration` validates the retained text controls,
 explicit component capacities and mandatory Aria startup. It constructs the
@@ -2720,7 +2831,7 @@ native handles and independent state copies.
 `VoiceChatConversation` groups these host policies under one owned admission.
 Its private candidate attaches a one-shot projection to the
 ordinary `PrepublicationRealtimeFrame` through the family-independent
-`map_host_output` mechanism. Exact completion and architecture observation run
+`project_host_output` mechanism. Exact completion and architecture observation run
 first; turn, tool-schema, reminder and publication-capacity checks then run on a
 private candidate before the scheduler can commit neural state. Immutable text,
 tool definitions and prepared phrases are shared; mutable history and cursors
@@ -2855,10 +2966,9 @@ one owned scheduler output. It retains the original gate and neither borrows the
 executor nor changes native retirement. Submission and completion failures expose
 `BackendFailure` with the original concrete source chain. The shared runtime
 mapping error exposes an `Arc`-retained observer's inner error as its source, so
-typed diagnostic downcasts reach the original failure. The feature-gated
-`submit_mlx_voicechat` binding calls this same portable driver and the existing
-`MlxVoiceChatExecution::submit`; family policy stays in portable layers and
-execution uses the core scheduler.
+typed diagnostic downcasts reach the original failure. The MLX VoiceChat executor
+passes its native submission callback to the portable work driver. The core
+scheduler owns publication and advancement.
 
 `VoiceChatSession` composes already prepared publication state with one request
 and one outstanding invocation in the existing core scheduler. Explicit
@@ -2926,11 +3036,13 @@ Errors and unwinds seal failed recovery without evaluating another graph.
 `eredu_nn::RetainedTensorRoots` visits borrowed tensor roots without allocation,
 evaluation or family inspection in the backend. Recurrent, convolution, spectral
 and VoiceChat component owners expose independent carry as well as visible output.
-The native VoiceChat adapter combines these roots with the joint neural caches,
-invocation inputs and RNG. Its completion owner retains model weights, stream,
-paging namespaces and the joint copy permit independently of candidate lifetime.
-Native retirement controls release even when candidate disposal follows a failed
-completion observation. Retained handles are not a deduplicated memory census.
+VoiceChat and Moshi use the same MLX execution gate and candidate recovery scope.
+Each portable graph declares its retained tensor roots. The native adapters add
+the selected cache and RNG resources; VoiceChat also supplies the joint copy
+permit. The shared completion owner retains the execution, streams, and any
+paging or collective authorities independently of candidate lifetime. Native
+retirement controls release if candidate disposal follows a failed completion
+observation. Retained handles are not a deduplicated memory census.
 
 Fixed-Aria prompt and silence preparation share a native completion scope with
 retained model ownership. Architecture-declared roots cover every startup tensor;
@@ -2938,20 +3050,20 @@ errors and unwinds preserve pending native work and poison shared execution.
 Successful preparation returns only after exact completion. Shared execution
 handles retain one active/poison gate without copying caches or random state.
 
-`MlxVoiceChatExecution` binds the portable coupled executor to the existing shared
-output submission and prepublication gate. Architecture preflight runs before the
-native scope, so missing PCM and malformed requests remain retryable without
-poisoning execution. Once equations begin, errors or unwinds attach failed
-completion and poison the execution. Callers consume and release completed native
-frames before preparing another branch; retained completion handles keep joint
-admission occupied. This selected adapter does not choose conversational policy
-or distributed placement.
-Compact coupled conformance fixtures live in `eredu-evaluation`, consumed only
-by neutral and native validation code. The native test binds nonzero learned
-components to the production coupled equations and shared submission mechanism;
-synthetic geometry does not bypass released-artifact admission. Its explicit
-branch and shared-scheduler runs compare output and retained state at the same
-committed boundaries with identical native RNG seeds.
+VoiceChat's portable invocation runs preflight and enters
+`SharedRealtimeExecution` before executing the coupled equations. The generic
+MLX owner accepts the invocation, branch and input roots, opaque native
+retention, and a host observer. It attaches exact completion to the unpublished
+branch and handles recovery for errors or unwinds after submission begins.
+The categorical coordinator and the coupled invocation use the same native
+candidate lifecycle to consume retention authority once, enter recovery, and
+finish exact completion. Each portable driver controls when its preflight
+allows that lifecycle to begin. Rejected preflight leaves the execution
+available for retry.
+Siblings share the execution gate until completion and its retained resources
+are released. VoiceChat's joint admission also stays occupied while completion
+owns the copy permit. Its portable observer validates output attribution around
+the generic MLX readback before the scheduler can commit the branch.
 
 `eredu-codec::mimi::specs::MimiSpec` owns the validated released codec's
 canonical parameter identities, geometry, semantic roles and component groups.
@@ -3664,11 +3776,9 @@ inspection. It requires unique invocations and matching execution groups, retain
 nonzero global indices, and supplies the same local slots for completion and abort.
 Cloned native policy handles share this immutable mapping. Parameter-storage and
 mutable-state ownership remain independent of this invocation address translation.
-MLX materializes those addressed bindings through the
-ordinary resident, host-layerwise and disk-streamed providers; unowned groups
-have no residency or transfer declarations. Its TTS stage adapter consumes the
-prepared partition and invokes the shared local-stage runtime, with optional
-native tensor collectives.
+MLX materializes those addressed bindings through the ordinary resident,
+host-layerwise and disk-streamed providers. Unowned groups have no residency or
+transfer declarations.
 
 `PreparedTtsTransformerPipelineBindings` retains exact component bindings,
 partition ownership, the communication manifest and `PartitionedExecutionPlan`.
@@ -4629,14 +4739,13 @@ source, content identity under the architecture-selected domain, retained
 resolution and metadata validation, selected topology and architecture, and a
 consistent lowering summary. MLX receives that completed handoff and adds only
 groups, streams, caches, arrays, random state, completion, and final erasure.
-`MlxPreparedRealtimeExecution` privately pairs that handoff with the exact
-native rank/device token validated during cold selection. Realtime
-materialization consumes this pair without accepting replacement load options;
-it validates the retained device against the execution stream before payload
-binding or construction. `MlxLoadRequest` holds one `NormalizedLoadRequest`
-and optional native device assignment, not an independently mutable portable
-mirror. Backend-author callers build portable policy directly on the normalized
-request and wrap it once; the MLX adapter exposes only native pairing operations.
+`MlxRealtimeExecutionContext::bind_realtime` consumes a neutral prepared
+construction and a native target. It compares the selected world size and rank
+with the target and world group, then checks the execution stream's device.
+Only after those checks can the portable construction access native binding
+mechanisms. `MlxLoadRequest` holds one `NormalizedLoadRequest` with its optional
+native device assignment. Portable selection uses the normalized policy and
+the binder checks the assigned target against the retained realization.
 Prepared MLX models retain their actual native device and, for distributed
 execution, the selected world handle. Session publication and every
 backend-taking session operation validate this retained target before input
@@ -4851,6 +4960,14 @@ target ownership maps before materialization. Native binding preparation retains
 map through policy construction rather than reconstructing identity ownership from
 module counts. Selected parameter ownership permits additional constructed consumers of
 the same canonical owner, while retaining every selected consumer.
+
+Portable partition session facts carry the selected prompt-cache topology and
+unit scope. Dense direct execution binds all units. Dense pipeline, routed, and
+composite execution bind owned units. MLX shares rank preparation across these
+paths, including source claims, native communication realization and session
+assembly. Text and composite finalizers consume the bound session and its
+cache and publication metadata. Composite construction also supplies its
+selected processor, boundary schema, and applicable parameter providers.
 
 Shared decoder configurations explicitly declare each whole-block parameter owner.
 The parameter description groups logical consumers under that owner, and ordinary
@@ -5551,9 +5668,10 @@ selection or grouped projection mechanisms.
 External RoPE maps and their family aliases are architecture configuration
 input, not a backend contract. Architectures normalize them into the closed
 `RotaryAlgorithm` carried by `RotarySpec`, including all defaults and validated
-scalar geometry. A concrete backend only lowers that typed algorithm to its
-native rotary operator; it must not parse configuration keys, choose defaults,
-or decide which model-family scaling names are supported.
+scalar geometry. The neutral neural layer prepares explicit frequency tables
+for wavelength scaling and zero-tail RoPE. The backend receives a
+`PreparedRotarySpec` and lowers its table or primitive to a native rotary
+operator. Architecture code owns external names and defaults.
 
 The architecture configuration registry is the sole owner of Hugging Face
 family aliases, GGUF `general.architecture` spellings, nested-wrapper
@@ -6817,15 +6935,27 @@ The selected local adapter also
 completes this inspection and selection before it realizes an MLX device or
 creates execution and weight-materialization streams.
 
-Typed Moshi architecture dispatch builds static, temporal, and depth modules
-and passes them to `eredu_runtime::construct_realtime_model`. Resident and
-bounded policies share that constructor and its `RealtimeLayerwiseRuntime`;
-pure tensor parallelism wraps the same selected traversal in the partitioned
-runtime. The implementation backend binds generic tensors,
-operators, stores, state, streams, and collectives, then performs only a final
-opaque erasure of the already constructed executable. Its public native handle
-is this mechanism bundle, not a prepared Moshi model or semantic realtime
-state, session, or scheduler.
+The portable realtime selector dispatches admitted artifacts and rejects
+protocol mismatches before binding. Moshi consumes side-effect-free capability
+facts for exact lowering, state and residency selection, then pins the selected
+checkpoint source. VoiceChat declares its independent hybrid and TTS cache
+profiles and selects both with the backend's state predicates before admitting
+the parameter pools. Binding consumes the retained selections. MLX supplies
+native support facts and retains an explicitly selected rank target for
+distributed execution.
+
+Portable Moshi construction implements `PreparedRealtimeBinding`. It builds
+static, temporal, and depth modules and passes them to
+`eredu_runtime::construct_realtime_execution`. Resident and bounded policies
+share that constructor and its `RealtimeLayerwiseRuntime`. The portable
+constructor requests the selected transport before building modules and
+assembles tensor-parallel execution using the retained partition plan.
+`RealtimeBindingMechanisms` supplies materialization, telemetry, transport,
+and erasure for the prepared executor. Moshi's portable generation constructor
+validates its sampling and ingress and requests state and optional seeded RNG
+through the same startup contracts as VoiceChat. Parameter binding and
+request-state allocation are separate operations. The MLX submission
+interface consumes the portable frame plan and bound executor.
 
 `eredu-runtime` owns the complete frame lifecycle. Validated portable ingress,
 typed coordinate payload history, schedule advancement, delayed temporal
@@ -6912,9 +7042,18 @@ retention traverses these payloads without assembling family-specific matrices.
 Native host observation checks tensor dimensions against each declaration and
 converts values to portable categorical or dense storage. Shared validation
 rejects invalid domains, extents and nonfinite values before publication.
-Moshi's architecture-owned output projection collects validated host columns in
-its public text/depth/codebook order, including PersonaPlex warmup behavior.
-The native adapter supplies conversions and delegates that semantic projection.
+Moshi prepares its ingress contract, decision policy, and typed host output
+projection together as a `RealtimeFramePlan`. The selected portable traversal
+implements `PreparedRealtimeFrameExecutor` for replicated and tensor-parallel
+execution and delegates live `RealtimeResidencyTelemetry` to the active weight
+policy. MLX binds any compatible executor and telemetry provider through one
+erasure path. The executor exposes retained tensors through
+`RetainedTensorRoots`, so native completion can retain the correct roots
+without interpreting architecture state. The MLX channel observer reads back
+completed tensors into the portable host representation. Runtime invokes the
+plan's projection after exact completion and successful host observation,
+before committing the frame. Moshi's projection arranges those columns in its
+public text/depth/codebook order and applies PersonaPlex warmup behavior.
 
 `RealtimeCompletionMechanism<R>` consumes an explicitly typed resource bundle.
 The categorical interpreter supplies `RealtimeFrameResources`; component
@@ -6956,11 +7095,9 @@ geometry from a configuration-only canonical parameter description, and projects
 all-reduce and uneven-gather bounds into an opaque communication manifest. It
 also publishes the fully local temporal/depth traversal as a neutral
 `PartitionedTextRuntime` plan. Selection and manifest consensus finish before
-any MLX module is constructed; MLX materialization then realizes the opaque
-group before opening tensor payloads and installs the local layered runtime in the
-generic traversal partition executor; it does not plan Moshi sharding,
-reconstruct local family geometry, retain a distributed session in the
-realtime model, or select a separate parallel forward path. Frame scheduling,
+any MLX module is constructed. MLX realizes the opaque communication group
+and retains native completion authority. The portable constructor installs the
+selected local layered runtime in the generic traversal partition executor. Frame scheduling,
 audio handling, forcing, and realtime decisions remain the distinct realtime
 extension around that one neutral model driver.
 
@@ -15237,10 +15374,31 @@ so rejection cannot leave peers submitting a collective alone. Only the owner ma
 row decoders/scalars and reports pool occupancy. Stages without lexical units have no rows.
 
 `ParallelCompositeArchitecture` separates parallel ingress from ordinary composite admission.
-`CompositeTextRequirements` retains architecture-authored wire schemas, sequence bounds and
-source-unit continuation geometry. Inactive media groups have no continuation
-geometry; active encoders validate every source-unit shape before execution. The
-shared composite executor consumes typed reductions and retained row sources.
+`CompositeTextRequirements` retains architecture-authored wire schemas and sequence bounds.
+Each invocation supplies one portable group plan with activity, output extent,
+source-unit continuation geometry, and per-stage collective waves. During chunked
+prefill, Muse can reuse retained media context without scheduling an encoder again.
+The executor validates active boundary shapes against the selected routes before
+traversal and uses the resolved schemas for transport. An encoder continuation
+declares its exact native shape, either uniform or per source unit. The executor
+folds all axes before the feature width into a batch-one wire sequence and
+restores the declared shape at the receiving cut. Model code supplies the native
+extents and handles any auxiliary boundary values. Group entry carries graph
+producer identities alongside their available activation values. Ordinary
+traversal omits values from skipped request-optional producers, and distributed
+traversal uses retained invocation activity and rejects a missing active output.
+The component adapter validates producer identities against the graph before
+the decoder selects the modality outputs it needs. A received pipeline boundary
+retains its route, resolved invocation schema, and complete tensor bundle until
+destination ingress. The ordinary executor decodes auxiliary state using the
+architecture's declaration for that route. Composite ingress installs an encoder
+continuation or producer value and resumes decoder continuations through retained
+context or typed partition initialization. Inkling
+derives its vision shapes from the admitted patch count and the tower fold specs.
+The final vision owner normalizes projected rows, and the first decoder owner
+embeds text and merges the ordered input. Caller-projected rows enter the decoder
+without a tower dependency. The shared composite executor consumes typed
+reductions and retained row sources.
 Conditional partitioning composes target TP/PP/EP with shared Qwen vision sharding. Receiving vision stages construct geometry/rotary state without accessing
 another stage's patch parameters, then consume transported activation. Encoder edges use
 full-request extent; target edges use decoder chunks. Boundaries retain complete residual
@@ -16724,12 +16882,15 @@ consumes the same projected media positions and runs the shared parallel
 decoder traversal. The reference route replicates the vision tower and
 projector across ranks.
 VL and Audio share language stage placement and communication contracts.
+Audio constructs the retained pipeline plan, cache layout, and vocabulary
+output facts before native binding. MLX binds the resulting plan through the
+same component pipeline mechanism as other retained rank plans.
 VL pipeline selection bounds the vocabulary rows and activation positions
 published by one decoder pass. Each rank agrees the exact request descriptor
 and commits its candidate decoder state after collective completion.
-With the image feature, the VL media adapter feeds the retained processor
-through shared MLX media preparation. The opaque MLX prompt and the other
-composite sessions use the same conversion to portable tensor roles. VL
+With the image feature, shared MLX media preparation executes the retained
+processor. The opaque MLX prompt and other composite sessions use the same
+conversion to portable tensor roles. VL
 uses shared composite admission to validate those roles and record ordered
 token and patch plans, including decoder positions and vision workspace. It
 checks the expanded request against the checkpoint's decoder context limit.
@@ -16803,18 +16964,20 @@ retained alongside the component declarations.
 
 The shared realtime loader dispatches `lfm3_audio` to SafeTensors or explicit
 GGUF backbone/projector preparation. It retains the selected payloads
-independently of the model asset directory. The Audio declaration projects the
-selected packed formats and dense parameters into independent source views for
-the tied language embedding, language blocks and output, speech encoder and
-projector, depth decoder and feedback, and LiquidCodec synthesis. Each view
-retains logical geometry and reports its physical parameter bytes. Tied codebook
+independently of the model asset directory. Each Audio component prepares its
+exact bindings from its own parameter declarations and admitted recipes. The
+same preparation restricts checkpoint access to the physical inputs of those
+recipes and supplies the bindings used to size residency windows. Tied codebook
 tables have one owner across embedding and scoring, even when several
 tables come from one packed GGUF tensor. LiquidCodec declares decoder
 ownership without admitting encoder-side quantizer weights into synthesis.
-`PreparedResidentAudio` retains a shared prepared language component and
-speech-input, depth/feedback, and LiquidCodec synthesis plans. It reports
-logical bytes by component and validates sampling without creating native
-tensors. The speech replacement hook, vocabulary projection, encoder stream
+`PreparedResidentAudio` retains the selected language rank, state layout, and
+source bindings alongside the speech-input, depth/feedback, and LiquidCodec
+synthesis plans. Audio and Omni use this same cold selector, including each
+component's residency, physical parameter bytes and device window. Selection
+uses mechanism support facts and validates sampling without creating native
+tensors. Native loaders verify that the supplied world matches the retained
+rank before binding. The speech replacement hook, vocabulary projection, encoder stream
 carry, and projector equations stay in the architecture. The low-level MLX
 composition binds each component through independent shared layerwise
 parameter policies. The language policy accounts for its pinned
@@ -16827,29 +16990,60 @@ executing refinement. The LiquidCodec policy acquires scalar output, latent
 projection, causal blocks, and synthesis independently. Codec neural and
 overlap-add continuation remain in caller-owned state across evictions. The codec encoder is
 available through the separate full codec composition.
-The low-level tensor-cohort adapter applies the retained language recipes to
-the selected rank layout and uses the rank-local language state declaration
-when creating caches. The architecture substitutes speech rows after the
+Audio prepares the replicated or tensor-sharded language component with the
+selected recipes and storage preferences. MLX uses the generic local component
+binder for both and supplies the tensor collective for a sharded execution.
+The retained Audio selection assembles replicated, tensor, and pipeline graphs.
+It compares a distributed transport’s world and rank with the retained route
+before binding components. Backends supply communication handles and reusable
+realtime graph mechanisms for state allocation and branching, recovery,
+sampling, and local or pipeline component realization.
+Audio and VL use the same MLX component binder for parameter units, local
+execution, and pipeline stages. Its local component runs observed execution,
+tensor-parallel execution, and architecture-owned readout over retained weights.
+Pipeline binding realizes a session from a native world or reuses the session
+already established by model loading. Both supply the retained plan to the same
+native pipeline materializer. Cache allocation consumes the selected component's state
+declaration. The architecture substitutes speech rows after the
 vocabulary collective, keeps normalized hidden states for refinement, and
 uses the existing sharded vocabulary projection for text readout. Encoder,
 depth, feedback and codec resources are replicated per rank. The caller
 owns request ordering and failure handling for the native cohort.
+The finite Omni turn retains vision and speech in one portable selection.
+It admits the vision residency window, projects ordered visual inputs, aligns
+soundtracks and speech features, and uses the shared Audio prompt and session
+construction. A distributed turn votes on local media preparation before
+entering speech prefill, including when a rank has a local preparation error.
+The Audio facade renders and tokenizes chat and decodes text. It submits local
+Audio and Omni through one neutral task binding. The binding returns host
+operations for transcription, PCM ingress, or a controlled response.
+`AudioTaskBinder` composes independent providers for realtime graph mechanisms,
+media lowering, and pipeline transport. MLX supplies the same component and
+media mechanisms available to other prepared executions and a Ring transport
+provider.
 The language pipeline preparation retains a separate source, parameter plan,
 and cache geometry per stage, including tensor-local geometry for combined
 placement. The typed Audio invocation substitutes speech rows on the embedding
 owner. The shared pipeline driver transports the F32 residual stream along each
 tensor lane and publishes the final normalized states from the output stage to
-the session group. Vocabulary readout uses the output stage's selected tensor
-collective and the same publication group. Encoder, depth, feedback and codec
-execution are replicated across the session ranks. The controlled generation
-driver agrees sampled decisions before feedback and agrees the completed event
-after exact local completion, retention, and state validation. Only a successful
-session commit makes the candidate state and output visible.
+the session group. The portable Audio pipeline driver owns prompt admission,
+commit epochs, and vocabulary readout. It projects vocabulary on the output
+stage using the selected tensor collective and supplies matching receive
+buffers on the other stages. The generic pipeline mechanism handles native
+completion and publication. Encoder, depth, feedback and codec execution are
+replicated across the session ranks. The controlled generation driver agrees
+sampled decisions before feedback and agrees the completed event after exact
+local completion, retention, and state validation. A successful session commit
+makes the candidate state and output visible.
 
 
 Callers prepare each prompt separately from model loading. The turn-based
 audio facade renders task prompts from retained templates and adapts controlled
-generation and transcription to text fragments and mono PCM. The CLI shares
+generation and transcription to text fragments and mono PCM. MLX load
+adapters return the portable sessions directly. Streamed ingress and
+transcription open a native recovery scope through the binding before
+advancing, including PCM transcription that delegates to mel blocks.
+The CLI shares
 WAV admission and finalization, PCM output sinks, and device-context selection
 across audio tasks and full-duplex conversation. Each task supplies its sample
 rates. Full-duplex conversation owns pacing, echo cancellation, interruption,

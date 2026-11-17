@@ -58,6 +58,11 @@ pub trait RealtimeCompletionMechanism<R> {
     /// Native submission or retention failure.
     type Error;
 
+    /// Enters native recovery after host preflight, before materialization or execution.
+    fn begin_submission(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
     /// Submits or records work while retaining every possibly live resource.
     fn complete(
         &mut self,
@@ -223,6 +228,30 @@ pub trait RealtimeFrameHostObserver<T> {
     fn observe(&mut self, frame: &T) -> Result<Self::Output, Self::Error>;
 }
 
+/// One-shot architecture output projection over completed host values.
+pub trait RealtimeHostOutputProjection<T> {
+    /// The portable output published by the scheduler.
+    type Output;
+    /// Portable validation or projection failure.
+    type Error: std::error::Error + 'static;
+
+    /// Projects the observed host values before state publication.
+    fn project(self, values: T) -> Result<Self::Output, Self::Error>;
+}
+
+impl<T, O, E, F> RealtimeHostOutputProjection<T> for F
+where
+    F: FnOnce(T) -> Result<O, E>,
+    E: std::error::Error + 'static,
+{
+    type Output = O;
+    type Error = E;
+
+    fn project(self, values: T) -> Result<O, E> {
+        self(values)
+    }
+}
+
 enum HostObservationState<H: RealtimeFrameHostObserver<T>, T> {
     Pending(H),
     Ready(H::Output),
@@ -277,22 +306,21 @@ where
     /// already observed successfully is mapped immediately; a failed gate keeps
     /// its original failure without invoking the mapping. Native output and exact
     /// completion resources stay retained by the returned gate in every case.
-    pub fn map_host_output<F, O, E>(
+    pub fn project_host_output<P>(
         self,
-        map: F,
-    ) -> PrepublicationRealtimeFrame<T, C, MappedRealtimeFrameHostObserver<H, F>>
+        projection: P,
+    ) -> PrepublicationRealtimeFrame<T, C, MappedRealtimeFrameHostObserver<H, P>>
     where
-        F: FnOnce(H::Output) -> Result<O, E>,
-        E: std::error::Error + 'static,
+        P: RealtimeHostOutputProjection<H::Output>,
     {
         let observation = match self.observation.into_inner() {
             HostObservationState::Pending(observer) => {
                 HostObservationState::Pending(MappedRealtimeFrameHostObserver {
                     observer,
-                    map: Some(map),
+                    map: Some(projection),
                 })
             }
-            HostObservationState::Ready(output) => match map(output) {
+            HostObservationState::Ready(output) => match projection.project(output) {
                 Ok(output) => HostObservationState::Ready(output),
                 Err(error) => HostObservationState::Failed(Arc::new(
                     RealtimeHostOutputMappingError::Mapping(error),
@@ -310,21 +338,20 @@ where
 }
 
 /// Composed host observer returned by
-/// [`PrepublicationRealtimeFrame::map_host_output`]. Its one-shot mapping sees
+/// [`PrepublicationRealtimeFrame::project_host_output`]. Its one-shot mapping sees
 /// only host values; execution and native lifetime ownership remain unchanged.
 pub struct MappedRealtimeFrameHostObserver<H, F> {
     observer: H,
     map: Option<F>,
 }
 
-impl<T, H, F, O, E> RealtimeFrameHostObserver<T> for MappedRealtimeFrameHostObserver<H, F>
+impl<T, H, F> RealtimeFrameHostObserver<T> for MappedRealtimeFrameHostObserver<H, F>
 where
     H: RealtimeFrameHostObserver<T>,
-    F: FnOnce(H::Output) -> Result<O, E>,
-    E: std::error::Error + 'static,
+    F: RealtimeHostOutputProjection<H::Output>,
 {
-    type Output = O;
-    type Error = RealtimeHostOutputMappingError<H::Error, E>;
+    type Output = F::Output;
+    type Error = RealtimeHostOutputMappingError<H::Error, F::Error>;
 
     fn observe(&mut self, frame: &T) -> Result<Self::Output, Self::Error> {
         let output = self
@@ -333,8 +360,9 @@ where
             .map_err(|error| RealtimeHostOutputMappingError::Observation(Arc::new(error)))?;
         self.map
             .take()
-            .expect("prepublication observers run only once")(output)
-        .map_err(RealtimeHostOutputMappingError::Mapping)
+            .expect("prepublication observers run only once")
+            .project(output)
+            .map_err(RealtimeHostOutputMappingError::Mapping)
     }
 }
 
@@ -545,6 +573,33 @@ impl RealtimeDecisionExecution {
     }
 }
 
+/// Contract and host projection supplied by a selected portable realtime architecture.
+pub struct RealtimeFramePlan<P> {
+    ingress: RealtimeIngressContract,
+    decisions: RealtimeDecisionExecution,
+    projection: P,
+}
+
+impl<P> RealtimeFramePlan<P> {
+    /// Pairs ingress, decision policy and projection for one selected frame.
+    pub const fn new(
+        ingress: RealtimeIngressContract,
+        decisions: RealtimeDecisionExecution,
+        projection: P,
+    ) -> Self {
+        Self {
+            ingress,
+            decisions,
+            projection,
+        }
+    }
+
+    /// Transfers the portable policy to the generic submission driver.
+    pub fn into_parts(self) -> (RealtimeIngressContract, RealtimeDecisionExecution, P) {
+        (self.ingress, self.decisions, self.projection)
+    }
+}
+
 /// Coordinates one complete realtime frame on an already unpublished branch.
 ///
 /// Host validation precedes opaque materialization. Schedule and payload-history
@@ -630,6 +685,9 @@ where
     let validated = contract
         .validate(frame)
         .map_err(RealtimeFrameCoordinatorError::Ingress)?;
+    completion_mechanism
+        .begin_submission()
+        .map_err(RealtimeFrameCoordinatorError::Completion)?;
     let input = validated
         .materialize(host_materializer)
         .map_err(RealtimeFrameCoordinatorError::Materialization)?;
@@ -1807,7 +1865,7 @@ mod tests {
                 assert_eq!(transition.is_complete().is_ok(), initial == "ready");
             }
             let mapped_calls = mapper_calls.clone();
-            let mapped = transition.map_host_output(move |values| {
+            let mapped = transition.project_host_output(move |values: Vec<i32>| {
                 mapped_calls.set(mapped_calls.get() + 1);
                 Ok::<_, ObservationError>(values[0] + 10)
             });
@@ -1867,7 +1925,7 @@ mod tests {
                         fail: false,
                     },
                 )
-                .map_host_output(move |values| {
+                .project_host_output(move |values: Vec<i32>| {
                     assert_eq!(values, vec![3]);
                     calls.set(calls.get() + 1);
                     Err::<(), _>(ObservationError)

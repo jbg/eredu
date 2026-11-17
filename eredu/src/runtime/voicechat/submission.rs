@@ -241,8 +241,3 @@ where
         self.0.physically_preemptible()
     }
 }
-
-#[cfg(feature = "mlx")]
-mod mlx;
-#[cfg(feature = "mlx")]
-pub use mlx::submit_mlx_voicechat;

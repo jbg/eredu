@@ -2,6 +2,11 @@
 
 use std::collections::BTreeMap;
 
+use super::function_head_layered::BoundFunctionHead;
+use eredu_core::BackendFailure;
+use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Tensor};
+use eredu_runtime::{LayeredTensorCohort, ParameterUnitMechanisms, SubmissionBackend};
+
 use eredu_checkpoint::{
     recipe::{RecipeDtype, RecipeError},
     store::{SharedCheckpointSource, StoreError},
@@ -12,10 +17,10 @@ use eredu_runtime::{
 
 use super::{
     artifact::{ParameterAdmission, RetainedVoiceChatArtifacts},
-    channels::ChannelError,
+    channels::{ChannelError, FunctionHead},
     checkpoint::Component,
     function_head_layered::{
-        released_declaration, FunctionHeadDeclaration, FunctionHeadDimensions,
+        released_declaration, FunctionHeadDeclaration, FunctionHeadDimensions, FunctionHeadKernel,
     },
     parameters::{admitted_member, SpeechParameterError},
 };
@@ -142,6 +147,63 @@ impl PreparedFunctionHeadBindings {
         })
     }
 
+    /// Binds prepared units locally or to an explicitly selected tensor cohort.
+    pub fn bind<B, H, C>(
+        self,
+        residency: eredu_runtime::LayerWeightResidency,
+        context: &<B::Tensor as Tensor>::Context,
+        mechanisms: &H,
+        cohort: Option<C>,
+    ) -> Result<
+        (
+            BoundFunctionHead<B, H::UnitPolicy<FunctionHead<B>>, C>,
+            eredu_runtime::LayerwiseModelMetadata,
+        ),
+        BackendFailure,
+    >
+    where
+        B: DistributedNeuralBackend
+            + SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>
+            + 'static,
+        H: ParameterUnitMechanisms<B>,
+        C: LayeredTensorCohort<B>,
+    {
+        let selected = if let Some(cohort) = &cohort {
+            let (manifest, group) = cohort.selection();
+            validate_parallel_communication(self.dimensions(), manifest, group)
+                .map_err(BackendFailure::from_error)?;
+            self.select_parallel(cohort.tensor_topology()?)
+                .map_err(BackendFailure::from_error)?
+                .0
+        } else {
+            if self.local_layout().is_some() {
+                return Err(BackendFailure::from_error(ChannelError::Configuration(
+                    "tensor-local parameter placement requires its selected cohort",
+                )));
+            }
+            self
+        };
+        let (declaration, local, invocations, source, units) = selected.into_parts();
+        let definition = declaration.definition().clone();
+        let kernel = match local.as_ref() {
+            Some(layout) => FunctionHeadKernel::<B>::new_parallel(declaration, layout),
+            None => FunctionHeadKernel::<B>::new(declaration),
+        }
+        .map_err(BackendFailure::from_error)?;
+        let architecture = eredu_runtime::ComponentAdapter::new(definition, kernel)
+            .map_err(BackendFailure::from_error)?;
+        BoundFunctionHead::bind(
+            architecture,
+            source,
+            invocations,
+            units,
+            residency,
+            context,
+            mechanisms,
+            cohort,
+        )
+    }
+
     /// Selects vocabulary rows through the shared physical parameter planner,
     /// or validates an already retained selection against the exact topology.
     pub fn select_parallel(
@@ -218,7 +280,7 @@ impl PreparedFunctionHeadBindings {
     }
 
     /// Consumes exact source authority and the canonical ordered binding plan.
-    pub fn into_parts(
+    fn into_parts(
         self,
     ) -> (
         FunctionHeadDeclaration,

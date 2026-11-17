@@ -338,9 +338,13 @@ where
             .ok_or(AudioIngressError::Prompt)?;
         let encoder = self
             .encoder
-            .stream(self.binding.state(self.artifact.encoder.state_layout())?, 1)
+            .stream(
+                self.binding
+                    .realize_state(self.artifact.encoder.state_layout())?,
+                1,
+            )
             .map_err(failure)?;
-        let language = self.binding.state(self.language.state_layout())?;
+        let language = self.binding.realize_state(self.language.state_layout())?;
         let mut suffix = request.suffix.to_vec();
         suffix.extend(marker);
         Ok(AudioIngress {
@@ -383,12 +387,18 @@ where
         samples: &[f32],
         sample_rate: u32,
     ) -> Result<AudioIngressProgress, AudioIngressError> {
-        self.advance(samples, sample_rate, false)?;
-        Ok(self.progress())
+        H::with_input_recovery(|| {
+            self.advance(samples, sample_rate, false)?;
+            Ok(self.progress())
+        })
     }
 
     /// Flushes the trailing input and appends the text suffix, then enters the ordinary response driver.
-    pub fn finish(mut self) -> Result<AudioSession<ResidentAudio<B, H>>, AudioIngressError> {
+    pub fn finish(self) -> Result<AudioSession<ResidentAudio<B, H>>, AudioIngressError> {
+        H::with_input_recovery(|| self.finish_input())
+    }
+
+    fn finish_input(mut self) -> Result<AudioSession<ResidentAudio<B, H>>, AudioIngressError> {
         self.advance(&[], 16_000, true)?;
         let state = ResidentAudioState {
             language: self.state.language,

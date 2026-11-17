@@ -152,6 +152,50 @@ impl PreparedVisionExecution {
         &self.bindings
     }
 
+    pub(in crate::lfm3) fn validate_device_window(
+        &self,
+        residency: eredu_runtime::LayerWeightResidency,
+    ) -> Result<(), Error> {
+        let limits = residency.offload().map_err(Error::backend_source)?;
+        if let Some(budget) = limits.device_budget_bytes() {
+            let bytes = super::selection::window(&self.addresses, &self.bindings, residency)?;
+            if bytes > budget {
+                return Err(Error::backend(format!(
+                    "LFM3 vision requires {bytes} device parameter bytes with a budget of {budget}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Constructs the portable vision traversal through a generic unit policy binder.
+    pub fn bind<B, P>(
+        self,
+        context: &<B::Tensor as Tensor>::Context,
+        bind_units: impl FnOnce(
+            SharedCheckpointSource,
+            ExecutionUnitAddressMap,
+            Vec<Vec<WeightBinding>>,
+            &dyn Fn() -> Result<Vec<VisionModule<B>>, eredu_core::BackendFailure>,
+        ) -> Result<P, eredu_core::BackendFailure>,
+    ) -> Result<PolicyVision<B, P>, eredu_core::BackendFailure>
+    where
+        B: NeuralBackend,
+        P: LayerwisePolicy<B, VisionModule<B>>,
+    {
+        use eredu_core::BackendFailure;
+
+        let (declaration, source, addresses, bindings) = self.into_parts();
+        let policy = bind_units(source, addresses.clone(), bindings, &|| {
+            declaration
+                .units()
+                .map(|unit| VisionModule::new(&declaration, unit, context))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(BackendFailure::from_error)
+        })?;
+        PolicyVision::new(declaration, addresses, policy).map_err(BackendFailure::from_error)
+    }
+
     /// Transfers the prepared policy inputs to a native binding visitor.
     pub fn into_parts(
         self,
@@ -258,6 +302,19 @@ where
             policy: Some(policy),
             context,
         })
+    }
+
+    /// Projects admitted media and returns the complete expanded language prompt.
+    pub fn project_prompt(
+        &mut self,
+        mut input: super::VisionPromptPreparation<B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<super::ProjectedVisionPrompt<B::Tensor>, Error> {
+        while let Some(media) = input.next_media() {
+            let (_, rows) = self.forward(media, context)?;
+            input.accept_projection(rows)?;
+        }
+        input.finish(context)
     }
 
     /// Drains the controlled driver and returns encoder activations and projected rows.

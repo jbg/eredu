@@ -6,17 +6,22 @@ use eredu_checkpoint::{
     recipe::{RecipeDtype, RecipeError},
     store::{SharedCheckpointSource, StoreError},
 };
+use eredu_core::BackendFailure;
+use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Tensor};
 use eredu_runtime::{
     ComponentPreparationError, LocalModelLayout, PreparedComponent, RecipeBindingError,
     WeightBinding,
 };
+use eredu_runtime::{LayeredTensorCohort, ParameterUnitMechanisms, SubmissionBackend};
 
 use super::{
     artifact::{ParameterAdmission, RetainedVoiceChatArtifacts},
     checkpoint::Component,
     parameters::{admitted_member, execution_parameter, SpeechParameterError},
     tts_transformer::TransformerConfig,
-    tts_transformer_layered::TransformerError,
+    tts_transformer_layered::{
+        BoundTransformer, TransformerError, TransformerKernel, TransformerUnit,
+    },
     tts_transformer_specs::{released_declarations, TransformerDeclaration},
 };
 
@@ -159,10 +164,81 @@ impl PreparedTtsTransformerBindings {
         Ok(Self { prepared })
     }
 
+    /// Binds prepared units locally or to an explicitly selected tensor cohort.
+    pub fn bind<B, H, C>(
+        self,
+        residency: eredu_runtime::LayerWeightResidency,
+        context: &<B::Tensor as Tensor>::Context,
+        mechanisms: &H,
+        cohort: Option<C>,
+    ) -> Result<
+        (
+            BoundTransformer<B, H::UnitPolicy<TransformerUnit<B>>, C>,
+            eredu_runtime::LayerwiseModelMetadata,
+        ),
+        BackendFailure,
+    >
+    where
+        B: DistributedNeuralBackend
+            + SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>
+            + 'static,
+        H: ParameterUnitMechanisms<B>,
+        C: LayeredTensorCohort<B>,
+    {
+        let selected = if let Some(cohort) = &cohort {
+            let (manifest, group) = cohort.selection();
+            let width = self.config().geometry().hidden_size;
+            let sum = eredu_runtime::CommunicationOperationRequirement::tensors(
+                eredu_runtime::CommunicationOperation::AllReduceSum,
+                [eredu_core::checkpoint::TensorDtype::F32],
+                eredu_runtime::CommunicationTensorLimits::new(1, 3, width, None)
+                    .map_err(BackendFailure::from_error)?,
+                true,
+            )
+            .map_err(BackendFailure::from_error)?;
+            eredu_runtime::replicated_execution::validate_collective_coordination(
+                manifest,
+                group,
+                [sum],
+            )
+            .map_err(BackendFailure::from_error)?;
+            self.select_parallel(cohort.tensor_topology()?)
+                .map_err(BackendFailure::from_error)?
+                .0
+        } else {
+            if self.local_layout().is_some() {
+                return Err(BackendFailure::from_error(TransformerError::Configuration(
+                    "tensor-local parameter placement requires its selected cohort",
+                )));
+            }
+            self
+        };
+        let (declaration, local, invocations, source, units) = selected.into_parts();
+        let definition = declaration.definition().clone();
+        let kernel = match local.as_ref() {
+            Some(layout) => TransformerKernel::<B>::new_parallel(declaration, layout),
+            None => TransformerKernel::<B>::new(declaration),
+        }
+        .map_err(BackendFailure::from_error)?;
+        let architecture = eredu_runtime::ComponentAdapter::new(definition, kernel)
+            .map_err(BackendFailure::from_error)?;
+        let (units, metadata) = eredu_runtime::BoundLayerwiseComponent::bind(
+            architecture,
+            source,
+            invocations,
+            units,
+            residency,
+            context,
+            mechanisms,
+            cohort,
+        )?;
+        Ok((BoundTransformer::new(units), metadata))
+    }
+
     /// Selects complete-stack tensor placement using the shared physical planner.
     /// Component construction owns no pipeline transport or expert/data replicas;
     /// those dimensions require an enclosing architecture partition selection.
-    pub fn select_parallel(
+    fn select_parallel(
         self,
         topology: eredu_core::ParallelRankTopology,
     ) -> Result<(Self, LocalModelLayout), TtsTransformerPreparationError> {
@@ -173,7 +249,7 @@ impl PreparedTtsTransformerBindings {
     /// Applies an already selected rank-local layout to the exact retained recipes.
     /// Shape validation precedes recipe lowering and source authority is preserved.
     /// Reusing the same retained selection preserves its transformed recipes.
-    pub fn into_parallel(
+    fn into_parallel(
         mut self,
         layout: &LocalModelLayout,
     ) -> Result<Self, TtsTransformerPreparationError> {
@@ -196,13 +272,18 @@ impl PreparedTtsTransformerBindings {
     /// Narrows retained source authority and exact bindings to one selected stage.
     /// Unit addresses remain canonical; this result is not a zero-based complete
     /// provider layout and must be consumed by a partition traversal.
+    /// Applies the optional tensor layout before narrowing the stage bindings.
     pub fn into_partition<G>(
-        self,
+        mut self,
+        tensor_layout: Option<&LocalModelLayout>,
         partition: &eredu_runtime::ArchitecturePartition<
             G,
             super::tts_transformer_layered::TransformerBoundarySchema,
         >,
     ) -> Result<PreparedTtsTransformerPartitionBindings, TtsTransformerPreparationError> {
+        if let Some(layout) = tensor_layout {
+            self = self.into_parallel(layout)?;
+        }
         super::tts_transformer_layered::validate_transformer_partition(
             self.declaration(),
             self.prepared.local_layout(),
@@ -221,7 +302,7 @@ impl PreparedTtsTransformerBindings {
     }
 
     /// Exact retained tensor selection, when present.
-    pub fn local_layout(&self) -> Option<&LocalModelLayout> {
+    fn local_layout(&self) -> Option<&LocalModelLayout> {
         self.prepared.local_layout()
     }
 
@@ -246,7 +327,7 @@ impl PreparedTtsTransformerBindings {
     }
 
     /// Consumes exact source authority and the canonical ordered binding plan.
-    pub fn into_parts(
+    fn into_parts(
         self,
     ) -> (
         TransformerDeclaration,

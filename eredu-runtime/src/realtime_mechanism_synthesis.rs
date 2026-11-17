@@ -46,6 +46,17 @@ impl RealtimeMechanismFacts {
         }
     }
 
+    /// Whether this route realizes the selected parameter residency mechanism.
+    pub fn supports_residency(&self, residency: ExecutionResidency) -> bool {
+        self.residencies.contains(&residency)
+    }
+
+    /// Whether this route has collectives for the requested tensor cohort.
+    pub fn supports_collectives(&self, tensor_size: usize) -> bool {
+        self.mechanisms.contains(&RealtimeMechanism::Collectives)
+            && tensor_size <= self.maximum_tensor_parallel_size.get()
+    }
+
     /// Declares exact state lifecycle support independently of component enumeration.
     pub const fn with_state_lifecycle(mut self, state: StateLifecycleCapabilities) -> Self {
         self.state = state;
@@ -85,6 +96,12 @@ pub trait RealtimeMechanismSupport {
         Option<StateComponentPlacement>,
         Option<StateComponentPlacement>,
     );
+}
+
+/// Cold support for realtime graphs with both categorical and independent cache profiles.
+pub trait RealtimeLoadSupport: RealtimeMechanismSupport {
+    /// Side-effect-free cache support for independent selected state profiles.
+    fn independent_state_support(&self) -> &impl crate::ReplicatedTextMechanismSupport;
 }
 
 /// Synthesizes a stable exact report from every source/execution alternative.

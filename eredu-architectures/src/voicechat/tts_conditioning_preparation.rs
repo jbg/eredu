@@ -1,6 +1,11 @@
 //! Cold exact binding plans for independently leased TTS conditioning units.
 
+use super::tts_conditioning_layered::{BoundConditioning, ConditioningKernel, ConditioningUnit};
 use std::collections::BTreeMap;
+
+use eredu_core::BackendFailure;
+use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Tensor};
+use eredu_runtime::{LayeredTensorCohort, ParameterUnitMechanisms, SubmissionBackend};
 
 use eredu_checkpoint::{
     recipe::{RecipeDtype, RecipeError},
@@ -89,9 +94,85 @@ impl PreparedConditioningBindings {
         Ok(Self { prepared })
     }
 
+    /// Binds prepared units locally or to an explicitly selected tensor cohort.
+    pub fn bind<B, H, C>(
+        self,
+        residency: eredu_runtime::LayerWeightResidency,
+        context: &<B::Tensor as Tensor>::Context,
+        mechanisms: &H,
+        cohort: Option<C>,
+    ) -> Result<
+        (
+            BoundConditioning<B, H::UnitPolicy<ConditioningUnit<B>>, C>,
+            eredu_runtime::LayerwiseModelMetadata,
+        ),
+        BackendFailure,
+    >
+    where
+        B: DistributedNeuralBackend
+            + SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>
+            + 'static,
+        H: ParameterUnitMechanisms<B>,
+        C: LayeredTensorCohort<B>,
+    {
+        let selected = if let Some(cohort) = &cohort {
+            let (manifest, group) = cohort.selection();
+            let character = self.dimensions().character;
+            let sum = eredu_runtime::CommunicationOperationRequirement::tensors(
+                eredu_runtime::CommunicationOperation::AllReduceSum,
+                [eredu_core::checkpoint::TensorDtype::F32],
+                eredu_runtime::CommunicationTensorLimits::new(
+                    1,
+                    3,
+                    character.width.max(character.output_width) as usize,
+                    None,
+                )
+                .map_err(BackendFailure::from_error)?,
+                true,
+            )
+            .map_err(BackendFailure::from_error)?;
+            eredu_runtime::replicated_execution::validate_collective_coordination(
+                manifest,
+                group,
+                [sum],
+            )
+            .map_err(BackendFailure::from_error)?;
+            self.select_parallel(cohort.tensor_topology()?)
+                .map_err(BackendFailure::from_error)?
+                .0
+        } else {
+            if self.local_layout().is_some() {
+                return Err(BackendFailure::from_error(TtsError::Configuration(
+                    "tensor-local parameter placement requires its selected cohort",
+                )));
+            }
+            self
+        };
+        let (declaration, local, invocations, source, units) = selected.into_parts();
+        let definition = declaration.definition().clone();
+        let kernel = match local.as_ref() {
+            Some(layout) => ConditioningKernel::<B>::new_parallel(declaration, layout),
+            None => ConditioningKernel::<B>::new(declaration),
+        }
+        .map_err(BackendFailure::from_error)?;
+        let architecture = eredu_runtime::ComponentAdapter::new(definition, kernel)
+            .map_err(BackendFailure::from_error)?;
+        let (units, metadata) = eredu_runtime::BoundStatelessComponent::bind(
+            architecture,
+            source,
+            invocations,
+            units,
+            residency,
+            context,
+            mechanisms,
+            cohort,
+        )?;
+        Ok((BoundConditioning::new(units), metadata))
+    }
+
     /// Selects exact tensor placement or validates a retained selection without
     /// applying its recipes a second time. Source authority remains unchanged.
-    pub fn select_parallel(
+    fn select_parallel(
         self,
         topology: eredu_core::ParallelRankTopology,
     ) -> Result<(Self, LocalModelLayout), ConditioningPreparationError> {
@@ -100,7 +181,7 @@ impl PreparedConditioningBindings {
     }
 
     /// Lowers each canonical binding through the selected shared physical layout.
-    pub fn into_parallel(
+    fn into_parallel(
         mut self,
         layout: &LocalModelLayout,
     ) -> Result<Self, ConditioningPreparationError> {
@@ -110,7 +191,7 @@ impl PreparedConditioningBindings {
     }
 
     /// Exact retained tensor placement, when selected.
-    pub fn local_layout(&self) -> Option<&LocalModelLayout> {
+    fn local_layout(&self) -> Option<&LocalModelLayout> {
         self.prepared.local_layout()
     }
 
@@ -129,13 +210,8 @@ impl PreparedConditioningBindings {
         self.prepared.source()
     }
 
-    /// Complete semantic declaration retained through precision and placement selection.
-    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
-        self.prepared.declaration().definition()
-    }
-
     /// Consumes exact source authority and the canonical ordered binding plan.
-    pub fn into_parts(
+    fn into_parts(
         self,
     ) -> (
         ConditioningDeclaration,

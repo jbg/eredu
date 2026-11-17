@@ -299,7 +299,7 @@ where
         &mut self,
         group: usize,
         initial: &B::Tensor,
-        dependencies: &[&B::Tensor],
+        dependencies: &eredu_runtime::GroupDependencies<'_, B::Tensor>,
         _: &mut S,
         _: &mut Self::ForwardContext,
         _: &<B::Tensor as Tensor>::Context,

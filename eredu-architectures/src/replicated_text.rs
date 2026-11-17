@@ -7121,14 +7121,6 @@ where
     /// Records that validated dispatch is about to construct architecture modules.
     fn construction_started(&mut self);
 
-    /// Binds the retained dense vision-language graph and its cursor adapter.
-    fn visit_vl(
-        self,
-        _prepared: crate::lfm3::vision::PreparedVlGraph,
-    ) -> Result<Self::Output, crate::prepared_execution::PreparedExecutionError<Self::Error>> {
-        Err(crate::prepared_execution::PreparedExecutionError::UnavailableExecution)
-    }
-
     /// Binds a routed composite target and its independently prepared predictor.
     /// Native adaptation retains processor policy and uses the shared speculative driver.
     fn visit_prediction<A, W>(
@@ -8050,7 +8042,11 @@ pub(crate) fn qwen_vl_with_formats(
         .filter_map(|(name, format)| format.weight_quantization().map(|format| (name, format)))
         .collect();
     let mut target = crate::qwen::vl::with_checkpoint_formats(args, text, HashMap::new())?;
-    target.vision.linear_formats = vision;
+    // Dense is the vision default, including for non-linear tensors in the artifact.
+    target.vision.linear_formats = vision
+        .into_iter()
+        .filter(|(_, format)| *format != LinearFormat::Dense)
+        .collect();
     target
         .vision
         .validate_for(crate::qwen::vision::VisionMode::DeepStack)

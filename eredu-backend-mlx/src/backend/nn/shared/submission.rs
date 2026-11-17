@@ -463,7 +463,7 @@ impl CommunicationBackend for MlxNeuralBackend {
 
 /// Mechanical tensor metadata used by the backend-neutral partition driver.
 #[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct MlxCommunicationTensorMetadata;
+pub struct MlxCommunicationTensorMetadata;
 
 impl eredu_runtime::CommunicationTensorMetadata<MlxNeuralBackend>
     for MlxCommunicationTensorMetadata

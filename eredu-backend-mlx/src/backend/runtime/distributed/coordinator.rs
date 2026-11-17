@@ -61,7 +61,7 @@ impl MlxReplicatedCoordinator {
     /// Realizes the manifest once, then retains independent logical coordinator
     /// handles over the same completion authority and native resources. The
     /// number of local selections need not match other ranks' selections.
-    pub(crate) fn from_manifest_selections(
+    pub fn from_manifest_selections(
         manifest: CommunicationManifest,
         selections: &[(CollectiveGroupId, usize)],
         world: &safemlx::distributed::Group,
@@ -148,6 +148,31 @@ impl ReplicatedCoordinator<MlxTensor, Stream> for MlxReplicatedCoordinator {
     }
     fn publish(&mut self, value: MlxTensor, _: &Stream) -> Result<MlxTensor, BackendFailure> {
         self.inner.borrow_mut().publish(value, &self.stream)
+    }
+}
+
+impl eredu_runtime::LayeredTensorCohort<MlxNeuralBackend> for MlxReplicatedCoordinator {
+    fn selection(&self) -> (&CommunicationManifest, CollectiveGroupId) {
+        (&self.manifest, self.group)
+    }
+
+    fn parallel_context(&self) -> &Group {
+        self.parallel_group()
+    }
+
+    fn agree(
+        &self,
+        descriptor: [u64; 8],
+        ready: bool,
+        context: &Stream,
+    ) -> Result<bool, BackendFailure> {
+        self.parallel.agree_local_phase(descriptor, ready, context)
+    }
+
+    fn traversal_hook<C, E: From<BackendFailure>>(
+        &self,
+    ) -> impl LayeredTraversalHook<MlxNeuralBackend, C, E> + '_ {
+        MlxLayeredAgreement::new(self.parallel_group())
     }
 }
 

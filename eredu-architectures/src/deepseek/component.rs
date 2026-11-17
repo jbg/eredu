@@ -108,16 +108,6 @@ pub(super) fn project_parameters(
         .map_err(Error::from)
 }
 
-pub(super) fn begin_group<T: Clone>(
-    definition: &ComponentDefinition,
-    group: usize,
-    initial: &T,
-    dependencies: &[&T],
-) -> Result<T, Error> {
-    definition.validate_group_dependencies(group, dependencies.len())?;
-    Ok(dependencies.first().copied().unwrap_or(initial).clone())
-}
-
 pub(super) fn state_partition_plan(
     parameters: &ArchitectureParameterDescription,
     state: &StateLayout,

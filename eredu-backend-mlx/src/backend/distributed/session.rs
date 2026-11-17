@@ -151,6 +151,11 @@ impl MlxDistributedSession {
         Ok(())
     }
 
+    /// Returns the shared authority for the selected rank communication.
+    pub(crate) const fn authority(&self) -> &eredu_runtime::PartitionCommunicationAuthority {
+        &self.authority
+    }
+
     /// Returns the communicator for an active opaque group identity.
     pub(crate) fn selected_group(&self, id: CollectiveGroupId) -> Option<&Group> {
         self.communicators.group(id)

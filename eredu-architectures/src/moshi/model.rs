@@ -325,6 +325,20 @@ pub struct ForwardContext<T> {
     previous_depth_token: Option<T>,
 }
 
+impl<T> eredu_nn::RetainedTensorRoots<T> for ForwardContext<T> {
+    fn visit_retained_tensors<'a>(&'a self, visitor: &mut dyn FnMut(&'a T)) {
+        [
+            self.temporal_mask.as_ref(),
+            self.temporal_output.as_ref(),
+            self.text_logits.as_ref(),
+            self.previous_depth_token.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .for_each(visitor);
+    }
+}
+
 impl<T> ForwardContext<T> {
     /// Borrows the shared temporal attention mask.
     pub const fn temporal_mask(&self) -> Option<&T> {
@@ -336,19 +350,9 @@ impl<T> ForwardContext<T> {
         self.allow_sliding_prefill
     }
 
-    /// Borrows normalized temporal hidden state after the temporal group.
-    pub const fn temporal_output(&self) -> Option<&T> {
-        self.temporal_output.as_ref()
-    }
-
     /// Borrows text logits after the temporal group.
     pub const fn text_logits(&self) -> Option<&T> {
         self.text_logits.as_ref()
-    }
-
-    /// Borrows the token feeding the next depth slice.
-    pub const fn previous_depth_token(&self) -> Option<&T> {
-        self.previous_depth_token.as_ref()
     }
 
     /// Records normalized temporal state and complete text logits.
@@ -722,14 +726,14 @@ where
         &mut self,
         group: usize,
         initial: &B::Tensor,
-        dependencies: &[&B::Tensor],
+        dependencies: &eredu_runtime::GroupDependencies<'_, B::Tensor>,
         _state: &mut S,
         _forward: &mut Self::ForwardContext,
         _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        match (group, dependencies) {
-            (0, []) => Ok(initial.clone()),
-            (1, [temporal]) => Ok((*temporal).clone()),
+        match (group, dependencies.only()) {
+            (0, None) => Ok(initial.clone()),
+            (1, Some(temporal)) => Ok(temporal.clone()),
             _ => Err(Error::backend(format!(
                 "Moshi group {group} received {} dependencies",
                 dependencies.len()

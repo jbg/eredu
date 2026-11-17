@@ -82,80 +82,123 @@ where
             .map_err(Error::backend_source)?
             .token_ids(context)
     }
-    fn should_execute_prepared_group(
+    fn prepared_group_invocation(
         &self,
         group: usize,
         input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
-    ) -> bool {
-        group == TARGET_INDEX
-            || (group == VISION_INDEX
-                && MediaInputPartPlan::chunk(input.admitted().parts())
-                    .is_none_or(|chunk| chunk.range.start == 0 && chunk.projected.is_none())
-                && input
+        tensor_partitions: usize,
+        stage_units: &[std::ops::Range<usize>],
+    ) -> Result<crate::composite_execution::CompositeGroupInvocation, String> {
+        use crate::composite_execution::{
+            CompositeContinuationGeometry, CompositeGroupInvocation, CompositeGroupUse,
+            CompositeTensorCollective,
+        };
+        let active = {
+            group == TARGET_INDEX
+                || (group == VISION_INDEX
+                    && MediaInputPartPlan::chunk(input.admitted().parts())
+                        .is_none_or(|chunk| chunk.range.start == 0 && chunk.projected.is_none())
+                    && input
+                        .admitted()
+                        .parts()
+                        .iter()
+                        .any(|part| matches!(part.shared(), QwenInputPartPlan::Media { .. })))
+        };
+        let mode = if active {
+            CompositeGroupUse::Execute
+        } else {
+            CompositeGroupUse::Bypassed
+        };
+        let boundary_sequence = (|| -> Result<i32, String> {
+            let positions = if group == VISION_INDEX {
+                input
                     .admitted()
                     .parts()
                     .iter()
-                    .any(|part| matches!(part.shared(), QwenInputPartPlan::Media { .. })))
-    }
-    fn prepared_group_boundary_sequence(
-        &self,
-        group: usize,
-        input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
-    ) -> Result<i32, String> {
-        let positions = if group == VISION_INDEX {
-            input
-                .admitted()
-                .parts()
-                .iter()
-                .filter_map(|part| match part.shared() {
-                    QwenInputPartPlan::Media { shape, .. } => Some(shape.decoder_positions),
-                    _ => None,
-                })
-                .try_fold(0u64, |sum, n| sum.checked_add(n))
-                .ok_or("projected media extent overflow")?
+                    .filter_map(|part| match part.shared() {
+                        QwenInputPartPlan::Media { shape, .. } => Some(shape.decoder_positions),
+                        _ => None,
+                    })
+                    .try_fold(0u64, |sum, n| sum.checked_add(n))
+                    .ok_or("projected media extent overflow")?
+            } else {
+                MediaInputPartPlan::chunk(input.admitted().parts())
+                    .map(|chunk| (chunk.range.end - chunk.range.start) as u64)
+                    .unwrap_or_else(|| input.admitted().decoder_positions())
+            };
+            i32::try_from(positions).map_err(|_| "composite boundary exceeds i32".into())
+        })()?;
+        let continuation = if active {
+            (|| -> Result<Option<CompositeContinuationGeometry>, String> {
+                let this = self.kernel();
+                if group != VISION_INDEX {
+                    return Ok(None);
+                }
+                let patches = input
+                    .admitted()
+                    .parts()
+                    .iter()
+                    .filter_map(|part| match part.shared() {
+                        QwenInputPartPlan::Media { ingress, .. } => Some(&ingress.patch_grid),
+                        _ => None,
+                    })
+                    .flatten()
+                    .try_fold(0_i64, |total, &(time, height, width)| {
+                        i64::from(time)
+                            .checked_mul(i64::from(height))
+                            .and_then(|area| area.checked_mul(i64::from(width)))
+                            .and_then(|count| total.checked_add(count))
+                            .ok_or("vision patch extent overflow")
+                    })?;
+                Ok(Some(CompositeContinuationGeometry::Uniform(vec![
+                    1,
+                    i32::try_from(patches).map_err(|_| "vision patch extent exceeds i32")?,
+                    this.vision.hidden_size,
+                ])))
+            })()?
         } else {
-            MediaInputPartPlan::chunk(input.admitted().parts())
-                .map(|chunk| (chunk.range.end - chunk.range.start) as u64)
-                .unwrap_or_else(|| input.admitted().decoder_positions())
+            None
         };
-        i32::try_from(positions).map_err(|_| "composite boundary exceeds i32".into())
+        let collective_waves =
+            (|| -> Result<Option<Vec<Vec<CompositeTensorCollective>>>, String> {
+                let this = self.kernel();
+                let pipeline_stages = stage_units.len();
+                if group != VISION_INDEX || tensor_partitions <= 1 || pipeline_stages <= 1 {
+                    return Ok(None);
+                }
+                if !active {
+                    return Ok(Some(vec![Vec::new(); pipeline_stages]));
+                }
+                let (patches, width) = continuation
+                    .as_ref()
+                    .ok_or("missing vision continuation")?
+                    .after_unit_end(1)?;
+                let projected = boundary_sequence;
+                let mut stages = Vec::with_capacity(pipeline_stages);
+                for range in &stage_units[..pipeline_stages] {
+                    let mut operations = vec![
+                        CompositeTensorCollective::Sum {
+                            shape: vec![patches, width]
+                        };
+                        range.len() * 2
+                    ];
+                    if range.end == this.vision.layer_count() {
+                        operations.push(CompositeTensorCollective::Sum {
+                            shape: vec![projected, this.vision.out_hidden_size],
+                        });
+                    }
+                    stages.push(operations);
+                }
+                Ok(Some(stages))
+            })()?;
+        Ok(CompositeGroupInvocation {
+            mode,
+            boundary_sequence,
+            continuation,
+            collective_waves,
+        })
     }
-    fn prepared_group_continuation_geometry(
-        &self,
-        group: usize,
-        input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
-    ) -> Result<Option<crate::composite_execution::CompositeContinuationGeometry>, String> {
-        let this = self.kernel();
-        if group != VISION_INDEX {
-            return Ok(None);
-        }
-        let patches = input
-            .admitted()
-            .parts()
-            .iter()
-            .filter_map(|part| match part.shared() {
-                QwenInputPartPlan::Media { ingress, .. } => Some(&ingress.patch_grid),
-                _ => None,
-            })
-            .flatten()
-            .try_fold(0_i64, |total, &(time, height, width)| {
-                i64::from(time)
-                    .checked_mul(i64::from(height))
-                    .and_then(|area| area.checked_mul(i64::from(width)))
-                    .and_then(|count| total.checked_add(count))
-                    .ok_or("vision patch extent overflow")
-            })?;
-        Ok(Some(
-            (
-                i32::try_from(patches).map_err(|_| "vision patch extent exceeds i32")?,
-                this.vision.hidden_size,
-            )
-                .into(),
-        ))
-    }
-    fn prepared_group_continuation_batched(&self, group: usize) -> bool {
-        group != VISION_INDEX
-    }
+
     fn prepared_primary_ingress_collectives(
         &self,
         _: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
@@ -175,49 +218,7 @@ where
     fn routed_tensor_vocabulary_sharded(&self) -> bool {
         false
     }
-    fn prepared_group_collective_waves(
-        &self,
-        group: usize,
-        input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
-        tensor_partitions: usize,
-        stage_units: &[std::ops::Range<usize>],
-    ) -> Result<Option<Vec<Vec<crate::composite_execution::CompositeTensorCollective>>>, String>
-    {
-        let this = self.kernel();
-        let pipeline_stages = stage_units.len();
-        if group != VISION_INDEX || tensor_partitions <= 1 || pipeline_stages <= 1 {
-            return Ok(None);
-        }
-        if !<Self as CompositeArchitecture<B, S>>::should_execute_prepared_group(self, group, input)
-        {
-            return Ok(Some(vec![Vec::new(); pipeline_stages]));
-        }
-        let (patches, width) =
-            <Self as CompositeArchitecture<B, S>>::prepared_group_continuation_geometry(
-                self, group, input,
-            )?
-            .ok_or("missing vision continuation")?
-            .after_unit_end(1)?;
-        let projected = <Self as CompositeArchitecture<B, S>>::prepared_group_boundary_sequence(
-            self, group, input,
-        )?;
-        let mut stages = Vec::with_capacity(pipeline_stages);
-        for range in &stage_units[..pipeline_stages] {
-            let mut operations = vec![
-                crate::composite_execution::CompositeTensorCollective::Sum {
-                    shape: vec![patches, width]
-                };
-                range.len() * 2
-            ];
-            if range.end == this.vision.layer_count() {
-                operations.push(crate::composite_execution::CompositeTensorCollective::Sum {
-                    shape: vec![projected, this.vision.out_hidden_size],
-                });
-            }
-            stages.push(operations);
-        }
-        Ok(Some(stages))
-    }
+
     fn partition_boundary_schema(
         &self,
         source_group: usize,
@@ -225,7 +226,7 @@ where
         _: &ResolvedBoundaryWireSchema,
         batch: i32,
         source_sequence: i32,
-        _: &[i32],
+        _: &[crate::composite_execution::CompositeGroupInvocation],
         continuation: Option<(i32, i32)>,
     ) -> Result<Option<ResolvedBoundaryWireSchema>, Error> {
         let this = self.kernel();

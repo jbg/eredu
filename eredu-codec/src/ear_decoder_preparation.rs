@@ -1,10 +1,17 @@
 //! Cold exact binding plans for independently leased EAR neural decoder units.
 
+use crate::{
+    ear_decoder::DecoderUnit,
+    ear_decoder_layered::{BoundEarDecoder, DecoderKernel},
+};
 use eredu_checkpoint::{recipe::RecipeDtype, store::SharedCheckpointSource};
+use eredu_core::BackendFailure;
+use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Tensor};
 use eredu_runtime::{
     ComponentPreparationError, ComponentRecipeConversion, LocalModelLayout, PreparedComponent,
     WeightBinding,
 };
+use eredu_runtime::{LayeredTensorCohort, ParameterUnitMechanisms, SubmissionBackend};
 
 use crate::ear_decoder::DecoderConfig;
 
@@ -53,6 +60,87 @@ impl PreparedDecoderBindings {
             |name| DecoderPreparationError::MissingParameter(name.into()),
         )?;
         Ok(Self { prepared })
+    }
+
+    /// Binds prepared units locally or to an explicitly selected tensor cohort.
+    pub fn bind<B, H, C>(
+        self,
+        residency: eredu_runtime::LayerWeightResidency,
+        context: &<B::Tensor as Tensor>::Context,
+        mechanisms: &H,
+        cohort: Option<C>,
+    ) -> Result<
+        (
+            BoundEarDecoder<B, H::UnitPolicy<DecoderUnit<B::Tensor>>, C>,
+            eredu_runtime::LayerwiseModelMetadata,
+        ),
+        BackendFailure,
+    >
+    where
+        B: DistributedNeuralBackend
+            + SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>
+            + 'static,
+        H: ParameterUnitMechanisms<B>,
+        C: LayeredTensorCohort<B>,
+    {
+        let selected = if let Some(cohort) = &cohort {
+            let (manifest, group) = cohort.selection();
+            let width = self
+                .config()
+                .unit_specs()
+                .map_err(BackendFailure::from_error)?
+                .iter()
+                .map(|spec| match spec {
+                    crate::ear_decoder::DecoderUnitSpec::Upsample { output, .. }
+                    | crate::ear_decoder::DecoderUnitSpec::Output { output, .. } => *output,
+                    crate::ear_decoder::DecoderUnitSpec::Block { width, .. } => *width,
+                })
+                .max()
+                .expect("validated nonempty decoder") as usize;
+            let sum = eredu_runtime::CommunicationOperationRequirement::tensors(
+                eredu_runtime::CommunicationOperation::AllReduceSum,
+                [eredu_core::checkpoint::TensorDtype::F32],
+                eredu_runtime::CommunicationTensorLimits::new(1, 3, width, None)
+                    .map_err(BackendFailure::from_error)?,
+                true,
+            )
+            .map_err(BackendFailure::from_error)?;
+            eredu_runtime::replicated_execution::validate_collective_coordination(
+                manifest,
+                group,
+                [sum],
+            )
+            .map_err(BackendFailure::from_error)?;
+            self.select_parallel(cohort.tensor_topology()?)
+                .map_err(BackendFailure::from_error)?
+                .0
+        } else {
+            if self.local_layout().is_some() {
+                return Err(BackendFailure::from_error(crate::Error::InvalidShape(
+                    "tensor-local parameter placement requires its selected cohort".into(),
+                )));
+            }
+            self
+        };
+        let (declaration, local, invocations, source, units) = selected.into_parts();
+        let definition = declaration.definition().clone();
+        let kernel = match local.as_ref() {
+            Some(layout) => DecoderKernel::<B>::new_parallel(declaration, layout),
+            None => DecoderKernel::<B>::new(declaration),
+        }
+        .map_err(BackendFailure::from_error)?;
+        let architecture = eredu_runtime::ComponentAdapter::new(definition, kernel)
+            .map_err(BackendFailure::from_error)?;
+        eredu_runtime::BoundLayerwiseComponent::bind(
+            architecture,
+            source,
+            invocations,
+            units,
+            residency,
+            context,
+            mechanisms,
+            cohort,
+        )
     }
 
     /// Selects exact tensor placement or validates a retained selection without
@@ -104,10 +192,6 @@ impl PreparedDecoderBindings {
     pub fn config(&self) -> &DecoderConfig {
         self.prepared.declaration().config()
     }
-    /// Canonical parameter namespace retained from preparation.
-    pub fn prefix(&self) -> &str {
-        self.prepared.declaration().prefix()
-    }
 
     /// Exact prepared unit bindings for cold resource accounting.
     pub fn unit_bindings(&self) -> &[Vec<WeightBinding>] {
@@ -119,13 +203,8 @@ impl PreparedDecoderBindings {
         self.prepared.source()
     }
 
-    /// Validated semantic definition retained through source and placement selection.
-    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
-        self.prepared.declaration().definition()
-    }
-
     /// Consumes exact source authority and the canonical ordered binding plan.
-    pub fn into_parts(
+    fn into_parts(
         self,
     ) -> (
         crate::declarations::DecoderDeclaration,

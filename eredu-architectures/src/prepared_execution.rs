@@ -19,10 +19,13 @@ mod partitioned;
 mod prediction;
 mod routed_partition;
 mod routed_session;
+mod retained_session;
+pub use retained_session::{PreparedRetainedTextSession, RealizedRank};
 
 pub use direct_session::{construct_selected_composite_session, construct_selected_text_session};
 pub use ordinary::{
-    CompositeRoute, KeyValueRoute, ReplicatedRoute, RetainedArchitectureConstruction, RoutedRoute,
+    construct_vl_rank, RetainedCompositeVisitor, CompositeRoute, KeyValueRoute,
+    ReplicatedRoute, RetainedArchitectureConstruction, RoutedRoute,
 };
 pub use partition_facts::PreparedPartitionSessionFacts;
 pub use partitioned::{PartitionedCompositeRoute, PartitionedDenseRoute, PartitionedRoutedRoute};
@@ -51,6 +54,9 @@ pub enum PreparedExecutionError<E> {
     /// A native materialization, communication, or publication mechanism failed.
     #[error("prepared execution mechanism failed: {0}")]
     Backend(E),
+    /// A native mechanism failed while binding portable components.
+    #[error(transparent)]
+    Binding(eredu_core::BackendFailure),
     /// A partitioned selection has no realized communication.
     #[error("partitioned construction has no realized communication")]
     MissingCommunication,
@@ -90,17 +96,6 @@ pub trait PreparedExecutableAssembler<C>: Sized {
         manifest: &CommunicationManifest,
         communication: &C,
     ) -> Result<(), Self::Error>;
-
-    /// Binds a VL rank using its already realized communication.
-    fn bind_vl_rank(
-        &mut self,
-        _prepared: crate::lfm3::vision::PreparedVlRankGraph,
-        _communication: &C,
-    ) -> Result<Self::Executable, PreparedExecutionError<Self::Error>> {
-        Err(PreparedExecutionError::Architecture(
-            "missing VL rank binding visitor".into(),
-        ))
-    }
 
     /// Publishes one outer model only after every typed construction step succeeds.
     fn finish(
@@ -216,6 +211,7 @@ pub struct PreparedConstructionBranch<S, C> {
     prediction: Option<PreparedPredictionSelection>,
     retained_prediction: Option<PredictionBinding>,
     retained_construction: Option<RetainedArchitectureConstruction>,
+    retained_composite_rank: Option<crate::lfm3::vision::PreparedVlRankGraph>,
 }
 
 impl<S, C> PreparedConstructionBranch<S, C> {
@@ -575,6 +571,7 @@ where
     let retained_communication = communication.clone();
     let context = BranchContext {
         retained_construction,
+        retained_composite_rank: vl_rank,
         retained_prediction,
         inspection,
         target: Arc::clone(graph.target()),
@@ -585,31 +582,14 @@ where
         communication,
         prediction,
     };
-    let executable = if let Some(prepared) = vl_rank {
-        assembler.bind_vl_rank(
-            prepared,
-            retained_communication
-                .as_ref()
-                .ok_or(PreparedExecutionError::MissingCommunication)?,
-        )?
-    } else {
-        let (execution, _, _, _) = selected.into_parts();
-        execution.dispatch(ConstructionDispatcher::<
-            _,
-            _,
-            _,
-            _,
-            _,
-            _,
-            _,
-            A::Executable,
-            A::Error,
-        > {
-            routes,
-            context,
-            marker: std::marker::PhantomData,
-        })?
-    };
+    let (execution, _, _, _) = selected.into_parts();
+    let executable = execution.dispatch(ConstructionDispatcher::<
+        _, _, _, _, _, _, _, A::Executable, A::Error,
+    > {
+        routes,
+        context,
+        marker: std::marker::PhantomData,
+    })?;
     assembler
         .finish(PreparedExecutableParts {
             executable,
@@ -630,6 +610,7 @@ struct BranchContext<C> {
     prediction: Option<PreparedPredictionSelection>,
     retained_prediction: Option<PredictionBinding>,
     retained_construction: Option<RetainedArchitectureConstruction>,
+    retained_composite_rank: Option<crate::lfm3::vision::PreparedVlRankGraph>,
 }
 impl<C> BranchContext<C> {
     fn branch<S>(self, selected: S) -> PreparedConstructionBranch<S, C> {
@@ -642,6 +623,7 @@ impl<C> BranchContext<C> {
             prediction: self.prediction,
             retained_prediction: self.retained_prediction,
             retained_construction: self.retained_construction,
+            retained_composite_rank: self.retained_composite_rank,
         }
     }
 }

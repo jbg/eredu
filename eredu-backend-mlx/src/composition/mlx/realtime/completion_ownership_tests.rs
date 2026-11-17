@@ -1,4 +1,4 @@
-use super::{completion::submission_failure, MlxRealtimeSubmissionScope};
+use super::completion::{submission_failure, MlxRealtimeSubmissionScope};
 use crate::backend::{
     nn::tensor::validate_token_domain,
     submission_recovery::{self, Probe, Recovery, Retention, Status},

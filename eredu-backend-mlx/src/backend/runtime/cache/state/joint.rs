@@ -7,20 +7,12 @@ use eredu_core::{execution_control::SnapshotEstimate, BackendFailure};
 use eredu_runtime::execution_control::{
     ForkStateEstimate, IsolatedStateCopy, IsolatedStateFork, SnapshotReservation,
 };
+use eredu_runtime::RealtimeCopyLimits;
 use safemlx::{transforms::async_eval_with_event, Event};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
-
-/// Copy admission limits. Execution growth is admitted by the enclosing session.
-#[derive(Debug, Clone, Copy)]
-pub struct JointCopyLimits {
-    /// Maximum conservative storage and temporary-copy estimate for one branch.
-    pub max_branch_bytes: u64,
-    /// Cumulative copy allowance, including discarded and failed copies.
-    pub max_total_copy_bytes: u64,
-}
 
 /// Joint native transaction or copy admission failure.
 #[derive(Debug, thiserror::Error)]
@@ -57,7 +49,7 @@ struct Admission {
 // cache owner's proof; independent construction never grants restore authority.
 struct CopyAccounting {
     consumed: AtomicU64,
-    limits: JointCopyLimits,
+    limits: RealtimeCopyLimits,
 }
 
 #[derive(Clone)]
@@ -95,21 +87,25 @@ pub struct MlxJointStateBranch {
 impl MlxJointStateBranch {
     /// Shares lifetime authority, without making another transaction or copying
     /// native values. Completion retains this before any eager execution work.
-    pub(crate) fn retention(&self) -> impl Sized + 'static {
+    pub fn retention(&self) -> impl Sized + 'static {
         JointRetention {
             _hybrid: self.hybrid.clone(),
             _key_value: self.key_value.clone(),
             _permit: self.permit.clone(),
         }
     }
-    /// Borrows the two independent cache families for one coupled invocation.
-    pub fn parts_mut(&mut self) -> (&mut MlxHybridState, &mut [MlxKeyValueLayerState]) {
-        (&mut self.hybrid, self.key_value.as_mut())
-    }
-
     /// Native values retained by the candidate, including every batch lane.
     pub fn retained_arrays(&self) -> Vec<&Array> {
         arrays(&self.hybrid, &self.key_value)
+    }
+}
+
+impl eredu_runtime::RealtimeJointStateParts for MlxJointStateBranch {
+    type Left = MlxHybridState;
+    type Right = [MlxKeyValueLayerState];
+
+    fn parts_mut(&mut self) -> (&mut Self::Left, &mut Self::Right) {
+        (&mut self.hybrid, self.key_value.as_mut())
     }
 }
 
@@ -119,7 +115,7 @@ impl MlxJointState {
         hybrid: MlxHybridState,
         key_value: MlxKeyValueState,
         stream: &Stream,
-        limits: JointCopyLimits,
+        limits: RealtimeCopyLimits,
     ) -> Result<Self, JointStateError> {
         if !hybrid.supports_isolated_snapshot() || !key_value.supports_isolated_snapshot() {
             return Err(JointStateError::UnsupportedStorage);
@@ -541,16 +537,18 @@ mod tests {
             &stream,
         )
         .unwrap();
-        MlxJointState::new(
-            hybrid,
-            key_value,
-            &stream,
-            JointCopyLimits {
-                max_branch_bytes: 1 << 20,
-                max_total_copy_bytes: 1 << 20,
-            },
-        )
-        .unwrap()
+        use eredu_runtime::RealtimeStateGroup;
+        let mechanisms = crate::native::MlxRealtimeExecutionContext::new(&stream, &stream);
+        mechanisms
+            .group_state(
+                hybrid,
+                key_value,
+                RealtimeCopyLimits {
+                    max_branch_bytes: 1 << 20,
+                    max_total_copy_bytes: 1 << 20,
+                },
+            )
+            .unwrap()
     }
 
     #[test]
@@ -572,7 +570,7 @@ mod tests {
                 // Immutable candidates need no cumulative native-copy allowance.
                 Arc::get_mut(&mut owner.admission).unwrap().accounting = Arc::new(CopyAccounting {
                     consumed: AtomicU64::new(0),
-                    limits: JointCopyLimits {
+                    limits: RealtimeCopyLimits {
                         max_branch_bytes: 1 << 20,
                         max_total_copy_bytes: 0,
                     },

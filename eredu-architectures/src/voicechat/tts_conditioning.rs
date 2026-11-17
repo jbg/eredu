@@ -334,7 +334,7 @@ impl<B: NeuralBackend> CharacterEmbedding<B> {
         hidden: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, TtsError> {
-        self.finish_with_projection(batch, hidden, context, Ok)
+        self.finish_with_projection(batch, hidden, context, |local| local)
     }
 
     pub(super) fn finish_with_projection<F>(
@@ -345,35 +345,38 @@ impl<B: NeuralBackend> CharacterEmbedding<B> {
         gather: F,
     ) -> Result<B::Tensor, TtsError>
     where
-        F: FnOnce(B::Tensor) -> Result<B::Tensor, TtsError>,
+        F: FnOnce(Result<B::Tensor, TtsError>) -> Result<B::Tensor, TtsError>,
     {
-        self.validate(batch)?;
-        f32_shape(hidden, self.dimensions.width)?;
-        if hidden.shape()[..2] != batch.shape() {
-            return Err(TtsError::Shape(
-                "character backbone output does not match packed inputs",
-            ));
-        }
-        let values = batch
-            .lengths
-            .iter()
-            .flat_map(|length| {
-                (0..batch.columns).map(move |column| if column < *length { 1.0 } else { 0.0 })
-            })
-            .collect::<Vec<_>>();
-        let mask = B::Tensor::from_f32_slice(&values, &[batch.rows, batch.columns, 1], context)?;
-        let denominator = B::Tensor::from_f32_slice(
-            &batch
+        let projected = gather((|| {
+            self.validate(batch)?;
+            f32_shape(hidden, self.dimensions.width)?;
+            if hidden.shape()[..2] != batch.shape() {
+                return Err(TtsError::Shape(
+                    "character backbone output does not match packed inputs",
+                ));
+            }
+            let values = batch
                 .lengths
                 .iter()
-                .map(|length| (*length).max(1) as f32)
-                .collect::<Vec<_>>(),
-            &[batch.rows, 1],
-            context,
-        )?;
-        let mean = B::Tensor::sum_axis(&hidden.multiply(&mask, context)?, 1, false, context)?
-            .divide(&denominator, context)?;
-        let projected = gather(self.projection.forward(&mean, context)?)?;
+                .flat_map(|length| {
+                    (0..batch.columns).map(move |column| if column < *length { 1.0 } else { 0.0 })
+                })
+                .collect::<Vec<_>>();
+            let mask =
+                B::Tensor::from_f32_slice(&values, &[batch.rows, batch.columns, 1], context)?;
+            let denominator = B::Tensor::from_f32_slice(
+                &batch
+                    .lengths
+                    .iter()
+                    .map(|length| (*length).max(1) as f32)
+                    .collect::<Vec<_>>(),
+                &[batch.rows, 1],
+                context,
+            )?;
+            let mean = B::Tensor::sum_axis(&hidden.multiply(&mask, context)?, 1, false, context)?
+                .divide(&denominator, context)?;
+            Ok(self.projection.forward(&mean, context)?)
+        })())?;
         let scatter = B::Tensor::from_i32_slice(
             &batch
                 .selected
@@ -465,7 +468,7 @@ impl<B: NeuralBackend> GatedFusion<B> {
         text: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, TtsError> {
-        self.forward_with_projection(audio, text, context, Ok)
+        self.forward_with_projection(audio, text, context, |local| local)
     }
 
     pub(super) fn forward_with_projection<F>(
@@ -473,23 +476,24 @@ impl<B: NeuralBackend> GatedFusion<B> {
         audio: &B::Tensor,
         text: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
-        gather: F,
+        mut gather: F,
     ) -> Result<B::Tensor, TtsError>
     where
-        F: Fn(B::Tensor) -> Result<B::Tensor, TtsError>,
+        F: FnMut(Result<B::Tensor, TtsError>) -> Result<B::Tensor, TtsError>,
     {
-        f32_shape(audio, self.width)?;
-        f32_shape(text, self.width)?;
-        if audio.shape() != text.shape() {
-            return Err(TtsError::Shape("audio/text fusion shape mismatch"));
-        }
-        super::precision::require_float32(self, audio).map_err(TtsError::Shape)?;
-        let divisor = B::Tensor::full_f32(31.0, &[], context)?;
-        let audio = gather(
-            self.audio
-                .forward(&audio.divide(&divisor, context)?, context)?,
-        )?;
-        let text = gather(self.text.forward(text, context)?)?;
+        let audio = gather((|| {
+            f32_shape(audio, self.width)?;
+            f32_shape(text, self.width)?;
+            if audio.shape() != text.shape() {
+                return Err(TtsError::Shape("audio/text fusion shape mismatch"));
+            }
+            super::precision::require_float32(self, audio).map_err(TtsError::Shape)?;
+            let divisor = B::Tensor::full_f32(31.0, &[], context)?;
+            Ok(self
+                .audio
+                .forward(&audio.divide(&divisor, context)?, context)?)
+        })())?;
+        let text = gather(self.text.forward(text, context).map_err(Into::into))?;
         let gate = B::sigmoid(self.gate.as_ref().clone(), context)?;
         let scale = B::sigmoid(self.residual_scale.as_ref().clone(), context)?;
         let complement = B::Tensor::full_f32(1.0, &[], context)?.subtract(&gate, context)?;

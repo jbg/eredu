@@ -417,7 +417,7 @@ impl<B: NeuralBackend> AudioKernel<B> {
                     AudioUnitKind::Convolution { .. } => {}
                     AudioUnitKind::Projection => width = self.config.out_hidden_size,
                 }
-                (sequence, width)
+                vec![1, sequence, width]
             })
             .collect();
         Ok(crate::composite_execution::CompositeContinuationGeometry::AfterUnits(shapes))

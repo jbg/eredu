@@ -5,6 +5,7 @@ mod composite;
 mod mechanisms;
 pub(super) mod prepared_parameters;
 mod replicated;
+pub(super) mod retained_session;
 mod retention;
 
 pub(super) use composite::*;

@@ -38,71 +38,23 @@ pub(crate) fn test_stream() -> &'static Stream {
 /// backend facilities are organized under [`backend`].
 pub mod native {
     pub use crate::backend::runtime::distributed::coordinator::MlxReplicatedCoordinator;
-    /// Reports exact cold cache mechanisms for an architecture-declared state layout.
-    /// This allocates no native device, stream, or cache storage.
-    pub fn state_capabilities(
-        requirements: &eredu_runtime::StateRealizationRequirements,
-        policy: &eredu_runtime::CacheResidencyPolicy,
-    ) -> eredu_runtime::StateMechanismCapabilities {
-        crate::composition::mlx::state_capabilities(requirements, policy)
-    }
+    pub use crate::backend::runtime::execution::pipeline::MlxComponentPipeline;
+    #[cfg(any(feature = "image", feature = "audio"))]
+    pub use crate::composition::mlx::{MlxMediaInputLowering, ModelProcessor as MlxMediaProcessor};
 
-    #[cfg(feature = "audio")]
-    pub use crate::composition::lfm3_audio::{
-        MlxAudioEncoder, MlxAudioIngress, MlxAudioIngressSnapshot, MlxAudioPcmTranscription,
-        MlxAudioPcmTranscriptionSnapshot,
-    };
-    pub use crate::composition::lfm3_audio::{
-        MlxAudioModel, MlxAudioSession, MlxAudioSnapshot, MlxAudioTranscription,
-        MlxAudioTranscriptionSnapshot, MlxPipelineAudioModel, MlxPipelineAudioSession,
-        MlxTensorParallelAudioModel, MlxTensorParallelAudioSession,
-    };
-    #[cfg(feature = "image")]
-    pub use crate::composition::lfm3_vision::MlxVlMedia;
-    pub use crate::composition::lfm3_vision::{
-        bind_vl_rank, bind_vl_weights, MlxVlDecoder, MlxVlGraph, MlxVlGraphRequest, MlxVlPrefill,
-        MlxVlPrefillCursor, MlxVlVision, MlxVlVisionSession,
-    };
-
-    pub use crate::composition::moshi::MlxRealtimeExecution;
+    pub use crate::composition::mlx::component_binding::MlxComponentBinder;
+    pub use crate::composition::mlx::realtime::MlxRealtimeExecution;
+    pub use crate::composition::mlx::replicated_text::MlxLocalComponent;
     use safemlx::Stream;
 
-    pub use crate::backend::distributed::MlxRealtimeConsensusTransport;
+    pub use crate::backend::distributed::{MlxRealtimeConsensusTransport, MlxRingTransport};
     pub use crate::backend::topology::DeviceAssignment;
     pub use crate::backend::{random::RandomState, ExecutionContext};
     pub use crate::composition::mlx::realtime::{
-        MlxPreparedRealtimeExecution, MlxRealtimeCompletion, MlxRealtimeCompletionMechanism,
-        MlxRealtimeExecutionContext, MlxRealtimeFrameTensorMechanisms, MlxRealtimeHostObserver,
+        MlxPrepublicationFrame, MlxRealtimeBinding, MlxRealtimeCompletion,
+        MlxRealtimeExecutionContext, MlxRealtimeSupport, SharedRealtimeExecution,
     };
     pub use crate::composition::mlx::speculative::MlxDrafter;
-    pub use crate::composition::mlx::voicechat::{
-        initialize_voicechat_neural_state, materialize_ear_decoder,
-        materialize_ear_decoder_parallel, materialize_ear_decoder_pipeline,
-        materialize_ear_encoder, materialize_ear_encoder_parallel,
-        materialize_ear_encoder_pipeline, materialize_prvq, materialize_prvq_parallel,
-        materialize_voicechat_backbone, materialize_voicechat_components,
-        materialize_voicechat_conditioning, materialize_voicechat_conditioning_parallel,
-        materialize_voicechat_function_head, materialize_voicechat_function_head_parallel,
-        materialize_voicechat_mog, materialize_voicechat_mog_parallel,
-        materialize_voicechat_perception, materialize_voicechat_perception_parallel,
-        materialize_voicechat_perception_pipeline, materialize_voicechat_perception_rnnt_pipeline,
-        materialize_voicechat_rnnt, materialize_voicechat_rnnt_parallel,
-        materialize_voicechat_rnnt_predictor_pipeline, materialize_voicechat_rnnt_projection,
-        materialize_voicechat_rnnt_projection_parallel, materialize_voicechat_rvq,
-        materialize_voicechat_rvq_parallel, materialize_voicechat_speech_providers,
-        materialize_voicechat_tts_transformer, materialize_voicechat_tts_transformer_parallel,
-        materialize_voicechat_tts_transformer_partition,
-        materialize_voicechat_tts_transformer_pipeline, MaterializedMlxSpeechProviders,
-        MlxConditioning, MlxEarDecoder, MlxEarDecoderPipeline, MlxEarDecoderPipelineState,
-        MlxEarEncoder, MlxEarEncoderPipeline, MlxFunctionHead, MlxMog, MlxPerception,
-        MlxPerceptionPipeline, MlxPerceptionPipelineState, MlxPerceptionRnntMetadata,
-        MlxPerceptionRnntPipeline, MlxPerceptionRnntResidencyReports, MlxPrvq, MlxRnnt,
-        MlxRnntPredictorPipeline, MlxRnntProjection, MlxRvq, MlxSpeechProviders, MlxTtsTransformer,
-        MlxTtsTransformerPartition, MlxTtsTransformerPipeline, MlxTtsTransformerPipelineState,
-        MlxVoiceChatBackbone, MlxVoiceChatBranch, MlxVoiceChatComponents, MlxVoiceChatExecution,
-        MlxVoiceChatGeneration, MlxVoiceChatPrepublication, VoiceChatNeuralInitializationError,
-        VoiceChatSubmissionError,
-    };
     pub use crate::composition::mlx::{
         inspect_model, inspect_model_preparation, MlxInspectionOptions, MlxModelInput,
         MlxModelOutput, MlxModelSession, MlxNativeTextState, MlxSessionCompletion,

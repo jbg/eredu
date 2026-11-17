@@ -248,6 +248,17 @@ impl<'a, T, P> PreparedCompositeInput<'a, T, P> {
             })
     }
 
+    /// Decoder positions for this invocation, including chunked prefill.
+    pub(crate) fn decoder_sequence(&self) -> Result<i32, String> {
+        let positions = self
+            .decoder_chunk()
+            .map_or(self.admitted().decoder_positions(), |chunk| {
+                chunk.range.len() as u64
+            });
+        i32::try_from(positions)
+            .map_err(|_| "prepared composite boundary sequence exceeds i32".into())
+    }
+
     /// Exact backend-native prepared tensor handles.
     pub const fn prepared(&self) -> &'a eredu_runtime::PreparedModelInput<T> {
         self.prepared
@@ -375,47 +386,51 @@ where
     }
 }
 
-/// Request-specific encoder geometry at an intra-group pipeline cut.
+/// Native encoder activation shapes at intra-group pipeline cuts.
+/// The last axis is the feature width. Transport packs all preceding axes
+/// into one sequence on a batch-one wire.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum CompositeContinuationGeometry {
-    /// Every internal cut has the same frame count and width.
-    Uniform {
-        /// Prepared encoder frames.
-        sequence: i32,
-        /// Encoder activation width.
-        width: i32,
-    },
-    /// Shape after each source unit, including reductions between encoder stages.
-    AfterUnits(Vec<(i32, i32)>),
-}
-
-impl From<(i32, i32)> for CompositeContinuationGeometry {
-    fn from((sequence, width): (i32, i32)) -> Self {
-        Self::Uniform { sequence, width }
-    }
+    /// Every source unit has the same native shape.
+    Uniform(Vec<i32>),
+    /// Native shape after each source unit, in execution order.
+    AfterUnits(Vec<Vec<i32>>),
 }
 
 impl CompositeContinuationGeometry {
-    /// Resolves the exact shape after a positive exclusive source-unit frontier.
+    /// Native shape after a positive exclusive source-unit frontier.
+    pub fn native_shape(&self, end: usize) -> Result<&[i32], String> {
+        let index = end
+            .checked_sub(1)
+            .ok_or("encoder continuation has no completed source unit")?;
+        match self {
+            Self::Uniform(shape) => Ok(shape),
+            Self::AfterUnits(shapes) => shapes
+                .get(index)
+                .map(Vec::as_slice)
+                .ok_or_else(|| "encoder continuation exceeds its source units".into()),
+        }
+    }
+
+    /// Resolves the packed sequence and feature width.
     pub fn after_unit_end(&self, end: usize) -> Result<(i32, i32), String> {
-        if end == 0 {
-            return Err("encoder continuation has no completed source unit".into());
-        }
-        let shape = match self {
-            Self::Uniform { sequence, width } => (*sequence, *width),
-            Self::AfterUnits(shapes) => *shapes
-                .get(end - 1)
-                .ok_or("encoder continuation exceeds its source units")?,
-        };
-        if shape.0 <= 0 || shape.1 <= 0 {
-            return Err("encoder continuation geometry must be positive".into());
-        }
-        Ok(shape)
+        let (&width, axes) = self
+            .native_shape(end)?
+            .split_last()
+            .filter(|(width, axes)| **width > 0 && !axes.is_empty())
+            .ok_or("encoder continuation requires positive sequence and width axes")?;
+        let sequence = axes
+            .iter()
+            .try_fold(1i32, |product, &extent| {
+                (extent > 0).then(|| product.checked_mul(extent)).flatten()
+            })
+            .ok_or("encoder continuation has invalid native extents")?;
+        Ok((sequence, width))
     }
 
     /// Checks complete unit coverage before beginning any native operation.
     pub fn validate_units(&self, units: usize) -> Result<(), String> {
-        if units == 0 || matches!(self,Self::AfterUnits(shapes) if shapes.len() != units) {
+        if units == 0 || matches!(self, Self::AfterUnits(shapes) if shapes.len() != units) {
             return Err("encoder continuation geometry differs from its unit count".into());
         }
         for end in 1..=units {
@@ -423,6 +438,36 @@ impl CompositeContinuationGeometry {
         }
         Ok(())
     }
+}
+
+/// Whether a group produces a new value for this invocation.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum CompositeGroupUse {
+    /// Execute the group's equations for the admitted input.
+    Execute,
+    /// Reuse context carried by the architecture from an earlier decoder chunk.
+    Retained,
+    /// The request supplies no work for this group, including caller-projected inputs.
+    Bypassed,
+}
+
+impl CompositeGroupUse {
+    /// Whether the group runs and participates in activation transfers.
+    pub fn is_active(self) -> bool {
+        self == Self::Execute
+    }
+}
+
+/// Request-specific execution and transport contract for one composite group.
+pub struct CompositeGroupInvocation {
+    /// How the current request uses the group.
+    pub mode: CompositeGroupUse,
+    /// Sequence extent emitted to other groups.
+    pub boundary_sequence: i32,
+    /// Per-cut geometry when an internal activation differs from the output.
+    pub continuation: Option<CompositeContinuationGeometry>,
+    /// Exact operations by pipeline stage, including explicitly empty waves.
+    pub collective_waves: Option<Vec<Vec<CompositeTensorCollective>>>,
 }
 
 /// Architecture-owned interpretation of admitted prepared input.
@@ -534,99 +579,27 @@ where
         B::Tensor::concatenate(&prepared_token_parts(input, context, |_| None)?, 1, context)
     }
 
-    /// Returns whether one request-optional execution group is active for the
-    /// exact admitted input.
-    ///
-    /// This decision intentionally consumes the architecture-owned part plan,
-    /// rather than modality presence alone: projected media embeddings retain
-    /// their semantic modality but must not execute the corresponding native
-    /// media tower.
-    fn should_execute_prepared_group(
+    /// Plans one group from admitted input and selected group-local stage ranges.
+    fn prepared_group_invocation(
         &self,
         group: usize,
         input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
-    ) -> bool;
+        tensor_partitions: usize,
+        stage_units: &[std::ops::Range<usize>],
+    ) -> Result<CompositeGroupInvocation, String>;
 
-    /// Exact sequence extent emitted across one prepared group boundary.
-    ///
-    /// Most composite groups preserve the complete decoder extent. Media
-    /// towers whose projected output occupies only their admitted placeholder
-    /// span override this before the prepared input is consumed.
-    fn prepared_group_boundary_sequence(
+    /// Decoder batch extent. Media-first inputs can have a patch or frame axis
+    /// instead of a batch axis on their first payload.
+    fn prepared_decoder_batch_size(
         &self,
-        _group: usize,
         input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
     ) -> Result<i32, String> {
-        let positions = input
-            .decoder_chunk()
-            .map_or(input.admitted().decoder_positions(), |chunk| {
-                chunk.range.len() as u64
-            });
-        i32::try_from(positions)
-            .map_err(|_| "prepared composite boundary sequence exceeds i32".to_owned())
-    }
-
-    /// Exact intermediate activation geometry for a pipeline continuation
-    /// within one execution group.
-    ///
-    /// `None` means the group preserves the ordinary decoder-width
-    /// `[batch, sequence, hidden]` boundary. Media towers whose internal
-    /// workspace differs from their projected output declare its exact
-    /// sequence and width here.
-    fn prepared_group_continuation_geometry(
-        &self,
-        _group: usize,
-        _input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
-    ) -> Result<Option<CompositeContinuationGeometry>, String> {
-        Ok(None)
-    }
-
-    /// Whether transport adds a leading batch axis to an internal group activation.
-    ///
-    /// `true` expands before encoding and squeezes before decoding. Architectures
-    /// whose activation already has its wire-ready batch axis, or whose encoding
-    /// owns that reshape, return `false`.
-    fn prepared_group_continuation_batched(&self, _group: usize) -> bool {
-        true
-    }
-
-    /// Packs an internal group activation into its declared continuation shape.
-    /// The default preserves the ordinary wire-ready activation without work.
-    fn encode_group_continuation(
-        &self,
-        _group: usize,
-        hidden: B::Tensor,
-        _context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error> {
-        Ok(hidden)
-    }
-
-    /// Restores the internal shape using the retained, admitted request context.
-    fn decode_group_continuation(
-        &self,
-        _group: usize,
-        hidden: B::Tensor,
-        _forward: &Self::ForwardContext,
-        _context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error> {
-        Ok(hidden)
-    }
-
-    /// Exact TP collective sequence for every PP stage of one prepared group.
-    ///
-    /// `None` means the architecture declares no shared-world schedule for the
-    /// group. `stage_units` carries exact retained group-local ownership for every
-    /// pipeline stage, including empty ranges. A tensor-sharded optional group
-    /// active under TP+PP returns one entry per stage and uses these ranges to
-    /// describe its native operation order.
-    fn prepared_group_collective_waves(
-        &self,
-        _group: usize,
-        _input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
-        _tensor_partitions: usize,
-        _stage_units: &[std::ops::Range<usize>],
-    ) -> Result<Option<Vec<Vec<CompositeTensorCollective>>>, String> {
-        Ok(None)
+        input
+            .prepared()
+            .parts()
+            .first()
+            .map(|part| part.payload().value().dim(0))
+            .ok_or_else(|| "composite request has no prepared parts".into())
     }
 
     /// Exact TP collectives emitted while the primary decoder ingress is assembled.
@@ -692,7 +665,7 @@ where
         _selected: &eredu_runtime::ResolvedBoundaryWireSchema,
         _batch: i32,
         _source_sequence: i32,
-        _group_sequences: &[i32],
+        _groups: &[CompositeGroupInvocation],
         _continuation: Option<(i32, i32)>,
     ) -> Result<Option<eredu_runtime::ResolvedBoundaryWireSchema>, Self::Error> {
         Ok(None)

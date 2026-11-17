@@ -358,6 +358,13 @@ pub struct TokenizedMultimodalRequest {
 }
 
 impl TokenizedMultimodalRequest {
+    /// Creates a prepared request containing a single decoded media item.
+    pub fn from_media(media: Media) -> Self {
+        Self {
+            segments: vec![TokenizedMultimodalSegment::Media(media)],
+        }
+    }
+
     /// Ordered token and media segments.
     pub fn segments(&self) -> &[TokenizedMultimodalSegment] {
         &self.segments

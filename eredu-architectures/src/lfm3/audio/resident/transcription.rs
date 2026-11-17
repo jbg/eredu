@@ -350,9 +350,13 @@ where
     ) -> Result<AudioTranscription<B, H, I>, AudioTranscriptionError> {
         let encoder = self
             .encoder
-            .stream(self.binding.state(self.artifact.encoder.state_layout())?, 1)
+            .stream(
+                self.binding
+                    .realize_state(self.artifact.encoder.state_layout())?,
+                1,
+            )
             .map_err(failure)?;
-        let language = self.binding.state(self.language.state_layout())?;
+        let language = self.binding.realize_state(self.language.state_layout())?;
         Ok(AudioTranscription {
             model: Rc::new(RefCell::new(self)),
             state: TranscriptionState {
@@ -384,6 +388,15 @@ where
     /// Advances one live mel block, optionally restarting the text context.
     /// Blocks contain no batch padding. An empty final block closes the stream.
     pub fn advance(
+        &mut self,
+        features: &LogMelFeatures,
+        final_chunk: bool,
+        restart: bool,
+    ) -> Result<AudioTranscriptionBlock, AudioTranscriptionError> {
+        H::with_input_recovery(|| self.advance_with_retention(features, final_chunk, restart))
+    }
+
+    fn advance_with_retention(
         &mut self,
         features: &LogMelFeatures,
         final_chunk: bool,
@@ -451,7 +464,7 @@ where
         let mut encoder = self.state.encoder.try_branch(H::branch_state)?;
         let projected = model.project_stream_chunk(features, &mut encoder, final_chunk)?;
         let mut language = if restart {
-            Some(model.binding.state(model.language.state_layout())?)
+            Some(model.binding.realize_state(model.language.state_layout())?)
         } else if generate {
             Some(H::branch_state(&self.state.language)?)
         } else {

@@ -597,7 +597,8 @@ impl<B: NeuralBackend> Attention<B> {
                     algorithm: eredu_nn::RotaryAlgorithm::ZeroTail {
                         rotary_fraction: 1.0,
                     },
-                },
+                }
+                .prepare()?,
                 ctx,
             )?,
             window,

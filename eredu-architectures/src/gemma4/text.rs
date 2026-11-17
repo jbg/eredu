@@ -109,7 +109,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> {
                 .key_norm
                 .map(|s| B::normalization(s, context))
                 .transpose()?,
-            rotary: B::rotary(spec.rotary, context)?,
+            rotary: B::rotary(spec.rotary.prepare()?, context)?,
         })
     }
 

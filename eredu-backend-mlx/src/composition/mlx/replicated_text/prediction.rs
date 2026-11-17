@@ -904,9 +904,6 @@ pub(crate) trait ErasedPrefillCursor {
     fn decoder_position(&self) -> usize;
     /// Identifies whether this advance requires preparation or decoder execution.
     fn next_step(&self) -> Result<eredu_runtime::prefill::PrefillStep, Error>;
-    fn cache_identity(&self) -> Option<&eredu_runtime::PreparedInputCacheIdentity> {
-        None
-    }
     fn token_count(&self) -> usize;
     fn final_decoder_range(&self) -> Result<std::ops::Range<usize>, Error> {
         use eredu_runtime::prefill::PrefillStep;
@@ -918,6 +915,52 @@ pub(crate) trait ErasedPrefillCursor {
         }
     }
     fn retained_bytes(&self) -> Result<usize, Error>;
+}
+
+/// Adapts a portable cursor to the native snapshot and retention interface.
+impl<C> ErasedPrefillCursor for C
+where
+    C: eredu_runtime::prefill::RetainedPrefillCursor<Tensor = MlxTensor> + 'static,
+{
+    fn clone_box(&self) -> Box<dyn ErasedPrefillCursor> {
+        Box::new(self.clone())
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
+    fn decoder_position(&self) -> usize {
+        self.decoder_position()
+    }
+
+    fn next_step(&self) -> Result<eredu_runtime::prefill::PrefillStep, Error> {
+        self.next_step().map_err(|error| Error::Other(Box::new(error)))
+    }
+
+    fn token_count(&self) -> usize {
+        self.token_count()
+    }
+
+    fn retained_bytes(&self) -> Result<usize, Error> {
+        let unknown = || {
+            Error::ArchitectureModel("retained prefill cursor storage is unavailable".into())
+        };
+        let mut arrays = Vec::new();
+        self.visit_retained_values(|tensor| arrays.push(tensor.as_array()));
+        let survey = safemlx::inspect_storage(&arrays)?;
+        if survey.values.iter().any(Option::is_none) {
+            return Err(unknown());
+        }
+        survey.backings.into_iter().try_fold(
+            self.retained_metadata_bytes().ok_or_else(unknown)?,
+            |bytes, backing| {
+                bytes
+                    .checked_add(backing.allocator_capacity_bytes.ok_or_else(unknown)?)
+                    .ok_or_else(unknown)
+            },
+        )
+    }
 }
 
 /// Backend-private erased operations for a paired architecture and mutable state.

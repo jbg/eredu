@@ -229,6 +229,13 @@ where
         &mut self,
         restart: bool,
     ) -> Result<Option<AudioTranscriptionBlock>, AudioTranscriptionError> {
+        H::with_input_recovery(|| self.advance_pcm(restart))
+    }
+
+    fn advance_pcm(
+        &mut self,
+        restart: bool,
+    ) -> Result<Option<AudioTranscriptionBlock>, AudioTranscriptionError> {
         if self.is_finished() {
             return Err(AudioTranscriptionError::Finished);
         }
@@ -246,7 +253,9 @@ where
             mel_bins: BINS,
         };
         let final_chunk = self.session.state.input.finished && available <= cadence;
-        let block = self.session.advance(&features, final_chunk, restart)?;
+        let block = self
+            .session
+            .advance_with_retention(&features, final_chunk, restart)?;
         self.session.state.input.values.drain(..values);
         Ok(Some(block))
     }

@@ -310,7 +310,6 @@ fn select_architecture_expert_units(
 }
 
 pub mod mlx;
-pub mod moshi;
 
 #[cfg(test)]
 mod expert_selection_tests {
@@ -389,7 +388,3 @@ mod expert_selection_tests {
 #[cfg(test)]
 #[path = "tests/neutral_observer.rs"]
 mod neutral_observer_tests;
-
-pub(crate) mod lfm3_audio;
-
-pub(crate) mod lfm3_vision;

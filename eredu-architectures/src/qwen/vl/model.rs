@@ -264,189 +264,202 @@ where
         crate::media_plan::admit_qwen_vl_input(config, input, inspector)
     }
 
-    fn should_execute_prepared_group(
-        &self,
-        group: usize,
-        input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
-    ) -> bool {
-        group == 1
-            || (group == 0
-                && input
-                    .admitted()
-                    .parts()
-                    .iter()
-                    .any(|part| matches!(part, QwenVlInputPartPlan::Media { .. })))
-    }
-
-    fn prepared_group_boundary_sequence(
-        &self,
-        group: usize,
-        input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
-    ) -> Result<i32, String> {
-        let positions = if group == 0 {
-            input
-                .admitted()
-                .parts()
-                .iter()
-                .filter_map(|part| match part {
-                    QwenVlInputPartPlan::Media { shape, .. } => Some(shape.decoder_positions),
-                    _ => None,
-                })
-                .try_fold(0_u64, |total, positions| total.checked_add(positions))
-                .ok_or_else(|| "Qwen3-VL projected media positions overflowed".to_owned())?
-        } else {
-            input.admitted().decoder_positions()
-        };
-        i32::try_from(positions)
-            .map_err(|_| "Qwen3-VL prepared group boundary sequence exceeds i32".to_owned())
-    }
-
-    fn prepared_group_continuation_geometry(
-        &self,
-        group: usize,
-        input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
-    ) -> Result<Option<crate::composite_execution::CompositeContinuationGeometry>, String> {
-        if group != 0 {
-            return Ok(None);
-        }
-        let patches = input
-            .admitted()
-            .parts()
-            .iter()
-            .filter_map(|part| match part {
-                QwenVlInputPartPlan::Media { ingress, .. } => Some(&ingress.patch_grid),
-                _ => None,
-            })
-            .flatten()
-            .try_fold(0_u64, |total, &(time, height, width)| {
-                u64::try_from(time)
-                    .ok()
-                    .and_then(|time| {
-                        u64::try_from(height)
-                            .ok()
-                            .and_then(|height| time.checked_mul(height))
-                    })
-                    .and_then(|area| {
-                        u64::try_from(width)
-                            .ok()
-                            .and_then(|width| area.checked_mul(width))
-                    })
-                    .and_then(|patches| total.checked_add(patches))
-                    .ok_or_else(|| "Qwen3-VL continuation patch geometry overflowed".to_owned())
-            })?;
-        let patches = i32::try_from(patches)
-            .map_err(|_| "Qwen3-VL continuation patch count exceeds i32".to_owned())?;
-        Ok((patches > 0).then_some((patches, self.kernel().args.vision.hidden_size).into()))
-    }
-
-    fn prepared_group_collective_waves(
+    fn prepared_group_invocation(
         &self,
         group: usize,
         input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
         tensor_partitions: usize,
         stage_units: &[std::ops::Range<usize>],
-    ) -> Result<Option<Vec<Vec<crate::composite_execution::CompositeTensorCollective>>>, String>
-    {
-        let pipeline_stages = stage_units.len();
-        if group != 0 || tensor_partitions <= 1 || pipeline_stages <= 1 {
-            return Ok(None);
-        }
-        let mut patch_positions = 0_u64;
-        let mut projected_positions = 0_u64;
-        for part in input.admitted().parts() {
-            let QwenVlInputPartPlan::Media { ingress, shape } = part else {
-                continue;
+    ) -> Result<crate::composite_execution::CompositeGroupInvocation, String> {
+        use crate::composite_execution::{
+            CompositeContinuationGeometry, CompositeGroupInvocation, CompositeGroupUse,
+            CompositeTensorCollective,
+        };
+        let active = {
+            group == 1
+                || (group == 0
+                    && input
+                        .admitted()
+                        .parts()
+                        .iter()
+                        .any(|part| matches!(part, QwenVlInputPartPlan::Media { .. })))
+        };
+        let mode = if active {
+            CompositeGroupUse::Execute
+        } else {
+            CompositeGroupUse::Bypassed
+        };
+        let boundary_sequence = (|| -> Result<i32, String> {
+            let positions = if group == 0 {
+                input
+                    .admitted()
+                    .parts()
+                    .iter()
+                    .filter_map(|part| match part {
+                        QwenVlInputPartPlan::Media { shape, .. } => Some(shape.decoder_positions),
+                        _ => None,
+                    })
+                    .try_fold(0_u64, |total, positions| total.checked_add(positions))
+                    .ok_or_else(|| "Qwen3-VL projected media positions overflowed".to_owned())?
+            } else {
+                input.admitted().decoder_positions()
             };
-            projected_positions = projected_positions
-                .checked_add(shape.decoder_positions)
-                .ok_or_else(|| "Qwen3-VL projected media positions overflowed".to_owned())?;
-            for &(time, height, width) in &ingress.patch_grid {
-                let patches = u64::try_from(time)
-                    .ok()
-                    .and_then(|time| {
-                        u64::try_from(height)
-                            .ok()
-                            .and_then(|height| time.checked_mul(height))
-                    })
-                    .and_then(|area| {
-                        u64::try_from(width)
-                            .ok()
-                            .and_then(|width| area.checked_mul(width))
-                    })
-                    .ok_or_else(|| "Qwen3-VL patch-grid geometry overflowed".to_owned())?;
-                patch_positions = patch_positions
-                    .checked_add(patches)
-                    .ok_or_else(|| "Qwen3-VL patch positions overflowed".to_owned())?;
-            }
-        }
-        let patch_positions = i32::try_from(patch_positions)
-            .map_err(|_| "Qwen3-VL patch positions exceed i32".to_owned())?;
-        let projected_positions = i32::try_from(projected_positions)
-            .map_err(|_| "Qwen3-VL projected positions exceed i32".to_owned())?;
-        if patch_positions == 0 || projected_positions == 0 {
-            return Ok(Some(vec![Vec::new(); pipeline_stages]));
-        }
-        let layers = self.kernel().args.vision.layer_count();
-        if layers < pipeline_stages {
-            return Err(
-                "Qwen3-VL vision collective schedule has fewer units than PP stages".into(),
-            );
-        }
-        let patch_shape = vec![patch_positions, self.kernel().args.vision.hidden_size];
-        let projected_shape = vec![
-            projected_positions,
-            self.kernel().args.vision.out_hidden_size,
-        ];
-        let mut ingress_operations = Vec::new();
-        for (part, plan) in input
-            .prepared()
-            .parts()
-            .iter()
-            .zip(input.admitted().parts())
-        {
-            if let QwenVlInputPartPlan::TextTokens { positions } = plan {
-                let batch = part.payload().value().dim(0);
-                let positions = i32::try_from(*positions)
-                    .map_err(|_| "Qwen3-VL text positions exceed i32".to_owned())?;
-                ingress_operations.push(
-                    crate::composite_execution::CompositeTensorCollective::Sum {
-                        shape: vec![batch, positions, self.kernel().args.text.hidden_size],
-                    },
-                );
-            }
-        }
-        let mut stages = Vec::with_capacity(pipeline_stages);
-        for range in &stage_units[..pipeline_stages] {
-            let mut operations = ingress_operations.clone();
-            for layer in range.clone() {
-                operations.extend([
-                    crate::composite_execution::CompositeTensorCollective::Sum {
-                        shape: patch_shape.clone(),
-                    },
-                    crate::composite_execution::CompositeTensorCollective::Sum {
-                        shape: patch_shape.clone(),
-                    },
-                ]);
-                if self
-                    .kernel()
-                    .args
-                    .vision
-                    .layer_policy(layer)
-                    .is_some_and(|policy| policy.deepstack_merger.is_some())
-                {
-                    operations.push(crate::composite_execution::CompositeTensorCollective::Sum {
-                        shape: projected_shape.clone(),
-                    });
+            i32::try_from(positions)
+                .map_err(|_| "Qwen3-VL prepared group boundary sequence exceeds i32".to_owned())
+        })()?;
+        let continuation = if active {
+            (|| -> Result<Option<CompositeContinuationGeometry>, String> {
+                if group != 0 {
+                    return Ok(None);
                 }
-            }
-            if range.end == layers {
-                operations.push(crate::composite_execution::CompositeTensorCollective::Sum {
-                    shape: projected_shape.clone(),
-                });
-            }
-            stages.push(operations);
-        }
-        Ok(Some(stages))
+                let patches = input
+                    .admitted()
+                    .parts()
+                    .iter()
+                    .filter_map(|part| match part {
+                        QwenVlInputPartPlan::Media { ingress, .. } => Some(&ingress.patch_grid),
+                        _ => None,
+                    })
+                    .flatten()
+                    .try_fold(0_u64, |total, &(time, height, width)| {
+                        u64::try_from(time)
+                            .ok()
+                            .and_then(|time| {
+                                u64::try_from(height)
+                                    .ok()
+                                    .and_then(|height| time.checked_mul(height))
+                            })
+                            .and_then(|area| {
+                                u64::try_from(width)
+                                    .ok()
+                                    .and_then(|width| area.checked_mul(width))
+                            })
+                            .and_then(|patches| total.checked_add(patches))
+                            .ok_or_else(|| {
+                                "Qwen3-VL continuation patch geometry overflowed".to_owned()
+                            })
+                    })?;
+                let patches = i32::try_from(patches)
+                    .map_err(|_| "Qwen3-VL continuation patch count exceeds i32".to_owned())?;
+                Ok(
+                    (patches > 0).then_some(CompositeContinuationGeometry::Uniform(vec![
+                        patches,
+                        self.kernel().args.vision.hidden_size,
+                    ])),
+                )
+            })()?
+        } else {
+            None
+        };
+        let collective_waves =
+            (|| -> Result<Option<Vec<Vec<CompositeTensorCollective>>>, String> {
+                let pipeline_stages = stage_units.len();
+                if group != 0 || tensor_partitions <= 1 || pipeline_stages <= 1 {
+                    return Ok(None);
+                }
+                let mut patch_positions = 0_u64;
+                let mut projected_positions = 0_u64;
+                for part in input.admitted().parts() {
+                    let QwenVlInputPartPlan::Media { ingress, shape } = part else {
+                        continue;
+                    };
+                    projected_positions = projected_positions
+                        .checked_add(shape.decoder_positions)
+                        .ok_or_else(|| {
+                            "Qwen3-VL projected media positions overflowed".to_owned()
+                        })?;
+                    for &(time, height, width) in &ingress.patch_grid {
+                        let patches = u64::try_from(time)
+                            .ok()
+                            .and_then(|time| {
+                                u64::try_from(height)
+                                    .ok()
+                                    .and_then(|height| time.checked_mul(height))
+                            })
+                            .and_then(|area| {
+                                u64::try_from(width)
+                                    .ok()
+                                    .and_then(|width| area.checked_mul(width))
+                            })
+                            .ok_or_else(|| "Qwen3-VL patch-grid geometry overflowed".to_owned())?;
+                        patch_positions = patch_positions
+                            .checked_add(patches)
+                            .ok_or_else(|| "Qwen3-VL patch positions overflowed".to_owned())?;
+                    }
+                }
+                let patch_positions = i32::try_from(patch_positions)
+                    .map_err(|_| "Qwen3-VL patch positions exceed i32".to_owned())?;
+                let projected_positions = i32::try_from(projected_positions)
+                    .map_err(|_| "Qwen3-VL projected positions exceed i32".to_owned())?;
+                if patch_positions == 0 || projected_positions == 0 {
+                    return Ok(Some(vec![Vec::new(); pipeline_stages]));
+                }
+                let layers = self.kernel().args.vision.layer_count();
+                if layers < pipeline_stages {
+                    return Err(
+                        "Qwen3-VL vision collective schedule has fewer units than PP stages".into(),
+                    );
+                }
+                let patch_shape = vec![patch_positions, self.kernel().args.vision.hidden_size];
+                let projected_shape = vec![
+                    projected_positions,
+                    self.kernel().args.vision.out_hidden_size,
+                ];
+                let mut ingress_operations = Vec::new();
+                for (part, plan) in input
+                    .prepared()
+                    .parts()
+                    .iter()
+                    .zip(input.admitted().parts())
+                {
+                    if let QwenVlInputPartPlan::TextTokens { positions } = plan {
+                        let batch = part.payload().value().dim(0);
+                        let positions = i32::try_from(*positions)
+                            .map_err(|_| "Qwen3-VL text positions exceed i32".to_owned())?;
+                        ingress_operations.push(CompositeTensorCollective::Sum {
+                            shape: vec![batch, positions, self.kernel().args.text.hidden_size],
+                        });
+                    }
+                }
+                let mut stages = Vec::with_capacity(pipeline_stages);
+                for range in &stage_units[..pipeline_stages] {
+                    let mut operations = ingress_operations.clone();
+                    for layer in range.clone() {
+                        operations.extend([
+                            CompositeTensorCollective::Sum {
+                                shape: patch_shape.clone(),
+                            },
+                            CompositeTensorCollective::Sum {
+                                shape: patch_shape.clone(),
+                            },
+                        ]);
+                        if self
+                            .kernel()
+                            .args
+                            .vision
+                            .layer_policy(layer)
+                            .is_some_and(|policy| policy.deepstack_merger.is_some())
+                        {
+                            operations.push(CompositeTensorCollective::Sum {
+                                shape: projected_shape.clone(),
+                            });
+                        }
+                    }
+                    if range.end == layers {
+                        operations.push(CompositeTensorCollective::Sum {
+                            shape: projected_shape.clone(),
+                        });
+                    }
+                    stages.push(operations);
+                }
+                Ok(Some(stages))
+            })()?;
+        Ok(CompositeGroupInvocation {
+            mode,
+            boundary_sequence,
+            continuation,
+            collective_waves,
+        })
     }
 
     fn routed_tensor_reductions(
@@ -467,13 +480,10 @@ where
         selected: &eredu_runtime::ResolvedBoundaryWireSchema,
         batch: i32,
         source_sequence: i32,
-        group_sequences: &[i32],
+        _groups: &[crate::composite_execution::CompositeGroupInvocation],
         continuation: Option<(i32, i32)>,
     ) -> Result<Option<eredu_runtime::ResolvedBoundaryWireSchema>, Self::Error> {
         if source_group == 1 && destination_group == 1 {
-            let _media_sequence = *group_sequences.first().ok_or_else(|| {
-                Error::backend("Qwen3-VL decoder continuation has no vision sequence authority")
-            })?;
             let schema = eredu_runtime::ArchitectureBoundary::wire_schema(
                 &PipelineBoundarySchema::from_args(&self.kernel().args),
             )
@@ -2705,7 +2715,7 @@ where
         &mut self,
         group: usize,
         initial: &B::Tensor,
-        dependencies: &[&B::Tensor],
+        dependencies: &eredu_runtime::GroupDependencies<'_, B::Tensor>,
         _state: &mut S,
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
@@ -2716,7 +2726,7 @@ where
                 let vision = forward
                     .vision_output
                     .as_ref()
-                    .and_then(|_| dependencies.first().copied())
+                    .and_then(|_| dependencies.only())
                     .or(forward.vision_output.as_ref());
                 let assembled = self.assemble(&forward.parts, vision, context)?;
                 forward.visual_mask = if forward.deepstack.is_empty() {

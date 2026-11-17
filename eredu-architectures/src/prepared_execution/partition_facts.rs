@@ -3,7 +3,7 @@
 use eredu_core::{cache::PromptCacheTopology, CollectiveGroupId};
 use eredu_runtime::{
     ArchitectureParameters, LayerWeightResidency, PartitionOutputAuthority,
-    PartitionedExecutionPlan, PipelineActivationDtype,
+    PartitionedExecutionPlan, PartitionedUnitScope, PipelineActivationDtype,
 };
 
 use super::PreparedTextSessionFacts;
@@ -21,6 +21,7 @@ pub struct PreparedPartitionSessionFacts {
     tensor_group: Option<CollectiveGroupId>,
     session_group: CollectiveGroupId,
     activation_dtype: PipelineActivationDtype,
+    unit_scope: PartitionedUnitScope,
 }
 
 impl PreparedPartitionSessionFacts {
@@ -45,6 +46,11 @@ impl PreparedPartitionSessionFacts {
         self.activation_dtype
     }
 
+    /// Selected ownership of rank-local execution units.
+    pub const fn unit_scope(&self) -> PartitionedUnitScope {
+        self.unit_scope
+    }
+
     /// Immutable text-session facts retained across local materialization.
     pub const fn text(&self) -> &PreparedTextSessionFacts {
         &self.text
@@ -58,11 +64,6 @@ impl PreparedPartitionSessionFacts {
     /// Architecture-selected complete execution plan.
     pub const fn execution_plan(&self) -> &PartitionedExecutionPlan {
         &self.execution
-    }
-
-    /// Exact output ownership in world and selected group-local coordinates.
-    pub const fn publication_authority(&self) -> PartitionOutputAuthority {
-        self.publication
     }
 
     /// Consumes the facts for native runtime assembly and final adaptation.
@@ -83,6 +84,7 @@ impl PreparedPartitionSessionFacts {
         capability: &crate::capability::CapabilityEstimate,
         model_type: &str,
         residency: LayerWeightResidency,
+        unit_scope: PartitionedUnitScope,
     ) -> Result<Self, String>
     where
         B: eredu_nn::NeuralBackend,
@@ -124,6 +126,7 @@ impl PreparedPartitionSessionFacts {
             tensor_group: selected.tensor_group(),
             session_group,
             activation_dtype: selected.activation_dtype(),
+            unit_scope,
         })
     }
 }
@@ -137,10 +140,13 @@ where
     /// Projects publication/cache/session facts through this exact dense partition selection.
     pub fn session_facts(&self) -> Result<PreparedPartitionSessionFacts, String> {
         let selected = self.prepared().selected();
-        let execution = if selected.topology().pipeline_parallel_size() > 1 {
-            selected.pipeline_execution_plan()?
+        let (execution, unit_scope) = if selected.topology().pipeline_parallel_size() > 1 {
+            (
+                selected.pipeline_execution_plan()?,
+                PartitionedUnitScope::Owned,
+            )
         } else {
-            selected.direct_execution_plan()?
+            (selected.direct_execution_plan()?, PartitionedUnitScope::All)
         };
         PreparedPartitionSessionFacts::from_admission::<B, _, _, _, _, _>(
             self.prepared(),
@@ -148,6 +154,7 @@ where
             self.capability_estimate(),
             self.effective_model_type(),
             selected.base().residency(),
+            unit_scope,
         )
     }
 }
@@ -166,6 +173,7 @@ where
             self.capability_estimate(),
             self.effective_model_type(),
             self.prepared().selected().base().text().residency(),
+            PartitionedUnitScope::Owned,
         )
     }
 }
@@ -184,6 +192,7 @@ impl<A, G, W> crate::composite_partitioned::PreparedCompositePartition<A, G, W> 
             self.capability_estimate(),
             self.effective_model_type(),
             self.prepared().selected().base().execution().residency(),
+            PartitionedUnitScope::Owned,
         )
     }
 }

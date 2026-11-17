@@ -1,20 +1,27 @@
 //! Cold composition of perception and transcription sources and distributed authority.
 use super::{
     perception_distribution::PreparedPerceptionPipelineBindings,
-    rnnt_predictor_distribution::PreparedRnntPredictorPipelineBindings,
-    rnnt_preparation::RnntPreparationError,
-    rnnt_projection_preparation::{
-        validate_projection_parallel_communication, PreparedRnntProjectionBindings,
+    perception_layered::PerceptionRuntimeState,
+    perception_rnnt_pipeline::{
+        PerceptionRnntMetadata, PerceptionRnntPipeline, PerceptionRnntResidency,
     },
+    perception_stage::PerceptionPipelineArchitecture,
+    rnnt_layered::RnntUnit,
+    rnnt_predictor::RnntPredictorRuntimeState,
+    rnnt_predictor_distribution::PreparedRnntPredictorPipelineBindings,
+    rnnt_predictor_stage::RnntPredictorPipelineArchitecture,
+    rnnt_preparation::RnntPreparationError,
+    rnnt_projection_layered::RnntProjection,
+    rnnt_projection_preparation::PreparedRnntProjectionBindings,
 };
-use eredu_core::{
-    checkpoint::TensorDtype, CollectiveGroupId, ParallelRankTopology, ParallelTopology,
-};
+use eredu_core::{checkpoint::TensorDtype, BackendFailure, CollectiveGroupId};
+use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Tensor};
 use eredu_runtime::{
-    replicated_execution::{validate_coordination, CoordinationError},
+    replicated_execution::{validate_coordination, CoordinationError, ReplicatedCoordinator},
     CommunicationCapabilities, CommunicationCapabilityError, CommunicationGroupDescriptor,
     CommunicationManifest, CommunicationManifestError, CommunicationOperation,
-    CommunicationOperationRequirement, CommunicationTensorLimits, WeightBinding,
+    CommunicationOperationRequirement, CommunicationTensorLimits, ComponentRankMechanisms,
+    LayeredTensorCohort, SubmissionBackend, WeightBinding,
 };
 use std::collections::BTreeSet;
 
@@ -65,8 +72,7 @@ pub struct PreparedPerceptionRnntPipelineBindings {
     coordination: CommunicationManifest,
     decision_group: CollectiveGroupId,
     owner: usize,
-    projection_group: Option<CollectiveGroupId>,
-    projection_owner: Option<usize>,
+    projection: Option<(CollectiveGroupId, usize)>,
     resources: PerceptionRnntPipelineResources,
 }
 fn group(
@@ -155,21 +161,8 @@ impl PreparedPerceptionRnntPipelineBindings {
             .transpose()?;
         let projections = match projection_group {
             Some(id) => {
-                validate_projection_parallel_communication(rnnt, &coordination, id)?;
                 let cohort = group(&coordination, id)?;
                 validate_coordination(&coordination, id, projection_owner.unwrap())?;
-                let capabilities = CommunicationCapabilities::new(
-                    cohort.requirements().operations().iter().cloned(),
-                )?;
-                capabilities.validate_requirement(
-                    &CommunicationOperationRequirement::failure_agreement(true),
-                )?;
-                capabilities.validate_requirement(&CommunicationOperationRequirement::tensors(
-                    CommunicationOperation::Broadcast,
-                    [TensorDtype::I32],
-                    CommunicationTensorLimits::new(1, 1, 1, None)?,
-                    true,
-                )?)?;
                 if !cohort
                     .members()
                     .iter()
@@ -179,12 +172,7 @@ impl PreparedPerceptionRnntPipelineBindings {
                         "projection cohort exceeds paired-frame participants",
                     ));
                 }
-                let topology = ParallelTopology::new(cohort.members().len(), 1, 1, 1)
-                    .and_then(|topology| {
-                        ParallelRankTopology::new(topology, cohort.local_index().unwrap())
-                    })
-                    .map_err(|_| Contract("invalid projection tensor topology"))?;
-                projections.select_parallel(topology)?.0
+                projections.select_parallel(&coordination, id)?
             }
             None if projections.local_layout().is_none() => projections,
             None => {
@@ -230,8 +218,7 @@ impl PreparedPerceptionRnntPipelineBindings {
             coordination,
             decision_group,
             owner,
-            projection_group,
-            projection_owner,
+            projection: projection_group.zip(projection_owner),
             resources,
         })
     }
@@ -239,31 +226,96 @@ impl PreparedPerceptionRnntPipelineBindings {
     pub fn resources(&self) -> PerceptionRnntPipelineResources {
         self.resources
     }
-    /// Architecture-declared authority for the optional projection tensor cohort.
-    /// This owner is retained at preparation rather than selected during binding.
-    pub fn projection_owner(&self) -> Option<usize> {
-        self.projection_owner
-    }
-    /// Retains every source and communication object for ordinary component materializers.
-    pub fn into_parts(
+    /// Binds all three components and the retained decision authority.
+    ///
+    /// The coordinator factory realizes one manifest and returns handles in
+    /// selection order. The projection retains the selected tensor coordinator.
+    pub fn bind<B, C, H, D>(
         self,
-    ) -> (
-        PreparedPerceptionPipelineBindings,
-        PreparedRnntPredictorPipelineBindings,
-        PreparedRnntProjectionBindings,
-        CommunicationManifest,
-        CollectiveGroupId,
-        usize,
-        Option<CollectiveGroupId>,
-    ) {
+        residency: PerceptionRnntResidency,
+        communication: &C,
+        context: &<B::Tensor as Tensor>::Context,
+        mechanisms: &H,
+        bind_coordinators: impl FnOnce(
+            CommunicationManifest,
+            &[(CollectiveGroupId, usize)],
+        ) -> Result<Vec<D>, BackendFailure>,
+    ) -> Result<
         (
-            self.perception,
-            self.predictor,
-            self.projections,
-            self.coordination,
-            self.decision_group,
-            self.owner,
-            self.projection_group,
-        )
+            PerceptionRnntPipeline<
+                B,
+                <H as ComponentRankMechanisms<B, PerceptionRuntimeState<B::Tensor>, C>>::Pipeline<
+                    PerceptionPipelineArchitecture<B>,
+                >,
+                <H as ComponentRankMechanisms<B, RnntPredictorRuntimeState<B::Tensor>, C>>::Pipeline<
+                    RnntPredictorPipelineArchitecture<B>,
+                >,
+                RnntProjection<B, H::UnitPolicy<RnntUnit<B>>, D>,
+                D,
+            >,
+            PerceptionRnntMetadata,
+        ),
+        BackendFailure,
+    >
+    where
+        B: DistributedNeuralBackend + SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context> + 'static,
+        B::Tensor: 'static,
+        H: ComponentRankMechanisms<B, PerceptionRuntimeState<B::Tensor>, C>
+            + ComponentRankMechanisms<B, RnntPredictorRuntimeState<B::Tensor>, C>,
+        D: ReplicatedCoordinator<B::Tensor, <B::Tensor as Tensor>::Context> + LayeredTensorCohort<B>,
+{
+        for policy in [
+            residency.perception,
+            residency.predictor,
+            residency.projections,
+        ] {
+            policy.offload().map_err(BackendFailure::from_error)?;
+        }
+        <H as ComponentRankMechanisms<B, PerceptionRuntimeState<B::Tensor>, C>>::validate_pipeline_communication(
+            mechanisms, self.perception.manifest(), self.perception.tensor_group(),
+        )?;
+        <H as ComponentRankMechanisms<B, RnntPredictorRuntimeState<B::Tensor>, C>>::validate_pipeline_communication(
+            mechanisms, self.predictor.manifest(), self.predictor.tensor_group(),
+        )?;
+
+        let mut selections = vec![(self.decision_group, self.owner)];
+        selections.extend(self.projection);
+        let coordinators = bind_coordinators(self.coordination, &selections)?;
+        if coordinators.len() != selections.len() {
+            return Err(BackendFailure::from_error(CoordinationError(
+                "coordinator count differs from the retained selection",
+            )));
+        }
+        let mut coordinators = coordinators.into_iter();
+        let decision = coordinators
+            .next()
+            .expect("decision coordinator was selected");
+        let projection_coordinator = coordinators.next();
+        let (perception, perception_metadata) =
+            self.perception
+                .bind::<B, _, _>(residency.perception, communication, mechanisms)?;
+        let (predictor, predictor_metadata) =
+            self.predictor
+                .bind::<B, _, _>(residency.predictor, communication, mechanisms)?;
+        let (projections, projection_metadata) = self.projections.bind::<B, _, _>(
+            residency.projections,
+            context,
+            mechanisms,
+            projection_coordinator,
+        )?;
+        Ok((
+            PerceptionRnntPipeline {
+                perception,
+                predictor,
+                projections,
+                decision,
+                resources: self.resources,
+            },
+            PerceptionRnntMetadata {
+                perception: perception_metadata,
+                predictor: predictor_metadata,
+                projections: projection_metadata,
+            },
+        ))
     }
 }

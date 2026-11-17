@@ -96,7 +96,7 @@ impl Drop for ObservationUnwind<'_> {
 
 /// Captures every native submission in a coupled invocation, including eager
 /// work performed before its final output arrays exist.
-pub(crate) struct MlxRealtimeSubmissionScope {
+pub(super) struct MlxRealtimeSubmissionScope {
     recovery: Option<Recovery<RealtimeCompletionResources>>,
     token_validations: Option<TokenValidationScope>,
 }
@@ -107,26 +107,16 @@ impl MlxRealtimeSubmissionScope {
         execution_resources: Option<Arc<dyn MlxRealtimeExecutionResources>>,
     ) -> Result<Self, Error> {
         let validations = TokenValidationScope::begin()?;
-        let mut scope =
-            Self::with_validations(execution_resources, TokenValidationBatch::default())?;
-        scope.token_validations = Some(validations);
-        Ok(scope)
-    }
-
-    fn with_validations(
-        execution_resources: Option<Arc<dyn MlxRealtimeExecutionResources>>,
-        token_validations: TokenValidationBatch,
-    ) -> Result<Self, Error> {
         Ok(Self {
             recovery: Some(Recovery::begin(RealtimeCompletionResources {
                 event: None,
                 submission_failed: Cell::new(false),
                 observation_error: RefCell::new(None),
                 retained: Vec::new(),
-                token_validations,
+                token_validations: TokenValidationBatch::default(),
                 _execution_resources: execution_resources,
             })?),
-            token_validations: None,
+            token_validations: Some(validations),
         })
     }
 
@@ -140,7 +130,7 @@ impl MlxRealtimeSubmissionScope {
             resources.token_validations = validations.finish();
         }
         retained.extend(resources.token_validations.arrays().cloned());
-        resources.retained = retained;
+        resources.retained.extend(retained);
     }
 
     /// Submits final arrays inside the scope that captured earlier eager work.
@@ -204,7 +194,9 @@ fn mark_failed(resources: &RealtimeCompletionResources) {
 
 impl Drop for MlxRealtimeSubmissionScope {
     fn drop(&mut self) {
-        if let Some(recovery) = &mut self.recovery {
+        if self.recovery.is_some() {
+            self.retain(Vec::new());
+            let recovery = self.recovery.as_mut().expect("live submission scope");
             mark_failed(recovery.retention());
             recovery.seal();
         }
@@ -232,34 +224,6 @@ impl std::fmt::Debug for MlxRealtimeCompletion {
 }
 
 impl MlxRealtimeCompletion {
-    #[cfg(test)]
-    pub(super) fn submit_retained(
-        retained: Vec<Array>,
-        token_validations: TokenValidationBatch,
-    ) -> Result<Self, Error> {
-        Self::submit_retained_with_resources(retained, token_validations, None).map_err(|error| {
-            match error {
-                RealtimeCompletionCreationError::BeforeSubmission(error) => error,
-                RealtimeCompletionCreationError::AfterSubmission {
-                    error,
-                    completion: _,
-                } => error,
-            }
-        })
-    }
-
-    // Failure must carry the retained completion authority back to its owner.
-    #[allow(clippy::result_large_err)]
-    pub(crate) fn submit_retained_with_resources(
-        retained: Vec<Array>,
-        token_validations: TokenValidationBatch,
-        execution_resources: Option<Arc<dyn MlxRealtimeExecutionResources>>,
-    ) -> Result<Self, RealtimeCompletionCreationError<Self, Error>> {
-        MlxRealtimeSubmissionScope::with_validations(execution_resources, token_validations)
-            .map_err(RealtimeCompletionCreationError::before_submission)?
-            .finish(retained)
-    }
-
     /// Number of array handles retained through exact completion.
     pub fn retained_resources(&self) -> usize {
         self.inner.recovery.retention().retained.len()
@@ -369,8 +333,10 @@ mod observation_tests {
     }
 
     fn completion() -> MlxRealtimeCompletion {
-        let validations = TokenValidationScope::begin().unwrap().finish();
-        MlxRealtimeCompletion::submit_retained(Vec::new(), validations).unwrap()
+        MlxRealtimeSubmissionScope::begin(None)
+            .unwrap()
+            .finish(Vec::new())
+            .unwrap_or_else(|_| panic!("completion submission failed"))
     }
 
     #[test]
@@ -490,26 +456,25 @@ mod observation_tests {
 
     #[test]
     fn failed_observation_becomes_releasable_only_after_its_native_scope_settles() {
-        struct ExecutionOwner(Rc<Cell<bool>>);
-        impl MlxRealtimeExecutionResources for ExecutionOwner {
-            fn poison(&self) {
-                self.0.set(true);
-            }
-        }
-        let poisoned = Rc::new(Cell::new(false));
-        let owner = Arc::new(ExecutionOwner(Rc::clone(&poisoned)));
+        use super::super::submission::SharedRealtimeExecution;
+
+        let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let execution = SharedRealtimeExecution::new((), &stream);
+        let sibling = execution.share();
+        assert!(sibling.require_available().is_ok());
+        let owner = execution.retain(());
         let retained_owner = Arc::downgrade(&owner);
-        let completion = MlxRealtimeCompletion::submit_retained_with_resources(
-            Vec::new(),
-            TokenValidationScope::begin().unwrap().finish(),
-            Some(owner),
-        )
-        .unwrap_or_else(|failure| match failure {
-            RealtimeCompletionCreationError::BeforeSubmission(error)
-            | RealtimeCompletionCreationError::AfterSubmission { error, .. } => {
-                panic!("completion submission failed: {error}")
-            }
-        });
+        let completion = MlxRealtimeSubmissionScope::begin(Some(owner))
+            .unwrap()
+            .finish(Vec::new())
+            .unwrap_or_else(|failure| match failure {
+                RealtimeCompletionCreationError::BeforeSubmission(error)
+                | RealtimeCompletionCreationError::AfterSubmission { error, .. } => {
+                    panic!("completion submission failed: {error}")
+                }
+            });
+        assert!(sibling.is_busy());
+        assert!(sibling.require_available().is_err());
         completion.wait().unwrap();
         let state = Rc::new(Cell::new(Status {
             settled: false,
@@ -523,7 +488,8 @@ mod observation_tests {
         crate::backend::submission_recovery::wait_for_retirement(|| {
             completion.is_complete().is_err()
         });
-        assert!(poisoned.get());
+        assert!(!sibling.is_busy());
+        assert!(sibling.require_healthy().is_err());
         assert!(retained_owner.upgrade().is_some());
         assert!(!completion.resources_releasable());
         state.set(Status {

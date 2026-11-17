@@ -67,9 +67,12 @@ use eredu_architectures::replicated_text::{
 };
 
 mod capability;
+pub(super) use capability::MlxReplicatedTextSupport;
+mod local_component;
 mod lowering;
 mod partitioned;
 mod prediction;
+pub use local_component::MlxLocalComponent;
 mod session;
 mod state;
 

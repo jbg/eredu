@@ -55,24 +55,6 @@ where
     }
 }
 
-/// Concrete state paired with the exact realization its mechanism implemented.
-pub struct RealizedRealtimeState<S> {
-    state: S,
-    realization: crate::SelectedRealtimeStateRealization,
-}
-
-impl<S> RealizedRealtimeState<S> {
-    /// Attaches an exact state realization report to concrete storage.
-    pub fn new(state: S, realization: crate::SelectedRealtimeStateRealization) -> Self {
-        Self { state, realization }
-    }
-
-    /// Consumes concrete state and its exact realization report.
-    pub fn into_parts(self) -> (S, crate::SelectedRealtimeStateRealization) {
-        (self.state, self.realization)
-    }
-}
-
 /// Concrete layer storage paired with the exact residency it implemented.
 pub struct RealizedRealtimePolicy<P> {
     policy: P,
@@ -508,13 +490,141 @@ where
         selected: &SelectedRealtimeRealization,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
     ) -> Result<RealizedRealtimePolicy<Self::BoundedPolicy>, Self::Error>;
+}
 
-    /// Realizes exact selected state components and placements.
-    fn realize_state(
-        &mut self,
-        selected: &crate::SelectedRealtimeStateRealization,
-        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
-    ) -> Result<RealizedRealtimeState<Self::State>, Self::Error>;
+/// Retained portable construction that can be bound by native mechanisms.
+pub trait PreparedRealtimeBinding<B, State, M>: Sized {
+    /// Bound portable execution.
+    type Execution;
+    /// Failure constructing or binding this preparation.
+    type Error;
+
+    /// Exact admitted realization used to validate the native target.
+    fn realization(&self) -> &SelectedRealtimeRealization;
+
+    /// Constructs from the retained selection and sources.
+    fn bind(self, mechanisms: &M) -> Result<Self::Execution, Self::Error>;
+}
+
+/// Realized transport for a selected tensor group.
+pub struct RealtimeTensorResources<B: crate::CommunicationBackend, G, R, I>
+where
+    B::ParallelContext: Sized,
+{
+    /// Communication manifest and authority.
+    pub communication: crate::PartitionCommunication<B, G, R, I>,
+    /// Selected tensor collective.
+    pub parallel: B::ParallelContext,
+    /// Executor owning the communication submissions.
+    pub executor: B::OwnedExecutor,
+}
+
+/// Native mechanisms for binding a portable layered realtime construction.
+pub trait RealtimeBindingMechanisms<B, State>
+where
+    B: crate::CommunicationBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    B::ParallelContext: Sized,
+    State: RuntimeState<B>,
+{
+    /// Retained native execution handle.
+    type Execution;
+    /// Native binding or policy error.
+    type Error: std::fmt::Display;
+    /// Retained communication group.
+    type Group: std::borrow::Borrow<B::CommunicationGroup>;
+    /// Realized communication route.
+    type Route: std::borrow::Borrow<B::CommunicationRoute>;
+    /// Native tensor metadata used in transfer admission.
+    type TensorMetadata: crate::CommunicationTensorMetadata<B>;
+    /// Sampling primitives for a bound executor.
+    type Sampling: crate::SamplingBackend<
+        Logits = B::Tensor,
+        Token = B::Tensor,
+        Context = B::Executor,
+    >;
+    /// Sampler supported by this binding.
+    type Sampler: crate::Sampler<Self::Sampling>;
+    /// Native materializer specialized to the declared architecture units.
+    type Materializer<A>: RealtimeModelConstructionMechanisms<
+            A,
+            B,
+            State = State,
+            PolicyError = Self::Error,
+            Error = Self::Error,
+            ResidentPolicy: RealtimeResidencyTelemetry<Error = Self::Error>,
+            BoundedPolicy: RealtimeResidencyTelemetry<Error = Self::Error>,
+        > + 'static
+    where
+        A: LayeredArchitecture<B, State> + 'static,
+        A::Unit: 'static;
+
+    /// Borrowed context for architecture module construction.
+    fn context(&self) -> &B::Executor;
+
+    /// Realizes the exact group declared by portable construction.
+    fn realize_tensor(
+        &self,
+        manifest: crate::CommunicationManifest,
+        group: eredu_core::CollectiveGroupId,
+    ) -> Result<
+        RealtimeTensorResources<B, Self::Group, Self::Route, Self::TensorMetadata>,
+        Self::Error,
+    >;
+
+    /// Supplies native weight storage for the retained source and local layout.
+    fn materializer<A>(
+        &self,
+        source: eredu_checkpoint::store::SharedCheckpointSource,
+        residency: LayerWeightResidency,
+        transform: Option<eredu_checkpoint::WeightQuantization>,
+        layout: Option<&crate::LocalModelLayout>,
+    ) -> Self::Materializer<A>
+    where
+        A: LayeredArchitecture<B, State> + 'static,
+        A::Unit: 'static;
+
+    /// Reads native materialization metadata after construction.
+    fn materialization_metadata<A>(
+        &self,
+        materializer: &Self::Materializer<A>,
+    ) -> Result<crate::LayerwiseModelMetadata, Self::Error>
+    where
+        A: LayeredArchitecture<B, State> + 'static,
+        A::Unit: 'static;
+
+    /// Erases the portable executor while retaining its native resources.
+    fn bind_executor<E, F, R>(
+        &self,
+        executor: E,
+        metadata: crate::LayerwiseModelMetadata,
+        source: eredu_checkpoint::store::SharedCheckpointSource,
+    ) -> Self::Execution
+    where
+        E: crate::PreparedRealtimeFrameExecutor<
+                Self::Sampling,
+                Self::Sampler,
+                State,
+                Error = F,
+                Retained = R,
+            > + RealtimeResidencyTelemetry<Error = Self::Error>
+            + 'static,
+        F: std::fmt::Display,
+        R: eredu_nn::RetainedTensorRoots<B::Tensor> + 'static;
+}
+
+/// Live telemetry of the policy serving a bound realtime execution.
+pub trait RealtimeResidencyTelemetry {
+    /// Failure reading the native policy.
+    type Error;
+
+    /// Logical residency and transfers.
+    fn residency_report(&self) -> Result<crate::ResidencyReport, Self::Error>;
+
+    /// Dense disk-stream counters when active.
+    fn dense_stream_report(&self) -> Result<Option<crate::DenseDiskStreamReport>, Self::Error>;
+
+    /// Per-execution-group residency.
+    fn execution_group_reports(&self) -> Result<Vec<crate::ResidentLayerGroupReport>, Self::Error>;
 }
 
 /// Resident or bounded runtime chosen by the authoritative realization.
@@ -594,97 +704,16 @@ where
     }
 }
 
-/// Fully constructed execution paired with its initial mutable model state.
-pub struct ConstructedRealtimeModel<A, B, M>
-where
-    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
-    M: RealtimeModelConstructionMechanisms<A, B>,
-    A: LayeredArchitecture<B, M::State>,
-{
-    execution: ConstructedRealtimeExecution<A, B, M>,
-    state: M::State,
-}
-
-impl<A, B, M> ConstructedRealtimeModel<A, B, M>
-where
-    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
-    M: RealtimeModelConstructionMechanisms<A, B>,
-    A: LayeredArchitecture<B, M::State>,
-{
-    /// Returns the immutable selected realization.
-    pub const fn selected(&self) -> &SelectedRealtimeRealization {
-        self.execution.selected()
-    }
-
-    /// Returns the selected resident or bounded runtime.
-    pub const fn execution(
-        &self,
-    ) -> &RealtimeLayerwiseRuntime<A, B, M::State, M::ResidentPolicy, M::BoundedPolicy> {
-        self.execution.execution()
-    }
-
-    /// Mutably borrows the selected resident or bounded runtime.
-    pub fn execution_mut(
-        &mut self,
-    ) -> &mut RealtimeLayerwiseRuntime<A, B, M::State, M::ResidentPolicy, M::BoundedPolicy> {
-        self.execution.execution_mut()
-    }
-
-    /// Returns realized architecture state.
-    pub const fn state(&self) -> &M::State {
-        &self.state
-    }
-
-    /// Mutably borrows realized architecture state.
-    pub fn state_mut(&mut self) -> &mut M::State {
-        &mut self.state
-    }
-
-    /// Mutably borrows execution and state together for one atomic model pass.
-    #[allow(clippy::type_complexity)]
-    pub fn execution_and_state_mut(
-        &mut self,
-    ) -> (
-        &mut RealtimeLayerwiseRuntime<A, B, M::State, M::ResidentPolicy, M::BoundedPolicy>,
-        &mut M::State,
-    ) {
-        (self.execution.execution_mut(), &mut self.state)
-    }
-
-    /// Mutably borrows detached execution and state as separate typed values.
-    #[allow(clippy::type_complexity)]
-    pub fn constructed_execution_and_state_mut(
-        &mut self,
-    ) -> (&mut ConstructedRealtimeExecution<A, B, M>, &mut M::State) {
-        (&mut self.execution, &mut self.state)
-    }
-
-    /// Returns generic construction mechanisms for reports or later composition.
-    pub const fn mechanisms(&self) -> &M {
-        self.execution.mechanisms()
-    }
-
-    /// Mutably borrows generic mechanisms.
-    pub fn mechanisms_mut(&mut self) -> &mut M {
-        self.execution.mechanisms_mut()
-    }
-
-    /// Consumes the combined model into static execution and mutable state.
-    pub fn into_execution_and_state(self) -> (ConstructedRealtimeExecution<A, B, M>, M::State) {
-        (self.execution, self.state)
-    }
-}
-
-/// Constructs static modules, selected units, storage, and exact state once.
+/// Constructs static modules, selected units and their exact parameter storage.
 #[allow(clippy::type_complexity)]
-pub fn construct_realtime_model<A, B, M>(
+pub fn construct_realtime_execution<A, B, M>(
     mut architecture: A,
     mut source_architecture: Option<A>,
     prepared: PreparedRealtimeModelContract,
     mut mechanisms: M,
     context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
 ) -> Result<
-    ConstructedRealtimeModel<A, B, M>,
+    ConstructedRealtimeExecution<A, B, M>,
     RealtimeModelConstructionError<A::Error, M::PolicyError, M::Error>,
 >
 where
@@ -710,15 +739,6 @@ where
     if let Some(source) = source_architecture.as_ref() {
         validate_architecture::<A, B, M::State>(source, &selected, true, context)
             .map_err(widen_error)?;
-    }
-    let (state, state_realization) = mechanisms
-        .realize_state(selected.state(), context)
-        .map_err(RealtimeModelConstructionError::Mechanism)?
-        .into_parts();
-    if &state_realization != selected.state() || state.layout() != selected.state().layout() {
-        return Err(RealtimeModelConstructionError::Contract(
-            "realized realtime state differs from selection".into(),
-        ));
     }
     let execution = match selected.residency() {
         LayerWeightResidency::FullyResident => {
@@ -770,14 +790,11 @@ where
             RealtimeLayerwiseRuntime::Bounded(LayerwiseRuntime::new(architecture, policy))
         }
     };
-    Ok(ConstructedRealtimeModel {
-        execution: ConstructedRealtimeExecution {
-            selected,
-            execution,
-            mechanisms,
-            backend: PhantomData,
-        },
-        state,
+    Ok(ConstructedRealtimeExecution {
+        selected,
+        execution,
+        mechanisms,
+        backend: PhantomData,
     })
 }
 

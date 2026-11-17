@@ -1724,6 +1724,148 @@ pub struct RotarySpec {
     pub algorithm: RotaryAlgorithm,
 }
 
+/// Rotary construction data consumed by a concrete backend.
+#[derive(Debug, Clone)]
+pub struct PreparedRotarySpec {
+    /// Explicit product rounding policy.
+    pub arithmetic: RotaryArithmetic,
+    /// Rotated head dimensions.
+    pub dimensions: i32,
+    /// Base frequency for generated schedules.
+    pub base: f32,
+    /// Whether adjacent pairs are rotated instead of split halves.
+    pub traditional: bool,
+    /// Frequency representation and native application policy.
+    pub algorithm: PreparedRotaryAlgorithm,
+}
+
+/// Backend rotary mechanisms after portable frequency preparation.
+#[derive(Debug, Clone)]
+pub enum PreparedRotaryAlgorithm {
+    /// Ordinary rotary embeddings with uniform position interpolation.
+    Standard {
+        /// Context extension factor, or one for unscaled embeddings.
+        factor: f32,
+    },
+    /// One frequency denominator per pair, in rotary order. An infinite
+    /// denominator gives a zero inverse frequency and leaves that pair unrotated.
+    FrequencyTable(Vec<f32>),
+    /// Rotary embeddings over a prefix of each head.
+    Proportional {
+        /// Frequency scaling factor.
+        factor: f32,
+        /// Fraction of the head covered by rotary embeddings.
+        rotary_fraction: f32,
+    },
+    /// YaRN frequency interpolation and attention concentration.
+    Yarn {
+        /// Context extension factor.
+        factor: f32,
+        /// Context length used during training.
+        original_max_positions: i32,
+        /// Fast correction rotation count.
+        beta_fast: f32,
+        /// Slow correction rotation count.
+        beta_slow: f32,
+        /// Multiplier on rotary sine and cosine values.
+        amplitude: f32,
+        /// Whether correction boundaries are rounded to integer frequency slots.
+        truncate: bool,
+    },
+}
+
+impl RotarySpec {
+    /// Validates rotary geometry and prepares portable frequency tables.
+    pub fn prepare(self) -> Result<PreparedRotarySpec, Error> {
+        self.algorithm.validate()?;
+        if self.dimensions <= 0
+            || self.dimensions % 2 != 0
+            || !self.base.is_finite()
+            || self.base <= 0.0
+        {
+            return Err(Error::backend(
+                "invalid rotary head geometry or frequency base",
+            ));
+        }
+        let denominator = |index: i32| self.base.powf(2.0 * index as f32 / self.dimensions as f32);
+        let pairs = 0..self.dimensions / 2;
+        let algorithm = match self.algorithm {
+            RotaryAlgorithm::Default => PreparedRotaryAlgorithm::Standard { factor: 1.0 },
+            RotaryAlgorithm::Linear { factor } => PreparedRotaryAlgorithm::Standard { factor },
+            RotaryAlgorithm::ZeroTail { rotary_fraction } => {
+                let active = (rotary_fraction * self.dimensions as f32) as i32 / 2;
+                PreparedRotaryAlgorithm::FrequencyTable(
+                    pairs
+                        .map(|index| {
+                            if index < active {
+                                denominator(index)
+                            } else {
+                                f32::INFINITY
+                            }
+                        })
+                        .collect(),
+                )
+            }
+            RotaryAlgorithm::Llama3 {
+                factor,
+                low_frequency_factor,
+                high_frequency_factor,
+                original_max_positions,
+            } => {
+                let original = original_max_positions as f32;
+                let low = original / low_frequency_factor;
+                let high = original / high_frequency_factor;
+                PreparedRotaryAlgorithm::FrequencyTable(
+                    pairs
+                        .map(|index| {
+                            let frequency = denominator(index);
+                            let wavelength = (2.0 * std::f32::consts::PI) * frequency;
+                            if wavelength > low {
+                                frequency * factor
+                            } else if wavelength > high && wavelength < low {
+                                let smooth = (wavelength.recip() * original - low_frequency_factor)
+                                    / (high_frequency_factor - low_frequency_factor);
+                                frequency / ((1.0 - smooth) / factor + smooth)
+                            } else {
+                                frequency
+                            }
+                        })
+                        .collect(),
+                )
+            }
+            RotaryAlgorithm::Proportional {
+                factor,
+                rotary_fraction,
+            } => PreparedRotaryAlgorithm::Proportional {
+                factor,
+                rotary_fraction,
+            },
+            RotaryAlgorithm::Yarn {
+                factor,
+                original_max_positions,
+                beta_fast,
+                beta_slow,
+                amplitude,
+                truncate,
+            } => PreparedRotaryAlgorithm::Yarn {
+                factor,
+                original_max_positions,
+                beta_fast,
+                beta_slow,
+                amplitude,
+                truncate,
+            },
+        };
+        Ok(PreparedRotarySpec {
+            arithmetic: self.arithmetic,
+            dimensions: self.dimensions,
+            base: self.base,
+            traditional: self.traditional,
+            algorithm,
+        })
+    }
+}
+
 /// Physical scalar type of a neural tensor, independent of checkpoint encoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TensorElementType {
@@ -4771,7 +4913,7 @@ pub trait NeuralBackend: Sized + 'static {
     ) -> Result<Self::Normalization, Error>;
     /// Builds the model's rotary-position operator.
     fn rotary(
-        spec: RotarySpec,
+        spec: PreparedRotarySpec,
         context: &<Self::Tensor as Tensor>::Context,
     ) -> Result<Self::Rotary, Error>;
     /// Looks up a stacked codebook vector per depth and sums in depth order.

@@ -220,6 +220,24 @@ fn prepared_semantic_tokens<T: Tensor>(
     })
 }
 
+fn inkling_group_media(
+    group: usize,
+    parts: &[InklingInputPartPlan],
+) -> impl Iterator<Item = u64> + '_ {
+    parts.iter().filter_map(move |part| match part {
+        InklingInputPartPlan::Media {
+            modality, shape, ..
+        } if matches!(
+            (group, modality),
+            (0, eredu_core::InputModality::Image) | (1, eredu_core::InputModality::Audio)
+        ) =>
+        {
+            Some(shape.decoder_positions)
+        }
+        _ => None,
+    })
+}
+
 /// Materializes placeholders, retained media extents, and ordered segments from
 /// an architecture admission.
 pub fn prepare_input<T: Tensor>(
@@ -374,50 +392,59 @@ where
         B::Tensor::concatenate(&prepared_semantic_tokens(input, context)?, 1, context)
     }
 
-    fn should_execute_prepared_group(
+    fn prepared_group_invocation(
         &self,
         group: usize,
         input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
-    ) -> bool {
-        match group {
-            0 => input.admitted().parts().iter().any(|part| {
-                matches!(
-                    part,
-                    InklingInputPartPlan::Media {
-                        modality: eredu_core::InputModality::Image,
-                        ..
-                    }
-                )
-            }),
-            1 => input.admitted().parts().iter().any(|part| {
-                matches!(
-                    part,
-                    InklingInputPartPlan::Media {
-                        modality: eredu_core::InputModality::Audio,
-                        ..
-                    }
-                )
-            }),
-            2 => true,
-            _ => false,
-        }
-    }
-
-    fn prepared_group_collective_waves(
-        &self,
-        group: usize,
-        _input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
         tensor_partitions: usize,
         stage_units: &[std::ops::Range<usize>],
-    ) -> Result<Option<Vec<Vec<crate::composite_execution::CompositeTensorCollective>>>, String>
-    {
+    ) -> Result<crate::composite_execution::CompositeGroupInvocation, String> {
+        use crate::composite_execution::{
+            CompositeContinuationGeometry, CompositeGroupInvocation, CompositeGroupUse,
+        };
+        let boundary_sequence = if group == 2 {
+            input.decoder_sequence()?
+        } else {
+            let positions = inkling_group_media(group, input.admitted().parts())
+                .try_fold(0u64, u64::checked_add)
+                .ok_or("Inkling media boundary sequence overflow")?;
+            i32::try_from(positions).map_err(|_| "Inkling boundary sequence exceeds i32")?
+        };
+        let mode = if group == 2 || boundary_sequence > 0 {
+            CompositeGroupUse::Execute
+        } else {
+            CompositeGroupUse::Bypassed
+        };
+        let continuation = if group == 0 && mode.is_active() {
+            let vision = self
+                .kernel()
+                .args
+                .vision_config
+                .as_ref()
+                .ok_or("Inkling vision continuation requires a vision configuration")?;
+            Some(CompositeContinuationGeometry::AfterUnits(
+                vision.parameters().continuation_shapes(boundary_sequence),
+            ))
+        } else {
+            None
+        };
         let pipeline_stages = stage_units.len();
-        // Inkling's hMLP units and projector are replicated equations even
-        // when their parameters are selected with TP-local ownership. The
-        // explicit empty schedule prevents the generic driver from inventing
-        // row reductions for this group.
-        Ok((group == 0 && tensor_partitions > 1 && pipeline_stages > 1)
-            .then(|| vec![Vec::new(); pipeline_stages]))
+        // Replicated vision equations emit no tensor collective.
+        let collective_waves = (group == 0 && tensor_partitions > 1 && pipeline_stages > 1)
+            .then(|| vec![Vec::new(); pipeline_stages]);
+        Ok(CompositeGroupInvocation {
+            mode,
+            boundary_sequence,
+            continuation,
+            collective_waves,
+        })
+    }
+
+    fn prepared_decoder_batch_size(
+        &self,
+        _input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
+    ) -> Result<i32, String> {
+        Ok(1)
     }
 
     fn prepared_primary_ingress_collectives(
@@ -439,6 +466,13 @@ where
             self.kernel().args.text_config.hidden_size,
             tensor_partitions,
         )
+    }
+
+    fn primary_ingress_collectives_pending(&self, forward: &Self::ForwardContext) -> bool {
+        forward
+            .parts
+            .iter()
+            .any(|part| matches!(part, PreparedPart::PendingText { .. }))
     }
 
     fn routed_tensor_output_width(&self) -> Result<Option<usize>, Self::Error> {
@@ -467,6 +501,7 @@ pub struct PartitionMtpOutput<T> {
 }
 
 enum PreparedPart<T> {
+    PendingText { tokens: T },
     Text { tokens: T, embeddings: T },
     Image { tokens: T },
     Audio { tokens: T },
@@ -493,28 +528,6 @@ pub struct ForwardContext<T> {
     vision_output: Option<T>,
     has_vision: bool,
     target_hidden: Option<T>,
-}
-
-impl<T> ForwardContext<T> {
-    /// Whether this request carries raw vision input.
-    pub const fn has_vision_input(&self) -> bool {
-        self.has_vision
-    }
-
-    /// Whether this request carries raw audio input.
-    pub const fn has_audio_input(&self) -> bool {
-        self.audio_input.is_some()
-    }
-
-    /// Installs the architecture-declared vision projector output received from another owner.
-    pub fn replace_vision_output(&mut self, output: T) {
-        self.vision_output = Some(output);
-    }
-
-    /// Installs the architecture-declared audio projector output received from another owner.
-    pub fn replace_audio_output(&mut self, output: T) {
-        self.audio_output = Some(output);
-    }
 }
 
 /// Inkling architecture shared by resident, layerwise, and streamed runtimes.
@@ -1347,70 +1360,23 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> InklingKernel
         )
     }
 
-    fn prepare_parts(
-        &mut self,
-        parts: &[DecoderInputPart<'_, B::Tensor>],
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Vec<PreparedPart<B::Tensor>>, Error> {
-        if parts.is_empty() {
-            return Err(Error::backend("Inkling input has no ordered parts"));
-        }
+    fn prepare_parts(parts: &[DecoderInputPart<'_, B::Tensor>]) -> Vec<PreparedPart<B::Tensor>> {
         parts
             .iter()
             .map(|part| match part {
-                DecoderInputPart::Text(tokens) => Ok(PreparedPart::Text {
+                DecoderInputPart::Text(tokens) => PreparedPart::PendingText {
                     tokens: (*tokens).clone(),
-                    embeddings: self
-                        .static_modules
-                        .embeddings_mut()?
-                        .forward(tokens, context)?,
-                }),
-                DecoderInputPart::Image(tokens) => Ok(PreparedPart::Image {
+                },
+                DecoderInputPart::Image(tokens) => PreparedPart::Image {
                     tokens: (*tokens).clone(),
-                }),
-                DecoderInputPart::Audio(tokens) => Ok(PreparedPart::Audio {
+                },
+                DecoderInputPart::Audio(tokens) => PreparedPart::Audio {
                     tokens: (*tokens).clone(),
-                }),
-                DecoderInputPart::Projected { tokens, embeddings } => Ok(PreparedPart::Projected {
+                },
+                DecoderInputPart::Projected { tokens, embeddings } => PreparedPart::Projected {
                     tokens: (*tokens).clone(),
                     embeddings: (*embeddings).clone(),
-                }),
-            })
-            .collect()
-    }
-
-    fn prepare_parts_parallel(
-        &mut self,
-        parts: &[DecoderInputPart<'_, B::Tensor>],
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Vec<PreparedPart<B::Tensor>>, Error> {
-        if parts.is_empty() {
-            return Err(Error::backend("Inkling input has no ordered parts"));
-        }
-        parts
-            .iter()
-            .map(|part| match part {
-                DecoderInputPart::Text(tokens) => Ok(PreparedPart::Text {
-                    tokens: (*tokens).clone(),
-                    embeddings: B::vocabulary_parallel_lookup(
-                        self.static_modules.embeddings_mut()?,
-                        tokens,
-                        EmbeddingLookupPolicy::Strict,
-                        parallel,
-                        context,
-                    )?,
-                }),
-                DecoderInputPart::Image(tokens) => Ok(PreparedPart::Image {
-                    tokens: (*tokens).clone(),
-                }),
-                DecoderInputPart::Audio(tokens) => Ok(PreparedPart::Audio {
-                    tokens: (*tokens).clone(),
-                }),
-                DecoderInputPart::Projected { tokens, embeddings } => Ok(PreparedPart::Projected {
-                    tokens: (*tokens).clone(),
-                    embeddings: (*embeddings).clone(),
-                }),
+                },
             })
             .collect()
     }
@@ -1461,6 +1427,9 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> InklingKernel
         let mut embeddings = Vec::with_capacity(parts.len());
         for part in parts {
             match part {
+                PreparedPart::PendingText { .. } => {
+                    return Err(Error::backend("Inkling text embeddings are pending"));
+                }
                 PreparedPart::Text {
                     embeddings: value, ..
                 } => embeddings.push(value.clone()),
@@ -1517,9 +1486,25 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> InklingKernel
     }
 }
 
+fn resolve_text_parts<T: Clone>(
+    parts: &mut [PreparedPart<T>],
+    mut lookup: impl FnMut(&T) -> Result<T, Error>,
+) -> Result<(), Error> {
+    for part in parts {
+        if let PreparedPart::PendingText { tokens } = part {
+            *part = PreparedPart::Text {
+                embeddings: lookup(tokens)?,
+                tokens: tokens.clone(),
+            };
+        }
+    }
+    Ok(())
+}
+
 fn prepared_part_tokens<T>(part: &PreparedPart<T>) -> &T {
     match part {
         PreparedPart::Text { tokens, .. }
+        | PreparedPart::PendingText { tokens }
         | PreparedPart::Image { tokens }
         | PreparedPart::Audio { tokens }
         | PreparedPart::Projected { tokens, .. } => tokens,
@@ -1586,12 +1571,8 @@ pub fn state_identity(
 fn ordered_tokens<T: Tensor>(parts: &[PreparedPart<T>], context: &T::Context) -> Result<T, Error> {
     let tokens = parts
         .iter()
-        .map(|part| match part {
-            PreparedPart::Text { tokens, .. }
-            | PreparedPart::Image { tokens }
-            | PreparedPart::Audio { tokens }
-            | PreparedPart::Projected { tokens, .. } => tokens.clone(),
-        })
+        .map(prepared_part_tokens)
+        .cloned()
         .collect::<Vec<_>>();
     T::concatenate(&tokens, 1, context)
 }
@@ -1603,12 +1584,7 @@ fn part_token_count<T: Tensor>(
     parts
         .iter()
         .filter(|part| select(part))
-        .map(|part| match part {
-            PreparedPart::Text { tokens, .. }
-            | PreparedPart::Image { tokens }
-            | PreparedPart::Audio { tokens }
-            | PreparedPart::Projected { tokens, .. } => tokens.dim(1),
-        })
+        .map(|part| prepared_part_tokens(part).dim(1))
         .sum()
 }
 
@@ -1839,9 +1815,9 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ComponentKern
         for part in &forward.parts {
             match part {
                 PreparedPart::Text { tokens, embeddings } => values.extend([tokens, embeddings]),
-                PreparedPart::Image { tokens } | PreparedPart::Audio { tokens } => {
-                    values.push(tokens)
-                }
+                PreparedPart::Image { tokens }
+                | PreparedPart::Audio { tokens }
+                | PreparedPart::PendingText { tokens } => values.push(tokens),
                 PreparedPart::Projected { tokens, embeddings } => {
                     values.extend([tokens, embeddings])
                 }
@@ -1888,40 +1864,28 @@ where
         &mut self,
         group: usize,
         initial: &B::Tensor,
-        dependencies: &[&B::Tensor],
+        dependencies: &eredu_runtime::GroupDependencies<'_, B::Tensor>,
         _state: &mut S,
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        match (group, dependencies) {
-            (0, []) => Ok(initial.clone()),
-            (1, []) if forward.audio_input.is_some() => {
-                Ok(forward.audio_input.as_ref().expect("checked").clone())
-            }
-            (1, []) => Ok(initial.clone()),
-            (2, [vision, audio]) => self.assemble(
+        if group == 2 {
+            resolve_text_parts(&mut forward.parts, |tokens| {
+                self.static_modules
+                    .embeddings_mut()?
+                    .forward(tokens, context)
+            })?;
+        }
+        match group {
+            0 => Ok(initial.clone()),
+            1 => Ok(forward.audio_input.as_ref().unwrap_or(initial).clone()),
+            2 => self.assemble(
                 &forward.parts,
-                forward.vision_output.as_ref().map(|_| *vision),
-                forward.audio_output.as_ref().map(|_| *audio),
+                dependencies.get(0),
+                dependencies.get(1),
                 context,
             ),
-            (2, dependencies)
-                if dependencies.len()
-                    == usize::from(forward.vision_output.is_some())
-                        + usize::from(forward.audio_output.is_some()) =>
-            {
-                let mut dependencies = dependencies.iter().copied();
-                let vision = forward
-                    .vision_output
-                    .as_ref()
-                    .and_then(|_| dependencies.next());
-                let audio = forward
-                    .audio_output
-                    .as_ref()
-                    .and_then(|_| dependencies.next());
-                self.assemble(&forward.parts, vision, audio, context)
-            }
-            _ => Err(Error::backend("invalid Inkling execution dependencies")),
+            _ => Err(Error::backend("invalid Inkling execution group")),
         }
     }
     fn execute(
@@ -2060,17 +2024,38 @@ where
         &mut self,
         input: Self::Input<'a>,
         state: &mut S,
-        parallel: &B::ParallelContext,
+        _parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        match input {
-            crate::composite_execution::CompositeModelInput::Native(input) => {
-                self.begin_native_parallel(input, state, parallel, context)
-            }
-            crate::composite_execution::CompositeModelInput::Prepared(input) => {
-                self.begin_prepared_parallel(input, state, parallel, context)
-            }
+        if self.parallel_geometry.is_none() {
+            return Err(Error::backend(
+                "Inkling model was not built with local geometry",
+            ));
         }
+        <Self as ComponentEquations<B, S>>::begin(self, input, state, context)
+    }
+    fn begin_group_parallel(
+        &mut self,
+        group: usize,
+        initial: &B::Tensor,
+        dependencies: &eredu_runtime::GroupDependencies<'_, B::Tensor>,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        if group == 2 {
+            resolve_text_parts(&mut forward.parts, |tokens| {
+                B::vocabulary_parallel_lookup(
+                    self.static_modules.embeddings_mut()?,
+                    tokens,
+                    EmbeddingLookupPolicy::Strict,
+                    parallel,
+                    context,
+                )
+            })?;
+        }
+        self.begin_group(group, initial, dependencies, state, forward, context)
     }
     fn execute_parallel(
         &mut self,
@@ -2483,21 +2468,6 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> InklingKernel
         let prepared = prepare_input(input, context)?;
         prepared.with_model_input(|input| self.begin_native(input, state, context))
     }
-    fn begin_prepared_parallel<'a, S>(
-        &mut self,
-        input: PreparedCompositeInput<'a, B::Tensor, InklingInputPartPlan>,
-        state: &mut S,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
-    where
-        S: LayerRuntimeState<B>,
-        S::LayerState: AuxiliaryConvolutionState<B::Tensor>,
-        B: eredu_nn::TensorParallelGroupedNeuralBackend,
-    {
-        prepare_input(input, context)?
-            .with_model_input(|input| self.begin_native_parallel(input, state, parallel, context))
-    }
     fn begin_native<'a, S>(
         &mut self,
         input: ModelInput<'a, B::Tensor>,
@@ -2511,7 +2481,10 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> InklingKernel
         if !self.accepts_execution_state(state.layout())? {
             return Err(Error::backend("Inkling runtime state layout mismatch"));
         }
-        let parts = self.prepare_parts(input.parts, context)?;
+        if input.parts.is_empty() {
+            return Err(Error::backend("Inkling input has no ordered parts"));
+        }
+        let parts = Self::prepare_parts(input.parts);
         let tokens = ordered_tokens(&parts, context)?;
         let audio_input = input.audio.as_ref().map(|audio| audio.code_ids.clone());
         let audio_valid_frames = input.audio.as_ref().map(|audio| audio.valid_frames);
@@ -2524,56 +2497,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> InklingKernel
                 patches.clone()
             }
             None if audio_input.is_some() => audio_input.as_ref().expect("checked").clone(),
-            None => self.assemble(&parts, None, None, context)?,
-        };
-        Ok(LayeredForwardState {
-            hidden,
-            context: ForwardContext {
-                parts,
-                tokens,
-                audio_input,
-                audio_valid_frames,
-                audio_output: None,
-                vision_output: None,
-                has_vision,
-                target_hidden: None,
-            },
-        })
-    }
-    fn begin_native_parallel<'a, S>(
-        &mut self,
-        input: ModelInput<'a, B::Tensor>,
-        state: &mut S,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
-    where
-        S: LayerRuntimeState<B>,
-        S::LayerState: AuxiliaryConvolutionState<B::Tensor>,
-        B: eredu_nn::TensorParallelGroupedNeuralBackend,
-    {
-        if self.parallel_geometry.is_none() {
-            return Err(Error::backend(
-                "Inkling model was not built with local geometry",
-            ));
-        }
-        if !self.accepts_execution_state(state.layout())? {
-            return Err(Error::backend("Inkling rank-local state layout mismatch"));
-        }
-        let parts = self.prepare_parts_parallel(input.parts, parallel, context)?;
-        let tokens = ordered_tokens(&parts, context)?;
-        let audio_input = input.audio.as_ref().map(|audio| audio.code_ids.clone());
-        let audio_valid_frames = input.audio.as_ref().map(|audio| audio.valid_frames);
-        let has_vision = input.vision_patches.is_some();
-        let hidden = match input.vision_patches {
-            Some(patches) => {
-                if patches.shape().len() != 5 || patches.shape()[1..] != [2, 40, 40, 3] {
-                    return Err(Error::backend("invalid Inkling hMLP patch geometry"));
-                }
-                patches.clone()
-            }
-            None if audio_input.is_some() => audio_input.as_ref().expect("checked").clone(),
-            None => self.assemble(&parts, None, None, context)?,
+            None => tokens.clone(),
         };
         Ok(LayeredForwardState {
             hidden,

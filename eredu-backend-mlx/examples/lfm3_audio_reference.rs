@@ -3,8 +3,8 @@
 use clap::Parser;
 use eredu_architectures::lfm3::{
     audio::{
-        AudioParameterResidency, AudioPrompt, BindingSource, CompletedSpeechFrame, DepthDecoder,
-        Encoder, Feedback, PreparedAudio, Projector,
+        AudioParameterResidency, AudioPlacement, AudioPrompt, BindingSource, CompletedSpeechFrame,
+        DepthDecoder, Encoder, Feedback, PreparedAudio, Projector,
     },
     CompleteLfm3Kernel, LayeredModel,
 };
@@ -20,7 +20,7 @@ use eredu_backend_mlx::{
         },
         ExecutionContext,
     },
-    native::MlxAudioModel,
+    native::{MlxComponentBinder, MlxRealtimeSupport, RandomState},
     MlxTensor,
 };
 use eredu_checkpoint::{
@@ -110,6 +110,29 @@ enum Residency {
     Resident,
     Host,
     Disk,
+}
+
+type LocalAudio = eredu_architectures::lfm3::audio::ResidentAudio<
+    MlxNeuralBackend,
+    eredu_architectures::lfm3::audio::PlacedAudio<
+        MlxComponentBinder,
+        eredu_architectures::lfm3::audio::ReplicatedAudio,
+    >,
+>;
+
+fn load_local_audio(
+    artifact: PreparedAudio,
+    residency: AudioParameterResidency,
+    execution: &ExecutionContext,
+) -> Result<LocalAudio, Box<dyn Error>> {
+    let prepared = eredu_architectures::lfm3::audio::PreparedResidentAudio::select(
+        artifact,
+        residency,
+        AudioPlacement::Local,
+        &MlxRealtimeSupport::new(false),
+    )?;
+    let mechanisms = MlxComponentBinder::new(ExecutionContext::cpu()?.stream(), execution.stream());
+    Ok(prepared.bind_local(mechanisms)?)
 }
 
 impl Residency {
@@ -535,7 +558,11 @@ fn compare_live_asr(
         .collect();
     let blocks: Vec<LiveBlock> = serde_json::from_value(metadata["blocks"].clone())?;
     let (matched_blocks, token_count) = if args.live_asr_pcm {
-        compare_live_pcm(&pcm, &blocks, MlxAudioModel::load(model, native)?)?
+        compare_live_pcm(
+            &pcm,
+            &blocks,
+            load_local_audio(model, AudioParameterResidency::default(), &native)?,
+        )?
     } else {
         compare_live_mel(&pcm, &blocks, model, native)?
     };
@@ -561,7 +588,8 @@ fn compare_live_mel(
         .processor
         .transform()?
         .extract(AudioWaveform::new(pcm, 16_000)?)?;
-    let mut session = MlxAudioModel::load(model, native)?.prepare_live_transcription()?;
+    let mut session = load_local_audio(model, AudioParameterResidency::default(), &native)?
+        .prepare_live_transcription()?;
     session.enable_snapshots(eredu_core::execution_control::SnapshotLimits {
         max_snapshots: 1,
         max_branches: 1,
@@ -619,7 +647,7 @@ fn compare_live_mel(
 fn compare_live_pcm(
     pcm: &[f32],
     blocks: &[LiveBlock],
-    model: MlxAudioModel,
+    model: LocalAudio,
 ) -> Result<(usize, usize), Box<dyn Error>> {
     use eredu_architectures::lfm3::audio::AudioTranscriptionError;
     use eredu_core::execution_control::SnapshotLimits;
@@ -950,7 +978,6 @@ fn compare_ingress_replay(
 ) -> Result<(), Box<dyn Error>> {
     use eredu_architectures::lfm3::audio::{
         AudioAdvance, AudioIngressRequest, AudioMode, AudioRequest, AudioSnapshotError,
-        PreparedResidentAudio,
     };
     use eredu_core::execution_control::SnapshotLimits;
 
@@ -965,9 +992,9 @@ fn compare_ingress_replay(
         let mut tokens = prefix.to_vec();
         tokens.extend([artifact.tokens.input; 2]);
         tokens.extend(suffix);
-        let model = MlxAudioModel::load_prepared(
-            PreparedResidentAudio::select(artifact.clone())?,
-            &ExecutionContext::cpu()?,
+        let model = load_local_audio(
+            artifact.clone(),
+            AudioParameterResidency::default(),
             &execution,
         )?;
         model
@@ -979,14 +1006,14 @@ fn compare_ingress_replay(
                     mode: AudioMode::Speech,
                     max_slots: 3,
                 },
-                41,
+                RandomState::with_seed(41)?,
             )?
             .events()
             .collect::<Result<Vec<_>, _>>()?
     };
 
-    let mut ingress = MlxAudioModel::load_prepared_with_parameter_residency(
-        PreparedResidentAudio::select(artifact)?,
+    let mut ingress = load_local_audio(
+        artifact,
         AudioParameterResidency {
             language: args.language_residency.policy(2 << 30, 12 << 30, 2 << 30)?,
             encoder: args
@@ -995,7 +1022,6 @@ fn compare_ingress_replay(
             depth: args.depth_residency.policy(256 << 20, 1 << 30, 256 << 20)?,
             codec: args.codec_residency.policy(64 << 20, 256 << 20, 64 << 20)?,
         },
-        &ExecutionContext::cpu()?,
         &execution,
     )?
     .prepare_ingress(
@@ -1005,7 +1031,7 @@ fn compare_ingress_replay(
             mode: AudioMode::Speech,
             max_slots: 3,
         },
-        41,
+        RandomState::with_seed(41)?,
     )?;
     let limits = SnapshotLimits {
         max_snapshots: 2,
@@ -1112,7 +1138,6 @@ fn tensor_replay(
     use eredu_architectures::lfm3::audio::{
         AudioAdvance, AudioMode, AudioParameterResidency, AudioRequest, PreparedResidentAudio,
     };
-    use eredu_backend_mlx::native::{MlxPipelineAudioModel, MlxTensorParallelAudioModel};
     use safemlx::distributed::{Backend, Group};
 
     let pcm = audio_fixture();
@@ -1141,7 +1166,6 @@ fn tensor_replay(
         max_slots: 3,
     };
     let weights = ExecutionContext::cpu()?;
-    let prepared = PreparedResidentAudio::select(artifact)?;
     let residency = AudioParameterResidency {
         language: args.language_residency.policy(1 << 30, 4 << 30, 1 << 30)?,
         encoder: args
@@ -1154,8 +1178,23 @@ fn tensor_replay(
         let group = Group::init(true, Backend::Ring)?;
         let stages = args.pipeline_stages as usize;
         if stages == 1 {
-            MlxTensorParallelAudioModel::load(prepared, residency, group, &weights, &execution)?
-                .start(request, args.tensor_seed)?
+            let topology = eredu_core::ParallelTopology::new(group.size(), 1, 1, 1)?;
+            let rank = eredu_core::ParallelRankTopology::new(topology, group.rank())?;
+            let prepared = PreparedResidentAudio::select(
+                artifact,
+                residency,
+                AudioPlacement::Tensor(rank),
+                &MlxRealtimeSupport::new(true),
+            )?;
+            let world = eredu_runtime::PlacementRank::new(group.size(), group.rank())?;
+            let collective = MlxComponentBinder::tensor_group(&group);
+            prepared
+                .bind_tensor::<MlxNeuralBackend, _>(
+                    MlxComponentBinder::new(weights.stream(), execution.stream()),
+                    world,
+                    collective,
+                )?
+                .start(request, RandomState::with_seed(args.tensor_seed)?)?
                 .events()
                 .collect::<Result<Vec<_>, _>>()?
         } else {
@@ -1163,10 +1202,21 @@ fn tensor_replay(
                 return Err("Audio cohort size must be divisible by its pipeline stages".into());
             }
             let topology = eredu_core::ParallelTopology::new(group.size() / stages, stages, 1, 1)?;
-            let mut session = MlxPipelineAudioModel::load(
-                prepared, residency, topology, group, &weights, &execution,
-            )?
-            .start(request, args.tensor_seed)?;
+            let rank = eredu_core::ParallelRankTopology::new(topology, group.rank())?;
+            let prepared = PreparedResidentAudio::select(
+                artifact,
+                residency,
+                AudioPlacement::Pipeline(rank),
+                &MlxRealtimeSupport::new(true),
+            )?;
+            let world = eredu_runtime::PlacementRank::new(group.size(), group.rank())?;
+            let mut session = prepared
+                .bind_pipeline::<MlxNeuralBackend, _, _>(
+                    MlxComponentBinder::new(weights.stream(), execution.stream()),
+                    world,
+                    group,
+                )?
+                .start(request, RandomState::with_seed(args.tensor_seed)?)?;
             if args.reject_first_advance {
                 let error = session
                     .advance()
@@ -1193,9 +1243,8 @@ fn tensor_replay(
             session.events().collect::<Result<Vec<_>, _>>()?
         }
     } else {
-        inspect_audio_pipeline_placement(&prepared, &execution)?;
-        MlxAudioModel::load_prepared(prepared, &weights, &execution)?
-            .start(request, args.tensor_seed)?
+        load_local_audio(artifact, residency, &execution)?
+            .start(request, RandomState::with_seed(args.tensor_seed)?)?
             .events()
             .collect::<Result<Vec<_>, _>>()?
     };
@@ -1234,39 +1283,5 @@ fn tensor_replay(
         &args.output,
         serde_json::to_vec(&json!({ "tokens": generated, "codes": codes, "pcm": pcm }))?,
     )?;
-    Ok(())
-}
-
-fn inspect_audio_pipeline_placement(
-    prepared: &eredu_architectures::lfm3::audio::PreparedResidentAudio,
-    execution: &ExecutionContext,
-) -> Result<(), Box<dyn Error>> {
-    use eredu_core::{ParallelRankTopology, ParallelTopology};
-
-    for tensor_size in [1, 2] {
-        let topology = ParallelTopology::new(tensor_size, 2, 1, 1)?;
-        for rank in 0..topology.world_size() {
-            let coordinates = ParallelRankTopology::new(topology, rank)?;
-            let prepared_stage = prepared.language_pipeline_partition(coordinates)?;
-            let stage = prepared_stage.partition();
-            let layers = stage
-                .state()
-                .ok_or("missing pipeline stage state")?
-                .global_layers();
-            let owns_input = stage.ownership().owns_input();
-            let owns_output = stage.ownership().owns_output();
-            let (_, _, _, pinned, units) = prepared_stage
-                .into_layerwise::<MlxNeuralBackend, MlxHybridState>(execution.stream())?;
-            let bytes = pinned
-                .iter()
-                .chain(units.iter().flatten())
-                .filter(|binding| !binding.is_alias())
-                .map(eredu_runtime::WeightBinding::expected_bytes)
-                .sum::<u64>();
-            eprintln!(
-                "Audio placement TP={tensor_size} PP=2 rank={rank}: layers={layers:?}, input={owns_input}, output={owns_output}, parameter_bytes={bytes}",
-            );
-        }
-    }
     Ok(())
 }

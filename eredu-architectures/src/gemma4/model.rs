@@ -500,12 +500,18 @@ where
         crate::media_plan::admit_gemma4_input(config, input, inspector)
     }
 
-    fn should_execute_prepared_group(
+    fn prepared_group_invocation(
         &self,
         group: usize,
         input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
-    ) -> bool {
-        match group {
+        tensor_partitions: usize,
+        stage_units: &[std::ops::Range<usize>],
+    ) -> Result<crate::composite_execution::CompositeGroupInvocation, String> {
+        use crate::composite_execution::{
+            CompositeContinuationGeometry, CompositeGroupInvocation, CompositeGroupUse,
+            CompositeTensorCollective,
+        };
+        let group_active = |group| match group {
             0 => input
                 .admitted()
                 .parts()
@@ -518,155 +524,113 @@ where
                 .any(|part| matches!(part, Gemma4InputPartPlan::Audio { .. })),
             2 => true,
             _ => false,
-        }
-    }
-
-    fn prepared_group_boundary_sequence(
-        &self,
-        group: usize,
-        input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
-    ) -> Result<i32, String> {
-        let positions = if group < 2 {
-            input
-                .admitted()
-                .parts()
-                .iter()
-                .filter_map(|part| match (group, part) {
-                    (0, Gemma4InputPartPlan::Vision { shape, .. })
-                    | (1, Gemma4InputPartPlan::Audio { shape, .. }) => {
-                        Some(shape.decoder_positions)
-                    }
-                    _ => None,
-                })
-                .try_fold(0_u64, |total, count| total.checked_add(count))
-                .ok_or_else(|| "Gemma media boundary positions overflowed".to_owned())?
+        };
+        let active = group_active(group);
+        let mode = if active {
+            CompositeGroupUse::Execute
         } else {
-            input.admitted().decoder_positions()
+            CompositeGroupUse::Bypassed
         };
-        i32::try_from(positions).map_err(|_| "Gemma boundary sequence exceeds i32".into())
-    }
-
-    fn prepared_group_continuation_geometry(
-        &self,
-        group: usize,
-        input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
-    ) -> Result<Option<crate::composite_execution::CompositeContinuationGeometry>, String> {
-        let extents = input
-            .admitted()
-            .parts()
-            .iter()
-            .filter_map(|part| match (group, part) {
-                (0, Gemma4InputPartPlan::Vision { ingress, .. }) => Some(ingress.padded_patches),
-                (1, Gemma4InputPartPlan::Audio { ingress, .. }) => {
-                    Some((ingress.padded_frames / 2 + ingress.padded_frames % 2 + 1) / 2)
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let extent = extents
-            .iter()
-            .copied()
-            .max()
-            .map(|maximum| {
-                i32::try_from(extents.len())
-                    .ok()
-                    .and_then(|count| maximum.checked_mul(count))
-                    .ok_or_else(|| "Gemma batched continuation extent exceeds i32".to_owned())
-            })
-            .transpose()?;
-        let width = match group {
-            0 => self
-                .kernel()
-                .args
-                .vision
-                .as_ref()
-                .map(|config| config.hidden_size),
-            1 => self
-                .kernel()
-                .args
-                .audio
-                .as_ref()
-                .map(|config| config.hidden_size),
-            _ => None,
+        let boundary_sequence = (|| -> Result<i32, String> {
+            let positions = if group < 2 {
+                input
+                    .admitted()
+                    .parts()
+                    .iter()
+                    .filter_map(|part| match (group, part) {
+                        (0, Gemma4InputPartPlan::Vision { shape, .. })
+                        | (1, Gemma4InputPartPlan::Audio { shape, .. }) => {
+                            Some(shape.decoder_positions)
+                        }
+                        _ => None,
+                    })
+                    .try_fold(0_u64, |total, count| total.checked_add(count))
+                    .ok_or_else(|| "Gemma media boundary positions overflowed".to_owned())?
+            } else {
+                input.admitted().decoder_positions()
+            };
+            i32::try_from(positions).map_err(|_| "Gemma boundary sequence exceeds i32".into())
+        })()?;
+        let continuation = if active {
+            (|| -> Result<Option<CompositeContinuationGeometry>, String> {
+                let extents = input
+                    .admitted()
+                    .parts()
+                    .iter()
+                    .filter_map(|part| match (group, part) {
+                        (0, Gemma4InputPartPlan::Vision { ingress, .. }) => {
+                            Some(ingress.padded_patches)
+                        }
+                        (1, Gemma4InputPartPlan::Audio { ingress, .. }) => {
+                            Some((ingress.padded_frames / 2 + ingress.padded_frames % 2 + 1) / 2)
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                let count = i32::try_from(extents.len())
+                    .map_err(|_| "Gemma continuation batch exceeds i32")?;
+                let maximum = extents.into_iter().max();
+                let width = match group {
+                    0 => self
+                        .kernel()
+                        .args
+                        .vision
+                        .as_ref()
+                        .map(|config| config.hidden_size),
+                    1 => self
+                        .kernel()
+                        .args
+                        .audio
+                        .as_ref()
+                        .map(|config| config.hidden_size),
+                    _ => None,
+                };
+                Ok(maximum.zip(width).map(|(sequence, width)| {
+                    CompositeContinuationGeometry::Uniform(vec![count, sequence, width])
+                }))
+            })()?
+        } else {
+            None
         };
-        Ok(extent.zip(width).map(Into::into))
-    }
-
-    fn prepared_group_continuation_batched(&self, _group: usize) -> bool {
-        // Gemma's encoder activations already retain their batch dimension.
-        false
-    }
-
-    fn encode_group_continuation(
-        &self,
-        group: usize,
-        hidden: B::Tensor,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error> {
-        if group >= 2 {
-            return Ok(hidden);
-        }
-        hidden.reshape(&[1, -1, hidden.dim(2)], context)
-    }
-
-    fn decode_group_continuation(
-        &self,
-        group: usize,
-        hidden: B::Tensor,
-        forward: &Self::ForwardContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error> {
-        let initial = match group {
-            0 => forward.vision_initial.as_ref(),
-            1 => forward.audio_initial.as_ref(),
-            _ => return Ok(hidden),
-        }
-        .ok_or_else(|| Error::backend("Gemma media continuation has no admitted batch geometry"))?;
-        hidden.reshape(initial.shape(), context)
-    }
-
-    fn prepared_group_collective_waves(
-        &self,
-        group: usize,
-        input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
-        tensor_partitions: usize,
-        stage_units: &[std::ops::Range<usize>],
-    ) -> Result<Option<Vec<Vec<crate::composite_execution::CompositeTensorCollective>>>, String>
-    {
-        let pipeline_stages = stage_units.len();
-        if group >= 2 || tensor_partitions <= 1 || pipeline_stages <= 1 {
-            return Ok(None);
-        }
-        // Encoder equations/projectors are replicated. Eager text embedding
-        // lookups run when each stage first creates its composite context.
-        let first_active = (0..2).find(|group| {
-            <Self as CompositeArchitecture<B, S>>::should_execute_prepared_group(
-                self, *group, input,
-            )
-        });
-        let mut ingress = Vec::new();
-        if first_active == Some(group) {
-            for (part, plan) in input
-                .prepared()
-                .parts()
-                .iter()
-                .zip(input.admitted().parts())
-            {
-                if let Gemma4InputPartPlan::TextTokens { positions } = plan {
-                    ingress.push(crate::composite_execution::CompositeTensorCollective::Sum {
-                        shape: vec![
-                            part.payload().value().dim(0),
-                            i32::try_from(*positions)
-                                .map_err(|_| "Gemma text extent exceeds i32")?,
-                            self.kernel().args.text.hidden_size,
-                        ],
-                    });
+        let collective_waves =
+            (|| -> Result<Option<Vec<Vec<CompositeTensorCollective>>>, String> {
+                let pipeline_stages = stage_units.len();
+                if group >= 2 || tensor_partitions <= 1 || pipeline_stages <= 1 {
+                    return Ok(None);
                 }
-            }
-        }
-        let mut waves = vec![Vec::new(); pipeline_stages];
-        waves[0] = ingress;
-        Ok(Some(waves))
+                // Encoder equations/projectors are replicated. Eager text embedding
+                // lookups run when each stage first creates its composite context.
+                let first_active = (0..2).find(|&group| group_active(group));
+                let mut ingress = Vec::new();
+                if first_active == Some(group) {
+                    for (part, plan) in input
+                        .prepared()
+                        .parts()
+                        .iter()
+                        .zip(input.admitted().parts())
+                    {
+                        if let Gemma4InputPartPlan::TextTokens { positions } = plan {
+                            ingress.push(CompositeTensorCollective::Sum {
+                                shape: vec![
+                                    part.payload().value().dim(0),
+                                    i32::try_from(*positions)
+                                        .map_err(|_| "Gemma text extent exceeds i32")?,
+                                    self.kernel().args.text.hidden_size,
+                                ],
+                            });
+                        }
+                    }
+                }
+                let mut waves = vec![Vec::new(); pipeline_stages];
+                waves[0] = ingress;
+                Ok(Some(waves))
+            })()?;
+        Ok(CompositeGroupInvocation {
+            mode,
+            boundary_sequence,
+            continuation,
+            collective_waves,
+        })
     }
 
     fn prepared_primary_ingress_collectives(
@@ -2847,7 +2811,7 @@ where
         &mut self,
         group: usize,
         initial: &B::Tensor,
-        dependencies: &[&B::Tensor],
+        dependencies: &eredu_runtime::GroupDependencies<'_, B::Tensor>,
         _state: &mut S,
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
@@ -2856,16 +2820,8 @@ where
             0 => Ok(forward.vision_initial.as_ref().unwrap_or(initial).clone()),
             1 => Ok(forward.audio_initial.as_ref().unwrap_or(initial).clone()),
             2 => {
-                let vision = forward
-                    .vision_output
-                    .as_ref()
-                    .and_then(|_| dependencies.first().copied())
-                    .or(forward.vision_output.as_ref());
-                let audio = forward
-                    .audio_output
-                    .as_ref()
-                    .and_then(|_| dependencies.get(1).copied())
-                    .or(forward.audio_output.as_ref());
+                let vision = dependencies.get(0);
+                let audio = dependencies.get(1);
                 let assembled = self.assemble(&forward.parts, vision, audio, context)?;
                 let per_layer_tokens = forward
                     .per_layer_token_override
@@ -3323,10 +3279,23 @@ where
             return Ok(initial.clone());
         }
         match parallel {
-            Some(parallel) => {
-                self.begin_group_parallel(group, initial, &[], state, forward, parallel, context)
-            }
-            None => self.begin_group(group, initial, &[], state, forward, context),
+            Some(parallel) => self.begin_group_parallel(
+                group,
+                initial,
+                &eredu_runtime::GroupDependencies::empty(),
+                state,
+                forward,
+                parallel,
+                context,
+            ),
+            None => self.begin_group(
+                group,
+                initial,
+                &eredu_runtime::GroupDependencies::empty(),
+                state,
+                forward,
+                context,
+            ),
         }
     }
     fn finish_partition(

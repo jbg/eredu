@@ -2,6 +2,14 @@
 
 use std::collections::BTreeMap;
 
+use super::{
+    rnnt_layered::{RnntKernel, RnntUnit},
+    rnnt_projection_layered::BoundRnnt,
+};
+use eredu_core::BackendFailure;
+use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Tensor};
+use eredu_runtime::{LayeredTensorCohort, ParameterUnitMechanisms, SubmissionBackend};
+
 use eredu_checkpoint::{
     recipe::{DerivedWeightRecipe, RecipeDtype},
     store::SharedCheckpointSource,
@@ -16,8 +24,10 @@ use super::{
     checkpoint::Component,
     parameters::{admitted_member, SpeechParameterError},
     rnnt::{RnntDimensions, RnntError},
-    rnnt_specs::{released_declaration, RnntDeclaration},
+    rnnt_specs::released_declaration,
 };
+
+pub use super::rnnt_specs::RnntDeclaration;
 
 /// Invalid RNNT geometry, retained source authority, or execution recipe.
 #[derive(Debug, thiserror::Error)]
@@ -112,6 +122,63 @@ impl PreparedRnntBindings {
         Ok(Self { prepared })
     }
 
+    /// Binds prepared units locally or to an explicitly selected tensor cohort.
+    pub fn bind<B, H, C>(
+        self,
+        residency: eredu_runtime::LayerWeightResidency,
+        context: &<B::Tensor as Tensor>::Context,
+        mechanisms: &H,
+        cohort: Option<C>,
+    ) -> Result<
+        (
+            BoundRnnt<B, H::UnitPolicy<RnntUnit<B>>, C>,
+            eredu_runtime::LayerwiseModelMetadata,
+        ),
+        BackendFailure,
+    >
+    where
+        B: DistributedNeuralBackend
+            + SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>
+            + 'static,
+        H: ParameterUnitMechanisms<B>,
+        C: LayeredTensorCohort<B>,
+    {
+        let selected = if let Some(cohort) = &cohort {
+            let (manifest, group) = cohort.selection();
+            validate_parallel_communication(self.dimensions(), manifest, group)
+                .map_err(BackendFailure::from_error)?;
+            self.select_parallel(cohort.tensor_topology()?)
+                .map_err(BackendFailure::from_error)?
+                .0
+        } else {
+            if self.local_layout().is_some() {
+                return Err(BackendFailure::from_error(RnntError::InvalidConfiguration(
+                    "tensor-local parameter placement requires its selected cohort",
+                )));
+            }
+            self
+        };
+        let (declaration, local, invocations, source, units) = selected.into_parts();
+        let definition = declaration.definition().clone();
+        let kernel = match local.as_ref() {
+            Some(layout) => RnntKernel::<B>::new_parallel(declaration, layout),
+            None => RnntKernel::<B>::new(declaration),
+        }
+        .map_err(BackendFailure::from_error)?;
+        let architecture = eredu_runtime::ComponentAdapter::new(definition, kernel)
+            .map_err(BackendFailure::from_error)?;
+        BoundRnnt::bind(
+            architecture,
+            source,
+            invocations,
+            units,
+            residency,
+            context,
+            mechanisms,
+            cohort,
+        )
+    }
+
     /// Selects vocabulary rows while retaining replicated recurrent and joint
     /// parameters. Repeated selection validates the exact retained topology.
     pub fn select_parallel(
@@ -158,7 +225,7 @@ impl PreparedRnntBindings {
         self.prepared.declaration().definition()
     }
     /// Transfers source authority and architecture-ordered unit bindings.
-    pub fn into_parts(
+    fn into_parts(
         self,
     ) -> (
         RnntDeclaration,

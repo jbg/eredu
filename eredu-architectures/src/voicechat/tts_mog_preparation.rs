@@ -1,5 +1,8 @@
 //! Cold exact binding plans for independently leased TTS MoG units.
 
+use eredu_core::BackendFailure;
+use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Tensor};
+use eredu_runtime::{LayeredTensorCohort, ParameterUnitMechanisms, SubmissionBackend};
 use std::collections::BTreeMap;
 
 use eredu_checkpoint::{
@@ -16,6 +19,7 @@ use super::{
     checkpoint::Component,
     parameters::{admitted_member, execution_parameter, SpeechParameterError},
     tts_mog::{MogDimensions, TtsError},
+    tts_mog_layered::{BoundMog, MogKernel, MogUnit},
     tts_mog_specs::{released_declaration, MogDeclaration},
 };
 
@@ -80,7 +84,7 @@ impl PreparedMogBindings {
             .validate()
             .map_err(MogPreparationError::Precision)?;
         let declaration = super::precision::SpeechPrecisionDeclaration::from_groups(
-            self.definition().parameters().groups().iter().filter(|owned| matches!(
+            self.prepared.declaration().definition().parameters().groups().iter().filter(|owned| matches!(
                 owned.owner(), eredu_runtime::ParameterGroupOwner::ExecutionUnit { group, .. }
                     if group.as_str() == super::tts_mog_layered::BLOCKS
             )),
@@ -140,6 +144,65 @@ impl PreparedMogBindings {
         })
     }
 
+    /// Binds prepared units locally or to an explicitly selected tensor cohort.
+    pub fn bind<B, H, C>(
+        self,
+        residency: eredu_runtime::LayerWeightResidency,
+        context: &<B::Tensor as Tensor>::Context,
+        mechanisms: &H,
+        cohort: Option<C>,
+    ) -> Result<
+        (
+            BoundMog<B, H::UnitPolicy<MogUnit<B>>, C>,
+            eredu_runtime::LayerwiseModelMetadata,
+        ),
+        BackendFailure,
+    >
+    where
+        B: DistributedNeuralBackend
+            + SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>
+            + 'static,
+        H: ParameterUnitMechanisms<B>,
+        C: LayeredTensorCohort<B>,
+    {
+        let selected = if let Some(cohort) = &cohort {
+            let (manifest, group) = cohort.selection();
+            validate_parallel_communication(self.dimensions(), manifest, group)
+                .map_err(BackendFailure::from_error)?;
+            self.select_parallel(cohort.tensor_topology()?)
+                .map_err(BackendFailure::from_error)?
+                .0
+        } else {
+            if self.local_layout().is_some() {
+                return Err(BackendFailure::from_error(TtsError::Configuration(
+                    "tensor-local parameter placement requires its selected cohort",
+                )));
+            }
+            self
+        };
+        let precision = selected.precision();
+        let (declaration, local, invocations, source, units) = selected.into_parts();
+        let definition = declaration.definition().clone();
+        let kernel = match local.as_ref() {
+            Some(layout) => MogKernel::<B>::new_parallel(declaration, layout),
+            None => MogKernel::<B>::new(declaration),
+        }
+        .and_then(|kernel| kernel.with_precision(precision))
+        .map_err(BackendFailure::from_error)?;
+        let architecture = eredu_runtime::ComponentAdapter::new(definition, kernel)
+            .map_err(BackendFailure::from_error)?;
+        BoundMog::bind(
+            architecture,
+            source,
+            invocations,
+            units,
+            residency,
+            context,
+            mechanisms,
+            cohort,
+        )
+    }
+
     /// Selects exact tensor placement or validates a retained selection without
     /// applying its recipes a second time. Source authority remains unchanged.
     pub fn select_parallel(
@@ -172,18 +235,13 @@ impl PreparedMogBindings {
         self.prepared.unit_bindings()
     }
 
-    /// Restricted retained source used by these exact bindings.
-    pub fn source(&self) -> &SharedCheckpointSource {
+    /// Restricted source used for cold residency accounting.
+    pub(super) fn source(&self) -> &SharedCheckpointSource {
         self.prepared.source()
     }
 
-    /// Complete semantic declaration retained through precision and placement selection.
-    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
-        self.prepared.declaration().definition()
-    }
-
     /// Consumes exact source authority and the canonical ordered binding plan.
-    pub fn into_parts(
+    fn into_parts(
         self,
     ) -> (
         MogDeclaration,

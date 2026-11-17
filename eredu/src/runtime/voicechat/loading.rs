@@ -158,7 +158,7 @@ pub struct PreparedVoiceChatSession<'a> {
 
 /// Consuming inputs for a backend realization of the ordinary session path.
 /// Learned preparation retains the original artifact guards and source views.
-pub struct PreparedVoiceChatSessionParts<'a> {
+pub(super) struct PreparedVoiceChatSessionParts<'a> {
     /// Exact cold construction of the coupled learned components.
     pub construction: PreparedVoiceChatConstruction<'a>,
     /// One validated shared generation contract.
@@ -269,8 +269,8 @@ impl<'a> PreparedVoiceChatSession<'a> {
         })
     }
 
-    #[cfg(feature = "mlx")]
-    pub(crate) fn construction(&self) -> &PreparedVoiceChatConstruction<'_> {
+    /// Retained architecture and parameter preparation for selecting session resources.
+    pub fn construction(&self) -> &PreparedVoiceChatConstruction<'_> {
         &self.parts.construction
     }
 
@@ -280,7 +280,7 @@ impl<'a> PreparedVoiceChatSession<'a> {
     }
 
     /// Moves the complete admitted request into its selected backend realization.
-    pub fn into_parts(self) -> PreparedVoiceChatSessionParts<'a> {
+    pub(super) fn into_parts(self) -> PreparedVoiceChatSessionParts<'a> {
         self.parts
     }
 }

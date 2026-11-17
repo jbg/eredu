@@ -528,15 +528,18 @@ impl<B: NeuralBackend> ComponentEquations<B, StatelessComponentState> for Quanti
         &mut self,
         group: usize,
         initial: &B::Tensor,
-        dependencies: &[&B::Tensor],
+        dependencies: &eredu_runtime::GroupDependencies<'_, B::Tensor>,
         _: &mut StatelessComponentState,
         _: &mut Self::ForwardContext,
         _: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
         if group == 0 && dependencies.is_empty() {
             Ok(initial.clone())
-        } else if group > 0 && group < self.geometry.depth && dependencies.len() == 1 {
-            Ok(dependencies[0].clone())
+        } else if group > 0 && group < self.geometry.depth {
+            dependencies
+                .get(group - 1)
+                .cloned()
+                .ok_or_else(|| invalid("residual quantizer graph dependency mismatch"))
         } else {
             Err(invalid("residual quantizer graph dependency mismatch"))
         }
@@ -794,51 +797,8 @@ where
     }
 }
 
-/// Tensor-parallel range operations over independently leased residual codebooks.
-/// Implementors supply typed invocation and guarded channel-collective participation.
-pub trait ParallelQuantizerExecution<B: DistributedNeuralBackend>: QuantizerExecution<B> {
-    /// Invokes a selected depth range with request-local roots retained to completion.
-    fn invoke_parallel(
-        &mut self,
-        input: QuantizerInput<'_, B::Tensor>,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<(B::Tensor, QuantizerForward<B::Tensor>), Error>;
-
-    /// Publishes full decoded channels while the final selected codebook stays leased.
-    fn decode_range_parallel(
-        &mut self,
-        codes: &B::Tensor,
-        range: Range<usize>,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        self.invoke_parallel(QuantizerInput::Decode { codes, range }, parallel, context)
-            .map(|(output, _)| output)
-    }
-
-    /// Reduces distance scores before each categorical decision and retains global results.
-    fn quantize_range_parallel(
-        &mut self,
-        latent: &B::Tensor,
-        range: Range<usize>,
-        metric: DistanceMetric,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Quantized<B::Tensor>, Error> {
-        self.invoke_parallel(
-            QuantizerInput::Quantize {
-                latent,
-                range,
-                metric,
-            },
-            parallel,
-            context,
-        )?
-        .1
-        .into_quantized()
-    }
-
+/// Guards range operations before their channel collectives.
+trait GuardedQuantizerExecution<B: DistributedNeuralBackend> {
     /// Runs channel shards with shared acquisition and collective-preparation gates.
     fn invoke_parallel_guarded<H, F>(
         &mut self,
@@ -853,7 +813,7 @@ pub trait ParallelQuantizerExecution<B: DistributedNeuralBackend>: QuantizerExec
         F: FnMut([u64; 8], bool, &<B::Tensor as Tensor>::Context) -> Result<bool, Error>;
 }
 
-impl<B, P> ParallelQuantizerExecution<B>
+impl<B, P> GuardedQuantizerExecution<B>
     for LayerwiseRuntime<
         ComponentAdapter<ComponentDefinition, QuantizerKernel<B>>,
         B,
@@ -866,22 +826,6 @@ where
     P: LayerwisePolicy<B, Codebook<B::Tensor>>,
     P::Error: std::error::Error + Send + Sync + 'static,
 {
-    fn invoke_parallel(
-        &mut self,
-        input: QuantizerInput<'_, B::Tensor>,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<(B::Tensor, QuantizerForward<B::Tensor>), Error> {
-        self.forward_parallel_with_context_hook(
-            input,
-            &mut StatelessComponentState::new()?,
-            parallel,
-            context,
-            |_, _, _| Ok(()),
-        )
-        .map_err(runtime_error)
-    }
-    /// Runs channel shards with shared acquisition and local collective-preparation gates.
     fn invoke_parallel_guarded<H, F>(
         &mut self,
         input: QuantizerInput<'_, B::Tensor>,
@@ -938,5 +882,140 @@ where
             hook,
         )
         .map_err(runtime_error)
+    }
+}
+
+/// Bound PRVQ codebooks and their optional tensor cohort.
+pub struct BoundQuantizer<B, P, C>
+where
+    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    P: LayerwisePolicy<B, Codebook<B::Tensor>>,
+{
+    units: eredu_runtime::BoundStatelessComponent<
+        ComponentAdapter<ComponentDefinition, QuantizerKernel<B>>,
+        B,
+        P,
+        C,
+    >,
+}
+
+impl<B, P, C> BoundQuantizer<B, P, C>
+where
+    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    P: LayerwisePolicy<B, Codebook<B::Tensor>>,
+{
+    pub(crate) fn new(
+        units: eredu_runtime::BoundStatelessComponent<
+            ComponentAdapter<ComponentDefinition, QuantizerKernel<B>>,
+            B,
+            P,
+            C,
+        >,
+    ) -> Self {
+        Self { units }
+    }
+}
+
+impl<B, P, C> eredu_runtime::UnitPolicyResidency for BoundQuantizer<B, P, C>
+where
+    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    P: LayerwisePolicy<B, Codebook<B::Tensor>> + eredu_runtime::UnitPolicyResidency,
+    P::Error: std::fmt::Display,
+{
+    fn residency(&self) -> Result<eredu_runtime::ResidencyReport, BackendFailure> {
+        self.units.residency()
+    }
+
+    fn dense_stream_report(
+        &self,
+    ) -> Result<Option<eredu_runtime::DenseDiskStreamReport>, BackendFailure> {
+        self.units.dense_stream_report()
+    }
+}
+
+fn invoke_bound<B, P, C>(
+    bound: &mut BoundQuantizer<B, P, C>,
+    input: QuantizerInput<'_, B::Tensor>,
+    context: &<B::Tensor as Tensor>::Context,
+) -> Result<(B::Tensor, QuantizerForward<B::Tensor>), Error>
+where
+    B: DistributedNeuralBackend
+        + SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    P: LayerwisePolicy<B, Codebook<B::Tensor>>,
+    P::Error: std::error::Error + Send + Sync + 'static,
+    C: eredu_runtime::LayeredTensorCohort<B>,
+{
+    let (runtime, cohort) = bound.units.parts_mut();
+    if let Some(cohort) = cohort {
+        runtime.invoke_parallel_guarded(
+            input,
+            cohort.parallel_context(),
+            context,
+            &mut cohort.traversal_hook(),
+            |descriptor, ready, context| {
+                cohort.agree(descriptor, ready, context).map_err(Into::into)
+            },
+        )
+    } else {
+        runtime
+            .invoke_with_context(input, &mut StatelessComponentState::new()?, context)
+            .map_err(runtime_error)
+    }
+}
+
+impl<B, P, C> QuantizerExecution<B> for BoundQuantizer<B, P, C>
+where
+    B: DistributedNeuralBackend
+        + SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    P: LayerwisePolicy<B, Codebook<B::Tensor>>,
+    P::Error: std::error::Error + Send + Sync + 'static,
+    C: eredu_runtime::LayeredTensorCohort<B>,
+{
+    fn validate_coordinated_execution(&self) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn geometry(&self) -> Geometry {
+        self.units.architecture().kernel().geometry()
+    }
+
+    fn decode(
+        &mut self,
+        codes: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        // Invalid shapes enter cohort agreement before a peer can execute a collective.
+        let depth = codes.shape().get(2).copied().unwrap_or(0).max(0) as usize;
+        self.decode_range(codes, 0..depth, context)
+    }
+
+    fn decode_range(
+        &mut self,
+        codes: &B::Tensor,
+        range: Range<usize>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        invoke_bound(self, QuantizerInput::Decode { codes, range }, context)
+            .map(|(output, _)| output)
+    }
+
+    fn quantize_range(
+        &mut self,
+        latent: &B::Tensor,
+        range: Range<usize>,
+        metric: DistanceMetric,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Quantized<B::Tensor>, Error> {
+        invoke_bound(
+            self,
+            QuantizerInput::Quantize {
+                latent,
+                range,
+                metric,
+            },
+            context,
+        )?
+        .1
+        .into_quantized()
     }
 }

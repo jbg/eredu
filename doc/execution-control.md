@@ -309,12 +309,17 @@ or response termination flushes the codec tail. The event iterator drains the
 same driver. Cancellation occurs between settled advances and drops any
 unpublished speech frame.
 
-The Rust Omni facade's `PreparedMultimodalAudioTask::load_distributed`
-selects a tensor, pipeline, or combined rank. All ranks agree on media
-preparation before prefill and must drain `AudioTaskSession::next_output`
-in the same order. This uses the same output decoder as the resident
-facade. The native `MlxPipelineAudioSession::advance` exposes individual
-text decisions and depth passes for callers that drive the rank cohort.
+Audio's distributed placements reject independent snapshots and forks. A
+distributed restore or fork requires coordinated rank-local state and
+communication authority. The portable session reports
+`AudioSnapshotError::RequiresCohort` for those placements.
+
+The Rust Omni facade retains a pipeline rank, with optional tensor
+partitioning, in `OmniAudioSelection`. All ranks agree on media preparation
+before prefill and drain `AudioTaskSession::next_output` in the same order.
+This uses the same output decoder as the resident facade.
+`AudioSession::advance` exposes individual text decisions and depth passes
+to callers driving a typed rank cohort.
 
 The Rust d1 decision facade advances one complete packed question row
 per `DecisionSession::advance` call. The model uses fresh language state for
@@ -374,7 +379,7 @@ admit retained state growth before publishing a step. A refused step leaves
 its generation state and output frontier unchanged. Restoring a child does
 not refund the child's high-water retention or the lineage's copy usage.
 
-With the audio feature, `MlxAudioModel::prepare_ingress` starts a controlled
+With the audio feature, `ResidentAudio::prepare_ingress` starts a controlled
 prompt with one live mono 16-kHz PCM utterance between caller-supplied token
 spans. Each `submit` advances complete mel windows and appends any newly
 projected positions to the language cache. Rejected chunks leave both sample
@@ -390,7 +395,7 @@ Each continuation accepts and finalizes its own input. The child's retained
 state must fit its shared budget before publication. Finishing the child
 carries the same branch slot and high-water retention into its response.
 
-For continuous English transcription, `MlxAudioModel::prepare_live_transcription`
+For continuous English transcription, `ResidentAudio::prepare_live_transcription`
 opens the publisher's LiveASR protocol. The caller supplies unpadded mel blocks
 from the checkpoint processor, normally 96 frames. Each advance publishes a
 complete greedy text block, including its projected audio-position count and
@@ -398,7 +403,7 @@ whether it reached a closing token. A restart resets the language context and
 keeps the encoder following the stream. Cancellation and finalization close
 the session at a block boundary.
 
-With the audio feature, `MlxAudioModel::prepare_pcm_transcription` accepts
+With the audio feature, `ResidentAudio::prepare_pcm_transcription` accepts
 mono 16-kHz PCM in arbitrary chunk sizes up to the reported sample capacity.
 `submit` preprocesses input without running the model. `advance` publishes
 one block when enough features are ready, or returns `None` while it waits

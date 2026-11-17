@@ -644,47 +644,61 @@ where
     }
 }
 
-/// Tensor-parallel neural decoding with caller-owned immutable parent carry.
-/// Implementors publish output and candidate carry only through ordinary completion.
-pub trait ParallelDecoderExecution<B: DistributedNeuralBackend>: DecoderExecution<B> {
-    /// Executes ordered local parameters into a complete unpublished candidate.
-    fn step_parallel(
-        &mut self,
-        latent: &B::Tensor,
-        parent: &DecoderState<B::Tensor>,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<(B::Tensor, DecoderState<B::Tensor>), Error>;
-}
+/// Bound decoder weights with caller-owned convolution carry.
+pub type BoundEarDecoder<B, P, C> = eredu_runtime::BoundLayerwiseComponent<
+    ComponentAdapter<ComponentDefinition, DecoderKernel<B>>,
+    B,
+    P,
+    C,
+    DecoderRuntimeState<<B as NeuralBackend>::Tensor>,
+>;
 
-impl<B, P> ParallelDecoderExecution<B>
-    for LayerwiseRuntime<
-        ComponentAdapter<ComponentDefinition, DecoderKernel<B>>,
-        B,
-        DecoderRuntimeState<B::Tensor>,
-        P,
-    >
+impl<B, P, C> DecoderExecution<B> for BoundEarDecoder<B, P, C>
 where
     B: DistributedNeuralBackend
         + SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     P: LayerwisePolicy<B, DecoderUnit<B::Tensor>>,
     P::Error: std::error::Error + Send + Sync + 'static,
+    C: eredu_runtime::LayeredTensorCohort<B>,
 {
-    /// Executes the same ordered transition with local parameters and global candidate carry.
-    fn step_parallel(
+    fn config(&self) -> &DecoderConfig {
+        self.architecture().kernel().config()
+    }
+
+    fn step(
         &mut self,
         latent: &B::Tensor,
         parent: &DecoderState<B::Tensor>,
-        parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<(B::Tensor, DecoderState<B::Tensor>), Error> {
-        let mut state = DecoderRuntimeState::from_state(self.config(), parent)?;
-        let output = self
-            .forward_parallel_with_context_hook(latent, &mut state, parallel, context, |_, _, _| {
-                Ok(())
+        let candidate = DecoderRuntimeState::from_state(self.config(), parent);
+        let agreed = self
+            .cohort()
+            .map(|cohort| {
+                let [batch, frames, channels] = latent.shape().try_into().unwrap_or([-1; 3]);
+                cohort.agree(
+                    [
+                        0x4541524445434f44,
+                        batch as u64,
+                        frames as u64,
+                        channels as u64,
+                        u64::from(parent.phase() == crate::streaming::StreamPhase::Finished),
+                        0,
+                        0,
+                        0,
+                    ],
+                    candidate.is_ok(),
+                    context,
+                )
             })
-            .map_err(runtime_error)?
-            .0;
-        Ok((output, state.into_state()))
+            .transpose();
+        let mut candidate = candidate?;
+        if agreed? == Some(false) {
+            return Err(invalid("EAR decoder cohort input or parent differs"));
+        }
+        let (output, _) = self
+            .invoke_with_context(latent, &mut candidate, context)
+            .map_err(runtime_error)?;
+        Ok((output, candidate.into_state()))
     }
 }

@@ -1,13 +1,13 @@
 //! Rotary position embedding initialization and variants.
 
 use eredu_backend_mlx_macros::PhysicalParameters;
-use eredu_nn::RotaryAlgorithm;
+use eredu_nn::{PreparedRotaryAlgorithm, PreparedRotarySpec};
 use safemlx::{
     error::Exception,
     ops::{
-        arange, concatenate_axis, cos,
+        concatenate_axis, cos,
         indexing::{NewAxis, TryIndexOp},
-        r#where, sin,
+        sin,
     },
     Array, Stream,
 };
@@ -29,83 +29,6 @@ pub struct FrequencyScaledRope {
     pub scale: f32,
     /// Pre-computed scaled frequencies. Not a module parameter.
     pub freqs: Array,
-}
-
-impl FrequencyScaledRope {
-    /// Builds a piecewise frequency-scaled RoPE module.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        dims: i32,
-        traditional: bool,
-        original_max_position_embeddings: i32,
-        base: f32,
-        factor: f32,
-        low_freq_factor: f32,
-        high_freq_factor: f32,
-        stream: &Stream,
-    ) -> Result<Self, Exception> {
-        let half_dims = dims / 2;
-
-        // Compute freqs using MLX ops, matching Python:
-        //   freqs = base ** (mx.arange(0, dims, 2) / dims)
-        // which equals base^(2i/dims) for i in 0..half_dims
-        let indices = arange::<_, f32>(None, half_dims, None, stream)?;
-        let exponents = indices.multiply(Array::from_f32(2.0 / dims as f32), stream)?;
-        let freqs = Array::from_f32(base).power(&exponents, stream)?;
-
-        let old_context_len = original_max_position_embeddings as f32;
-        let low_freq_wavelen = old_context_len / low_freq_factor;
-        let high_freq_wavelen = old_context_len / high_freq_factor;
-
-        // wavelens = 2 * pi * freqs
-        // Apply piecewise scaling matching Python exactly:
-        //   freqs = where(wavelens > low_freq_wavelen, freqs * factor, freqs)
-        //   is_medium = (wavelens > high_freq_wavelen) & (wavelens < low_freq_wavelen)
-        //   smooth_factors = (old_context_len / wavelens - low_freq_factor) / (high - low)
-        //   smooth_freqs = freqs / ((1 - smooth_factors) / factor + smooth_factors)
-        //   freqs = where(is_medium, smooth_freqs, freqs)
-        let two_pi = Array::from_f32(2.0 * std::f32::consts::PI);
-        let wavelens = freqs.multiply(&two_pi, stream)?;
-
-        // First pass: scale low frequencies (long wavelengths) by factor
-        let is_low = wavelens.gt(Array::from_f32(low_freq_wavelen), stream)?;
-        let freqs = r#where(
-            &is_low,
-            &freqs.multiply(Array::from_f32(factor), stream)?,
-            &freqs,
-            stream,
-        )?;
-
-        // Second pass: smooth interpolation for medium frequencies
-        let is_medium = wavelens
-            .gt(Array::from_f32(high_freq_wavelen), stream)?
-            .logical_and(
-                &wavelens.lt(Array::from_f32(low_freq_wavelen), stream)?,
-                stream,
-            )?;
-
-        let smooth_factors = wavelens
-            .reciprocal(stream)?
-            .multiply(Array::from_f32(old_context_len), stream)?
-            .subtract(Array::from_f32(low_freq_factor), stream)?
-            .divide(Array::from_f32(high_freq_factor - low_freq_factor), stream)?;
-
-        // smooth_freqs = freqs / ((1 - smooth_factors) / factor + smooth_factors)
-        let one_minus_smooth = Array::from_f32(1.0).subtract(&smooth_factors, stream)?;
-        let denom = one_minus_smooth
-            .divide(Array::from_f32(factor), stream)?
-            .add(&smooth_factors, stream)?;
-        let smooth_freqs = freqs.divide(&denom, stream)?;
-
-        let freqs = r#where(&is_medium, &smooth_freqs, &freqs, stream)?;
-
-        Ok(Self {
-            dimensions: dims,
-            traditional,
-            scale: 1.0,
-            freqs,
-        })
-    }
 }
 
 impl<'a, Input> Module<Input> for FrequencyScaledRope
@@ -413,13 +336,13 @@ pub(super) struct ElementwiseRotary {
 
 impl ElementwiseRotary {
     pub(super) fn new(
-        spec: eredu_nn::RotarySpec,
+        spec: &PreparedRotarySpec,
         native: &RopeVariant,
         stream: &Stream,
     ) -> Result<Self, Exception> {
         let (inverse_frequencies, amplitude) = match native {
             RopeVariant::Yarn(rope) => {
-                let RotaryAlgorithm::Yarn {
+                let PreparedRotaryAlgorithm::Yarn {
                     factor,
                     original_max_positions,
                     beta_fast,
@@ -450,7 +373,7 @@ impl ElementwiseRotary {
             RopeVariant::Proportional(rope) => (rope.freqs.reciprocal(stream)?, 1.0),
             RopeVariant::Default(_) => {
                 let factor = match spec.algorithm {
-                    RotaryAlgorithm::Linear { factor } => factor,
+                    PreparedRotaryAlgorithm::Standard { factor } => factor,
                     _ => 1.0,
                 };
                 let values = (0..spec.dimensions / 2)
@@ -588,72 +511,30 @@ where
     }
 }
 
-/// Creates the RoPE implementation requested by a model config.
+/// Materializes a portable rotary construction specification.
 pub fn initialize_rope(
-    dims: i32,
-    base: f32, // rope_theta
-    traditional: bool,
-    algorithm: RotaryAlgorithm,
+    spec: &PreparedRotarySpec,
     stream: &Stream,
 ) -> Result<RopeVariant, Exception> {
-    algorithm
-        .validate()
-        .map_err(|error| Exception::custom(error.to_string()))?;
-    if dims <= 0 || dims % 2 != 0 || !base.is_finite() || base <= 0.0 {
-        return Err(Exception::custom(
-            "invalid rotary head geometry or frequency base",
-        ));
-    }
-    match algorithm {
-        RotaryAlgorithm::ZeroTail { rotary_fraction } => {
-            let active = (rotary_fraction * dims as f32) as i32 / 2;
-            let denominators = (0..dims / 2)
-                .map(|index| {
-                    if index < active {
-                        base.powf(2.0 * index as f32 / dims as f32)
-                    } else {
-                        f32::INFINITY
-                    }
-                })
-                .collect::<Vec<_>>();
+    let (dims, base, traditional) = (spec.dimensions, spec.base, spec.traditional);
+    match spec.algorithm {
+        PreparedRotaryAlgorithm::FrequencyTable(ref denominators) => {
             Ok(RopeVariant::FrequencyScaled(FrequencyScaledRope {
                 dimensions: dims,
                 traditional,
                 scale: 1.0,
-                freqs: Array::from_slice(&denominators, &[dims / 2]),
+                freqs: Array::from_slice(denominators, &[dims / 2]),
             }))
         }
-        RotaryAlgorithm::Default | RotaryAlgorithm::Linear { .. } => {
-            let scale = match algorithm {
-                RotaryAlgorithm::Linear { factor } => factor.recip(),
-                RotaryAlgorithm::Default => 1.0,
-                _ => unreachable!(),
-            };
-            Ok(RopeVariant::Default(
-                nn::RotaryPositionalEncodingBuilder::new(dims)
-                    .traditional(traditional)
-                    .base(base)
-                    .scale(scale)
-                    .build()
-                    .expect("infallible MLX RoPE construction"),
-            ))
-        }
-        RotaryAlgorithm::Llama3 {
-            factor,
-            low_frequency_factor,
-            high_frequency_factor,
-            original_max_positions,
-        } => Ok(RopeVariant::FrequencyScaled(FrequencyScaledRope::new(
-            dims,
-            traditional,
-            original_max_positions,
-            base,
-            factor,
-            low_frequency_factor,
-            high_frequency_factor,
-            stream,
-        )?)),
-        RotaryAlgorithm::Proportional {
+        PreparedRotaryAlgorithm::Standard { factor } => Ok(RopeVariant::Default(
+            nn::RotaryPositionalEncodingBuilder::new(dims)
+                .traditional(traditional)
+                .base(base)
+                .scale(factor.recip())
+                .build()
+                .expect("infallible MLX RoPE construction"),
+        )),
+        PreparedRotaryAlgorithm::Proportional {
             factor,
             rotary_fraction,
         } => Ok(RopeVariant::Proportional(ProportionalRope::new(
@@ -664,7 +545,7 @@ pub fn initialize_rope(
             rotary_fraction,
             stream,
         )?)),
-        RotaryAlgorithm::Yarn {
+        PreparedRotaryAlgorithm::Yarn {
             factor,
             original_max_positions,
             beta_fast,

@@ -131,22 +131,6 @@ impl BindingSource {
         self
     }
 
-    pub(super) fn project(
-        &self,
-        scope: &str,
-        recipes: BTreeMap<String, DerivedWeightRecipe>,
-    ) -> Result<Self, ArtifactError> {
-        let mut projected =
-            Self::from_recipes(self.source.clone(), scope, recipes).map_err(checkpoint)?;
-        projected.shared_source_keys = self
-            .shared_source_keys
-            .iter()
-            .filter(|key| projected.source.source_metadata(key).is_ok())
-            .cloned()
-            .collect();
-        Ok(projected)
-    }
-
     /// Exact retained source for this scope, without checkpoint rediscovery.
     pub fn source(&self) -> &SharedCheckpointSource {
         &self.source

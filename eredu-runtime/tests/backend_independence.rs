@@ -24,8 +24,8 @@ use eredu_nn::{
     AttentionCache, AttentionMask, AttentionRequest, EmbeddingOperator, EmbeddingSpec, Error,
     GatedProductPolicy, Index, LinearOperator, LinearSpec, NeuralBackend,
     NeuralOperatorCapabilities, NormalizationConstructionSpec, NormalizationOperator, PadMode,
-    ParameterVisitor, ParameterVisitorMut, Parameterized, RotaryOperator, RotaryPosition,
-    RotarySpec, Tensor,
+    ParameterVisitor, ParameterVisitorMut, Parameterized, PreparedRotarySpec, RotaryOperator,
+    RotaryPosition, Tensor,
 };
 use eredu_runtime::{
     bind_materialized_unit, build_module_binding_plan, construct_replicated_text_session,
@@ -380,7 +380,7 @@ impl NeuralBackend for FakeBackend {
     ) -> Result<Self::Normalization, Error> {
         Ok(FakeOperator)
     }
-    fn rotary(_: RotarySpec, _: &()) -> Result<Self::Rotary, Error> {
+    fn rotary(_: PreparedRotarySpec, _: &()) -> Result<Self::Rotary, Error> {
         Ok(FakeOperator)
     }
     fn silu(input: Self::Tensor, _: &()) -> Result<Self::Tensor, Error> {
@@ -464,7 +464,7 @@ impl NeuralBackend for PartitionCollectiveBackend {
     ) -> Result<Self::Normalization, Error> {
         Ok(FakeOperator)
     }
-    fn rotary(_: RotarySpec, _: &()) -> Result<Self::Rotary, Error> {
+    fn rotary(_: PreparedRotarySpec, _: &()) -> Result<Self::Rotary, Error> {
         Ok(FakeOperator)
     }
     fn silu(input: Self::Tensor, _: &()) -> Result<Self::Tensor, Error> {
@@ -2381,7 +2381,7 @@ impl LayeredArchitecture<FakeBackend, DeviceState<FakeBackend, FakeLayerState>>
         &mut self,
         _: usize,
         initial: &FakeTensor,
-        _: &[&FakeTensor],
+        _: &eredu_runtime::GroupDependencies<'_, FakeTensor>,
         _: &mut DeviceState<FakeBackend, FakeLayerState>,
         _: &mut Self::ForwardContext,
         _: &(),
@@ -2576,7 +2576,7 @@ impl LayeredArchitecture<FakeBackend, DeviceState<FakeBackend, FakeLayerState>>
         &mut self,
         group: usize,
         initial: &FakeTensor,
-        dependencies: &[&FakeTensor],
+        dependencies: &eredu_runtime::GroupDependencies<'_, FakeTensor>,
         state: &mut DeviceState<FakeBackend, FakeLayerState>,
         _forward: &mut Self::ForwardContext,
         context: &(),
@@ -3030,7 +3030,7 @@ impl LayeredArchitecture<FakeBackend, DeviceState<FakeBackend, HybridLayerState>
         &mut self,
         _: usize,
         initial: &FakeTensor,
-        _: &[&FakeTensor],
+        _: &eredu_runtime::GroupDependencies<'_, FakeTensor>,
         _: &mut DeviceState<FakeBackend, HybridLayerState>,
         _: &mut Self::ForwardContext,
         _: &(),
@@ -4110,9 +4110,7 @@ impl
     fn accept_boundary(
         &mut self,
         _: &mut Self::Pass<'_>,
-        _: &eredu_runtime::PartitionBoundaryRoute,
-        _: Vec<FakeTensor>,
-        _: &(),
+        _: eredu_runtime::ReceivedPartitionBoundary<FakeTensor>,
     ) -> Result<(), Error> {
         Err(Error::backend("reference path has no pipeline boundary"))
     }
@@ -4289,10 +4287,9 @@ impl
     fn accept_boundary(
         &mut self,
         pass: &mut Self::Pass<'_>,
-        _: &PartitionBoundaryRoute,
-        mut values: Vec<FakeTensor>,
-        _: &(),
+        boundary: eredu_runtime::ReceivedPartitionBoundary<FakeTensor>,
     ) -> Result<(), Error> {
+        let (_, _, mut values) = boundary.into_parts();
         self.trace.borrow_mut().push("accept");
         pass.hidden = values
             .pop()
@@ -7869,7 +7866,7 @@ impl LayeredArchitecture<FakeBackend, DeviceState<FakeBackend, FakeLayerState>> 
         &mut self,
         group: usize,
         initial: &FakeTensor,
-        dependencies: &[&FakeTensor],
+        dependencies: &eredu_runtime::GroupDependencies<'_, FakeTensor>,
         _: &mut DeviceState<FakeBackend, FakeLayerState>,
         _: &mut Self::ForwardContext,
         _: &(),
@@ -7878,7 +7875,7 @@ impl LayeredArchitecture<FakeBackend, DeviceState<FakeBackend, FakeLayerState>> 
             return if group == 0 && dependencies.is_empty() {
                 Ok(FakeTensor(vec![10]))
             } else if dependencies.len() == 1 {
-                Ok(dependencies[0].clone())
+                Ok(dependencies.only().expect("one dependency").clone())
             } else {
                 Err(Error::backend("invalid serial dependency inputs"))
             };
@@ -7888,7 +7885,9 @@ impl LayeredArchitecture<FakeBackend, DeviceState<FakeBackend, FakeLayerState>> 
                 0 if dependencies.is_empty() => Ok(FakeTensor(vec![initial.0[1]])),
                 1 if dependencies.is_empty() => Ok(FakeTensor(vec![initial.0[2]])),
                 2 if dependencies.len() == 2 => Ok(FakeTensor(vec![
-                    initial.0[0] + dependencies[0].0[0] + dependencies[1].0[0],
+                    initial.0[0]
+                        + dependencies.get(0).unwrap().0[0]
+                        + dependencies.get(1).unwrap().0[0],
                 ])),
                 _ => Err(Error::backend("invalid composite dependency inputs")),
             };
@@ -7896,7 +7895,10 @@ impl LayeredArchitecture<FakeBackend, DeviceState<FakeBackend, FakeLayerState>> 
         match group {
             0 if dependencies.is_empty() => Ok(FakeTensor(vec![10])),
             1 if dependencies.is_empty() => Ok(FakeTensor(vec![20])),
-            2 if dependencies == [&FakeTensor(vec![10, 0]), &FakeTensor(vec![20, 10])] => {
+            2 if dependencies
+                .values()
+                .eq([&FakeTensor(vec![10, 0]), &FakeTensor(vec![20, 10])]) =>
+            {
                 Ok(FakeTensor(vec![30]))
             }
             _ => Err(Error::backend("invalid fixture dependency inputs")),

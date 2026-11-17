@@ -1,6 +1,8 @@
 //! LFM3 speech-input processor and encoder declarations.
 
 mod artifact;
+mod binding;
+pub use binding::PlacedAudio;
 mod depth;
 pub use artifact::{ArtifactError, AudioTokens, BindingSource, PreparedAudio, TextAssets};
 mod encoder;
@@ -11,15 +13,13 @@ pub use gguf::{
 };
 mod language;
 pub use language::{
-    AudioLanguage, PreparedAudioLanguage, PreparedAudioLanguagePartition, SpeechPrompt,
-    TensorParallelAudioLanguage,
+    AudioLanguage, AudioLanguagePlacement, PipelineAudio, PreparedAudioLanguage, ReplicatedAudio,
+    SpeechPrompt, TensorParallelAudio,
 };
 mod pipeline;
 pub use pipeline::AudioPipelineCommunication;
 mod placement;
-pub use placement::{
-    AudioParameterResidency, AudioWeightUnit, PreparedAudioCodec, PreparedAudioWeightUnit,
-};
+pub use placement::{AudioParameterResidency, AudioPlacement};
 mod prompt;
 mod realtime;
 mod resident;
@@ -45,8 +45,8 @@ pub use resident::{
 };
 pub use resident::{
     AudioRequest, AudioResidentParameterBytes, AudioTranscription, AudioTranscriptionBlock,
-    AudioTranscriptionError, AudioTranscriptionSnapshot, OmniAudioRequest, PreparedResidentAudio,
-    ResidentAudio, ResidentAudioBinding, ResidentAudioError, ResidentAudioState,
+    AudioTranscriptionError, AudioTranscriptionSnapshot, PreparedResidentAudio, ResidentAudio,
+    ResidentAudioBinding, ResidentAudioError, ResidentAudioState,
 };
 pub use schedule::{
     AudioMode, AudioPhase, AudioSchedule, AudioScheduleError, AudioSchedulePolicy, DepthProgress,
@@ -126,3 +126,18 @@ impl ProcessorConfig {
         })
     }
 }
+
+#[cfg(feature = "audio")]
+mod turn_binding;
+#[cfg(feature = "audio")]
+pub use turn_binding::AudioTaskBinder;
+
+#[cfg(feature = "audio")]
+pub(in crate::lfm3) use resident::OmniAudioRequest;
+#[cfg(feature = "audio")]
+mod task;
+#[cfg(feature = "audio")]
+pub use task::{
+    AudioTaskBinding, AudioTaskError, AudioTaskExecution, AudioTaskIngress, AudioTaskResponse,
+    AudioTaskTranscription, BoundAudioTask, LocalAudioTask,
+};

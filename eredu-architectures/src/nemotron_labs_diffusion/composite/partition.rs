@@ -324,18 +324,189 @@ where
     ) -> Result<AdmittedCompositeInput<InputPartPlan>, eredu_core::CapabilityError> {
         admit_input(config, input, inspector)
     }
-    fn should_execute_prepared_group(
+    fn prepared_group_invocation(
         &self,
         group: usize,
-        input: PreparedCompositeInput<'_, B::Tensor, InputPartPlan>,
-    ) -> bool {
-        group == 2
-            || ((group == 0 || group == 1)
-                && input
+        input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
+        tensor_partitions: usize,
+        stage_units: &[std::ops::Range<usize>],
+    ) -> Result<crate::composite_execution::CompositeGroupInvocation, String> {
+        use crate::composite_execution::{
+            CompositeContinuationGeometry, CompositeGroupInvocation, CompositeGroupUse,
+            CompositeTensorCollective,
+        };
+        let active = {
+            group == 2
+                || ((group == 0 || group == 1)
+                    && input
+                        .admitted()
+                        .parts()
+                        .iter()
+                        .any(|part| matches!(part, InputPartPlan::Image { native: true, .. })))
+        };
+        let mode = if active {
+            CompositeGroupUse::Execute
+        } else {
+            CompositeGroupUse::Bypassed
+        };
+        let boundary_sequence = (|| -> Result<i32, String> {
+            if group == 0 {
+                return native_patch_positions(input);
+            }
+            let positions = if group == 1 {
+                input
                     .admitted()
                     .parts()
                     .iter()
-                    .any(|part| matches!(part, InputPartPlan::Image { native: true, .. })))
+                    .filter_map(|part| match part {
+                        InputPartPlan::Image {
+                            grid, native: true, ..
+                        } => Some(
+                            (grid.0 as u64) * (grid.1 as u64)
+                                / u64::from(self.kernel().config.spatial_merge_size).pow(2),
+                        ),
+                        _ => None,
+                    })
+                    .try_fold(0u64, |n, count| n.checked_add(count))
+                    .ok_or("projector extent overflow")?
+            } else {
+                input.admitted().decoder_positions()
+            };
+            i32::try_from(positions).map_err(|_| "group extent exceeds i32".into())
+        })()?;
+        let continuation = if active {
+            (|| -> Result<Option<CompositeContinuationGeometry>, String> {
+                if group != 0 {
+                    return Ok(None);
+                }
+                let patches = native_patch_positions(input)?;
+                Ok((patches > 0).then(|| {
+                    CompositeContinuationGeometry::Uniform(vec![
+                        1,
+                        patches,
+                        self.kernel()
+                            .config
+                            .vision
+                            .as_ref()
+                            .expect("validated tower")
+                            .hidden_size,
+                    ])
+                }))
+            })()?
+        } else {
+            None
+        };
+        let collective_waves =
+            (|| -> Result<Option<Vec<Vec<CompositeTensorCollective>>>, String> {
+                let pipeline_stages = stage_units.len();
+                if tensor_partitions <= 1 {
+                    return Ok(None);
+                }
+                if group == 2 {
+                    let sequence = i32::try_from(input.admitted().decoder_positions())
+                        .map_err(|_| "decoder sequence exceeds i32")?;
+                    let width = self.kernel().config.hidden_size();
+                    let vocabulary = self.kernel().config.vocabulary_size() as usize;
+                    let counts = (0..tensor_partitions)
+                        .map(|rank| {
+                            eredu_core::balanced_contiguous_range(
+                                vocabulary,
+                                tensor_partitions,
+                                rank,
+                                false,
+                            )
+                            .map(|range| range.len())
+                            .map_err(|error| error.to_string())
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let adapter_rank = self
+                        .kernel()
+                        .config
+                        .draft_parameters()
+                        .map(|adapter| {
+                            adapter
+                                .layer(0)
+                                .map(|declaration| declaration.projection().down.output)
+                                .map_err(|error| error.to_string())
+                        })
+                        .transpose()?;
+                    let last = self.kernel().config.num_hidden_layers() as usize;
+                    return Ok(Some(
+                        stage_units
+                            .iter()
+                            .map(|range| {
+                                let mut operations = Vec::new();
+                                if !range.is_empty() && range.start == 0 {
+                                    operations.push(CompositeTensorCollective::Sum {
+                                        shape: vec![1, sequence, width],
+                                    });
+                                }
+                                for _ in range.clone() {
+                                    operations.push(CompositeTensorCollective::Sum {
+                                        shape: vec![1, sequence, width],
+                                    });
+                                    if input.attention_invocation().is_some_and(|invocation| {
+                                        invocation.adapters
+                                            == eredu_core::decoding::AdapterScope::Draft
+                                    }) {
+                                        if let Some(rank) = adapter_rank {
+                                            operations.push(CompositeTensorCollective::Sum {
+                                                shape: vec![1, sequence, rank],
+                                            });
+                                        }
+                                    }
+                                    operations.push(CompositeTensorCollective::Sum {
+                                        shape: vec![1, sequence, width],
+                                    });
+                                }
+                                if !range.is_empty() && range.end == last {
+                                    operations.push(CompositeTensorCollective::Gather {
+                                        shape: vec![1, sequence, vocabulary as i32],
+                                        counts: counts.clone(),
+                                        axis: 2,
+                                    });
+                                }
+                                operations
+                            })
+                            .collect(),
+                    ));
+                }
+                if group != 0 {
+                    return Ok(None);
+                }
+                if pipeline_stages == 0 {
+                    return Err(
+                        "Pixtral collective schedule requires a positive stage count".into(),
+                    );
+                }
+                let patches = native_patch_positions(input)?;
+                let vision = self
+                    .kernel()
+                    .config
+                    .vision
+                    .as_ref()
+                    .expect("validated tower");
+                let mut stages = Vec::with_capacity(pipeline_stages);
+                for range in &stage_units[..pipeline_stages] {
+                    stages.push(if patches == 0 {
+                        Vec::new()
+                    } else {
+                        vec![
+                            CompositeTensorCollective::Sum {
+                                shape: vec![1, patches, vision.hidden_size]
+                            };
+                            2 * range.len()
+                        ]
+                    });
+                }
+                Ok(Some(stages))
+            })()?;
+        Ok(CompositeGroupInvocation {
+            mode,
+            boundary_sequence,
+            continuation,
+            collective_waves,
+        })
     }
 
     fn primary_ingress_collectives_pending(&self, forward: &Self::ForwardContext) -> bool {
@@ -359,38 +530,7 @@ where
             Vec::new()
         }))
     }
-    fn prepared_group_boundary_sequence(
-        &self,
-        group: usize,
-        input: PreparedCompositeInput<'_, B::Tensor, InputPartPlan>,
-    ) -> Result<i32, String> {
-        if group == 0 {
-            return native_patch_positions(input);
-        }
-        let positions = if group == 1 {
-            input
-                .admitted()
-                .parts()
-                .iter()
-                .filter_map(|part| match part {
-                    InputPartPlan::Image {
-                        grid, native: true, ..
-                    } => Some(
-                        (grid.0 as u64) * (grid.1 as u64)
-                            / u64::from(self.kernel().config.spatial_merge_size).pow(2),
-                    ),
-                    _ => None,
-                })
-                .try_fold(0u64, |n, count| n.checked_add(count))
-                .ok_or("projector extent overflow")?
-        } else {
-            input.admitted().decoder_positions()
-        };
-        i32::try_from(positions).map_err(|_| "group extent exceeds i32".into())
-    }
-    fn prepared_group_continuation_batched(&self, _: usize) -> bool {
-        false
-    }
+
     fn partition_boundary_values(
         &self,
         source: usize,
@@ -420,7 +560,7 @@ where
         selected: &eredu_runtime::ResolvedBoundaryWireSchema,
         batch: i32,
         sequence: i32,
-        _: &[i32],
+        _: &[crate::composite_execution::CompositeGroupInvocation],
         continuation: Option<(i32, i32)>,
     ) -> Result<Option<eredu_runtime::ResolvedBoundaryWireSchema>, Error> {
         resolve_group_boundary(
@@ -432,117 +572,6 @@ where
             sequence,
             continuation,
         )
-    }
-    fn prepared_group_continuation_geometry(
-        &self,
-        group: usize,
-        input: PreparedCompositeInput<'_, B::Tensor, InputPartPlan>,
-    ) -> Result<Option<crate::composite_execution::CompositeContinuationGeometry>, String> {
-        if group != 0 {
-            return Ok(None);
-        }
-        let patches = native_patch_positions(input)?;
-        Ok((patches > 0).then_some(
-            (
-                patches,
-                self.kernel()
-                    .config
-                    .vision
-                    .as_ref()
-                    .expect("validated tower")
-                    .hidden_size,
-            )
-                .into(),
-        ))
-    }
-    fn prepared_group_collective_waves(
-        &self,
-        group: usize,
-        input: PreparedCompositeInput<'_, B::Tensor, InputPartPlan>,
-        tensor_partitions: usize,
-        stage_units: &[std::ops::Range<usize>],
-    ) -> Result<Option<Vec<Vec<crate::composite_execution::CompositeTensorCollective>>>, String>
-    {
-        let pipeline_stages = stage_units.len();
-        if tensor_partitions <= 1 {
-            return Ok(None);
-        }
-        if group == 2 {
-            let sequence = i32::try_from(input.admitted().decoder_positions())
-                .map_err(|_| "decoder sequence exceeds i32")?;
-            let width = self.kernel().config.hidden_size();
-            let vocabulary = self.kernel().config.vocabulary_size() as usize;
-            let counts = (0..tensor_partitions)
-                .map(|rank| {
-                    eredu_core::balanced_contiguous_range(
-                        vocabulary,
-                        tensor_partitions,
-                        rank,
-                        false,
-                    )
-                    .map(|range| range.len())
-                    .map_err(|error| error.to_string())
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let adapter_rank = self
-                .kernel()
-                .config
-                .draft_parameters()
-                .map(|adapter| {
-                    adapter
-                        .layer(0)
-                        .map(|declaration| declaration.projection().down.output)
-                        .map_err(|error| error.to_string())
-                })
-                .transpose()?;
-            let last = self.kernel().config.num_hidden_layers() as usize;
-            return Ok(Some(stage_units.iter().map(|range| {
-                let mut operations = Vec::new();
-                if !range.is_empty() && range.start == 0 {
-                    operations.push(crate::composite_execution::CompositeTensorCollective::Sum { shape: vec![1, sequence, width] });
-                }
-                for _ in range.clone() {
-                    operations.push(crate::composite_execution::CompositeTensorCollective::Sum { shape: vec![1, sequence, width] });
-                    if input.attention_invocation().is_some_and(|invocation| invocation.adapters == eredu_core::decoding::AdapterScope::Draft) {
-                        if let Some(rank) = adapter_rank {
-                            operations.push(crate::composite_execution::CompositeTensorCollective::Sum { shape: vec![1, sequence, rank] });
-                        }
-                    }
-                    operations.push(crate::composite_execution::CompositeTensorCollective::Sum { shape: vec![1, sequence, width] });
-                }
-                if !range.is_empty() && range.end == last {
-                    operations.push(crate::composite_execution::CompositeTensorCollective::Gather { shape: vec![1, sequence, vocabulary as i32], counts: counts.clone(), axis: 2 });
-                }
-                operations
-            }).collect()));
-        }
-        if group != 0 {
-            return Ok(None);
-        }
-        if pipeline_stages == 0 {
-            return Err("Pixtral collective schedule requires a positive stage count".into());
-        }
-        let patches = native_patch_positions(input)?;
-        let vision = self
-            .kernel()
-            .config
-            .vision
-            .as_ref()
-            .expect("validated tower");
-        let mut stages = Vec::with_capacity(pipeline_stages);
-        for range in &stage_units[..pipeline_stages] {
-            stages.push(if patches == 0 {
-                Vec::new()
-            } else {
-                vec![
-                    crate::composite_execution::CompositeTensorCollective::Sum {
-                        shape: vec![1, patches, vision.hidden_size]
-                    };
-                    2 * range.len()
-                ]
-            });
-        }
-        Ok(Some(stages))
     }
 }
 impl<B, S> ParallelCompositeArchitecture<B, S> for Model<B>

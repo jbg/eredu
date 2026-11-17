@@ -1,21 +1,5 @@
 use super::*;
 
-/// Exact cold realtime preparation inseparably paired with its native target.
-///
-/// Only cold selection constructs this value. Materialization accepts no new
-/// load request, so a caller cannot replace the admitted rank/device binding.
-///
-/// ```compile_fail
-/// use eredu_backend_mlx::native::MlxPreparedRealtimeExecution;
-/// fn discard_selected_target(mut prepared: MlxPreparedRealtimeExecution) {
-///     prepared.rank_context = None;
-/// }
-/// ```
-pub struct MlxPreparedRealtimeExecution {
-    source: PreparedMoshiRealtimeSource,
-    rank_context: Option<crate::backend::MlxRankContext>,
-}
-
 /// MLX stream and collective mechanisms for neutral realtime execution.
 pub struct MlxRealtimeExecutionContext {
     stream: Stream,
@@ -44,140 +28,108 @@ impl MlxRealtimeExecutionContext {
         &self.stream
     }
 
-    /// Selected MLX checkpoint materialization stream.
-    pub const fn weights_stream(&self) -> &Stream {
-        &self.weights_stream
-    }
-
-    /// Fail-closed capabilities of this concrete session mechanism route.
-    pub const fn session_capabilities() -> eredu_core::SessionCapabilities {
-        realtime_session_capabilities()
-    }
-
-    /// Inspects and selects architecture semantics without creating native work.
-    ///
-    /// `collectives_supported` reports static route capability; an actual group
-    /// is realized only later while materializing an already selected topology.
-    pub fn select_realtime_execution(
-        preparation: MoshiPreparationPlan,
-        options: &MlxLoadRequest,
-        collectives_supported: bool,
-    ) -> Result<MlxPreparedRealtimeExecution, Error> {
-        select_realtime_model(preparation, options, collectives_supported)
-    }
-
-    /// Materializes an already selected architecture through MLX mechanisms.
-    pub fn materialize_realtime_execution(
+    /// Binds retained portable construction after validating the native target.
+    pub fn bind_realtime<P, E, F>(
         &self,
-        selected: MlxPreparedRealtimeExecution,
-    ) -> Result<MoshiRealtimeExecution<MlxRealtimeExecution>, Error> {
+        prepared: P,
+        rank: Option<crate::backend::MlxRankContext>,
+    ) -> Result<E, Error>
+    where
+        for<'a> P: eredu_runtime::PreparedRealtimeBinding<
+            crate::backend::nn::shared::MlxNeuralBackend,
+            MlxKeyValueState,
+            MlxRealtimeBinding<'a>,
+            Execution = E,
+            Error = F,
+        >,
+        F: std::error::Error + Send + Sync + 'static,
+    {
+        let selected = prepared.realization();
+        let size = selected.topology().world_size();
+        let selected_rank = selected.rank();
+        match (rank, self.world_group.as_deref()) {
+            (None, None) if size == 1 => {}
+            (Some(rank), world)
+                if (rank.world_size(), rank.global_rank()) == (size, selected_rank)
+                    && match world {
+                        Some(world) => {
+                            size > 1 && (world.size(), world.rank()) == (size, selected_rank)
+                        }
+                        None => size == 1,
+                    } =>
+            {
+                rank.validate_execution_stream(&self.stream)?;
+            }
+            _ => {
+                return Err(Error::Parallel(
+                    "native rank or world group does not match the selected realtime target".into(),
+                ))
+            }
+        }
         crate::initialize_allocator_cache_policy(false)?;
-        let result = materialize_realtime_model(
-            selected,
-            self.world_group.clone(),
-            &self.stream,
-            &self.weights_stream,
-        );
+        crate::backend::ordinary_retirement::reclaim();
+        let result = prepared
+            .bind(&MlxRealtimeBinding { context: self })
+            .map_err(|error| Error::Other(Box::new(error)));
         let trim = crate::trim_allocator_cache();
-        result.and_then(|model| {
+        result.and_then(|execution| {
             trim?;
-            Ok(model)
+            Ok(execution)
         })
     }
 
-    /// Creates backend-native cache state from the selected neutral layout.
-    pub fn new_realtime_model_state(
+    /// Validates an execution handle before portable generation startup.
+    pub fn validate_execution(
         &self,
-        model: &MoshiRealtimeExecution<MlxRealtimeExecution>,
-    ) -> Result<MlxKeyValueState, Error> {
-        model
-            .executor()
-            .validate_context(&self.stream, self.world_group.as_deref())?;
-        model.executor().new_realtime_state()
+        execution: &MlxRealtimeExecution,
+    ) -> Result<(), eredu_core::BackendFailure> {
+        execution
+            .validate_context(&self.stream, self.world_group.as_deref())
+            .map_err(eredu_core::BackendFailure::from_error)
     }
 
-    /// Realizes backend-native random state from an optional portable seed.
-    ///
-    /// Architecture and runtime composition decide whether randomness is
-    /// required; this mechanism only creates the opaque backend state.
-    pub fn realize_random_state(&self, seed: Option<u64>) -> Result<Option<RandomState>, Error> {
-        Ok(seed
-            .map(|seed| random::key(seed).map(RandomState::from_key))
-            .transpose()?)
-    }
-
-    /// Submits one portable frame on an unpublished neutral scheduler branch.
-    pub fn submit_realtime_frame(
+    /// Submits a portable plan on an unpublished scheduler branch.
+    pub fn submit_realtime<P>(
         &self,
-        model: &mut MoshiRealtimeExecution<MlxRealtimeExecution>,
+        execution: &MlxRealtimeExecution,
+        plan: RealtimeFramePlan<P>,
         frame: &RealtimeInputFrame,
         branch: &mut MlxFrameSessionBranch,
-    ) -> Result<MlxPrepublicationFrame, Error> {
-        model
-            .executor()
-            .validate_context(&self.stream, self.world_group.as_deref())?;
-        submit_scheduled_realtime_frame(model, branch, frame, &self.stream)
+    ) -> Result<MlxPrepublicationFrame<P>, Error>
+    where
+        P: RealtimeHostOutputProjection<observation::MlxHostChannels>,
+    {
+        execution.validate_context(&self.stream, self.world_group.as_deref())?;
+        let mut executor = execution;
+        submit_scheduled_realtime_frame(
+            plan,
+            &mut executor,
+            || execution.retain_frame(),
+            branch,
+            frame,
+            &self.stream,
+        )
     }
 }
 
-pub(super) const fn realtime_session_capabilities() -> eredu_core::SessionCapabilities {
-    eredu_core::SessionCapabilities::new(true, true, false)
-}
-
-fn materialize_realtime_model(
-    selected: MlxPreparedRealtimeExecution,
-    world: Option<Arc<Group>>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<MoshiRealtimeExecution<MlxRealtimeExecution>, Error> {
-    let MlxPreparedRealtimeExecution {
-        source,
-        rank_context,
-    } = selected;
-    if let Some(rank) = rank_context {
-        rank.validate_execution_stream(stream)?;
-    }
-    neutral_moshi::materialize_selected(source, world, stream, weights_stream)
-}
-
-fn select_realtime_model(
-    preparation: MoshiPreparationPlan,
-    options: &MlxLoadRequest,
+/// Side-effect-free MLX support for realtime loading.
+pub struct MlxRealtimeSupport {
     collectives_supported: bool,
-) -> Result<MlxPreparedRealtimeExecution, Error> {
-    let (normalized, rank_context) = options.checked_normalized()?;
-    let request = moshi_realtime_request_from_normalized(
-        normalized,
-        RealtimeObservationRequirements::new(true, []),
-    )
-    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let inspected = inspect_moshi_realtime(preparation, request)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let capabilities = mlx_realtime_capabilities(inspected.requirements(), collectives_supported);
-    let selected = select_inspected_moshi_realtime(inspected, &capabilities)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let source = prepare_selected_moshi_realtime_source(selected)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    Ok(MlxPreparedRealtimeExecution {
-        source,
-        rank_context,
-    })
 }
 
-fn mlx_realtime_capabilities(
-    requirements: &RealtimeArchitectureRequirements,
-    collectives_supported: bool,
-) -> RealtimeMechanismCapabilities {
-    eredu_runtime::synthesize_realtime_capabilities(
-        requirements,
-        &MlxRealtimeSupport {
+impl MlxRealtimeSupport {
+    /// Declares whether the selected route provides collectives.
+    pub const fn new(collectives_supported: bool) -> Self {
+        Self {
             collectives_supported,
-        },
-    )
+        }
+    }
 }
 
-struct MlxRealtimeSupport {
-    collectives_supported: bool,
+impl eredu_runtime::RealtimeLoadSupport for MlxRealtimeSupport {
+    fn independent_state_support(&self) -> &impl eredu_runtime::ReplicatedTextMechanismSupport {
+        &crate::composition::mlx::replicated_text::MlxReplicatedTextSupport
+    }
 }
 
 impl eredu_runtime::RealtimeMechanismSupport for MlxRealtimeSupport {
@@ -195,7 +147,7 @@ impl eredu_runtime::RealtimeMechanismSupport for MlxRealtimeSupport {
                 CompletionCancellationMode::QuarantineUntilComplete,
             ])
             .expect("MLX quarantine completion capability is valid"),
-            SessionCapabilities::new(true, true, false),
+            eredu_core::SessionCapabilities::new(true, true, false),
         )
         .with_state_lifecycle(
             eredu_runtime::StateLifecycleCapabilities::new()
@@ -281,5 +233,136 @@ pub(super) fn mlx_supports_realtime_lowering(
             LinearFormat::Affine(_) | LinearFormat::MxFp4
         ),
         _ => false,
+    }
+}
+
+/// Materialization authority available after native target validation.
+pub struct MlxRealtimeBinding<'a> {
+    context: &'a MlxRealtimeExecutionContext,
+}
+
+impl
+    eredu_runtime::RealtimeBindingMechanisms<
+        crate::backend::nn::shared::MlxNeuralBackend,
+        MlxKeyValueState,
+    > for MlxRealtimeBinding<'_>
+{
+    type Execution = MlxRealtimeExecution;
+    type Error = Error;
+    type Group = Group;
+    type Route = crate::backend::runtime::distributed::topology::CommunicationRouteRealization;
+    type TensorMetadata = crate::backend::nn::shared::MlxCommunicationTensorMetadata;
+    type Sampling = MlxSamplingBackend;
+    type Sampler = GenerationSampler;
+    type Materializer<A>
+        = construction::MlxRealtimeConstructionMechanisms<A::Unit>
+    where
+        A: eredu_runtime::LayeredArchitecture<
+                crate::backend::nn::shared::MlxNeuralBackend,
+                MlxKeyValueState,
+            > + 'static,
+        A::Unit: 'static;
+
+    fn context(&self) -> &Stream {
+        self.context.stream()
+    }
+
+    fn realize_tensor(
+        &self,
+        manifest: eredu_runtime::CommunicationManifest,
+        tensor_group: eredu_core::CollectiveGroupId,
+    ) -> Result<
+        eredu_runtime::RealtimeTensorResources<
+            crate::backend::nn::shared::MlxNeuralBackend,
+            Self::Group,
+            Self::Route,
+            Self::TensorMetadata,
+        >,
+        Error,
+    > {
+        let world = self.context.world_group.as_deref().ok_or_else(|| {
+            Error::Parallel("selected tensor parallelism requires a native world group".into())
+        })?;
+        let distributed = crate::backend::MlxDistributedSession::from_manifest(
+            &manifest,
+            world.native_group(),
+            self.context.stream(),
+        )?;
+        let (communication, parallel, executor) =
+            distributed.into_component_communication(manifest, Some(tensor_group))?;
+        let parallel = parallel
+            .ok_or_else(|| Error::Parallel("selected tensor group was not realized".into()))?;
+        Ok(eredu_runtime::RealtimeTensorResources {
+            communication,
+            parallel,
+            executor,
+        })
+    }
+
+    fn materializer<A>(
+        &self,
+        source: eredu_checkpoint::store::SharedCheckpointSource,
+        residency: eredu_runtime::LayerWeightResidency,
+        transform: Option<eredu_checkpoint::WeightQuantization>,
+        layout: Option<&eredu_runtime::LocalModelLayout>,
+    ) -> Self::Materializer<A>
+    where
+        A: eredu_runtime::LayeredArchitecture<
+                crate::backend::nn::shared::MlxNeuralBackend,
+                MlxKeyValueState,
+            > + 'static,
+        A::Unit: 'static,
+    {
+        construction::MlxRealtimeConstructionMechanisms::new(
+            source,
+            residency,
+            transform,
+            &self.context.weights_stream,
+            layout.cloned(),
+        )
+    }
+
+    fn materialization_metadata<A>(
+        &self,
+        materializer: &Self::Materializer<A>,
+    ) -> Result<eredu_runtime::LayerwiseModelMetadata, Error>
+    where
+        A: eredu_runtime::LayeredArchitecture<
+                crate::backend::nn::shared::MlxNeuralBackend,
+                MlxKeyValueState,
+            > + 'static,
+        A::Unit: 'static,
+    {
+        materializer.metadata().cloned().ok_or_else(|| {
+            Error::ArchitectureModel("realtime construction produced no metadata".into())
+        })
+    }
+
+    fn bind_executor<E, F, R>(
+        &self,
+        executor: E,
+        metadata: eredu_runtime::LayerwiseModelMetadata,
+        source: eredu_checkpoint::store::SharedCheckpointSource,
+    ) -> MlxRealtimeExecution
+    where
+        E: PreparedRealtimeFrameExecutor<
+                MlxSamplingBackend,
+                GenerationSampler,
+                MlxKeyValueState,
+                Error = F,
+                Retained = R,
+            > + eredu_runtime::RealtimeResidencyTelemetry<Error = Error>
+            + 'static,
+        F: std::fmt::Display,
+        R: eredu_nn::RetainedTensorRoots<MlxTensor> + 'static,
+    {
+        MlxRealtimeExecution::bind(
+            executor,
+            metadata,
+            source,
+            self.context.world_group.clone(),
+            self.context.stream(),
+            self.context.weights_stream.clone(),
+        )
     }
 }

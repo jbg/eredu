@@ -557,14 +557,14 @@ impl<B: NeuralBackend> ComponentEquations<B, StatelessComponentState> for MogKer
         &mut self,
         group: usize,
         initial: &B::Tensor,
-        dependencies: &[&B::Tensor],
+        dependencies: &eredu_runtime::GroupDependencies<'_, B::Tensor>,
         _: &mut StatelessComponentState,
         _: &mut Self::ForwardContext,
         _: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, TtsError> {
-        match (group, dependencies) {
-            (0, []) => Ok(initial.clone()),
-            (1 | 2, [one]) => Ok((*one).clone()),
+        match (group, dependencies.only()) {
+            (0, None) => Ok(initial.clone()),
+            (1 | 2, Some(one)) => Ok(one.clone()),
             _ => Err(TtsError::Configuration(
                 "MoG group dependencies differ from graph",
             )),
@@ -882,52 +882,7 @@ where
 
 /// Tensor-parallel MoG operations with typed prediction and selected-component results.
 /// Implementors supply invocation and guarded agreement through ordinary completion.
-pub trait ParallelMogExecution<B: DistributedNeuralBackend>: MogExecution<B> {
-    /// Invokes the selected operation while retaining its prediction, decisions and draws.
-    fn invoke_parallel(
-        &mut self,
-        input: MogInput<'_, B::Tensor>,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<(B::Tensor, MogForward<B::Tensor>), TtsError>;
-
-    /// Runs residual projections and returns complete guided mixture logits.
-    fn predict_parallel(
-        &mut self,
-        hidden: &B::Tensor,
-        guidance: f32,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<MogPrediction<B::Tensor>, TtsError> {
-        self.invoke_parallel(MogInput::Predict { hidden, guidance }, parallel, context)?
-            .1
-            .into_prediction()
-    }
-
-    /// Evaluates coherent component shards with supplied shared decisions and draws.
-    fn selected_parallel(
-        &mut self,
-        prediction: &MogPrediction<B::Tensor>,
-        mixture: &B::Tensor,
-        gaussian: &B::Tensor,
-        noise_scale: f32,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<MogSample<B::Tensor>, TtsError> {
-        self.invoke_parallel(
-            MogInput::Selected {
-                prediction,
-                mixture,
-                gaussian,
-                noise_scale,
-            },
-            parallel,
-            context,
-        )?
-        .1
-        .into_sample()
-    }
-
+trait GuardedMogExecution<B: DistributedNeuralBackend> {
     /// Executes retained tensor shards with acquisition and pre-reduction agreement.
     fn invoke_parallel_guarded<H, F>(
         &mut self,
@@ -942,7 +897,7 @@ pub trait ParallelMogExecution<B: DistributedNeuralBackend>: MogExecution<B> {
         F: FnMut([u64; 8], bool, &<B::Tensor as Tensor>::Context) -> Result<bool, TtsError>;
 }
 
-impl<B, P> ParallelMogExecution<B>
+impl<B, P> GuardedMogExecution<B>
     for LayerwiseRuntime<
         ComponentAdapter<ComponentDefinition, MogKernel<B>>,
         B,
@@ -955,22 +910,6 @@ where
     P: LayerwisePolicy<B, MogUnit<B>>,
     P::Error: std::error::Error + Send + Sync + 'static,
 {
-    fn invoke_parallel(
-        &mut self,
-        input: MogInput<'_, B::Tensor>,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<(B::Tensor, MogForward<B::Tensor>), TtsError> {
-        self.forward_parallel_with_context_hook(
-            input,
-            &mut StatelessComponentState::new()?,
-            parallel,
-            context,
-            |_, _, _| Ok(()),
-        )
-        .map_err(runtime_error)
-    }
-    /// Executes retained tensor shards with acquisition and pre-reduction agreement.
     fn invoke_parallel_guarded<H, F>(
         &mut self,
         input: MogInput<'_, B::Tensor>,
@@ -1057,5 +996,89 @@ where
             hook,
         )
         .map_err(runtime_error)
+    }
+}
+
+/// Bound Mog units and their optional tensor cohort.
+pub type BoundMog<B, P, C> = eredu_runtime::BoundStatelessComponent<
+    ComponentAdapter<ComponentDefinition, MogKernel<B>>,
+    B,
+    P,
+    C,
+>;
+
+fn invoke_bound<B, P, C>(
+    bound: &mut BoundMog<B, P, C>,
+    input: MogInput<'_, B::Tensor>,
+    context: &<B::Tensor as Tensor>::Context,
+) -> Result<(B::Tensor, MogForward<B::Tensor>), TtsError>
+where
+    B: DistributedNeuralBackend
+        + SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    P: LayerwisePolicy<B, MogUnit<B>>,
+    P::Error: std::error::Error + Send + Sync + 'static,
+    C: eredu_runtime::LayeredTensorCohort<B>,
+{
+    let (runtime, cohort) = bound.parts_mut();
+    if let Some(cohort) = cohort {
+        runtime.invoke_parallel_guarded(
+            input,
+            cohort.parallel_context(),
+            context,
+            &mut cohort.traversal_hook(),
+            |descriptor, ready, context| {
+                cohort.agree(descriptor, ready, context).map_err(Into::into)
+            },
+        )
+    } else {
+        runtime
+            .invoke_with_context(input, &mut StatelessComponentState::new()?, context)
+            .map_err(runtime_error)
+    }
+}
+
+impl<B, P, C> MogExecution<B> for BoundMog<B, P, C>
+where
+    B: DistributedNeuralBackend
+        + SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    P: LayerwisePolicy<B, MogUnit<B>>,
+    P::Error: std::error::Error + Send + Sync + 'static,
+    C: eredu_runtime::LayeredTensorCohort<B>,
+{
+    fn dimensions(&self) -> MogDimensions {
+        self.architecture().kernel().dimensions()
+    }
+
+    fn predict(
+        &mut self,
+        hidden: &B::Tensor,
+        guidance: f32,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<MogPrediction<B::Tensor>, TtsError> {
+        invoke_bound(self, MogInput::Predict { hidden, guidance }, context)?
+            .1
+            .into_prediction()
+    }
+
+    fn selected(
+        &mut self,
+        prediction: &MogPrediction<B::Tensor>,
+        mixture: &B::Tensor,
+        gaussian: &B::Tensor,
+        noise_scale: f32,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<MogSample<B::Tensor>, TtsError> {
+        invoke_bound(
+            self,
+            MogInput::Selected {
+                prediction,
+                mixture,
+                gaussian,
+                noise_scale,
+            },
+            context,
+        )?
+        .1
+        .into_sample()
     }
 }

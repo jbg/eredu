@@ -2,30 +2,21 @@
 
 use std::{num::NonZeroUsize, ops::Deref, sync::Arc};
 
-use eredu_architectures::moshi::{
-    inspect_moshi_realtime, moshi_realtime_request_from_normalized,
-    prepare_selected_moshi_realtime_source, select_inspected_moshi_realtime, MoshiPreparationPlan,
-    MoshiRealtimeExecution, PreparedMoshiRealtimeSource,
-};
 use eredu_checkpoint::{LinearFormat, SourceTensorEncoding};
 use eredu_core::cache::{StateComponentPolicy, StateComponentRole};
-use eredu_core::{
-    backend::Completion,
-    realtime::{RealtimeInputFrame, RealtimeOutputFrame},
-    CompletionCancellationMode, SessionCapabilities,
-};
+use eredu_core::{backend::Completion, realtime::RealtimeInputFrame, CompletionCancellationMode};
 use eredu_runtime::{
     execute_realtime_frame, CommunicationCompletionCapabilities, CompletedRealtimeFrame,
     ExecutionResidency, GenerationSampler, PreparedRealtimeFrameExecutor,
-    PrepublicationRealtimeFrame, RealtimeArchitectureRequirements, RealtimeCompletionCreationError,
-    RealtimeCompletionMechanism, RealtimeFrameHostObserver, RealtimeFrameResources,
-    RealtimeFrameTensorMechanisms, RealtimeHostTokenMaterializer, RealtimeMechanism,
-    RealtimeMechanismCapabilities, RealtimeObservationRequirements, RealtimePayloadBranch,
-    RealtimeSessionBranch, StateComponentPlacement, WeightLoweringKind,
+    PrepublicationRealtimeFrame, RealtimeCompletionCreationError, RealtimeCompletionMechanism,
+    RealtimeFrameHostObserver, RealtimeFramePlan, RealtimeFrameResources,
+    RealtimeFrameTensorMechanisms, RealtimeHostOutputProjection, RealtimeHostTokenMaterializer,
+    RealtimeMechanism, RealtimePayloadBranch, RealtimeSessionBranch, StateComponentPlacement,
+    WeightLoweringKind,
 };
 #[cfg(test)]
 use safemlx::ops::{indexing::TryIndexOp, stack_axis};
-use safemlx::{random, transforms::async_eval_with_event, Array, Event, Stream};
+use safemlx::{transforms::async_eval_with_event, Array, Event, Stream};
 
 use crate::backend::runtime::distributed::Group;
 use crate::{
@@ -38,20 +29,24 @@ use crate::{
         error::Error,
         nn::tensor::{TokenValidationBatch, TokenValidationScope},
     },
-    composition::moshi::{self as neutral_moshi, MlxRealtimeExecution},
-    MlxLoadRequest, MlxTensor,
+    MlxTensor,
 };
 
 mod completion;
+pub(crate) mod construction;
+mod execution;
 mod frame_execution;
 mod observation;
 mod selection_loading;
+mod startup;
+pub(crate) mod submission;
 
 pub use completion::MlxRealtimeCompletion;
-pub(crate) use completion::{MlxRealtimeExecutionResources, MlxRealtimeSubmissionScope};
-pub use frame_execution::{MlxRealtimeCompletionMechanism, MlxRealtimeFrameTensorMechanisms};
-pub use observation::{MlxFrameSessionBranch, MlxPrepublicationFrame, MlxRealtimeHostObserver};
-pub use selection_loading::{MlxPreparedRealtimeExecution, MlxRealtimeExecutionContext};
+pub(crate) use completion::MlxRealtimeExecutionResources;
+pub use execution::MlxRealtimeExecution;
+pub use observation::{MlxFrameSessionBranch, MlxPrepublicationFrame};
+pub use selection_loading::{MlxRealtimeBinding, MlxRealtimeExecutionContext, MlxRealtimeSupport};
+pub use submission::SharedRealtimeExecution;
 
 use frame_execution::submit_scheduled_realtime_frame;
 

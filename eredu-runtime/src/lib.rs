@@ -51,8 +51,8 @@ pub use component_partition::{
 /// Exact cold component preparation and consuming placement.
 pub mod prepared_component;
 pub use prepared_component::{
-    ComponentPreparationDeclaration, ComponentPreparationError, ComponentRecipe,
-    ComponentRecipeConversion, PreparedComponent,
+    ComponentPreparation, ComponentPreparationDeclaration, ComponentPreparationError,
+    ComponentRecipe, ComponentRecipeConversion, PreparedComponent,
 };
 mod component_pipeline;
 /// Mechanism-only selection contracts for composite model input.
@@ -77,6 +77,8 @@ pub use execution_unit_preparation::{
     ParameterResourcePreparation, ParameterResourcePreparationError,
     PreparedExecutionUnitResources, PreparedParameterResources,
 };
+/// Statically dispatched layered architecture lifecycle and resident policy.
+mod bound_layerwise_component;
 /// Completed-token lifecycle, snapshot reservation and branch accounting policy.
 pub mod execution_control;
 pub mod execution_plan;
@@ -96,7 +98,7 @@ pub mod input_transfer;
 pub mod inspection;
 /// Immutable intervention scheduling and evidence using the shared capture ledger.
 pub mod intervention;
-/// Statically dispatched layered architecture lifecycle and resident policy.
+pub use bound_layerwise_component::{BoundLayerwiseComponent, BoundStatelessComponent};
 pub mod layered;
 /// Shared access to existing resident and bounded layered invocations.
 pub mod layered_invocation;
@@ -127,11 +129,15 @@ pub use parameter_selection::{
     project_additional_parameter_ranges, project_parameter_selection_layout,
     ParameterSelectionLayoutError,
 };
+mod local_component;
 pub mod parameter_operations;
 /// Backend-neutral rank-local architecture ownership.
 pub mod partition;
 /// Rank-local graph execution over opaque communication resources.
 pub mod partitioned_execution;
+pub use local_component::{
+    BoundLocalComponent, LocalComponentMechanisms, LocalComponentPolicy, PreparedLocalComponent,
+};
 mod pipeline_executor;
 /// Bounded agreement and owner publication for architecture-owned replicated transitions.
 pub mod replicated_execution;
@@ -141,9 +147,12 @@ pub use component_pipeline::{
     ComponentPipelinePreparationError, PipelineBindingError,
 };
 pub use pipeline_executor::{
-    validate_pipeline_local_agreement, OrdinaryPipelinePartitionUnitStrategy,
-    PartitionTensorAllocator, PipelineLocalAgreementError, PipelinePartitionArchitecture,
-    PipelinePartitionExecutor, PipelinePartitionUnitStrategy, ResidentPipelinePartitionPass,
+    validate_pipeline_local_agreement, BoundComponentPipeline, ComponentRankMechanisms,
+    DecoderPipelineState, ImmutableParameterPolicy, LayeredTensorCohort,
+    OrdinaryPipelinePartitionUnitStrategy, ParameterUnitMechanisms, PartitionTensorAllocator,
+    PipelineLocalAgreementError, PipelinePartitionArchitecture, PipelinePartitionExecutor,
+    PipelinePartitionUnitStrategy, PreparedComponentPipeline, ResidentPipelinePartitionPass,
+    UnitPolicyResidency,
 };
 pub use tensor_wave::{RoutedTensorDimension, RoutedTensorReduction, RoutedTensorReductions};
 pub mod placement;
@@ -343,8 +352,8 @@ pub use inspection::{
 pub use layered::{
     ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitectureGroupTransport,
     ArchitectureMergeDestination, ArchitectureParallelSubgroup, ArchitectureParameters,
-    CompositeLayeredTraversalHook, LayeredArchitecture, LayeredForwardState, LayeredLocalPhase,
-    LayeredPartitionInput, LayeredPartitionOutput, LayeredPipelineSchedule,
+    CompositeLayeredTraversalHook, GroupDependencies, LayeredArchitecture, LayeredForwardState,
+    LayeredLocalPhase, LayeredPartitionInput, LayeredPartitionOutput, LayeredPipelineSchedule,
     LayeredPipelineScheduleError, LayeredTraversalHook, LayeredTraversalPoint, LayeredUnitAction,
     LayerwiseAcquireError, LayerwisePolicy, LayerwisePolicyForward, LayerwiseRuntime,
     LayerwiseRuntimeError, ParallelLayeredArchitecture, ParallelRoutedLayeredArchitecture,
@@ -418,7 +427,7 @@ pub use partitioned_execution::{
     PartitionOutputAuthority, PartitionOutputPublication, PartitionOutputPublisher,
     PartitionedExecutionPlan, PartitionedGroupExecutor, PartitionedTextExecution,
     PartitionedTextRuntime, PartitionedTraversalError, PartitionedTraversalResult,
-    RealizedCommunicationGroup, RealizedCommunicationRoute,
+    RealizedCommunicationGroup, RealizedCommunicationRoute, ReceivedPartitionBoundary,
 };
 pub use placement::{
     place_addressable_member_bindings, place_weight_bindings, placement_selection,
@@ -446,9 +455,9 @@ pub use realtime_executor::{
     execute_realtime_frame, submit_realtime_output, MappedRealtimeFrameHostObserver,
     PreparedRealtimeFrameExecutor, PrepublicationRealtimeFrame, RealtimeCompletionCreationError,
     RealtimeCompletionMechanism, RealtimeDecisionExecution, RealtimeFrameCoordinatorError,
-    RealtimeFrameHostObserver, RealtimeFrameResources, RealtimeHostOutputMappingError,
-    RealtimeHostOutputUnavailable, RealtimeOutputSubmissionError, RealtimePrepublicationError,
-    SubmittedRealtimeFrame,
+    RealtimeFrameHostObserver, RealtimeFramePlan, RealtimeFrameResources,
+    RealtimeHostOutputMappingError, RealtimeHostOutputProjection, RealtimeHostOutputUnavailable,
+    RealtimeOutputSubmissionError, RealtimePrepublicationError, SubmittedRealtimeFrame,
 };
 pub use realtime_ingress::{
     MaterializedRealtimeInput, RealtimeHostFrameMaterializer, RealtimeHostTokenMaterializer,
@@ -460,15 +469,18 @@ pub use realtime_interpreter::{
     RealtimeFrameInterpretationError, RealtimeFrameTensorMechanisms,
 };
 pub use realtime_mechanism_synthesis::{
-    synthesize_realtime_capabilities, RealtimeMechanismFacts, RealtimeMechanismSupport,
+    synthesize_realtime_capabilities, RealtimeLoadSupport, RealtimeMechanismFacts,
+    RealtimeMechanismSupport,
 };
 pub use realtime_model::{
-    construct_realtime_model, preflight_realtime_materialization_tasks, realtime_task_binding_plan,
-    ConstructedRealtimeExecution, ConstructedRealtimeModel, PreparedRealtimeModelContract,
-    RealizedRealtimePolicy, RealizedRealtimeState, RealtimeArchitectureConstructionIdentity,
-    RealtimeArchitectureIdentity, RealtimeLayerwiseRuntime, RealtimeMaterializationComponent,
+    construct_realtime_execution, preflight_realtime_materialization_tasks,
+    realtime_task_binding_plan, ConstructedRealtimeExecution, PreparedRealtimeBinding,
+    PreparedRealtimeModelContract, RealizedRealtimePolicy,
+    RealtimeArchitectureConstructionIdentity, RealtimeArchitectureIdentity,
+    RealtimeBindingMechanisms, RealtimeLayerwiseRuntime, RealtimeMaterializationComponent,
     RealtimeMaterializationTask, RealtimeModelConstructionError,
-    RealtimeModelConstructionMechanisms, RealtimeModelContractError, RealtimeTaskBindingPlan,
+    RealtimeModelConstructionMechanisms, RealtimeModelContractError, RealtimeResidencyTelemetry,
+    RealtimeTaskBindingPlan, RealtimeTensorResources,
 };
 pub use realtime_payload::{
     RealtimePayloadContract, RealtimePayloadContractError, RealtimePayloadEnvelope,
@@ -637,3 +649,10 @@ pub use unit_policy_view::{
 
 mod vocabulary_module;
 pub use vocabulary_module::VocabularyModulePlacement;
+
+mod realtime_startup;
+pub use realtime_startup::{
+    PipelineTransportProvider, RealtimeCopyLimits, RealtimeGraphMechanisms,
+    RealtimeJointStateParts, RealtimeStartupMechanisms, RealtimeStartupPreparation,
+    RealtimeStateGroup, RealtimeStateMaterializer,
+};

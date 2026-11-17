@@ -92,7 +92,14 @@ pub trait PartitionComponentKernel<B: NeuralBackend, S: RuntimeState<B>>:
         _parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        self.begin_group(group, initial, &[], state, forward, context)
+        self.begin_group(
+            group,
+            initial,
+            &crate::GroupDependencies::empty(),
+            state,
+            forward,
+            context,
+        )
     }
     /// Publishes the completed local result or its typed boundary.
     fn finish_partition(

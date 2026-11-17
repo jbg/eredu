@@ -571,7 +571,7 @@ impl ComponentDefinition {
                         return Err(invalid(&format!(
                             "selected companion {} has no matching primary owner",
                             member.target()
-                        )))
+                        )));
                     }
                 }
             }
@@ -676,16 +676,16 @@ impl ComponentDefinition {
             })
     }
     /// Validates a group invocation against the retained dependency declaration.
-    pub fn validate_group_dependencies(
+    pub fn validate_group_dependencies<T>(
         &self,
         group: usize,
-        count: usize,
+        dependencies: &crate::GroupDependencies<'_, T>,
     ) -> Result<(), ComponentDefinitionError> {
         if self
             .parameters
             .graph()
             .dependencies(group)
-            .is_none_or(|declared| declared.len() != count)
+            .is_none_or(|declared| !declared.iter().copied().eq(dependencies.producers()))
         {
             return Err(ComponentDefinitionError::Invalid {
                 component: self.id.clone(),
@@ -850,6 +850,10 @@ impl StatelessComponentState {
         &self.layout
     }
 }
+impl<T> eredu_nn::RetainedTensorRoots<T> for StatelessComponentState {
+    fn visit_retained_tensors<'a>(&'a self, _: &mut dyn FnMut(&'a T)) {}
+}
+
 impl<B: NeuralBackend> RuntimeState<B> for StatelessComponentState {
     type RetainedValues<'a>
         = std::iter::Empty<&'a B::Tensor>
@@ -1043,7 +1047,7 @@ pub trait ComponentEquations<B: NeuralBackend, S: RuntimeState<B>>: ComponentKer
         &mut self,
         _group: usize,
         initial: &B::Tensor,
-        _dependencies: &[&B::Tensor],
+        _dependencies: &crate::GroupDependencies<'_, B::Tensor>,
         _state: &mut S,
         _forward: &mut Self::ForwardContext,
         _context: &<B::Tensor as Tensor>::Context,
@@ -1154,7 +1158,7 @@ pub trait ParallelComponentKernel<B: NeuralBackend, S: RuntimeState<B>>:
         &mut self,
         group: usize,
         initial: &B::Tensor,
-        dependencies: &[&B::Tensor],
+        dependencies: &crate::GroupDependencies<'_, B::Tensor>,
         state: &mut S,
         forward: &mut Self::ForwardContext,
         _parallel: &B::ParallelContext,
@@ -1891,13 +1895,13 @@ where
         &mut self,
         group: usize,
         initial: &B::Tensor,
-        dependencies: &[&B::Tensor],
+        dependencies: &crate::GroupDependencies<'_, B::Tensor>,
         state: &mut S,
         forward: &mut K::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, K::Error> {
         self.definition()
-            .validate_group_dependencies(group, dependencies.len())?;
+            .validate_group_dependencies(group, dependencies)?;
         self.kernel
             .begin_group(group, initial, dependencies, state, forward, context)
     }
@@ -1927,9 +1931,6 @@ where
     }
     fn retained_state_ordinals(&self, group: usize, index: usize, _: usize) -> Range<usize> {
         self.local_state_slots(group, index)
-    }
-    fn state_ordinal(&self, group: usize, index: usize, _: usize) -> usize {
-        self.local_state_slots(group, index).start
     }
     fn forward_unit(
         &mut self,
@@ -2088,14 +2089,14 @@ where
         &mut self,
         group: usize,
         initial: &B::Tensor,
-        dependencies: &[&B::Tensor],
+        dependencies: &crate::GroupDependencies<'_, B::Tensor>,
         state: &mut S,
         forward: &mut K::ForwardContext,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, K::Error> {
         self.definition()
-            .validate_group_dependencies(group, dependencies.len())?;
+            .validate_group_dependencies(group, dependencies)?;
         self.kernel.begin_group_parallel(
             group,
             initial,

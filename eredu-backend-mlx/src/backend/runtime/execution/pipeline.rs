@@ -15,7 +15,6 @@ use crate::{
     },
     MlxTensor,
 };
-use eredu_checkpoint::store::SharedCheckpointSource;
 use eredu_core::{
     BackendFailure, BoundedCompletion, BoundedCompletionOutcome, CollectiveGroupId,
     DistributedCommitEpoch, DistributedCommitOutcome,
@@ -23,11 +22,10 @@ use eredu_core::{
 use eredu_nn::Parameterized;
 use eredu_runtime::{
     CommunicationManifest, DenseDiskStreamReport, DistributedExecutionPhase, ExecutionUnitAddress,
-    ExpertPass, LayerWeightResidency, LayeredArchitecture, LayerwiseModelMetadata, NoopObserver,
-    OpaqueBoundaryTransport, OpaqueFailureAgreement, OpaqueOutputPublisher,
-    PartitionCommunicationAuthority, PartitionedExecutionPlan, PartitionedTextExecution,
-    PartitionedTextRuntime, PipelineActivationDtype, ReplicatedTextExecutionStrategy,
-    ResidencyReport, RuntimeState, WeightBinding,
+    ExpertPass, LayeredArchitecture, LayerwiseModelMetadata, NoopObserver, OpaqueBoundaryTransport,
+    OpaqueFailureAgreement, OpaqueOutputPublisher, PartitionCommunicationAuthority,
+    PartitionedExecutionPlan, PartitionedTextExecution, PartitionedTextRuntime,
+    PipelineActivationDtype, ReplicatedTextExecutionStrategy, ResidencyReport, RuntimeState,
 };
 use eredu_runtime::{PipelinePartitionArchitecture, PipelinePartitionExecutor};
 use safemlx::{Array, Stream};
@@ -35,8 +33,8 @@ use std::marker::PhantomData;
 
 type Policy<A, S> =
     MlxSelectedLayerwisePolicy<<A as LayeredArchitecture<MlxNeuralBackend, S>>::Unit, ()>;
-type Executor<A, S> =
-    PipelinePartitionExecutor<A, MlxNeuralBackend, S, Policy<A, S>, MlxPartitionTensorAllocator>;
+type Executor<A, S, P = Policy<A, S>> =
+    PipelinePartitionExecutor<A, MlxNeuralBackend, S, P, MlxPartitionTensorAllocator>;
 type Strategy<A, S> = PartitionedTextExecution<
     Executor<A, S>,
     Group,
@@ -46,12 +44,12 @@ type Strategy<A, S> = PartitionedTextExecution<
     OpaqueOutputPublisher,
     OpaqueFailureAgreement,
 >;
-type Runtime<A, S> = PartitionedTextRuntime<
+type Runtime<A, S, P = Policy<A, S>> = PartitionedTextRuntime<
     A,
     MlxNeuralBackend,
     S,
-    Policy<A, S>,
-    Executor<A, S>,
+    P,
+    Executor<A, S, P>,
     Group,
     CommunicationRouteRealization,
     MlxCommunicationTensorMetadata,
@@ -60,8 +58,87 @@ type Runtime<A, S> = PartitionedTextRuntime<
     OpaqueFailureAgreement,
 >;
 
+/// Realizes the ordinary portable partition driver with MLX transport and allocation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn bind_pipeline_runtime<A, S, P>(
+    architecture: A,
+    policy: P,
+    addresses: Vec<ExecutionUnitAddress>,
+    plan: PartitionedExecutionPlan,
+    activation_dtype: PipelineActivationDtype,
+    communication: eredu_runtime::PartitionCommunication<
+        MlxNeuralBackend,
+        Group,
+        CommunicationRouteRealization,
+        MlxCommunicationTensorMetadata,
+    >,
+    parallel: Option<Group>,
+    communication_stream: Stream,
+    local_agreement: Option<CollectiveGroupId>,
+    residency: eredu_runtime::ExecutionResidency,
+    bounded_policy: Option<P>,
+) -> Result<Runtime<A, S, P>, BackendFailure>
+where
+    S: RuntimeState<MlxNeuralBackend>,
+    A: PipelinePartitionArchitecture<MlxNeuralBackend, S>,
+    A::Error: From<eredu_nn::Error>,
+    P: eredu_runtime::LayerwisePolicy<MlxNeuralBackend, A::Unit>,
+{
+    let executor = Executor::<A, S, P>::new(
+        architecture,
+        policy,
+        addresses,
+        parallel,
+        MlxPartitionTensorAllocator,
+        activation_dtype,
+    )
+    .map_err(BackendFailure::from_error)?
+    .with_local_agreement(local_agreement);
+    Runtime::<A, S, P>::new(
+        plan,
+        executor,
+        communication,
+        communication_stream,
+        OpaqueBoundaryTransport,
+        OpaqueOutputPublisher,
+        OpaqueFailureAgreement,
+        residency,
+        bounded_policy,
+    )
+    .map_err(BackendFailure::from_error)
+}
+
+pub(crate) trait PipelineCommunication {
+    fn session(
+        &self,
+        manifest: &CommunicationManifest,
+        stream: &Stream,
+    ) -> Result<MlxDistributedSession, BackendFailure>;
+}
+
+impl PipelineCommunication for safemlx::distributed::Group {
+    fn session(
+        &self,
+        manifest: &CommunicationManifest,
+        stream: &Stream,
+    ) -> Result<MlxDistributedSession, BackendFailure> {
+        MlxDistributedSession::from_manifest(manifest, self, stream)
+            .map_err(BackendFailure::from_error)
+    }
+}
+
+impl PipelineCommunication for MlxDistributedSession {
+    fn session(
+        &self,
+        _: &CommunicationManifest,
+        _: &Stream,
+    ) -> Result<MlxDistributedSession, BackendFailure> {
+        Ok(self.clone())
+    }
+}
+
 /// Exact selected execution, residency and communication ownership for one rank.
-pub(crate) struct MlxComponentPipeline<A, S>
+pub struct MlxComponentPipeline<A, S>
 where
     S: RuntimeState<MlxNeuralBackend>,
     A: PipelinePartitionArchitecture<MlxNeuralBackend, S>,
@@ -69,7 +146,8 @@ where
 {
     runtime: Runtime<A, S>,
     policy: Policy<A, S>,
-    distributed: MlxDistributedSession,
+    // Retains the native world for standalone component execution.
+    _distributed: MlxDistributedSession,
     authority: PartitionCommunicationAuthority,
     groups: Vec<Group>,
     completion_wait: eredu_core::BoundedCompletionWait,
@@ -83,60 +161,16 @@ where
     A::Error: From<eredu_nn::Error>,
     A::Unit: Parameterized<MlxTensor> + 'static,
 {
-    /// Native realization consumes an already validated portable selection.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        architecture: A,
-        source: SharedCheckpointSource,
-        invocations: eredu_runtime::ExecutionUnitAddressMap,
-        units: Vec<(ExecutionUnitAddress, Vec<WeightBinding>)>,
-        manifest: CommunicationManifest,
-        plan: PartitionedExecutionPlan,
-        tensor_group: Option<CollectiveGroupId>,
-        activation_dtype: PipelineActivationDtype,
-        world: &safemlx::distributed::Group,
-        residency: LayerWeightResidency,
+    /// Realizes a retained plan with either a native world or an established session.
+    pub(crate) fn bind_prepared(
+        prepared: eredu_runtime::PreparedComponentPipeline<A>,
+        communication: &impl PipelineCommunication,
         weights_stream: &Stream,
         execution_stream: &Stream,
     ) -> Result<(Self, LayerwiseModelMetadata), BackendFailure> {
-        Self::with_pinned(
-            architecture,
-            source,
-            invocations,
-            Vec::new(),
-            units,
-            manifest,
-            plan,
-            tensor_group,
-            activation_dtype,
-            world,
-            residency,
-            weights_stream,
-            execution_stream,
-        )
-    }
-
-    /// Binds a selected pipeline that owns stage-local pinned parameters.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn with_pinned(
-        architecture: A,
-        source: SharedCheckpointSource,
-        invocations: eredu_runtime::ExecutionUnitAddressMap,
-        pinned: Vec<WeightBinding>,
-        units: Vec<(ExecutionUnitAddress, Vec<WeightBinding>)>,
-        manifest: CommunicationManifest,
-        plan: PartitionedExecutionPlan,
-        tensor_group: Option<CollectiveGroupId>,
-        activation_dtype: PipelineActivationDtype,
-        world: &safemlx::distributed::Group,
-        residency: LayerWeightResidency,
-        weights_stream: &Stream,
-        execution_stream: &Stream,
-    ) -> Result<(Self, LayerwiseModelMetadata), BackendFailure> {
-        let distributed = MlxDistributedSession::from_manifest(&manifest, world, execution_stream)
-            .map_err(BackendFailure::from_error)?;
-        Self::with_pinned_session(
-            architecture,
+        let distributed = communication.session(&prepared.manifest, execution_stream)?;
+        let eredu_runtime::PreparedComponentPipeline {
+            mut architecture,
             source,
             invocations,
             pinned,
@@ -145,29 +179,8 @@ where
             plan,
             tensor_group,
             activation_dtype,
-            distributed,
             residency,
-            weights_stream,
-            execution_stream,
-        )
-    }
-
-    /// Binds a stage to the communication already realized by model preparation.
-    pub(crate) fn with_pinned_session(
-        mut architecture: A,
-        source: SharedCheckpointSource,
-        invocations: eredu_runtime::ExecutionUnitAddressMap,
-        pinned: Vec<WeightBinding>,
-        units: Vec<(ExecutionUnitAddress, Vec<WeightBinding>)>,
-        manifest: CommunicationManifest,
-        plan: PartitionedExecutionPlan,
-        tensor_group: Option<CollectiveGroupId>,
-        activation_dtype: PipelineActivationDtype,
-        distributed: MlxDistributedSession,
-        residency: LayerWeightResidency,
-        weights_stream: &Stream,
-        execution_stream: &Stream,
-    ) -> Result<(Self, LayerwiseModelMetadata), BackendFailure> {
+        } = prepared;
         validate_component_communication(&manifest, tensor_group)?;
         let completion_wait = manifest
             .completion_policy()
@@ -209,33 +222,24 @@ where
                 } else {
                     Policy::<A, S>::bounded(policy)
                 };
-                let executor = Executor::<A, S>::new(
+                let runtime = bind_pipeline_runtime(
                     architecture,
                     policy.clone(),
                     addresses,
-                    parallel,
-                    MlxPartitionTensorAllocator,
-                    activation_dtype,
-                )
-                .map_err(BackendFailure::from_error)?
-                .with_local_agreement(tensor_group);
-                let runtime = Runtime::<A, S>::new(
                     plan,
-                    executor,
+                    activation_dtype,
                     communication,
+                    parallel,
                     communication_stream,
-                    OpaqueBoundaryTransport,
-                    OpaqueOutputPublisher,
-                    OpaqueFailureAgreement,
+                    tensor_group,
                     residency.execution_residency(),
                     (!residency.is_fully_resident()).then(|| policy.clone()),
-                )
-                .map_err(BackendFailure::from_error)?;
+                )?;
                 Ok((
                     Self {
                         runtime,
                         policy,
-                        distributed,
+                        _distributed: distributed,
                         authority,
                         groups,
                         completion_wait,
@@ -247,89 +251,18 @@ where
             BackendFailure::from_error,
         )
     }
-    /// Retained architecture for parameter-free state lifecycle operations.
-    pub(crate) fn architecture(&self) -> &A {
-        self.runtime.executor().architecture()
-    }
 
-    pub(crate) fn distributed(&self) -> &MlxDistributedSession {
-        &self.distributed
-    }
-
-    pub(crate) fn communication_authority(&self) -> &PartitionCommunicationAuthority {
-        &self.authority
-    }
-
-    pub(crate) fn residency_report(&self) -> Result<ResidencyReport, BackendFailure> {
-        self.policy
-            .residency_report()
-            .map_err(BackendFailure::from_error)
-    }
-    pub(crate) fn dense_stream_report(
-        &self,
-    ) -> Result<Option<DenseDiskStreamReport>, BackendFailure> {
-        self.policy
-            .dense_stream_report()
-            .map_err(BackendFailure::from_error)
-    }
-
-    /// Publishes within the selected rank group, completes exact output/state
-    /// roots, and agrees the caller's epoch. External publication remains with
-    /// the enclosing session, which owns the unpublished candidate state.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn forward<R, F, O>(
+    fn forward_inner<R>(
         &mut self,
         input: A::Input<'_>,
         state: &mut S,
         descriptor: [u64; 8],
         epoch: DistributedCommitEpoch,
         stream: &Stream,
-        mut input_roots: Vec<Array>,
-        state_roots: F,
-        prepare_output: O,
+        prepare_output: impl FnOnce(MlxTensor) -> Result<(R, Vec<MlxTensor>), BackendFailure>,
     ) -> Result<(R, DistributedCommitOutcome), BackendFailure>
     where
-        F: Fn(&S) -> Vec<Array>,
-        O: FnOnce(&MlxTensor) -> Result<(R, Vec<Array>), BackendFailure>,
-    {
-        if self.failed {
-            return Err(contract(
-                "component pipeline requires recovery after a failed invocation",
-            ));
-        }
-        input_roots.extend(state_roots(state));
-        let result = detached_preparation(
-            input_roots,
-            || {
-                self.forward_inner(
-                    input,
-                    state,
-                    descriptor,
-                    epoch,
-                    stream,
-                    &state_roots,
-                    prepare_output,
-                )
-            },
-            BackendFailure::from_error,
-        );
-        self.failed = self.authority.ensure_active().is_err()
-            || matches!(&result,Ok((_,outcome)) if !matches!(outcome,DistributedCommitOutcome::Committed(_)));
-        result
-    }
-    fn forward_inner<R, F, O>(
-        &mut self,
-        input: A::Input<'_>,
-        state: &mut S,
-        descriptor: [u64; 8],
-        epoch: DistributedCommitEpoch,
-        stream: &Stream,
-        state_roots: &F,
-        prepare_output: O,
-    ) -> Result<(R, DistributedCommitOutcome), BackendFailure>
-    where
-        F: Fn(&S) -> Vec<Array>,
-        O: FnOnce(&MlxTensor) -> Result<(R, Vec<Array>), BackendFailure>,
+        S: eredu_nn::RetainedTensorRoots<MlxTensor>,
     {
         if !<Strategy<A, S> as ReplicatedTextExecutionStrategy<
             A,
@@ -384,7 +317,7 @@ where
         );
         let output = published.map_err(BackendFailure::from_error)?;
         agreement?;
-        let prepared = prepare_output(&output);
+        let prepared = prepare_output(output.clone());
         let agreement = self.agree(
             DistributedExecutionPhase::OutputObservation,
             prepared.is_ok(),
@@ -393,8 +326,12 @@ where
         let (prepared, output_roots) = prepared?;
         agreement?;
         let arrays = std::iter::once(output.as_array().clone())
-            .chain(state_roots(state))
-            .chain(output_roots)
+            .chain(retained_arrays(state))
+            .chain(
+                output_roots
+                    .into_iter()
+                    .map(|tensor| tensor.as_array().clone()),
+            )
             .collect::<Vec<_>>();
         let completed = MlxCommunicationCompletion::submit(
             arrays.iter(),
@@ -427,9 +364,11 @@ where
         );
         match completed.map_err(BackendFailure::from_error)? {
             BoundedCompletionOutcome::Completed => {}
-            _ => return Err(contract(
-                "component pipeline completion deadline expired; native resources remain retained",
-            )),
+            _ => {
+                return Err(contract(
+                    "component pipeline completion deadline expired; native resources remain retained",
+                ));
+            }
         }
         agreement?;
         let outcome = <Strategy<A, S> as ReplicatedTextExecutionStrategy<
@@ -440,107 +379,6 @@ where
             Policy<A, S>,
         >>::commit_after_completion(&mut self.runtime, epoch, stream);
         Ok((prepared, outcome))
-    }
-
-    /// Agrees a local application decision before dependent transport or publication.
-    pub(crate) fn agree_descriptor(
-        &mut self,
-        descriptor: [u64; 8],
-        success: bool,
-        stream: &Stream,
-    ) -> Result<(), BackendFailure> {
-        let accepted = self.agree_application(descriptor, success, stream)?;
-        if accepted {
-            Ok(())
-        } else {
-            Err(contract(
-                "component pipeline rank rejected the application decision",
-            ))
-        }
-    }
-
-    pub(crate) fn agree_application(
-        &mut self,
-        descriptor: [u64; 8],
-        success: bool,
-        stream: &Stream,
-    ) -> Result<bool, BackendFailure> {
-        <Strategy<A, S> as ReplicatedTextExecutionStrategy<
-            A,
-            MlxNeuralBackend,
-            S,
-            Policy<A, S>,
-            Policy<A, S>,
-        >>::agree_distributed_descriptor(
-            &mut self.runtime,
-            DistributedExecutionPhase::InputPreparation,
-            success,
-            descriptor,
-            stream,
-        )
-        .map_err(BackendFailure::from_error)
-    }
-
-    /// Commits an application candidate after all its local roots have completed.
-    pub(crate) fn commit(
-        &mut self,
-        epoch: DistributedCommitEpoch,
-        stream: &Stream,
-    ) -> Result<(), BackendFailure> {
-        let outcome = <Strategy<A, S> as ReplicatedTextExecutionStrategy<
-            A,
-            MlxNeuralBackend,
-            S,
-            Policy<A, S>,
-            Policy<A, S>,
-        >>::commit_after_completion(&mut self.runtime, epoch, stream);
-        if outcome == DistributedCommitOutcome::Committed(epoch) {
-            Ok(())
-        } else {
-            self.failed = true;
-            Err(contract(
-                "component pipeline application commit did not complete",
-            ))
-        }
-    }
-
-    /// Runs a stage-owned readout and publishes its output using the retained authority.
-    pub(crate) fn readout(
-        &mut self,
-        stream: &Stream,
-        input_roots: Vec<Array>,
-        project: impl FnOnce(&mut A, Option<&Group>) -> Result<MlxTensor, BackendFailure>,
-    ) -> Result<MlxTensor, BackendFailure> {
-        detached_preparation(
-            input_roots,
-            || {
-                let (architecture, parallel) = self.runtime.executor_mut().readout_resources();
-                let local = project(architecture, parallel);
-                let agreement =
-                    self.agree(DistributedExecutionPhase::Execution, local.is_ok(), stream);
-                let local = local?;
-                agreement?;
-                let output = <Strategy<A, S> as ReplicatedTextExecutionStrategy<
-                    A,
-                    MlxNeuralBackend,
-                    S,
-                    Policy<A, S>,
-                    Policy<A, S>,
-                >>::publish_observed_output(
-                    &mut self.runtime, local, stream
-                )
-                .map_err(BackendFailure::from_error);
-                let agreement = self.agree(
-                    DistributedExecutionPhase::OutputPublication,
-                    output.is_ok(),
-                    stream,
-                );
-                let output = output?;
-                agreement?;
-                Ok(output)
-            },
-            BackendFailure::from_error,
-        )
     }
 
     fn agree(
@@ -590,8 +428,8 @@ pub(crate) fn validate_component_communication(
             selected.members(),
         ) {
             return Err(contract(
-                    "component cohort status agreement requires unsupported inactive-stage participation",
-                ));
+                "component cohort status agreement requires unsupported inactive-stage participation",
+            ));
         }
     }
     if manifest.completion_policy().is_none() {
@@ -600,4 +438,175 @@ pub(crate) fn validate_component_communication(
         ));
     }
     Ok(())
+}
+
+fn retained_arrays(state: &impl eredu_nn::RetainedTensorRoots<MlxTensor>) -> Vec<Array> {
+    let mut roots = Vec::new();
+    state.visit_retained_tensors(&mut |tensor| roots.push(tensor.as_array().clone()));
+    roots
+}
+
+impl<A, S> eredu_runtime::BoundComponentPipeline<A, MlxNeuralBackend, S>
+    for MlxComponentPipeline<A, S>
+where
+    S: RuntimeState<MlxNeuralBackend> + 'static,
+    A: PipelinePartitionArchitecture<MlxNeuralBackend, S> + 'static,
+    A::Error: From<eredu_nn::Error>,
+    A::Unit: Parameterized<MlxTensor> + 'static,
+{
+    fn architecture(&self) -> &A {
+        self.runtime.executor().architecture()
+    }
+
+    fn agree(
+        &mut self,
+        descriptor: [u64; 8],
+        ready: bool,
+        context: &Stream,
+    ) -> Result<(), BackendFailure> {
+        if self.agree_application(descriptor, ready, context)? {
+            Ok(())
+        } else {
+            Err(contract(
+                "component pipeline rank rejected the application decision",
+            ))
+        }
+    }
+
+    fn agree_application(
+        &mut self,
+        descriptor: [u64; 8],
+        ready: bool,
+        context: &Stream,
+    ) -> Result<bool, BackendFailure> {
+        <Strategy<A, S> as ReplicatedTextExecutionStrategy<
+            A,
+            MlxNeuralBackend,
+            S,
+            Policy<A, S>,
+            Policy<A, S>,
+        >>::agree_distributed_descriptor(
+            &mut self.runtime,
+            DistributedExecutionPhase::InputPreparation,
+            ready,
+            descriptor,
+            context,
+        )
+        .map_err(BackendFailure::from_error)
+    }
+
+    fn invoke<R>(
+        &mut self,
+        input: A::Input<'_>,
+        roots: Vec<MlxTensor>,
+        state: &mut S,
+        descriptor: [u64; 8],
+        epoch: DistributedCommitEpoch,
+        context: &Stream,
+        project: impl FnOnce(MlxTensor) -> Result<(R, Vec<MlxTensor>), BackendFailure>,
+    ) -> Result<(R, DistributedCommitOutcome), BackendFailure>
+    where
+        S: eredu_nn::RetainedTensorRoots<MlxTensor>,
+    {
+        if self.failed {
+            return Err(contract(
+                "component pipeline requires recovery after a failed invocation",
+            ));
+        }
+        let roots = roots
+            .into_iter()
+            .map(|tensor| tensor.as_array().clone())
+            .chain(retained_arrays(state))
+            .collect::<Vec<_>>();
+        let result = detached_preparation(
+            roots,
+            || self.forward_inner(input, state, descriptor, epoch, context, project),
+            BackendFailure::from_error,
+        );
+        self.failed = self.authority.ensure_active().is_err()
+            || matches!(&result, Ok((_, outcome)) if !matches!(outcome, DistributedCommitOutcome::Committed(_)));
+        result
+    }
+
+    fn commit_candidate(
+        &mut self,
+        epoch: DistributedCommitEpoch,
+        stream: &Stream,
+    ) -> Result<(), BackendFailure> {
+        let outcome = <Strategy<A, S> as ReplicatedTextExecutionStrategy<
+            A,
+            MlxNeuralBackend,
+            S,
+            Policy<A, S>,
+            Policy<A, S>,
+        >>::commit_after_completion(&mut self.runtime, epoch, stream);
+        if outcome == DistributedCommitOutcome::Committed(epoch) {
+            Ok(())
+        } else {
+            self.failed = true;
+            Err(contract(
+                "component pipeline application commit did not complete",
+            ))
+        }
+    }
+
+    fn publish_readout(
+        &mut self,
+        roots: Vec<MlxTensor>,
+        stream: &Stream,
+        project: impl FnOnce(&mut A, Option<&Group>) -> Result<MlxTensor, BackendFailure>,
+    ) -> Result<MlxTensor, BackendFailure> {
+        detached_preparation(
+            roots
+                .into_iter()
+                .map(|tensor| tensor.as_array().clone())
+                .collect::<Vec<_>>(),
+            || {
+                let (architecture, parallel) = self.runtime.executor_mut().readout_resources();
+                let local = project(architecture, parallel);
+                let agreement =
+                    self.agree(DistributedExecutionPhase::Execution, local.is_ok(), stream);
+                let local = local?;
+                agreement?;
+                let output = <Strategy<A, S> as ReplicatedTextExecutionStrategy<
+                    A,
+                    MlxNeuralBackend,
+                    S,
+                    Policy<A, S>,
+                    Policy<A, S>,
+                >>::publish_observed_output(
+                    &mut self.runtime, local, stream
+                )
+                .map_err(BackendFailure::from_error);
+                let agreement = self.agree(
+                    DistributedExecutionPhase::OutputPublication,
+                    output.is_ok(),
+                    stream,
+                );
+                let output = output?;
+                agreement?;
+                Ok(output)
+            },
+            BackendFailure::from_error,
+        )
+    }
+
+    fn settle_values<'a>(
+        values: impl Iterator<Item = &'a MlxTensor>,
+    ) -> Result<(), BackendFailure> {
+        safemlx::transforms::eval(values.map(MlxTensor::as_array))
+            .map_err(BackendFailure::from_error)
+    }
+
+    fn residency(&self) -> Result<ResidencyReport, BackendFailure> {
+        self.policy
+            .residency_report()
+            .map_err(BackendFailure::from_error)
+    }
+
+    fn dense_stream_report(&self) -> Result<Option<DenseDiskStreamReport>, BackendFailure> {
+        self.policy
+            .dense_stream_report()
+            .map_err(BackendFailure::from_error)
+    }
 }

@@ -413,19 +413,20 @@ pub(crate) fn from_config(
         }
         CompositeConfig::Inkling(args) => {
             if let Some(vision) = &args.vision_config {
-                let schemas = (0..vision.num_hidden_layers as usize)
-                    .map(|layer| {
-                        let spec = vision
-                            .parameters()
-                            .layer(layer)
-                            .map_err(|error| error.to_string())?;
-                        hidden(spec.projection.output, false)
+                let geometry = vision
+                    .parameters()
+                    .continuation_shapes(1)
+                    .into_iter()
+                    .map(|shape| {
+                        let width = shape[4];
+                        let positions_per_patch = shape[..4].iter().product();
+                        Ok((hidden(width, false)?, DecoderMultiple(positions_per_patch)))
                     })
-                    .collect::<Result<Vec<_>, _>>()?;
+                    .collect::<Result<Vec<_>, String>>()?;
                 plan = plan.with_boundary(
                     0,
                     0,
-                    CompositePartitionBoundary::after_units(schemas, Decoder)?,
+                    CompositePartitionBoundary::after_unit_geometry(geometry)?,
                 )?;
             }
             // Audio embeddings are static modules: this execution group has

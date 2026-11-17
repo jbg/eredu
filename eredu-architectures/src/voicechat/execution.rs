@@ -23,7 +23,9 @@ use eredu_nn::RetainedTensorRoots;
 
 use eredu_core::BackendFailure;
 use eredu_nn::{DistributedNeuralBackend, GroupedNeuralBackend, Tensor, TensorElementType};
-use eredu_runtime::{DenseSamplingBackend, RealtimeGenerationBranch, TokenDomain};
+use eredu_runtime::{
+    DenseSamplingBackend, RealtimeGenerationBranch, RealtimeJointStateParts, TokenDomain,
+};
 
 use super::{
     agent_sampling::AgentSampler,
@@ -40,7 +42,7 @@ use super::{
     progress,
     schedule::{AudioSource, ScheduleState, Step, StepPlan},
     speech::{SpeechComponents, SpeechOutput},
-    state::{NeuralStateParts, StateBranch},
+    state::StateBranch,
     tts_conditioning::CharacterMapping,
     tts_feedback::OutputPolicy,
     tts_ingress::{PromptLayout, SpeakerPrompt},
@@ -244,9 +246,9 @@ impl<
         >,
         D::RandomState: Clone,
         D::Error: std::error::Error + Send + Sync + 'static,
-        N: NeuralStateParts,
-        X: CausalTransformerExecution<B, N::TtsState>,
-        R: BackboneExecution<B, N::Backbone>,
+        N: RealtimeJointStateParts,
+        X: CausalTransformerExecution<B, N::Right>,
+        R: BackboneExecution<B, N::Left>,
         R::Error: std::error::Error + Send + Sync + 'static,
     {
         if branch.has_submission_completion() {
@@ -435,9 +437,9 @@ impl<
         >,
         D::RandomState: Clone,
         D::Error: std::error::Error + Send + Sync + 'static,
-        N: NeuralStateParts,
-        X: CausalTransformerExecution<B, N::TtsState>,
-        R: BackboneExecution<B, N::Backbone>,
+        N: RealtimeJointStateParts,
+        X: CausalTransformerExecution<B, N::Right>,
+        R: BackboneExecution<B, N::Left>,
         R::Error: std::error::Error + Send + Sync + 'static,
     {
         let local = self.preflight::<D, N, P, C>(invocation, branch, coordination.as_deref());

@@ -370,7 +370,7 @@ pub fn load(
     let (weights, execution) = execution_contexts(device)?;
     match prepared.load(&weights, &execution)? {
         LoadedMlxRealtime::Speech(session) => Ok(session),
-        LoadedMlxRealtime::Categorical { .. } | LoadedMlxRealtime::Lfm3Audio(_) => {
+        LoadedMlxRealtime::Categorical { .. } => {
             anyhow::bail!("this WAV conversation command requires a VoiceChat artifact")
         }
     }

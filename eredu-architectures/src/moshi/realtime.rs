@@ -32,7 +32,7 @@ use super::{
 };
 
 /// Derives portable input validation from normalized Moshi architecture policy.
-pub fn realtime_ingress_contract(
+fn realtime_ingress_contract(
     config: &MoshiConfig,
 ) -> Result<eredu_runtime::RealtimeIngressContract, String> {
     let boundary = DecisionBoundary::new(config).map_err(|error| error.to_string())?;
@@ -68,7 +68,7 @@ pub fn realtime_frame_contract(
 /// The architecture owns prediction cardinality and ordering: one text
 /// decision followed by every depth-transformer audio decision. Concrete
 /// backends supply only sampling and random-number mechanisms.
-pub fn realtime_generation_samplers(
+fn realtime_generation_samplers(
     schedule: &RealtimeSpeechConfig,
     sampling: RealtimeSampling,
 ) -> Result<Vec<GenerationSampler>, MoshiRealtimeSamplingError> {
@@ -93,7 +93,7 @@ pub fn realtime_generation_samplers(
 /// Declares the exact schedule identity and text-plus-depth sampler cardinality.
 /// Native composition retains this architecture contract without deriving its
 /// decision ordering or count from backend resources.
-pub fn realtime_generation_contract(
+fn realtime_generation_contract(
     schedule: &RealtimeSpeechConfig,
 ) -> eredu_runtime::RealtimeGenerationContract<RealtimeSpeechConfig> {
     eredu_runtime::RealtimeGenerationContract::new(
@@ -106,7 +106,7 @@ pub fn realtime_generation_contract(
 ///
 /// The neutral sequential driver still disables the optimization whenever
 /// diagnostics are requested or any remaining target is sampled/existing.
-pub const fn realtime_decision_execution() -> RealtimeDecisionExecution {
+const fn realtime_decision_execution() -> RealtimeDecisionExecution {
     RealtimeDecisionExecution::new(true)
 }
 
@@ -122,7 +122,7 @@ pub enum MoshiRealtimeSamplingError {
 }
 
 /// Typed Moshi layered architecture admitted to the realtime decision slice.
-pub trait MoshiRealtimeExecutionArchitecture<B, S>:
+pub(super) trait MoshiRealtimeExecutionArchitecture<B, S>:
     'static
     + for<'a> eredu_runtime::LayeredArchitecture<
         B,
@@ -162,118 +162,12 @@ where
     }
 }
 
-/// Architecture-owned bridge from a prepared frame to detached Moshi execution.
-pub struct MoshiPreparedRealtimeFrameExecutor<A, B, M, O = eredu_runtime::NoopObserver>
-where
-    B: eredu_runtime::SubmissionBackend<
-        Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context,
-    >,
-    M: eredu_runtime::RealtimeModelConstructionMechanisms<A, B>,
-    A: eredu_runtime::LayeredArchitecture<B, M::State>,
-{
-    execution: eredu_runtime::ConstructedRealtimeExecution<A, B, M>,
-    observer: O,
-}
-
-impl<A, B, M> MoshiPreparedRealtimeFrameExecutor<A, B, M, eredu_runtime::NoopObserver>
-where
-    B: eredu_runtime::SubmissionBackend<
-        Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context,
-    >,
-    M: eredu_runtime::RealtimeModelConstructionMechanisms<A, B>,
-    A: eredu_runtime::LayeredArchitecture<B, M::State>,
-{
-    /// Adopts one selected and fully constructed detached execution.
-    pub const fn new(execution: eredu_runtime::ConstructedRealtimeExecution<A, B, M>) -> Self {
-        Self {
-            execution,
-            observer: eredu_runtime::NoopObserver,
-        }
-    }
-}
-
-impl<A, B, M, O> MoshiPreparedRealtimeFrameExecutor<A, B, M, O>
-where
-    B: eredu_runtime::SubmissionBackend<
-        Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context,
-    >,
-    M: eredu_runtime::RealtimeModelConstructionMechanisms<A, B>,
-    A: eredu_runtime::LayeredArchitecture<B, M::State>,
-{
-    /// Adopts selected execution with one statically dispatched observer.
-    pub const fn with_observer(
-        execution: eredu_runtime::ConstructedRealtimeExecution<A, B, M>,
-        observer: O,
-    ) -> Self {
-        Self {
-            execution,
-            observer,
-        }
-    }
-
-    /// Borrows the detached selected execution.
-    pub const fn execution(&self) -> &eredu_runtime::ConstructedRealtimeExecution<A, B, M> {
-        &self.execution
-    }
-
-    /// Recovers the detached execution and its construction mechanisms.
-    pub fn into_execution(self) -> eredu_runtime::ConstructedRealtimeExecution<A, B, M> {
-        self.execution
-    }
-}
-
-impl<A, B, M, O, SB, S, T> eredu_runtime::PreparedRealtimeFrameExecutor<SB, S, T>
-    for MoshiPreparedRealtimeFrameExecutor<A, B, M, O>
-where
-    B: eredu_runtime::SubmissionBackend<
-            Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context,
-        > + DistributedNeuralBackend,
-    SB: eredu_runtime::SamplingBackend<
-        Logits = <B as NeuralBackend>::Tensor,
-        Token = <B as NeuralBackend>::Tensor,
-        Context = <<B as NeuralBackend>::Tensor as Tensor>::Context,
-    >,
-    A: MoshiRealtimeExecutionArchitecture<B, M::State> + 'static,
-    M: eredu_runtime::RealtimeModelConstructionMechanisms<A, B>,
-    M::State: eredu_runtime::LayerRuntimeState<B> + ResettableRuntimeState<B>,
-    <M::State as eredu_runtime::LayerRuntimeState<B>>::LayerState:
-        eredu_nn::AttentionCache<<B as NeuralBackend>::Tensor>,
-    M::PolicyError: std::fmt::Display,
-    SB::Error: std::fmt::Display,
-    S: eredu_runtime::Sampler<SB>,
-    T: std::ops::DerefMut<Target = M::State>,
-    O: ActivationObserver<<B as NeuralBackend>::Tensor, eredu_nn::Error>,
-{
-    type Error = MoshiRealtimeExecutionError<M::PolicyError>;
-    type Retained = (
-        <B as NeuralBackend>::Tensor,
-        super::ForwardContext<<B as NeuralBackend>::Tensor>,
-    );
-
-    fn execute(
-        &mut self,
-        model_state: &mut T,
-        temporal: &[<B as NeuralBackend>::Tensor],
-        driver: &mut eredu_runtime::SequentialDecisionDriver<SB, S>,
-        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
-    ) -> Result<Self::Retained, Self::Error> {
-        execute_detached_replicated_moshi_realtime_with_observer(
-            &mut self.execution,
-            &mut **model_state,
-            temporal,
-            driver,
-            context,
-            &mut self.observer,
-        )
-    }
-}
-
 /// Runs one prepared replicated temporal token list through detached execution.
 ///
 /// The list is canonical text-first followed by every temporal audio codebook.
 /// Schedule advancement, delayed history, and output publication remain outside
 /// this architecture execution slice.
-pub fn execute_detached_replicated_moshi_realtime<A, B, M, SB, S>(
+pub(super) fn execute_detached_replicated_moshi_realtime<A, B, M, SB, S>(
     constructed: &mut eredu_runtime::ConstructedRealtimeExecution<A, B, M>,
     state: &mut M::State,
     temporal: &[B::Tensor],
@@ -317,7 +211,7 @@ where
 /// Each optional replacement is installed before the next layer, decision, or
 /// completion consumes it. The caller retains publication authority over the
 /// model-state branch if observation fails.
-pub fn execute_detached_replicated_moshi_realtime_with_observer<A, B, M, SB, S, O>(
+fn execute_detached_replicated_moshi_realtime_with_observer<A, B, M, SB, S, O>(
     constructed: &mut eredu_runtime::ConstructedRealtimeExecution<A, B, M>,
     state: &mut M::State,
     temporal: &[B::Tensor],
@@ -474,7 +368,20 @@ where
 /// Runs one prepared temporal token list through an architecture-selected
 /// pure tensor-parallel traversal.
 #[allow(clippy::type_complexity)]
-pub fn execute_detached_partitioned_moshi_realtime<A, B, State, Policy, G, R, I, T, U, V, SB, S>(
+pub(super) fn execute_detached_partitioned_moshi_realtime<
+    A,
+    B,
+    State,
+    Policy,
+    G,
+    R,
+    I,
+    T,
+    U,
+    V,
+    SB,
+    S,
+>(
     runtime: &mut eredu_runtime::LayerwiseTraversalRuntime<
         eredu_runtime::LayerwiseRuntime<A, B, State, Policy>,
         Box<
@@ -556,44 +463,9 @@ where
         })
 }
 
-/// Runs one prepared temporal token list through a combined constructed model.
-///
-/// New orchestration should split construction and retain mutable state in its
-/// transaction owner, then call [`execute_detached_replicated_moshi_realtime`].
-pub fn execute_replicated_moshi_realtime<A, B, M, SB, S>(
-    model: &mut eredu_runtime::ConstructedRealtimeModel<A, B, M>,
-    temporal: &[B::Tensor],
-    driver: &mut eredu_runtime::SequentialDecisionDriver<SB, S>,
-    context: &<B::Tensor as Tensor>::Context,
-) -> Result<
-    (B::Tensor, super::ForwardContext<B::Tensor>),
-    MoshiRealtimeExecutionError<M::PolicyError>,
->
-where
-    B: eredu_runtime::SubmissionBackend<
-            Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context,
-        > + DistributedNeuralBackend,
-    A: MoshiRealtimeExecutionArchitecture<B, M::State> + 'static,
-    M: eredu_runtime::RealtimeModelConstructionMechanisms<A, B>,
-    M::State: eredu_runtime::LayerRuntimeState<B> + ResettableRuntimeState<B>,
-    <M::State as eredu_runtime::LayerRuntimeState<B>>::LayerState:
-        eredu_nn::AttentionCache<B::Tensor>,
-    M::PolicyError: std::fmt::Display,
-    SB: eredu_runtime::SamplingBackend<
-        Logits = B::Tensor,
-        Token = B::Tensor,
-        Context = <B::Tensor as Tensor>::Context,
-    >,
-    SB::Error: std::fmt::Display,
-    S: eredu_runtime::Sampler<SB>,
-{
-    let (constructed, state) = model.constructed_execution_and_state_mut();
-    execute_detached_replicated_moshi_realtime(constructed, state, temporal, driver, context)
-}
-
 /// Failure while running one already-prepared Moshi temporal execution slice.
 #[derive(Debug, thiserror::Error)]
-pub enum MoshiRealtimeExecutionError<P: std::fmt::Display> {
+pub(super) enum MoshiRealtimeExecutionError<P: std::fmt::Display> {
     /// The prepared token list did not contain text plus every audio codebook.
     #[error("Moshi temporal token count is {actual}, expected {expected}")]
     TemporalCardinality {
@@ -717,21 +589,9 @@ pub struct PreparedMoshiRealtime {
 
 /// Exact executable and transforming quantization selected for Moshi weights.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub struct MoshiWeightLoweringSummary {
+struct MoshiWeightLoweringSummary {
     transform: Option<WeightQuantization>,
     target: Option<WeightQuantization>,
-}
-
-impl MoshiWeightLoweringSummary {
-    /// Quantization applied while transforming source weights, when selected.
-    pub const fn transform(self) -> Option<WeightQuantization> {
-        self.transform
-    }
-
-    /// Quantization format consumed by the executable target, when selected.
-    pub const fn target(self) -> Option<WeightQuantization> {
-        self.target
-    }
 }
 
 /// Selected Moshi execution inseparably paired with its exact neutral source handoff.
@@ -759,88 +619,6 @@ impl PreparedMoshiRealtimeSource {
     ) -> Result<ArtifactIdentity, std::sync::Arc<eredu_core::artifact::ArtifactError>> {
         self.artifact_identity.resolve()
     }
-
-    /// Shares the pending identity without initiating payload reads.
-    pub fn deferred_artifact_identity(&self) -> DeferredArtifactIdentity {
-        self.artifact_identity.clone()
-    }
-
-    /// Neutral reduction of all admitted weight lowerings.
-    pub const fn lowering(&self) -> MoshiWeightLoweringSummary {
-        self.lowering
-    }
-
-    /// Consumes the handoff inside the architecture-owned typed dispatch.
-    fn into_parts(
-        self,
-    ) -> (
-        PreparedMoshiRealtime,
-        SharedCheckpointSource,
-        DeferredArtifactIdentity,
-        MoshiWeightLoweringSummary,
-    ) {
-        (
-            self.selected,
-            self.source,
-            self.artifact_identity,
-            self.lowering,
-        )
-    }
-
-    /// Builds a synthetic handoff for the backend-neutral reference harness.
-    ///
-    /// This API is absent from optimized production builds. It still validates
-    /// the complete selected metadata contract before allowing typed dispatch.
-    #[cfg(debug_assertions)]
-    pub fn from_reference_source(
-        selected: PreparedMoshiRealtime,
-        source: SharedCheckpointSource,
-    ) -> Result<Self, MoshiRealtimeSourceError> {
-        validate_store_metadata(&selected, source.as_ref())
-            .map_err(MoshiRealtimeSourceError::Source)?;
-        let artifact_identity =
-            DeferredArtifactIdentity::ready(reference_source_contract_identity(source.as_ref())?);
-        let lowering = selected_moshi_lowering_summary(selected.selected())?;
-        Ok(Self {
-            selected,
-            source,
-            artifact_identity,
-            lowering,
-        })
-    }
-}
-
-/// Produces an unswappable identity for a metadata-only reference source.
-///
-/// Reference sources deliberately have no readable payload. Their complete
-/// observable content is the validated catalog and provenance contract, which
-/// is therefore the exact identity domain for this debug-only harness path.
-#[cfg(debug_assertions)]
-fn reference_source_contract_identity(
-    source: &dyn eredu_checkpoint::store::CheckpointSource,
-) -> Result<ArtifactIdentity, MoshiRealtimeSourceError> {
-    use sha2::Digest as _;
-
-    let mut keys = source.source_keys();
-    keys.sort();
-    let mut hasher = sha2::Sha256::new();
-    for key in &keys {
-        let metadata = source.source_metadata(key)?;
-        let provenance = source.source_provenance(key)?;
-        let fact = format!("{key:?}\0{metadata:?}\0{provenance:?}\0");
-        hasher.update((fact.len() as u64).to_le_bytes());
-        hasher.update(fact.as_bytes());
-    }
-    let digest = hasher.finalize().into();
-    eredu_core::artifact::fingerprint_artifact(
-        "eredu.reference-moshi-source-contract.v1",
-        [eredu_core::artifact::ArtifactMemberIdentity::new(
-            "validated-catalog-and-provenance",
-            u64::try_from(keys.len()).unwrap_or(u64::MAX),
-            digest,
-        )],
-    )
-    .map_err(MoshiRealtimeSourceError::Artifact)
 }
 
 /// Failure while preparing the final neutral Moshi source handoff.
@@ -894,6 +672,33 @@ impl MoshiRealtimeExecutionDescriptor {
     }
 }
 
+/// Initial categorical generation for one selected Moshi execution.
+pub type MoshiRealtimeGeneration<S, T, R, C> = eredu_runtime::RealtimeGenerationState<
+    eredu_runtime::RealtimePayloadState<S, T>,
+    eredu_core::RealtimeFrameScheduleState,
+    RealtimeSampling,
+    GenerationSampler,
+    R,
+    C,
+>;
+
+/// Failure while constructing a fresh Moshi generation transaction.
+#[derive(Debug, thiserror::Error)]
+pub enum MoshiRealtimeStartupError {
+    /// Sampling policy cannot be represented for the selected schedule.
+    #[error(transparent)]
+    Sampling(#[from] MoshiRealtimeSamplingError),
+    /// The selected architecture cannot describe its categorical ingress.
+    #[error("invalid Moshi realtime ingress: {0}")]
+    Ingress(String),
+    /// Selected native state or RNG could not be realized.
+    #[error(transparent)]
+    Backend(#[from] eredu_core::BackendFailure),
+    /// The ordinary generation transaction rejected its initial state.
+    #[error(transparent)]
+    Generation(#[from] eredu_runtime::RealtimeGenerationTransactionError),
+}
+
 impl<E> MoshiRealtimeExecution<E> {
     /// Admitted source artifact configuration.
     pub const fn source_config(&self) -> &MoshiConfig {
@@ -910,81 +715,87 @@ impl<E> MoshiRealtimeExecution<E> {
         &self.selected
     }
 
+    /// Prepares the portable frame contract, decision controls and host projection.
+    pub fn prepare_frame(
+        &self,
+    ) -> Result<eredu_runtime::RealtimeFramePlan<super::MoshiRealtimeOutputProjection>, String>
+    {
+        let ingress = realtime_ingress_contract(&self.execution_config)?;
+        let projection = super::MoshiRealtimeOutputProjection::new(&ingress);
+        Ok(eredu_runtime::RealtimeFramePlan::new(
+            ingress,
+            realtime_decision_execution(),
+            projection,
+        ))
+    }
+
+    /// Constructs request-local state using the exact selected storage and sampling.
+    pub fn initialize_generation<S, T, M>(
+        &self,
+        mechanisms: &M,
+        sampling: RealtimeSampling,
+    ) -> Result<MoshiRealtimeGeneration<S, T, M::Random, M::Completion>, MoshiRealtimeStartupError>
+    where
+        S: eredu_core::scheduler::SemanticStateTransaction,
+        S::Error: Send + Sync + 'static,
+        T: Clone,
+        M: eredu_runtime::RealtimeStartupMechanisms
+            + eredu_runtime::RealtimeStateMaterializer<
+                eredu_runtime::SelectedRealtimeStateRealization,
+                S,
+            >,
+    {
+        let schedule = self.execution_config.frame_schedule();
+        let samplers = realtime_generation_samplers(schedule, sampling)?;
+        let channels = realtime_ingress_contract(&self.execution_config)
+            .map_err(MoshiRealtimeStartupError::Ingress)?
+            .channels()
+            .clone();
+        let model = mechanisms.realize_state(self.selected.state())?;
+        let random = sampling
+            .is_stochastic()
+            .then(|| mechanisms.realize_random(sampling.seed()))
+            .transpose()?;
+        Ok(eredu_runtime::RealtimeGenerationState::new(
+            eredu_runtime::RealtimePayloadState::fresh(model, channels),
+            realtime_generation_contract(schedule),
+            eredu_core::RealtimeFrameScheduleState::new(schedule.clone()),
+            sampling,
+            samplers,
+            random,
+        )?)
+    }
+
     /// Borrows the materialized backend mechanism bundle.
     pub const fn executor(&self) -> &E {
         &self.executor
     }
-
-    /// Mutably borrows the materialized backend mechanism bundle.
-    pub fn executor_mut(&mut self) -> &mut E {
-        &mut self.executor
-    }
-
-    /// Consumes the architecture wrapper into its mechanism bundle.
-    pub fn into_executor(self) -> E {
-        self.executor
-    }
 }
 
 /// Typed architecture handoff produced only after exact realtime selection.
-pub struct PreparedMoshiRealtimeArchitecture<A> {
-    architecture: Option<A>,
+pub(super) struct PreparedMoshiRealtimeArchitecture<A, T> {
+    architecture: A,
     source_architecture: Option<A>,
-    contract: Option<PreparedRealtimeModelContract>,
-    parallel: Option<MoshiParallelSelection>,
+    contract: PreparedRealtimeModelContract,
+    parallel: Option<(MoshiParallelSelection, T)>,
 }
 
-impl<A> PreparedMoshiRealtimeArchitecture<A> {
-    /// Takes the selected execution-format architecture exactly once.
-    pub fn take_architecture(&mut self) -> A {
-        self.architecture
-            .take()
-            .expect("realtime architecture already taken")
-    }
-
-    /// Takes the source-format architecture required by a selected transform.
-    pub fn take_source_architecture(&mut self) -> Option<A> {
-        self.source_architecture.take()
-    }
-
-    /// Takes the validated neutral construction contract exactly once.
-    pub fn take_contract(&mut self) -> PreparedRealtimeModelContract {
-        self.contract
-            .take()
-            .expect("realtime model contract already taken")
-    }
-
-    /// Takes the architecture-selected rank-local pure-TP execution plan.
-    pub fn take_parallel(&mut self) -> Option<MoshiParallelSelection> {
-        self.parallel.take()
-    }
-}
-
-/// Family-blind visitor for one selected replicated realtime architecture.
-pub trait MoshiRealtimeArchitectureVisitor<B, S>: Sized
-where
-    B: NeuralBackend + DistributedNeuralBackend,
-    S: RuntimeState<B>,
-{
-    /// Completed construction output.
-    type Output;
-    /// Generic mechanism-binding failure.
-    type Error;
-
-    /// Records the exact point at which backend module construction may begin.
-    fn construction_started(&mut self) {}
-
-    /// Receives an opaque layered architecture and exact materialization work.
-    fn visit<A>(
+impl<A, T> PreparedMoshiRealtimeArchitecture<A, T> {
+    pub(super) fn into_construction_parts(
         self,
-        prepared: PreparedMoshiRealtimeArchitecture<A>,
-        store: eredu_checkpoint::store::SharedCheckpointSource,
-    ) -> Result<Self::Output, Self::Error>
-    where
-        A: MoshiRealtimeExecutionArchitecture<B, S>
-            + eredu_runtime::RealtimeArchitectureIdentity
-            + 'static,
-        A::Error: std::fmt::Display;
+    ) -> (
+        A,
+        Option<A>,
+        PreparedRealtimeModelContract,
+        Option<(MoshiParallelSelection, T)>,
+    ) {
+        (
+            self.architecture,
+            self.source_architecture,
+            self.contract,
+            self.parallel,
+        )
+    }
 }
 
 /// Failure before or during the selected architecture/mechanism handoff.
@@ -994,7 +805,7 @@ pub enum MoshiRealtimeDispatchError<E> {
     /// Selected structure, store metadata, or module construction was invalid.
     #[error("Moshi realtime architecture construction failed: {0}")]
     Architecture(String),
-    /// The family-blind mechanism visitor rejected the prepared architecture.
+    /// The native mechanisms could not realize the selected construction.
     #[error("realtime mechanism binding failed: {0}")]
     Mechanism(E),
 }
@@ -1174,21 +985,48 @@ pub fn select_inspected_moshi_realtime(
     })
 }
 
-/// Selects Moshi or PersonaPlex execution before any backend construction.
-pub fn select_moshi_realtime(
+/// Selects categorical execution using side-effect-free native capability facts.
+pub fn select_moshi_realtime_with_support(
     preparation: MoshiPreparationPlan,
-    request: MoshiRealtimeRequest,
-    capabilities: &RealtimeMechanismCapabilities,
+    request: &NormalizedLoadRequest,
+    support: &impl eredu_runtime::RealtimeMechanismSupport,
 ) -> Result<PreparedMoshiRealtime, MoshiRealtimeSelectionError> {
+    let request = moshi_realtime_request_from_normalized(
+        request,
+        RealtimeObservationRequirements::new(true, []),
+    )?;
     let inspected = inspect_moshi_realtime(preparation, request)?;
-    select_inspected_moshi_realtime(inspected, capabilities)
+    let capabilities =
+        eredu_runtime::synthesize_realtime_capabilities(inspected.requirements(), support);
+    select_inspected_moshi_realtime(inspected, &capabilities)
 }
 
-/// Opens and validates the exact source selected for one Moshi realization.
+/// Cold categorical selection or preparation of its exact checkpoint source.
+#[derive(Debug, thiserror::Error)]
+pub enum MoshiRealtimePreparationError {
+    /// The portable request cannot be selected with the reported support.
+    #[error(transparent)]
+    Selection(#[from] MoshiRealtimeSelectionError),
+    /// The selected source could not be retained.
+    #[error(transparent)]
+    Source(#[from] MoshiRealtimeSourceError),
+}
+
+/// Selects and retains the exact categorical plan and checkpoint source.
+pub fn prepare_moshi_realtime_with_support(
+    preparation: MoshiPreparationPlan,
+    request: &NormalizedLoadRequest,
+    support: &impl eredu_runtime::RealtimeMechanismSupport,
+) -> Result<PreparedMoshiRealtimeSource, MoshiRealtimePreparationError> {
+    let selected = select_moshi_realtime_with_support(preparation, request, support)?;
+    Ok(prepare_selected_moshi_realtime_source(selected)?)
+}
+
+// Opens and validates the exact source selected for one Moshi realization.
 ///
 /// Selection remains header-only. This handoff pins sources and constructs their caches;
 /// content fingerprinting remains deferred until an identity consumer requests it.
-pub fn prepare_selected_moshi_realtime_source(
+fn prepare_selected_moshi_realtime_source(
     selected: PreparedMoshiRealtime,
 ) -> Result<PreparedMoshiRealtimeSource, MoshiRealtimeSourceError> {
     let shards = selected
@@ -1219,7 +1057,7 @@ pub fn prepare_selected_moshi_realtime_source(
 }
 
 /// Reduces exact selected Moshi lowering work into backend materialization inputs.
-pub fn selected_moshi_lowering_summary(
+fn selected_moshi_lowering_summary(
     selected: &SelectedRealtimeRealization,
 ) -> Result<MoshiWeightLoweringSummary, MoshiRealtimeSourceError> {
     if selected.weight_lowerings().is_empty() {
@@ -1266,86 +1104,136 @@ pub fn selected_moshi_lowering_summary(
     Ok(MoshiWeightLoweringSummary { transform, target })
 }
 
-/// Constructs and visits one selected Moshi-family architecture.
-///
-/// Store validation and task assembly inspect metadata only. The visitor is
-/// the first code allowed to materialize checkpoint payloads.
-pub fn visit_selected_moshi_realtime_architecture<B, S, V>(
-    prepared_source: PreparedMoshiRealtimeSource,
-    context: &<B::Tensor as Tensor>::Context,
-    mut visitor: V,
-) -> Result<V::Output, MoshiRealtimeDispatchError<V::Error>>
+/// Constructs the selected Moshi-family executor from the retained source.
+/// Store validation inspects metadata before transport and materialization.
+impl<B, S, M> eredu_runtime::PreparedRealtimeBinding<B, S, M> for PreparedMoshiRealtimeSource
 where
-    B: NeuralBackend + DistributedNeuralBackend,
-    S: eredu_runtime::LayerRuntimeState<B> + ResettableRuntimeState<B>,
+    B: eredu_runtime::CommunicationBackend<
+            Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context,
+        > + DistributedNeuralBackend,
+    B::ParallelContext: Sized,
+    B::Tensor: 'static,
+    S: eredu_runtime::LayerRuntimeState<B> + ResettableRuntimeState<B> + 'static,
     S::LayerState: eredu_nn::AttentionCache<B::Tensor>,
-    V: MoshiRealtimeArchitectureVisitor<B, S>,
+    M: eredu_runtime::RealtimeBindingMechanisms<B, S>,
+    <M::Sampling as eredu_runtime::SamplingBackend>::Error: std::fmt::Display,
+    M::Group: 'static,
+    M::Route: 'static,
+    M::TensorMetadata: 'static,
 {
-    let (prepared, store, _artifact_identity, _lowering) = prepared_source.into_parts();
-    validate_store_metadata(&prepared, store.as_ref())
-        .map_err(MoshiRealtimeDispatchError::Architecture)?;
-    let (
-        _preparation,
-        _execution_config,
-        source_parameters,
-        execution_parameters,
-        parallel,
-        contract,
-    ) = prepared.into_parts();
-    let selected = contract.selected();
-    if selected.topology().is_replicated() != parallel.is_none() {
-        return Err(MoshiRealtimeDispatchError::Architecture(
-            "Moshi realtime topology and rank-local parallel plan differ".into(),
-        ));
-    }
-    let transforms = selected
-        .weight_lowerings()
-        .iter()
-        .any(|lowering| lowering.kind().transforms_payload());
+    type Execution = MoshiRealtimeExecution<M::Execution>;
+    type Error = MoshiRealtimeDispatchError<M::Error>;
 
-    visitor.construction_started();
-    let source_architecture = transforms
-        .then(|| {
-            super::MoshiKernel::<B>::from_prepared(
-                source_parameters.clone(),
-                source_parameters.retained_definition(),
+    fn realization(&self) -> &SelectedRealtimeRealization {
+        self.selected().selected()
+    }
+
+    fn bind(self, mechanisms: &M) -> Result<Self::Execution, Self::Error> {
+        let context = mechanisms.context();
+        let descriptor = self.selected().execution_descriptor();
+        let model_type = self
+            .selected()
+            .execution_config()
+            .effective_model_type()
+            .as_str()
+            .to_owned();
+        let Self {
+            selected: prepared,
+            source: store,
+            lowering,
+            ..
+        } = self;
+        validate_store_metadata(&prepared, store.as_ref())
+            .map_err(MoshiRealtimeDispatchError::Architecture)?;
+        let (
+            _preparation,
+            _execution_config,
+            source_parameters,
+            execution_parameters,
+            parallel,
+            contract,
+        ) = prepared.into_parts();
+        let selected = contract.selected();
+        let residency = selected.residency();
+        if selected.topology().is_replicated() != parallel.is_none() {
+            return Err(MoshiRealtimeDispatchError::Architecture(
+                "Moshi realtime topology and rank-local parallel plan differ".into(),
+            ));
+        }
+        let transforms = selected
+            .weight_lowerings()
+            .iter()
+            .any(|lowering| lowering.kind().transforms_payload());
+
+        let parallel = parallel
+            .map(|plan| {
+                if plan.layout().is_empty() {
+                    return Err(MoshiRealtimeDispatchError::Architecture(
+                        "selected Moshi tensor-parallel layout is empty".into(),
+                    ));
+                }
+                let resources = mechanisms
+                    .realize_tensor(plan.communication().clone(), plan.tensor_group())
+                    .map_err(MoshiRealtimeDispatchError::Mechanism)?;
+                Ok((plan, resources))
+            })
+            .transpose()?;
+
+        let source_architecture = transforms
+            .then(|| {
+                super::MoshiKernel::<B>::from_prepared(
+                    source_parameters.clone(),
+                    source_parameters.retained_definition(),
+                    None,
+                    None,
+                    context,
+                )
+                .and_then(super::MoshiKernel::into_model)
+            })
+            .transpose()
+            .map_err(|error| MoshiRealtimeDispatchError::Architecture(error.to_string()))?;
+        let architecture = match parallel.as_ref() {
+            Some((parallel, _)) => super::MoshiKernel::<B>::from_prepared(
+                execution_parameters.clone(),
+                parallel.retained_definition(),
+                Some(parallel.geometry().clone()),
+                Some(parallel.execution_identity().to_owned()),
+                context,
+            ),
+            None => super::MoshiKernel::<B>::from_prepared(
+                execution_parameters.clone(),
+                execution_parameters.retained_definition(),
                 None,
                 None,
                 context,
-            )
-            .and_then(super::MoshiKernel::into_model)
-        })
-        .transpose()
+            ),
+        }
+        .and_then(super::MoshiKernel::into_model)
         .map_err(|error| MoshiRealtimeDispatchError::Architecture(error.to_string()))?;
-    let architecture = match parallel.as_ref() {
-        Some(parallel) => super::MoshiKernel::<B>::from_prepared(
-            execution_parameters.clone(),
-            parallel.retained_definition(),
-            Some(parallel.geometry().clone()),
-            Some(parallel.execution_identity().to_owned()),
+        let prepared = PreparedMoshiRealtimeArchitecture {
+            architecture,
+            source_architecture,
+            contract,
+            parallel,
+        };
+        let (executor, mut metadata) = prepared.construct(
             context,
-        ),
-        None => super::MoshiKernel::<B>::from_prepared(
-            execution_parameters.clone(),
-            execution_parameters.retained_definition(),
-            None,
-            None,
-            context,
-        ),
-    }
-    .and_then(super::MoshiKernel::into_model)
-    .map_err(|error| MoshiRealtimeDispatchError::Architecture(error.to_string()))?;
-    visitor
-        .visit(
-            PreparedMoshiRealtimeArchitecture {
-                architecture: Some(architecture),
-                source_architecture,
-                contract: Some(contract),
-                parallel,
+            |layout| {
+                mechanisms.materializer::<super::LayeredModel<B>>(
+                    store.clone(),
+                    residency,
+                    lowering.transform,
+                    layout,
+                )
             },
-            store,
-        )
-        .map_err(MoshiRealtimeDispatchError::Mechanism)
+            |materializer| {
+                mechanisms.materialization_metadata::<super::LayeredModel<B>>(materializer)
+            },
+        )?;
+        metadata.set_effective_model_type(model_type);
+        metadata.set_quantization(lowering.target);
+        Ok(descriptor.bind(mechanisms.bind_executor(executor, metadata, store)))
+    }
 }
 
 fn validate_store_metadata(

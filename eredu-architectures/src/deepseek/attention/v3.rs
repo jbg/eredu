@@ -95,7 +95,7 @@ impl<B: BlockwiseAttentionBackend> Attention<B> {
             kv_norm: B::normalization(spec.kv_norm, context)?,
             kv_b: B::linear(spec.kv_b, context)?,
             output: B::linear(spec.output, context)?,
-            rotary: B::rotary(spec.rotary, context)?,
+            rotary: B::rotary(spec.rotary.prepare()?, context)?,
         })
     }
 

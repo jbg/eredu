@@ -233,7 +233,7 @@ impl<B: NeuralBackend> TtsIngress<B> {
             conditioning,
             guidance,
             context,
-            Ok,
+            |local| local,
         )
     }
 
@@ -249,23 +249,29 @@ impl<B: NeuralBackend> TtsIngress<B> {
         gather: F,
     ) -> Result<ConditioningLanes<B::Tensor>, TtsError>
     where
-        F: FnOnce(B::Tensor) -> Result<B::Tensor, TtsError>,
+        F: FnOnce(Result<B::Tensor, TtsError>) -> Result<B::Tensor, TtsError>,
     {
-        validate_embedded(embedded, self.hidden, conditioning)?;
-        if embedded.shape()[..2] != [layout.batch, layout.frames]
-            || (matches!(speaker, SpeakerPrompt::Aria) && layout.frames != self.speaker_frames)
-        {
-            return Err(TtsError::Shape(
-                "speaker prompt and embedded feedback geometry disagree",
-            ));
-        }
-        super::precision::require_float32(&self.bos, embedded).map_err(TtsError::Shape)?;
+        let validate = || {
+            validate_embedded(embedded, self.hidden, conditioning)?;
+            if embedded.shape()[..2] != [layout.batch, layout.frames]
+                || (matches!(speaker, SpeakerPrompt::Aria) && layout.frames != self.speaker_frames)
+            {
+                return Err(TtsError::Shape(
+                    "speaker prompt and embedded feedback geometry disagree",
+                ));
+            }
+            super::precision::require_float32(&self.bos, embedded).map_err(TtsError::Shape)?;
+            Ok::<_, TtsError>(())
+        };
         let prompt = match speaker {
             SpeakerPrompt::Aria => {
+                validate()?;
                 super::precision::require_float32(&self.aria, embedded).map_err(TtsError::Shape)?;
                 self.aria.as_ref().clone()
             }
-            SpeakerPrompt::ProjectedCodes => gather(self.project_prompt(embedded, context)?)?,
+            SpeakerPrompt::ProjectedCodes => {
+                gather(validate().and_then(|()| self.project_prompt(embedded, context)))?
+            }
         };
         let shape = [layout.batch, layout.frames, 1];
         let before_bos = B::Tensor::from_i32_slice(&layout.before_bos, &shape, context)?

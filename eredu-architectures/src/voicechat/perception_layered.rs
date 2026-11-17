@@ -644,12 +644,12 @@ impl<B: NeuralBackend> ComponentEquations<B, PerceptionRuntimeState<B::Tensor>>
         &mut self,
         group: usize,
         initial: &B::Tensor,
-        dependencies: &[&B::Tensor],
+        dependencies: &eredu_runtime::GroupDependencies<'_, B::Tensor>,
         _: &mut PerceptionRuntimeState<B::Tensor>,
         forward: &mut Self::ForwardContext,
         _: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, PerceptionError> {
-        let hidden = dependencies.first().copied().unwrap_or(initial);
+        let hidden = dependencies.only().unwrap_or(initial);
         if group == 2 {
             forward.encoder = Some(hidden.clone());
         }
@@ -884,72 +884,87 @@ where
                 &mut state,
                 context,
             )
-            .map_err(|error| match error {
-                eredu_runtime::LayerwiseRuntimeError::Architecture(error) => error,
-                eredu_runtime::LayerwiseRuntimeError::State(error) => error.into(),
-                eredu_runtime::LayerwiseRuntimeError::Layout(error) => error.into(),
-                eredu_runtime::LayerwiseRuntimeError::Policy(error) => backend(error),
-                error @ eredu_runtime::LayerwiseRuntimeError::Submission(_) => backend(error),
-            })?;
+            .map_err(runtime_error)?;
         output(projected, forward, state)
     }
 }
 
-/// Selected tensor-parallel perception with caller-owned complete-cache parents.
-/// The retained native mechanisms determine admitted rank-local construction.
-pub trait ParallelPerceptionExecution<B: NeuralBackend>: PerceptionExecution<B> {
-    /// Returns raw encoder features, language projections and unpublished candidate caches.
-    fn forward_parallel(
-        &mut self,
-        mel: &B::Tensor,
-        drop_preencoded: usize,
-        previous: &PerceptionState<B::Tensor>,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<PerceptionOutput<B::Tensor>, PerceptionError>;
+fn runtime_error<P: std::error::Error + Send + Sync + 'static>(
+    error: eredu_runtime::LayerwiseRuntimeError<PerceptionError, P>,
+) -> PerceptionError {
+    match error {
+        eredu_runtime::LayerwiseRuntimeError::Architecture(error) => error,
+        eredu_runtime::LayerwiseRuntimeError::State(error) => error.into(),
+        eredu_runtime::LayerwiseRuntimeError::Layout(error) => error.into(),
+        eredu_runtime::LayerwiseRuntimeError::Policy(error) => backend(error),
+        error @ eredu_runtime::LayerwiseRuntimeError::Submission(_) => backend(error),
+    }
 }
 
-impl<B, P> ParallelPerceptionExecution<B>
-    for LayerwiseRuntime<
-        ComponentAdapter<ComponentDefinition, PerceptionKernel<B>>,
-        B,
-        PerceptionRuntimeState<B::Tensor>,
-        P,
-    >
+/// Bound perception weights with caller-owned Conformer state.
+pub type BoundPerception<B, P, C> = eredu_runtime::BoundLayerwiseComponent<
+    ComponentAdapter<ComponentDefinition, PerceptionKernel<B>>,
+    B,
+    P,
+    C,
+    PerceptionRuntimeState<<B as NeuralBackend>::Tensor>,
+>;
+
+impl<B, P, C> PerceptionExecution<B> for BoundPerception<B, P, C>
 where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     P: LayerwisePolicy<B, PerceptionUnit<B>>,
     P::Error: std::error::Error + Send + Sync + 'static,
+    C: eredu_runtime::LayeredTensorCohort<B>,
 {
-    /// Executes the selected tensor partition against a private complete-cache replica.
-    /// Both raw encoder features and language projections use the same invocation.
-    fn forward_parallel(
+    fn dimensions(&self) -> PerceptionDimensions {
+        self.architecture().kernel().dimensions()
+    }
+
+    fn forward(
         &mut self,
         mel: &B::Tensor,
         drop_preencoded: usize,
         previous: &PerceptionState<B::Tensor>,
-        parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<PerceptionOutput<B::Tensor>, PerceptionError> {
-        let mut state = PerceptionRuntimeState::from_state(self.dimensions(), previous)?;
+        let candidate = PerceptionRuntimeState::from_state(self.dimensions(), previous);
+        let agreed = self
+            .cohort()
+            .map(|cohort| {
+                let [batch, frames, bins] = mel.shape().try_into().unwrap_or([-1; 3]);
+                cohort.agree(
+                    [
+                        0x504552434550544e,
+                        batch as u64,
+                        frames as u64,
+                        bins as u64,
+                        drop_preencoded as u64,
+                        previous.frames(),
+                        0,
+                        0,
+                    ],
+                    candidate.is_ok(),
+                    context,
+                )
+            })
+            .transpose();
+        let mut candidate = candidate?;
+        if agreed? == Some(false) {
+            return Err(PerceptionError::State(
+                "perception cohort input or parent differs",
+            ));
+        }
         let (projected, forward) = self
-            .forward_parallel_with_context_hook(
+            .invoke_with_context(
                 PerceptionInput {
                     mel,
                     drop_preencoded,
                 },
-                &mut state,
-                parallel,
+                &mut candidate,
                 context,
-                |_, _, _| Ok(()),
             )
-            .map_err(|error| match error {
-                eredu_runtime::LayerwiseRuntimeError::Architecture(error) => error,
-                eredu_runtime::LayerwiseRuntimeError::State(error) => error.into(),
-                eredu_runtime::LayerwiseRuntimeError::Layout(error) => error.into(),
-                eredu_runtime::LayerwiseRuntimeError::Policy(error) => backend(error),
-                error @ eredu_runtime::LayerwiseRuntimeError::Submission(_) => backend(error),
-            })?;
-        output(projected, forward, state)
+            .map_err(runtime_error)?;
+        output(projected, forward, candidate)
     }
 }

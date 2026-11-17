@@ -86,6 +86,17 @@ pub enum NeuralStateGeometryError {
     TtsLayout,
 }
 
+/// Cold rejection of a requested VoiceChat state realization.
+#[derive(Debug, thiserror::Error)]
+pub enum VoiceChatStateSelectionError {
+    /// The architecture's state profile is invalid.
+    #[error(transparent)]
+    Contract(#[from] eredu_runtime::ReplicatedTextContractError),
+    /// Native support facts cannot realize the profile.
+    #[error(transparent)]
+    Selection(#[from] eredu_runtime::ReplicatedTextSelectionError),
+}
+
 /// Architecture-owned neural state geometry, independent of storage policy.
 ///
 /// Nemotron processes one conversation lane. TTS classifier-free guidance uses
@@ -121,6 +132,56 @@ impl NeuralStateGeometry {
         &self.tts
     }
 
+    /// Declares the two independently selected cache profiles in graph order.
+    fn state_requirements(
+        &self,
+    ) -> Result<
+        [eredu_runtime::StateRealizationRequirements; 2],
+        eredu_runtime::ReplicatedTextContractError,
+    > {
+        use eredu_core::checkpoint::TensorDtype;
+        use eredu_runtime::{ReplicatedTextStateAccess, StateRealizationRequirements};
+        Ok([
+            StateRealizationRequirements::new(
+                self.backbone.clone(),
+                ReplicatedTextStateAccess::AttentionWithFixed,
+                Some(TensorDtype::F32),
+                Vec::new(),
+            )?,
+            StateRealizationRequirements::new(
+                self.tts.clone(),
+                ReplicatedTextStateAccess::KeyValue,
+                Some(TensorDtype::F32),
+                Vec::new(),
+            )?,
+        ])
+    }
+
+    /// Selects the backbone and TTS state from exact backend facts before binding.
+    pub fn select_state_realizations(
+        &self,
+        policy: &eredu_runtime::CacheResidencyPolicy,
+        support: &impl eredu_runtime::ReplicatedTextMechanismSupport,
+    ) -> Result<[eredu_runtime::SelectedStateRealization; 2], VoiceChatStateSelectionError> {
+        use eredu_runtime::{
+            select_state_realization, synthesize_state_capabilities, LayerWeightResidency,
+            ReplicatedTextSelectionRequest,
+        };
+        let [backbone, tts] = self.state_requirements()?;
+        let request = ReplicatedTextSelectionRequest::new(
+            LayerWeightResidency::FullyResident,
+            policy.clone(),
+        )
+        .with_session(eredu_core::SessionCapabilities::new(true, true, true))
+        .with_exact_completion(true);
+        let select = |requirements: &eredu_runtime::StateRealizationRequirements| {
+            let capabilities =
+                synthesize_state_capabilities(requirements, request.state(), support);
+            select_state_realization(requirements, &request, &capabilities)
+        };
+        Ok([select(&backbone)?, select(&tts)?])
+    }
+
     /// Number of conversation rows in each Nemotron cache tensor.
     pub const fn backbone_batch_size(&self) -> usize {
         1
@@ -145,18 +206,6 @@ impl NeuralStateGeometry {
         }
         Ok(())
     }
-}
-
-/// Borrowed access to both neural cache families in one unpublished branch.
-/// The implementation owns their joint branch, commit and rollback semantics.
-pub trait NeuralStateParts {
-    /// Existing Nemotron layered runtime state.
-    type Backbone;
-    /// Selected causal TTS state, owned by this same unpublished transaction.
-    type TtsState: ?Sized;
-
-    /// Borrows disjoint cache families without transferring their transaction owner.
-    fn parts_mut(&mut self) -> (&mut Self::Backbone, &mut Self::TtsState);
 }
 
 /// Canonical component state retained by the shared realtime generation owner.

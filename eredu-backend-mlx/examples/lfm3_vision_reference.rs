@@ -7,14 +7,18 @@ use eredu_architectures::{
     lfm3::{
         vision::{
             Declaration, PolicyVisionProgress, PreparedVisionExecution, PreparedVisionLanguage,
-            ProjectorConfig, VisionInput, VisionPrompt, VisionUnit, VlWeightPolicies,
+            ProjectorConfig, VisionInput, VisionPrompt, VisionUnit, VlDecoder, VlWeightPolicies,
         },
-        Lfm3Input,
+        LayeredModel, Lfm3Input, PartitionedLayeredModel,
     },
 };
 use eredu_backend_mlx::{
-    backend::ExecutionContext,
-    native::{bind_vl_rank, bind_vl_weights, MlxVlDecoder, MlxVlVision},
+    backend::{
+        nn::shared::MlxNeuralBackend,
+        runtime::{cache::state::MlxHybridState, execution::generic::bind_parameter_units},
+        ExecutionContext,
+    },
+    native::{MlxComponentBinder, MlxComponentPipeline, MlxLocalComponent},
     MlxTensor,
 };
 use eredu_checkpoint::{
@@ -23,8 +27,8 @@ use eredu_checkpoint::{
 };
 use eredu_nn::{Index, Tensor};
 use eredu_runtime::{
-    DenseDiskStreamLoadOptions, LayerWeightResidency, LayerwiseLoadOptions, ResidencyReport,
-    WeightBinding,
+    ComponentRankMechanisms, DenseDiskStreamLoadOptions, LayerWeightResidency,
+    LayerwiseLoadOptions, ResidencyReport, WeightBinding,
 };
 use safemlx::{Array, Device, DeviceType, Dtype, Stream};
 use serde_json::{json, Value};
@@ -164,16 +168,62 @@ impl Residency {
     }
 }
 
+type BoundVision = eredu_architectures::lfm3::vision::PolicyVision<
+    eredu_backend_mlx::backend::nn::shared::MlxNeuralBackend,
+    eredu_backend_mlx::backend::runtime::execution::generic::MlxSelectedLayerwisePolicy<
+        eredu_architectures::lfm3::vision::VisionModule<
+            eredu_backend_mlx::backend::nn::shared::MlxNeuralBackend,
+        >,
+        (),
+    >,
+>;
+
+type ReferenceDecoder = VlDecoder<
+    MlxNeuralBackend,
+    MlxHybridState,
+    MlxLocalComponent<LayeredModel<MlxNeuralBackend>>,
+    MlxComponentPipeline<PartitionedLayeredModel<MlxNeuralBackend>, MlxHybridState>,
+>;
+
+fn bind_local_decoder(
+    decoder: eredu_architectures::lfm3::vision::PreparedVlDecoder,
+    residency: LayerWeightResidency,
+    weights: &Stream,
+    stream: &Stream,
+) -> Result<ReferenceDecoder, eredu_core::BackendFailure> {
+    Ok(ReferenceDecoder::local(MlxLocalComponent::bind(
+        || decoder.prepare_local(residency, stream),
+        weights,
+        stream,
+    )?))
+}
+
+fn bind_vision(
+    prepared: PreparedVisionExecution,
+    residency: LayerWeightResidency,
+    weights: &Stream,
+    stream: &Stream,
+) -> Result<BoundVision, eredu_core::BackendFailure> {
+    prepared.bind(stream, |source, addresses, units, build| {
+        bind_parameter_units(source, addresses, units, residency, stream, weights, build)
+            .map(|(policy, _)| policy)
+    })
+}
+
 fn controlled_vision(
-    vision: &mut MlxVlVision,
+    vision: &mut BoundVision,
     input: VisionInput<'_, MlxTensor>,
     cancel_first: bool,
+    stream: &Stream,
 ) -> Result<(MlxTensor, MlxTensor), Box<dyn Error>> {
     if cancel_first {
-        let mut cancelled = vision.begin(VisionInput {
-            pixels: input.pixels,
-            grid: input.grid,
-        })?;
+        let mut cancelled = vision.begin(
+            VisionInput {
+                pixels: input.pixels,
+                grid: input.grid,
+            },
+            stream,
+        )?;
         for unit in [VisionUnit::Patchifier, VisionUnit::Block(0)] {
             if cancelled.next_unit() != Some(unit)
                 || !matches!(cancelled.advance()?, PolicyVisionProgress::Pending)
@@ -184,7 +234,7 @@ fn controlled_vision(
         // Drop the transaction with an unfinished encoder activation.
         drop(cancelled);
     }
-    let mut session = vision.begin(input)?;
+    let mut session = vision.begin(input, stream)?;
     while let Some(unit) = session.next_unit() {
         match session.advance()? {
             PolicyVisionProgress::Pending if unit != VisionUnit::Projector => {}
@@ -330,7 +380,7 @@ fn compare_decoder_rows(
         parameters.unit_bindings(),
         &pinned,
     )?;
-    let mut model = MlxVlDecoder::bind(decoder, residency, weights, stream)?;
+    let mut model = bind_local_decoder(decoder, residency, weights, stream)?;
     let mut state = model.new_state()?;
     let mut actual = Vec::new();
     for ids in std::iter::once(prompt.as_slice()).chain(decode.iter().map(std::slice::from_ref)) {
@@ -341,6 +391,7 @@ fn compare_decoder_rows(
                 mask: None,
             }),
             &mut state,
+            stream,
         )?;
         let array = scores.as_array().evaluated()?;
         let values = array.as_slice::<f32>();
@@ -552,7 +603,16 @@ fn main() -> Result<(), Box<dyn Error>> {
             decoder: args.residency.policy_for_device(required.decoder)?,
         })?;
         let selected_bytes = selected.device_weight_bytes().combined;
-        let (vision, decoder) = bind_vl_rank(selected, group, source_stream, stream)?;
+        let (vision, decoder) = selected.bind_components(
+            |decoder, residency, communication| {
+                ReferenceDecoder::bind_rank(decoder, residency, communication, stream, |pipeline| {
+                    MlxComponentBinder::new(source_stream, stream)
+                        .bind_pipeline(pipeline, group)
+                        .map(|(execution, _)| execution)
+                })
+            },
+            |vision, residency| bind_vision(vision, residency, source_stream, stream),
+        )?;
         (vision, Some(decoder), Some(selected_bytes))
     } else if let Some(artifact) = &artifact {
         let prepared = artifact.prepare_weights(RecipeDtype::F32)?;
@@ -566,7 +626,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             decoder: args.residency.policy_for_device(required.decoder)?,
         })?;
         let selected_bytes = selected.device_weight_bytes().combined;
-        let (vision, decoder) = bind_vl_weights(selected, source_stream, stream)?;
+        let ((vision, vision_residency), (decoder, decoder_residency)) = selected.into_parts();
+        let vision = bind_vision(vision, vision_residency, source_stream, stream)?;
+        let decoder = bind_local_decoder(decoder, decoder_residency, source_stream, stream)?;
         (vision, Some(decoder), Some(selected_bytes))
     } else {
         let prepared = standalone.ok_or("missing standalone vision preparation")?;
@@ -574,7 +636,18 @@ fn main() -> Result<(), Box<dyn Error>> {
             args.residency
                 .policy(prepared.invocations(), prepared.unit_bindings(), &[])?;
         (
-            MlxVlVision::bind(prepared, options, source_stream, stream)?,
+            prepared.bind(stream, |source, addresses, units, build| {
+                eredu_backend_mlx::backend::runtime::execution::generic::bind_parameter_units(
+                    source,
+                    addresses,
+                    units,
+                    options,
+                    stream,
+                    source_stream,
+                    build,
+                )
+                .map(|(policy, _)| policy)
+            })?,
             None,
             None,
         )
@@ -633,9 +706,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             grid: &grid,
         };
         let (hidden, projected) = if args.controlled_vision {
-            controlled_vision(&mut vision, input, results.is_empty())?
+            controlled_vision(&mut vision, input, results.is_empty(), stream)?
         } else {
-            vision.forward(input)?
+            vision.forward(input, stream)?
         };
         let encoder = compare(&hidden, &reference[&format!("{name}.hidden")], stream, atol)?;
         let projection = compare(
@@ -704,13 +777,24 @@ fn main() -> Result<(), Box<dyn Error>> {
                 &reference,
                 stream,
                 |preparation, chunk, identity| {
-                    let mut request = decoder.start_prefill(&mut vision, preparation, chunk)?;
+                    let (mut request, mut state) =
+                        decoder.start_prefill(preparation, chunk, stream)?;
                     check_cache_identity(request.cache_identity(), identity)?;
                     let logits = drain_raw_prefill(chunk, case, stream, || {
                         let step = request.next_step()?;
-                        Ok((step, decoder.advance_prefill(&mut vision, &mut request)?))
+                        Ok((
+                            step,
+                            decoder.advance_prefill(
+                                &mut vision,
+                                &mut request,
+                                &mut state,
+                                stream,
+                            )?,
+                        ))
                     })?;
-                    let state = request.into_state()?;
+                    if !request.is_complete() {
+                        return Err("VL prefill is incomplete".into());
+                    }
                     compare_decode(
                         decoder, state, logits, "raw", case, &reference, stream, atol, None,
                     )
@@ -756,7 +840,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .iter()
                 .all(|k| r[k]["passed"] == true)
         });
-    let (vision_residency, vision_disk) = vision.residency()?;
+    let vision_residency = vision.policy().residency_report()?;
+    let vision_disk = vision.policy().dense_stream_report()?;
     std::fs::write(
         &args.output,
         serde_json::to_vec_pretty(&json!({"device":args.device,"dtype":"float32",
@@ -775,7 +860,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn compare_conditional(
-    runtime: &mut MlxVlDecoder,
+    runtime: &mut ReferenceDecoder,
     name: &str,
     case: &Value,
     reference: &std::collections::HashMap<String, Array>,
@@ -785,14 +870,14 @@ fn compare_conditional(
     capture: Option<&mut std::collections::HashMap<String, Array>>,
 ) -> Result<Value, Box<dyn Error>> {
     let mut state = runtime.new_state()?;
-    let logits = runtime.forward(Lfm3Input::Vision(prompt), &mut state)?;
+    let logits = runtime.forward(Lfm3Input::Vision(prompt), &mut state, stream)?;
     compare_decode(
         runtime, state, logits, name, case, reference, stream, atol, capture,
     )
 }
 
 fn compare_decode(
-    runtime: &mut MlxVlDecoder,
+    runtime: &mut ReferenceDecoder,
     mut state: eredu_backend_mlx::backend::runtime::cache::state::MlxHybridState,
     logits: MlxTensor,
     name: &str,
@@ -811,7 +896,7 @@ fn compare_decode(
         stream,
         atol,
         capture,
-        |input, state| runtime.forward(Lfm3Input::Text(input), state),
+        |input, state| runtime.forward(Lfm3Input::Text(input), state, stream),
     )?;
     let (residency, disk) = runtime.residency()?;
     result["residency"] = residency_report(&residency, disk.as_ref());
@@ -906,7 +991,10 @@ fn compare_component_graph(
     atol: f64,
 ) -> Result<Value, Box<dyn Error>> {
     use eredu_architectures::lfm3::vision::VlInput;
-    use eredu_backend_mlx::{backend::nn::shared::MlxNeuralBackend, native::MlxVlGraph};
+    use eredu_backend_mlx::{backend::nn::shared::MlxNeuralBackend, native::MlxLocalComponent};
+    use eredu_runtime::{
+        BoundLocalComponent, LocalComponentPolicy, NoopObserver, PreparedLocalComponent,
+    };
 
     #[cfg(feature = "image")]
     if args.publisher_raw_projections && metadata.get("raw_processor").is_none() {
@@ -922,8 +1010,25 @@ fn compare_component_graph(
     let options =
         args.residency
             .policy(prepared.invocations(), prepared.unit_bindings(), &pinned)?;
-    let mut runtime = MlxVlGraph::bind(architecture, prepared, options, weights, stream)?;
-    let mut state = runtime.new_state()?;
+    let mut runtime = MlxLocalComponent::bind(
+        || {
+            PreparedLocalComponent::new(
+                architecture,
+                prepared,
+                LocalComponentPolicy {
+                    residency: options,
+                    state: None,
+                    conversion_retention: None,
+                    conversion_eligibility:
+                        eredu_core::residency::ParameterConversionRetentionEligibility::Eligible,
+                },
+            )
+            .map_err(eredu_core::BackendFailure::from_error)
+        },
+        weights,
+        stream,
+    )?;
+    let mut state = runtime.fresh_state()?;
     let mut projections = BTreeMap::new();
     let mut scores = BTreeMap::new();
     for id in ["image", "video_odd"] {
@@ -933,12 +1038,13 @@ fn compare_component_graph(
             .ok_or("missing combined graph media case")?;
         let grid = serde_json::from_value::<Vec<(i32, i32, i32)>>(case["grid"].clone())?;
         let pixels = MlxTensor::from_array(reference[&format!("{id}.patches")].clone());
-        let rows = runtime.forward(
+        let rows = runtime.execute(
             VlInput::Media(VisionInput {
                 pixels: &pixels,
                 grid: &grid,
             }),
             &mut state,
+            &mut NoopObserver,
         )?;
         scores.insert(
             id,
@@ -958,7 +1064,7 @@ fn compare_component_graph(
         projections.get("video_odd"),
         stream,
     )?;
-    let logits = runtime.forward(VlInput::Projected(&prompt), &mut state)?;
+    let logits = runtime.execute(VlInput::Projected(&prompt), &mut state, &mut NoopObserver)?;
     let conditional = compare_decode_rows(
         &mut state,
         logits,
@@ -968,7 +1074,11 @@ fn compare_component_graph(
         stream,
         atol,
         None,
-        |input, state| runtime.forward(VlInput::Text(input), state),
+        |input, state| {
+            runtime
+                .execute(VlInput::Text(input), state, &mut NoopObserver)
+                .map_err(eredu_core::BackendFailure::from_error)
+        },
     )?;
     #[cfg(not(feature = "image"))]
     let raw: Option<Value> = None;
@@ -985,10 +1095,14 @@ fn compare_component_graph(
                 stream,
                 |preparation, chunk, identity| {
                     let mut media = preparation.clone();
-                    let mut media_state = runtime.new_state()?;
+                    let mut media_state = runtime.fresh_state()?;
                     let mut rows = Vec::new();
                     while let Some(input) = media.next_media() {
-                        let projected = runtime.forward(VlInput::Media(input), &mut media_state)?;
+                        let projected = runtime.execute(
+                            VlInput::Media(input),
+                            &mut media_state,
+                            &mut NoopObserver,
+                        )?;
                         media.accept_projection(projected.clone())?;
                         rows.push(projected);
                     }
@@ -1002,13 +1116,20 @@ fn compare_component_graph(
                         )?;
                         scores.insert(id, compare(rows, expected, stream, atol)?);
                     }
-                    let mut request = runtime.start_prefill_request(preparation, chunk)?;
+                    let mut request =
+                        eredu_architectures::lfm3::vision::VlPrefill::new(preparation, chunk);
+                    let mut state = runtime.fresh_state()?;
                     check_cache_identity(request.cache_identity(), identity)?;
                     let logits = drain_raw_prefill(chunk, case, stream, || {
                         let step = request.next_step()?;
-                        Ok((step, runtime.advance_prefill_request(&mut request)?))
+                        let progress = request.advance_input(stream, |input| {
+                            runtime.execute(input, &mut state, &mut NoopObserver)
+                        })?;
+                        safemlx::transforms::eval(
+                            request.retained_values().map(MlxTensor::as_array),
+                        )?;
+                        Ok((step, progress))
                     })?;
-                    let mut state = request.into_state()?;
                     let mut generation = compare_decode_rows(
                         &mut state,
                         logits,
@@ -1018,7 +1139,11 @@ fn compare_component_graph(
                         stream,
                         atol,
                         None,
-                        |input, state| runtime.forward(VlInput::Text(input), state),
+                        |input, state| {
+                            runtime
+                                .execute(VlInput::Text(input), state, &mut NoopObserver)
+                                .map_err(eredu_core::BackendFailure::from_error)
+                        },
                     )?;
                     if args.publisher_raw_projections {
                         let publisher_image =
@@ -1039,14 +1164,17 @@ fn compare_component_graph(
                                 Some(video),
                                 stream,
                             )?;
-                            let mut state = runtime.new_state()?;
+                            let mut state = runtime.fresh_state()?;
                             let mut prefixes = Vec::new();
                             for start in (0..ids.len()).step_by(chunk.get()) {
                                 let end = start.saturating_add(chunk.get()).min(ids.len());
                                 let prefix = prompt
                                     .slice(i32::try_from(start)?..i32::try_from(end)?, stream)?;
-                                let scores =
-                                    runtime.forward(VlInput::Projected(&prefix), &mut state)?;
+                                let scores = runtime.execute(
+                                    VlInput::Projected(&prefix),
+                                    &mut state,
+                                    &mut NoopObserver,
+                                )?;
                                 let _ = scores.as_array().evaluated()?;
                                 prefixes.push(scores);
                             }
@@ -1060,7 +1188,11 @@ fn compare_component_graph(
                                 stream,
                                 atol,
                                 None,
-                                |input, state| runtime.forward(VlInput::Text(input), state),
+                                |input, state| {
+                                    runtime
+                                        .execute(VlInput::Text(input), state, &mut NoopObserver)
+                                        .map_err(eredu_core::BackendFailure::from_error)
+                                },
                             )?;
                         }
                     }
@@ -1101,6 +1233,11 @@ fn compare_processor(
         Option<&eredu_runtime::PreparedInputCacheIdentity>,
     ) -> Result<Value, Box<dyn Error>>,
 ) -> Result<Value, Box<dyn Error>> {
+    use eredu_architectures::lfm3::vision::VisionPromptAdmission;
+    use eredu_backend_mlx::{
+        backend::runtime::media::input::MlxTensorInputInspector, native::MlxMediaProcessor,
+    };
+
     use eredu_core::{
         InputMetadataKey, InputModality, Media, MultimodalRequest, MultimodalSegment, RgbImage,
         Video, VideoSampling,
@@ -1142,7 +1279,7 @@ fn compare_processor(
     .tokenize(|_| Err::<Vec<u32>, _>("unexpected text segment"))?;
     let tokenizer = eredu_text::tokenizer::Tokenizer::from_file(checkpoint.join("tokenizer.json"))
         .map_err(|error| error.to_string())?;
-    let processor = eredu_backend_mlx::native::MlxVlMedia::new(artifact)?;
+    let processor = MlxMediaProcessor::from_prepared(artifact.processor());
     let input = processor.prepare(&request, &mut |text| {
         tokenizer
             .encode(text, false)
@@ -1195,8 +1332,11 @@ fn compare_processor(
             json!({"grid_matches": grid_matches, "patches": result}),
         );
     }
-    let prompt = eredu_backend_mlx::native::MlxModelInput::from_prepared(&input);
-    let preparation = processor.admit_prompt(&prompt)?;
+    let preparation = VisionPromptAdmission::new(artifact)?.admit_with_identity(
+        &input.to_runtime_input()?,
+        &MlxTensorInputInspector,
+        input.cache_identity(),
+    )?;
     let expected: Vec<i32> = serde_json::from_value(case["prompt"].clone())?;
     let prompt_matches = preparation.token_ids() == expected;
     let reference_chunk = match case.get("prefill_chunk") {
@@ -1206,7 +1346,7 @@ fn compare_processor(
     let chunk = std::num::NonZeroUsize::new(usize::try_from(reference_chunk.unwrap_or(17))?)
         .ok_or("raw prefill chunk must be positive")?;
     let generation = if prompt_matches && case.get("generated").is_some() {
-        Some(execute(preparation, chunk, prompt.cache_identity())?)
+        Some(execute(preparation, chunk, input.cache_identity())?)
     } else {
         None
     };

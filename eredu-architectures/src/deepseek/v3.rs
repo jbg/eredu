@@ -1826,14 +1826,14 @@ where
     }
     fn begin_group(
         &mut self,
-        group: usize,
+        _group: usize,
         initial: &B::Tensor,
-        dependencies: &[&B::Tensor],
+        dependencies: &eredu_runtime::GroupDependencies<'_, B::Tensor>,
         _state: &mut S,
         _forward: &mut Self::ForwardContext,
         _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        super::component::begin_group(&self.construction.definition, group, initial, dependencies)
+        Ok(dependencies.only().unwrap_or(initial).clone())
     }
     fn execute(
         &mut self,

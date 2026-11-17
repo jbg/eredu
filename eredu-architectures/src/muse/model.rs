@@ -379,144 +379,132 @@ where
         crate::media_plan::admit_muse_input(config, input, inspector)
     }
 
-    fn should_execute_prepared_group(
+    fn prepared_group_invocation(
         &self,
         group: usize,
         input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
-    ) -> bool {
-        if matches!(group, 0 | 2)
+        tensor_partitions: usize,
+        stage_units: &[std::ops::Range<usize>],
+    ) -> Result<crate::composite_execution::CompositeGroupInvocation, String> {
+        use crate::composite_execution::{
+            CompositeContinuationGeometry, CompositeGroupInvocation, CompositeGroupUse,
+        };
+        let is_media = matches!(group, 0 | 2);
+        let boundary_sequence = if is_media {
+            let positions = input
+                .admitted()
+                .parts()
+                .iter()
+                .filter_map(|part| match (group, part) {
+                    (0, MuseInputPartPlan::Vision { ingress, .. }) => {
+                        Some(ingress.placeholder_count)
+                    }
+                    (2, MuseInputPartPlan::Audio { ingress, .. }) => {
+                        Some(ingress.placeholder_count)
+                    }
+                    _ => None,
+                })
+                .try_fold(0u64, u64::checked_add)
+                .ok_or("Muse media positions overflowed")?;
+            i32::try_from(positions).map_err(|_| "Muse prepared boundary sequence exceeds i32")?
+        } else {
+            input.decoder_sequence()?
+        };
+        let mode = if is_media && boundary_sequence == 0 {
+            CompositeGroupUse::Bypassed
+        } else if is_media
             && input
                 .decoder_chunk()
                 .is_some_and(|chunk| chunk.range.start > 0)
         {
-            return false;
-        }
-        match group {
-            2 => input
-                .admitted()
-                .parts()
-                .iter()
-                .any(|part| matches!(part, MuseInputPartPlan::Audio { .. })),
-            0 => input
-                .admitted()
-                .parts()
-                .iter()
-                .any(|part| matches!(part, MuseInputPartPlan::Vision { .. })),
-            _ => true,
-        }
-    }
-
-    fn prepared_group_boundary_sequence(
-        &self,
-        group: usize,
-        input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
-    ) -> Result<i32, String> {
-        let positions = if group == 2 {
-            input
-                .admitted()
-                .parts()
-                .iter()
-                .filter_map(|part| match part {
-                    MuseInputPartPlan::Audio { ingress, .. } => Some(ingress.placeholder_count),
-                    _ => None,
-                })
-                .try_fold(0u64, |sum, positions| sum.checked_add(positions))
-                .ok_or_else(|| "Muse audio positions overflowed".to_owned())?
-        } else if group == 0 {
-            input
-                .admitted()
-                .parts()
-                .iter()
-                .filter_map(|part| match part {
-                    MuseInputPartPlan::Vision { ingress, .. } => Some(ingress.placeholder_count),
-                    _ => None,
-                })
-                .try_fold(0_u64, |total, positions| total.checked_add(positions))
-                .ok_or_else(|| "Muse projected media positions overflowed".to_owned())?
+            CompositeGroupUse::Retained
         } else {
-            input
-                .decoder_chunk()
-                .map_or(input.admitted().decoder_positions(), |chunk| {
-                    chunk.range.len() as u64
-                })
+            CompositeGroupUse::Execute
         };
-        i32::try_from(positions)
-            .map_err(|_| "Muse prepared boundary sequence exceeds i32".to_owned())
-    }
-
-    fn prepared_group_continuation_geometry(
-        &self,
-        group: usize,
-        input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
-    ) -> Result<Option<crate::composite_execution::CompositeContinuationGeometry>, String> {
-        let model = self.kernel();
-        if group == 2 {
-            let samples = input
-                .admitted()
-                .parts()
-                .iter()
-                .filter_map(|part| match part {
-                    MuseInputPartPlan::Audio { ingress, .. } => Some(ingress.padded_samples),
-                    _ => None,
-                })
-                .try_fold(0u64, |sum, samples| sum.checked_add(samples))
-                .ok_or_else(|| "Muse waveform sample count overflowed".to_owned())?;
-            if samples == 0 {
-                return Ok(None);
-            }
-            let config = model
-                .args
-                .audio_config
-                .as_ref()
-                .ok_or("Muse audio continuation has no admitted tower")?;
-            return super::audio::execution::AudioKernel::<B>::new(config.clone())
-                .and_then(|audio| {
-                    audio
-                        .kernel()
-                        .continuation_geometry(i32::try_from(samples).map_err(Error::backend)?)
-                })
-                .map(Some)
-                .map_err(|error| error.to_string());
-        }
-        if group != 0 {
-            return Ok(None);
-        }
-        let patches = input
-            .admitted()
-            .parts()
-            .iter()
-            .filter_map(|part| match part {
-                MuseInputPartPlan::Vision { ingress, .. } => Some(&ingress.patch_grid),
-                _ => None,
-            })
-            .flatten()
-            .try_fold(0_u64, |total, &(time, height, width)| {
-                [time, height, width]
-                    .into_iter()
-                    .try_fold(1_u64, |product, value| {
-                        u64::try_from(value)
-                            .ok()
-                            .and_then(|value| product.checked_mul(value))
+        let continuation = if mode.is_active() {
+            (|| -> Result<Option<CompositeContinuationGeometry>, String> {
+                let model = self.kernel();
+                if group == 2 {
+                    let samples = input
+                        .admitted()
+                        .parts()
+                        .iter()
+                        .filter_map(|part| match part {
+                            MuseInputPartPlan::Audio { ingress, .. } => {
+                                Some(ingress.padded_samples)
+                            }
+                            _ => None,
+                        })
+                        .try_fold(0u64, |sum, samples| sum.checked_add(samples))
+                        .ok_or_else(|| "Muse waveform sample count overflowed".to_owned())?;
+                    if samples == 0 {
+                        return Ok(None);
+                    }
+                    let config = model
+                        .args
+                        .audio_config
+                        .as_ref()
+                        .ok_or("Muse audio continuation has no admitted tower")?;
+                    return super::audio::execution::AudioKernel::<B>::new(config.clone())
+                        .and_then(|audio| {
+                            audio.kernel().continuation_geometry(
+                                i32::try_from(samples).map_err(Error::backend)?,
+                            )
+                        })
+                        .map(Some)
+                        .map_err(|error| error.to_string());
+                }
+                if group != 0 {
+                    return Ok(None);
+                }
+                let patches = input
+                    .admitted()
+                    .parts()
+                    .iter()
+                    .filter_map(|part| match part {
+                        MuseInputPartPlan::Vision { ingress, .. } => Some(&ingress.patch_grid),
+                        _ => None,
                     })
-                    .and_then(|patches| total.checked_add(patches))
-                    .ok_or_else(|| "Muse continuation patch geometry overflowed".to_owned())
-            })?;
-        if patches == 0 {
-            return Ok(None);
-        }
-        let patches = i32::try_from(patches)
-            .map_err(|_| "Muse continuation patch count exceeds i32".to_owned())?;
-        let width = model
-            .args
-            .vision_config
-            .as_ref()
-            .ok_or_else(|| "Muse continuation has no vision configuration".to_owned())?
-            .hidden_size;
-        Ok(Some((patches, width).into()))
-    }
-
-    fn prepared_group_continuation_batched(&self, _group: usize) -> bool {
-        false
+                    .flatten()
+                    .try_fold(0_u64, |total, &(time, height, width)| {
+                        [time, height, width]
+                            .into_iter()
+                            .try_fold(1_u64, |product, value| {
+                                u64::try_from(value)
+                                    .ok()
+                                    .and_then(|value| product.checked_mul(value))
+                            })
+                            .and_then(|patches| total.checked_add(patches))
+                            .ok_or_else(|| "Muse continuation patch geometry overflowed".to_owned())
+                    })?;
+                if patches == 0 {
+                    return Ok(None);
+                }
+                let patches = i32::try_from(patches)
+                    .map_err(|_| "Muse continuation patch count exceeds i32".to_owned())?;
+                let width = model
+                    .args
+                    .vision_config
+                    .as_ref()
+                    .ok_or_else(|| "Muse continuation has no vision configuration".to_owned())?
+                    .hidden_size;
+                Ok(Some(CompositeContinuationGeometry::Uniform(vec![
+                    1, patches, width,
+                ])))
+            })()?
+        } else {
+            None
+        };
+        let pipeline_stages = stage_units.len();
+        // Replicated media equations emit no tensor collectives.
+        let collective_waves = (is_media && tensor_partitions > 1 && pipeline_stages > 1)
+            .then(|| vec![Vec::new(); pipeline_stages]);
+        Ok(CompositeGroupInvocation {
+            mode,
+            boundary_sequence,
+            continuation,
+            collective_waves,
+        })
     }
 
     fn partition_boundary_schema(
@@ -526,7 +514,7 @@ where
         _selected: &eredu_runtime::ResolvedBoundaryWireSchema,
         batch: i32,
         source_sequence: i32,
-        _group_sequences: &[i32],
+        _groups: &[crate::composite_execution::CompositeGroupInvocation],
         continuation: Option<(i32, i32)>,
     ) -> Result<Option<eredu_runtime::ResolvedBoundaryWireSchema>, Error> {
         let model = self.kernel();
@@ -559,49 +547,6 @@ where
             .resolve(batch, sequence)
             .map(Some)
             .map_err(Error::backend)
-    }
-
-    fn accept_partition_boundary(
-        &mut self,
-        source_group: usize,
-        destination_group: usize,
-        schema: &eredu_runtime::ResolvedBoundaryWireSchema,
-        values: Vec<B::Tensor>,
-        _forward: &mut Self::ForwardContext,
-        _context: &<B::Tensor as eredu_nn::Tensor>::Context,
-    ) -> Result<Option<B::Tensor>, Error> {
-        if !matches!(
-            (source_group, destination_group),
-            (0, 0) | (0, 1) | (1, 1) | (2, 2) | (2, 1)
-        ) {
-            return Ok(None);
-        }
-        if values.len() != 1 || !schema.auxiliary().is_empty() {
-            return Err(Error::backend(
-                "Muse boundary must contain exactly its primary activation",
-            ));
-        }
-        // A rank that already executed vision retains its admitted request
-        // context. Resume the incoming decoder value without reassembling it.
-        Ok(values.into_iter().next())
-    }
-
-    fn prepared_group_collective_waves(
-        &self,
-        group: usize,
-        _input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
-        tensor_partitions: usize,
-        stage_units: &[std::ops::Range<usize>],
-    ) -> Result<Option<Vec<Vec<crate::composite_execution::CompositeTensorCollective>>>, String>
-    {
-        let pipeline_stages = stage_units.len();
-        // Muse-Glimmer's vision blocks and projector are replicated equations.
-        // Under TP+PP they still execute on every tensor rank, but emit no tensor
-        // collective; the explicit empty waves keep that fact architecture-owned.
-        Ok(
-            (matches!(group, 0 | 2) && tensor_partitions > 1 && pipeline_stages > 1)
-                .then(|| vec![Vec::new(); pipeline_stages]),
-        )
     }
 
     fn routed_tensor_reductions(
@@ -1918,7 +1863,7 @@ where
         &mut self,
         group: usize,
         initial: &B::Tensor,
-        dependencies: &[&B::Tensor],
+        dependencies: &eredu_runtime::GroupDependencies<'_, B::Tensor>,
         _state: &mut S,
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
@@ -1939,54 +1884,18 @@ where
                 return self.retain_prefill_ingress(group, assembled, forward, context);
             }
         }
-        let hidden = (|| {
-            if group == 1 && self.args.audio_config.is_some() {
-                // Ordinary traversal retains inactive dependency values; partitioned
-                // traversal transports only active producers. Both carry the same
-                // ordered semantic roots: vision, then waveform.
-                let (vision, audio) = if let [vision, audio] = dependencies {
-                    (
-                        forward.vision_active.then_some(*vision),
-                        forward.audio.as_ref().map(|_| *audio),
-                    )
-                } else {
-                    let mut values = dependencies.iter().copied();
-                    let vision = if forward.vision_active {
-                        Some(values.next().ok_or_else(|| {
-                            Error::backend("Muse decoder ingress lost its active vision dependency")
-                        })?)
-                    } else {
-                        None
-                    };
-                    let audio = if forward.audio.is_some() {
-                        Some(values.next().ok_or_else(|| {
-                            Error::backend("Muse decoder ingress lost its active audio dependency")
-                        })?)
-                    } else {
-                        None
-                    };
-                    if values.next().is_some() {
-                        return Err(Error::backend(
-                            "Muse decoder ingress has excess media dependencies",
-                        ));
-                    }
-                    (vision, audio)
-                };
-                return self.assemble(&forward.parts, vision, audio, context);
-            }
-            match (group, dependencies) {
-                (0, []) => Ok(initial.clone()),
-                (2, []) => Ok(forward.waveform.as_ref().unwrap_or(initial).clone()),
-                (1, [vision_or_assembled]) if forward.vision_active => {
-                    self.assemble(&forward.parts, Some(vision_or_assembled), None, context)
-                }
-                (1, []) if !forward.vision_active => Ok(initial.clone()),
-                (1, [assembled]) => Ok((*assembled).clone()),
-                _ => Err(Error::backend(
-                    "invalid Muse-Glimmer execution dependencies",
-                )),
-            }
-        })()?;
+        let hidden = match group {
+            0 => initial.clone(),
+            2 => forward.waveform.as_ref().unwrap_or(initial).clone(),
+            1 if self.args.audio_config.is_some() || forward.vision_active => self.assemble(
+                &forward.parts,
+                dependencies.get(0),
+                dependencies.get(2),
+                context,
+            )?,
+            1 => initial.clone(),
+            _ => return Err(Error::backend("invalid Muse execution group")),
+        };
         self.retain_prefill_ingress(group, hidden, forward, context)
     }
     fn execute(
@@ -2164,7 +2073,7 @@ where
         &mut self,
         group: usize,
         initial: &B::Tensor,
-        dependencies: &[&B::Tensor],
+        dependencies: &eredu_runtime::GroupDependencies<'_, B::Tensor>,
         state: &mut S,
         forward: &mut Self::ForwardContext,
         parallel: &B::ParallelContext,

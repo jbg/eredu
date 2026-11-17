@@ -697,14 +697,14 @@ impl<B: NeuralBackend, const PREDICTOR: bool> ComponentEquations<B, StatelessCom
         &mut self,
         group: usize,
         initial: &B::Tensor,
-        dependencies: &[&B::Tensor],
+        dependencies: &eredu_runtime::GroupDependencies<'_, B::Tensor>,
         _: &mut StatelessComponentState,
         _: &mut Self::ForwardContext,
         _: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, RnntError> {
-        match (group, dependencies) {
-            (0, []) => Ok(initial.clone()),
-            (1..=4, [one]) => Ok((*one).clone()),
+        match (group, dependencies.only()) {
+            (0, None) => Ok(initial.clone()),
+            (1..=4, Some(one)) => Ok(one.clone()),
             _ => Err(RnntError::InvalidConfiguration(
                 "RNNT graph dependencies mismatch",
             )),
@@ -919,98 +919,5 @@ impl<B: DistributedNeuralBackend, const PREDICTOR: bool>
             Some(parallel),
             context,
         )
-    }
-}
-/// Tensor-parallel RNNT phases with complete recurrent ownership.
-/// The typed invocation uses the shared resource and completion lifecycle.
-pub trait ParallelRnntExecution<B: DistributedNeuralBackend>: RnntExecution<B> {
-    /// Executes one selected phase and returns its unpublished request-local state.
-    fn invoke_parallel(
-        &mut self,
-        input: RnntInput<'_, B::Tensor>,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<(B::Tensor, RnntForward<B::Tensor>), RnntError>;
-    /// Looks up and sums the selected vocabulary row across exact owners.
-    fn embed_token_parallel(
-        &mut self,
-        token: usize,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, RnntError> {
-        self.invoke_parallel(RnntInput::Embed(token), parallel, context)
-            .map(|(value, _)| value)
-    }
-    /// Advances fully replicated recurrent layers through the same leased traversal.
-    fn predictor_step_parallel(
-        &mut self,
-        input: &B::Tensor,
-        previous: Option<&RnntPredictionState<B::Tensor>>,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<RnntPredictionState<B::Tensor>, RnntError> {
-        self.invoke_parallel(RnntInput::Predict { input, previous }, parallel, context)?
-            .1
-            .into_predictor()
-    }
-    /// Applies the replicated perception projection in its learned precision.
-    fn encode_frame_parallel(
-        &mut self,
-        encoder: &B::Tensor,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, RnntError> {
-        self.invoke_parallel(RnntInput::Encode(encoder), parallel, context)
-            .map(|(value, _)| value)
-    }
-    /// Applies the replicated predictor projection without another recurrent step.
-    fn project_prediction_parallel(
-        &mut self,
-        prediction: &B::Tensor,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, RnntError> {
-        self.invoke_parallel(RnntInput::Prediction(prediction), parallel, context)
-            .map(|(value, _)| value)
-    }
-    /// Gathers complete logits, including the blank row, from uneven vocabulary owners.
-    fn project_output_parallel(
-        &mut self,
-        hidden: &B::Tensor,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, RnntError> {
-        self.invoke_parallel(RnntInput::Output(hidden), parallel, context)
-            .map(|(value, _)| value)
-    }
-}
-
-impl<B, P> ParallelRnntExecution<B>
-    for LayerwiseRuntime<
-        ComponentAdapter<ComponentDefinition, RnntKernel<B>>,
-        B,
-        StatelessComponentState,
-        P,
-    >
-where
-    B: DistributedNeuralBackend
-        + SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
-    P: LayerwisePolicy<B, RnntUnit<B>>,
-    P::Error: std::error::Error + Send + Sync + 'static,
-{
-    fn invoke_parallel(
-        &mut self,
-        input: RnntInput<'_, B::Tensor>,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<(B::Tensor, RnntForward<B::Tensor>), RnntError> {
-        self.forward_parallel_with_context_hook(
-            input,
-            &mut StatelessComponentState::new()?,
-            parallel,
-            context,
-            |_, _, _| Ok(()),
-        )
-        .map_err(runtime_error)
     }
 }

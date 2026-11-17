@@ -88,38 +88,53 @@ pub struct PolicyDecoder<B: NeuralBackend, P> {
     unweighted_quantizer: Option<ScalarDecoder<B>>,
 }
 
-impl<B: NeuralBackend, P> PolicyDecoder<B, P> {
-    /// Constructs one unloaded native module per declared owner.
-    pub fn resident_units(
-        d: &Declaration,
-        ctx: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Vec<DecoderModule<B>>, Error> {
-        d.decoder_units().map(|unit| build(d, unit, ctx)).collect()
-    }
-
-    /// Attaches the retained parameter policy to the architecture traversal.
-    pub fn new(
-        declaration: Declaration,
+impl Declaration {
+    /// Constructs the synthesis traversal through a generic parameter materializer.
+    pub fn bind_decoder<B, P>(
+        self,
+        source: eredu_checkpoint::store::SharedCheckpointSource,
         invocations: ExecutionUnitAddressMap,
-        policy: P,
-        ctx: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
+        units: Vec<Vec<eredu_runtime::WeightBinding>>,
+        context: &<B::Tensor as Tensor>::Context,
+        bind_units: impl FnOnce(
+            eredu_checkpoint::store::SharedCheckpointSource,
+            ExecutionUnitAddressMap,
+            Vec<Vec<eredu_runtime::WeightBinding>>,
+            &dyn Fn() -> Result<Vec<DecoderModule<B>>, BackendFailure>,
+        ) -> Result<P, BackendFailure>,
+    ) -> Result<PolicyDecoder<B, P>, BackendFailure>
+    where
+        B: NeuralBackend,
+        P: LayerwisePolicy<B, DecoderModule<B>>,
+    {
         B::require_operator_capabilities(
             "LiquidCodec neural decoder",
             eredu_nn::NeuralOperatorCapabilities::SIGMOID,
-        )?;
-        if invocations != declaration.decoder_invocations()? {
-            return Err(invalid(
-                "LiquidCodec invocations differ from the retained decoder",
-            ));
+        )
+        .map_err(BackendFailure::from_error)?;
+        if invocations
+            != self
+                .decoder_invocations()
+                .map_err(BackendFailure::from_error)?
+            || units.len() != self.decoder_units().count()
+        {
+            return Err(BackendFailure::from_error(invalid(
+                "LiquidCodec bindings differ from the retained decoder",
+            )));
         }
-        let unweighted_quantizer = if declaration.quantizer.output.is_none() {
-            Some(ScalarDecoder::new(&declaration.quantizer, ctx)?)
+        let policy = bind_units(source, invocations.clone(), units, &|| {
+            self.decoder_units()
+                .map(|unit| build(&self, unit, context))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(BackendFailure::from_error)
+        })?;
+        let unweighted_quantizer = if self.quantizer.output.is_none() {
+            Some(ScalarDecoder::new(&self.quantizer, context).map_err(BackendFailure::from_error)?)
         } else {
             None
         };
-        Ok(Self {
-            declaration,
+        Ok(PolicyDecoder {
+            declaration: self,
             invocations,
             policy,
             unweighted_quantizer,
