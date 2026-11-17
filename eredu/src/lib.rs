@@ -26,6 +26,4 @@ pub mod runtime;
 // Internal bindings keep implementation paths concise without adding public
 // aliases for contracts owned by dependency crates.
 #[cfg(feature = "mlx")]
-use eredu_core::{
-    AllocatorTelemetry, DevicePlan, ExecutionPlan, ExpertCacheTelemetry, ResidencyTelemetry,
-};
+use eredu_core::{ExpertCacheTelemetry, ResidencyTelemetry};

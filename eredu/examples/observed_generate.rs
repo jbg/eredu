@@ -1,8 +1,8 @@
 //! Complete facade workflow: cold discovery, bounded admission, ordinary sampling,
 //! attributed streaming, and cancellation. No native tensors or custom generation loop.
 use eredu::api::{
-    inspect_architecture, local_device_plan, LoadedModel, LocalDevice, ObservedGenerationEvent,
-    PreparedChatGenerationSettings, TraceLimits,
+    inspect_architecture, LoadedModel, ObservedGenerationEvent, PreparedChatGenerationSettings,
+    TraceLimits,
 };
 use eredu::runtime::chat::ChatTemplateRequest;
 use eredu_backend_mlx::MlxBackendFactory;
@@ -31,7 +31,7 @@ fn main() -> anyhow::Result<()> {
         descriptor.observations.points.len()
     );
 
-    let execution = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Cpu)?)
+    let execution = ExecutionPlan::fully_resident(eredu_core::DevicePlan::new("mlx", "cpu:0")?)
         .with_required_session_capabilities(SessionCapabilities::new(true, true, true));
     let (mut model, _) =
         LoadedModel::load_execution_plan(&MlxBackendFactory::default(), path, &execution)?

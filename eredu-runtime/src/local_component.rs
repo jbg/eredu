@@ -131,8 +131,12 @@ where
 pub trait LocalComponentMechanisms<B: NeuralBackend, S: RuntimeState<B>> {
     /// Bound component for any compatible layerwise architecture.
     type Local<A>: BoundLocalComponent<A, B, S>
-        + crate::LayeredInvocation<B, S, Architecture = A>
-        + 'static
+        + crate::LayeredInvocation<
+            B,
+            S,
+            Architecture = A,
+            Error: std::error::Error + Send + Sync + 'static,
+        > + 'static
     where
         A: LayeredArchitecture<B, S, Error = eredu_nn::Error> + 'static,
         A::Unit: 'static;

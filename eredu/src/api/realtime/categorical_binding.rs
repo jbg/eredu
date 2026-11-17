@@ -1,48 +1,49 @@
-//! Selected native realization of the categorical application protocol.
+//! Portable construction and scheduling of categorical realtime execution.
 
 use std::{rc::Rc, time::Instant};
 
-use eredu_architectures::moshi::{MoshiRealtimeExecution, MoshiRealtimeOutputProjection};
-use eredu_backend_mlx::{
-    backend::runtime::cache::state::MlxKeyValueState,
-    native::{
-        MlxPrepublicationFrame, MlxRealtimeCompletion, MlxRealtimeExecution,
-        MlxRealtimeExecutionContext, RandomState,
-    },
-    MlxTensor,
+use eredu_architectures::moshi::{
+    MoshiRealtimeExecution, MoshiRealtimeOutputProjection, PreparedMoshiRealtimeSource,
 };
-use eredu_core::scheduler::{SchedulerError, WorkId};
-use eredu_core::BackendFailure;
-use eredu_runtime::{GenerationSampler, RealtimePayloadState};
+use eredu_core::{
+    scheduler::{SchedulerError, WorkId},
+    BackendFailure,
+};
+use eredu_runtime::{
+    CategoricalRealtimeMechanisms, GenerationSampler, RealtimePayloadState,
+    RealtimeStartupMechanisms,
+};
 
 use super::*;
 
-type CategoricalScheduler = RealtimeSessionScheduler<
+type NativeTensor<M> =
+    <<M as CategoricalRealtimeMechanisms>::Neural as eredu_nn::NeuralBackend>::Tensor;
+
+type CategoricalScheduler<M> = RealtimeSessionScheduler<
     RealtimeInputFrame,
-    RealtimePayloadState<MlxKeyValueState, MlxTensor>,
+    RealtimePayloadState<<M as CategoricalRealtimeMechanisms>::State, NativeTensor<M>>,
     RealtimeFrameScheduleState,
     RealtimeSampling,
     GenerationSampler,
-    RandomState,
-    MlxRealtimeCompletion,
-    MlxPrepublicationFrame<MoshiRealtimeOutputProjection>,
+    <M as RealtimeStartupMechanisms>::Random,
+    <M as RealtimeStartupMechanisms>::Completion,
+    <M as CategoricalRealtimeMechanisms>::Frame<MoshiRealtimeOutputProjection>,
 >;
 
-pub(super) struct MlxCategoricalModel {
-    context: MlxRealtimeExecutionContext,
-    model: MoshiRealtimeExecution<MlxRealtimeExecution>,
+pub(super) fn bind_categorical<M: CategoricalRealtimeMechanisms>(
+    selected: PreparedMoshiRealtimeSource,
+    mechanisms: M,
+) -> Result<Box<dyn CategoricalRealtimeModel>, BackendFailure> {
+    let model = mechanisms.bind(selected)?;
+    Ok(Box::new(Rc::new(CategoricalModel { mechanisms, model })))
 }
 
-impl MlxCategoricalModel {
-    pub(super) fn new(
-        context: MlxRealtimeExecutionContext,
-        model: MoshiRealtimeExecution<MlxRealtimeExecution>,
-    ) -> Self {
-        Self { context, model }
-    }
+struct CategoricalModel<M: CategoricalRealtimeMechanisms> {
+    mechanisms: M,
+    model: MoshiRealtimeExecution<M::Execution>,
 }
 
-impl CategoricalRealtimeModel for Rc<MlxCategoricalModel> {
+impl<M: CategoricalRealtimeMechanisms> CategoricalRealtimeModel for Rc<CategoricalModel<M>> {
     fn frame_schedule(&self) -> &RealtimeSpeechConfig {
         self.model.execution_config().frame_schedule()
     }
@@ -57,13 +58,13 @@ impl CategoricalRealtimeModel for Rc<MlxCategoricalModel> {
             RealtimeModelSessionIdentity::from_selected(self.model.selected()),
             limits,
         )?;
-        self.context.validate_execution(self.model.executor())?;
+        self.mechanisms.validate_execution(self.model.executor())?;
         let state = self
             .model
-            .initialize_generation(&self.context, sampling)
+            .initialize_generation(&self.mechanisms, sampling)
             .map_err(BackendFailure::from_error)?;
         scheduler.register(request, state)?;
-        Ok(Box::new(MlxCategoricalSession {
+        Ok(Box::new(CategoricalSession {
             model: Rc::clone(self),
             scheduler,
             request,
@@ -71,13 +72,13 @@ impl CategoricalRealtimeModel for Rc<MlxCategoricalModel> {
     }
 }
 
-struct MlxCategoricalSession {
-    model: Rc<MlxCategoricalModel>,
-    scheduler: CategoricalScheduler,
+struct CategoricalSession<M: CategoricalRealtimeMechanisms> {
+    model: Rc<CategoricalModel<M>>,
+    scheduler: CategoricalScheduler<M>,
     request: RequestId,
 }
 
-impl CategoricalRealtimeSession for MlxCategoricalSession {
+impl<M: CategoricalRealtimeMechanisms> CategoricalRealtimeSession for CategoricalSession<M> {
     fn enqueue(&mut self, frame: RealtimeInputFrame) -> Result<WorkId, SchedulerError> {
         self.scheduler.enqueue(self.request, frame)
     }
@@ -90,22 +91,15 @@ impl CategoricalRealtimeSession for MlxCategoricalSession {
                 .map_err(std::io::Error::other)
                 .map_err(BackendFailure::from_error)?;
             self.model
-                .context
-                .submit_realtime(model.executor(), plan, input, branch)
-                .map_err(BackendFailure::from_error)
+                .mechanisms
+                .submit(model.executor(), plan, input, branch)
         })?;
         Ok(CategoricalRealtimeProgress {
             newly_submitted: progress.newly_submitted,
             committed: progress
                 .committed
                 .into_iter()
-                .map(|(work, input, frame)| {
-                    (
-                        work,
-                        input,
-                        frame.into_host_output().map_err(BackendFailure::from_error),
-                    )
-                })
+                .map(|(work, input, frame)| (work, input, M::into_host_output(frame)))
                 .collect(),
             failed: progress.failed,
         })
@@ -114,11 +108,9 @@ impl CategoricalRealtimeSession for MlxCategoricalSession {
     fn status(&self) -> Option<RequestStatus> {
         self.scheduler.request_status(self.request)
     }
-
     fn finish(&mut self) -> Result<(), SchedulerError> {
         self.scheduler.finish(self.request)
     }
-
     fn cancel(&mut self) -> Result<(), SchedulerError> {
         self.scheduler.cancel(self.request)
     }

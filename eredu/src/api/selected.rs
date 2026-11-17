@@ -1,79 +1,11 @@
-//! MLX runtime configuration, inspection, and diagnostics for generic facade models.
+//! MLX diagnostics for loaded facade models.
 
-#[cfg(all(feature = "metal", target_vendor = "apple"))]
-use std::path::PathBuf;
 use std::time::Duration;
 
-pub use eredu_core::{AllocatorCachePolicyReport, AllocatorCachePolicySource};
-
-/// Observes the cache limit and native provenance atomically without configuring it.
-pub fn local_allocator_cache_policy(
-) -> Result<AllocatorCachePolicyReport, eredu_core::BackendFailure> {
-    eredu_backend_mlx::allocator_cache_policy().map_err(|error| {
-        eredu_core::BackendFailure::from_error(error).with_operation("allocator-cache policy query")
-    })
-}
-
-/// Reads the process-global allocator-cache limit in bytes without changing it.
-/// This snapshot may initialize the native allocator and can change later.
-pub fn local_allocator_cache_limit() -> Result<usize, eredu_core::BackendFailure> {
-    eredu_backend_mlx::allocator_cache_limit().map_err(|error| {
-        eredu_core::BackendFailure::from_error(error).with_operation("allocator-cache limit query")
-    })
-}
-
-/// Sets the process-global allocator-cache limit and returns the previous value
-/// for explicit restoration. Coordinate changes with other runtime users.
-pub fn set_local_allocator_cache_limit(bytes: usize) -> Result<usize, eredu_core::BackendFailure> {
-    eredu_backend_mlx::set_allocator_cache_limit(bytes).map_err(|error| {
-        eredu_core::BackendFailure::from_error(error)
-            .with_operation("allocator-cache configuration")
-    })
-}
-
-impl super::BackendInspection for eredu_backend_mlx::MlxBackendFactory {
-    fn inspect_execution(
-        &self,
-        path: &std::path::Path,
-        plan: &crate::ExecutionPlan,
-    ) -> Result<eredu_architectures::ModelInspectionOutcome, BackendFailure> {
-        let request = self
-            .load_request_for_plan(plan)
-            .map_err(BackendFailure::from_error)?;
-        eredu_backend_mlx::native::inspect_model_preparation(
-            path,
-            eredu_backend_mlx::native::MlxInspectionOptions::new(request),
-        )
-        .map_err(|error| BackendFailure::from_error(error).with_operation("model inspection"))
-    }
-
-    fn device_uses_host_memory(&self, device: &crate::DevicePlan) -> Result<bool, BackendFailure> {
-        self.device_uses_host_memory(device)
-            .map_err(BackendFailure::from_error)
-    }
-
-    fn allocator_observation(
-        &self,
-    ) -> Result<Option<(AllocatorCachePolicyReport, crate::AllocatorTelemetry)>, BackendFailure>
-    {
-        Ok(Some((
-            local_allocator_cache_policy()?,
-            allocator_telemetry()?,
-        )))
-    }
-}
-
-use super::{DevicePlanError, ExpertCacheBenchmarkError};
+use super::ExpertCacheBenchmarkError;
 use eredu_core::BackendFailure;
 
 impl super::LoadedModel<eredu_backend_mlx::backend::MlxBackend<'_>> {
-    /// Synchronizes the model and samples allocator counters.
-    pub fn allocator_telemetry(&self) -> Result<crate::AllocatorTelemetry, BackendFailure> {
-        self.synchronize()
-            .map_err(|error| BackendFailure::from_error(error).with_operation("synchronization"))?;
-        allocator_telemetry()
-    }
-
     /// Returns portable sparse expert-cache telemetry when available.
     pub fn expert_cache_telemetry(
         &self,
@@ -101,141 +33,6 @@ impl super::LoadedModel<eredu_backend_mlx::backend::MlxBackend<'_>> {
             })
             .map(|report| report.as_ref().map(eredu_runtime::residency_telemetry))
     }
-}
-
-/// A facade-level device class for the selected local backend.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum LocalDevice {
-    /// Host CPU execution.
-    Cpu,
-    /// The selected native accelerator at this zero-based index.
-    Accelerator(u32),
-}
-
-/// Selects accelerator zero when this build includes a native accelerator
-/// family, or the CPU for CPU-only builds.
-pub const fn default_local_device() -> LocalDevice {
-    if compiled_accelerator_family().is_some() {
-        LocalDevice::Accelerator(0)
-    } else {
-        LocalDevice::Cpu
-    }
-}
-
-/// Process-global allocator policy, selected before native model realization.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum LocalAllocatorCachePolicy {
-    /// Cap an untouched native default at 1/32 of available memory, up to 2 GiB.
-    /// Missing memory observations use 256 MiB; smaller native defaults remain.
-    /// Explicit settings and earlier initialization always take precedence.
-    #[default]
-    Automatic,
-    /// Preserve the untouched native default across subsequent automatic startup.
-    /// This must be selected before the first model is realized or policy initialized.
-    PreserveNative,
-    /// Explicitly set the process-global byte limit, overriding earlier policy.
-    Fixed(usize),
-}
-
-/// Process-global configuration for the selected local runtime.
-#[derive(Debug, Clone, Default)]
-pub struct LocalRuntimeConfiguration {
-    #[cfg(all(feature = "metal", target_vendor = "apple"))]
-    accelerator_library_path: Option<PathBuf>,
-    allocator_cache_policy: LocalAllocatorCachePolicy,
-}
-
-impl LocalRuntimeConfiguration {
-    /// Overrides the native accelerator kernel-library path.
-    ///
-    /// Embedded Apple applications use this when their bundled library cannot
-    /// be found through the runtime's default search path.
-    #[cfg(all(feature = "metal", target_vendor = "apple"))]
-    pub fn with_accelerator_library(mut self, path: impl Into<PathBuf>) -> Self {
-        self.accelerator_library_path = Some(path.into());
-        self
-    }
-
-    /// Sets the selected runtime's process-global allocator-cache limit.
-    pub const fn with_allocator_cache_limit(mut self, bytes: usize) -> Self {
-        self.allocator_cache_policy = LocalAllocatorCachePolicy::Fixed(bytes);
-        self
-    }
-
-    /// Selects automatic, preserved-native or explicit cache policy. Initialization
-    /// is process-global; coordinate it with other MLX users before loading models.
-    pub const fn with_allocator_cache_policy(mut self, policy: LocalAllocatorCachePolicy) -> Self {
-        self.allocator_cache_policy = policy;
-        self
-    }
-}
-
-/// Applies process-global configuration before creating a local model session.
-pub fn configure_local_runtime(
-    configuration: &LocalRuntimeConfiguration,
-) -> Result<(), BackendFailure> {
-    #[cfg(all(feature = "metal", target_vendor = "apple"))]
-    if let Some(path) = &configuration.accelerator_library_path {
-        eredu_backend_mlx::set_accelerator_library_path(path).map_err(|error| {
-            BackendFailure::from_error(error).with_operation("runtime configuration")
-        })?;
-    }
-    match configuration.allocator_cache_policy {
-        LocalAllocatorCachePolicy::Fixed(bytes) => {
-            set_local_allocator_cache_limit(bytes)?;
-        }
-        policy => {
-            eredu_backend_mlx::initialize_allocator_cache_policy(
-                policy == LocalAllocatorCachePolicy::PreserveNative,
-            )
-            .map_err(|error| {
-                BackendFailure::from_error(error).with_operation("allocator-cache initialization")
-            })?;
-        }
-    }
-    Ok(())
-}
-
-/// Creates a portable plan device for the selected local backend.
-pub fn local_device_plan(device: LocalDevice) -> Result<crate::DevicePlan, DevicePlanError> {
-    let device = match device {
-        LocalDevice::Cpu => "cpu:0".to_owned(),
-        LocalDevice::Accelerator(index) => {
-            let family =
-                compiled_accelerator_family().ok_or(DevicePlanError::AcceleratorNotCompiled)?;
-            format!("{family}:{index}")
-        }
-    };
-    Ok(crate::DevicePlan::new("mlx", device)
-        .expect("the selected local backend and generated device identifier are non-empty"))
-}
-
-const fn compiled_accelerator_family() -> Option<&'static str> {
-    if cfg!(feature = "cuda") {
-        Some("cuda")
-    } else if cfg!(all(feature = "metal", target_vendor = "apple")) {
-        Some("metal")
-    } else {
-        None
-    }
-}
-
-/// Resets the selected runtime's allocator high-water mark.
-pub fn reset_local_allocator_peak() -> Result<(), BackendFailure> {
-    eredu_backend_mlx::reset_allocator_peak().map_err(|error| {
-        BackendFailure::from_error(error).with_operation("allocator peak reset")
-    })?;
-    Ok(())
-}
-
-fn allocator_telemetry() -> Result<crate::AllocatorTelemetry, BackendFailure> {
-    let memory = eredu_backend_mlx::allocator_memory()
-        .map_err(|error| BackendFailure::from_error(error).with_operation("allocator telemetry"))?;
-    Ok(crate::AllocatorTelemetry {
-        peak_bytes: memory.peak_bytes(),
-        active_bytes: memory.active_bytes(),
-        cache_bytes: memory.cached_bytes(),
-    })
 }
 
 /// One measured phase of a selected-backend expert-cache benchmark.
@@ -477,12 +274,4 @@ mod tests {
         ));
         validate_expert_cache_benchmark_prompt(&[1]).unwrap();
     }
-}
-
-/// Releases unused local allocator buffers without changing the configured policy.
-/// Active tensors and unresolved native submissions remain protected.
-pub fn trim_local_allocator_cache() -> Result<(), eredu_core::BackendFailure> {
-    eredu_backend_mlx::trim_allocator_cache().map_err(|error| {
-        eredu_core::BackendFailure::from_error(error).with_operation("allocator-cache trimming")
-    })
 }

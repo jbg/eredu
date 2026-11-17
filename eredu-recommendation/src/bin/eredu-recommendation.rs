@@ -118,7 +118,21 @@ fn builder(hub: Hub, planning: Planning) -> Result<CatalogueBuilder> {
 #[tokio::main]
 async fn main() -> Result<()> {
     if std::env::args().nth(1).as_deref() == Some("--worker") {
-        return worker::run();
+        return worker::run(|backend, _metadata, _request| match backend {
+            #[cfg(feature = "mlx")]
+            "mlx" => Ok(eredu::api::inspect_model_metadata(
+                _metadata,
+                _request,
+                &eredu_backend_mlx::inspection_mechanisms(),
+                eredu_core::MediaFeatureAvailability {
+                    image: cfg!(feature = "image"),
+                    audio: cfg!(feature = "audio"),
+                },
+            )),
+            #[cfg(not(feature = "mlx"))]
+            "mlx" => anyhow::bail!("inspection backend mlx requires the mlx Cargo feature"),
+            _ => anyhow::bail!("unknown inspection backend {backend}"),
+        });
     }
     let cli = Cli::parse();
     // Offline operations do not initialize an HTTP client or resolve credentials.

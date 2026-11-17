@@ -17,11 +17,11 @@ default = []
 hub = ["dep:reqwest", "dep:futures", "dep:tokio", "dep:regex", "dep:tempfile", "dep:chrono"]
 builder = ["hub", "dep:base64", "dep:sysinfo"]
 cli = ["builder", "dep:clap"]
-mlx = ["eredu/mlx"]
-metal = ["eredu/metal"]
-cuda = ["eredu/cuda"]
-image = ["eredu/image"]
-audio = ["eredu/audio"]
+mlx = ["dep:eredu-backend-mlx"]
+metal = ["mlx", "eredu-backend-mlx/metal"]
+cuda = ["mlx", "eredu-backend-mlx/cuda"]
+image = ["eredu/image", "eredu-backend-mlx?/image"]
+audio = ["eredu/audio", "eredu-backend-mlx?/audio"]
 
 [[bin]]
 name = "eredu-recommendation"
@@ -35,6 +35,7 @@ base64 = { version = "0.22", optional = true }
 clap = { workspace = true, optional = true }
 eredu.workspace = true
 eredu-architectures.workspace = true
+eredu-backend-mlx = { workspace = true, optional = true }
 eredu-core.workspace = true
 eredu-runtime.workspace = true
 futures = { version = "0.3", optional = true }

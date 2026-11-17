@@ -220,7 +220,7 @@ fn record_step(
 fn main() -> anyhow::Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     let reference: Value = serde_json::from_slice(&std::fs::read(args.first().context(
-        "usage: component_sparse_probe <reference.json> <output.json> [cpu|gpu] [controlled] [writes|scores]",
+        "usage: component_sparse_probe <reference.json> <output.json> [DEVICE_ID] [controlled] [writes|scores]",
     )?)?)?;
     let score_mode = args.iter().skip(3).any(|arg| arg == "scores");
     let write_mode = score_mode || args.iter().skip(3).any(|arg| arg == "writes");
@@ -233,12 +233,8 @@ fn main() -> anyhow::Result<()> {
         .context("checkpoint path")?;
     let prefix: Vec<u32> = serde_json::from_value(reference["prefix_ids"].clone())?;
     let graph = inspect_architecture(path)?;
-    let device = match args.get(2).map(String::as_str).unwrap_or("cpu") {
-        "cpu" => LocalDevice::Cpu,
-        "gpu" => LocalDevice::Accelerator(0),
-        other => anyhow::bail!("unknown device {other}"),
-    };
-    let execution = ExecutionPlan::fully_resident(local_device_plan(device)?);
+    let device = args.get(2).map(String::as_str).unwrap_or("cpu:0");
+    let execution = ExecutionPlan::fully_resident(eredu_core::DevicePlan::new("mlx", device)?);
     let (mut model, _) =
         LoadedModel::load_execution_plan(&MlxBackendFactory::default(), path, &execution)?
             .into_parts();

@@ -943,6 +943,7 @@ impl AutomaticPlanningBackend for MockBackend {
                 detail: None,
                 devices: vec![HardwareDeviceProfile {
                     id: "gpu:0".into(),
+                    kind: eredu_core::HardwareDeviceKind::Gpu,
                     family: "mock-accelerator".into(),
                     index: 0,
                     total_memory_bytes: Observed::exact(8 * 1024, "conformance fixture"),

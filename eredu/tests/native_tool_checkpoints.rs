@@ -4,10 +4,7 @@
 //! model directory or GGUF and run the exact ignored test on a Metal host.
 
 use eredu::{
-    api::{
-        local_device_plan, GenerationRequest, LoadedModel, LocalDevice,
-        PreparedChatGenerationSettings, PreparedChatInput,
-    },
+    api::{GenerationRequest, LoadedModel, PreparedChatGenerationSettings, PreparedChatInput},
     runtime::chat::{ChatTemplateRequest, NativeToolSupport, ToolChoice},
 };
 use eredu_backend_mlx::MlxBackendFactory;
@@ -29,7 +26,7 @@ fn smoke(environment: &str, expected_profile_prefix: &str) {
 
 fn accelerator_plan() -> ExecutionPlan {
     ExecutionPlan::fully_resident(
-        local_device_plan(LocalDevice::Accelerator(0))
+        eredu_core::DevicePlan::new("mlx", "metal:0")
             .expect("native checkpoint smoke tests require a compiled accelerator"),
     )
 }

@@ -288,7 +288,13 @@ pub fn inspect(
 }
 
 /// Internal CLI protocol. No network or device discovery runs in this process.
-pub fn run() -> Result<()> {
+pub fn run(
+    inspect: impl FnOnce(
+        &str,
+        &ArtifactMetadata,
+        &eredu_runtime::NormalizedLoadRequest,
+    ) -> Result<eredu::api::ModelInspectionOutcome>,
+) -> Result<()> {
     const LIMIT: u64 = 128 * 1024 * 1024;
     let mut bytes = Vec::new();
     std::io::stdin().take(LIMIT + 1).read_to_end(&mut bytes)?;
@@ -299,10 +305,10 @@ pub fn run() -> Result<()> {
     let input: WorkerInput = serde_json::from_slice(&bytes)?;
     let result = (|| -> Result<Inspection> {
         let metadata = input.metadata.decode()?;
-        let options = input.profile.inspection_options()?;
-        Ok(forecast::inspect(
-            &metadata,
-            &options,
+        let request = input.profile.inspection_request()?;
+        let outcome = inspect(&input.profile.backend, &metadata, &request)?;
+        Ok(forecast::from_inspection(
+            &outcome,
             &input.profile.memory_options()?,
             &eredu::api::ForecastCalibration::default(),
         )?)

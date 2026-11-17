@@ -650,6 +650,11 @@ pub use unit_policy_view::{
 mod vocabulary_module;
 pub use vocabulary_module::VocabularyModulePlacement;
 
+mod realtime_mechanisms;
+pub use realtime_mechanisms::{
+    BeginRealtimeSubmission, CategoricalFrameBranch, CategoricalRealtimeMechanisms,
+    RealtimeBackendFactory, RealtimeHostFrame, RealtimeSubmissionBranch, SpeechRealtimeMechanisms,
+};
 mod realtime_startup;
 pub use realtime_startup::{
     PipelineTransportProvider, RealtimeCopyLimits, RealtimeGraphMechanisms,

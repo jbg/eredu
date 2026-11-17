@@ -2,8 +2,8 @@
 //! Usage: chat_probe CHECKPOINT OUTPUT_PREFIX [MAX_TOKENS] [TEMPERATURE] [cpu|metal]
 use eredu::{
     api::{
-        local_device_plan, ControlledGenerationRecord, GenerationRequest, LoadedModel, LocalDevice,
-        ObservedGenerationEvent, PreparedChatGenerationSettings, PreparedChatInput, TraceLimits,
+        ControlledGenerationRecord, GenerationRequest, LoadedModel, ObservedGenerationEvent,
+        PreparedChatGenerationSettings, PreparedChatInput, TraceLimits,
     },
     runtime::chat::ChatTemplateRequest,
 };
@@ -21,11 +21,11 @@ fn main() -> anyhow::Result<()> {
     let max_tokens: usize = args.get(2).map(String::as_str).unwrap_or("2048").parse()?;
     let temperature: f32 = args.get(3).map(String::as_str).unwrap_or("0").parse()?;
     let device = match args.get(4).map(String::as_str).unwrap_or("cpu") {
-        "cpu" => LocalDevice::Cpu,
-        "metal" => LocalDevice::Accelerator(0),
+        "cpu" => "cpu:0",
+        "metal" => "metal:0",
         other => anyhow::bail!("unknown device {other}"),
     };
-    let plan = ExecutionPlan::fully_resident(local_device_plan(device)?);
+    let plan = ExecutionPlan::fully_resident(eredu_core::DevicePlan::new("mlx", device)?);
     let (mut model, _) =
         LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &args[0], &plan)?
             .into_parts();

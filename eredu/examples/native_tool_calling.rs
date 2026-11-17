@@ -3,14 +3,13 @@
 //! Run with a target checkpoint and, optionally, an external Gemma 4 assistant:
 //! `cargo run -p eredu --example native_tool_calling -- TARGET [DRAFTER]`.
 
+mod device_selection;
+
 use eredu_backend_mlx::MlxBackendFactory;
 use std::env;
 
 use eredu::{
-    api::{
-        default_local_device, local_device_plan, GenerationRequest, LoadedModel, LocalDevice,
-        PreparedChatGenerationSettings, PreparedChatInput,
-    },
+    api::{GenerationRequest, LoadedModel, PreparedChatGenerationSettings, PreparedChatInput},
     runtime::chat::{ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, ToolChoice},
 };
 use eredu_core::{
@@ -26,13 +25,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("usage: native_tool_calling TARGET [DRAFTER]")?;
     let drafter_path = arguments.next();
 
-    let mut plan = ExecutionPlan::fully_resident(local_device_plan(default_local_device())?);
+    let mut plan = ExecutionPlan::fully_resident(device_selection::default_device(
+        &MlxBackendFactory::default(),
+    )?);
     if let Some(path) = &drafter_path {
         plan = plan.with_drafting(DraftingPlan::External {
             residency: eredu_core::ResidencyPlan::FullyResident,
             model: path.clone(),
             placement: DraftPlacementPlan::Device {
-                device: local_device_plan(LocalDevice::Cpu)?,
+                device: eredu_core::DevicePlan::new("mlx", "cpu:0")?,
             },
             max_draft_tokens: 3,
             lookahead: true,

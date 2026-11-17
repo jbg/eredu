@@ -46,7 +46,7 @@ fn main() -> anyhow::Result<()> {
         .filter(|g| captured_layers.contains(&g.layer_index))
         .flat_map(|g| [g.activation.clone(), g.effective_activation.clone()])
         .collect();
-    let execution = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Cpu)?);
+    let execution = ExecutionPlan::fully_resident(eredu_core::DevicePlan::new("mlx", "cpu:0")?);
     let (mut model, _) =
         LoadedModel::load_execution_plan(&MlxBackendFactory::default(), path, &execution)?
             .into_parts();

@@ -1704,8 +1704,9 @@ pub(crate) fn selected_k2_horizon_args(
     crate::k2_horizon::with_checkpoint_formats(
         args,
         selected
-            .parameters()
+            .materialization_tasks()
             .iter()
+            .filter(|p| p.logical_shape().len() >= 2)
             .map(|p| (p.name().to_owned(), p.executable())),
     )
 }
@@ -1720,6 +1721,7 @@ pub(crate) fn source_k2_horizon_args(
             .requirements()
             .parameters()
             .iter()
+            .filter(|parameter| parameter.logical_shape().len() >= 2)
             .map(|parameter| (parameter.name().to_owned(), parameter.native_executable())),
     )
 }

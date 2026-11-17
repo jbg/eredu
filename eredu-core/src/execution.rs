@@ -504,7 +504,7 @@ impl ExecutionPlan {
     /// ```
     /// use eredu_core::{DevicePlan, ExecutionPlan};
     /// use eredu_core::residency::ParameterConversionRetentionPolicy;
-    /// let plan = ExecutionPlan::fully_resident(DevicePlan::new("mlx", "gpu:0")?)
+    /// let plan = ExecutionPlan::fully_resident(DevicePlan::new("mlx", "cpu:0")?)
     ///     .with_parameter_conversion_retention(Some(
     ///         ParameterConversionRetentionPolicy::Bounded { max_bytes: 32 << 20 },
     ///     ));

@@ -1,13 +1,12 @@
+mod device_selection;
+
 use std::{
     path::{Path, PathBuf},
     time::Instant,
 };
 
 use eredu::{
-    api::{
-        default_local_device, local_device_plan, GenerationRequest, LoadedModel,
-        PreparedChatGenerationSettings, PreparedChatInput,
-    },
+    api::{GenerationRequest, LoadedModel, PreparedChatGenerationSettings, PreparedChatInput},
     runtime::chat::{ChatTemplateRequest, PreparedChat},
 };
 use eredu_backend_mlx::MlxBackendFactory;
@@ -77,7 +76,9 @@ struct GenerationResult {
 }
 
 fn prepare_prompt(target_dir: &PathBuf, prompt: &str) -> anyhow::Result<PreparedChat> {
-    let plan = ExecutionPlan::fully_resident(local_device_plan(default_local_device())?);
+    let plan = ExecutionPlan::fully_resident(device_selection::default_device(
+        &MlxBackendFactory::default(),
+    )?);
     let planned =
         LoadedModel::load_execution_plan(&MlxBackendFactory::default(), target_dir, &plan)?;
     let (mut loaded, _) = planned.into_parts();
@@ -98,7 +99,9 @@ fn run_greedy(
     prompt: &str,
     max_tokens: usize,
 ) -> anyhow::Result<GenerationResult> {
-    let plan = ExecutionPlan::fully_resident(local_device_plan(default_local_device())?);
+    let plan = ExecutionPlan::fully_resident(device_selection::default_device(
+        &MlxBackendFactory::default(),
+    )?);
     let planned =
         LoadedModel::load_execution_plan(&MlxBackendFactory::default(), target_dir, &plan)?;
     let (mut loaded, _) = planned.into_parts();
@@ -139,15 +142,17 @@ fn run_speculative(
     prepared: &PreparedChat,
     max_tokens: usize,
 ) -> anyhow::Result<GenerationResult> {
-    let plan = ExecutionPlan::fully_resident(local_device_plan(default_local_device())?)
-        .with_drafting(DraftingPlan::External {
-            residency: eredu_core::ResidencyPlan::FullyResident,
-            model: assistant_dir.display().to_string(),
-            placement: DraftPlacementPlan::Target,
-            max_draft_tokens: 3,
-            lookahead: false,
-            adaptive_lookahead: false,
-        });
+    let plan = ExecutionPlan::fully_resident(device_selection::default_device(
+        &MlxBackendFactory::default(),
+    )?)
+    .with_drafting(DraftingPlan::External {
+        residency: eredu_core::ResidencyPlan::FullyResident,
+        model: assistant_dir.display().to_string(),
+        placement: DraftPlacementPlan::Target,
+        max_draft_tokens: 3,
+        lookahead: false,
+        adaptive_lookahead: false,
+    });
     let mut target =
         LoadedModel::load_execution_plan(&MlxBackendFactory::default(), target_dir, &plan)?;
     let output = target.generate(GenerationRequest {

@@ -233,7 +233,7 @@ parity is unvalidated unless explicitly recorded below.
 
 ## Cold resources and speculative execution
 
-Automatic schema version 7 retains the unsharded artifact profile and a separate
+The automatic planning report retains the unsharded artifact profile and a separate
 selected-rank profile. Cold tests cover TP/PP/EP combinations, repeated/static
 parameter owners, replicated routers, shared experts, each bank's unequal expert
 cardinality, physical quantization companions and rank-local KV heads/layers.

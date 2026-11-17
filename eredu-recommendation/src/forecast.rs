@@ -1,16 +1,14 @@
 //! Metadata inspection and exact reuse of the facade's request-aware forecasts.
 use crate::{Assessment, Compatibility, Suitability};
 use eredu::api::{
-    forecast_inspected_generation, inspect_model_metadata, ArtifactMetadata, ForecastCalibration,
-    GenerationForecast, GenerationForecastError, GenerationMemoryOptions, InspectionReadiness,
-    MemoryBudget, MemoryDomain, MetadataInspectionError, MetadataInspectionOptions,
+    forecast_inspected_generation, ForecastCalibration, GenerationForecast,
+    GenerationForecastError, GenerationMemoryOptions, InspectionReadiness, MemoryBudget,
+    MemoryDomain,
 };
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ForecastError {
-    #[error(transparent)]
-    Inspection(#[from] MetadataInspectionError),
     #[error(transparent)]
     Forecast(#[from] GenerationForecastError),
     #[error("invalid memory budgets: {0}")]
@@ -25,16 +23,6 @@ pub struct Inspection {
     pub compatibility: Compatibility,
     pub reasons: Vec<String>,
     pub forecast: Option<GenerationForecast>,
-}
-
-pub fn inspect(
-    metadata: &ArtifactMetadata,
-    inspection: &MetadataInspectionOptions,
-    memory: &GenerationMemoryOptions,
-    calibration: &ForecastCalibration,
-) -> Result<Inspection, ForecastError> {
-    let outcome = inspect_model_metadata(metadata, inspection)?;
-    from_inspection(&outcome, memory, calibration)
 }
 
 /// Assess an existing architecture selection using caller-supplied cold mechanism facts.

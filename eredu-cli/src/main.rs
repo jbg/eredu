@@ -40,10 +40,9 @@ use anyhow::{bail, Context, Result};
 use clap::{parser::ValueSource, ArgMatches, CommandFactory, FromArgMatches, Parser, ValueEnum};
 use eredu::{
     api::{
-        benchmark_local_expert_cache, inspect_execution, local_device_plan,
-        reset_local_allocator_peak, BackendInspection, GenerationRequest, LoadedModel, LocalDevice,
-        LocalExpertCacheBenchmarkSample, PreparedChatGenerationSettings, PreparedChatInput,
-        TextDecoder, TextModelError,
+        benchmark_local_expert_cache, inspect_execution, BackendInspection, GenerationRequest,
+        LoadedModel, LocalExpertCacheBenchmarkSample, PreparedChatGenerationSettings,
+        PreparedChatInput, TextDecoder, TextModelError,
     },
     runtime::chat::{
         ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, SemanticSupport, ToolChoice,
@@ -57,10 +56,11 @@ use eredu_core::{
     AutomaticPlanRequest, AutomaticPlanner, AutomaticPlannerPolicy, AutomaticPlanningBackend,
     DeviceCapabilities, DevicePlan, DraftPlacementPlan, DraftingPlan, ExecutionPlan,
     ExecutionPlanReport, ExecutionTelemetry, ExpertCachePlan, FinishReason,
-    GenerationCancellationToken, GenerationConfigOverrides, HardwareMemorySemantics,
-    HardwareProfile, InspectionSeverity, ModelResourceProfile, Observed, PlanExplanation,
-    PlanExplanationEntry, PlanExplanationLevel, ResidencyPlan, SemanticEvent, SessionCapabilities,
-    TextGenerationConfig, TimingTelemetry, WeightTransformationPlan, EXECUTION_PLAN_SCHEMA_VERSION,
+    GenerationCancellationToken, GenerationConfigOverrides, HardwareBackendProfile,
+    HardwareDeviceKind, HardwareMemorySemantics, HardwareProfile, InspectionSeverity,
+    ModelResourceProfile, Observed, PlanExplanation, PlanExplanationEntry, PlanExplanationLevel,
+    ResidencyPlan, SemanticEvent, SessionCapabilities, TextGenerationConfig, TimingTelemetry,
+    WeightTransformationPlan, EXECUTION_PLAN_SCHEMA_VERSION,
 };
 use eredu_runtime::DenseDiskStreamLoadOptions;
 use hf_cache_reader::{resolve_cache_dir, scan_repo, CachedRevision, RepoType};
@@ -129,25 +129,7 @@ impl From<CliToolChoice> for ToolChoice {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum CliDevice {
     Cpu,
-    Gpu(i32),
-}
-
-impl Default for CliDevice {
-    fn default() -> Self {
-        match eredu::api::default_local_device() {
-            LocalDevice::Cpu => Self::Cpu,
-            LocalDevice::Accelerator(index) => Self::Gpu(index as i32),
-        }
-    }
-}
-
-impl CliDevice {
-    fn local(self) -> LocalDevice {
-        match self {
-            Self::Cpu => LocalDevice::Cpu,
-            Self::Gpu(index) => LocalDevice::Accelerator(index as u32),
-        }
-    }
+    Gpu(usize),
 }
 
 impl fmt::Display for CliDevice {
@@ -170,11 +152,8 @@ impl FromStr for CliDevice {
             return Err("expected `cpu` or `gpu:N`".into());
         };
         let index = index
-            .parse::<i32>()
+            .parse::<usize>()
             .map_err(|_| "GPU index must be a non-negative integer".to_string())?;
-        if index < 0 {
-            return Err("GPU index must be a non-negative integer".into());
-        }
         Ok(Self::Gpu(index))
     }
 }
@@ -578,6 +557,7 @@ impl AutomaticCliOverrides {
         original: &Cli,
         draft_model_path: Option<&Path>,
         resources: &ModelResourceProfile,
+        devices: &HardwareBackendProfile,
     ) -> Result<ExecutionPlan> {
         if self.is_empty() {
             return Ok(if plan.prepared_checkpoint_cache().is_some() {
@@ -596,7 +576,38 @@ impl AutomaticCliOverrides {
                 .embedded_draft_capacity
                 .value()
                 .is_some_and(|capacity| *capacity > 0);
-        cli_execution_plan(&args, draft_model_path, embedded_mtp)
+        let mut result = cli_execution_plan(
+            &args,
+            plan.device(),
+            devices,
+            draft_model_path,
+            embedded_mtp,
+        )?;
+        if !self.contains("speculative_draft_device") && !self.contains("draft_model") {
+            if let (
+                DraftingPlan::External { placement, .. },
+                DraftingPlan::External {
+                    residency,
+                    model,
+                    max_draft_tokens,
+                    lookahead,
+                    adaptive_lookahead,
+                    ..
+                },
+            ) = (plan.drafting(), result.drafting())
+            {
+                let drafting = DraftingPlan::External {
+                    placement: placement.clone(),
+                    residency: residency.clone(),
+                    model: model.clone(),
+                    max_draft_tokens: *max_draft_tokens,
+                    lookahead: *lookahead,
+                    adaptive_lookahead: *adaptive_lookahead,
+                };
+                result = result.with_drafting(drafting);
+            }
+        }
+        Ok(result)
     }
 
     fn restore(&self, args: &mut Cli, original: &Cli) {
@@ -1432,12 +1443,11 @@ fn choose_automatic_residency(
 fn automatic_observations(
     factory: &impl BackendInspection,
     model_path: &Path,
-    device: CliDevice,
+    device: &DevicePlan,
 ) -> Result<ExecutionPlanReport> {
     let hardware = factory.discover_hardware()?;
-    let selected_device = device_plan(device)?;
-    validate_automatic_device(&hardware, &selected_device)?;
-    let plan = ExecutionPlan::fully_resident(selected_device);
+    validate_automatic_device(&hardware, device)?;
+    let plan = ExecutionPlan::fully_resident(device.clone());
     let resources = inspect_execution(factory, model_path, &plan)?
         .into_report()
         .resources;
@@ -1483,10 +1493,10 @@ fn read_automatic_feedback(paths: &[PathBuf]) -> Result<Vec<ExecutionTelemetry>>
 fn automatic_plan(
     factory: &impl AutomaticPlanningBackend,
     model_path: &Path,
-    device: CliDevice,
+    device: &DevicePlan,
     prior_telemetry: &[ExecutionTelemetry],
 ) -> Result<ExecutionPlanReport> {
-    let request = AutomaticPlanRequest::new(model_path, device_plan(device)?)
+    let request = AutomaticPlanRequest::new(model_path, device.clone())
         .with_prior_telemetry(prior_telemetry.iter().cloned());
     AutomaticPlanner::default()
         .plan(factory, &request)
@@ -1496,20 +1506,19 @@ fn automatic_plan(
 fn automatic_plan_with_overrides(
     factory: &impl BackendInspection<Inspection = TextArtifactInspection>,
     model_path: &Path,
+    device: &DevicePlan,
+    devices: &HardwareBackendProfile,
     args: &Cli,
     overrides: &AutomaticCliOverrides,
     draft_model_path: Option<&Path>,
     prior_telemetry: &[ExecutionTelemetry],
 ) -> Result<(ExecutionPlanReport, TextArtifactInspection)> {
-    let request = AutomaticPlanRequest::new(
-        model_path,
-        device_plan(args.common.device.unwrap_or_default())?,
-    )
-    .with_prior_telemetry(prior_telemetry.iter().cloned());
+    let request = AutomaticPlanRequest::new(model_path, device.clone())
+        .with_prior_telemetry(prior_telemetry.iter().cloned());
     AutomaticPlanner::default()
         .plan_retained_with_overrides(factory, &request, |plan, resources| {
             overrides
-                .apply_to_plan(plan, args, draft_model_path, resources)
+                .apply_to_plan(plan, args, draft_model_path, resources, devices)
                 .map_err(|error| eredu_core::AutomaticPlanningError::Invalid(error.to_string()))
         })
         .map(|retained| retained.into_parts())
@@ -1584,25 +1593,6 @@ fn automatic_benchmark_candidates(
     Ok(plans)
 }
 
-fn cli_device_for_plan(device: &DevicePlan) -> Result<CliDevice> {
-    if device.backend().as_str() != "mlx" {
-        bail!("the Eredu CLI cannot execute backend {}", device.backend());
-    }
-    let (family, index) = device
-        .device()
-        .split_once(':')
-        .context("planned MLX device must use family:index syntax")?;
-    let index = index
-        .parse::<i32>()
-        .context("planned MLX device index is invalid")?;
-    match family {
-        "cpu" if index == 0 => Ok(CliDevice::Cpu),
-        "metal" | "cuda" => Ok(CliDevice::Gpu(index)),
-        "cpu" => bail!("CPU plan device index must be zero"),
-        _ => bail!("unsupported MLX device family {family:?}"),
-    }
-}
-
 fn temporary_trial_path(label: &str, candidate: usize, run: usize) -> PathBuf {
     std::env::temp_dir().join(format!(
         "eredu-auto-{label}-{}-{candidate}-{run}.json",
@@ -1641,8 +1631,6 @@ fn isolated_benchmark_trial(
         let mut child = Command::new(executable)
             .arg("--model")
             .arg(model_path)
-            .arg("--device")
-            .arg(cli_device_for_plan(plan.device())?.to_string())
             .arg("--auto-trial-plan")
             .arg(&plan_path)
             .arg("--telemetry-json")
@@ -1881,7 +1869,6 @@ fn exact_automatic_report(
 }
 
 fn apply_automatic_plan(args: &mut Cli, plan: &ExecutionPlan) -> Result<()> {
-    args.common.device = Some(cli_device_for_plan(plan.device())?);
     args.common.prepared_cache =
         crate::common::PreparedCacheArgs::from_policy(plan.prepared_checkpoint_cache());
     args.vision_companion = plan.media_companions().vision().map(Path::to_path_buf);
@@ -1970,6 +1957,8 @@ fn apply_automatic_plan(args: &mut Cli, plan: &ExecutionPlan) -> Result<()> {
 fn automatic_report_with_cache(
     factory: &impl BackendInspection<Inspection = TextArtifactInspection>,
     model_path: &Path,
+    device: &DevicePlan,
+    devices: &HardwareBackendProfile,
     args: &Cli,
     overrides: &AutomaticCliOverrides,
     draft_model_path: Option<&Path>,
@@ -1977,8 +1966,7 @@ fn automatic_report_with_cache(
     prior_telemetry: &[ExecutionTelemetry],
 ) -> Result<ExecutionPlanReport> {
     if let Some(path) = cache_path {
-        let observations =
-            automatic_observations(factory, model_path, args.common.device.unwrap_or_default())?;
+        let observations = automatic_observations(factory, model_path, device)?;
         let key = automatic_cache_key(model_path, &observations)?;
         if prior_telemetry.is_empty() {
             if let Some(mut cached) = cached_automatic_report(path, &key)? {
@@ -1990,6 +1978,7 @@ fn automatic_report_with_cache(
                         args,
                         draft_model_path,
                         &observations.resources,
+                        devices,
                     )? == cached.plan
                     && cached_plan_resource_admitted(&observations, &cached.plan)
                     && candidate_is_loadable(factory, model_path, &cached.plan)?
@@ -2012,6 +2001,8 @@ fn automatic_report_with_cache(
         let heuristic = automatic_plan_with_overrides(
             factory,
             model_path,
+            device,
+            devices,
             args,
             overrides,
             draft_model_path,
@@ -2024,6 +2015,8 @@ fn automatic_report_with_cache(
         automatic_plan_with_overrides(
             factory,
             model_path,
+            device,
+            devices,
             args,
             overrides,
             draft_model_path,
@@ -2085,6 +2078,12 @@ fn main() -> Result<()> {
         MlxBackendFactory::default().with_residency_diagnostics(args.verbose, args.verbose);
     let original_args = args.clone();
     validate_args(&args)?;
+    let devices = discover_devices(&factory)?;
+    let device = if args.auto_trial_plan.is_some() && args.common.device.is_none() {
+        None
+    } else {
+        Some(resolve_device(&devices, args.common.device)?)
+    };
     let decision_request = args.decisions.as_deref().map(decisions::read).transpose()?;
     let (resolved_model, resolved_draft) = resolve_model_pair(
         args.common
@@ -2102,7 +2101,15 @@ fn main() -> Result<()> {
     if let Some((mut request, assets)) = decision_request {
         request.seed = args.common.seed.or(request.seed);
         args.common.configure_runtime()?;
-        let plan = cli_execution_plan(&args, None, false)?;
+        let plan = cli_execution_plan(
+            &args,
+            device
+                .as_ref()
+                .context("decisions require a selected device")?,
+            &devices,
+            None,
+            false,
+        )?;
         let load_started = Instant::now();
         let mut decision_started = None;
         let mut on_loaded = || {
@@ -2134,12 +2141,20 @@ fn main() -> Result<()> {
                 .with_context(|| format!("failed to read exact trial plan {}", path.display()))?;
             let plan: ExecutionPlan = serde_json::from_slice(&bytes)
                 .with_context(|| format!("failed to parse exact trial plan {}", path.display()))?;
-            if plan.device() != &device_plan(args.common.device.unwrap_or_default())? {
+            if plan.device().backend() != &devices.backend {
                 bail!(
-                    "exact trial plan device {}:{} does not match --device {}",
+                    "exact trial plan targets backend {}, selected backend is {}",
                     plan.device().backend(),
-                    plan.device().device(),
-                    args.common.device.unwrap_or_default()
+                    devices.backend
+                );
+            }
+            if device
+                .as_ref()
+                .is_some_and(|device| device != plan.device())
+            {
+                bail!(
+                    "exact trial plan device {} does not match --device",
+                    plan.device().device()
                 );
             }
             let plan = if automatic_overrides.is_empty() {
@@ -2149,16 +2164,13 @@ fn main() -> Result<()> {
                     plan.with_prepared_checkpoint_cache(args.common.prepared_cache.policy())
                 }
             } else {
-                let observations = automatic_observations(
-                    &factory,
-                    &model_path,
-                    args.common.device.unwrap_or_default(),
-                )?;
+                let observations = automatic_observations(&factory, &model_path, plan.device())?;
                 automatic_overrides.apply_to_plan(
                     &plan,
                     &original_args,
                     draft_model_path.as_deref(),
                     &observations.resources,
+                    &devices,
                 )?
             };
             exact_automatic_report(&factory, &model_path, plan)
@@ -2172,6 +2184,7 @@ fn main() -> Result<()> {
             report,
         )?)
     } else {
+        let device = device.as_ref().context("no execution device selected")?;
         match args.auto {
             Some(mode) => match mode {
                 AutoMode::Benchmark => {
@@ -2184,12 +2197,8 @@ fn main() -> Result<()> {
                             "performance overrides are supported by automatic quick execution and plan reporting, not --auto benchmark"
                         );
                     }
-                    let mut heuristic = automatic_plan(
-                        &factory,
-                        &model_path,
-                        args.common.device.unwrap_or_default(),
-                        &automatic_feedback,
-                    )?;
+                    let mut heuristic =
+                        automatic_plan(&factory, &model_path, device, &automatic_feedback)?;
                     heuristic.plan = heuristic
                         .plan
                         .with_prepared_checkpoint_cache(args.common.prepared_cache.policy());
@@ -2223,6 +2232,8 @@ fn main() -> Result<()> {
                     let report = automatic_report_with_cache(
                         &factory,
                         &model_path,
+                        device,
+                        &devices,
                         &original_args,
                         &automatic_overrides,
                         draft_model_path.as_deref(),
@@ -2244,6 +2255,8 @@ fn main() -> Result<()> {
                     let (report, inspection) = automatic_plan_with_overrides(
                         &factory,
                         &model_path,
+                        device,
+                        &devices,
                         &original_args,
                         &automatic_overrides,
                         draft_model_path.as_deref(),
@@ -2251,11 +2264,7 @@ fn main() -> Result<()> {
                     )?;
                     retained_automatic_inspection = Some(inspection);
                     if let Some(path) = &args.auto_cache {
-                        let observations = automatic_observations(
-                            &factory,
-                            &model_path,
-                            args.common.device.unwrap_or_default(),
-                        )?;
+                        let observations = automatic_observations(&factory, &model_path, device)?;
                         let key = automatic_cache_key(&model_path, &observations)?;
                         write_auto_plan_cache(path, key, report.clone(), None)?;
                     }
@@ -2306,7 +2315,13 @@ fn main() -> Result<()> {
     };
     let execution_plan = match automatic_report.as_ref() {
         Some(report) => report.plan.clone(),
-        None => cli_execution_plan(&args, draft_model_path.as_deref(), configured_embedded_mtp)?,
+        None => cli_execution_plan(
+            &args,
+            device.as_ref().context("no execution device selected")?,
+            &devices,
+            draft_model_path.as_deref(),
+            configured_embedded_mtp,
+        )?,
     };
 
     if let Some(tokens) = args.estimate_memory_tokens {
@@ -2326,7 +2341,7 @@ fn main() -> Result<()> {
     if args.verbose {
         eprintln!("--- Eredu MLX diagnostics (stderr) ---");
         eprintln!("model: {}", model_path.display());
-        eprintln!("device: {}", args.common.device.unwrap_or_default());
+        eprintln!("device: {}", execution_plan.device().device());
         if let Some(bytes) = args.common.mlx_cache_limit_bytes {
             eprintln!("mlx_cache_limit: {}", format_bytes(bytes as usize));
         }
@@ -2346,7 +2361,7 @@ fn main() -> Result<()> {
 
     if args.verbose || args.telemetry_json.is_some() {
         // Capture the complete model-load and generation high-water mark.
-        reset_local_allocator_peak()?;
+        factory.reset_allocator_peak()?;
     }
     let resource_profile = if let Some(report) = &automatic_report {
         Some(report.resources.clone())
@@ -2696,16 +2711,16 @@ fn main() -> Result<()> {
     }
 
     let allocator_telemetry = if args.verbose || args.telemetry_json.is_some() {
-        Some(model.allocator_telemetry()?)
+        model.synchronize()?;
+        factory
+            .allocator_observation()?
+            .map(|(_, telemetry)| telemetry)
     } else {
         None
     };
     let total_elapsed = total_started.elapsed();
 
     if args.verbose {
-        let allocator = allocator_telemetry
-            .as_ref()
-            .expect("verbose execution collected allocator telemetry");
         eprintln!(
             "model_family: {}, effective_model_type: {}, prompt_tokens: {}, generated_tokens: {}",
             model.model_family().canonical_name(),
@@ -2760,18 +2775,20 @@ fn main() -> Result<()> {
             }
             eprintln!("speculative_accept_lens: {:?}", stats.accept_lens());
         }
-        eprintln!(
-            "mlx_peak_memory: {}",
-            format_bytes(allocator.peak_bytes as usize)
-        );
-        eprintln!(
-            "mlx_active_memory: {}",
-            format_bytes(allocator.active_bytes as usize)
-        );
-        eprintln!(
-            "mlx_cache_memory: {}",
-            format_bytes(allocator.cache_bytes as usize)
-        );
+        if let Some(allocator) = &allocator_telemetry {
+            eprintln!(
+                "mlx_peak_memory: {}",
+                format_bytes(allocator.peak_bytes as usize)
+            );
+            eprintln!(
+                "mlx_active_memory: {}",
+                format_bytes(allocator.active_bytes as usize)
+            );
+            eprintln!(
+                "mlx_cache_memory: {}",
+                format_bytes(allocator.cache_bytes as usize)
+            );
+        }
         if let Some(report) = model.residency_telemetry()? {
             eprintln!(
                 "residency_current_host_device: {} / {} bytes",
@@ -2880,12 +2897,76 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn device_plan(device: CliDevice) -> Result<DevicePlan> {
-    local_device_plan(device.local()).map_err(Into::into)
+fn discover_devices(factory: &impl AutomaticPlanningBackend) -> Result<HardwareBackendProfile> {
+    let backend = factory.backend_id();
+    let profile = factory
+        .discover_hardware()?
+        .backends
+        .into_iter()
+        .find(|profile| profile.backend == backend)
+        .with_context(|| format!("device discovery did not report backend {backend}"))?;
+
+    if !profile.available {
+        bail!(
+            "backend {} is unavailable: {}",
+            profile.backend,
+            profile.detail.as_deref().unwrap_or("no detail reported")
+        );
+    }
+    Ok(profile)
+}
+
+fn resolve_device(
+    profile: &HardwareBackendProfile,
+    request: Option<CliDevice>,
+) -> Result<DevicePlan> {
+    let cpu = || {
+        profile
+            .devices
+            .iter()
+            .filter(|device| device.kind == HardwareDeviceKind::Cpu)
+            .min_by_key(|device| (device.index, &device.id))
+    };
+    let selected = match request {
+        Some(CliDevice::Cpu) => cpu(),
+        Some(CliDevice::Gpu(index)) => {
+            let mut matches = profile
+                .devices
+                .iter()
+                .filter(|device| device.kind == HardwareDeviceKind::Gpu && device.index == index);
+            let selected = matches.next();
+            if matches.next().is_some() {
+                bail!(
+                    "backend {} reported multiple GPUs at index {index}",
+                    profile.backend
+                );
+            }
+            selected
+        }
+        None => profile
+            .devices
+            .iter()
+            .filter(|device| device.kind == HardwareDeviceKind::Gpu)
+            .min_by_key(|device| (device.index, &device.id))
+            .or_else(cpu),
+    }
+    .with_context(|| match request {
+        Some(device) => format!(
+            "backend {} did not discover device {device}",
+            profile.backend
+        ),
+        None => format!(
+            "backend {} reported no CPU or GPU for default selection",
+            profile.backend
+        ),
+    })?;
+    Ok(DevicePlan::new(profile.backend.as_str(), &selected.id)?)
 }
 
 fn cli_execution_plan(
     args: &Cli,
+    device: &DevicePlan,
+    devices: &HardwareBackendProfile,
     draft_model: Option<&Path>,
     embedded_mtp: bool,
 ) -> Result<ExecutionPlan> {
@@ -2916,7 +2997,7 @@ fn cli_execution_plan(
         let placement = match args.speculative_draft_device {
             SpeculativeDraftDevice::Target => DraftPlacementPlan::Target,
             SpeculativeDraftDevice::Device(device) => DraftPlacementPlan::Device {
-                device: device_plan(device)?,
+                device: resolve_device(devices, Some(device))?,
             },
         };
         DraftingPlan::External {
@@ -2944,7 +3025,7 @@ fn cli_execution_plan(
         args.expert_cache_prefill_bank_bytes,
         args.expert_cache_eviction.into(),
     ));
-    let plan = ExecutionPlan::fully_resident(device_plan(args.common.device.unwrap_or_default())?)
+    let plan = ExecutionPlan::fully_resident(device.clone())
         .with_topology(
             eredu_core::topology::ParallelTopology::new(1, 1, 1, 1)
                 .expect("the singleton topology is valid"),
@@ -3760,8 +3841,8 @@ mod tests {
 
     use super::{
         apply_automatic_plan, artifact_file_stamps, base_automatic_candidates,
-        cached_automatic_report, choose_automatic_residency, cli_execution_plan, device_plan,
-        format_bytes, median, requested_load_quantization, select_cached_gguf_from_revisions,
+        cached_automatic_report, choose_automatic_residency, cli_execution_plan, format_bytes,
+        median, requested_load_quantization, select_cached_gguf_from_revisions,
         select_cached_gguf_pair_from_revisions, select_cached_gguf_path, select_revision,
         select_unique_cached_gguf, should_report_stop_reason, split_hf_model_spec, stop_reason,
         use_semantic_generation, validate_args, validate_artifact_pair, write_auto_plan_cache,
@@ -3772,6 +3853,26 @@ mod tests {
         ResolvedModel, SemanticEvent, SemanticSupport, SpeculativeDraftDevice, StopReason,
         WeightTransformationPlan,
     };
+
+    fn cpu_plan() -> super::DevicePlan {
+        super::DevicePlan::new("mlx", "cpu:0").unwrap()
+    }
+
+    fn test_devices() -> super::HardwareBackendProfile {
+        super::HardwareBackendProfile {
+            backend: cpu_plan().backend().clone(),
+            available: true,
+            detail: None,
+            devices: vec![eredu_core::HardwareDeviceProfile {
+                id: "cpu:0".into(),
+                family: "test-host".into(),
+                kind: super::HardwareDeviceKind::Cpu,
+                index: 0,
+                total_memory_bytes: Observed::exact(1, "fixture"),
+                available_memory_bytes: Observed::exact(1, "fixture"),
+            }],
+        }
+    }
 
     fn scanned_revision() -> CachedRevision {
         let directory = tempfile::tempdir().unwrap();
@@ -3863,7 +3964,7 @@ mod tests {
         let cache_path = directory.path().join("plans.json");
         let model_path = directory.path().join("model.gguf");
         std::fs::write(&model_path, b"fixture").unwrap();
-        let device = device_plan(CliDevice::Cpu).unwrap();
+        let device = cpu_plan();
         let hardware = super::MlxBackendFactory::default()
             .discover_hardware()
             .unwrap();
@@ -3932,8 +4033,8 @@ mod tests {
         );
         resources.embedded_draft_layers = Observed::exact(1, "fixture");
         resources.embedded_draft_capacity = Observed::exact(1, "fixture");
-        let base = ExecutionPlan::fully_resident(device_plan(CliDevice::Cpu).unwrap())
-            .with_drafting(DraftingPlan::Embedded {
+        let base =
+            ExecutionPlan::fully_resident(cpu_plan()).with_drafting(DraftingPlan::Embedded {
                 max_draft_tokens: 1,
                 lookahead: true,
                 adaptive_lookahead: true,
@@ -4010,11 +4111,11 @@ mod tests {
             let overrides = AutomaticCliOverrides::from_matches(&matches);
             let draft = original.draft_model.as_deref().map(Path::new);
             let plan = overrides
-                .apply_to_plan(&base, &original, draft, &resources)
+                .apply_to_plan(&base, &original, draft, &resources, &test_devices())
                 .unwrap();
             assert_eq!(
                 overrides
-                    .apply_to_plan(&plan, &original, draft, &resources)
+                    .apply_to_plan(&plan, &original, draft, &resources, &test_devices())
                     .unwrap(),
                 plan,
                 "overrides must be idempotent"
@@ -4081,6 +4182,8 @@ mod tests {
             assert_eq!(
                 cli_execution_plan(
                     &applied,
+                    &cpu_plan(),
+                    &test_devices(),
                     draft,
                     draft.is_none() && applied.speculative_draft_tokens > 0
                 )
@@ -4103,7 +4206,8 @@ mod tests {
             "audio-source",
         ])
         .unwrap();
-        let selected = cli_execution_plan(&original, None, false).unwrap();
+        let selected =
+            cli_execution_plan(&original, &cpu_plan(), &test_devices(), None, false).unwrap();
         assert_eq!(
             selected.media_companions().vision(),
             Some(Path::new("vision-source"))
@@ -4117,7 +4221,10 @@ mod tests {
         let mut replay =
             Cli::try_parse_from(["eredu", "--model", "text-model", "--no-auto"]).unwrap();
         apply_automatic_plan(&mut replay, &selected).unwrap();
-        assert_eq!(cli_execution_plan(&replay, None, false).unwrap(), selected);
+        assert_eq!(
+            cli_execution_plan(&replay, &cpu_plan(), &test_devices(), None, false).unwrap(),
+            selected
+        );
         let resources = ModelResourceProfile::unmeasured(
             "text-model".into(),
             eredu_core::ArtifactFormat::SafeTensors,
@@ -4141,7 +4248,7 @@ mod tests {
                 .unwrap();
             let args = Cli::from_arg_matches(&matches).unwrap();
             let plan = AutomaticCliOverrides::from_matches(&matches)
-                .apply_to_plan(&selected, &args, None, &resources)
+                .apply_to_plan(&selected, &args, None, &resources, &test_devices())
                 .unwrap();
             assert_eq!(
                 plan.media_companions().vision(),
@@ -4175,8 +4282,8 @@ mod tests {
             host_lookahead: 1,
             background_queue: 1,
         };
-        let plan = ExecutionPlan::fully_resident(device_plan(CliDevice::Cpu).unwrap())
-            .with_drafting(DraftingPlan::External {
+        let plan =
+            ExecutionPlan::fully_resident(cpu_plan()).with_drafting(DraftingPlan::External {
                 model: "assistant".into(),
                 placement: super::DraftPlacementPlan::Target,
                 residency: residency.clone(),
@@ -4188,7 +4295,14 @@ mod tests {
         replay.common.device = Some(CliDevice::Gpu(0));
         apply_automatic_plan(&mut replay, &plan).unwrap();
         assert_eq!(
-            cli_execution_plan(&replay, Some(Path::new("assistant")), false).unwrap(),
+            cli_execution_plan(
+                &replay,
+                &cpu_plan(),
+                &test_devices(),
+                Some(Path::new("assistant")),
+                false
+            )
+            .unwrap(),
             plan.clone()
                 .with_prepared_checkpoint_cache(replay.common.prepared_cache.policy())
         );
@@ -4197,7 +4311,13 @@ mod tests {
             eredu_core::ArtifactFormat::SafeTensors,
         );
         let selected = AutomaticCliOverrides::from_matches(&matches)
-            .apply_to_plan(&plan, &args, Some(Path::new("assistant")), &resources)
+            .apply_to_plan(
+                &plan,
+                &args,
+                Some(Path::new("assistant")),
+                &resources,
+                &test_devices(),
+            )
             .unwrap();
         assert!(matches!(selected.drafting(), DraftingPlan::External {
             residency: actual, max_draft_tokens: 5, ..
@@ -4237,7 +4357,7 @@ mod tests {
         let mut args =
             Cli::try_parse_from(["eredu", "--model", "model-id", "--auto", "quick", "prompt"])
                 .unwrap();
-        let device = device_plan(CliDevice::Cpu).unwrap();
+        let device = cpu_plan();
         let plan = base_automatic_candidates(device, 1 << 30, 2 << 30)[1]
             .clone()
             .with_expert_cache(Some(super::ExpertCachePlan::new(
@@ -4272,11 +4392,12 @@ mod tests {
         let mut args =
             Cli::try_parse_from(["eredu", "--model", "model-id", "--auto", "quick", "prompt"])
                 .unwrap();
-        let mut plan = ExecutionPlan::fully_resident(device_plan(CliDevice::Cpu).unwrap())
-            .with_weight_transformation(WeightTransformationPlan::Affine {
+        let mut plan = ExecutionPlan::fully_resident(cpu_plan()).with_weight_transformation(
+            WeightTransformationPlan::Affine {
                 bits: 4,
                 group_size: 128,
-            });
+            },
+        );
         apply_automatic_plan(&mut args, &plan).unwrap();
         assert_eq!(args.common.quantize, Some(4));
         assert_eq!(args.common.quantization_group_size, 128);
@@ -4319,7 +4440,7 @@ mod tests {
         .unwrap();
         assert_eq!(args.telemetry_json.as_deref(), Some(Path::new("run.json")));
 
-        let plan = cli_execution_plan(&args, None, false).unwrap();
+        let plan = cli_execution_plan(&args, &cpu_plan(), &test_devices(), None, false).unwrap();
         assert_eq!(plan.device().backend().as_str(), "mlx");
         assert_eq!(plan.device().device(), "cpu:0");
         assert!(matches!(
@@ -4881,16 +5002,30 @@ mod tests {
         );
 
         let defaults = Cli::try_parse_from(["eredu", "--model", "model-id", "prompt"]).unwrap();
-        let expected_default = if cfg!(any(
-            feature = "cuda",
-            all(feature = "metal", target_vendor = "apple")
-        )) {
-            CliDevice::Gpu(0)
-        } else {
-            CliDevice::Cpu
-        };
-        assert_eq!(defaults.common.device.unwrap_or_default(), expected_default);
-        assert!(device_plan(defaults.common.device.unwrap_or_default()).is_ok());
+        assert!(defaults.common.device.is_none());
+        assert_eq!(
+            super::resolve_device(&test_devices(), None).unwrap(),
+            cpu_plan()
+        );
+
+        // Device IDs and family labels are opaque to the CLI.
+        let mut profile = test_devices();
+        let mut gpu = profile.devices[0].clone();
+        gpu.kind = super::HardwareDeviceKind::Gpu;
+        gpu.id = "opaque-accelerator-id".into();
+        gpu.index = 3;
+        profile.devices.push(gpu);
+        assert_eq!(
+            super::resolve_device(&profile, Some(CliDevice::Cpu)).unwrap(),
+            cpu_plan()
+        );
+        for request in [None, Some(CliDevice::Gpu(3))] {
+            assert_eq!(
+                super::resolve_device(&profile, request).unwrap().device(),
+                "opaque-accelerator-id"
+            );
+        }
+        assert!(super::resolve_device(&profile, Some(CliDevice::Gpu(0))).is_err());
         assert_eq!(
             defaults.speculative_draft_device,
             SpeculativeDraftDevice::Target
@@ -4985,7 +5120,7 @@ mod tests {
             .unwrap();
             validate_args(&args).unwrap();
             assert_eq!(
-                cli_execution_plan(&args, None, false)
+                cli_execution_plan(&args, &cpu_plan(), &test_devices(), None, false)
                     .unwrap()
                     .weight_transformation(),
                 WeightTransformationPlan::Affine {

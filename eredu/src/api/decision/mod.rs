@@ -78,4 +78,5 @@ pub struct DecisionResponse {
 }
 
 mod task;
-pub use task::{evaluate_decisions, DecisionBackendFactory};
+pub use eredu_architectures::decision_task::DecisionBackendFactory;
+pub use task::evaluate_decisions;

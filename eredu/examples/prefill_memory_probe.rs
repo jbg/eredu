@@ -6,10 +6,7 @@
 //! bounded activation summaries on the original chat (not the synthetic IDs).
 //! Each invocation is a fresh process; the request peak is reset after loading.
 use eredu::{
-    api::{
-        local_device_plan, GenerationRequest, LoadedModel, PreparedChatGenerationSettings,
-        PreparedChatInput,
-    },
+    api::{GenerationRequest, LoadedModel, PreparedChatGenerationSettings, PreparedChatInput},
     runtime::chat::ChatTemplateRequest,
 };
 use eredu_backend_mlx::{allocator_memory, reset_allocator_peak, MlxBackendFactory};
@@ -33,8 +30,7 @@ fn main() -> anyhow::Result<()> {
     anyhow::ensure!(args.len() >= 4, "CHECKPOINT REQUEST_JSON CHUNK [CANCEL_MS]");
     let chunk: usize = args[3].parse()?;
     let input: Value = serde_json::from_slice(&std::fs::read(&args[2])?)?;
-    let plan =
-        ExecutionPlan::fully_resident(local_device_plan(eredu::api::LocalDevice::Accelerator(0))?);
+    let plan = ExecutionPlan::fully_resident(eredu_core::DevicePlan::new("mlx", "metal:0")?);
     let (mut model, _) =
         LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &args[1], &plan)?
             .into_parts();

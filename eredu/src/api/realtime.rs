@@ -53,14 +53,12 @@ pub use selection::{
     PreparedSpeechSelection, RealtimeLoadError,
 };
 mod categorical;
+mod categorical_binding;
 mod selected;
-#[cfg(feature = "mlx")]
-mod selected_categorical_mlx;
 mod speech;
 pub use categorical::*;
-pub use selected::{
-    bind_realtime, prepare_realtime, PreparedRealtime, RealtimeBackendFactory, RealtimeSession,
-};
+pub use eredu_runtime::RealtimeBackendFactory;
+pub use selected::{bind_realtime, prepare_realtime, PreparedRealtime, RealtimeSession};
 pub use speech::{
     ShareSpeechExecution, SpeechRealtimeFork, SpeechRealtimeSession, SpeechRealtimeSnapshot,
 };

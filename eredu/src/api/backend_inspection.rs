@@ -2,30 +2,11 @@
 
 use std::path::Path;
 
-use eredu_core::{
-    AllocatorCachePolicyReport, AllocatorTelemetry, AutomaticPlanningBackend, BackendFailure,
-    DevicePlan, ExecutionPlan, InputTokenCount,
-};
+use eredu_core::{BackendFailure, DevicePlan, ExecutionPlan, InputTokenCount};
 
 use super::{ForecastCalibration, GenerationForecastError, GenerationMemoryOptions, MemoryBytes};
 
-/// Backend observations used by facade inspection and memory forecasts.
-pub trait BackendInspection: AutomaticPlanningBackend {
-    /// Inspects and retains the exact artifact admission for this execution plan.
-    fn inspect_execution(
-        &self,
-        path: &Path,
-        plan: &ExecutionPlan,
-    ) -> Result<eredu_architectures::ModelInspectionOutcome, BackendFailure>;
-
-    /// Determines placement from a backend device identifier without allocating it.
-    fn device_uses_host_memory(&self, device: &DevicePlan) -> Result<bool, BackendFailure>;
-
-    /// Observes allocator overhead inputs if the backend exposes a retained cache.
-    fn allocator_observation(
-        &self,
-    ) -> Result<Option<(AllocatorCachePolicyReport, AllocatorTelemetry)>, BackendFailure>;
-}
+pub use eredu_architectures::BackendInspection;
 
 /// Inspects an artifact against the selected backend and plan without loading it.
 pub fn inspect_execution(

@@ -3003,19 +3003,27 @@ codec-encoder weights. The prepared artifact retains exact auxiliary assets,
 restricted component sources, canonical recipes and conversion bounds.
 
 `prepare_realtime` applies `RealtimeLoadOptions` to this retained artifact using
-the selected factory’s cold support predicates, before native device or tensor creation. Architecture dispatch
-selects the categorical-frame or PCM-speech protocol; a mismatch is a typed error.
+the selected factory’s cold support predicates before native device or tensor
+creation. Architecture dispatch selects the categorical-frame or PCM-speech
+protocol and returns a typed error on a mismatch.
 For speech, cold selection uses `PreparedVoiceChatSession` to validate recorded
 startup time, queue reservations, matching PCM precision, text/tool policy,
 RNNT/turn configuration and prompt capacities. It also selects both neural cache
 layouts and validates the complete parameter-residency allowances.
 `bind_realtime` consumes that selection and a portable device plan, binds
-components, prepares fixed-Aria and silence inputs, and
-registers the existing session. Loading accepts no replacement sources or policy.
+components, prepares fixed-Aria and silence inputs, and registers the existing
+session. Loading accepts no replacement sources or policy.
 Prefill runs only on advancement. `RealtimeSession::Speech` exposes a
-`SpeechRealtimeSession` with controlled advancement, snapshots and forks. The facade consumes the neutral `eredu-nn` dtype
-contract; native realization stays behind its MLX feature and no accelerator
-dependency enters portable definitions.
+`SpeechRealtimeSession` with controlled advancement, snapshots and forks.
+The backend implements the realtime factory and mechanism contracts in
+`eredu-runtime`. The factory opens one native realtime context. The portable
+categorical scheduler binds architecture preparations through execution, state,
+and host observation contracts. Coupled PCM startup uses generic component
+binding, joint state, isolated copying, and exact submission ownership.
+The portable speech driver owns invocation construction and the output
+projection. MLX retains its native cache roots, RNG and completion at submission.
+The facade consumes the neutral `eredu-nn` dtype contract. Applications link the
+concrete backend they select.
 
 Discovery identifies the realtime loading protocol; it does not advertise ordinary
 text generation or native support in every backend. The logical descriptor names
@@ -7340,13 +7348,13 @@ do not receive an unrestricted assistant store, reopen configuration or
 metadata for dispatch, bind against raw native topology, or duplicate
 assistant admission.
 
-`eredu::api::local_device_plan` maps the facade's CPU or accelerator choice to
-the selected local backend and rejects accelerator choices when that
-build contains no native accelerator family. `LocalRuntimeConfiguration`
-applies any process-global allocator or embedded accelerator-library
-configuration before the factory realizes that plan. Platform applications
-import the concrete backend factory and use the generic facade to load and
-operate the session.
+The facade accepts a `DevicePlan` with an exact backend and opaque device ID.
+The backend reports device kind and process-local index independently of memory
+placement. The CLI resolves `cpu` and `gpu:N` from those discovery facts and
+prefers a discovered GPU when the user leaves the device unspecified. MLX
+startup configures its process-global allocator and any embedded Metal library
+through the backend adapter. Optional allocator telemetry and peak reset use the
+selected factory.
 
 Architecture inspection reports both embedded-draft depth and maximum proposal
 capacity from the normalized, admitted artifact composition in
@@ -8734,7 +8742,7 @@ selection supplies the independent-bank identities; shared experts remain in
 ordinary block windows. Artifact profiles retain their unsharded scope, while
 native session observations report actual rank-local replicas and bank occupancy.
 
-Automatic schema version 7 also retains a separate selected-rank resource
+Automatic planning reports also retain a separate selected-rank resource
 profile. Llama-compatible, Gemma 2, Nanbeige, Qwen2/3, GPT-OSS, K2, LFM2, Kimi
 Linear, Nemotron-H, DeepSeek V3/V4, Nemotron Labs Diffusion and Muse selections retain
 their executable component projection beside the source declaration before native
@@ -13544,7 +13552,7 @@ before trimming its one-use conversion buffers. Final text and VoiceChat
 executable owners schedule cache trimming through ordinary retirement. Nested
 resource retirement finishes before that trim runs, outside native locks and
 without releasing unresolved completion roots. Inference frames retain reusable
-buffers under the selected policy. `trim_local_allocator_cache` exposes explicit
+buffers under the selected policy. `eredu_backend_mlx::trim_allocator_cache` exposes explicit
 ordinary-host trimming without changing the limit or its provenance.
 
 `eredu-checkpoint::prepared_cache` owns content-addressed, file-backed prepared
@@ -14279,16 +14287,12 @@ or unsafe-code exception.
 
 ## Supplied metadata and local payload admission
 
-Cold recommendation clients supply `ArtifactMetadata` and
-`MetadataInspectionOptions` through `eredu::api::inspect_model_metadata`.
-The options select an explicit `BackendId` and portable loading policy. The
-facade resolves the compiled adapter and obtains its cold capability provider;
-the shared architecture driver performs validation and execution selection.
-Unknown or disabled backends return typed errors, without fallback. Backend
-adapters own capability facts; applications import the complete inspection and
-forecasting surface through `eredu` without direct backend dependencies or
-capability-provider implementations. Transport, caching and immutable-revision
-provenance belong to the application.
+Cold recommendation clients supply `ArtifactMetadata`, portable loading
+policy, host media availability, and a selected backend's cold capability
+provider to `eredu::api::inspect_model_metadata`. The architecture driver
+performs validation and execution selection. The recommendation executable
+resolves profile backend identifiers at startup. Transport, caching and
+immutable-revision provenance belong to the application.
 `eredu-gguf` and `eredu-checkpoint` own supplied-header parsing and structural
 validation, including full object lengths and complete shard membership.
 `eredu-core` retains provenance and enforces the distinction between metadata

@@ -271,7 +271,10 @@ fn run_turn(
     if let Some(input) = &wav_input {
         ensure!(input.sample_count() > 0, "audio input is empty");
     }
-    let (weights, execution) = pcm::execution_contexts(args.device.unwrap_or_default().local())?;
+    let factory = eredu_backend_mlx::MlxBackendFactory::default();
+    let device = crate::resolve_device(&crate::discover_devices(&factory)?, args.device)?;
+    let weights = eredu_backend_mlx::native::ExecutionContext::cpu()?;
+    let execution = factory.execution_context(&device)?;
     let binding = AudioTaskBinder::new(
         MlxComponentBinder::new(weights.stream(), execution.stream()),
         MlxMediaInputLowering,

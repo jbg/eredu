@@ -104,8 +104,8 @@ fn main() -> anyhow::Result<()> {
             max_bytes: args[2].parse()?,
         }
     };
-    set_local_allocator_cache_limit(0)?;
-    let plan = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Accelerator(0))?)
+    eredu_backend_mlx::set_allocator_cache_limit(0)?;
+    let plan = ExecutionPlan::fully_resident(eredu_core::DevicePlan::new("mlx", "metal:0")?)
         .with_parameter_conversion_retention(Some(policy));
     let settings = PreparedChatGenerationSettings {
         overrides: GenerationConfigOverrides {

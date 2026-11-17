@@ -65,7 +65,8 @@ fn forbidden_tool_candidates_match_ordinary_and_controlled_domains_before_forcin
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     config.as_object_mut().unwrap().remove("eos_token_id");
     std::fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
-    let execution = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Cpu).unwrap());
+    let execution =
+        ExecutionPlan::fully_resident(eredu_core::DevicePlan::new("mlx", "cpu:0").unwrap());
     let (mut model, _) =
         LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &root.0, &execution)
             .unwrap()

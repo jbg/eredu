@@ -2,22 +2,15 @@
 
 Applications can inspect checkpoint metadata without downloading weight payloads
 or creating a native device. `eredu::api::inspect_model_metadata` accepts an
-`ArtifactMetadata` bundle and `MetadataInspectionOptions`. The options require an
-explicit `BackendId` and carry a `NormalizedLoadRequest` for quantization,
-residency, speculation and parallel policy. The facade obtains cold capability
-facts from that backend and invokes the shared architecture inspection driver.
-The returned `ModelInspectionOutcome` feeds `forecast_inspected_generation` and
-`estimate_inspected_generation_memory`.
+`ArtifactMetadata` bundle, a `NormalizedLoadRequest`, and the selected
+backend's cold capability provider and host media availability. The shared
+architecture driver validates and selects execution. The resulting
+`ModelInspectionOutcome` feeds the same forecasting interfaces as local
+inspection.
 
-Applications depend only on `eredu` and import these contracts through
-`eredu::api`. They do not construct capability providers or import backend crates.
-Selecting `BackendId::new("mlx")` requires eredu's `mlx` Cargo feature. A known
-backend without its feature returns `MetadataInspectionError::BackendNotCompiled`;
-an unknown identifier returns `MetadataInspectionError::UnknownBackend`. There is
-no default backend, automatic selection or fallback. Compiling an adapter makes
-its capabilities available; it does not select it or establish hardware
-availability. Inspection does not discover hardware, fetch objects, create a
-device or access local checkpoint files.
+Applications select the provider at startup. Inspecting headers neither
+discovers hardware nor opens checkpoint payloads. The recommendation CLI
+resolves its worker profile's backend ID at the process entry point.
 
 ## Inputs and provenance
 
@@ -77,9 +70,12 @@ let metadata = ArtifactMetadata {
 };
 let load_request = NormalizedLoadRequest::default()
     .with_parameter_conversion_retention(Some(ParameterConversionRetentionPolicy::Unlimited));
-let inspection_options = MetadataInspectionOptions::new(BackendId::new("mlx")?)
-    .with_load_request(load_request);
-let inspection = inspect_model_metadata(&metadata, &inspection_options)?;
+let inspection = inspect_model_metadata(
+    &metadata,
+    &load_request,
+    &eredu_backend_mlx::inspection_mechanisms(),
+    eredu_core::MediaFeatureAvailability { image: false, audio: false },
+);
 if !inspection.report().is_compatible() {
     // Present structured issues or exclude this candidate.
     return Ok(());
@@ -132,15 +128,6 @@ paths remain explicit. Applications preserve indeterminate fit results and use
 the forecast's bounds and assumptions when ranking candidates.
 
 ## Validation
-
-`eredu/tests/fixtures/metadata-client` has `eredu` as its only dependency. Its
-behavioral tests exercise unknown and disabled backend errors, explicit MLX
-inspection, metadata rejection and forecasting using only facade imports:
-
-```sh
-cargo test --manifest-path eredu/tests/fixtures/metadata-client/Cargo.toml
-cargo test --manifest-path eredu/tests/fixtures/metadata-client/Cargo.toml --features mlx
-```
 
 `cargo test -p eredu --no-default-features --test metadata_forecast` compares
 local and supplied-header selection, complete forecast requests and estimates at

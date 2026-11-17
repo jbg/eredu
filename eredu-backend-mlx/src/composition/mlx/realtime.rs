@@ -36,6 +36,7 @@ mod completion;
 pub(crate) mod construction;
 mod execution;
 mod frame_execution;
+mod mechanisms;
 mod observation;
 mod selection_loading;
 mod startup;

@@ -13,13 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use eredu::{
-    api::{
-        configure_local_runtime, local_device_plan, LoadedModel, LocalDevice,
-        LocalRuntimeConfiguration,
-    },
-    runtime::chat::ChatTemplateRequest,
-};
+use eredu::{api::LoadedModel, runtime::chat::ChatTemplateRequest};
 use eredu_core::{ExecutionPlan, GenerationConfigOverrides, TextGenerationConfig};
 
 /// Receives one UTF-8 text fragment. The bytes are valid only during the call.
@@ -164,12 +158,12 @@ fn worker_main(
     ready: Sender<Result<(), String>>,
 ) {
     let initialized = (|| {
-        configure_local_runtime(
-            &LocalRuntimeConfiguration::default().with_accelerator_library(metallib_path),
-        )
-        .map_err(|error| error.to_string())?;
+        eredu_backend_mlx::set_accelerator_library_path(metallib_path)
+            .map_err(|error| error.to_string())?;
+        eredu_backend_mlx::initialize_allocator_cache_policy(false)
+            .map_err(|error| error.to_string())?;
         let plan = ExecutionPlan::fully_resident(
-            local_device_plan(LocalDevice::Accelerator(0)).map_err(|error| error.to_string())?,
+            eredu_core::DevicePlan::new("mlx", "metal:0").map_err(|error| error.to_string())?,
         );
         let planned =
             LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &model_path, &plan)

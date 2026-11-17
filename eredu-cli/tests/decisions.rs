@@ -161,7 +161,7 @@ fn cli_reads_choice_noul_and_score_with_resident_and_bounded_weights() {
 fn ordinary_and_controlled_facade_preserve_pins_and_canonical_commitment() {
     let root = tempfile::tempdir().unwrap();
     fixture(root.path());
-    let plan = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Cpu).unwrap());
+    let plan = ExecutionPlan::fully_resident(eredu_core::DevicePlan::new("mlx", "cpu:0").unwrap());
     let (mut model, _) =
         LoadedModel::load_execution_plan(&MlxBackendFactory::default(), root.path(), &plan)
             .unwrap()

@@ -3,9 +3,9 @@
 use std::path::Path;
 
 use eredu_core::{
-    AutomaticPlanningBackend, AutomaticPlanningError, BackendId, BoundedResidencyRequirement,
-    CandidateAdmission, DevicePlan, DraftPlacementPlan, DraftingPlan, ExecutionPlan,
-    ExecutionPlanBackendFactory, ExecutionPlanTarget, ExecutionPlanTargetSelection,
+    AutomaticPlanningBackend, AutomaticPlanningError, BackendFailure, BackendId,
+    BoundedResidencyRequirement, CandidateAdmission, DevicePlan, DraftPlacementPlan, DraftingPlan,
+    ExecutionPlan, ExecutionPlanBackendFactory, ExecutionPlanTarget, ExecutionPlanTargetSelection,
     ExpertCacheTelemetry, ExternalDraftArtifact, HardwareBackendProfile, HardwareDeviceProfile,
     HardwareMemorySemantics, HardwareProfile, ModelResourceProfile, ModelRuntime, Observed,
     RealizedDrafting, ResidencyPlan, SelectedExecutionPlanTarget, SpeculativeDraftSource,
@@ -37,19 +37,62 @@ pub struct MlxBackendFactory {
     parallel: Option<ParallelExecution>,
 }
 
-impl MlxBackendFactory {
-    /// Realizes an execution context from a canonical MLX device plan.
-    pub fn execution_context(
+impl eredu_architectures::BackendInspection for MlxBackendFactory {
+    fn inspect_execution(
         &self,
-        plan: &DevicePlan,
-    ) -> Result<crate::native::ExecutionContext, eredu_core::BackendFailure> {
-        let device = mlx_device(plan).map_err(eredu_core::BackendFailure::from_error)?;
-        crate::native::ExecutionContext::try_new(device.device)
-            .map_err(eredu_core::BackendFailure::from_error)
+        path: &std::path::Path,
+        plan: &ExecutionPlan,
+    ) -> Result<eredu_architectures::ModelInspectionOutcome, BackendFailure> {
+        let request = self
+            .load_request_for_plan(plan)
+            .map_err(BackendFailure::from_error)?;
+        crate::native::inspect_model_preparation(
+            path,
+            crate::native::MlxInspectionOptions::new(request),
+        )
+        .map_err(|error| BackendFailure::from_error(error).with_operation("model inspection"))
     }
 
-    /// Binds an architecture-selected decision through native component mechanisms.
-    pub fn bind_prepared_decision(
+    fn device_uses_host_memory(&self, device: &DevicePlan) -> Result<bool, BackendFailure> {
+        self.device_uses_host_memory(device)
+            .map_err(BackendFailure::from_error)
+    }
+
+    fn reset_allocator_peak(&self) -> Result<bool, BackendFailure> {
+        crate::reset_allocator_peak().map_err(|error| {
+            BackendFailure::from_error(error).with_operation("allocator peak reset")
+        })?;
+        Ok(true)
+    }
+
+    fn allocator_observation(
+        &self,
+    ) -> Result<
+        Option<(
+            eredu_core::AllocatorCachePolicyReport,
+            eredu_core::AllocatorTelemetry,
+        )>,
+        BackendFailure,
+    > {
+        Ok(Some((
+            crate::allocator_cache_policy().map_err(BackendFailure::from_error)?,
+            allocator_telemetry()?,
+        )))
+    }
+}
+
+fn allocator_telemetry() -> Result<eredu_core::AllocatorTelemetry, BackendFailure> {
+    let memory = crate::allocator_memory()
+        .map_err(|error| BackendFailure::from_error(error).with_operation("allocator telemetry"))?;
+    Ok(eredu_core::AllocatorTelemetry {
+        peak_bytes: memory.peak_bytes(),
+        active_bytes: memory.active_bytes(),
+        cache_bytes: memory.cached_bytes(),
+    })
+}
+
+impl eredu_architectures::decision_task::DecisionBackendFactory for MlxBackendFactory {
+    fn bind_decision(
         &self,
         model: eredu_architectures::decision_task::PreparedDecisionModel,
         device: &DevicePlan,
@@ -64,7 +107,6 @@ impl MlxBackendFactory {
             distributed::MlxDistributedSession, nn::shared::MlxNeuralBackend,
             runtime::cache::state::MlxHybridState, ExecutionContext,
         };
-        use eredu_core::BackendFailure;
 
         let weights = ExecutionContext::cpu().map_err(BackendFailure::from_error)?;
         let execution = self.execution_context(device)?;
@@ -90,6 +132,18 @@ impl MlxBackendFactory {
                 .map_err(BackendFailure::from_error)?;
         }
         Ok(bound)
+    }
+}
+
+impl MlxBackendFactory {
+    /// Realizes an execution context from a canonical MLX device plan.
+    pub fn execution_context(
+        &self,
+        plan: &DevicePlan,
+    ) -> Result<crate::native::ExecutionContext, eredu_core::BackendFailure> {
+        let device = mlx_device(plan).map_err(eredu_core::BackendFailure::from_error)?;
+        crate::native::ExecutionContext::try_new(device.device)
+            .map_err(eredu_core::BackendFailure::from_error)
     }
 
     /// Classifies a canonical plan device without realizing native resources.
@@ -186,6 +240,7 @@ pub fn discover_hardware() -> HardwareProfile {
     #[allow(unused_mut)] // Native-device probes are target and feature gated.
     let mut devices = vec![HardwareDeviceProfile {
         id: "cpu:0".into(),
+        kind: eredu_core::HardwareDeviceKind::Cpu,
         family: "cpu".into(),
         index: 0,
         total_memory_bytes: physical_memory_bytes.clone(),
@@ -214,6 +269,7 @@ pub fn discover_hardware() -> HardwareProfile {
             };
             devices.push(HardwareDeviceProfile {
                 id: "metal:0".into(),
+                kind: eredu_core::HardwareDeviceKind::Gpu,
                 family: "metal".into(),
                 index: 0,
                 total_memory_bytes: total,
@@ -233,6 +289,7 @@ pub fn discover_hardware() -> HardwareProfile {
         if available {
             devices.push(HardwareDeviceProfile {
                 id: "cuda:0".into(),
+                kind: eredu_core::HardwareDeviceKind::Gpu,
                 family: "cuda".into(),
                 index: 0,
                 total_memory_bytes: Observed::unavailable(

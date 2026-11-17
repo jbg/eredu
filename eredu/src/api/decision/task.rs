@@ -2,32 +2,17 @@ use std::path::Path;
 
 use anyhow::{ensure, Result};
 use eredu_architectures::{
-    decision_task::{
-        BoundDecisionModel, DecisionInput, DecisionMedia, DecisionTaskError, PreparedDecisionModel,
-    },
+    decision_task::{DecisionInput, DecisionMedia, PreparedDecisionModel},
     processor_plan::ArtifactArchitecturePlan,
     ExternalDraftPreparation,
 };
 use eredu_core::{
-    ExecutionPlan, ExecutionPlanBackendFactory, Media, ModelConfigurationResolver,
-    ModelLoadingBackend, TextGenerationBackend, WeightTransformationPlan,
+    ExecutionPlan, Media, ModelConfigurationResolver, ModelLoadingBackend, TextGenerationBackend,
+    WeightTransformationPlan,
 };
-use eredu_runtime::{execution_plan_layer_residency, LayerWeightResidency, ResidencyDiagnostics};
+use eredu_runtime::{execution_plan_layer_residency, ResidencyDiagnostics};
 
 use super::*;
-
-/// Binds a retained decision artifact using a configured backend factory.
-pub trait DecisionBackendFactory: ExecutionPlanBackendFactory {
-    /// Realizes the retained artifact on the plan's selected device.
-    /// Synchronizes native load work when completion must be observed.
-    fn bind_decision(
-        &self,
-        model: PreparedDecisionModel,
-        plan: &ExecutionPlan,
-        residency: LayerWeightResidency,
-        synchronize_load: bool,
-    ) -> Result<Box<dyn BoundDecisionModel>, DecisionTaskError>;
-}
 
 /// Evaluates a request using the artifact's declared decision or refinement capability.
 /// The optional callback runs after binding and synchronization.
@@ -82,8 +67,12 @@ where
             plan.max_cached_shards(),
             ResidencyDiagnostics::default(),
         )?;
-        let mut model =
-            factory.bind_decision(prepared, plan, residency.into(), on_loaded.is_some())?;
+        let mut model = factory.bind_decision(
+            prepared,
+            plan.device(),
+            residency.into(),
+            on_loaded.is_some(),
+        )?;
         if let Some(callback) = on_loaded {
             callback();
         }
@@ -144,17 +133,4 @@ where
         callback();
     }
     evaluate_refinement(loaded.model_mut(), request)
-}
-
-#[cfg(feature = "mlx")]
-impl DecisionBackendFactory for eredu_backend_mlx::MlxBackendFactory {
-    fn bind_decision(
-        &self,
-        model: PreparedDecisionModel,
-        plan: &ExecutionPlan,
-        residency: LayerWeightResidency,
-        synchronize_load: bool,
-    ) -> Result<Box<dyn BoundDecisionModel>, DecisionTaskError> {
-        self.bind_prepared_decision(model, plan.device(), residency, synchronize_load)
-    }
 }
