@@ -5,7 +5,7 @@ use std::path::Path;
 use eredu_checkpoint::{prepared_cache::PreparedCheckpointCachePolicy, recipe::RecipeDtype};
 use eredu_core::{
     decision::{DecisionEvaluation, DecisionQuestion},
-    Audio, BackendFailure, Media, MediaCompanionSources,
+    Audio, BackendFailure, DevicePlan, ExecutionPlanBackendFactory, Media, MediaCompanionSources,
 };
 use eredu_nn::{
     AttentionCache, DistributedNeuralBackend, Tensor, TensorParallelGroupedNeuralBackend,
@@ -16,6 +16,19 @@ use eredu_runtime::{
 };
 
 use crate::lfm3::decision::{self, execution::TextChoiceModel, PreparedTextChoiceModel};
+
+/// Binds a retained decision artifact using a configured backend factory.
+pub trait DecisionBackendFactory: ExecutionPlanBackendFactory {
+    /// Realizes the retained artifact on the plan's selected device.
+    /// Synchronizes native load work when completion must be observed.
+    fn bind_decision(
+        &self,
+        model: PreparedDecisionModel,
+        device: &DevicePlan,
+        residency: LayerWeightResidency,
+        synchronize_load: bool,
+    ) -> Result<Box<dyn BoundDecisionModel>, DecisionTaskError>;
+}
 
 /// Media requirements for selecting a finite decision task.
 #[derive(Clone, Copy, Debug, Default)]

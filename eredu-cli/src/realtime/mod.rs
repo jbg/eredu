@@ -449,16 +449,13 @@ pub fn run(args: Args, timing: bool, total_started: Instant) -> Result<()> {
         );
     }
     args.common.configure_runtime()?;
-    let device = args.common.device.unwrap_or_else(|| match config.device {
-        load::Device::Cpu => {
-            if args.config.is_some() {
-                CliDevice::Cpu
-            } else {
-                CliDevice::default()
-            }
-        }
-        load::Device::Gpu => CliDevice::Gpu(0),
+    let requested_device = args.common.device.or_else(|| match config.device {
+        load::Device::Cpu if args.config.is_some() => Some(CliDevice::Cpu),
+        load::Device::Cpu => None,
+        load::Device::Gpu => Some(CliDevice::Gpu(0)),
     });
+    let factory = eredu_backend_mlx::MlxBackendFactory::default();
+    let device = crate::resolve_device(&crate::discover_devices(&factory)?, requested_device)?;
     let started = Instant::now();
     let sampling = eredu_architectures::voicechat::agent_sampling::AgentSamplingPolicy::new(
         args.common.temperature.unwrap_or(0.0),
@@ -467,15 +464,19 @@ pub fn run(args: Args, timing: bool, total_started: Instant) -> Result<()> {
         usize::try_from(config.max_model_steps)?,
     )?;
     let mut session = load::load(
-        &eredu_backend_mlx::MlxBackendFactory::default(),
+        &factory,
         &config,
         policy,
-        &crate::device_plan(device)?,
+        &device,
         args.common.cached_shards,
         sampling,
     )?;
     let load_elapsed = started.elapsed();
-    eprintln!("loaded in {:.3} s on {device}", load_elapsed.as_secs_f64());
+    eprintln!(
+        "loaded in {:.3} s on {}",
+        load_elapsed.as_secs_f64(),
+        device.device()
+    );
     let stop = Arc::new(AtomicUsize::new(0));
     #[cfg(feature = "system-audio")]
     {

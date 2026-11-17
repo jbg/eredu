@@ -1,37 +1,13 @@
 //! Backend-selected binding of a retained realtime plan.
 
 use eredu_core::DevicePlan;
-use eredu_runtime::RealtimeLoadSupport;
+use eredu_runtime::RealtimeBackendFactory;
 
 use super::{
-    prepare_realtime_selection, CategoricalRealtimeModel, PreparedRealtimeArtifact,
-    PreparedRealtimeSelection, PreparedSpeechSelection, RealtimeLoadError, RealtimeLoadOptions,
+    categorical_binding::bind_categorical, prepare_realtime_selection, CategoricalRealtimeModel,
+    PreparedRealtimeArtifact, PreparedRealtimeSelection, RealtimeLoadError, RealtimeLoadOptions,
     SpeechRealtimeSession,
 };
-use eredu_architectures::moshi::PreparedMoshiRealtimeSource;
-
-/// Supplies cold capability facts and binds the protocol selected by the artifact.
-pub trait RealtimeBackendFactory {
-    /// Capability predicates used before sources or devices are bound.
-    type Support: RealtimeLoadSupport;
-
-    /// Reports exact, side-effect-free support for local realtime loading.
-    fn realtime_support(&self) -> Self::Support;
-
-    /// Binds a retained categorical execution on the selected device.
-    fn bind_categorical(
-        &self,
-        selected: PreparedMoshiRealtimeSource,
-        device: &DevicePlan,
-    ) -> Result<Box<dyn CategoricalRealtimeModel>, RealtimeLoadError>;
-
-    /// Binds a retained PCM speech execution on the selected device.
-    fn bind_speech(
-        &self,
-        selected: PreparedSpeechSelection<'_>,
-        device: &DevicePlan,
-    ) -> Result<Box<dyn SpeechRealtimeSession>, RealtimeLoadError>;
-}
 
 /// Bound execution retaining the artifact's declared host input protocol.
 pub enum RealtimeSession {
@@ -71,67 +47,18 @@ pub fn bind_realtime<F: RealtimeBackendFactory>(
     prepared: PreparedRealtime<'_, F>,
     device: &DevicePlan,
 ) -> Result<RealtimeSession, RealtimeLoadError> {
+    let mechanisms = prepared
+        .factory
+        .open_realtime(device)
+        .map_err(RealtimeLoadError::Backend)?;
     match prepared.selected {
-        PreparedRealtimeSelection::Categorical(selected) => prepared
-            .factory
-            .bind_categorical(selected, device)
-            .map(RealtimeSession::Categorical),
-        PreparedRealtimeSelection::Speech(selected) => prepared
-            .factory
-            .bind_speech(*selected, device)
-            .map(RealtimeSession::Speech),
-    }
-}
-
-#[cfg(feature = "mlx")]
-mod mlx {
-    use super::*;
-    use eredu_backend_mlx::{
-        native::{ExecutionContext, MlxRealtimeExecutionContext, MlxRealtimeSupport},
-        MlxBackendFactory,
-    };
-    use eredu_core::BackendFailure;
-
-    fn backend(error: impl std::error::Error + Send + Sync + 'static) -> RealtimeLoadError {
-        RealtimeLoadError::Backend(BackendFailure::from_error(error))
-    }
-
-    impl RealtimeBackendFactory for MlxBackendFactory {
-        type Support = MlxRealtimeSupport;
-
-        fn realtime_support(&self) -> Self::Support {
-            MlxRealtimeSupport::new(false)
-        }
-
-        fn bind_categorical(
-            &self,
-            selected: PreparedMoshiRealtimeSource,
-            device: &DevicePlan,
-        ) -> Result<Box<dyn CategoricalRealtimeModel>, RealtimeLoadError> {
-            let weights = ExecutionContext::cpu().map_err(backend)?;
-            let execution = self.execution_context(device).map_err(backend)?;
-            let context = MlxRealtimeExecutionContext::new(execution.stream(), weights.stream());
-            let model = context.bind_realtime(selected, None).map_err(backend)?;
-            Ok(Box::new(std::rc::Rc::new(
-                super::super::selected_categorical_mlx::MlxCategoricalModel::new(context, model),
-            )))
-        }
-
-        fn bind_speech(
-            &self,
-            selected: PreparedSpeechSelection<'_>,
-            device: &DevicePlan,
-        ) -> Result<Box<dyn SpeechRealtimeSession>, RealtimeLoadError> {
-            let weights = ExecutionContext::cpu().map_err(backend)?;
-            let execution = self.execution_context(device).map_err(backend)?;
-            let (prepared, resources) = selected.into_startup();
-            Ok(crate::runtime::voicechat::start_mlx_voicechat(
-                prepared,
-                resources.parameters(),
-                resources.startup(),
-                &weights,
-                &execution,
-            )?)
+        PreparedRealtimeSelection::Categorical(selected) => bind_categorical(selected, mechanisms)
+            .map(RealtimeSession::Categorical)
+            .map_err(RealtimeLoadError::Backend),
+        PreparedRealtimeSelection::Speech(selected) => {
+            crate::runtime::voicechat::bind_speech(*selected, &mechanisms)
+                .map(RealtimeSession::Speech)
+                .map_err(Into::into)
         }
     }
 }

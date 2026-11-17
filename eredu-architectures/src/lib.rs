@@ -67,7 +67,7 @@ pub mod memory_estimation;
 pub mod model_inspection;
 pub use model_inspection::{
     inspect_model, inspect_model_metadata, inspect_selected_model, prepare_inspected_model_sources,
-    ModelInspectionOutcome, SelectedModelInspection,
+    BackendInspection, ModelInspectionOutcome, SelectedModelInspection,
 };
 pub mod component_partition;
 /// Optional backend operators required by each architecture family.

@@ -28,6 +28,11 @@ impl MlxRealtimeExecutionContext {
         &self.stream
     }
 
+    /// Opens ordinary component-binding mechanisms on the same streams.
+    pub(super) fn component_binder(&self) -> crate::native::MlxComponentBinder {
+        crate::native::MlxComponentBinder::new(&self.weights_stream, &self.stream)
+    }
+
     /// Binds retained portable construction after validating the native target.
     pub fn bind_realtime<P, E, F>(
         &self,

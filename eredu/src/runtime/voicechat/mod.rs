@@ -78,8 +78,6 @@ pub use tools::{
     VoiceChatToolTicket, VoiceChatTurnIdentity,
 };
 
-#[cfg(feature = "mlx")]
-mod selected_mlx;
-#[cfg(feature = "mlx")]
-pub(crate) use selected_mlx::start_mlx_voicechat;
+mod binding;
+pub(crate) use binding::bind_speech;
 pub use startup::{VoiceChatLoadSelection, VoiceChatStartError, VoiceChatStartupInputs};

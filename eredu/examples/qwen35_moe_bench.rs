@@ -1,8 +1,8 @@
+mod device_selection;
+
 use std::{path::PathBuf, time::Instant};
 
-use eredu::api::{
-    default_local_device, local_device_plan, reset_local_allocator_peak, LoadedModel,
-};
+use eredu::api::LoadedModel;
 use eredu_backend_mlx::{backend::MlxBackend, MlxBackendFactory};
 use eredu_core::{
     ExecutionPlan, GenerationConfigOverrides, TextGenerationConfig, WeightTransformationPlan,
@@ -41,25 +41,28 @@ fn main() -> anyhow::Result<()> {
     println!("decode_tokens={decode_tokens}");
     println!("quantize_on_load={quantize_on_load}");
 
-    let mut plan = ExecutionPlan::fully_resident(local_device_plan(default_local_device())?);
+    let mut plan = ExecutionPlan::fully_resident(device_selection::default_device(
+        &MlxBackendFactory::default(),
+    )?);
     if quantize_on_load {
         plan = plan.with_weight_transformation(WeightTransformationPlan::Affine {
             bits: 4,
             group_size: 64,
         });
     }
-    reset_local_allocator_peak()?;
+    eredu_backend_mlx::reset_allocator_peak()?;
     let load_start = Instant::now();
     let planned =
         LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &model_dir, &plan)?;
     let (mut model, _) = planned.into_parts();
     model.synchronize()?;
     let load_elapsed = load_start.elapsed();
-    let allocator = model.allocator_telemetry()?;
+    model.synchronize()?;
+    let allocator = eredu_backend_mlx::allocator_memory()?;
     println!("load_s={:.3}", load_elapsed.as_secs_f64());
-    println!("mlx_active_memory_bytes={}", allocator.active_bytes);
-    println!("mlx_peak_memory_bytes={}", allocator.peak_bytes);
-    println!("mlx_cache_memory_bytes={}", allocator.cache_bytes);
+    println!("mlx_active_memory_bytes={}", allocator.active_bytes());
+    println!("mlx_peak_memory_bytes={}", allocator.peak_bytes());
+    println!("mlx_cache_memory_bytes={}", allocator.cached_bytes());
 
     let warmup_start = Instant::now();
     let warmup_prompt = prompt_near_token_count(&mut model, 16)?;

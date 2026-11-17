@@ -58,7 +58,7 @@ fn shared_target_prepared_modes_preserve_output_and_pending_adapter_forecasts() 
         adapter.0.join("adapter_model.safetensors"),
     )
     .unwrap();
-    let plan = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Cpu).unwrap())
+    let plan = ExecutionPlan::fully_resident(eredu_core::DevicePlan::new("mlx", "cpu:0").unwrap())
         .with_draft_adapter(eredu_core::DraftAdapterSource::new(
             &adapter.0,
             "nvidia/Nemotron-Labs-Diffusion-3B",

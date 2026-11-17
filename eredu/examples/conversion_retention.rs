@@ -1,10 +1,9 @@
 //! Bound optional weight conversions, observe their scope, trim, and forecast a fresh request.
+mod device_selection;
+
 use std::path::PathBuf;
 
-use eredu::api::{
-    default_local_device, local_device_plan, GenerationForecastOptions, LoadedModel,
-    PreparedChatGenerationSettings,
-};
+use eredu::api::{GenerationForecastOptions, LoadedModel, PreparedChatGenerationSettings};
 use eredu_backend_mlx::MlxBackendFactory;
 use eredu_core::{
     residency::ParameterConversionRetentionPolicy, ExecutionPlan, GenerationConfigOverrides,
@@ -22,10 +21,12 @@ fn main() -> anyhow::Result<()> {
         .get(1)
         .map(String::as_str)
         .unwrap_or("Explain gravity briefly.");
-    let plan = ExecutionPlan::fully_resident(local_device_plan(default_local_device())?)
-        .with_parameter_conversion_retention(Some(ParameterConversionRetentionPolicy::Bounded {
-            max_bytes: 32 * 1024 * 1024,
-        }));
+    let plan = ExecutionPlan::fully_resident(device_selection::default_device(
+        &MlxBackendFactory::default(),
+    )?)
+    .with_parameter_conversion_retention(Some(ParameterConversionRetentionPolicy::Bounded {
+        max_bytes: 32 * 1024 * 1024,
+    }));
     let (mut model, _) =
         LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &artifact, &plan)?
             .into_parts();

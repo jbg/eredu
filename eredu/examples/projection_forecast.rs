@@ -35,9 +35,9 @@ fn main() -> anyhow::Result<()> {
             max_bytes: args[2].parse()?,
         }
     };
-    set_local_allocator_cache_limit(0)?;
+    eredu_backend_mlx::set_allocator_cache_limit(0)?;
     let factory = MlxBackendFactory::default();
-    let plan = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Accelerator(0))?)
+    let plan = ExecutionPlan::fully_resident(eredu_core::DevicePlan::new("mlx", "metal:0")?)
         .with_parameter_conversion_retention(Some(policy));
     let inspection = eredu_backend_mlx::native::inspect_model_preparation(
         &path,
@@ -129,7 +129,7 @@ fn main() -> anyhow::Result<()> {
             == outside_without.domains[0].generation_peak.upper_bytes,
         "unsupported prefill received conversion credit"
     );
-    reset_local_allocator_peak()?;
+    eredu_backend_mlx::reset_allocator_peak()?;
     let config = model.resolve_generation_config(settings.overrides)?;
     let mut tokens =
         model.generate_tokens(vec![1; positions], TextGenerationConfig::new(config))?;

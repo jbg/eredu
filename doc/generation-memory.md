@@ -220,7 +220,7 @@ native default, preserving smaller defaults. If available memory is unknown, the
 ceiling is 256 MiB. This is a one-time process policy; later memory pressure does
 not resize the cache. Explicit limits remain authoritative. Pure cold queries still observe
 the current policy; they do not apply runtime configuration. To forecast with the
-managed default before loading, call `configure_local_runtime(&Default::default())`
+managed default before loading, call `eredu_backend_mlx::initialize_allocator_cache_policy(false)`
 first. `--mlx-cache-limit-bytes 0` disables allocator-cache retention when desired.
 
 On macOS, the MLX factory’s `discover_hardware` observes available host memory from Mach
@@ -527,10 +527,8 @@ finite bound derived from token and decoded-input geometry.
 ### Supplied checkpoint metadata
 
 `inspect_model_metadata` accepts complete SafeTensors or GGUF headers and
-configuration without local weight files. `MetadataInspectionOptions` specifies
-an explicit backend ID and portable loading policy. The facade obtains that
-backend's cold capability facts without creating a device; unknown or disabled
-backends return typed errors. Its retained selection feeds
+configuration without local weight files. The caller supplies the selected
+backend's cold facts and portable loading policy. The retained selection feeds
 `forecast_inspected_generation` and the existing request builders. Metadata
 compatibility does not authorize payload loading;
 `is_compatible()` and `is_loadable()` express these distinct outcomes. Source
@@ -611,15 +609,15 @@ The generic `GenerationMemoryOptions::new` remains backend-neutral and leaves
 native overhead unknown. Local policy sampling can initialize the native allocator;
 the subsequent cold inspection and estimation remain free of native queries.
 
-`local_allocator_cache_limit()` reads the native value without changing policy or
-evicting cache. `set_local_allocator_cache_limit(bytes)` returns the previous value
+`allocator_cache_limit()` reads the native value without changing policy or
+evicting cache. `set_allocator_cache_limit(bytes)` returns the previous value
 for restoration; the backend adapter preserves that result:
 
 ```rust,ignore
-let previous = eredu::api::set_local_allocator_cache_limit(32 * 1024 * 1024)?;
+let previous = eredu_backend_mlx::set_allocator_cache_limit(32 * 1024 * 1024)?;
 let options = eredu::api::GenerationMemoryOptions::for_backend(&factory, input, placement);
 // Inspect or run the request, then restore policy when appropriate.
-eredu::api::set_local_allocator_cache_limit(previous)?;
+eredu_backend_mlx::set_allocator_cache_limit(previous)?;
 ```
 
 Both policy and observations are process-global snapshots. Coordinate mutations
@@ -627,7 +625,7 @@ with other users, restore policy on error paths as well, and recreate options
 after policy changes. The native getter also observes changes made outside Rust;
 there is no shadow configuration or mutation-based getter.
 
-`local_allocator_cache_policy()` additionally returns `limit_bytes` and a
+`allocator_cache_policy()` additionally returns `limit_bytes` and a
 snake_case provenance value: `native_default`, `managed_default`, `explicit`, or
 `preserved`. Native allocator locks protect both fields. Every native setter marks
 the policy explicit, even when its argument equals the existing default; callers
@@ -645,12 +643,10 @@ This is a process-wide performance/memory tradeoff, not a physical process cap.
 Applications can retain the native policy before any model is realized:
 
 ```rust,ignore
-use eredu::api::{configure_local_runtime, LocalAllocatorCachePolicy, LocalRuntimeConfiguration};
-configure_local_runtime(&LocalRuntimeConfiguration::default()
-    .with_allocator_cache_policy(LocalAllocatorCachePolicy::PreserveNative))?;
+eredu_backend_mlx::initialize_allocator_cache_policy(true)?;
 ```
 
-`with_allocator_cache_limit(bytes)` selects an explicit limit and can override
+`set_allocator_cache_limit(bytes)` selects an explicit limit and can override
 earlier initialization. Forecasts and policy getters never select a policy as a
 side effect; before runtime initialization, a pure cold forecast can therefore
 still report a large native allowance. Cold selection remains backend-neutral.

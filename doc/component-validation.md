@@ -145,7 +145,7 @@ and maximum physical-write error is `0.00048828125`. Signed projections use
 CARGO_INCREMENTAL=0 cargo run -j1 -p eredu \
   --no-default-features --features mlx,metal --example component_sparse_probe -- \
   /tmp/eredu-lfm2-sparse-validation/transformers-reference.json \
-  /tmp/eredu-lfm2-sparse-validation/native-gpu.json gpu controlled writes
+  /tmp/eredu-lfm2-sparse-validation/native-gpu.json metal:0 controlled writes
 /tmp/eredu-component-reference-env/bin/python \
   eredu-evaluation/scripts/compare_component_sparse.py \
   /tmp/eredu-lfm2-sparse-validation/transformers-reference.json \

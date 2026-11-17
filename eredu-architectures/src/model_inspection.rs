@@ -759,3 +759,37 @@ fn invalidate_architecture(report: &mut ModelInspectionReport, detail: String) {
         Some(report.path.clone()),
     );
 }
+
+/// Backend observations used by facade inspection and memory forecasts.
+pub trait BackendInspection: eredu_core::AutomaticPlanningBackend {
+    /// Inspects and retains the exact artifact admission for this execution plan.
+    fn inspect_execution(
+        &self,
+        path: &std::path::Path,
+        plan: &eredu_core::ExecutionPlan,
+    ) -> Result<crate::ModelInspectionOutcome, eredu_core::BackendFailure>;
+
+    /// Determines placement from a backend device identifier without allocating it.
+    fn device_uses_host_memory(
+        &self,
+        device: &eredu_core::DevicePlan,
+    ) -> Result<bool, eredu_core::BackendFailure>;
+
+    /// Resets the allocator high-water mark when supported.
+    fn reset_allocator_peak(&self) -> Result<bool, eredu_core::BackendFailure> {
+        Ok(false)
+    }
+
+    /// Observes allocator overhead inputs if the backend exposes a retained cache.
+    fn allocator_observation(
+        &self,
+    ) -> Result<
+        Option<(
+            eredu_core::AllocatorCachePolicyReport,
+            eredu_core::AllocatorTelemetry,
+        )>,
+        eredu_core::BackendFailure,
+    > {
+        Ok(None)
+    }
+}

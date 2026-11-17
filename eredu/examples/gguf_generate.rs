@@ -1,9 +1,8 @@
+mod device_selection;
+
 use std::path::PathBuf;
 
-use eredu::{
-    api::{default_local_device, local_device_plan, LoadedModel},
-    runtime::chat::ChatTemplateRequest,
-};
+use eredu::{api::LoadedModel, runtime::chat::ChatTemplateRequest};
 use eredu_backend_mlx::{backend::MlxBackend, MlxBackendFactory};
 use eredu_core::{ExecutionPlan, GenerationConfigOverrides, TextGenerationConfig};
 
@@ -55,7 +54,9 @@ fn main() -> anyhow::Result<()> {
         .transpose()?
         .unwrap_or(0.0);
 
-    let plan = ExecutionPlan::fully_resident(local_device_plan(default_local_device())?);
+    let plan = ExecutionPlan::fully_resident(device_selection::default_device(
+        &MlxBackendFactory::default(),
+    )?);
     let planned =
         LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &gguf_file, &plan)?;
     let (mut model, _) = planned.into_parts();

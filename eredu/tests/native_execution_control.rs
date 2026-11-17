@@ -150,7 +150,7 @@ fn semantics(records: &[ControlledGenerationRecord]) -> Vec<SemanticEvent> {
     ignore = "run the CPU fixture with --no-default-features --features mlx; Metal-enabled MLX initialization needs an accessible GPU"
 )]
 fn native_cpu_facade_restores_and_forks_sampled_partial_text_without_reopening_artifacts() {
-    native_facade(LocalDevice::Cpu, false);
+    native_facade("cpu:0", false);
 }
 
 #[test]
@@ -159,17 +159,17 @@ fn native_cpu_facade_restores_and_forks_sampled_partial_text_without_reopening_a
     ignore = "run with --no-default-features --features mlx for CPU-only native initialization"
 )]
 fn native_cpu_controlled_text_restores_and_forks_without_semantic_support() {
-    native_facade(LocalDevice::Cpu, true);
+    native_facade("cpu:0", true);
 }
 
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
 #[test]
 #[ignore = "requires an accessible Metal device; run explicitly on a GPU worker"]
 fn native_metal_facade_restores_and_forks_sampled_partial_text() {
-    native_facade(LocalDevice::Accelerator(0), false);
+    native_facade("metal:0", false);
 }
 
-fn native_facade(device: LocalDevice, text: bool) {
+fn native_facade(device: &str, text: bool) {
     let root = fixture(true);
     if text {
         std::fs::write(
@@ -178,8 +178,9 @@ fn native_facade(device: LocalDevice, text: bool) {
         )
         .unwrap();
     }
-    let execution = ExecutionPlan::fully_resident(local_device_plan(device).unwrap())
-        .with_required_session_capabilities(SessionCapabilities::new(true, true, true));
+    let execution =
+        ExecutionPlan::fully_resident(eredu_core::DevicePlan::new("mlx", device).unwrap())
+            .with_required_session_capabilities(SessionCapabilities::new(true, true, true));
     let (mut model, _) =
         LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &root.0, &execution)
             .unwrap()
@@ -354,15 +355,16 @@ fn text_matches_ordinary_sampling_with_policy(
     std::fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
     std::fs::write(root.0.join("generation_config.json"), r#"{"do_sample":true,"temperature":1.7,"top_k":12,"top_p":0.9,"repetition_penalty":1.1,"max_new_tokens":12}"#).unwrap();
     std::fs::write(root.0.join("chat_template.jinja"), "{% for m in messages %}{{ m.content }}{% endfor %}{% if add_generation_prompt %} word3 word7{% endif %}").unwrap();
-    let execution = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Cpu).unwrap())
-        .with_residency(residency)
-        .with_weight_transformation(transformation)
-        .with_prepared_checkpoint_cache(
-            eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy {
-                directory: root.0.join("prepared"),
-                max_bytes: 64 * 1024 * 1024,
-            },
-        );
+    let execution =
+        ExecutionPlan::fully_resident(eredu_core::DevicePlan::new("mlx", "cpu:0").unwrap())
+            .with_residency(residency)
+            .with_weight_transformation(transformation)
+            .with_prepared_checkpoint_cache(
+                eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy {
+                    directory: root.0.join("prepared"),
+                    max_bytes: 64 * 1024 * 1024,
+                },
+            );
     let (mut model, _) =
         LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &root.0, &execution)
             .unwrap()
@@ -454,9 +456,10 @@ mod candidate_domain;
 )]
 fn prompt_cache_stores_share_generation_identity_cancellation_and_budget_contracts() {
     let root = fixture(false);
-    let execution = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Cpu).unwrap())
-        .with_paged_state(eredu_core::PagedStatePlan::new(3, 4 << 20, 4 << 20).unwrap())
-        .with_prompt_cache_persistence(true);
+    let execution =
+        ExecutionPlan::fully_resident(eredu_core::DevicePlan::new("mlx", "cpu:0").unwrap())
+            .with_paged_state(eredu_core::PagedStatePlan::new(3, 4 << 20, 4 << 20).unwrap())
+            .with_prompt_cache_persistence(true);
     let load = || {
         LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &root.0, &execution)
             .unwrap()

@@ -16,15 +16,13 @@ opens a device, or implements model-family memory formulas.
 | `hub` | Hugging Face discovery, pinned metadata transport, variant enumeration and Artificial Analysis benchmark ingestion |
 | `builder` | Catalogue construction and supervised inspection workers; includes `hub` |
 | `cli` | Command-line tools; includes `builder` |
-| `mlx` | Explicit facade adapter selection for live metadata inspection |
-| `metal`, `cuda` | Forward the corresponding facade configuration; select `mlx` separately |
+| `mlx` | MLX cold capability provider for the worker |
+| `metal`, `cuda` | Enable the corresponding MLX accelerator family |
 | `image`, `audio` | Forward portable media capability configuration |
 
 No native adapter is enabled by default. `forecast::from_inspection` consumes
 an existing architecture selection built with caller-supplied mechanism facts.
-`forecast::inspect` resolves the explicitly selected facade backend and returns
-its typed error when that adapter is unavailable. Offline catalogue assessment
-works without compiling the adapter used to produce the catalogue.
+The worker entry point resolves the selected backend's cold capability provider.
 
 ## Sources and ranking evidence
 
@@ -135,7 +133,7 @@ let repositories = hub.search("SmolLM", 10).await?;
 let (repository, manifest) = hub.repository(&repositories[0], None).await?;
 for variant in &repository.variants {
     let metadata = hub.metadata(&repository, variant, &manifest).await?;
-    // Pass successful metadata to forecast::inspect, or to a supervised worker.
+    // Pass admitted metadata to backend-selected inspection or a supervised worker.
     println!("{}: metadata fetched: {}", variant.variant_id, metadata.is_ok());
 }
 # Ok(())

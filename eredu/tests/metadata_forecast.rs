@@ -1,6 +1,5 @@
 //! Architecture inspection and facade forecast parity with cold mock facts.
 use eredu::api::*;
-use eredu_architectures::inspect_model_metadata;
 use eredu_architectures::PreparationMechanismProvider;
 use eredu_core::{
     MediaFeatureAvailability, ModelConfigurationResolver, PreparationMechanismCapabilities,

@@ -56,7 +56,7 @@ impl Profile {
             ));
         }
         if let Some(state) = &self.paged_state {
-            self.inspection_options()?;
+            self.inspection_request()?;
             if state.block_size_tokens > i32::MAX as u32 {
                 return Err(CatalogueError::Invalid("state block exceeds i32".into()));
             }
@@ -65,12 +65,12 @@ impl Profile {
     }
 
     /// Uses the same selected execution-state policy when building cold forecasts.
-    pub fn inspection_options(
+    pub fn inspection_request(
         &self,
-    ) -> Result<eredu::api::MetadataInspectionOptions, CatalogueError> {
-        let options = eredu::api::MetadataInspectionOptions::new(
-            BackendId::new(&self.backend).map_err(|e| CatalogueError::Invalid(e.to_string()))?,
-        );
+    ) -> Result<eredu_runtime::NormalizedLoadRequest, CatalogueError> {
+        BackendId::new(&self.backend)
+            .map_err(|error| CatalogueError::Invalid(error.to_string()))?;
+        let request = eredu_runtime::NormalizedLoadRequest::default();
         if let Some(state) = &self.paged_state {
             let block = i32::try_from(state.block_size_tokens)
                 .map_err(|e| CatalogueError::Invalid(e.to_string()))?;
@@ -83,14 +83,12 @@ impl Profile {
             .map_err(|e| CatalogueError::Invalid(e.to_string()))?
             .with_full_attention(true)
             .with_persistence_retention(true);
-            let request = options
-                .load_request()
-                .clone()
+            let request = request
                 .with_state_residency(eredu_runtime::CacheResidencyPolicy::Paged(paged))
                 .with_prompt_cache_persistence(true);
-            Ok(options.with_load_request(request))
+            Ok(request)
         } else {
-            Ok(options)
+            Ok(request)
         }
     }
 

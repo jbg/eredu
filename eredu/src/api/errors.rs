@@ -1,14 +1,6 @@
-//! Portable errors for device selection and diagnostic workflows.
+//! Portable errors for diagnostic workflows.
 
 use eredu_core::BackendFailure;
-
-/// Failure to map a facade device choice to the selected local backend.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, thiserror::Error)]
-pub enum DevicePlanError {
-    /// This build contains no native accelerator family for the selected adapter.
-    #[error("no local accelerator family is compiled for this target")]
-    AcceleratorNotCompiled,
-}
 
 /// Failure while running the facade-owned expert-cache benchmark workflow.
 #[derive(Debug, thiserror::Error)]

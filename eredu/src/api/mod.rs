@@ -1,7 +1,7 @@
 //! Backend-neutral language-model facade.
 //!
 //! This module is available without an execution backend. Enabling the
-//! `mlx` feature adds MLX runtime and diagnostic helpers. Models, requests,
+//! `mlx` feature enables MLX-specific diagnostics. Models, requests,
 //! generation controls, and realtime mechanisms retain their generic parameters;
 //! import a concrete backend factory from its owning crate to select execution.
 //!
@@ -10,7 +10,7 @@
 //! in `eredu-core`.
 
 mod errors;
-pub use errors::{DevicePlanError, ExpertCacheBenchmarkError};
+pub use errors::ExpertCacheBenchmarkError;
 
 mod chat_input;
 mod media;

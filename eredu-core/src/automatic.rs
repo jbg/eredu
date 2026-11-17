@@ -38,7 +38,7 @@ fn next_execution_plan_target_id() -> Result<u64, AutomaticPlanningError> {
 }
 
 /// Schema version shared by automatic-planning and telemetry documents.
-pub const AUTOMATIC_SCHEMA_VERSION: u32 = 7;
+pub const AUTOMATIC_SCHEMA_VERSION: u32 = 8;
 
 /// Confidence attached to an observed or derived value.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -240,14 +240,29 @@ impl ModelResourceProfile {
     }
 }
 
+/// Execution device class reported by the backend independently of memory placement.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum HardwareDeviceKind {
+    /// Host processor.
+    Cpu,
+    /// Graphics processor.
+    Gpu,
+    /// A device outside the CPU and GPU classes.
+    Other,
+}
+
 /// One logical device visible to an execution backend.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HardwareDeviceProfile {
     /// Backend-stable device identifier.
     pub id: String,
+    /// Portable device class.
+    pub kind: HardwareDeviceKind,
     /// Backend-defined device family.
     pub family: String,
-    /// Process-local device index.
+    /// Backend-reported process-local index within this device kind.
     pub index: usize,
     /// Total physical device capacity, if independently observable.
     pub total_memory_bytes: Observed<u64>,
@@ -2011,6 +2026,7 @@ mod tests {
                     detail: None,
                     devices: vec![HardwareDeviceProfile {
                         id: "gpu:0".into(),
+                        kind: HardwareDeviceKind::Gpu,
                         family: "gpu".into(),
                         index: 0,
                         total_memory_bytes: Observed::exact(16 << 30, "fixture"),

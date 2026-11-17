@@ -1,7 +1,6 @@
 //! Native diagnostic baseline; collection/replay is separate from ordinary timings.
 use anyhow::{ensure, Context};
-use eredu::api::{local_device_plan, LoadedModel, LocalDevice};
-use eredu::api::{reset_local_allocator_peak, set_local_allocator_cache_limit};
+use eredu::api::LoadedModel;
 use eredu_backend_mlx::allocator_memory;
 use eredu_backend_mlx::{
     backend::nn::projection_profile::{CastGemmReference, ProjectionCapture},
@@ -42,8 +41,8 @@ fn main() -> anyhow::Result<()> {
         positions > 0 && samples > 0,
         "positions/samples must be positive"
     );
-    set_local_allocator_cache_limit(0)?;
-    let plan = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Accelerator(0))?)
+    eredu_backend_mlx::set_allocator_cache_limit(0)?;
+    let plan = ExecutionPlan::fully_resident(eredu_core::DevicePlan::new("mlx", "metal:0")?)
         .with_parameter_conversion_retention(Some(policy));
     let factory = MlxBackendFactory::default();
     let (mut model, _) = LoadedModel::load_execution_plan(&factory, &path, &plan)?.into_parts();
@@ -61,7 +60,7 @@ fn main() -> anyhow::Result<()> {
         model.synchronize()?;
         let before = allocator_memory()?.active_bytes();
         let retained_before = model.parameter_conversion_retention()?;
-        reset_local_allocator_peak()?;
+        eredu_backend_mlx::reset_allocator_peak()?;
         let capture = if mode != "baseline" {
             Some(ProjectionCapture::begin(128)?)
         } else {

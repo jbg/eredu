@@ -1,9 +1,8 @@
 //! Complete local facade workflow; bounded JSONL records go to stdout.
 use eredu::{
     api::{
-        local_device_plan, ControlledGenerationRecord, GenerationBranchOptions, LoadedModel,
-        LocalDevice, ObservedGenerationEvent, PreparedChatGenerationSettings, SamplingOverride,
-        TraceLimits,
+        ControlledGenerationRecord, GenerationBranchOptions, LoadedModel, ObservedGenerationEvent,
+        PreparedChatGenerationSettings, SamplingOverride, TraceLimits,
     },
     runtime::chat::ChatTemplateRequest,
 };
@@ -55,7 +54,7 @@ pub fn run_example(
     prompt: &str,
     dtype: InterventionDtype,
 ) -> anyhow::Result<()> {
-    let execution = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Cpu)?)
+    let execution = ExecutionPlan::fully_resident(eredu_core::DevicePlan::new("mlx", "cpu:0")?)
         .with_required_session_capabilities(SessionCapabilities::new(true, true, true));
     let (mut model, _) =
         LoadedModel::load_execution_plan(&MlxBackendFactory::default(), artifact, &execution)?

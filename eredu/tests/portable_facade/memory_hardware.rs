@@ -21,6 +21,7 @@ fn hardware(semantics: HardwareMemorySemantics) -> HardwareProfile {
 fn device(id: &str, available: u64) -> HardwareDeviceProfile {
     HardwareDeviceProfile {
         id: id.into(),
+        kind: eredu_core::HardwareDeviceKind::Gpu,
         family: "opaque backend family".into(),
         index: 7,
         total_memory_bytes: Observed::exact(500, "installed device capacity"),

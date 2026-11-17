@@ -36,11 +36,11 @@ backend factory to infer `B`; the same API also works with mock backends:
 ```rust,no_run
 # #[cfg(feature = "mlx")]
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
-use eredu::api::{default_local_device, local_device_plan, LoadedModel};
-use eredu_core::ExecutionPlan;
+use eredu::api::LoadedModel;
+use eredu_core::{DevicePlan, ExecutionPlan};
 use eredu_backend_mlx::MlxBackendFactory;
 
-let device = local_device_plan(default_local_device())?;
+let device = DevicePlan::new("mlx", "cpu:0")?;
 let plan = ExecutionPlan::fully_resident(device);
 let factory = MlxBackendFactory::default();
 let planned = LoadedModel::load_execution_plan(&factory, "/path/to/model", &plan)?;
@@ -51,10 +51,10 @@ let (mut model, drafting) = planned.into_parts();
 # fn main() {}
 ```
 
-`default_local_device` selects accelerator zero in CUDA and Apple Metal builds,
-and falls back to CPU in CPU-only MLX builds. Pass `LocalDevice::Cpu` or
-`LocalDevice::Accelerator(index)` to `local_device_plan` when an application
-needs an explicit device.
+Applications can construct an exact `DevicePlan` from a backend ID and a device
+ID or select one from the factory's hardware discovery report. The CLI resolves
+`cpu` and `gpu:N` using reported device kind and index. When omitted, the CLI
+prefers a discovered GPU, then a discovered CPU.
 
 Model-family architecture modules are owned by `eredu-architectures`.
 Reusable MLX tensors, operators, caches, streams, and family composition live

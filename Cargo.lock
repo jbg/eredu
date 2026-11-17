@@ -1083,6 +1083,7 @@ dependencies = [
  "clap",
  "eredu",
  "eredu-architectures",
+ "eredu-backend-mlx",
  "eredu-core",
  "eredu-runtime",
  "futures",

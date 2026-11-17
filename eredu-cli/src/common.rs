@@ -79,17 +79,11 @@ pub struct CommonOptions {
 }
 impl CommonOptions {
     pub fn configure_runtime(&self) -> Result<()> {
-        let runtime = self
-            .mlx_cache_limit_bytes
-            .map(|bytes| {
-                usize::try_from(bytes).map(|limit| {
-                    eredu::api::LocalRuntimeConfiguration::default()
-                        .with_allocator_cache_limit(limit)
-                })
-            })
-            .transpose()?
-            .unwrap_or_default();
-        eredu::api::configure_local_runtime(&runtime)?;
+        if let Some(bytes) = self.mlx_cache_limit_bytes {
+            eredu_backend_mlx::set_allocator_cache_limit(usize::try_from(bytes)?)?;
+        } else {
+            eredu_backend_mlx::initialize_allocator_cache_policy(false)?;
+        }
         Ok(())
     }
     pub fn validate(&self) -> Result<()> {

@@ -1,4 +1,4 @@
-//! Common host PCM files, playback sinks, and execution contexts.
+//! Common host PCM files and playback sinks.
 
 use std::{
     fs::File,
@@ -7,8 +7,6 @@ use std::{
 };
 
 use anyhow::{ensure, Result};
-use eredu::api::LocalDevice;
-use eredu_backend_mlx::native::ExecutionContext;
 #[cfg(feature = "system-audio")]
 use eredu_media::audio::system::SystemAudioOutput;
 use eredu_media::audio::wav::{WavReader, WavWriter};
@@ -54,15 +52,6 @@ impl PcmOutput {
         }
         Ok(())
     }
-}
-
-pub fn execution_contexts(device: LocalDevice) -> Result<(ExecutionContext, ExecutionContext)> {
-    let weights = ExecutionContext::cpu()?;
-    let execution = match device {
-        LocalDevice::Cpu => ExecutionContext::cpu()?,
-        LocalDevice::Accelerator(index) => ExecutionContext::accelerator(usize::try_from(index)?)?,
-    };
-    Ok((weights, execution))
 }
 
 pub(crate) fn decode_wav(path: &Path) -> Result<eredu_core::Audio> {
