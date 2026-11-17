@@ -1,6 +1,5 @@
 //! MLX runtime configuration, inspection, and diagnostics for generic facade models.
 
-use std::path::Path;
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
 use std::path::PathBuf;
 use std::time::Duration;
@@ -13,12 +12,6 @@ pub fn local_allocator_cache_policy(
     eredu_backend_mlx::allocator_cache_policy().map_err(|error| {
         eredu_core::BackendFailure::from_error(error).with_operation("allocator-cache policy query")
     })
-}
-
-/// Discovers hardware available to the MLX backend.
-/// Available memory is a point-in-time estimate, not an allocation guarantee.
-pub fn discover_local_hardware() -> eredu_core::HardwareProfile {
-    eredu_backend_mlx::discover_hardware()
 }
 
 /// Reads the process-global allocator-cache limit in bytes without changing it.
@@ -38,72 +31,36 @@ pub fn set_local_allocator_cache_limit(bytes: usize) -> Result<usize, eredu_core
     })
 }
 
-impl super::GenerationMemoryOptions {
-    /// Creates cold-forecast options for the exact selected local device.
-    ///
-    /// Observes local hardware once, derives placement and available execution
-    /// and host capacity, and samples allocator overhead. Application limits and
-    /// reserves remain unset. Missing capacity/overhead stays unknown; an invalid
-    /// or undiscovered device is rejected. This does not load a model, allocate
-    /// tensors, or change allocator policy; diagnostic queries may initialize
-    /// the native runtime. Availability is a point-in-time observation.
-    pub fn for_local_device(
-        input: eredu_core::InputTokenCount,
-        device: &crate::DevicePlan,
-    ) -> Result<Self, super::GenerationForecastError> {
-        let host_execution = eredu_backend_mlx::MlxBackendFactory::default()
-            .device_uses_host_memory(device)
-            .map_err(|error| eredu_core::CapabilityError::InvalidConfiguration {
-                field: "device",
-                detail: error.to_string(),
-            })?;
-        let hardware = discover_local_hardware();
-        let mut options = Self::for_hardware_device(input, &hardware, device, host_execution)?;
-        options.backend_overhead = observed_local_allocator_overhead();
-        Ok(options)
+impl super::BackendInspection for eredu_backend_mlx::MlxBackendFactory {
+    fn inspect_execution(
+        &self,
+        path: &std::path::Path,
+        plan: &crate::ExecutionPlan,
+    ) -> Result<eredu_architectures::ModelInspectionOutcome, BackendFailure> {
+        let request = self
+            .load_request_for_plan(plan)
+            .map_err(BackendFailure::from_error)?;
+        eredu_backend_mlx::native::inspect_model_preparation(
+            path,
+            eredu_backend_mlx::native::MlxInspectionOptions::new(request),
+        )
+        .map_err(|error| BackendFailure::from_error(error).with_operation("model inspection"))
     }
 
-    /// Creates local-backend options with an observed allocator-cache allowance.
-    /// Use [`Self::for_local_device`] to also derive placement and availability
-    /// from a selected device. This explicit-placement constructor is unchanged.
-    ///
-    /// Overhead uses the larger of the current cache limit and retained cache,
-    /// plus a 64 MiB graph/driver planning allowance. This is an estimated bound,
-    /// not a total-process limit. Other execution mechanisms remain explicit.
-    /// Query failure or an unrepresentable bound leaves overhead unknown.
-    ///
-    /// This diagnostic may initialize the native allocator; cold inspection
-    /// itself does not query native resources. Recreate options after changing
-    /// the process-global cache limit. Callers may override `backend_overhead`.
-    pub fn for_local_backend(
-        input: eredu_core::InputTokenCount,
-        placement: super::GenerationMemoryPlacement,
-    ) -> Self {
-        let mut options = Self::new(input, placement);
-        options.backend_overhead = observed_local_allocator_overhead();
-        options
+    fn device_uses_host_memory(&self, device: &crate::DevicePlan) -> Result<bool, BackendFailure> {
+        self.device_uses_host_memory(device)
+            .map_err(BackendFailure::from_error)
     }
-}
 
-fn observed_local_allocator_overhead() -> super::MemoryBytes {
-    match local_allocator_cache_policy()
-        .and_then(|policy| allocator_telemetry().map(|memory| (policy, memory.cache_bytes)))
+    fn allocator_observation(
+        &self,
+    ) -> Result<Option<(AllocatorCachePolicyReport, crate::AllocatorTelemetry)>, BackendFailure>
     {
-        Ok((policy, cached)) => {
-            let mut overhead = local_allocator_overhead(policy.limit_bytes, cached);
-            overhead
-                .detail
-                .push_str(&format!("; native policy provenance: {:?}", policy.source));
-            overhead
-        }
-        Err(error) => super::MemoryBytes::unknown(format!(
-            "local allocator-cache observation failed: {error}"
-        )),
+        Ok(Some((
+            local_allocator_cache_policy()?,
+            allocator_telemetry()?,
+        )))
     }
-}
-
-fn local_allocator_overhead(limit: u64, cached: u64) -> super::MemoryBytes {
-    super::ForecastCalibration::default().allocator_overhead(limit, cached)
 }
 
 use super::{DevicePlanError, ExpertCacheBenchmarkError};
@@ -144,190 +101,6 @@ impl super::LoadedModel<eredu_backend_mlx::backend::MlxBackend<'_>> {
             })
             .map(|report| report.as_ref().map(eredu_runtime::residency_telemetry))
     }
-}
-
-/// Facade-owned policy for loading a model on the selected local backend.
-///
-/// Distributed native device bindings are intentionally absent. Application
-/// clients select portable placement and topology through an
-/// [`crate::ExecutionPlan`].
-#[derive(Debug, Clone, Default, Eq, PartialEq)]
-pub struct LocalLoadOptions {
-    normalized: eredu_runtime::NormalizedLoadRequest,
-}
-
-impl LocalLoadOptions {
-    /// Enables file-backed prepared weights with the supplied directory and byte budget.
-    pub fn with_prepared_checkpoint_cache(
-        mut self,
-        policy: eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy,
-    ) -> Self {
-        self.normalized = self.normalized.with_prepared_checkpoint_cache(policy);
-        self
-    }
-
-    /// Selects model-scoped retained conversion payload at load time. `None`
-    /// uses the finite 256 MiB managed default for eligible resident executions.
-    /// This is independent of allocator caching and does not limit temporary casts.
-    /// Zero normalizes to disabled; unlimited reuse requires an explicit request.
-    /// Host-layerwise, disk-streamed and explicit device ceilings disable retention.
-    /// Inspect [`super::LoadedModel::parameter_conversion_retention`] for effective
-    /// policy and live usage. Reset preserves conversions; settled trimming releases
-    /// optional claims without reloading weights or changing the selected policy.
-    pub fn with_parameter_conversion_retention(
-        mut self,
-        policy: Option<eredu_core::residency::ParameterConversionRetentionPolicy>,
-    ) -> Self {
-        self.normalized = self.normalized.with_parameter_conversion_retention(policy);
-        self
-    }
-
-    /// Explicit retention request, or `None` for the managed default.
-    pub const fn parameter_conversion_retention(
-        &self,
-    ) -> Option<eredu_core::residency::ParameterConversionRetentionPolicy> {
-        self.normalized.parameter_conversion_retention()
-    }
-
-    /// Creates load options that quantize eligible dense weights on load.
-    pub fn with_quantization(quantization: crate::QuantizationRequest) -> Self {
-        Self {
-            normalized: eredu_runtime::NormalizedLoadRequest::with_quantization(quantization),
-        }
-    }
-
-    /// Selects fully resident or bounded layer execution for checkpoint weights.
-    pub fn with_weight_residency(mut self, residency: eredu_runtime::WeightResidency) -> Self {
-        self.normalized = self.normalized.with_weight_residency(residency);
-        self
-    }
-
-    /// Requires capabilities from the exact inspected and realized session.
-    pub fn with_required_session_capabilities(
-        mut self,
-        capabilities: crate::SessionCapabilities,
-    ) -> Self {
-        self.normalized = self
-            .normalized
-            .with_required_session_capabilities(capabilities);
-        self
-    }
-
-    /// Requested dense-weight transformation, if any.
-    pub const fn quantization(&self) -> Option<crate::QuantizationRequest> {
-        self.normalized.quantization()
-    }
-
-    /// Selected immutable-weight residency policy.
-    pub const fn weight_residency(&self) -> eredu_runtime::WeightResidency {
-        self.normalized.weight_residency()
-    }
-
-    /// Capabilities required from the realized session.
-    pub const fn required_session_capabilities(&self) -> crate::SessionCapabilities {
-        self.normalized.required_session_capabilities()
-    }
-
-    /// Selects portable drafting intent before checkpoint preparation.
-    pub fn with_drafting(mut self, drafting: eredu_runtime::DraftingLoadRequest) -> Self {
-        self.normalized = self.normalized.with_drafting(drafting);
-        self
-    }
-
-    /// Portable drafting policy retained from explicit or planned loading.
-    pub const fn drafting(&self) -> eredu_runtime::DraftingLoadRequest {
-        self.normalized.drafting()
-    }
-
-    /// Supplies a separate artifact for the selected embedded prediction extension.
-    /// The architecture validates the artifact against the target before loading.
-    pub fn with_prediction_source(mut self, path: impl Into<std::path::PathBuf>) -> Self {
-        self.normalized = self.normalized.with_prediction_source(path);
-        self
-    }
-
-    /// Admits separate low-rank parameters used only by shared-backbone drafting.
-    pub fn with_draft_adapter(mut self, source: eredu_core::DraftAdapterSource) -> Self {
-        self.normalized = self.normalized.with_draft_adapter(source);
-        self
-    }
-    /// Optional shared-backbone draft adapter selected at load time.
-    pub fn draft_adapter(&self) -> Option<&eredu_core::DraftAdapterSource> {
-        self.normalized.draft_adapter()
-    }
-
-    /// Selects independently admitted image/video and waveform sources.
-    pub fn with_media_companions(mut self, sources: eredu_core::MediaCompanionSources) -> Self {
-        self.normalized = self.normalized.with_media_companions(sources);
-        self
-    }
-    /// Explicit independent media sources selected at load time.
-    pub fn media_companions(&self) -> &eredu_core::MediaCompanionSources {
-        self.normalized.media_companions()
-    }
-
-    /// Explicit embedded prediction artifact, if supplied.
-    pub fn prediction_source(&self) -> Option<&std::path::Path> {
-        self.normalized.prediction_source()
-    }
-
-    fn into_backend(self) -> eredu_backend_mlx::MlxLoadRequest {
-        eredu_backend_mlx::MlxLoadRequest::from_normalized(self.normalized)
-    }
-
-    fn from_backend(
-        options: eredu_backend_mlx::MlxLoadRequest,
-    ) -> Result<Self, crate::AutomaticPlanningError> {
-        if options.normalized().has_parallel_execution() {
-            return Err(crate::AutomaticPlanningError::Invalid(
-                "selected-local inspection options cannot contain a native parallel context; use a portable execution plan"
-                    .into(),
-            ));
-        }
-        Ok(Self {
-            normalized: options.normalized().clone(),
-        })
-    }
-}
-
-/// Facade-owned options for selected-local-backend model inspection.
-#[derive(Debug, Clone, Default, Eq, PartialEq)]
-pub struct LocalInspectionOptions {
-    /// The exact facade loading policy that admission should validate.
-    load: LocalLoadOptions,
-}
-
-impl LocalInspectionOptions {
-    /// Creates inspection options for one exact facade load request.
-    pub const fn new(load: LocalLoadOptions) -> Self {
-        Self { load }
-    }
-
-    /// Returns the load request whose feasibility is being inspected.
-    pub fn load(&self) -> LocalLoadOptions {
-        self.load.clone()
-    }
-
-    /// Derives inspection options from a portable execution plan.
-    pub fn for_execution_plan(
-        factory: &eredu_backend_mlx::MlxBackendFactory,
-        plan: &crate::ExecutionPlan,
-    ) -> Result<Self, crate::AutomaticPlanningError> {
-        let options = factory.load_request_for_plan(plan)?;
-        Ok(Self::new(LocalLoadOptions::from_backend(options)?))
-    }
-}
-
-/// Inspects a model using facade-owned options and errors.
-pub fn inspect_local_model(
-    path: impl AsRef<Path>,
-    options: LocalInspectionOptions,
-) -> Result<crate::ModelInspectionReport, BackendFailure> {
-    eredu_backend_mlx::native::inspect_model(
-        path,
-        eredu_backend_mlx::native::MlxInspectionOptions::new(options.load().into_backend()),
-    )
-    .map_err(|error| BackendFailure::from_error(error).with_operation("model inspection"))
 }
 
 /// A facade-level device class for the selected local backend.
@@ -695,27 +468,6 @@ pub fn benchmark_local_expert_cache(
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{validate_expert_cache_benchmark_prompt, ExpertCacheBenchmarkError};
-
-    #[test]
-    fn local_overhead_covers_retained_cache_and_checks_overflow() {
-        let allowance = 64 * 1024 * 1024;
-        assert_eq!(
-            super::local_allocator_overhead(0, 0).upper_bytes,
-            Some(allowance)
-        );
-        assert_eq!(
-            super::local_allocator_overhead(1024, 4096).upper_bytes,
-            Some(4096 + allowance)
-        );
-        assert_eq!(
-            super::local_allocator_overhead(8192, 4096).upper_bytes,
-            Some(8192 + allowance)
-        );
-        assert_eq!(
-            super::local_allocator_overhead(0, u64::MAX).upper_bytes,
-            None
-        );
-    }
 
     #[test]
     fn empty_benchmark_prompt_is_a_facade_input_error() {

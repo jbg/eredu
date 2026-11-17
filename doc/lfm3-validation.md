@@ -1774,8 +1774,8 @@ question groups, and answer positions. Read each slot through
 admit the same source with `PreparedTextChoiceModel::open` and
 `RecipeDtype::F32`. The native slot comparison binds the retained decoder
 with `MlxVlDecoder::bind` and forwards `Lfm3Input::Decision` with fresh state.
-The public comparison calls `TextChoiceModel::evaluate` on the same
-fixture and checks the calibrated answers and usage.
+The public comparison runs the same fixture through `api::decision::evaluate_decisions`
+with the selected backend factory and checks the calibrated answers and usage.
 
 The two cases compare every vocabulary score in three answer rows. The
 longer state crosses the global query block size and the sliding window.
@@ -1884,9 +1884,9 @@ The [image state fixture](../validation/fixtures/lfm3/d1-image-state.json)
 uses one decoded RGB image with the same pinned d1-2B SafeTensors checkpoint.
 The reference uses `media.Reader.encode` and `media.Reader.inputs` before
 `prompt.prefix_text`, `attention.pack_set`, and `slots.slot_logits`. The
-public Rust replay uses `PreparedTextChoiceModel::open_with_images`,
-`TextChoiceModel::load_with_images`, and `evaluate_with_images`. Decoder and
-vision residency are independently selected.
+public Rust replay passes an image in `DecisionRequest::media` to
+`api::decision::evaluate_decisions`. The architecture prepares the image and binds
+its vision encoder with the same component mechanisms used for the decoder.
 
 The F32 CPU replay projects 64 image rows and matches all 136 packed tokens
 and both slot positions. Full-vocabulary slot logits match with maximum
@@ -2251,8 +2251,8 @@ uses a released d1 Omni SafeTensors checkpoint, an image and PCM
 state, and 17 questions in two packed rows. The last question uses
 synthetic PCM as its instruction. Use CPU F32 recipes and
 `PreparedTextChoiceModel::open_with_omni`. On each process, set
-`MLX_HOSTFILE` and `MLX_RANK`, then call
-`TextChoiceModel::load_distributed` with the same Ring topology,
+`MLX_HOSTFILE` and `MLX_RANK` and initialize the MLX Ring world. Call the architecture’s
+`TextChoiceModel::load_distributed` with that world, its exact rank topology,
 a 1024-token row bound, and resident decoder, vision, and speech weights.
 
 Compare `evaluate_with_spoken_questions` with repeated

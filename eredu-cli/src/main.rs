@@ -40,10 +40,10 @@ use anyhow::{bail, Context, Result};
 use clap::{parser::ValueSource, ArgMatches, CommandFactory, FromArgMatches, Parser, ValueEnum};
 use eredu::{
     api::{
-        benchmark_local_expert_cache, discover_local_hardware, inspect_local_model,
-        local_device_plan, reset_local_allocator_peak, GenerationRequest, LoadedModel, LocalDevice,
-        LocalExpertCacheBenchmarkSample, LocalInspectionOptions, PreparedChatGenerationSettings,
-        PreparedChatInput, TextDecoder, TextModelError,
+        benchmark_local_expert_cache, inspect_execution, local_device_plan,
+        reset_local_allocator_peak, BackendInspection, GenerationRequest, LoadedModel, LocalDevice,
+        LocalExpertCacheBenchmarkSample, PreparedChatGenerationSettings, PreparedChatInput,
+        TextDecoder, TextModelError,
     },
     runtime::chat::{
         ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, SemanticSupport, ToolChoice,
@@ -54,13 +54,13 @@ use eredu_backend_mlx::MlxBackendFactory;
 use eredu_core::QuantizationRequest;
 use eredu_core::{
     residency::CacheEvictionPolicy, speculative::SpeculativeStats, speculative_decoding_telemetry,
-    AutomaticPlanRequest, AutomaticPlanner, AutomaticPlannerPolicy, DeviceCapabilities, DevicePlan,
-    DraftPlacementPlan, DraftingPlan, ExecutionPlan, ExecutionPlanReport, ExecutionTelemetry,
-    ExpertCachePlan, FinishReason, GenerationCancellationToken, GenerationConfigOverrides,
-    HardwareMemorySemantics, HardwareProfile, InspectionSeverity, ModelResourceProfile, Observed,
-    PlanExplanation, PlanExplanationEntry, PlanExplanationLevel, ResidencyPlan, SemanticEvent,
-    SessionCapabilities, TextGenerationConfig, TimingTelemetry, WeightTransformationPlan,
-    EXECUTION_PLAN_SCHEMA_VERSION,
+    AutomaticPlanRequest, AutomaticPlanner, AutomaticPlannerPolicy, AutomaticPlanningBackend,
+    DeviceCapabilities, DevicePlan, DraftPlacementPlan, DraftingPlan, ExecutionPlan,
+    ExecutionPlanReport, ExecutionTelemetry, ExpertCachePlan, FinishReason,
+    GenerationCancellationToken, GenerationConfigOverrides, HardwareMemorySemantics,
+    HardwareProfile, InspectionSeverity, ModelResourceProfile, Observed, PlanExplanation,
+    PlanExplanationEntry, PlanExplanationLevel, ResidencyPlan, SemanticEvent, SessionCapabilities,
+    TextGenerationConfig, TimingTelemetry, WeightTransformationPlan, EXECUTION_PLAN_SCHEMA_VERSION,
 };
 use eredu_runtime::DenseDiskStreamLoadOptions;
 use hf_cache_reader::{resolve_cache_dir, scan_repo, CachedRevision, RepoType};
@@ -1041,11 +1041,6 @@ struct AutoPlanCache {
     entries: Vec<AutoPlanCacheEntry>,
 }
 
-#[derive(Debug)]
-struct AutoCandidate {
-    supported: bool,
-}
-
 fn observed_u64(value: &Observed<u64>) -> Option<u64> {
     match value {
         Observed::Available { value, .. } => Some(*value),
@@ -1320,18 +1315,16 @@ fn cached_plan_resource_admitted(observations: &ExecutionPlanReport, plan: &Exec
     }
 }
 
-fn candidate_load_options(plan: &ExecutionPlan) -> Result<eredu::api::LocalLoadOptions> {
-    Ok(LocalInspectionOptions::for_execution_plan(&MlxBackendFactory::default(), plan)?.load())
-}
+type TextArtifactInspection =
+    eredu_core::ArtifactInspection<eredu_architectures::processor_plan::ArtifactArchitecturePlan>;
 
-fn inspect_candidate(model_path: &Path, plan: &ExecutionPlan) -> Result<AutoCandidate> {
-    let report = inspect_local_model(
-        model_path,
-        LocalInspectionOptions::new(candidate_load_options(plan)?),
-    )?;
-    Ok(AutoCandidate {
-        supported: report.is_loadable(),
-    })
+fn candidate_is_loadable(
+    factory: &impl BackendInspection,
+    model_path: &Path,
+    plan: &ExecutionPlan,
+) -> Result<bool> {
+    let inspection = inspect_execution(factory, model_path, plan)?;
+    Ok(inspection.report().is_loadable())
 }
 
 fn base_automatic_candidates(
@@ -1436,16 +1429,23 @@ fn choose_automatic_residency(
     }
 }
 
-fn automatic_observations(model_path: &Path, device: CliDevice) -> Result<ExecutionPlanReport> {
-    let hardware = discover_local_hardware();
+fn automatic_observations(
+    factory: &impl BackendInspection,
+    model_path: &Path,
+    device: CliDevice,
+) -> Result<ExecutionPlanReport> {
+    let hardware = factory.discover_hardware()?;
     let selected_device = device_plan(device)?;
     validate_automatic_device(&hardware, &selected_device)?;
-    let resources = inspect_local_model(model_path, LocalInspectionOptions::default())?.resources;
+    let plan = ExecutionPlan::fully_resident(selected_device);
+    let resources = inspect_execution(factory, model_path, &plan)?
+        .into_report()
+        .resources;
     Ok(ExecutionPlanReport {
         schema_version: eredu_core::AUTOMATIC_SCHEMA_VERSION,
         hardware,
         resources,
-        plan: ExecutionPlan::fully_resident(selected_device),
+        plan,
         explanation: PlanExplanation {
             summary: "collected automatic planning inputs".into(),
             entries: Vec::new(),
@@ -1481,6 +1481,7 @@ fn read_automatic_feedback(paths: &[PathBuf]) -> Result<Vec<ExecutionTelemetry>>
 }
 
 fn automatic_plan(
+    factory: &impl AutomaticPlanningBackend,
     model_path: &Path,
     device: CliDevice,
     prior_telemetry: &[ExecutionTelemetry],
@@ -1488,35 +1489,29 @@ fn automatic_plan(
     let request = AutomaticPlanRequest::new(model_path, device_plan(device)?)
         .with_prior_telemetry(prior_telemetry.iter().cloned());
     AutomaticPlanner::default()
-        .plan(&MlxBackendFactory::default(), &request)
+        .plan(factory, &request)
         .map_err(Into::into)
 }
 
 fn automatic_plan_with_overrides(
+    factory: &impl BackendInspection<Inspection = TextArtifactInspection>,
     model_path: &Path,
     args: &Cli,
     overrides: &AutomaticCliOverrides,
     draft_model_path: Option<&Path>,
     prior_telemetry: &[ExecutionTelemetry],
-) -> Result<(
-    ExecutionPlanReport,
-    eredu_core::ArtifactInspection<eredu_architectures::processor_plan::ArtifactArchitecturePlan>,
-)> {
+) -> Result<(ExecutionPlanReport, TextArtifactInspection)> {
     let request = AutomaticPlanRequest::new(
         model_path,
         device_plan(args.common.device.unwrap_or_default())?,
     )
     .with_prior_telemetry(prior_telemetry.iter().cloned());
     AutomaticPlanner::default()
-        .plan_retained_with_overrides(
-            &MlxBackendFactory::default(),
-            &request,
-            |plan, resources| {
-                overrides
-                    .apply_to_plan(plan, args, draft_model_path, resources)
-                    .map_err(|error| eredu_core::AutomaticPlanningError::Invalid(error.to_string()))
-            },
-        )
+        .plan_retained_with_overrides(factory, &request, |plan, resources| {
+            overrides
+                .apply_to_plan(plan, args, draft_model_path, resources)
+                .map_err(|error| eredu_core::AutomaticPlanningError::Invalid(error.to_string()))
+        })
         .map(|retained| retained.into_parts())
         .map_err(Into::into)
 }
@@ -1533,6 +1528,7 @@ fn push_unique_plan(
 }
 
 fn automatic_benchmark_candidates(
+    factory: &impl BackendInspection,
     model_path: &Path,
     heuristic: &ExecutionPlanReport,
 ) -> Result<Vec<ExecutionPlan>> {
@@ -1565,13 +1561,13 @@ fn automatic_benchmark_candidates(
         if (index == 0 && !resident_fits) || (index == 1 && !layerwise_fits) {
             continue;
         }
-        if !inspect_candidate(model_path, &plan)?.supported {
+        if !candidate_is_loadable(factory, model_path, &plan)? {
             continue;
         }
         let mut residency_plans = vec![plan.clone()];
         if index != 0 {
             let expert = with_expert_cache(plan.clone());
-            if inspect_candidate(model_path, &expert)?.supported {
+            if candidate_is_loadable(factory, model_path, &expert)? {
                 residency_plans.push(expert);
             }
         }
@@ -1740,6 +1736,7 @@ fn median(mut values: Vec<f64>) -> Option<f64> {
 }
 
 fn benchmark_automatic_plans(
+    factory: &impl BackendInspection,
     model_path: &Path,
     mut heuristic: ExecutionPlanReport,
     tokens: usize,
@@ -1747,7 +1744,7 @@ fn benchmark_automatic_plans(
     timeout_seconds: u64,
     prompt: &str,
 ) -> Result<AutoBenchmarkReport> {
-    let plans = automatic_benchmark_candidates(model_path, &heuristic)?;
+    let plans = automatic_benchmark_candidates(factory, model_path, &heuristic)?;
     let candidate_count = plans.len();
     let mut candidates = Vec::with_capacity(candidate_count);
     for (candidate, plan) in plans.into_iter().enumerate() {
@@ -1842,7 +1839,11 @@ fn benchmark_automatic_plans(
     })
 }
 
-fn exact_automatic_report(model_path: &Path, plan: ExecutionPlan) -> Result<ExecutionPlanReport> {
+fn exact_automatic_report(
+    factory: &impl BackendInspection,
+    model_path: &Path,
+    plan: ExecutionPlan,
+) -> Result<ExecutionPlanReport> {
     if plan.schema_version() != EXECUTION_PLAN_SCHEMA_VERSION {
         bail!(
             "exact automatic plan schema {} does not match supported schema {}",
@@ -1850,12 +1851,9 @@ fn exact_automatic_report(model_path: &Path, plan: ExecutionPlan) -> Result<Exec
             EXECUTION_PLAN_SCHEMA_VERSION
         );
     }
-    let hardware = discover_local_hardware();
+    let hardware = factory.discover_hardware()?;
     validate_automatic_device(&hardware, plan.device())?;
-    let inspection = inspect_local_model(
-        model_path,
-        LocalInspectionOptions::new(candidate_load_options(&plan)?),
-    )?;
+    let inspection = inspect_execution(factory, model_path, &plan)?.into_report();
     if !inspection.is_loadable() {
         let detail = inspection
             .issues
@@ -1970,6 +1968,7 @@ fn apply_automatic_plan(args: &mut Cli, plan: &ExecutionPlan) -> Result<()> {
 }
 
 fn automatic_report_with_cache(
+    factory: &impl BackendInspection<Inspection = TextArtifactInspection>,
     model_path: &Path,
     args: &Cli,
     overrides: &AutomaticCliOverrides,
@@ -1979,7 +1978,7 @@ fn automatic_report_with_cache(
 ) -> Result<ExecutionPlanReport> {
     if let Some(path) = cache_path {
         let observations =
-            automatic_observations(model_path, args.common.device.unwrap_or_default())?;
+            automatic_observations(factory, model_path, args.common.device.unwrap_or_default())?;
         let key = automatic_cache_key(model_path, &observations)?;
         if prior_telemetry.is_empty() {
             if let Some(mut cached) = cached_automatic_report(path, &key)? {
@@ -1993,7 +1992,7 @@ fn automatic_report_with_cache(
                         &observations.resources,
                     )? == cached.plan
                     && cached_plan_resource_admitted(&observations, &cached.plan)
-                    && inspect_candidate(model_path, &cached.plan)?.supported
+                    && candidate_is_loadable(factory, model_path, &cached.plan)?
                 {
                     cached.explanation.entries.insert(
                         0,
@@ -2011,6 +2010,7 @@ fn automatic_report_with_cache(
             }
         }
         let heuristic = automatic_plan_with_overrides(
+            factory,
             model_path,
             args,
             overrides,
@@ -2022,6 +2022,7 @@ fn automatic_report_with_cache(
         Ok(heuristic)
     } else {
         automatic_plan_with_overrides(
+            factory,
             model_path,
             args,
             overrides,
@@ -2080,6 +2081,8 @@ fn main() -> Result<()> {
     if args.decisions.is_some() {
         args.speculative_draft_tokens = 0;
     }
+    let factory =
+        MlxBackendFactory::default().with_residency_diagnostics(args.verbose, args.verbose);
     let original_args = args.clone();
     validate_args(&args)?;
     let decision_request = args.decisions.as_deref().map(decisions::read).transpose()?;
@@ -2106,11 +2109,11 @@ fn main() -> Result<()> {
             eprintln!("load_seconds={:.3}", load_started.elapsed().as_secs_f64());
             decision_started = Some(Instant::now());
         };
-        let result = eredu::api::decision::evaluate_local_decisions_with_load_callback(
+        let result = eredu::api::decision::evaluate_decisions(
+            &factory,
             &model_path,
             assets.as_deref(),
             &request,
-            args.common.device.unwrap_or_default().local(),
             &plan,
             (args.timing || args.verbose).then_some(&mut on_loaded as &mut dyn FnMut()),
         )?;
@@ -2146,8 +2149,11 @@ fn main() -> Result<()> {
                     plan.with_prepared_checkpoint_cache(args.common.prepared_cache.policy())
                 }
             } else {
-                let observations =
-                    automatic_observations(&model_path, args.common.device.unwrap_or_default())?;
+                let observations = automatic_observations(
+                    &factory,
+                    &model_path,
+                    args.common.device.unwrap_or_default(),
+                )?;
                 automatic_overrides.apply_to_plan(
                     &plan,
                     &original_args,
@@ -2155,7 +2161,7 @@ fn main() -> Result<()> {
                     &observations.resources,
                 )?
             };
-            exact_automatic_report(&model_path, plan)
+            exact_automatic_report(&factory, &model_path, plan)
         })
         .transpose()?;
     let automatic_report = if let Some(report) = exact_trial_report {
@@ -2179,6 +2185,7 @@ fn main() -> Result<()> {
                         );
                     }
                     let mut heuristic = automatic_plan(
+                        &factory,
                         &model_path,
                         args.common.device.unwrap_or_default(),
                         &automatic_feedback,
@@ -2187,6 +2194,7 @@ fn main() -> Result<()> {
                         .plan
                         .with_prepared_checkpoint_cache(args.common.prepared_cache.policy());
                     let benchmark = benchmark_automatic_plans(
+                        &factory,
                         &model_path,
                         heuristic,
                         args.auto_benchmark_tokens,
@@ -2213,6 +2221,7 @@ fn main() -> Result<()> {
                 }
                 AutoMode::Plan => {
                     let report = automatic_report_with_cache(
+                        &factory,
                         &model_path,
                         &original_args,
                         &automatic_overrides,
@@ -2233,6 +2242,7 @@ fn main() -> Result<()> {
                 }
                 AutoMode::Quick => {
                     let (report, inspection) = automatic_plan_with_overrides(
+                        &factory,
                         &model_path,
                         &original_args,
                         &automatic_overrides,
@@ -2242,6 +2252,7 @@ fn main() -> Result<()> {
                     retained_automatic_inspection = Some(inspection);
                     if let Some(path) = &args.auto_cache {
                         let observations = automatic_observations(
+                            &factory,
                             &model_path,
                             args.common.device.unwrap_or_default(),
                         )?;
@@ -2262,14 +2273,11 @@ fn main() -> Result<()> {
         }
     };
     validate_args(&args)?;
-    let hardware_profile = automatic_report
-        .as_ref()
-        .map(|report| report.hardware.clone())
-        .or_else(|| {
-            args.telemetry_json
-                .as_ref()
-                .map(|_| discover_local_hardware())
-        });
+    let hardware_profile = match &automatic_report {
+        Some(report) => Some(report.hardware.clone()),
+        None if args.telemetry_json.is_some() => Some(factory.discover_hardware()?),
+        None => None,
+    };
     if args.estimate_memory_tokens.is_none() {
         args.common.configure_runtime()?;
     }
@@ -2303,6 +2311,7 @@ fn main() -> Result<()> {
 
     if let Some(tokens) = args.estimate_memory_tokens {
         let report = memory::report(
+            &factory,
             &args,
             &model_path,
             &execution_plan,
@@ -2343,18 +2352,14 @@ fn main() -> Result<()> {
         Some(report.resources.clone())
     } else if args.telemetry_json.is_some() {
         Some(
-            inspect_local_model(
-                &model_path,
-                LocalInspectionOptions::new(candidate_load_options(&execution_plan)?),
-            )?
-            .resources,
+            inspect_execution(&factory, &model_path, &execution_plan)?
+                .into_report()
+                .resources,
         )
     } else {
         None
     };
     let load_started = Instant::now();
-    let factory =
-        MlxBackendFactory::default().with_residency_diagnostics(args.verbose, args.verbose);
     let planned = match retained_automatic_inspection {
         Some(inspection) => {
             eredu::api::PreparedTextModel::from_artifact(inspection, Default::default())
@@ -3623,6 +3628,7 @@ fn select_revision<'a>(
 
 #[cfg(test)]
 mod tests {
+    use eredu_core::AutomaticPlanningBackend;
     #[cfg(feature = "realtime")]
     #[test]
     fn root_cli_keeps_text_options_and_separates_realtime_options() {
@@ -3755,16 +3761,16 @@ mod tests {
     use super::{
         apply_automatic_plan, artifact_file_stamps, base_automatic_candidates,
         cached_automatic_report, choose_automatic_residency, cli_execution_plan, device_plan,
-        discover_local_hardware, format_bytes, median, requested_load_quantization,
-        select_cached_gguf_from_revisions, select_cached_gguf_pair_from_revisions,
-        select_cached_gguf_path, select_revision, select_unique_cached_gguf,
-        should_report_stop_reason, split_hf_model_spec, stop_reason, use_semantic_generation,
-        validate_args, validate_artifact_pair, write_auto_plan_cache, write_semantic_event,
-        write_timing_report, AutoMode, AutoPlanCacheKey, AutomaticCliOverrides, CachedGgufRole,
-        Cli, CliDevice, CliToolChoice, DraftingPlan, ExecutionPlan, ExecutionPlanReport,
-        ModelResourceProfile, NativeToolSupport, Observed, PlanExplanation, QuantizationRequest,
-        ReasoningOutput, ReasoningStream, ResidencyPlan, ResolvedModel, SemanticEvent,
-        SemanticSupport, SpeculativeDraftDevice, StopReason, WeightTransformationPlan,
+        format_bytes, median, requested_load_quantization, select_cached_gguf_from_revisions,
+        select_cached_gguf_pair_from_revisions, select_cached_gguf_path, select_revision,
+        select_unique_cached_gguf, should_report_stop_reason, split_hf_model_spec, stop_reason,
+        use_semantic_generation, validate_args, validate_artifact_pair, write_auto_plan_cache,
+        write_semantic_event, write_timing_report, AutoMode, AutoPlanCacheKey,
+        AutomaticCliOverrides, CachedGgufRole, Cli, CliDevice, CliToolChoice, DraftingPlan,
+        ExecutionPlan, ExecutionPlanReport, ModelResourceProfile, NativeToolSupport, Observed,
+        PlanExplanation, QuantizationRequest, ReasoningOutput, ReasoningStream, ResidencyPlan,
+        ResolvedModel, SemanticEvent, SemanticSupport, SpeculativeDraftDevice, StopReason,
+        WeightTransformationPlan,
     };
 
     fn scanned_revision() -> CachedRevision {
@@ -3858,7 +3864,9 @@ mod tests {
         let model_path = directory.path().join("model.gguf");
         std::fs::write(&model_path, b"fixture").unwrap();
         let device = device_plan(CliDevice::Cpu).unwrap();
-        let hardware = discover_local_hardware();
+        let hardware = super::MlxBackendFactory::default()
+            .discover_hardware()
+            .unwrap();
         let resources = ModelResourceProfile {
             schema_version: eredu_core::AUTOMATIC_SCHEMA_VERSION,
             path: model_path.clone(),

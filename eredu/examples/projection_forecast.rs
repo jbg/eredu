@@ -43,7 +43,8 @@ fn main() -> anyhow::Result<()> {
         &path,
         eredu_backend_mlx::native::MlxInspectionOptions::new(factory.load_request_for_plan(&plan)?),
     )?;
-    let mut cold_options = GenerationMemoryOptions::for_local_device(
+    let mut cold_options = GenerationMemoryOptions::for_backend_device(
+        &eredu_backend_mlx::MlxBackendFactory::default(),
         InputTokenCount::text(positions as u64),
         plan.device(),
     )?;

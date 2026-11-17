@@ -82,6 +82,4 @@ pub use tools::{
 mod selected_mlx;
 #[cfg(feature = "mlx")]
 pub(crate) use selected_mlx::start_mlx_voicechat;
-#[cfg(feature = "mlx")]
-pub use selected_mlx::{MlxVoiceChatExecutor, MlxVoiceChatSession};
 pub use startup::{VoiceChatLoadSelection, VoiceChatStartError, VoiceChatStartupInputs};

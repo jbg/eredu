@@ -22,20 +22,16 @@ pub(super) fn requested(args: &Cli) -> bool {
 }
 
 pub(super) fn report(
+    factory: &impl eredu::api::BackendInspection,
     args: &Cli,
     path: &Path,
     plan: &ExecutionPlan,
     input_tokens: u64,
     output_tokens: Option<u64>,
 ) -> Result<Report> {
-    let inspection = eredu_backend_mlx::native::inspect_model_preparation(
-        path,
-        eredu_backend_mlx::native::MlxInspectionOptions::new(
-            MlxBackendFactory::default().load_request_for_plan(plan)?,
-        ),
-    )?;
+    let inspection = eredu::api::inspect_execution(factory, path, plan)?;
     let input = eredu_core::InputTokenCount::text(input_tokens);
-    let mut options = GenerationMemoryOptions::for_local_device(input, plan.device())?;
+    let mut options = GenerationMemoryOptions::for_backend_device(factory, input, plan.device())?;
     if let Some(cache_limit) = args.common.mlx_cache_limit_bytes {
         // Cold explicit overrides describe the proposed policy without changing
         // process-global allocator state. Loaded reports sample the actual policy.

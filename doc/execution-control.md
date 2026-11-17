@@ -1758,12 +1758,11 @@ authorize reclamation or budget refunds. Native completion ownership governs rel
 
 Realtime discovery and loading preserve the controlled session boundary.
 `api::realtime::prepare_realtime_model` discovers the architecture and retains exact
-component sources, pinned assets and source guards. `prepare_mlx_realtime` admits
+component sources, pinned assets and source guards. `prepare_realtime` admits
 `RealtimeLoadOptions::Speech` for PCM conversations or `Categorical` for
 Moshi/PersonaPlex frames before native binding. A protocol mismatch fails before
-native resources are created. The consuming `PreparedMlxRealtime::load` accepts
-execution contexts, with no replacement sources or host policy, and returns the
-selected bound execution. Speech loading registers the existing session and queues
+native resources are created. `bind_realtime` consumes the selection, takes
+a device plan and returns the bound execution through the factory that selected it. Speech loading registers the existing session and queues
 prefill; neural work starts only when that session advances. The same session
 provides PCM ingress, tool waits, committed output, snapshots, restore and forks.
 The [VoiceChat validation contract](voicechat-validation.md) distinguishes artifact
@@ -1949,7 +1948,8 @@ queued work and permitting retry at the same recorded timestamp. Polling the
 current session can retire its own completion before this availability check.
 `session_mut` exposes the existing snapshot, restore and host-policy operations.
 `fork_with_executor` explicitly binds compatible prepared resources to the ordinary
-accounted fork; selected MLX sessions provide `fork_shared` for the same model.
+accounted fork. The facade’s `SpeechRealtimeSession::fork` shares the admitted
+executor and returns a child with the same host protocol.
 
 The independently selected TTS tensor-parallel component borrows caller-owned
 local cache branches through `forward_parallel_with_state`. It shares the ordinary

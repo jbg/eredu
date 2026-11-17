@@ -64,8 +64,8 @@ callback-to-speaker latency measurement.
 
 The CLI uses the shared loading entry points: `prepare_realtime_model` performs
 architecture-owned family discovery, source admission and auxiliary-asset retention;
-`prepare_mlx_realtime` selects cache mechanisms and parameter pools without native
-allocation; consuming `PreparedMlxRealtime::load` constructs the selected execution.
+`prepare_realtime` selects cache mechanisms and parameter pools without native
+allocation; consuming `bind_realtime` constructs the selected execution.
 The same preparation and loading interfaces admit Moshi/PersonaPlex categorical
 frames. `RealtimeLoadOptions` distinguishes categorical frames from PCM speech;
 a protocol mismatch fails before binding. The serialized checkpoint-source contract

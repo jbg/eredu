@@ -36,30 +36,15 @@ complete headers, file lengths, and exact index membership using canonical
 completeness. This check does not establish payload checksums, supported model
 architecture, text readiness, or native backend availability.
 
-Path-based `LoadedModel` convenience loaders use the same retained pipeline.
-`inspect_local_model` remains a report-only diagnostic for selected-local-backend
-policy; callers proceeding to loading use the retained API.
+Path-based `LoadedModel` loaders use the same retained pipeline.
+`inspect_execution` takes a backend factory and the intended `ExecutionPlan`. It
+returns an inspection report and retains any admitted selection. The plan carries
+quantization, weight residency and required session capabilities. Native
+distributed groups are the backend’s responsibility.
 
-The selected local backend's `eredu::api::LocalLoadOptions` contain portable
-load policy:
-
-- `quantization`: an optional transformation for eligible dense weights; and
-- `weight_residency`: the static parameter placement policy; and
-- `required_session_capabilities`: fail-closed requirements for the realized
-  session.
-
-The same requirement applies to realtime loading. An unsupported requirement
-fails before checkpoint payload materialization. Loaded realtime models expose
-the admitted report with `PreparedRealtimeModel::session_capabilities`; exact
-capability coverage is documented by the selected backend.
-
-These facade-owned options are configured with builders and queried with
-accessors. They do not contain a native device or parallel context. Applications
-derive them from a portable `ExecutionPlan` with
-`LocalInspectionOptions::for_execution_plan` when inspection must exactly
-match a planned load. Backend-author tooling that binds native distributed
-groups uses the selected implementation crate directly. Non-replicated
-distributed topologies still use the same architecture-erased loader.
+Realtime preparation checks required capabilities against the selected factory
+before checkpoint payload materialization. A bound protocol retains the admitted
+state and execution resources.
 
 ## Gemma 4 MLX conversions
 
@@ -164,18 +149,17 @@ or video request without the corresponding components produces a typed
 `MissingCompanion` error during preparation. Cold inspection describes the
 missing optional source without rejecting text loading.
 
-Select independent vision and audio sources in the ordinary load options:
+Use the execution plan to select independent vision and audio sources.
 
 ```rust,no_run
-use eredu::api::{LocalLoadOptions, MediaCompanionSources};
+use eredu::api::MediaCompanionSources;
 
 let companions = MediaCompanionSources::default()
     .with_vision("/path/to/spark-bf16-vision")
     .with_audio("/path/to/spark-bf16-audio");
-let options = LocalLoadOptions::default().with_media_companions(companions);
+let plan = plan.with_media_companions(companions);
 ```
 
-The same source selection is available through `ExecutionPlan::with_media_companions`.
 Vision and audio can share one directory or select different directories. Muse
 validates the selected BF16 tower schemas, decoder geometry, token identities,
 processor policy and provenance before acquiring payloads. Indexed source

@@ -443,35 +443,3 @@ fn no_default_facade_selects_runs_and_resumes_realtime_with_reference_mechanisms
         1
     );
 }
-
-#[cfg(feature = "mlx")]
-#[test]
-fn shared_realtime_loader_rejects_unavailable_observation_before_source_binding() {
-    use eredu::api::realtime::prepare_mlx_realtime;
-    let config = config();
-    let catalog = HeaderCatalog::for_config(&config);
-    // No filesystem source exists. Required capability selection must fail before
-    // source binding, and this API accepts no device or stream to allocate.
-    let artifact = PreparedRealtimeArtifact::Moshi(
-        prepare_moshi_from_catalog(
-            "absent-artifact",
-            "absent-model.safetensors",
-            config,
-            &catalog,
-        )
-        .unwrap(),
-    );
-    let options = RealtimeLoadOptions::Categorical(
-        eredu_runtime::NormalizedLoadRequest::default().with_required_session_capabilities(
-            SessionCapabilities::default().with_activation_inspection(true),
-        ),
-    );
-    let error = match prepare_mlx_realtime(&artifact, &options) {
-        Ok(_) => panic!("unavailable activation inspection must fail cold selection"),
-        Err(error) => error,
-    };
-    assert!(
-        error.to_string().contains("activation inspection"),
-        "{error}"
-    );
-}

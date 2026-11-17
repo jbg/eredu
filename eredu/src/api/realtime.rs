@@ -52,12 +52,18 @@ pub use selection::{
     prepare_realtime_selection, PreparedRealtimeSelection, PreparedSpeechResources,
     PreparedSpeechSelection, RealtimeLoadError,
 };
-#[cfg(feature = "mlx")]
+mod categorical;
 mod selected;
 #[cfg(feature = "mlx")]
-pub use crate::runtime::voicechat::{MlxVoiceChatExecutor, MlxVoiceChatSession};
-#[cfg(feature = "mlx")]
-pub use selected::{prepare_mlx_realtime, LoadedMlxRealtime, PreparedMlxRealtime};
+mod selected_categorical_mlx;
+mod speech;
+pub use categorical::*;
+pub use selected::{
+    bind_realtime, prepare_realtime, PreparedRealtime, RealtimeBackendFactory, RealtimeSession,
+};
+pub use speech::{
+    ShareSpeechExecution, SpeechRealtimeFork, SpeechRealtimeSession, SpeechRealtimeSnapshot,
+};
 
 pub use eredu_architectures::realtime::{
     prepare_realtime_model, PreparedRealtimeArtifact, RealtimeArtifactRequest,

@@ -5,8 +5,8 @@
 artifact headers and the admitted family plan. It does not create a device,
 read tensor payloads, or initialize an accelerator.
 
-For selected execution, use `eredu::api::inspect_local_model` or
-`eredu_architectures::inspect_model` with the exact intended load request.
+For selected execution, use `eredu::api::inspect_execution` with the selected backend factory and the exact
+execution plan.
 `ModelInspectionReport.architecture_descriptor` contains the same logical
 graph, even when execution selection is rejected.
 `ModelInspectionReport.observation_support` reports prefill and decode support
