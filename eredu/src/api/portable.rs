@@ -429,6 +429,20 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         self.runtime.synchronize()
     }
 
+    /// Returns weight-residency telemetry when the loaded session provides it.
+    pub fn residency_telemetry(
+        &self,
+    ) -> Result<Option<eredu_core::ResidencyTelemetry>, eredu_core::BackendFailure> {
+        B::residency_telemetry(&self.runtime)
+    }
+
+    /// Returns expert-cache telemetry when the loaded session provides it.
+    pub fn expert_cache_telemetry(
+        &self,
+    ) -> Result<Option<eredu_core::ExpertCacheTelemetry>, eredu_core::BackendFailure> {
+        B::expert_cache_telemetry(&self.runtime)
+    }
+
     /// Combines any prepared backend runtime with portable tokenizer metadata.
     pub fn from_runtime(
         runtime: ModelRuntime<B>,

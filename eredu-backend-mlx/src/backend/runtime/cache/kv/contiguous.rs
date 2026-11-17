@@ -667,16 +667,14 @@ impl KeyValueCache for ConcatKeyValueCache {
             self.key_buffer = None;
             self.value_buffer = None;
             let combined_keys = match self.keys.take() {
-                Some(previous) => append_immutable(previous, keys, "cache_append_keys", stream)?,
+                Some(previous) => concatenate_axis(&[&previous, &keys], -2, stream)?,
                 None => keys,
             };
             let combined_values = if self.key_only {
                 combined_keys.clone()
             } else {
                 match self.values.take() {
-                    Some(previous) => {
-                        append_immutable(previous, values, "cache_append_values", stream)?
-                    }
+                    Some(previous) => concatenate_axis(&[&previous, &values], -2, stream)?,
                     None => values,
                 }
             };
@@ -701,17 +699,14 @@ impl KeyValueCache for ConcatKeyValueCache {
         if self.step <= 1 {
             if self.key_only {
                 self.keys = Some(match self.keys.take() {
-                    Some(previous) => {
-                        append_immutable(previous, keys, "cache_append_keys", stream)?
-                    }
+                    Some(previous) => concatenate_axis(&[&previous, &keys], -2, stream)?,
                     None => keys,
                 });
             } else {
                 match (self.keys.take(), self.values.take()) {
                     (Some(k), Some(v)) => {
-                        self.keys = Some(append_immutable(k, keys, "cache_append_keys", stream)?);
-                        self.values =
-                            Some(append_immutable(v, values, "cache_append_values", stream)?);
+                        self.keys = Some(concatenate_axis(&[&k, &keys], -2, stream)?);
+                        self.values = Some(concatenate_axis(&[&v, &values], -2, stream)?);
                     }
                     _ => {
                         self.keys = Some(keys);
@@ -947,29 +942,6 @@ mod mechanism_memory_tests {
         );
         assert_eq!((cache.offset, cache.length), (6, 3));
     }
-}
-
-// Immutable append roots can be observed without copying mutable backing storage.
-fn append_immutable(
-    previous: Array,
-    next: Array,
-    _role: &'static str,
-    stream: &Stream,
-) -> Result<Array, Exception> {
-    let output = concatenate_axis(&[&previous, &next], -2, stream)?;
-    #[cfg(feature = "projection-profiling")]
-    {
-        use crate::backend::nn::projection_profile::operations::{record, Operation};
-        record(
-            Operation::Concatenate(-2),
-            _role,
-            &previous,
-            &next,
-            &output,
-            stream,
-        );
-    }
-    Ok(output)
 }
 
 #[cfg(test)]

@@ -1824,6 +1824,22 @@ pub trait TextGenerationBackend: BackendProvider {
     /// implement the corresponding idle/health check, or a no-op when always idle.
     fn synchronize_session(backend: &Self, session: &Self::Session) -> Result<(), BackendFailure>;
 
+    /// Observes weight residency for this loaded session when supported.
+    /// An unavailable report is distinct from a failed observation.
+    fn residency_telemetry(
+        _runtime: &ModelRuntime<Self>,
+    ) -> Result<Option<crate::ResidencyTelemetry>, BackendFailure> {
+        Ok(None)
+    }
+
+    /// Observes expert-cache occupancy for this loaded session when supported.
+    /// An unavailable report is distinct from a failed observation.
+    fn expert_cache_telemetry(
+        _runtime: &ModelRuntime<Self>,
+    ) -> Result<Option<crate::ExpertCacheTelemetry>, BackendFailure> {
+        Ok(None)
+    }
+
     /// Exact support for serial, completed-token control on this loaded session.
     /// Backends opt in only for verified ordinary single-sequence execution.
     /// Snapshot mechanisms and complete facade-state support are separate facts.

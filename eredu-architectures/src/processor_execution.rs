@@ -6,9 +6,15 @@ use eredu_core::{
 };
 use eredu_media::audio::{AudioWaveform, LeadingSlaneyLogMelConfig, LogMelConfig};
 use eredu_media::{audio::LogMelFeatures, image::NormalizedImage};
+use eredu_nn::{
+    DistributedNeuralBackend, NeuralBackend, RetainedTensorRoots, Tensor,
+    TensorParallelGroupedNeuralBackend,
+};
 use eredu_runtime::{
-    observe_and_intervene, ActivationObserver, PreparedInputInspector, PreparedInputPart,
-    PreparedInputPayload, PreparedModelInput,
+    observe_and_intervene, ActivationObserver, ComponentRankMechanisms, LocalComponentMechanisms,
+    PipelineTransportProvider, PreparedInputInspector, PreparedInputPart, PreparedInputPayload,
+    PreparedModelInput, RealtimeGraphMechanisms, RealtimeStartupMechanisms, SamplingBackend,
+    SubmissionBackend,
 };
 
 use crate::processor_plan::RgbResample;
@@ -43,6 +49,47 @@ pub trait MediaInputLowering<T> {
         ),
         eredu_core::BackendFailure,
     >;
+}
+
+/// Native mechanisms for finite media-conditioned execution over a layered graph.
+///
+/// Implemented on the context opened by the neutral realtime factory. Portable
+/// execution selects components and transport routes before using these mechanisms.
+pub trait MediaGraphMechanisms {
+    /// Neural, distributed, and submission operators used by the graph.
+    type Neural: TensorParallelGroupedNeuralBackend
+        + DistributedNeuralBackend
+        + SubmissionBackend<Executor = <<Self::Neural as NeuralBackend>::Tensor as Tensor>::Context>
+        + 'static;
+    /// Native transport for a selected distributed route.
+    type Transport: 'static;
+    /// State allocation, parameter binding, and sampling on the selected device.
+    type Graph: RealtimeGraphMechanisms<
+            Self::Neural,
+            State: RetainedTensorRoots<<Self::Neural as NeuralBackend>::Tensor>,
+            Components: LocalComponentMechanisms<
+                Self::Neural,
+                <Self::Graph as RealtimeGraphMechanisms<Self::Neural>>::State,
+            > + ComponentRankMechanisms<
+                Self::Neural,
+                <Self::Graph as RealtimeGraphMechanisms<Self::Neural>>::State,
+                Self::Transport,
+            >,
+            Sampling: SamplingBackend<
+                RandomState = <Self::Graph as RealtimeStartupMechanisms>::Random,
+            >,
+        > + RealtimeStartupMechanisms<Random: Clone>
+        + Clone
+        + 'static;
+
+    /// Opens the graph's component and state mechanisms on the selected device.
+    fn graph(&self) -> Self::Graph;
+
+    /// Supplies native media lowering for an already selected processor.
+    fn media_lowering(&self) -> impl MediaInputLowering<<Self::Neural as NeuralBackend>::Tensor>;
+
+    /// Supplies the transport provider for a retained pipeline route.
+    fn pipeline_transport(&self) -> impl PipelineTransportProvider<Transport = Self::Transport>;
 }
 
 /// Prepared inputs with optional coarse request preparation limits.

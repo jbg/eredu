@@ -1,24 +1,15 @@
 //! Host operations for finite speech tasks over retained execution.
 
 use eredu_core::BackendFailure;
-use eredu_nn::{
-    DistributedNeuralBackend, GroupedNeuralBackend, NeuralBackend, RetainedTensorRoots, Tensor,
-    TensorParallelGroupedNeuralBackend,
-};
-use eredu_runtime::{
-    ComponentRankMechanisms, LocalComponentMechanisms, PipelineTransportProvider,
-    RealtimeGraphMechanisms, RealtimeStartupMechanisms, SamplingBackend, SubmissionBackend,
-};
+use eredu_nn::{DistributedNeuralBackend, GroupedNeuralBackend, NeuralBackend, Tensor};
+use eredu_runtime::{RealtimeStartupMechanisms, SamplingBackend, SubmissionBackend};
 
 use super::{
     AudioAdvance, AudioExecutionKernel, AudioIngress, AudioIngressError, AudioIngressRequest,
-    AudioPcmTranscription, AudioRequest, AudioSession, AudioSessionError, AudioTaskBinder,
-    AudioTranscriptionError, PreparedResidentAudio, ResidentAudioBinding, ResidentAudioError,
+    AudioPcmTranscription, AudioRequest, AudioSession, AudioSessionError, AudioTranscriptionError,
+    PreparedResidentAudio, ResidentAudioBinding, ResidentAudioError,
 };
-use crate::{
-    lfm3::omni::{OmniTurnError, PreparedOmniTurn},
-    processor_execution::MediaInputLowering,
-};
+use crate::{lfm3::omni::OmniTurnError, processor_execution::MediaGraphMechanisms};
 
 type Context<B> = <<B as NeuralBackend>::Tensor as Tensor>::Context;
 
@@ -30,24 +21,6 @@ pub enum LocalAudioTask<'a> {
     Ingress(AudioIngressRequest<'a>, u64),
     /// Prefill and start a response immediately.
     Respond(AudioRequest<'a>, u64),
-}
-
-/// Architecture-owned prepared execution and its host input.
-pub enum AudioTaskExecution<'a> {
-    /// A selected local Audio graph and its startup action.
-    Local {
-        /// Exact retained model selection.
-        selected: Box<PreparedResidentAudio>,
-        /// Startup action after binding the graph.
-        task: LocalAudioTask<'a>,
-    },
-    /// A selected multimodal turn.
-    Omni {
-        /// Exact selected vision and speech inputs.
-        turn: Box<PreparedOmniTurn>,
-        /// Encodes processor-generated text, such as timestamps.
-        encode_text: &'a mut dyn FnMut(&str) -> Result<Vec<u32>, std::io::Error>,
-    },
 }
 
 /// Ready host operations for the selected task.
@@ -81,12 +54,6 @@ pub enum AudioTaskError {
     /// The task binding encountered a native failure.
     #[error(transparent)]
     Backend(#[from] BackendFailure),
-}
-
-/// Native binding entry point for a prepared finite speech task.
-pub trait AudioTaskBinding {
-    /// Realizes the selected task and returns only host-facing operations.
-    fn bind(&self, task: AudioTaskExecution<'_>) -> Result<BoundAudioTask, AudioTaskError>;
 }
 
 /// Host PCM operations for streaming transcription.
@@ -177,39 +144,25 @@ where
     }
 }
 
-impl<B, G, M, P> AudioTaskBinding for AudioTaskBinder<B, G, M, P>
-where
-    B: TensorParallelGroupedNeuralBackend
-        + DistributedNeuralBackend
-        + SubmissionBackend<Executor = Context<B>>
-        + 'static,
-    G: RealtimeGraphMechanisms<B> + RealtimeStartupMechanisms<Random: Clone> + Clone + 'static,
-    G::State: RetainedTensorRoots<B::Tensor>,
-    G::Components:
-        LocalComponentMechanisms<B, G::State> + ComponentRankMechanisms<B, G::State, P::Transport>,
-    G::Sampling: SamplingBackend<RandomState = G::Random>,
-    M: MediaInputLowering<B::Tensor>,
-    P: PipelineTransportProvider<Transport: 'static>,
-{
-    fn bind(&self, task: AudioTaskExecution<'_>) -> Result<BoundAudioTask, AudioTaskError> {
-        Ok(match task {
-            AudioTaskExecution::Local { selected, task } => {
-                let model = selected.bind_local(self.graph.clone())?;
-                match task {
-                    LocalAudioTask::Transcribe => {
-                        BoundAudioTask::Transcribe(Box::new(model.prepare_pcm_transcription()?))
-                    }
-                    LocalAudioTask::Ingress(request, seed) => BoundAudioTask::Ingress(Box::new(
-                        model.prepare_ingress(request, self.graph.realize_random(seed)?)?,
-                    )),
-                    LocalAudioTask::Respond(request, seed) => BoundAudioTask::Response(Box::new(
-                        model.start(request, self.graph.realize_random(seed)?)?,
-                    )),
-                }
+impl LocalAudioTask<'_> {
+    /// Binds the retained local graph and starts the selected host operation.
+    pub fn bind(
+        self,
+        selected: PreparedResidentAudio,
+        mechanisms: &impl MediaGraphMechanisms,
+    ) -> Result<BoundAudioTask, AudioTaskError> {
+        let graph = mechanisms.graph();
+        let model = selected.bind_local(graph.clone())?;
+        Ok(match self {
+            Self::Transcribe => {
+                BoundAudioTask::Transcribe(Box::new(model.prepare_pcm_transcription()?))
             }
-            AudioTaskExecution::Omni { turn, encode_text } => {
-                BoundAudioTask::Response(turn.start(self, encode_text)?)
-            }
+            Self::Ingress(request, seed) => BoundAudioTask::Ingress(Box::new(
+                model.prepare_ingress(request, graph.realize_random(seed)?)?,
+            )),
+            Self::Respond(request, seed) => BoundAudioTask::Response(Box::new(
+                model.start(request, graph.realize_random(seed)?)?,
+            )),
         })
     }
 }

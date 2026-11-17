@@ -212,21 +212,6 @@ pub struct Args {
     tail_frames: u64,
     #[arg(long, default_value_t = 100000)]
     max_steps: u64,
-    #[cfg(feature = "projection-profiling")]
-    #[arg(long, requires = "offline")]
-    projection_profile: Option<PathBuf>,
-    #[cfg(feature = "projection-profiling")]
-    #[arg(long, default_value_t = 22, requires = "projection_profile")]
-    profile_advance: u64,
-    #[cfg(feature = "projection-profiling")]
-    #[arg(long, default_value_t = 5, requires = "projection_profile")]
-    profile_samples: usize,
-    #[cfg(all(feature = "projection-profiling", feature = "metal"))]
-    #[arg(long, requires = "projection_profile")]
-    profile_metal: Option<PathBuf>,
-    #[cfg(all(feature = "projection-profiling", feature = "metal"))]
-    #[arg(long, default_value_t = 0, requires = "profile_metal")]
-    profile_metal_case: usize,
 }
 
 fn json<T: serde::de::DeserializeOwned>(path: &Path, limit: u64) -> Result<T> {
@@ -364,7 +349,12 @@ fn quantization(args: &Args) -> Result<SpeechQuantizationPolicy> {
     }
     Ok(policy)
 }
-pub fn run(args: Args, timing: bool, total_started: Instant) -> Result<()> {
+pub fn run(
+    factory: &(impl eredu::api::BackendInspection + eredu::api::realtime::RealtimeBackendFactory),
+    args: Args,
+    timing: bool,
+    total_started: Instant,
+) -> Result<()> {
     #[cfg(feature = "system-audio")]
     if args.list_audio_devices {
         for device in eredu_media::audio::system::devices()? {
@@ -420,15 +410,7 @@ pub fn run(args: Args, timing: bool, total_started: Instant) -> Result<()> {
             "input plus response tail exceeds --max-frames"
         );
     }
-    let paths = [
-        args.output.as_ref(),
-        args.events.as_ref(),
-        args.record_input.as_ref(),
-    ]
-    .into_iter()
-    .flatten()
-    .map(|p| destination(p))
-    .collect::<Result<Vec<_>>>()?;
+    let paths = args.output_destinations()?;
     for path in &paths {
         ensure!(
             !path.try_exists()?,
@@ -440,31 +422,22 @@ pub fn run(args: Args, timing: bool, total_started: Instant) -> Result<()> {
         paths.iter().collect::<std::collections::HashSet<_>>().len() == paths.len(),
         "speech, input recording and events must have different paths"
     );
-    #[cfg(feature = "projection-profiling")]
-    if let Some(path) = &args.projection_profile {
-        let path = destination(path)?;
-        ensure!(
-            !path.try_exists()? && !paths.contains(&path),
-            "profile output must be a new distinct path"
-        );
-    }
-    args.common.configure_runtime()?;
     let requested_device = args.common.device.or_else(|| match config.device {
         load::Device::Cpu if args.config.is_some() => Some(CliDevice::Cpu),
         load::Device::Cpu => None,
         load::Device::Gpu => Some(CliDevice::Gpu(0)),
     });
-    let factory = eredu_backend_mlx::MlxBackendFactory::default();
-    let device = crate::resolve_device(&crate::discover_devices(&factory)?, requested_device)?;
-    let started = Instant::now();
+    let device = crate::resolve_device(&crate::discover_devices(factory)?, requested_device)?;
     let sampling = eredu_architectures::voicechat::agent_sampling::AgentSamplingPolicy::new(
         args.common.temperature.unwrap_or(0.0),
         args.common.top_p.unwrap_or(1.0),
         args.common.repeat_penalty.unwrap_or(1.0),
         usize::try_from(config.max_model_steps)?,
     )?;
+    args.common.apply_allocator_cache_limit(factory)?;
+    let started = Instant::now();
     let mut session = load::load(
-        &factory,
+        factory,
         &config,
         policy,
         &device,
@@ -523,23 +496,6 @@ pub fn run(args: Args, timing: bool, total_started: Instant) -> Result<()> {
         chunk_samples: args.chunk_samples,
         tail_frames: args.tail_frames,
         max_steps: args.max_steps,
-        #[cfg(feature = "projection-profiling")]
-        profile: args
-            .projection_profile
-            .as_ref()
-            .map(|p| run::ProfileOptions {
-                output: p.clone(),
-                advance: args.profile_advance,
-                samples: args.profile_samples,
-                #[cfg(feature = "metal")]
-                metal: args.profile_metal.clone(),
-                #[cfg(not(feature = "metal"))]
-                metal: None,
-                #[cfg(feature = "metal")]
-                metal_case: args.profile_metal_case,
-                #[cfg(not(feature = "metal"))]
-                metal_case: 0,
-            }),
     };
     eprintln!(
         "{}; Ctrl-C closes input and drains the response, a second Ctrl-C cancels{}",
@@ -567,6 +523,16 @@ pub fn run(args: Args, timing: bool, total_started: Instant) -> Result<()> {
     }
     Ok(())
 }
+impl Args {
+    fn output_destinations(&self) -> Result<Vec<PathBuf>> {
+        [&self.output, &self.events, &self.record_input]
+            .into_iter()
+            .flatten()
+            .map(|path| destination(path))
+            .collect()
+    }
+}
+
 fn destination(path: &Path) -> Result<PathBuf> {
     let parent = path
         .parent()

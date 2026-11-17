@@ -128,16 +128,11 @@ impl ProcessorConfig {
 }
 
 #[cfg(feature = "audio")]
-mod turn_binding;
-#[cfg(feature = "audio")]
-pub use turn_binding::AudioTaskBinder;
-
-#[cfg(feature = "audio")]
 pub(in crate::lfm3) use resident::OmniAudioRequest;
 #[cfg(feature = "audio")]
 mod task;
 #[cfg(feature = "audio")]
 pub use task::{
-    AudioTaskBinding, AudioTaskError, AudioTaskExecution, AudioTaskIngress, AudioTaskResponse,
-    AudioTaskTranscription, BoundAudioTask, LocalAudioTask,
+    AudioTaskError, AudioTaskIngress, AudioTaskResponse, AudioTaskTranscription, BoundAudioTask,
+    LocalAudioTask,
 };

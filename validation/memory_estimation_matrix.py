@@ -35,7 +35,7 @@ def main() -> None:
                 estimate = args.output / f"{name}.estimate.json"
                 command = [str(args.binary.resolve()), "--model", str(args.model.resolve()),
                            "--no-auto", "--raw", "--max-tokens", "8", "--temperature", "0",
-                           "--prefill-chunk-size", str(chunk), "--mlx-cache-limit-bytes", "0",
+                           "--prefill-chunk-size", str(chunk), "--allocator-cache-limit-bytes", "0",
                            "--telemetry-json", str(telemetry.resolve()),
                            "--memory-report", str(estimate.resolve())]
                 if quant != "original":

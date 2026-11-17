@@ -780,6 +780,28 @@ pub trait BackendInspection: eredu_core::AutomaticPlanningBackend {
         Ok(false)
     }
 
+    /// Validates a proposed explicit cache limit without changing allocator state.
+    /// Returns the effective ceiling in bytes for cold forecasts.
+    fn proposed_allocator_cache_limit(
+        &self,
+        _bytes: u64,
+    ) -> Result<u64, eredu_core::BackendFailure> {
+        Err(eredu_core::BackendFailure::from_error(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "the selected backend does not expose an allocator cache limit",
+        ))
+        .with_operation("allocator cache policy"))
+    }
+
+    /// Applies an explicit allocator cache limit at application startup.
+    fn set_allocator_cache_limit(&self, _bytes: u64) -> Result<(), eredu_core::BackendFailure> {
+        Err(eredu_core::BackendFailure::from_error(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "the selected backend does not allow changing its allocator cache limit",
+        ))
+        .with_operation("allocator cache policy"))
+    }
+
     /// Observes allocator overhead inputs if the backend exposes a retained cache.
     fn allocator_observation(
         &self,

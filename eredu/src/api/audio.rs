@@ -4,17 +4,18 @@ use std::{error::Error, sync::Arc};
 
 use eredu_architectures::lfm3::audio::{
     AudioAdvance, AudioIngressRequest, AudioMode, AudioPlacement, AudioRequest, AudioTurn,
-    PreparedResidentAudio,
+    BoundAudioTask, LocalAudioTask, PreparedResidentAudio,
 };
-use eredu_runtime::RealtimeMechanismSupport;
+use eredu_core::DevicePlan;
 use eredu_text::tokenizer::{ModelChatTemplate, Tokenizer};
 
 use super::{realtime::PreparedRealtimeArtifact, TextDecoder};
 
-pub use eredu_architectures::lfm3::audio::{
-    AudioParameterResidency, AudioTaskBinder, AudioTaskBinding, AudioTaskError, AudioTaskExecution,
-    AudioTaskIngress, AudioTaskResponse, AudioTaskTranscription, BoundAudioTask, LocalAudioTask,
+pub use eredu_architectures::{
+    lfm3::audio::{AudioParameterResidency, AudioTaskError},
+    processor_execution::MediaGraphMechanisms,
 };
+use eredu_runtime::RealtimeBackendFactory;
 
 #[cfg(feature = "image")]
 mod multimodal;
@@ -61,7 +62,8 @@ enum Prompt {
 }
 
 /// Cold task selection and prompt preparation.
-pub struct PreparedAudioTask {
+pub struct PreparedAudioTask<'a, F> {
+    factory: &'a F,
     selected: PreparedResidentAudio,
     prompt: Prompt,
     decoder: TextDecoder,
@@ -72,14 +74,14 @@ pub struct PreparedAudioTask {
     speech_only: bool,
 }
 
-impl PreparedAudioTask {
+impl<'a, F: RealtimeBackendFactory<Mechanisms: MediaGraphMechanisms>> PreparedAudioTask<'a, F> {
     /// Resolves a task using the retained model assets and selected backend.
     pub fn new(
         artifact: &PreparedRealtimeArtifact,
         task: AudioTask<'_>,
         max_slots: usize,
         seed: u64,
-        support: &impl RealtimeMechanismSupport,
+        factory: &'a F,
     ) -> TaskResult<Self> {
         Self::with_parameter_residency(
             artifact,
@@ -87,7 +89,7 @@ impl PreparedAudioTask {
             max_slots,
             seed,
             AudioParameterResidency::default(),
-            support,
+            factory,
         )
     }
 
@@ -98,7 +100,7 @@ impl PreparedAudioTask {
         max_slots: usize,
         seed: u64,
         residency: AudioParameterResidency,
-        support: &impl RealtimeMechanismSupport,
+        factory: &'a F,
     ) -> TaskResult<Self> {
         let PreparedRealtimeArtifact::Lfm3Audio(audio) = artifact else {
             return Err("the selected model has no turn-based audio adapter".into());
@@ -169,11 +171,12 @@ impl PreparedAudioTask {
         };
         let decoder = TextDecoder::from_shared_tokenizer(Arc::new((*tokenizer).clone()), true);
         Ok(Self {
+            factory,
             selected: PreparedResidentAudio::select(
                 (**audio).clone(),
                 residency,
                 AudioPlacement::Local,
-                support,
+                &factory.media_graph_support(),
             )?,
             prompt,
             decoder,
@@ -195,8 +198,9 @@ impl PreparedAudioTask {
         self.output_rate
     }
 
-    /// Binds the selected model and starts the task.
-    pub fn load(self, binding: &dyn AudioTaskBinding) -> TaskResult<AudioTaskSession> {
+    /// Starts the task on a device through the factory that admitted it.
+    pub fn load(self, device: &DevicePlan) -> TaskResult<AudioTaskSession> {
+        let mechanisms = self.factory.open_realtime(device)?;
         let task = match &self.prompt {
             Prompt::Transcribe => LocalAudioTask::Transcribe,
             Prompt::Text(tokens, mode) => LocalAudioTask::Respond(
@@ -219,10 +223,7 @@ impl PreparedAudioTask {
                 self.seed,
             ),
         };
-        let session = binding.bind(AudioTaskExecution::Local {
-            selected: Box::new(self.selected),
-            task,
-        })?;
+        let session = task.bind(self.selected, &mechanisms)?;
         Ok(AudioTaskSession::from_bound(
             session,
             self.decoder,

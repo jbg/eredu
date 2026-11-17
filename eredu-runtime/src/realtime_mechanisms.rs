@@ -34,6 +34,11 @@ pub trait RealtimeBackendFactory {
     /// Reports exact, side-effect-free support for local realtime loading.
     fn realtime_support(&self) -> Self::Support;
 
+    /// Reports cold support for finite media graphs, including any pipeline transport.
+    fn media_graph_support(&self) -> impl crate::RealtimeMechanismSupport {
+        self.realtime_support()
+    }
+
     /// Opens native execution and weight resources on the selected device.
     fn open_realtime(&self, device: &DevicePlan) -> Result<Self::Mechanisms, BackendFailure>;
 }

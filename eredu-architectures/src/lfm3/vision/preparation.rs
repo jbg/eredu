@@ -209,7 +209,8 @@ impl PreparedVlRankGraph {
     where
         B: GroupedNeuralBackend + DistributedNeuralBackend,
         S: eredu_runtime::LayerRuntimeState<B>,
-        S::LayerState: eredu_nn::AttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
+        S::LayerState:
+            eredu_nn::AttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
     {
         let decoder_residency = self.weights.decoder_residency();
         let (weights, admission, capabilities, processor, raw_processor, session, dtype) =
