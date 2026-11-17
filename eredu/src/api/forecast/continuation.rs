@@ -15,6 +15,7 @@ pub struct ContinuationForecast {
     pub decoding: Option<eredu_runtime::memory_forecast::DecodingContinuationMemoryPlan>,
     /// Horizon-specific capture geometry and charged history, when instrumented.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg(feature = "tensor-capture")]
     pub capture: Option<CaptureMemoryPlan>,
     /// Total and additional continuation peaks, with no loading/prefill phases.
     pub estimate: GenerationMemoryEstimate,
@@ -227,7 +228,9 @@ pub(crate) fn continuation_forecast<B: ContinuationForecastBackend + TextSnapsho
     });
     add_retention(&mut forecast.request, sequence_storage,
         "common request driver retained canonical IDs; future commitment storage is in the phase horizon", true)?;
+    #[cfg(feature = "tensor-capture")]
     let mut capture_plan = None;
+    #[cfg(feature = "tensor-capture")]
     if let Some(capture) = B::capture_run(state) {
         let first = B::sampling_prediction(sampling);
         let projection = B::capture_memory_projection(
@@ -251,7 +254,10 @@ pub(crate) fn continuation_forecast<B: ContinuationForecastBackend + TextSnapsho
         plan.inherited_usage = capture.cumulative_usage();
         plan.apply(&mut forecast.request, additional_tokens)?;
         capture_plan = Some(plan);
-    } else if let Some(trace) = trace {
+    }
+    #[cfg(feature = "tensor-capture")]
+    let trace = if capture_plan.is_none() { trace } else { None };
+    if let Some(trace) = trace {
         add_retention(
             &mut forecast.request,
             Some(trace.total_bytes),
@@ -261,6 +267,7 @@ pub(crate) fn continuation_forecast<B: ContinuationForecastBackend + TextSnapsho
     }
     let mut result = ContinuationForecast {
         decoding: Some(decoding),
+        #[cfg(feature = "tensor-capture")]
         capture: capture_plan,
         estimate: estimate_continuation_memory(&forecast.request, &profile.plan)?,
         request: forecast.request,

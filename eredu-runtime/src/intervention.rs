@@ -1,14 +1,15 @@
 //! Prospective intervention scheduling under the ordinary capture/run owner.
 //! There is no additional sampling loop or native-resource owner here.
 
-use crate::capture::{
-    bounded_diagnostic, capture_value, metadata_reservation, CaptureExecutionError, CaptureSession,
-};
+use crate::capture::CaptureExecutionError;
+#[cfg(feature = "tensor-capture")]
+use crate::capture::{bounded_diagnostic, capture_value, metadata_reservation, CaptureSession};
 use eredu_core::{capture::*, intervention::*, ObservationPosition};
 
 mod activation;
 mod partition;
 mod routed;
+#[cfg(feature = "tensor-capture")]
 mod session;
 pub use activation::{apply_activation, localize_component_mask};
 pub use partition::{
@@ -18,9 +19,12 @@ pub use partition::{
 pub use routed::{
     lower_partition_routed_intervention, lower_routed_intervention, LoweredRoutedIntervention,
 };
+#[cfg(feature = "tensor-capture")]
 pub(crate) use session::validate_continuation;
+#[cfg(feature = "tensor-capture")]
 pub use session::{install_session, validate_session, CaptureObserver};
 
+#[cfg(feature = "tensor-capture")]
 pub(crate) struct InterventionRun {
     pub(crate) plan: AdmittedInterventionPlan,
     pub(crate) records: Option<Vec<InterventionRecord>>,
@@ -28,6 +32,7 @@ pub(crate) struct InterventionRun {
     pub(crate) estimator: std::sync::Arc<dyn InterventionEstimator>,
 }
 
+#[cfg(feature = "tensor-capture")]
 impl InterventionRun {
     pub(crate) fn begin_step(
         &mut self,
@@ -97,6 +102,7 @@ impl InterventionRun {
     }
 }
 
+#[cfg(feature = "tensor-capture")]
 impl CaptureSession {
     /// Selects an already admitted plan between drained prediction steps. Used
     /// when speculative target/draft rows or isolated branches share one ledger.
@@ -389,6 +395,7 @@ pub(crate) fn evidence_selections(
     entries
 }
 
+#[cfg(feature = "tensor-capture")]
 pub(crate) fn capture_evidence<B: CaptureBackend>(
     backend: &mut B,
     tensor: &B::Tensor,
@@ -420,6 +427,7 @@ pub(crate) fn capture_evidence<B: CaptureBackend>(
 
 /// Joint preflight counts every ordinary capture, intervention diagnostic and
 /// before/after transform against the same per-step and cumulative budgets.
+#[cfg(feature = "tensor-capture")]
 pub fn preflight(
     capture: &AdmittedCapturePlan,
     intervention: &AdmittedInterventionPlan,
@@ -428,6 +436,7 @@ pub fn preflight(
     preflight_continuation(capture, intervention, estimator, 0, CaptureUsage::default())
 }
 
+#[cfg(feature = "tensor-capture")]
 pub(crate) fn preflight_continuation(
     capture: &AdmittedCapturePlan,
     intervention: &AdmittedInterventionPlan,
@@ -533,6 +542,7 @@ pub(crate) fn preflight_continuation(
     )
 }
 
+#[cfg(feature = "tensor-capture")]
 fn activation_cost(
     estimator: &dyn InterventionEstimator,
     source: &[u64],
@@ -548,6 +558,7 @@ fn activation_cost(
     Ok(cost)
 }
 
+#[cfg(feature = "tensor-capture")]
 fn original_route_cost(
     estimator: &dyn InterventionEstimator,
     policy: &InterventionRoutingPolicy,
@@ -564,8 +575,10 @@ fn original_route_cost(
 }
 
 #[cfg(test)]
+#[cfg(feature = "tensor-capture")]
 mod tests;
 
+#[cfg(feature = "tensor-capture")]
 impl CaptureSession {
     /// Validates a scheduled routing operation against actual flattened token rows
     /// and reserves any original-decision work before the selector runs.

@@ -8,7 +8,7 @@ use super::*;
 use eredu_core::capture::*;
 use safemlx::ops::indexing::{ArrayIndex, IntoStrideBy};
 
-const CHUNK: u64 = 1024;
+use super::score_readout::CHUNK;
 
 #[cfg(test)]
 mod tests;
@@ -467,16 +467,18 @@ impl CaptureBackend for NativeCapture<'_> {
 }
 
 fn scalar_f32(array: Array) -> Result<f64, Exception> {
-    #[cfg(test)]
-    record_host_read(1);
-    Ok(f64::from(array.evaluated()?.as_slice::<f32>()[0]))
+    super::score_readout::scalar_f32(array, report_host_read)
 }
 
 fn count_mask(mask: Array, stream: &Stream) -> Result<u64, Exception> {
+    super::score_readout::count_mask(mask, stream, report_host_read)
+}
+
+fn report_host_read(elements: usize) {
     #[cfg(test)]
-    record_host_read(1);
-    let sum = mask.as_dtype(Dtype::Uint32, stream)?.sum(false, stream)?;
-    Ok(u64::from(sum.evaluated()?.as_slice::<u32>()[0]))
+    record_host_read(elements);
+    #[cfg(not(test))]
+    let _ = elements;
 }
 
 fn summary(flat: &Array, stream: &Stream) -> Result<CaptureSummary, Exception> {

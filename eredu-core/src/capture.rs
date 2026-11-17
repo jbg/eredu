@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 #[cfg(test)]
+#[cfg(feature = "tensor-capture")]
 mod candidate_tests;
 mod invocation;
 mod prefill;
@@ -17,6 +18,7 @@ mod prepared_geometry_tests;
 pub use invocation::{CaptureInvocationBounds, CaptureInvocationShape, CaptureMediaShape};
 pub use prefill::CapturePrefillSpan;
 mod routed;
+#[cfg(feature = "tensor-capture")]
 mod tensor_wire;
 pub use routed::*;
 
@@ -51,6 +53,7 @@ pub enum CapturePhase {
 
 /// Half-open selection of prediction indices (zero is the prefill prediction).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg(feature = "tensor-capture")]
 pub struct CaptureSchedule {
     /// Whether prompt-prefill observations are selected.
     pub prefill: bool,
@@ -64,6 +67,7 @@ pub struct CaptureSchedule {
     pub every: u64,
 }
 
+#[cfg(feature = "tensor-capture")]
 impl Default for CaptureSchedule {
     fn default() -> Self {
         Self {
@@ -76,6 +80,7 @@ impl Default for CaptureSchedule {
     }
 }
 
+#[cfg(feature = "tensor-capture")]
 impl CaptureSchedule {
     /// Returns selected prediction count and last index within a bounded run.
     pub fn count_and_last(
@@ -178,6 +183,7 @@ pub struct CaptureSlice {
 /// A transform is applied after axis selection. Full tensors require explicit opt-in.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[cfg(feature = "tensor-capture")]
 pub enum CaptureTransform {
     /// Raw selected expert units with original token/route/expert/coefficient
     /// identity. Only valid at a declared sparse routed-unit boundary.
@@ -234,6 +240,7 @@ pub enum CaptureTransformKind {
     TokenScores,
 }
 
+#[cfg(feature = "tensor-capture")]
 impl CaptureTransform {
     /// Transformation category for capability matching.
     pub fn kind(&self) -> CaptureTransformKind {
@@ -266,6 +273,7 @@ pub struct CaptureCapabilities {
 
 /// One exact path, schedule, axis selection, and transformation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg(feature = "tensor-capture")]
 pub struct CaptureSelection {
     /// Unique caller identity, allowing several transforms at one observation point.
     pub id: String,
@@ -366,6 +374,7 @@ pub enum CaptureProvenance {
 
 /// Serializable request; only admission produces execution authority.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg(feature = "tensor-capture")]
 pub struct CapturePlan {
     /// Wire schema version; unsupported versions are rejected.
     pub schema_version: u32,
@@ -378,6 +387,7 @@ pub struct CapturePlan {
     pub limits: CaptureLimits,
 }
 
+#[cfg(feature = "tensor-capture")]
 impl CapturePlan {
     /// Creates an explicit capture-none plan with zero capture budgets.
     pub fn none() -> Self {
@@ -757,6 +767,7 @@ impl CaptureRequestShape {
 
 /// Immutable admission proof. Deserialization cannot forge admission.
 #[derive(Debug, Clone)]
+#[cfg(feature = "tensor-capture")]
 pub struct AdmittedCapturePlan {
     plan: CapturePlan,
     points: Vec<ObservationPoint>,
@@ -766,6 +777,7 @@ pub struct AdmittedCapturePlan {
     identity: String,
 }
 
+#[cfg(feature = "tensor-capture")]
 impl AdmittedCapturePlan {
     /// Stable digest of the plan, selected catalog semantics, and request shape.
     pub fn identity(&self) -> &str {
@@ -815,6 +827,7 @@ impl AdmittedCapturePlan {
         }
     }
     /// Revalidates this same geometry authority against current selected discovery.
+    #[cfg(feature = "tensor-capture")]
     pub fn readmit(&self, discovery: &CaptureDeclarations) -> Result<Self, CaptureError> {
         self.plan.clone().admit_geometry(
             &discovery.catalog,
@@ -844,11 +857,28 @@ impl AdmittedCapturePlan {
 
 mod partition;
 pub use partition::{CaptureFragmentGeometry, CaptureSlicePartition};
+/// How measured native regions form the globally selected activation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PartitionCaptureCombination {
+    /// Each selected coordinate has one authoritative producer.
+    #[default]
+    Disjoint,
+    /// Every producer supplies the complete selected floating summand. Terms are
+    /// converted by the ordinary raw collector to F32, accumulated in canonical
+    /// rank order with compensated F64 arithmetic, and converted to F32 before
+    /// the requested transform. This is a host assembly,
+    /// not evidence that a separate complete native tensor existed.
+    SumF64ToF32,
+}
+
+#[cfg(feature = "tensor-capture")]
 mod partition_wire;
+#[cfg(feature = "tensor-capture")]
 pub use partition_wire::{
-    PartitionCaptureCombination, PartitionCaptureContext, PartitionCaptureContributionRecord,
-    PartitionCaptureEvidence, PartitionCaptureFragmentRecord, PartitionCaptureProducerRecord,
-    PartitionCaptureRegion, PARTITION_CAPTURE_SCHEMA_VERSION,
+    PartitionCaptureContext, PartitionCaptureContributionRecord, PartitionCaptureEvidence,
+    PartitionCaptureFragmentRecord, PartitionCaptureProducerRecord, PartitionCaptureRegion,
+    PARTITION_CAPTURE_SCHEMA_VERSION,
 };
 
 /// Numeric axis slices resolved against an actual tensor before any retention/copy.
@@ -865,6 +895,7 @@ pub struct ResolvedCaptureSlice {
 }
 
 /// Checks axis selection against actual extents without touching tensor payloads.
+#[cfg(feature = "tensor-capture")]
 pub fn resolve_slice(
     point: &ObservationPoint,
     selection: &CaptureSelection,
@@ -910,6 +941,7 @@ pub fn resolve_slice(
 /// accumulated in F64. Integer raw captures remain exact; integer statistics may
 /// round. Empty/all-nonfinite inputs have None aggregates, never fabricated zeros.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg(feature = "tensor-capture")]
 pub struct CaptureSummary {
     /// Total element count, including non-finite values.
     pub elements: u64,
@@ -935,6 +967,7 @@ pub struct CaptureSummary {
 
 /// Bounded finite-value histogram with explicit excluded-value counts.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg(feature = "tensor-capture")]
 pub struct CaptureHistogram {
     /// Finite, strictly increasing bin edges.
     pub edges: Vec<f32>,
@@ -951,6 +984,7 @@ pub struct CaptureHistogram {
 /// Bounded portable output from one native transformation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+#[cfg(feature = "tensor-capture")]
 pub enum CapturePayload {
     /// Raw or sliced tensor values; integer identifiers retain exact precision.
     Tensor(#[serde(with = "tensor_wire")] TensorObservation),
@@ -968,6 +1002,7 @@ pub enum CapturePayload {
 
 /// One selected token evaluated against the complete raw model distribution.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg(feature = "tensor-capture")]
 pub struct CaptureTokenScore {
     /// Exact selected ID and raw F32 score, with separate sampling-domain membership.
     pub target: CaptureCandidate,
@@ -984,6 +1019,7 @@ pub struct CaptureTokenScore {
 /// Normalization includes every model output ID, including tokenizer holes/padding.
 /// Domain membership is evidence only; it does not alter this distribution.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg(feature = "tensor-capture")]
 pub struct CaptureTokenScores {
     /// Explicit raw score stage; nonlinear architecture output transforms have already run.
     pub stage: CandidateScoreStage,
@@ -1002,6 +1038,7 @@ pub struct CaptureTokenScores {
 /// The processing stage represented by a candidate score.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg(feature = "tensor-capture")]
 pub enum CandidateScoreStage {
     /// Raw model logits before token filtering, penalties, temperature, top-k/p,
     /// Mirostat processing or normalization. These are not probabilities.
@@ -1011,6 +1048,7 @@ pub enum CandidateScoreStage {
 /// Whether raw candidates precede or follow mutation at the logits hook.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg(feature = "tensor-capture")]
 pub enum CandidateLogitsSource {
     /// Before interventions at this hook; earlier hooks may already have changed it.
     #[default]
@@ -1021,6 +1059,7 @@ pub enum CandidateLogitsSource {
 
 /// One exact vocabulary identity and finite raw model score.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg(feature = "tensor-capture")]
 pub struct CaptureCandidate {
     /// Canonical tokenizer vocabulary ID.
     pub token_id: u32,
@@ -1033,6 +1072,7 @@ pub struct CaptureCandidate {
     pub allowed: bool,
 }
 
+#[cfg(feature = "tensor-capture")]
 fn candidate_allowed_default() -> bool {
     true
 }
@@ -1080,6 +1120,7 @@ impl CaptureTokenDomain<'_> {
 
 /// Bounded highest-score candidates for the last row of the current model logits.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg(feature = "tensor-capture")]
 pub struct CaptureCandidates {
     /// Explicit score-processing stage; never inferred to be a probability.
     pub stage: CandidateScoreStage,
@@ -1112,6 +1153,7 @@ pub enum CaptureBudget {
 /// Measured data and diagnostic outcomes remain distinct.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[cfg(feature = "tensor-capture")]
 pub enum CaptureOutcome {
     /// The requested result is present.
     Captured,
@@ -1141,6 +1183,7 @@ pub enum CaptureOutcome {
 /// Portable capture-failure categories; diagnostic text is separately bounded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[cfg(feature = "tensor-capture")]
 pub enum CaptureFailureReason {
     /// The requested reservation exceeded an admitted budget.
     Limit {
@@ -1177,6 +1220,7 @@ pub enum CaptureSkipReason {
 /// One result linked back to a catalog point. The enclosing generation record owns
 /// run/session identity, prediction token, phase, positions, and timing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg(feature = "tensor-capture")]
 pub struct CaptureRecord {
     /// Wire schema version; unsupported versions are rejected.
     pub schema_version: u32,
@@ -1268,12 +1312,14 @@ impl CaptureReservation for CaptureQuota {
 
 /// Monotone per-run ledger. Reservations cannot be refunded after work begins.
 #[derive(Debug)]
+#[cfg(feature = "tensor-capture")]
 pub struct CaptureLedger {
     limits: CaptureLimits,
     step: CaptureUsage,
     total: CaptureUsage,
 }
 
+#[cfg(feature = "tensor-capture")]
 impl CaptureLedger {
     /// Creates a fresh run ledger with the admitted limits.
     pub fn new(plan: &AdmittedCapturePlan) -> Self {
@@ -1339,6 +1385,7 @@ impl CaptureLedger {
     }
 }
 
+#[cfg(feature = "tensor-capture")]
 impl CaptureReservation for CaptureLedger {
     fn reserve(&mut self, usage: CaptureUsage) -> Result<Option<CaptureSkipReason>, CaptureError> {
         CaptureLedger::reserve(self, usage)
@@ -1370,14 +1417,18 @@ pub enum CaptureError {
     },
 }
 
+impl From<crate::routing::RoutedGeometryError> for CaptureError {
+    fn from(error: crate::routing::RoutedGeometryError) -> Self {
+        match error {
+            crate::routing::RoutedGeometryError::Empty => Self::Invalid(error.to_string()),
+            crate::routing::RoutedGeometryError::Overflow => Self::Overflow,
+        }
+    }
+}
+
 /// Computes tensor element count using checked multiplication.
 pub fn elements(shape: &[u64]) -> Result<u64, CaptureError> {
-    // Even a shape containing zero must not conceal overflow in another extent.
-    let nonzero = shape
-        .iter()
-        .filter(|dimension| **dimension != 0)
-        .try_fold(1, |count, dimension| mul(count, *dimension))?;
-    Ok(if shape.contains(&0) { 0 } else { nonzero })
+    crate::tensor_shape::checked_elements(shape).ok_or(CaptureError::Overflow)
 }
 /// Adds two size quantities with overflow rejection.
 pub fn add(a: u64, b: u64) -> Result<u64, CaptureError> {
@@ -1393,6 +1444,7 @@ pub fn mul(a: u64, b: u64) -> Result<u64, CaptureError> {
 /// backing arrays and dependencies), host buffers/transfers, and JSON payloads.
 /// `transform` may run only after successful reservation. It must not retain the
 /// tensor beyond the call or fall back to copying an unsliced source to the host.
+#[cfg(feature = "tensor-capture")]
 pub trait CaptureBackend {
     /// Backend-native tensor type; never crosses the host-record boundary.
     type Tensor;
@@ -1501,6 +1553,7 @@ pub trait CaptureBackend {
 /// Outcome of the enclosing model forward, distinct from each capture operation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg(feature = "tensor-capture")]
 pub enum CaptureStepOutcome {
     /// A low-level caller or older serialized record supplied no transaction evidence.
     #[default]
@@ -1516,6 +1569,7 @@ pub enum CaptureStepOutcome {
 /// Timing is measured separately from native forward/sampling time; synchronous
 /// callback costs are included in end-to-end time.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg(feature = "tensor-capture")]
 pub struct CapturedStep {
     /// Actual model transaction outcome; absence in older records is untracked.
     #[serde(default)]
@@ -1535,6 +1589,7 @@ pub struct CapturedStep {
     /// Verified global ownership and forward provenance for partitioned records.
     /// Evidence is published only after the enclosing model transaction commits.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg(feature = "tensor-capture")]
     pub partitions: Vec<PartitionCaptureEvidence>,
     /// Attributed intervention outcomes and optional evidence sharing these budgets.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

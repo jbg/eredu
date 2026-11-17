@@ -41,26 +41,35 @@ fn prepare(
     settings: PreparedChatGenerationSettings,
     mode: u8,
 ) -> PreparedObservedGeneration<MockBackend> {
+    if mode == 0 {
+        return model.prepare_controlled_chat(chat, settings).unwrap();
+    }
+    #[cfg(not(feature = "tensor-capture"))]
+    unreachable!("capture and intervention cases require tensor-capture");
+    #[cfg(feature = "tensor-capture")]
     let mut capture = if mode & 1 == 0 {
         CapturePlan::none()
     } else {
         observed_mock::plan()
     };
-    capture.limits = observed_mock::plan().limits;
-    if mode & 2 == 0 {
-        model
-            .prepare_observed_chat(chat, settings, capture, limits())
-            .unwrap()
-    } else {
-        model
-            .prepare_intervened_chat(
-                chat,
-                settings,
-                capture,
-                observed_mock::intervention_plan(1.0),
-                limits(),
-            )
-            .unwrap()
+    #[cfg(feature = "tensor-capture")]
+    {
+        capture.limits = observed_mock::plan().limits;
+        if mode & 2 == 0 {
+            model
+                .prepare_observed_chat(chat, settings, capture, limits())
+                .unwrap()
+        } else {
+            model
+                .prepare_intervened_chat(
+                    chat,
+                    settings,
+                    capture,
+                    observed_mock::intervention_plan(1.0),
+                    limits(),
+                )
+                .unwrap()
+        }
     }
 }
 
@@ -75,7 +84,11 @@ fn collect(
 
 #[test]
 fn observed_literal_text_matches_controlled_text_for_unrecognized_templates_and_plans() {
-    for mode in 0..4 {
+    #[cfg(feature = "tensor-capture")]
+    let modes = 0..4;
+    #[cfg(not(feature = "tensor-capture"))]
+    let modes = 0..1;
+    for mode in modes {
         let (mut model, chat, settings, _) = text_setup();
         let prepared = prepare(&model, &chat, settings, mode);
         let mut ordinary = vec![];
@@ -114,32 +127,42 @@ fn observed_literal_text_matches_controlled_text_for_unrecognized_templates_and_
             })
             .collect();
         assert_eq!(events, semantic(&controlled));
-        let evidence = |record: &eredu::api::ObservedGenerationRecord| match &record.event {
-            ObservedGenerationEvent::Token {
-                forced, captures, ..
-            } => {
-                assert!(!forced);
-                Some(
-                    captures
-                        .as_ref()
-                        .map(|step| (step.records.clone(), step.interventions.clone())),
-                )
-            }
-            _ => None,
-        };
-        assert_eq!(
-            ordinary.iter().filter_map(evidence).collect::<Vec<_>>(),
-            controlled
-                .iter()
-                .filter_map(|r| evidence(&r.generation))
-                .collect::<Vec<_>>()
-        );
+        #[cfg(feature = "tensor-capture")]
+        {
+            let evidence = |record: &eredu::api::ObservedGenerationRecord| match &record.event {
+                ObservedGenerationEvent::Token {
+                    forced,
+                    #[cfg(feature = "tensor-capture")]
+                    captures,
+                    ..
+                } => {
+                    assert!(!forced);
+                    Some(
+                        captures
+                            .as_ref()
+                            .map(|step| (step.records.clone(), step.interventions.clone())),
+                    )
+                }
+                _ => None,
+            };
+            assert_eq!(
+                ordinary.iter().filter_map(evidence).collect::<Vec<_>>(),
+                controlled
+                    .iter()
+                    .filter_map(|r| evidence(&r.generation))
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 }
 
 #[test]
 fn unrecognized_chat_stays_strict_while_text_retains_exact_prompt_admissions_and_controls() {
-    for mode in 0..4 {
+    #[cfg(feature = "tensor-capture")]
+    let modes = 0..4;
+    #[cfg(not(feature = "tensor-capture"))]
+    let modes = 0..1;
+    for mode in modes {
         let (mut model, chat, settings, first) = text_setup();
         assert!(matches!(
             chat.semantic_support(),
@@ -166,7 +189,9 @@ fn unrecognized_chat_stays_strict_while_text_retains_exact_prompt_admissions_and
             .unwrap();
         assert!(error.to_string().contains("executable semantic plan"));
         let prepared = prepare(&model, &chat, settings, mode);
+        #[cfg(feature = "tensor-capture")]
         let capture_id = prepared.capture_plan().identity().to_owned();
+        #[cfg(feature = "tensor-capture")]
         let intervention_id = prepared
             .intervention_plan()
             .map(|p| p.identity().to_owned());
@@ -228,16 +253,21 @@ fn unrecognized_chat_stays_strict_while_text_retains_exact_prompt_admissions_and
         assert!(run.step(|_| panic!("completed run emitted")).is_err());
         for (sequence, record) in records.iter().enumerate() {
             assert_eq!(record.sequence, sequence as u64);
+            #[cfg(feature = "tensor-capture")]
             assert_eq!(record.generation.capture_plan_id, capture_id);
+            #[cfg(feature = "tensor-capture")]
             assert_eq!(record.generation.intervention_plan_id, intervention_id);
             if let ObservedGenerationEvent::Token {
+                #[cfg(feature = "tensor-capture")]
                 captures,
                 committed,
                 ..
             } = &record.generation.event
             {
                 assert!(*committed);
+                #[cfg(feature = "tensor-capture")]
                 assert_eq!(captures.is_some(), mode != 0);
+                #[cfg(feature = "tensor-capture")]
                 if let Some(step) = captures {
                     assert_eq!(step.records.len(), usize::from(mode & 1 != 0));
                     assert_eq!(step.interventions.len(), usize::from(mode & 2 != 0));
@@ -268,7 +298,8 @@ fn unrecognized_chat_stays_strict_while_text_retains_exact_prompt_admissions_and
 fn text_stops_cancellation_and_callback_closure_preserve_committed_prefix() {
     for cancel_at in [None, Some(0), Some(1)] {
         let (mut model, chat, settings, first) = text_setup();
-        let prepared = prepare(&model, &chat, settings, 1);
+        let mode = u8::from(cfg!(feature = "tensor-capture"));
+        let prepared = prepare(&model, &chat, settings, mode);
         let control = GenerationControlHandle::default();
         let mut records = vec![];
         let mut run = model
@@ -322,7 +353,11 @@ fn text_stops_cancellation_and_callback_closure_preserve_committed_prefix() {
 
 #[test]
 fn text_snapshots_and_siblings_preserve_unicode_stop_lookbehind_and_bounded_storage() {
-    for mode in 0..4 {
+    #[cfg(feature = "tensor-capture")]
+    let modes = 0..4;
+    #[cfg(not(feature = "tensor-capture"))]
+    let modes = 0..1;
+    for mode in modes {
         for stop in ["never", "é!"] {
             let (mut model, chat, settings, first) = text_setup();
             let prepared = prepare(&model, &chat, settings, mode);
@@ -357,8 +392,10 @@ fn text_snapshots_and_siblings_preserve_unicode_stop_lookbehind_and_bounded_stor
                     per_record_bytes: 16384,
                     total_bytes: 65536,
                 },
+                #[cfg(feature = "tensor-capture")]
                 capture_limits: Some(observed_mock::plan().limits),
                 sampling: None,
+                #[cfg(feature = "tensor-capture")]
                 intervention: None,
             };
             let mut left = run.fork(&saved, options(), collect(&mut records)).unwrap();

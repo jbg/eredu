@@ -332,6 +332,7 @@ fn nemotron_real_checkpoint_native_tool_smoke() {
     smoke("EREDU_NEMOTRON_TOOL_CHECKPOINT", "nvidia.");
 }
 
+#[cfg(feature = "tensor-capture")]
 #[test]
 #[ignore = "requires EREDU_NANBEIGE_CHECKPOINT and an MLX Metal device"]
 fn nanbeige_real_checkpoint_executes_tool_and_answers_from_result() {

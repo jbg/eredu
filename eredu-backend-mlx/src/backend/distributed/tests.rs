@@ -4,6 +4,7 @@ use eredu_core::{
     CompletionCancellationMode,
 };
 use safemlx::{Device, DeviceType};
+#[cfg(feature = "tensor-capture")]
 mod capture_hook;
 
 fn singleton_data_manifest() -> (

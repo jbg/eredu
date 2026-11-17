@@ -249,6 +249,7 @@ pub enum PreparedChatError {
     MissingTerminalToken,
 }
 
+#[cfg(feature = "tensor-capture")]
 impl From<eredu_core::run_preparation::TextCaptureSetupError> for PreparedChatError {
     fn from(error: eredu_core::run_preparation::TextCaptureSetupError) -> Self {
         match error {
@@ -589,17 +590,22 @@ pub(super) enum GenerationStepKind {
         progress: eredu_core::TextProgress,
         position: eredu_core::refinement::GenerationPosition,
     },
+    #[cfg(feature = "tensor-capture")]
     Failed,
 }
+
+#[cfg(feature = "tensor-capture")]
+pub(super) type GenerationStepCallback<'a> =
+    dyn FnMut(GenerationStepKind, Option<eredu_core::capture::CapturedStep>, f64) + 'a;
+#[cfg(not(feature = "tensor-capture"))]
+pub(super) type GenerationStepCallback<'a> = dyn FnMut(GenerationStepKind, f64) + 'a;
 
 pub(super) struct BackendGenerationTokenSource<'a, B>
 where
     B: eredu_core::TextGenerationBackend,
 {
     pub(super) generator: eredu_core::ControlledTextGeneration<'a, B, ConstraintController>,
-    pub(super) on_token: Option<
-        &'a mut dyn FnMut(GenerationStepKind, Option<eredu_core::capture::CapturedStep>, f64),
-    >,
+    pub(super) on_token: Option<&'a mut GenerationStepCallback<'a>>,
     pub(super) delivery_failure: Option<&'a dyn Fn() -> Option<eredu_core::capture::CaptureError>>,
     pub(super) generation_started: std::time::Instant,
     pub(super) time_to_first_token: Option<std::time::Duration>,
@@ -638,6 +644,7 @@ where
         let advance = match result {
             Ok(advance) => advance,
             Err(error) => {
+                #[cfg(feature = "tensor-capture")]
                 if let (Some(callback), Ok(Some(capture))) =
                     (&mut self.on_token, self.generator.take_captured_step())
                 {
@@ -650,9 +657,14 @@ where
                 return Err(error);
             }
         };
+        #[cfg(feature = "tensor-capture")]
         let capture = self
             .generator
             .take_captured_step()
+            .map_err(eredu_core::ControlledTextGenerationError::Backend)?;
+        #[cfg(not(feature = "tensor-capture"))]
+        self.generator
+            .settle_step()
             .map_err(eredu_core::ControlledTextGenerationError::Backend)?;
         let (outcome, record) = match advance {
             Some(eredu_core::TextAdvancement::ModeChanged(acknowledgement)) => (
@@ -685,7 +697,12 @@ where
             }
         };
         if let Some(callback) = &mut self.on_token {
-            callback(record, capture, started.elapsed().as_secs_f64());
+            callback(
+                record,
+                #[cfg(feature = "tensor-capture")]
+                capture,
+                started.elapsed().as_secs_f64(),
+            );
         }
         Ok(outcome)
     }

@@ -2,7 +2,9 @@
 
 use super::*;
 use eredu_core::{execution_control::SnapshotEstimate, PendingTextInput};
-use eredu_runtime::{capture::CaptureSession, execution_control::TextSnapshotBackend};
+#[cfg(feature = "tensor-capture")]
+use eredu_runtime::capture::CaptureSession;
+use eredu_runtime::execution_control::TextSnapshotBackend;
 use generation::MlxTextSamplingState;
 
 fn array_storage(array: &Array) -> Option<u64> {
@@ -313,20 +315,29 @@ impl TextSnapshotBackend for MlxBackend<'_> {
     }
     fn assemble_generation_state(
         sampling: MlxTextSamplingState,
-        capture: Option<CaptureSession>,
+        #[cfg(feature = "tensor-capture")] capture: Option<CaptureSession>,
     ) -> MlxTextGenerationState {
-        MlxTextGenerationState { sampling, capture }
+        MlxTextGenerationState {
+            sampling,
+            #[cfg(feature = "tensor-capture")]
+            capture,
+            readout_selection: None,
+            readout_rows: None,
+        }
     }
     fn sampling_prediction(sampling: &MlxTextSamplingState) -> u64 {
         sampling.next_prediction
     }
+    #[cfg(feature = "tensor-capture")]
     fn capture_run(state: &MlxTextGenerationState) -> Option<&CaptureSession> {
         state.capture.as_ref()
     }
+    #[cfg(feature = "tensor-capture")]
     fn capture_run_mut(state: &mut MlxTextGenerationState) -> Option<&mut CaptureSession> {
         state.capture.as_mut()
     }
 
+    #[cfg(feature = "tensor-capture")]
     fn estimate_child_capture(
         _: &ModelRuntime<Self>,
         shape: &[u64],
@@ -335,6 +346,7 @@ impl TextSnapshotBackend for MlxBackend<'_> {
     ) -> Result<eredu_core::capture::CaptureUsage, eredu_core::capture::CaptureError> {
         super::bounded_capture::estimate_shape(shape, selection, slice)
     }
+    #[cfg(feature = "tensor-capture")]
     fn child_intervention_estimator(
         _: &ModelRuntime<Self>,
     ) -> Result<

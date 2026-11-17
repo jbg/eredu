@@ -34,18 +34,6 @@ impl Executable {
         self.inner.as_mut()
     }
 
-    pub(crate) fn install_embedded_prediction_observers(
-        &mut self,
-        observers: eredu_architectures::speculative_execution::EmbeddedPredictionObservers<
-            crate::MlxTensor,
-            Array,
-            Exception,
-        >,
-    ) -> bool {
-        self.erased_mut()
-            .install_embedded_prediction_observers(observers)
-    }
-
     pub(crate) fn has_neutral_partitioned_control(&self) -> bool {
         self.erased().has_partition_control()
     }

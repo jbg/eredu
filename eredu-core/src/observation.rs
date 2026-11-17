@@ -239,47 +239,6 @@ impl ObservationSelector {
     }
 }
 
-/// Explicit selection for an instrumented execution pass.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ObservationRequest {
-    selectors: Vec<ObservationSelector>,
-}
-
-impl ObservationRequest {
-    /// Selects every observation point reached by the operation.
-    pub const fn all() -> Self {
-        Self {
-            selectors: Vec::new(),
-        }
-    }
-
-    /// Selects the supplied exact paths or prefixes.
-    pub fn selected(selectors: impl IntoIterator<Item = ObservationSelector>) -> Self {
-        Self {
-            selectors: selectors.into_iter().collect(),
-        }
-    }
-
-    /// Returns whether a named point is requested.
-    pub fn matches(&self, path: &str) -> bool {
-        self.selectors.is_empty() || self.selectors.iter().any(|selector| selector.matches(path))
-    }
-
-    /// Requested selectors; empty means all points.
-    pub fn selectors(&self) -> &[ObservationSelector] {
-        &self.selectors
-    }
-}
-
-/// A completed instrumented operation and its portable observations.
-#[derive(Debug)]
-pub struct InspectedOutput<O> {
-    /// Ordinary backend output from the operation.
-    pub output: O,
-    /// Requested host-materialized observations.
-    pub observations: ObservationSet,
-}
-
 /// Invalid portable observation data.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 pub enum ObservationError {
@@ -326,15 +285,7 @@ mod tests {
     }
 
     #[test]
-    fn selectors_and_sets_are_stable_and_collision_safe() {
-        let request = ObservationRequest::selected([
-            ObservationSelector::Exact(MODEL_LOGITS_OBSERVATION_PATH.into()),
-            ObservationSelector::Prefix("model.layers.2".into()),
-        ]);
-        assert!(request.matches(MODEL_LOGITS_OBSERVATION_PATH));
-        assert!(request.matches("model.layers.2.output"));
-        assert!(!request.matches("model.layers.20.output"));
-
+    fn observation_sets_are_collision_safe() {
         let mut set = ObservationSet::new();
         set.insert(MODEL_LOGITS_OBSERVATION_PATH, ObservationValue::Unsigned(3))
             .unwrap();

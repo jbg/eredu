@@ -28,6 +28,7 @@ pub trait SpeculativeActivationObserver<T, E>: ActivationObserver<T, E> {
         None
     }
     /// Saves authority without refunding its cumulative invocation allowance.
+    #[cfg(feature = "tensor-capture")]
     fn activation_checkpoint(
         &self,
     ) -> Result<
@@ -41,6 +42,7 @@ pub trait SpeculativeActivationObserver<T, E>: ActivationObserver<T, E> {
         )
     }
     /// Prepares an infallible authority commit before native state is replaced.
+    #[cfg(feature = "tensor-capture")]
     fn prepare_activation_restore<'a>(
         &'a mut self,
         _saved: &crate::capture::SpeculativeActivationCheckpoint,
@@ -56,6 +58,7 @@ pub trait SpeculativeActivationObserver<T, E>: ActivationObserver<T, E> {
     }
     /// Replaces prospective internal edits while keeping capture authority fixed.
     /// The enclosing loaded controller validates exact discovery before this call.
+    #[cfg(feature = "tensor-capture")]
     fn readmit_activation_interventions(
         &mut self,
         _plan: eredu_core::speculative::AdmittedSpeculativeActivations,
@@ -73,6 +76,7 @@ pub trait SpeculativeActivationObserver<T, E>: ActivationObserver<T, E> {
 
     /// Moves one already charged record to the consumer. Returning a record
     /// neither commits tentative output nor refunds any cumulative allowance.
+    #[cfg(feature = "tensor-capture")]
     fn take_activation_capture(
         &mut self,
     ) -> Option<eredu_core::speculative::SpeculativeActivationCapture> {

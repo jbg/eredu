@@ -194,9 +194,7 @@ fn flash_next_tagged_tools_pause_partial_arguments_and_replay_tool_results() {
                 _ => None,
             })
             .unwrap();
-        let prepared = model
-            .prepare_observed_chat(&chat, settings(), CapturePlan::none(), limits())
-            .unwrap();
+        let prepared = model.prepare_controlled_chat(&chat, settings()).unwrap();
         let mut records = vec![];
         let mut session = model
             .start_controlled(
@@ -323,9 +321,7 @@ fn flash_next_tagged_tools_pause_partial_arguments_and_replay_tool_results() {
         assert!(!events
             .iter()
             .any(|event| matches!(event, SemanticEvent::ToolCallStart { .. })));
-        let prepared = model
-            .prepare_observed_chat(&chat, settings(), CapturePlan::none(), limits())
-            .unwrap();
+        let prepared = model.prepare_controlled_chat(&chat, settings()).unwrap();
         let mut records = vec![];
         let mut controlled = model
             .start_controlled(

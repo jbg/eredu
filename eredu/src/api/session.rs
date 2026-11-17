@@ -370,12 +370,15 @@ where
 #[derive(Debug, Clone)]
 pub struct GenerationControlOptions {
     /// Ordinary forward capture, or a plan to admit for speculative prediction rows.
+    #[cfg(feature = "tensor-capture")]
     pub capture: eredu_core::capture::CapturePlan,
     /// Record transport bounds shared by ordinary and speculative delivery.
     pub trace_limits: super::TraceLimits,
     /// Already admitted target/draft prediction capture, excluding `capture` above.
+    #[cfg(feature = "tensor-capture")]
     pub speculative_capture: Option<eredu_core::capture::AdmittedCapturePlan>,
     /// Phase-aware internal forward capture and interventions.
+    #[cfg(feature = "tensor-capture")]
     pub speculative_activations: Option<eredu_core::speculative::AdmittedSpeculativeActivations>,
     /// Speculative snapshot retention and copy bounds. Ordinary snapshots use
     /// the typed controller's `enable_snapshots` after startup.
@@ -384,12 +387,15 @@ pub struct GenerationControlOptions {
 impl Default for GenerationControlOptions {
     fn default() -> Self {
         Self {
+            #[cfg(feature = "tensor-capture")]
             capture: eredu_core::capture::CapturePlan::none(),
             trace_limits: super::TraceLimits {
                 per_record_bytes: 1 << 20,
                 total_bytes: 64 << 20,
             },
+            #[cfg(feature = "tensor-capture")]
             speculative_capture: None,
+            #[cfg(feature = "tensor-capture")]
             speculative_activations: None,
             speculative_snapshots: None,
         }
@@ -629,10 +635,12 @@ impl<B: eredu_core::ModelCapabilityBackend> ControlSource<B> for NoDrafting {
             if request.cancellation.is_cancelled() {
                 return Ok(None);
             }
-            if options.speculative_capture.is_some()
-                || options.speculative_activations.is_some()
-                || options.speculative_snapshots.is_some()
-            {
+            #[cfg(feature = "tensor-capture")]
+            let speculative_capture =
+                options.speculative_capture.is_some() || options.speculative_activations.is_some();
+            #[cfg(not(feature = "tensor-capture"))]
+            let speculative_capture = false;
+            if speculative_capture || options.speculative_snapshots.is_some() {
                 return Err(eredu_core::decoding::DecodingModeError::Unsupported(
                     "draft-phase inspection requires a speculative executor",
                 )
@@ -645,19 +653,44 @@ impl<B: eredu_core::ModelCapabilityBackend> ControlSource<B> for NoDrafting {
             let chat = request.input.prepared_chat().clone();
             let input = request.input.into_unbound();
             let prepared = match input {
-                PreparedChatInput::RenderedPrompt(_) => model.prepare_observed_chat(
-                    &chat,
-                    request.settings,
-                    options.capture,
-                    options.trace_limits,
-                )?,
-                PreparedChatInput::TokenIds { token_ids, .. } => model.prepare_observed_token_ids(
-                    &chat,
-                    token_ids,
-                    request.settings,
-                    options.capture,
-                    options.trace_limits,
-                )?,
+                PreparedChatInput::RenderedPrompt(_) => {
+                    #[cfg(feature = "tensor-capture")]
+                    let prepared = model.prepare_observed_chat(
+                        &chat,
+                        request.settings,
+                        options.capture,
+                        options.trace_limits,
+                    )?;
+                    #[cfg(not(feature = "tensor-capture"))]
+                    let prepared = {
+                        let ids = model.encode(chat.rendered_prompt(), false)?;
+                        model.prepare_controlled_token_ids(
+                            &chat,
+                            ids,
+                            request.settings,
+                            options.trace_limits,
+                        )?
+                    };
+                    prepared
+                }
+                PreparedChatInput::TokenIds { token_ids, .. } => {
+                    #[cfg(feature = "tensor-capture")]
+                    let prepared = model.prepare_observed_token_ids(
+                        &chat,
+                        token_ids,
+                        request.settings,
+                        options.capture,
+                        options.trace_limits,
+                    )?;
+                    #[cfg(not(feature = "tensor-capture"))]
+                    let prepared = model.prepare_controlled_token_ids(
+                        &chat,
+                        token_ids,
+                        request.settings,
+                        options.trace_limits,
+                    )?;
+                    prepared
+                }
                 PreparedChatInput::PreparedBackendInput { prompt, .. } => {
                     let count = model.count_prepared_input(&prompt)?;
                     let ids = B::prepared_input_token_ids(&model.runtime, &prompt)
@@ -668,14 +701,27 @@ impl<B: eredu_core::ModelCapabilityBackend> ControlSource<B> for NoDrafting {
                             actual: ids.len(),
                         });
                     }
-                    model.prepare_observed_input(
+                    #[cfg(feature = "tensor-capture")]
+                    let prepared = model.prepare_observed_input(
                         &chat,
                         prompt,
                         ids,
                         request.settings,
                         options.capture,
                         options.trace_limits,
-                    )?
+                    )?;
+                    #[cfg(not(feature = "tensor-capture"))]
+                    let prepared = {
+                        let mut prepared = model.prepare_controlled_token_ids(
+                            &chat,
+                            ids,
+                            request.settings,
+                            options.trace_limits,
+                        )?;
+                        prepared.prompt = Some(prompt);
+                        prepared
+                    };
+                    prepared
                 }
                 PreparedChatInput::SessionBound { .. } => {
                     unreachable!("validated input was unbound")
@@ -756,7 +802,9 @@ where
         D: FnOnce(&mut GenerationControl<'_, '_, B>) -> Result<(), SessionControlError>,
     {
         let mode = request.output_mode;
+        #[cfg(feature = "tensor-capture")]
         let mut options = options;
+        #[cfg(feature = "tensor-capture")]
         let admission = (|| -> Result<(), PreparedChatError> {
             if !options.capture.selections.is_empty() {
                 if options.speculative_capture.is_some() {
@@ -768,6 +816,7 @@ where
             }
             Ok(())
         })();
+        #[cfg(feature = "tensor-capture")]
         if let Err(error) = admission {
             return model.runtime.finish_text_preparation(
                 eredu_core::run_preparation::TextPreparationStage::Instrumentation,
@@ -780,7 +829,9 @@ where
             with_source(request, self.reborrow(), limits, started),
             eredu_runtime::speculative::ControlledSpeculativeOptions {
                 trace_limits: options.trace_limits,
+                #[cfg(feature = "tensor-capture")]
                 capture: options.speculative_capture,
+                #[cfg(feature = "tensor-capture")]
                 activations: options.speculative_activations,
                 snapshots: options.speculative_snapshots,
             },

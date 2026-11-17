@@ -1,9 +1,12 @@
 use super::*;
 use eredu_core::{intervention::*, *};
+#[cfg(feature = "tensor-capture")]
 use eredu_runtime::capture::CaptureSession;
 use std::{cell::Cell, collections::VecDeque, io, rc::Rc, sync::Arc};
 
+#[cfg(feature = "tensor-capture")]
 mod records;
+#[cfg(feature = "tensor-capture")]
 use records::*;
 
 #[derive(Clone, Default)]
@@ -46,6 +49,7 @@ struct Sampling {
 }
 struct Generation {
     sampling: Sampling,
+    #[cfg(feature = "tensor-capture")]
     capture: Option<CaptureSession>,
 }
 #[derive(Clone, Copy)]
@@ -129,7 +133,9 @@ fn sample(
     filter: &TokenFilter,
 ) -> io::Result<Submission<Token, Done>> {
     let sampling = &mut state.sampling;
+    #[cfg(feature = "tensor-capture")]
     let mut value = vec![(value % 65536) as f32];
+    #[cfg(feature = "tensor-capture")]
     if let Some(run) = &mut state.capture {
         run.begin_step(
             if sampling.next == 0 {
@@ -155,7 +161,11 @@ fn sample(
     sampling.rng ^= sampling.rng << 13;
     sampling.rng ^= sampling.rng >> 7;
     sampling.rng ^= sampling.rng << 17;
-    let scaled = (f64::from(value[0]) / f64::from(sampling.temperature)) as u64;
+    #[cfg(feature = "tensor-capture")]
+    let raw = value[0];
+    #[cfg(not(feature = "tensor-capture"))]
+    let raw = (value % 65536) as f32;
+    let scaled = (f64::from(raw) / f64::from(sampling.temperature)) as u64;
     let mut token = ((sampling.rng ^ sampling.adaptive ^ scaled) % 64) as u32;
     while filter
         .allowed_mask()
@@ -199,6 +209,7 @@ impl TextGenerationBackend for Host {
                 adaptive: 0,
                 next: 0,
             },
+            #[cfg(feature = "tensor-capture")]
             capture: None,
         })
     }
@@ -246,19 +257,23 @@ impl TextGenerationBackend for Host {
         })
     }
 
+    #[cfg(feature = "tensor-capture")]
     fn capture_declarations(
         _: &ModelRuntime<Self>,
     ) -> Result<eredu_core::capture::CaptureDeclarations, CaptureError> {
         Ok(discovery().declarations())
     }
+    #[cfg(feature = "tensor-capture")]
     fn capture_discovery(_: &ModelRuntime<Self>) -> Result<CaptureDiscovery, CaptureError> {
         Ok(discovery())
     }
+    #[cfg(feature = "tensor-capture")]
     fn intervention_discovery(
         _: &ModelRuntime<Self>,
     ) -> Result<InterventionDiscovery, CaptureError> {
         Ok(interventions())
     }
+    #[cfg(feature = "tensor-capture")]
     fn configure_text_interventions(
         runtime: &ModelRuntime<Self>,
         state: &mut Generation,
@@ -278,10 +293,12 @@ impl TextGenerationBackend for Host {
         )?;
         eredu_runtime::intervention::install_session(
             &mut state.capture,
+            #[cfg(feature = "tensor-capture")]
             capture,
             Some((intervention, Arc::new(Records))),
         )
     }
+    #[cfg(feature = "tensor-capture")]
     fn take_text_capture(state: &mut Generation) -> Option<CapturedStep> {
         state.capture.as_mut().and_then(CaptureSession::take_step)
     }
@@ -388,9 +405,13 @@ impl TextSnapshotBackend for Host {
     }
     fn assemble_generation_state(
         sampling: Sampling,
-        capture: Option<CaptureSession>,
+        #[cfg(feature = "tensor-capture")] capture: Option<CaptureSession>,
     ) -> Generation {
-        Generation { sampling, capture }
+        Generation {
+            sampling,
+            #[cfg(feature = "tensor-capture")]
+            capture,
+        }
     }
     fn sampling_prediction(sampling: &Sampling) -> u64 {
         sampling.next
@@ -425,12 +446,15 @@ impl TextSnapshotBackend for Host {
             PendingTextInput::Continue => PendingTextInput::Continue,
         }))
     }
+    #[cfg(feature = "tensor-capture")]
     fn capture_run(state: &Generation) -> Option<&CaptureSession> {
         state.capture.as_ref()
     }
+    #[cfg(feature = "tensor-capture")]
     fn capture_run_mut(state: &mut Generation) -> Option<&mut CaptureSession> {
         state.capture.as_mut()
     }
+    #[cfg(feature = "tensor-capture")]
     fn estimate_child_capture(
         _: &ModelRuntime<Self>,
         shape: &[u64],
@@ -439,6 +463,7 @@ impl TextSnapshotBackend for Host {
     ) -> Result<CaptureUsage, CaptureError> {
         estimate(shape, selection, slice)
     }
+    #[cfg(feature = "tensor-capture")]
     fn child_intervention_estimator(
         _: &ModelRuntime<Self>,
     ) -> Result<Arc<dyn InterventionEstimator>, CaptureError> {
@@ -522,17 +547,28 @@ fn start_with_controller<C: TokenFilterController>(
         .unwrap(),
     )
     .with_seed(12345);
-    let mut state = driver.start(vec![1, 2], config, controller).unwrap();
-    let (capture, intervention) = plans(mode);
-    driver
-        .enable_interventions(&mut state, capture, intervention)
-        .unwrap();
+    let state = driver.start(vec![1, 2], config, controller).unwrap();
+    #[cfg(feature = "tensor-capture")]
+    let state = {
+        let mut state = state;
+        let (capture, intervention) = plans(mode);
+        driver
+            .enable_interventions(&mut state, capture, intervention)
+            .unwrap();
+        state
+    };
+    #[cfg(not(feature = "tensor-capture"))]
+    assert_eq!(mode, 0);
     ManagedTextContinuation::root(state)
 }
 
 #[test]
 fn host_continuations_conform_for_all_record_modes() {
-    for mode in 0..4 {
+    for mode in 0..if cfg!(feature = "tensor-capture") {
+        4
+    } else {
+        1
+    } {
         let host = Host::default();
         let mut runtime = ModelRuntime::prepare(host.clone(), ()).unwrap();
         let mut driver = TextGenerationDriver::new(&mut runtime);
@@ -548,7 +584,10 @@ fn host_continuations_conform_for_all_record_modes() {
                 host_bytes: 4096,
                 growth_bytes: 4096,
                 max_predictions: 20,
+                #[cfg(feature = "tensor-capture")]
                 capture: Some(limits()),
+                #[cfg(not(feature = "tensor-capture"))]
+                capture: None,
             },
             64,
             || host.forwards.get(),
@@ -560,7 +599,10 @@ fn host_continuations_conform_for_all_record_modes() {
                 host_bytes: 4096,
                 growth_bytes: 4096,
                 max_predictions: 20,
+                #[cfg(feature = "tensor-capture")]
                 capture: Some(limits()),
+                #[cfg(not(feature = "tensor-capture"))]
+                capture: None,
             },
             || host.forwards.get(),
         );
@@ -571,7 +613,10 @@ fn host_continuations_conform_for_all_record_modes() {
                 host_bytes: 4096,
                 growth_bytes: 4096,
                 max_predictions: 20,
+                #[cfg(feature = "tensor-capture")]
                 capture: Some(limits()),
+                #[cfg(not(feature = "tensor-capture"))]
+                capture: None,
             },
             || host.forwards.get(),
         );
@@ -580,7 +625,11 @@ fn host_continuations_conform_for_all_record_modes() {
 
 #[test]
 fn staged_failures_preserve_source_snapshot_and_monotone_copy_accounting() {
-    for mode in 0..4 {
+    for mode in 0..if cfg!(feature = "tensor-capture") {
+        4
+    } else {
+        1
+    } {
         let host = Host::default();
         let mut runtime = ModelRuntime::prepare(host.clone(), ()).unwrap();
         let mut driver = TextGenerationDriver::new(&mut runtime);
@@ -669,7 +718,9 @@ fn staged_failures_preserve_source_snapshot_and_monotone_copy_accounting() {
             TextBranchRequest {
                 session_id: "failed-host-child",
                 max_predictions: 8,
+                #[cfg(feature = "tensor-capture")]
                 capture_limits: Some(limits()),
+                #[cfg(feature = "tensor-capture")]
                 intervention: None,
                 host_bytes: Some(4096),
                 continuation_growth_bytes: Some(4096),

@@ -161,12 +161,10 @@ All currently cataloged values are tensors. Activations usually have
 have `[token_rows, selected_expert]`, where token rows flatten batch and
 sequence. The semantic dtype is independent of checkpoint storage. MLX declares
 F32 conversion for floating host observations; integer signedness is retained in
-the returned `TensorObservationData`. Captures retain complete tensors, and byte
-estimates remain unknown when the request shape or native dtype is unknown.
-These statements describe the legacy `ObservationRequest` API. The admitted
-`CapturePlan` API adds native slicing, previews, summaries, histograms, and raw
-candidate-score summaries with explicit budgets. Selected support reports now
-include `capture` transformation capabilities and conditions. See
+the returned `TensorObservationData`. With `tensor-capture`, `CapturePlan`
+admits exact paths and phases with explicit budgets and supports full tensors,
+slices, previews, summaries, histograms, and candidate scores. Selected support
+reports describe the transformations compiled into the backend. See
 [bounded capture and observed generation](bounded-capture.md).
 
 Block inputs/outputs and logits are observed **before an intervention at that
@@ -893,29 +891,18 @@ Run the portable example:
 cargo run -p eredu --no-default-features --example architecture_discovery -- /path/to/artifact
 ```
 
-The example also contains a compiled generic `capture_advertised` helper using
-an application's existing `ModelRuntime`. A complete native example inspects,
-prints support, selects an advertised path, loads the model, and captures both
-prefill and decode values:
+The native example selects an advertised path, loads the model on CPU,
+and uses `CapturePlan` with `FullTensor` for prefill and decode.
 
 ```sh
-cargo run -p eredu-backend-mlx --example capture_discovery -- /path/to/artifact 1 2 3
+cargo run -p eredu-backend-mlx --features tensor-capture --example capture_discovery -- /path/to/artifact 1 2 3
 ```
 
-Provide valid token IDs for the artifact. This example explicitly chooses CPU
-execution; native resources are created only after cold discovery.
-
-LM Inspector should retain the inspected descriptor, render `nodes`/`edges`,
-list `observations.points`, and join selected support by exact `path`. Offer
-capture for `Supported` points, show conditional requirements, and display
-unsupported/unverified reasons. Pass the selected path to
-`ObservationSelector::Exact` and use the existing `inspect_prefill` /
-`inspect_decode` calls. Do not use an empty selector list as “capture none”:
-the existing observation API treats it as capture-all. Missing returned values
-must remain missing, not become numerical zero. For ordinary instrumented text
-generation, use `capture_discovery`, `prepare_observed_chat`, and
-`generate_observed`; `CapturePlan::none()` and empty new-plan selections both
-mean capture none. The complete [`observed_generate`](../eredu/examples/observed_generate.rs)
+Provide valid token IDs for the artifact. Native resources are created after
+cold discovery. Join the observation catalog and selected support by exact
+`path`. Pass the path and explicit schedules to `CapturePlan`, then use
+`prepare_observed_chat` and `generate_observed`. An empty plan collects no
+tensors. The complete [`observed_generate`](../eredu/examples/observed_generate.rs)
 example includes prompt alignment, ordinary sampling, bounded capture and cancellation.
 
 Mixed V3 independently cached expert variants pass all 63 CPU Ring TP/PP/EP and

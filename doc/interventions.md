@@ -325,7 +325,7 @@ The complete facade example discovers support, emits a baseline, resets the
 session, zeros the final prefill logits row, and emits bounded before/after evidence:
 
 ```sh
-cargo run -p eredu --no-default-features --features mlx --example intervened_generate -- /path/to/artifact "Explain gravity" f32
+cargo run -p eredu --no-default-features --features mlx,tensor-capture --example intervened_generate -- /path/to/artifact "Explain gravity" f32
 ```
 
 Pass the actual activation dtype (`f32`, `f16`, or `bf16`). Discovery lists native

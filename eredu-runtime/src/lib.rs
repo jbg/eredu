@@ -97,6 +97,7 @@ pub mod input;
 pub mod input_transfer;
 pub mod inspection;
 /// Immutable intervention scheduling and evidence using the shared capture ledger.
+#[cfg(feature = "tensor-capture")]
 pub mod intervention;
 pub use bound_layerwise_component::{BoundLayerwiseComponent, BoundStatelessComponent};
 pub mod layered;

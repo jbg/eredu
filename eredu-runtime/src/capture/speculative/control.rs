@@ -1,11 +1,15 @@
 //! Immutable internal authority and atomic selection over one cumulative ledger.
+#[cfg(feature = "tensor-capture")]
 use super::*;
+#[cfg(feature = "tensor-capture")]
 use eredu_core::speculative::AdmittedSpeculativeActivations;
+#[cfg(feature = "tensor-capture")]
 use std::sync::Arc;
 
 /// Host-only saved authority. Native state and snapshot reservations remain with
 /// the enclosing execution controller. Invocation IDs and consumption are not saved.
 #[derive(Clone, Debug)]
+#[cfg(feature = "tensor-capture")]
 pub struct SpeculativeActivationCheckpoint {
     owner: Arc<()>,
     plan: AdmittedSpeculativeActivations,
@@ -18,6 +22,7 @@ pub trait PreparedSpeculativeActivationRestore {
     fn commit(self: Box<Self>);
 }
 
+#[cfg(feature = "tensor-capture")]
 struct Prepared<'a, P: CaptureBackendProvider, F> {
     observer: &'a mut SpeculativeCaptureObserver<P, F>,
     plan: AdmittedSpeculativeActivations,
@@ -26,6 +31,7 @@ struct Prepared<'a, P: CaptureBackendProvider, F> {
     scopes: Vec<SpeculativeCaptureScope>,
 }
 
+#[cfg(feature = "tensor-capture")]
 impl<P: CaptureBackendProvider, F> PreparedSpeculativeActivationRestore for Prepared<'_, P, F> {
     fn commit(self: Box<Self>) {
         self.observer.session.interventions = self.intervention;
@@ -36,6 +42,7 @@ impl<P: CaptureBackendProvider, F> PreparedSpeculativeActivationRestore for Prep
     }
 }
 
+#[cfg(feature = "tensor-capture")]
 fn storage(plan: &AdmittedSpeculativeActivations) -> Option<u64> {
     use crate::execution_control::storage::heap_bytes;
     let strings = [
@@ -66,6 +73,7 @@ fn storage(plan: &AdmittedSpeculativeActivations) -> Option<u64> {
     .checked_mul(2)
 }
 
+#[cfg(feature = "tensor-capture")]
 impl<P: CaptureBackendProvider, F> SpeculativeCaptureObserver<P, F> {
     pub(super) fn control_storage_bytes(&self) -> Option<u64> {
         self.drained_boundary().ok()?;

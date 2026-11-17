@@ -106,17 +106,7 @@ fn prepared_sampling_preserves_strategy_resolved_controls_and_vocabulary_masks()
         // The observed path shares the same strategy resolution and constraints.
         for observed in [false, true] {
             let output = if observed {
-                let prepared = model
-                    .prepare_observed_chat(
-                        &chat,
-                        settings,
-                        eredu_core::capture::CapturePlan::none(),
-                        eredu::api::TraceLimits {
-                            per_record_bytes: 65536,
-                            total_bytes: 1024 * 1024,
-                        },
-                    )
-                    .unwrap();
+                let prepared = model.prepare_controlled_chat(&chat, settings).unwrap();
                 model
                     .generate_observed(
                         prepared,

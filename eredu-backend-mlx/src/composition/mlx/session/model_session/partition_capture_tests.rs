@@ -316,9 +316,7 @@ fn verify_native_partition_components(
             let mut submit = |observer: &mut dyn RuntimeActivationObserver<MlxTensor, Error>| -> Result<Vec<f32>, Error> {
             let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
             let submitted = if step_index == 0 {
-                session.submit_prefill_with_observer(
-                    &backend,
-                    MlxBackend::prepare_text_prompt(&backend, vec![1, 2]).unwrap(),
+                session.submit_prefill_result_with_observer(&backend, Ok(MlxBackend::prepare_text_prompt(&backend, vec![1, 2]).unwrap()), None,
                     &mut borrowed,
                 )
             } else {
@@ -498,9 +496,10 @@ fn native_input_rejection_preserves_cause_cached_state_and_capture_epoch() {
                 .unwrap();
         let mut session = backend.create_session(prepared).unwrap();
         session
-            .submit_prefill_with_observer(
+            .submit_prefill_result_with_observer(
                 &backend,
-                MlxBackend::prepare_text_prompt(&backend, vec![1, 2]).unwrap(),
+                Ok(MlxBackend::prepare_text_prompt(&backend, vec![1, 2]).unwrap()),
+                None,
                 &mut eredu_runtime::NoopObserver,
             )
             .unwrap()

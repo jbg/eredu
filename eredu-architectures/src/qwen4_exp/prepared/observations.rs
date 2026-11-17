@@ -1,11 +1,16 @@
 //! Invocation-scoped declarations authored from the retained target/prediction specs.
-use super::{SelectedTargetExecution, UnitSpec};
-use crate::{qwen4_exp::target::MixerSpec, speculative_execution::SpeculativeActivationExecution};
+#[cfg(feature = "tensor-capture")]
+use super::SelectedTargetExecution;
+use super::UnitSpec;
+use crate::qwen4_exp::target::MixerSpec;
+#[cfg(feature = "tensor-capture")]
+use crate::speculative_execution::SpeculativeActivationExecution;
 use eredu_core::{capture::*, intervention::*, speculative::*, *};
 
 /// Loaded source/session authority and native collector facts. The composition
 /// owner supplies the content identity of the retained prepared source graph;
 /// discovery never reopens checkpoint files or hashes model payloads itself.
+#[cfg(feature = "tensor-capture")]
 pub struct PredictionObservationBinding<'a> {
     /// Content-exact identity resolved by the source owner.
     pub artifact: artifact::ArtifactIdentity,
@@ -24,6 +29,7 @@ pub struct PredictionObservationBinding<'a> {
 /// Joined logical ownership and exact loaded speculative capture admission.
 /// The graph describes invocations and sharing, not native residency or memory usage.
 #[derive(Debug, Clone)]
+#[cfg(feature = "tensor-capture")]
 pub struct PredictionDiscovery {
     /// Architecture-authored operations, parameter groups, state edges and catalog.
     pub architecture: ArchitectureDescriptor,
@@ -31,6 +37,7 @@ pub struct PredictionDiscovery {
     pub activations: SpeculativeActivationDiscovery,
 }
 
+#[cfg(feature = "tensor-capture")]
 impl SelectedTargetExecution {
     /// Projects the actual sequential target/MTP hook contract. Scope and tensor
     /// geometry come from retained architecture specifications, never path parsing

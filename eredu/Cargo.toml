@@ -28,27 +28,27 @@ path = "examples/architecture_discovery.rs"
 [[example]]
 name = "observed_generate"
 path = "examples/observed_generate.rs"
-required-features = ["mlx"]
+required-features = ["mlx", "tensor-capture"]
 
 [[example]]
 name = "intervened_generate"
 path = "examples/intervened_generate.rs"
-required-features = ["mlx"]
+required-features = ["mlx", "tensor-capture"]
 
 [[example]]
 name = "component_reference_probe"
 path = "examples/component_reference_probe.rs"
-required-features = ["mlx"]
+required-features = ["mlx", "tensor-capture"]
 
 [[example]]
 name = "component_sparse_probe"
 path = "examples/component_sparse_probe.rs"
-required-features = ["mlx"]
+required-features = ["mlx", "tensor-capture"]
 
 [[example]]
 name = "controlled_generate"
 path = "examples/controlled_generate.rs"
-required-features = ["mlx"]
+required-features = ["mlx", "tensor-capture"]
 
 [[example]]
 name = "gemma4_generate"
@@ -78,12 +78,12 @@ required-features = ["mlx"]
 [[example]]
 name = "projection_forecast"
 path = "examples/projection_forecast.rs"
-required-features = ["mlx", "metal", "projection-profiling"]
+required-features = ["mlx", "metal", "projection-profiling", "tensor-capture"]
 
 [[example]]
 name = "projection_parity"
 path = "examples/projection_parity.rs"
-required-features = ["mlx", "metal", "projection-profiling"]
+required-features = ["mlx", "metal", "projection-profiling", "tensor-capture"]
 
 [[example]]
 name = "projection_baseline"
@@ -98,12 +98,12 @@ required-features = ["mlx"]
 [[example]]
 name = "prefill_memory_probe"
 path = "examples/prefill_memory_probe.rs"
-required-features = ["mlx", "metal"]
+required-features = ["mlx", "metal", "tensor-capture"]
 
 [[example]]
 name = "chat_probe"
 path = "examples/chat_probe.rs"
-required-features = ["mlx"]
+required-features = ["mlx", "tensor-capture"]
 
 [[example]]
 name = "qwen35_moe_bench"
@@ -134,12 +134,12 @@ required-features = ["mlx"]
 [[test]]
 name = "native_execution_control"
 path = "tests/native_execution_control.rs"
-required-features = ["mlx"]
+required-features = ["mlx", "tensor-capture"]
 
 [[test]]
 name = "native_tool_checkpoints"
 path = "tests/native_tool_checkpoints.rs"
-required-features = ["mlx"]
+required-features = ["mlx", "tensor-capture"]
 
 [package.metadata.docs.rs]
 targets = [
@@ -151,6 +151,13 @@ no-default-features = true
 features = ["mlx", "metal", "image", "audio"]
 
 [features]
+tensor-capture = [
+    "eredu-core/tensor-capture",
+    "eredu-runtime/tensor-capture",
+    "eredu-architectures/tensor-capture",
+    "eredu-backend-mlx?/tensor-capture",
+    "eredu-evaluation/tensor-capture",
+]
 default = ["mlx", "metal", "distributed", "onig", "esaxx_fast"]
 
 distributed = ["eredu-backend-mlx?/distributed"]

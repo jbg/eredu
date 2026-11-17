@@ -707,6 +707,7 @@ where
 /// Target rows can belong to an uncommitted verification; use the step's
 /// verification dispositions to determine which predictions became canonical.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg(feature = "tensor-capture")]
 pub struct SpeculativePredictionCapture {
     /// Target verifier or draft model.
     pub role: SpeculativeCaptureRole,
@@ -790,6 +791,7 @@ pub struct SpeculativeActivationOrigin {
 /// Bounded internal evidence from an actual speculative forward. A successful
 /// forward is still tentative until the generation driver commits its tokens.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg(feature = "tensor-capture")]
 pub struct SpeculativeActivationCapture {
     /// Exact loaded activation-plan identity when installed through immutable
     /// public admission. Low-level observer fixtures may have no such authority.
@@ -860,6 +862,7 @@ pub(super) fn with_activation_origin<E: SpeculativeExecutor, R>(
 
 /// Prospective tensor edits admitted for one model's speculative prediction rows.
 #[derive(Debug, Clone)]
+#[cfg(feature = "tensor-capture")]
 pub struct SpeculativeInterventionPlan {
     /// Target or draft logits; roles never share an implicit edit.
     pub role: SpeculativeCaptureRole,

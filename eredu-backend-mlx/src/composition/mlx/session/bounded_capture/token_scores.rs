@@ -10,80 +10,18 @@ impl NativeCapture<'_> {
         position: Option<u64>,
     ) -> Result<CapturePayload, Exception> {
         let stream = self.stream;
-        let vocabulary = *tensor
-            .shape()
-            .last()
-            .ok_or_else(|| Exception::custom("scalar logits"))?;
-        if vocabulary <= 0 || ids.iter().any(|id| *id >= vocabulary as u32) {
-            return Err(Exception::custom("invalid selected score vocabulary"));
-        }
-        let positions = tensor
-            .shape()
-            .iter()
-            .take(tensor.shape().len() - 1)
-            .try_fold(1u64, |n, v| n.checked_mul(*v as u64))
-            .ok_or_else(|| Exception::custom("score position geometry overflow"))?;
-        if position.is_some_and(|p| p >= positions) {
-            return Err(Exception::custom(
-                "selected score position lies outside the invocation",
-            ));
-        }
-        let row_index = position.map_or(-1, |p| p as i32);
-        let row = tensor
-            .as_array()
-            .reshape(&[-1, vocabulary], stream)?
-            .try_index_device((row_index, ..), stream)?
-            .as_dtype(Dtype::Float32, stream)?;
-        if count_mask(row.is_finite(stream)?, stream)? != vocabulary as u64 {
-            return Err(Exception::custom(
-                "full-vocabulary scoring requires finite raw logits",
-            ));
-        }
-        let maximum = scalar_f32(row.max(false, stream)?)?;
-        let mut total = 0.0f64;
-        let mut correction = 0.0f64;
-        let mut accumulate = |sum: f32| {
-            let sum = f64::from(sum);
-            let next = total + sum;
-            correction += if total.abs() >= sum.abs() {
-                (total - next) + sum
-            } else {
-                (sum - next) + total
-            };
-            total = next;
-        };
-        // Preserve F32 chunk reductions and compensated F64 aggregation, but
-        // transfer batches of chunk sums instead of synchronizing for each chunk.
-        // Host reads stay bounded by CHUNK, independently of vocabulary extent.
-        for start in (0..vocabulary).step_by((CHUNK * CHUNK) as usize) {
-            let end = start.saturating_add((CHUNK * CHUNK) as i32).min(vocabulary);
-            let complete = (end - start) / CHUNK as i32;
-            let boundary = start + complete * CHUNK as i32;
-            if complete > 0 {
-                let sums = row
-                    .try_index_device(start..boundary, stream)?
-                    .reshape(&[complete, CHUNK as i32], stream)?
-                    .subtract(Array::from_f32(maximum as f32), stream)?
-                    .exp(stream)?
-                    .sum_axis(1, false, stream)?;
+        let (row, vocabulary, maximum, log_mass) = super::super::score_readout::normalized_row(
+            tensor.as_array(),
+            ids,
+            position,
+            stream,
+            |elements| {
                 #[cfg(test)]
-                record_host_read(complete as usize);
-                let sums = sums.evaluated()?;
-                for &sum in sums.as_slice::<f32>() {
-                    accumulate(sum);
-                }
-            }
-            if boundary < end {
-                let sum = scalar_f32(
-                    row.try_index_device(boundary..end, stream)?
-                        .subtract(Array::from_f32(maximum as f32), stream)?
-                        .exp(stream)?
-                        .sum(false, stream)?,
-                )?;
-                accumulate(sum as f32);
-            }
-        }
-        let log_mass = (total + correction).ln();
+                record_host_read(elements);
+                #[cfg(not(test))]
+                let _ = elements;
+            },
+        )?;
         let log_partition = maximum + log_mass;
         let candidate = |token_id, score| CaptureCandidate {
             token_id,

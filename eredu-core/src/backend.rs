@@ -30,7 +30,7 @@ use crate::{
     checkpoint::TensorDtype,
     generation::{GenerationError, ResolvedGenerationConfig},
     media::TokenizedMultimodalRequest,
-    observation::{InspectedOutput, ObservationRequest, ObservationSet},
+    observation::ObservationSet,
     PreparationAdmission,
 };
 
@@ -1099,30 +1099,6 @@ pub trait BackendSession<B: BackendProvider> {
     ) -> Result<ObservationSet, B::Error>;
 }
 
-/// Optional named-activation inspection for a selected backend session.
-///
-/// This is a general diagnostics and observability capability. Implementations
-/// execute the requested operation to completion and materialize only selected
-/// observation points. It is intentionally separate from ordinary native
-/// submission so production inference pays no instrumentation cost.
-pub trait InspectableBackendSession<B: BackendProvider>: BackendSession<B> {
-    /// Executes and inspects one prompt prefill operation.
-    fn inspect_prefill(
-        &mut self,
-        backend: &B,
-        input: Self::PrefillInput,
-        request: &ObservationRequest,
-    ) -> Result<InspectedOutput<Self::Output>, B::Error>;
-
-    /// Executes and inspects one cached decode operation.
-    fn inspect_decode(
-        &mut self,
-        backend: &B,
-        input: Self::DecodeInput,
-        request: &ObservationRequest,
-    ) -> Result<InspectedOutput<Self::Output>, B::Error>;
-}
-
 /// One submission produced by the selected backend session.
 pub type SessionSubmission<B> = Submission<
     <<B as BackendProvider>::Session as BackendSession<B>>::Output,
@@ -1262,32 +1238,6 @@ impl<B: BackendProvider> ModelRuntime<B> {
     ) -> Result<ObservationSet, B::Error> {
         self.validate_session_admission()?;
         self.session.observe_output(&self.backend, output)
-    }
-}
-
-impl<B> ModelRuntime<B>
-where
-    B: BackendProvider,
-    B::Session: InspectableBackendSession<B>,
-{
-    /// Executes a completed, explicitly instrumented prefill operation.
-    pub fn inspect_prefill(
-        &mut self,
-        input: <B::Session as BackendSession<B>>::PrefillInput,
-        request: &ObservationRequest,
-    ) -> Result<InspectedOutput<<B::Session as BackendSession<B>>::Output>, B::Error> {
-        self.validate_session_admission()?;
-        self.session.inspect_prefill(&self.backend, input, request)
-    }
-
-    /// Executes a completed, explicitly instrumented decode operation.
-    pub fn inspect_decode(
-        &mut self,
-        input: <B::Session as BackendSession<B>>::DecodeInput,
-        request: &ObservationRequest,
-    ) -> Result<InspectedOutput<<B::Session as BackendSession<B>>::Output>, B::Error> {
-        self.validate_session_admission()?;
-        self.session.inspect_decode(&self.backend, input, request)
     }
 }
 
@@ -1867,6 +1817,7 @@ pub trait TextGenerationBackend: BackendProvider {
     }
 
     /// Returns genuine mutable points for this exact loaded session.
+    #[cfg(feature = "tensor-capture")]
     fn intervention_discovery(
         _runtime: &ModelRuntime<Self>,
     ) -> Result<crate::intervention::InterventionDiscovery, crate::capture::CaptureError> {
@@ -1876,6 +1827,7 @@ pub trait TextGenerationBackend: BackendProvider {
     }
 
     /// Checks both plans without submitting work or changing model/sampler state.
+    #[cfg(feature = "tensor-capture")]
     fn validate_text_interventions(
         runtime: &ModelRuntime<Self>,
         capture: &crate::capture::AdmittedCapturePlan,
@@ -1891,6 +1843,7 @@ pub trait TextGenerationBackend: BackendProvider {
 
     /// Installs immutable plans before the first submission. Diagnostics and
     /// evidence must share capture accounting and ordinary completion ownership.
+    #[cfg(feature = "tensor-capture")]
     fn configure_text_interventions(
         runtime: &ModelRuntime<Self>,
         state: &mut Self::TextGenerationState,
@@ -1902,6 +1855,7 @@ pub trait TextGenerationBackend: BackendProvider {
     }
 
     /// Returns retained admission facts without resolving checkpoint content identity.
+    #[cfg(feature = "tensor-capture")]
     fn capture_declarations(
         _runtime: &ModelRuntime<Self>,
     ) -> Result<crate::capture::CaptureDeclarations, crate::capture::CaptureError> {
@@ -1911,6 +1865,7 @@ pub trait TextGenerationBackend: BackendProvider {
     }
 
     /// Resolves content-exact provenance together with retained observation facts.
+    #[cfg(feature = "tensor-capture")]
     fn capture_discovery(
         _runtime: &ModelRuntime<Self>,
     ) -> Result<crate::capture::CaptureDiscovery, crate::capture::CaptureError> {
@@ -1922,6 +1877,7 @@ pub trait TextGenerationBackend: BackendProvider {
     /// Exact bounds for independently shaped physical forwards. An absent value
     /// selects ordinary causal prefill/decode geometry. This reads retained
     /// executable facts without model work or native allocations.
+    #[cfg(feature = "tensor-capture")]
     fn text_capture_invocation_bounds(
         _runtime: &ModelRuntime<Self>,
         _request: crate::capture::CaptureRequestShape,
@@ -1931,6 +1887,7 @@ pub trait TextGenerationBackend: BackendProvider {
 
     /// Enables an immutable capture plan before the first submission. Implementations
     /// must validate it against this session and reject unsupported combinations.
+    #[cfg(feature = "tensor-capture")]
     fn configure_text_capture(
         _runtime: &ModelRuntime<Self>,
         _state: &mut Self::TextGenerationState,
@@ -1947,6 +1904,7 @@ pub trait TextGenerationBackend: BackendProvider {
 
     /// Validates known capture costs and execution combinations without submitting
     /// native work or advancing sampler state.
+    #[cfg(feature = "tensor-capture")]
     fn validate_text_capture(
         _runtime: &ModelRuntime<Self>,
         plan: &crate::capture::AdmittedCapturePlan,
@@ -1962,6 +1920,7 @@ pub trait TextGenerationBackend: BackendProvider {
 
     /// Moves out at most one completed capture step. No implementation may queue
     /// unconsumed steps without a separately admitted finite buffering contract.
+    #[cfg(feature = "tensor-capture")]
     fn take_text_capture(
         _state: &mut Self::TextGenerationState,
     ) -> Option<crate::capture::CapturedStep> {
@@ -2097,7 +2056,23 @@ pub trait TextGenerationBackend: BackendProvider {
         None
     }
 
-    /// Complete score vocabulary of the selected iterative realization.
+    /// Admits ordered selected scores for the next refinement operation.
+    fn configure_refinement_readout(
+        _runtime: &ModelRuntime<Self>,
+        _state: &mut Self::TextGenerationState,
+        _selections: Vec<crate::refinement::RefinementScoreSelection>,
+    ) -> Result<(), crate::refinement::RefinementReadoutError> {
+        Err(crate::refinement::RefinementReadoutError::Unsupported)
+    }
+
+    /// Drains the selected scores for the completed operation.
+    fn take_refinement_readout(
+        _state: &mut Self::TextGenerationState,
+    ) -> Option<crate::refinement::RefinementScoreRows> {
+        None
+    }
+
+    /// Vocabulary extent for refinement canvas admission.
     fn refinement_vocabulary_size(_runtime: &ModelRuntime<Self>) -> Option<std::num::NonZeroU32> {
         None
     }
@@ -2515,6 +2490,7 @@ where
     }
 
     /// Installs capture while preserving the existing sampling/controller state.
+    #[cfg(feature = "tensor-capture")]
     pub fn enable_capture(
         &mut self,
         plan: crate::capture::AdmittedCapturePlan,
@@ -2534,6 +2510,7 @@ where
     }
 
     /// Installs admitted interventions and captures before ordinary generation.
+    #[cfg(feature = "tensor-capture")]
     pub fn enable_interventions(
         &mut self,
         capture: crate::capture::AdmittedCapturePlan,
@@ -2558,10 +2535,16 @@ where
         )
     }
 
+    /// Establishes exact native completion at the current operation boundary.
+    pub fn settle_step(&mut self) -> Result<(), B::Error> {
+        self.inner.resolve_completions_before_decode()
+    }
+
     /// Establishes exact completion before delivering this step's host captures.
     /// The ordinary machine retains authority and handles errors/drop as before.
+    #[cfg(feature = "tensor-capture")]
     pub fn take_captured_step(&mut self) -> Result<Option<crate::capture::CapturedStep>, B::Error> {
-        self.inner.resolve_completions_before_decode()?;
+        self.settle_step()?;
         Ok(B::take_text_capture(&mut self.inner.backend_state))
     }
 
@@ -4072,7 +4055,10 @@ mod tests {
                 Err(TextContinuationError::NotQuiescent)
             ));
             assert_eq!(state.controller().committed, index + 1);
+            #[cfg(feature = "tensor-capture")]
             assert!(driver.take_completed_step(&mut state).unwrap().is_none());
+            #[cfg(not(feature = "tensor-capture"))]
+            driver.take_completed_step(&mut state).unwrap();
             state.require_quiescent().unwrap();
         }
         assert!(driver.advance(&mut state).unwrap().is_none());

@@ -24,10 +24,12 @@ pub struct ControlledSpeculativeOptions {
     pub trace_limits: TraceLimits,
     /// Admitted raw-logit selections, captured independently for draft and target.
     /// Other activation paths require a backend with phase-aware capture support.
+    #[cfg(feature = "tensor-capture")]
     pub capture: Option<eredu_core::capture::AdmittedCapturePlan>,
     /// Internal forward observations and interventions under one cumulative
     /// invocation budget. Physical sequence positions are independent of the
     /// scheduler's prediction coordinate and the sampler's one-row captures.
+    #[cfg(feature = "tensor-capture")]
     pub activations: Option<eredu_core::speculative::AdmittedSpeculativeActivations>,
     /// Snapshot retention and copying limits. `None` disables snapshots.
     pub snapshots: Option<SnapshotLimits>,
@@ -36,6 +38,7 @@ pub struct ControlledSpeculativeOptions {
 /// One already charged internal record drained after cancellation or a failed
 /// action. Forward completion is separate from speculative token acceptance.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg(feature = "tensor-capture")]
 pub struct ControlledSpeculativeActivation {
     /// Wire version for the delivery envelope.
     pub schema_version: u32,
@@ -57,7 +60,9 @@ impl Default for ControlledSpeculativeOptions {
                 total_bytes: 64 << 20,
             },
             snapshots: None,
+            #[cfg(feature = "tensor-capture")]
             capture: None,
+            #[cfg(feature = "tensor-capture")]
             activations: None,
         }
     }
@@ -132,11 +137,13 @@ pub struct ControlledSpeculativeStep {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sampling: Option<crate::execution_control::SamplingStateFacts>,
     /// Bounded raw-logit captures, including tentative draft and target rows.
+    #[cfg(feature = "tensor-capture")]
     pub captures: Vec<eredu_core::speculative::SpeculativePredictionCapture>,
     /// Internal component evidence from actual forwards in this action. Physical
     /// rows, scheduler coordinates and tentative phases remain distinct. These
     /// records share this step's run/restore identity and transport accounting.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg(feature = "tensor-capture")]
     pub activations: Vec<eredu_core::speculative::SpeculativeActivationCapture>,
     /// Active time to the first committed target token, before its callbacks.
     pub timing: GenerationTiming,
@@ -229,6 +236,7 @@ pub trait ControlledSpeculativeSession {
     }
     /// Replaces future internal edits using authority prepared for this loaded
     /// execution. Capture selections, geometry and allowances remain fixed.
+    #[cfg(feature = "tensor-capture")]
     fn readmit_activation_interventions(
         &mut self,
         plan: eredu_core::speculative::AdmittedSpeculativeActivations,
@@ -273,6 +281,7 @@ pub trait ControlledSpeculativeSession {
     /// Clears a staged choice at a settled boundary.
     fn clear_forced_token(&mut self) -> Result<bool, SpeculativeControlError>;
     /// Replaces future role-specific tensor edits; an empty list removes them.
+    #[cfg(feature = "tensor-capture")]
     fn intervene(
         &mut self,
         plans: Vec<eredu_core::speculative::SpeculativeInterventionPlan>,
@@ -285,6 +294,7 @@ pub trait ControlledSpeculativeSession {
     /// allowed on failed sessions and uses the same cumulative transport budget
     /// as ordinary steps. It never launches or recovers native work. A rejected
     /// delivery is consumed, without refunding capture or invocation allowances.
+    #[cfg(feature = "tensor-capture")]
     fn take_activation_evidence(
         &mut self,
     ) -> Result<Option<ControlledSpeculativeActivation>, SpeculativeControlError>;
@@ -345,7 +355,9 @@ where
     first_token_work: Duration,
     failed: bool,
     vocabulary: usize,
+    #[cfg(feature = "tensor-capture")]
     intervention_discovery: Option<eredu_core::intervention::InterventionDiscovery>,
+    #[cfg(feature = "tensor-capture")]
     activation_discovery: Option<eredu_core::speculative::SpeculativeActivationDiscovery>,
     forecast_profiles: Option<(
         crate::memory_forecast::LoadedMemoryProfile,
@@ -541,7 +553,7 @@ where
                     - stats.discarded_optimistic_tokens(),
             })
         });
-        let mut record = ControlledSpeculativeStep {
+        let record = ControlledSpeculativeStep {
             schema_version: 1,
             sequence: self.sequence,
             epoch: self.epoch,
@@ -554,21 +566,28 @@ where
             forced_token: forced.filter(|_| !committed.is_empty()),
             sampling: self.sampling_state(),
             committed_token_ids: committed,
+            #[cfg(feature = "tensor-capture")]
             captures: Vec::new(),
+            #[cfg(feature = "tensor-capture")]
             activations: Vec::new(),
             timing: self.timing,
             step_seconds: elapsed.as_secs_f64(),
         };
-        record.captures = self
-            .scheduler
-            .requests
-            .request_mut(self.id.expect("submitted request"))
-            .expect("submitted request")
-            .sampler_mut()
-            .take_control_captures();
-        while let Some(capture) = self.scheduler.executor.take_activation_capture() {
-            record.activations.push(capture);
-        }
+        #[cfg(feature = "tensor-capture")]
+        let record = {
+            let mut record = record;
+            record.captures = self
+                .scheduler
+                .requests
+                .request_mut(self.id.expect("submitted request"))
+                .expect("submitted request")
+                .sampler_mut()
+                .take_control_captures();
+            while let Some(capture) = self.scheduler.executor.take_activation_capture() {
+                record.activations.push(capture);
+            }
+            record
+        };
         let local = (|| {
             self.trace.charge(&record)?;
             self.sequence = self
@@ -654,6 +673,7 @@ where
     > {
         self.forecast_inner(additional_tokens, options)
     }
+    #[cfg(feature = "tensor-capture")]
     fn readmit_activation_interventions(
         &mut self,
         plan: eredu_core::speculative::AdmittedSpeculativeActivations,
@@ -777,6 +797,7 @@ where
         request.validate_control_edit()?;
         Ok(request.sampler_mut().control_clear_forced())
     }
+    #[cfg(feature = "tensor-capture")]
     fn intervene(
         &mut self,
         plans: Vec<eredu_core::speculative::SpeculativeInterventionPlan>,
@@ -822,9 +843,12 @@ where
     }
     fn step(&mut self) -> Result<Option<ControlledSpeculativeStep>, SpeculativeControlError> {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.step_inner())) {
-            Ok(mut result) => {
+            Ok(result) => {
+                #[cfg(feature = "tensor-capture")]
+                let mut result = result;
                 if result.is_err() {
                     self.failed = true;
+                    #[cfg(feature = "tensor-capture")]
                     if let Some(error) = self.scheduler.executor.take_activation_error() {
                         result = Err(error);
                     }
@@ -837,6 +861,7 @@ where
             }
         }
     }
+    #[cfg(feature = "tensor-capture")]
     fn take_activation_evidence(
         &mut self,
     ) -> Result<Option<ControlledSpeculativeActivation>, SpeculativeControlError> {
@@ -883,6 +908,7 @@ where
         });
         if result.is_err() {
             self.failed = true;
+            #[cfg(feature = "tensor-capture")]
             if let Some(error) = self.scheduler.executor.take_activation_error() {
                 return Err(error);
             }
@@ -1000,7 +1026,9 @@ pub struct DriveControlledSpeculation<'f, F> {
     drive: F,
     failure: &'f mut Option<SpeculativeControlError>,
     vocabulary: usize,
+    #[cfg(feature = "tensor-capture")]
     intervention_discovery: Option<eredu_core::intervention::InterventionDiscovery>,
+    #[cfg(feature = "tensor-capture")]
     activation_discovery: Option<eredu_core::speculative::SpeculativeActivationDiscovery>,
     forecast_profiles: Option<(
         crate::memory_forecast::LoadedMemoryProfile,
@@ -1021,7 +1049,9 @@ impl<'f, F> DriveControlledSpeculation<'f, F> {
             drive,
             failure,
             vocabulary: 0,
+            #[cfg(feature = "tensor-capture")]
             intervention_discovery: None,
+            #[cfg(feature = "tensor-capture")]
             activation_discovery: None,
             forecast_profiles: None,
         }
@@ -1054,6 +1084,7 @@ impl<F> DriveControlledSpeculation<'_, F> {
         self
     }
     /// Retains authoritative loaded internal discovery for prospective edits.
+    #[cfg(feature = "tensor-capture")]
     pub fn with_activation_discovery(
         mut self,
         discovery: Option<eredu_core::speculative::SpeculativeActivationDiscovery>,
@@ -1062,6 +1093,7 @@ impl<F> DriveControlledSpeculation<'_, F> {
         self
     }
     /// Retains exact loaded capabilities for re-admission of prospective edits.
+    #[cfg(feature = "tensor-capture")]
     pub fn with_intervention_discovery(
         mut self,
         discovery: Option<eredu_core::intervention::InterventionDiscovery>,
@@ -1110,8 +1142,11 @@ where
                 |status| executor.agree_text_preparation(stage, status, context),
                 SpeculativeControlError::backend,
             )?;
-            let mut lane = lanes.pop().expect("checked single lane");
+            let lane = lanes.pop().expect("checked single lane");
+            #[cfg(feature = "tensor-capture")]
+            let mut lane = lane;
             let local = (|| {
+                #[cfg(feature = "tensor-capture")]
                 if let Some(plan) = self.options.activations.clone() {
                     // A fresh single-lane scheduler assigns its first request index zero.
                     executor.configure_activation_capture(
@@ -1120,6 +1155,7 @@ where
                         context,
                     )?;
                 }
+                #[cfg(feature = "tensor-capture")]
                 if let Some(plan) = self.options.capture.clone() {
                     lane.runtime_mut()
                         .sampler_mut()
@@ -1163,9 +1199,12 @@ where
                 first_token_work: Duration::ZERO,
                 failed: false,
                 vocabulary: self.vocabulary,
+                #[cfg(feature = "tensor-capture")]
                 intervention_discovery: self.intervention_discovery,
+                #[cfg(feature = "tensor-capture")]
                 activation_discovery: self.activation_discovery,
                 forecast_profiles: self.forecast_profiles,
+                #[cfg(feature = "tensor-capture")]
                 forecast_instrumented: self
                     .options
                     .capture
@@ -1176,6 +1215,8 @@ where
                         .activations
                         .as_ref()
                         .is_some_and(|a| !a.is_empty()),
+                #[cfg(not(feature = "tensor-capture"))]
+                forecast_instrumented: false,
             };
             let driven = (self.drive)(&mut session);
             if session.failed {

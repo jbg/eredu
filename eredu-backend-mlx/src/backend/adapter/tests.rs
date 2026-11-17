@@ -59,7 +59,7 @@ fn prepared_model_rejects_another_native_device_before_session_reset() {
 
 #[test]
 fn prepared_session_allows_another_stream_but_rejects_another_device_before_work() {
-    use eredu_core::{BackendSession as _, Completion as _, InspectableBackendSession as _};
+    use eredu_core::{BackendSession as _, Completion as _};
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let second = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let other = ExecutionContext::new(Device::new(DeviceType::Cpu, 1));
@@ -100,22 +100,6 @@ fn prepared_session_allows_another_stream_but_rejects_another_device_before_work
     reject(session.submit_token_decode(&replacement, 2).err().unwrap());
     reject(session.prefill(&replacement, input.clone()).err().unwrap());
     reject(session.decode(&replacement, token.clone()).err().unwrap());
-    reject(
-        session
-            .inspect_prefill(
-                &replacement,
-                input.clone(),
-                &eredu_core::ObservationRequest::all(),
-            )
-            .err()
-            .unwrap(),
-    );
-    reject(
-        session
-            .inspect_decode(&replacement, token, &eredu_core::ObservationRequest::all())
-            .err()
-            .unwrap(),
-    );
     reject(
         session
             .save_prompt_cache(

@@ -682,33 +682,6 @@ impl MlxDrafter {
         })
     }
 
-    /// Installs typed production observers for external-assistant tensors and logits.
-    pub fn install_external_observers<TensorObserver, LogitsObserver>(
-        &mut self,
-        tensors: TensorObserver,
-        logits: LogitsObserver,
-    ) -> Result<(), Error>
-    where
-        TensorObserver: eredu_runtime::ActivationObserver<MlxTensor, Exception> + 'static,
-        LogitsObserver: eredu_runtime::ActivationObserver<Array, Exception> + 'static,
-    {
-        if self.is_autoregressive() {
-            return Err(Error::Speculative("independent drafts expose ordinary model observations, not target-feature assistant observations".into()));
-        }
-        let mut operation = self.begin_operation()?;
-        operation
-            .payload()
-            .execution
-            .visit(InstallExternalObservers {
-                observers: Some(
-                    eredu_architectures::external_assistant::ExternalAssistantObservers::new(
-                        tensors, logits,
-                    ),
-                ),
-            });
-        operation.finish(Ok(()))
-    }
-
     /// Materializes an architecture-inspected drafter with proven tokenizer compatibility.
     pub(crate) fn materialize(
         preparation: eredu_architectures::PreparedExternalDraft,
@@ -821,32 +794,6 @@ impl MlxDrafter {
         &self,
     ) -> &eredu_architectures::composite_execution::ExternalPredictionCaptureRequest {
         self.payload.execution.capture()
-    }
-}
-
-struct InstallExternalObservers {
-    observers: Option<
-        eredu_architectures::external_assistant::ExternalAssistantObservers<
-            MlxTensor,
-            Array,
-            Exception,
-        >,
-    >,
-}
-
-impl eredu_architectures::MaterializedExternalAssistantVisitor<MlxAssistantPreparationVisitor>
-    for InstallExternalObservers
-{
-    type Output = ();
-
-    fn visit<A: eredu_architectures::ExternalAssistantArchitecture>(
-        mut self,
-        assistant: &mut MlxExternalAssistant<A>,
-    ) -> Self::Output {
-        assistant.observers = self
-            .observers
-            .take()
-            .expect("external observers are installed exactly once");
     }
 }
 

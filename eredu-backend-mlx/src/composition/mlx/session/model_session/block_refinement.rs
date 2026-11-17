@@ -1,6 +1,7 @@
 //! Native realization of the portable alternating block state machine.
 
 use super::*;
+#[cfg(feature = "tensor-capture")]
 use eredu_core::capture::{CaptureError, CaptureInvocationShape, CapturePhase};
 use eredu_core::refinement::GenerationPhase;
 use eredu_core::{PendingTextInput, TextOperationOutput, TextProgress};
@@ -25,6 +26,7 @@ fn causal_next_logits(scores: Array, stream: &Stream) -> Result<Array, Error> {
 }
 
 impl MlxModelSession {
+    #[cfg(feature = "tensor-capture")]
     pub(super) fn refinement_capture_shape(
         &self,
         sequence: u64,
@@ -298,6 +300,7 @@ impl MlxBackend<'_> {
                         }
                     };
                     let (backend, session) = runtime.parts_mut();
+                    #[cfg(feature = "tensor-capture")]
                     let invocation = prompt.with_borrowed(|input| {
                         let plans = session
                             .payload
@@ -315,7 +318,12 @@ impl MlxBackend<'_> {
                             .refinement_capture_shape(sequence)
                             .map(|shape| (CapturePhase::Prefill, shape))
                     });
-                    match &mut state.capture {
+                    #[cfg(feature = "tensor-capture")]
+                    let capture = state.capture.as_mut();
+                    #[cfg(not(feature = "tensor-capture"))]
+                    let capture = None::<()>;
+                    match capture {
+                        #[cfg(feature = "tensor-capture")]
                         Some(capture) => partition_capture::with_invocation_observer(
                             session,
                             capture,
@@ -331,7 +339,7 @@ impl MlxBackend<'_> {
                                 )
                             },
                         )?,
-                        None => session.submit_prefill_result_with_observer(
+                        _ => session.submit_prefill_result_with_observer(
                             backend,
                             Ok(prompt),
                             None,
@@ -365,11 +373,13 @@ impl MlxBackend<'_> {
                     })
                     .transpose()?;
                 let (backend, session) = runtime.parts_mut();
+                #[cfg(feature = "tensor-capture")]
                 let invocation = session
                     .refinement_capture_shape(u64::from(geometry.canvas_length.get()))
                     .map(|shape| (CapturePhase::Decode, shape));
-                match &mut state.capture {
-                    Some(capture) => partition_capture::with_invocation_observer(
+                #[cfg(feature = "tensor-capture")]
+                let captured = if let Some(capture) = &mut state.capture {
+                    Some(partition_capture::with_invocation_observer(
                         session,
                         capture,
                         &stream,
@@ -383,7 +393,14 @@ impl MlxBackend<'_> {
                                 observer,
                             )
                         },
-                    )?,
+                    )?)
+                } else {
+                    None
+                };
+                #[cfg(not(feature = "tensor-capture"))]
+                let captured = None;
+                match captured {
+                    Some(submission) => submission,
                     None => session.submit_refinement_with_observer(
                         backend,
                         &canvas,
@@ -515,6 +532,13 @@ impl MlxBackend<'_> {
                     block
                         .refine(&scores, &stream)
                         .map_err(eredu_nn::Error::backend_source)?;
+                    if let Some(selections) = state.readout_selection.take() {
+                        state.readout_rows = Some(super::super::score_readout::read_selected(
+                            scores.as_array(),
+                            selections,
+                            &stream,
+                        )?);
+                    }
                     let tentative_token_ids = if state.sampling.draft_events {
                         Some(
                             block
@@ -607,6 +631,7 @@ impl MlxBackend<'_> {
                     .map(|refinement| refinement.canvas().as_array().clone())
                     .unwrap_or_else(|| submission.output.clone()),
             };
+            #[cfg(feature = "tensor-capture")]
             if let Some(capture) = &mut state.capture {
                 capture
                     .set_commitment_boundary(state.sampling.next_prediction)

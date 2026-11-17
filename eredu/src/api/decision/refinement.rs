@@ -1,15 +1,10 @@
 //! Typed decisions evaluated with a pinned refinement canvas.
-use crate::api::{
-    LoadedModel, ObservedGenerationEvent, PreparedChatGenerationSettings, TraceLimits,
-};
+use crate::api::{LoadedModel, PreparedChatGenerationSettings};
 use crate::runtime::chat::ChatTemplateRequest;
 use anyhow::{ensure, Context, Result};
-use eredu_core::{capture::*, refinement::*, GenerationConfigOverrides, TextGenerationBackend};
+use eredu_core::{refinement::*, GenerationConfigOverrides, TextGenerationBackend};
 use serde_json::json;
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    ops::ControlFlow,
-};
+use std::{collections::BTreeSet, ops::ControlFlow};
 
 use super::{DecisionAnswer, DecisionQuestion, DecisionRequest, DecisionResponse, DecisionResult};
 use eredu_core::decision::{ChoiceAnswer, ChoiceProbability};
@@ -46,14 +41,10 @@ fn alternatives(q: &DecisionQuestion) -> Result<(&str, Vec<ChoiceProbability>)> 
     Ok((text, options))
 }
 
-struct Slot {
-    position: u64,
-    ids: Vec<u32>,
-}
 struct Compiled {
     prompt: String,
     canvas: RefinementCanvas,
-    slots: Vec<Slot>,
+    slots: Vec<RefinementScoreSelection>,
 }
 fn compile(
     request: &DecisionRequest,
@@ -88,9 +79,9 @@ fn compile(
             ids.iter().collect::<BTreeSet<_>>().len() == labels.len(),
             "answer labels do not have distinct token IDs"
         );
-        slots.push(Slot {
-            position: (seed.len() + position) as u64,
-            ids,
+        slots.push(RefinementScoreSelection {
+            position: u32::try_from(seed.len() + position)?,
+            token_ids: ids,
         });
         seed.extend(
             first
@@ -209,56 +200,9 @@ pub fn evaluate_refinement<B: TextGenerationBackend>(
         add_generation_prompt: true,
         ..Default::default()
     })?;
-    let count = request.questions.len() as u64;
-    // Row-sized native reductions include the full vocabulary; host output is bounded by selected IDs.
-    let vocabulary = model
-        .capture_declarations()?
-        .catalog
-        .get(eredu_core::MODEL_LOGITS_OBSERVATION_PATH)
-        .and_then(|p| p.axes.as_ref())
-        .and_then(|axes| axes.last())
-        .and_then(|axis| match axis.dimension {
-            eredu_core::SymbolicDimension::Known(n) => Some(n as u64),
-            _ => None,
-        })
-        .context("model score vocabulary is not declared")?;
-    let per_step = CaptureUsage {
-        captures: count,
-        retained_bytes: count * (vocabulary * 32 + (2 << 20)),
-        host_bytes: count * (128 << 10),
-        encoded_bytes: count * (128 << 10),
-    };
-    let plan = CapturePlan {
-        schema_version: CAPTURE_SCHEMA_VERSION,
-        provenance: eredu_core::capture::CaptureProvenance::Session,
-        selections: compiled
-            .slots
-            .iter()
-            .enumerate()
-            .map(|(i, slot)| CaptureSelection {
-                id: format!("slot-{i}"),
-                path: eredu_core::MODEL_LOGITS_OBSERVATION_PATH.into(),
-                schedule: CaptureSchedule {
-                    prefill: false,
-                    ..Default::default()
-                },
-                slices: vec![],
-                transform: CaptureTransform::TokenScores {
-                    position: Some(slot.position),
-                    token_ids: slot.ids.clone(),
-                },
-            })
-            .collect(),
-        limits: CaptureLimits {
-            per_step,
-            cumulative: per_step.checked_mul(u64::from(steps) + 2)?,
-            physical_native_bytes: None,
-            on_limit: CaptureLimitPolicy::Fail,
-        },
-    };
     let seed = request.seed.unwrap_or_default();
     let prepared = model
-        .prepare_observed_chat(
+        .prepare_controlled_chat(
             &chat,
             PreparedChatGenerationSettings {
                 overrides: GenerationConfigOverrides {
@@ -278,34 +222,9 @@ pub fn evaluate_refinement<B: TextGenerationBackend>(
                 }),
                 ..Default::default()
             },
-            plan,
-            TraceLimits {
-                per_record_bytes: count * (256 << 10) + (1 << 20),
-                total_bytes: (count * (256 << 10) + (1 << 20)) * (u64::from(steps) + 8),
-            },
         )?
         .with_refinement_canvas(compiled.canvas);
-    let mut latest = BTreeMap::new();
-    let mut iteration = 0;
-    let mut collect = |record: crate::api::ControlledGenerationRecord| {
-        if let ObservedGenerationEvent::Progress {
-            progress,
-            captures: Some(step),
-            ..
-        } = record.generation.event
-        {
-            if progress.phase == GenerationPhase::Refinement {
-                iteration = progress.iteration;
-                latest.clear();
-                for capture in step.records {
-                    if let Some(CapturePayload::TokenScores(scores)) = capture.payload {
-                        latest.insert(capture.selection_id, scores);
-                    }
-                }
-            }
-        }
-        ControlFlow::Continue(())
-    };
+    let mut collect = |_| ControlFlow::Continue(());
     let prompt_tokens = prepared.prompt_token_ids().len();
     let mut session = model.start_controlled(
         prepared,
@@ -315,33 +234,31 @@ pub fn evaluate_refinement<B: TextGenerationBackend>(
         crate::api::OutputMode::Text,
     )?;
     session.step(&mut collect)?;
-    for _ in 0..steps {
+    for _ in 1..steps {
         session.step(&mut collect)?;
     }
+    let rows = session.step_with_refinement_readout(compiled.slots.clone(), &mut collect)?;
+    let iteration = session.position().iteration;
     session.cancel(&mut collect)?;
 
     ensure!(
         iteration == steps,
         "refinement ended before the requested readout"
     );
+    ensure!(
+        rows.len() == request.questions.len(),
+        "missing requested refinement score rows"
+    );
     let mut answers = Vec::new();
-    for (i, question) in request.questions.iter().enumerate() {
-        let row = latest
-            .get(&format!("slot-{i}"))
-            .context("missing requested position score capture")?;
+    for ((row, selection), question) in rows.iter().zip(&compiled.slots).zip(&request.questions) {
         ensure!(
-            row.scores
-                .iter()
-                .map(|s| s.target.token_id)
-                .eq(compiled.slots[i].ids.iter().copied()),
-            "capture token IDs differ from requested alternatives"
+            row.iter()
+                .map(|score| score.token_id)
+                .eq(selection.token_ids.iter().copied()),
+            "selected refinement scores differ from the requested token IDs"
         );
-        let scores: Vec<_> = row
-            .scores
-            .iter()
-            .map(|s| f64::from(s.target.score))
-            .collect();
-        let label_mass: f64 = row.scores.iter().map(|s| s.log_probability.exp()).sum();
+        let scores: Vec<_> = row.iter().map(|s| f64::from(s.score)).collect();
+        let label_mass: f64 = row.iter().map(|s| s.log_probability.exp()).sum();
         ensure!(label_mass.is_finite(), "invalid full-vocabulary label mass");
         answers.push(DecisionResult {
             id: question.id.clone(),

@@ -1,5 +1,6 @@
 //! Shared lifecycle integration for globally admitted partition observations.
 use super::*;
+#[cfg(feature = "tensor-capture")]
 use eredu_core::{Completion, DistributedCommitEpoch};
 
 /// Architecture-owned producers and all ranks that execute the actual hook.
@@ -40,6 +41,7 @@ pub struct PartitionRoutedCapturePlacement {
 /// Cold semantic projection supplied by the retained architecture selection.
 /// Runtime owns admission and native work; implementations declare only where
 /// this exact invocation executes and how its local scalar coordinates map.
+#[cfg(feature = "tensor-capture")]
 pub trait PartitionCaptureLayout {
     /// Projects an explicitly shaped invocation through retained architecture
     /// ownership. Implementations must preserve the original admitted plan.
@@ -111,6 +113,7 @@ pub trait PartitionCaptureLayout {
 
 /// Observer failures retain both typed capture errors and native transport causes.
 #[derive(Debug, thiserror::Error)]
+#[cfg(feature = "tensor-capture")]
 pub enum PartitionCaptureObserverError<E: std::error::Error + 'static> {
     /// Producer transform, factory admission, or ordinary capture policy failed.
     #[error(transparent)]
@@ -123,12 +126,14 @@ pub enum PartitionCaptureObserverError<E: std::error::Error + 'static> {
     HookRejected,
 }
 
+#[cfg(feature = "tensor-capture")]
 impl<E: std::error::Error + 'static> From<CaptureError> for PartitionCaptureObserverError<E> {
     fn from(error: CaptureError) -> Self {
         Self::Capture(CaptureExecutionError::Admission(error))
     }
 }
 
+#[cfg(feature = "tensor-capture")]
 struct Selection<'a, T: PartitionCaptureHookTransport> {
     work: SessionPartitionCapture<'a, T>,
     hook: Option<SessionPartitionHook<'a, T>>,
@@ -136,16 +141,19 @@ struct Selection<'a, T: PartitionCaptureHookTransport> {
     routed: Option<RoutedSelection>,
 }
 
+#[cfg(feature = "tensor-capture")]
 struct RoutedSelection {
     routing: String,
     effective: bool,
     ownership: Option<RoutedUnitCaptureOwnership>,
 }
 
+#[cfg(feature = "tensor-capture")]
 mod routed;
 
 // Static adapters let capture-only backends retain the ordinary observer. Native
 // composition explicitly supplies the stronger activation mechanism and layout.
+#[cfg(feature = "tensor-capture")]
 struct InterventionCallbacks<B: CaptureBackend, T: PartitionCaptureHookTransport, L> {
     begin_routed: fn(
         &mut CaptureSession,
@@ -187,6 +195,7 @@ struct InterventionCallbacks<B: CaptureBackend, T: PartitionCaptureHookTransport
 /// and final commit callbacks. It performs no world collective from a local hook.
 /// Native composition provides retained transport, architecture layout, estimates
 /// and error conversion. Construction submits and reserves nothing.
+#[cfg(feature = "tensor-capture")]
 pub struct PartitionCaptureObserver<
     'a,
     B: CaptureBackend,
@@ -214,6 +223,7 @@ pub struct PartitionCaptureObserver<
     routed_error: Option<&'a dyn Fn(eredu_nn::Error) -> eredu_nn::Error>,
 }
 
+#[cfg(feature = "tensor-capture")]
 impl<'a, B: CaptureBackend, T: PartitionCaptureHookTransport, L, N, F>
     PartitionCaptureObserver<'a, B, T, L, N, F>
 {
@@ -296,6 +306,7 @@ impl<'a, B: CaptureBackend, T: PartitionCaptureHookTransport, L, N, F>
     }
 }
 
+#[cfg(feature = "tensor-capture")]
 impl<B, T, L, N, F, E> crate::ActivationObserver<B::Tensor, E>
     for PartitionCaptureObserver<'_, B, T, L, N, F>
 where

@@ -177,10 +177,11 @@ fn fixture_value(key: &str, index: usize) -> f32 {
 }
 
 fn sampled_conformance(root: &Path, routed: bool) {
-    use eredu_core::{
-        capture::*, intervention::*, GenerationConfigOverrides, TextGenerationConfig,
-        TextGenerationDriver,
-    };
+    #[cfg(feature = "tensor-capture")]
+    use eredu_core::{capture::*, intervention::*};
+    #[cfg(not(feature = "tensor-capture"))]
+    let _ = routed;
+    use eredu_core::{GenerationConfigOverrides, TextGenerationConfig, TextGenerationDriver};
     use eredu_evaluation::execution_control::{
         continuation_conformance, forced_choice_conformance, sampling_override_conformance,
         ContinuationFixtureLimits,
@@ -188,98 +189,107 @@ fn sampled_conformance(root: &Path, routed: bool) {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
     for adaptive in [false, true] {
         // Ordinary, capture-only, intervention-only and combined shared owners.
-        for mode in 0..4 {
+        #[cfg(feature = "tensor-capture")]
+        let modes = 0..4;
+        #[cfg(not(feature = "tensor-capture"))]
+        let modes = 0..1;
+        for _mode in modes {
             let mut runtime = load(root, &stream);
-            let discovery = Backend::capture_discovery(&runtime).unwrap();
-            let intervention_discovery = Backend::intervention_discovery(&runtime).unwrap();
-            let usage = CaptureUsage {
-                captures: 10_000,
-                retained_bytes: 32_000_000,
-                host_bytes: 32_000_000,
-                encoded_bytes: 32_000_000,
-            };
-            let request = CaptureRequestShape {
-                batch: 1,
-                prompt_tokens: 2,
-                max_predictions: 20,
-            };
-            let capture = CapturePlan {
-                schema_version: eredu_core::capture::CAPTURE_SCHEMA_VERSION,
-                provenance: eredu_core::capture::CaptureProvenance::ContentExact,
-                selections: if mode & 1 != 0 {
-                    vec![CaptureSelection {
-                        id: "raw-logits".into(),
-                        path: eredu_core::MODEL_LOGITS_OBSERVATION_PATH.into(),
-                        schedule: CaptureSchedule::default(),
+            #[cfg(feature = "tensor-capture")]
+            let (capture, intervention, usage) = {
+                let mode = _mode;
+                let discovery = Backend::capture_discovery(&runtime).unwrap();
+                let intervention_discovery = Backend::intervention_discovery(&runtime).unwrap();
+                let usage = CaptureUsage {
+                    captures: 10_000,
+                    retained_bytes: 32_000_000,
+                    host_bytes: 32_000_000,
+                    encoded_bytes: 32_000_000,
+                };
+                let request = CaptureRequestShape {
+                    batch: 1,
+                    prompt_tokens: 2,
+                    max_predictions: 20,
+                };
+                let capture = CapturePlan {
+                    schema_version: eredu_core::capture::CAPTURE_SCHEMA_VERSION,
+                    provenance: eredu_core::capture::CaptureProvenance::ContentExact,
+                    selections: if mode & 1 != 0 {
+                        vec![CaptureSelection {
+                            id: "raw-logits".into(),
+                            path: eredu_core::MODEL_LOGITS_OBSERVATION_PATH.into(),
+                            schedule: CaptureSchedule::default(),
+                            slices: vec![],
+                            transform: CaptureTransform::TopCandidates { count: 4 },
+                        }]
+                    } else {
+                        vec![]
+                    },
+                    limits: CaptureLimits {
+                        per_step: usage,
+                        cumulative: usage,
+                        physical_native_bytes: None,
+                        on_limit: CaptureLimitPolicy::Fail,
+                    },
+                }
+                .admit(
+                    &discovery.catalog,
+                    &discovery.support,
+                    &discovery.support.capture,
+                    request,
+                )
+                .unwrap();
+                let mut operations = if mode & 2 != 0 {
+                    vec![InterventionOperation {
+                        id: "future-scale".into(),
+                        target: eredu_core::MODEL_LOGITS_OBSERVATION_PATH.into(),
+                        schedule: CaptureSchedule {
+                            first_prediction: 2,
+                            every: 2,
+                            prefill: false,
+                            ..Default::default()
+                        },
                         slices: vec![],
-                        transform: CaptureTransform::TopCandidates { count: 4 },
+                        action: InterventionAction::Scale {
+                            dtype: InterventionDtype::Float32,
+                            factor: 0.8,
+                        },
+                        evidence: InterventionEvidence::Preview { max_elements: 2 },
                     }]
                 } else {
                     vec![]
-                },
-                limits: CaptureLimits {
-                    per_step: usage,
-                    cumulative: usage,
-                    physical_native_bytes: None,
-                    on_limit: CaptureLimitPolicy::Fail,
-                },
-            }
-            .admit(
-                &discovery.catalog,
-                &discovery.support,
-                &discovery.support.capture,
-                request,
-            )
-            .unwrap();
-            let mut operations = if mode & 2 != 0 {
-                vec![InterventionOperation {
-                    id: "future-scale".into(),
-                    target: eredu_core::MODEL_LOGITS_OBSERVATION_PATH.into(),
-                    schedule: CaptureSchedule {
-                        first_prediction: 2,
-                        every: 2,
-                        prefill: false,
-                        ..Default::default()
-                    },
-                    slices: vec![],
-                    action: InterventionAction::Scale {
-                        dtype: InterventionDtype::Float32,
-                        factor: 0.8,
-                    },
-                    evidence: InterventionEvidence::Preview { max_elements: 2 },
-                }]
-            } else {
-                vec![]
+                };
+                if routed && mode & 2 != 0 {
+                    let point = intervention_discovery
+                        .points
+                        .iter()
+                        .find(|p| p.routing.is_some())
+                        .expect("fixture must expose real routing");
+                    operations.push(InterventionOperation {
+                        id: "future-route".into(),
+                        target: point.path.clone(),
+                        schedule: CaptureSchedule {
+                            first_prediction: 2,
+                            every: 2,
+                            prefill: false,
+                            ..Default::default()
+                        },
+                        slices: vec![],
+                        action: InterventionAction::ForceExperts {
+                            shape: [1, 1],
+                            expert_ids: vec![1],
+                        },
+                        evidence: InterventionEvidence::Preview { max_elements: 2 },
+                    });
+                }
+                let intervention = InterventionPlan {
+                    schema_version: eredu_core::intervention::INTERVENTION_SCHEMA_VERSION,
+                    operations,
+                }
+                .admit(&intervention_discovery, request, "native-snapshot-root")
+                .unwrap();
+                (capture, intervention, usage)
             };
-            if routed && mode & 2 != 0 {
-                let point = intervention_discovery
-                    .points
-                    .iter()
-                    .find(|p| p.routing.is_some())
-                    .expect("fixture must expose real routing");
-                operations.push(InterventionOperation {
-                    id: "future-route".into(),
-                    target: point.path.clone(),
-                    schedule: CaptureSchedule {
-                        first_prediction: 2,
-                        every: 2,
-                        prefill: false,
-                        ..Default::default()
-                    },
-                    slices: vec![],
-                    action: InterventionAction::ForceExperts {
-                        shape: [1, 1],
-                        expert_ids: vec![1],
-                    },
-                    evidence: InterventionEvidence::Preview { max_elements: 2 },
-                });
-            }
-            let intervention = InterventionPlan {
-                schema_version: eredu_core::intervention::INTERVENTION_SCHEMA_VERSION,
-                operations,
-            }
-            .admit(&intervention_discovery, request, "native-snapshot-root")
-            .unwrap();
             let config = TextGenerationConfig::new(
                 eredu_core::resolve_generation_config(
                     None,
@@ -305,7 +315,7 @@ fn sampled_conformance(root: &Path, routed: bool) {
             };
             let prompt = Backend::prepare_text_prompt(runtime.backend(), vec![1, 2]).unwrap();
             let mut driver = TextGenerationDriver::new(&mut runtime);
-            let mut state = driver
+            let state = driver
                 .start(
                     prompt,
                     config,
@@ -315,9 +325,14 @@ fn sampled_conformance(root: &Path, routed: bool) {
                     ),
                 )
                 .unwrap();
-            driver
-                .enable_interventions(&mut state, capture, intervention)
-                .unwrap();
+            #[cfg(feature = "tensor-capture")]
+            let state = {
+                let mut state = state;
+                driver
+                    .enable_interventions(&mut state, capture, intervention)
+                    .unwrap();
+                state
+            };
             let mut state = eredu_runtime::execution_control::ManagedTextContinuation::root(state);
             let limits = ContinuationFixtureLimits {
                 host_bytes: 4096,
@@ -325,6 +340,9 @@ fn sampled_conformance(root: &Path, routed: bool) {
                 // one MiB also bounds its remaining scalar/history growth.
                 growth_bytes: 1_048_576,
                 max_predictions: 20,
+                #[cfg(not(feature = "tensor-capture"))]
+                capture: None,
+                #[cfg(feature = "tensor-capture")]
                 capture: Some(CaptureLimits {
                     per_step: usage,
                     cumulative: usage,

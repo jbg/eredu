@@ -58,11 +58,12 @@ impl MlxModel {
                     .partition_parameter_description()
                     .cloned(),
             )
-            .and_then(|discovery| {
-                discovery.bind_partition_observation_hooks(
-                    self.executable.erased().partition_observation_hooks(),
-                )
-            })
+            .map_err(|error| Error::Other(Box::new(error)))?;
+        #[cfg(feature = "tensor-capture")]
+        let discovery = discovery
+            .bind_partition_observation_hooks(
+                self.executable.erased().partition_observation_hooks(),
+            )
             .map_err(|error| Error::Other(Box::new(error)))?;
         if let Some(target) = self.executable.erased_mut().external_prediction_mut() {
             target.bind_target_discovery(std::sync::Arc::new(discovery.clone()));

@@ -182,7 +182,7 @@ impl HyperHead {
     }
 
     /// Borrows the coefficients already consumed by the ordinary final sum.
-    pub fn forward_with_coefficients_observer(
+    pub(crate) fn forward_with_coefficients_observer(
         &mut self,
         residual: &Array,
         stream: &Stream,

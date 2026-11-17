@@ -210,6 +210,7 @@ pub trait SharedBackboneMechanisms: AutoregressiveMechanisms {
     type ActivationTensor;
 
     /// Binds explicitly admitted authority before any sequence work starts.
+    #[cfg(feature = "tensor-capture")]
     fn activation_observer(
         plan: &eredu_core::speculative::AdmittedSpeculativeActivations,
         _request: eredu_core::SpeculativeRequestId,
@@ -389,6 +390,7 @@ pub struct SharedBackboneSeed<C, O, R, F> {
     options: O,
     randomness: R,
     refinement_randomness: R,
+    #[cfg(feature = "tensor-capture")]
     activations: Option<crate::capture::SpeculativeActivationCheckpoint>,
     refinement: Option<F>,
 }
@@ -399,6 +401,7 @@ impl<C: Clone, O: Clone, R: Clone, F: Clone> Clone for SharedBackboneSeed<C, O, 
             options: self.options.clone(),
             randomness: self.randomness.clone(),
             refinement_randomness: self.refinement_randomness.clone(),
+            #[cfg(feature = "tensor-capture")]
             activations: self.activations.clone(),
             refinement: self.refinement.clone(),
         }
@@ -427,10 +430,13 @@ impl<O, R> SharedBackboneProposal<O, R> {
 pub struct SharedBackboneExecutor<'a, M: SharedBackboneMechanisms> {
     model: &'a mut M::Model,
     capacity: std::num::NonZeroUsize,
+    #[cfg(feature = "tensor-capture")]
     observer: Option<
         Box<dyn crate::inspection::SpeculativeActivationObserver<M::ActivationTensor, M::Error>>,
     >,
+    #[cfg(feature = "tensor-capture")]
     execution_started: bool,
+    #[cfg(feature = "tensor-capture")]
     observation_configured: bool,
 }
 
@@ -441,8 +447,11 @@ impl<'a, M: SharedBackboneMechanisms> SharedBackboneExecutor<'a, M> {
         Self {
             model,
             capacity,
+            #[cfg(feature = "tensor-capture")]
             observer: None,
+            #[cfg(feature = "tensor-capture")]
             execution_started: false,
+            #[cfg(feature = "tensor-capture")]
             observation_configured: false,
         }
     }
@@ -461,6 +470,7 @@ impl<'a, M: SharedBackboneMechanisms> SharedBackboneExecutor<'a, M> {
             options,
             randomness,
             refinement_randomness,
+            #[cfg(feature = "tensor-capture")]
             activations: None,
             refinement: None,
         }
@@ -472,6 +482,7 @@ impl<'a, M: SharedBackboneMechanisms> SharedBackboneExecutor<'a, M> {
 }
 
 impl<M: SharedBackboneMechanisms> SpeculativeExecutor for SharedBackboneExecutor<'_, M> {
+    #[cfg(feature = "tensor-capture")]
     fn configure_activation_capture<'context>(
         &mut self,
         plan: eredu_core::speculative::AdmittedSpeculativeActivations,
@@ -490,9 +501,11 @@ impl<M: SharedBackboneMechanisms> SpeculativeExecutor for SharedBackboneExecutor
         self.observation_configured = true;
         Ok(())
     }
+    #[cfg(feature = "tensor-capture")]
     fn requires_activation_origin(&self) -> bool {
         self.observer.is_some()
     }
+    #[cfg(feature = "tensor-capture")]
     fn set_activation_origin(
         &mut self,
         origin: Option<eredu_core::speculative::SpeculativeActivationOrigin>,
@@ -501,16 +514,19 @@ impl<M: SharedBackboneMechanisms> SpeculativeExecutor for SharedBackboneExecutor
             observer.set_activation_origin(origin);
         }
     }
+    #[cfg(feature = "tensor-capture")]
     fn take_activation_capture(
         &mut self,
     ) -> Option<eredu_core::speculative::SpeculativeActivationCapture> {
         self.observer.as_mut()?.take_activation_capture()
     }
+    #[cfg(feature = "tensor-capture")]
     fn take_activation_error(
         &mut self,
     ) -> Option<eredu_core::speculative::SpeculativeControlError> {
         self.observer.as_mut()?.take_activation_error()
     }
+    #[cfg(feature = "tensor-capture")]
     fn readmit_activation_interventions(
         &mut self,
         plan: eredu_core::speculative::AdmittedSpeculativeActivations,
@@ -596,7 +612,10 @@ impl<M: SharedBackboneMechanisms> SpeculativeExecutor for SharedBackboneExecutor
     where
         Self: 'a,
     {
-        self.execution_started = true;
+        #[cfg(feature = "tensor-capture")]
+        {
+            self.execution_started = true;
+        }
         M::refine(
             self.model,
             &state.prefix,
@@ -607,9 +626,12 @@ impl<M: SharedBackboneMechanisms> SpeculativeExecutor for SharedBackboneExecutor
             &mut state.refinement_randomness,
             &mut state.refinement,
             context,
+            #[cfg(feature = "tensor-capture")]
             self.observer.as_mut().map(|observer| {
                 &mut **observer as &mut dyn crate::inspection::SpeculativeActivationObserver<_, _>
             }),
+            #[cfg(not(feature = "tensor-capture"))]
+            None,
         )
     }
     fn verification_policy(&self) -> eredu_core::speculative::SpeculativeVerificationPolicy {
@@ -648,15 +670,21 @@ impl<M: SharedBackboneMechanisms> SpeculativeExecutor for SharedBackboneExecutor
     where
         Self: 'context,
     {
-        self.execution_started = true;
+        #[cfg(feature = "tensor-capture")]
+        {
+            self.execution_started = true;
+        }
         let (output, count) = M::prefill_observed(
             self.model,
             &input.input,
             cache,
             context,
+            #[cfg(feature = "tensor-capture")]
             self.observer.as_mut().map(|observer| {
                 &mut **observer as &mut dyn crate::inspection::SpeculativeActivationObserver<_, _>
             }),
+            #[cfg(not(feature = "tensor-capture"))]
+            None,
         )?;
         if count == 0 {
             return Err(M::invalid(
@@ -670,6 +698,7 @@ impl<M: SharedBackboneMechanisms> SpeculativeExecutor for SharedBackboneExecutor
                 randomness: input.randomness,
                 refinement_randomness: input.refinement_randomness,
                 options: input.options,
+                #[cfg(feature = "tensor-capture")]
                 activations: None,
                 refinement: None,
             },
@@ -690,7 +719,10 @@ impl<M: SharedBackboneMechanisms> SpeculativeExecutor for SharedBackboneExecutor
         if capacity > self.capacity.get() {
             return Err(M::invalid("invalid shared-backbone proposal capacity"));
         }
-        self.execution_started = true;
+        #[cfg(feature = "tensor-capture")]
+        {
+            self.execution_started = true;
+        }
         let mut randomness = seed.randomness.clone();
         let tokens = if capacity == 0 {
             Vec::new()
@@ -703,10 +735,13 @@ impl<M: SharedBackboneMechanisms> SpeculativeExecutor for SharedBackboneExecutor
                 &seed.options,
                 &mut randomness,
                 context,
+                #[cfg(feature = "tensor-capture")]
                 self.observer.as_mut().map(|observer| {
                     &mut **observer
                         as &mut dyn crate::inspection::SpeculativeActivationObserver<_, _>
                 }),
+                #[cfg(not(feature = "tensor-capture"))]
+                None,
             )?
         };
         if tokens.len() != capacity {
@@ -778,16 +813,22 @@ impl<M: SharedBackboneMechanisms> SpeculativeExecutor for SharedBackboneExecutor
         if tokens.is_empty() {
             return Err(M::invalid("invalid shared-backbone verification width"));
         }
-        self.execution_started = true;
+        #[cfg(feature = "tensor-capture")]
+        {
+            self.execution_started = true;
+        }
         let output = M::decode_observed(
             self.model,
             tokens,
             cache,
             AutoregressivePass::Verification,
             context,
+            #[cfg(feature = "tensor-capture")]
             self.observer.as_mut().map(|observer| {
                 &mut **observer as &mut dyn crate::inspection::SpeculativeActivationObserver<_, _>
             }),
+            #[cfg(not(feature = "tensor-capture"))]
+            None,
         )?;
         let completion = M::completion(&output, context)?;
         Ok(Submission {
@@ -836,10 +877,13 @@ impl<M: SharedBackboneMechanisms> SpeculativeExecutor for SharedBackboneExecutor
                 &mut accepted,
                 AutoregressivePass::TargetCommit,
                 context,
+                #[cfg(feature = "tensor-capture")]
                 self.observer.as_mut().map(|observer| {
                     &mut **observer
                         as &mut dyn crate::inspection::SpeculativeActivationObserver<_, _>
                 }),
+                #[cfg(not(feature = "tensor-capture"))]
+                None,
             )?;
             *cache = accepted;
             verified
@@ -852,6 +896,7 @@ impl<M: SharedBackboneMechanisms> SpeculativeExecutor for SharedBackboneExecutor
                 randomness: draft.randomness,
                 refinement_randomness: draft.refinement_randomness,
                 options: draft.options,
+                #[cfg(feature = "tensor-capture")]
                 activations: None,
                 refinement: None,
             },
@@ -922,10 +967,13 @@ impl<M: SharedBackboneMechanisms> SpeculativeExecutor for SharedBackboneExecutor
         cache: &Self::Cache,
         seed: &Self::TargetState,
     ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
+        #[cfg(feature = "tensor-capture")]
         let authority = self
             .observer
             .as_ref()
             .map_or(Some(0), |observer| observer.activation_checkpoint_bytes())?;
+        #[cfg(not(feature = "tensor-capture"))]
+        let authority = 0;
         let cache = M::estimate_state(cache)?;
         let randomness = M::proposal_randomness_bytes(&seed.randomness)?
             .checked_add(M::proposal_randomness_bytes(&seed.refinement_randomness)?)?;
@@ -968,11 +1016,14 @@ impl<M: SharedBackboneMechanisms> SpeculativeExecutor for SharedBackboneExecutor
         Self: 'context,
     {
         let mut seed = seed.clone();
-        seed.activations = self
-            .observer
-            .as_ref()
-            .map(|observer| observer.activation_checkpoint())
-            .transpose()?;
+        #[cfg(feature = "tensor-capture")]
+        {
+            seed.activations = self
+                .observer
+                .as_ref()
+                .map(|observer| observer.activation_checkpoint())
+                .transpose()?;
+        }
         Ok(Some((
             M::checkpoint(cache)
                 .map_err(eredu_core::speculative::SpeculativeControlError::backend)?,
@@ -989,6 +1040,7 @@ impl<M: SharedBackboneMechanisms> SpeculativeExecutor for SharedBackboneExecutor
     where
         Self: 'context,
     {
+        #[cfg(feature = "tensor-capture")]
         let prepared = match (self.observer.as_mut(), seed.activations.as_ref()) {
             (Some(observer), Some(saved)) => Some(observer.prepare_activation_restore(saved)?),
             (None, None) => None,
@@ -1001,11 +1053,15 @@ impl<M: SharedBackboneMechanisms> SpeculativeExecutor for SharedBackboneExecutor
         let replacement = M::restore(saved, context)
             .map_err(eredu_core::speculative::SpeculativeControlError::backend)?;
         *cache = replacement;
+        #[cfg(feature = "tensor-capture")]
         if let Some(prepared) = prepared {
             prepared.commit();
         }
         let mut seed = seed.clone();
-        seed.activations = None;
+        #[cfg(feature = "tensor-capture")]
+        {
+            seed.activations = None;
+        }
         Ok(Some(seed))
     }
 }

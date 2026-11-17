@@ -18,6 +18,9 @@ include = [
     "LICENSE-APACHE",
 ]
 
+[features]
+tensor-capture = ["eredu-core/tensor-capture", "eredu-runtime/tensor-capture", "eredu-architectures/tensor-capture"]
+
 [lints]
 workspace = true
 

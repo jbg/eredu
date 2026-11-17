@@ -322,6 +322,7 @@ pub use prediction_plan::PreparedPredictionExecution;
 mod graph;
 mod observations;
 mod resources;
+#[cfg(feature = "tensor-capture")]
 pub use observations::{PredictionDiscovery, PredictionObservationBinding};
 pub use resources::TargetResourceReport;
 
@@ -443,4 +444,5 @@ pub use conditional_partition::{
     SelectedConditionalPartitionExecution,
 };
 
+#[cfg(feature = "tensor-capture")]
 pub(crate) use graph::join_prediction_descriptor;

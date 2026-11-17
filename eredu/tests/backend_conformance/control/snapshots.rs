@@ -1,6 +1,8 @@
 use super::*;
 use eredu_core::PendingTextInput;
-use eredu_runtime::{capture::CaptureSession, execution_control::TextSnapshotBackend};
+#[cfg(feature = "tensor-capture")]
+use eredu_runtime::capture::CaptureSession;
+use eredu_runtime::execution_control::TextSnapshotBackend;
 
 // This semantic fixture has no persistent model tensors: its model continuation
 // retains only the consumed-input position and pending canonical input. Native storage conformance runs separately
@@ -123,9 +125,13 @@ impl TextSnapshotBackend for MockBackend {
     }
     fn assemble_generation_state(
         sampling: Sampling,
-        capture: Option<CaptureSession>,
+        #[cfg(feature = "tensor-capture")] capture: Option<CaptureSession>,
     ) -> observed_mock::State {
-        observed_mock::State { sampling, capture }
+        observed_mock::State {
+            sampling,
+            #[cfg(feature = "tensor-capture")]
+            capture,
+        }
     }
     fn sampling_prediction(sampling: &Sampling) -> u64 {
         sampling.prediction
@@ -175,12 +181,15 @@ impl TextSnapshotBackend for MockBackend {
             PendingTextInput::Continue => PendingTextInput::Continue,
         }))
     }
+    #[cfg(feature = "tensor-capture")]
     fn capture_run(state: &observed_mock::State) -> Option<&CaptureSession> {
         state.capture.as_ref()
     }
+    #[cfg(feature = "tensor-capture")]
     fn capture_run_mut(state: &mut observed_mock::State) -> Option<&mut CaptureSession> {
         state.capture.as_mut()
     }
+    #[cfg(feature = "tensor-capture")]
     fn estimate_child_capture(
         _: &ModelRuntime<Self>,
         shape: &[u64],
@@ -189,6 +198,7 @@ impl TextSnapshotBackend for MockBackend {
     ) -> Result<eredu_core::capture::CaptureUsage, eredu_core::capture::CaptureError> {
         observed_mock::cost(shape)
     }
+    #[cfg(feature = "tensor-capture")]
     fn child_intervention_estimator(
         _: &ModelRuntime<Self>,
     ) -> Result<
@@ -254,6 +264,7 @@ fn snapshot_limits() -> SnapshotLimits {
     }
 }
 
+#[cfg(feature = "tensor-capture")]
 #[test]
 fn facade_complete_snapshots_restore_partial_unicode_terminal_state_and_cumulative_budgets() {
     for mode in 0..4 {
@@ -394,9 +405,7 @@ fn facade_complete_snapshots_restore_partial_unicode_terminal_state_and_cumulati
 fn opaque_grammar_estimates_fail_before_snapshot_retention() {
     let (mut model, chat, settings, _) =
         snapshot_setup_with_tool_choice(eredu::runtime::chat::ToolChoice::Auto);
-    let prepared = model
-        .prepare_observed_chat(&chat, settings, CapturePlan::none(), limits())
-        .unwrap();
+    let prepared = model.prepare_controlled_chat(&chat, settings).unwrap();
     let mut session = model
         .start_controlled(
             prepared,
@@ -425,6 +434,7 @@ fn collect(
     }
 }
 
+#[cfg(feature = "tensor-capture")]
 #[test]
 fn facade_branches_keep_partial_text_identity_siblings_and_budgets_isolated() {
     use eredu::api::{GenerationBranchOptions, SamplingOverride};
@@ -456,8 +466,10 @@ fn facade_branches_keep_partial_text_identity_siblings_and_budgets_isolated() {
                 per_record_bytes: 16384,
                 total_bytes: 65536,
             },
+            #[cfg(feature = "tensor-capture")]
             capture_limits: Some(observed_mock::plan().limits),
             sampling: None,
+            #[cfg(feature = "tensor-capture")]
             intervention: None,
         };
         let mut records = vec![];
@@ -585,9 +597,7 @@ fn facade_branches_keep_partial_text_identity_siblings_and_budgets_isolated() {
 fn facade_snapshot_preserves_pending_choice_and_child_stream_includes_semantic_prefix() {
     use eredu::api::GenerationBranchOptions;
     let (mut model, chat, settings, first) = snapshot_setup();
-    let prepared = model
-        .prepare_observed_chat(&chat, settings, CapturePlan::none(), limits())
-        .unwrap();
+    let prepared = model.prepare_controlled_chat(&chat, settings).unwrap();
     let mut records = vec![];
     let mut run = model
         .start_controlled(
@@ -623,8 +633,10 @@ fn facade_snapshot_preserves_pending_choice_and_child_stream_includes_semantic_p
                     per_record_bytes: 16384,
                     total_bytes: 32768,
                 },
+                #[cfg(feature = "tensor-capture")]
                 capture_limits: None,
                 sampling: None,
+                #[cfg(feature = "tensor-capture")]
                 intervention: None,
             },
             collect(&mut records),
@@ -664,9 +676,7 @@ fn facade_snapshot_preserves_pending_choice_and_child_stream_includes_semantic_p
 fn facade_fork_rejects_snapshot_from_an_earlier_driver_on_the_same_loaded_model() {
     use eredu::api::GenerationBranchOptions;
     let (mut model, chat, settings, _) = snapshot_setup();
-    let prepared = model
-        .prepare_observed_chat(&chat, settings, CapturePlan::none(), limits())
-        .unwrap();
+    let prepared = model.prepare_controlled_chat(&chat, settings).unwrap();
     let snapshot = {
         let mut run = model
             .start_controlled(
@@ -680,9 +690,7 @@ fn facade_fork_rejects_snapshot_from_an_earlier_driver_on_the_same_loaded_model(
         run.enable_snapshots(snapshot_limits()).unwrap();
         run.snapshot(|_| ControlFlow::Continue(())).unwrap()
     };
-    let prepared = model
-        .prepare_observed_chat(&chat, settings, CapturePlan::none(), limits())
-        .unwrap();
+    let prepared = model.prepare_controlled_chat(&chat, settings).unwrap();
     let mut run = model
         .start_controlled(
             prepared,
@@ -705,8 +713,10 @@ fn facade_fork_rejects_snapshot_from_an_earlier_driver_on_the_same_loaded_model(
                 per_record_bytes: 4096,
                 total_bytes: 8192,
             },
+            #[cfg(feature = "tensor-capture")]
             capture_limits: None,
             sampling: None,
+            #[cfg(feature = "tensor-capture")]
             intervention: None,
         },
         |_| ControlFlow::Continue(()),
@@ -727,9 +737,7 @@ fn facade_restore_preserves_stop_lookbehind_across_a_saved_token_boundary() {
     let (mut model, chat, settings, first) = snapshot_setup();
     let alternate = first + 3;
     let stop = format!("é{}", model.decode(&[alternate], false).unwrap());
-    let prepared = model
-        .prepare_observed_chat(&chat, settings, CapturePlan::none(), limits())
-        .unwrap();
+    let prepared = model.prepare_controlled_chat(&chat, settings).unwrap();
     let mut records = vec![];
     let mut run = model
         .start_controlled(
@@ -765,6 +773,7 @@ fn facade_restore_preserves_stop_lookbehind_across_a_saved_token_boundary() {
     }
 }
 
+#[cfg(feature = "tensor-capture")]
 #[test]
 fn explicit_intervention_removal_retains_its_empty_override_provenance() {
     use eredu::api::GenerationBranchOptions;
@@ -808,8 +817,10 @@ fn explicit_intervention_removal_retains_its_empty_override_provenance() {
                     per_record_bytes: 16384,
                     total_bytes: 65536,
                 },
+                #[cfg(feature = "tensor-capture")]
                 capture_limits: Some(observed_mock::plan().limits),
                 sampling: None,
+                #[cfg(feature = "tensor-capture")]
                 intervention: Some(empty.clone()),
             },
             collect(&mut records),
@@ -834,6 +845,7 @@ fn explicit_intervention_removal_retains_its_empty_override_provenance() {
     run.step(collect(&mut records)).unwrap();
 }
 
+#[cfg(feature = "tensor-capture")]
 #[test]
 fn continuation_forecasts_follow_restore_and_branch_without_charging_budgets() {
     use eredu::api::{GenerationBranchOptions, MemoryFit};
@@ -953,8 +965,10 @@ fn continuation_forecasts_follow_restore_and_branch_without_charging_budgets() {
             &saved,
             GenerationBranchOptions {
                 trace_limits: trace,
+                #[cfg(feature = "tensor-capture")]
                 capture_limits: Some(observed_mock::plan().limits),
                 sampling: None,
+                #[cfg(feature = "tensor-capture")]
                 intervention: None,
             },
             |_| ControlFlow::Continue(()),
@@ -976,6 +990,7 @@ fn continuation_forecasts_follow_restore_and_branch_without_charging_budgets() {
     );
 }
 
+#[cfg(feature = "tensor-capture")]
 #[test]
 fn large_trace_budget_bounds_semantic_history_and_branch_reservations_without_header_multiplier() {
     use eredu::api::{GenerationBranchOptions, GenerationForecastOptions, MemoryBudget, MemoryFit};
@@ -1039,8 +1054,10 @@ fn large_trace_budget_bounds_semantic_history_and_branch_reservations_without_he
                 &saved,
                 GenerationBranchOptions {
                     trace_limits: trace,
+                    #[cfg(feature = "tensor-capture")]
                     capture_limits: Some(observed_mock::plan().limits),
                     sampling: None,
+                    #[cfg(feature = "tensor-capture")]
                     intervention: None,
                 },
                 |_| ControlFlow::Continue(()),
@@ -1078,6 +1095,7 @@ fn large_trace_budget_bounds_semantic_history_and_branch_reservations_without_he
     );
 }
 
+#[cfg(feature = "tensor-capture")]
 #[test]
 fn trimming_preserves_controlled_snapshot_branch_sampling_and_delivery_state() {
     let (_, chat, settings, first) = snapshot_setup();
@@ -1108,8 +1126,10 @@ fn trimming_preserves_controlled_snapshot_branch_sampling_and_delivery_state() {
             &saved,
             eredu::api::GenerationBranchOptions {
                 trace_limits: limits(),
+                #[cfg(feature = "tensor-capture")]
                 capture_limits: Some(observed_mock::plan().limits),
                 sampling: None,
+                #[cfg(feature = "tensor-capture")]
                 intervention: None,
             },
             |_| ControlFlow::Continue(()),
@@ -1157,6 +1177,7 @@ fn trimming_preserves_controlled_snapshot_branch_sampling_and_delivery_state() {
     assert_eq!(ordinary.token_ids, expected);
 }
 
+#[cfg(feature = "tensor-capture")]
 #[test]
 fn session_capture_fork_adds_content_exact_intervention_attribution() {
     use eredu::api::GenerationBranchOptions;
@@ -1192,8 +1213,10 @@ fn session_capture_fork_adds_content_exact_intervention_attribution() {
                     per_record_bytes: 16384,
                     total_bytes: 65536,
                 },
+                #[cfg(feature = "tensor-capture")]
                 capture_limits: Some(observed_mock::plan().limits),
                 sampling: None,
+                #[cfg(feature = "tensor-capture")]
                 intervention: Some(observed_mock::intervention_plan(1.0)),
             },
             collect(&mut records),

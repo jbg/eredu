@@ -99,18 +99,15 @@ fn setup() -> (
 #[test]
 fn iterative_drafts_preserve_controlled_and_ordinary_unicode_and_eos_commitment() {
     use eredu::api::{ObservedGenerationEvent, TraceLimits};
-    use eredu_core::{capture::CapturePlan, refinement::DraftEvent};
+    use eredu_core::refinement::DraftEvent;
     use std::ops::ControlFlow;
     let (mut model, chat, settings) = setup();
     let limits = TraceLimits {
         per_record_bytes: 65536,
         total_bytes: 1024 * 1024,
     };
-    let prepare = |model: &LoadedModel<MockBackend>| {
-        model
-            .prepare_observed_chat(&chat, settings, CapturePlan::none(), limits)
-            .unwrap()
-    };
+    let prepare =
+        |model: &LoadedModel<MockBackend>| model.prepare_controlled_chat(&chat, settings).unwrap();
     let mut ordinary = Vec::new();
     let output = model
         .generate_observed(
@@ -186,6 +183,7 @@ fn iterative_drafts_preserve_controlled_and_ordinary_unicode_and_eos_commitment(
     );
 }
 
+#[cfg(feature = "tensor-capture")]
 #[test]
 fn iterative_facade_rejects_explicit_causal_sampling_overrides() {
     let (model, chat, mut settings) = setup();
@@ -210,18 +208,14 @@ fn iterative_facade_rejects_explicit_causal_sampling_overrides() {
 #[test]
 fn iterative_active_draft_snapshot_restore_fork_and_cancel_preserve_commitment() {
     use eredu::api::{GenerationBranchOptions, ObservedGenerationEvent, TraceLimits};
-    use eredu_core::{
-        capture::CapturePlan, execution_control::SnapshotLimits, refinement::DraftEvent,
-    };
+    use eredu_core::{execution_control::SnapshotLimits, refinement::DraftEvent};
     use std::ops::ControlFlow;
     let (mut model, chat, settings) = setup();
     let limits = TraceLimits {
         per_record_bytes: 65536,
         total_bytes: 1024 * 1024,
     };
-    let request = model
-        .prepare_observed_chat(&chat, settings, CapturePlan::none(), limits)
-        .unwrap();
+    let request = model.prepare_controlled_chat(&chat, settings).unwrap();
     let mut records = Vec::new();
     let collect = |record| {
         records.push(record);
@@ -258,8 +252,10 @@ fn iterative_active_draft_snapshot_restore_fork_and_cancel_preserve_commitment()
             &saved,
             GenerationBranchOptions {
                 trace_limits: limits,
+                #[cfg(feature = "tensor-capture")]
                 capture_limits: None,
                 sampling: None,
+                #[cfg(feature = "tensor-capture")]
                 intervention: None,
             },
             &mut collect,

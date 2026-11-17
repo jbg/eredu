@@ -590,19 +590,17 @@ fn pending_recovery_does_not_excuse_unknown_or_enclosing_operation_errors() {
     }
 }
 
+#[cfg(feature = "tensor-capture")]
 #[test]
-fn unsupported_observer_preflight_does_not_poison_an_unmodified_session() {
+fn unsupported_speculative_capture_discovery_preserves_session() {
     use eredu_core::Completion as _;
-    let context =
-        crate::backend::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-    let backend = super::MlxBackend::new(context.stream(), context.stream());
+    let stream = crate::test_stream();
+    let backend = super::MlxBackend::new(stream, stream);
     let (_artifact, mut session) = native_session(&backend);
-    assert!(session
-        .install_embedded_prediction_observers(
-            eredu_runtime::NoopObserver,
-            eredu_runtime::NoopObserver
-        )
-        .is_err());
+    assert!(matches!(
+        session.speculative_activation_discovery(),
+        Err(eredu_core::capture::CaptureError::Unsupported(_))
+    ));
     session
         .submit_token_decode(&backend, 1)
         .unwrap()
@@ -611,6 +609,7 @@ fn unsupported_observer_preflight_does_not_poison_an_unmodified_session() {
         .unwrap();
 }
 
+#[cfg(feature = "tensor-capture")]
 #[test]
 fn deferred_capture_admission_failure_allows_native_session_reuse_after_settlement() {
     use eredu_core::{capture::*, Completion as _};
@@ -653,9 +652,10 @@ fn deferred_capture_admission_failure_allows_native_session_reuse_after_settleme
     .unwrap();
     let mut capture = eredu_runtime::capture::CaptureSession::new(plan);
     let prompt = super::MlxBackend::prepare_text_prompt(&backend, vec![1, 2]).unwrap();
-    let result = session.submit_prefill_with_observer(
+    let result = session.submit_prefill_result_with_observer(
         &backend,
-        prompt,
+        Ok(prompt),
+        None,
         &mut super::bounded_capture::observer(&mut capture, stream, None, 1),
     );
     let error = match result {
@@ -682,9 +682,10 @@ fn deferred_capture_admission_failure_allows_native_session_reuse_after_settleme
     // the capture owner too, proving its failed pending transaction was drained.
     let prompt = super::MlxBackend::prepare_text_prompt(&backend, vec![1, 2]).unwrap();
     session
-        .submit_prefill_with_observer(
+        .submit_prefill_result_with_observer(
             &backend,
-            prompt,
+            Ok(prompt),
+            None,
             &mut super::bounded_capture::observer(&mut capture, stream, None, 0),
         )
         .unwrap()

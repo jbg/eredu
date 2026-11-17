@@ -130,8 +130,10 @@ impl MlxBackend<'_> {
                 },
                 Ok,
             )?;
+            #[cfg(feature = "tensor-capture")]
             let prediction = state.sampling.next_prediction;
             let session = runtime.session_mut();
+            #[cfg(feature = "tensor-capture")]
             let invocation = session
                 .refinement_capture_shape((capacity.get() + 1) as u64)
                 .map(|shape| (eredu_core::capture::CapturePhase::Decode, shape));
@@ -175,12 +177,15 @@ impl MlxBackend<'_> {
                 observer.finish()?;
                 Ok(transaction)
             };
+            #[cfg(feature = "tensor-capture")]
             let transaction = match &mut state.capture {
                 Some(capture) => partition_capture::with_invocation_observer(
                     session, capture, &stream, prediction, invocation, execute,
                 )?,
                 None => execute(session, &mut eredu_runtime::NoopObserver)?,
             };
+            #[cfg(not(feature = "tensor-capture"))]
+            let transaction = execute(session, &mut eredu_runtime::NoopObserver)?;
             state.sampling.proposal_random = Some(transaction.proposal_randomness().clone());
             state.sampling.speculative = Some(Box::new(transaction));
             let (backend, session) = runtime.parts_mut();

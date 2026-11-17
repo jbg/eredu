@@ -300,17 +300,7 @@ fn observed_ttft_counts_a_buffered_unicode_token_before_record_delivery() {
         .len() as u32;
     let mut model = unicode_model(Some(first));
     let chat = chat(&mut model);
-    let prepared = model
-        .prepare_observed_chat(
-            &chat,
-            settings(),
-            eredu_core::capture::CapturePlan::none(),
-            eredu::api::TraceLimits {
-                per_record_bytes: 65536,
-                total_bytes: 1024 * 1024,
-            },
-        )
-        .unwrap();
+    let prepared = model.prepare_controlled_chat(&chat, settings()).unwrap();
     let started = Instant::now();
     let mut token_delivered = None;
     let output = model

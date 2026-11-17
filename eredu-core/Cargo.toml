@@ -9,6 +9,9 @@ rust-version.workspace = true
 description = "Backend-neutral contracts and orchestration for eredu"
 readme = "README.md"
 
+[features]
+tensor-capture = []
+
 [lints]
 workspace = true
 

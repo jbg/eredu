@@ -17,7 +17,9 @@ mod loaded;
 pub use loaded::*;
 mod continuation;
 pub use continuation::*;
+#[cfg(feature = "tensor-capture")]
 mod capture;
+#[cfg(feature = "tensor-capture")]
 pub use capture::{apply_capture_memory_bound, CaptureMemoryPlan};
 mod speculative;
 pub use speculative::*;
@@ -180,6 +182,7 @@ pub trait GenerationForecastBackend: ModelCapabilityBackend {
 
     /// Complete ordinary capture sizing, including source creation where needed.
     /// None retains the admitted ceilings. No submission or reservation is allowed.
+    #[cfg(feature = "tensor-capture")]
     fn capture_memory_projection(
         _runtime: &ModelRuntime<Self>,
         _capture: &eredu_core::capture::AdmittedCapturePlan,
@@ -192,6 +195,7 @@ pub trait GenerationForecastBackend: ModelCapabilityBackend {
     /// Whether capture/intervention native temporaries are completed and released
     /// before the next prediction. This excludes allocator cache, accounted for
     /// separately. The conservative default uses the cumulative retained limit.
+    #[cfg(feature = "tensor-capture")]
     fn capture_transforms_complete_per_step(_runtime: &ModelRuntime<Self>) -> bool {
         false
     }

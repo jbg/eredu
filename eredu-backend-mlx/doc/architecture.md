@@ -141,9 +141,9 @@ checks requested capabilities before payload materialization, and verifies the
 same report on the realized session.
 
 Completed output is observed through `BackendSession::observe_output`.
-Instrumented execution binds architecture-named activation points to
-`InspectableBackendSession`; distributed observations remain rank-local and
-only the logits-owning rank reports `model.logits`. Comparison policy,
+With `tensor-capture`, bounded execution binds architecture-named activation
+points to capture plans and delivers distributed values according to their
+selected producer layout. Comparison policy,
 statistics, and evaluation drivers remain in `eredu-evaluation`.
 
 Collective support is reported only when the backend instance has an attached

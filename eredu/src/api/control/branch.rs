@@ -11,10 +11,12 @@ pub struct GenerationBranchOptions {
     /// Fresh child transport budget, including the self-contained prefix record.
     pub trace_limits: TraceLimits,
     /// Required for captured/intervened sources; includes inherited consumption.
+    #[cfg(feature = "tensor-capture")]
     pub capture_limits: Option<CaptureLimits>,
     /// Prospective temperature/reseed; absence preserves the saved sampler exactly.
     pub sampling: Option<SamplingOverride>,
     /// None inherits; Some re-admits a replacement plan for future positions only.
+    #[cfg(feature = "tensor-capture")]
     pub intervention: Option<eredu_core::intervention::InterventionPlan>,
 }
 
@@ -28,6 +30,7 @@ pub struct GenerationBranchMetadata {
     /// Exact parent snapshot and inherited absolute/output boundary.
     pub parent: GenerationSnapshotMetadata,
     /// Capture consumption already inherited before the child executes.
+    #[cfg(feature = "tensor-capture")]
     pub inherited_capture_usage: CaptureUsage,
     /// Explicit child transport limit, independent of the parent's consumption.
     pub trace_limits: TraceLimits,
@@ -38,6 +41,7 @@ pub struct GenerationBranchMetadata {
     /// Effective child sampler facts after the prospective override.
     pub sampling_after: SamplingStateFacts,
     /// Prospective immutable request re-admitted under this child's session.
+    #[cfg(feature = "tensor-capture")]
     pub intervention_override: Option<eredu_core::intervention::InterventionPlan>,
 }
 
@@ -152,15 +156,18 @@ impl<B: TextSnapshotBackend + TextSamplingControlBackend> ControlledGenerationSe
                 bytes.checked_add(std::mem::size_of::<ControlledGenerationBranch<B>>() as u64)
             })
             .and_then(|bytes| bytes.checked_add((run_id.len() + session_id.len()) as u64))
-            .and_then(|bytes| {
-                bytes.checked_add(match &options.intervention {
-                    Some(plan) => {
-                        eredu_runtime::execution_control::intervention_plan_storage_bytes(plan)?
-                    }
-                    None => 0,
-                })
+            .ok_or(ExecutionControlError::Overflow)?;
+        #[cfg(feature = "tensor-capture")]
+        let host = host
+            .checked_add(match &options.intervention {
+                Some(plan) => {
+                    eredu_runtime::execution_control::intervention_plan_storage_bytes(plan)
+                        .ok_or(ExecutionControlError::Overflow)?
+                }
+                None => 0,
             })
             .ok_or(ExecutionControlError::Overflow)?;
+        #[cfg(feature = "tensor-capture")]
         let replacement_schema = options
             .intervention
             .as_ref()
@@ -172,7 +179,9 @@ impl<B: TextSnapshotBackend + TextSamplingControlBackend> ControlledGenerationSe
                 TextBranchRequest {
                     session_id: &session_id,
                     max_predictions,
+                    #[cfg(feature = "tensor-capture")]
                     capture_limits: options.capture_limits,
+                    #[cfg(feature = "tensor-capture")]
                     intervention: options.intervention,
                     host_bytes: Some(host),
                     continuation_growth_bytes: Some(growth),
@@ -195,11 +204,13 @@ impl<B: TextSnapshotBackend + TextSamplingControlBackend> ControlledGenerationSe
                                 }
                             })?;
                     }
+                    #[cfg(feature = "tensor-capture")]
                     let capture = B::capture_run(generation);
                     let lineage = GenerationBranchMetadata {
                         schema_version: EXECUTION_CONTROL_SCHEMA_VERSION,
                         run_id: run_id.clone(),
                         parent: snapshot.metadata.clone(),
+                        #[cfg(feature = "tensor-capture")]
                         inherited_capture_usage: snapshot
                             .continuation
                             .capture_checkpoint()
@@ -210,6 +221,7 @@ impl<B: TextSnapshotBackend + TextSamplingControlBackend> ControlledGenerationSe
                         sampling_override: options.sampling,
                         sampling_before,
                         sampling_after: B::sampling_control_facts(generation),
+                        #[cfg(feature = "tensor-capture")]
                         intervention_override: replacement_schema.map(|schema_version| {
                             capture
                                 .and_then(|run| run.intervention_plan())
@@ -223,6 +235,9 @@ impl<B: TextSnapshotBackend + TextSamplingControlBackend> ControlledGenerationSe
                     let template = ObservedGenerationRecord {
                         schema_version: CAPTURE_SCHEMA_VERSION,
                         run_id: run_id.clone(),
+                        #[cfg(not(feature = "tensor-capture"))]
+                        artifact_identity: snapshot.metadata.artifact_identity.clone(),
+                        #[cfg(feature = "tensor-capture")]
                         artifact_identity: capture
                             .and_then(|run| run.intervention_plan())
                             .map(|plan| plan.artifact_identity().to_owned())
@@ -230,10 +245,16 @@ impl<B: TextSnapshotBackend + TextSamplingControlBackend> ControlledGenerationSe
                         parameter_overlay_id: B::active_parameter_overlay(runtime)
                             .map(str::to_owned),
                         session_id: session_id.clone(),
+                        #[cfg(not(feature = "tensor-capture"))]
+                        capture_plan_id: String::new(),
+                        #[cfg(feature = "tensor-capture")]
                         capture_plan_id: capture.map_or_else(
                             || snapshot.metadata.capture_plan_id.clone(),
                             |run| run.plan().identity().into(),
                         ),
+                        #[cfg(not(feature = "tensor-capture"))]
+                        intervention_plan_id: None,
+                        #[cfg(feature = "tensor-capture")]
                         intervention_plan_id: capture
                             .and_then(|run| run.intervention_plan())
                             .map(|plan| plan.identity().into()),

@@ -460,6 +460,7 @@ pub enum InterventionEvidence {
 
 /// One exact operation. List order is deterministic for activation composition.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg(feature = "tensor-capture")]
 pub struct InterventionOperation {
     /// Unique, nonempty caller identity, at most 128 UTF-8 bytes.
     pub id: String,
@@ -477,6 +478,7 @@ pub struct InterventionOperation {
 
 /// Serializable request. Only admission produces an executable immutable plan.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg(feature = "tensor-capture")]
 pub struct InterventionPlan {
     /// Intervention wire version.
     pub schema_version: u32,
@@ -484,6 +486,7 @@ pub struct InterventionPlan {
     pub operations: Vec<InterventionOperation>,
 }
 
+#[cfg(feature = "tensor-capture")]
 impl InterventionPlan {
     /// Empty plan preserves the ordinary path and sampling/RNG behavior.
     pub fn none() -> Self {
@@ -694,6 +697,7 @@ impl std::io::Write for PlanCounter {
 
 /// Immutable admission proof. It cannot be deserialized or edited during a run.
 #[derive(Debug, Clone)]
+#[cfg(feature = "tensor-capture")]
 pub struct AdmittedInterventionPlan {
     plan: InterventionPlan,
     points: Vec<InterventionPoint>,
@@ -705,6 +709,7 @@ pub struct AdmittedInterventionPlan {
     session_id: String,
 }
 
+#[cfg(feature = "tensor-capture")]
 impl AdmittedInterventionPlan {
     /// Logical storage of both fixed-length digest strings created by admission.
     /// Cold child preparation uses this before cloning or admitting its plan.
@@ -766,6 +771,7 @@ impl AdmittedInterventionPlan {
         }
     }
     /// Revalidates the same admission mode against retained loaded declarations.
+    #[cfg(feature = "tensor-capture")]
     pub fn readmit(&self, discovery: &InterventionDiscovery) -> Result<Self, CaptureError> {
         self.plan.clone().admit_geometry(
             discovery,
@@ -838,6 +844,7 @@ impl AdmittedInterventionPlan {
     }
 }
 
+#[cfg(feature = "tensor-capture")]
 impl InterventionOperation {
     /// Resolves semantic selection with the same half-open/stride rules as capture.
     pub fn resolve_slice(
@@ -859,6 +866,7 @@ impl InterventionOperation {
     }
 }
 
+#[cfg(feature = "tensor-capture")]
 fn validate_operation(
     operation: &InterventionOperation,
     point: &InterventionPoint,
@@ -1240,6 +1248,7 @@ pub enum InterventionOutcome {
 
 /// Bounded attributed event. Large plan payloads are never repeated in events.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg(feature = "tensor-capture")]
 pub struct InterventionRecord {
     /// Intervention wire version.
     pub schema_version: u32,
@@ -1270,6 +1279,7 @@ pub struct InterventionRecord {
 
 /// Native activation primitives. Portable runtime code owns operation dispatch,
 /// payload validation, region selection/update order, and composition.
+#[cfg(feature = "tensor-capture")]
 pub trait InterventionBackend: CaptureBackend {
     /// Copies partition route coordinates after full-invocation reservation.
     /// Every source peer is retained; publication filtering must not skip edits.
@@ -1368,6 +1378,7 @@ pub trait InterventionBackend: CaptureBackend {
 
 /// Cold backend facts used by both admission and execution reservation. Unknown
 /// estimates must return an error; they must never be represented as zero cost.
+#[cfg(feature = "tensor-capture")]
 pub trait InterventionEstimator: Send + Sync {
     /// Bounds all received rows and local units for a partitioned sparse edit,
     /// including coordinate copies and global-payload lowering on every source.
@@ -1429,4 +1440,5 @@ pub trait InterventionEstimator: Send + Sync {
 }
 
 #[cfg(test)]
+#[cfg(feature = "tensor-capture")]
 mod tests;

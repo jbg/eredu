@@ -208,7 +208,9 @@ impl MlxModelSession {
             encoded_bytes: max_bytes,
             ..Default::default()
         })?;
-        let artifact = prepared.capture()?.artifact_identity;
+        let artifact = prepared
+            .artifact_identity()
+            .map_err(|error| ParameterError::Invalid(error.to_string()))?;
         let mut digest = Sha256::new();
         digest.update(b"eredu-loaded-parameter-catalog-v1\0");
         for value in [&artifact, prepared.execution_identity()] {

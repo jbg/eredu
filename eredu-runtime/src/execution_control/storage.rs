@@ -28,11 +28,13 @@ pub(crate) fn heap_bytes<T: Serialize + ?Sized>(value: &T) -> Option<u64> {
 const COMPOSITE_INLINE: u64 = 1024;
 const _: () = {
     use eredu_core::{capture::*, discovery::*, intervention::*};
+    #[cfg(feature = "tensor-capture")]
     assert!(std::mem::size_of::<CaptureSelection>() <= COMPOSITE_INLINE as usize);
     assert!(std::mem::size_of::<CaptureSlice>() <= COMPOSITE_INLINE as usize);
     assert!(std::mem::size_of::<ObservationPoint>() <= COMPOSITE_INLINE as usize);
     assert!(std::mem::size_of::<TensorAxis>() <= COMPOSITE_INLINE as usize);
     assert!(std::mem::size_of::<SymbolicDimension>() <= COMPOSITE_INLINE as usize);
+    #[cfg(feature = "tensor-capture")]
     assert!(std::mem::size_of::<InterventionOperation>() <= COMPOSITE_INLINE as usize);
     assert!(std::mem::size_of::<InterventionPoint>() <= COMPOSITE_INLINE as usize);
     assert!(std::mem::size_of::<InterventionAction>() <= COMPOSITE_INLINE as usize);

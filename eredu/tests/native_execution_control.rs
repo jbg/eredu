@@ -216,9 +216,7 @@ fn native_facade(device: &str, text: bool) {
         per_record_bytes: 16384,
         total_bytes: 65536,
     };
-    let prepared = model
-        .prepare_observed_chat(&chat, settings, CapturePlan::none(), trace)
-        .unwrap();
+    let prepared = model.prepare_controlled_chat(&chat, settings).unwrap();
     // Every subsequent action must use the resident prepared model and tokenizer.
     std::fs::remove_file(root.0.join("model.safetensors")).unwrap();
     std::fs::remove_file(root.0.join("tokenizer.json")).unwrap();
@@ -274,8 +272,10 @@ fn native_facade(device: &str, text: bool) {
             &partial,
             GenerationBranchOptions {
                 trace_limits: trace,
+                #[cfg(feature = "tensor-capture")]
                 capture_limits: None,
                 sampling: None,
+                #[cfg(feature = "tensor-capture")]
                 intervention: None,
             },
             collect(&mut records),
@@ -389,9 +389,7 @@ fn text_matches_ordinary_sampling_with_policy(
             per_record_bytes: 16384,
             total_bytes: 65536,
         };
-        let prepared = model
-            .prepare_observed_chat(&chat, settings, CapturePlan::none(), trace)
-            .unwrap();
+        let prepared = model.prepare_controlled_chat(&chat, settings).unwrap();
         let prompt = prepared.prompt_token_ids().to_vec();
         assert_eq!(prompt, [4, 2, 3, 7]);
         let resolved = prepared.generation_config();

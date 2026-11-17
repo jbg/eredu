@@ -13,6 +13,7 @@ readme = "README.md"
 workspace = true
 
 [features]
+tensor-capture = ["eredu-core/tensor-capture", "eredu-runtime/tensor-capture"]
 default = []
 image = ["eredu-media/image"]
 audio = ["eredu-media/audio"]

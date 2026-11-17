@@ -519,6 +519,7 @@ impl TextGenerationBackend for MockBackend {
     type TextGenerationState = observed_mock::State;
     type TextCompletion = MockSessionCompletion;
 
+    #[cfg(feature = "tensor-capture")]
     fn intervention_discovery(
         runtime: &ModelRuntime<Self>,
     ) -> Result<eredu_core::intervention::InterventionDiscovery, eredu_core::capture::CaptureError>
@@ -527,6 +528,7 @@ impl TextGenerationBackend for MockBackend {
             &runtime.session().intervention_identity,
         ))
     }
+    #[cfg(feature = "tensor-capture")]
     fn validate_text_interventions(
         runtime: &ModelRuntime<Self>,
         capture: &eredu_core::capture::AdmittedCapturePlan,
@@ -541,6 +543,7 @@ impl TextGenerationBackend for MockBackend {
         )
     }
 
+    #[cfg(feature = "tensor-capture")]
     fn configure_text_interventions(
         runtime: &ModelRuntime<Self>,
         state: &mut Self::TextGenerationState,
@@ -555,22 +558,26 @@ impl TextGenerationBackend for MockBackend {
         )
     }
 
+    #[cfg(feature = "tensor-capture")]
     fn capture_declarations(
         _: &ModelRuntime<Self>,
     ) -> Result<eredu_core::capture::CaptureDeclarations, eredu_core::capture::CaptureError> {
         Ok(observed_mock::discovery().declarations())
     }
+    #[cfg(feature = "tensor-capture")]
     fn capture_discovery(
         _: &ModelRuntime<Self>,
     ) -> Result<eredu_core::capture::CaptureDiscovery, eredu_core::capture::CaptureError> {
         Ok(observed_mock::content_discovery())
     }
+    #[cfg(feature = "tensor-capture")]
     fn validate_text_capture(
         _: &ModelRuntime<Self>,
         plan: &eredu_core::capture::AdmittedCapturePlan,
     ) -> Result<(), eredu_core::capture::CaptureError> {
         observed_mock::validate(plan)
     }
+    #[cfg(feature = "tensor-capture")]
     fn configure_text_capture(
         _: &ModelRuntime<Self>,
         state: &mut Self::TextGenerationState,
@@ -581,6 +588,7 @@ impl TextGenerationBackend for MockBackend {
         observed_mock::validate(&plan)?;
         eredu_runtime::intervention::install_session(&mut state.capture, plan, None)
     }
+    #[cfg(feature = "tensor-capture")]
     fn take_text_capture(
         state: &mut Self::TextGenerationState,
     ) -> Option<eredu_core::capture::CapturedStep> {
@@ -1115,6 +1123,7 @@ struct MockSpeculativeExecutor {
     retention: eredu_core::residency::ExecutionConversionRetentionReport,
     embedded: bool,
     reject_second: bool,
+    #[cfg(feature = "tensor-capture")]
     activations: Option<observed_mock::InternalCapture>,
 }
 const CONTROL_REJECTION_PROMPT_TOKEN: u32 = u32::MAX - 32;
@@ -1204,6 +1213,7 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
         Ok(preparation::agreement(stage, status))
     }
 
+    #[cfg(feature = "tensor-capture")]
     fn configure_activation_capture<'a>(
         &mut self,
         plan: eredu_core::speculative::AdmittedSpeculativeActivations,
@@ -1219,9 +1229,11 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
         self.activations = observed_mock::InternalCapture::new(&plan, request)?;
         Ok(())
     }
+    #[cfg(feature = "tensor-capture")]
     fn requires_activation_origin(&self) -> bool {
         self.activations.is_some()
     }
+    #[cfg(feature = "tensor-capture")]
     fn set_activation_origin(
         &mut self,
         origin: Option<eredu_core::speculative::SpeculativeActivationOrigin>,
@@ -1230,11 +1242,13 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
             observer.origin(origin);
         }
     }
+    #[cfg(feature = "tensor-capture")]
     fn take_activation_capture(
         &mut self,
     ) -> Option<eredu_core::speculative::SpeculativeActivationCapture> {
         self.activations.as_mut().and_then(|o| o.take())
     }
+    #[cfg(feature = "tensor-capture")]
     fn take_activation_error(
         &mut self,
     ) -> Option<eredu_core::speculative::SpeculativeControlError> {
@@ -1353,6 +1367,7 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
         preparation::forward();
         preparation::action("prefill");
         *cache = input.len();
+        #[cfg(feature = "tensor-capture")]
         let scale = self
             .activations
             .as_mut()
@@ -1364,6 +1379,8 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
             })
             .transpose()?
             .unwrap_or(1.0);
+        #[cfg(not(feature = "tensor-capture"))]
+        let scale = 1.0;
         Ok(SpeculativePrefill::new(
             (7.0 * scale) as u32,
             (),
@@ -1395,6 +1412,7 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
         Self: 'a,
     {
         preparation::action("proposal_step");
+        #[cfg(feature = "tensor-capture")]
         let scale = self
             .activations
             .as_mut()
@@ -1406,6 +1424,8 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
             })
             .transpose()?
             .unwrap_or(1.0);
+        #[cfg(not(feature = "tensor-capture"))]
+        let scale = 1.0;
         Ok(eredu_core::speculative::SpeculativeProposalStep::CausalLogits((11.0 * scale) as u32))
     }
 
@@ -1438,6 +1458,7 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
     {
         preparation::action("verification");
         *cache += input_tokens.len();
+        #[cfg(feature = "tensor-capture")]
         let scale = self
             .activations
             .as_mut()
@@ -1449,6 +1470,8 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
             })
             .transpose()?
             .unwrap_or(1.0);
+        #[cfg(not(feature = "tensor-capture"))]
+        let scale = 1.0;
         Ok(Submission {
             output: if self.reject_second {
                 vec![11, 12, 17, 17]
@@ -1685,6 +1708,7 @@ impl SpeculativeSampling for MockSpeculativeSampling {
 impl SpeculativeGenerationBackend for MockBackend {
     type Drafter = MockDrafter;
 
+    #[cfg(feature = "tensor-capture")]
     fn speculative_activation_discovery(
         runtime: &ModelRuntime<Self>,
     ) -> Result<
@@ -1767,6 +1791,7 @@ impl SpeculativeGenerationBackend for MockBackend {
                     retention,
                     embedded,
                     reject_second: result_cardinality == Some(CONTROL_REJECTION_PROMPT_TOKEN),
+                    #[cfg(feature = "tensor-capture")]
                     activations: None,
                 },
                 prepared,
@@ -2725,7 +2750,7 @@ fn assert_prepared_generation_and_speculative_conformance() {
     assert_eq!(output.token_ids.len(), 2);
     assert_eq!(output.finish_reason, FinishReason::MaxTokens);
     let observed = model
-        .prepare_observed_chat(
+        .prepare_controlled_chat(
             &prepared,
             PreparedChatGenerationSettings {
                 overrides: GenerationConfigOverrides {
@@ -2734,11 +2759,6 @@ fn assert_prepared_generation_and_speculative_conformance() {
                 },
                 seed: 7,
                 ..Default::default()
-            },
-            eredu_core::capture::CapturePlan::none(),
-            eredu::api::TraceLimits {
-                per_record_bytes: 64 * 1024,
-                total_bytes: 1024 * 1024,
             },
         )
         .unwrap();
@@ -2779,8 +2799,12 @@ fn assert_prepared_generation_and_speculative_conformance() {
         .iter()
         .filter_map(|record| match &record.event {
             eredu::api::ObservedGenerationEvent::Token {
-                token_id, captures, ..
+                token_id,
+                #[cfg(feature = "tensor-capture")]
+                captures,
+                ..
             } => {
+                #[cfg(feature = "tensor-capture")]
                 assert!(captures.is_none());
                 Some(*token_id)
             }
@@ -2796,7 +2820,7 @@ fn assert_prepared_generation_and_speculative_conformance() {
     );
 
     let observed = model
-        .prepare_observed_chat(
+        .prepare_controlled_chat(
             &prepared,
             PreparedChatGenerationSettings {
                 overrides: GenerationConfigOverrides {
@@ -2805,11 +2829,6 @@ fn assert_prepared_generation_and_speculative_conformance() {
                 },
                 seed: 7,
                 ..Default::default()
-            },
-            eredu_core::capture::CapturePlan::none(),
-            eredu::api::TraceLimits {
-                per_record_bytes: 64 * 1024,
-                total_bytes: 1024 * 1024,
             },
         )
         .unwrap();
@@ -2838,33 +2857,36 @@ fn assert_prepared_generation_and_speculative_conformance() {
     assert_eq!(cancelled.token_ids.len(), 1);
     assert!(consumer_closed);
 
-    let observed = model
-        .prepare_observed_chat(
-            &prepared,
-            PreparedChatGenerationSettings::default(),
-            eredu_core::capture::CapturePlan::none(),
-            eredu::api::TraceLimits {
-                per_record_bytes: 1,
-                total_bytes: 1,
-            },
-        )
-        .unwrap();
-    let overflow = model
-        .generate_observed(
-            observed,
-            &[],
-            Default::default(),
-            |_| panic!("oversized trace must not be delivered"),
-            eredu::api::OutputMode::Semantic,
-        )
-        .unwrap_err();
-    assert!(matches!(
-        overflow,
-        PreparedChatError::Capture(eredu_core::capture::CaptureError::Limit {
-            budget: eredu_core::capture::CaptureBudget::Encoded,
-            ..
-        })
-    ));
+    #[cfg(feature = "tensor-capture")]
+    {
+        let observed = model
+            .prepare_observed_chat(
+                &prepared,
+                PreparedChatGenerationSettings::default(),
+                eredu_core::capture::CapturePlan::none(),
+                eredu::api::TraceLimits {
+                    per_record_bytes: 1,
+                    total_bytes: 1,
+                },
+            )
+            .unwrap();
+        let overflow = model
+            .generate_observed(
+                observed,
+                &[],
+                Default::default(),
+                |_| panic!("oversized trace must not be delivered"),
+                eredu::api::OutputMode::Semantic,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            overflow,
+            PreparedChatError::Capture(eredu_core::capture::CaptureError::Limit {
+                budget: eredu_core::capture::CaptureBudget::Encoded,
+                ..
+            })
+        ));
+    }
     assert_eq!(
         events.last(),
         Some(&SemanticEvent::Finished {
@@ -3011,6 +3033,7 @@ fn unicode_model_with_runtime(
     )
 }
 
+#[cfg(feature = "tensor-capture")]
 #[test]
 fn observed_facade_preserves_streaming_unicode_special_tokens_and_eos() {
     let request = || ChatTemplateRequest {
@@ -3218,6 +3241,7 @@ fn non_mlx_backend_conforms_to_residency_realization() {
     assert_residency_realization_conformance();
 }
 
+#[cfg(feature = "tensor-capture")]
 #[test]
 fn live_observations_skip_content_discovery_and_exact_provenance_is_explicit() {
     use eredu::api::{PreparedChatGenerationSettings, TraceLimits};

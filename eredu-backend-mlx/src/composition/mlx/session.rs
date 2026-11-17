@@ -1,10 +1,10 @@
 //! Architecture-erased MLX model-session execution.
 
 use eredu_core::{
-    BackendSession, Completion, InputModality, InspectableBackendSession, InspectedOutput,
-    ModelRuntime, ObservationRequest, ObservationSet, ObservationValue, SessionAdmission,
-    SessionAuthority, Submission, SubmissionLease, TensorObservation, TensorObservationData,
-    TextGenerationBackend, TextGenerationConfig, TextSamplingStrategy, TokenFilter, TokenOutput,
+    BackendSession, Completion, InputModality, ModelRuntime, ObservationSet, ObservationValue,
+    SessionAdmission, SessionAuthority, Submission, SubmissionLease, TensorObservation,
+    TensorObservationData, TextGenerationBackend, TextGenerationConfig, TextSamplingStrategy,
+    TokenFilter, TokenOutput,
 };
 use eredu_nn::Tensor as _;
 use eredu_runtime::{
@@ -37,12 +37,15 @@ use super::{
     MlxModel,
 };
 
+#[cfg(feature = "tensor-capture")]
 pub(crate) mod bounded_capture;
 mod generation;
+#[cfg(feature = "tensor-capture")]
 pub(crate) mod intervention;
 mod model_session;
 mod observation;
 mod output_completion;
+mod score_readout;
 mod text_snapshot;
 pub(super) use crate::backend::submission_recovery as recovery;
 
@@ -57,11 +60,18 @@ use generation::sample_text_submission;
 pub(crate) use generation::MlxTextSampler;
 #[cfg(test)]
 use model_session::model_submission;
+use observation::observe_tensor;
 pub(in crate::composition::mlx) use observation::ArrayObserverAdapter;
-use observation::{observe_tensor, InspectionCollector};
 use output_completion::MlxSessionCompletionKind;
 
 #[cfg(test)]
 mod recovery_tests;
 #[cfg(test)]
 mod tests;
+
+pub(super) fn capture_capabilities() -> eredu_core::capture::CaptureCapabilities {
+    #[cfg(feature = "tensor-capture")]
+    return bounded_capture::capabilities();
+    #[cfg(not(feature = "tensor-capture"))]
+    eredu_core::capture::CaptureCapabilities::default()
+}

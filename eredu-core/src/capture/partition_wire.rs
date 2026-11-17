@@ -1,26 +1,11 @@
 //! Versioned host records for bounded partition capture delivery.
 //! These records describe evidence; deserialization never grants execution authority.
 
-use super::{CaptureError, CapturePhase, CaptureRecord};
+use super::{CaptureError, CapturePhase, CaptureRecord, PartitionCaptureCombination};
 use serde::{Deserialize, Serialize};
 
 /// Version of partition capture receipt records.
 pub const PARTITION_CAPTURE_SCHEMA_VERSION: u32 = 4;
-
-/// How measured native regions form the globally selected activation.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PartitionCaptureCombination {
-    /// Each selected coordinate has one authoritative producer.
-    #[default]
-    Disjoint,
-    /// Every producer supplies the complete selected floating summand. Terms are
-    /// converted by the ordinary raw collector to F32, accumulated in canonical
-    /// rank order with compensated F64 arithmetic, and converted to F32 before
-    /// the requested transform. This is a host assembly,
-    /// not evidence that a separate complete native tensor existed.
-    SumF64ToF32,
-}
 
 /// Host evidence for a numeric region. Deserialization is not slice authority;
 /// execution uses the separately validated producer projection.

@@ -530,7 +530,7 @@ pub enum ObservationValueType {
         /// Exact architecture provider invocation, without suffix interpretation.
         routing: String,
         /// Complete bank and selected-route geometry.
-        geometry: crate::capture::RoutedUnitGeometry,
+        geometry: crate::routing::RoutedUnitGeometry,
     },
 }
 
@@ -563,7 +563,7 @@ pub enum ObservationRequirement {
 /// One exact implemented tensor observation, not a hypothetical internal value.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ObservationPoint {
-    /// Exact activation path accepted by ObservationSelector::Exact.
+    /// Exact activation path used by a bounded capture selection.
     pub path: String,
     /// Associated architecture node identity.
     pub node_id: String,
@@ -640,7 +640,7 @@ pub enum ObservationSupportStatus {
 /// Support for one architecture-declared path under an exact selected execution.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ObservationSupport {
-    /// Exact activation path accepted by ObservationSelector::Exact.
+    /// Exact activation path used by a bounded capture selection.
     pub path: String,
     /// Availability during a prefill operation.
     pub prefill: ObservationSupportStatus,

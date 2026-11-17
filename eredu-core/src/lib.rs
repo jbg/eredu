@@ -36,6 +36,10 @@ pub mod decoding;
 /// Logical architecture and capture discovery contracts.
 pub mod discovery;
 pub mod parameters;
+/// Logical expert and routed-unit geometry.
+pub mod routing;
+/// Checked logical tensor extents.
+pub mod tensor_shape;
 pub use discovery::*;
 /// Portable execution plans, capabilities, and telemetry.
 pub mod execution;
@@ -112,8 +116,8 @@ pub use backend::{
     ControlledTextGenerationError, ControlledToken, DeviceCapabilities, DeviceDescriptor,
     DistributedBackend, DistributedCapabilities, DistributedCommitEpoch, DistributedCommitOutcome,
     DistributedCommitPhase, DistributedSession, DistributedSessionDescriptor,
-    InspectableBackendSession, ModelCapabilityBackend, ModelLoadError, ModelLoadingBackend,
-    ModelRuntime, MultimodalPreparationBackend, MultimodalPreparationFailure, PendingTextInput,
+    ModelCapabilityBackend, ModelLoadError, ModelLoadingBackend, ModelRuntime,
+    MultimodalPreparationBackend, MultimodalPreparationFailure, PendingTextInput,
     PrefillChunkPolicy, PreparedModel, SelectedModelPreparation, SessionCapabilities,
     SessionCapabilityError, SpeculativeTokenFilterController, Submission, TextAdvancement,
     TextContinuationBoundary, TextContinuationError, TextContinuationIdentity, TextDriverIdentity,
@@ -161,11 +165,10 @@ pub use media::{
     TokenizedMultimodalRequest, TokenizedMultimodalSegment, Video, VideoSampling,
 };
 pub use observation::{
-    InspectedOutput, ObservationError, ObservationRequest, ObservationSelector, ObservationSet,
-    ObservationValue, TensorObservation, TensorObservationData,
-    AUDIO_PROJECTOR_OUTPUT_OBSERVATION_PATH, MODALITY_MERGE_OUTPUT_OBSERVATION_PATH,
-    MODEL_LOGITS_OBSERVATION_PATH, PROCESSOR_OUTPUT_OBSERVATION_PATH,
-    VISION_PROJECTOR_OUTPUT_OBSERVATION_PATH,
+    ObservationError, ObservationSelector, ObservationSet, ObservationValue, TensorObservation,
+    TensorObservationData, AUDIO_PROJECTOR_OUTPUT_OBSERVATION_PATH,
+    MODALITY_MERGE_OUTPUT_OBSERVATION_PATH, MODEL_LOGITS_OBSERVATION_PATH,
+    PROCESSOR_OUTPUT_OBSERVATION_PATH, VISION_PROJECTOR_OUTPUT_OBSERVATION_PATH,
 };
 pub use realtime_channels::{
     RealtimeChannelCadence, RealtimeChannelDeclaration, RealtimeChannelError,

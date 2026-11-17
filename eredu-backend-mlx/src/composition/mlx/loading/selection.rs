@@ -173,15 +173,15 @@ impl eredu_architectures::PreparationMechanismProvider for MlxPreparationMechani
 
     fn observation_mechanisms(&self) -> eredu_core::ObservationMechanisms {
         eredu_core::ObservationMechanisms {
-            activation_tensors: true,
-            routing_tensors: true,
-            routed_unit_tensors: true,
-            floating_to_f32: true,
+            activation_tensors: cfg!(feature = "tensor-capture"),
+            routing_tensors: cfg!(feature = "tensor-capture"),
+            routed_unit_tensors: cfg!(feature = "tensor-capture"),
+            floating_to_f32: cfg!(feature = "tensor-capture"),
         }
     }
 
     fn capture_capabilities(&self) -> eredu_core::capture::CaptureCapabilities {
-        super::super::session::bounded_capture::capabilities()
+        super::super::session::capture_capabilities()
     }
 
     fn preparation_capabilities(&self) -> eredu_core::PreparationMechanismCapabilities {

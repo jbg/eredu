@@ -2,10 +2,11 @@
 
 use std::marker::PhantomData;
 
+#[cfg(feature = "tensor-capture")]
+use eredu_core::speculative::{AdmittedSpeculativeActivations, SpeculativeActivationCapture};
 use eredu_core::speculative::{
-    AdmittedSpeculativeActivations, GenerationExecutorCacheFactory, GenerationExecutorTypes,
-    SpeculativeActivationCapture, SpeculativeActivationOrigin, SpeculativeActivationPhase,
-    SpeculativeControlError,
+    GenerationExecutorCacheFactory, GenerationExecutorTypes, SpeculativeActivationOrigin,
+    SpeculativeActivationPhase, SpeculativeControlError,
 };
 use eredu_core::{
     BoundedCompletion, SpeculativeCommit, SpeculativeExecutor, SpeculativePrefill,
@@ -32,6 +33,7 @@ pub const EMBEDDED_VERIFICATION_LOGITS_PATH: &str = "embedded_prediction.verific
 pub struct EmbeddedPredictionObservers<T, L, E> {
     tensors: Box<dyn eredu_runtime::ActivationObserver<T, E>>,
     logits: Box<dyn eredu_runtime::ActivationObserver<L, E>>,
+    #[cfg(feature = "tensor-capture")]
     internal: Option<Box<dyn SpeculativeActivationObserver<T, E>>>,
 }
 
@@ -44,12 +46,14 @@ impl<T, L, E> EmbeddedPredictionObservers<T, L, E> {
         Self {
             tensors: Box::new(tensors),
             logits: Box::new(logits),
+            #[cfg(feature = "tensor-capture")]
             internal: None,
         }
     }
 
     /// Adds explicitly admitted internal phase instrumentation. Existing outer
     /// observers do not enable this route or incur component tensor work.
+    #[cfg(feature = "tensor-capture")]
     pub fn with_internal(
         mut self,
         observer: impl SpeculativeActivationObserver<T, E> + 'static,
@@ -59,6 +63,7 @@ impl<T, L, E> EmbeddedPredictionObservers<T, L, E> {
     }
 
     /// Drains one admitted internal record after the executor scope has returned.
+    #[cfg(feature = "tensor-capture")]
     pub fn take_activation_capture(&mut self) -> Option<SpeculativeActivationCapture> {
         self.internal()?.take_activation_capture()
     }
@@ -72,6 +77,9 @@ impl<T, L, E> EmbeddedPredictionObservers<T, L, E> {
 
     /// Borrows the admitted observer for one actual target or prediction invocation.
     pub fn internal(&mut self) -> Option<&mut dyn SpeculativeActivationObserver<T, E>> {
+        #[cfg(not(feature = "tensor-capture"))]
+        return None;
+        #[cfg(feature = "tensor-capture")]
         match self.internal.as_mut() {
             Some(observer) => Some(&mut **observer),
             None => None,
@@ -430,6 +438,7 @@ pub trait SpeculativeTensorMechanisms: 'static {
 
     /// Binds an admitted portable collector to native capture mechanisms. Scopes
     /// and family semantics have already been resolved by architecture admission.
+    #[cfg(feature = "tensor-capture")]
     fn activation_observer<'a>(
         plan: &AdmittedSpeculativeActivations,
         _request: eredu_core::SpeculativeRequestId,
@@ -1760,7 +1769,9 @@ where
 {
     strategy: &'a mut S,
     observers: EmbeddedPredictionObservers<M::Tensor, M::Logits, M::Error>,
+    #[cfg(feature = "tensor-capture")]
     prior_internal: Option<Option<Box<dyn SpeculativeActivationObserver<M::Tensor, M::Error>>>>,
+    #[cfg(feature = "tensor-capture")]
     execution_started: bool,
     _mechanisms: PhantomData<fn() -> M>,
 }
@@ -1770,6 +1781,7 @@ where
 #[derive(Debug)]
 pub struct EmbeddedPredictionCheckpoint<C> {
     cache: C,
+    #[cfg(feature = "tensor-capture")]
     activations: Option<eredu_runtime::capture::SpeculativeActivationCheckpoint>,
 }
 
@@ -1783,7 +1795,9 @@ where
         Self {
             strategy,
             observers: EmbeddedPredictionObservers::default(),
+            #[cfg(feature = "tensor-capture")]
             prior_internal: None,
+            #[cfg(feature = "tensor-capture")]
             execution_started: false,
             _mechanisms: PhantomData,
         }
@@ -1797,7 +1811,9 @@ where
         Self {
             strategy,
             observers,
+            #[cfg(feature = "tensor-capture")]
             prior_internal: None,
+            #[cfg(feature = "tensor-capture")]
             execution_started: false,
             _mechanisms: PhantomData,
         }
@@ -1805,6 +1821,7 @@ where
 
     /// Returns the production observer set after execution so a session can retain it.
     pub fn into_observers(mut self) -> EmbeddedPredictionObservers<M::Tensor, M::Logits, M::Error> {
+        #[cfg(feature = "tensor-capture")]
         if let Some(prior) = self.prior_internal.take() {
             self.observers.internal = prior;
         }
@@ -1952,6 +1969,9 @@ where
             self.strategy
                 .control_prediction_estimate(&state.prediction_cache),
             M::control_tensor_estimate(&state.capture),
+            #[cfg(not(feature = "tensor-capture"))]
+            snapshot::host::<Self::CacheCheckpoint>(None),
+            #[cfg(feature = "tensor-capture")]
             self.observers
                 .internal
                 .as_ref()
@@ -1978,6 +1998,7 @@ where
         if self.control_snapshot_estimate(cache, state).is_none() {
             return Ok(None);
         }
+        #[cfg(feature = "tensor-capture")]
         let activations = self
             .observers
             .internal
@@ -1989,7 +2010,11 @@ where
             return Ok(None);
         };
         Ok(Some((
-            EmbeddedPredictionCheckpoint { cache, activations },
+            EmbeddedPredictionCheckpoint {
+                cache,
+                #[cfg(feature = "tensor-capture")]
+                activations,
+            },
             state,
         )))
     }
@@ -2004,6 +2029,7 @@ where
     where
         Self: 'a,
     {
+        #[cfg(feature = "tensor-capture")]
         let prepared = match (self.observers.internal.as_mut(), saved.activations.as_ref()) {
             (Some(observer), Some(saved)) => Some(observer.prepare_activation_restore(saved)?),
             (None, None) => None,
@@ -2019,12 +2045,14 @@ where
             return Ok(None);
         };
         *cache = replacement;
+        #[cfg(feature = "tensor-capture")]
         if let Some(prepared) = prepared {
             prepared.commit();
         }
         Ok(Some(seed))
     }
 
+    #[cfg(feature = "tensor-capture")]
     fn readmit_activation_interventions(
         &mut self,
         plan: AdmittedSpeculativeActivations,
@@ -2071,6 +2099,7 @@ where
         M::agree_text_preparation(stage, status, context)
     }
 
+    #[cfg(feature = "tensor-capture")]
     fn configure_activation_capture<'a>(
         &mut self,
         plan: AdmittedSpeculativeActivations,
@@ -2095,16 +2124,19 @@ where
         Ok(())
     }
 
+    #[cfg(feature = "tensor-capture")]
     fn requires_activation_origin(&self) -> bool {
         self.observers.internal.is_some()
     }
 
+    #[cfg(feature = "tensor-capture")]
     fn set_activation_origin(&mut self, origin: Option<SpeculativeActivationOrigin>) {
         if let Some(observer) = self.observers.internal() {
             observer.set_activation_origin(origin);
         }
     }
 
+    #[cfg(feature = "tensor-capture")]
     fn take_activation_capture(&mut self) -> Option<SpeculativeActivationCapture> {
         self.observers.take_activation_capture()
     }
@@ -2148,7 +2180,11 @@ where
     where
         Self: 'context,
     {
-        self.execution_started = true;
+        #[cfg(feature = "tensor-capture")]
+        {
+            self.execution_started = true;
+        }
+        #[cfg(feature = "tensor-capture")]
         if self.observers.internal.is_some() && !self.strategy.supports_internal_observations() {
             return Err(M::observation_error(
                 "selected speculative strategy has no complete internal activation path",
@@ -2269,6 +2305,7 @@ where
     fn checkpoint(&self, cache: &Self::Cache) -> Result<Self::CacheCheckpoint, Self::Error> {
         S::checkpoint_target(cache).map(|cache| EmbeddedPredictionCheckpoint {
             cache,
+            #[cfg(feature = "tensor-capture")]
             activations: None,
         })
     }

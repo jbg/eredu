@@ -422,6 +422,7 @@ fn speculative_forecast_covers_a_pending_return_from_ar_without_advancing() {
         .unwrap();
 }
 
+#[cfg(feature = "tensor-capture")]
 #[test]
 fn public_internal_activation_authority_preserves_parity_and_applies_edits() {
     use eredu::api::SpeculativeActivationPlan;
@@ -561,6 +562,7 @@ fn public_internal_activation_authority_preserves_parity_and_applies_edits() {
     }
 }
 
+#[cfg(feature = "tensor-capture")]
 #[test]
 fn failed_internal_actions_deliver_bounded_original_evidence_without_recovery() {
     use eredu::api::SpeculativeActivationPlan;
@@ -739,6 +741,7 @@ fn controlled_speculation_uses_identical_semantics_and_reports_accepted_and_fail
     }
 }
 
+#[cfg(feature = "tensor-capture")]
 #[test]
 fn controlled_speculative_snapshots_replay_semantics_without_rewinding_delivery_or_budgets() {
     let (mut model, chat, settings) = setup();

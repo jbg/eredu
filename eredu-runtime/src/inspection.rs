@@ -81,6 +81,7 @@ impl ObservationHookSupport {
 /// Combines explicit architecture intervention declarations with exact loaded
 /// observation support and backend arithmetic facts. Read-only catalog values
 /// never acquire intervention capabilities through this projection.
+#[cfg(feature = "tensor-capture")]
 pub fn intervention_support(
     mut points: Vec<eredu_core::intervention::InterventionPoint>,
     capture: &eredu_core::capture::CaptureDiscovery,

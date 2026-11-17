@@ -250,14 +250,7 @@ fn modes() -> [DecodingMode; 3] {
 #[test]
 fn controlled_mode_forecast_observes_pending_handoff_without_advancement() {
     let (mut model, chat, settings, _, _) = setup(DecodingMode::Autoregressive, 10);
-    let prepared = model
-        .prepare_observed_chat(
-            &chat,
-            settings,
-            eredu_core::capture::CapturePlan::none(),
-            limits(),
-        )
-        .unwrap();
+    let prepared = model.prepare_controlled_chat(&chat, settings).unwrap();
     let mut run = model
         .start_controlled(
             prepared,
@@ -362,14 +355,7 @@ fn six_directed_handoffs_settle_committed_suffix_once_and_clear_tentative_output
             let (mut model, chat, mut settings, first, audit) = setup(previous, 10);
             settings.overrides.temperature = Some(0.8);
             settings.overrides.repetition_penalty = Some(1.1);
-            let prepared = model
-                .prepare_observed_chat(
-                    &chat,
-                    settings,
-                    eredu_core::capture::CapturePlan::none(),
-                    limits(),
-                )
-                .unwrap();
+            let prepared = model.prepare_controlled_chat(&chat, settings).unwrap();
             let mut run = model
                 .start_controlled(
                     prepared,
@@ -442,14 +428,7 @@ fn mode_snapshot_restores_pending_block_and_forks_independent_commands_without_r
     use eredu::api::GenerationBranchOptions;
     use eredu_core::execution_control::SnapshotLimits;
     let (mut model, chat, settings, first, audit) = setup(modes()[2], 10);
-    let prepared = model
-        .prepare_observed_chat(
-            &chat,
-            settings,
-            eredu_core::capture::CapturePlan::none(),
-            limits(),
-        )
-        .unwrap();
+    let prepared = model.prepare_controlled_chat(&chat, settings).unwrap();
     let mut run = model
         .start_controlled(
             prepared,
@@ -478,8 +457,10 @@ fn mode_snapshot_restores_pending_block_and_forks_independent_commands_without_r
             &saved,
             GenerationBranchOptions {
                 trace_limits: limits(),
+                #[cfg(feature = "tensor-capture")]
                 capture_limits: None,
                 sampling: None,
+                #[cfg(feature = "tensor-capture")]
                 intervention: None,
             },
             |_| ControlFlow::Continue(()),
@@ -527,14 +508,7 @@ fn cancellation_during_settlement_and_failed_settlement_never_acknowledge_or_com
 {
     for failure in [false, true] {
         let (mut model, chat, settings, first, audit) = setup(modes()[0], 10);
-        let prepared = model
-            .prepare_observed_chat(
-                &chat,
-                settings,
-                eredu_core::capture::CapturePlan::none(),
-                limits(),
-            )
-            .unwrap();
+        let prepared = model.prepare_controlled_chat(&chat, settings).unwrap();
         let mut run = model
             .start_controlled(
                 prepared,
@@ -584,12 +558,7 @@ fn uninterrupted_and_controlled_advancement_follow_the_same_repeated_command_sch
     let control = eredu_core::execution_control::GenerationControlHandle::default();
     let mut committed = 0;
     let prepared = model
-        .prepare_observed_chat(
-            &chat,
-            settings,
-            eredu_core::capture::CapturePlan::none(),
-            limits(),
-        )
+        .prepare_controlled_chat(&chat, settings)
         .unwrap()
         .with_control_handle(control.clone());
     let output = model
@@ -612,14 +581,7 @@ fn uninterrupted_and_controlled_advancement_follow_the_same_repeated_command_sch
         )
         .unwrap();
     let (mut model, chat, settings, _, _) = setup(modes()[0], 10);
-    let prepared = model
-        .prepare_observed_chat(
-            &chat,
-            settings,
-            eredu_core::capture::CapturePlan::none(),
-            limits(),
-        )
-        .unwrap();
+    let prepared = model.prepare_controlled_chat(&chat, settings).unwrap();
     let mut run = model
         .start_controlled(
             prepared,
@@ -655,14 +617,7 @@ fn mirostat_rejects_position_score_modes_before_enqueuing_a_change() {
     let (mut model, chat, mut settings, first, audit) = setup(DecodingMode::Autoregressive, 4);
     settings.strategy = eredu_core::TextSamplingStrategy::MirostatV2 { tau: 5.0, eta: 0.1 };
     settings.overrides.temperature = Some(0.8);
-    let prepared = model
-        .prepare_observed_chat(
-            &chat,
-            settings,
-            eredu_core::capture::CapturePlan::none(),
-            limits(),
-        )
-        .unwrap();
+    let prepared = model.prepare_controlled_chat(&chat, settings).unwrap();
     let mut run = model
         .start_controlled(
             prepared,
@@ -695,14 +650,7 @@ fn mirostat_rejects_position_score_modes_before_enqueuing_a_change() {
 #[test]
 fn unsupported_mode_options_leave_execution_and_pending_command_unchanged() {
     let (mut model, chat, settings, first, _) = setup(modes()[0], 4);
-    let prepared = model
-        .prepare_observed_chat(
-            &chat,
-            settings,
-            eredu_core::capture::CapturePlan::none(),
-            limits(),
-        )
-        .unwrap();
+    let prepared = model.prepare_controlled_chat(&chat, settings).unwrap();
     let mut run = model
         .start_controlled(
             prepared,

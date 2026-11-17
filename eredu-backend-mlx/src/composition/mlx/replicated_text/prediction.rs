@@ -1285,12 +1285,7 @@ pub(crate) trait ErasedReplicatedTextExecutable {
     ) -> Option<eredu_architectures::speculative_execution::SpeculativeActivationExecution> {
         None
     }
-    fn install_embedded_prediction_observers(
-        &mut self,
-        _observers: MlxEmbeddedPredictionObservers,
-    ) -> bool {
-        false
-    }
+    #[cfg(feature = "tensor-capture")]
     fn take_speculative_activation_capture(
         &mut self,
     ) -> Option<eredu_core::speculative::SpeculativeActivationCapture> {
