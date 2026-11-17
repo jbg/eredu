@@ -40,17 +40,21 @@ use anyhow::{bail, Context, Result};
 use clap::{parser::ValueSource, ArgMatches, CommandFactory, FromArgMatches, Parser, ValueEnum};
 use eredu::{
     api::{
-        benchmark_local_expert_cache, inspect_execution, BackendInspection, GenerationRequest,
-        LoadedModel, LocalExpertCacheBenchmarkSample, PreparedChatGenerationSettings,
-        PreparedChatInput, TextDecoder, TextModelError,
+        inspect_execution, BackendInspection, GenerationRequest, LoadedModel,
+        PreparedChatGenerationSettings, PreparedChatInput, TextDecoder, TextModelError,
     },
     runtime::chat::{
         ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, SemanticSupport, ToolChoice,
     },
 };
+#[cfg(test)]
 use eredu_backend_mlx::MlxBackendFactory;
+#[cfg(feature = "vision")]
+use eredu_core::MultimodalPreparationBackend as TextInputBackend;
 #[cfg(test)]
 use eredu_core::QuantizationRequest;
+#[cfg(not(feature = "vision"))]
+use eredu_core::TextGenerationBackend as TextInputBackend;
 use eredu_core::{
     residency::CacheEvictionPolicy, speculative::SpeculativeStats, speculative_decoding_telemetry,
     AutomaticPlanRequest, AutomaticPlanner, AutomaticPlannerPolicy, AutomaticPlanningBackend,
@@ -404,12 +408,8 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = ExpertCacheEviction::Lru)]
     expert_cache_eviction: ExpertCacheEviction,
 
-    /// Measure cold prefill, repeated prefill, and one cached decode separately.
-    #[arg(long)]
-    expert_cache_benchmark: bool,
-
     /// Evaluate typed questions and evidence from JSON; '-' reads stdin.
-    #[arg(long, value_name = "PATH", conflicts_with_all = ["prompt", "auto", "auto_feedback", "auto_trial_plan", "raw", "tools", "draft_model", "mirostat_v2", "temperature", "top_p", "top_k", "min_p", "repeat_penalty", "repeat_last_n", "frequency_penalty", "presence_penalty", "max_tokens", "stop_sequences", "thinking", "reasoning_effort", "expert_cache_benchmark", "memory_report", "estimate_memory_tokens", "telemetry_json", "memory_budget_bytes", "memory_policy", "memory_reserve_bytes", "speculative_draft_tokens"])]
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["prompt", "auto", "auto_feedback", "auto_trial_plan", "raw", "tools", "draft_model", "mirostat_v2", "temperature", "top_p", "top_k", "min_p", "repeat_penalty", "repeat_last_n", "frequency_penalty", "presence_penalty", "max_tokens", "stop_sequences", "thinking", "reasoning_effort", "memory_report", "estimate_memory_tokens", "telemetry_json", "memory_budget_bytes", "memory_policy", "memory_reserve_bytes", "speculative_draft_tokens"])]
     decisions: Option<PathBuf>,
 
     #[cfg(feature = "vision")]
@@ -500,7 +500,7 @@ const AUTOMATIC_OVERRIDE_ARGUMENTS: &[&str] = &[
     "vision_companion",
     "audio_companion",
     "draft_model",
-    "mlx_cache_limit_bytes",
+    "allocator_cache_limit_bytes",
     "speculative_draft_tokens",
     "disable_speculative_lookahead",
     "disable_speculative_adaptive_lookahead",
@@ -521,7 +521,6 @@ const AUTOMATIC_OVERRIDE_ARGUMENTS: &[&str] = &[
     "expert_cache_scratch_bytes",
     "expert_cache_prefill_bank_bytes",
     "expert_cache_eviction",
-    "expert_cache_benchmark",
     "cached_shards",
     "prepared_cache_dir",
     "prepared_cache_bytes",
@@ -620,8 +619,8 @@ impl AutomaticCliOverrides {
         if self.contains("audio_companion") {
             args.audio_companion = original.audio_companion.clone();
         }
-        if self.contains("mlx_cache_limit_bytes") {
-            args.common.mlx_cache_limit_bytes = original.common.mlx_cache_limit_bytes;
+        if self.contains("allocator_cache_limit_bytes") {
+            args.common.allocator_cache_limit_bytes = original.common.allocator_cache_limit_bytes;
         }
         if self.contains("quantize") {
             args.common.quantize = original.common.quantize;
@@ -668,9 +667,6 @@ impl AutomaticCliOverrides {
         }
         if self.contains("expert_cache_eviction") {
             args.expert_cache_eviction = original.expert_cache_eviction;
-        }
-        if self.contains("expert_cache_benchmark") {
-            args.expert_cache_benchmark = original.expert_cache_benchmark;
         }
         if self.contains("cached_shards") {
             args.common.cached_shards = original.common.cached_shards;
@@ -2060,25 +2056,49 @@ fn apply_automatic_report(
 fn main() -> Result<()> {
     let total_started = Instant::now();
     let matches = cli_command().get_matches();
+    let factory = eredu_backend_mlx::MlxBackendFactory::default();
+
     #[cfg(feature = "realtime")]
     if matches.subcommand_name().is_some() {
         return match CliCommand::from_arg_matches(&matches)? {
-            CliCommand::Audio(args) => audio::run(args, total_started),
+            CliCommand::Audio(args) => audio::run(&factory, args, total_started),
         };
     }
-    let automatic_overrides = AutomaticCliOverrides::from_matches(&matches);
-    let mut args = Cli::from_arg_matches(&matches)?;
+    let overrides = AutomaticCliOverrides::from_matches(&matches);
+    let args = Cli::from_arg_matches(&matches)?;
+    let factory = factory.with_residency_diagnostics(args.verbose, args.verbose);
+    run_text(&factory, args, overrides, total_started)
+}
+
+fn run_text<F>(
+    factory: &F,
+    mut args: Cli,
+    automatic_overrides: AutomaticCliOverrides,
+    total_started: Instant,
+) -> Result<()>
+where
+    F: BackendInspection<Inspection = TextArtifactInspection>
+        + eredu::api::decision::DecisionBackendFactory<
+            DrafterPreparation = eredu_architectures::ExternalDraftPreparation,
+        >,
+    F::Backend: eredu_core::SpeculativeGenerationBackend<Drafter = F::Drafter>
+        + TextInputBackend
+        + eredu::api::GenerationForecastBackend
+        + eredu::api::SpeculativeForecastBackend<F::Drafter>,
+    <F::Backend as eredu_core::ModelLoadingBackend>::ConfigurationResolver:
+        eredu_core::ModelConfigurationResolver<
+            ArtifactPlan = eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+        >,
+{
     if args.no_auto {
         args.auto = None;
     }
     if args.decisions.is_some() {
         args.speculative_draft_tokens = 0;
     }
-    let factory =
-        MlxBackendFactory::default().with_residency_diagnostics(args.verbose, args.verbose);
     let original_args = args.clone();
     validate_args(&args)?;
-    let devices = discover_devices(&factory)?;
+    let devices = discover_devices(factory)?;
     let device = if args.auto_trial_plan.is_some() && args.common.device.is_none() {
         None
     } else {
@@ -2100,7 +2120,6 @@ fn main() -> Result<()> {
     let draft_model_path = resolved_draft.map(|artifact| artifact.path);
     if let Some((mut request, assets)) = decision_request {
         request.seed = args.common.seed.or(request.seed);
-        args.common.configure_runtime()?;
         let plan = cli_execution_plan(
             &args,
             device
@@ -2110,6 +2129,7 @@ fn main() -> Result<()> {
             None,
             false,
         )?;
+        args.common.apply_allocator_cache_limit(factory)?;
         let load_started = Instant::now();
         let mut decision_started = None;
         let mut on_loaded = || {
@@ -2117,7 +2137,7 @@ fn main() -> Result<()> {
             decision_started = Some(Instant::now());
         };
         let result = eredu::api::decision::evaluate_decisions(
-            &factory,
+            factory,
             &model_path,
             assets.as_deref(),
             &request,
@@ -2164,7 +2184,7 @@ fn main() -> Result<()> {
                     plan.with_prepared_checkpoint_cache(args.common.prepared_cache.policy())
                 }
             } else {
-                let observations = automatic_observations(&factory, &model_path, plan.device())?;
+                let observations = automatic_observations(factory, &model_path, plan.device())?;
                 automatic_overrides.apply_to_plan(
                     &plan,
                     &original_args,
@@ -2173,7 +2193,7 @@ fn main() -> Result<()> {
                     &devices,
                 )?
             };
-            exact_automatic_report(&factory, &model_path, plan)
+            exact_automatic_report(factory, &model_path, plan)
         })
         .transpose()?;
     let automatic_report = if let Some(report) = exact_trial_report {
@@ -2198,12 +2218,12 @@ fn main() -> Result<()> {
                         );
                     }
                     let mut heuristic =
-                        automatic_plan(&factory, &model_path, device, &automatic_feedback)?;
+                        automatic_plan(factory, &model_path, device, &automatic_feedback)?;
                     heuristic.plan = heuristic
                         .plan
                         .with_prepared_checkpoint_cache(args.common.prepared_cache.policy());
                     let benchmark = benchmark_automatic_plans(
-                        &factory,
+                        factory,
                         &model_path,
                         heuristic,
                         args.auto_benchmark_tokens,
@@ -2230,7 +2250,7 @@ fn main() -> Result<()> {
                 }
                 AutoMode::Plan => {
                     let report = automatic_report_with_cache(
-                        &factory,
+                        factory,
                         &model_path,
                         device,
                         &devices,
@@ -2253,7 +2273,7 @@ fn main() -> Result<()> {
                 }
                 AutoMode::Quick => {
                     let (report, inspection) = automatic_plan_with_overrides(
-                        &factory,
+                        factory,
                         &model_path,
                         device,
                         &devices,
@@ -2264,7 +2284,7 @@ fn main() -> Result<()> {
                     )?;
                     retained_automatic_inspection = Some(inspection);
                     if let Some(path) = &args.auto_cache {
-                        let observations = automatic_observations(&factory, &model_path, device)?;
+                        let observations = automatic_observations(factory, &model_path, device)?;
                         let key = automatic_cache_key(&model_path, &observations)?;
                         write_auto_plan_cache(path, key, report.clone(), None)?;
                     }
@@ -2287,9 +2307,6 @@ fn main() -> Result<()> {
         None if args.telemetry_json.is_some() => Some(factory.discover_hardware()?),
         None => None,
     };
-    if args.estimate_memory_tokens.is_none() {
-        args.common.configure_runtime()?;
-    }
     let prompt = if args.estimate_memory_tokens.is_some() {
         String::new()
     } else {
@@ -2326,7 +2343,7 @@ fn main() -> Result<()> {
 
     if let Some(tokens) = args.estimate_memory_tokens {
         let report = memory::report(
-            &factory,
+            factory,
             &args,
             &model_path,
             &execution_plan,
@@ -2338,12 +2355,13 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    args.common.apply_allocator_cache_limit(factory)?;
     if args.verbose {
-        eprintln!("--- Eredu MLX diagnostics (stderr) ---");
+        eprintln!("--- Eredu diagnostics (stderr) ---");
         eprintln!("model: {}", model_path.display());
         eprintln!("device: {}", execution_plan.device().device());
-        if let Some(bytes) = args.common.mlx_cache_limit_bytes {
-            eprintln!("mlx_cache_limit: {}", format_bytes(bytes as usize));
+        if let Some(bytes) = args.common.allocator_cache_limit_bytes {
+            eprintln!("allocator_cache_limit: {}", format_bytes(bytes));
         }
         if let Some(path) = &draft_model_path {
             eprintln!("draft_model: {}", path.display());
@@ -2367,7 +2385,7 @@ fn main() -> Result<()> {
         Some(report.resources.clone())
     } else if args.telemetry_json.is_some() {
         Some(
-            inspect_execution(&factory, &model_path, &execution_plan)?
+            inspect_execution(factory, &model_path, &execution_plan)?
                 .into_report()
                 .resources,
         )
@@ -2379,15 +2397,15 @@ fn main() -> Result<()> {
         Some(inspection) => {
             eredu::api::PreparedTextModel::from_artifact(inspection, Default::default())
                 .map_err(eredu::api::PlannedModelLoadError::from)
-                .and_then(|prepared| prepared.select_execution_plan(&factory, &execution_plan))
+                .and_then(|prepared| prepared.select_execution_plan(factory, &execution_plan))
                 .and_then(|selected| selected.load())
         }
-        None => LoadedModel::load_execution_plan(&factory, &model_path, &execution_plan),
+        None => LoadedModel::load_execution_plan(factory, &model_path, &execution_plan),
     }
     .with_context(|| format!("failed to load model from {}", model_path.display()))?;
     let drafting_enabled = planned.drafting().is_enabled();
     let mut session = planned;
-    let mut model = session.model_mut();
+    let model = session.model_mut();
     if args.prefill_chunk_size > 0 && (args.verbose || memory::requested(&args)) {
         if let Err(reason) = model.prefill_chunking_support() {
             eprintln!("prefill uses one complete pass: {reason}");
@@ -2460,7 +2478,7 @@ fn main() -> Result<()> {
             ..ChatTemplateRequest::default()
         };
         #[cfg(feature = "vision")]
-        let media_chat = args.media.prepare(&mut model, &request, &prompt)?;
+        let media_chat = args.media.prepare(model, &request, &prompt)?;
         #[cfg(not(feature = "vision"))]
         let media_chat: Option<eredu::api::PreparedChatRequest<_>> = None;
         let prepared = if let Some(prepared) = media_chat {
@@ -2543,14 +2561,6 @@ fn main() -> Result<()> {
         },
         ..Default::default()
     };
-    if args.expert_cache_benchmark {
-        let benchmark = benchmark_local_expert_cache(&mut model, &prompt_token_ids)?;
-        print_expert_benchmark_result("cold_prefill", benchmark.cold_prefill);
-        print_expert_benchmark_result("repeated_prefill", benchmark.repeated_prefill);
-        print_expert_benchmark_result("cached_decode", benchmark.cached_decode);
-        model.reset()?;
-    }
-
     let eos_token_ids = model.eos_token_ids().to_vec();
     let mut output_ids = Vec::with_capacity(max_tokens);
     let generation_started = Instant::now();
@@ -2574,9 +2584,6 @@ fn main() -> Result<()> {
     }
     let mut stderr = stderr.lock();
 
-    let _component_timing_guard = args
-        .verbose
-        .then(eredu_backend_mlx::SpeculativeComponentTimingGuard::enable);
     let mut prepared_finish_reason = None;
     if let Some(prepared) = &prepared_chat {
         let semantic = matches!(prepared.semantic_support(), SemanticSupport::Supported);
@@ -2704,7 +2711,7 @@ fn main() -> Result<()> {
     stdout.flush()?;
 
     if args.verbose {
-        eprintln!("--- Eredu MLX diagnostics (stderr) ---");
+        eprintln!("--- Eredu diagnostics (stderr) ---");
     }
     if tools_requested || should_report_stop_reason(stop_reason, args.verbose) {
         eprintln!("stop_reason: {}", stop_reason.label());
@@ -2719,6 +2726,14 @@ fn main() -> Result<()> {
         None
     };
     let total_elapsed = total_started.elapsed();
+    let (residency, expert_cache) = if args.verbose || args.telemetry_json.is_some() {
+        (
+            model.residency_telemetry()?,
+            model.expert_cache_telemetry()?,
+        )
+    } else {
+        (None, None)
+    };
 
     if args.verbose {
         eprintln!(
@@ -2777,19 +2792,19 @@ fn main() -> Result<()> {
         }
         if let Some(allocator) = &allocator_telemetry {
             eprintln!(
-                "mlx_peak_memory: {}",
-                format_bytes(allocator.peak_bytes as usize)
+                "allocator_peak_memory: {}",
+                format_bytes(allocator.peak_bytes)
             );
             eprintln!(
-                "mlx_active_memory: {}",
-                format_bytes(allocator.active_bytes as usize)
+                "allocator_active_memory: {}",
+                format_bytes(allocator.active_bytes)
             );
             eprintln!(
-                "mlx_cache_memory: {}",
-                format_bytes(allocator.cache_bytes as usize)
+                "allocator_cache_memory: {}",
+                format_bytes(allocator.cache_bytes)
             );
         }
-        if let Some(report) = model.residency_telemetry()? {
+        if let Some(report) = &residency {
             eprintln!(
                 "residency_current_host_device: {} / {} bytes",
                 report.current_host_bytes, report.current_device_bytes
@@ -2798,7 +2813,7 @@ fn main() -> Result<()> {
                 "residency_peak_host_device: {} / {} bytes",
                 report.peak_host_bytes, report.peak_device_bytes
             );
-            for transfer in report.transfers {
+            for transfer in &report.transfers {
                 if transfer.count > 0 {
                     eprintln!(
                         "residency_{}: {} transfers, {} bytes",
@@ -2807,7 +2822,7 @@ fn main() -> Result<()> {
                 }
             }
         }
-        if let Some(report) = model.expert_cache_telemetry()? {
+        if let Some(report) = &expert_cache {
             eprintln!(
                 "expert_cache_owned: {} experts, {} bytes",
                 report.owned_experts, report.owned_bytes
@@ -2862,8 +2877,6 @@ fn main() -> Result<()> {
             },
             |report| report.explanation.clone(),
         );
-        let residency = model.residency_telemetry()?;
-        let expert_cache = model.expert_cache_telemetry()?;
         let telemetry = ExecutionTelemetry {
             schema_version: eredu_core::AUTOMATIC_SCHEMA_VERSION,
             effective_model_type: model.effective_model_type().into(),
@@ -3041,8 +3054,8 @@ fn cli_execution_plan(
     Ok(plan.with_prepared_checkpoint_cache(args.common.prepared_cache.policy()))
 }
 
-fn format_bytes(bytes: usize) -> String {
-    format!("{} ({bytes} bytes)", format_memory_size(bytes as u64))
+fn format_bytes(bytes: u64) -> String {
+    format!("{} ({bytes} bytes)", format_memory_size(bytes))
 }
 
 fn format_memory_size(bytes: u64) -> String {
@@ -3061,28 +3074,6 @@ fn format_memory_size(bytes: u64) -> String {
         (bytes_float, "B")
     };
     format!("{value:.2} {unit}")
-}
-
-fn print_expert_benchmark_result(label: &str, sample: LocalExpertCacheBenchmarkSample) {
-    eprintln!(
-        "expert_cache_benchmark_{label}: latency={:.3}s routes={} distinct={} coalesced={} compact_banks={} compact_bytes={} host_hits={} host_misses={} host_evictions={} device_hits={} device_misses={} device_evictions={} host_resident={}({} bytes) device_resident={}({} bytes)",
-        sample.elapsed.as_secs_f64(),
-        sample.requested_routes,
-        sample.distinct_experts,
-        sample.coalesced_duplicates,
-        sample.compact_banks,
-        sample.compact_bank_bytes,
-        sample.host_hits,
-        sample.host_misses,
-        sample.host_evictions,
-        sample.device_hits,
-        sample.device_misses,
-        sample.device_evictions,
-        sample.host_resident_experts,
-        sample.host_resident_bytes,
-        sample.device_resident_experts,
-        sample.device_resident_bytes,
-    );
 }
 
 fn validate_args(args: &Cli) -> Result<()> {
@@ -3176,9 +3167,6 @@ fn validate_args(args: &Cli) -> Result<()> {
         bail!("frequency and presence penalties must be finite numbers");
     }
     args.common.validate()?;
-    if args.expert_cache_benchmark && !args.expert_cache {
-        bail!("--expert-cache-benchmark requires --expert-cache");
-    }
     if args.expert_cache_scratch_bytes == 0 {
         bail!("--expert-cache-scratch-bytes must be greater than zero");
     }
@@ -3727,7 +3715,7 @@ mod tests {
             "pinned",
             "--device",
             "cpu",
-            "--mlx-cache-limit-bytes",
+            "--allocator-cache-limit-bytes",
             "0",
             "--quantize",
             "8",
@@ -4084,8 +4072,7 @@ mod tests {
                 "524288",
                 "--expert-cache-eviction",
                 "lfu",
-                "--expert-cache-benchmark",
-                "--mlx-cache-limit-bytes",
+                "--allocator-cache-limit-bytes",
                 "0",
             ],
             &[

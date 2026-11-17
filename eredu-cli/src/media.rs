@@ -16,11 +16,11 @@ use image::{ImageFormat, ImageReader};
 #[derive(Debug, Clone, Default, clap::Args)]
 pub(crate) struct MediaArgs {
     /// Append a JPEG or PNG image to the user prompt. May be repeated.
-    #[arg(long, value_name = "PATH", conflicts_with_all = ["raw", "decisions", "expert_cache_benchmark", "estimate_memory_tokens"])]
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["raw", "decisions", "estimate_memory_tokens"])]
     image: Vec<PathBuf>,
 
     /// Append a clip from a directory of JPEG or PNG frames in filename order.
-    #[arg(long, value_name = "DIRECTORY", requires = "video_fps", conflicts_with_all = ["raw", "decisions", "expert_cache_benchmark", "estimate_memory_tokens"])]
+    #[arg(long, value_name = "DIRECTORY", requires = "video_fps", conflicts_with_all = ["raw", "decisions", "estimate_memory_tokens"])]
     video_frames: Option<PathBuf>,
 
     /// Source frame rate of the image sequence supplied with --video-frames.

@@ -4225,10 +4225,16 @@ in the public error type.
 
 Application targets depend on `eredu` for facade operations, their selected
 backend for factories, and the neutral crates whose public values they
-construct. Backend dependencies remain feature-gated. The MLX facade helpers
-provide device-plan creation, process runtime configuration, allocator
-telemetry, and diagnostic benchmarks. Rich allocator and residency telemetry
-methods remain specialized on `LoadedModel<MlxBackend<'_>>`.
+construct. Backend dependencies remain feature-gated. Session telemetry uses
+the loaded backend's portable weight-residency and expert-cache reports.
+Process allocator observations come from the selected factory. The CLI matches
+the compiled backend at startup and passes its factory to the shared text,
+decision, audio task and realtime command runners. The CLI build selects the
+native adapter directly. Its use of the facade requires only portable features.
+Explicit allocator cache limits use the factory's allocator policy contract.
+Cold forecasting validates a proposed ceiling without applying it. Native
+realization supplies the default policy when the application has no override.
+Verbose generation uses portable session, allocator and speculation reports.
 Session lifecycle is portable: every `TextGenerationBackend` implements explicit
 `reset_session` and `synchronize_session` hooks, exposed by `ModelRuntime<B>` and
 `LoadedModel<B>` as `reset()` and `synchronize()` with the same non-generic
@@ -7355,6 +7361,11 @@ prefers a discovered GPU when the user leaves the device unspecified. MLX
 startup configures its process-global allocator and any embedded Metal library
 through the backend adapter. Optional allocator telemetry and peak reset use the
 selected factory.
+
+Loaded text sessions expose optional weight-residency and expert-cache reports
+through the neutral `TextGenerationBackend` contract. The backend projects its
+session counters into portable telemetry, and `LoadedModel` forwards the
+observation. An unavailable report is distinct from an observation failure.
 
 Architecture inspection reports both embedded-draft depth and maximum proposal
 capacity from the normalized, admitted artifact composition in
@@ -17025,13 +17036,16 @@ It admits the vision residency window, projects ordered visual inputs, aligns
 soundtracks and speech features, and uses the shared Audio prompt and session
 construction. A distributed turn votes on local media preparation before
 entering speech prefill, including when a rank has a local preparation error.
-The Audio facade renders and tokenizes chat and decodes text. It submits local
-Audio and Omni through one neutral task binding. The binding returns host
-operations for transcription, PCM ingress, or a controlled response.
-`AudioTaskBinder` composes independent providers for realtime graph mechanisms,
-media lowering, and pipeline transport. MLX supplies the same component and
-media mechanisms available to other prepared executions and a Ring transport
-provider.
+The Audio facade renders and tokenizes chat and decodes text. Its finite Audio
+and Omni preparations retain the selected factory and use its cold support
+facts for finite media graphs, including pipeline availability. Loading opens
+the factory's realtime context for the portable device plan. The context supplies
+graph binding, processor lowering, and pipeline transport through
+`MediaGraphMechanisms`. The retained architecture preparations use those
+mechanisms to produce host operations for transcription, PCM ingress, or a
+controlled response.
+The CLI selects the factory at startup and uses the prepared task's sample rates
+and host operations for audio I/O.
 The language pipeline preparation retains a separate source, parameter plan,
 and cache geometry per stage, including tensor-local geometry for combined
 placement. The typed Audio invocation substitutes speech rows on the embedding

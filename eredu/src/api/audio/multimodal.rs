@@ -11,12 +11,15 @@ use super::*;
 pub use eredu_architectures::lfm3::omni::{OmniAudioSelection, PreparedOmni};
 
 /// A finite mixed-media turn prepared with the selected Omni checkpoint.
-pub struct PreparedMultimodalAudioTask {
+pub struct PreparedMultimodalAudioTask<'a, F> {
+    factory: &'a F,
     turn: PreparedOmniTurn,
     tokenizer: Tokenizer,
 }
 
-impl PreparedMultimodalAudioTask {
+impl<'a, F: RealtimeBackendFactory<Mechanisms: MediaGraphMechanisms>>
+    PreparedMultimodalAudioTask<'a, F>
+{
     /// Applies the checkpoint's chat template to one ordered user turn.
     ///
     /// Text segments carry user text. Image, video and mono PCM segments are
@@ -27,7 +30,7 @@ impl PreparedMultimodalAudioTask {
         mode: AudioMode,
         max_slots: usize,
         seed: u64,
-        support: &impl RealtimeMechanismSupport,
+        factory: &'a F,
     ) -> TaskResult<Self> {
         Self::new_with_soundtracks(
             artifact,
@@ -37,7 +40,7 @@ impl PreparedMultimodalAudioTask {
             max_slots,
             seed,
             OmniAudioSelection::default(),
-            support,
+            factory,
         )
     }
 
@@ -52,7 +55,7 @@ impl PreparedMultimodalAudioTask {
         max_slots: usize,
         seed: u64,
         selection: OmniAudioSelection,
-        support: &impl RealtimeMechanismSupport,
+        factory: &'a F,
     ) -> TaskResult<Self> {
         let assets = &artifact.speech().text_assets;
         let mut tokenizer = Tokenizer::from_bytes(&assets.tokenizer)?;
@@ -101,9 +104,13 @@ impl PreparedMultimodalAudioTask {
             max_slots,
             seed,
             selection,
-            support,
+            &factory.media_graph_support(),
         )?;
-        Ok(Self { turn, tokenizer })
+        Ok(Self {
+            factory,
+            turn,
+            tokenizer,
+        })
     }
 
     /// Required sample rate for decoded PCM inputs.
@@ -117,11 +124,13 @@ impl PreparedMultimodalAudioTask {
     }
 
     /// Binds resident weights, prepares the media and starts the shared response session.
-    pub fn load(self, binding: &dyn AudioTaskBinding) -> TaskResult<AudioTaskSession> {
-        let session = binding.bind(AudioTaskExecution::Omni {
-            turn: Box::new(self.turn),
-            encode_text: &mut |text| encode(&self.tokenizer, text),
-        })?;
+    pub fn load(self, device: &DevicePlan) -> TaskResult<AudioTaskSession> {
+        let mechanisms = self.factory.open_realtime(device)?;
+        let session = BoundAudioTask::Response(
+            self.turn
+                .start(&mechanisms, &mut |text| encode(&self.tokenizer, text))
+                .map_err(AudioTaskError::from)?,
+        );
         let decoder = TextDecoder::from_shared_tokenizer(Arc::new((*self.tokenizer).clone()), true);
         Ok(AudioTaskSession::from_bound(session, decoder, None, false))
     }

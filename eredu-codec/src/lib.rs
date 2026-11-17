@@ -34,24 +34,24 @@ pub mod ear_decoder;
 pub mod ear_decoder_distribution;
 /// EAR neural decoder execution over shared resident and bounded parameter providers.
 pub mod ear_decoder_layered;
-/// Portable codec decoder execution for bound pipelines.
-pub mod ear_decoder_stage;
 /// Streaming decoder pipeline ownership, state and changing-cadence transport.
 pub mod ear_decoder_partition;
 /// Cold exact parameter bindings for independently leased EAR decoder units.
 pub mod ear_decoder_preparation;
+/// Portable codec decoder execution for bound pipelines.
+pub mod ear_decoder_stage;
 
 /// EAR codec finite spectrogram-to-latent encoder.
 pub mod ear_encoder;
 /// Cold admission of exact finite encoder pipeline communication and sources.
 pub mod ear_encoder_distribution;
 pub mod ear_encoder_layered;
-/// Portable codec encoder execution for bound pipelines.
-pub mod ear_encoder_stage;
 /// Exact finite encoder pipeline ownership and changing-cadence transport.
 pub mod ear_encoder_partition;
 /// Cold exact binding plans for EAR encoder execution units.
 pub mod ear_encoder_preparation;
+/// Portable codec encoder execution for bound pipelines.
+pub mod ear_encoder_stage;
 
 /// Shared bounded streaming convolutions and finite-stream lifecycle.
 pub mod streaming;

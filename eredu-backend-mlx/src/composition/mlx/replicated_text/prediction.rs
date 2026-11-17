@@ -935,7 +935,8 @@ where
     }
 
     fn next_step(&self) -> Result<eredu_runtime::prefill::PrefillStep, Error> {
-        self.next_step().map_err(|error| Error::Other(Box::new(error)))
+        self.next_step()
+            .map_err(|error| Error::Other(Box::new(error)))
     }
 
     fn token_count(&self) -> usize {
@@ -943,9 +944,8 @@ where
     }
 
     fn retained_bytes(&self) -> Result<usize, Error> {
-        let unknown = || {
-            Error::ArchitectureModel("retained prefill cursor storage is unavailable".into())
-        };
+        let unknown =
+            || Error::ArchitectureModel("retained prefill cursor storage is unavailable".into());
         let mut arrays = Vec::new();
         self.visit_retained_values(|tensor| arrays.push(tensor.as_array()));
         let survey = safemlx::inspect_storage(&arrays)?;

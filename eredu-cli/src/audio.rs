@@ -2,9 +2,6 @@
 
 pub(crate) mod pcm;
 
-use eredu_backend_mlx::native::{
-    MlxComponentBinder, MlxMediaInputLowering, MlxRealtimeSupport, MlxRingTransport,
-};
 use std::{
     io::{self, Write},
     path::PathBuf,
@@ -14,10 +11,10 @@ use std::{
 use anyhow::{bail, ensure, Context, Result};
 use clap::{Args as ClapArgs, Subcommand};
 use eredu::api::{
-    audio::{AudioTask, AudioTaskBinder, AudioTaskOutput, PreparedAudioTask},
+    audio::{AudioTask, AudioTaskOutput, MediaGraphMechanisms, PreparedAudioTask},
     realtime::{
         prepare_realtime_model, RealtimeArtifactRequest, RealtimeArtifactSource,
-        RealtimeAssetDirectories,
+        RealtimeAssetDirectories, RealtimeBackendFactory,
     },
 };
 
@@ -171,10 +168,16 @@ fn positive_seconds(value: &str) -> Result<f64, &'static str> {
     }
 }
 
-pub fn run(args: Args, total_started: Instant) -> Result<()> {
+pub fn run(
+    factory: &(impl eredu::api::BackendInspection
+          + RealtimeBackendFactory<Mechanisms: MediaGraphMechanisms>),
+    args: Args,
+    total_started: Instant,
+) -> Result<()> {
     let Args { timing, command } = args;
     match command {
         Command::Transcribe(args) => run_turn(
+            factory,
             AudioTask::Transcribe,
             args.model,
             Some(args.input),
@@ -183,6 +186,7 @@ pub fn run(args: Args, total_started: Instant) -> Result<()> {
             total_started,
         ),
         Command::Translate(args) => run_turn(
+            factory,
             AudioTask::Translate {
                 source_language: &args.source_language,
                 language: &args.language,
@@ -194,6 +198,7 @@ pub fn run(args: Args, total_started: Instant) -> Result<()> {
             total_started,
         ),
         Command::Speak(args) => run_turn(
+            factory,
             AudioTask::Speak { text: &args.text },
             args.model,
             None,
@@ -202,6 +207,7 @@ pub fn run(args: Args, total_started: Instant) -> Result<()> {
             total_started,
         ),
         Command::Respond(args) => run_turn(
+            factory,
             AudioTask::Respond {
                 instruction: args.text.as_deref().unwrap_or(""),
             },
@@ -211,11 +217,13 @@ pub fn run(args: Args, total_started: Instant) -> Result<()> {
             timing,
             total_started,
         ),
-        Command::Realtime(args) => crate::realtime::run(args, timing, total_started),
+        Command::Realtime(args) => crate::realtime::run(factory, args, timing, total_started),
     }
 }
 
 fn run_turn(
+    factory: &(impl eredu_core::AutomaticPlanningBackend
+          + RealtimeBackendFactory<Mechanisms: MediaGraphMechanisms>),
     task: AudioTask<'_>,
     args: ModelArgs,
     input: Option<InputArgs>,
@@ -253,14 +261,9 @@ fn run_turn(
         },
         prepared_checkpoint_cache: Some(args.prepared_cache.policy()),
     })?;
-    let prepared = PreparedAudioTask::new(
-        &artifact,
-        task,
-        args.max_slots as usize,
-        args.seed,
-        &MlxRealtimeSupport::new(false),
-    )
-    .map_err(anyhow::Error::from_boxed)?;
+    let prepared =
+        PreparedAudioTask::new(&artifact, task, args.max_slots as usize, args.seed, factory)
+            .map_err(anyhow::Error::from_boxed)?;
     let input_rate = prepared.input_sample_rate();
     let output_rate = prepared.output_sample_rate();
     let mut wav_input = input
@@ -271,16 +274,8 @@ fn run_turn(
     if let Some(input) = &wav_input {
         ensure!(input.sample_count() > 0, "audio input is empty");
     }
-    let factory = eredu_backend_mlx::MlxBackendFactory::default();
-    let device = crate::resolve_device(&crate::discover_devices(&factory)?, args.device)?;
-    let weights = eredu_backend_mlx::native::ExecutionContext::cpu()?;
-    let execution = factory.execution_context(&device)?;
-    let binding = AudioTaskBinder::new(
-        MlxComponentBinder::new(weights.stream(), execution.stream()),
-        MlxMediaInputLowering,
-        MlxRingTransport,
-    );
-    let mut session = prepared.load(&binding).map_err(anyhow::Error::from_boxed)?;
+    let device = crate::resolve_device(&crate::discover_devices(factory)?, args.device)?;
+    let mut session = prepared.load(&device).map_err(anyhow::Error::from_boxed)?;
     let load_elapsed = load_started.map(|start| start.elapsed());
     if let Some(elapsed) = load_elapsed {
         eprintln!("model loaded in {:.3} s", elapsed.as_secs_f64());

@@ -3,12 +3,12 @@ use super::super::*;
 use crate::backend::{
     distributed::MlxDistributedSession,
     nn::shared::MlxCommunicationTensorMetadata,
-    runtime::distributed::{Group, topology::CommunicationRouteRealization},
+    runtime::distributed::{topology::CommunicationRouteRealization, Group},
 };
 use eredu_architectures::prepared_execution::{
     PreparedPartitionSessionFacts, PreparedTextSessionFacts,
 };
-use eredu_core::{CollectiveGroupId, cache::PromptCacheTopology};
+use eredu_core::{cache::PromptCacheTopology, CollectiveGroupId};
 use eredu_runtime::{
     LocalModelLayout, PartitionCommunication, PartitionCommunicationAuthority,
     PartitionOutputAuthority, PartitionedExecutionPlan, PartitionedSessionFactoryInput,
@@ -53,12 +53,12 @@ where
     A: eredu_runtime::LayeredArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>,
     A::Unit: 'static,
     D: eredu_runtime::ReplicatedTextExecutionStrategy<
-            A,
-            MlxNeuralBackend,
-            S,
-            MlxArchitectureLayerwisePolicy<A, S>,
-            MlxArchitectureLayerwisePolicy<A, S>,
-        >,
+        A,
+        MlxNeuralBackend,
+        S,
+        MlxArchitectureLayerwisePolicy<A, S>,
+        MlxArchitectureLayerwisePolicy<A, S>,
+    >,
 {
     pub session: ReplicatedTextSession<A, MlxNeuralBackend, MlxReplicatedTextMechanisms<A, S>, D>,
     pub text: PreparedTextSessionFacts,
@@ -75,12 +75,12 @@ where
     A::StaticModules: Clone,
     A::Unit: 'static,
     D: eredu_runtime::ReplicatedTextExecutionStrategy<
-            A,
-            MlxNeuralBackend,
-            S,
-            MlxArchitectureLayerwisePolicy<A, S>,
-            MlxArchitectureLayerwisePolicy<A, S>,
-        >,
+        A,
+        MlxNeuralBackend,
+        S,
+        MlxArchitectureLayerwisePolicy<A, S>,
+        MlxArchitectureLayerwisePolicy<A, S>,
+    >,
 {
     pub(super) fn into_text(self) -> CompletedReplicatedText<A, S, D> {
         let (identity, capability, model_type, residency) = self.text.into_parts();
@@ -212,13 +212,13 @@ where
     ) -> Result<BoundPartitionSession<'a, A, S, D>, Error>
     where
         D: eredu_runtime::ReplicatedTextExecutionStrategy<
-                A,
-                MlxNeuralBackend,
-                S,
-                MlxArchitectureLayerwisePolicy<A, S>,
-                MlxArchitectureLayerwisePolicy<A, S>,
-                Runtime = R,
-            >,
+            A,
+            MlxNeuralBackend,
+            S,
+            MlxArchitectureLayerwisePolicy<A, S>,
+            MlxArchitectureLayerwisePolicy<A, S>,
+            Runtime = R,
+        >,
     {
         let (text, _, _, publication) = self.facts.into_parts();
         let session = eredu_runtime::construct_replicated_text_session_with_runtime(

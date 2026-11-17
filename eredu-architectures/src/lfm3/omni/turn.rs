@@ -7,30 +7,23 @@ use eredu_core::{
     Audio, BackendFailure, Media, TokenizedMultimodalRequest, TokenizedMultimodalSegment,
 };
 use eredu_media::audio::AudioWaveform;
-use eredu_nn::{
-    DistributedNeuralBackend, NeuralBackend, RetainedTensorRoots, Tensor,
-    TensorParallelGroupedNeuralBackend,
-};
+use eredu_nn::Tensor;
 use eredu_runtime::{
-    ComponentRankMechanisms, LayerWeightResidency, LocalComponentMechanisms,
-    ParameterUnitMechanisms, PipelineTransportProvider, RealtimeGraphMechanisms,
-    RealtimeMechanismSupport, RealtimeStartupMechanisms, SamplingBackend,
+    LayerWeightResidency, ParameterUnitMechanisms, PipelineTransportProvider,
+    RealtimeGraphMechanisms, RealtimeMechanismSupport, RealtimeStartupMechanisms,
 };
 
 use super::{ArtifactError, MediaTokens, OmniVideoPrompt, PreparedOmni, ProcessorConfig};
 use crate::{
     lfm3::{
         audio::{
-            AudioMode, AudioParameterResidency, AudioPlacement, AudioRequest, AudioTaskBinder,
-            AudioTaskResponse, LogMelFeatures, OmniAudioRequest, PreparedResidentAudio,
-            ResidentAudioError,
+            AudioMode, AudioParameterResidency, AudioPlacement, AudioRequest, AudioTaskResponse,
+            LogMelFeatures, OmniAudioRequest, PreparedResidentAudio, ResidentAudioError,
         },
         vision::{PreparedVisionExecution, ProjectedVisionPrompt, VisionPromptAdmission},
     },
-    processor_execution::{MediaInputLowering, PreparedProcessor},
+    processor_execution::{MediaGraphMechanisms, MediaInputLowering, PreparedProcessor},
 };
-
-type Context<B> = <<B as NeuralBackend>::Tensor as Tensor>::Context;
 
 /// Cold weight and language placement policy for an Omni speech response.
 #[derive(Clone, Copy)]
@@ -202,26 +195,17 @@ impl PreparedOmniTurn {
     }
 
     /// Binds the selected route, agrees rank-local media preparation, and starts speech prefill.
-    pub(in crate::lfm3) fn start<B, G, M, P, E>(
+    pub fn start<M, E>(
         self,
-        binding: &AudioTaskBinder<B, G, M, P>,
+        mechanisms: &M,
         encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
     ) -> Result<Box<dyn AudioTaskResponse>, OmniTurnError>
     where
-        B: TensorParallelGroupedNeuralBackend
-            + DistributedNeuralBackend
-            + eredu_runtime::SubmissionBackend<Executor = Context<B>>
-            + 'static,
-        G: RealtimeGraphMechanisms<B> + RealtimeStartupMechanisms<Random: Clone> + Clone + 'static,
-        G::State: RetainedTensorRoots<B::Tensor>,
-        G::Components: LocalComponentMechanisms<B, G::State>
-            + ComponentRankMechanisms<B, G::State, P::Transport>,
-        G::Sampling: SamplingBackend<RandomState = G::Random>,
-        M: MediaInputLowering<B::Tensor>,
-        P: PipelineTransportProvider<Transport: 'static>,
+        M: MediaGraphMechanisms,
         E: std::error::Error + Send + Sync + 'static,
     {
-        let graph = &binding.graph;
+        let graph = mechanisms.graph();
+        let media_lowering = mechanisms.media_lowering();
         let context = graph.context();
         let Self {
             speech,
@@ -241,18 +225,19 @@ impl PreparedOmniTurn {
             ..
         } = self;
         let prepare = || {
-            let mut vision = vision.bind::<B, _>(context, |source, addresses, units, build| {
-                graph
-                    .components()
-                    .bind_units(source, addresses, units, vision_residency, build)
-                    .map(|(policy, _)| policy)
-            })?;
+            let mut vision =
+                vision.bind::<M::Neural, _>(context, |source, addresses, units, build| {
+                    graph
+                        .components()
+                        .bind_units(source, addresses, units, vision_residency, build)
+                        .map(|(policy, _)| policy)
+                })?;
             let projected = |request: &TokenizedMultimodalRequest| {
                 let (input, identity) =
-                    binding.media.prepare_input(&media, request, encode_text)?;
+                    media_lowering.prepare_input(&media, request, encode_text)?;
                 let input = vision_admission.admit_with_identity(
                     &input,
-                    binding.media.inspector(),
+                    media_lowering.inspector(),
                     identity.as_ref(),
                 )?;
                 Ok(vision.project_prompt(input, context)?)
@@ -270,7 +255,7 @@ impl PreparedOmniTurn {
             Ok::<_, OmniTurnError>((prepared, graph.realize_random(seed)?))
         };
         if speech.placement().rank().is_some() {
-            let (world, transport) = binding.pipeline.open()?;
+            let (world, transport) = mechanisms.pipeline_transport().open()?;
             let mut model = speech.bind_pipeline(graph.clone(), world, transport)?;
             let (prepared, random) =
                 agree_preparation(prepare(), |success| model.agree_prompt_preparation(success))?;

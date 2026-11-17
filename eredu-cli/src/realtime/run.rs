@@ -36,19 +36,10 @@ pub struct ScriptedToolResponse {
     pub generic: Vec<String>,
 }
 
-#[cfg(feature = "projection-profiling")]
-#[path = "profiling.rs"]
-mod profiling;
-#[cfg(feature = "projection-profiling")]
-pub use profiling::Options as ProfileOptions;
-
-#[derive(Clone)]
 pub struct RunOptions {
     pub chunk_samples: usize,
     pub tail_frames: u64,
     pub max_steps: u64,
-    #[cfg(feature = "projection-profiling")]
-    pub profile: Option<ProfileOptions>,
 }
 
 // This adapter exposes application actions for a small host-driver fixture. The
@@ -124,13 +115,7 @@ impl Session for dyn SpeechRealtimeSession + '_ {
         at: Duration,
         messages: VoiceChatToolWaitMessages<'_>,
     ) -> Result<()> {
-        Ok(SpeechRealtimeSession::start_wait(
-            self,
-            ticket,
-            at,
-            VoiceChatToolWaitPolicy::default(),
-            messages,
-        )?)
+        Ok(self.start_wait(ticket, at, VoiceChatToolWaitPolicy::default(), messages)?)
     }
     fn response(&mut self, ticket: VoiceChatToolTicket, text: &str) -> Result<bool> {
         match self.submit_response(ticket, text) {
@@ -222,7 +207,7 @@ fn drive<S: Session>(
     )
 }
 /// Drives WAV and system audio through the same controlled session and tool driver.
-pub fn run_io<H: AudioIo>(
+pub(super) fn run_io<H: AudioIo>(
     session: &mut dyn SpeechRealtimeSession,
     io: &mut H,
     events: &mut impl Write,
@@ -231,6 +216,7 @@ pub fn run_io<H: AudioIo>(
 ) -> Result<()> {
     drive_with_io(session, io, events, options, scripts)
 }
+
 fn drive_with_io<S: Session + ?Sized, H: AudioIo>(
     session: &mut S,
     io: &mut H,
@@ -243,12 +229,6 @@ fn drive_with_io<S: Session + ?Sized, H: AudioIo>(
         "chunk samples must be in 1..=1048576"
     );
     ensure!(options.max_steps > 0, "max steps must be positive");
-    #[cfg(feature = "projection-profiling")]
-    let mut profile = options
-        .profile
-        .clone()
-        .map(profiling::Profiler::new)
-        .transpose()?;
     let mut scripts = validated_scripts(scripts)?;
     let mut buffer = vec![0.0; options.chunk_samples];
     let (mut filled, mut consumed) = (0, 0);
@@ -491,18 +471,10 @@ fn drive_with_io<S: Session + ?Sized, H: AudioIo>(
                 options.max_steps
             );
             steps += 1;
-            #[cfg(feature = "projection-profiling")]
-            if let Some(profile) = &mut profile {
-                profile.before(steps)?;
-            }
             execution_started = Some(std::time::Instant::now());
             let progress = session.advance(at)?;
             if progress.submitted == 0 && progress.committed == 0 {
                 execution_started = None;
-            }
-            #[cfg(feature = "projection-profiling")]
-            if let Some(profile) = &mut profile {
-                profile.after(steps)?;
             }
             if matches!(
                 progress.status,
@@ -515,13 +487,7 @@ fn drive_with_io<S: Session + ?Sized, H: AudioIo>(
         }
     })();
     match outcome {
-        Ok(()) => {
-            #[cfg(feature = "projection-profiling")]
-            if let Some(profile) = profile {
-                profile.finish()?;
-            }
-            Ok(())
-        }
+        Ok(()) => Ok(()),
         Err(error) => {
             let _ = io.interrupt();
             match session.cancel(at) {
@@ -934,8 +900,6 @@ mod tests {
                     chunk_samples,
                     tail_frames: 1,
                     max_steps: 100,
-                    #[cfg(feature = "projection-profiling")]
-                    profile: None,
                 },
                 vec![],
             )
@@ -1029,8 +993,6 @@ mod tests {
                     chunk_samples: 127,
                     tail_frames: 1,
                     max_steps: 100,
-                    #[cfg(feature = "projection-profiling")]
-                    profile: None,
                 },
                 vec![],
             );
@@ -1194,8 +1156,6 @@ mod tests {
                     chunk_samples: 4_096,
                     tail_frames: 1,
                     max_steps: 100,
-                    #[cfg(feature = "projection-profiling")]
-                    profile: None,
                 },
                 vec![ScriptedToolResponse {
                     call_index: 0,
@@ -1276,8 +1236,6 @@ mod tests {
                 chunk_samples: INPUT_FRAME_SAMPLES,
                 tail_frames: 2,
                 max_steps: 100,
-                #[cfg(feature = "projection-profiling")]
-                profile: None,
             },
             vec![ScriptedToolResponse {
                 call_index: 0,
@@ -1337,8 +1295,6 @@ mod tests {
                 chunk_samples: 1_280,
                 tail_frames: 0,
                 max_steps: 3,
-                #[cfg(feature = "projection-profiling")]
-                profile: None,
             },
             Vec::new(),
         )

@@ -199,6 +199,10 @@ impl RealtimeBackendFactory for MlxBackendFactory {
         MlxRealtimeSupport::new(false)
     }
 
+    fn media_graph_support(&self) -> impl eredu_runtime::RealtimeMechanismSupport {
+        MlxRealtimeSupport::new(crate::native::MlxRingTransport::is_available())
+    }
+
     fn open_realtime(&self, device: &DevicePlan) -> Result<Self::Mechanisms, BackendFailure> {
         let weights = ExecutionContext::cpu().map_err(BackendFailure::from_error)?;
         let execution = self.execution_context(device)?;
@@ -206,5 +210,31 @@ impl RealtimeBackendFactory for MlxBackendFactory {
             execution.stream(),
             weights.stream(),
         ))
+    }
+}
+
+#[cfg(feature = "audio")]
+impl eredu_architectures::processor_execution::MediaGraphMechanisms
+    for MlxRealtimeExecutionContext
+{
+    type Neural = MlxNeuralBackend;
+    type Transport =
+        <crate::native::MlxRingTransport as eredu_runtime::PipelineTransportProvider>::Transport;
+    type Graph = MlxComponentBinder;
+
+    fn graph(&self) -> Self::Graph {
+        self.component_binder()
+    }
+
+    fn media_lowering(
+        &self,
+    ) -> impl eredu_architectures::processor_execution::MediaInputLowering<MlxTensor> {
+        crate::native::MlxMediaInputLowering
+    }
+
+    fn pipeline_transport(
+        &self,
+    ) -> impl eredu_runtime::PipelineTransportProvider<Transport = Self::Transport> {
+        crate::native::MlxRingTransport
     }
 }

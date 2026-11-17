@@ -32,11 +32,11 @@ pub(super) fn report(
     let inspection = eredu::api::inspect_execution(factory, path, plan)?;
     let input = eredu_core::InputTokenCount::text(input_tokens);
     let mut options = GenerationMemoryOptions::for_backend_device(factory, input, plan.device())?;
-    if let Some(cache_limit) = args.common.mlx_cache_limit_bytes {
+    if let Some(cache_limit) = args.common.allocator_cache_limit_bytes {
         // Cold explicit overrides describe the proposed policy without changing
         // process-global allocator state. Loaded reports sample the actual policy.
-        options.backend_overhead =
-            ForecastCalibration::default().allocator_overhead(cache_limit, 0);
+        options.backend_overhead = ForecastCalibration::default()
+            .allocator_overhead(factory.proposed_allocator_cache_limit(cache_limit)?, 0);
     }
     options.max_output_tokens = output_tokens;
     options.prefill_chunk_tokens = if args.prefill_chunk_size == 0 {

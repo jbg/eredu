@@ -1703,6 +1703,41 @@ impl<'a> InspectableBackendSession<MlxBackend<'a>> for MlxModelSession {
 }
 
 impl<'a> TextGenerationBackend for MlxBackend<'a> {
+    fn residency_telemetry(
+        runtime: &ModelRuntime<Self>,
+    ) -> Result<Option<eredu_core::ResidencyTelemetry>, BackendFailure> {
+        runtime
+            .session()
+            .residency_report()
+            .map(|report| report.as_ref().map(eredu_runtime::residency_telemetry))
+            .map_err(|error| {
+                BackendFailure::from_error(error).with_operation("residency telemetry")
+            })
+    }
+
+    fn expert_cache_telemetry(
+        runtime: &ModelRuntime<Self>,
+    ) -> Result<Option<eredu_core::ExpertCacheTelemetry>, BackendFailure> {
+        runtime
+            .session()
+            .parameter_bank_report()
+            .map(|report| {
+                report.map(|report| eredu_core::ExpertCacheTelemetry {
+                    owned_experts: report.owned_entries(),
+                    owned_bytes: report.owned_bytes(),
+                    host_resident_experts: report.host_resident_entries(),
+                    device_resident_experts: report.device_resident_entries(),
+                    host_resident_bytes: report.host_resident_bytes(),
+                    device_resident_bytes: report.device_resident_bytes(),
+                    peak_host_resident_bytes: report.peak_host_resident_bytes(),
+                    peak_device_resident_bytes: report.peak_device_resident_bytes(),
+                })
+            })
+            .map_err(|error| {
+                BackendFailure::from_error(error).with_operation("expert-cache telemetry")
+            })
+    }
+
     fn agree_text_preparation(
         runtime: &ModelRuntime<Self>,
         stage: eredu_core::run_preparation::TextPreparationStage,

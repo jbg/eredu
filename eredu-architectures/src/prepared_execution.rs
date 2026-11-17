@@ -17,15 +17,15 @@ mod ordinary;
 mod partition_facts;
 mod partitioned;
 mod prediction;
+mod retained_session;
 mod routed_partition;
 mod routed_session;
-mod retained_session;
 pub use retained_session::{PreparedRetainedTextSession, RealizedRank};
 
 pub use direct_session::{construct_selected_composite_session, construct_selected_text_session};
 pub use ordinary::{
-    construct_vl_rank, RetainedCompositeVisitor, CompositeRoute, KeyValueRoute,
-    ReplicatedRoute, RetainedArchitectureConstruction, RoutedRoute,
+    construct_vl_rank, CompositeRoute, KeyValueRoute, ReplicatedRoute,
+    RetainedArchitectureConstruction, RetainedCompositeVisitor, RoutedRoute,
 };
 pub use partition_facts::PreparedPartitionSessionFacts;
 pub use partitioned::{PartitionedCompositeRoute, PartitionedDenseRoute, PartitionedRoutedRoute};
@@ -584,7 +584,15 @@ where
     };
     let (execution, _, _, _) = selected.into_parts();
     let executable = execution.dispatch(ConstructionDispatcher::<
-        _, _, _, _, _, _, _, A::Executable, A::Error,
+        _,
+        _,
+        _,
+        _,
+        _,
+        _,
+        _,
+        A::Executable,
+        A::Error,
     > {
         routes,
         context,

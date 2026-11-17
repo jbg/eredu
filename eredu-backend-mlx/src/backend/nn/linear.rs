@@ -494,7 +494,7 @@ impl PhysicalLinear {
             } else {
                 None
             };
-            let output = match sparse {
+            match sparse {
                 Some(output) => output,
                 None => quantized_matmul_with_mode(
                     input,
@@ -507,21 +507,7 @@ impl PhysicalLinear {
                     self.mode,
                     stream,
                 )?,
-            };
-            #[cfg(feature = "projection-profiling")]
-            super::projection_profile::affine::record(
-                input,
-                self.weight.as_ref(),
-                scales,
-                self.biases.as_ref().as_ref(),
-                &output,
-                self.group_size,
-                self.bits,
-                self.mode,
-                "linear",
-                stream,
-            );
-            output
+            }
         } else if let Some(scale) = self.weight_scale_inv.as_ref() {
             super::fp8::linear_with_input_observer(
                 input,

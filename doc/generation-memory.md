@@ -209,7 +209,7 @@ available capacity is compared with **additional** request memory after subtract
 the declared resident portion. `--memory-reserve-bytes` defaults to 256 MiB per
 physical pool for other work and uncertainty. Shared library overhead uses an explicit
 0–64 MiB graph/driver planning interval plus the configured allocator-cache
-limit, separately from this reserve. Without `--mlx-cache-limit-bytes`, reports
+limit, separately from this reserve. Without `--allocator-cache-limit-bytes`, reports
 query the allocator's actual current limit. The allowance uses the larger of
 that limit and already retained cache, because lowering the limit may defer
 eviction. An explicit cache limit during cold inspection describes the proposed
@@ -221,7 +221,7 @@ ceiling is 256 MiB. This is a one-time process policy; later memory pressure doe
 not resize the cache. Explicit limits remain authoritative. Pure cold queries still observe
 the current policy; they do not apply runtime configuration. To forecast with the
 managed default before loading, call `eredu_backend_mlx::initialize_allocator_cache_policy(false)`
-first. `--mlx-cache-limit-bytes 0` disables allocator-cache retention when desired.
+first. `--allocator-cache-limit-bytes 0` disables allocator-cache retention when desired.
 
 On macOS, the MLX factory’s `discover_hardware` observes available host memory from Mach
 host VM statistics: free pages (which already include speculative pages) plus

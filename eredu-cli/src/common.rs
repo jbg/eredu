@@ -21,9 +21,9 @@ pub struct CommonOptions {
     #[arg(long, value_name = "DEVICE")]
     pub device: Option<CliDevice>,
 
-    /// Process-global MLX allocator-cache limit in bytes; zero disables caching.
+    /// Backend allocator-cache limit in bytes; zero disables caching.
     #[arg(long, value_name = "BYTES")]
-    pub mlx_cache_limit_bytes: Option<u64>,
+    pub allocator_cache_limit_bytes: Option<u64>,
 
     /// Quantize eligible dense weights to this bit width while loading.
     #[arg(long, value_name = "BITS")]
@@ -78,11 +78,12 @@ pub struct CommonOptions {
     pub seed: Option<u64>,
 }
 impl CommonOptions {
-    pub fn configure_runtime(&self) -> Result<()> {
-        if let Some(bytes) = self.mlx_cache_limit_bytes {
-            eredu_backend_mlx::set_allocator_cache_limit(usize::try_from(bytes)?)?;
-        } else {
-            eredu_backend_mlx::initialize_allocator_cache_policy(false)?;
+    pub fn apply_allocator_cache_limit(
+        &self,
+        factory: &impl eredu::api::BackendInspection,
+    ) -> Result<()> {
+        if let Some(bytes) = self.allocator_cache_limit_bytes {
+            factory.set_allocator_cache_limit(bytes)?;
         }
         Ok(())
     }

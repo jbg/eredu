@@ -1641,8 +1641,9 @@ extents and SHA-256 values, and tensor type counts. The header replay verifies
 the ten descriptor prefixes and the component recipe geometry using the model
 and codec configs from the pinned SafeTensors revision.
 
-`api::audio::PreparedOmni::open_gguf(backbone, projector, assets, max_cached_readers)`
-takes the explicit GGUF pair and the matching Omni sidecar directory. The
+`api::audio::PreparedOmni::open_gguf(backbone, projector, assets, max_cached_readers, prepared_cache)`
+takes the explicit GGUF pair, the matching Omni sidecar directory, and an optional
+prepared checkpoint cache policy. The
 sidecars supply the model, processor, tokenizer, generation and LiquidCodec
 configs. The backbone supplies the chat template and vocabulary metadata.
 The combined projector supplies both the vision and speech paths, including
@@ -1706,16 +1707,12 @@ let selection = OmniAudioSelection {
     language: AudioPlacement::Pipeline(rank),
     ..Default::default()
 };
+let factory = MlxBackendFactory::default();
 let task = PreparedMultimodalAudioTask::new_with_soundtracks(
     &artifact, &input, soundtracks, AudioMode::Speech, 5, 42, selection,
-    &MlxRealtimeSupport::new(MlxRingTransport::is_available()),
+    &factory,
 )?;
-let binding = AudioTaskBinder::new(
-    MlxComponentBinder::new(weights.stream(), execution.stream()),
-    MlxMediaInputLowering,
-    MlxRingTransport,
-);
-let mut session = task.load(&binding)?;
+let mut session = task.load(&device)?;
 while let Some(output) = session.next_output()? {
     // Consume committed text or PCM on every rank.
 }

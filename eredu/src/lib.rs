@@ -22,8 +22,3 @@ compile_error!(
 pub mod api;
 /// Backend-independent chat and committed-generation orchestration.
 pub mod runtime;
-
-// Internal bindings keep implementation paths concise without adding public
-// aliases for contracts owned by dependency crates.
-#[cfg(feature = "mlx")]
-use eredu_core::{ExpertCacheTelemetry, ResidencyTelemetry};

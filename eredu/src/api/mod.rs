@@ -1,16 +1,12 @@
 //! Backend-neutral language-model facade.
 //!
-//! This module is available without an execution backend. Enabling the
-//! `mlx` feature enables MLX-specific diagnostics. Models, requests,
+//! This module is available without an execution backend. Models, requests,
 //! generation controls, and realtime mechanisms retain their generic parameters;
 //! import a concrete backend factory from its owning crate to select execution.
 //!
 //! Application errors are backend-independent. Native failures are retained as
 //! sources in `eredu_core::BackendFailure`; backend implementation traits remain
 //! in `eredu-core`.
-
-mod errors;
-pub use errors::ExpertCacheBenchmarkError;
 
 mod chat_input;
 mod media;
@@ -25,16 +21,11 @@ pub mod realtime;
 mod request;
 mod tokenizer;
 
-#[cfg(feature = "mlx")]
-mod selected;
-
 pub use request::{
     GenerationRequest, OutputMode, PreparedChatError, PreparedChatGenerationSettings,
     PreparedChatInput, PreparedChatSpeculativeBatchLane, PreparedChatSpeculativeBatchRequest,
     PreparedChatSpeculativeConstraint,
 };
-#[cfg(feature = "mlx")]
-pub use selected::*;
 pub use tokenizer::{chat_template_kwargs, load_tokenizer, TextMetadataError};
 
 mod capability;

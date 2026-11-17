@@ -6,10 +6,9 @@ use eredu_core::{
     AutomaticPlanningBackend, AutomaticPlanningError, BackendFailure, BackendId,
     BoundedResidencyRequirement, CandidateAdmission, DevicePlan, DraftPlacementPlan, DraftingPlan,
     ExecutionPlan, ExecutionPlanBackendFactory, ExecutionPlanTarget, ExecutionPlanTargetSelection,
-    ExpertCacheTelemetry, ExternalDraftArtifact, HardwareBackendProfile, HardwareDeviceProfile,
-    HardwareMemorySemantics, HardwareProfile, ModelResourceProfile, ModelRuntime, Observed,
-    RealizedDrafting, ResidencyPlan, SelectedExecutionPlanTarget, SpeculativeDraftSource,
-    SpeculativeGenerationBackend,
+    ExternalDraftArtifact, HardwareBackendProfile, HardwareDeviceProfile, HardwareMemorySemantics,
+    HardwareProfile, ModelResourceProfile, ModelRuntime, Observed, RealizedDrafting, ResidencyPlan,
+    SelectedExecutionPlanTarget, SpeculativeDraftSource, SpeculativeGenerationBackend,
 };
 use safemlx::{Device, DeviceType, Stream};
 
@@ -17,10 +16,7 @@ use super::{
     capability::available_memory, inspection::MlxInspectionOptions, speculative::MlxDrafter,
     MlxBackend, MlxLoadRequest,
 };
-use crate::{
-    backend::runtime::residency::parameter_bank::ParameterBanksResidencyReport,
-    backend::{MlxAcceleratorFamily, MlxDeviceIdentity},
-};
+use crate::backend::{MlxAcceleratorFamily, MlxDeviceIdentity};
 use eredu_runtime::selected_text_bounded_requirement;
 
 #[derive(Debug, Clone, Copy)]
@@ -65,6 +61,19 @@ impl eredu_architectures::BackendInspection for MlxBackendFactory {
         Ok(true)
     }
 
+    fn proposed_allocator_cache_limit(&self, bytes: u64) -> Result<u64, BackendFailure> {
+        native_cache_limit(bytes)?;
+        Ok(bytes)
+    }
+
+    fn set_allocator_cache_limit(&self, bytes: u64) -> Result<(), BackendFailure> {
+        crate::set_allocator_cache_limit(native_cache_limit(bytes)?)
+            .map(|_| ())
+            .map_err(|error| {
+                BackendFailure::from_error(error).with_operation("allocator cache policy")
+            })
+    }
+
     fn allocator_observation(
         &self,
     ) -> Result<
@@ -79,6 +88,13 @@ impl eredu_architectures::BackendInspection for MlxBackendFactory {
             allocator_telemetry()?,
         )))
     }
+}
+
+fn native_cache_limit(bytes: u64) -> Result<usize, BackendFailure> {
+    usize::try_from(bytes).map_err(|error| {
+        BackendFailure::new(eredu_core::BackendFailureKind::InvalidInput, error)
+            .with_operation("allocator cache policy")
+    })
 }
 
 fn allocator_telemetry() -> Result<eredu_core::AllocatorTelemetry, BackendFailure> {
@@ -137,7 +153,7 @@ impl eredu_architectures::decision_task::DecisionBackendFactory for MlxBackendFa
 
 impl MlxBackendFactory {
     /// Realizes an execution context from a canonical MLX device plan.
-    pub fn execution_context(
+    pub(crate) fn execution_context(
         &self,
         plan: &DevicePlan,
     ) -> Result<crate::native::ExecutionContext, eredu_core::BackendFailure> {
@@ -565,20 +581,6 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
                 "unsupported speculative drafting plan".into(),
             )),
         }
-    }
-}
-
-/// Converts an MLX routed-expert cache snapshot into neutral telemetry.
-pub fn parameter_bank_telemetry(report: &ParameterBanksResidencyReport) -> ExpertCacheTelemetry {
-    ExpertCacheTelemetry {
-        owned_experts: report.owned_entries(),
-        owned_bytes: report.owned_bytes(),
-        host_resident_experts: report.host_resident_entries(),
-        device_resident_experts: report.device_resident_entries(),
-        host_resident_bytes: report.host_resident_bytes(),
-        device_resident_bytes: report.device_resident_bytes(),
-        peak_host_resident_bytes: report.peak_host_resident_bytes(),
-        peak_device_resident_bytes: report.peak_device_resident_bytes(),
     }
 }
 
