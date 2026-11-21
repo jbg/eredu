@@ -416,13 +416,16 @@ fn fused_bf16_rms(
     }
     let rows = i32::try_from(input.size() / width as usize)
         .map_err(|_| Exception::custom("normalization row count overflow"))?;
+    // This geometry has four complete 16-step chunks in each of its 32 chains.
+    let chunks = if lanes == 8 && width == 2048 { 4 } else { 1 };
     let epsilon = Array::from_slice(&[epsilon], &[1]);
     let config = CustomKernelConfig::new()
         .with_template_arg_int("WIDTH", width)
         .with_template_arg_int("LANES", lanes)
         .with_template_arg_int("WEIGHTED", i32::from(gain.is_some()))
-        .with_grid([32, rows, 1])
-        .with_thread_group([32, 1, 1])
+        .with_template_arg_int("CHUNKS", chunks)
+        .with_grid([32, rows, chunks])
+        .with_thread_group([32, 1, chunks])
         .with_output_arg(input.shape(), Dtype::Bfloat16);
     KERNEL.with(|cell| {
         if cell.borrow().is_none() {
