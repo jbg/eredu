@@ -1,4 +1,4 @@
-//! Native FP32 pointwise and softmax arithmetic with explicit rounding.
+//! Native pointwise and softmax arithmetic with explicit rounding.
 use safemlx::{error::Exception, Array, Stream};
 #[derive(Clone, Copy)]
 pub(crate) enum Pointwise {
@@ -70,6 +70,71 @@ pub(crate) fn f32_pointwise(
     #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
     {
         let _ = (input, operation, stream);
+        Ok(None)
+    }
+}
+
+/// Single-row BF16 sigmoid or ordinary SwiGLU with FP32 activation arithmetic.
+pub(crate) fn bf16_pointwise(
+    input: &Array,
+    up: Option<&Array>,
+    stream: &Stream,
+) -> Result<Option<Array>, Exception> {
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    {
+        use safemlx::{
+            fast::{CustomKernelConfig, MetalKernel},
+            DeviceType, Dtype,
+        };
+        use std::cell::RefCell;
+        thread_local! { static KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) }; }
+        if input.dtype() != Dtype::Bfloat16
+            || input.ndim() == 0
+            || input.size() == 0
+            || input.size() != input.dim(-1) as usize
+            || up.is_some_and(|up| up.shape() != input.shape() || up.dtype() != Dtype::Bfloat16)
+            || stream.get_device()?.get_type()? != DeviceType::Gpu
+        {
+            return Ok(None);
+        }
+        let config = CustomKernelConfig::new()
+            .with_template_arg_bool("SWIGLU", up.is_some())
+            .with_grid([input.dim(-1), 1, 1])
+            .with_thread_group([256, 1, 1])
+            .with_output_arg(input.shape(), Dtype::Bfloat16);
+        KERNEL.with(|cell| {
+            if cell.borrow().is_none() {
+                *cell.borrow_mut() = Some(MetalKernel::new(
+                    "bf16_pointwise",
+                    ["input", "up"],
+                    ["output"],
+                    r#"
+                    uint i = thread_position_in_grid.x;
+                    float x = float(input[i]);
+                    if (SWIGLU) {
+                        // The multiplication consumes the rounded SiLU result.
+                        bfloat16_t gate = bfloat16_t(x / (1.0f + stable_exp_f32(-x)));
+                        output[i] = bfloat16_t(float(gate) * float(up[i]));
+                    } else {
+                        output[i] = bfloat16_t(
+                            metal::fast::divide(1.0f, 1.0f + metal::fast::exp(-x)));
+                    }
+                    "#,
+                    include_str!("exp_f32.metal"),
+                    true,
+                    false,
+                )?);
+            }
+            cell.borrow()
+                .as_ref()
+                .expect("BF16 pointwise kernel initialized")
+                .apply_one_device([input, up.unwrap_or(input)], &config, stream)
+                .map(Some)
+        })
+    }
+    #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
+    {
+        let _ = (input, up, stream);
         Ok(None)
     }
 }

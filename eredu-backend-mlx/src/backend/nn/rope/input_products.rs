@@ -1,6 +1,8 @@
-//! Native fusion of frequency-based rotary encoding with F32 product boundaries.
+//! Native frequency-based rotary encoding with explicit table and product precision.
+use eredu_nn::RotaryArithmetic;
 use safemlx::{error::Exception, Array, Stream};
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn forward(
     input: &Array,
     frequencies: &Array,
@@ -8,6 +10,7 @@ pub(super) fn forward(
     traditional: bool,
     offset: i32,
     amplitude: f32,
+    arithmetic: RotaryArithmetic,
     stream: &Stream,
 ) -> Result<Option<Array>, Exception> {
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
@@ -18,16 +21,26 @@ pub(super) fn forward(
         };
         use std::cell::RefCell;
         thread_local! { static KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) }; }
-        if input.dtype() != Dtype::Float32
-            || input.size() == 0
+        if input.size() == 0
             || input.shape().len() < 2
             || dimensions <= 0
             || dimensions % 2 != 0
             || dimensions > input.dim(-1)
             || frequencies.dtype() != Dtype::Float32
             || frequencies.shape() != [dimensions / 2]
-            || stream.get_device()?.get_type()? != DeviceType::Gpu
         {
+            return Ok(None);
+        }
+        let input_table = match (arithmetic, input.dtype()) {
+            (RotaryArithmetic::InputProducts, Dtype::Float32) => false,
+            (RotaryArithmetic::InputTableFloat32Products, Dtype::Bfloat16)
+                if input.dim(-2) == 1 && offset < i32::MAX =>
+            {
+                true
+            }
+            _ => return Ok(None),
+        };
+        if stream.get_device()?.get_type()? != DeviceType::Gpu {
             return Ok(None);
         }
         let width = input.dim(-1);
@@ -44,13 +57,15 @@ pub(super) fn forward(
             .with_template_arg_int("WIDTH", width)
             .with_template_arg_int("DIMENSIONS", dimensions)
             .with_template_arg_bool("TRADITIONAL", traditional)
+            .with_template_arg_bool("INPUT_TABLE", input_table)
+            .with_template_arg_dtype("T", input.dtype())
             .with_grid([count, 1, 1])
             .with_thread_group([128, 1, 1])
-            .with_output_arg(input.shape(), Dtype::Float32);
+            .with_output_arg(input.shape(), input.dtype());
         let mut output = KERNEL.with(|cell| -> Result<Vec<Array>, Exception> {
             if cell.borrow().is_none() {
                 *cell.borrow_mut() = Some(MetalKernel::new(
-                    "f32_input_products_rotary",
+                    "ordered_frequency_rotary",
                     ["input", "frequencies", "position", "amplitude"],
                     ["output"],
                     include_str!("input_products.metal"),
@@ -75,6 +90,7 @@ pub(super) fn forward(
             traditional,
             offset,
             amplitude,
+            arithmetic,
             stream,
         );
         Ok(None)

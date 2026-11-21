@@ -399,18 +399,17 @@ impl ElementwiseRotary {
         offset: i32,
         stream: &Stream,
     ) -> Result<Array, Exception> {
-        if self.arithmetic == eredu_nn::RotaryArithmetic::InputProducts {
-            if let Some(output) = input_products::forward(
-                input,
-                &self.inverse_frequencies,
-                self.dimensions,
-                self.traditional,
-                offset,
-                self.amplitude,
-                stream,
-            )? {
-                return Ok(output);
-            }
+        if let Some(output) = input_products::forward(
+            input,
+            &self.inverse_frequencies,
+            self.dimensions,
+            self.traditional,
+            offset,
+            self.amplitude,
+            self.arithmetic,
+            stream,
+        )? {
+            return Ok(output);
         }
         let shape = input.shape();
         let length = input.dim(-2);
