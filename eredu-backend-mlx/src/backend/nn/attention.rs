@@ -10,6 +10,8 @@ use safemlx::{
 use crate::backend::nn::tensor::create_causal_mask;
 
 mod indexed;
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+mod score_softmax;
 pub use indexed::indexed_sparse_attention;
 pub(crate) use indexed::{attend_indexed_row, positions as indexed_positions};
 
@@ -561,12 +563,10 @@ fn attention_with_prepared_key_values(
     softcap: Option<f32>,
     stream: &Stream,
 ) -> Result<Array, Exception> {
-    let batch = queries.dim(0);
-    let heads = queries.dim(1);
     let tokens = prepared.values.dim(2);
     let score_dtype = prepared.score_dtype;
     let query = queries.as_dtype(score_dtype, stream)?;
-    let mut scores = match prepared
+    let scores = match prepared
         .key_product
         .as_ref()
         .map(|product| product.apply(&query, stream))
@@ -586,6 +586,70 @@ fn attention_with_prepared_key_values(
             }
         }
     };
+    let probabilities = explicit_probabilities(
+        scores,
+        score_dtype,
+        queries.dtype(),
+        tokens,
+        scale,
+        mask,
+        sinks,
+        softcap,
+        stream,
+    )?;
+    match prepared
+        .value_product
+        .as_ref()
+        .map(|product| product.apply(&probabilities, stream))
+        .transpose()?
+        .flatten()
+    {
+        Some(output) => Ok(output),
+        None => {
+            let ordered = if score_dtype == Dtype::Bfloat16 {
+                super::matrix::ordered_bf16_batched_product(
+                    &probabilities,
+                    &prepared.values,
+                    prepared.value_reduction,
+                    stream,
+                )?
+            } else {
+                None
+            };
+            match ordered {
+                Some(output) => Ok(output),
+                None => grouped_head_product(&probabilities, &prepared.values, stream),
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn explicit_probabilities(
+    mut scores: Array,
+    score_dtype: Dtype,
+    output_dtype: Dtype,
+    tokens: i32,
+    scale: f32,
+    mask: Option<&Array>,
+    sinks: Option<&Array>,
+    softcap: Option<f32>,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    if score_dtype == Dtype::Bfloat16
+        && output_dtype == Dtype::Bfloat16
+        && sinks.is_none()
+        && softcap.is_none()
+    {
+        if let Some(probabilities) = score_softmax::apply(&scores, scale, mask, stream)? {
+            return Ok(probabilities);
+        }
+    }
+
+    let batch = scores.dim(0);
+    let heads = scores.dim(1);
+    let queries = scores.dim(2);
     scores = scores
         .as_dtype(Dtype::Float32, stream)?
         .multiply(Array::from_f32(scale), stream)?
@@ -612,7 +676,7 @@ fn attention_with_prepared_key_values(
             &sinks
                 .as_dtype(score_dtype, stream)?
                 .reshape(&[1, heads, 1, 1], stream)?,
-            &[batch, heads, queries.dim(2), 1],
+            &[batch, heads, queries, 1],
             stream,
         )?;
         scores = concatenate_axis(&[&scores, &sinks], -1, stream)?;
@@ -623,34 +687,9 @@ fn attention_with_prepared_key_values(
             Some(value) => value,
             None => safemlx::ops::softmax_axis(&scores, -1, true, stream)?,
         };
-    let probabilities = probabilities
+    probabilities
         .try_index_device((.., .., .., ..tokens), stream)?
-        .as_dtype(queries.dtype(), stream)?;
-    match prepared
-        .value_product
-        .as_ref()
-        .map(|product| product.apply(&probabilities, stream))
-        .transpose()?
-        .flatten()
-    {
-        Some(output) => Ok(output),
-        None => {
-            let ordered = if score_dtype == Dtype::Bfloat16 {
-                super::matrix::ordered_bf16_batched_product(
-                    &probabilities,
-                    &prepared.values,
-                    prepared.value_reduction,
-                    stream,
-                )?
-            } else {
-                None
-            };
-            match ordered {
-                Some(output) => Ok(output),
-                None => grouped_head_product(&probabilities, &prepared.values, stream),
-            }
-        }
-    }
+        .as_dtype(output_dtype, stream)
 }
 
 /// Explicit rounding need not materialize the complete Q-by-K score matrix.
