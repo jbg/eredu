@@ -495,6 +495,11 @@ fn bf16_row_tile(
     thread_local! {
         static KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     }
+    // Four query rows per tile leave room for a second output accumulator
+    // and let each activation load serve both output columns.
+    if batches.is_none() && rows >= 8 && outputs % 32 == 0 {
+        return bf16_paired_row_tile(input, weight, rows, width, outputs, stream);
+    }
     let grouped = batches.is_some();
     let batches = batches.unwrap_or(ProjectionBatches {
         query_heads: 1,
@@ -546,6 +551,50 @@ fn bf16_row_tile(
         cell.borrow()
             .as_ref()
             .expect("dense tile kernel initialized")
+            .apply_one_device([input, weight], &config, stream)
+    })
+}
+
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+fn bf16_paired_row_tile(
+    input: &Array,
+    weight: &Array,
+    rows: i32,
+    width: i32,
+    outputs: i32,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    use safemlx::fast::{CustomKernelConfig, MetalKernel};
+    use std::cell::RefCell;
+
+    thread_local! {
+        static KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
+    }
+    let mut shape = input.shape().to_vec();
+    *shape.last_mut().expect("matrix input rank") = outputs;
+    let config = CustomKernelConfig::new()
+        .with_template_arg_int("WIDTH", width)
+        .with_template_arg_int("OUTPUTS", outputs)
+        .with_template_arg_int("ROWS", rows)
+        .with_template_arg_int("UNROLL", if rows >= 512 { 4 } else { 2 })
+        .with_grid([32, outputs / 8, (rows - 1) / 4 + 1])
+        .with_thread_group([32, 4, 1])
+        .with_output_arg(shape, Dtype::Bfloat16);
+    KERNEL.with(|cell| {
+        if cell.borrow().is_none() {
+            *cell.borrow_mut() = Some(MetalKernel::new(
+                "bf16_paired_row_tile",
+                ["input", "weight"],
+                ["output"],
+                include_str!("bf16_paired_row_tile.metal"),
+                "",
+                true,
+                false,
+            )?);
+        }
+        cell.borrow()
+            .as_ref()
+            .expect("paired row tile kernel initialized")
             .apply_one_device([input, weight], &config, stream)
     })
 }
