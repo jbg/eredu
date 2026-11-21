@@ -303,7 +303,7 @@ fn bf16_projection(
     reduction: BatchedDotReduction,
     bias: Option<&Array>,
     stream: &Stream,
-    tile_rows: bool,
+    tile_dense: bool,
 ) -> Result<Option<Array>, Exception> {
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
     {
@@ -325,7 +325,7 @@ fn bf16_projection(
             return Ok(None);
         }
         let rows = input.size() / width as usize;
-        let tile_rows = tile_rows && rows > 1;
+        let tile_rows = tile_dense && rows > 1;
         let outputs = weight.dim(-2);
         if rows == 0 {
             return Ok(None);
@@ -335,8 +335,7 @@ fn bf16_projection(
         if weight.dim(-1) != width || weight.ndim() != if groups.is_some() { 3 } else { 2 } {
             return Err(Exception::custom("invalid row projection geometry"));
         }
-        // The dense tile uses four SIMD groups, each covering two output columns.
-        if tile_rows && rows >= 8 && outputs >= 64 && outputs % 8 == 0 {
+        if tile_dense && (rows == 1 || rows >= 8) && outputs >= 64 && outputs % 8 == 0 {
             return bf16_dense_tile(input, weight, rows, width, outputs, stream).map(Some);
         }
         if let Some(group) = &groups {
@@ -467,7 +466,7 @@ fn bf16_projection(
     #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
     {
         let _ = (
-            input, weight, groups, columns, reduction, bias, stream, tile_rows,
+            input, weight, groups, columns, reduction, bias, stream, tile_dense,
         );
         Ok(None)
     }
@@ -488,14 +487,15 @@ fn bf16_dense_tile(
     thread_local! {
         static KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     }
-    const TILE_ROWS: i32 = 8;
+    let tile_rows = if rows == 1 { 1 } else { 8 };
+    let simd_groups = if outputs % 16 == 0 { 4 } else { 2 };
     let config = CustomKernelConfig::new()
         .with_template_arg_int("WIDTH", width)
         .with_template_arg_int("OUTPUTS", outputs)
         .with_template_arg_int("ROWS", rows)
-        .with_template_arg_int("TILE_ROWS", TILE_ROWS)
-        .with_grid([32, outputs / 2, (rows - 1) / TILE_ROWS + 1])
-        .with_thread_group([32, 4, 1])
+        .with_template_arg_int("TILE_ROWS", tile_rows)
+        .with_grid([32, outputs / 4, (rows - 1) / tile_rows + 1])
+        .with_thread_group([32, simd_groups, 1])
         .with_output_arg([rows, outputs], Dtype::Bfloat16);
     let output = KERNEL.with(|cell| {
         if cell.borrow().is_none() {
