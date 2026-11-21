@@ -511,10 +511,20 @@ impl PreparedAttentionKeyValues {
             values.dim(3) as u64,
             super::matrix::BatchedDotReduction::Native,
         );
-        let key_product =
-            super::matrix::PreparedBf16BatchedProduct::new(&keys, false, score_reduction, stream)?;
-        let value_product =
-            super::matrix::PreparedBf16BatchedProduct::new(&values, true, value_reduction, stream)?;
+        let key_product = super::matrix::PreparedBf16BatchedProduct::new(
+            &keys,
+            false,
+            score_reduction,
+            queries.dim(2),
+            stream,
+        )?;
+        let value_product = super::matrix::PreparedBf16BatchedProduct::new(
+            &values,
+            true,
+            value_reduction,
+            queries.dim(2),
+            stream,
+        )?;
         Ok(Self {
             keys,
             values,

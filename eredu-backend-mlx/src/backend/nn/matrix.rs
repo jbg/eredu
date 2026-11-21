@@ -336,7 +336,7 @@ fn bf16_projection(
             return Err(Exception::custom("invalid row projection geometry"));
         }
         if tile_dense && (rows == 1 || rows >= 8) && outputs >= 64 && outputs % 8 == 0 {
-            return bf16_dense_tile(input, weight, rows, width, outputs, stream).map(Some);
+            return bf16_row_tile(input, weight, rows, width, outputs, None, stream).map(Some);
         }
         if let Some(group) = &groups {
             let ids = group.values();
@@ -473,12 +473,20 @@ fn bf16_projection(
 }
 
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
-fn bf16_dense_tile(
+struct ProjectionBatches {
+    query_heads: i32,
+    key_value_heads: i32,
+    query_banks: i32,
+}
+
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+fn bf16_row_tile(
     input: &Array,
     weight: &Array,
     rows: i32,
     width: i32,
     outputs: i32,
+    batches: Option<ProjectionBatches>,
     stream: &Stream,
 ) -> Result<Array, Exception> {
     use safemlx::fast::{CustomKernelConfig, MetalKernel};
@@ -487,17 +495,43 @@ fn bf16_dense_tile(
     thread_local! {
         static KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     }
-    let tile_rows = if rows == 1 { 1 } else { 8 };
-    let simd_groups = if outputs % 16 == 0 { 4 } else { 2 };
+    let grouped = batches.is_some();
+    let batches = batches.unwrap_or(ProjectionBatches {
+        query_heads: 1,
+        key_value_heads: 1,
+        query_banks: 1,
+    });
+    let tile_rows = match (rows, grouped) {
+        (1, _) => 1,
+        (_, true) => 4,
+        _ => 8,
+    };
+    let row_tiles = (rows - 1) / tile_rows + 1;
+    let grid_depth = batches
+        .query_banks
+        .checked_mul(row_tiles)
+        .ok_or_else(|| Exception::custom("projection tile count overflow"))?;
+    let (grid_columns, simd_groups) = if grouped {
+        (((outputs - 1) / 16 + 1) * 4, 4)
+    } else {
+        (outputs / 4, if outputs % 16 == 0 { 4 } else { 2 })
+    };
+    let mut shape = input.shape().to_vec();
+    *shape.last_mut().expect("matrix input rank") = outputs;
     let config = CustomKernelConfig::new()
         .with_template_arg_int("WIDTH", width)
         .with_template_arg_int("OUTPUTS", outputs)
         .with_template_arg_int("ROWS", rows)
         .with_template_arg_int("TILE_ROWS", tile_rows)
-        .with_grid([32, outputs / 4, (rows - 1) / tile_rows + 1])
+        .with_template_arg_bool("GROUPED", grouped)
+        .with_template_arg_int("HEADS", batches.query_heads)
+        .with_template_arg_int("KV_HEADS", batches.key_value_heads)
+        .with_template_arg_int("REPEATS", batches.query_heads / batches.key_value_heads)
+        .with_template_arg_int("ROW_TILES", row_tiles)
+        .with_grid([32, grid_columns, grid_depth])
         .with_thread_group([32, simd_groups, 1])
-        .with_output_arg([rows, outputs], Dtype::Bfloat16);
-    let output = KERNEL.with(|cell| {
+        .with_output_arg(shape, Dtype::Bfloat16);
+    KERNEL.with(|cell| {
         if cell.borrow().is_none() {
             *cell.borrow_mut() = Some(MetalKernel::new(
                 "bf16_dense_tile",
@@ -513,18 +547,63 @@ fn bf16_dense_tile(
             .as_ref()
             .expect("dense tile kernel initialized")
             .apply_one_device([input, weight], &config, stream)
-    })?;
-    let mut shape = input.shape().to_vec();
-    *shape.last_mut().expect("matrix input rank") = outputs;
-    output.reshape(&shape, stream)
+    })
 }
 
-/// Reusable RHS layout for complete FP32 batched BF16 products.
-/// The contiguous node belongs to the complete invocation, so the native kernel
-/// does not insert a separate layout copy for every query tile. Preparation is
-/// lazy and preserves the row-dot / strided-column reduction order.
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+fn bf16_value_tile(
+    input: &Array,
+    values: &Array,
+    outputs: i32,
+    batches: ProjectionBatches,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    use safemlx::fast::{CustomKernelConfig, MetalKernel};
+    use std::cell::RefCell;
+
+    thread_local! {
+        static KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
+    }
+    let rows = input.dim(2);
+    let mut shape = input.shape().to_vec();
+    shape[3] = outputs;
+    let config = CustomKernelConfig::new()
+        .with_template_arg_int("WIDTH", input.dim(3))
+        .with_template_arg_int("OUTPUTS", outputs)
+        .with_template_arg_int("ROWS", rows)
+        .with_template_arg_int("HEADS", batches.query_heads)
+        .with_template_arg_int("KV_HEADS", batches.key_value_heads)
+        .with_template_arg_int("REPEATS", batches.query_heads / batches.key_value_heads)
+        .with_grid([outputs, rows, batches.query_banks])
+        .with_thread_group([32, 1, 1])
+        .with_output_arg(shape, Dtype::Bfloat16);
+    KERNEL.with(|cell| {
+        if cell.borrow().is_none() {
+            *cell.borrow_mut() = Some(MetalKernel::new(
+                "bf16_grouped_value_tile",
+                ["input", "values"],
+                ["output"],
+                include_str!("bf16_grouped_value_tile.metal"),
+                "",
+                true,
+                false,
+            )?);
+        }
+        cell.borrow()
+            .as_ref()
+            .expect("grouped value tile kernel initialized")
+            .apply_one_device([input, values], &config, stream)
+    })
+}
+
+/// Invocation-local RHS layouts for exact batched BF16 products.
+/// Query tiles share the contiguous layout nodes. A multi-row value tile reads
+/// channels directly from token-major values, and the scalar path uses its
+/// transposed layout. Unused layouts stay lazy.
 pub(crate) struct PreparedBf16BatchedProduct {
     weights: Array,
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    value_rows: Option<Array>,
     batch: i32,
     heads: i32,
     width: i32,
@@ -538,6 +617,7 @@ impl PreparedBf16BatchedProduct {
         rhs: &Array,
         columns: bool,
         reduction: BatchedDotReduction,
+        query_rows: i32,
         stream: &Stream,
     ) -> Result<Option<Self>, Exception> {
         if !cfg!(all(feature = "metal", not(feature = "cuda")))
@@ -559,8 +639,19 @@ impl PreparedBf16BatchedProduct {
             .swap_axes(-1, -2, stream)?
             .reshape(&[batches, outputs, width], stream)?
             .contiguous(false, stream)?;
+        #[cfg(all(feature = "metal", not(feature = "cuda")))]
+        let value_rows = (columns
+            && reduction == BatchedDotReduction::Native
+            && query_rows > 1
+            && outputs % 32 == 0)
+            .then(|| rhs.contiguous(false, stream))
+            .transpose()?;
+        #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
+        let _ = query_rows;
         Ok(Some(Self {
             weights,
+            #[cfg(all(feature = "metal", not(feature = "cuda")))]
+            value_rows,
             batch: rhs.dim(0),
             heads: rhs.dim(1),
             width,
@@ -587,6 +678,29 @@ impl PreparedBf16BatchedProduct {
             .batch
             .checked_mul(heads)
             .ok_or_else(|| Exception::custom("matrix batch count overflow"))?;
+        #[cfg(all(feature = "metal", not(feature = "cuda")))]
+        let batches = ProjectionBatches {
+            query_heads: heads,
+            key_value_heads: self.heads,
+            query_banks,
+        };
+        #[cfg(all(feature = "metal", not(feature = "cuda")))]
+        if let Some(values) = self.value_rows.as_ref().filter(|_| rows > 1) {
+            return bf16_value_tile(lhs, values, self.outputs, batches, stream).map(Some);
+        }
+        #[cfg(all(feature = "metal", not(feature = "cuda")))]
+        if !self.columns && self.reduction == BatchedDotReduction::Row32 && self.outputs >= 64 {
+            return bf16_row_tile(
+                lhs,
+                &self.weights,
+                rows,
+                self.width,
+                self.outputs,
+                Some(batches),
+                stream,
+            )
+            .map(Some);
+        }
         let input = lhs.reshape(&[-1, self.width], stream)?;
         // query_banks = batch * heads and repeats = heads / key-value heads;
         // every generated bank is in 0..batch*key-value-heads (weights.dim(0)).
