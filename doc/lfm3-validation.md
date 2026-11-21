@@ -8,6 +8,8 @@ rotate the highest-frequency half. Rotary tables are computed in F32 and stored
 in the activation dtype. The products and sums use F32 before the final cast.
 The causal convolution uses four-lane FP32 tap accumulation and rounds its
 affine output once. Carry stays in the activation dtype.
+The text SafeTensors declaration uses an eight-lane FP32 RMS cascade and
+rounds the normalized value before applying the learned gain.
 
 Resident, host-layerwise and disk-streamed execution use independently leased decoder
 layers. TP/PP construction consumes the same declaration and local state geometry.
@@ -43,11 +45,10 @@ after prefill and after each of eight teacher-forced cached inputs
 A greedy CPU run also matches all nine predicted IDs and full score rows, with
 maximum absolute error `6.318092346191406e-5`.
 
-Metal F32 execution with `MLX_ENABLE_TF32=0` matches the same independent reference:
-greedy maximum error is `6.67572021484375e-5`; the 269-token input has maximum error
-`1.1399388313293457e-4`. All nine argmax IDs agree in both cases. Default TF32
-execution exceeds the `5e-4` F32 tolerance (maximum decode error `0.0238952637`);
-the precise setting is part of this acceptance configuration.
+Metal F32 execution with `MLX_ENABLE_TF32=0` matches the same independent
+reference on both teacher-forced fixtures. The short and 269-token cases have
+maximum absolute errors of `8.89301e-5` and `1.03831e-4` respectively, and all
+nine argmax IDs agree in each case.
 
 The longer input crosses the 256-token sliding window. Full tensors and diagnostic
 outputs live outside the repository. The shared `chunked_prefill` conformance driver
@@ -55,6 +56,23 @@ passes on CPU and Metal with a compact convolution/sliding/global LFM3 fixture,
 using the same
 residency, affine loading and controlled/uninterrupted checks as existing fixtures.
 Shared execution agreement does not substitute for released-checkpoint acceptance.
+
+### Native BF16 text comparison
+
+MLX on an Apple M3 Ultra with `MLX_ENABLE_TF32=0` and the CPU publisher
+implementation both use the original instruction checkpoint in BF16. The
+publisher runner uses PyTorch 2.15.0, Transformers 5.22.2, and eager attention.
+Both runs compare the final prefill score row and eight teacher-forced cached
+rows. The longer prompt crosses the 256-token sliding window.
+
+| Prompt tokens | Prefill max absolute error | Cached max absolute error | Maximum relative L2 across rows | Argmax agreement |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 0.015625 | 0.03125 | 0.00003767 | 9/9 |
+| 269 | 0.00000763 | 0.03125 | 0.00004008 | 9/9 |
+
+Both cases pass the shared score profile, including its relative L2 limit of
+0.02, minimum cosine similarity of 0.999, and top-five overlap of at least four.
+Independent greedy runs also match the first nine predictions on each prompt.
 
 ## Same-artifact GGUF evidence
 
@@ -102,10 +120,31 @@ artifact from a probe JSON using `--trust-remote-code --local-files-only --devic
 with its result. The exporter emits full prefill and cached-decode vocabulary rows;
 generated token agreement alone is insufficient.
 
-Native BF16, the base checkpoint and physical multi-device numerical parity
-have no recorded acceptance here. Vision, speech and decision results are absent.
+The base checkpoint and physical multi-device numerical parity have no recorded
+acceptance here. Vision, speech and decision results are absent.
 
-For precise Metal acceptance, build the probe with `--features metal`, select
+For the native BF16 text comparison, use the original source directory and
+the reference environment described above. The output files stay outside the
+checkout.
+
+```sh
+source_path=$(python -c 'import json, sys; print(json.load(open(sys.argv[1]))["path"])' /private/tmp/lfm3-source/provenance.json)
+for length in 128 269; do
+    ids=$(python -c 'import sys; print(",".join(str((13*i + 1) % 128000) for i in range(int(sys.argv[1]))))' "$length")
+    actual="/private/tmp/lfm3-bf16-mlx-$length"
+    reference="/private/tmp/lfm3-bf16-reference-$length"
+    MLX_ENABLE_TF32=0 cargo run --release -p eredu --no-default-features --features mlx,metal --example checkpoint_probe -- \
+        --model "$source_path" --device gpu --input-ids "$ids" \
+        --teacher-forced-ids 5,8,13,21,34,55,3,2 --warmup-runs 0 --output "$actual"
+    python validation/reference_runner.py --model "$source_path" \
+        --probe "$actual.json" --output "$reference" --device cpu --dtype bfloat16 \
+        --trust-remote-code --local-files-only --warmup-runs 0
+    cargo run --release -p eredu-evaluation --bin eredu-parity -- \
+        --actual "$actual.json" --reference "$reference.json" --output "$actual-parity.json"
+done
+```
+
+For precise Metal acceptance, build the probe with `--features mlx,metal`, select
 `--device gpu`, and set `MLX_ENABLE_TF32=0`. Metal execution needs device access.
 The same probe accepts the GGUF file as `--model`; use
 `--output /private/tmp/lfm3-gguf-actual` for the comparison command below. Build the independent exporter

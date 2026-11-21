@@ -2037,7 +2037,7 @@ fn resolve_safetensors_architecture(
     };
     let lfm3 = match &model {
         SafetensorsModelConfig::Lfm3(args) => Some(std::sync::Arc::new(
-            crate::lfm3::Declaration::new(args.clone())
+            crate::lfm3::Declaration::for_text_safetensors(args.clone())
                 .map_err(|e| invalid_configuration(kind, e))?,
         )),
         _ => None,

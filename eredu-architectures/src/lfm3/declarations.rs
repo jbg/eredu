@@ -279,10 +279,23 @@ impl Declaration {
         Self::with_decision_policy(args, false)
     }
 
+    /// Declares the publisher's normalization arithmetic for text SafeTensors.
+    pub(crate) fn for_text_safetensors(args: ModelArgs) -> Result<Self, Error> {
+        Self::with_language_policy(args, false, true)
+    }
+
     pub(super) fn with_decision_policy(args: ModelArgs, decision: bool) -> Result<Self, Error> {
+        Self::with_language_policy(args, decision, decision)
+    }
+
+    fn with_language_policy(
+        args: ModelArgs,
+        decision: bool,
+        eight_lane_rms: bool,
+    ) -> Result<Self, Error> {
         args.validate().map_err(Error::backend_source)?;
         let mut statics = super::static_spec(&args).construction_specs()?;
-        if decision {
+        if eight_lane_rms {
             let mut norm = statics.normalization_spec().clone();
             norm.reduction = eredu_nn::NormalizationReduction::EightLaneInputPrecision;
             statics = crate::decoder::StaticModuleConstruction::new(
@@ -297,13 +310,15 @@ impl Declaration {
                 if let MixerParameters::Attention(spec, _) = &mut block.mixer {
                     if decision {
                         spec.arithmetic = eredu_nn::AttentionArithmetic::Float32;
+                    }
+                    if eight_lane_rms {
                         spec.query_norm.reduction =
                             eredu_nn::NormalizationReduction::EightLaneInputPrecision;
                         spec.key_norm.reduction =
                             eredu_nn::NormalizationReduction::EightLaneInputPrecision;
                     }
                 }
-                if decision {
+                if eight_lane_rms {
                     for norm in [
                         Some(&mut block.operator_norm),
                         Some(&mut block.feed_forward_norm),

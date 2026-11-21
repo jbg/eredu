@@ -618,10 +618,11 @@ fn attention_with_prepared_key_values(
         scores = concatenate_axis(&[&scores, &sinks], -1, stream)?;
     }
     let scores = scores.as_dtype(Dtype::Float32, stream)?;
-    let probabilities = match super::arithmetic::softmax_last(&scores, stream)? {
-        Some(value) => value,
-        None => safemlx::ops::softmax_axis(&scores, -1, true, stream)?,
-    };
+    let probabilities =
+        match super::arithmetic::softmax_last(&scores, score_dtype == Dtype::Bfloat16, stream)? {
+            Some(value) => value,
+            None => safemlx::ops::softmax_axis(&scores, -1, true, stream)?,
+        };
     let probabilities = probabilities
         .try_index_device((.., .., .., ..tokens), stream)?
         .as_dtype(queries.dtype(), stream)?;

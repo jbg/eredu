@@ -65,12 +65,12 @@ inline float cascade_sum_f32(Pointer values, size_t size) {
   return sum;
 }
 
-// Sixteen independent chains preserve the CPU cascade's FP32 addition order.
+// One thread per independent chain preserves the cascade's FP32 addition order.
 // A 32-thread SIMD group exchanges chains without changing the merge tree.
-template <typename Pointer>
+template <size_t lanes = 4, typename Pointer>
 inline float parallel_cascade_sum_f32(Pointer values, size_t size, uint lane_id) {
-  constexpr size_t lanes = 4;
   constexpr size_t parallel = 4;
+  static_assert(lanes * parallel <= 32, "cascade chains must fit in one SIMD group");
   const size_t vectors = size / lanes;
   const size_t steps = vectors / parallel;
   size_t ceil_log = 0;
