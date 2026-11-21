@@ -74,8 +74,13 @@ pub(crate) fn f32_pointwise(
     }
 }
 
-/// Cooperative last-axis softmax with four FP32 sum chains merged left to right.
-pub(crate) fn softmax_last(input: &Array, stream: &Stream) -> Result<Option<Array>, Exception> {
+/// Cooperative FP32 softmax. Narrow probability storage uses a stable
+/// exponential, pairwise summation and precise reciprocal before rounding.
+pub(crate) fn softmax_last(
+    input: &Array,
+    narrow_probabilities: bool,
+    stream: &Stream,
+) -> Result<Option<Array>, Exception> {
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
     {
         use safemlx::{
@@ -97,6 +102,7 @@ pub(crate) fn softmax_last(input: &Array, stream: &Stream) -> Result<Option<Arra
         // Shape data is a runtime input: growing histories reuse one shader.
         let dimensions = Array::from_slice(&[width, rows], &[2]);
         let config = CustomKernelConfig::new()
+            .with_template_arg_bool("PAIRWISE", narrow_probabilities)
             .with_grid([32, rows, 1])
             .with_thread_group([32, 1, 1])
             .with_output_arg(input.shape(), Dtype::Float32);
@@ -107,7 +113,7 @@ pub(crate) fn softmax_last(input: &Array, stream: &Stream) -> Result<Option<Arra
                     ["input", "dimensions"],
                     ["output"],
                     include_str!("softmax_f32.metal"),
-                    "",
+                    include_str!("exp_f32.metal"),
                     true,
                     false,
                 )?);
@@ -121,7 +127,7 @@ pub(crate) fn softmax_last(input: &Array, stream: &Stream) -> Result<Option<Arra
     }
     #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
     {
-        let _ = (input, stream);
+        let _ = (input, narrow_probabilities, stream);
         Ok(None)
     }
 }

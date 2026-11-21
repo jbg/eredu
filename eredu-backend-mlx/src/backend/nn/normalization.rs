@@ -338,6 +338,10 @@ pub(crate) fn weightless_rms(
     epsilon: f32,
     stream: &Stream,
 ) -> Result<Array, Exception> {
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    if let Some(output) = fused_bf16_rms(input, None, epsilon, 4, stream)? {
+        return Ok(output);
+    }
     let dtype = input.dtype();
     let wide = if matches!(dtype, safemlx::Dtype::Bfloat16 | safemlx::Dtype::Float16) {
         input.as_dtype(safemlx::Dtype::Float32, stream)?
@@ -374,9 +378,81 @@ pub(crate) fn input_precision_rms(
         .last()
         .is_some_and(|width| weight.shape() == [*width])
     {
+        #[cfg(all(feature = "metal", not(feature = "cuda")))]
+        if let Some(output) = fused_bf16_rms(input, Some(weight), epsilon, 4, stream)? {
+            return Ok(output);
+        }
         return weightless_rms(input, epsilon, stream)?.multiply(weight, stream);
     }
     safemlx::fast::rms_norm(input, weight, epsilon, stream)
+}
+
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+fn fused_bf16_rms(
+    input: &Array,
+    gain: Option<&Array>,
+    epsilon: f32,
+    lanes: i32,
+    stream: &Stream,
+) -> Result<Option<Array>, Exception> {
+    use safemlx::{
+        fast::{CustomKernelConfig, MetalKernel},
+        DeviceType, Dtype,
+    };
+    use std::cell::RefCell;
+
+    thread_local! {
+        static KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
+    }
+    let Some(&width) = input.shape().last() else {
+        return Ok(None);
+    };
+    if input.dtype() != Dtype::Bfloat16
+        || gain.is_some_and(|gain| gain.dtype() != Dtype::Bfloat16 || gain.shape() != [width])
+        || input.size() == 0
+        || stream.get_device()?.get_type()? != DeviceType::Gpu
+    {
+        return Ok(None);
+    }
+    let rows = i32::try_from(input.size() / width as usize)
+        .map_err(|_| Exception::custom("normalization row count overflow"))?;
+    let epsilon = Array::from_slice(&[epsilon], &[1]);
+    let config = CustomKernelConfig::new()
+        .with_template_arg_int("WIDTH", width)
+        .with_template_arg_int("LANES", lanes)
+        .with_template_arg_int("WEIGHTED", i32::from(gain.is_some()))
+        .with_grid([32, rows, 1])
+        .with_thread_group([32, 1, 1])
+        .with_output_arg(input.shape(), Dtype::Bfloat16);
+    KERNEL.with(|cell| {
+        if cell.borrow().is_none() {
+            *cell.borrow_mut() = Some(MetalKernel::new(
+                "fused_bf16_rms",
+                ["input", "gain", "epsilon"],
+                ["output"],
+                include_str!("rms_bf16.metal"),
+                concat!(
+                    include_str!("rms_cascade.metal"),
+                    r#"
+                    struct SquaredBfloat {
+                        const device bfloat16_t* values;
+                        float operator[](size_t index) const thread {
+                            float value = float(values[index]);
+                            return value * value;
+                        }
+                    };
+                    "#
+                ),
+                true,
+                false,
+            )?);
+        }
+        cell.borrow()
+            .as_ref()
+            .expect("fused RMS kernel initialized")
+            .apply_one_device([input, gain.unwrap_or(input), &epsilon], &config, stream)
+            .map(Some)
+    })
 }
 
 fn f32_weightless_rms(
@@ -402,31 +478,53 @@ fn f32_weightless_rms(
         let width = input.dim(-1);
         let rows = i32::try_from(input.size() / width as usize)
             .map_err(|_| Exception::custom("normalization row count overflow"))?;
+        let grid = if lanes == 4 {
+            [32, rows, 1]
+        } else {
+            [rows, 1, 1]
+        };
         let squared = input.square(stream)?;
         let epsilon = Array::from_slice(&[epsilon], &[1]);
         let config = CustomKernelConfig::new()
             .with_template_arg_int("WIDTH", width)
             .with_template_arg_int("LANES", lanes)
-            .with_grid([rows, 1, 1])
+            .with_grid(grid)
             .with_thread_group([32, 1, 1])
             .with_template_arg_int("ROWS", rows)
             .with_output_arg(input.shape(), Dtype::Float32);
         let mut output = KERNEL.with(|cell| -> Result<Vec<Array>, Exception> {
             if cell.borrow().is_none() {
-                *cell.borrow_mut() =
-                    Some(MetalKernel::new(
-                        "f32_weightless_rms",
-                        ["input", "squared", "epsilon"],
-                        ["output"],
-                        concat!("uint row = thread_position_in_grid.x; if (row >= ROWS) return;",
-                        "size_t base = size_t(row) * WIDTH;",
-                        "float variance = cascade_sum_f32<LANES,4>(squared + base, WIDTH) / float(WIDTH);",
-                        "float inverse = 1.0f / metal::precise::sqrt(variance + epsilon[0]);",
-                        "for (uint i=0; i<WIDTH; ++i) output[base+i] = input[base+i] * inverse;"),
-                        include_str!("rms_cascade.metal"),
-                        true,
-                        false,
-                    )?);
+                *cell.borrow_mut() = Some(MetalKernel::new(
+                    "f32_weightless_rms",
+                    ["input", "squared", "epsilon"],
+                    ["output"],
+                    r#"
+                        if (LANES == 4) {
+                            uint row = threadgroup_position_in_grid.y;
+                            uint lane = thread_position_in_threadgroup.x;
+                            size_t base = size_t(row) * WIDTH;
+                            float sum = parallel_cascade_sum_f32(squared + base, WIDTH, lane);
+                            float variance = sum / float(WIDTH);
+                            float inverse = 1.0f / metal::precise::sqrt(variance + epsilon[0]);
+                            for (uint i = lane; i < WIDTH; i += 32) {
+                                output[base + i] = input[base + i] * inverse;
+                            }
+                        } else {
+                            uint row = thread_position_in_grid.x;
+                            if (row >= ROWS) return;
+                            size_t base = size_t(row) * WIDTH;
+                            float variance =
+                                cascade_sum_f32<LANES, 4>(squared + base, WIDTH) / float(WIDTH);
+                            float inverse = 1.0f / metal::precise::sqrt(variance + epsilon[0]);
+                            for (uint i = 0; i < WIDTH; ++i) {
+                                output[base + i] = input[base + i] * inverse;
+                            }
+                        }
+                        "#,
+                    include_str!("rms_cascade.metal"),
+                    true,
+                    false,
+                )?);
             }
             cell.borrow()
                 .as_ref()
@@ -714,6 +812,11 @@ pub(crate) fn eight_lane_rms(
     stream: &Stream,
 ) -> Result<Array, Exception> {
     use safemlx::{Device, DeviceType, Dtype};
+
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    if let Some(output) = fused_bf16_rms(input, weight, epsilon, 8, stream)? {
+        return Ok(output);
+    }
 
     let wide = input.as_dtype(Dtype::Float32, stream)?;
     let normalized = if let Some(output) = f32_weightless_rms(&wide, epsilon, 8, stream)? {

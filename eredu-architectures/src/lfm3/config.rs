@@ -527,6 +527,7 @@ pub fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String {
             ),
             ("sandwich", args.use_sandwich_norm.to_string()),
             ("norm_eps", format!("{:08x}", args.norm_eps.to_bits())),
+            ("text_safetensors_rms_reduction", "eight-lane".to_owned()),
             ("conv_history", args.conv_l_cache.to_string()),
             ("conv_bias", args.conv_bias.to_string()),
             (

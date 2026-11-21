@@ -335,6 +335,10 @@ fn bf16_projection(
         if weight.dim(-1) != width || weight.ndim() != if groups.is_some() { 3 } else { 2 } {
             return Err(Exception::custom("invalid row projection geometry"));
         }
+        // The dense tile uses four SIMD groups, each covering two output columns.
+        if tile_rows && rows >= 8 && outputs >= 64 && outputs % 8 == 0 {
+            return bf16_dense_tile(input, weight, rows, width, outputs, stream).map(Some);
+        }
         if let Some(group) = &groups {
             let ids = group.values();
             if ids.ndim() != 1
@@ -467,6 +471,52 @@ fn bf16_projection(
         );
         Ok(None)
     }
+}
+
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+fn bf16_dense_tile(
+    input: &Array,
+    weight: &Array,
+    rows: i32,
+    width: i32,
+    outputs: i32,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    use safemlx::fast::{CustomKernelConfig, MetalKernel};
+    use std::cell::RefCell;
+
+    thread_local! {
+        static KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
+    }
+    const TILE_ROWS: i32 = 8;
+    let config = CustomKernelConfig::new()
+        .with_template_arg_int("WIDTH", width)
+        .with_template_arg_int("OUTPUTS", outputs)
+        .with_template_arg_int("ROWS", rows)
+        .with_template_arg_int("TILE_ROWS", TILE_ROWS)
+        .with_grid([32, outputs / 2, (rows - 1) / TILE_ROWS + 1])
+        .with_thread_group([32, 4, 1])
+        .with_output_arg([rows, outputs], Dtype::Bfloat16);
+    let output = KERNEL.with(|cell| {
+        if cell.borrow().is_none() {
+            *cell.borrow_mut() = Some(MetalKernel::new(
+                "bf16_dense_tile",
+                ["input", "weight"],
+                ["output"],
+                include_str!("bf16_dense_tile.metal"),
+                "",
+                true,
+                false,
+            )?);
+        }
+        cell.borrow()
+            .as_ref()
+            .expect("dense tile kernel initialized")
+            .apply_one_device([input, weight], &config, stream)
+    })?;
+    let mut shape = input.shape().to_vec();
+    *shape.last_mut().expect("matrix input rank") = outputs;
+    output.reshape(&shape, stream)
 }
 
 /// Reusable RHS layout for complete FP32 batched BF16 products.
