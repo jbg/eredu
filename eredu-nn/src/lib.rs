@@ -6427,6 +6427,27 @@ pub trait Tensor: Clone + Debug + Sized + 'static {
         context: &Self::Context,
     ) -> Result<Self, Error>;
 
+    /// Optional single-token gated causal depthwise convolution with existing
+    /// history, unit dilation, no bias, and identity activation.
+    ///
+    /// `projected` contains three equal, component-major segments in the order
+    /// input gate, output gate, value. Multiply the input gate by the value in
+    /// input precision, append it to the history, and apply the checkpoint
+    /// kernel using [`ConvolutionArithmetic::FourLaneFloat32Affine`]. Round the
+    /// convolution to input precision before multiplying by the output gate.
+    /// The kernel shape is `[channels, 1, taps]` and the history shape is
+    /// `[batch, taps - 1, channels]`. Return the output shaped
+    /// `[batch, 1, channels]` and replacement history without mutating
+    /// the input history. `None` requests the portable fallback.
+    fn gated_causal_depthwise_step(
+        _projected: &Self,
+        _history: &Self,
+        _weight: &Self,
+        _context: &Self::Context,
+    ) -> Result<Option<(Self, Self)>, Error> {
+        Ok(None)
+    }
+
     /// One-dimensional convolution.
     #[allow(clippy::too_many_arguments)]
     fn conv1d(
@@ -7072,14 +7093,39 @@ impl<B: NeuralBackend> GatedShortConvolution<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<(B::Tensor, Option<B::Tensor>), Error> {
         let projected = self.input_projection.forward(input, context)?;
+        let convolution = &self.convolution;
+        let step_history = match (history, projected.shape()) {
+            (Some(history), &[batch, 1, width])
+                if convolution.arithmetic == ConvolutionArithmetic::FourLaneFloat32Affine
+                    && convolution.activation == ConvolutionActivation::Identity
+                    && convolution.dilation == 1
+                    && convolution.bias.is_none()
+                    && batch > 0
+                    && width == self.input_layout.output_width()
+                    && convolution.history_len > 0
+                    && history.shape()
+                        == [batch, convolution.history_len, convolution.channels] =>
+            {
+                Some(history)
+            }
+            _ => None,
+        };
+        if let Some(history) = step_history {
+            if let Some((output, history)) = B::Tensor::gated_causal_depthwise_step(
+                &projected,
+                history,
+                convolution.weight.as_ref(),
+                context,
+            )? {
+                return Ok((output, Some(history)));
+            }
+        }
         let [b, c, x]: [B::Tensor; 3] = self
             .input_layout
             .split(&projected, context)?
             .try_into()
             .map_err(|_| Error::backend("short-convolution requires three declared components"))?;
-        let convolution = self
-            .convolution
-            .forward(&b.multiply(&x, context)?, history, context)?;
+        let convolution = convolution.forward(&b.multiply(&x, context)?, history, context)?;
         Ok((
             c.multiply(&convolution.output, context)?,
             convolution.history,
