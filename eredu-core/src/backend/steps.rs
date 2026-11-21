@@ -8,6 +8,8 @@ use crate::refinement::{GenerationPhase, PredictionScoreKind};
 pub enum TextOperationKind {
     /// Context encoding or tentative refinement without constraint advancement.
     Progress(GenerationPhase),
+    /// Run ordinary causal prefill, decode, or score continuation and sample its output.
+    CausalDecision,
     /// Select one authoritative token under the current commitment constraints.
     Decision(PredictionScoreKind),
 }
@@ -72,6 +74,9 @@ pub enum TextOperationPolicyError {
     /// A selecting operation received no controller decision.
     #[error("token selection requires a commitment decision")]
     MissingDecision,
+    /// This backend has no native mechanism for the declared causal operation.
+    #[error("the backend cannot submit the declared causal operation")]
+    UnsupportedCausalSubmission,
     /// This executable has no independently resumable physical operation.
     #[error("the executable does not accept a physical continuation")]
     UnsupportedContinuation,

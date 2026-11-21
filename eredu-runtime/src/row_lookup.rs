@@ -21,27 +21,15 @@ pub use selection::{
     SelectedRowLookupRequirements, SelectedRowLookups,
 };
 
+mod storage;
+pub use storage::{
+    preflight_row_range, BoundRowBank, BoundRowLookups, RowDecode, RowDecodeBinding,
+};
+
 mod prepared;
 pub use prepared::{PreparedRowLookup, PreparedRowScale};
 
-/// Architecture-declared row encoding; companions have authoritative identities.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RowEncoding {
-    /// Ordinary floating-point matrix rows.
-    Dense,
-    /// E4M3 bytes multiplied in FP32 by one shared floating-point scalar.
-    ScalarE4M3 {
-        /// Exact shared scale parameter, retained separately from table rows.
-        scale: ParameterId,
-    },
-    /// Independently decodable GGML row blocks.
-    Gguf {
-        /// Canonical block encoding.
-        encoding: eredu_gguf::GgmlType,
-        /// Byte order of the retained payload.
-        endian: eredu_gguf::Endian,
-    },
-}
+pub use eredu_core::preparation::rows::RowEncoding;
 
 /// Exact logical geometry and generic bank ownership for one row source.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +72,14 @@ impl RowLookupSpec {
         }
         Ok(())
     }
+    fn decode_geometry(&self) -> eredu_core::preparation::rows::RowDecodeGeometry<'_> {
+        eredu_core::preparation::rows::RowDecodeGeometry {
+            dimensions: self.dimensions,
+            encoding: &self.encoding,
+            output_type: self.output_type,
+        }
+    }
+
     fn key(&self, row: u64) -> ParameterBankKey {
         ParameterBankKey::new(self.bank, self.unit, row as usize)
     }
@@ -176,6 +172,18 @@ impl RowLookupError {
 
 /// Row decoding shares acquisition and accounting with grouped parameter banks.
 pub trait RowLookupBank<B: NeuralBackend>: ParameterBank<B> {
+    /// Exact retained row addressing, including the physical residency namespace.
+    fn descriptor(&self) -> &RowLookupDescriptor;
+
+    /// The shared residency manager for this admitted range.
+    fn residency(&self) -> &Self::Residency;
+
+    /// Computes the exact native decoding workspace for this batch size.
+    fn decode_scratch_bytes(&self, rows: u64) -> Result<u64, Self::Error>;
+
+    /// Workspace allowance selected before the row bank was bound.
+    fn decode_scratch_limit(&self) -> u64;
+
     /// Decodes acquired rows in acquisition order and completes their use before
     /// returning. On failure unresolved submissions must retain every lease.
     /// The output owns its compact storage independently of resident source rows.
@@ -185,6 +193,46 @@ pub trait RowLookupBank<B: NeuralBackend>: ParameterBank<B> {
         spec: &RowLookupSpec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>;
+}
+
+/// Admits row demand and acquires exact device storage in caller order.
+pub fn acquire_row_bank<B: NeuralBackend, K: RowLookupBank<B>>(
+    bank: &K,
+    request: ParameterBankAcquisition<'_>,
+    context: &<B::Tensor as Tensor>::Context,
+) -> Result<K::Acquisition, RowLookupError> {
+    use crate::expert::BankTransfer;
+    use crate::residency::ResidencyAccess;
+    use eredu_core::residency::{MemoryTier, ResidencyTransferOrdering};
+
+    let demand = bank
+        .descriptor()
+        .plan_demand(request.entries())
+        .map_err(RowLookupError::bank)?;
+    let scratch_bytes = bank
+        .decode_scratch_bytes(request.entries().len() as u64)
+        .map_err(RowLookupError::bank)?;
+    admit(
+        "native row decode scratch",
+        scratch_bytes,
+        bank.decode_scratch_limit(),
+    )?;
+    let transfer = bank
+        .residency()
+        .acquire_many_with_transfer(demand.requests(), MemoryTier::Device)
+        .map_err(RowLookupError::bank)?;
+    transfer
+        .order_after(context)
+        .map_err(RowLookupError::bank)?;
+    let (identities, demand) = demand.entries().iter().copied().unzip();
+    Ok(BankTransfer {
+        identities,
+        demand,
+        scratch_bytes,
+        access: request.access(),
+        transfer,
+    }
+    .into())
 }
 
 /// Shared execution-provider surface; original integer IDs never pass through floats.
@@ -320,10 +368,11 @@ impl<B: NeuralBackend, K: RowLookupBank<B>> RowLookupProvider<B> for BoundedRowL
                 .clone()
                 .map(|i| (spec.key(unique[i]), demands[i]))
                 .collect::<Vec<_>>();
-            let acquisition = self
-                .bank
-                .acquire(ParameterBankAcquisition::new(&entries, access), context)
-                .map_err(RowLookupError::bank)?;
+            let acquisition = acquire_row_bank::<B, _>(
+                &self.bank,
+                ParameterBankAcquisition::new(&entries, access),
+                context,
+            )?;
             let output = self
                 .bank
                 .rows(acquisition, spec, context)
@@ -416,3 +465,5 @@ impl<B: NeuralBackend> RowLookupProvider<B> for NoRowLookups {
         Err(RowLookupError::Missing(spec.parameter.clone()))
     }
 }
+
+pub use storage::BindLocalRows;

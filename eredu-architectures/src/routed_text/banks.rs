@@ -75,7 +75,6 @@ impl PlannedResidentBank {
                     owner_group,
                     plan,
                     routes_by_unit,
-                    partition_unit_coordinates: None,
                 })
             }
             RoutedGroupedPlan::Relu2(plan) => {
@@ -244,6 +243,44 @@ where
             Self::Relu2(p) => p.bank_report(),
             Self::Linear(p) => p.bank_report(),
         }
+    }
+}
+
+impl<B, Bank> eredu_runtime::executable_binding::routed_session::RoutedBankObservation<B, Bank>
+    for PlannedResidentBank
+where
+    B: GroupedNeuralBackend,
+    Bank: AddressableGroupedBank<B>,
+{
+    const ADDRESSABLE: bool = false;
+
+    fn addressable_storage(&self) -> Option<&Bank> {
+        None
+    }
+
+    fn addressable_report(&self) -> Result<Option<Bank::Report>, RoutedTextExecutionError> {
+        Ok(None)
+    }
+}
+
+impl<B, Bank, Movement>
+    eredu_runtime::executable_binding::routed_session::RoutedBankObservation<B, Bank>
+    for PlannedAddressableBank<B, Bank, Movement>
+where
+    B: GroupedNeuralBackend,
+    Bank: AddressableGroupedBank<B>,
+    Bank::Error: std::fmt::Display,
+    Movement: IndexedMovement<B>,
+    Movement::Error: std::fmt::Display,
+{
+    const ADDRESSABLE: bool = true;
+
+    fn addressable_storage(&self) -> Option<&Bank> {
+        Some(self.bank_storage())
+    }
+
+    fn addressable_report(&self) -> Result<Option<Bank::Report>, RoutedTextExecutionError> {
+        self.bank_report().map(Some)
     }
 }
 
@@ -502,172 +539,37 @@ where
     }
 }
 
-impl<A> PreparedRoutedTextArchitecture<A> {
-    fn validate_row_provider<B: eredu_nn::NeuralBackend, L: eredu_runtime::RowLookupProvider<B>>(
-        &self,
-        provider: &Option<L>,
-    ) -> Result<(), String> {
-        match (&self.rows, provider) {
-            (None, None) => Ok(()),
-            (Some(selected), Some(provider)) => {
-                for id in selected.prepared().entries().keys() {
-                    if !provider.has_row_parameter(id) {
-                        return Err(format!("missing selected row provider {id}"));
-                    }
-                }
-                Ok(())
-            }
-            _ => Err("row provider presence differs from the cold selection".into()),
-        }
+impl eredu_runtime::executable_binding::routed_session::RoutedBankBinding for SelectedRoutedBank {
+    fn addressable_members(&self) -> &[eredu_runtime::AddressableBankMember] {
+        self.addressable_members()
     }
-    /// Constructs resident execution through the shared session driver, returning
-    /// moved auxiliary banks for prediction or other separately materialized roles.
-    /// All providers are constructed once before splitting their ownership.
-    pub fn construct_resident_session<B, M, L>(
-        self,
-        mechanisms: M,
-        rows: Option<L>,
-        auxiliary_banks: &[RoutedBankId],
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<
-        (
-            eredu_runtime::ReplicatedTextSession<
-                A,
-                B,
-                M,
-                eredu_runtime::RoutedReplicatedTextExecution<
-                    eredu_runtime::ParameterProviders<
-                        eredu_runtime::RoutedBankProviders<PlannedResidentBank>,
-                        Option<L>,
-                    >,
-                >,
-            >,
-            Option<eredu_runtime::RoutedBankProviders<PlannedResidentBank>>,
-        ),
-        String,
-    >
+
+    type Resident = PlannedResidentBank;
+    type Addressable<B, Bank, Movement>
+        = PlannedAddressableBank<B, Bank, Movement>
     where
-        B: eredu_runtime::SubmissionBackend<
-                Executor = <<B as eredu_nn::NeuralBackend>::Tensor as Tensor>::Context,
-            > + GroupedNeuralBackend,
-        M: eredu_runtime::ReplicatedTextSessionMechanisms<A, B>,
-        A: eredu_runtime::LayeredArchitecture<B, M::State>
-            + eredu_runtime::RoutedLayeredArchitecture<B, M::State>,
-        A::Error: std::fmt::Display,
-        M::PolicyError: std::fmt::Display,
-        M::Error: std::fmt::Display,
-        L: eredu_runtime::RowLookupProvider<B>,
-    {
-        self.validate_row_provider::<B, L>(&rows)?;
-        let (mut modules, residency, banks, _) = self.into_parts();
-        if residency != eredu_runtime::ParameterBankResidency::WithLayer {
-            return Err("selected banks are not resident with their layers".into());
-        }
-        let providers = banks
-            .into_iter()
-            .map(|(id, bank)| PlannedResidentBank::from_selected(bank).map(|p| (id, p)))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        let mut providers =
-            eredu_runtime::RoutedBankProviders::new(providers).map_err(|e| e.to_string())?;
-        let auxiliary = providers
-            .split_off(auxiliary_banks)
-            .map_err(|e| e.to_string())?;
-        eredu_runtime::construct_replicated_text_session_with_execution(
-            modules.take_architecture(),
-            modules.take_source_architecture(),
-            modules.take_contract(),
-            mechanisms,
-            eredu_runtime::RoutedReplicatedTextExecution::new(eredu_runtime::ParameterProviders {
-                grouped: providers,
-                rows,
-            }),
-            context,
-        )
-        .map(|session| (session, auxiliary))
-        .map_err(|e| e.to_string())
+        B: GroupedNeuralBackend,
+        Bank: AddressableGroupedBank<B>,
+        Movement: IndexedMovement<B>;
+
+    fn bind_resident(self) -> Result<Self::Resident, RoutedTextExecutionError> {
+        PlannedResidentBank::from_selected(self)
     }
-    /// Constructs addressable execution and returns separately owned auxiliary banks.
-    /// Native banks must cover the complete selected collection and share the admitted
-    /// residency accounting before ownership is split; budgets are not reconstructed.
-    pub fn construct_addressable_session<B, M, Bank, Movement, L>(
+
+    fn bind_addressable<B, Bank, Movement>(
         self,
-        mechanisms: M,
-        native_banks: BTreeMap<RoutedBankId, (Bank, Movement)>,
-        rows: Option<L>,
-        auxiliary_banks: &[RoutedBankId],
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<
-        (
-            eredu_runtime::ReplicatedTextSession<
-                A,
-                B,
-                M,
-                eredu_runtime::RoutedReplicatedTextExecution<
-                    eredu_runtime::ParameterProviders<
-                        eredu_runtime::RoutedBankProviders<
-                            PlannedAddressableBank<B, Bank, Movement>,
-                        >,
-                        Option<L>,
-                    >,
-                >,
-            >,
-            Option<eredu_runtime::RoutedBankProviders<PlannedAddressableBank<B, Bank, Movement>>>,
-        ),
-        String,
-    >
+        bank: Bank,
+        movement: Movement,
+        options: eredu_runtime::ParameterBankLoadOptions,
+    ) -> Result<Self::Addressable<B, Bank, Movement>, RoutedTextExecutionError>
     where
-        B: eredu_runtime::SubmissionBackend<
-                Executor = <<B as eredu_nn::NeuralBackend>::Tensor as Tensor>::Context,
-            > + GroupedNeuralBackend,
-        M: eredu_runtime::ReplicatedTextSessionMechanisms<A, B>,
-        A: eredu_runtime::LayeredArchitecture<B, M::State>
-            + eredu_runtime::RoutedLayeredArchitecture<B, M::State>,
-        A::Error: std::fmt::Display,
-        M::PolicyError: std::fmt::Display,
-        M::Error: std::fmt::Display,
-        L: eredu_runtime::RowLookupProvider<B>,
+        B: GroupedNeuralBackend,
         Bank: AddressableGroupedBank<B>,
         Bank::Error: std::fmt::Display,
         Movement: IndexedMovement<B>,
         Movement::Error: std::fmt::Display,
     {
-        self.validate_row_provider::<B, L>(&rows)?;
-        let (mut modules, residency, banks, _) = self.into_parts();
-        let eredu_runtime::ParameterBankResidency::IndependentCache(options) = residency else {
-            return Err("selected banks are not independently addressable".into());
-        };
-        if native_banks.keys().ne(banks.keys()) {
-            return Err("materialized bank identities differ from selected banks".into());
-        }
-        let mut native_banks = native_banks;
-        let providers = banks
-            .into_iter()
-            .map(|(id, selected)| {
-                let (bank, movement) = native_banks.remove(&id).expect("checked bank identities");
-                PlannedAddressableBank::from_selected(selected, bank, movement, options)
-                    .map(|p| (id, p))
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        let mut providers =
-            eredu_runtime::RoutedBankProviders::new(providers).map_err(|e| e.to_string())?;
-        let auxiliary = providers
-            .split_off(auxiliary_banks)
-            .map_err(|e| e.to_string())?;
-        eredu_runtime::construct_replicated_text_session_with_execution(
-            modules.take_architecture(),
-            modules.take_source_architecture(),
-            modules.take_contract(),
-            mechanisms,
-            eredu_runtime::RoutedReplicatedTextExecution::new(eredu_runtime::ParameterProviders {
-                grouped: providers,
-                rows,
-            }),
-            context,
-        )
-        .map(|session| (session, auxiliary))
-        .map_err(|e| e.to_string())
+        PlannedAddressableBank::from_selected(self, bank, movement, options)
     }
 }
 

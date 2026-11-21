@@ -1,20 +1,23 @@
 //! Semantic tensor-parallel parameter plans and rank-local Moshi geometry.
 
+use eredu_core::communication::{CommunicationOperation, PipelineActivationDtype};
 use std::{collections::BTreeMap, ops::Range};
 
 use crate::decoder;
 use eredu_checkpoint::LinearFormat;
+use eredu_core::communication::{
+    CommunicationCompletionPolicy, CommunicationGroupRequirements, CommunicationManifest,
+    CommunicationOperationRequirement, CommunicationTensorLimits,
+};
 use eredu_core::{checkpoint::TensorDtype, CollectiveGroupId, ParallelRankTopology};
 use eredu_nn::{DeclareLogicalParameters, NeuralBackend};
 use eredu_runtime::{
     aligned_partition_units, ArchitectureParameterDescription, ArchitecturePartition,
-    CommunicationCompletionPolicy, CommunicationGroupRequirements, CommunicationManifest,
-    CommunicationOperation, CommunicationOperationRequirement, CommunicationTensorLimits,
     ExecutionGraph, ExecutionUnitLayout, LayerRuntimeState, LayeredPartitionDriver,
     LocalModelLayout, MemberSharding, NoAuxiliaryBoundarySchema, OwnedParameterGroupSpec,
     ParallelPlanError, ParameterGroupOwner, ParameterGroupSpec, ParameterRole, PartitionOwnership,
-    PartitionedExecutionPlan, PipelineActivationDtype, PipelineWireContract, StateLayout,
-    StateSegmentLifetime, StateSegmentSpec, TopologyCommunicationPlan,
+    PartitionedExecutionPlan, PipelineWireContract, StateLayout, StateSegmentLifetime,
+    StateSegmentSpec, TopologyCommunicationPlan,
 };
 
 use super::{

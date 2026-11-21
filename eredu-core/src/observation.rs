@@ -297,3 +297,29 @@ mod tests {
         );
     }
 }
+
+/// Representation and error conversions supplied by the concrete tensor backend.
+/// Borrowing a tensor preserves its backing, shape, and lifetime.
+pub trait ObserverTensorMapping {
+    /// Tensor used by the invocation.
+    type InvocationTensor;
+    /// Tensor used by the observer.
+    type ObserverTensor;
+    /// Error returned by the invocation.
+    type InvocationError;
+    /// Error returned by the observer.
+    type ObserverError: std::error::Error + Send + Sync + 'static;
+
+    /// Borrows the same native tensor through the observer's representation.
+    fn borrow_tensor(value: &Self::InvocationTensor) -> &Self::ObserverTensor;
+    /// Borrows the native invocation handle from an observer-facing tensor.
+    fn borrow_invocation_tensor(value: &Self::ObserverTensor) -> &Self::InvocationTensor;
+    /// Transfers a generated native handle to the observer's representation.
+    fn generated_tensor(value: Self::InvocationTensor) -> Self::ObserverTensor;
+    /// Transfers a replacement native handle back to the invocation.
+    fn replacement_tensor(value: Self::ObserverTensor) -> Self::InvocationTensor;
+    /// Preserves an observer error at the invocation boundary.
+    fn invocation_error(error: Self::ObserverError) -> Self::InvocationError;
+    /// Preserves native failure while the observer is materializing a generated value.
+    fn observer_error(error: Self::InvocationError) -> Self::ObserverError;
+}

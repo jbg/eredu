@@ -20,12 +20,14 @@ use eredu_checkpoint::{
     validation::{resolve_safetensors_plan, CheckpointValidation, ResolvedCheckpointPlan},
     SourceTensorEncoding, StoredDtype,
 };
+use eredu_core::checkpoint_mechanisms::CheckpointParameterBackend;
+use eredu_core::residency::parameter_binding::{ResidencyDeclarationError, WeightBinding};
 use eredu_nn::{
     AttentionMask, Index, LayerNorm, Linear, NeuralBackend, Parameter, Parameterized, Rope, Tensor,
 };
 use eredu_runtime::{
-    bind_materialized_unit, materialize_selected_bindings, select_bindings, ParameterBackend,
-    ParameterOrchestrationError, ResidencyDeclarationError, SelectedBindingPlan, WeightBinding,
+    bind_materialized_unit, materialize_selected_bindings, select_bindings,
+    ParameterOrchestrationError, SelectedBindingPlan,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -371,7 +373,7 @@ impl PreparedMimiArtifact {
         self,
     ) -> Result<SelectedMimiArtifact<B>, MimiConstructionError<B::ParameterError>>
     where
-        B: ParameterBackend<Parameter = <B as NeuralBackend>::Tensor>,
+        B: CheckpointParameterBackend<Parameter = <B as NeuralBackend>::Tensor>,
     {
         let Self {
             declaration,
@@ -391,7 +393,7 @@ impl PreparedMimiArtifact {
 /// Backend-admitted Mimi plan ready for native materialization.
 pub struct SelectedMimiArtifact<B>
 where
-    B: ParameterBackend<Parameter = <B as NeuralBackend>::Tensor>,
+    B: CheckpointParameterBackend<Parameter = <B as NeuralBackend>::Tensor>,
 {
     declaration: MimiSpec,
     requirements: Vec<MimiParameterRequirement>,
@@ -400,7 +402,7 @@ where
 
 impl<B> std::fmt::Debug for SelectedMimiArtifact<B>
 where
-    B: ParameterBackend<Parameter = <B as NeuralBackend>::Tensor>,
+    B: CheckpointParameterBackend<Parameter = <B as NeuralBackend>::Tensor>,
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -414,7 +416,7 @@ where
 
 impl<B> SelectedMimiArtifact<B>
 where
-    B: ParameterBackend<Parameter = <B as NeuralBackend>::Tensor>,
+    B: CheckpointParameterBackend<Parameter = <B as NeuralBackend>::Tensor>,
 {
     /// Constructs, materializes, validates, and atomically binds the ordinary
     /// backend-neutral Mimi type.
@@ -523,7 +525,7 @@ pub fn construct<B>(
     materialization_context: &B::MaterializationContext,
 ) -> Result<Mimi<<B as NeuralBackend>::Tensor>, MimiConstructionError<B::ParameterError>>
 where
-    B: ParameterBackend<Parameter = <B as NeuralBackend>::Tensor>,
+    B: CheckpointParameterBackend<Parameter = <B as NeuralBackend>::Tensor>,
 {
     prepared
         .select::<B>()?

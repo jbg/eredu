@@ -12,7 +12,7 @@ use eredu_core::{
     execution_control::{ExecutionControlError, SnapshotEstimate},
     BackendFailure,
 };
-use eredu_runtime::execution_control::{SnapshotReservation, SnapshotValue};
+use eredu_runtime::execution_control::{SnapshotRetention, SnapshotValue};
 
 use super::assets::PreparedVoiceChatAssets;
 
@@ -83,7 +83,7 @@ impl SnapshotValue for RnntTextDecoder {
         })
     }
 
-    fn copy_snapshot_value(&self, _: &SnapshotReservation) -> Result<Self, BackendFailure> {
+    fn copy_snapshot_value(&self, _: &SnapshotRetention) -> Result<Self, BackendFailure> {
         let mut pending = String::new();
         pending
             .try_reserve_exact(self.pending.len())

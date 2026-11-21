@@ -100,15 +100,14 @@ where
         prepare_partitioned::<B, S, _, _, _, _, _>(model, selected, partition).map_err(error)?;
     visitor
         .visit(
-            PreparedPartitionedArchitecture {
+            prepare_dense_partition_binding(
                 prepared,
                 source_architecture,
                 layout,
                 tasks,
                 capability_estimate,
                 effective_model_type,
-                backend: PhantomData,
-            },
+            ),
             store,
         )
         .map_err(DenseDecoderPartitionedDispatchError::Visitor)

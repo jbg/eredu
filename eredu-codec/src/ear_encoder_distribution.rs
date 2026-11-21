@@ -6,13 +6,14 @@ use crate::{
     },
     ear_encoder_preparation::PreparedEncoderPartitionBindings,
 };
+use eredu_core::communication::CommunicationManifest;
+use eredu_core::communication::PipelineActivationDtype;
 use eredu_core::{BackendFailure, CollectiveGroupId};
 use eredu_nn::{DistributedNeuralBackend, NeuralBackend};
 use eredu_runtime::{
-    ArchitectureBoundary, ArchitectureGroupKind, ArchitecturePartition, CommunicationManifest,
+    ArchitectureBoundary, ArchitectureGroupKind, ArchitecturePartition,
     ComponentPipelinePreparationError, ComponentRankMechanisms, LayerWeightResidency,
-    LayerwiseModelMetadata, PartitionedExecutionPlan, PipelineActivationDtype,
-    PipelineBindingError,
+    LayerwiseModelMetadata, PartitionedExecutionPlan, PipelineBindingError,
 };
 
 use crate::ear_encoder_stage::{EarEncoderPipeline, EarEncoderPipelineArchitecture};
@@ -125,7 +126,7 @@ impl PreparedEncoderPipelineBindings {
         H: ComponentRankMechanisms<B, eredu_runtime::StatelessComponentState, C>,
     {
         let pipeline = self.into_pipeline::<B>(residency)?;
-        let (execution, metadata) = mechanisms.bind_pipeline(pipeline, communication)?;
+        let (execution, metadata) = pipeline.bind(mechanisms, communication)?;
         Ok((EarEncoderPipeline::new(execution), metadata))
     }
 

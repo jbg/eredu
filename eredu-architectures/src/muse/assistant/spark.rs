@@ -367,7 +367,7 @@ impl SparkAssistantConfig {
     {
         self.prove_compatibility(target)?;
         Ok(
-            crate::composite_execution::ExternalPredictionCaptureRequest::Muse {
+            crate::composite_execution::ExternalPredictionCaptureRequest::OrderedLayerOutputs {
                 target_layers: self.capture_layers.clone().into_boxed_slice(),
                 target_paths: self
                     .capture_layers

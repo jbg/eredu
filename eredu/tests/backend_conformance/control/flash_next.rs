@@ -25,7 +25,7 @@ fn request(thinking: bool) -> ChatTemplateRequest {
     }
 }
 
-fn model(first: Option<u32>, pieces: &[&str]) -> LoadedModel<MockBackend> {
+fn model(first: Option<u32>, pieces: &[&str]) -> LoadedModel<MockBackend, MockSession> {
     let mut vocabulary = std::iter::once(("[UNK]".to_owned(), 0))
         .chain((1..VOCABULARY).map(|i| (format!("ordinary_{i}"), i)))
         .collect::<std::collections::HashMap<_, _>>();
@@ -51,7 +51,11 @@ fn model(first: Option<u32>, pieces: &[&str]) -> LoadedModel<MockBackend> {
         .add_special_tokens([AddedToken::from("<|im_end|>", true).normalized(false)])
         .unwrap();
     LoadedModel::from_runtime(
-        ModelRuntime::prepare(MockBackend, Default::default()).unwrap(),
+        ModelRuntime::install::<MockSession>(
+            MockBackend,
+            fixture_prepared_model(Default::default()),
+        )
+        .unwrap(),
         ChatTokenizer::from_tokenizer(tokenizer),
         LoadedTextModelConfig {
             model_family: ModelKind::Qwen4Exp,
@@ -67,7 +71,11 @@ fn model(first: Option<u32>, pieces: &[&str]) -> LoadedModel<MockBackend> {
 fn setup(
     request: ChatTemplateRequest,
     pieces: &[&str],
-) -> (LoadedModel<MockBackend>, PreparedChat, Vec<u32>) {
+) -> (
+    LoadedModel<MockBackend, MockSession>,
+    PreparedChat,
+    Vec<u32>,
+) {
     let mut probe = model(None, pieces);
     let chat = probe.prepare_chat(request.clone()).unwrap();
     let first = probe.encode(chat.rendered_prompt(), false).unwrap().len() as u32;

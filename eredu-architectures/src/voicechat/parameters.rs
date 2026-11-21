@@ -4,18 +4,19 @@
 //! codec blocks can be bound independently. This contract does not select a
 //! residency schedule or construct a realtime executable.
 
+use eredu_core::checkpoint_mechanisms::CheckpointParameterBackend;
 use std::collections::BTreeMap;
 
 use eredu_checkpoint::{
     recipe::{DerivedWeightRecipe, RecipeDtype, RecipeError},
     store::{SharedCheckpointSource, StoreError},
 };
+use eredu_core::residency::parameter_binding::WeightBinding;
 use eredu_nn::Parameterized;
 use eredu_runtime::{
     bind_materialized_unit, materialize_selected_bindings, select_bindings,
-    ArchitectureParameterDescription, ComponentPreparationError, ParameterBackend,
-    ParameterMemberSpec, ParameterOrchestrationError, PreparedComponent, RecipeBindingError,
-    SelectedBindingPlan, WeightBinding,
+    ArchitectureParameterDescription, ComponentPreparationError, ParameterMemberSpec,
+    ParameterOrchestrationError, PreparedComponent, RecipeBindingError, SelectedBindingPlan,
 };
 
 use super::{
@@ -119,7 +120,7 @@ impl PreparedSpeechParameterUnit {
     }
 
     /// Admits backend mechanisms before any weight payload is read.
-    pub fn select<B: ParameterBackend>(
+    pub fn select<B: CheckpointParameterBackend>(
         self,
     ) -> Result<SelectedSpeechParameterUnit<B>, ParameterOrchestrationError<B::ParameterError>>
     {
@@ -130,11 +131,11 @@ impl PreparedSpeechParameterUnit {
 }
 
 /// A unit whose exact source and recipes passed generic backend admission.
-pub struct SelectedSpeechParameterUnit<B: ParameterBackend> {
+pub struct SelectedSpeechParameterUnit<B: CheckpointParameterBackend> {
     selected: SelectedBindingPlan<B>,
 }
 
-impl<B: ParameterBackend> SelectedSpeechParameterUnit<B> {
+impl<B: CheckpointParameterBackend> SelectedSpeechParameterUnit<B> {
     /// Materializes through exact completion and atomically replaces the module's
     /// matching slots. A mismatched or incomplete module receives no replacements.
     pub fn bind<M: Parameterized<B::Parameter>>(

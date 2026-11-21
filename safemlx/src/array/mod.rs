@@ -730,6 +730,19 @@ impl Array {
         })
     }
 
+    /// Evaluates one batch and returns its owned host-readable arrays in order.
+    pub fn into_evaluated_batch(
+        arrays: Vec<Self>,
+    ) -> crate::error::Result<Vec<EvaluatedArray<'static>>> {
+        crate::transforms::eval(&arrays)?;
+        Ok(arrays
+            .into_iter()
+            .map(|array| EvaluatedArray {
+                storage: EvaluatedArrayStorage::Owned(array),
+            })
+            .collect())
+    }
+
     /// Evaluate and access the value of a scalar array.
     ///
     /// If `T` does not match the array's dtype, the value is converted on

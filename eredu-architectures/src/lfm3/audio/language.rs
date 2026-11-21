@@ -107,7 +107,7 @@ impl PreparedAudioLanguage {
         &self,
         residency: LayerWeightResidency,
     ) -> Result<u64, super::ResidentAudioError> {
-        use eredu_runtime::physical_binding_bytes;
+        use eredu_core::residency::parameter_binding::physical_binding_bytes;
         let (invocations, units, pinned) = match &self.0 {
             AudioLanguagePlan::Local(local) => {
                 let pinned = local.parameters.pinned_bindings().values().try_fold(
@@ -452,7 +452,7 @@ impl PreparedAudioLanguage {
                 manifest: communication.manifest,
                 plan: communication.plan,
                 tensor_group: communication.tensor_group,
-                activation_dtype: eredu_runtime::PipelineActivationDtype::Float32,
+                activation_dtype: eredu_core::communication::PipelineActivationDtype::Float32,
                 residency,
             },
             layout,
@@ -631,9 +631,10 @@ where
         context: &Context<B>,
         mechanisms: &H,
     ) -> Result<Self::Execution, BackendFailure> {
-        mechanisms
-            .bind_local(|| prepared.prepare_layerwise::<B, S>(residency, context))
-            .map(LocalAudioLanguage)
+        use eredu_core::checkpoint_mechanisms::unit_binding::ComponentPreparationScope as _;
+        let scope = mechanisms.begin_local_preparation()?;
+        let prepared = scope.finish(prepared.prepare_layerwise::<B, S>(residency, context))?;
+        prepared.bind(mechanisms, context).map(LocalAudioLanguage)
     }
 }
 
@@ -670,8 +671,10 @@ where
         context: &Context<B>,
         mechanisms: &H,
     ) -> Result<Self::Execution, BackendFailure> {
-        let component =
-            mechanisms.bind_local(|| prepared.prepare_layerwise::<B, S>(residency, context))?;
+        use eredu_core::checkpoint_mechanisms::unit_binding::ComponentPreparationScope as _;
+        let scope = mechanisms.begin_local_preparation()?;
+        let prepared = scope.finish(prepared.prepare_layerwise::<B, S>(residency, context))?;
+        let component = prepared.bind(mechanisms, context)?;
         Ok(TensorParallelAudioLanguage {
             component,
             collective: self.collective.clone(),
@@ -714,8 +717,8 @@ where
         let stage = prepared
             .prepare_pipeline::<B, S>(residency, context)?
             .bind(|pipeline| {
-                mechanisms
-                    .bind_pipeline(pipeline, &self.communication)
+                pipeline
+                    .bind(mechanisms, &self.communication)
                     .map(|(execution, _)| execution)
             })?;
         Ok(PipelineAudioLanguage::new(stage))

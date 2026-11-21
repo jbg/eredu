@@ -3,6 +3,8 @@
 //! All retained component recipes are admitted before the first binding callback.
 //! The architecture owns composition; native visitors supply parameter mechanisms.
 
+use eredu_core::SubmissionBackend;
+
 use std::collections::BTreeMap;
 
 use eredu_codec::{
@@ -18,7 +20,7 @@ use eredu_codec::{
 };
 use eredu_core::BackendFailure;
 use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Tensor};
-use eredu_runtime::{LayeredTensorCohort, ParameterUnitMechanisms, SubmissionBackend};
+use eredu_runtime::{LayeredTensorCohort, ParameterUnitMechanisms};
 
 use super::{
     artifact::{ParameterAdmission, RetainedVoiceChatArtifacts},

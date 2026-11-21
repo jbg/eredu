@@ -15,8 +15,8 @@ use eredu_architectures::voicechat::{
     schedule::{AudioSource, Progress, Step},
     tts_feedback::{OutputPolicy, WaveformSilence},
 };
+use eredu_core::sampling::TokenDomain;
 use eredu_core::BackendFailure;
-use eredu_runtime::TokenDomain;
 
 use super::{VoiceChatToolChannel, VoiceChatToolError, VoiceChatTurnIdentity};
 

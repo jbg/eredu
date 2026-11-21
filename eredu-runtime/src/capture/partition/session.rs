@@ -7,7 +7,7 @@ use std::{collections::BTreeMap, sync::Arc};
 mod coordination;
 pub use coordination::SessionPartitionCoordination;
 mod hook;
-pub use hook::{PartitionCaptureHookTransport, SessionPartitionHook};
+pub use hook::SessionPartitionHook;
 mod intervention;
 mod intervention_evidence;
 pub use intervention::SessionPartitionIntervention;
@@ -26,7 +26,7 @@ pub struct PartitionCaptureIdentity {
     artifact: Option<String>,
     execution: String,
     run: String,
-    setup: Option<crate::CommunicationSessionIdentity>,
+    setup: Option<eredu_core::communication::CommunicationSessionIdentity>,
     first_epoch: Option<DistributedCommitEpoch>,
     overlay: Option<String>,
     world_size: usize,
@@ -75,7 +75,7 @@ impl PartitionCaptureIdentity {
     pub fn for_session(
         artifact: Option<String>,
         execution: String,
-        setup: crate::CommunicationSessionIdentity,
+        setup: eredu_core::communication::CommunicationSessionIdentity,
         overlay: Option<String>,
     ) -> Result<Self, CaptureError> {
         let mut identity = Self::new(
@@ -161,17 +161,6 @@ impl PartitionCaptureIdentity {
 
 fn invalid(message: &str) -> CaptureError {
     CaptureError::Invalid(message.into())
-}
-
-/// Side-effect-free native bounds for one producer fragment. The creation bound
-/// covers a deferred input factory in addition to the ordinary capture estimate;
-/// unused credits are not refunded when this point uses an existing tensor.
-#[derive(Debug, Clone, Copy)]
-pub struct PartitionCaptureNativeEstimate {
-    /// Same conservative source/transform/host/record bound as `CaptureBackend::estimate`.
-    pub capture: CaptureUsage,
-    /// Maximum separately declared native work for a deferred source factory.
-    pub generated_creation_bytes: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -361,7 +350,6 @@ impl<T: PartitionCaptureTransport> SessionPartitionCapture<'_, T> {
     }
 }
 
-#[cfg(feature = "tensor-capture")]
 impl CaptureSession {
     /// Checks this run against the actual loaded setup without replacing its
     /// first forward epoch. Fresh runs may be bound; an already-bound parent or

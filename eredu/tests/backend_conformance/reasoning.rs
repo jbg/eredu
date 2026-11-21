@@ -6,7 +6,13 @@ use std::ops::ControlFlow;
 const TEMPLATE: &str =
     include_str!("../fixtures/chat_templates/deepseek-r1-distill-qwen-1.5b-ad9f0ae0.jinja");
 
-fn setup(method: usize) -> (LoadedModel<MockBackend>, PreparedChat, Vec<u32>) {
+fn setup(
+    method: usize,
+) -> (
+    LoadedModel<MockBackend, MockSession>,
+    PreparedChat,
+    Vec<u32>,
+) {
     let (mut model, ids) = text::output_model(
         method,
         ["Check</thi", "nk>Answer<tool_call>emulated</tool_call>"],
@@ -191,7 +197,9 @@ fn retained_text_inspection_and_loading_agree_on_reasoning_only_support() {
         report.native_tools,
         eredu_core::InspectionReadiness::Unsupported
     );
-    let mut loaded = prepared.load_on(MockBackend, ()).unwrap();
+    let mut loaded = prepared
+        .load_on::<_, super::FixtureLoadSelection>(MockBackend, Default::default())
+        .unwrap();
     let chat = loaded.prepare_chat(request).unwrap();
     assert!(chat.capabilities().reasoning_parser.is_supported());
     assert!(!chat.native_tool_support().is_supported());

@@ -19,7 +19,7 @@ pub use session::*;
 pub mod audio;
 pub mod realtime;
 mod request;
-mod tokenizer;
+pub(crate) mod tokenizer;
 
 pub use request::{
     GenerationRequest, OutputMode, PreparedChatError, PreparedChatGenerationSettings,
@@ -105,3 +105,8 @@ mod tests;
 
 /// Finite, non-autoregressive model decisions.
 pub mod decision;
+
+pub use crate::runtime::model_loading::TextSessionComposition;
+
+#[cfg(feature = "mlx")]
+mod mlx;

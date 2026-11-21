@@ -27,8 +27,7 @@ SCOPED = (
     "eredu-backend-mlx/src/backend/runtime/checkpoint/binding.rs",
     "eredu-backend-mlx/src/backend/runtime/checkpoint/binding/*.rs",
     "eredu-backend-mlx/src/composition/mlx/replicated_text/lowering.rs",
-    "eredu-backend-mlx/src/composition/mlx/replicated_text/tests/*.rs",
-    "eredu-backend-mlx/src/tests/*.rs",
+    "eredu/tests/native_ring/*.rs",
 )
 # This implementation is behind pub(crate) mod grouped. Changing that module
 # boundary or adding a re-export changes a file outside SCOPED and forces full.

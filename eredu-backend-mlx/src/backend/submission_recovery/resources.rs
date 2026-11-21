@@ -1,7 +1,7 @@
 //! A bounded, non-progressing observation of the current thread's recovery list.
 use super::*;
-use eredu_runtime::detached_resources::{
-    DetachedResourceInventory, DetachedResourceLimits, DetachedResourceScan,
+use eredu_core::resources::detached::{
+    DetachedResourceLimits, DetachedResourceObservation, DetachedResourceScan,
 };
 
 thread_local! {
@@ -10,19 +10,18 @@ thread_local! {
 
 pub(crate) fn describe_resources(
     limits: DetachedResourceLimits,
-) -> Result<DetachedResourceInventory, ResourceDescriptionError> {
+) -> Result<DetachedResourceObservation, ResourceDescriptionError> {
     let source = format!("MLX detached submissions on {:?}; active work, ordinary retirement, other threads and unregistered/thread-exit holdings are excluded", std::thread::current().id());
     let unavailable = |reason: &str| {
-        DetachedResourceInventory::new(
-            source.clone(),
-            limits,
-            0,
-            0,
-            DetachedResourceScan::Unavailable {
+        Ok(DetachedResourceObservation {
+            source: source.clone(),
+            inspected_nodes: 0,
+            undescribed_nodes: 0,
+            scan: DetachedResourceScan::Unavailable {
                 reason: reason.into(),
             },
-            vec![],
-        )
+            descriptions: Vec::new(),
+        })
     };
     if REAPING.try_with(|flag| flag.get()).unwrap_or(true) {
         return unavailable(
@@ -73,21 +72,17 @@ pub(crate) fn describe_resources(
                 }
                 node = current.next();
             }
-            DetachedResourceInventory::new(
-                source.clone(),
-                limits,
-                inspected,
-                unknown,
-                if node.is_some() {
+            Ok(DetachedResourceObservation {
+                source: source.clone(),
+                inspected_nodes: inspected,
+                undescribed_nodes: unknown,
+                scan: if node.is_some() {
                     DetachedResourceScan::Truncated
                 } else {
                     DetachedResourceScan::Complete
                 },
                 descriptions,
-            )
+            })
         })
         .unwrap_or_else(|_| unavailable("detached submission thread-local storage has exited"))
 }
-
-#[cfg(test)]
-mod tests;

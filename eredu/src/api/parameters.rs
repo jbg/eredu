@@ -2,12 +2,17 @@
 use super::{observed::new_identity, LoadedModel};
 use eredu_core::{capture::CaptureUsage, parameters::*};
 
-impl<B: ParameterBackend> LoadedModel<B> {
+impl<
+        B: eredu_core::TextGenerationBackend,
+        S: eredu_core::TextExecutionSession<B> + ParameterSession<B>,
+    > LoadedModel<B, S>
+{
     /// Discovers actual loaded parameter access and active edit provenance.
     /// Distributed models require all ranks to participate in the same order;
     /// bounded metadata exchange contributes to the reported cumulative usage.
     pub fn parameter_discovery(&mut self) -> Result<ParameterDiscovery, ParameterError> {
-        B::parameter_discovery(&mut self.runtime)
+        let (backend, session) = self.runtime.parts_mut();
+        session.parameter_discovery(backend)
     }
     /// Obtains a bounded effective read row, write column or normalization region.
     /// Limits are cumulative for this loaded session and are never refunded by reset.
@@ -18,7 +23,8 @@ impl<B: ParameterBackend> LoadedModel<B> {
         region: ParameterRegion,
         limits: CaptureUsage,
     ) -> Result<ParameterValues, ParameterError> {
-        B::query_parameter(&mut self.runtime, identity, parameter, region, limits)
+        let (backend, session) = self.runtime.parts_mut();
+        session.query_parameter(backend, identity, parameter, region, limits)
     }
     /// Admits an immutable multi-parameter edit against current loaded facts.
     pub fn admit_parameter_overlay(
@@ -36,7 +42,8 @@ impl<B: ParameterBackend> LoadedModel<B> {
         projection: ParameterProjection,
         limits: CaptureUsage,
     ) -> Result<ParameterProjectionValues, ParameterError> {
-        B::project_parameter(&mut self.runtime, identity, parameter, projection, limits)
+        let (backend, session) = self.runtime.parts_mut();
+        session.project_parameter(backend, identity, parameter, projection, limits)
     }
     /// Atomically installs prepared replacements and clears incompatible model state.
     /// Previously prepared generation requests become stale; prepare new exact-token trials.
@@ -47,7 +54,8 @@ impl<B: ParameterBackend> LoadedModel<B> {
         overlay: &AdmittedParameterOverlay,
         limits: CaptureUsage,
     ) -> Result<ParameterDiscovery, ParameterError> {
-        let result = B::activate_parameter_overlay(&mut self.runtime, overlay, limits)?;
+        let (backend, session) = self.runtime.parts_mut();
+        let result = session.activate_parameter_overlay(backend, overlay, limits)?;
         self.session_identity = new_identity("parameter-session");
         Ok(result)
     }
@@ -58,7 +66,8 @@ impl<B: ParameterBackend> LoadedModel<B> {
         &mut self,
         identity: &str,
     ) -> Result<ParameterDiscovery, ParameterError> {
-        let result = B::remove_parameter_overlay(&mut self.runtime, identity)?;
+        let (backend, session) = self.runtime.parts_mut();
+        let result = session.remove_parameter_overlay(backend, identity)?;
         self.session_identity = new_identity("parameter-session");
         Ok(result)
     }

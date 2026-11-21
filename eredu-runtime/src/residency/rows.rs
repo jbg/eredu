@@ -19,7 +19,10 @@ impl RowResidencyRange {
         source: Arc<PreparedRowSource>,
         binding: impl Into<String>,
     ) -> Result<Self, ResidencyControllerError> {
-        let binding = validate_name(binding.into())?;
+        let binding = binding.into();
+        if binding.trim().is_empty() {
+            return Err(ResidencyDeclarationError::InvalidBindingName.into());
+        }
         let rows = source.metadata().shape[0] as u64;
         let bytes = source.metadata().byte_len;
         if range.end() - range.start() != rows
@@ -90,7 +93,7 @@ mod tests {
     use super::*;
     use eredu_checkpoint::{
         recipe::DerivedWeightRecipe,
-        store::{MemoryWeightStore, SharedCheckpointSource},
+        store::{MemoryWeightStore, SharedCheckpointSource, TensorSelection},
     };
     use eredu_core::residency::{OffloadConfig, ResidencyPolicy};
     fn fixture() -> (

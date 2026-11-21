@@ -46,7 +46,7 @@ pub struct SelectedVlRankGraph {
 
 impl SelectedVlRankGraph {
     /// Manifest available to the loader before binding any checkpoint source.
-    pub fn communication_manifest(&self) -> &eredu_runtime::CommunicationManifest {
+    pub fn communication_manifest(&self) -> &eredu_core::communication::CommunicationManifest {
         self.placement.communication_manifest()
     }
 
@@ -157,7 +157,7 @@ where
             manifest: communication.manifest,
             plan: communication.plan,
             tensor_group: communication.tensor_group,
-            activation_dtype: eredu_runtime::PipelineActivationDtype::Float32,
+            activation_dtype: eredu_core::communication::PipelineActivationDtype::Float32,
             residency,
         },
         prefix,

@@ -1,16 +1,16 @@
 use super::*;
 use eredu_runtime::memory_forecast::{
     ConditionedAssistantMemoryProfile, ConditionedPredictionBody, ConditionedPredictionScoring,
-    ConditionedPredictionTopology, SpeculativeForecastBackend, SpeculativeMemoryProfile,
+    ConditionedPredictionTopology, SpeculativeForecastSession, SpeculativeMemoryProfile,
 };
 
 struct ConditionedFixture {
     scratch: MemoryBytes,
 }
 
-impl SpeculativeForecastBackend<ConditionedFixture> for MockBackend {
+impl SpeculativeForecastSession<MockBackend, ConditionedFixture> for MockSession {
     fn speculative_memory_profile(
-        _: &ModelRuntime<Self>,
+        _: &ModelRuntime<MockBackend, Self>,
         drafting: &eredu_core::SpeculativeDraft<'_, ConditionedFixture>,
     ) -> Result<Option<SpeculativeMemoryProfile>, GenerationForecastError> {
         let eredu_core::SpeculativeDraft::External(assistant) = drafting else {

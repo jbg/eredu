@@ -5,14 +5,13 @@
 //! completion object. Copy mechanisms finish through the backend's existing owner.
 
 use super::{SnapshotBudget, SnapshotReservation};
+use crate::capture::CaptureSession;
 #[cfg(feature = "tensor-capture")]
-use crate::capture::{
-    CaptureCheckpoint, CaptureForkRequest, CaptureSession, InterventionForkRequest,
-};
+use crate::capture::{CaptureCheckpoint, CaptureForkRequest, InterventionForkRequest};
 use eredu_core::{
     capture::CaptureError,
     execution_control::{
-        ExecutionControlError, NativeTextStateBackend, SnapshotEstimate, SnapshotResourceKind,
+        ExecutionControlError, NativeTextStateSession, SnapshotEstimate, SnapshotResourceKind,
     },
     ModelRuntime, PendingTextInput, TextContinuationBoundary, TextContinuationIdentity,
     TokenFilterController,
@@ -21,46 +20,49 @@ use eredu_core::{
 /// Native ordinary-generation mechanisms used by the portable snapshot driver.
 /// Capture/intervention ownership stays in the shared `CaptureSession`; adapters
 /// expose that owner and perform native copying, never duplicate its bookkeeping.
-pub trait TextSnapshotBackend: NativeTextStateBackend {
+pub trait TextSnapshotBackend<
+    S: NativeTextStateSession<Self> + eredu_core::backend::TextOperationDriver<Self>,
+>: eredu_core::TextGenerationBackend
+{
     /// Sampling parameters, penalties/history, adaptive state, exact RNG and
     /// absolute next-prediction position. Copies must have isolated mutable state.
     type SamplingState;
 
     /// Borrows the native sampling component without changing it.
-    fn sampling_state(state: &Self::TextGenerationState) -> &Self::SamplingState;
+    fn sampling_state(state: &S::TextGenerationState) -> &Self::SamplingState;
     /// Installs an independently copied sampler after native restoration succeeds.
     /// Must be infallible, submit no work and leave capture ownership unchanged.
-    fn install_sampling_state(state: &mut Self::TextGenerationState, sampling: Self::SamplingState);
+    fn install_sampling_state(state: &mut S::TextGenerationState, sampling: Self::SamplingState);
     /// Creates child backend state from prepared sampling and shared capture owners.
     /// No new random draw, model execution, or admission occurs here.
     fn assemble_generation_state(
         sampling: Self::SamplingState,
         #[cfg(feature = "tensor-capture")] capture: Option<CaptureSession>,
-    ) -> Self::TextGenerationState;
+    ) -> S::TextGenerationState;
     /// Absolute next prediction, including the inherited prefix.
     fn sampling_prediction(sampling: &Self::SamplingState) -> u64;
     /// Complete known logical sampling-state copy cost, without native allocation.
     fn estimate_sampling_state(
-        runtime: &ModelRuntime<Self>,
+        runtime: &ModelRuntime<Self, S>,
         sampling: &Self::SamplingState,
     ) -> Result<Option<SnapshotEstimate>, Self::Error>;
     /// Isolates all mutable sampling state and establishes exact native completion.
     fn copy_sampling_state(
-        runtime: &mut ModelRuntime<Self>,
+        runtime: &mut ModelRuntime<Self, S>,
         sampling: &Self::SamplingState,
     ) -> Result<Self::SamplingState, Self::Error>;
     /// Complete known cost for preserving pending prefill/decode input. Unsupported
     /// input kinds, including media for a text-only realization, return unknown.
     fn estimate_pending_input(
-        runtime: &ModelRuntime<Self>,
-        input: Option<PendingTextInput<&Self::Prompt, &Self::Token>>,
+        runtime: &ModelRuntime<Self, S>,
+        input: Option<PendingTextInput<&S::Prompt, &Self::Token>>,
     ) -> Result<Option<SnapshotEstimate>, Self::Error>;
     /// Upper bound on input tokens submitted by the next `predictions` decisions,
     /// including the pending prompt or last committed token exactly once.
     fn continuation_input_tokens(
-        _runtime: &ModelRuntime<Self>,
+        _runtime: &ModelRuntime<Self, S>,
         _sampling: &Self::SamplingState,
-        _input: Option<PendingTextInput<&Self::Prompt, &Self::Token>>,
+        _input: Option<PendingTextInput<&S::Prompt, &Self::Token>>,
         _predictions: u64,
     ) -> Option<u64> {
         None
@@ -68,16 +70,16 @@ pub trait TextSnapshotBackend: NativeTextStateBackend {
     /// Committed causal input appended at a queued mode's settled boundary.
     /// Includes a block that finishes before the handoff. No work, draws or copies occur.
     fn decoding_settlement_input_tokens(
-        _runtime: &ModelRuntime<Self>,
+        _runtime: &ModelRuntime<Self, S>,
         _sampling: &Self::SamplingState,
-        _input: Option<PendingTextInput<&Self::Prompt, &Self::Token>>,
+        _input: Option<PendingTextInput<&S::Prompt, &Self::Token>>,
     ) -> Option<u64> {
         None
     }
     /// Additional sampler and pending-input retention through those decisions.
     /// Includes future history and lazily created native RNG/input storage.
     fn estimate_sampling_growth(
-        _runtime: &ModelRuntime<Self>,
+        _runtime: &ModelRuntime<Self, S>,
         _sampling: &Self::SamplingState,
         _predictions: u64,
     ) -> Result<Option<u64>, Self::Error> {
@@ -86,38 +88,29 @@ pub trait TextSnapshotBackend: NativeTextStateBackend {
     /// Copies pending input without executing it, sampling or retokenizing.
     #[allow(clippy::type_complexity)]
     fn copy_pending_input(
-        runtime: &mut ModelRuntime<Self>,
-        input: Option<PendingTextInput<&Self::Prompt, &Self::Token>>,
-    ) -> Result<Option<PendingTextInput<Self::Prompt, Self::Token>>, Self::Error>;
+        runtime: &mut ModelRuntime<Self, S>,
+        input: Option<PendingTextInput<&S::Prompt, &Self::Token>>,
+    ) -> Result<Option<PendingTextInput<S::Prompt, Self::Token>>, Self::Error>;
     /// Existing shared observation/intervention owner, when enabled.
     #[cfg(feature = "tensor-capture")]
-    fn capture_run(state: &Self::TextGenerationState) -> Option<&CaptureSession>;
+    fn capture_run(state: &S::TextGenerationState) -> Option<&CaptureSession>;
     /// Mutably borrows that same owner for validated, non-refunding restoration.
     #[cfg(feature = "tensor-capture")]
-    fn capture_run_mut(state: &mut Self::TextGenerationState) -> Option<&mut CaptureSession>;
+    fn capture_run_mut(state: &mut S::TextGenerationState) -> Option<&mut CaptureSession>;
 
     /// Actual native capture facts for shared child re-admission.
     #[cfg(feature = "tensor-capture")]
     fn estimate_child_capture(
-        _runtime: &ModelRuntime<Self>,
-        _shape: &[u64],
-        _selection: &eredu_core::capture::CaptureSelection,
-        _slice: &eredu_core::capture::ResolvedCaptureSlice,
-    ) -> Result<eredu_core::capture::CaptureUsage, CaptureError> {
-        Err(CaptureError::Unsupported(
-            "backend has no capture support".into(),
-        ))
-    }
+        runtime: &ModelRuntime<Self, S>,
+        shape: &[u64],
+        selection: &eredu_core::capture::CaptureSelection,
+        slice: &eredu_core::capture::ResolvedCaptureSlice,
+    ) -> Result<eredu_core::capture::CaptureUsage, CaptureError>;
     /// Actual intervention estimator for this loaded backend, kept out of saved metadata.
     #[cfg(feature = "tensor-capture")]
     fn child_intervention_estimator(
-        _runtime: &ModelRuntime<Self>,
-    ) -> Result<std::sync::Arc<dyn eredu_core::intervention::InterventionEstimator>, CaptureError>
-    {
-        Err(CaptureError::Unsupported(
-            "backend has no capture support".into(),
-        ))
-    }
+        runtime: &ModelRuntime<Self, S>,
+    ) -> Result<std::sync::Arc<dyn eredu_core::intervention::InterventionEstimator>, CaptureError>;
 }
 
 /// Explicit independent-copy contract for the canonical constraint owner. A
@@ -184,23 +177,36 @@ pub struct TextBranchRequest<'a> {
 
 /// Independently prepared branch slot. Exchange is serial and moves the previous
 /// installed continuation into this slot; immutable weights stay in one runtime.
-pub struct TextContinuationBranch<B: TextSnapshotBackend, C: TokenFilterController> {
-    continuation: ManagedTextContinuation<B, C>,
-    native: B::NativeTextState,
+pub struct TextContinuationBranch<
+    B: TextSnapshotBackend<S>,
+    C: TokenFilterController,
+    S: eredu_core::TextExecutionSession<B> + NativeTextStateSession<B>,
+> {
+    continuation: ManagedTextContinuation<B, C, S>,
+    native: <S as NativeTextStateSession<B>>::NativeTextState,
 }
 
 /// Ordinary continuation plus its logical branch-retention ownership. Moving or
 /// swapping native slots must keep this lease with the logical child, including
 /// while that child is installed in the shared executable.
-pub struct ManagedTextContinuation<B: eredu_core::TextGenerationBackend, C: TokenFilterController> {
-    state: eredu_core::TextGenerationContinuation<B, C>,
+pub struct ManagedTextContinuation<
+    B: eredu_core::TextGenerationBackend,
+    C: TokenFilterController,
+    S: eredu_core::TextExecutionSession<B>,
+> {
+    state: eredu_core::TextGenerationContinuation<B, C, S>,
     reservation: Option<SnapshotReservation>,
 }
 
-impl<B: eredu_core::TextGenerationBackend, C: TokenFilterController> ManagedTextContinuation<B, C> {
+impl<
+        B: eredu_core::TextGenerationBackend,
+        C: TokenFilterController,
+        S: eredu_core::TextExecutionSession<B>,
+    > ManagedTextContinuation<B, C, S>
+{
     /// Wraps the initial ordinary run, whose baseline execution state is owned by
     /// the caller's loaded runtime. Forked children are constructed with leases.
-    pub fn root(state: eredu_core::TextGenerationContinuation<B, C>) -> Self {
+    pub fn root(state: eredu_core::TextGenerationContinuation<B, C, S>) -> Self {
         Self {
             state,
             reservation: None,
@@ -217,7 +223,7 @@ impl<B: eredu_core::TextGenerationBackend, C: TokenFilterController> ManagedText
     #[allow(clippy::type_complexity)]
     pub fn advance(
         &mut self,
-        driver: &mut eredu_core::TextGenerationDriver<'_, B>,
+        driver: &mut eredu_core::TextGenerationDriver<'_, B, S>,
     ) -> Result<
         Option<eredu_core::ControlledToken<B::Token>>,
         eredu_core::TextContinuationError<B::Error, C::Error>,
@@ -227,7 +233,7 @@ impl<B: eredu_core::TextGenerationBackend, C: TokenFilterController> ManagedText
     /// Advances one physical operation through the ordinary generation machine.
     pub fn advance_operation(
         &mut self,
-        driver: &mut eredu_core::TextGenerationDriver<'_, B>,
+        driver: &mut eredu_core::TextGenerationDriver<'_, B, S>,
     ) -> Result<
         Option<eredu_core::TextAdvancement<B::Token>>,
         eredu_core::TextContinuationError<B::Error, C::Error>,
@@ -237,7 +243,7 @@ impl<B: eredu_core::TextGenerationBackend, C: TokenFilterController> ManagedText
     /// Requests selected scores for the next refinement operation.
     pub fn configure_refinement_readout(
         &mut self,
-        driver: &eredu_core::TextGenerationDriver<'_, B>,
+        driver: &eredu_core::TextGenerationDriver<'_, B, S>,
         selections: Vec<eredu_core::refinement::RefinementScoreSelection>,
     ) -> Result<(), eredu_core::refinement::RefinementReadoutError> {
         driver.configure_refinement_readout(&mut self.state, selections)
@@ -246,7 +252,7 @@ impl<B: eredu_core::TextGenerationBackend, C: TokenFilterController> ManagedText
     /// Drains selected scores after completion.
     pub fn take_refinement_readout(
         &mut self,
-        driver: &eredu_core::TextGenerationDriver<'_, B>,
+        driver: &eredu_core::TextGenerationDriver<'_, B, S>,
     ) -> Result<
         Option<eredu_core::refinement::RefinementScoreRows>,
         eredu_core::refinement::RefinementReadoutError,
@@ -257,7 +263,7 @@ impl<B: eredu_core::TextGenerationBackend, C: TokenFilterController> ManagedText
     /// Completes one nonfinal prompt chunk through the ordinary driver.
     pub fn advance_prefill(
         &mut self,
-        driver: &mut eredu_core::TextGenerationDriver<'_, B>,
+        driver: &mut eredu_core::TextGenerationDriver<'_, B, S>,
     ) -> Result<bool, eredu_core::TextContinuationError<B::Error, C::Error>> {
         driver.advance_prefill(&mut self.state)
     }
@@ -265,7 +271,7 @@ impl<B: eredu_core::TextGenerationBackend, C: TokenFilterController> ManagedText
     #[cfg(not(feature = "tensor-capture"))]
     pub fn take_completed_step(
         &mut self,
-        driver: &mut eredu_core::TextGenerationDriver<'_, B>,
+        driver: &mut eredu_core::TextGenerationDriver<'_, B, S>,
     ) -> Result<(), eredu_core::TextContinuationError<B::Error, C::Error>> {
         driver.take_completed_step(&mut self.state)
     }
@@ -274,7 +280,7 @@ impl<B: eredu_core::TextGenerationBackend, C: TokenFilterController> ManagedText
     #[cfg(feature = "tensor-capture")]
     pub fn take_completed_step(
         &mut self,
-        driver: &mut eredu_core::TextGenerationDriver<'_, B>,
+        driver: &mut eredu_core::TextGenerationDriver<'_, B, S>,
     ) -> Result<
         Option<eredu_core::capture::CapturedStep>,
         eredu_core::TextContinuationError<B::Error, C::Error>,
@@ -284,9 +290,9 @@ impl<B: eredu_core::TextGenerationBackend, C: TokenFilterController> ManagedText
     /// Lends a completed boundary while retaining this run's branch reservation.
     pub fn boundary<'d, 's>(
         &'s mut self,
-        driver: &'d mut eredu_core::TextGenerationDriver<'_, B>,
+        driver: &'d mut eredu_core::TextGenerationDriver<'_, B, S>,
     ) -> Result<
-        TextContinuationBoundary<'d, 's, B, C>,
+        TextContinuationBoundary<'d, 's, B, C, S>,
         eredu_core::TextContinuationError<B::Error, C::Error>,
     > {
         driver.quiescent(&mut self.state)
@@ -337,7 +343,12 @@ impl<B: eredu_core::TextGenerationBackend, C: TokenFilterController> ManagedText
             .map(SnapshotReservation::retained_bytes)
     }
 }
-impl<B: TextSnapshotBackend, C: TokenFilterController> TextContinuationBranch<B, C> {
+impl<
+        B: TextSnapshotBackend<S>,
+        C: TokenFilterController,
+        S: eredu_core::TextExecutionSession<B> + NativeTextStateSession<B>,
+    > TextContinuationBranch<B, C, S>
+{
     /// Binds commands to the independently owned logical child, even while inactive.
     pub fn bind_control_handle(
         &self,
@@ -349,8 +360,8 @@ impl<B: TextSnapshotBackend, C: TokenFilterController> TextContinuationBranch<B,
     /// must also swap its matching semantic state before executing a prediction.
     pub fn exchange(
         &mut self,
-        driver: &mut eredu_core::TextGenerationDriver<'_, B>,
-        active: &mut ManagedTextContinuation<B, C>,
+        driver: &mut eredu_core::TextGenerationDriver<'_, B, S>,
+        active: &mut ManagedTextContinuation<B, C, S>,
     ) -> Result<(), eredu_core::TextContinuationError<B::Error, C::Error>> {
         driver
             .quiescent(&mut active.state)?
@@ -363,12 +374,16 @@ impl<B: TextSnapshotBackend, C: TokenFilterController> TextContinuationBranch<B,
 /// Opaque reusable model/sampler/input/controller/capture checkpoint. The facade
 /// pairs this with its semantic/output/lifecycle checkpoint before exposing a full
 /// generation snapshot. Native state is never serialized or shallow-cloned.
-pub struct TextContinuationSnapshot<B: TextSnapshotBackend, C: TokenFilterController> {
+pub struct TextContinuationSnapshot<
+    B: TextSnapshotBackend<S>,
+    C: TokenFilterController,
+    S: eredu_core::TextExecutionSession<B> + NativeTextStateSession<B>,
+> {
     driver: eredu_core::TextDriverIdentity,
     identity: TextContinuationIdentity,
-    native: B::NativeTextState,
+    native: <S as NativeTextStateSession<B>>::NativeTextState,
     sampling: B::SamplingState,
-    pending: Option<PendingTextInput<B::Prompt, B::Token>>,
+    pending: Option<PendingTextInput<S::Prompt, B::Token>>,
     controller: C,
     sequence: eredu_core::GenerationSequence,
     remaining_tokens: Option<usize>,
@@ -380,7 +395,12 @@ pub struct TextContinuationSnapshot<B: TextSnapshotBackend, C: TokenFilterContro
     _reservation: SnapshotReservation,
 }
 
-impl<B: TextSnapshotBackend, C: SnapshotTokenController> TextContinuationSnapshot<B, C> {
+impl<
+        B: TextSnapshotBackend<S>,
+        C: SnapshotTokenController,
+        S: eredu_core::TextExecutionSession<B> + NativeTextStateSession<B>,
+    > TextContinuationSnapshot<B, C, S>
+{
     /// Logical policy at the same boundary as the saved sampler and cache.
     pub fn decoding_state(&self) -> eredu_core::decoding::DecodingState {
         self.decoding
@@ -410,7 +430,7 @@ impl<B: TextSnapshotBackend, C: SnapshotTokenController> TextContinuationSnapsho
     /// reserved before publishing a runnable child. No copy or prediction occurs.
     pub fn native_continuation_growth(
         &self,
-        runtime: &ModelRuntime<B>,
+        runtime: &ModelRuntime<B, S>,
         max_predictions: u64,
     ) -> Result<u64, TextSnapshotError<B::Error>> {
         let predictions = max_predictions
@@ -423,7 +443,7 @@ impl<B: TextSnapshotBackend, C: SnapshotTokenController> TextContinuationSnapsho
             predictions,
         )
         .ok_or(ExecutionControlError::UnknownEstimate)?;
-        let native = B::estimate_native_text_growth(runtime, &self.native, input)
+        let native = S::estimate_native_text_growth(runtime, &self.native, input)
             .map_err(TextSnapshotError::Backend)?
             .ok_or(ExecutionControlError::UnknownEstimate)?;
         let sampling = B::estimate_sampling_growth(runtime, &self.sampling, predictions)
@@ -439,7 +459,7 @@ impl<B: TextSnapshotBackend, C: SnapshotTokenController> TextContinuationSnapsho
     /// capture and caller-owned host state. `host_bytes` covers facade semantic/
     /// output checkpoint storage; the controller supplies its own known estimate.
     pub fn capture(
-        boundary: &mut TextContinuationBoundary<'_, '_, B, C>,
+        boundary: &mut TextContinuationBoundary<'_, '_, B, C, S>,
         budget: &SnapshotBudget,
         host_bytes: Option<u64>,
     ) -> Result<Self, TextSnapshotError<B::Error>> {
@@ -456,7 +476,7 @@ impl<B: TextSnapshotBackend, C: SnapshotTokenController> TextContinuationSnapsho
         let (runtime, state, pending) = boundary.parts();
         #[cfg(feature = "tensor-capture")]
         let discovery = B::capture_run(state)
-            .map(|_| B::capture_discovery(runtime))
+            .map(|_| runtime.session().capture_discovery())
             .transpose()?;
         #[cfg(feature = "tensor-capture")]
         let capture_bytes = match (B::capture_run(state), discovery.as_ref()) {
@@ -467,7 +487,7 @@ impl<B: TextSnapshotBackend, C: SnapshotTokenController> TextContinuationSnapsho
         };
         let estimate = combine_estimates(
             [
-                B::estimate_native_text_state(runtime, None).map_err(TextSnapshotError::Backend)?,
+                S::estimate_native_text_state(runtime, None).map_err(TextSnapshotError::Backend)?,
                 B::estimate_sampling_state(runtime, B::sampling_state(state))
                     .map_err(TextSnapshotError::Backend)?,
                 B::estimate_pending_input(runtime, pending).map_err(TextSnapshotError::Backend)?,
@@ -512,7 +532,7 @@ impl<B: TextSnapshotBackend, C: SnapshotTokenController> TextContinuationSnapsho
             B::copy_pending_input(runtime, pending).map_err(TextSnapshotError::Backend)?;
         let sampling = B::copy_sampling_state(runtime, B::sampling_state(state))
             .map_err(TextSnapshotError::Backend)?;
-        let native = B::capture_native_text_state(runtime).map_err(TextSnapshotError::Backend)?;
+        let native = S::capture_native_text_state(runtime).map_err(TextSnapshotError::Backend)?;
         Ok(Self {
             driver,
             identity,
@@ -533,11 +553,11 @@ impl<B: TextSnapshotBackend, C: SnapshotTokenController> TextContinuationSnapsho
 
     fn copy_estimate(
         &self,
-        runtime: &ModelRuntime<B>,
+        runtime: &ModelRuntime<B, S>,
     ) -> Result<SnapshotEstimate, TextSnapshotError<B::Error>> {
         combine_estimates(
             [
-                B::estimate_native_text_state(runtime, Some(&self.native))
+                S::estimate_native_text_state(runtime, Some(&self.native))
                     .map_err(TextSnapshotError::Backend)?,
                 B::estimate_sampling_state(runtime, &self.sampling)
                     .map_err(TextSnapshotError::Backend)?,
@@ -580,7 +600,7 @@ impl<B: TextSnapshotBackend, C: SnapshotTokenController> TextContinuationSnapsho
     /// Cumulative capture and copy usage are never restored from old values.
     pub fn restore(
         &self,
-        boundary: &mut TextContinuationBoundary<'_, '_, B, C>,
+        boundary: &mut TextContinuationBoundary<'_, '_, B, C, S>,
         budget: &SnapshotBudget,
     ) -> Result<(), TextSnapshotError<B::Error>> {
         self.restore_with(boundary, budget, || Ok(()))
@@ -592,7 +612,7 @@ impl<B: TextSnapshotBackend, C: SnapshotTokenController> TextContinuationSnapsho
     /// returned host state is installed infallibly by the owning composition.
     pub fn restore_with<H>(
         &self,
-        boundary: &mut TextContinuationBoundary<'_, '_, B, C>,
+        boundary: &mut TextContinuationBoundary<'_, '_, B, C, S>,
         budget: &SnapshotBudget,
         prepare_host: impl FnOnce() -> Result<H, String>,
     ) -> Result<H, TextSnapshotError<B::Error>> {
@@ -600,7 +620,7 @@ impl<B: TextSnapshotBackend, C: SnapshotTokenController> TextContinuationSnapsho
             return Err(TextSnapshotError::IncompatibleRun);
         }
         let (runtime, state, _) = boundary.parts();
-        B::validate_native_text_state(runtime, &self.native).map_err(TextSnapshotError::Backend)?;
+        S::validate_native_text_state(runtime, &self.native).map_err(TextSnapshotError::Backend)?;
         #[cfg(feature = "tensor-capture")]
         match (B::capture_run(state), &self.capture) {
             (Some(run), Some(saved)) => run.validate_restore(saved)?,
@@ -623,14 +643,14 @@ impl<B: TextSnapshotBackend, C: SnapshotTokenController> TextContinuationSnapsho
         let sampling =
             B::copy_sampling_state(runtime, &self.sampling).map_err(TextSnapshotError::Backend)?;
         let mut native =
-            B::copy_native_text_state(runtime, &self.native).map_err(TextSnapshotError::Backend)?;
+            S::copy_native_text_state(runtime, &self.native).map_err(TextSnapshotError::Backend)?;
         #[cfg(feature = "tensor-capture")]
         let capture_restore = match (B::capture_run_mut(state), &self.capture) {
             (Some(run), Some(saved)) => Some(run.prepare_restore(saved)?),
             (None, None) => None,
             _ => return Err(TextSnapshotError::InconsistentState),
         };
-        B::exchange_native_text_state(runtime, &mut native).map_err(TextSnapshotError::Backend)?;
+        S::exchange_native_text_state(runtime, &mut native).map_err(TextSnapshotError::Backend)?;
         #[cfg(feature = "tensor-capture")]
         if let Some(restore) = capture_restore {
             restore.commit();
@@ -652,10 +672,10 @@ impl<B: TextSnapshotBackend, C: SnapshotTokenController> TextContinuationSnapsho
     /// is replayed and no original run accounting is reset.
     pub fn fork(
         &self,
-        boundary: &mut TextContinuationBoundary<'_, '_, B, C>,
+        boundary: &mut TextContinuationBoundary<'_, '_, B, C, S>,
         budget: &SnapshotBudget,
         request: TextBranchRequest<'_>,
-    ) -> Result<TextContinuationBranch<B, C>, TextSnapshotError<B::Error>> {
+    ) -> Result<TextContinuationBranch<B, C, S>, TextSnapshotError<B::Error>> {
         self.fork_with(boundary, budget, request, |_, _| Ok(()))
             .map(|(branch, ())| branch)
     }
@@ -667,14 +687,14 @@ impl<B: TextSnapshotBackend, C: SnapshotTokenController> TextContinuationSnapsho
     #[allow(clippy::type_complexity)]
     pub fn fork_with<H>(
         &self,
-        boundary: &mut TextContinuationBoundary<'_, '_, B, C>,
+        boundary: &mut TextContinuationBoundary<'_, '_, B, C, S>,
         budget: &SnapshotBudget,
         request: TextBranchRequest<'_>,
         prepare: impl FnOnce(
-            &mut ModelRuntime<B>,
-            &mut B::TextGenerationState,
+            &mut ModelRuntime<B, S>,
+            &mut S::TextGenerationState,
         ) -> Result<H, TextSnapshotError<B::Error>>,
-    ) -> Result<(TextContinuationBranch<B, C>, H), TextSnapshotError<B::Error>> {
+    ) -> Result<(TextContinuationBranch<B, C, S>, H), TextSnapshotError<B::Error>> {
         if self.driver != boundary.driver_identity() {
             return Err(TextSnapshotError::IncompatibleRun);
         }
@@ -690,7 +710,7 @@ impl<B: TextSnapshotBackend, C: SnapshotTokenController> TextContinuationSnapsho
         let remaining = usize::try_from(request.max_predictions - self.next_prediction())
             .map_err(|_| ExecutionControlError::Overflow)?;
         let (runtime, _, _) = boundary.parts();
-        B::validate_native_text_state(runtime, &self.native).map_err(TextSnapshotError::Backend)?;
+        S::validate_native_text_state(runtime, &self.native).map_err(TextSnapshotError::Backend)?;
         #[cfg(feature = "tensor-capture")]
         if self.capture.is_none() && request.intervention.is_some() {
             return Err(TextSnapshotError::Unsupported(
@@ -701,7 +721,7 @@ impl<B: TextSnapshotBackend, C: SnapshotTokenController> TextContinuationSnapsho
         let discovery = self
             .capture
             .as_ref()
-            .map(|_| B::capture_discovery(runtime))
+            .map(|_| runtime.session().capture_discovery())
             .transpose()?;
         #[cfg(feature = "tensor-capture")]
         let needs_intervention = self
@@ -711,7 +731,7 @@ impl<B: TextSnapshotBackend, C: SnapshotTokenController> TextContinuationSnapsho
             || request.intervention.is_some();
         #[cfg(feature = "tensor-capture")]
         let intervention_discovery = needs_intervention
-            .then(|| B::intervention_discovery(runtime))
+            .then(|| runtime.session().intervention_discovery())
             .transpose()?;
         #[cfg(feature = "tensor-capture")]
         let child = match discovery.as_ref() {
@@ -778,7 +798,7 @@ impl<B: TextSnapshotBackend, C: SnapshotTokenController> TextContinuationSnapsho
         let sampling =
             B::copy_sampling_state(runtime, &self.sampling).map_err(TextSnapshotError::Backend)?;
         let native =
-            B::copy_native_text_state(runtime, &self.native).map_err(TextSnapshotError::Backend)?;
+            S::copy_native_text_state(runtime, &self.native).map_err(TextSnapshotError::Backend)?;
         let mut generation = B::assemble_generation_state(
             sampling,
             #[cfg(feature = "tensor-capture")]

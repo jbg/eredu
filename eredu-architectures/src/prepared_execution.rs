@@ -1,192 +1,58 @@
 //! Total construction of selected architectures through typed native mechanisms.
 
-use std::{collections::BTreeSet, num::NonZeroU8, sync::Arc};
+use std::{collections::BTreeSet, sync::Arc};
 
 use eredu_checkpoint::store::SharedCheckpointSource;
-use eredu_core::{ArtifactInspection, ParallelRankTopology, ParallelTopology, SessionCapabilities};
-use eredu_runtime::{CacheResidencyPolicy, CommunicationManifest};
+use eredu_core::{ArtifactInspection, ParallelRankTopology, ParallelTopology};
+use eredu_runtime::executable_binding::{
+    KeyValueRoute, PreparedExecutableConstruction, PreparedExecutableDiscovery,
+    PreparedExecutablePlan,
+};
 
 use crate::{
-    capability::CapabilityEstimate, preparation::FloatingStateDtypeSource,
-    prepared_sources::PreparedModelSources, processor_execution::PreparedProcessor,
-    processor_plan::ArtifactArchitecturePlan, selected_execution::*,
+    capability::CapabilityEstimate,
+    prepared_sources::{PreparedModelDiscovery, PreparedModelSources},
+    processor_execution::PreparedProcessor,
+    processor_plan::ArtifactArchitecturePlan,
+    selected_execution::*,
 };
 
 mod direct_session;
 mod ordinary;
-mod partition_facts;
+pub(crate) mod partition_facts;
 mod partitioned;
 mod prediction;
 mod retained_session;
 mod routed_partition;
-mod routed_session;
 pub use retained_session::{PreparedRetainedTextSession, RealizedRank};
 
 pub use direct_session::{construct_selected_composite_session, construct_selected_text_session};
-pub use ordinary::{
-    construct_vl_rank, CompositeRoute, KeyValueRoute, ReplicatedRoute,
-    RetainedArchitectureConstruction, RetainedCompositeVisitor, RoutedRoute,
+pub use eredu_runtime::executable_binding::{
+    routed_session::construct_selected_routed_composite_session, PreparedCompositeSessionFacts,
+    PreparedTextSessionFacts,
 };
+pub use ordinary::{construct_vl_rank, RetainedArchitectureConstruction, RetainedCompositeVisitor};
 pub use partition_facts::PreparedPartitionSessionFacts;
-pub use partitioned::{PartitionedCompositeRoute, PartitionedDenseRoute, PartitionedRoutedRoute};
-pub use prediction::{
-    PredictionBinding, PredictionConstruction, PredictionMechanisms, WithoutPrediction,
-};
+pub use prediction::PredictionConstruction;
 pub use routed_partition::{
-    construct_partition_bank_providers, construct_selected_partition_providers,
-    PartitionBankMechanisms, PartitionBankProviders, PreparedPartitionBanks,
-};
-pub use routed_session::{
-    construct_selected_routed_composite_session, construct_selected_routed_session,
-    PreparedCompositeSessionFacts, PreparedTextSessionFacts,
+    construct_partition_bank_providers, PartitionBankMechanisms, PartitionBankProviders,
+    PreparedPartitionBanks,
 };
 
 pub(crate) mod sealed {
     pub trait Sealed {}
 }
 
-/// Failure before publication of a fully constructed executable.
-#[derive(Debug, thiserror::Error)]
-pub enum PreparedExecutionError<E> {
-    /// Selected sources or architecture construction violated their contract.
-    #[error("prepared execution construction failed: {0}")]
-    Architecture(String),
-    /// A native materialization, communication, or publication mechanism failed.
-    #[error("prepared execution mechanism failed: {0}")]
-    Backend(E),
-    /// A native mechanism failed while binding portable components.
-    #[error(transparent)]
-    Binding(eredu_core::BackendFailure),
-    /// A partitioned selection has no realized communication.
-    #[error("partitioned construction has no realized communication")]
-    MissingCommunication,
-    /// Ordinary execution was paired with partition communication.
-    #[error("ordinary construction has unexpected realized communication")]
-    UnexpectedCommunication,
-    /// Extension selection and its exact prepared source do not agree.
-    #[error("prepared prediction selection and source role disagree")]
-    PredictionSourceMismatch,
-    /// The selected class has no supplied typed construction mechanism.
-    #[error("selected execution has no supplied typed construction mechanism")]
-    UnavailableExecution,
-    /// An embedded extension was selected without a native extension materializer.
-    #[error("selected prediction extension has no supplied construction mechanism")]
-    UnavailablePrediction,
-}
-
-/// Native facts and final outer adaptation after architecture construction.
-pub trait PreparedExecutableAssembler<C>: Sized {
-    /// Completely bound executable returned by each typed visitor.
-    type Executable;
-    /// Backend-owned outer prepared model.
-    type Output;
-    /// Native mechanism failure.
-    type Error;
-
-    /// Reports the physical floating-state dtype of this exact admitted source.
-    /// Construction compares it with the representation accepted during cold selection.
-    fn floating_state_dtype(
-        &mut self,
-        source: &FloatingStateDtypeSource,
-    ) -> Result<eredu_runtime::StateStorageDtype, Self::Error>;
-
-    /// Checks the realized native handle against the exact selected manifest.
-    fn validate_communication(
-        &mut self,
-        manifest: &CommunicationManifest,
-        communication: &C,
-    ) -> Result<(), Self::Error>;
-
-    /// Publishes one outer model only after every typed construction step succeeds.
-    fn finish(
-        self,
-        parts: PreparedExecutableParts<Self::Executable, C>,
-    ) -> Result<Self::Output, Self::Error>;
-}
-
-/// Fully checked pieces consumed by a backend's final model adapter.
-pub struct PreparedExecutableParts<E, C> {
-    executable: E,
-    floating_state_bytes: NonZeroU8,
-    state_residency: CacheResidencyPolicy,
-    communication: Option<C>,
-    processor: Option<PreparedProcessor>,
-    capabilities: SessionCapabilities,
-}
-
-impl<E, C> PreparedExecutableParts<E, C> {
-    /// Physical width reported for the architecture-selected floating-state source.
-    pub const fn floating_state_bytes(&self) -> NonZeroU8 {
-        self.floating_state_bytes
-    }
-    /// Exact selected mutable-state residency.
-    pub const fn state_residency(&self) -> &CacheResidencyPolicy {
-        &self.state_residency
-    }
-    /// Exact retained session admission.
-    pub const fn capabilities(&self) -> SessionCapabilities {
-        self.capabilities
-    }
-    /// Removes the already checked native communication handle.
-    pub fn take_communication(&mut self) -> Option<C> {
-        self.communication.take()
-    }
-    /// Removes the architecture-prepared raw-media processor, when selected.
-    pub fn take_processor(&mut self) -> Option<PreparedProcessor> {
-        self.processor.take()
-    }
-    /// Consumes these parts after extracting the other adapter-owned resources.
-    pub fn into_executable(self) -> E {
-        self.executable
-    }
-}
-
-/// Checked native resources for a partition-specific typed binding visitor.
-pub struct PreparedPartitionResources<C> {
-    communication: C,
-    target: SharedCheckpointSource,
-    extension_sources: BTreeSet<String>,
-}
-
-impl<C> PreparedPartitionResources<C> {
-    /// Exact communication handle checked against the selected manifest.
-    pub const fn communication(&self) -> &C {
-        &self.communication
-    }
-    /// Exact target source, excluding prediction-only parameters.
-    pub const fn target(&self) -> &SharedCheckpointSource {
-        &self.target
-    }
-    /// Exact physical keys claimed by the separately materialized extension.
-    pub const fn extension_sources(&self) -> &BTreeSet<String> {
-        &self.extension_sources
-    }
-    /// Moves the checked communication handle into a native visitor.
-    pub fn into_communication(self) -> C {
-        self.communication
-    }
-}
-
-/// Checked facts and native resources for a partitioned prediction binding visitor.
-pub struct PreparedPartitionPredictionResources<C> {
-    partition: PreparedPartitionResources<C>,
-    prediction: PredictionBinding,
-}
-
-impl<C> PreparedPartitionPredictionResources<C> {
-    /// Exact prediction realization and architecture capability estimate.
-    pub const fn prediction(&self) -> &PredictionBinding {
-        &self.prediction
-    }
-    /// Checked target source, claimed extension keys, and native communication.
-    pub const fn partition(&self) -> &PreparedPartitionResources<C> {
-        &self.partition
-    }
-    /// Moves the checked partition resources into a native visitor.
-    pub fn into_partition(self) -> PreparedPartitionResources<C> {
-        self.partition
-    }
-}
+pub use eredu_runtime::executable_binding::{
+    CompositeRoute, PartitionedCompositeRoute, PartitionedDenseRoute, PartitionedRoutedRoute,
+    PredictionMechanisms, ReplicatedRoute, RoutedRoute, WithoutPrediction,
+};
+pub use eredu_runtime::executable_binding::{
+    PredictionBinding, PreparedExecutionError, PreparedExecutionRoutes,
+    PreparedPartitionPredictionResources, PreparedPartitionResources, Unavailable,
+};
+#[doc(hidden)]
+pub use prediction::RetainedPredictionBinding;
 
 /// Opaque, mutually agreeing prediction selection and source roles.
 #[doc(hidden)]
@@ -209,7 +75,7 @@ pub struct PreparedConstructionBranch<S, C> {
     communication: Option<C>,
     extension_sources: BTreeSet<String>,
     prediction: Option<PreparedPredictionSelection>,
-    retained_prediction: Option<PredictionBinding>,
+    retained_prediction: Option<RetainedPredictionBinding>,
     retained_construction: Option<RetainedArchitectureConstruction>,
     retained_composite_rank: Option<crate::lfm3::vision::PreparedVlRankGraph>,
 }
@@ -218,14 +84,13 @@ impl<S, C> PreparedConstructionBranch<S, C> {
     fn partition_resources<E>(
         &mut self,
     ) -> Result<PreparedPartitionResources<C>, PreparedExecutionError<E>> {
-        Ok(PreparedPartitionResources {
-            communication: self
-                .communication
+        Ok(PreparedPartitionResources::new(
+            self.communication
                 .take()
                 .ok_or(PreparedExecutionError::MissingCommunication)?,
-            target: Arc::clone(&self.target),
-            extension_sources: std::mem::take(&mut self.extension_sources),
-        })
+            Arc::clone(&self.target),
+            std::mem::take(&mut self.extension_sources),
+        ))
     }
 }
 
@@ -242,9 +107,6 @@ pub trait PreparedExecutionRoute<S, C, E, F>: sealed::Sealed {
     ) -> Result<E, PreparedExecutionError<F>>;
 }
 
-/// An explicitly absent optional construction capability.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Unavailable;
 impl sealed::Sealed for Unavailable {}
 impl<S, C, E, F> PreparedExecutionRoute<S, C, E, F> for Unavailable {
     fn construct(
@@ -255,359 +117,226 @@ impl<S, C, E, F> PreparedExecutionRoute<S, C, E, F> for Unavailable {
     }
 }
 
-/// Typed architecture construction routes with optional capabilities absent by default.
-pub struct PreparedExecutionRoutes<
-    R = Unavailable,
-    T = Unavailable,
-    X = Unavailable,
-    PD = Unavailable,
-    PT = Unavailable,
-    PX = Unavailable,
-> {
-    replicated: R,
-    routed: T,
-    composite: X,
-    partitioned_dense: PD,
-    partitioned_routed: PT,
-    partitioned_composite: PX,
-}
-
-impl Default for PreparedExecutionRoutes {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-impl PreparedExecutionRoutes {
-    /// Creates an empty capability bundle; add only implemented typed routes.
-    pub const fn new() -> Self {
-        Self {
-            replicated: Unavailable,
-            routed: Unavailable,
-            composite: Unavailable,
-            partitioned_dense: Unavailable,
-            partitioned_routed: Unavailable,
-            partitioned_composite: Unavailable,
-        }
+impl PreparedExecutableDiscovery for PreparedModelDiscovery {
+    fn bind_executable(
+        self,
+        parameters: Option<Arc<eredu_runtime::ArchitectureParameterDescription>>,
+        hooks: Option<eredu_runtime::inspection::ObservationHookSupport>,
+    ) -> Result<Self, eredu_core::capture::CaptureError> {
+        self.bind_partition_parameters(parameters)?
+            .bind_partition_observation_hooks(hooks)
     }
 }
 
-impl<R, T, X, PD, PT, PX> PreparedExecutionRoutes<R, T, X, PD, PT, PX> {
-    /// Supplies ordinary replicated construction.
-    pub fn with_replicated<N>(self, route: N) -> PreparedExecutionRoutes<N, T, X, PD, PT, PX> {
-        PreparedExecutionRoutes {
-            replicated: route,
-            routed: self.routed,
-            composite: self.composite,
-            partitioned_dense: self.partitioned_dense,
-            partitioned_routed: self.partitioned_routed,
-            partitioned_composite: self.partitioned_composite,
-        }
-    }
-    /// Supplies routed text construction.
-    pub fn with_routed<N>(self, route: N) -> PreparedExecutionRoutes<R, N, X, PD, PT, PX> {
-        PreparedExecutionRoutes {
-            replicated: self.replicated,
-            routed: route,
-            composite: self.composite,
-            partitioned_dense: self.partitioned_dense,
-            partitioned_routed: self.partitioned_routed,
-            partitioned_composite: self.partitioned_composite,
-        }
-    }
-    /// Supplies composite text construction.
-    pub fn with_composite<N>(self, route: N) -> PreparedExecutionRoutes<R, T, N, PD, PT, PX> {
-        PreparedExecutionRoutes {
-            replicated: self.replicated,
-            routed: self.routed,
-            composite: route,
-            partitioned_dense: self.partitioned_dense,
-            partitioned_routed: self.partitioned_routed,
-            partitioned_composite: self.partitioned_composite,
-        }
-    }
-    /// Supplies direct partitioned construction.
-    pub fn with_partitioned_dense<N>(
-        self,
-        route: N,
-    ) -> PreparedExecutionRoutes<R, T, X, N, PT, PX> {
-        PreparedExecutionRoutes {
-            replicated: self.replicated,
-            routed: self.routed,
-            composite: self.composite,
-            partitioned_dense: route,
-            partitioned_routed: self.partitioned_routed,
-            partitioned_composite: self.partitioned_composite,
-        }
-    }
-    /// Supplies routed partitioned construction.
-    pub fn with_partitioned_routed<N>(
-        self,
-        route: N,
-    ) -> PreparedExecutionRoutes<R, T, X, PD, N, PX> {
-        PreparedExecutionRoutes {
-            replicated: self.replicated,
-            routed: self.routed,
-            composite: self.composite,
-            partitioned_dense: self.partitioned_dense,
-            partitioned_routed: route,
-            partitioned_composite: self.partitioned_composite,
-        }
-    }
-    /// Supplies composite partitioned construction.
-    pub fn with_partitioned_composite<N>(
-        self,
-        route: N,
-    ) -> PreparedExecutionRoutes<R, T, X, PD, PT, N> {
-        PreparedExecutionRoutes {
-            replicated: self.replicated,
-            routed: self.routed,
-            composite: self.composite,
-            partitioned_dense: self.partitioned_dense,
-            partitioned_routed: self.partitioned_routed,
-            partitioned_composite: route,
-        }
-    }
-}
-
-/// Constructs one exact selected model through architecture-owned typed routes.
-///
-/// All common agreement checks precede typed construction. No native tensor or
-/// optional neural trait is required by this total outer driver.
-pub fn construct_prepared_execution<C, A, R, T, X, PD, PT, PX>(
-    sources: PreparedModelSources,
-    communication: Option<C>,
-    routes: PreparedExecutionRoutes<R, T, X, PD, PT, PX>,
-    mut assembler: A,
-) -> Result<A::Output, PreparedExecutionError<A::Error>>
+impl<C, R, T, X, PD, PT, PX, E, F>
+    PreparedExecutableConstruction<C, E, F, PreparedExecutionRoutes<R, T, X, PD, PT, PX>>
+    for PreparedModelSources
 where
-    C: Clone,
-    A: PreparedExecutableAssembler<C>,
-    R: PreparedExecutionRoute<
-        eredu_runtime::SelectedReplicatedTextRealization,
-        C,
-        A::Executable,
-        A::Error,
-    >,
-    T: PreparedExecutionRoute<crate::SelectedRoutedTextRealization, C, A::Executable, A::Error>,
-    X: PreparedExecutionRoute<
-        crate::replicated_text::SelectedCompositeTextRealization,
-        C,
-        A::Executable,
-        A::Error,
-    >,
-    PD: PreparedExecutionRoute<SelectedDensePartitionedExecution, C, A::Executable, A::Error>,
-    PT: PreparedExecutionRoute<SelectedRoutedPartitionedExecution, C, A::Executable, A::Error>,
-    PX: PreparedExecutionRoute<SelectedCompositePartitionedExecution, C, A::Executable, A::Error>,
+    R: PreparedExecutionRoute<eredu_runtime::SelectedReplicatedTextRealization, C, E, F>,
+    T: PreparedExecutionRoute<crate::SelectedRoutedTextRealization, C, E, F>,
+    X: PreparedExecutionRoute<crate::replicated_text::SelectedCompositeTextRealization, C, E, F>,
+    PD: PreparedExecutionRoute<SelectedDensePartitionedExecution, C, E, F>,
+    PT: PreparedExecutionRoute<SelectedRoutedPartitionedExecution, C, E, F>,
+    PX: PreparedExecutionRoute<SelectedCompositePartitionedExecution, C, E, F>,
 {
-    let (selected, inspection, mut graph, vl_rank) = sources.into_parts();
-    let retained_construction = graph.take_retained_construction();
-    let topology = selected.execution().parallel_topology().unwrap_or(
-        ParallelTopology::new(1, 1, 1, 1)
-            .and_then(|topology| ParallelRankTopology::new(topology, 0))
-            .map_err(|error| PreparedExecutionError::Architecture(error.to_string()))?,
-    );
-    let retained_prediction = match (&retained_construction, selected.prediction_realization()) {
-        (Some(RetainedArchitectureConstruction::Qwen4Exp(target)), Some(realization))
-            if target.prediction_state().is_some() && graph.extension().is_some() =>
+    type Processor = PreparedProcessor;
+    type Discovery = PreparedModelDiscovery;
+
+    fn prepare(
+        self,
+        routes: PreparedExecutionRoutes<R, T, X, PD, PT, PX>,
+        observation: eredu_core::ObservationMechanisms,
+        capture: eredu_core::capture::CaptureCapabilities,
+    ) -> Result<
+        PreparedExecutablePlan<
+            Self::Processor,
+            Self::Discovery,
+            impl FnOnce(Option<C>) -> Result<E, PreparedExecutionError<F>>
+                + use<C, R, T, X, PD, PT, PX, E, F>,
+        >,
+        PreparedExecutionError<F>,
+    > {
+        let discovery = self.prepare_discovery(observation, capture);
+        let (selected, inspection, mut graph, vl_rank) = self.into_parts();
+        let retained_construction = graph.take_retained_construction();
+        let topology = selected.execution().parallel_topology().unwrap_or(
+            ParallelTopology::new(1, 1, 1, 1)
+                .and_then(|topology| ParallelRankTopology::new(topology, 0))
+                .map_err(|error| PreparedExecutionError::Architecture(error.to_string()))?,
+        );
+        let retained_prediction = match (&retained_construction, selected.prediction_realization())
         {
-            Some(PredictionBinding::new(
-                realization.clone(),
-                target.capability_estimate().clone(),
-                Arc::clone(&graph.prediction_placement),
-                topology,
-            ))
-        }
-        (Some(RetainedArchitectureConstruction::Qwen4Exp(target)), None)
-            if target.prediction_state().is_some() =>
-        {
-            return Err(PreparedExecutionError::PredictionSourceMismatch);
-        }
-        (Some(RetainedArchitectureConstruction::Qwen4Conditional(target)), Some(realization))
-            if target.prediction_state().is_some() && graph.extension().is_some() =>
-        {
-            Some(PredictionBinding::new(
-                realization.clone(),
-                target.capability_estimate().clone(),
-                Arc::clone(&graph.prediction_placement),
-                topology,
-            ))
-        }
-        (Some(RetainedArchitectureConstruction::Qwen4Conditional(target)), None)
-            if target.prediction_state().is_some() =>
-        {
-            return Err(PreparedExecutionError::PredictionSourceMismatch);
-        }
-        (Some(RetainedArchitectureConstruction::Qwen4Partition(target)), Some(realization))
-            if target.prediction_state().is_some() && graph.extension().is_some() =>
-        {
-            Some(PredictionBinding::new(
-                realization.clone(),
-                target.capability_estimate().clone(),
-                Arc::clone(&graph.prediction_placement),
-                topology,
-            ))
-        }
-        (
-            Some(RetainedArchitectureConstruction::Qwen4ConditionalPartition(target)),
-            Some(realization),
-        ) if target.prediction_state().is_some() && graph.extension().is_some() => {
-            Some(PredictionBinding::new(
-                realization.clone(),
-                target.capability_estimate().clone(),
-                Arc::clone(&graph.prediction_placement),
-                topology,
-            ))
-        }
-        (Some(RetainedArchitectureConstruction::Qwen4Partition(target)), None)
-            if target.prediction_state().is_some() =>
-        {
-            return Err(PreparedExecutionError::PredictionSourceMismatch)
-        }
-        (Some(RetainedArchitectureConstruction::Qwen4ConditionalPartition(target)), None)
-            if target.prediction_state().is_some() =>
-        {
-            return Err(PreparedExecutionError::PredictionSourceMismatch)
-        }
-        _ => None,
-    };
-    match (selected.communication_manifest(), communication.as_ref()) {
-        (Some(manifest), Some(communication)) => assembler
-            .validate_communication(manifest, communication)
-            .map_err(PreparedExecutionError::Backend)?,
-        (Some(_), None) => return Err(PreparedExecutionError::MissingCommunication),
-        (None, Some(_)) => return Err(PreparedExecutionError::UnexpectedCommunication),
-        (None, None) => {}
-    }
-    let state_residency = selected.text_realization().state().policy().clone();
-    let capabilities = selected.session_capabilities();
-    let prediction = match (
-        selected.prediction_extension(),
-        graph.prediction_extension(),
-        graph.extension(),
-        selected.prediction_realization(),
-    ) {
-        (Some(extension), Some(source_extension), Some(source), Some(realization))
-            if extension.same_admission(source_extension)
-                && selected
-                    .execution()
-                    .prediction_parameters()
-                    .is_some_and(|parameters| parameters.same_admission(extension)) =>
-        {
-            Some(PreparedPredictionSelection {
-                placement: Arc::clone(&graph.prediction_placement),
-                parameters: selected
-                    .execution()
-                    .prediction_parameters()
-                    .cloned()
-                    .ok_or_else(|| {
-                        PreparedExecutionError::Architecture(
-                            "prediction selection has no retained executable parameters".into(),
-                        )
-                    })?,
-                source: Arc::clone(source),
-                realization: realization.clone(),
-                capability: crate::prediction_extension::prediction_extension_capability(extension)
+            (Some(RetainedArchitectureConstruction::Qwen4Exp(target)), Some(realization))
+                if target.prediction_state().is_some() && graph.extension().is_some() =>
+            {
+                Some(RetainedPredictionBinding::new(
+                    realization.clone(),
+                    target.capability_estimate().clone(),
+                    Arc::clone(&graph.prediction_placement),
+                    topology,
+                ))
+            }
+            (Some(RetainedArchitectureConstruction::Qwen4Exp(target)), None)
+                if target.prediction_state().is_some() =>
+            {
+                return Err(PreparedExecutionError::PredictionSourceMismatch);
+            }
+            (
+                Some(RetainedArchitectureConstruction::Qwen4Conditional(target)),
+                Some(realization),
+            ) if target.prediction_state().is_some() && graph.extension().is_some() => {
+                Some(RetainedPredictionBinding::new(
+                    realization.clone(),
+                    target.capability_estimate().clone(),
+                    Arc::clone(&graph.prediction_placement),
+                    topology,
+                ))
+            }
+            (Some(RetainedArchitectureConstruction::Qwen4Conditional(target)), None)
+                if target.prediction_state().is_some() =>
+            {
+                return Err(PreparedExecutionError::PredictionSourceMismatch);
+            }
+            (Some(RetainedArchitectureConstruction::Qwen4Partition(target)), Some(realization))
+                if target.prediction_state().is_some() && graph.extension().is_some() =>
+            {
+                Some(RetainedPredictionBinding::new(
+                    realization.clone(),
+                    target.capability_estimate().clone(),
+                    Arc::clone(&graph.prediction_placement),
+                    topology,
+                ))
+            }
+            (
+                Some(RetainedArchitectureConstruction::Qwen4ConditionalPartition(target)),
+                Some(realization),
+            ) if target.prediction_state().is_some() && graph.extension().is_some() => {
+                Some(RetainedPredictionBinding::new(
+                    realization.clone(),
+                    target.capability_estimate().clone(),
+                    Arc::clone(&graph.prediction_placement),
+                    topology,
+                ))
+            }
+            (Some(RetainedArchitectureConstruction::Qwen4Partition(target)), None)
+                if target.prediction_state().is_some() =>
+            {
+                return Err(PreparedExecutionError::PredictionSourceMismatch)
+            }
+            (Some(RetainedArchitectureConstruction::Qwen4ConditionalPartition(target)), None)
+                if target.prediction_state().is_some() =>
+            {
+                return Err(PreparedExecutionError::PredictionSourceMismatch)
+            }
+            _ => None,
+        };
+        let state_residency = selected.text_realization().state().policy().clone();
+        let prediction = match (
+            selected.prediction_extension(),
+            graph.prediction_extension(),
+            graph.extension(),
+            selected.prediction_realization(),
+        ) {
+            (Some(extension), Some(source_extension), Some(source), Some(realization))
+                if extension.same_admission(source_extension)
+                    && selected
+                        .execution()
+                        .prediction_parameters()
+                        .is_some_and(|parameters| parameters.same_admission(extension)) =>
+            {
+                Some(PreparedPredictionSelection {
+                    placement: Arc::clone(&graph.prediction_placement),
+                    parameters: selected
+                        .execution()
+                        .prediction_parameters()
+                        .cloned()
+                        .ok_or_else(|| {
+                            PreparedExecutionError::Architecture(
+                                "prediction selection has no retained executable parameters".into(),
+                            )
+                        })?,
+                    source: Arc::clone(source),
+                    realization: realization.clone(),
+                    capability: crate::prediction_extension::prediction_extension_capability(
+                        extension,
+                    )
                     .map_err(|error| PreparedExecutionError::Architecture(error.to_string()))?,
-                topology,
-                residency: selected.text_realization().residency(),
-            })
-        }
-        (None, None, None, None) => None,
-        (None, None, Some(_), Some(_)) if retained_prediction.is_some() => None,
-        _ => return Err(PreparedExecutionError::PredictionSourceMismatch),
-    };
-    let processor = if let Some(prepared) = &vl_rank {
-        prepared.processor()
-    } else {
-        match &retained_construction {
-        Some(RetainedArchitectureConstruction::Lfm3Vl(prepared)) => prepared.processor(),
-        _ => match selected.execution().processor() {
-            Some(processor) if processor.raw_media() => Some(match selected.qwen4_construction() {
-                Some(crate::selected_execution::SelectedQwen4Construction::Conditional {
-                    selected: conditional,
-                    ..
-                }) => {
-                    let budget = conditional.header_plan().processor_budget();
-                    conditional.processor().prepared_processor(budget)
-                }
-                Some(
-                    crate::selected_execution::SelectedQwen4Construction::ConditionalPartitioned {
+                    topology,
+                    residency: selected.text_realization().residency(),
+                })
+            }
+            (None, None, None, None) => None,
+            (None, None, Some(_), Some(_)) if retained_prediction.is_some() => None,
+            _ => return Err(PreparedExecutionError::PredictionSourceMismatch),
+        };
+        let processor = if let Some(prepared) = &vl_rank {
+            prepared.processor()
+        } else {
+            match &retained_construction {
+            Some(RetainedArchitectureConstruction::Lfm3Vl(prepared)) => prepared.processor(),
+            _ => match selected.execution().processor() {
+                Some(processor) if processor.raw_media() => Some(match selected.qwen4_construction() {
+                    Some(crate::selected_execution::SelectedQwen4Construction::Conditional {
                         selected: conditional,
                         ..
-                    },
-                ) => {
-                    let budget = conditional.header_plan().processor_budget();
-                    conditional.processor().prepared_processor(budget)
-                }
-                _ => PreparedProcessor::from_artifact(graph.architecture()).ok_or_else(|| {
-                    PreparedExecutionError::Architecture(
-                        "selected raw-media execution has no retained architecture processor"
-                            .into(),
-                    )
-                })?,
-            }),
-            _ => None,
-        },
-    }
-    };
-    let inspection = inspection.map_architecture_plan(|_| graph.architecture().clone());
-    let source = crate::preparation::prepared_floating_state_dtype_source(&inspection)
-        .map_err(|error| PreparedExecutionError::Architecture(error.to_string()))?;
-    let floating_state_dtype = assembler
-        .floating_state_dtype(&source)
-        .map_err(PreparedExecutionError::Backend)?;
-    if !floating_state_dtype.is_floating()
-        || selected
-            .text_realization()
-            .state()
-            .floating_dtype()
-            .is_some_and(|dtype| dtype != floating_state_dtype)
-    {
-        return Err(PreparedExecutionError::Architecture(
-            "native floating-state dtype differs from the admitted storage dtype".into(),
-        ));
-    }
-    let floating_state_bytes = floating_state_dtype.bytes();
-    let retained_communication = communication.clone();
-    let context = BranchContext {
-        retained_construction,
-        retained_composite_rank: vl_rank,
-        retained_prediction,
-        inspection,
-        target: Arc::clone(graph.target()),
-        extension_sources: graph
-            .extension()
-            .map(|source| source.source_keys().into_iter().collect())
-            .unwrap_or_default(),
-        communication,
-        prediction,
-    };
-    let (execution, _, _, _) = selected.into_parts();
-    let executable = execution.dispatch(ConstructionDispatcher::<
-        _,
-        _,
-        _,
-        _,
-        _,
-        _,
-        _,
-        A::Executable,
-        A::Error,
-    > {
-        routes,
-        context,
-        marker: std::marker::PhantomData,
-    })?;
-    assembler
-        .finish(PreparedExecutableParts {
-            executable,
-            floating_state_bytes,
+                    }) => {
+                        let budget = conditional.header_plan().processor_budget();
+                        conditional.processor().prepared_processor(budget)
+                    }
+                    Some(
+                        crate::selected_execution::SelectedQwen4Construction::ConditionalPartitioned {
+                            selected: conditional,
+                            ..
+                        },
+                    ) => {
+                        let budget = conditional.header_plan().processor_budget();
+                        conditional.processor().prepared_processor(budget)
+                    }
+                    _ => PreparedProcessor::from_artifact(graph.architecture()).ok_or_else(|| {
+                        PreparedExecutionError::Architecture(
+                            "selected raw-media execution has no retained architecture processor"
+                                .into(),
+                        )
+                    })?,
+                }),
+                _ => None,
+            },
+        }
+        };
+        let inspection = inspection.map_architecture_plan(|_| graph.architecture().clone());
+        let source = crate::preparation::prepared_floating_state_dtype_source(&inspection)
+            .map_err(|error| PreparedExecutionError::Architecture(error.to_string()))?;
+        let expected_dtype = selected.text_realization().state().floating_dtype();
+        let mut context = BranchContext {
+            retained_construction,
+            retained_composite_rank: vl_rank,
+            retained_prediction,
+            inspection,
+            target: Arc::clone(graph.target()),
+            extension_sources: graph
+                .extension()
+                .map(|source| source.source_keys().into_iter().collect())
+                .unwrap_or_default(),
+            communication: None,
+            prediction,
+        };
+        let (execution, _, _, _) = selected.into_parts();
+        Ok(PreparedExecutablePlan {
+            floating_source: source,
+            expected_dtype,
             state_residency,
-            communication: retained_communication,
             processor,
-            capabilities,
+            discovery,
+            dispatch: move |communication| {
+                context.communication = communication;
+                execution.dispatch(ConstructionDispatcher {
+                    routes,
+                    context,
+                    marker: std::marker::PhantomData,
+                })
+            },
         })
-        .map_err(PreparedExecutionError::Backend)
+    }
 }
 
 struct BranchContext<C> {
@@ -616,7 +345,7 @@ struct BranchContext<C> {
     communication: Option<C>,
     extension_sources: BTreeSet<String>,
     prediction: Option<PreparedPredictionSelection>,
-    retained_prediction: Option<PredictionBinding>,
+    retained_prediction: Option<RetainedPredictionBinding>,
     retained_construction: Option<RetainedArchitectureConstruction>,
     retained_composite_rank: Option<crate::lfm3::vision::PreparedVlRankGraph>,
 }

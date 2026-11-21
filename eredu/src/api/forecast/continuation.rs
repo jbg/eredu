@@ -2,7 +2,7 @@ use super::*;
 use eredu_core::{ModelRuntime, PendingTextInput};
 use eredu_runtime::execution_control::{TextSnapshotBackend, TraceLimits};
 pub use eredu_runtime::memory_forecast::{
-    estimate_continuation_memory, ContinuationForecastBackend, ContinuationMemoryPlan,
+    estimate_continuation_memory, ContinuationForecastSession, ContinuationMemoryPlan,
 };
 
 /// A read-only, horizon-specific continuation observation. Request a new forecast
@@ -41,7 +41,13 @@ impl ContinuationForecast {
     }
 }
 
-impl<B: ContinuationForecastBackend + TextSnapshotBackend> super::super::TextGeneration<'_, B> {
+impl<
+        B: TextSnapshotBackend<S>,
+        S: ContinuationForecastSession<B>
+            + eredu_core::TextExecutionSession<B>
+            + eredu_core::execution_control::NativeTextStateSession<B>,
+    > super::super::TextGeneration<'_, B, S>
+{
     /// Forecasts `additional_tokens` further predictions at a settled decode
     /// boundary, without consuming a token or changing this iterator's limit.
     /// Initial prefill, terminal, and in-flight states are rejected. If native
@@ -54,7 +60,7 @@ impl<B: ContinuationForecastBackend + TextSnapshotBackend> super::super::TextGen
         options: &GenerationForecastOptions,
     ) -> Result<ContinuationForecast, GenerationForecastError> {
         let (runtime, state, pending) = self.inner.observation_parts();
-        continuation_forecast::<B>(
+        continuation_forecast::<B, S>(
             runtime,
             state,
             pending,
@@ -67,10 +73,15 @@ impl<B: ContinuationForecastBackend + TextSnapshotBackend> super::super::TextGen
     }
 }
 
-pub(crate) fn continuation_forecast<B: ContinuationForecastBackend + TextSnapshotBackend>(
-    runtime: &ModelRuntime<B>,
-    state: &B::TextGenerationState,
-    pending: Option<PendingTextInput<&B::Prompt, &B::Token>>,
+pub(crate) fn continuation_forecast<
+    B: TextSnapshotBackend<S>,
+    S: ContinuationForecastSession<B>
+        + eredu_core::TextExecutionSession<B>
+        + eredu_core::execution_control::NativeTextStateSession<B>,
+>(
+    runtime: &ModelRuntime<B, S>,
+    state: &S::TextGenerationState,
+    pending: Option<PendingTextInput<&S::Prompt, &B::Token>>,
     decoding_state: eredu_core::decoding::DecodingState,
     sequence: &eredu_core::GenerationSequence,
     additional_tokens: u64,
@@ -112,7 +123,7 @@ pub(crate) fn continuation_forecast<B: ContinuationForecastBackend + TextSnapsho
         match mode {
             eredu_core::decoding::DecodingMode::Autoregressive => {}
             eredu_core::decoding::DecodingMode::Diffusion { policy } => {
-                let plan = B::refinement_memory_plan(runtime, policy)?.ok_or_else(|| {
+                let plan = S::refinement_memory_plan(runtime, policy)?.ok_or_else(|| {
                     GenerationForecastError::UnsupportedContinuation(
                         "selected refinement invocation has no complete storage projection".into(),
                     )
@@ -120,7 +131,7 @@ pub(crate) fn continuation_forecast<B: ContinuationForecastBackend + TextSnapsho
                 decoding.refinement.push(plan);
             }
             eredu_core::decoding::DecodingMode::SelfSpeculation(options) => {
-                let profile = B::shared_backbone_memory_profile(runtime)?.ok_or_else(|| {
+                let profile = S::shared_backbone_memory_profile(runtime)?.ok_or_else(|| {
                     GenerationForecastError::UnsupportedContinuation(
                         "selected shared-target transaction has no complete storage projection"
                             .into(),
@@ -173,7 +184,7 @@ pub(crate) fn continuation_forecast<B: ContinuationForecastBackend + TextSnapsho
         )
     })?;
     let inputs = decoding.input_horizon(additional_tokens, inputs)?;
-    let mut profile = B::continuation_memory_profile(runtime, inputs)?.ok_or_else(|| {
+    let mut profile = S::continuation_memory_profile(runtime, inputs)?.ok_or_else(|| {
         GenerationForecastError::UnsupportedContinuation(
             "selected executable has no settled continuation state projection".into(),
         )
@@ -233,7 +244,7 @@ pub(crate) fn continuation_forecast<B: ContinuationForecastBackend + TextSnapsho
     #[cfg(feature = "tensor-capture")]
     if let Some(capture) = B::capture_run(state) {
         let first = B::sampling_prediction(sampling);
-        let projection = B::capture_memory_projection(
+        let projection = S::capture_memory_projection(
             runtime,
             capture.plan(),
             capture.intervention_plan(),
@@ -247,7 +258,7 @@ pub(crate) fn continuation_forecast<B: ContinuationForecastBackend + TextSnapsho
                 per_record_bytes: 0,
                 total_bytes: 0,
             }),
-            B::capture_transforms_complete_per_step(runtime),
+            S::capture_transforms_complete_per_step(runtime),
             projection,
         );
         plan.first_prediction = first;

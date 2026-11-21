@@ -6,10 +6,11 @@ use std::{
 };
 
 use eredu_checkpoint::{LinearFormat, SourceTensorEncoding, StoredDtype, WeightQuantization};
+#[cfg(test)]
+use eredu_core::cache::StateTensorDtype;
 use eredu_core::{
-    cache::{StateComponentPolicy, StateTensorDtype},
-    checkpoint::TensorDtype,
-    ParallelTopology, QuantizationRequest, SessionCapabilities,
+    cache::StateComponentPolicy, checkpoint::TensorDtype, ParallelTopology, QuantizationRequest,
+    SessionCapabilities,
 };
 use eredu_nn::{NeuralBackend, NeuralOperatorCapabilities};
 
@@ -144,162 +145,11 @@ impl WeightLoweringCapability {
     }
 }
 
-/// Exact source-to-executable lowering query presented to a backend.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct WeightLoweringDescriptor {
-    source: SourceTensorEncoding,
-    executable: LinearFormat,
-    physical_shape: Vec<usize>,
-    logical_shape: Vec<usize>,
-    packed_axis: Option<usize>,
-}
+pub use eredu_checkpoint::lowering::WeightLoweringDescriptor;
 
-impl WeightLoweringDescriptor {
-    /// Creates a geometry-bearing lowering query.
-    pub fn new(
-        source: SourceTensorEncoding,
-        executable: LinearFormat,
-        physical_shape: Vec<usize>,
-        logical_shape: Vec<usize>,
-        packed_axis: Option<usize>,
-    ) -> Result<Self, ReplicatedTextContractError> {
-        if physical_shape.contains(&0)
-            || logical_shape.contains(&0)
-            || physical_shape.len() != logical_shape.len()
-        {
-            return Err(ReplicatedTextContractError::invalid(
-                "weight lowering requires positive extents and equal physical and logical ranks",
-            ));
-        }
-        if packed_axis.is_some_and(|axis| axis >= logical_shape.len()) {
-            return Err(ReplicatedTextContractError::invalid(
-                "weight lowering packed axis is outside the logical shape",
-            ));
-        }
-        Ok(Self {
-            source,
-            executable,
-            physical_shape,
-            logical_shape,
-            packed_axis,
-        })
-    }
-
-    /// Returns the admitted source encoding.
-    pub const fn source(&self) -> &SourceTensorEncoding {
-        &self.source
-    }
-
-    /// Returns the selected executable format.
-    pub const fn executable(&self) -> LinearFormat {
-        self.executable
-    }
-
-    /// Returns the admitted physical source shape.
-    pub fn physical_shape(&self) -> &[usize] {
-        &self.physical_shape
-    }
-
-    /// Returns the architecture-declared logical shape.
-    pub fn logical_shape(&self) -> &[usize] {
-        &self.logical_shape
-    }
-
-    /// Returns the executable packing axis, when the parameter is packable.
-    pub const fn packed_axis(&self) -> Option<usize> {
-        self.packed_axis
-    }
-
-    /// Returns the exact extent along the packing axis.
-    pub fn packed_extent(&self) -> Option<usize> {
-        self.packed_axis.map(|axis| self.logical_shape[axis])
-    }
-}
-
-/// Weight-residency mechanism implemented by a backend.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum WeightResidencyMechanism {
-    /// All parameters remain device resident.
-    Resident,
-    /// A bounded device window is staged from host storage.
-    Windowed,
-    /// Bounded host and device windows are populated from disk.
-    DiskStreamed,
-}
-
-/// Physical placement selected for one semantic mutable-state component.
-#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
-#[non_exhaustive]
-pub enum StateComponentPlacement {
-    /// The mutable component remains on the execution device.
-    Device,
-    /// The append-only component is managed by bounded paged storage.
-    Paged,
-}
-
-/// Physical scalar representation selected for native mutable state.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum StateStorageDtype {
-    /// IEEE half precision.
-    F16,
-    /// Brain floating point.
-    Bf16,
-    /// IEEE single precision.
-    F32,
-    /// IEEE double precision.
-    F64,
-    /// Two IEEE single-precision components.
-    Complex64,
-    /// Signed 32-bit integer.
-    I32,
-    /// Unsigned 32-bit integer.
-    U32,
-}
-
-impl StateStorageDtype {
-    /// Exact neutral tensor scalar representation used by typed state bindings.
-    pub const fn element_type(self) -> eredu_nn::TensorElementType {
-        use eredu_nn::TensorElementType as Element;
-        match self {
-            Self::F16 => Element::F16,
-            Self::Bf16 => Element::Bf16,
-            Self::F32 => Element::F32,
-            Self::F64 => Element::F64,
-            Self::Complex64 => Element::Complex64,
-            Self::I32 => Element::I32,
-            Self::U32 => Element::U32,
-        }
-    }
-    /// Exact bytes occupied by one native state element.
-    pub const fn bytes(self) -> std::num::NonZeroU8 {
-        let bytes = match self {
-            Self::F16 | Self::Bf16 => 2,
-            Self::F32 | Self::I32 | Self::U32 => 4,
-            Self::F64 | Self::Complex64 => 8,
-        };
-        std::num::NonZeroU8::new(bytes).unwrap()
-    }
-
-    /// Whether this representation belongs to the model's floating state family.
-    pub const fn is_floating(self) -> bool {
-        !matches!(self, Self::I32 | Self::U32)
-    }
-
-    /// Resolves an architecture dtype policy without overriding fixed-width tensors.
-    pub const fn resolve(policy: StateTensorDtype, floating: Option<Self>) -> Option<Self> {
-        match policy {
-            StateTensorDtype::Floating => match floating {
-                Some(dtype) if dtype.is_floating() => Some(dtype),
-                _ => None,
-            },
-            StateTensorDtype::Float32 => Some(Self::F32),
-            StateTensorDtype::Int32 => Some(Self::I32),
-            StateTensorDtype::Uint32 => Some(Self::U32),
-        }
-    }
-}
+pub use eredu_core::preparation::{
+    StateComponentPlacement, StateStorageDtype, WeightResidencyMechanism,
+};
 
 /// Exact state component and placements implemented by a backend mechanism.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1212,6 +1062,7 @@ impl ReplicatedTextParameterRequirement {
             lowering_shape.clone(),
             packed_axis,
         )
+        .map_err(|error| ReplicatedTextContractError::invalid(error.to_string()))
     }
 }
 
@@ -1276,7 +1127,7 @@ pub struct ReplicatedTextRequirements {
     group_transports: Vec<ArchitectureGroupTransport>,
     /// Complete architecture-owned mutable-state geometry.
     state_layout: StateLayout,
-    append_streams: Vec<crate::AppendStreamBinding>,
+    append_streams: Vec<eredu_core::cache::append_stream::AppendStreamBinding>,
     /// Static state-access semantics used by architecture traversal.
     state_access: ReplicatedTextStateAccess,
     /// Canonical logical parameter requirements.
@@ -1320,16 +1171,16 @@ impl ReplicatedTextRequirements {
     /// Retains complete finite stream bounds before mechanism selection.
     pub fn with_append_streams(
         mut self,
-        bindings: Vec<crate::AppendStreamBinding>,
+        bindings: Vec<eredu_core::cache::append_stream::AppendStreamBinding>,
     ) -> Result<Self, ReplicatedTextContractError> {
-        crate::AppendStreamBinding::validate_layout(&self.state_layout, &bindings)
+        crate::validate_append_stream_layout(&self.state_layout, &bindings)
             .map_err(|error| ReplicatedTextContractError::invalid(error.to_string()))?;
         self.append_streams = bindings;
         Ok(self)
     }
 
     /// Exact architecture-owned stream identities, lanes and finite allowances.
-    pub fn append_streams(&self) -> &[crate::AppendStreamBinding] {
+    pub fn append_streams(&self) -> &[eredu_core::cache::append_stream::AppendStreamBinding] {
         &self.append_streams
     }
 
@@ -1458,7 +1309,7 @@ impl ReplicatedTextRequirements {
         }
         validate_state_access_profile(&layout, self.state_access)?;
         if !self.append_streams.is_empty() {
-            crate::AppendStreamBinding::validate_layout(&layout, &self.append_streams)
+            crate::validate_append_stream_layout(&layout, &self.append_streams)
                 .map_err(|error| ReplicatedTextContractError::invalid(error.to_string()))?;
         }
         self.state_layout = layout;
@@ -1950,110 +1801,9 @@ fn validate_state_access_profile(
     )))
 }
 
-/// One required grouped-compute mechanism.
-#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
-#[non_exhaustive]
-pub enum GroupedOperationRequirement {
-    /// Activated selected linear projections with explicitly owned output rows.
-    Linear,
-    /// Ordinary grouped gated-product output.
-    GatedProduct,
-    /// Rank-local gated-product partial with an explicit post-reduce term.
-    GatedProductTensorParallelPartial,
-    /// Ordinary grouped ReLU-squared output.
-    Relu2,
-    /// Rank-local ReLU-squared partial with an explicit post-reduce term.
-    Relu2TensorParallelPartial,
-}
+pub use eredu_nn::GroupedOperationRequirement;
 
-/// Generic independently addressable storage facilities implemented by a backend.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub struct AddressableStorageCapabilities {
-    bulk_access: bool,
-    incremental_access: bool,
-    lease_completion: bool,
-    maximum_compact_bytes: u64,
-    tiers: AddressableStorageTiers,
-}
-
-/// Generic storage tiers usable by an independently addressable bank.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub struct AddressableStorageTiers {
-    device: bool,
-    host: bool,
-    disk: bool,
-}
-
-impl AddressableStorageTiers {
-    /// Creates one exact tier capability set.
-    pub const fn new(device: bool, host: bool, disk: bool) -> Self {
-        Self { device, host, disk }
-    }
-
-    /// Returns whether executable device storage is available.
-    pub const fn device(self) -> bool {
-        self.device
-    }
-
-    /// Returns whether host staging storage is available.
-    pub const fn host(self) -> bool {
-        self.host
-    }
-
-    /// Returns whether lazy checkpoint-backed storage is available.
-    pub const fn disk(self) -> bool {
-        self.disk
-    }
-}
-
-impl AddressableStorageCapabilities {
-    /// Creates an exact addressable-storage capability report.
-    pub const fn new(
-        bulk_access: bool,
-        incremental_access: bool,
-        lease_completion: bool,
-        maximum_compact_bytes: u64,
-    ) -> Self {
-        Self {
-            bulk_access,
-            incremental_access,
-            lease_completion,
-            maximum_compact_bytes,
-            tiers: AddressableStorageTiers::new(true, true, true),
-        }
-    }
-
-    /// Replaces the exact supported storage-tier set.
-    pub const fn with_tiers(mut self, tiers: AddressableStorageTiers) -> Self {
-        self.tiers = tiers;
-        self
-    }
-
-    /// Returns whether bounded multi-row access is implemented.
-    pub const fn bulk_access(self) -> bool {
-        self.bulk_access
-    }
-
-    /// Returns whether latency-sensitive incremental access is implemented.
-    pub const fn incremental_access(self) -> bool {
-        self.incremental_access
-    }
-
-    /// Returns whether acquisitions remain leased through native completion.
-    pub const fn lease_completion(self) -> bool {
-        self.lease_completion
-    }
-
-    /// Returns the largest supported per-acquisition compact bank.
-    pub const fn maximum_compact_bytes(self) -> u64 {
-        self.maximum_compact_bytes
-    }
-
-    /// Returns the exact independently addressable storage tiers.
-    pub const fn tiers(self) -> AddressableStorageTiers {
-        self.tiers
-    }
-}
+pub use eredu_core::residency::{AddressableStorageCapabilities, AddressableStorageTiers};
 
 /// Family- and execution-class-neutral backend mechanism report.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -3674,7 +3424,7 @@ pub struct StateRealizationRequirements {
     layout: StateLayout,
     access: ReplicatedTextStateAccess,
     floating_source: Option<TensorDtype>,
-    append_streams: Vec<crate::AppendStreamBinding>,
+    append_streams: Vec<eredu_core::cache::append_stream::AppendStreamBinding>,
 }
 impl StateRealizationRequirements {
     /// Validates access semantics and finite stream geometry before cold selection.
@@ -3682,10 +3432,10 @@ impl StateRealizationRequirements {
         layout: StateLayout,
         access: ReplicatedTextStateAccess,
         floating_source: Option<TensorDtype>,
-        append_streams: Vec<crate::AppendStreamBinding>,
+        append_streams: Vec<eredu_core::cache::append_stream::AppendStreamBinding>,
     ) -> Result<Self, ReplicatedTextContractError> {
         validate_state_access_profile(&layout, access)?;
-        crate::AppendStreamBinding::validate_layout(&layout, &append_streams)
+        crate::validate_append_stream_layout(&layout, &append_streams)
             .map_err(|e| ReplicatedTextContractError::invalid(e.to_string()))?;
         Ok(Self {
             layout,
@@ -3707,7 +3457,7 @@ impl StateRealizationRequirements {
         self.floating_source.as_ref()
     }
     /// Required streams, lanes and finite allowances.
-    pub fn append_streams(&self) -> &[crate::AppendStreamBinding] {
+    pub fn append_streams(&self) -> &[eredu_core::cache::append_stream::AppendStreamBinding] {
         &self.append_streams
     }
 }
@@ -3804,13 +3554,13 @@ pub fn select_state_realization(
     if !issues.is_empty() {
         return Err(ReplicatedTextSelectionError { issues });
     }
-    let selected = SelectedStateRealization {
+    let mut selected = SelectedStateRealization {
         floating_dtype,
         layout: requirements.layout.clone(),
         access: requirements.access,
         policy: request.state.clone(),
         components: state_components,
-        append_streams: requirements.append_streams.clone(),
+        append_streams: Vec::new(),
         checkpoint: true,
         rollback: true,
         reset: true,
@@ -3818,11 +3568,12 @@ pub fn select_state_realization(
         observation_retention: request.session.output_observation()
             || request.session.activation_inspection(),
     };
-    crate::AppendStreamBinding::validate_selected(&selected, selected.append_streams()).map_err(
-        |error| ReplicatedTextSelectionError {
-            issues: vec![format!("append-stream binding: {error}")],
-        },
-    )?;
+    selected.append_streams =
+        crate::resolve_append_stream_allocations(&selected, &requirements.append_streams).map_err(
+            |error| ReplicatedTextSelectionError {
+                issues: vec![format!("append-stream binding: {error}")],
+            },
+        )?;
     Ok(selected)
 }
 
@@ -3834,7 +3585,10 @@ pub struct SelectedStateRealization {
     access: ReplicatedTextStateAccess,
     policy: CacheResidencyPolicy,
     components: Vec<SelectedStateComponentRealization>,
-    append_streams: Vec<crate::AppendStreamBinding>,
+    append_streams: Vec<(
+        eredu_core::cache::append_stream::AppendStreamBinding,
+        eredu_core::cache::append_stream::AppendStreamBacking,
+    )>,
     checkpoint: bool,
     rollback: bool,
     reset: bool,
@@ -3844,27 +3598,45 @@ pub struct SelectedStateRealization {
 
 impl SelectedStateRealization {
     /// Complete retained stream bindings; native construction cannot replace them.
-    pub fn append_streams(&self) -> &[crate::AppendStreamBinding] {
+    pub fn append_streams(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &eredu_core::cache::append_stream::AppendStreamBinding> {
+        self.append_streams.iter().map(|(binding, _)| binding)
+    }
+
+    /// Exact physical append-stream allocations selected for this state.
+    pub fn append_stream_allocations(
+        &self,
+    ) -> &[(
+        eredu_core::cache::append_stream::AppendStreamBinding,
+        eredu_core::cache::append_stream::AppendStreamBacking,
+    )] {
         &self.append_streams
     }
 
     /// Aggregate local allowances, preserving the selected number of sequence lanes.
     pub fn append_stream_allowances(&self) -> crate::AppendStreamAllowances {
-        crate::AppendStreamBinding::allowances(&self.append_streams)
+        crate::append_stream_allowances(self.append_streams())
             .expect("selected append stream allowances were checked before construction")
     }
 
     fn partition_streams(
         &self,
         partition: &crate::PartitionState,
-    ) -> Result<Vec<crate::AppendStreamBinding>, ReplicatedTextContractError> {
+    ) -> Result<
+        Vec<(
+            eredu_core::cache::append_stream::AppendStreamBinding,
+            eredu_core::cache::append_stream::AppendStreamBacking,
+        )>,
+        ReplicatedTextContractError,
+    > {
         let range = partition.global_layers();
         let bindings = self
             .append_streams
             .iter()
-            .filter(|binding| partition.owns_global_layer(binding.layer))
+            .filter(|(binding, _)| partition.owns_global_layer(binding.layer))
             .cloned()
-            .map(|mut binding| {
+            .map(|(mut binding, backing)| {
                 let global_policy = self
                     .layout
                     .layer(binding.layer)
@@ -3901,11 +3673,14 @@ impl SelectedStateRealization {
                     ));
                 }
                 binding.spec.width = policy.width();
-                Ok(binding)
+                Ok((binding, backing))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        crate::AppendStreamBinding::validate_layout(partition.layout(), &bindings)
-            .map_err(|error| ReplicatedTextContractError::invalid(error.to_string()))?;
+        crate::validate_append_stream_layout(
+            partition.layout(),
+            bindings.iter().map(|(binding, _)| binding),
+        )
+        .map_err(|error| ReplicatedTextContractError::invalid(error.to_string()))?;
         Ok(bindings)
     }
 
@@ -4067,6 +3842,39 @@ impl SelectedStateRealization {
     /// Returns the selected residency policy.
     pub const fn policy(&self) -> &CacheResidencyPolicy {
         &self.policy
+    }
+
+    /// Creates the portable live cache when the selected state uses paging.
+    pub fn create_live_cache<M: eredu_core::cache::mechanisms::LiveCacheBackend>(
+        &self,
+    ) -> Result<Option<crate::cache::live::CacheResidencyManager<M>>, eredu_core::BackendFailure>
+    {
+        self.paging_options()
+            .map_err(eredu_core::BackendFailure::from_error)?
+            .cloned()
+            .map(crate::cache::live::CacheResidencyManager::new)
+            .transpose()
+            .map_err(eredu_core::BackendFailure::from_error)
+    }
+
+    /// Returns the paging allocation inputs for this selected state realization.
+    pub fn paging_options(
+        &self,
+    ) -> Result<Option<&crate::PagedCacheOptions>, ReplicatedTextContractError> {
+        match &self.policy {
+            CacheResidencyPolicy::Paged(options) => Ok(Some(options)),
+            CacheResidencyPolicy::Device
+                if self
+                    .components
+                    .iter()
+                    .any(|component| component.placement() == StateComponentPlacement::Paged) =>
+            {
+                Err(ReplicatedTextContractError::invalid(
+                    "selected paged state component has no paging policy",
+                ))
+            }
+            CacheResidencyPolicy::Device => Ok(None),
+        }
     }
 
     /// Returns exact selected component realizations in layer/component order.
@@ -5759,7 +5567,7 @@ mod tests {
             member_output.clone(),
             transformed_bytes,
             Some(
-                crate::QuantizationCompanionBindings::new(
+                eredu_core::residency::parameter_binding::QuantizationCompanionBindings::new(
                     "weight_scales",
                     Some("weight_biases".into()),
                 )
@@ -5774,7 +5582,7 @@ mod tests {
             member_output.clone(),
             transformed_bytes,
             Some(
-                crate::QuantizationCompanionBindings::new(
+                eredu_core::residency::parameter_binding::QuantizationCompanionBindings::new(
                     "drifted_scales",
                     Some("weight_biases".into()),
                 )
@@ -5809,7 +5617,11 @@ mod tests {
         let scale_only_bytes =
             crate::selected_addressable_parameter_bytes(&scale_only, &member_output).unwrap();
         let scale_companions =
-            crate::QuantizationCompanionBindings::new("weight_scales", None).unwrap();
+            eredu_core::residency::parameter_binding::QuantizationCompanionBindings::new(
+                "weight_scales",
+                None,
+            )
+            .unwrap();
         assert!(crate::AddressableBankParameter::new(
             "weight",
             scale_only.clone(),
@@ -5819,11 +5631,12 @@ mod tests {
             Some(scale_companions),
         )
         .is_ok());
-        let invented_bias = crate::QuantizationCompanionBindings::new(
-            "weight_scales",
-            Some("invented_bias".into()),
-        )
-        .unwrap();
+        let invented_bias =
+            eredu_core::residency::parameter_binding::QuantizationCompanionBindings::new(
+                "weight_scales",
+                Some("invented_bias".into()),
+            )
+            .unwrap();
         assert!(crate::AddressableBankParameter::new(
             "weight",
             scale_only,
@@ -5981,7 +5794,9 @@ mod tests {
 
     #[test]
     fn combined_stream_profile_selects_exact_integer_storage_and_requires_complete_bindings() {
-        use crate::{AppendStreamBinding, AppendStreamLimits, AppendStreamSpec};
+        use eredu_core::cache::append_stream::{
+            AppendStreamBinding, AppendStreamLimits, AppendStreamSpec,
+        };
         use eredu_core::cache::AppendStreamPolicy;
         use eredu_nn::TensorElementType;
         let layout = StateLayout::new(
@@ -6074,7 +5889,7 @@ mod tests {
             selected.state().components().last().unwrap().placement(),
             StateComponentPlacement::Paged
         );
-        AppendStreamBinding::validate_selected(selected.state(), std::slice::from_ref(&binding))
+        crate::resolve_append_stream_allocations(selected.state(), std::slice::from_ref(&binding))
             .unwrap();
         use crate::execution_resources::PreparedStateResource;
         let states = [
@@ -6095,8 +5910,12 @@ mod tests {
         assert_eq!(allowances.scratch_bytes, 4 * 112);
         assert_eq!(allowances.catalog_bytes, 4 * 65536);
         let mut large = selected.state().clone();
-        large.append_streams[0].catalog_bytes = u64::MAX / 2;
-        AppendStreamBinding::validate_selected(&large, large.append_streams()).unwrap();
+        large.append_streams[0].0.catalog_bytes = u64::MAX / 2;
+        crate::resolve_append_stream_allocations(
+            &large,
+            &large.append_streams().cloned().collect::<Vec<_>>(),
+        )
+        .unwrap();
         assert!(
             PreparedStateResource::append_stream_allowances(&[
                 PreparedStateResource {
@@ -6112,10 +5931,10 @@ mod tests {
             "individually valid allowances can overflow their joint total"
         );
 
-        assert!(AppendStreamBinding::validate_selected(selected.state(), &[]).is_err());
+        assert!(crate::resolve_append_stream_allocations(selected.state(), &[]).is_err());
         let mut wrong = binding;
         wrong.spec.element = TensorElementType::F32;
-        assert!(AppendStreamBinding::validate_selected(selected.state(), &[wrong]).is_err());
+        assert!(crate::resolve_append_stream_allocations(selected.state(), &[wrong]).is_err());
         mechanisms.state.components.pop();
         assert!(select_replicated_text_realization(
             &requirements,

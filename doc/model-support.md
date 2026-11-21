@@ -25,7 +25,7 @@ let artifact = inspect_artifact(&source)?;
 let prepared = PreparedTextModel::from_artifact(artifact, TextModelOptions::default())?;
 let factory = MlxBackendFactory::default();
 let plan = ExecutionPlan::fully_resident(DevicePlan::new("mlx", "metal:0")?);
-let mut selected = prepared.select_execution_plan(&factory, &plan)?;
+let mut selected = prepared.select_execution_plan(&factory, &plan, None)?;
 let report = selected.inspect(TextInspectionOptions::default());
 assert!(report.is_loadable());
 let model = selected.load()?;
@@ -795,7 +795,7 @@ credential. Fetch the pinned independent sources into external paths, then run:
 
 ```sh
 python3 validation/muse_spark_reference_run.py "$spark_checkpoint" "$spark_transformers_source" "$spark_modelopt_source" "$spark_reference_output"
-cargo run --profile conformance -p eredu-backend-mlx --no-default-features --example muse_spark_reference -- "$spark_checkpoint" "$spark_reference_output" "$spark_native_output" --atol 0 --rtol 0 --device cpu
+cargo run --profile conformance -p eredu --no-default-features --features mlx --example muse_spark_reference -- "$spark_checkpoint" "$spark_reference_output" "$spark_native_output" --atol 0 --rtol 0 --device cpu
 ```
 
 Mixed-media acceptance adds `--multimodal --vision-utils PATH --configuration PATH`

@@ -73,7 +73,7 @@ impl CaptureSession {
     where
         B: InterventionBackend,
         T: PartitionCaptureHookTransport,
-        L: PartitionActivationLayout + PartitionCaptureLayout,
+        L: PartitionActivationLayout + PartitionCaptureLayout + ?Sized,
         T::Error: Send + Sync + 'static,
         <T::Completion as Completion>::Error: Send + Sync + 'static,
     {
@@ -112,7 +112,7 @@ impl CaptureSession {
             return self
                 .prepare_partition_routed_intervention(transport, layout, backend, index, limits);
         }
-        let wait = transport.capture_wait()?;
+        let wait = crate::capture::partition::capture_wait(transport)?;
         if !T::Completion::supports_cancellation(wait.cancellation()) {
             return Err(CaptureError::Unsupported(
                 "partition intervention cancellation policy".into(),
@@ -212,8 +212,7 @@ impl CaptureSession {
                 local = Some(work);
             }
         }
-        let vote = transport
-            .estimate_capture_hook(&members)?
+        let vote = crate::capture::partition::estimate_hook(transport, &members)?
             .checked_mul(mul(members.len() as u64, 2)?)?;
         let receipt = super::super::exchange::gather_usage(transport, world, RECEIPT_WORDS)?
             .checked_mul(world as u64)?;
@@ -358,7 +357,7 @@ impl CaptureSession {
             Ok(affected) => affected,
             Err(error) => {
                 if !matches!(error, PartitionCaptureExchangeError::PeerRejected { .. }) {
-                    work.transport.fail_capture_exchange(&error);
+                    work.transport.fence_capture_exchange();
                 }
                 return Err(error);
             }
@@ -368,7 +367,7 @@ impl CaptureSession {
                 let error = PartitionCaptureExchangeError::Protocol(
                     "sparse outcome count exceeds admitted logical values",
                 );
-                work.transport.fail_capture_exchange(&error);
+                work.transport.fence_capture_exchange();
                 return Err(error);
             }
             let record = &mut self
@@ -405,14 +404,11 @@ fn prepare_value<B: InterventionBackend, T: PartitionCaptureHookTransport>(
         Ok(BoundedCompletionOutcome::Completed) => Ok(()),
         Ok(BoundedCompletionOutcome::DeadlineExceeded { cancellation }) => {
             let error = PartitionCaptureExchangeError::Deadline { cancellation };
-            work.transport.fail_capture_exchange(&error);
+            work.transport.fence_capture_exchange();
             Err(error.into())
         }
         Err(error) => {
-            work.transport
-                .fail_capture_exchange(&PartitionCaptureExchangeError::Protocol(
-                    "intervention dependency failed",
-                ));
+            work.transport.fence_capture_exchange();
             Err(CaptureExecutionError::Backend(error).into())
         }
     }

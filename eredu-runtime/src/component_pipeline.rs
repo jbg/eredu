@@ -1,11 +1,13 @@
 //! Cold consistency checks shared by layered component pipelines.
 use crate::{
     ArchitectureBoundary, ArchitectureGroupKind, ArchitectureParameterDescription,
-    ArchitecturePartition, BoundaryDimensionContract, BoundaryTensorDimension, BoundaryTensorDtype,
-    BoundaryWireSchema, CommunicationManifest, CommunicationRouteDescriptor, ExecutionUnitAddress,
-    LocalModelLayout, PartitionExecutionError, PartitionedExecutionPlan, PipelineActivationDtype,
-    StateLayout,
+    ArchitecturePartition, BoundaryTensorDimension, BoundaryWireSchema, ExecutionUnitAddress,
+    LocalModelLayout, PartitionExecutionError, PartitionedExecutionPlan, StateLayout,
 };
+use eredu_core::communication::{
+    BoundaryDimensionContract, CommunicationManifest, CommunicationRouteDescriptor,
+};
+use eredu_core::communication::{BoundaryTensorDtype, PipelineActivationDtype};
 use eredu_core::{checkpoint::TensorDtype, CollectiveGroupId};
 
 /// Cold mismatch between retained component execution and pipeline binding.
@@ -36,10 +38,10 @@ pub enum ComponentPipelinePreparationError<E> {
     LocalAgreement(#[from] crate::PipelineLocalAgreementError),
     /// Publication cannot cover its declared payload.
     #[error(transparent)]
-    Capability(#[from] crate::CommunicationCapabilityError),
+    Capability(#[from] eredu_core::communication::CommunicationCapabilityError),
     /// An exact communication requirement cannot be represented.
     #[error(transparent)]
-    Manifest(#[from] crate::CommunicationManifestError),
+    Manifest(#[from] eredu_core::communication::CommunicationManifestError),
     /// Retained selection disagrees with the component's contract.
     #[error("invalid {component} pipeline selection: {reason}")]
     Contract {
@@ -156,17 +158,13 @@ pub fn validate_component_pipeline<G, A: ArchitectureBoundary>(
             "output publication must include every participating rank",
         ));
     }
-    let activation_tensor_dtype = match activation_dtype {
-        PipelineActivationDtype::Float32 => TensorDtype::F32,
-        PipelineActivationDtype::Float16 => TensorDtype::F16,
-        PipelineActivationDtype::Bfloat16 => TensorDtype::Bf16,
-    };
+    let activation_tensor_dtype = activation_dtype.tensor_dtype();
     if !publication_group
         .requirements()
         .operations()
         .iter()
         .any(|operation| {
-            operation.operation() == crate::CommunicationOperation::Broadcast
+            operation.operation() == eredu_core::communication::CommunicationOperation::Broadcast
                 && operation.exact_completion()
                 && operation.dtypes().contains(&activation_tensor_dtype)
         })
@@ -210,7 +208,8 @@ pub fn validate_component_pipeline<G, A: ArchitectureBoundary>(
             }
             crate::validate_pipeline_local_agreement(manifest, id)?;
             if !group.requirements().operations().iter().any(|operation| {
-                operation.operation() == crate::CommunicationOperation::AllReduceSum
+                operation.operation()
+                    == eredu_core::communication::CommunicationOperation::AllReduceSum
                     && operation.exact_completion()
                     && operation.dtypes().contains(&TensorDtype::F32)
             }) {
@@ -293,7 +292,7 @@ pub fn validate_component_pipeline_ranges(
     count: usize,
     local_range: std::ops::Range<usize>,
     group: usize,
-    cuts: impl IntoIterator<Item = (crate::CommunicationRouteId, usize)>,
+    cuts: impl IntoIterator<Item = (eredu_core::communication::CommunicationRouteId, usize)>,
     manifest: &CommunicationManifest,
     plan: &PartitionedExecutionPlan,
     tensor_group: Option<CollectiveGroupId>,

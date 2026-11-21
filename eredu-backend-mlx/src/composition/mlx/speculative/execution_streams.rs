@@ -1,261 +1,31 @@
 use super::*;
 
-/// Target and assistant streams assigned to one speculative session.
-#[derive(Clone, Copy)]
-pub struct SpeculativeExecutionStreams<'a> {
-    target: &'a Stream,
-    draft: &'a Stream,
-    topology: SpeculativeExecutionTopology,
-    capture: Option<&'a super::super::session::SpeculativePartitionBinding>,
-    target_observer: Option<&'a dyn TargetObserver>,
-}
+impl eredu_core::speculative::SpeculativeQueueMechanisms
+    for super::autoregressive::MlxAutoregressiveMechanisms
+{
+    type Queue = Stream;
+    type Root = Array;
+    type Handoff = Event;
+    type Error = Exception;
 
-impl std::fmt::Debug for SpeculativeExecutionStreams<'_> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("SpeculativeExecutionStreams")
-            .field("topology", &self.topology)
-            .field("target_observer", &self.target_observer.is_some())
-            .finish_non_exhaustive()
-    }
-}
-
-impl<'a> SpeculativeExecutionStreams<'a> {
-    /// Binds queues to topology already selected by portable composition.
-    pub fn bind(
-        target: &'a Stream,
-        draft: &'a Stream,
-        topology: SpeculativeExecutionTopology,
-    ) -> Result<Self, Exception> {
-        let matches = match topology {
-            SpeculativeExecutionTopology::Single => target == draft,
-            SpeculativeExecutionTopology::SameDeviceSplit => {
-                target != draft && target.get_device()? == draft.get_device()?
-            }
-            SpeculativeExecutionTopology::CrossDeviceSplit => {
-                target.get_device()? != draft.get_device()?
-            }
-            _ => {
-                return Err(Exception::custom(
-                    "selected speculative topology is unsupported by the MLX queue binder",
-                ))
-            }
-        };
-        if !matches {
-            return Err(Exception::custom(format!(
-                "selected speculative topology {topology:?} does not match bound MLX queues"
-            )));
-        }
-        Ok(Self {
-            target,
-            draft,
-            topology,
-            capture: None,
-            target_observer: None,
-        })
+    fn same_queue(left: &Stream, right: &Stream) -> bool {
+        left == right
     }
 
-    #[cfg(test)]
-    pub(super) fn for_test(target: &'a Stream, draft: &'a Stream) -> Result<Self, Exception> {
-        let topology = if target == draft {
-            SpeculativeExecutionTopology::Single
-        } else if target.get_device()? == draft.get_device()? {
-            SpeculativeExecutionTopology::SameDeviceSplit
-        } else {
-            SpeculativeExecutionTopology::CrossDeviceSplit
-        };
-        Self::bind(target, draft, topology)
+    fn same_device(left: &Stream, right: &Stream) -> Result<bool, Exception> {
+        Ok(left.get_device()? == right.get_device()?)
     }
 
-    /// Creates an assignment in which all speculative work uses one stream.
-    pub const fn single(stream: &'a Stream) -> Self {
-        Self {
-            target: stream,
-            draft: stream,
-            topology: SpeculativeExecutionTopology::Single,
-            capture: None,
-            target_observer: None,
-        }
-    }
-
-    pub(in crate::composition::mlx) fn with_target_observer(
-        mut self,
-        observer: &'a dyn TargetObserver,
-    ) -> Self {
-        self.target_observer = Some(observer);
-        self
-    }
-
-    pub(in crate::composition::mlx) fn observe_target(
-        self,
-        mut execute: impl FnMut(
-            &mut dyn eredu_runtime::ActivationObserver<Array, Error>,
-        ) -> Result<Array, Error>,
-    ) -> Result<Array, Error> {
-        match self.target_observer {
-            Some(observer) => observer.with_observer(&mut execute),
-            None => execute(&mut eredu_runtime::NoopObserver),
-        }
-    }
-
-    pub(in crate::composition::mlx) fn with_capture_binding(
-        mut self,
-        binding: Option<&'a super::super::session::SpeculativePartitionBinding>,
-    ) -> Self {
-        self.capture = binding;
-        self
-    }
-    pub(in crate::composition::mlx) fn capture_binding(
-        self,
-    ) -> Option<&'a super::super::session::SpeculativePartitionBinding> {
-        self.capture
-    }
-
-    pub(in crate::composition::mlx) fn assistant_parallel_context(
-        self,
-        requirements: &eredu_runtime::CommunicationGroupRequirements,
-    ) -> Result<Option<&'a crate::backend::runtime::distributed::Group>, eredu_core::BackendFailure>
-    {
-        match self.capture {
-            Some(binding) => binding.assistant_parallel_context(requirements),
-            None => Ok(None),
-        }
-    }
-
-    pub(in crate::composition::mlx) fn coordinate_speculative_step(
-        self,
-        local: Vec<eredu_core::SpeculativeScheduleState>,
-    ) -> Result<Vec<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure> {
-        match self.capture {
-            Some(binding) => binding.coordinate_speculative_step(local),
-            None => Ok(local),
-        }
-    }
-
-    pub(in crate::composition::mlx) fn coordinate_decoding_control(
-        self,
-        local: eredu_core::decoding::DecodingCoordination,
-    ) -> Result<eredu_core::decoding::DecodingCoordination, eredu_core::BackendFailure> {
-        match self.capture {
-            Some(binding) => binding.coordinate_decoding_control(local),
-            None => Ok(local),
-        }
-    }
-
-    pub(in crate::composition::mlx) fn agree_text_preparation(
-        self,
-        stage: eredu_core::run_preparation::TextPreparationStage,
-        status: eredu_core::run_preparation::TextPreparationStatus,
-    ) -> Result<eredu_core::run_preparation::TextPreparationOutcome, eredu_core::BackendFailure>
-    {
-        use eredu_core::run_preparation::{
-            TextPreparationOutcome as O, TextPreparationStatus as S,
-        };
-        match self.capture {
-            Some(binding) => binding.agree_text_preparation(stage, status),
-            None => Ok(match status {
-                S::Ready => O::Ready,
-                S::Cancelled => O::Cancelled,
-                S::Failed => O::Rejected { rank: 0 },
-            }),
-        }
-    }
-
-    pub(in crate::composition::mlx) fn finish_preparation<T, E>(
-        self,
-        stage: eredu_core::run_preparation::TextPreparationStage,
-        local: Result<T, E>,
-        map_backend: impl FnOnce(eredu_core::BackendFailure) -> E,
-    ) -> Result<T, E> {
-        match self.capture {
-            Some(binding) => binding.finish_preparation(stage, local, map_backend),
-            None => local,
-        }
-    }
-
-    /// Stream used for target prefill and verification.
-    pub const fn target(self) -> &'a Stream {
-        self.target
-    }
-
-    /// Stream used for proposal generation.
-    pub const fn draft(self) -> &'a Stream {
-        self.draft
-    }
-
-    /// Relationship between the target and assistant streams.
-    pub const fn topology(self) -> SpeculativeExecutionTopology {
-        self.topology
-    }
-
-    /// Whether target and assistant work use different streams.
-    pub const fn is_split(self) -> bool {
-        !matches!(self.topology, SpeculativeExecutionTopology::Single)
-    }
-
-    /// Whether values must be physically transferred between devices.
-    pub const fn crosses_devices(self) -> bool {
-        matches!(
-            self.topology,
-            SpeculativeExecutionTopology::CrossDeviceSplit
-        )
-    }
-
-    /// Submits target outputs and orders subsequent assistant work after them.
-    pub fn wait_for_target_outputs<'b>(
-        self,
-        outputs: impl IntoIterator<Item = &'b Array>,
-    ) -> Result<Event, Exception> {
-        self.wait_for_same_device_outputs(outputs, self.draft, "target-to-draft")
-    }
-
-    /// Submits assistant outputs and orders subsequent target work after them.
-    pub fn wait_for_draft_outputs<'b>(
-        self,
-        outputs: impl IntoIterator<Item = &'b Array>,
-    ) -> Result<Event, Exception> {
-        self.wait_for_same_device_outputs(outputs, self.target, "draft-to-target")
-    }
-
-    fn wait_for_same_device_outputs<'b>(
-        self,
-        outputs: impl IntoIterator<Item = &'b Array>,
+    fn order_roots<'a>(
+        roots: impl IntoIterator<Item = &'a Array>,
         consumer: &Stream,
-        direction: &str,
     ) -> Result<Event, Exception> {
-        if self.topology != SpeculativeExecutionTopology::SameDeviceSplit {
-            return Err(Exception::custom(format!(
-                "speculative {direction} event handoff requires distinct streams on one device, got {}",
-                self.topology
-            )));
-        }
-        let completion = async_eval_with_event(outputs)?;
+        let completion = async_eval_with_event(roots)?;
         completion.wait_on(consumer)?;
         Ok(completion)
     }
-}
 
-/// Request-local observation is borrowed only across the exact native invocation.
-/// Erasing its implementation preserves covariance of queue assignments.
-pub(in crate::composition::mlx) trait TargetObserver {
-    fn with_observer(
-        &self,
-        execute: &mut dyn FnMut(
-            &mut dyn eredu_runtime::ActivationObserver<Array, Error>,
-        ) -> Result<Array, Error>,
-    ) -> Result<Array, Error>;
-}
-
-pub(in crate::composition::mlx) struct BorrowedTargetObserver<'a>(
-    pub std::cell::RefCell<&'a mut dyn eredu_runtime::ActivationObserver<Array, Error>>,
-);
-impl TargetObserver for BorrowedTargetObserver<'_> {
-    fn with_observer(
-        &self,
-        execute: &mut dyn FnMut(
-            &mut dyn eredu_runtime::ActivationObserver<Array, Error>,
-        ) -> Result<Array, Error>,
-    ) -> Result<Array, Error> {
-        execute(&mut **self.0.borrow_mut())
+    fn invalid_assignment(message: String) -> Exception {
+        Exception::custom(message)
     }
 }

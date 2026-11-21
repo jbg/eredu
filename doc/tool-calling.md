@@ -10,7 +10,7 @@ including for chats without tools. It renders the selected checkpoint template,
 validates the request, and returns the prompt and its generation metadata.
 Applications can encode `PreparedChat::rendered_prompt()` for raw token
 generation or pass the prepared chat to `session.generate` with semantic output.
-Backend authors can use the generic `LoadedModel<B>` surface instead.
+Backend authors can use the generic `LoadedModel<B, S>` surface instead.
 The complete semantic-generation example is
 [`eredu/examples/native_tool_calling.rs`](../eredu/examples/native_tool_calling.rs).
 

@@ -1,4 +1,5 @@
 //! Restricted RNNT embedding and joint recipes without recurrent allocation.
+
 use super::{
     rnnt::{RnntDimensions, RnntError},
     rnnt_layered::{RnntKernel, RnntUnit},
@@ -6,12 +7,14 @@ use super::{
     rnnt_projection_layered::RnntProjection,
     rnnt_specs::RnntDeclaration,
 };
+use eredu_core::communication::CommunicationManifest;
+use eredu_core::residency::parameter_binding::WeightBinding;
+use eredu_core::SubmissionBackend;
 use eredu_core::{BackendFailure, CollectiveGroupId, ParallelRankTopology, ParallelTopology};
 use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Tensor};
 use eredu_runtime::{
-    CommunicationManifest, ComponentAdapter, LayerWeightResidency, LayeredTensorCohort,
-    LayerwiseModelMetadata, LocalModelLayout, ParameterUnitMechanisms, PreparedComponent,
-    SubmissionBackend, WeightBinding,
+    ComponentAdapter, LayerWeightResidency, LayeredTensorCohort, LayerwiseModelMetadata,
+    LocalModelLayout, ParameterUnitMechanisms, PreparedComponent,
 };
 
 /// Exact four-unit source authority, including vocabulary placement when selected.

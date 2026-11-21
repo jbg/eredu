@@ -6,8 +6,9 @@ use eredu_nn::{NeuralBackend, Tensor};
 
 use crate::{
     layered::{LayeredTraversalHook, LayeredTraversalPoint, LayeredUnitAction},
-    Sampler, SamplingBackend, TokenDomain,
+    Sampler,
 };
+use eredu_core::sampling::{SamplingBackend, TokenDomain};
 
 /// How a complete sequential prediction plan obtains its tokens.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -697,7 +698,7 @@ pub enum SequentialDecisionError<E> {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
-    use crate::PenaltyConfig;
+    use eredu_core::sampling::PenaltyConfig;
     use eredu_core::TokenFilter;
 
     struct Backend;
@@ -1048,7 +1049,7 @@ mod tests {
 
 impl<B, S> SequentialDecisionDriver<B, S>
 where
-    B: crate::DenseSamplingBackend,
+    B: eredu_core::sampling::DenseSamplingBackend,
     B::RandomState: Clone,
     S: Sampler<B>,
 {
@@ -1077,16 +1078,16 @@ where
     pub fn sample_gumbel(
         &mut self,
         logits: &B::Logits,
-        truncation: crate::GumbelTruncation,
+        truncation: eredu_core::sampling::GumbelTruncation,
         epsilon: f32,
         context: &B::Context,
     ) -> Result<B::Token, crate::DenseSamplingError<B::Error>> {
         truncation.validate()?;
-        crate::dense_sampling::validate_gumbel_epsilon(epsilon)?;
+        eredu_core::sampling::validate_gumbel_epsilon(epsilon)?;
         let shape = B::dense_shape(logits);
-        crate::dense_sampling::validate_dense_draw_shape(shape)?;
+        eredu_core::sampling::validate_dense_draw_shape(shape)?;
         if shape.is_empty() {
-            return Err(crate::DenseSamplingPolicyError::InvalidShape.into());
+            return Err(eredu_core::sampling::DenseSamplingPolicyError::InvalidShape.into());
         }
         let mut candidate = self
             .random

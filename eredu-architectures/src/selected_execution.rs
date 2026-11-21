@@ -1,14 +1,16 @@
 //! Total backend-neutral selections retained between cold admission and materialization.
 
+use eredu_core::communication::PipelineActivationDtype;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use eredu_core::communication::CommunicationManifest;
 use eredu_core::{
     artifact::ArtifactAdmissionToken, CollectiveGroupId, PreparationAdmission, SessionCapabilities,
 };
 use eredu_runtime::{
-    CommunicationManifest, ParameterBankResidency, PipelineActivationDtype,
-    ReplicatedTextRequirements, SelectedReplicatedTextRealization, SelectedSpeculativeRealization,
+    ParameterBankResidency, ReplicatedTextRequirements, SelectedReplicatedTextRealization,
+    SelectedSpeculativeRealization,
 };
 
 use crate::{
@@ -351,7 +353,7 @@ impl SelectedExecution {
         parameters: &eredu_runtime::ArchitectureParameterDescription,
         parameter: &str,
         global_rank: usize,
-        reservation: &mut impl eredu_core::capture::CaptureReservation,
+        reservation: &mut (impl eredu_core::capture::CaptureReservation + ?Sized),
     ) -> Result<
         Option<eredu_runtime::ParameterPartitionLayout>,
         eredu_core::parameters::ParameterError,
@@ -391,7 +393,7 @@ impl SelectedExecution {
         parameter: &str,
         global_rank: usize,
         index: Option<&eredu_runtime::ParameterMemberIndex>,
-        reservation: &mut impl eredu_core::capture::CaptureReservation,
+        reservation: &mut (impl eredu_core::capture::CaptureReservation + ?Sized),
     ) -> Result<
         Option<eredu_runtime::ParameterPartitionLayout>,
         eredu_core::parameters::ParameterError,

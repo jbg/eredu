@@ -126,7 +126,7 @@ impl CaptureSession {
         <T::Completion as Completion>::Error: Send + Sync + 'static,
     {
         let vote = self.prepare_partition_vote(work, members.clone(), true)?;
-        let wait = work.exchange.transport().capture_wait()?;
+        let wait = crate::capture::partition::capture_wait(work.exchange.transport())?;
         let world = work.exchange.transport().participant_count() as u64;
         let mut usage = CaptureUsage::default();
         let mut descriptor = Sha256::new();
@@ -324,15 +324,13 @@ impl CaptureSession {
             }
             Ok(BoundedCompletionOutcome::DeadlineExceeded { cancellation }) => {
                 let error = PartitionCaptureExchangeError::Deadline { cancellation };
-                work.exchange.transport().fail_capture_exchange(&error);
+                work.exchange.transport().fence_capture_exchange();
                 Err(error.into())
             }
             Err(error) => {
                 // The native cause remains the returned error. Fence transport
                 // because a failed dependency may leave a model collective live.
-                work.exchange.transport().fail_capture_exchange(
-                    &PartitionCaptureExchangeError::Protocol("capture source preparation failed"),
-                );
+                work.exchange.transport().fence_capture_exchange();
                 Err(CaptureExecutionError::Backend(error).into())
             }
         }

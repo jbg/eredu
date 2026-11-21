@@ -9,7 +9,7 @@ fn load(
 ) -> (
     TestDirectory,
     TestDirectory,
-    PlannedModel<MockBackend, RealizedDrafting<MockDrafter>>,
+    PlannedModel<MockBackend, MockSession, RealizedDrafting<MockDrafter>>,
 ) {
     let target = TestDirectory::new();
     let assistant = TestDirectory::new();
@@ -42,6 +42,7 @@ fn load(
         &MockBackend,
         target.path(),
         &plan,
+        None,
         eredu::api::TextModelOptions {
             chat_template: Some(QWEN_TEMPLATE.into()),
         },

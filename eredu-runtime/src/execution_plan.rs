@@ -10,22 +10,37 @@ use crate::{
     ParameterBankLoadOptions, WeightResidency,
 };
 
-/// Optional observations requested from the backend's residency mechanisms.
-///
-/// Deriving a request never samples memory or creates a native resource.
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
-pub struct ResidencyDiagnostics {
-    backend_memory: bool,
-    process_memory: bool,
+pub use eredu_core::preparation::ResidencyDiagnostics;
+
+/// Portable load options paired with exact native placement support.
+pub struct ExecutionPlanPreparation {
+    /// Observations enabled for this backend.
+    pub diagnostics: ResidencyDiagnostics,
+    /// Explicit rank, wire and completion inputs for a distributed plan.
+    pub parallel: Option<ParallelLoadRequest>,
+    /// Native support for the proposed device and communication binding.
+    pub native_support: Result<(), eredu_core::AutomaticPlanningError>,
 }
 
-impl ResidencyDiagnostics {
-    /// Selects backend allocator and process-memory observations independently.
-    pub const fn new(backend_memory: bool, process_memory: bool) -> Self {
-        Self {
-            backend_memory,
-            process_memory,
-        }
+/// Projects portable parallel policy to the exact world assignment needed by native placement.
+pub fn execution_plan_world_rank(parallel: Option<ParallelLoadRequest>) -> Option<(usize, usize)> {
+    parallel.map(|request| {
+        let rank = request.rank();
+        (rank.world_size(), rank.global_rank())
+    })
+}
+
+impl ExecutionPlanPreparation {
+    /// Resolves portable policy before reporting native binding rejection.
+    pub fn normalize(
+        self,
+        plan: &ExecutionPlan,
+    ) -> Result<NormalizedLoadRequest, eredu_core::AutomaticPlanningError> {
+        let request =
+            NormalizedLoadRequest::from_execution_plan(plan, self.diagnostics, self.parallel)
+                .map_err(|error| eredu_core::AutomaticPlanningError::Invalid(error.to_string()))?;
+        self.native_support?;
+        Ok(request)
     }
 }
 
@@ -103,7 +118,7 @@ pub fn execution_plan_layer_residency(
                 *device_layer_window,
             )?)
             .with_max_cached_shards(max_cached_shards)
-            .with_memory_sampling(diagnostics.backend_memory, diagnostics.process_memory),
+            .with_memory_sampling(diagnostics.backend_memory(), diagnostics.process_memory()),
         )),
         ResidencyPlan::DenseDiskStream {
             device_budget_bytes,
@@ -118,7 +133,7 @@ pub fn execution_plan_layer_residency(
                 *background_queue,
             )?
             .with_max_cached_shards(max_cached_shards)
-            .with_memory_sampling(diagnostics.backend_memory, diagnostics.process_memory),
+            .with_memory_sampling(diagnostics.backend_memory(), diagnostics.process_memory()),
         )),
         _ => Err(ExecutionPlanLoadError::Unsupported("residency")),
     }

@@ -1,6 +1,7 @@
 //! Exact host PCM queue copies; external admissions cannot be rewound.
 
 use super::*;
+use eredu_core::execution_control::SnapshotRetention;
 use eredu_core::{execution_control::SnapshotEstimate, BackendFailure};
 use eredu_runtime::execution_control::{
     snapshot_value_estimate, SnapshotReservation, SnapshotValue,
@@ -50,7 +51,7 @@ impl SnapshotValue for Ingress {
             copy_bytes: bytes,
         })])
     }
-    fn copy_snapshot_value(&self, _: &SnapshotReservation) -> Result<Self, BackendFailure> {
+    fn copy_snapshot_value(&self, _: &SnapshotRetention) -> Result<Self, BackendFailure> {
         Ok(Self {
             external: self.external.clone(),
             fork_retention: None,

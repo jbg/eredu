@@ -63,8 +63,9 @@ fn smoke_with_tool(
     let tool_name = tool["function"]["name"].as_str().unwrap().to_owned();
     let path = std::env::var(environment)
         .unwrap_or_else(|_| panic!("{environment} must name a local checkpoint"));
-    let planned = LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &path, &plan)
-        .unwrap_or_else(|error| panic!("failed to load {environment}={path:?}: {error}"));
+    let planned =
+        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &path, &plan, None)
+            .unwrap_or_else(|error| panic!("failed to load {environment}={path:?}: {error}"));
     let (mut model, _) = planned.into_parts();
     // Tool declarations must also prepare for an ordinary text request.
     model
@@ -341,10 +342,14 @@ fn nanbeige_real_checkpoint_executes_tool_and_answers_from_result() {
     use std::ops::ControlFlow;
 
     let path = std::env::var("EREDU_NANBEIGE_CHECKPOINT").unwrap();
-    let (mut model, _) =
-        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &path, &accelerator_plan())
-            .unwrap()
-            .into_parts();
+    let (mut model, _) = LoadedModel::load_execution_plan(
+        &MlxBackendFactory::default(),
+        &path,
+        &accelerator_plan(),
+        None,
+    )
+    .unwrap()
+    .into_parts();
     let tool = json!({"type":"function", "function": {
         "name":"lookup", "description":"Look up the secret word for an integer.",
         "parameters":{"type":"object", "properties":{"value":{"type":"integer", "enum":[7]}},

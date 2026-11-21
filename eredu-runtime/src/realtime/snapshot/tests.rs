@@ -1,5 +1,6 @@
 use super::*;
 use crate::execution_control::{IsolatedStateSnapshot, SnapshotBudget};
+use eredu_core::execution_control::SnapshotRetention;
 use eredu_core::{
     execution_control::SnapshotLimits, scheduler::SemanticStateTransaction, Completion,
 };
@@ -14,7 +15,7 @@ impl SnapshotValue for Value {
             copy_bytes: 8,
         })
     }
-    fn copy_snapshot_value(&self, _: &SnapshotReservation) -> Result<Self, BackendFailure> {
+    fn copy_snapshot_value(&self, _: &SnapshotRetention) -> Result<Self, BackendFailure> {
         Ok(self.clone())
     }
 }
@@ -43,7 +44,7 @@ impl SnapshotValue for Schedule {
             copy_bytes: 16,
         })
     }
-    fn copy_snapshot_value(&self, _: &SnapshotReservation) -> Result<Self, BackendFailure> {
+    fn copy_snapshot_value(&self, _: &SnapshotRetention) -> Result<Self, BackendFailure> {
         Ok(self.clone())
     }
 }

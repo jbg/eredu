@@ -2,6 +2,7 @@
 
 use super::decision_source::NativeDecisionState;
 use super::*;
+use crate::execution_control::NativeTextStateSession;
 use std::sync::Arc;
 
 /// Unforgeable identity of one continuation, distinct from its shared driver.
@@ -53,21 +54,23 @@ where
 /// After commitment, the last token remains pending decode input. Completion
 /// handles stay here until settling or drop. The owning facade also retains
 /// native model state, semantic decoding, termination and output delivery.
-pub struct TextGenerationContinuation<B, C>
+pub struct TextGenerationContinuation<B, C, S>
 where
     B: TextGenerationBackend,
+    S: TextExecutionSession<B>,
     C: TokenFilterController,
 {
     owner: Arc<()>,
     identity: TextContinuationIdentity,
-    inner: TextRequestDriver<B, C>,
+    inner: TextRequestDriver<B, C, S>,
     failed: bool,
     records_drained: bool,
 }
 
-impl<B, C> TextGenerationContinuation<B, C>
+impl<B, C, S> TextGenerationContinuation<B, C, S>
 where
     B: TextGenerationBackend,
+    S: TextExecutionSession<B>,
     C: TokenFilterController,
 {
     /// Borrows the canonical constraint state without advancing it.
@@ -159,16 +162,16 @@ where
 /// saved native model states. It does not switch those native states itself: the
 /// facade must compose the backend's validated state-exchange mechanism. Native
 /// objects need not implement `Send` or `Sync`.
-pub struct TextGenerationDriver<'a, B: TextGenerationBackend> {
-    runtime: &'a mut ModelRuntime<B>,
+pub struct TextGenerationDriver<'a, B: TextGenerationBackend, S: TextExecutionSession<B>> {
+    runtime: &'a mut ModelRuntime<B, S>,
     owner: Arc<()>,
 }
 
-impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
+impl<'a, B: TextGenerationBackend, S: TextExecutionSession<B>> TextGenerationDriver<'a, B, S> {
     /// Exclusively borrows the runtime while this driver exists. A continuation
     /// retained after driver drop can be cleaned up but cannot attach to another
     /// driver, even one borrowing the same runtime.
-    pub fn new(runtime: &'a mut ModelRuntime<B>) -> Self {
+    pub fn new(runtime: &'a mut ModelRuntime<B, S>) -> Self {
         Self {
             runtime,
             owner: Arc::new(()),
@@ -176,7 +179,7 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
     }
 
     /// Read-only access for exact loaded-session discovery and native estimates.
-    pub fn runtime(&self) -> &ModelRuntime<B> {
+    pub fn runtime(&self) -> &ModelRuntime<B, S> {
         self.runtime
     }
 
@@ -184,11 +187,13 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
     /// Neither model execution nor token sampling occurs here.
     pub fn start<C: TokenFilterController>(
         &mut self,
-        prompt: B::Prompt,
+        prompt: S::Prompt,
         config: TextGenerationConfig,
         controller: C,
-    ) -> Result<TextGenerationContinuation<B, C>, ControlledTextGenerationError<B::Error, C::Error>>
-    {
+    ) -> Result<
+        TextGenerationContinuation<B, C, S>,
+        ControlledTextGenerationError<B::Error, C::Error>,
+    > {
         Ok(TextGenerationContinuation {
             owner: Arc::clone(&self.owner),
             identity: TextContinuationIdentity(Arc::new(())),
@@ -200,7 +205,7 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
 
     fn validate<C: TokenFilterController>(
         &self,
-        state: &TextGenerationContinuation<B, C>,
+        state: &TextGenerationContinuation<B, C, S>,
     ) -> Result<(), TextContinuationError<B::Error, C::Error>> {
         if !Arc::ptr_eq(&self.owner, &state.owner) {
             return Err(TextContinuationError::IncompatibleDriver);
@@ -214,8 +219,8 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
     /// copies, compatibility validation and host-state installation are composed.
     pub fn quiescent<'d, 's, C: TokenFilterController>(
         &'d mut self,
-        state: &'s mut TextGenerationContinuation<B, C>,
-    ) -> Result<TextContinuationBoundary<'d, 's, B, C>, TextContinuationError<B::Error, C::Error>>
+        state: &'s mut TextGenerationContinuation<B, C, S>,
+    ) -> Result<TextContinuationBoundary<'d, 's, B, C, S>, TextContinuationError<B::Error, C::Error>>
     {
         self.validate(state)?;
         state.require_quiescent()?;
@@ -231,7 +236,7 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
     #[allow(clippy::type_complexity)]
     pub fn advance<C: TokenFilterController>(
         &mut self,
-        state: &mut TextGenerationContinuation<B, C>,
+        state: &mut TextGenerationContinuation<B, C, S>,
     ) -> Result<Option<ControlledToken<B::Token>>, TextContinuationError<B::Error, C::Error>> {
         self.validate(state)?;
         state.require_quiescent()?;
@@ -258,7 +263,7 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
     #[allow(clippy::type_complexity)]
     pub fn advance_operation<C: TokenFilterController>(
         &mut self,
-        state: &mut TextGenerationContinuation<B, C>,
+        state: &mut TextGenerationContinuation<B, C, S>,
     ) -> Result<Option<TextAdvancement<B::Token>>, TextContinuationError<B::Error, C::Error>> {
         self.validate(state)?;
         state.require_quiescent()?;
@@ -284,7 +289,7 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
     /// prefix work. Call `take_completed_step` after progress or failure.
     pub fn advance_prefill<C: TokenFilterController>(
         &mut self,
-        state: &mut TextGenerationContinuation<B, C>,
+        state: &mut TextGenerationContinuation<B, C, S>,
     ) -> Result<bool, TextContinuationError<B::Error, C::Error>> {
         self.validate(state)?;
         state.require_quiescent()?;
@@ -306,21 +311,21 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
     /// without sampling. This commits the prepared input's cache provenance.
     pub fn complete_prefill<C: TokenFilterController>(
         &mut self,
-        mut state: TextGenerationContinuation<B, C>,
+        mut state: TextGenerationContinuation<B, C, S>,
     ) -> Result<bool, TextContinuationError<B::Error, C::Error>> {
         self.validate(&state)?;
         state.require_quiescent()?;
         let Some(PendingTextInput::Prefill(prompt)) = state.inner.step.take() else {
             return Ok(false);
         };
-        B::complete_text_prefill(self.runtime, prompt, &mut state.inner.backend_state)
+        S::complete_text_prefill(self.runtime, prompt, &mut state.inner.backend_state)
             .map_err(|error| ControlledTextGenerationError::Backend(error).into())
     }
 
     /// Requests selected scores for the next refinement operation.
     pub fn configure_refinement_readout<C: TokenFilterController>(
         &self,
-        state: &mut TextGenerationContinuation<B, C>,
+        state: &mut TextGenerationContinuation<B, C, S>,
         selections: Vec<crate::refinement::RefinementScoreSelection>,
     ) -> Result<(), crate::refinement::RefinementReadoutError> {
         use crate::refinement::RefinementReadoutError;
@@ -329,13 +334,15 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
         state
             .require_quiescent()
             .map_err(|_| RefinementReadoutError::Boundary)?;
-        B::configure_refinement_readout(self.runtime, &mut state.inner.backend_state, selections)
+        self.runtime
+            .session()
+            .configure_refinement_readout(&mut state.inner.backend_state, selections)
     }
 
     /// Drains selected scores after exact completion.
     pub fn take_refinement_readout<C: TokenFilterController>(
         &self,
-        state: &mut TextGenerationContinuation<B, C>,
+        state: &mut TextGenerationContinuation<B, C, S>,
     ) -> Result<
         Option<crate::refinement::RefinementScoreRows>,
         crate::refinement::RefinementReadoutError,
@@ -346,14 +353,14 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
         state
             .require_quiescent()
             .map_err(|_| RefinementReadoutError::Boundary)?;
-        Ok(B::take_refinement_readout(&mut state.inner.backend_state))
+        Ok(S::take_refinement_readout(&mut state.inner.backend_state))
     }
 
     /// Establishes exact native completion at the current operation boundary.
     #[cfg(not(feature = "tensor-capture"))]
     pub fn take_completed_step<C: TokenFilterController>(
         &mut self,
-        state: &mut TextGenerationContinuation<B, C>,
+        state: &mut TextGenerationContinuation<B, C, S>,
     ) -> Result<(), TextContinuationError<B::Error, C::Error>> {
         self.validate(state)?;
         let was_failed = state.failed;
@@ -373,7 +380,7 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
     #[cfg(feature = "tensor-capture")]
     pub fn take_completed_step<C: TokenFilterController>(
         &mut self,
-        state: &mut TextGenerationContinuation<B, C>,
+        state: &mut TextGenerationContinuation<B, C, S>,
     ) -> Result<Option<crate::capture::CapturedStep>, TextContinuationError<B::Error, C::Error>>
     {
         self.validate(state)?;
@@ -382,7 +389,7 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
         if let Err(error) = state.inner.resolve_completions_before_decode() {
             return Err(ControlledTextGenerationError::Backend(error).into());
         }
-        let records = B::take_text_capture(&mut state.inner.backend_state);
+        let records = S::take_text_capture(&mut state.inner.backend_state);
         state.records_drained = true;
         state.failed = was_failed;
         Ok(records)
@@ -392,11 +399,13 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
     #[cfg(feature = "tensor-capture")]
     pub fn enable_capture<C: TokenFilterController>(
         &mut self,
-        state: &mut TextGenerationContinuation<B, C>,
+        state: &mut TextGenerationContinuation<B, C, S>,
         plan: crate::capture::AdmittedCapturePlan,
     ) -> Result<(), crate::run_preparation::TextCaptureSetupError> {
         let local = self.validate_installation(state).and_then(|()| {
-            B::configure_text_capture(self.runtime, &mut state.inner.backend_state, plan)
+            self.runtime
+                .session()
+                .configure_text_capture(&mut state.inner.backend_state, plan)
         });
         self.runtime.finish_text_preparation(
             crate::run_preparation::TextPreparationStage::Instrumentation,
@@ -409,13 +418,12 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
     #[cfg(feature = "tensor-capture")]
     pub fn enable_interventions<C: TokenFilterController>(
         &mut self,
-        state: &mut TextGenerationContinuation<B, C>,
+        state: &mut TextGenerationContinuation<B, C, S>,
         capture: crate::capture::AdmittedCapturePlan,
         plan: crate::intervention::AdmittedInterventionPlan,
     ) -> Result<(), crate::run_preparation::TextCaptureSetupError> {
         let local = self.validate_installation(state).and_then(|()| {
-            B::configure_text_interventions(
-                self.runtime,
+            self.runtime.session().configure_text_interventions(
                 &mut state.inner.backend_state,
                 capture,
                 plan,
@@ -430,7 +438,7 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
 
     fn validate_installation<C: TokenFilterController>(
         &self,
-        state: &TextGenerationContinuation<B, C>,
+        state: &TextGenerationContinuation<B, C, S>,
     ) -> Result<(), crate::capture::CaptureError> {
         self.validate(state)
             .and_then(|()| state.require_quiescent())
@@ -448,16 +456,19 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
 /// continuation boundary. This is a backend/runtime-author surface, not a full
 /// snapshot API. Operations must validate before mutation and preserve or fence
 /// state on failure. Catching an unwind fences this continuation automatically.
-pub struct TextContinuationBoundary<'d, 's, B, C>
+pub struct TextContinuationBoundary<'d, 's, B, C, S>
 where
     B: TextGenerationBackend,
+    S: TextExecutionSession<B>,
     C: TokenFilterController,
 {
-    runtime: &'d mut ModelRuntime<B>,
-    state: &'s mut TextGenerationContinuation<B, C>,
+    runtime: &'d mut ModelRuntime<B, S>,
+    state: &'s mut TextGenerationContinuation<B, C, S>,
 }
 
-impl<B: TextGenerationBackend, C: TokenFilterController> TextContinuationBoundary<'_, '_, B, C> {
+impl<B: TextGenerationBackend, C: TokenFilterController, S: TextExecutionSession<B>>
+    TextContinuationBoundary<'_, '_, B, C, S>
+{
     /// Same-run identity used before restoring any state component.
     pub fn identity(&self) -> TextContinuationIdentity {
         self.state.identity.clone()
@@ -497,9 +508,9 @@ impl<B: TextGenerationBackend, C: TokenFilterController> TextContinuationBoundar
     pub fn parts(
         &self,
     ) -> (
-        &ModelRuntime<B>,
-        &B::TextGenerationState,
-        Option<PendingTextInput<&B::Prompt, &B::Token>>,
+        &ModelRuntime<B, S>,
+        &S::TextGenerationState,
+        Option<PendingTextInput<&S::Prompt, &B::Token>>,
     ) {
         (
             self.runtime,
@@ -515,9 +526,9 @@ impl<B: TextGenerationBackend, C: TokenFilterController> TextContinuationBoundar
     pub fn mechanism_parts(
         &mut self,
     ) -> (
-        &mut ModelRuntime<B>,
-        &mut B::TextGenerationState,
-        Option<PendingTextInput<&B::Prompt, &B::Token>>,
+        &mut ModelRuntime<B, S>,
+        &mut S::TextGenerationState,
+        Option<PendingTextInput<&S::Prompt, &B::Token>>,
     ) {
         let inner = &mut *self.state.inner;
         (
@@ -532,7 +543,7 @@ impl<B: TextGenerationBackend, C: TokenFilterController> TextContinuationBoundar
     pub fn install_host_state(
         &mut self,
         controller: C,
-        pending: Option<PendingTextInput<B::Prompt, B::Token>>,
+        pending: Option<PendingTextInput<S::Prompt, B::Token>>,
         remaining_tokens: Option<usize>,
         position: crate::refinement::GenerationPosition,
         decoding: crate::decoding::DecodingState,
@@ -553,14 +564,14 @@ impl<B: TextGenerationBackend, C: TokenFilterController> TextContinuationBoundar
     #[allow(clippy::too_many_arguments)]
     pub fn fork_host_state(
         &self,
-        backend_state: B::TextGenerationState,
+        backend_state: S::TextGenerationState,
         controller: C,
-        pending: Option<PendingTextInput<B::Prompt, B::Token>>,
+        pending: Option<PendingTextInput<S::Prompt, B::Token>>,
         remaining_tokens: Option<usize>,
         position: crate::refinement::GenerationPosition,
         decoding: crate::decoding::DecodingState,
         sequence: crate::GenerationSequence,
-    ) -> TextGenerationContinuation<B, C> {
+    ) -> TextGenerationContinuation<B, C, S> {
         TextGenerationContinuation {
             owner: Arc::clone(&self.state.owner),
             identity: TextContinuationIdentity(Arc::new(())),
@@ -591,8 +602,8 @@ impl<B: TextGenerationBackend, C: TokenFilterController> TextContinuationBoundar
     }
 }
 
-impl<B: TextGenerationBackend, C: TokenFilterController> Drop
-    for TextContinuationBoundary<'_, '_, B, C>
+impl<B: TextGenerationBackend, C: TokenFilterController, S: TextExecutionSession<B>> Drop
+    for TextContinuationBoundary<'_, '_, B, C, S>
 {
     fn drop(&mut self) {
         if std::thread::panicking() {
@@ -601,10 +612,14 @@ impl<B: TextGenerationBackend, C: TokenFilterController> Drop
     }
 }
 
-impl<B: crate::execution_control::NativeTextStateBackend> TextGenerationDriver<'_, B> {
+impl<B, S> TextGenerationDriver<'_, B, S>
+where
+    B: TextGenerationBackend,
+    S: TextExecutionSession<B> + NativeTextStateSession<B>,
+{
     fn validate_boundary<C: TokenFilterController>(
         &self,
-        state: &TextGenerationContinuation<B, C>,
+        state: &TextGenerationContinuation<B, C, S>,
     ) -> Result<(), TextContinuationError<B::Error, C::Error>> {
         self.validate(state)?;
         state.require_quiescent()
@@ -615,14 +630,14 @@ impl<B: crate::execution_control::NativeTextStateBackend> TextGenerationDriver<'
     /// resources before calling either copying operation below.
     pub fn estimate_native_state<C: TokenFilterController>(
         &self,
-        state: &TextGenerationContinuation<B, C>,
-        saved: Option<&B::NativeTextState>,
+        state: &TextGenerationContinuation<B, C, S>,
+        saved: Option<&<S as NativeTextStateSession<B>>::NativeTextState>,
     ) -> Result<
         Option<crate::execution_control::SnapshotEstimate>,
         TextContinuationError<B::Error, C::Error>,
     > {
         self.validate_boundary(state)?;
-        B::estimate_native_text_state(self.runtime, saved)
+        S::estimate_native_text_state(self.runtime, saved)
             .map_err(|error| ControlledTextGenerationError::Backend(error).into())
     }
 
@@ -630,10 +645,13 @@ impl<B: crate::execution_control::NativeTextStateBackend> TextGenerationDriver<'
     /// Caller must first reserve the complete snapshot's resource estimate.
     pub fn capture_native_state<C: TokenFilterController>(
         &mut self,
-        state: &TextGenerationContinuation<B, C>,
-    ) -> Result<B::NativeTextState, TextContinuationError<B::Error, C::Error>> {
+        state: &TextGenerationContinuation<B, C, S>,
+    ) -> Result<
+        <S as NativeTextStateSession<B>>::NativeTextState,
+        TextContinuationError<B::Error, C::Error>,
+    > {
         self.validate_boundary(state)?;
-        B::capture_native_text_state(self.runtime)
+        S::capture_native_text_state(self.runtime)
             .map_err(|error| ControlledTextGenerationError::Backend(error).into())
     }
 
@@ -641,11 +659,14 @@ impl<B: crate::execution_control::NativeTextStateBackend> TextGenerationDriver<'
     /// The currently installed continuation remains unchanged.
     pub fn copy_native_state<C: TokenFilterController>(
         &mut self,
-        state: &TextGenerationContinuation<B, C>,
-        saved: &B::NativeTextState,
-    ) -> Result<B::NativeTextState, TextContinuationError<B::Error, C::Error>> {
+        state: &TextGenerationContinuation<B, C, S>,
+        saved: &<S as NativeTextStateSession<B>>::NativeTextState,
+    ) -> Result<
+        <S as NativeTextStateSession<B>>::NativeTextState,
+        TextContinuationError<B::Error, C::Error>,
+    > {
         self.validate_boundary(state)?;
-        B::copy_native_text_state(self.runtime, saved)
+        S::copy_native_text_state(self.runtime, saved)
             .map_err(|error| ControlledTextGenerationError::Backend(error).into())
     }
 
@@ -654,17 +675,20 @@ impl<B: crate::execution_control::NativeTextStateBackend> TextGenerationDriver<'
     /// semantic state before advancing again. No token or sampler advances here.
     pub fn exchange_native_state<C: TokenFilterController>(
         &mut self,
-        state: &TextGenerationContinuation<B, C>,
-        slot: &mut B::NativeTextState,
+        state: &TextGenerationContinuation<B, C, S>,
+        slot: &mut <S as NativeTextStateSession<B>>::NativeTextState,
     ) -> Result<(), TextContinuationError<B::Error, C::Error>> {
         self.validate_boundary(state)?;
-        B::exchange_native_text_state(self.runtime, slot)
+        S::exchange_native_text_state(self.runtime, slot)
             .map_err(|error| ControlledTextGenerationError::Backend(error).into())
     }
 }
 
-impl<B: crate::execution_control::NativeTextStateBackend, C: TokenFilterController>
-    TextContinuationBoundary<'_, '_, B, C>
+impl<B, C, S> TextContinuationBoundary<'_, '_, B, C, S>
+where
+    B: TextGenerationBackend,
+    C: TokenFilterController,
+    S: TextExecutionSession<B> + NativeTextStateSession<B>,
 {
     /// Exchanges a quiescent child and its model-state slot with the installed
     /// continuation. All host checks precede native exchange; after its success
@@ -672,23 +696,28 @@ impl<B: crate::execution_control::NativeTextStateBackend, C: TokenFilterControll
     /// the matching semantic/lifecycle state before another prediction.
     pub fn exchange_branch(
         &mut self,
-        other: &mut TextGenerationContinuation<B, C>,
-        native: &mut B::NativeTextState,
+        other: &mut TextGenerationContinuation<B, C, S>,
+        native: &mut <S as NativeTextStateSession<B>>::NativeTextState,
     ) -> Result<(), TextContinuationError<B::Error, C::Error>> {
         if !Arc::ptr_eq(&self.state.owner, &other.owner) {
             return Err(TextContinuationError::IncompatibleDriver);
         }
         other.require_quiescent()?;
-        B::validate_native_text_state(self.runtime, native)
+        S::validate_native_text_state(self.runtime, native)
             .map_err(ControlledTextGenerationError::Backend)?;
-        B::exchange_native_text_state(self.runtime, native)
+        S::exchange_native_text_state(self.runtime, native)
             .map_err(ControlledTextGenerationError::Backend)?;
         std::mem::swap(self.state, other);
         Ok(())
     }
 }
 
-impl<B: ModelCapabilityBackend, C: TokenFilterController> TextContinuationBoundary<'_, '_, B, C> {
+impl<
+        B: TextGenerationBackend,
+        C: TokenFilterController,
+        S: TextExecutionSession<B> + ModelCapabilitySession<B>,
+    > TextContinuationBoundary<'_, '_, B, C, S>
+{
     /// Releases optional conversions without advancing or settling this already
     /// completed and drained continuation. Native authority is checked by the
     /// same backend hook used after ordinary synchronization.
@@ -698,6 +727,6 @@ impl<B: ModelCapabilityBackend, C: TokenFilterController> TextContinuationBounda
         Vec<crate::residency::ParameterConversionRetentionTrimReport>,
         crate::residency::ParameterConversionTrimError,
     > {
-        B::trim_parameter_conversions(self.runtime)
+        S::trim_parameter_conversions(self.runtime)
     }
 }

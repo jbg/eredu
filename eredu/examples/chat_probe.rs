@@ -27,7 +27,7 @@ fn main() -> anyhow::Result<()> {
     };
     let plan = ExecutionPlan::fully_resident(eredu_core::DevicePlan::new("mlx", device)?);
     let (mut model, _) =
-        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &args[0], &plan)?
+        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &args[0], &plan, None)?
             .into_parts();
     let messages = vec![
         json!({"role":"system", "content":"You are a concise assistant. Follow the user's instructions and use tools when requested."}),

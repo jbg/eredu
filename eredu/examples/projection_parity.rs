@@ -121,7 +121,7 @@ fn main() -> anyhow::Result<()> {
         eprintln!("ordinary parity: reference={reference}");
         let _guard = reference.then(CastGemmReference::begin);
         let (mut model, _) =
-            LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &path, &plan)?
+            LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &path, &plan, None)?
                 .into_parts();
         let chat = model.prepare_chat(ChatTemplateRequest {
             messages: vec![json!({"role":"user", "content":"hello"})],
@@ -213,8 +213,12 @@ fn main() -> anyhow::Result<()> {
     for reference in [true, false] {
         eprintln!("speculative parity: reference={reference}");
         let _guard = reference.then(CastGemmReference::begin);
-        let mut loaded =
-            LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &path, &spec_plan)?;
+        let mut loaded = LoadedModel::load_execution_plan(
+            &MlxBackendFactory::default(),
+            &path,
+            &spec_plan,
+            None,
+        )?;
         let chat = loaded.model_mut().prepare_chat(ChatTemplateRequest {
             messages: vec![json!({"role":"user", "content":"hello"})],
             add_generation_prompt: true,

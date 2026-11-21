@@ -1,41 +1,6 @@
 use super::*;
 use std::{cell::OnceCell, rc::Rc};
 
-#[cfg(test)]
-use std::cell::Cell;
-
-#[cfg(test)]
-thread_local! {
-    static NATIVE_COLLECTIVE_SUBMISSIONS: Cell<usize> = const { Cell::new(0) };
-    static CONTRACTED_COLLECTIVE_SUBMISSIONS: Cell<usize> = const { Cell::new(0) };
-}
-
-#[cfg(test)]
-pub(crate) fn reset_native_collective_submissions() {
-    NATIVE_COLLECTIVE_SUBMISSIONS.with(|count| count.set(0));
-    CONTRACTED_COLLECTIVE_SUBMISSIONS.with(|count| count.set(0));
-}
-
-#[cfg(test)]
-pub(crate) fn native_collective_submissions() -> usize {
-    NATIVE_COLLECTIVE_SUBMISSIONS.with(Cell::get)
-}
-
-#[cfg(test)]
-pub(crate) fn contracted_collective_submissions() -> usize {
-    CONTRACTED_COLLECTIVE_SUBMISSIONS.with(Cell::get)
-}
-
-pub(super) fn record_native_collective_submission(_group: &Group) {
-    #[cfg(test)]
-    {
-        NATIVE_COLLECTIVE_SUBMISSIONS.with(|count| count.set(count.get() + 1));
-        if _group.contract.is_some() {
-            CONTRACTED_COLLECTIVE_SUBMISSIONS.with(|count| count.set(count.get() + 1));
-        }
-    }
-}
-
 /// A native MLX group or a backend-owned logical subgroup of one native world.
 #[derive(Clone)]
 pub struct Group {
@@ -44,11 +9,8 @@ pub struct Group {
     pub(super) logical: Option<LogicalSubgroup>,
     pub(super) contract: Option<ManifestGroupContract>,
     pub(super) completion: Option<CommunicationCompletionPolicy>,
-    local_phase: Option<Rc<LocalPhaseAgreement>>,
+    readiness: Option<eredu_core::communication::CommunicationAuthority>,
 }
-
-type LocalPhaseAgreement =
-    dyn Fn([u64; 8], bool, &Stream) -> std::result::Result<bool, eredu_core::BackendFailure>;
 
 #[derive(Debug, Clone)]
 pub(super) struct ManifestGroupContract {
@@ -79,33 +41,59 @@ impl Group {
             logical: None,
             contract: None,
             completion: None,
-            local_phase: None,
+            readiness: None,
         }
     }
 
-    /// Installs the selected communicator's retained failure authority on this clone.
-    pub(crate) fn with_local_phase_agreement(mut self, agreement: Rc<LocalPhaseAgreement>) -> Self {
-        self.local_phase = Some(agreement);
+    pub(crate) fn with_readiness_authority(
+        mut self,
+        authority: eredu_core::communication::CommunicationAuthority,
+    ) -> Self {
+        self.readiness = Some(authority);
         self
     }
 
-    /// Whether data collectives share transport with retained local-phase agreement.
-    pub(crate) fn has_local_phase_agreement(&self) -> bool {
-        self.local_phase.is_some()
+    pub(crate) fn readiness_authority(
+        &self,
+    ) -> Option<&eredu_core::communication::CommunicationAuthority> {
+        self.readiness.as_ref()
     }
 
-    /// Agrees local preparation before any peer enters a dependent data collective.
-    /// Groups without retained authority return their local success directly.
-    pub(crate) fn agree_local_phase(
+    pub(crate) fn record_data_failure(
         &self,
-        descriptor: [u64; 8],
-        success: bool,
-        context: &Stream,
-    ) -> std::result::Result<bool, eredu_core::BackendFailure> {
-        match &self.local_phase {
-            Some(agreement) => agreement(descriptor, success, context),
-            None => Ok(success),
+        operation: CommunicationOperation,
+        error: Exception,
+    ) -> Exception {
+        if let Some(authority) = &self.readiness {
+            // A settled failure already carries the completion cause and fence.
+            if authority.ensure_active().is_ok() {
+                return Exception::from_source(
+                    authority.submission_failure(error, operation, None),
+                );
+            }
         }
+        error
+    }
+
+    /// Settles data on the same transport before a subsequent readiness exchange.
+    pub(crate) fn finish_coordinated_output(
+        &self,
+        operation: CommunicationOperation,
+        output: &Array,
+        stream: &Stream,
+        started: std::time::Instant,
+    ) -> Result<()> {
+        if let Some(authority) = &self.readiness {
+            let policy = authority.completion_policy().ok_or_else(|| {
+                Exception::custom("coordinated tensor operation requires bounded completion")
+            })?;
+            super::status::complete_output(output, self, stream, policy, started).map_err(
+                |error| {
+                    Exception::from_source(authority.completion_failure(error, operation, None))
+                },
+            )?;
+        }
+        Ok(())
     }
 
     pub(crate) fn shares_native_world(&self, other: &Self) -> bool {
@@ -146,6 +134,9 @@ impl Group {
     }
 
     pub(super) fn ensure_available(&self) -> Result<()> {
+        if let Some(authority) = &self.readiness {
+            authority.ensure_active().map_err(Exception::from_source)?;
+        }
         crate::backend::runtime::distributed::completion::ensure_group_available(self)
             .map_err(|error| Exception::custom(error.to_string()))
     }
@@ -185,11 +176,6 @@ impl Group {
         self.completion
     }
 
-    #[cfg(test)]
-    pub(crate) fn opaque_id(&self) -> Option<CollectiveGroupId> {
-        self.contract.as_ref().map(|contract| contract.id)
-    }
-
     pub(crate) const fn native_group(&self) -> &native::Group {
         &self.native
     }
@@ -226,7 +212,7 @@ impl Group {
             logical: None,
             contract: None,
             completion: self.completion,
-            local_phase: None,
+            readiness: None,
         })
     }
 
@@ -274,7 +260,7 @@ impl Group {
             }),
             contract: None,
             completion: self.completion,
-            local_phase: None,
+            readiness: None,
         })
     }
 

@@ -5,7 +5,7 @@ through `GenerationControlHandle`; send step, resume, snapshot, restore and bran
 commands to that worker. The session exclusively borrows its `LoadedModel`, and
 native handles do not need to become `Send` or `Sync`.
 
-Use `eredu::api::LoadedModel<B>` with your backend factory. MLX applications
+Use `eredu::api::LoadedModel<B, S>` with your backend factory. MLX applications
 use `eredu_backend_mlx::MlxBackendFactory` with the same control API. The complete
 runnable example is:
 
@@ -129,7 +129,7 @@ Index records by `generation.run_id`, `sequence` and `epoch`. Sequences increase
 through the run's entire journal; a restore increases epoch and never refunds
 transport, capture or copying consumption.
 
-1. Save the `ControlledGenerationSnapshot<B>` handle and its serializable metadata.
+1. Save the `ControlledGenerationSnapshot<B, S>` handle and its serializable metadata.
 2. A snapshot's `output.next_prediction` is the next absolute decision. The most
    recently committed token may still be pending decode input; do not feed it again.
 3. On `Restored { output, ... }`, restore the view represented by the original

@@ -213,6 +213,7 @@ impl CaptureBackend for Mechanism {
         tensor: &Self::Tensor,
         selection: &CaptureSelection,
         _: &ResolvedCaptureSlice,
+        _score_row: Option<u64>,
     ) -> Result<CapturePayload, Self::Error> {
         if selection.id == "injected-native-failure" {
             return Err(MockError::Capture("injected capture fault".into()));
@@ -500,7 +501,11 @@ fn intervened_facade_keeps_outcomes_cancellation_failure_and_consumer_lifetimes(
         .unwrap();
     let eos = tokenizer.token_to_id("<|im_end|>").unwrap();
     let mut model = LoadedModel::from_runtime(
-        ModelRuntime::prepare(MockBackend, Default::default()).unwrap(),
+        ModelRuntime::install::<MockSession>(
+            MockBackend,
+            fixture_prepared_model(Default::default()),
+        )
+        .unwrap(),
         ChatTokenizer::from_tokenizer(tokenizer),
         LoadedTextModelConfig {
             model_family: ModelKind::Qwen2,
@@ -728,14 +733,22 @@ fn intervened_facade_keeps_outcomes_cancellation_failure_and_consumer_lifetimes(
 #[test]
 #[cfg(feature = "tensor-capture")]
 fn intervention_admission_cannot_transfer_between_identical_artifact_sessions() {
-    let runtime = ModelRuntime::prepare(MockBackend, Default::default()).unwrap();
-    let other = ModelRuntime::prepare(MockBackend, Default::default()).unwrap();
+    let runtime = ModelRuntime::install::<MockSession>(
+        MockBackend,
+        fixture_prepared_model(Default::default()),
+    )
+    .unwrap();
+    let other = ModelRuntime::install::<MockSession>(
+        MockBackend,
+        fixture_prepared_model(Default::default()),
+    )
+    .unwrap();
     let request = CaptureRequestShape {
         batch: 1,
         prompt_tokens: 2,
         max_predictions: 3,
     };
-    let discovery = MockBackend::capture_discovery(&runtime).unwrap();
+    let discovery = runtime.session().capture_discovery().unwrap();
     let capture = plan()
         .admit(
             &discovery.catalog,
@@ -746,11 +759,17 @@ fn intervention_admission_cannot_transfer_between_identical_artifact_sessions() 
         .unwrap();
     let admitted = intervention_plan(1.0)
         .admit(
-            &MockBackend::intervention_discovery(&runtime).unwrap(),
+            &runtime.session().intervention_discovery().unwrap(),
             request,
             "facade",
         )
         .unwrap();
-    MockBackend::validate_text_interventions(&runtime, &capture, &admitted).unwrap();
-    assert!(MockBackend::validate_text_interventions(&other, &capture, &admitted).is_err());
+    runtime
+        .session()
+        .validate_text_interventions(&capture, &admitted)
+        .unwrap();
+    assert!(other
+        .session()
+        .validate_text_interventions(&capture, &admitted)
+        .is_err());
 }

@@ -1,10 +1,10 @@
 //! Bounded all-rank preparation using retained session transport and identity.
 
-use crate::CommunicationSessionIdentity;
 use eredu_core::{
-    consensus::BoundedConsensusTransport,
+    communication::CommunicationSessionIdentity,
     run_preparation::{
-        TextPreparationOutcome, TextPreparationStage, TextPreparationStatus, TextPreparationUsage,
+        TextPreparationAdmission, TextPreparationOutcome, TextPreparationStage,
+        TextPreparationStatus, TextPreparationTransport, TextPreparationUsage,
     },
     BackendFailure, BoundedCompletion, BoundedCompletionWait, BoundedSubmissionOutcome, Completion,
     CompletionCancellationMode,
@@ -17,16 +17,6 @@ mod decoding;
 mod speculative;
 /// Fixed words in one preparation frame, independent of model and prompt size.
 pub const TEXT_PREPARATION_WORDS: usize = 18;
-
-/// Native transport facts and shared failure ownership for cold preparation.
-pub trait TextPreparationTransport: BoundedConsensusTransport {
-    /// Exact retained rank, independent of application-supplied labels.
-    fn preparation_rank(&self) -> usize;
-    /// Checks the actual selected communication authority before submission.
-    fn ensure_preparation_active(&self) -> Result<(), BackendFailure>;
-    /// Fences transport on unagreed failure without claiming native completion.
-    fn fail_preparation(&self, error: &TextPreparationAgreementError);
-}
 
 /// Agreement failures preserve native sources behind a neutral public wrapper.
 #[derive(Debug, thiserror::Error)]
@@ -87,6 +77,20 @@ pub struct TextPreparationCoordinator {
 }
 
 impl TextPreparationCoordinator {
+    /// Installs the shared coordinator from exact native admission facts.
+    pub fn from_admission(
+        admission: TextPreparationAdmission,
+    ) -> Result<Self, TextPreparationAgreementError> {
+        Self::new(admission.identity, admission.native_usage, admission.wait)
+    }
+
+    /// Requires that the selected transport admitted bounded preparation.
+    pub fn require(coordinator: Option<&Self>) -> Result<&Self, TextPreparationAgreementError> {
+        coordinator.ok_or(TextPreparationAgreementError::Admission(
+            "selected session has no bounded preparation transport",
+        ))
+    }
+
     /// Admits native retention/host resolution plus runtime framing at setup.
     /// `native` must conservatively price a `TEXT_PREPARATION_WORDS` gather;
     /// its `attempts` field is zero because runtime owns exchange counting.
@@ -160,7 +164,7 @@ impl TextPreparationCoordinator {
             Ok(state) => state,
             Err(_) => {
                 let error = TextPreparationAgreementError::Busy;
-                transport.fail_preparation(&error);
+                transport.fence_preparation();
                 return Err(error);
             }
         };
@@ -168,9 +172,9 @@ impl TextPreparationCoordinator {
             return Err(TextPreparationAgreementError::Fenced);
         }
         let result = self.agree_inner(transport, stage, local, &mut state);
-        if let Err(error) = &result {
+        if result.is_err() {
             state.fenced = true;
-            transport.fail_preparation(error);
+            transport.fence_preparation();
         }
         result
     }

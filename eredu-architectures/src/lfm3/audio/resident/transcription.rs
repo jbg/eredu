@@ -198,10 +198,11 @@ impl<S: SnapshotValue, T: Tensor + SnapshotValue, I: SnapshotValue> IsolatedStat
     }
 
     fn copy_isolated(&self, retention: &SnapshotReservation) -> Result<Self, BackendFailure> {
+        let retention = retention.authority();
         Ok(Self {
-            encoder: self.encoder.copy_snapshot_value(retention)?,
-            language: self.language.copy_snapshot_value(retention)?,
-            input: self.input.copy_snapshot_value(retention)?,
+            encoder: self.encoder.copy_snapshot_value(&retention)?,
+            language: self.language.copy_snapshot_value(&retention)?,
+            input: self.input.copy_snapshot_value(&retention)?,
             origin: self.origin.clone(),
             ..*self
         })
@@ -393,7 +394,8 @@ where
         final_chunk: bool,
         restart: bool,
     ) -> Result<AudioTranscriptionBlock, AudioTranscriptionError> {
-        H::with_input_recovery(|| self.advance_with_retention(features, final_chunk, restart))
+        let _scope = H::open_input_recovery()?;
+        self.advance_with_retention(features, final_chunk, restart)
     }
 
     fn advance_with_retention(
@@ -402,13 +404,12 @@ where
         final_chunk: bool,
         restart: bool,
     ) -> Result<AudioTranscriptionBlock, AudioTranscriptionError> {
-        if let Some(fork) = &self.fork {
-            H::with_fork_retention(fork.model.clone(), || {
-                self.advance_block(features, final_chunk, restart)
-            })?
-        } else {
-            self.advance_block(features, final_chunk, restart)
-        }
+        let _retention = self
+            .fork
+            .as_ref()
+            .map(|fork| H::hold_fork_retention(fork.model.clone()))
+            .transpose()?;
+        self.advance_block(features, final_chunk, restart)
     }
 
     fn advance_block(

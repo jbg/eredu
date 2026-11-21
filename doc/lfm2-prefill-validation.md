@@ -47,7 +47,7 @@ python3 -m venv /private/tmp/eredu-prefill-reference
 /private/tmp/eredu-prefill-reference/bin/pip install torch==2.14.0 transformers==5.17.0
 /private/tmp/eredu-prefill-reference/bin/python eredu-evaluation/scripts/download_component_fixture.py /private/tmp/eredu-prefill-lfm2 --model lfm2
 /private/tmp/eredu-prefill-reference/bin/python eredu-evaluation/scripts/prefill_reference.py /private/tmp/eredu-prefill-lfm2/provenance.json /private/tmp/eredu-prefill-lfm2/reference.json --f32-checkpoint /private/tmp/eredu-prefill-lfm2/f32
-EREDU_PREFILL_REFERENCE=/private/tmp/eredu-prefill-lfm2/reference.json CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --features metal --test chunked_prefill released_checkpoint --locked -- --ignored --nocapture --test-threads=1
+EREDU_PREFILL_REFERENCE=/private/tmp/eredu-prefill-lfm2/reference.json CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --features mlx,metal --test chunked_prefill released_checkpoint --locked -- --ignored --nocapture --test-threads=1
 ```
 
 The prompt is `[1,3,2,5,8,13,21,34,55]`; cached inputs are `[5,8,13]`.

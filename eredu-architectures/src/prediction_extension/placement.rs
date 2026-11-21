@@ -243,21 +243,3 @@ where
         Arc::new(placement)
     }
 }
-
-impl<M> PreparedPredictionUnit<M> {
-    pub(super) fn resource_module(
-        &self,
-        ordinal: usize,
-    ) -> eredu_runtime::prediction_resources::PreparedPredictionModule {
-        eredu_runtime::prediction_resources::PreparedPredictionModule {
-            ordinal,
-            residency_owner: self
-                .tasks
-                .iter()
-                .find_map(|task| task.auxiliary_residency())
-                .cloned(),
-            shared: self.role == PredictionModuleRole::Shared,
-            parameters: self.local_parameters.clone(),
-        }
-    }
-}

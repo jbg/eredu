@@ -105,18 +105,19 @@ where
     ) -> Result<Self, RealtimeSnapshotError> {
         // Copy values before model state, so a value failure cannot install or
         // mutate model state. Every returned value has completed its own copy.
+        let authority = retention.authority();
         let identity = self
             .contract
             .identity
-            .copy_snapshot_value(retention)
+            .copy_snapshot_value(&authority)
             .map_err(RealtimeSnapshotError::Component)?;
         let schedule_state = self
             .schedule_state
-            .copy_snapshot_value(retention)
+            .copy_snapshot_value(&authority)
             .map_err(RealtimeSnapshotError::Component)?;
         let sampling = self
             .sampling
-            .copy_snapshot_value(retention)
+            .copy_snapshot_value(&authority)
             .map_err(RealtimeSnapshotError::Component)?;
         let mut samplers = Vec::new();
         samplers
@@ -125,14 +126,14 @@ where
         for value in &self.samplers {
             samplers.push(
                 value
-                    .copy_snapshot_value(retention)
+                    .copy_snapshot_value(&authority)
                     .map_err(RealtimeSnapshotError::Component)?,
             );
         }
         let random_state = self
             .random_state
             .as_ref()
-            .map(|value| value.copy_snapshot_value(retention))
+            .map(|value| value.copy_snapshot_value(&authority))
             .transpose()
             .map_err(RealtimeSnapshotError::Component)?;
         let model_state = copy_model(&self.model_state)

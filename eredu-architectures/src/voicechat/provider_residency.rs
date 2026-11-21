@@ -7,7 +7,8 @@
 use std::collections::BTreeMap;
 
 use eredu_checkpoint::{recipe::RecipeError, store::SharedCheckpointSource};
-use eredu_runtime::{LayerWeightResidency, WeightBinding, WeightResidencyPolicyError};
+use eredu_core::residency::parameter_binding::WeightBinding;
+use eredu_runtime::{LayerWeightResidency, WeightResidencyPolicyError};
 
 use super::artifact::ParameterAdmission;
 

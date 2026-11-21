@@ -3,8 +3,8 @@
 
 use eredu::api::{GenerationMemoryOptions, GenerationMemoryPlacement};
 use eredu_backend_mlx::{
-    allocator_cache_limit, allocator_cache_policy, initialize_allocator_cache_policy,
-    set_allocator_cache_limit,
+    allocator_cache_limit, allocator_cache_policy, preserve_allocator_cache_policy,
+    set_allocator_cache_limit, MlxAllocatorCacheDefaults,
 };
 use eredu_core::InputTokenCount;
 
@@ -74,10 +74,13 @@ fn runtime_default_policy_and_forecast_observation() {
     assert_eq!(allocator_cache_policy().unwrap(), initial);
     match scenario.as_str() {
         "automatic" => {
-            initialize_allocator_cache_policy(false).unwrap();
+            eredu_runtime::automatic_support::initialize_allocator_defaults(Some(
+                &MlxAllocatorCacheDefaults,
+            ))
+            .unwrap();
         }
         "preserved" => {
-            initialize_allocator_cache_policy(true).unwrap();
+            preserve_allocator_cache_policy().unwrap();
         }
         "explicit" => {
             set_allocator_cache_limit(initial.limit_bytes as usize).unwrap();
@@ -113,7 +116,10 @@ fn runtime_default_policy_and_forecast_observation() {
             assert_eq!(configured.limit_bytes, initial.limit_bytes);
         }
     }
-    initialize_allocator_cache_policy(false).unwrap();
+    eredu_runtime::automatic_support::initialize_allocator_defaults(Some(
+        &MlxAllocatorCacheDefaults,
+    ))
+    .unwrap();
     assert_eq!(allocator_cache_policy().unwrap(), configured);
     let forecast = GenerationMemoryOptions::for_backend(
         &eredu_backend_mlx::MlxBackendFactory::default(),

@@ -8,10 +8,8 @@ use eredu_core::{
     QuantizationRequest, ResidencyRequest, SessionCapabilities,
 };
 
-use crate::{
-    CacheResidencyPolicy, CommunicationCompletionPolicy, LayerWeightResidency,
-    PipelineWireContract, WeightResidency,
-};
+use crate::{CacheResidencyPolicy, LayerWeightResidency, PipelineWireContract, WeightResidency};
+use eredu_core::communication::CommunicationCompletionPolicy;
 
 /// Portable drafting intent resolved before checkpoint payload selection.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
@@ -644,7 +642,7 @@ mod tests {
             ParallelRankTopology::new(ParallelTopology::new(2, 1, 1, 1).unwrap(), 1).unwrap();
         let parallel = ParallelLoadRequest::new(
             rank,
-            PipelineWireContract::new(crate::PipelineActivationDtype::Float32),
+            PipelineWireContract::new(eredu_core::communication::PipelineActivationDtype::Float32),
             2,
             128,
             completion(),
@@ -675,7 +673,7 @@ mod tests {
             ParallelRankTopology::new(ParallelTopology::new(2, 1, 1, 1).unwrap(), 0).unwrap();
         let parallel = ParallelLoadRequest::new(
             rank,
-            PipelineWireContract::new(crate::PipelineActivationDtype::Float32),
+            PipelineWireContract::new(eredu_core::communication::PipelineActivationDtype::Float32),
             2,
             128,
             completion(),
@@ -712,7 +710,7 @@ mod tests {
             ParallelRankTopology::new(ParallelTopology::new(2, 1, 1, 1).unwrap(), 0).unwrap();
         let request = ParallelLoadRequest::new(
             rank,
-            PipelineWireContract::new(crate::PipelineActivationDtype::Float32),
+            PipelineWireContract::new(eredu_core::communication::PipelineActivationDtype::Float32),
             0,
             128,
             completion(),
@@ -724,7 +722,7 @@ mod tests {
 
         let request = ParallelLoadRequest::new(
             rank,
-            PipelineWireContract::new(crate::PipelineActivationDtype::Float32),
+            PipelineWireContract::new(eredu_core::communication::PipelineActivationDtype::Float32),
             1,
             -1,
             completion(),
@@ -742,7 +740,9 @@ mod tests {
         assert!(matches!(
             ParallelLoadRequest::new(
                 rank,
-                PipelineWireContract::new(crate::PipelineActivationDtype::Float32),
+                PipelineWireContract::new(
+                    eredu_core::communication::PipelineActivationDtype::Float32
+                ),
                 1,
                 128,
                 completion(),
@@ -757,7 +757,7 @@ mod tests {
             ParallelRankTopology::new(ParallelTopology::new(2, 1, 1, 1).unwrap(), 0).unwrap();
         let parallel = ParallelLoadRequest::new(
             rank,
-            PipelineWireContract::new(crate::PipelineActivationDtype::Float32),
+            PipelineWireContract::new(eredu_core::communication::PipelineActivationDtype::Float32),
             1,
             128,
             completion(),

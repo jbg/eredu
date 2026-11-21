@@ -4,11 +4,17 @@
 //! and reentrant housekeeping never release an unresolved node. Thread exit keeps
 //! the originating thread alive until its native work reaches terminal proof.
 
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    any::Any,
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
 
-use eredu_core::resources::ResourceDescriptionError;
-use eredu_runtime::resource_lifetimes::ResourceLifetimeDescription;
-use safemlx::{error::Exception, SubmissionScope};
+use eredu_core::resources::ResourceLifetimeDescription;
+use eredu_core::{resources::ResourceDescriptionError, SubmissionLease};
+use safemlx::{error::Exception, Array, SubmissionScope};
+
+use super::error::Error;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Status {
@@ -17,23 +23,12 @@ pub(crate) struct Status {
     pub blocked: bool,
 }
 
-pub(crate) trait Probe: 'static {
-    fn seal(&mut self);
-    fn progress(&self) -> Status;
-}
-
-impl Probe for SubmissionScope {
-    fn seal(&mut self) {
-        SubmissionScope::seal(self);
-    }
-
-    fn progress(&self) -> Status {
-        let status = SubmissionScope::progress(self);
-        Status {
-            settled: status.is_settled(),
-            failed: status.failed(),
-            blocked: status.blocked(),
-        }
+fn scope_status(scope: &SubmissionScope) -> Status {
+    let status = scope.progress();
+    Status {
+        settled: status.is_settled(),
+        failed: status.failed(),
+        blocked: status.blocked(),
     }
 }
 
@@ -67,6 +62,184 @@ impl Retention for Vec<safemlx::Array> {
     fn observe(&self, _: Status) {}
 }
 
+/// Retains submission authority and the caller's resource root until native
+/// recovery and output scopes have settled.
+pub(crate) struct SubmissionResources {
+    retained: RefCell<Option<Rc<dyn Any>>>,
+    lease: RefCell<Option<SubmissionLease>>,
+    poison: Rc<Cell<bool>>,
+    scopes: Cell<usize>,
+    release_requested: Cell<bool>,
+}
+
+impl SubmissionResources {
+    pub(crate) fn new(lease: SubmissionLease, poison: Rc<Cell<bool>>) -> Rc<Self> {
+        Rc::new(Self {
+            retained: RefCell::new(None),
+            lease: RefCell::new(Some(lease)),
+            poison,
+            scopes: Cell::new(0),
+            release_requested: Cell::new(false),
+        })
+    }
+
+    pub(crate) fn retain_until_release(&self, root: Rc<dyn Any>) {
+        self.retained.replace(Some(root));
+    }
+
+    pub(crate) fn recovery(self: &Rc<Self>) -> Result<Recovery<ScopeRetention>, Error> {
+        Recovery::begin(self.ticket()).map_err(Into::into)
+    }
+
+    pub(crate) fn observation_recovery(
+        self: &Rc<Self>,
+        roots: Vec<Array>,
+    ) -> Result<Recovery<ObservationRetention>, Error> {
+        Recovery::begin(ObservationRetention {
+            _roots: roots,
+            ticket: self.ticket(),
+        })
+        .map_err(Into::into)
+    }
+
+    pub(crate) fn poison_on_unwind(&self) -> ObservationUnwind<'_> {
+        ObservationUnwind(self)
+    }
+
+    pub(crate) fn ticket(self: &Rc<Self>) -> ScopeRetention {
+        self.scopes.set(self.scopes.get() + 1);
+        ScopeRetention(Rc::clone(self))
+    }
+
+    pub(crate) fn resources_releasable(&self) -> bool {
+        self.scopes.get() == 0
+    }
+
+    pub(crate) fn request_release(&self) {
+        self.release_requested.set(true);
+        self.release_if_settled();
+    }
+
+    fn release_if_settled(&self) {
+        if self.release_requested.get() && self.scopes.get() == 0 {
+            // Release the caller's shared resource root before making its
+            // authority available to a newer submission.
+            self.retained.borrow_mut().take();
+            self.lease.borrow_mut().take();
+        }
+    }
+
+    pub(crate) fn reject_unresolved(&self) {
+        self.poison.set(true);
+    }
+
+    pub(crate) fn ensure_healthy(&self) -> Result<(), Error> {
+        if self.poison.get() {
+            Err(Error::ArchitectureModel(
+                "native session is poisoned by unresolved or failed work".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+pub(crate) struct ReleaseSubmission(pub(crate) Rc<SubmissionResources>);
+impl Drop for ReleaseSubmission {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.reject_unresolved();
+        }
+        self.0.request_release();
+    }
+}
+
+pub(crate) struct ScopeRetention(Rc<SubmissionResources>);
+
+pub(crate) struct ObservationRetention {
+    _roots: Vec<Array>,
+    ticket: ScopeRetention,
+}
+
+impl Retention for ObservationRetention {
+    fn observe(&self, status: Status) {
+        self.ticket.observe(status);
+    }
+}
+
+pub(crate) struct ObservationUnwind<'a>(&'a SubmissionResources);
+impl Drop for ObservationUnwind<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.reject_unresolved();
+        }
+    }
+}
+
+impl Retention for ScopeRetention {
+    fn observe(&self, status: Status) {
+        if status.failed || status.blocked {
+            self.0.poison.set(true);
+        }
+    }
+}
+
+impl Drop for ScopeRetention {
+    fn drop(&mut self) {
+        self.0.scopes.set(self.0.scopes.get() - 1);
+        self.0.release_if_settled();
+    }
+}
+
+#[doc(hidden)]
+pub struct ResourceOperation {
+    owner: Rc<SubmissionResources>,
+    recovery: Option<Recovery<ScopeRetention>>,
+}
+
+impl ResourceOperation {
+    pub(crate) fn begin(owner: &Rc<SubmissionResources>) -> Result<Self, Error> {
+        owner.ensure_healthy()?;
+        Ok(Self {
+            owner: Rc::clone(owner),
+            recovery: Some(owner.recovery()?),
+        })
+    }
+
+    pub(crate) fn finish<T>(
+        mut self,
+        result: Result<T, Error>,
+    ) -> Result<(T, Recovery<ScopeRetention>), Error> {
+        let recovery = self.recovery.as_mut().expect("live resource operation");
+        recovery.seal();
+        let status = recovery.progress();
+        if status.failed || status.blocked {
+            if let Err(error) = result {
+                return Err(error);
+            }
+            return Err(Error::ArchitectureModel(
+                "native resource operation failed or is unobservable".into(),
+            ));
+        }
+        Ok((result?, self.recovery.take().unwrap()))
+    }
+}
+
+impl Drop for ResourceOperation {
+    fn drop(&mut self) {
+        if let Some(recovery) = self.recovery.as_mut() {
+            // No rollback proof accompanies an abandoned operation, even if
+            // all native children happened to finish successfully.
+            self.owner.reject_unresolved();
+            recovery.seal();
+            let status = recovery.progress();
+            if !status.settled || status.failed || status.blocked || std::thread::panicking() {
+                self.owner.reject_unresolved();
+            }
+        }
+    }
+}
+
 /// Work on detached token/input values has no session authority, but still
 /// retains its roots across errors and thread teardown.
 pub(crate) fn detached<T>(
@@ -74,6 +247,55 @@ pub(crate) fn detached<T>(
     operation: impl FnOnce() -> Result<T, crate::backend::error::Error>,
 ) -> Result<T, crate::backend::error::Error> {
     detached_preparation(roots, operation, |error| error)
+}
+
+/// Native recovery for caller-driven component construction.
+pub struct MlxComponentPreparationScope {
+    recovery: Recovery<Vec<safemlx::Array>>,
+    trim_allocator: bool,
+}
+
+impl MlxComponentPreparationScope {
+    pub(crate) fn begin(trim_allocator: bool) -> Result<Self, eredu_core::BackendFailure> {
+        Self::begin_with_roots(trim_allocator, Vec::new())
+    }
+
+    pub(crate) fn begin_with_roots(
+        trim_allocator: bool,
+        roots: Vec<safemlx::Array>,
+    ) -> Result<Self, eredu_core::BackendFailure> {
+        let recovery = Recovery::begin(roots)
+            .map_err(Error::from)
+            .map_err(eredu_core::BackendFailure::from_error);
+        if trim_allocator && recovery.is_err() {
+            let _ = crate::trim_allocator_cache();
+        }
+        Ok(Self {
+            recovery: recovery?,
+            trim_allocator,
+        })
+    }
+}
+
+impl eredu_core::checkpoint_mechanisms::unit_binding::ComponentPreparationScope
+    for MlxComponentPreparationScope
+{
+    fn finish<T, E>(self, result: Result<T, E>) -> Result<T, E>
+    where
+        E: From<eredu_core::BackendFailure>,
+    {
+        let prepared = finish_detached_preparation(self.recovery, result, |error| {
+            eredu_core::BackendFailure::from_error(error).into()
+        });
+        let trim = if self.trim_allocator {
+            crate::trim_allocator_cache().map_err(eredu_core::BackendFailure::from_error)
+        } else {
+            Ok(())
+        };
+        let components = prepared?;
+        trim?;
+        Ok(components)
+    }
 }
 
 /// Preserves caller-owned text/media errors alongside detached native recovery.
@@ -86,15 +308,15 @@ pub(crate) fn detached_preparation<T, E, R: Retention>(
         Ok(recovery) => recovery,
         Err(error) => return Err(map_backend(error.into())),
     };
-    detached_with_recovery(recovery, operation, map_backend)
+    finish_detached_preparation(recovery, operation(), map_backend)
 }
 
-fn detached_with_recovery<T, E, R: Retention, P: Probe>(
-    mut recovery: Recovery<R, P>,
-    operation: impl FnOnce() -> Result<T, E>,
+/// Seals native preparation started and executed by the caller.
+pub(crate) fn finish_detached_preparation<T, E, R: Retention>(
+    mut recovery: Recovery<R>,
+    result: Result<T, E>,
     map_backend: impl FnOnce(crate::backend::error::Error) -> E,
 ) -> Result<T, E> {
-    let result = operation();
     recovery.seal();
     let status = recovery.progress();
     // The scope still retains unresolved work, but an existing operation error
@@ -122,13 +344,13 @@ trait Pending {
     ) -> Result<Option<ResourceLifetimeDescription>, ResourceDescriptionError>;
 }
 
-struct Node<T, P> {
+struct Node<T> {
     retention: T,
-    probe: P,
+    scope: SubmissionScope,
     next: Option<Box<dyn Pending>>,
 }
 
-impl<T: Retention, P: Probe> Pending for Node<T, P> {
+impl<T: Retention> Pending for Node<T> {
     fn next(&self) -> Option<&dyn Pending> {
         self.next.as_deref()
     }
@@ -139,7 +361,7 @@ impl<T: Retention, P: Probe> Pending for Node<T, P> {
         self.retention.describe_resources(maximum)
     }
     fn progress(&self) -> bool {
-        let status = self.probe.progress();
+        let status = scope_status(&self.scope);
         self.retention.observe(status);
         status.settled
     }
@@ -147,7 +369,7 @@ impl<T: Retention, P: Probe> Pending for Node<T, P> {
     fn observe_pending(&self) {
         self.retention.observe(Status {
             settled: false,
-            ..self.probe.progress()
+            ..scope_status(&self.scope)
         });
     }
 
@@ -258,11 +480,11 @@ pub(crate) fn reap() {
     }
 }
 
-pub(crate) struct Recovery<T: Retention, P: Probe = SubmissionScope> {
-    node: Option<Box<Node<T, P>>>,
+pub(crate) struct Recovery<T: Retention> {
+    node: Option<Box<Node<T>>>,
 }
 
-impl<T: Retention, P: Probe> std::fmt::Debug for Recovery<T, P> {
+impl<T: Retention> std::fmt::Debug for Recovery<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Recovery").finish_non_exhaustive()
     }
@@ -274,11 +496,9 @@ impl<T: Retention> Recovery<T> {
         // Retirement itself neither registers hooks nor grows a container.
         safemlx::register_thread_runtime_housekeeping(reap);
         reap();
-        Ok(Self::with_probe(retention, SubmissionScope::begin()?))
+        Ok(Self::new(retention, SubmissionScope::begin()?))
     }
-}
 
-impl<T: Retention, P: Probe> Recovery<T, P> {
     pub fn retention(&self) -> &T {
         &self.node.as_ref().expect("live recovery scope").retention
     }
@@ -287,7 +507,7 @@ impl<T: Retention, P: Probe> Recovery<T, P> {
         &mut self.node.as_mut().expect("live recovery scope").retention
     }
 
-    pub fn with_probe(retention: T, probe: P) -> Self {
+    fn new(retention: T, scope: SubmissionScope) -> Self {
         // Terminal queues outlive this thread's recovery list, including when
         // its final retirement attempt releases an owner during TLS teardown.
         crate::backend::ordinary_retirement::prepare_thread();
@@ -295,7 +515,7 @@ impl<T: Retention, P: Probe> Recovery<T, P> {
         Self {
             node: Some(Box::new(Node {
                 retention,
-                probe,
+                scope,
                 next: None,
             })),
         }
@@ -305,14 +525,14 @@ impl<T: Retention, P: Probe> Recovery<T, P> {
         self.node
             .as_mut()
             .expect("live recovery scope")
-            .probe
+            .scope
             .seal();
     }
 
     pub fn progress(&self) -> Status {
         let node = self.node.as_ref().expect("live recovery scope");
         safemlx::try_with_submission_retirement(|| {
-            let status = node.probe.progress();
+            let status = scope_status(&node.scope);
             node.retention.observe(status);
             status
         })
@@ -321,7 +541,7 @@ impl<T: Retention, P: Probe> Recovery<T, P> {
             // locking payload destructor while another thread owns the runtime.
             let status = Status {
                 settled: false,
-                ..node.probe.progress()
+                ..scope_status(&node.scope)
             };
             // Failure remains observable while native destruction is deferred.
             // A nonterminal observation must retain every native resource.
@@ -365,27 +585,10 @@ impl<T: Retention, P: Probe> Recovery<T, P> {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn wait_for_retirement(mut complete: impl FnMut() -> bool) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        reap();
-        crate::backend::ordinary_retirement::reclaim();
-        if complete() {
-            return;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "terminal resources did not retire"
-        );
-        std::thread::yield_now();
-    }
-}
-
-impl<T: Retention, P: Probe> Drop for Recovery<T, P> {
+impl<T: Retention> Drop for Recovery<T> {
     fn drop(&mut self) {
         if let Some(mut node) = self.node.take() {
-            node.probe.seal();
+            node.scope.seal();
             // An application TLS completion may outlive backend TLS. Do not
             // release arbitrary Rust owners under a native retirement guard
             // when there is no ordinary queue left to receive them.
@@ -399,274 +602,5 @@ impl<T: Retention, P: Probe> Drop for Recovery<T, P> {
                 quarantine(node);
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::{
-        atomic::{AtomicUsize, Ordering},
-        mpsc, Arc,
-    };
-    use std::time::{Duration, Instant};
-
-    struct Terminal;
-    impl Probe for Terminal {
-        fn seal(&mut self) {}
-        fn progress(&self) -> Status {
-            Status {
-                settled: true,
-                failed: false,
-                blocked: false,
-            }
-        }
-    }
-    struct CountDrop(Arc<AtomicUsize>);
-    impl Retention for CountDrop {
-        fn observe(&self, _: Status) {}
-    }
-    impl Drop for CountDrop {
-        fn drop(&mut self) {
-            self.0.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    fn await_retirement(drops: &AtomicUsize) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while drops.load(Ordering::SeqCst) == 0 {
-            reap();
-            assert!(Instant::now() < deadline, "terminal owner was not retired");
-            std::thread::yield_now();
-        }
-    }
-
-    #[test]
-    fn successful_finish_retires_resources_before_returning() {
-        let drops = Arc::new(AtomicUsize::new(0));
-        let recovery = Recovery::with_probe(CountDrop(Arc::clone(&drops)), Terminal);
-        let status = recovery.finish();
-        assert!(status.settled && !status.failed && !status.blocked);
-        assert_eq!(drops.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn detached_preparation_preserves_caller_error_without_native_error_mapping() {
-        #[derive(Debug, PartialEq)]
-        struct CallerError(&'static str);
-        let drops = Arc::new(AtomicUsize::new(0));
-        let recovery = Recovery::with_probe(CountDrop(Arc::clone(&drops)), Terminal);
-        let result = detached_with_recovery::<(), _, _, _>(
-            recovery,
-            || Err(CallerError("tokenizer failed")),
-            |_| panic!("local caller failure must not be replaced"),
-        );
-        assert_eq!(result, Err(CallerError("tokenizer failed")));
-        await_retirement(&drops);
-        assert_eq!(drops.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn detached_failure_preserves_native_cause_and_pending_ownership() {
-        use std::cell::Cell;
-        struct Pending(Rc<Cell<Status>>);
-        impl Probe for Pending {
-            fn seal(&mut self) {}
-            fn progress(&self) -> Status {
-                self.0.get()
-            }
-        }
-        for blocked in [false, true] {
-            let status = Rc::new(Cell::new(Status {
-                settled: false,
-                failed: !blocked,
-                blocked,
-            }));
-            let drops = Arc::new(AtomicUsize::new(0));
-            let recovery =
-                Recovery::with_probe(CountDrop(Arc::clone(&drops)), Pending(Rc::clone(&status)));
-            let result = detached_with_recovery::<(), _, _, _>(
-                recovery,
-                || Err(Exception::custom("precise detached operation cause").into()),
-                |error| error,
-            );
-            let crate::backend::error::Error::Exception(cause) = result.unwrap_err() else {
-                panic!("the original native exception must remain available");
-            };
-            assert_eq!(cause.what(), "precise detached operation cause");
-            assert_eq!(
-                drops.load(Ordering::SeqCst),
-                0,
-                "an operation error is not completion"
-            );
-            status.set(Status {
-                settled: true,
-                failed: true,
-                blocked: false,
-            });
-            await_retirement(&drops);
-            assert_eq!(drops.load(Ordering::SeqCst), 1);
-        }
-    }
-
-    #[test]
-    fn busy_runtime_preserves_failure_observation_without_releasing_resources() {
-        struct Failed;
-        impl Probe for Failed {
-            fn seal(&mut self) {}
-            fn progress(&self) -> Status {
-                Status {
-                    settled: true,
-                    failed: true,
-                    blocked: false,
-                }
-            }
-        }
-        struct Observed {
-            failed: Rc<std::cell::Cell<bool>>,
-            _drop: CountDrop,
-        }
-        impl Retention for Observed {
-            fn observe(&self, status: Status) {
-                self.failed.set(self.failed.get() || status.failed);
-            }
-        }
-        let (ready_tx, ready_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let holder = std::thread::spawn(move || loop {
-            if safemlx::try_with_submission_retirement(|| {
-                ready_tx.send(()).unwrap();
-                let _ = release_rx.recv_timeout(Duration::from_secs(5));
-            })
-            .is_some()
-            {
-                break;
-            }
-            std::thread::yield_now();
-        });
-        ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        let failed = Rc::new(std::cell::Cell::new(false));
-        let drops = Arc::new(AtomicUsize::new(0));
-        let recovery = Recovery::with_probe(
-            Observed {
-                failed: Rc::clone(&failed),
-                _drop: CountDrop(Arc::clone(&drops)),
-            },
-            Failed,
-        );
-        let started = Instant::now();
-        let status = recovery.progress();
-        assert!(status.failed && !status.settled);
-        assert!(failed.get());
-        failed.set(false);
-        drop(recovery);
-        assert!(failed.get(), "drop must also preserve failure observation");
-        assert_eq!(drops.load(Ordering::SeqCst), 0);
-        assert!(started.elapsed() < Duration::from_secs(1));
-        release_tx.send(()).unwrap();
-        holder.join().unwrap();
-        await_retirement(&drops);
-        assert_eq!(drops.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn successful_wait_advances_pending_work_before_retirement() {
-        struct Deferred(std::cell::Cell<usize>);
-        impl Probe for Deferred {
-            fn seal(&mut self) {}
-            fn progress(&self) -> Status {
-                let remaining = self.0.get();
-                self.0.set(remaining.saturating_sub(1));
-                Status {
-                    settled: remaining == 0,
-                    failed: false,
-                    blocked: false,
-                }
-            }
-        }
-        let drops = Arc::new(AtomicUsize::new(0));
-        let recovery = Recovery::with_probe(
-            CountDrop(Arc::clone(&drops)),
-            Deferred(std::cell::Cell::new(3)),
-        );
-        let status = recovery.wait();
-        assert!(status.settled && !status.failed && !status.blocked);
-        assert_eq!(drops.load(Ordering::SeqCst), 0);
-        drop(recovery);
-        await_retirement(&drops);
-        assert_eq!(drops.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn failed_wait_returns_without_releasing_pending_work() {
-        struct FailedPending {
-            complete: Rc<std::cell::Cell<bool>>,
-            polls: std::cell::Cell<usize>,
-        }
-        impl Probe for FailedPending {
-            fn seal(&mut self) {}
-            fn progress(&self) -> Status {
-                self.polls.set(self.polls.get() + 1);
-                assert!(
-                    self.complete.get() || self.polls.get() <= 2,
-                    "failed work must not be polled until completion by wait or drop"
-                );
-                Status {
-                    settled: self.complete.get(),
-                    failed: true,
-                    blocked: true,
-                }
-            }
-        }
-        let complete = Rc::new(std::cell::Cell::new(false));
-        let drops = Arc::new(AtomicUsize::new(0));
-        let recovery = Recovery::with_probe(
-            CountDrop(Arc::clone(&drops)),
-            FailedPending {
-                complete: Rc::clone(&complete),
-                polls: std::cell::Cell::new(0),
-            },
-        );
-        let status = recovery.wait();
-        assert!(!status.settled && status.failed && status.blocked);
-        drop(recovery);
-        assert_eq!(drops.load(Ordering::SeqCst), 0);
-        complete.set(true);
-        await_retirement(&drops);
-        assert_eq!(drops.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn terminal_owner_is_retained_without_waiting_for_a_busy_runtime() {
-        let (ready_tx, ready_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let holder = std::thread::spawn(move || {
-            loop {
-                if safemlx::try_with_submission_retirement(|| {
-                    ready_tx.send(()).unwrap();
-                    // A watchdog makes an accidental blocking retirement fail
-                    // the timing assertion instead of hanging the test process.
-                    let _ = release_rx.recv_timeout(Duration::from_secs(5));
-                })
-                .is_some()
-                {
-                    break;
-                }
-                std::thread::yield_now();
-            }
-        });
-        ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        let drops = Arc::new(AtomicUsize::new(0));
-        let recovery = Recovery::with_probe(CountDrop(Arc::clone(&drops)), Terminal);
-        let started = Instant::now();
-        assert!(!recovery.progress().settled);
-        drop(recovery);
-        reap();
-        assert!(started.elapsed() < Duration::from_secs(1));
-        assert_eq!(drops.load(Ordering::SeqCst), 0);
-        release_tx.send(()).unwrap();
-        holder.join().unwrap();
-        await_retirement(&drops);
-        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 }

@@ -4,11 +4,8 @@ pub mod automatic;
 mod capability;
 pub(crate) mod component_binding;
 pub mod distributed;
-mod execution;
 mod inspection;
-mod load_request;
 pub mod loading;
-mod model;
 mod prepared_speculative;
 mod processor;
 pub mod realtime;
@@ -17,19 +14,10 @@ mod session;
 pub mod speculative;
 pub mod structural;
 
-pub use inspection::{
-    inspect_model, inspect_model_preparation, inspection_mechanisms, MlxInspectionOptions,
-};
-pub use load_request::MlxLoadRequest;
-pub use loading::{MlxModelConfig, MlxSelectedPreparation};
-pub(crate) use model::Executable;
+pub use inspection::{inspection_mechanisms, inspection_media_features};
 #[cfg(any(feature = "image", feature = "audio"))]
-pub use processor::{MlxMediaInputLowering, ModelProcessor};
-pub use session::{
-    MlxModelInput, MlxModelOutput, MlxModelSession, MlxNativeTextState, MlxSessionCompletion,
-    MlxTextSamplingState,
-};
+pub use processor::MlxMediaInputLowering;
+pub use session::MlxSessionMechanisms;
+pub use session::{MlxModelOutput, MlxSessionCompletion};
 
-pub(crate) use crate::backend::{
-    error::Error, MlxBackend, MlxCompletion, MlxDistributedSession, MlxModel,
-};
+pub(crate) use crate::backend::{error::Error, MlxBackend, MlxCompletion, MlxDistributedSession};

@@ -9,9 +9,7 @@ use super::{
     EncoderAttention, FamilyConfig,
 };
 use crate::{
-    composite_execution::{
-        CompositeArchitecture, PreparedCompositeInput, SingleCompositePrefillRequest,
-    },
+    composite_execution::{PreparedCompositeInput, SingleCompositePrefillRequest},
     gemma4::{
         model::{prepare_composite_ingress, DecoderInputPart},
         VisionLayer, VisionState,
@@ -608,7 +606,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> CompositeKernel<B> {
     }
 }
 
-impl<B, S> CompositeArchitecture<B, S> for Model<B>
+impl<B, S> eredu_runtime::composite_execution::CompositeComponentKernel<B, S> for CompositeKernel<B>
 where
     B: GroupedNeuralBackend + DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
@@ -619,9 +617,9 @@ where
         input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
     ) -> Result<Option<i32>, String> {
         Ok(Some(if input.refinement().is_some() {
-            self.kernel().config.text.vocab_size
+            self.config.text.vocab_size
         } else {
-            self.kernel().config.text.hidden_size
+            self.config.text.hidden_size
         }))
     }
     fn accept_partition_boundary(
@@ -645,7 +643,7 @@ where
         let hidden = values.next().expect("validated boundary primary");
         forward.pending_text_boundary = Some(
             eredu_runtime::ArchitectureBoundary::decode(
-                &BoundarySchema::new(self.kernel().config.text.hidden_size),
+                &BoundarySchema::new(self.config.text.hidden_size),
                 values.collect(),
             )
             .map_err(Error::backend)?,
@@ -680,7 +678,7 @@ where
             .map_or(1, |feedback| 2 + usize::from(feedback.is_some()));
         Ok(Some(vec![
                 crate::composite_execution::CompositeTensorCollective::Sum {
-                    shape: vec![1, rows, self.kernel().config.text.hidden_size]
+                    shape: vec![1, rows, self.config.text.hidden_size]
                 };
                 copies
             ]))
@@ -716,19 +714,19 @@ where
         )
     }
     fn prepare_prefill_request(
-        prepared: eredu_runtime::PreparedModelInput<B::Tensor>,
+        prepared: eredu_core::PreparedModelInput<B::Tensor>,
         admitted: AdmittedCompositeInput<Gemma4InputPartPlan>,
         _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::PrefillRequest, Error> {
         SingleCompositePrefillRequest::new(prepared, admitted)
     }
     fn admission_config(&self) -> FamilyConfig {
-        self.kernel().config.clone()
+        self.config.clone()
     }
     fn admit_prepared_input(
         config: &FamilyConfig,
-        input: &eredu_runtime::PreparedModelInput<B::Tensor>,
-        inspector: &impl eredu_runtime::PreparedInputInspector<B::Tensor>,
+        input: &eredu_core::PreparedModelInput<B::Tensor>,
+        inspector: &impl eredu_core::input::PreparedInputInspector<B::Tensor>,
     ) -> Result<AdmittedCompositeInput<Gemma4InputPartPlan>, eredu_core::CapabilityError> {
         crate::media_plan::admit_gemma4_input(&ingress_config(config), input, inspector)
     }
@@ -795,7 +793,7 @@ where
                     CompositeContinuationGeometry::Uniform(vec![
                         count,
                         sequence,
-                        self.kernel().config.vision.as_ref().unwrap().hidden_size,
+                        self.config.vision.as_ref().unwrap().hidden_size,
                     ])
                 }))
             })()?

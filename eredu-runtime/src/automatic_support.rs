@@ -26,6 +26,20 @@ pub fn default_allocator_cache_bytes(available_memory_bytes: Option<u64>) -> u64
         .unwrap_or(256 * 1024 * 1024)
 }
 
+/// Applies portable sizing to an untouched native allocator, if supported.
+pub fn initialize_allocator_defaults(
+    native: Option<&dyn eredu_core::capability::NativeAllocatorCacheDefaults>,
+) -> Result<(), eredu_core::BackendFailure> {
+    if let Some(native) = native {
+        if let Some(facts) = native.initial_cache_facts()? {
+            native.apply_initial_cache_ceiling(default_allocator_cache_bytes(
+                facts.available_memory_bytes,
+            ))?;
+        }
+    }
+    Ok(())
+}
+
 /// Invalid exact resource sizing for selected bounded execution.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
@@ -196,9 +210,13 @@ pub fn placed_source_recipe<C: eredu_checkpoint::recipe::RecipeCatalog + ?Sized>
     member_selected: bool,
 ) -> Result<eredu_checkpoint::recipe::DerivedWeightRecipe, String> {
     let bytes = recipe.infer(source).map_err(|e| e.to_string())?.byte_len();
-    let binding = crate::WeightBinding::from_recipe(target, recipe.clone(), bytes)
-        .and_then(|binding| binding.with_logical_target(target))
-        .map_err(|e| e.to_string())?;
+    let binding = eredu_core::residency::parameter_binding::WeightBinding::from_recipe(
+        target,
+        recipe.clone(),
+        bytes,
+    )
+    .and_then(|binding| binding.with_logical_target(target))
+    .map_err(|e| e.to_string())?;
     let bindings = if let Some(layout) = layout {
         if member_selected {
             crate::place_addressable_member_bindings(vec![binding], source, layout)

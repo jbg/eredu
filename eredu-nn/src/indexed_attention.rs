@@ -150,3 +150,22 @@ impl<T> Clone for IndexedAttentionInput<'_, T> {
         *self
     }
 }
+
+/// Compacts requested positions into sorted unique rows and a slot-to-row map.
+/// Invalid slots remain absent, and repeated positions retain their multiplicity.
+pub fn compact_indexed_positions(positions: &[Option<i32>]) -> (Vec<i32>, Vec<Option<i32>>) {
+    let mut unique = positions.iter().flatten().copied().collect::<Vec<_>>();
+    unique.sort_unstable();
+    unique.dedup();
+    let slots = positions
+        .iter()
+        .map(|position| {
+            position.map(|position| {
+                unique
+                    .binary_search(&position)
+                    .expect("every valid position was collected") as i32
+            })
+        })
+        .collect();
+    (unique, slots)
+}

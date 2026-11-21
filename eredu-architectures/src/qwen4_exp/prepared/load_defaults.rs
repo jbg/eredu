@@ -1,10 +1,10 @@
 //! Practical ordinary-load defaults; explicit execution controls remain authoritative.
 use super::{Config, TargetLoadError};
+use eredu_core::cache::append_stream::AppendStreamLimits;
 use eredu_runtime::{
-    AppendStreamLimits, AppendStreamLoadPolicy, BoundedExecutionPolicy,
-    BoundedExecutionPolicyError, CacheResidencyPolicy, DraftingLoadRequest, InvocationLimits,
-    NormalizedLoadRequest, ParameterBankLoadOptions, RowLookupLimits, RowLookupLoadPolicy,
-    TiledSelectionLimits,
+    AppendStreamLoadPolicy, BoundedExecutionPolicy, BoundedExecutionPolicyError,
+    CacheResidencyPolicy, DraftingLoadRequest, InvocationLimits, NormalizedLoadRequest,
+    ParameterBankLoadOptions, RowLookupLimits, RowLookupLoadPolicy, TiledSelectionLimits,
 };
 
 /// Resolves ordinary loading without requiring callers to calculate family workspaces.

@@ -1,53 +1,22 @@
-//! MLX checkpoint placement and selective materialization.
+//! MLX communicator construction and native rank resources.
 
-#[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::{
-    collections::{BTreeSet, HashMap},
-    path::{Path, PathBuf},
-};
+use eredu_core::communication::CommunicationOperation;
+use std::collections::HashMap;
 
-use eredu_checkpoint::store::{
-    CheckpointSource, ReadPolicy, SafetensorsWeightStore, TensorReadRequest, TensorSelection,
+use eredu_core::communication::{
+    CommunicationCapabilities, CommunicationCompletionCapabilities, CommunicationGroupDescriptor,
+    CommunicationManifest, CommunicationOperationRequirement, CommunicationRouteDescriptor,
+    CommunicationRouteId, CommunicationTensorLimits,
 };
 use eredu_core::{
     checkpoint::TensorDtype, BoundedSubmissionOutcome, CollectiveGroupDescriptor,
     CollectiveGroupId, Submission,
 };
-use eredu_runtime::{
-    CommunicationCapabilities, CommunicationCompletionCapabilities, CommunicationGroupDescriptor,
-    CommunicationManifest, CommunicationOperation, CommunicationOperationRequirement,
-    CommunicationRouteDescriptor, CommunicationRouteId, CommunicationTensorLimits, TensorPlacement,
-};
 use safemlx::{distributed::Group as NativeGroup, Array, Stream};
 
-use crate::{
-    backend::error::Error, backend::runtime::checkpoint::store::MlxParameterMaterializationContext,
-};
+use crate::backend::error::Error;
 
 use crate::backend::runtime::distributed::Group;
-use crate::backend::topology::MlxRankContext;
-#[cfg(test)]
-use crate::backend::DeviceAssignment;
-#[cfg(test)]
-use safemlx::{Device, DeviceType};
-
-#[cfg(test)]
-static MANIFEST_GROUP_REALIZATIONS: AtomicUsize = AtomicUsize::new(0);
-#[cfg(test)]
-thread_local! {
-    static PARTITION_NATIVE_MATERIALIZATION_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-pub(super) fn reset_manifest_group_realizations() {
-    MANIFEST_GROUP_REALIZATIONS.store(0, Ordering::Relaxed);
-}
-
-#[cfg(test)]
-pub(super) fn manifest_group_realizations() -> usize {
-    MANIFEST_GROUP_REALIZATIONS.load(Ordering::Relaxed)
-}
 
 /// Backend-owned handle for one opaque directed communication route.
 #[derive(Debug, Clone)]
@@ -160,17 +129,50 @@ fn next_session_nonce() -> Option<[u8; 32]> {
     Some(hash.finalize().into())
 }
 
-struct NativeWorldManifestTransport<'a> {
+#[doc(hidden)]
+pub struct NativeWorldManifestTransport<'a> {
     world: &'a NativeGroup,
     stream: &'a Stream,
-    completion: eredu_runtime::CommunicationCompletionPolicy,
+    completion: eredu_core::communication::CommunicationCompletionPolicy,
 }
 
-fn manifest_consensus_completion_policy() -> eredu_runtime::CommunicationCompletionPolicy {
+impl<'a> NativeWorldManifestTransport<'a> {
+    /// Borrows the unsplit native world and its control-plane stream.
+    pub fn new(world: &'a NativeGroup, stream: &'a Stream) -> Self {
+        Self {
+            world,
+            stream,
+            completion: manifest_consensus_completion_policy(),
+        }
+    }
+
+    pub(crate) fn native_context(&self) -> (&'a NativeGroup, &'a Stream) {
+        (self.world, self.stream)
+    }
+}
+
+impl eredu_core::communication::CommunicationSetupTransport for NativeWorldManifestTransport<'_> {
+    fn setup_nonce(&self) -> Option<[u8; 32]> {
+        next_session_nonce()
+    }
+
+    fn capabilities(&self) -> CommunicationCapabilities {
+        mlx_communication_capabilities()
+    }
+
+    fn topology_capabilities(
+        &self,
+    ) -> eredu_core::communication::CommunicationTopologyCapabilities {
+        eredu_core::communication::CommunicationTopologyCapabilities::RingWithWorldWaves
+    }
+}
+
+fn manifest_consensus_completion_policy() -> eredu_core::communication::CommunicationCompletionPolicy
+{
     // The manifest's own policy is untrusted input until all ranks have
     // exchanged it. Use one backend setup bound solely for that control-plane
     // exchange, then validate and install the agreed serialized policy.
-    eredu_runtime::CommunicationCompletionPolicy::new(
+    eredu_core::communication::CommunicationCompletionPolicy::new(
         std::time::Duration::from_secs(30),
         eredu_core::CompletionCancellationMode::QuarantineUntilComplete,
     )
@@ -331,7 +333,7 @@ pub(crate) fn mlx_communication_capabilities() -> CommunicationCapabilities {
         CommunicationOperationRequirement::failure_agreement(true),
     ])
     .expect("static MLX communication capabilities are valid")
-    .with_boundary_framing([eredu_runtime::BoundaryFramingProtocol::RoleExactV1])
+    .with_boundary_framing([eredu_core::communication::BoundaryFramingProtocol::RoleExactV1])
     .expect("static MLX boundary framing capability is valid")
     .with_world_boundary_broadcast()
     .with_completion_capabilities(
@@ -352,7 +354,7 @@ pub(crate) fn mlx_communication_capabilities() -> CommunicationCapabilities {
 pub struct ParallelCommunicators {
     world_size: usize,
     global_rank: usize,
-    session_identity: eredu_runtime::CommunicationSessionIdentity,
+    session_identity: eredu_core::communication::CommunicationSessionIdentity,
     descriptors: Vec<CommunicationGroupDescriptor>,
     // Consensus-validated remote facts grant no local native participation.
     global_descriptors: std::sync::Arc<[CommunicationGroupDescriptor]>,
@@ -379,85 +381,12 @@ impl std::fmt::Debug for ParallelCommunicators {
 }
 
 impl ParallelCommunicators {
-    /// Realizes an already selected opaque manifest without semantic topology input.
-    ///
-    /// Capability and descriptor conversion complete before group realization.
-    /// Selected subgroups never enter MLX's non-cancellable native split.
-    pub fn from_manifest(
-        manifest: &CommunicationManifest,
+    pub(crate) fn new_with_routes(
+        prepared: eredu_core::communication::CommunicationBindings,
         world: &NativeGroup,
-        stream: &Stream,
-    ) -> Result<Self, Error> {
-        let agreed_session = eredu_runtime::establish_communication_session(
-            &NativeWorldManifestTransport {
-                world,
-                stream,
-                completion: manifest_consensus_completion_policy(),
-            },
-            manifest,
-            next_session_nonce(),
-        )
-        .map_err(|error| Error::CommunicationManifestConsensus(Box::new(error)))?;
-        let (session_identity, agreed_manifests) = agreed_session.into_parts();
-        // Every rank must finish the complete opaque-manifest exchange before
-        // any rank-local backend capability, quarantine, or world-identity
-        // check can diverge. A corrupt projection therefore has one shared
-        // fail-closed result and cannot strand peers in setup or payload work.
-        let prepared = eredu_runtime::prepare_communication_realization(
-            manifest,
-            &agreed_manifests,
-            &mlx_communication_capabilities(),
-            eredu_runtime::CommunicationTopologyCapabilities::RingWithWorldWaves,
-        )
-        .map_err(|error| {
-            Error::Parallel(format!(
-                "communication manifest cannot be realized by MLX mechanisms: {error}"
-            ))
-        })?;
-        let completion = manifest.completion_policy().ok_or_else(|| {
-            Error::Parallel(
-                "communication manifest requires an explicit bounded completion policy".into(),
-            )
-        })?;
-        let control = Group::uncontracted(world);
-        crate::backend::runtime::distributed::completion::ensure_group_available(&control)?;
-        let mut descriptors = std::collections::BTreeMap::new();
-        for group in agreed_manifests
-            .iter()
-            .flat_map(CommunicationManifest::groups)
-        {
-            if let std::collections::btree_map::Entry::Vacant(entry) = descriptors.entry(group.id())
-            {
-                entry.insert(
-                    CommunicationGroupDescriptor::new(
-                        group.id(),
-                        group.creation_order(),
-                        group.members().to_vec(),
-                        group
-                            .members()
-                            .iter()
-                            .position(|rank| *rank == manifest.rank()),
-                        group.requirements().clone(),
-                    )
-                    .map_err(|error| Error::Parallel(error.to_string()))?,
-                );
-            }
-        }
-        Self::new_with_routes(
-            prepared,
-            world,
-            completion,
-            descriptors.into_values().collect(),
-            session_identity,
-        )
-    }
-
-    fn new_with_routes(
-        prepared: eredu_runtime::PreparedCommunicationRealization,
-        world: &NativeGroup,
-        completion: eredu_runtime::CommunicationCompletionPolicy,
+        completion: eredu_core::communication::CommunicationCompletionPolicy,
         global_descriptors: std::sync::Arc<[CommunicationGroupDescriptor]>,
-        session_identity: eredu_runtime::CommunicationSessionIdentity,
+        session_identity: eredu_core::communication::CommunicationSessionIdentity,
     ) -> Result<Self, Error> {
         // Fence both manifest and uncontracted construction while any timed-out
         // work on this exact native communicator remains quarantined.
@@ -478,21 +407,21 @@ impl ParallelCommunicators {
         // plane from which exact manifest handles are realized.
         let world = owned_world;
         let groups = prepared
-            .try_create_groups(|descriptor, world_wave| {
+            .groups()
+            .map(|(descriptor, world_wave)| {
                 let group =
                     Self::materialize(descriptor, manifest.world_size(), &world, world_wave)?;
-                Ok::<_, Error>((descriptor.id(), group))
-            })?
-            .into_iter()
-            .collect::<HashMap<_, _>>();
+                Ok((descriptor.id(), group))
+            })
+            .collect::<Result<HashMap<_, _>, Error>>()?;
         let routes = prepared
-            .try_create_routes(|descriptor, world_wave| {
+            .routes()
+            .map(|(descriptor, world_wave)| {
                 let route =
                     CommunicationRouteRealization::from_descriptor(descriptor, &world, world_wave)?;
-                Ok::<_, Error>((descriptor.id(), route))
-            })?
-            .into_iter()
-            .collect::<HashMap<_, _>>();
+                Ok((descriptor.id(), route))
+            })
+            .collect::<Result<HashMap<_, _>, Error>>()?;
         Ok(Self {
             world_size: manifest.world_size(),
             global_rank: manifest.rank(),
@@ -511,8 +440,6 @@ impl ParallelCommunicators {
         world: &Group,
         world_collective_wave: bool,
     ) -> Result<GroupCommunicator, Error> {
-        #[cfg(test)]
-        MANIFEST_GROUP_REALIZATIONS.fetch_add(1, Ordering::Relaxed);
         let size = descriptor.members().len();
         let native = if size == world_size {
             world.clone()
@@ -543,7 +470,9 @@ impl ParallelCommunicators {
     }
 
     /// Instance identity established by the complete setup consensus.
-    pub const fn session_identity(&self) -> eredu_runtime::CommunicationSessionIdentity {
+    pub const fn session_identity(
+        &self,
+    ) -> eredu_core::communication::CommunicationSessionIdentity {
         self.session_identity
     }
 
@@ -579,8 +508,12 @@ impl ParallelCommunicators {
         manifest: &CommunicationManifest,
     ) -> Result<
         (
-            Vec<eredu_runtime::RealizedCommunicationGroup<Group>>,
-            Vec<eredu_runtime::RealizedCommunicationRoute<CommunicationRouteRealization>>,
+            Vec<eredu_core::communication::RealizedCommunicationGroup<Group>>,
+            Vec<
+                eredu_core::communication::RealizedCommunicationRoute<
+                    CommunicationRouteRealization,
+                >,
+            >,
         ),
         Error,
     > {
@@ -610,7 +543,7 @@ impl ParallelCommunicators {
                         descriptor.id().value()
                     ))
                 })?;
-                Ok(eredu_runtime::RealizedCommunicationGroup::new(
+                Ok(eredu_core::communication::RealizedCommunicationGroup::new(
                     descriptor.id(),
                     group,
                 ))
@@ -623,7 +556,10 @@ impl ParallelCommunicators {
                 routes
                     .remove(&descriptor.id())
                     .map(|route| {
-                        eredu_runtime::RealizedCommunicationRoute::new(descriptor.id(), route)
+                        eredu_core::communication::RealizedCommunicationRoute::new(
+                            descriptor.id(),
+                            route,
+                        )
                     })
                     .ok_or_else(|| {
                         Error::Parallel(format!(
@@ -670,13 +606,3 @@ impl ParallelCommunicators {
         self.global_rank
     }
 }
-
-mod placement;
-pub use placement::{
-    load_partition_from_store_on_streams, load_safetensors_partition,
-    load_safetensors_partition_on_streams, PlacementPlan, RankPartition,
-};
-
-#[cfg(test)]
-#[path = "topology/tests.rs"]
-mod tests;

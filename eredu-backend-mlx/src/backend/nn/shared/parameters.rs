@@ -200,36 +200,6 @@ pub(super) fn set_module_trainable(module: &mut impl PhysicalParameters, trainab
     }
 }
 
-struct ParameterRefCollector<'a> {
-    parameters: ModuleParamRef<'a>,
-    trainable_only: bool,
-}
-
-impl<'a> ParameterVisitor<'a, MlxTensor> for ParameterRefCollector<'a> {
-    fn visit(&mut self, metadata: ParameterMetadata, value: &'a MlxTensor) {
-        if !self.trainable_only || metadata.trainable {
-            self.parameters.insert(
-                Rc::from(metadata.id.as_str()),
-                NestedValue::Value(value.as_array()),
-            );
-        }
-    }
-}
-
-/// Collects immutable MLX parameter references from a neutral module.
-pub(crate) fn neutral_parameter_refs<M: Parameterized<MlxTensor>>(
-    module: &M,
-    trainable_only: bool,
-) -> ModuleParamRef<'_> {
-    validate_parameter_topology(module).expect("backend-neutral parameter topology is valid");
-    let mut collector = ParameterRefCollector {
-        parameters: ModuleParamRef::new(),
-        trainable_only,
-    };
-    module.visit_parameters(&mut collector);
-    collector.parameters
-}
-
 /// MLX module view over any backend-neutral parameterized value.
 ///
 /// Architecture types retain their neutral parameter identities while MLX

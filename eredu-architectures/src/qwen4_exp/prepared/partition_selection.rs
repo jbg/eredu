@@ -7,11 +7,14 @@ use crate::partitioned_execution::{
 use crate::qwen4_exp::target::TargetTensorPartition;
 use crate::routed_text::{select_routed_text_realization, RoutedTextSelectionRequest};
 use crate::selected_execution::SelectedRoutedPartitionedExecution;
+use eredu_core::communication::CommunicationOperation;
+use eredu_core::communication::{
+    CommunicationCapabilities, CommunicationOperationRequirement, CommunicationTensorLimits,
+};
 use eredu_core::{checkpoint::TensorDtype, ParallelRankTopology};
 use eredu_runtime::{
-    ArchitectureBoundary, BackendMechanismCapabilities, CommunicationCapabilities,
-    CommunicationOperation, CommunicationOperationRequirement, CommunicationTensorLimits,
-    RowLookupDescriptor, StateRealizationRequirements,
+    ArchitectureBoundary, BackendMechanismCapabilities, RowLookupDescriptor,
+    StateRealizationRequirements,
 };
 
 pub(crate) fn load_partition_request(

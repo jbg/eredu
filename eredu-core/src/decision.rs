@@ -1,5 +1,35 @@
 //! Portable inputs and results for non-autoregressive decisions.
 
+use eredu_nn::{NeuralBackend, Tensor};
+
+use crate::{BackendFailure, DevicePlan};
+
+/// Native resources used to construct a decision task on its selected device.
+pub trait DecisionBinding: Sized {
+    /// Neural operations for constructing and executing the task.
+    type Backend: crate::backend::LocalComponentStorage;
+    /// Native parallel communication binding type.
+    type Parallel;
+    /// Native media input conversion.
+    type InputLowering;
+
+    /// Context for allocating the selected task.
+    fn context(&self) -> &<<Self::Backend as NeuralBackend>::Tensor as Tensor>::Context;
+    /// Supplies native input conversion.
+    fn input_lowering(&self) -> Self::InputLowering;
+    /// Waits for checkpoint transfers and executable initialization.
+    fn synchronize(&self) -> Result<(), BackendFailure>;
+}
+
+/// Creates native resources without depending on the prepared program.
+pub trait DecisionBindingFactory {
+    /// Resources retained during construction.
+    type Binding: DecisionBinding;
+
+    /// Realizes the selected native device and weight access.
+    fn decision_binding(&self, device: &DevicePlan) -> Result<Self::Binding, BackendFailure>;
+}
+
 /// An ordered single-choice question about the input state.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ChoiceQuestion {

@@ -4,10 +4,13 @@
 //! portable publication boundary across model/cache state, delayed-frame
 //! scheduling, sequential sampler state, and backend randomness.
 
+use eredu_core::SubmissionBackend;
+
 use crate::{
-    Sampler, SamplingBackend, SequentialDecisionDriver, SequentialDecisionError,
-    SequentialDecisionPlan, SequentialDecisionPlanError, SubmissionBackend,
+    Sampler, SequentialDecisionDriver, SequentialDecisionError, SequentialDecisionPlan,
+    SequentialDecisionPlanError,
 };
+use eredu_core::sampling::SamplingBackend;
 use eredu_core::BackendFailure;
 use eredu_core::{
     scheduler::SemanticStateTransaction, Completion, RealtimeFrameScheduleState,
@@ -556,7 +559,7 @@ impl<MB, Q: RealtimeScheduleState, P, S, R, C> RealtimeGenerationBranch<MB, Q, P
         context: &B::Context,
     ) -> Result<B::Logits, crate::DenseSamplingError<B::Error>>
     where
-        B: crate::DenseSamplingBackend<RandomState = R>,
+        B: eredu_core::sampling::DenseSamplingBackend<RandomState = R>,
         R: Clone,
     {
         crate::dense_sampling::draw_uniform::<B>(&mut self.random_state, shape, context)
@@ -570,7 +573,7 @@ impl<MB, Q: RealtimeScheduleState, P, S, R, C> RealtimeGenerationBranch<MB, Q, P
         context: &B::Context,
     ) -> Result<B::Logits, crate::DenseSamplingError<B::Error>>
     where
-        B: crate::DenseSamplingBackend<RandomState = R>,
+        B: eredu_core::sampling::DenseSamplingBackend<RandomState = R>,
         R: Clone,
     {
         crate::dense_sampling::draw_standard_normal::<B>(&mut self.random_state, shape, context)
@@ -775,7 +778,8 @@ fn validate_sampler_cardinality(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{PenaltyConfig, PredictionDirective};
+    use crate::PredictionDirective;
+    use eredu_core::sampling::PenaltyConfig;
     use eredu_core::{
         scheduler::SemanticStateTransaction, RealtimeFrameConvention, RealtimeFrameForcing,
         RealtimeInputFrame, RealtimeSampling, TokenFilter,
@@ -875,7 +879,7 @@ mod tests {
 
         fn validate_token(
             token: &Self::Token,
-            domain: crate::TokenDomain,
+            domain: eredu_core::sampling::TokenDomain,
             _: &Self::Context,
         ) -> Result<Self::Token, Self::Error> {
             usize::try_from(*token)
@@ -981,7 +985,7 @@ mod tests {
 
     // Draws return their mock stream position, so lifecycle assertions observe
     // exact consumption without asserting any real distribution's numerics.
-    impl crate::DenseSamplingBackend for Backend {
+    impl eredu_core::sampling::DenseSamplingBackend for Backend {
         fn uniform_f32(shape: &[i32], random: &mut i32, _: &()) -> Result<i32, String> {
             *random += shape.iter().product::<i32>();
             Ok(*random)
@@ -999,7 +1003,7 @@ mod tests {
         fn gumbel_max(
             _: &i32,
             _: &i32,
-            _: crate::GumbelTruncation,
+            _: eredu_core::sampling::GumbelTruncation,
             _: f32,
             _: &(),
         ) -> Result<i32, String> {
@@ -1092,13 +1096,13 @@ mod tests {
             .unwrap();
         assert_eq!(
             driver
-                .resolve(0, &10, crate::TokenDomain::new(100), &())
+                .resolve(0, &10, eredu_core::sampling::TokenDomain::new(100), &())
                 .unwrap(),
             11
         );
         assert_eq!(
             driver
-                .resolve(1, &20, crate::TokenDomain::new(100), &())
+                .resolve(1, &20, eredu_core::sampling::TokenDomain::new(100), &())
                 .unwrap(),
             26
         );
@@ -1440,7 +1444,7 @@ mod tests {
             .decision_driver::<Backend>(plan, vec![1.0, 1.0])
             .unwrap();
         driver
-            .resolve(0, &10, crate::TokenDomain::new(100), &())
+            .resolve(0, &10, eredu_core::sampling::TokenDomain::new(100), &())
             .unwrap();
         assert!(matches!(
             branch.adopt_decision_driver(driver),
@@ -1470,7 +1474,7 @@ mod tests {
             .decision_driver::<Backend>(plan, vec![1.0, 1.0])
             .unwrap();
         assert!(matches!(
-            driver.resolve(0, &100, crate::TokenDomain::new(100), &()),
+            driver.resolve(0, &100, eredu_core::sampling::TokenDomain::new(100), &()),
             Err(SequentialDecisionError::Backend(_))
         ));
         assert!(driver.decisions().is_empty());
@@ -1502,7 +1506,7 @@ mod tests {
             .decision_driver::<Backend>(plan, vec![1.0, 1.0])
             .unwrap();
         assert!(matches!(
-            driver.forced_tail_tokens(0, 2, [crate::TokenDomain::new(100); 2], &()),
+            driver.forced_tail_tokens(0, 2, [eredu_core::sampling::TokenDomain::new(100); 2], &()),
             Err(SequentialDecisionError::Backend(_))
         ));
         drop(driver);
@@ -1701,7 +1705,7 @@ mod tests {
                 SequentialDecisionPlan::new([PredictionDirective::Sample], false, false).unwrap();
             let mut driver = branch.decision_driver::<Backend>(plan, vec![1.0]).unwrap();
             let token = driver
-                .resolve(0, &logits, crate::TokenDomain::new(100), &())
+                .resolve(0, &logits, eredu_core::sampling::TokenDomain::new(100), &())
                 .unwrap();
             branch.adopt_decision_driver(driver).unwrap();
             branch.model_state_mut().value = token;

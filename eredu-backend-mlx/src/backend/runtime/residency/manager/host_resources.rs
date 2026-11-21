@@ -16,7 +16,8 @@ pub(super) fn identity(scope: &str) -> ResourceIdentity {
 
 /// One owned native allocation. Sharing this object preserves its identity;
 /// rematerializing the same checkpoint selection creates a different allocation.
-pub(super) struct ResidentHostAllocation {
+#[doc(hidden)]
+pub struct ResidentHostAllocation {
     pub(super) buffer: ImmutableHostTransferBuffer,
     identity: ResourceIdentity,
     extent: ResourceExtent,
@@ -45,30 +46,6 @@ impl ResidentHostAllocation {
             extent,
             identity: identity("mlx.resident_host_allocation"),
         })
-    }
-}
-
-impl ResidencyManager {
-    /// Bounded snapshot of this calling thread's detached submissions, across
-    /// managers. This does not reap, poll, acquire native locks or advance work.
-    pub fn detached_storage_resources(
-        limits: eredu_runtime::detached_resources::DetachedResourceLimits,
-    ) -> Result<eredu_runtime::detached_resources::DetachedResourceInventory, ResidencyError> {
-        Ok(crate::backend::submission_recovery::describe_resources(
-            limits,
-        )?)
-    }
-
-    /// Observes currently cached host allocations under one storage lock. No
-    /// payload reads, evaluation, completion polling or native allocation occur.
-    /// Eviction removes cache ownership, not independently retained transfers.
-    pub fn host_storage_resources(&self) -> Result<ResourceDescription, ResidencyError> {
-        let state = self.observation_lock()?;
-        describe(
-            self.inner.resource_identity.clone(),
-            state.storage.values().filter_map(|s| s.host.as_deref()),
-            None,
-        )
     }
 }
 

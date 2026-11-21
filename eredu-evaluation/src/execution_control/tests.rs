@@ -71,9 +71,6 @@ impl Completion for Done {
     }
 }
 impl BackendProvider for Host {
-    type ModelConfig = ();
-    type Model = ();
-    type Session = Session;
     type Error = io::Error;
     fn descriptor(&self) -> BackendDescriptor {
         BackendDescriptor::new("host-continuation", "1")
@@ -81,16 +78,20 @@ impl BackendProvider for Host {
     fn devices(&self) -> io::Result<Vec<(DeviceDescriptor, DeviceCapabilities)>> {
         Ok(vec![])
     }
-    fn prepare_model(&self, _: ()) -> io::Result<PreparedModel<()>> {
-        Ok(PreparedModel::new((), SessionCapabilities::default()))
-    }
-    fn create_session(&self, _: PreparedModel<()>) -> io::Result<Session> {
+}
+
+impl eredu_core::backend::ModelSessionInstaller<Host> for Session {
+    type Model = ();
+    type Session = Self;
+
+    fn install_session(_: &Host, _: PreparedModel<()>) -> Result<Self, io::Error> {
         Ok(Session {
             identity: Arc::new(()),
             native: NativeState::default(),
         })
     }
 }
+
 impl BackendSession<Host> for Session {
     type PrefillInput = Vec<u32>;
     type DecodeInput = Token;
@@ -184,23 +185,31 @@ fn sample(
         completion: Done,
     })
 }
-impl TextGenerationBackend for Host {
-    fn reset_session(_: &Self, session: &mut Self::Session) -> Result<(), BackendFailure> {
-        session.native = NativeState::default();
+impl eredu_core::TextSessionLifecycle<Host> for Session {
+    fn reset_session(&mut self, _: &Host) -> Result<(), BackendFailure> {
+        self.native = NativeState::default();
         Ok(())
     }
-    fn synchronize_session(_: &Self, _: &Self::Session) -> Result<(), BackendFailure> {
+    fn synchronize_session(&self, _: &Host) -> Result<(), BackendFailure> {
         Ok(())
+    }
+}
+
+impl eredu_core::backend::CausalTextSession<Host, Vec<u32>, Token, Generation> for Session {}
+
+impl eredu_core::backend::TextOperationDriver<Host> for Session {
+    type Prompt = Vec<u32>;
+    fn prepare_text_prompt(_: &Host, ids: Vec<u32>) -> io::Result<Vec<u32>> {
+        Ok(ids)
     }
 
-    fn text_sampling_control_support(_: &ModelRuntime<Self>) -> ControlSupport {
-        ControlSupport::Supported
-    }
-    type Prompt = Vec<u32>;
-    type Token = Token;
     type TextGenerationState = Generation;
-    type TextCompletion = Done;
-    fn start_text_generation(_: &Self, config: TextGenerationConfig) -> io::Result<Generation> {
+
+    fn start_text_generation(
+        &self,
+        _: &Host,
+        config: TextGenerationConfig,
+    ) -> io::Result<Generation> {
         Ok(Generation {
             sampling: Sampling {
                 temperature: 0.8,
@@ -213,21 +222,72 @@ impl TextGenerationBackend for Host {
             capture: None,
         })
     }
-    fn prepare_text_prompt(_: &Self, ids: Vec<u32>) -> io::Result<Vec<u32>> {
-        Ok(ids)
+
+    fn text_sampling_control_support(&self, _: &Host) -> ControlSupport {
+        ControlSupport::Supported
     }
-    fn submit_text_operation(
-        runtime: &mut ModelRuntime<Self>,
-        input: eredu_core::PendingTextInput<Self::Prompt, Self::Token>,
+
+    #[cfg(feature = "tensor-capture")]
+    fn capture_declarations(
+        &self,
+    ) -> Result<eredu_core::capture::CaptureDeclarations, CaptureError> {
+        Ok(discovery().declarations())
+    }
+    #[cfg(feature = "tensor-capture")]
+    fn capture_discovery(&self) -> Result<CaptureDiscovery, CaptureError> {
+        Ok(discovery())
+    }
+    #[cfg(feature = "tensor-capture")]
+    fn intervention_discovery(&self) -> Result<InterventionDiscovery, CaptureError> {
+        Ok(interventions())
+    }
+    #[cfg(feature = "tensor-capture")]
+    fn configure_text_interventions(
+        &self,
+        state: &mut Generation,
+        capture: AdmittedCapturePlan,
+        intervention: AdmittedInterventionPlan,
+    ) -> Result<(), CaptureError> {
+        eredu_runtime::capture::validate_session(
+            &capture,
+            &self.capture_declarations()?,
+            estimate,
+        )?;
+        eredu_runtime::intervention::validate_session(
+            &capture,
+            &intervention,
+            &self.intervention_discovery()?,
+            &Records,
+        )?;
+        eredu_runtime::intervention::install_session(
+            &mut state.capture,
+            capture,
+            Some((intervention, Arc::new(Records))),
+        )
+    }
+    #[cfg(feature = "tensor-capture")]
+    fn take_text_capture(state: &mut Generation) -> Option<CapturedStep> {
+        state.capture.as_mut().and_then(CaptureSession::take_step)
+    }
+
+    fn submit_specialized_text_operation(
+        runtime: &mut ModelRuntime<Host, Session>,
+        input: eredu_core::PendingTextInput<
+            <Session as eredu_core::backend::TextOperationDriver<Host>>::Prompt,
+            <Host as TextGenerationBackend>::Token,
+        >,
         decision: Option<&eredu_core::TokenSamplingDecision<'_>>,
-        state: &mut Self::TextGenerationState,
+        state: &mut <Self as eredu_core::backend::TextOperationDriver<Host>>::TextGenerationState,
         _remaining_tokens: Option<usize>,
     ) -> Result<
         Submission<
-            eredu_core::TextOperationOutput<Self::Prompt, Self::Token>,
-            Self::TextCompletion,
+            eredu_core::TextOperationOutput<
+                <Session as eredu_core::backend::TextOperationDriver<Host>>::Prompt,
+                <Host as TextGenerationBackend>::Token,
+            >,
+            <Host as TextGenerationBackend>::TextCompletion,
         >,
-        eredu_core::TextOperationError<Self::Error>,
+        eredu_core::TextOperationError<<Host as eredu_core::BackendProvider>::Error>,
     > {
         let decision = decision.ok_or(eredu_core::TextOperationPolicyError::MissingDecision)?;
         let filter = decision.filter();
@@ -235,7 +295,7 @@ impl TextGenerationBackend for Host {
             return Err(eredu_core::TextOperationPolicyError::UnsupportedContinuation.into());
         }
         let submission =
-            || -> Result<Submission<Self::Token, Self::TextCompletion>, Self::Error> {
+            || -> Result<Submission<<Host as TextGenerationBackend>::Token, <Host as TextGenerationBackend>::TextCompletion>, <Host as eredu_core::BackendProvider>::Error> {
                 match input {
                     eredu_core::PendingTextInput::Prefill(prompt) => {
                         let submitted = runtime.prefill(prompt)?;
@@ -256,63 +316,28 @@ impl TextGenerationBackend for Host {
             completion: submission.completion,
         })
     }
-
-    #[cfg(feature = "tensor-capture")]
-    fn capture_declarations(
-        _: &ModelRuntime<Self>,
-    ) -> Result<eredu_core::capture::CaptureDeclarations, CaptureError> {
-        Ok(discovery().declarations())
-    }
-    #[cfg(feature = "tensor-capture")]
-    fn capture_discovery(_: &ModelRuntime<Self>) -> Result<CaptureDiscovery, CaptureError> {
-        Ok(discovery())
-    }
-    #[cfg(feature = "tensor-capture")]
-    fn intervention_discovery(
-        _: &ModelRuntime<Self>,
-    ) -> Result<InterventionDiscovery, CaptureError> {
-        Ok(interventions())
-    }
-    #[cfg(feature = "tensor-capture")]
-    fn configure_text_interventions(
-        runtime: &ModelRuntime<Self>,
-        state: &mut Generation,
-        capture: AdmittedCapturePlan,
-        intervention: AdmittedInterventionPlan,
-    ) -> Result<(), CaptureError> {
-        eredu_runtime::capture::validate_session(
-            &capture,
-            &Self::capture_declarations(runtime)?,
-            estimate,
-        )?;
-        eredu_runtime::intervention::validate_session(
-            &capture,
-            &intervention,
-            &Self::intervention_discovery(runtime)?,
-            &Records,
-        )?;
-        eredu_runtime::intervention::install_session(
-            &mut state.capture,
-            #[cfg(feature = "tensor-capture")]
-            capture,
-            Some((intervention, Arc::new(Records))),
-        )
-    }
-    #[cfg(feature = "tensor-capture")]
-    fn take_text_capture(state: &mut Generation) -> Option<CapturedStep> {
-        state.capture.as_mut().and_then(CaptureSession::take_step)
-    }
 }
+
+impl eredu_core::AutomaticPromptCacheSession<Host> for Session {}
+
+impl TextGenerationBackend for Host {
+    type InputTensor = u32;
+
+    type Token = Token;
+
+    type TextCompletion = Done;
+}
+
 fn estimate_copy(bytes: u64) -> Option<SnapshotEstimate> {
     Some(SnapshotEstimate {
         retained_bytes: bytes,
         copy_bytes: bytes,
     })
 }
-impl NativeTextStateBackend for Host {
+impl NativeTextStateSession<Host> for Session {
     type NativeTextState = Saved;
     fn estimate_native_text_growth(
-        runtime: &ModelRuntime<Self>,
+        runtime: &ModelRuntime<Host, Session>,
         saved: &Saved,
         _: u64,
     ) -> io::Result<Option<u64>> {
@@ -323,11 +348,11 @@ impl NativeTextStateBackend for Host {
             Some(256)
         })
     }
-    fn native_text_state_support(_: &ModelRuntime<Self>) -> ControlSupport {
+    fn native_text_state_support(_: &ModelRuntime<Host, Session>) -> ControlSupport {
         ControlSupport::Supported
     }
     fn estimate_native_text_state(
-        runtime: &ModelRuntime<Self>,
+        runtime: &ModelRuntime<Host, Session>,
         _: Option<&Saved>,
     ) -> io::Result<Option<SnapshotEstimate>> {
         Ok(if runtime.backend().fault.get() == Some("estimate") {
@@ -336,7 +361,7 @@ impl NativeTextStateBackend for Host {
             estimate_copy(256)
         })
     }
-    fn capture_native_text_state(runtime: &mut ModelRuntime<Self>) -> io::Result<Saved> {
+    fn capture_native_text_state(runtime: &mut ModelRuntime<Host, Session>) -> io::Result<Saved> {
         runtime.backend().copying("native")?;
         Ok(Saved {
             identity: runtime.session().identity.clone(),
@@ -344,7 +369,7 @@ impl NativeTextStateBackend for Host {
         })
     }
     fn copy_native_text_state(
-        runtime: &mut ModelRuntime<Self>,
+        runtime: &mut ModelRuntime<Host, Session>,
         saved: &Saved,
     ) -> io::Result<Saved> {
         Self::validate_native_text_state(runtime, saved)?;
@@ -354,7 +379,10 @@ impl NativeTextStateBackend for Host {
             native: saved.native.clone(),
         })
     }
-    fn validate_native_text_state(runtime: &ModelRuntime<Self>, saved: &Saved) -> io::Result<()> {
+    fn validate_native_text_state(
+        runtime: &ModelRuntime<Host, Session>,
+        saved: &Saved,
+    ) -> io::Result<()> {
         if Arc::ptr_eq(&runtime.session().identity, &saved.identity) {
             Ok(())
         } else {
@@ -362,7 +390,7 @@ impl NativeTextStateBackend for Host {
         }
     }
     fn exchange_native_text_state(
-        runtime: &mut ModelRuntime<Self>,
+        runtime: &mut ModelRuntime<Host, Session>,
         slot: &mut Saved,
     ) -> io::Result<()> {
         Self::validate_native_text_state(runtime, slot)?;
@@ -373,10 +401,10 @@ impl NativeTextStateBackend for Host {
         Ok(())
     }
 }
-impl TextSnapshotBackend for Host {
+impl TextSnapshotBackend<Session> for Host {
     type SamplingState = Sampling;
     fn continuation_input_tokens(
-        _: &ModelRuntime<Self>,
+        _: &ModelRuntime<Self, Session>,
         _: &Self::SamplingState,
         input: Option<PendingTextInput<&Vec<u32>, &Token>>,
         predictions: u64,
@@ -391,7 +419,7 @@ impl TextSnapshotBackend for Host {
         }
     }
     fn estimate_sampling_growth(
-        _: &ModelRuntime<Self>,
+        _: &ModelRuntime<Self, Session>,
         _: &Sampling,
         predictions: u64,
     ) -> io::Result<Option<u64>> {
@@ -417,26 +445,26 @@ impl TextSnapshotBackend for Host {
         sampling.next
     }
     fn estimate_sampling_state(
-        _: &ModelRuntime<Self>,
+        _: &ModelRuntime<Self, Session>,
         state: &Sampling,
     ) -> io::Result<Option<SnapshotEstimate>> {
         Ok(estimate_copy(128 + 4 * state.history.len() as u64))
     }
     fn copy_sampling_state(
-        runtime: &mut ModelRuntime<Self>,
+        runtime: &mut ModelRuntime<Self, Session>,
         state: &Sampling,
     ) -> io::Result<Sampling> {
         runtime.backend().copying("sampling")?;
         Ok(state.clone())
     }
     fn estimate_pending_input(
-        _: &ModelRuntime<Self>,
+        _: &ModelRuntime<Self, Session>,
         _: Option<PendingTextInput<&Vec<u32>, &Token>>,
     ) -> io::Result<Option<SnapshotEstimate>> {
         Ok(estimate_copy(128))
     }
     fn copy_pending_input(
-        runtime: &mut ModelRuntime<Self>,
+        runtime: &mut ModelRuntime<Self, Session>,
         input: Option<PendingTextInput<&Vec<u32>, &Token>>,
     ) -> io::Result<Option<PendingTextInput<Vec<u32>, Token>>> {
         runtime.backend().copying("pending")?;
@@ -456,7 +484,7 @@ impl TextSnapshotBackend for Host {
     }
     #[cfg(feature = "tensor-capture")]
     fn estimate_child_capture(
-        _: &ModelRuntime<Self>,
+        _: &ModelRuntime<Self, Session>,
         shape: &[u64],
         selection: &CaptureSelection,
         slice: &ResolvedCaptureSlice,
@@ -465,7 +493,7 @@ impl TextSnapshotBackend for Host {
     }
     #[cfg(feature = "tensor-capture")]
     fn child_intervention_estimator(
-        _: &ModelRuntime<Self>,
+        _: &ModelRuntime<Self, Session>,
     ) -> Result<Arc<dyn InterventionEstimator>, CaptureError> {
         Ok(Arc::new(Records))
     }
@@ -502,7 +530,7 @@ impl TokenFilterController for Controller {
         Ok(false)
     }
 }
-impl TextSamplingControlBackend for Host {
+impl TextSamplingControlBackend<Session> for Host {
     fn sampling_control_facts(
         state: &Generation,
     ) -> eredu_runtime::execution_control::SamplingStateFacts {
@@ -513,7 +541,7 @@ impl TextSamplingControlBackend for Host {
         }
     }
     fn install_sampling_override(
-        runtime: &mut ModelRuntime<Self>,
+        runtime: &mut ModelRuntime<Self, Session>,
         state: &mut Generation,
         request: eredu_runtime::execution_control::ValidatedSamplingOverride,
     ) -> io::Result<()> {
@@ -526,16 +554,16 @@ impl TextSamplingControlBackend for Host {
     }
 }
 fn start(
-    driver: &mut TextGenerationDriver<'_, Host>,
+    driver: &mut TextGenerationDriver<'_, Host, Session>,
     mode: u8,
-) -> ManagedTextContinuation<Host, Controller> {
+) -> ManagedTextContinuation<Host, Controller, Session> {
     start_with_controller(driver, mode, Controller::default())
 }
 fn start_with_controller<C: TokenFilterController>(
-    driver: &mut TextGenerationDriver<'_, Host>,
+    driver: &mut TextGenerationDriver<'_, Host, Session>,
     mode: u8,
     controller: C,
-) -> ManagedTextContinuation<Host, C> {
+) -> ManagedTextContinuation<Host, C, Session> {
     let config = TextGenerationConfig::new(
         resolve_generation_config(
             None,
@@ -570,12 +598,19 @@ fn host_continuations_conform_for_all_record_modes() {
         1
     } {
         let host = Host::default();
-        let mut runtime = ModelRuntime::prepare(host.clone(), ()).unwrap();
+        let mut runtime = ModelRuntime::install::<Session>(
+            host.clone(),
+            PreparedModel::new((), SessionCapabilities::default()),
+        )
+        .unwrap();
         let mut driver = TextGenerationDriver::new(&mut runtime);
         let mut state = start_with_controller(
             &mut driver,
             mode,
-            TokenChoiceController::new(Controller::default(), eredu_runtime::TokenDomain::new(64)),
+            TokenChoiceController::new(
+                Controller::default(),
+                eredu_core::sampling::TokenDomain::new(64),
+            ),
         );
         forced_choice_conformance(
             &mut driver,
@@ -631,7 +666,11 @@ fn staged_failures_preserve_source_snapshot_and_monotone_copy_accounting() {
         1
     } {
         let host = Host::default();
-        let mut runtime = ModelRuntime::prepare(host.clone(), ()).unwrap();
+        let mut runtime = ModelRuntime::install::<Session>(
+            host.clone(),
+            PreparedModel::new((), SessionCapabilities::default()),
+        )
+        .unwrap();
         let mut driver = TextGenerationDriver::new(&mut runtime);
         let mut state = start(&mut driver, mode);
         let budget = SnapshotBudget::new(SnapshotLimits {

@@ -1,6 +1,7 @@
 //! Invocation-scoped declarations authored from the retained target/prediction specs.
 #[cfg(feature = "tensor-capture")]
 use super::SelectedTargetExecution;
+#[cfg(feature = "tensor-capture")]
 use super::UnitSpec;
 use crate::qwen4_exp::target::MixerSpec;
 #[cfg(feature = "tensor-capture")]
@@ -52,8 +53,8 @@ impl SelectedTargetExecution {
             .prediction_spec()
             .map_err(|e| CaptureError::Invalid(e.to_string()))?;
         if binding.session.is_empty()
-            || execution.depth != prediction.units.len()
-            || execution.strategy
+            || execution.depth() != prediction.units.len()
+            || execution.strategy()
                 != Some(eredu_runtime::SpeculativeStrategyClass::EmbeddedSequential)
         {
             return Err(CaptureError::Invalid(

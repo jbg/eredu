@@ -99,9 +99,10 @@ impl CaptureBackend for SourceBackend {
         value: &Value,
         selection: &CaptureSelection,
         slice: &ResolvedCaptureSlice,
+        score_row: Option<u64>,
     ) -> Result<CapturePayload, Self::Error> {
         self.exports.fetch_add(1, Ordering::SeqCst);
-        self.inner.transform(value, selection, slice)
+        self.inner.transform(value, selection, slice, score_row)
     }
 }
 
@@ -138,8 +139,13 @@ fn summed_observer_prices_raw_terms_and_publishes_only_after_shared_completion()
                         scope.spawn(move || {
                             let identity = crate::establish_communication_session(
                                 &Bootstrap(transport(setup, rank, Fault::None)),
-                                &crate::CommunicationManifest::new(4, rank, vec![], vec![])
-                                    .unwrap(),
+                                &eredu_core::communication::CommunicationManifest::new(
+                                    4,
+                                    rank,
+                                    vec![],
+                                    vec![],
+                                )
+                                .unwrap(),
                                 Some([rank as u8 + 1; 32]),
                             )
                             .unwrap()

@@ -1,63 +1,29 @@
 //! Residency transfer ownership, storage lifecycle, and acquisition.
 
 use super::*;
+use crate::backend::runtime::checkpoint::recipe::{prepare_ordinary_recipe, DirectRecipeRead};
 use crate::backend::{
     ordinary_retirement::OrdinaryRetirement,
     submission_recovery::{Recovery, Retention, Status},
 };
+use eredu_core::{
+    checkpoint_mechanisms::{ParameterReadInput, ParameterReadScope},
+    residency::{
+        RealizedResidencyCopy, ResidencyCopyRequest, ResidencyCopyScope, ResidencyTransferTicket,
+        ResidentBindingAlias,
+    },
+};
 use std::{
     cell::{Cell, OnceCell, RefCell},
     rc::Rc,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Weak,
-    },
 };
 
-/// Shared lease and transfer owner for a residency manager.
-pub struct ManagerInner {
-    pub(super) resource_identity: eredu_core::resources::ResourceIdentity,
-    pub(super) sources: ResidencySources,
-    pub(super) state: Mutex<ManagerState>,
-    pub(super) changed: Condvar,
-    pub(super) failed_transfer: Arc<AtomicBool>,
-}
-
-impl ResidencyLeaseOwner for ManagerInner {
-    fn release_residency_pin(&self, id: &OffloadUnitId, tier: MemoryTier) {
-        if let Ok(mut state) = self.state.lock() {
-            state.control.ledger_mut().unpin(id, tier);
-        }
-    }
-}
-
-impl ManagerInner {
-    fn resolve_transfer(
-        &self,
-        ids: &[OffloadUnitId],
-        tier: MemoryTier,
-        generation: u64,
-        succeeded: bool,
-    ) -> Result<(), ResidencyError> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| ResidencyError::StatePoisoned)?;
-        let removed = state
-            .control
-            .resolve_transfer(ids, tier, generation, succeeded)?;
-        release_backend_copies(&mut state, &removed)?;
-        self.changed.notify_all();
-        Ok(())
-    }
-}
-
-pub(super) struct ManagerState {
+/// Serialized native storage backing one residency plan.
+#[doc(hidden)]
+pub struct NativeResidencyStorage {
     pub(super) conversion_retention_registered: bool,
     pub(super) failed_transfer: Arc<AtomicBool>,
-    pub(super) control: ResidencyController,
     pub(super) storage: BTreeMap<OffloadUnitId, UnitStorage>,
-    pub(super) alias_owner_pins: BTreeSet<(OffloadUnitId, MemoryTier)>,
     pub(super) materialization: MlxParameterMaterializationContext,
     pub(super) source_stream: Stream,
     pub(super) device_stream: Stream,
@@ -77,25 +43,6 @@ impl UnitStorage {
             MemoryTier::Disk => false,
         }
     }
-}
-
-pub(super) fn release_backend_copies(
-    state: &mut ManagerState,
-    copies: &[EvictedResidencyCopy],
-) -> Result<(), ResidencyError> {
-    for copy in copies {
-        let removed = state
-            .storage
-            .get_mut(&copy.id)
-            .is_some_and(|unit| unit.remove_storage(copy.tier));
-        if !removed {
-            return Err(ResidencyError::StatePoisoned);
-        }
-        if state.control.retire_unit_if_unused(&copy.id)? {
-            state.storage.remove(&copy.id);
-        }
-    }
-    Ok(())
 }
 
 /// Named device arrays retained by one resident unit.
@@ -121,7 +68,9 @@ pub struct ResidentTransferResources {
     application: Rc<OrdinaryRetirement<TransferApplication>>,
 }
 
-pub(super) struct SubmittedResidentTransfer {
+/// Exact pending native transfer before caller-owned publication.
+#[doc(hidden)]
+pub struct SubmittedResidentTransfer {
     retained: Recovery<Rc<ResidentTransferResources>>,
 }
 
@@ -135,23 +84,17 @@ struct TransferStatus {
 struct TransferApplication {
     resource_identity: eredu_core::resources::ResourceIdentity,
     leases: OnceCell<Vec<ResidentUnitLease>>,
-    owner: RefCell<Weak<ManagerInner>>,
-    ids: Vec<OffloadUnitId>,
-    tier: MemoryTier,
-    generation: Cell<u64>,
+    settlement: RefCell<Option<Box<dyn ResidencyTransferTicket<Error = ResidencyError>>>>,
     status: TransferStatus,
     failed_transfer: Arc<AtomicBool>,
 }
 
 impl TransferApplication {
-    fn new(ids: Vec<OffloadUnitId>, tier: MemoryTier, failed_transfer: Arc<AtomicBool>) -> Self {
+    fn new(failed_transfer: Arc<AtomicBool>) -> Self {
         Self {
             resource_identity: host_resources::identity("mlx.residency_transfer"),
             leases: OnceCell::new(),
-            owner: RefCell::new(Weak::new()),
-            ids,
-            tier,
-            generation: Cell::new(0),
+            settlement: RefCell::new(None),
             status: TransferStatus::default(),
             failed_transfer,
         }
@@ -163,22 +106,15 @@ impl TransferApplication {
     }
 
     fn resolve(&self) -> Result<(), ResidencyError> {
-        let generation = self.generation.get();
-        if generation == 0 {
-            return Ok(());
+        let mut settlement = self.settlement.borrow_mut();
+        if let Some(ticket) = settlement.as_mut() {
+            ticket.settle(
+                self.status.settled.get()
+                    && !self.status.failed.get()
+                    && self.status.children.get() == 0,
+            )?;
+            *settlement = None;
         }
-        let Some(owner) = self.owner.borrow().upgrade() else {
-            return Ok(());
-        };
-        owner.resolve_transfer(
-            &self.ids,
-            self.tier,
-            generation,
-            self.status.settled.get()
-                && !self.status.failed.get()
-                && self.status.children.get() == 0,
-        )?;
-        self.generation.set(0);
         Ok(())
     }
 }
@@ -193,9 +129,8 @@ impl Drop for TransferApplication {
 impl ResidentTransferResources {
     fn source_host_storage_resources(
         &self,
-    ) -> Result<eredu_runtime::resource_lifetimes::ResourceLifetimeDescription, ResidencyError>
-    {
-        use eredu_runtime::resource_lifetimes::{ResourceLifetime, ResourceLifetimeDescription};
+    ) -> Result<eredu_core::resources::ResourceLifetimeDescription, ResidencyError> {
+        use eredu_core::resources::{ResourceLifetime, ResourceLifetimeDescription};
         let owner = &self.application.resource_identity;
         let resources = host_resources::describe(
             owner.clone(),
@@ -225,7 +160,7 @@ impl Retention for ResidentTransferResources {
         &self,
         maximum: usize,
     ) -> Result<
-        Option<eredu_runtime::resource_lifetimes::ResourceLifetimeDescription>,
+        Option<eredu_core::resources::ResourceLifetimeDescription>,
         eredu_core::resources::ResourceDescriptionError,
     > {
         // Check the retained compact bindings before constructing metadata. An
@@ -261,7 +196,7 @@ impl Retention for TransferObservation {
         &self,
         maximum: usize,
     ) -> Result<
-        Option<eredu_runtime::resource_lifetimes::ResourceLifetimeDescription>,
+        Option<eredu_core::resources::ResourceLifetimeDescription>,
         eredu_core::resources::ResourceDescriptionError,
     > {
         self.owner.describe_resources(maximum)
@@ -278,16 +213,6 @@ impl Drop for TransferObservation {
     fn drop(&mut self) {
         let children = &self.owner.application.status.children;
         children.set(children.get() - 1);
-    }
-}
-
-impl SubmittedResidentTransfer {
-    pub(super) fn attach_owner(&self, owner: Weak<ManagerInner>) {
-        *self.retained.retention().application.owner.borrow_mut() = owner;
-    }
-
-    pub(super) fn retain_partial_leases(&self, leases: Vec<ResidentUnitLease>) {
-        let _ = self.retained.retention().application.leases.set(leases);
     }
 }
 
@@ -318,23 +243,9 @@ fn transfer_error(operation: &'static str, source: safemlx::error::Exception) ->
 }
 
 impl ResidentTransfer {
-    #[cfg(test)]
-    pub(super) fn retained_resources_for_test(&self) -> Rc<ResidentTransferResources> {
-        Rc::clone(
-            self.retained
-                .as_ref()
-                .expect("submitted transfer")
-                .retention(),
-        )
-    }
-    #[cfg(test)]
-    pub(super) fn mark_failed_for_test(&self) {
-        self.application.mark_failed();
-    }
-
     /// Creates a transfer for copies already resident in the requested tier.
-    pub fn immediate(leases: Vec<ResidentUnitLease>, tier: MemoryTier) -> Self {
-        let app = TransferApplication::new(Vec::new(), tier, Arc::new(AtomicBool::new(false)));
+    pub fn immediate(leases: Vec<ResidentUnitLease>) -> Self {
+        let app = TransferApplication::new(Arc::new(AtomicBool::new(false)));
         let _ = app.leases.set(leases);
         app.status.settled.set(true);
         Self {
@@ -367,12 +278,11 @@ impl ResidentTransfer {
     /// Destination leases and cache ownership are separate retention references.
     pub fn source_host_storage_resources(
         &self,
-    ) -> Result<eredu_runtime::resource_lifetimes::ResourceLifetimeDescription, ResidencyError>
-    {
+    ) -> Result<eredu_core::resources::ResourceLifetimeDescription, ResidencyError> {
         if let Some(retained) = &self.retained {
             return retained.retention().source_host_storage_resources();
         }
-        use eredu_runtime::resource_lifetimes::ResourceLifetimeDescription;
+        use eredu_core::resources::ResourceLifetimeDescription;
         let owner = &self.application.resource_identity;
         Ok(ResourceLifetimeDescription {
             resources: host_resources::describe(owner.clone(), std::iter::empty(), Some(owner))?,
@@ -405,48 +315,6 @@ impl ResidentTransfer {
         } else {
             Ok(status.settled.get() && status.children.get() == 0)
         }
-    }
-
-    /// Orders an independently retained consumer-stream dependency.
-    pub fn order_after(&self, stream: &Stream) -> Result<(), ResidencyError> {
-        self.check_native_status()?;
-        let Some(retained) = &self.retained else {
-            return Ok(());
-        };
-        let owner = retained.retention();
-        let _unwind = TransferUnwind(&owner.application);
-        let count = &owner.application.status.children;
-        let next = count.get().checked_add(1).ok_or_else(|| {
-            transfer_error(
-                "prepare transfer consumer",
-                safemlx::error::Exception::custom("transfer observation count exhausted"),
-            )
-        })?;
-        count.set(next);
-        let mut observation = Recovery::begin(TransferObservation {
-            owner: Rc::clone(owner),
-            _stream: stream.clone(),
-        })
-        .map_err(|error| transfer_error("prepare transfer consumer", error))?;
-        let result = owner
-            .event
-            .as_ref()
-            .expect("submitted transfer")
-            .wait_on(stream);
-        if result.is_err() {
-            self.application.mark_failed();
-        }
-        observation.seal();
-        let status = observation.progress();
-        if status.failed || status.blocked {
-            return Err(transfer_error(
-                "transfer consumer",
-                safemlx::error::Exception::custom(
-                    "native transfer consumer failed; unresolved resources remain retained",
-                ),
-            ));
-        }
-        result.map_err(|error| transfer_error("resident transfer stream wait", error))
     }
 
     /// Nonblocking exact completion query; runtime contention returns pending.
@@ -496,14 +364,48 @@ impl ResidentTransfer {
     }
 }
 
-pub(super) fn validate_target(
-    tier: MemoryTier,
-    operation: &'static str,
-) -> Result<(), ResidencyError> {
-    if tier == MemoryTier::Disk {
-        Err(ResidencyLedgerError::InvalidTargetTier { operation }.into())
-    } else {
-        Ok(())
+impl eredu_core::residency::ResidencyTransferOrdering<Stream> for ResidentTransfer {
+    type Error = ResidencyError;
+
+    fn order_after(&self, stream: &Stream) -> Result<(), ResidencyError> {
+        self.check_native_status()?;
+        let Some(retained) = &self.retained else {
+            return Ok(());
+        };
+        let owner = retained.retention();
+        let _unwind = TransferUnwind(&owner.application);
+        let count = &owner.application.status.children;
+        let next = count.get().checked_add(1).ok_or_else(|| {
+            transfer_error(
+                "prepare transfer consumer",
+                safemlx::error::Exception::custom("transfer observation count exhausted"),
+            )
+        })?;
+        count.set(next);
+        let mut observation = Recovery::begin(TransferObservation {
+            owner: Rc::clone(owner),
+            _stream: stream.clone(),
+        })
+        .map_err(|error| transfer_error("prepare transfer consumer", error))?;
+        let result = owner
+            .event
+            .as_ref()
+            .expect("submitted transfer")
+            .wait_on(stream);
+        if result.is_err() {
+            self.application.mark_failed();
+        }
+        observation.seal();
+        let status = observation.progress();
+        if status.failed || status.blocked {
+            return Err(transfer_error(
+                "transfer consumer",
+                safemlx::error::Exception::custom(
+                    "native transfer consumer failed; unresolved resources remain retained",
+                ),
+            ));
+        }
+        result.map_err(|error| transfer_error("resident transfer stream wait", error))
     }
 }
 
@@ -511,219 +413,70 @@ pub(super) fn internal_id() -> OffloadUnitId {
     OffloadUnitId::new("residency-manager").expect("static identifier is valid")
 }
 
-pub(super) fn prefetch_locked(
-    state: &mut ManagerState,
-    sources: &ResidencySources,
-    id: &OffloadUnitId,
-    tier: MemoryTier,
-) -> Result<PrefetchOutcome, ResidencyError> {
-    let outcome = state.control.begin_prefetch(id, tier)?;
-    ensure_resident(state, sources, id, tier, false)?;
-    Ok(outcome)
-}
+impl eredu_core::residency::ResidencyStorage for NativeResidencyStorage {
+    type Backend = MlxNeuralBackend;
+    type Copy = ResidentLeaseStorage;
+    type Transfer = SubmittedResidentTransfer;
+    type Error = ResidencyError;
 
-pub(super) fn ensure_resident(
-    state: &mut ManagerState,
-    sources: &ResidencySources,
-    id: &OffloadUnitId,
-    tier: MemoryTier,
-    initializing: bool,
-) -> Result<bool, ResidencyError> {
-    ensure_many_resident(
-        state,
-        sources,
-        std::slice::from_ref(id),
-        tier,
-        false,
-        initializing,
-    )
-    .map(|(created, _)| created[0])
-}
-
-pub(super) fn ensure_many_resident(
-    state: &mut ManagerState,
-    sources: &ResidencySources,
-    ids: &[OffloadUnitId],
-    tier: MemoryTier,
-    return_transfer: bool,
-    initializing: bool,
-) -> Result<(Vec<bool>, Option<SubmittedResidentTransfer>), ResidencyError> {
-    state.control.ledger().validate_batch(ids, tier)?;
-    if !initializing {
-        state.control.ledger().require_initialized()?;
-    }
-    let new = ids
-        .iter()
-        .filter(|id| state.control.unit(id).is_none())
-        .cloned()
-        .collect::<Vec<_>>();
-    state.control.prepare_units(ids)?;
-    let result = (|| {
-        for id in &new {
-            let unit = state
-                .control
-                .unit(id)
-                .ok_or(ResidencyError::StatePoisoned)?;
-            eredu_runtime::preflight_bindings::<MlxNeuralBackend>(
-                sources.source(id),
-                unit.bindings(),
-            )
-            .map_err(|error| ResidencyError::BindingPreflight(error.to_string()))?;
-            state.storage.entry(id.clone()).or_default();
-        }
-        ensure_many_prepared(state, sources, ids, tier, return_transfer, initializing)
-    })();
-    // Failed demand must not leave an ever-growing catalog of uncached rows.
-    // Reservations and unresolved native transfers remain charged and retained.
-    for id in ids {
-        if state.control.retire_unit_if_unused(id)? {
-            state.storage.remove(id);
-        }
-    }
-    result
-}
-
-fn ensure_many_prepared(
-    state: &mut ManagerState,
-    sources: &ResidencySources,
-    ids: &[OffloadUnitId],
-    tier: MemoryTier,
-    return_transfer: bool,
-    initializing: bool,
-) -> Result<(Vec<bool>, Option<SubmittedResidentTransfer>), ResidencyError> {
-    validate_target(tier, "residency transition")?;
-    if ids.is_empty() {
-        return Ok((Vec::new(), None));
-    }
-    let mut owner_ids = BTreeSet::new();
-    for id in ids {
-        let unit = state
-            .control
-            .unit(id)
-            .ok_or(ResidencyError::StatePoisoned)?;
-        for binding in unit.bindings() {
-            if let Some((owner, _)) = state.control.binding_owner(id, binding) {
-                // Materialize cross-unit owners before preparing the requested
-                // batch, even when that owner also appears later in `ids`.
-                // Batch preparation is atomic, so it cannot consume an owner
-                // that has only been prepared (rather than published) by the
-                // same batch.
-                if owner != id {
-                    owner_ids.insert(owner.clone());
-                }
-            }
-        }
-    }
-    for owner in owner_ids {
-        let owner_tier = tier;
-        ensure_resident(state, sources, &owner, owner_tier, initializing)?;
-        if state.alias_owner_pins.insert((owner.clone(), owner_tier)) {
-            state.control.ledger_mut().pin(&owner, owner_tier, 1)?;
-        }
-    }
-    let acquisition = if initializing {
-        state.control.plan_initialization_acquisition(ids, tier)?
-    } else {
-        state.control.plan_acquisition(ids, tier)?
-    };
-    let created = acquisition.missing().to_vec();
-    if acquisition.is_hit() {
-        state.control.touch_acquisition_hits(&acquisition, tier)?;
-        return Ok((created, None));
+    fn prepare_storage(&mut self, id: &OffloadUnitId) {
+        self.storage.entry(id.clone()).or_default();
     }
 
-    let started = Instant::now();
-    let result = (|| {
-        let mut reservations = Vec::new();
-        for (id, is_missing) in ids.iter().zip(&created) {
-            if !is_missing {
-                continue;
-            }
-            let planned = state.control.ledger().spec(id)?.bytes();
-            let bindings = state
-                .control
-                .unit(id)
-                .ok_or(ResidencyError::StatePoisoned)?
-                .bindings();
-            let required = resident_capacity_requirement(bindings, planned, tier)?;
-            reservations.push((id.clone(), required));
-        }
-        let evicted = state
-            .control
-            .reserve_acquisition(&acquisition, &reservations, tier)?;
-        release_backend_copies(state, &evicted)?;
+    fn retire_storage(&mut self, id: &OffloadUnitId) {
+        self.storage.remove(id);
+    }
 
+    fn capacity(
+        &self,
+        bindings: &[WeightBinding],
+        logical_bytes: u64,
+        tier: MemoryTier,
+    ) -> Result<u64, ResidencyError> {
+        resident_capacity_requirement(bindings, logical_bytes, tier)
+    }
+
+    fn resident_storage(
+        &self,
+        id: &OffloadUnitId,
+        tier: MemoryTier,
+    ) -> Result<ResidentLeaseStorage, ResidencyError> {
+        let unit = self.storage.get(id).ok_or(ResidencyError::StatePoisoned)?;
+        let storage = match tier {
+            MemoryTier::Host => unit
+                .host
+                .as_ref()
+                .map(|host| ResidentLeaseStorage::Host(Arc::clone(host))),
+            MemoryTier::Device => unit
+                .device
+                .as_ref()
+                .map(|device| ResidentLeaseStorage::Device(Arc::clone(device))),
+            MemoryTier::Disk => None,
+        };
+        storage.ok_or(ResidencyError::StatePoisoned)
+    }
+
+    fn release_copy(&mut self, id: &OffloadUnitId, tier: MemoryTier) -> Result<(), ResidencyError> {
+        let removed = self
+            .storage
+            .get_mut(id)
+            .is_some_and(|unit| unit.remove_storage(tier));
+        removed.then_some(()).ok_or(ResidencyError::StatePoisoned)
+    }
+
+    type Realization<'a> = NativeResidencyReadScope<'a>;
+
+    fn begin_realization(&self, tier: MemoryTier) -> Result<Self::Realization<'_>, ResidencyError> {
         if tier == MemoryTier::Host {
-            let mut prepared = Vec::new();
-            for (id, is_missing) in ids.iter().zip(&created) {
-                if !is_missing {
-                    continue;
-                }
-                let bindings = state
-                    .control
-                    .unit(id)
-                    .ok_or(ResidencyError::StatePoisoned)?
-                    .bindings()
-                    .to_vec();
-                let shared = shared_host_buffers_for_unit(state, id)?;
-                let buffers = materialize_host_buffers(
-                    id,
-                    sources.source(id),
-                    &bindings,
-                    &state.source_stream,
-                    &state.materialization,
-                    &shared,
-                )?;
-                let logical = host_buffers_nbytes(&buffers, &bindings)?;
-                let planned = state.control.ledger_mut().spec(id)?.bytes();
-                if logical != planned {
-                    return Err(ResidencyError::UnitByteMismatch {
-                        id: id.clone(),
-                        planned_bytes: planned,
-                        actual_bytes: logical,
-                    });
-                }
-                let capacity = host_buffers_capacity(&buffers, &bindings)?;
-                let reserved_capacity = resident_capacity_requirement(&bindings, planned, tier)?;
-                if capacity > reserved_capacity {
-                    return Err(ResidencyError::HostCapacityBoundExceeded {
-                        id: id.clone(),
-                        reserved_bytes: reserved_capacity,
-                        actual_bytes: capacity,
-                    });
-                }
-                prepared.push((id.clone(), buffers, logical, capacity, reserved_capacity));
-            }
-            for (id, buffers, logical, capacity, _) in prepared {
-                state.control.publish_acquisition_copy(
-                    &id,
-                    tier,
-                    capacity,
-                    logical,
-                    None,
-                    TransferDirection::DiskToHost,
-                    started.elapsed(),
-                )?;
-                state
-                    .storage
-                    .get_mut(&id)
-                    .ok_or(ResidencyError::StatePoisoned)?
-                    .host = Some(Arc::new(buffers));
-            }
-            state.control.touch_acquisition_hits(&acquisition, tier)?;
-            return Ok((created.clone(), None));
+            return Ok(NativeResidencyReadScope {
+                storage: self,
+                transfer: None,
+            });
         }
-
         let application = Rc::new(OrdinaryRetirement::new(TransferApplication::new(
-            ids.iter()
-                .zip(&created)
-                .filter(|(_, missing)| **missing)
-                .map(|(id, _)| id.clone())
-                .collect(),
-            tier,
-            Arc::clone(&state.failed_transfer),
+            Arc::clone(&self.failed_transfer),
         )));
-        let mut retained = Recovery::begin(Rc::new(ResidentTransferResources {
+        let retained = Recovery::begin(Rc::new(ResidentTransferResources {
             sources: Vec::new(),
             retained_arrays: Vec::new(),
             retained_host: Vec::new(),
@@ -732,102 +485,323 @@ fn ensure_many_prepared(
             application,
         }))
         .map_err(|error| transfer_error("prepare resident transfer recovery", error))?;
-        let mut direct = super::materialization::prepare_direct_units(
-            state,
-            sources,
-            ids,
-            &created,
-            Rc::get_mut(retained.retention_mut()).expect("unpublished transfer"),
+        Ok(NativeResidencyReadScope {
+            storage: self,
+            transfer: Some(retained),
+        })
+    }
+
+    fn retain_settlement(
+        transfer: &SubmittedResidentTransfer,
+        settlement: Box<dyn ResidencyTransferTicket<Error = ResidencyError>>,
+    ) {
+        let mut selected = transfer
+            .retained
+            .retention()
+            .application
+            .settlement
+            .borrow_mut();
+        assert!(selected.is_none(), "one settlement per native transfer");
+        *selected = Some(settlement);
+    }
+
+    fn install_copy(&mut self, id: OffloadUnitId, storage: ResidentLeaseStorage) {
+        let unit = self
+            .storage
+            .get_mut(&id)
+            .expect("prepared native storage slot");
+        match storage {
+            ResidentLeaseStorage::Host(host) => unit.host = Some(host),
+            ResidentLeaseStorage::Device(device) => unit.device = Some(device),
+        }
+    }
+}
+
+/// Native read and retirement resources for an admitted residency batch.
+#[doc(hidden)]
+pub struct NativeResidencyReadScope<'a> {
+    storage: &'a NativeResidencyStorage,
+    transfer: Option<Recovery<Rc<ResidentTransferResources>>>,
+}
+
+impl NativeResidencyReadScope<'_> {
+    fn transfer_resources(&mut self) -> &mut ResidentTransferResources {
+        Rc::get_mut(
+            self.transfer
+                .as_mut()
+                .expect("device read scope")
+                .retention_mut(),
+        )
+        .expect("unpublished transfer")
+    }
+}
+
+impl ParameterReadScope for NativeResidencyReadScope<'_> {
+    type DirectRead = DirectRecipeRead;
+    type Value = Array;
+    type Pending = Vec<Array>;
+    type Error = ResidencyError;
+
+    fn slots(&self) -> std::num::NonZeroUsize {
+        // The aggregate scope retains roots and source leases until publication.
+        std::num::NonZeroUsize::MIN
+    }
+
+    fn direct_read(
+        &self,
+        source: &dyn eredu_checkpoint::store::CheckpointSource,
+        binding: &WeightBinding,
+    ) -> Result<Option<DirectRecipeRead>, ResidencyError> {
+        DirectRecipeRead::for_binding(source, binding).map_err(|source| ResidencyError::Recipe {
+            binding: binding.name().into(),
+            source,
+        })
+    }
+
+    fn submit_direct(
+        &mut self,
+        reads: Vec<(DirectRecipeRead, eredu_nn::ParameterStorageLayout)>,
+    ) -> Result<Vec<Array>, ResidencyError> {
+        let (reads, layouts): (Vec<_>, Vec<_>) = reads.into_iter().unzip();
+        let storage = self.storage;
+        let resources = self.transfer_resources();
+        let inputs = DirectRecipeRead::materialize_many(reads, &storage.source_stream).map_err(
+            |source| ResidencyError::Recipe {
+                binding: "<parameter batch>".into(),
+                source,
+            },
         )?;
-        let mut prepared = Vec::new();
-        for (id, is_missing) in ids.iter().zip(&created) {
-            if !is_missing {
-                continue;
-            }
-            if let Some(item) = direct.remove(id) {
-                prepared.push((id.clone(), item));
-                continue;
-            }
-            let bindings = state
-                .control
-                .unit(id)
-                .ok_or(ResidencyError::StatePoisoned)?
-                .bindings()
-                .to_vec();
-            let store = sources.source(id);
-            let shared = shared_arrays_for_unit(state, store, id)?;
-            let item = loop {
-                let item = match tier {
-                    MemoryTier::Device => {
-                        if let Some(host) = state.storage[id].host.as_ref().map(Arc::clone) {
-                            prepare_copy_to_device(
-                                id,
-                                host,
-                                &state.device_stream,
-                                Rc::get_mut(retained.retention_mut())
-                                    .expect("unpublished transfer"),
-                            )
-                        } else {
-                            prepare_from_disk(
-                                store,
-                                &bindings,
-                                &state.source_stream,
-                                &state.device_stream,
-                                &state.materialization,
-                                TransferDirection::DiskToDevice,
-                                &shared,
-                                Rc::get_mut(retained.retention_mut())
-                                    .expect("unpublished transfer"),
-                            )
-                        }
-                    }
-                    MemoryTier::Host | MemoryTier::Disk => unreachable!("validated above"),
+        resources.retained_arrays.extend(inputs.iter().cloned());
+        inputs
+            .into_iter()
+            .zip(layouts)
+            .map(|(input, layout)| {
+                let output = if storage.source_stream == storage.device_stream {
+                    input
+                } else {
+                    crate::backend::runtime::checkpoint::recipe::copy_parameter_storage(
+                        &input,
+                        layout,
+                        &storage.device_stream,
+                    )
+                    .map_err(|source| ResidencyError::Recipe {
+                        binding: "<parameter batch>".into(),
+                        source: WeightRecipeError::Mlx(source),
+                    })?
                 };
-                match item {
-                    Ok(item) => break item,
-                    Err(error)
-                        if is_shard_cache_capacity_error(&error)
-                            && !retained.retention().sources.is_empty() =>
-                    {
-                        // Earlier units in this batch can pin the only cached
-                        // shard while a later cross-shard entry is prepared.
-                        // Their output arrays are complete evaluation roots, so
-                        // detach those leases and retry the current unit.
-                        let resources =
-                            Rc::get_mut(retained.retention_mut()).expect("unpublished transfer");
-                        let prior = WeightMaterialization::prepare_retained(
-                            Vec::new(),
-                            std::mem::take(&mut resources.sources),
-                        )?
-                        .submit_outputs(resources.retained_arrays.clone())?;
-                        prior.wait()?;
-                        prior.finish()?;
-                    }
-                    Err(error) => return Err(error),
+                resources.retained_arrays.push(output.clone());
+                Ok(output)
+            })
+            .collect()
+    }
+
+    fn submit_ordinary(
+        &mut self,
+        name: &str,
+        input: ParameterReadInput<'_>,
+    ) -> Result<Vec<Array>, ResidencyError> {
+        let storage = self.storage;
+        let resources = self.transfer_resources();
+        let output = match input {
+            ParameterReadInput::Recipe(recipe, source) => {
+                let (host, sources) =
+                    prepare_ordinary_recipe(recipe, source, &storage.materialization, false)
+                        .map_err(|source| ResidencyError::Recipe {
+                            binding: name.into(),
+                            source,
+                        })?
+                        .into_parts();
+                resources.sources.extend(sources);
+                resources.retained_arrays.push(host.clone());
+                if storage.source_stream == storage.device_stream {
+                    host
+                } else {
+                    host.ensure_device_storage(&storage.device_stream)
+                        .map_err(|source| ResidencyError::Recipe {
+                            binding: name.into(),
+                            source: WeightRecipeError::Mlx(source),
+                        })?
                 }
-            };
-            prepared.push((id.clone(), item));
-        }
-
-        for (id, item) in &prepared {
-            let bindings = state
-                .control
-                .unit(id)
-                .ok_or(ResidencyError::StatePoisoned)?
-                .bindings();
-            let actual = arrays_nbytes(&item.arrays, bindings)?;
-            let required = state.control.ledger_mut().spec(id)?.bytes();
-            if actual != required {
-                return Err(ResidencyError::UnitByteMismatch {
-                    id: id.clone(),
-                    planned_bytes: required,
-                    actual_bytes: actual,
-                });
             }
-        }
+            ParameterReadInput::Lease(lease) => {
+                let pending = storage
+                    .materialization
+                    .weight_lease(lease)?
+                    .prepare_materialization(&storage.source_stream, &storage.device_stream)?;
+                let output = pending.output().clone();
+                resources.sources.push(pending);
+                output
+            }
+        };
+        resources.retained_arrays.push(output.clone());
+        Ok(vec![output])
+    }
 
-        let submitted =
-            async_eval_with_event(prepared.iter().flat_map(|(_, item)| item.arrays.values()));
+    fn take_values(&mut self, pending: Vec<Array>) -> Result<Vec<Array>, ResidencyError> {
+        Ok(pending)
+    }
+
+    fn checkpoint_capacity_exhausted(error: &ResidencyError) -> bool {
+        use eredu_checkpoint::store::StoreError::CapacityExhausted;
+        matches!(
+            error,
+            ResidencyError::CheckpointStore(CapacityExhausted { .. })
+                | ResidencyError::Recipe {
+                    source: WeightRecipeError::CheckpointStore(CapacityExhausted { .. }),
+                    ..
+                }
+        )
+    }
+
+    fn release_checkpoint_capacity(&mut self) -> Result<bool, ResidencyError> {
+        let resources = self.transfer_resources();
+        if resources.sources.is_empty() {
+            return Ok(false);
+        }
+        let prior = WeightMaterialization::prepare_retained(
+            Vec::new(),
+            std::mem::take(&mut resources.sources),
+        )?
+        .submit_outputs(resources.retained_arrays.clone())?;
+        prior.wait()?;
+        prior.finish()?;
+        Ok(true)
+    }
+}
+
+impl ResidencyCopyScope for NativeResidencyReadScope<'_> {
+    type HostValue = Arc<ResidentHostAllocation>;
+    type Copy = ResidentLeaseStorage;
+    type Transfer = SubmittedResidentTransfer;
+
+    fn has_host_copy(&self, id: &OffloadUnitId) -> bool {
+        self.storage.storage[id].host.is_some()
+    }
+
+    fn host_alias(&self, alias: &ResidentBindingAlias) -> Result<Self::HostValue, ResidencyError> {
+        self.storage
+            .storage
+            .get(&alias.owner)
+            .and_then(|storage| storage.host.as_ref())
+            .and_then(|owner| owner.buffers.get(&alias.binding))
+            .cloned()
+            .ok_or(ResidencyError::StatePoisoned)
+    }
+
+    fn device_alias(&mut self, alias: &ResidentBindingAlias) -> Result<Array, ResidencyError> {
+        let array = self
+            .storage
+            .storage
+            .get(&alias.owner)
+            .and_then(|storage| storage.device.as_ref())
+            .and_then(|owner| owner.arrays.get(&alias.binding))
+            .cloned()
+            .ok_or(ResidencyError::StatePoisoned)?;
+        self.transfer_resources()
+            .retained_arrays
+            .push(array.clone());
+        Ok(array)
+    }
+
+    fn read_host(
+        &mut self,
+        id: &OffloadUnitId,
+        binding: &WeightBinding,
+        input: ParameterReadInput<'_>,
+    ) -> Result<Self::HostValue, ResidencyError> {
+        materialize_host_buffer(id, binding, input, &self.storage.materialization)
+    }
+
+    fn copy_from_host(
+        &mut self,
+        id: &OffloadUnitId,
+        names: &[&str],
+    ) -> Result<BTreeMap<String, Array>, ResidencyError> {
+        let storage = self.storage;
+        let host = storage.storage[id]
+            .host
+            .as_ref()
+            .cloned()
+            .ok_or(ResidencyError::StatePoisoned)?;
+        prepare_copy_to_device(
+            id,
+            names,
+            host,
+            &storage.device_stream,
+            self.transfer_resources(),
+        )
+    }
+
+    fn host_owner(
+        &self,
+        request: &ResidencyCopyRequest<'_>,
+        buffers: BTreeMap<String, Self::HostValue>,
+    ) -> Result<RealizedResidencyCopy<Self::Copy>, ResidencyError> {
+        let buffers = ResidentHostBuffers {
+            owner: host_resources::identity("mlx.resident_host_owner"),
+            buffers,
+        };
+        let logical = host_buffers_nbytes(&buffers, &request.bindings)?;
+        if logical != request.logical_bytes {
+            return Err(ResidencyError::UnitByteMismatch {
+                id: request.id.clone(),
+                planned_bytes: request.logical_bytes,
+                actual_bytes: logical,
+            });
+        }
+        let capacity = host_buffers_capacity(&buffers, &request.bindings)?;
+        if capacity > request.reserved_capacity {
+            return Err(ResidencyError::HostCapacityBoundExceeded {
+                id: request.id.clone(),
+                reserved_bytes: request.reserved_capacity,
+                actual_bytes: capacity,
+            });
+        }
+        Ok(RealizedResidencyCopy {
+            id: request.id.clone(),
+            storage: ResidentLeaseStorage::Host(Arc::new(buffers)),
+            capacity,
+            bytes: logical,
+            direction: TransferDirection::DiskToHost,
+        })
+    }
+
+    fn device_owner(
+        &self,
+        request: &ResidencyCopyRequest<'_>,
+        arrays: BTreeMap<String, Array>,
+        direction: TransferDirection,
+    ) -> Result<RealizedResidencyCopy<Self::Copy>, ResidencyError> {
+        let actual = arrays_nbytes(&arrays, &request.bindings)?;
+        if actual != request.logical_bytes {
+            return Err(ResidencyError::UnitByteMismatch {
+                id: request.id.clone(),
+                planned_bytes: request.logical_bytes,
+                actual_bytes: actual,
+            });
+        }
+        Ok(RealizedResidencyCopy {
+            id: request.id.clone(),
+            storage: ResidentLeaseStorage::Device(Arc::new(ResidentArrays {
+                parameter_conversions: Mutex::default(),
+                arrays,
+            })),
+            capacity: actual,
+            bytes: actual,
+            direction,
+        })
+    }
+
+    fn finish_device(
+        self,
+        copies: &[RealizedResidencyCopy<Self::Copy>],
+        return_transfer: bool,
+    ) -> Result<Option<Self::Transfer>, ResidencyError> {
+        let mut retained = self.transfer.expect("device read scope");
+        let submitted = async_eval_with_event(copies.iter().flat_map(|copy| match &copy.storage {
+            ResidentLeaseStorage::Device(device) => device.arrays.values(),
+            ResidentLeaseStorage::Host(_) => unreachable!("only device copies are submitted"),
+        }));
         retained.seal();
         if submitted.is_err() {
             retained.retention().application.mark_failed();
@@ -846,9 +820,7 @@ fn ensure_many_prepared(
                 ),
             ));
         }
-        let generation = if return_transfer {
-            state.control.ledger_mut().next_transfer_generation()?
-        } else {
+        if !return_transfer {
             loop {
                 let status = retained.progress();
                 if status.failed || status.blocked {
@@ -864,47 +836,8 @@ fn ensure_many_prepared(
                 }
                 std::thread::yield_now();
             }
-            0
-        };
-        retained.retention().application.generation.set(generation);
-
-        for (id, item) in prepared {
-            let bindings = state
-                .control
-                .unit(&id)
-                .ok_or(ResidencyError::StatePoisoned)?
-                .bindings();
-            let actual = arrays_nbytes(&item.arrays, bindings)?;
-            state.control.publish_acquisition_copy(
-                &id,
-                tier,
-                actual,
-                actual,
-                return_transfer.then_some(generation),
-                item.direction,
-                started.elapsed(),
-            )?;
-            let unit = state
-                .storage
-                .get_mut(&id)
-                .ok_or(ResidencyError::StatePoisoned)?;
-            match tier {
-                MemoryTier::Device => {
-                    unit.device = Some(Arc::new(ResidentArrays {
-                        parameter_conversions: Mutex::default(),
-                        arrays: item.arrays,
-                    }))
-                }
-                MemoryTier::Host | MemoryTier::Disk => unreachable!("validated above"),
-            }
         }
-        state.control.touch_acquisition_hits(&acquisition, tier)?;
-        let submitted = return_transfer.then_some(SubmittedResidentTransfer { retained });
-        Ok((created.clone(), submitted))
-    })();
 
-    if result.is_err() {
-        state.control.rollback_acquisition(&acquisition, tier)?;
+        Ok(return_transfer.then_some(SubmittedResidentTransfer { retained }))
     }
-    result
 }

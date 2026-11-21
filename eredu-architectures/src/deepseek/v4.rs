@@ -292,7 +292,8 @@ impl eredu_runtime::ArchitectureBoundary for TargetBoundarySchema {
     }
 
     fn auxiliary_tensor_specs(&self) -> Vec<eredu_runtime::BoundaryTensorSpec> {
-        use eredu_runtime::{BoundaryTensorDimension as Dim, BoundaryTensorDtype as Dtype};
+        use eredu_core::communication::BoundaryTensorDtype as Dtype;
+        use eredu_runtime::BoundaryTensorDimension as Dim;
         let mut specs = vec![eredu_runtime::BoundaryTensorSpec::new(
             "tokens",
             [Dim::Batch, Dim::Sequence],

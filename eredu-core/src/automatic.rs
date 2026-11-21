@@ -4,12 +4,13 @@
 //! module owns policy validation, resource budgeting, plan selection, feedback
 //! matching, and the serialized planning and telemetry documents.
 
+use crate::backend::AdmissionFacts;
+
 use crate::{
-    artifact::{
-        plan_model_preparation, ArtifactFormat, ArtifactInspection, ModelConfigurationResolver,
-        PreparationPolicy,
+    artifact::{plan_model_preparation, ArtifactFormat, ArtifactInspection, PreparationPolicy},
+    backend::{
+        BackendProvider, BackendSession, ModelLoadingBackend, ModelRuntime, SessionCapabilities,
     },
-    backend::{BackendProvider, ModelLoadingBackend, ModelRuntime, SessionCapabilities},
     execution::{
         DevicePlan, DraftingPlan, ExecutionPlan, ExpertCachePlan, ResidencyPlan,
         DEFAULT_MAX_CACHED_SHARDS,
@@ -753,31 +754,95 @@ pub struct BoundedResidencyRequirement {
     pub depth: usize,
 }
 
+/// Portable model analysis used by the automatic planner.
+pub trait AutomaticModelPlanning<Catalog> {
+    /// Exact inspection shared by resource reporting and every candidate probe.
+    type Artifact;
+
+    /// Inspects a model artifact and projects its resource requirements.
+    fn inspect(
+        self,
+        path: &std::path::Path,
+    ) -> Result<(ModelResourceProfile, Self::Artifact), AutomaticPlanningError>;
+
+    /// Tests an exact candidate against the retained artifact and mechanism facts.
+    fn admit(
+        self,
+        artifact: &Self::Artifact,
+        plan: &ExecutionPlan,
+    ) -> Result<CandidateAdmission, AutomaticPlanningError>;
+
+    /// Derives the bounded window for the selected realization.
+    fn bounded_requirement(
+        self,
+        artifact: &Self::Artifact,
+        plan: &ExecutionPlan,
+    ) -> Result<BoundedResidencyRequirement, AutomaticPlanningError>;
+}
+
 /// High-level observations a backend supplies to the neutral planner.
-pub trait AutomaticPlanningBackend {
-    /// Backend-neutral artifact inspection retained across every candidate probe.
-    type Inspection;
+pub trait BackendHardware {
     /// Stable identity used by execution plans for this backend adapter.
     fn backend_id(&self) -> crate::execution::BackendId;
     /// Discovers the devices and memory facts visible to this backend adapter.
     fn discover_hardware(&self) -> Result<HardwareProfile, AutomaticPlanningError>;
+}
+
+/// Backend facts used by automatic planning for the caller's catalog.
+pub trait AutomaticPlanningBackend<P>: BackendHardware {
+    /// Backend-neutral artifact inspection retained across every candidate probe.
+    type Inspection;
+    /// Side-effect-free mechanism and request facts for one planning operation.
+    type ModelFacts<'a>: AutomaticModelPlanning<P, Artifact = Self::Inspection> + AdmissionFacts
+    where
+        Self: 'a;
+    /// Supplies the cold facts for resource inspection or one exact candidate.
+    fn planning_inputs(
+        &self,
+        plan: Option<&ExecutionPlan>,
+    ) -> Result<<Self::ModelFacts<'_> as AdmissionFacts>::Inputs, AutomaticPlanningError>;
+    /// Projects the cold inputs into the portable catalog's planning facts.
+    fn model_facts(
+        &self,
+        plan: Option<&ExecutionPlan>,
+    ) -> Result<Self::ModelFacts<'_>, AutomaticPlanningError> {
+        self.planning_inputs(plan)
+            .map(Self::ModelFacts::from_inputs)
+    }
     /// Inspects an artifact without materializing its tensor payloads.
     fn inspect_resources(
         &self,
         model_path: &std::path::Path,
-    ) -> Result<(ModelResourceProfile, Self::Inspection), AutomaticPlanningError>;
+    ) -> Result<(ModelResourceProfile, Self::Inspection), AutomaticPlanningError> {
+        self.model_facts(None)?.inspect(model_path)
+    }
     /// Checks whether this backend can load a concrete portable plan.
     fn admit_candidate(
         &self,
         inspection: &Self::Inspection,
         plan: &ExecutionPlan,
-    ) -> Result<CandidateAdmission, AutomaticPlanningError>;
+    ) -> Result<CandidateAdmission, AutomaticPlanningError> {
+        self.model_facts(Some(plan))?.admit(inspection, plan)
+    }
     /// Establishes the exact bounded window needed by a non-resident plan.
     fn bounded_residency_requirement(
         &self,
         inspection: &Self::Inspection,
         plan: &ExecutionPlan,
-    ) -> Result<BoundedResidencyRequirement, AutomaticPlanningError>;
+    ) -> Result<BoundedResidencyRequirement, AutomaticPlanningError> {
+        if matches!(plan.residency(), ResidencyPlan::FullyResident) {
+            return Err(AutomaticPlanningError::Invalid(
+                "fully resident execution has no bounded device window".into(),
+            ));
+        }
+        let facts =
+            self.model_facts(Some(plan))
+                .map_err(|error| AutomaticPlanningError::Backend {
+                    operation: "bounded_residency_options",
+                    message: error.to_string(),
+                })?;
+        facts.bounded_requirement(inspection, plan)
+    }
 }
 
 // One planning call owns one inspection. Admission and bounded geometry are
@@ -799,15 +864,28 @@ struct PlanningValidation<'a, B> {
     >,
 }
 
-impl<B: AutomaticPlanningBackend> AutomaticPlanningBackend for PlanningValidation<'_, B> {
-    type Inspection = B::Inspection;
-
+impl<B: BackendHardware> BackendHardware for PlanningValidation<'_, B> {
     fn backend_id(&self) -> crate::execution::BackendId {
         self.backend.backend_id()
     }
 
     fn discover_hardware(&self) -> Result<HardwareProfile, AutomaticPlanningError> {
         self.backend.discover_hardware()
+    }
+}
+
+impl<B: AutomaticPlanningBackend<P>, P> AutomaticPlanningBackend<P> for PlanningValidation<'_, B> {
+    type Inspection = B::Inspection;
+    type ModelFacts<'a>
+        = B::ModelFacts<'a>
+    where
+        Self: 'a;
+
+    fn planning_inputs(
+        &self,
+        plan: Option<&ExecutionPlan>,
+    ) -> Result<<Self::ModelFacts<'_> as AdmissionFacts>::Inputs, AutomaticPlanningError> {
+        self.backend.planning_inputs(plan)
     }
 
     fn inspect_resources(
@@ -864,19 +942,19 @@ impl<I> RetainedAutomaticPlan<I> {
     }
 }
 
-/// Backend-owned preparation selected before native target realization.
-pub struct ExecutionPlanTargetSelection<B: ModelLoadingBackend> {
+/// Portable preparation selected before native target realization.
+pub struct ExecutionPlanTargetSelection<S> {
     policy: PreparationPolicy,
-    selected: B::SelectedPreparation,
+    selected: S,
     capabilities: SessionCapabilities,
     report: crate::ModelInspectionReport,
 }
 
-impl<B: ModelLoadingBackend> ExecutionPlanTargetSelection<B> {
-    /// Creates a backend selection from an exact policy, preparation, and capability report.
+impl<S> ExecutionPlanTargetSelection<S> {
+    /// Retains the exact policy, preparation, and capability report.
     pub fn new(
         policy: PreparationPolicy,
-        selected: B::SelectedPreparation,
+        selected: S,
         capabilities: SessionCapabilities,
         report: crate::ModelInspectionReport,
     ) -> Self {
@@ -889,29 +967,39 @@ impl<B: ModelLoadingBackend> ExecutionPlanTargetSelection<B> {
     }
 }
 
+/// Portable admission of an inspected execution-plan target.
+pub trait ExecutionPlanTargetAdmission<P> {
+    /// Portable preparation retained from the inspection.
+    type Preparation;
+
+    /// Selects and reports one exact preparation without realizing resources.
+    fn select(
+        self,
+        inspection: &ArtifactInspection<P>,
+        plan: &ExecutionPlan,
+    ) -> Result<ExecutionPlanTargetSelection<Self::Preparation>, AutomaticPlanningError>;
+}
+
 /// An inspected artifact and authoritative backend selection ready for native realization.
-pub struct SelectedExecutionPlanTarget<B: ModelLoadingBackend> {
+pub struct SelectedExecutionPlanTarget<B: ModelLoadingBackend, P, S> {
     execution_plan: ExecutionPlan,
-    preparation: crate::backend::SelectedModelPreparation<B>,
+    preparation: crate::backend::SelectedModelPreparation<B, P, S>,
     target_id: u64,
     report: crate::ModelInspectionReport,
 }
 
-impl<B: ModelLoadingBackend> SelectedExecutionPlanTarget<B> {
+impl<B: ModelLoadingBackend, P, S> SelectedExecutionPlanTarget<B, P, S> {
     /// Compatibility and resource facts produced by this exact selection.
     pub fn report(&self) -> &crate::ModelInspectionReport {
         &self.report
     }
 
-    fn into_preparation(self) -> crate::backend::SelectedModelPreparation<B> {
+    fn into_preparation(self) -> crate::backend::SelectedModelPreparation<B, P, S> {
         self.preparation
     }
 
     /// Borrows the exact target inspection retained by this selection.
-    pub fn inspection(
-        &self,
-    ) -> &ArtifactInspection<<B::ConfigurationResolver as ModelConfigurationResolver>::ArtifactPlan>
-    {
+    pub fn inspection(&self) -> &ArtifactInspection<P> {
         self.preparation.plan().inspection()
     }
 
@@ -919,7 +1007,7 @@ impl<B: ModelLoadingBackend> SelectedExecutionPlanTarget<B> {
     ///
     /// Cold drafting adapters use its retained portable placement decisions;
     /// borrowing this value does not realize native resources.
-    pub const fn selected_preparation(&self) -> &B::SelectedPreparation {
+    pub const fn selected_preparation(&self) -> &crate::SelectedModelBinding<S, B::Binding> {
         self.preparation.selected()
     }
 
@@ -929,30 +1017,33 @@ impl<B: ModelLoadingBackend> SelectedExecutionPlanTarget<B> {
     }
 }
 
+/// Target selected using the factory's portable catalog.
+pub type SelectedExecutionPlanTargetFor<F, P> = SelectedExecutionPlanTarget<
+    <F as ExecutionPlanBackendFactory<P>>::Backend,
+    P,
+    <F as ExecutionPlanBackendFactory<P>>::SourcePreparation,
+>;
+
 /// One target-backend instance and retained selection realized from a portable execution plan.
 ///
 /// The backend owns its selected device, execution queues, transfer queues, and
 /// optional communication state. The authoritative selection was completed
 /// before those resources existed and is retained unchanged for materialization.
-pub struct ExecutionPlanTarget<B: ModelLoadingBackend> {
+pub struct ExecutionPlanTarget<B: ModelLoadingBackend, P, S> {
     backend: B,
-    selected: SelectedExecutionPlanTarget<B>,
+    selected: SelectedExecutionPlanTarget<B, P, S>,
 }
-
-/// A realized backend paired with the model prepared from its retained selection.
-pub type PreparedExecutionPlanTarget<B> = ModelRuntime<B>;
 
 /// Failure while preparing the model retained by an execution-plan target.
 pub type ExecutionPlanTargetLoadError<B> =
     crate::backend::ModelLoadError<<B as BackendProvider>::Error>;
 
-impl<B: ModelLoadingBackend> ExecutionPlanTarget<B> {
-    /// Creates one backend-owned realization.
-    ///
-    /// Backend adapters call this from [`ExecutionPlanBackendFactory::realize_target`].
-    /// Portable identity, device, capability, and plan validation is applied by
-    /// [`realize_execution_plan_target`] before the value reaches an application.
-    pub fn new(backend: B, selected: SelectedExecutionPlanTarget<B>) -> Self {
+impl<B: ModelLoadingBackend, P, S> ExecutionPlanTarget<B, P, S>
+where
+    P: Clone + std::fmt::Debug,
+    S: crate::ModelSourcePreparation<P, Prepared: crate::BindModelSources<B>>,
+{
+    fn new(backend: B, selected: SelectedExecutionPlanTarget<B, P, S>) -> Self {
         Self { backend, selected }
     }
 
@@ -962,13 +1053,17 @@ impl<B: ModelLoadingBackend> ExecutionPlanTarget<B> {
     }
 
     /// Materializes the retained selection and creates its inseparably paired runtime.
-    pub fn into_runtime(
-        self,
-    ) -> Result<PreparedExecutionPlanTarget<B>, ExecutionPlanTargetLoadError<B>> {
+    pub fn install<I>(self) -> Result<ModelRuntime<B, I::Session>, ExecutionPlanTargetLoadError<B>>
+    where
+        I: crate::backend::ModelSessionInstaller<
+            B,
+            Model = crate::backend::LoadedModelFor<B, P, S>,
+        >,
+    {
         let target_id = self.selected.target_id;
         let preparation = self.selected.into_preparation();
         let prepared = crate::backend::prepare_selected_model(&self.backend, preparation)?;
-        ModelRuntime::from_prepared_execution_plan_target(self.backend, prepared, target_id)
+        ModelRuntime::install_with_target::<I>(self.backend, prepared, Some(target_id))
             .map_err(crate::backend::ModelLoadError::Backend)
     }
 }
@@ -1056,10 +1151,10 @@ impl<P> SelectedExecutionPlanDrafting<P> {
     /// Backend factory implementations use this at their realization boundary;
     /// a caller cannot extract and re-pair the selected assistant with another
     /// execution plan.
-    pub fn into_external_artifact<B: BackendProvider>(
+    pub fn into_external_artifact<B: BackendProvider, S: BackendSession<B>>(
         self,
         plan: &ExecutionPlan,
-        target: &ModelRuntime<B>,
+        target: &ModelRuntime<B, S>,
     ) -> Result<Option<ExternalDraftArtifact<P>>, AutomaticPlanningError> {
         if self.execution_plan != *plan {
             return Err(AutomaticPlanningError::Invalid(
@@ -1072,6 +1167,19 @@ impl<P> SelectedExecutionPlanDrafting<P> {
             ));
         }
         Ok(self.external_artifact)
+    }
+}
+
+/// Validated external-draft input bound to the exact realized target and plan.
+pub struct ExternalDraftBinding<'a, B: BackendProvider> {
+    placement: &'a crate::DraftPlacementPlan,
+    backend: &'a B,
+}
+
+impl<'a, B: BackendProvider> ExternalDraftBinding<'a, B> {
+    /// Returns the selected placement and native target.
+    pub fn into_parts(self) -> (&'a crate::DraftPlacementPlan, &'a B) {
+        (self.placement, self.backend)
     }
 }
 
@@ -1106,46 +1214,142 @@ impl<D> RealizedDrafting<D> {
     }
 }
 
+/// Native placement and retirement for an already selected secondary execution payload.
+pub trait DraftBindingResources: Sized {
+    /// Provider that materializes independent decoder resources.
+    type Backend: ModelLoadingBackend;
+    /// Native parameter and queue context used by conditioned assistants.
+    type AssistantBinder;
+    /// Opaque value to retain while native work can reference it.
+    type Payload: 'static;
+    /// Retirement owner for the exact payload and queues.
+    type Resources: crate::session_authority::RetainedExecutionPayload<Payload = Self::Payload>;
+
+    /// Retains the selected assistant parameter context.
+    fn assistant_binder(&self) -> Self::AssistantBinder;
+    /// Supplies the exact native placement for an independent model.
+    fn model_binding(
+        &self,
+    ) -> (
+        &Self::Backend,
+        <Self::Backend as ModelLoadingBackend>::Binding,
+    );
+    /// Settles initial materialization or transfers it to native retirement.
+    fn finish_binding(
+        self,
+        payload: Self::Payload,
+    ) -> Result<Self::Resources, AutomaticPlanningError>;
+}
+
+/// Portable external drafting selection over the exact retained target.
+pub trait ExecutionPlanDraftAdmission<Catalog, B: ModelLoadingBackend> {
+    /// Exact preparation retained by target admission.
+    type TargetPreparation;
+    /// Portable inspected preparation accepted by this policy.
+    type Inspection;
+    /// Exact prepared draft retained through native binding.
+    type Selection;
+
+    /// Selects the external artifact, when present, without creating native resources.
+    fn select(
+        self,
+        plan: &ExecutionPlan,
+        target: &SelectedExecutionPlanTarget<B, Catalog, Self::TargetPreparation>,
+        artifact: Option<ExternalDraftArtifact<Self::Inspection>>,
+    ) -> Result<Option<ExternalDraftArtifact<Self::Selection>>, AutomaticPlanningError>;
+}
+
+/// Portable construction of the selected draft through native binding mechanisms.
+pub trait ExternalDraftConstruction<P, B, M>: ExecutionPlanDraftAdmission<P, B>
+where
+    B: ModelLoadingBackend,
+{
+    /// Installed draft returned by the mechanism provider.
+    type Drafter;
+
+    /// Calls the mechanisms required by the selected draft route.
+    fn construct_external_draft(
+        artifact: ExternalDraftArtifact<Self::Selection>,
+        mechanisms: M,
+        target_identity: &str,
+    ) -> Result<Self::Drafter, AutomaticPlanningError>;
+}
+
+/// Draft inspection accepted by the factory's portable policy.
+pub type DraftInspectionFor<F, P> =
+    <<F as ExecutionPlanBackendFactory<P>>::DraftFacts as ExecutionPlanDraftAdmission<
+        P,
+        <F as ExecutionPlanBackendFactory<P>>::Backend,
+    >>::Inspection;
+
+/// Draft selection produced by the factory's portable policy.
+pub type DraftSelectionFor<F, P> =
+    <<F as ExecutionPlanBackendFactory<P>>::DraftFacts as ExecutionPlanDraftAdmission<
+        P,
+        <F as ExecutionPlanBackendFactory<P>>::Backend,
+    >>::Selection;
+
 /// Selects and creates an executable whole-model backend from a portable execution plan.
 ///
 /// This deliberately operates above tensor primitives. An implementation maps
-/// one complete [`DevicePlan`] and [`ExecutionPlan`] to an authoritative
-/// preparation selection before native resources exist, then to an owned
-/// backend. Core verifies the neutral preparation and target identities.
-pub trait ExecutionPlanBackendFactory: AutomaticPlanningBackend {
+/// one complete [`DevicePlan`] and [`ExecutionPlan`] to mechanism facts and native
+/// placement. The portable caller supplies the catalog through its retained
+/// artifact inspection. Core verifies the preparation and target identities.
+pub trait ExecutionPlanBackendFactory<P: Clone + std::fmt::Debug>: BackendHardware {
     /// Backend implementation created for the selected model/session.
     type Backend: ModelLoadingBackend;
-    /// Architecture-owned inspected preparation supplied to cold assistant selection.
-    type DrafterPreparation;
-    /// Authoritative assistant materialization selection retained before native realization.
-    type SelectedDrafterPreparation;
+    /// Portable preparation selected for the target artifact.
+    type SourcePreparation: crate::ModelSourcePreparation<
+        P,
+        Prepared: crate::BindModelSources<Self::Backend>,
+    >;
     /// Backend-owned separately prepared assistant type.
     type Drafter;
 
-    /// Selects the backend preparation without creating a native device or queue.
-    /// The returned compatibility/resource report describes this exact selection;
-    /// implementations produce both together rather than selecting again for reporting.
-    fn select_target(
-        &self,
-        inspection: &ArtifactInspection<
-            <<Self::Backend as ModelLoadingBackend>::ConfigurationResolver as ModelConfigurationResolver>::ArtifactPlan,
-        >,
-        plan: &ExecutionPlan,
-    ) -> Result<ExecutionPlanTargetSelection<Self::Backend>, AutomaticPlanningError>;
+    /// Side-effect-free request and mechanism facts consumed by target admission.
+    type TargetFacts: AdmissionFacts
+        + ExecutionPlanTargetAdmission<P, Preparation = Self::SourcePreparation>;
 
-    /// Selects external-assistant materialization without creating native resources.
-    ///
-    /// This hook runs before [`Self::realize_target`]. It must retain the exact
-    /// physical inputs and lowering choices which the backend will later consume.
-    fn select_drafting(
+    /// Portable per-load options owned by the caller and interpreted by composition.
+    type TargetOptions: Default;
+
+    /// Backend placement data paired with the cold admission request.
+    type TargetBinding;
+
+    /// Supplies portable admission inputs and retains backend placement data.
+    fn target_inputs(
         &self,
         plan: &ExecutionPlan,
-        target: &SelectedExecutionPlanTarget<Self::Backend>,
-        external_artifact: Option<ExternalDraftArtifact<Self::DrafterPreparation>>,
+        options: Self::TargetOptions,
     ) -> Result<
-        Option<ExternalDraftArtifact<Self::SelectedDrafterPreparation>>,
+        (
+            <Self::TargetFacts as AdmissionFacts>::Inputs,
+            Self::TargetBinding,
+        ),
         AutomaticPlanningError,
     >;
+
+    /// Retains native placement for later realization.
+    fn bind_target_placement(
+        &self,
+        binding: Self::TargetBinding,
+    ) -> Result<<Self::Backend as ModelLoadingBackend>::Binding, AutomaticPlanningError>;
+
+    /// Side-effect-free mechanism facts consumed by external draft admission.
+    type DraftFacts: AdmissionFacts
+        + ExternalDraftConstruction<
+            P,
+            Self::Backend,
+            Self::DraftBinding,
+            Drafter = Self::Drafter,
+            TargetPreparation = Self::SourcePreparation,
+        >;
+
+    /// Native resources and completion scope for the selected draft placement.
+    type DraftBinding;
+
+    /// Supplies native mechanism facts for portable external draft selection.
+    fn draft_inputs(&self) -> <Self::DraftFacts as AdmissionFacts>::Inputs;
 
     /// Backend hook which owns device/queue construction for an established selection.
     ///
@@ -1153,32 +1357,186 @@ pub trait ExecutionPlanBackendFactory: AutomaticPlanningBackend {
     /// validation cannot be bypassed accidentally.
     fn realize_target(
         &self,
-        selected: SelectedExecutionPlanTarget<Self::Backend>,
-    ) -> Result<ExecutionPlanTarget<Self::Backend>, AutomaticPlanningError>;
+        device: &DevicePlan,
+        placement: &<Self::Backend as ModelLoadingBackend>::Binding,
+    ) -> Result<Self::Backend, AutomaticPlanningError>;
 
-    /// Realizes the plan's complete drafting mode against a prepared target session.
-    ///
-    /// `external_artifact` is present exactly for [`DraftingPlan::External`].
-    /// It is assembled by the portable facade, which owns architecture
-    /// inspection, tokenizer loading, and architecture compatibility proof.
-    /// The backend binds only the already selected materialization, placement,
-    /// and mechanism resources.
-    fn realize_drafting(
+    /// Opens the native binding scope for a draft on the retained target.
+    fn begin_external_draft(
+        &self,
+        binding: ExternalDraftBinding<'_, Self::Backend>,
+    ) -> Result<Self::DraftBinding, AutomaticPlanningError>;
+}
+
+/// Side-effect-free placement for an exact device and world assignment.
+pub trait ColdPlanPlacement: BackendHardware {
+    /// Native placement paired with a cold selection.
+    type Placement;
+    /// Validates an exact device and optional world-size/global-rank assignment.
+    /// This query creates no device, queue, or communicator.
+    fn plan_placement(
+        &self,
+        device: &DevicePlan,
+        rank: Option<(usize, usize)>,
+    ) -> Result<Self::Placement, AutomaticPlanningError>;
+}
+
+/// Opens exact native resources for a portable execution plan.
+pub trait ExecutionPlanNativeFactory: ColdPlanPlacement {
+    /// Realized backend with its opaque draft payload representation.
+    type Backend<D: 'static>: ModelLoadingBackend<Binding = Self::Placement>;
+    /// Native parameter binding resources for a secondary model.
+    type AssistantBinder;
+    /// Native scope retaining exactly the supplied draft payload.
+    type DraftBinding<D: 'static, P: 'static>: DraftBindingResources<
+        Backend = Self::Backend<D>,
+        AssistantBinder = Self::AssistantBinder,
+        Payload = P,
+    >;
+
+    /// Realizes the already admitted placement.
+    fn realize_placement<D: 'static>(
+        &self,
+        device: &DevicePlan,
+        placement: &Self::Placement,
+    ) -> Result<Self::Backend<D>, AutomaticPlanningError>;
+    /// Opens native resources on the selected secondary placement.
+    fn open_draft<D: 'static, P: 'static>(
+        &self,
+        binding: ExternalDraftBinding<'_, Self::Backend<D>>,
+    ) -> Result<Self::DraftBinding<D, P>, AutomaticPlanningError>;
+}
+
+/// Portable policy composing a model catalog with independent native mechanisms.
+pub trait ExecutionPlanComposition<F: ExecutionPlanNativeFactory>: Clone + std::fmt::Debug {
+    /// Exact selected secondary dispatcher carried as an opaque type by the backend.
+    type Dispatch: 'static;
+    /// Model-independent retirement mechanisms protect this portable draft.
+    type DraftPayload: 'static;
+    /// Prepared checkpoint and execution selection retained through realization.
+    type Preparation: crate::ModelSourcePreparation<
+        Self,
+        Prepared: crate::BindModelSources<F::Backend<Self::Dispatch>>,
+    >;
+    /// Portable target and cold inspection facts.
+    type TargetFacts: AdmissionFacts
+        + ExecutionPlanTargetAdmission<Self, Preparation = Self::Preparation>;
+    /// Portable secondary-model admission and construction.
+    type DraftFacts: AdmissionFacts
+        + ExternalDraftConstruction<
+            Self,
+            F::Backend<Self::Dispatch>,
+            F::DraftBinding<Self::Dispatch, Self::DraftPayload>,
+            TargetPreparation = Self::Preparation,
+        >;
+
+    /// Portable options for one exact target.
+    type TargetOptions: Default;
+    /// Projects the optional world-size/global-rank assignment from caller policy.
+    fn target_rank(options: &Self::TargetOptions) -> Option<(usize, usize)>;
+
+    /// Projects exact mechanism inputs into the portable target policy.
+    fn target_inputs(
+        factory: &F,
+        options: Self::TargetOptions,
+        support: Result<(), AutomaticPlanningError>,
+    ) -> <Self::TargetFacts as AdmissionFacts>::Inputs;
+    /// Projects exact mechanism inputs into the portable secondary-model policy.
+    fn draft_inputs(factory: &F) -> <Self::DraftFacts as AdmissionFacts>::Inputs;
+}
+
+impl<F, P> ExecutionPlanBackendFactory<P> for F
+where
+    F: ExecutionPlanNativeFactory,
+    P: ExecutionPlanComposition<F>,
+{
+    type Backend = F::Backend<P::Dispatch>;
+    type SourcePreparation = P::Preparation;
+    type TargetFacts = P::TargetFacts;
+    type TargetOptions = P::TargetOptions;
+    type TargetBinding = Result<F::Placement, AutomaticPlanningError>;
+    type DraftFacts = P::DraftFacts;
+    type DraftBinding = F::DraftBinding<P::Dispatch, P::DraftPayload>;
+    type Drafter =
+        <P::DraftFacts as ExternalDraftConstruction<P, Self::Backend, Self::DraftBinding>>::Drafter;
+
+    fn target_inputs(
         &self,
         plan: &ExecutionPlan,
-        target: &ModelRuntime<Self::Backend>,
-        selected: SelectedExecutionPlanDrafting<Self::SelectedDrafterPreparation>,
-    ) -> Result<RealizedDrafting<Self::Drafter>, AutomaticPlanningError>;
+        options: Self::TargetOptions,
+    ) -> Result<
+        (
+            <Self::TargetFacts as AdmissionFacts>::Inputs,
+            Self::TargetBinding,
+        ),
+        AutomaticPlanningError,
+    > {
+        let placement = self.plan_placement(plan.device(), P::target_rank(&options));
+        let support = placement.as_ref().map(|_| ()).map_err(Clone::clone);
+        Ok((P::target_inputs(self, options, support), placement))
+    }
+
+    fn bind_target_placement(
+        &self,
+        placement: Self::TargetBinding,
+    ) -> Result<F::Placement, AutomaticPlanningError> {
+        placement
+    }
+
+    fn draft_inputs(&self) -> <Self::DraftFacts as AdmissionFacts>::Inputs {
+        P::draft_inputs(self)
+    }
+
+    fn realize_target(
+        &self,
+        device: &DevicePlan,
+        placement: &F::Placement,
+    ) -> Result<Self::Backend, AutomaticPlanningError> {
+        self.realize_placement(device, placement)
+    }
+
+    fn begin_external_draft(
+        &self,
+        binding: ExternalDraftBinding<'_, Self::Backend>,
+    ) -> Result<Self::DraftBinding, AutomaticPlanningError> {
+        self.open_draft(binding)
+    }
+}
+
+impl<F, P> AutomaticPlanningBackend<P> for F
+where
+    F: ExecutionPlanNativeFactory,
+    P: ExecutionPlanComposition<F>,
+    P::TargetFacts: AutomaticModelPlanning<P>,
+{
+    type Inspection = <P::TargetFacts as AutomaticModelPlanning<P>>::Artifact;
+    type ModelFacts<'a>
+        = P::TargetFacts
+    where
+        F: 'a;
+
+    fn planning_inputs(
+        &self,
+        plan: Option<&ExecutionPlan>,
+    ) -> Result<<Self::ModelFacts<'_> as AdmissionFacts>::Inputs, AutomaticPlanningError> {
+        let support = match plan {
+            Some(plan) => self.plan_placement(plan.device(), None).map(|_| ()),
+            None => Ok(()),
+        };
+        Ok(P::target_inputs(self, P::TargetOptions::default(), support))
+    }
 }
 
 /// Validates and selects the target portion before any native realization.
-pub fn select_execution_plan_target<F: ExecutionPlanBackendFactory>(
+pub fn select_execution_plan_target<
+    F: ExecutionPlanBackendFactory<P>,
+    P: Clone + std::fmt::Debug,
+>(
     factory: &F,
     plan: &ExecutionPlan,
-    inspection: ArtifactInspection<
-        <<F::Backend as ModelLoadingBackend>::ConfigurationResolver as ModelConfigurationResolver>::ArtifactPlan,
-    >,
-) -> Result<SelectedExecutionPlanTarget<F::Backend>, AutomaticPlanningError> {
+    inspection: ArtifactInspection<P>,
+    options: F::TargetOptions,
+) -> Result<SelectedExecutionPlanTargetFor<F, P>, AutomaticPlanningError> {
     let expected_backend = factory.backend_id();
     if plan.device.backend != expected_backend {
         return Err(AutomaticPlanningError::Invalid(format!(
@@ -1189,27 +1547,33 @@ pub fn select_execution_plan_target<F: ExecutionPlanBackendFactory>(
     plan.validate_structure()
         .map_err(|error| AutomaticPlanningError::Invalid(error.to_string()))?;
 
-    let selection = factory.select_target(&inspection, plan)?;
+    let (inputs, binding) = factory.target_inputs(plan, options)?;
+    let selection = F::TargetFacts::from_inputs(inputs).select(&inspection, plan)?;
     selection
         .policy
         .validate_session_capabilities(&selection.capabilities)
         .map_err(|error| AutomaticPlanningError::Invalid(error.to_string()))?;
     let preparation = plan_model_preparation(inspection, selection.policy, selection.capabilities)
         .map_err(|error| AutomaticPlanningError::Invalid(error.to_string()))?;
+    let placement = factory.bind_target_placement(binding)?;
+    let selected = crate::SelectedModelBinding::new(selection.selected, placement);
     Ok(SelectedExecutionPlanTarget {
         execution_plan: plan.clone(),
-        preparation: crate::backend::SelectedModelPreparation::new(preparation, selection.selected),
+        preparation: crate::backend::SelectedModelPreparation::new(preparation, selected),
         target_id: next_execution_plan_target_id()?,
         report: selection.report,
     })
 }
 
 /// Realizes native target resources for an already validated selection.
-pub fn realize_execution_plan_target<F: ExecutionPlanBackendFactory>(
+pub fn realize_execution_plan_target<
+    F: ExecutionPlanBackendFactory<P>,
+    P: Clone + std::fmt::Debug,
+>(
     factory: &F,
     plan: &ExecutionPlan,
-    selected: SelectedExecutionPlanTarget<F::Backend>,
-) -> Result<ExecutionPlanTarget<F::Backend>, AutomaticPlanningError> {
+    selected: SelectedExecutionPlanTargetFor<F, P>,
+) -> Result<ExecutionPlanTarget<F::Backend, P, F::SourcePreparation>, AutomaticPlanningError> {
     let expected_backend = factory.backend_id();
     if plan.device.backend != expected_backend {
         return Err(AutomaticPlanningError::Invalid(format!(
@@ -1224,8 +1588,9 @@ pub fn realize_execution_plan_target<F: ExecutionPlanBackendFactory>(
             "selected target was established for a different execution plan".into(),
         ));
     }
-    let realization = factory.realize_target(selected)?;
-    let descriptor = realization.backend().descriptor();
+    let backend =
+        factory.realize_target(plan.device(), selected.selected_preparation().native())?;
+    let descriptor = backend.descriptor();
     if descriptor.name() != expected_backend.as_str() {
         return Err(AutomaticPlanningError::Invalid(format!(
             "factory identity {} does not match realized backend {}",
@@ -1233,14 +1598,12 @@ pub fn realize_execution_plan_target<F: ExecutionPlanBackendFactory>(
             descriptor.name()
         )));
     }
-    let devices =
-        realization
-            .backend()
-            .devices()
-            .map_err(|error| AutomaticPlanningError::Backend {
-                operation: "realize_execution_plan_devices",
-                message: error.to_string(),
-            })?;
+    let devices = backend
+        .devices()
+        .map_err(|error| AutomaticPlanningError::Backend {
+            operation: "realize_execution_plan_devices",
+            message: error.to_string(),
+        })?;
     let capabilities = devices
         .iter()
         .find_map(|(device, capabilities)| {
@@ -1254,62 +1617,67 @@ pub fn realize_execution_plan_target<F: ExecutionPlanBackendFactory>(
         })?;
     plan.validate_device_capabilities(capabilities)
         .map_err(|error| AutomaticPlanningError::Invalid(error.to_string()))?;
-    Ok(realization)
+    Ok(ExecutionPlanTarget::new(backend, selected))
 }
 
 /// Validates and realizes the drafting portion of a portable execution plan.
-pub fn realize_execution_plan_drafting<F: ExecutionPlanBackendFactory>(
+pub fn realize_execution_plan_drafting<
+    F: ExecutionPlanBackendFactory<P>,
+    P: Clone + std::fmt::Debug,
+    S: BackendSession<F::Backend>,
+>(
     factory: &F,
     plan: &ExecutionPlan,
-    target: &ModelRuntime<F::Backend>,
-    selected: SelectedExecutionPlanDrafting<F::SelectedDrafterPreparation>,
+    target: &ModelRuntime<F::Backend, S>,
+    selected: SelectedExecutionPlanDrafting<DraftSelectionFor<F, P>>,
 ) -> Result<RealizedDrafting<F::Drafter>, AutomaticPlanningError> {
-    if selected.execution_plan != *plan {
-        return Err(AutomaticPlanningError::Invalid(
-            "selected drafting was established for a different execution plan".into(),
-        ));
-    }
-    if target.execution_plan_target_id() != Some(selected.target_id) {
-        return Err(AutomaticPlanningError::Invalid(
-            "selected drafting was established for a different realized target".into(),
-        ));
-    }
-    match (&plan.drafting, selected.external_artifact.as_ref()) {
-        (DraftingPlan::External { .. }, None) => {
-            return Err(AutomaticPlanningError::Invalid(
-                "external drafting requires proven tokenizer compatibility".into(),
-            ));
+    let artifact = selected.into_external_artifact(plan, target)?;
+    match (&plan.drafting, artifact) {
+        (DraftingPlan::Disabled, None) => Ok(RealizedDrafting::Disabled),
+        (DraftingPlan::Embedded { .. }, None) => {
+            let capability = target.session().speculative_capability();
+            if !capability.is_ready_for(crate::SpeculativeDraftSource::Embedded) {
+                return Err(AutomaticPlanningError::Invalid(format!(
+                    "execution plan selects embedded drafting but target capability is {capability:?}"
+                )));
+            }
+            Ok(RealizedDrafting::Embedded)
         }
+        (DraftingPlan::External { placement, .. }, Some(artifact)) => {
+            let target_identity = target.session().draft_target_identity().ok_or_else(|| {
+                AutomaticPlanningError::Invalid(
+                    "selected target session cannot bind an external draft".into(),
+                )
+            })?;
+            let mechanisms = factory.begin_external_draft(ExternalDraftBinding {
+                placement,
+                backend: target.backend(),
+            })?;
+            F::DraftFacts::construct_external_draft(artifact, mechanisms, target_identity)
+                .map(RealizedDrafting::External)
+        }
+        (DraftingPlan::External { .. }, None) => Err(AutomaticPlanningError::Invalid(
+            "external drafting requires proven tokenizer compatibility".into(),
+        )),
         (DraftingPlan::Disabled | DraftingPlan::Embedded { .. }, Some(_)) => {
-            return Err(AutomaticPlanningError::Invalid(
+            Err(AutomaticPlanningError::Invalid(
                 "tokenizer compatibility was supplied for a plan without an external assistant"
                     .into(),
-            ));
+            ))
         }
-        _ => {}
     }
-    let drafting = factory.realize_drafting(plan, target, selected)?;
-    let matches_plan = matches!(
-        (&plan.drafting, &drafting),
-        (DraftingPlan::Disabled, RealizedDrafting::Disabled)
-            | (DraftingPlan::Embedded { .. }, RealizedDrafting::Embedded)
-            | (DraftingPlan::External { .. }, RealizedDrafting::External(_))
-    );
-    if !matches_plan {
-        return Err(AutomaticPlanningError::Invalid(
-            "backend factory realized a drafting mode different from the execution plan".into(),
-        ));
-    }
-    Ok(drafting)
 }
 
 /// Selects drafting materialization before any native target realization.
-pub fn select_execution_plan_drafting<F: ExecutionPlanBackendFactory>(
+pub fn select_execution_plan_drafting<
+    F: ExecutionPlanBackendFactory<P>,
+    P: Clone + std::fmt::Debug,
+>(
     factory: &F,
     plan: &ExecutionPlan,
-    target: &SelectedExecutionPlanTarget<F::Backend>,
-    external_artifact: Option<ExternalDraftArtifact<F::DrafterPreparation>>,
-) -> Result<SelectedExecutionPlanDrafting<F::SelectedDrafterPreparation>, AutomaticPlanningError> {
+    target: &SelectedExecutionPlanTargetFor<F, P>,
+    external_artifact: Option<ExternalDraftArtifact<DraftInspectionFor<F, P>>>,
+) -> Result<SelectedExecutionPlanDrafting<DraftSelectionFor<F, P>>, AutomaticPlanningError> {
     if target.execution_plan != *plan {
         return Err(AutomaticPlanningError::Invalid(
             "selected target was established for a different execution plan".into(),
@@ -1329,7 +1697,11 @@ pub fn select_execution_plan_drafting<F: ExecutionPlanBackendFactory>(
         }
         _ => {}
     }
-    let external_artifact = factory.select_drafting(plan, target, external_artifact)?;
+    let external_artifact = F::DraftFacts::from_inputs(factory.draft_inputs()).select(
+        plan,
+        target,
+        external_artifact,
+    )?;
     Ok(SelectedExecutionPlanDrafting {
         execution_plan: plan.clone(),
         target_id: target.target_id,
@@ -1371,7 +1743,7 @@ impl AutomaticPlanner {
     }
 
     /// Selects a plan using only portable policy and backend observations.
-    pub fn plan<B: AutomaticPlanningBackend>(
+    pub fn plan<B: AutomaticPlanningBackend<P>, P>(
         &self,
         backend: &B,
         request: &AutomaticPlanRequest,
@@ -1380,7 +1752,7 @@ impl AutomaticPlanner {
     }
 
     /// Selects a plan and retains the one artifact inspection shared by every probe.
-    pub fn plan_retained<B: AutomaticPlanningBackend>(
+    pub fn plan_retained<B: AutomaticPlanningBackend<P>, P>(
         &self,
         backend: &B,
         request: &AutomaticPlanRequest,
@@ -1393,7 +1765,7 @@ impl AutomaticPlanner {
     /// The override function must be deterministic and idempotent. It receives the retained
     /// architecture observations and must preserve the request's device and single-device
     /// topology. Feedback is eligible only when its measured plan already satisfies overrides.
-    pub fn plan_retained_with_overrides<B: AutomaticPlanningBackend>(
+    pub fn plan_retained_with_overrides<B: AutomaticPlanningBackend<P>, P>(
         &self,
         backend: &B,
         request: &AutomaticPlanRequest,
@@ -1778,7 +2150,7 @@ fn validate_candidate(
     Ok(())
 }
 
-fn probe_candidate<B: AutomaticPlanningBackend>(
+fn probe_candidate<B: AutomaticPlanningBackend<P>, P>(
     backend: &B,
     inspection: &B::Inspection,
     plan: &ExecutionPlan,
@@ -1808,7 +2180,7 @@ fn probe_candidate<B: AutomaticPlanningBackend>(
     )
 }
 
-fn apply_bounded_probe<B: AutomaticPlanningBackend>(
+fn apply_bounded_probe<B: AutomaticPlanningBackend<P>, P>(
     backend: &B,
     inspection: &B::Inspection,
     plan: &ExecutionPlan,
@@ -1888,7 +2260,7 @@ fn with_expert_cache(mut plan: ExecutionPlan, policy: &AutomaticPlannerPolicy) -
     plan
 }
 
-fn select_feedback_plan<B: AutomaticPlanningBackend>(
+fn select_feedback_plan<B: AutomaticPlanningBackend<P>, P>(
     backend: &B,
     inspection: &B::Inspection,
     request: &AutomaticPlanRequest,
@@ -2004,9 +2376,7 @@ mod tests {
         }
     }
 
-    impl AutomaticPlanningBackend for MockPlanningBackend {
-        type Inspection = ();
-
+    impl BackendHardware for MockPlanningBackend {
         fn backend_id(&self) -> BackendId {
             BackendId::new("mock").unwrap()
         }
@@ -2035,11 +2405,35 @@ mod tests {
                 }],
             })
         }
+    }
 
-        fn inspect_resources(
+    impl AutomaticPlanningBackend<()> for MockPlanningBackend {
+        type Inspection = ();
+
+        type ModelFacts<'a> = &'a Self;
+
+        fn planning_inputs(
             &self,
+            _: Option<&ExecutionPlan>,
+        ) -> Result<&Self, AutomaticPlanningError> {
+            Ok(self)
+        }
+    }
+
+    impl<'a> AdmissionFacts for &'a MockPlanningBackend {
+        type Inputs = &'a MockPlanningBackend;
+        fn from_inputs(input: Self::Inputs) -> Self {
+            input
+        }
+    }
+
+    impl AutomaticModelPlanning<()> for &MockPlanningBackend {
+        type Artifact = ();
+
+        fn inspect(
+            self,
             path: &std::path::Path,
-        ) -> Result<(ModelResourceProfile, Self::Inspection), AutomaticPlanningError> {
+        ) -> Result<(ModelResourceProfile, Self::Artifact), AutomaticPlanningError> {
             let mut profile =
                 ModelResourceProfile::unmeasured(path.into(), ArtifactFormat::SafeTensors);
             profile.model_family = Some("llama".into());
@@ -2054,9 +2448,9 @@ mod tests {
             Ok((profile, ()))
         }
 
-        fn admit_candidate(
-            &self,
-            _inspection: &Self::Inspection,
+        fn admit(
+            self,
+            _inspection: &Self::Artifact,
             plan: &ExecutionPlan,
         ) -> Result<CandidateAdmission, AutomaticPlanningError> {
             let rejection = if matches!(plan.drafting(), DraftingPlan::Embedded { max_draft_tokens, .. } if *max_draft_tokens > self.embedded_capacity.unwrap_or(0))
@@ -2076,9 +2470,9 @@ mod tests {
             })
         }
 
-        fn bounded_residency_requirement(
-            &self,
-            _inspection: &Self::Inspection,
+        fn bounded_requirement(
+            self,
+            _inspection: &Self::Artifact,
             _plan: &ExecutionPlan,
         ) -> Result<BoundedResidencyRequirement, AutomaticPlanningError> {
             Ok(BoundedResidencyRequirement {
@@ -2238,9 +2632,7 @@ mod tests {
         bounded_probes: std::cell::RefCell<Vec<ExecutionPlan>>,
     }
 
-    impl AutomaticPlanningBackend for RetainedPlanningBackend {
-        type Inspection = usize;
-
+    impl BackendHardware for RetainedPlanningBackend {
         fn backend_id(&self) -> BackendId {
             self.inner.backend_id()
         }
@@ -2248,20 +2640,44 @@ mod tests {
         fn discover_hardware(&self) -> Result<HardwareProfile, AutomaticPlanningError> {
             self.inner.discover_hardware()
         }
+    }
 
-        fn inspect_resources(
+    impl AutomaticPlanningBackend<()> for RetainedPlanningBackend {
+        type Inspection = usize;
+
+        type ModelFacts<'a> = &'a Self;
+
+        fn planning_inputs(
             &self,
+            _: Option<&ExecutionPlan>,
+        ) -> Result<&Self, AutomaticPlanningError> {
+            Ok(self)
+        }
+    }
+
+    impl<'a> AdmissionFacts for &'a RetainedPlanningBackend {
+        type Inputs = &'a RetainedPlanningBackend;
+        fn from_inputs(input: Self::Inputs) -> Self {
+            input
+        }
+    }
+
+    impl AutomaticModelPlanning<()> for &RetainedPlanningBackend {
+        type Artifact = usize;
+
+        fn inspect(
+            self,
             path: &std::path::Path,
-        ) -> Result<(ModelResourceProfile, Self::Inspection), AutomaticPlanningError> {
+        ) -> Result<(ModelResourceProfile, Self::Artifact), AutomaticPlanningError> {
             self.inspections.set(self.inspections.get() + 1);
             self.inner
                 .inspect_resources(path)
                 .map(|(resources, ())| (resources, 7))
         }
 
-        fn admit_candidate(
-            &self,
-            inspection: &Self::Inspection,
+        fn admit(
+            self,
+            inspection: &Self::Artifact,
             plan: &ExecutionPlan,
         ) -> Result<CandidateAdmission, AutomaticPlanningError> {
             assert_eq!(*inspection, 7, "every admission must reuse one inspection");
@@ -2269,9 +2685,9 @@ mod tests {
             self.inner.admit_candidate(&(), plan)
         }
 
-        fn bounded_residency_requirement(
-            &self,
-            inspection: &Self::Inspection,
+        fn bounded_requirement(
+            self,
+            inspection: &Self::Artifact,
             plan: &ExecutionPlan,
         ) -> Result<BoundedResidencyRequirement, AutomaticPlanningError> {
             assert_eq!(

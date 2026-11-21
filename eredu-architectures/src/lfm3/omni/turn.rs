@@ -1,5 +1,6 @@
 //! Portable selection and startup for a finite Omni turn.
 
+use eredu_core::{input::MediaInputLowering, realtime_mechanisms::RealtimeStartupMechanisms};
 use std::collections::BTreeMap;
 
 use eredu_checkpoint::recipe::RecipeDtype;
@@ -8,10 +9,7 @@ use eredu_core::{
 };
 use eredu_media::audio::AudioWaveform;
 use eredu_nn::Tensor;
-use eredu_runtime::{
-    LayerWeightResidency, ParameterUnitMechanisms, PipelineTransportProvider,
-    RealtimeGraphMechanisms, RealtimeMechanismSupport, RealtimeStartupMechanisms,
-};
+use eredu_runtime::{LayerWeightResidency, RealtimeGraphMechanisms, RealtimeMechanismSupport};
 
 use super::{ArtifactError, MediaTokens, OmniVideoPrompt, PreparedOmni, ProcessorConfig};
 use crate::{
@@ -22,7 +20,7 @@ use crate::{
         },
         vision::{PreparedVisionExecution, ProjectedVisionPrompt, VisionPromptAdmission},
     },
-    processor_execution::{MediaGraphMechanisms, MediaInputLowering, PreparedProcessor},
+    processor_execution::{MediaGraphMechanisms, PreparedProcessor},
 };
 
 /// Cold weight and language placement policy for an Omni speech response.
@@ -106,7 +104,7 @@ impl PreparedOmniTurn {
                 "distributed speech requires the stage publication route",
             ));
         }
-        if !facts.supports_residency(selection.vision.execution_residency()) {
+        if !facts.supports_residency(selection.vision.execution_residency().weight_storage()) {
             return Err(OmniTurnError::Selection("vision parameter residency"));
         }
         let processor = artifact.speech().processor;
@@ -226,19 +224,18 @@ impl PreparedOmniTurn {
         } = self;
         let prepare = || {
             let mut vision =
-                vision.bind::<M::Neural, _>(context, |source, addresses, units, build| {
-                    graph
-                        .components()
-                        .bind_units(source, addresses, units, vision_residency, build)
-                        .map(|(policy, _)| policy)
-                })?;
+                vision.bind::<M::Neural, _>(context, vision_residency, graph.components())?;
             let projected = |request: &TokenizedMultimodalRequest| {
-                let (input, identity) =
-                    media_lowering.prepare_input(&media, request, encode_text)?;
+                let (input, identity) = eredu_runtime::processor_binding::prepare_graph_input(
+                    &media_lowering,
+                    &media,
+                    request,
+                    encode_text,
+                )?;
                 let input = vision_admission.admit_with_identity(
                     &input,
                     media_lowering.inspector(),
-                    identity.as_ref(),
+                    Some(&identity),
                 )?;
                 Ok(vision.project_prompt(input, context)?)
             };
@@ -255,7 +252,7 @@ impl PreparedOmniTurn {
             Ok::<_, OmniTurnError>((prepared, graph.realize_random(seed)?))
         };
         if speech.placement().rank().is_some() {
-            let (world, transport) = mechanisms.pipeline_transport().open()?;
+            let (world, transport) = mechanisms.open_pipeline()?;
             let mut model = speech.bind_pipeline(graph.clone(), world, transport)?;
             let (prepared, random) =
                 agree_preparation(prepare(), |success| model.agree_prompt_preparation(success))?;

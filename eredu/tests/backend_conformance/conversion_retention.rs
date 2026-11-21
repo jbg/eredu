@@ -1,6 +1,6 @@
 use super::*;
+use eredu_core::residency::conversion_claim::*;
 use eredu_core::residency::*;
-use eredu_runtime::residency::conversion_retention::*;
 
 pub(super) fn budget(request: &eredu_runtime::NormalizedLoadRequest) -> ConversionRetentionBudget {
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -56,7 +56,7 @@ fn loaded_facade_preserves_policy_scope_and_independent_models() {
     let artifact = TestDirectory::new();
     write_loadable_text_artifact(artifact.path());
     let mut first =
-        LoadedModel::load_execution_plan(&MockBackend, artifact.path(), &plan(None)).unwrap();
+        LoadedModel::load_execution_plan(&MockBackend, artifact.path(), &plan(None), None).unwrap();
     let before = first.parameter_conversion_retention().unwrap();
     let default = &before.target.value().unwrap()[0];
     assert_eq!(
@@ -75,9 +75,13 @@ fn loaded_facade_preserves_policy_scope_and_independent_models() {
         ParameterConversionRetentionPolicy::Bounded { max_bytes: 0 },
         ParameterConversionRetentionPolicy::Unlimited,
     ] {
-        let other =
-            LoadedModel::load_execution_plan(&MockBackend, artifact.path(), &plan(Some(policy)))
-                .unwrap();
+        let other = LoadedModel::load_execution_plan(
+            &MockBackend,
+            artifact.path(),
+            &plan(Some(policy)),
+            None,
+        )
+        .unwrap();
         let observation = other.parameter_conversion_retention().unwrap();
         let report = &observation.target.value().unwrap()[0];
         assert_ne!(report.group, default.group);
@@ -143,7 +147,8 @@ fn loaded_exclusions_preserve_the_explicit_request() {
         let requested =
             plan(Some(ParameterConversionRetentionPolicy::Unlimited)).with_residency(residency);
         let model =
-            LoadedModel::load_execution_plan(&MockBackend, artifact.path(), &requested).unwrap();
+            LoadedModel::load_execution_plan(&MockBackend, artifact.path(), &requested, None)
+                .unwrap();
         let report = model.parameter_conversion_retention().unwrap();
         let selected = report.target.value().unwrap()[0].policy.value().unwrap();
         assert_eq!(
@@ -160,11 +165,13 @@ fn loaded_exclusions_preserve_the_explicit_request() {
 
 #[test]
 fn telemetry_queries_leave_submission_authority_and_reservations_untouched() {
-    let mut runtime = ModelRuntime::prepare(
+    let mut runtime = ModelRuntime::<_, _>::install::<MockSession>(
         MockBackend,
-        eredu_runtime::NormalizedLoadRequest::default().with_parameter_conversion_retention(Some(
-            ParameterConversionRetentionPolicy::Bounded { max_bytes: 16 },
-        )),
+        fixture_prepared_model(
+            eredu_runtime::NormalizedLoadRequest::default().with_parameter_conversion_retention(
+                Some(ParameterConversionRetentionPolicy::Bounded { max_bytes: 16 }),
+            ),
+        ),
     )
     .unwrap();
     let registry = ConversionRetentionRegistry::default();
@@ -179,7 +186,7 @@ fn telemetry_queries_leave_submission_authority_and_reservations_untouched() {
         .unwrap();
     let reserved = parameter.reserve(&runtime.session().retention).unwrap();
     let pending = runtime.session_mut().authority.begin_submission().unwrap();
-    let before = MockBackend::parameter_conversion_retention(&runtime).unwrap();
+    let before = MockSession::parameter_conversion_retention(&runtime).unwrap();
     assert_eq!(
         before.value().unwrap()[0]
             .usage
@@ -190,7 +197,7 @@ fn telemetry_queries_leave_submission_authority_and_reservations_untouched() {
     );
     for _ in 0..3 {
         assert_eq!(
-            MockBackend::parameter_conversion_retention(&runtime).unwrap(),
+            MockSession::parameter_conversion_retention(&runtime).unwrap(),
             before
         );
         assert_eq!(runtime.session().cache_positions, 0);
@@ -198,7 +205,7 @@ fn telemetry_queries_leave_submission_authority_and_reservations_untouched() {
     }
     drop(reserved);
     assert_eq!(
-        MockBackend::parameter_conversion_retention(&runtime)
+        MockSession::parameter_conversion_retention(&runtime)
             .unwrap()
             .value()
             .unwrap()[0]
@@ -215,8 +222,12 @@ fn telemetry_queries_leave_submission_authority_and_reservations_untouched() {
 
 #[test]
 fn old_static_memory_documents_keep_retention_unknown() {
-    let runtime = ModelRuntime::prepare(MockBackend, Default::default()).unwrap();
-    let mut value = serde_json::to_value(MockBackend::static_memory(&runtime).unwrap()).unwrap();
+    let runtime = ModelRuntime::<_, _>::install::<MockSession>(
+        MockBackend,
+        fixture_prepared_model(Default::default()),
+    )
+    .unwrap();
+    let mut value = serde_json::to_value(MockSession::static_memory(&runtime).unwrap()).unwrap();
     value
         .as_object_mut()
         .unwrap()
@@ -244,7 +255,7 @@ fn composed_reports_distinguish_independent_drafter_and_embedded_ownership() {
         adaptive_lookahead: false,
     });
     let mut planned =
-        LoadedModel::load_execution_plan(&MockBackend, artifact.path(), &external).unwrap();
+        LoadedModel::load_execution_plan(&MockBackend, artifact.path(), &external, None).unwrap();
     let before = planned.parameter_conversion_retention().unwrap();
     let target = &before.target.value().unwrap()[0];
     let draft = &before.external_drafter.as_ref().unwrap().value().unwrap()[0];
@@ -268,7 +279,7 @@ fn composed_reports_distinguish_independent_drafter_and_embedded_ownership() {
         adaptive_lookahead: false,
     });
     let planned =
-        LoadedModel::load_execution_plan(&MockBackend, artifact.path(), &embedded).unwrap();
+        LoadedModel::load_execution_plan(&MockBackend, artifact.path(), &embedded, None).unwrap();
     let report = planned.parameter_conversion_retention().unwrap();
     assert_eq!(report.target.value().unwrap().len(), 1);
     assert!(report.external_drafter.is_none());
@@ -276,10 +287,14 @@ fn composed_reports_distinguish_independent_drafter_and_embedded_ownership() {
 
 #[test]
 fn retention_query_failure_preserves_native_source_and_pending_authority() {
-    let mut runtime = ModelRuntime::prepare(MockBackend, Default::default()).unwrap();
+    let mut runtime = ModelRuntime::<_, _>::install::<MockSession>(
+        MockBackend,
+        fixture_prepared_model(Default::default()),
+    )
+    .unwrap();
     runtime.session_mut().retention_failure = true;
     let pending = runtime.session_mut().authority.begin_submission().unwrap();
-    let error = MockBackend::parameter_conversion_retention(&runtime).unwrap_err();
+    let error = MockSession::parameter_conversion_retention(&runtime).unwrap_err();
     let source = std::error::Error::source(&error).unwrap();
     assert!(source.downcast_ref::<MockError>().is_some());
     assert!(runtime.session().authority.require_idle().is_err());
@@ -287,7 +302,7 @@ fn retention_query_failure_preserves_native_source_and_pending_authority() {
     drop(pending);
 }
 
-pub(super) fn retain_fixture(runtime: &ModelRuntime<MockBackend>) {
+pub(super) fn retain_fixture(runtime: &ModelRuntime<MockBackend, MockSession>) {
     let registry = ConversionRetentionRegistry::default();
     let identity = |key: &str| eredu_core::resources::ResourceIdentity {
         scope: runtime.session().retention.group().0.scope.clone(),
@@ -312,7 +327,11 @@ pub(super) fn retain_fixture(runtime: &ModelRuntime<MockBackend>) {
 
 #[test]
 fn ordinary_trim_preserves_request_and_reset_retention_then_allows_readmission() {
-    let mut runtime = ModelRuntime::prepare(MockBackend, Default::default()).unwrap();
+    let mut runtime = ModelRuntime::<_, _>::install::<MockSession>(
+        MockBackend,
+        fixture_prepared_model(Default::default()),
+    )
+    .unwrap();
     runtime.session_mut().cache_positions = 7;
     retain_fixture(&runtime);
     runtime.reset().unwrap();
@@ -331,7 +350,7 @@ fn ordinary_trim_preserves_request_and_reset_retention_then_allows_readmission()
     let identity = runtime.session().intervention_identity.clone();
     let pending = runtime.session_mut().authority.begin_submission().unwrap();
     assert!(matches!(
-        MockBackend::trim_parameter_conversions(&mut runtime),
+        MockSession::trim_parameter_conversions(&mut runtime),
         Err(ParameterConversionTrimError::NotQuiescent)
     ));
     assert!(runtime.trim_parameter_conversions().is_err());
@@ -378,7 +397,11 @@ fn ordinary_trim_preserves_request_and_reset_retention_then_allows_readmission()
 
 #[test]
 fn controlled_driver_requires_completed_drained_boundary_before_trimming() {
-    let mut runtime = ModelRuntime::prepare(MockBackend, Default::default()).unwrap();
+    let mut runtime = ModelRuntime::<_, _>::install::<MockSession>(
+        MockBackend,
+        fixture_prepared_model(Default::default()),
+    )
+    .unwrap();
     retain_fixture(&runtime);
     struct All;
     impl eredu_core::TokenFilterController for All {
@@ -479,6 +502,7 @@ fn planned_trim_preserves_independent_external_and_shared_embedded_scopes() {
             &MockBackend,
             artifact.path(),
             &plan(None).with_drafting(drafting),
+            None,
         )
         .unwrap();
         let before = planned.parameter_conversion_retention().unwrap();

@@ -1,5 +1,10 @@
 //! Readiness and bounded accounting before a distributed text run starts.
 
+use crate::{
+    communication::CommunicationSessionIdentity, consensus::BoundedConsensusTransport,
+    BackendFailure, BoundedCompletionWait,
+};
+
 use serde::{Deserialize, Serialize};
 
 /// Ordered application/backend readiness boundary around run setup and token steps.
@@ -27,6 +32,17 @@ pub enum TextPreparationStatus {
     Cancelled,
     /// The caller retains the original local preparation failure.
     Failed,
+}
+
+impl TextPreparationStatus {
+    /// Resolves the readiness of a session with one participant.
+    pub const fn local_outcome(self) -> TextPreparationOutcome {
+        match self {
+            Self::Ready => TextPreparationOutcome::Ready,
+            Self::Cancelled => TextPreparationOutcome::Cancelled,
+            Self::Failed => TextPreparationOutcome::Rejected { rank: 0 },
+        }
+    }
 }
 
 /// Complete agreement; an error or an incomplete exchange yields no outcome.
@@ -148,4 +164,24 @@ pub fn finish_preparation_cancellable<T, E>(
         ))),
         Err(error) => Err(map_backend(error)),
     }
+}
+
+/// Native transport facts and shared failure ownership for cold preparation.
+pub trait TextPreparationTransport: BoundedConsensusTransport {
+    /// Exact retained rank, independent of application-supplied labels.
+    fn preparation_rank(&self) -> usize;
+    /// Checks the actual selected communication authority before submission.
+    fn ensure_preparation_active(&self) -> Result<(), BackendFailure>;
+    /// Fences transport on unagreed failure without claiming native completion.
+    fn fence_preparation(&self);
+}
+
+/// Retained identity, native transport bounds and completion policy for preparation.
+pub struct TextPreparationAdmission {
+    /// Identity of the exact communication setup.
+    pub identity: CommunicationSessionIdentity,
+    /// Conservative native cost of one fixed preparation exchange.
+    pub native_usage: TextPreparationUsage,
+    /// Bounded completion disposition agreed at setup.
+    pub wait: BoundedCompletionWait,
 }

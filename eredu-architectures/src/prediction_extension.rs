@@ -1,18 +1,22 @@
 //! Prepared neutral construction for embedded prediction extensions.
 
+use eredu_runtime::speculative::validate_selected_capture_shapes;
+use eredu_runtime::speculative::{materialize_prediction_module, materialize_prediction_units};
+use eredu_runtime::speculative::{
+    PredictionModule, PredictionPoolingState, SequentialPredictionCache,
+};
+
 mod selection;
 pub use selection::SelectedPredictionParameters;
 
 mod bindings;
 use bindings::{PredictionBindingIndex, PreparedPredictionBindings};
 mod qwen4_exp;
-mod routed_preparation;
+pub use eredu_runtime::speculative::{PredictionConstructionError, PreparedRoutedPrediction};
 pub(crate) use qwen4_exp::speculative_contract as qwen4_speculative_contract;
 pub use qwen4_exp::{
-    MaterializedQwen4Prediction, PredictionConstructionError, PreparedQwen4PredictionWeights,
-    Qwen4PredictionTarget,
+    MaterializedQwen4Prediction, PreparedQwen4PredictionWeights, Qwen4PredictionTarget,
 };
-pub use routed_preparation::PreparedRoutedPrediction;
 
 use std::num::NonZeroUsize;
 
@@ -20,61 +24,24 @@ pub(crate) mod invocation;
 mod placement;
 pub(crate) mod residency;
 mod resources;
-mod snapshot;
-mod state_lifecycle;
+pub use eredu_runtime::speculative::{
+    MaterializedPredictionExecutor, ModelPredictionStateProfile, PoolingPredictionStateProfile,
+    PredictionStateLifecycle, SequentialPredictionStateProfile,
+};
+pub use eredu_runtime::speculative::{
+    PredictionExtensionMaterializer, PredictionInvocation, PredictionModuleRole,
+    PredictionModuleVisitor, PredictionOperationInvoker, PreparedPredictionUnit,
+};
 use invocation::prediction_invocation;
-pub use invocation::PredictionInvocation;
 pub(crate) use placement::PredictionPlacementSlot;
 pub use placement::PreparedPredictionPlacement;
-pub use state_lifecycle::{
-    ModelPredictionStateProfile, PoolingPredictionStateProfile, PredictionStateLifecycle,
-    SequentialPredictionStateProfile,
-};
-
-/// Visits the actual materialized prediction modules in architecture-declared
-/// ownership order. A module ordinal identifies a physical parameter owner; it
-/// is independent of proposal depth and mutable lane-state position.
-pub trait PredictionModuleVisitor<B, M>
-where
-    B: BlockwiseAttentionBackend
-        + DistributedNeuralBackend
-        + GroupedNeuralBackend
-        + HyperNeuralBackend,
-    M: PredictionExtensionMaterializer<B>,
-{
-    /// Traversal failure retained by the consumer.
-    type Error;
-    /// Borrows one complete typed module without rebuilding or loading parameters.
-    fn visit<U: Parameterized<B::Tensor>>(
-        &mut self,
-        ordinal: usize,
-        module: &mut M::Module<U>,
-    ) -> Result<(), Self::Error>;
-
-    /// Visits an ordered physical sequence from its declared first ordinal.
-    /// Shared modules remain separate calls in the surrounding topology.
-    fn visit_units<'a, U>(
-        &mut self,
-        first: usize,
-        units: impl IntoIterator<Item = &'a mut M::Module<U>>,
-    ) -> Result<(), Self::Error>
-    where
-        U: Parameterized<B::Tensor> + 'a,
-        M::Module<U>: 'a,
-    {
-        for (index, module) in units.into_iter().enumerate() {
-            self.visit::<U>(first + index, module)?;
-        }
-        Ok(())
-    }
-}
 
 use eredu_core::{cache::LayerCachePolicy, ParallelRankTopology, ParallelTopology};
 use eredu_nn::{
     BlockwiseAttentionBackend, DistributedNeuralBackend, GroupedNeuralBackend, HyperNeuralBackend,
     Parameterized, Tensor,
 };
-use eredu_runtime::{LocalModelLayout, StateLayout};
+use eredu_runtime::{state::PortableTextState, LocalModelLayout, StateLayout};
 use eredu_runtime::{
     ReplicatedTextMaterializationTask, ReplicatedTextOutputCompanion, RuntimeStateComponents,
 };
@@ -612,24 +579,13 @@ impl DsparkPredictionStrategy {
 }
 
 /// Simultaneous weight ownership within an embedded prediction invocation.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum PredictionModuleRole {
-    /// One physical unit; ordinary units execute sequentially.
-    Unit,
-    /// A shared module retained while ordinary units execute. Its bytes overlap
-    /// the largest unit instead of requiring every unit to stay resident.
-    Shared,
-}
-
-/// One architecture-constructed neutral module and its exact checkpoint recipes.
-pub struct PreparedPredictionUnit<M> {
+fn prepare_prediction_unit<T: 'static, M: Parameterized<T>>(
     source: M,
     local: M,
-    tasks: Vec<ReplicatedTextMaterializationTask>,
-    source_layout: Option<std::sync::Arc<LocalModelLayout>>,
-    residency: eredu_runtime::LayerWeightResidency,
-    role: PredictionModuleRole,
-    local_parameters: Vec<eredu_nn::ParameterMetadata>,
+    bindings: PreparedPredictionBindings,
+) -> Result<PreparedPredictionUnit<M>, eredu_core::artifact::ArtifactError> {
+    PreparedPredictionUnit::new(source, local, bindings.tasks, bindings.role)
+        .map_err(|error| invalid(error.to_string()))
 }
 
 /// Architecture-constructed fused DSpark modules and immutable strategy.
@@ -664,64 +620,6 @@ where
         PreparedPredictionUnit<crate::deepseek::v4::DsparkStatic<B>>,
     ) {
         (self.strategy, self.static_modules)
-    }
-}
-
-impl<M> PreparedPredictionUnit<M> {
-    fn new<T: 'static>(
-        source: M,
-        local: M,
-        bindings: PreparedPredictionBindings,
-    ) -> Result<Self, eredu_core::artifact::ArtifactError>
-    where
-        M: Parameterized<T>,
-    {
-        let local_parameters = eredu_nn::validate_parameter_topology(&local)
-            .map_err(|error| invalid(error.to_string()))?;
-        Ok(Self {
-            source,
-            local,
-            tasks: bindings.tasks,
-            source_layout: None,
-            residency: eredu_runtime::LayerWeightResidency::FullyResident,
-            role: bindings.role,
-            local_parameters,
-        })
-    }
-
-    fn with_residency(mut self, residency: eredu_runtime::LayerWeightResidency) -> Self {
-        self.residency = residency;
-        self
-    }
-
-    fn with_source_layout(mut self, layout: Option<std::sync::Arc<LocalModelLayout>>) -> Self {
-        self.source_layout = layout;
-        self
-    }
-
-    /// Source placement used by admitted local transforms, when present. The
-    /// source module already has this rank's floating geometry; recipes remain
-    /// global and are selected through this layout before bounded conversion.
-    pub fn source_layout(&self) -> Option<&std::sync::Arc<LocalModelLayout>> {
-        self.source_layout.as_ref()
-    }
-
-    /// Retained immutable-weight policy selected for the complete execution.
-    /// A native module owner must account for this module under the same bounds
-    /// as its target, including overlapping shared modules and target statics.
-    pub const fn residency(&self) -> eredu_runtime::LayerWeightResidency {
-        self.residency
-    }
-
-    /// Architecture-declared overlap with other physical prediction owners.
-    pub const fn role(&self) -> PredictionModuleRole {
-        self.role
-    }
-
-    /// Consumes source/target modules and exact tasks. A source layout marks a
-    /// rank-local conversion source; otherwise the source module is global.
-    pub fn into_parts(self) -> (M, M, Vec<ReplicatedTextMaterializationTask>) {
-        (self.source, self.local, self.tasks)
     }
 }
 
@@ -811,545 +709,7 @@ where
     },
 }
 
-/// Family-blind backend mechanisms used to materialize an architecture-owned
-/// prediction extension.
-///
-/// The architecture retains variant selection, parameter topology, state
-/// geometry, and construction order. A concrete backend only supplies the
-/// generic operations required to turn one prepared module or neutral state
-/// description into its native representation.
-pub trait PredictionExtensionMaterializer<B>
-where
-    B: BlockwiseAttentionBackend
-        + DistributedNeuralBackend
-        + GroupedNeuralBackend
-        + HyperNeuralBackend,
-{
-    /// Backend materialization failure.
-    type Error;
-    /// Native wrapper around any architecture-constructed module.
-    type Module<M>: AsMut<M>;
-    /// Native cache for one pooling-attention prediction layer.
-    type PoolingState: Clone
-        + eredu_nn::PoolingAttentionCache<B::Tensor>
-        + eredu_runtime::RuntimeLayerState<B>
-        + 'static;
-    /// Native cache for one sequential compressed-latent prediction layer.
-    type SequentialState: Clone
-        + eredu_nn::CompressedAttentionCache<B::Tensor>
-        + eredu_runtime::RuntimeLayerState<B>
-        + 'static;
-    /// Native realization of an architecture-declared state layout.
-    type ModelState: PredictionModelState<B> + 'static;
-    /// Borrowed resources used during one materialization pass.
-    type Context<'a>;
-
-    /// Invokes one typed module while its immutable parameters remain resident.
-    /// The result always carries changed state dependencies, including on an
-    /// equation failure. A paged owner must settle these dependencies before
-    /// unloading parameters or releasing their residency reservation.
-    fn invoke_module<U, O>(
-        module: &mut Self::Module<U>,
-        context: &<B::Tensor as Tensor>::Context,
-        operation: impl FnOnce(&mut U) -> PredictionInvocation<B::Tensor, O>,
-    ) -> Result<O, eredu_nn::Error>
-    where
-        U: Parameterized<B::Tensor>,
-    {
-        let invocation = operation(module.as_mut());
-        Self::complete_prediction_values(invocation.retained_values(), context)
-            .map_err(eredu_nn::Error::backend_source)?;
-        invocation.into_outcome()
-    }
-
-    /// Invokes a unit with a distinct shared parameter owner. Both reservations
-    /// remain live through their common output and state dependencies.
-    fn invoke_module_with_shared<U, V, O>(
-        module: &mut Self::Module<U>,
-        shared: Option<&mut Self::Module<V>>,
-        context: &<B::Tensor as Tensor>::Context,
-        operation: impl FnOnce(&mut U, Option<&mut V>) -> PredictionInvocation<B::Tensor, O>,
-    ) -> Result<O, eredu_nn::Error>
-    where
-        U: Parameterized<B::Tensor>,
-        V: Parameterized<B::Tensor>,
-    {
-        Self::invoke_module(module, context, |module| match shared {
-            None => operation(module, None),
-            Some(shared) => {
-                let mut retained = Vec::new();
-                let outcome = Self::invoke_module(shared, context, |shared| {
-                    let invocation = operation(module, Some(shared));
-                    retained.extend(invocation.retained_values().cloned());
-                    invocation
-                });
-                PredictionInvocation::new(outcome, retained)
-            }
-        })
-    }
-
-    /// Settles the exact retained prediction state and output dependencies before
-    /// observation publication. Native implementations include deferred validation
-    /// dependencies and retain the original error source on failure.
-    fn complete_prediction_values<'a>(
-        values: impl IntoIterator<Item = &'a B::Tensor>,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<(), eredu_core::BackendFailure>
-    where
-        B::Tensor: 'a;
-
-    /// Materializes one arbitrary architecture module and its derived recipes.
-    fn materialize_module<M>(
-        context: &mut Self::Context<'_>,
-        prepared: PreparedPredictionUnit<M>,
-        layout: Option<&LocalModelLayout>,
-    ) -> Result<Self::Module<M>, Self::Error>
-    where
-        M: Parameterized<B::Tensor>;
-
-    /// Materializes ordered units through their independent resource lifecycles.
-    /// Stops at the first error without acquiring later units.
-    fn materialize_units<U>(
-        context: &mut Self::Context<'_>,
-        units: impl IntoIterator<Item = PreparedPredictionUnit<U>>,
-        layout: Option<&LocalModelLayout>,
-    ) -> Result<Vec<Self::Module<U>>, Self::Error>
-    where
-        U: Parameterized<B::Tensor>,
-    {
-        units
-            .into_iter()
-            .map(|unit| Self::materialize_module(context, unit, layout))
-            .collect()
-    }
-
-    /// Realizes one architecture-selected pooling-attention cache policy.
-    fn pooling_state(
-        context: &mut Self::Context<'_>,
-        ordinal: usize,
-        policy: LayerCachePolicy,
-    ) -> Result<Self::PoolingState, Self::Error>;
-
-    /// Realizes one complete architecture-selected prediction state layout.
-    fn model_state(
-        context: &mut Self::Context<'_>,
-        layout: StateLayout,
-    ) -> Result<Self::ModelState, Self::Error>;
-
-    /// Constructs an empty sequential prediction-layer cache.
-    fn sequential_state() -> Self::SequentialState;
-
-    /// Observes native per-layer frontiers and capacity without copying or settling.
-    fn sequential_memory_observation(
-        _state: &Self::SequentialState,
-        _additional: u64,
-    ) -> Option<eredu_core::speculative::SpeculativePredictionMemoryObservation> {
-        None
-    }
-    /// Observes native pooling state, preserving unknown capacity where unavailable.
-    fn pooling_memory_observation(
-        _state: &Self::PoolingState,
-        _additional: u64,
-    ) -> Option<eredu_core::speculative::SpeculativePredictionMemoryObservation> {
-        None
-    }
-    /// Observes the ordinary native model-state profile.
-    fn model_memory_observation(
-        _state: &Self::ModelState,
-        _additional: u64,
-    ) -> Option<eredu_core::speculative::SpeculativePredictionMemoryObservation> {
-        None
-    }
-
-    /// Complete durable-copy bound for one sequential cache, including native
-    /// storage and any auxiliary ownership. Unknown support is never zero cost.
-    fn sequential_snapshot_estimate(
-        _state: &Self::SequentialState,
-    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
-        None
-    }
-    /// Copies one sequential cache into independently restorable storage after
-    /// reservation. Native failures retain their original source.
-    fn sequential_snapshot(
-        _state: &Self::SequentialState,
-        _context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Option<Self::SequentialState>, eredu_core::BackendFailure> {
-        Ok(None)
-    }
-    /// Complete durable-copy bound for one pooling cache.
-    fn pooling_snapshot_estimate(
-        _state: &Self::PoolingState,
-    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
-        None
-    }
-    /// Copies all pooling state and settles native copying before returning.
-    fn pooling_snapshot(
-        _state: &Self::PoolingState,
-        _context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Option<Self::PoolingState>, eredu_core::BackendFailure> {
-        Ok(None)
-    }
-    /// Complete durable-copy bound for the declared model-state profile.
-    fn model_snapshot_estimate(
-        _state: &Self::ModelState,
-    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
-        None
-    }
-    /// Copies the complete declared model-state profile after reservation.
-    fn model_snapshot(
-        _state: &Self::ModelState,
-        _context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Option<Self::ModelState>, eredu_core::BackendFailure> {
-        Ok(None)
-    }
-}
-
-/// Mutable prediction-only state with contiguous architecture-ordered layers.
-///
-/// This is deliberately narrower than a backend's complete model-state API:
-/// embedded extensions only need the ordered layer slice selected by the
-/// architecture when it constructed the extension.
-pub trait PredictionModelState<B>: Clone + eredu_runtime::RuntimeState<B>
-where
-    B: BlockwiseAttentionBackend
-        + DistributedNeuralBackend
-        + GroupedNeuralBackend
-        + HyperNeuralBackend,
-{
-    /// Concrete state consumed by an embedded prediction unit.
-    type LayerState: eredu_nn::AttentionCache<B::Tensor>
-        + eredu_nn::AuxiliaryConvolutionState<B::Tensor>
-        + eredu_runtime::RuntimeStateComponents<B>;
-
-    /// Borrows prediction layers in the architecture-declared execution order.
-    fn prediction_layers_mut(&mut self) -> &mut [Self::LayerState];
-}
-
-/// Family-blind mechanism for invoking an architecture-owned operation against
-/// the singular typed target session.
-pub trait PredictionOperationInvoker<A, B, S>
-where
-    B: BlockwiseAttentionBackend
-        + DistributedNeuralBackend
-        + GroupedNeuralBackend
-        + HyperNeuralBackend,
-    S: eredu_runtime::RuntimeState<B>,
-    A: eredu_runtime::LayeredArchitecture<B, S>,
-{
-    /// Backend/session invocation failure.
-    type Error;
-
-    /// Invokes one typed architecture operation without erasing its target.
-    fn invoke<O>(&mut self, operation: O) -> Result<O::Output, Self::Error>
-    where
-        O: eredu_runtime::PredictionTargetOperation<A, B, S>;
-
-    /// Constructs a mechanism error for a rejected architecture contract.
-    fn invalid(message: String) -> Self::Error;
-}
-
-mod executor_sealed {
-    pub trait Sealed<A> {}
-}
-
-fn validate_selected_capture_shapes(
-    selected: &eredu_runtime::SelectedSpeculativeRealization,
-    lane: &eredu_runtime::SpeculativeLaneIdentity,
-    shapes: Vec<Vec<usize>>,
-) -> Result<(), eredu_runtime::SpeculativeCaptureError> {
-    let actual = selected.requirements().capture().instantiate(shapes)?;
-    let values = vec![(); actual.entries().len()];
-    let envelope = eredu_runtime::SpeculativeCaptureEnvelope::new(
-        eredu_runtime::SpeculativeCaptureMetadata::new(actual, lane.capture_generation()),
-        values,
-    )?;
-    selected.validate_capture(lane, &envelope)
-}
-
-/// Architecture-owned executable strategy for one exactly paired materialized
-/// prediction extension.
-///
-/// Implementations own proposal depth, lane-state geometry, prefill/advance
-/// ordering, sequential versus fused execution, and every family-specific
-/// operation. A backend supplies only typed operation invocation and storage.
-pub trait MaterializedPredictionExecutor<A, B, M>: executor_sealed::Sealed<A>
-where
-    B: BlockwiseAttentionBackend
-        + DistributedNeuralBackend
-        + GroupedNeuralBackend
-        + HyperNeuralBackend,
-    M: PredictionExtensionMaterializer<B>,
-{
-    /// Exact mutable state retained for one speculative lane.
-    type LaneState: Clone + 'static;
-    /// Static state-membership and lifecycle declaration for this lane.
-    type StateProfile: PredictionStateLifecycle<B, M, State = Self::LaneState>;
-
-    /// Completes every retained lane value plus the actual phase outputs. The
-    /// architecture supplies state membership; the backend settles native work.
-    fn complete_state(
-        &self,
-        state: &mut Self::LaneState,
-        outputs: &[&B::Tensor],
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<(), eredu_core::BackendFailure> {
-        Self::StateProfile::complete_state(state, outputs, context)
-    }
-
-    /// Visits every materialized prediction parameter owner exactly once in
-    /// stable ordinal order. Shared target parameters remain with the target.
-    fn visit_modules<V: PredictionModuleVisitor<B, M>>(
-        &mut self,
-        visitor: &mut V,
-    ) -> Result<(), V::Error>;
-
-    /// Observes architecture-owned state membership through native mechanisms.
-    fn memory_observation(
-        &self,
-        state: &Self::LaneState,
-        additional: u64,
-    ) -> Option<eredu_core::speculative::SpeculativePredictionMemoryObservation> {
-        Self::StateProfile::memory_observation(state, additional)
-    }
-
-    /// Complete prediction-lane copy bound with architecture-owned membership.
-    fn snapshot_estimate(
-        &self,
-        state: &Self::LaneState,
-    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
-        Self::StateProfile::snapshot_estimate(state)
-    }
-    /// Copies every prediction state member into durable independent storage.
-    fn snapshot(
-        &self,
-        state: &Self::LaneState,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Option<Self::LaneState>, eredu_core::BackendFailure> {
-        Self::StateProfile::snapshot(state, context)
-    }
-
-    /// Returns the proposal depth exposed to the scheduler.
-    fn depth(&self) -> usize;
-
-    /// Whether this exact extension implements internal prefill, proposal and
-    /// replay hooks. This does not establish public collector or transport support.
-    fn supports_internal_observations(&self) -> bool {
-        false
-    }
-
-    /// Resolves complete phase hooks against the retained strategy. Backend
-    /// binding forwards this fact without interpreting a family or phase name.
-    fn activation_execution(
-        &self,
-        selected: &eredu_runtime::SelectedSpeculativeRealization,
-    ) -> Option<crate::speculative_execution::SpeculativeActivationExecution> {
-        crate::speculative_execution::SpeculativeActivationExecution::selected(
-            self.supports_internal_observations(),
-            self.depth(),
-            selected,
-        )
-    }
-
-    /// Maximum target prefill span for a sequential predictor that supports causal
-    /// streaming of hidden rows paired with the following original token. The shared
-    /// driver preserves that pair across chunk boundaries. No declaration keeps the
-    /// complete-input prefill contract, including for fused context builders.
-    /// Declaring extensions also apply the selected capture's architecture-owned bounds.
-    fn maximum_prefill_chunk_tokens(
-        &self,
-        _selected: &eredu_runtime::SelectedSpeculativeRealization,
-    ) -> Option<usize> {
-        None
-    }
-
-    /// Physical rows consumed while seeding prediction state. Sequential
-    /// prediction pairs each target hidden row with the following token; fused
-    /// context builders may instead consume the complete accepted prefix.
-    fn prefill_sequence_len(&self, target_sequence: usize) -> usize {
-        eredu_runtime::prediction_resources::PredictionExecutionMode::Sequential
-            .prefill_sequence_len(target_sequence)
-    }
-
-    /// Clones the architecture-materialized lane-state prototype.
-    fn new_state(&self) -> Self::LaneState;
-
-    /// Maps one physical target capture into the ordered logical entry shapes
-    /// declared by the selected architecture contract.
-    fn logical_capture_shapes(
-        &self,
-        physical_shape: &[i32],
-    ) -> Result<Vec<Vec<usize>>, eredu_runtime::SpeculativeCaptureError> {
-        let shape = physical_shape
-            .iter()
-            .copied()
-            .map(|extent| {
-                usize::try_from(extent)
-                    .ok()
-                    .filter(|extent| *extent > 0)
-                    .ok_or(eredu_runtime::SpeculativeCaptureError::ShapeMismatch)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(vec![shape])
-    }
-
-    /// Validates a physical target capture against the exact selected lane
-    /// before any extension state can be mutated.
-    fn validate_capture(
-        &self,
-        selected: &eredu_runtime::SelectedSpeculativeRealization,
-        lane: &eredu_runtime::SpeculativeLaneIdentity,
-        physical_shape: &[i32],
-    ) -> Result<(), eredu_runtime::SpeculativeCaptureError> {
-        validate_selected_capture_shapes(
-            selected,
-            lane,
-            self.logical_capture_shapes(physical_shape)?,
-        )
-    }
-
-    /// Advances extension state across a target-prefill observation.
-    fn prefill<S, I>(
-        &mut self,
-        invoker: &mut I,
-        target_capture: &B::Tensor,
-        hidden: &B::Tensor,
-        tokens: &B::Tensor,
-        lane: &mut Self::LaneState,
-    ) -> Result<(), I::Error>
-    where
-        S: eredu_runtime::RuntimeState<B>,
-        A: eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<A, B, S>,
-    {
-        self.prefill_observed::<S, I>(invoker, target_capture, hidden, tokens, lane, None)
-    }
-
-    /// Executes exactly one sequential proposal depth.
-    fn logits<S, I>(
-        &mut self,
-        invoker: &mut I,
-        hidden: &B::Tensor,
-        token: &B::Tensor,
-        draft_index: usize,
-        lane: &mut Self::LaneState,
-    ) -> Result<(B::Tensor, B::Tensor), I::Error>
-    where
-        S: eredu_runtime::RuntimeState<B>,
-        A: eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<A, B, S>,
-    {
-        self.logits_observed::<S, I>(invoker, hidden, token, draft_index, lane, None)
-    }
-
-    /// Required prefill equation path, with optional internal hooks. Ordinary
-    /// calls use the same path without creating diagnostic tensors.
-    #[allow(clippy::too_many_arguments)]
-    fn prefill_observed<S, I>(
-        &mut self,
-        invoker: &mut I,
-        target_capture: &B::Tensor,
-        hidden: &B::Tensor,
-        tokens: &B::Tensor,
-        lane: &mut Self::LaneState,
-        observer: Option<&mut dyn eredu_runtime::ActivationObserver<B::Tensor, eredu_nn::Error>>,
-    ) -> Result<(), I::Error>
-    where
-        S: eredu_runtime::RuntimeState<B>,
-        A: eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<A, B, S>;
-
-    /// Required proposal equation path, with optional admitted internal hooks.
-    /// Runtime support reports retain the exact selected observation capability.
-    #[allow(clippy::too_many_arguments)]
-    fn logits_observed<S, I>(
-        &mut self,
-        invoker: &mut I,
-        hidden: &B::Tensor,
-        token: &B::Tensor,
-        draft_index: usize,
-        lane: &mut Self::LaneState,
-        observer: Option<&mut dyn eredu_runtime::ActivationObserver<B::Tensor, eredu_nn::Error>>,
-    ) -> Result<(B::Tensor, B::Tensor), I::Error>
-    where
-        S: eredu_runtime::RuntimeState<B>,
-        A: eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<A, B, S>;
-
-    /// Executes a fused proposal when selected by the architecture.
-    fn fused_logits<S, I>(
-        &mut self,
-        _invoker: &mut I,
-        _anchor: &B::Tensor,
-        _capacity: usize,
-        _lane: &Self::LaneState,
-    ) -> Result<Option<B::Tensor>, I::Error>
-    where
-        S: eredu_runtime::RuntimeState<B>,
-        A: eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<A, B, S>,
-    {
-        Ok(None)
-    }
-
-    /// Executes a fused proposal using the caller's temporary lane. The caller
-    /// retains this lane through completion and discards it after the phase;
-    /// speculative cache writes are never committed by this operation.
-    #[allow(clippy::too_many_arguments)]
-    fn fused_logits_observed<S, I>(
-        &mut self,
-        invoker: &mut I,
-        anchor: &B::Tensor,
-        capacity: usize,
-        lane: &mut Self::LaneState,
-        observer: Option<&mut dyn eredu_runtime::ActivationObserver<B::Tensor, eredu_nn::Error>>,
-    ) -> Result<Option<B::Tensor>, I::Error>
-    where
-        S: eredu_runtime::RuntimeState<B>,
-        A: eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<A, B, S>,
-    {
-        if observer.is_some() {
-            return Err(I::invalid(
-                "selected fused proposal has no internal observation path".into(),
-            ));
-        }
-        self.fused_logits::<S, I>(invoker, anchor, capacity, lane)
-    }
-
-    /// Advances extension state after committed target execution.
-    fn advance<S, I>(
-        &mut self,
-        invoker: &mut I,
-        hidden: &B::Tensor,
-        tokens: &B::Tensor,
-        lane: &mut Self::LaneState,
-    ) -> Result<(), I::Error>
-    where
-        S: eredu_runtime::RuntimeState<B>,
-        A: eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<A, B, S>,
-    {
-        self.prefill::<S, I>(invoker, hidden, hidden, tokens, lane)
-    }
-
-    /// Replays retained target inputs with internal hooks when the selected
-    /// extension supplies them. The caller retains replay/proposal attribution.
-    fn advance_observed<S, I>(
-        &mut self,
-        invoker: &mut I,
-        hidden: &B::Tensor,
-        tokens: &B::Tensor,
-        lane: &mut Self::LaneState,
-        observer: Option<&mut dyn eredu_runtime::ActivationObserver<B::Tensor, eredu_nn::Error>>,
-    ) -> Result<(), I::Error>
-    where
-        S: eredu_runtime::RuntimeState<B>,
-        A: eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<A, B, S>,
-    {
-        self.prefill_observed::<S, I>(invoker, hidden, hidden, tokens, lane, observer)
-    }
-}
+pub use eredu_runtime::PredictionModelState;
 
 /// Architecture-owned prediction topology after generic backend
 /// materialization.
@@ -1364,48 +724,48 @@ where
     /// DeepSeek-V3 sequential MTP units.
     DeepSeekV3 {
         /// Units in proposal order.
-        units: Vec<M::Module<crate::deepseek::v3::Unit<B>>>,
+        units: Vec<PredictionModule<B, M, crate::deepseek::v3::Unit<B>>>,
     },
     /// DeepSeek-V4 sequential MTP units.
     DeepSeekV4 {
         /// Units in proposal order.
-        units: Vec<M::Module<crate::deepseek::v4::Unit<B>>>,
+        units: Vec<PredictionModule<B, M, crate::deepseek::v4::Unit<B>>>,
         /// Immutable lane-state prototypes in unit order.
-        state: Vec<M::PoolingState>,
+        state: Vec<PredictionPoolingState<B, M>>,
     },
     /// DeepSeek-V4 fused DSpark execution.
     DeepSeekV4Dspark {
         /// Exact fused strategy retained from configuration.
         strategy: DsparkPredictionStrategy,
         /// Checkpoint-global fused projection modules.
-        static_modules: M::Module<crate::deepseek::v4::DsparkStatic<B>>,
+        static_modules: PredictionModule<B, M, crate::deepseek::v4::DsparkStatic<B>>,
         /// Physical blocks in fused execution order.
-        units: Vec<M::Module<crate::deepseek::v4::Unit<B>>>,
+        units: Vec<PredictionModule<B, M, crate::deepseek::v4::Unit<B>>>,
         /// Immutable lane-state prototypes in block order.
-        state: Vec<M::PoolingState>,
+        state: Vec<PredictionPoolingState<B, M>>,
     },
     /// Inkling sequential prediction units.
     Inkling {
         /// Units in proposal order.
-        units: Vec<M::Module<crate::inkling::MtpDepth<B>>>,
+        units: Vec<PredictionModule<B, M, crate::inkling::MtpDepth<B>>>,
         /// Optional canonical chain normalization.
-        shared: Option<M::Module<crate::inkling::MtpShared<B>>>,
+        shared: Option<PredictionModule<B, M, crate::inkling::MtpShared<B>>>,
         /// Immutable prediction-state prototype.
         state: M::ModelState,
     },
     /// Dense Qwen hybrid MTP units.
     QwenHybrid {
         /// Units in proposal order.
-        units: Vec<M::Module<crate::qwen::hybrid::PredictionUnit<B>>>,
+        units: Vec<PredictionModule<B, M, crate::qwen::hybrid::PredictionUnit<B>>>,
         /// Canonical shared fusion/normalization.
-        shared: M::Module<crate::qwen::hybrid::PredictionShared<B>>,
+        shared: PredictionModule<B, M, crate::qwen::hybrid::PredictionShared<B>>,
         /// Immutable prediction-state prototype.
         state: M::ModelState,
     },
     /// Nemotron-H patterned MTP groups.
     NemotronH {
         /// Groups in proposal order and units in physical execution order.
-        groups: Vec<Vec<M::Module<crate::nemotron_h::PredictionUnit<B>>>>,
+        groups: Vec<Vec<PredictionModule<B, M, crate::nemotron_h::PredictionUnit<B>>>>,
         /// Immutable prediction-state prototype.
         state: M::ModelState,
     },
@@ -1424,7 +784,7 @@ where
     M: PredictionExtensionMaterializer<B>,
 {
     /// Units in proposal order.
-    pub units: Vec<M::Module<crate::deepseek::v3::Unit<B>>>,
+    pub units: Vec<PredictionModule<B, M, crate::deepseek::v3::Unit<B>>>,
 }
 
 /// Materialized DeepSeek-V4 prediction execution paired with its exact target.
@@ -1439,20 +799,20 @@ where
     /// Sequential MTP units and their cache prototypes.
     Sequential {
         /// Units in proposal order.
-        units: Vec<M::Module<crate::deepseek::v4::Unit<B>>>,
+        units: Vec<PredictionModule<B, M, crate::deepseek::v4::Unit<B>>>,
         /// Immutable lane-state prototypes in unit order.
-        state: Vec<M::PoolingState>,
+        state: Vec<PredictionPoolingState<B, M>>,
     },
     /// Fused DSpark modules and their cache prototypes.
     Dspark {
         /// Exact fused proposal strategy.
         strategy: DsparkPredictionStrategy,
         /// Checkpoint-global fused projection modules.
-        static_modules: M::Module<crate::deepseek::v4::DsparkStatic<B>>,
+        static_modules: PredictionModule<B, M, crate::deepseek::v4::DsparkStatic<B>>,
         /// Physical blocks in fused execution order.
-        units: Vec<M::Module<crate::deepseek::v4::Unit<B>>>,
+        units: Vec<PredictionModule<B, M, crate::deepseek::v4::Unit<B>>>,
         /// Immutable lane-state prototypes in block order.
-        state: Vec<M::PoolingState>,
+        state: Vec<PredictionPoolingState<B, M>>,
     },
 }
 
@@ -1466,9 +826,9 @@ where
     M: PredictionExtensionMaterializer<B>,
 {
     /// Units in proposal order.
-    pub units: Vec<M::Module<crate::inkling::MtpDepth<B>>>,
+    pub units: Vec<PredictionModule<B, M, crate::inkling::MtpDepth<B>>>,
     /// Optional canonical chain normalization.
-    pub shared: Option<M::Module<crate::inkling::MtpShared<B>>>,
+    pub shared: Option<PredictionModule<B, M, crate::inkling::MtpShared<B>>>,
     /// Immutable prediction-state prototype.
     pub state: M::ModelState,
 }
@@ -1483,9 +843,9 @@ where
     M: PredictionExtensionMaterializer<B>,
 {
     /// Units in proposal order.
-    pub units: Vec<M::Module<crate::qwen::hybrid::PredictionUnit<B>>>,
+    pub units: Vec<PredictionModule<B, M, crate::qwen::hybrid::PredictionUnit<B>>>,
     /// Canonical shared fusion/normalization, visited once for parameter control.
-    pub shared: M::Module<crate::qwen::hybrid::PredictionShared<B>>,
+    pub shared: PredictionModule<B, M, crate::qwen::hybrid::PredictionShared<B>>,
     /// Immutable prediction-state prototype.
     pub state: M::ModelState,
 }
@@ -1500,7 +860,7 @@ where
     M: PredictionExtensionMaterializer<B>,
 {
     /// Groups in proposal order and units in physical execution order.
-    pub groups: Vec<Vec<M::Module<crate::nemotron_h::PredictionUnit<B>>>>,
+    pub groups: Vec<Vec<PredictionModule<B, M, crate::nemotron_h::PredictionUnit<B>>>>,
     /// Immutable prediction-state prototype.
     pub state: M::ModelState,
 }
@@ -1742,10 +1102,10 @@ where
         + HyperNeuralBackend,
     M: PredictionExtensionMaterializer<B>,
 {
-    unit: &'a mut M::Module<crate::deepseek::v3::Unit<B>>,
+    unit: &'a mut PredictionModule<B, M, crate::deepseek::v3::Unit<B>>,
     hidden: &'a B::Tensor,
     tokens: &'a B::Tensor,
-    cache: &'a mut M::SequentialState,
+    cache: &'a mut SequentialPredictionCache<B, M>,
     depth: usize,
     pass: eredu_runtime::ExpertPass,
     observer: Option<&'o mut dyn eredu_runtime::ActivationObserver<B::Tensor, eredu_nn::Error>>,
@@ -1762,7 +1122,6 @@ where
     crate::deepseek::v3::Model<B>:
         eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
     M: PredictionExtensionMaterializer<B>,
-    M::SequentialState: eredu_nn::CompressedAttentionCache<B::Tensor>,
 {
     type Output = crate::deepseek::mtp::PredictionOutput<B::Tensor>;
 
@@ -1827,10 +1186,10 @@ where
         + HyperNeuralBackend,
     M: PredictionExtensionMaterializer<B>,
 {
-    unit: &'a mut M::Module<crate::deepseek::v4::Unit<B>>,
+    unit: &'a mut PredictionModule<B, M, crate::deepseek::v4::Unit<B>>,
     hidden: &'a B::Tensor,
     tokens: &'a B::Tensor,
-    cache: &'a mut M::PoolingState,
+    cache: &'a mut PredictionPoolingState<B, M>,
     depth: usize,
     pass: eredu_runtime::ExpertPass,
     observer: Option<&'o mut dyn eredu_runtime::ActivationObserver<B::Tensor, eredu_nn::Error>>,
@@ -1847,7 +1206,7 @@ where
     crate::deepseek::v4::Model<B>:
         eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
     M: PredictionExtensionMaterializer<B>,
-    M::PoolingState: eredu_nn::PoolingAttentionCache<B::Tensor>,
+    PredictionPoolingState<B, M>: eredu_nn::PoolingAttentionCache<B::Tensor>,
 {
     type Output = crate::deepseek::mtp::PredictionOutput<B::Tensor>;
 
@@ -2035,8 +1394,8 @@ where
         + HyperNeuralBackend,
     M: PredictionExtensionMaterializer<B>,
 {
-    unit: &'a mut M::Module<crate::inkling::MtpDepth<B>>,
-    shared: Option<&'a mut M::Module<crate::inkling::MtpShared<B>>>,
+    unit: &'a mut PredictionModule<B, M, crate::inkling::MtpDepth<B>>,
+    shared: Option<&'a mut PredictionModule<B, M, crate::inkling::MtpShared<B>>>,
     hidden: &'a B::Tensor,
     tokens: &'a B::Tensor,
     depth: usize,
@@ -2284,8 +1643,8 @@ where
         + HyperNeuralBackend,
     M: PredictionExtensionMaterializer<B>,
 {
-    unit: &'a mut M::Module<crate::qwen::hybrid::PredictionUnit<B>>,
-    shared: &'a mut M::Module<crate::qwen::hybrid::PredictionShared<B>>,
+    unit: &'a mut PredictionModule<B, M, crate::qwen::hybrid::PredictionUnit<B>>,
+    shared: &'a mut PredictionModule<B, M, crate::qwen::hybrid::PredictionShared<B>>,
     hidden: &'a B::Tensor,
     tokens: &'a B::Tensor,
     depth: usize,
@@ -2346,7 +1705,7 @@ where
         + HyperNeuralBackend,
     M: PredictionExtensionMaterializer<B>,
 {
-    units: &'a mut [M::Module<crate::nemotron_h::PredictionUnit<B>>],
+    units: &'a mut [PredictionModule<B, M, crate::nemotron_h::PredictionUnit<B>>],
     hidden: &'a B::Tensor,
     tokens: &'a B::Tensor,
     depth: usize,
@@ -2475,17 +1834,6 @@ where
     }
 }
 
-impl<B, M> executor_sealed::Sealed<crate::deepseek::v3::Model<B>>
-    for MaterializedDeepSeekV3Prediction<B, M>
-where
-    B: BlockwiseAttentionBackend
-        + DistributedNeuralBackend
-        + GroupedNeuralBackend
-        + HyperNeuralBackend,
-    M: PredictionExtensionMaterializer<B>,
-{
-}
-
 impl<B, M> MaterializedPredictionExecutor<crate::deepseek::v3::Model<B>, B, M>
     for MaterializedDeepSeekV3Prediction<B, M>
 where
@@ -2494,9 +1842,8 @@ where
         + GroupedNeuralBackend
         + HyperNeuralBackend,
     M: PredictionExtensionMaterializer<B>,
-    M::SequentialState: 'static,
 {
-    type LaneState = Vec<M::SequentialState>;
+    type LaneState = Vec<SequentialPredictionCache<B, M>>;
     type StateProfile = SequentialPredictionStateProfile;
 
     fn visit_modules<V: PredictionModuleVisitor<B, M>>(
@@ -2516,7 +1863,7 @@ where
 
     fn new_state(&self) -> Self::LaneState {
         (0..self.units.len())
-            .map(|_| M::sequential_state())
+            .map(|_| SequentialPredictionCache::<B, M>::new())
             .collect()
     }
 
@@ -2597,17 +1944,6 @@ where
     }
 }
 
-impl<B, M> executor_sealed::Sealed<crate::deepseek::v4::Model<B>>
-    for MaterializedDeepSeekV4Prediction<B, M>
-where
-    B: BlockwiseAttentionBackend
-        + DistributedNeuralBackend
-        + GroupedNeuralBackend
-        + HyperNeuralBackend,
-    M: PredictionExtensionMaterializer<B>,
-{
-}
-
 impl<B, M> MaterializedPredictionExecutor<crate::deepseek::v4::Model<B>, B, M>
     for MaterializedDeepSeekV4Prediction<B, M>
 where
@@ -2616,9 +1952,9 @@ where
         + GroupedNeuralBackend
         + HyperNeuralBackend,
     M: PredictionExtensionMaterializer<B>,
-    M::PoolingState: 'static,
+    PredictionPoolingState<B, M>: 'static,
 {
-    type LaneState = Vec<M::PoolingState>;
+    type LaneState = Vec<PredictionPoolingState<B, M>>;
     type StateProfile = PoolingPredictionStateProfile;
 
     fn visit_modules<V: PredictionModuleVisitor<B, M>>(
@@ -2905,17 +2241,6 @@ where
     }
 }
 
-impl<A, B, M> executor_sealed::Sealed<A> for MaterializedInklingPrediction<B, M>
-where
-    B: BlockwiseAttentionBackend
-        + DistributedNeuralBackend
-        + GroupedNeuralBackend
-        + HyperNeuralBackend,
-    M: PredictionExtensionMaterializer<B>,
-    A: InklingPredictionTarget<B>,
-{
-}
-
 impl<A, B, M> MaterializedPredictionExecutor<A, B, M> for MaterializedInklingPrediction<B, M>
 where
     B: BlockwiseAttentionBackend
@@ -3035,17 +2360,6 @@ where
     }
 }
 
-impl<A, B, M> executor_sealed::Sealed<A> for MaterializedQwenHybridPrediction<B, M>
-where
-    B: BlockwiseAttentionBackend
-        + DistributedNeuralBackend
-        + eredu_nn::TensorParallelGroupedNeuralBackend
-        + HyperNeuralBackend,
-    M: PredictionExtensionMaterializer<B>,
-    A: QwenHybridPredictionTarget<B>,
-{
-}
-
 impl<A, B, M> MaterializedPredictionExecutor<A, B, M> for MaterializedQwenHybridPrediction<B, M>
 where
     B: BlockwiseAttentionBackend
@@ -3156,17 +2470,6 @@ where
             })
             .map(|output| (output.logits, output.capture))
     }
-}
-
-impl<A, B, M> executor_sealed::Sealed<A> for MaterializedNemotronHPrediction<B, M>
-where
-    B: BlockwiseAttentionBackend
-        + DistributedNeuralBackend
-        + eredu_nn::TensorParallelGroupedNeuralBackend
-        + HyperNeuralBackend,
-    M: PredictionExtensionMaterializer<B>,
-    A: NemotronHPredictionTarget<B>,
-{
 }
 
 impl<A, B, M> MaterializedPredictionExecutor<A, B, M> for MaterializedNemotronHPrediction<B, M>
@@ -3285,10 +2588,10 @@ where
     M: PredictionExtensionMaterializer<B>,
 {
     strategy: &'a DsparkPredictionStrategy,
-    static_modules: &'a mut M::Module<crate::deepseek::v4::DsparkStatic<B>>,
-    units: &'a mut [M::Module<crate::deepseek::v4::Unit<B>>],
+    static_modules: &'a mut PredictionModule<B, M, crate::deepseek::v4::DsparkStatic<B>>,
+    units: &'a mut [PredictionModule<B, M, crate::deepseek::v4::Unit<B>>],
     captures: &'a B::Tensor,
-    caches: &'a mut [M::PoolingState],
+    caches: &'a mut [PredictionPoolingState<B, M>],
     observer: Option<&'o mut dyn eredu_runtime::ActivationObserver<B::Tensor, eredu_nn::Error>>,
 }
 
@@ -3303,7 +2606,7 @@ where
     crate::deepseek::v4::Model<B>:
         eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
     M: PredictionExtensionMaterializer<B>,
-    M::PoolingState: eredu_nn::PoolingAttentionCache<B::Tensor>,
+    PredictionPoolingState<B, M>: eredu_nn::PoolingAttentionCache<B::Tensor>,
 {
     type Output = ();
 
@@ -3344,11 +2647,11 @@ where
     M: PredictionExtensionMaterializer<B>,
 {
     strategy: &'a DsparkPredictionStrategy,
-    static_modules: &'a mut M::Module<crate::deepseek::v4::DsparkStatic<B>>,
-    units: &'a mut [M::Module<crate::deepseek::v4::Unit<B>>],
+    static_modules: &'a mut PredictionModule<B, M, crate::deepseek::v4::DsparkStatic<B>>,
+    units: &'a mut [PredictionModule<B, M, crate::deepseek::v4::Unit<B>>],
     anchor: &'a B::Tensor,
     capacity: usize,
-    caches: &'a mut [M::PoolingState],
+    caches: &'a mut [PredictionPoolingState<B, M>],
     observer: Option<&'o mut dyn eredu_runtime::ActivationObserver<B::Tensor, eredu_nn::Error>>,
 }
 
@@ -3363,7 +2666,7 @@ where
     crate::deepseek::v4::Model<B>:
         eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
     M: PredictionExtensionMaterializer<B>,
-    M::PoolingState: eredu_nn::PoolingAttentionCache<B::Tensor>,
+    PredictionPoolingState<B, M>: eredu_nn::PoolingAttentionCache<B::Tensor>,
 {
     type Output = B::Tensor;
 
@@ -3403,23 +2706,14 @@ mod pairing_sealed {
 
 /// Architecture-owned proof that one materialized extension belongs to one
 /// exact ordinary target architecture.
-pub trait MaterializedPredictionTarget<B>: pairing_sealed::Sealed
+pub trait MaterializedPredictionTarget<B>:
+    pairing_sealed::Sealed + eredu_runtime::speculative::PredictionTarget<B>
 where
     B: BlockwiseAttentionBackend
         + DistributedNeuralBackend
         + GroupedNeuralBackend
         + HyperNeuralBackend,
 {
-    /// Target-specific extension shape retained after pairing.
-    type Extension<M>: MaterializedPredictionExecutor<Self, B, M>
-        + TryFrom<
-            MaterializedPredictionExtension<B, M>,
-            Error = MaterializedPredictionExtension<B, M>,
-        >
-    where
-        M: PredictionExtensionMaterializer<B>,
-        Self: Sized;
-
     /// Exact target context reported when the materialized family does not match.
     const PAIRING_MISMATCH: &'static str;
 
@@ -3429,213 +2723,111 @@ where
     ) -> Result<Self::Extension<M>, eredu_core::artifact::ArtifactError>
     where
         M: PredictionExtensionMaterializer<B>,
-        Self: Sized,
-    {
-        Self::Extension::<M>::try_from(extension).map_err(|_| invalid(Self::PAIRING_MISMATCH))
-    }
+        Self: Sized;
 }
 
-macro_rules! sealed_prediction_target {
-    ($target:ty) => {
-        impl<B> pairing_sealed::Sealed for $target where
-            B: BlockwiseAttentionBackend
-                + DistributedNeuralBackend
-                + GroupedNeuralBackend
-                + HyperNeuralBackend
+macro_rules! prediction_pairing {
+    (
+        $backend:ident $(, $policy:ident)?; $materializer:ident;
+        $kernel:ty => $target:ty;
+        $extension:ty; $grouped:path;
+        $mismatch:literal
+    ) => {
+        impl<$backend $(, $policy: 'static)?> pairing_sealed::Sealed for $target
+        where
+            $backend: BlockwiseAttentionBackend + DistributedNeuralBackend + $grouped + HyperNeuralBackend,
+        {}
+
+        impl<$backend $(, $policy: 'static)?> eredu_runtime::speculative::PredictionKernel<$backend, $target> for $kernel
+        where
+            $backend: BlockwiseAttentionBackend + DistributedNeuralBackend + $grouped + HyperNeuralBackend,
         {
+            type Extension<$materializer> = $extension
+            where
+                $materializer: PredictionExtensionMaterializer<$backend>;
+        }
+
+        impl<$backend $(, $policy: 'static)?> MaterializedPredictionTarget<$backend> for $target
+        where
+            $backend: BlockwiseAttentionBackend + DistributedNeuralBackend + $grouped + HyperNeuralBackend,
+        {
+            const PAIRING_MISMATCH: &'static str = $mismatch;
+
+            fn pair_prediction_extension<$materializer>(
+                extension: MaterializedPredictionExtension<$backend, $materializer>,
+            ) -> Result<Self::Extension<$materializer>, eredu_core::artifact::ArtifactError>
+            where
+                $materializer: PredictionExtensionMaterializer<$backend>,
+            {
+                Self::Extension::<$materializer>::try_from(extension)
+                    .map_err(|_| invalid(Self::PAIRING_MISMATCH))
+            }
         }
     };
 }
 
-sealed_prediction_target!(crate::deepseek::v3::Model<B>);
-sealed_prediction_target!(crate::deepseek::v4::Model<B>);
-sealed_prediction_target!(crate::nemotron_h::PartitionedLayeredModel<B>);
-sealed_prediction_target!(crate::nemotron_h::LayeredModel<B>);
-sealed_prediction_target!(crate::inkling::LayeredModel<B>);
-sealed_prediction_target!(crate::qwen::hybrid::ConditionalLayeredModel<B>);
-sealed_prediction_target!(crate::qwen::hybrid::LayeredModel<B>);
+prediction_pairing!(
+    B; M;
+    crate::deepseek::v3::V3Kernel<B> => crate::deepseek::v3::Model<B>;
+    MaterializedDeepSeekV3Prediction<B, M>; GroupedNeuralBackend;
+    "materialized prediction extension does not match the DeepSeek-V3 target"
+);
 
-impl<B, P: 'static> pairing_sealed::Sealed
-    for crate::replicated_model::FixedReplicatedModel<
-        B,
-        crate::replicated_text::NemotronHReplicated,
-        P,
-    >
-where
-    B: BlockwiseAttentionBackend
-        + DistributedNeuralBackend
-        + GroupedNeuralBackend
-        + HyperNeuralBackend,
-{
-}
+prediction_pairing!(
+    B; M;
+    crate::deepseek::v4::V4Kernel<B> => crate::deepseek::v4::Model<B>;
+    MaterializedDeepSeekV4Prediction<B, M>; GroupedNeuralBackend;
+    "materialized prediction extension does not match the DeepSeek-V4 target"
+);
 
-impl<B, P: 'static> pairing_sealed::Sealed
-    for crate::replicated_model::FixedReplicatedModel<
-        B,
-        crate::replicated_text::QwenHybridReplicated,
-        P,
-    >
-where
-    B: BlockwiseAttentionBackend
-        + DistributedNeuralBackend
-        + GroupedNeuralBackend
-        + HyperNeuralBackend,
-{
-}
+prediction_pairing!(
+    B; M;
+    crate::nemotron_h::NemotronKernel<B> => crate::nemotron_h::PartitionedLayeredModel<B>;
+    MaterializedNemotronHPrediction<B, M>; eredu_nn::TensorParallelGroupedNeuralBackend;
+    "materialized prediction extension does not match the Nemotron-H target"
+);
 
-impl<B> MaterializedPredictionTarget<B> for crate::deepseek::v3::Model<B>
-where
-    B: BlockwiseAttentionBackend
-        + DistributedNeuralBackend
-        + GroupedNeuralBackend
-        + HyperNeuralBackend,
-{
-    type Extension<M>
-        = MaterializedDeepSeekV3Prediction<B, M>
-    where
-        M: PredictionExtensionMaterializer<B>;
+prediction_pairing!(
+    B; M;
+    crate::nemotron_h::CompleteNemotronKernel<B> => crate::nemotron_h::LayeredModel<B>;
+    MaterializedNemotronHPrediction<B, M>; eredu_nn::TensorParallelGroupedNeuralBackend;
+    "materialized prediction extension does not match the Nemotron-H target"
+);
 
-    const PAIRING_MISMATCH: &'static str =
-        "materialized prediction extension does not match the DeepSeek-V3 target";
-}
+prediction_pairing!(
+    B, P; M;
+    crate::replicated_model::FixedReplicatedKernel<B, crate::replicated_text::NemotronHReplicated, P> => crate::replicated_model::FixedReplicatedModel<B, crate::replicated_text::NemotronHReplicated, P>;
+    MaterializedNemotronHPrediction<B, M>; eredu_nn::TensorParallelGroupedNeuralBackend;
+    "materialized prediction extension does not match the Nemotron-H target"
+);
 
-impl<B> MaterializedPredictionTarget<B> for crate::deepseek::v4::Model<B>
-where
-    B: BlockwiseAttentionBackend
-        + DistributedNeuralBackend
-        + GroupedNeuralBackend
-        + HyperNeuralBackend,
-{
-    type Extension<M>
-        = MaterializedDeepSeekV4Prediction<B, M>
-    where
-        M: PredictionExtensionMaterializer<B>;
+prediction_pairing!(
+    B; M;
+    crate::inkling::InklingKernel<B> => crate::inkling::LayeredModel<B>;
+    MaterializedInklingPrediction<B, M>; eredu_nn::TensorParallelGroupedNeuralBackend;
+    "materialized prediction extension does not match the Inkling target"
+);
 
-    const PAIRING_MISMATCH: &'static str =
-        "materialized prediction extension does not match the DeepSeek-V4 target";
-}
+prediction_pairing!(
+    B; M;
+    crate::qwen::hybrid::ConditionalKernel<B> => crate::qwen::hybrid::ConditionalLayeredModel<B>;
+    MaterializedQwenHybridPrediction<B, M>; eredu_nn::TensorParallelGroupedNeuralBackend;
+    "materialized prediction extension does not match the conditional Qwen target"
+);
 
-impl<B> MaterializedPredictionTarget<B> for crate::nemotron_h::PartitionedLayeredModel<B>
-where
-    B: BlockwiseAttentionBackend
-        + DistributedNeuralBackend
-        + eredu_nn::TensorParallelGroupedNeuralBackend
-        + HyperNeuralBackend,
-{
-    type Extension<M>
-        = MaterializedNemotronHPrediction<B, M>
-    where
-        M: PredictionExtensionMaterializer<B>;
+prediction_pairing!(
+    B; M;
+    crate::qwen::hybrid::QwenKernel<B> => crate::qwen::hybrid::LayeredModel<B>;
+    MaterializedQwenHybridPrediction<B, M>; eredu_nn::TensorParallelGroupedNeuralBackend;
+    "materialized prediction extension does not match the Qwen text target"
+);
 
-    const PAIRING_MISMATCH: &'static str =
-        "materialized prediction extension does not match the Nemotron-H target";
-}
-
-impl<B> MaterializedPredictionTarget<B> for crate::nemotron_h::LayeredModel<B>
-where
-    B: BlockwiseAttentionBackend
-        + DistributedNeuralBackend
-        + eredu_nn::TensorParallelGroupedNeuralBackend
-        + HyperNeuralBackend,
-{
-    type Extension<M>
-        = MaterializedNemotronHPrediction<B, M>
-    where
-        M: PredictionExtensionMaterializer<B>;
-
-    const PAIRING_MISMATCH: &'static str =
-        "materialized prediction extension does not match the Nemotron-H target";
-}
-
-impl<B, P: 'static> MaterializedPredictionTarget<B>
-    for crate::replicated_model::FixedReplicatedModel<
-        B,
-        crate::replicated_text::NemotronHReplicated,
-        P,
-    >
-where
-    B: BlockwiseAttentionBackend
-        + DistributedNeuralBackend
-        + eredu_nn::TensorParallelGroupedNeuralBackend
-        + HyperNeuralBackend,
-{
-    type Extension<M>
-        = MaterializedNemotronHPrediction<B, M>
-    where
-        M: PredictionExtensionMaterializer<B>;
-
-    const PAIRING_MISMATCH: &'static str =
-        "materialized prediction extension does not match the replicated Nemotron-H target";
-}
-
-impl<B> MaterializedPredictionTarget<B> for crate::inkling::LayeredModel<B>
-where
-    B: BlockwiseAttentionBackend
-        + DistributedNeuralBackend
-        + GroupedNeuralBackend
-        + HyperNeuralBackend,
-{
-    type Extension<M>
-        = MaterializedInklingPrediction<B, M>
-    where
-        M: PredictionExtensionMaterializer<B>;
-
-    const PAIRING_MISMATCH: &'static str =
-        "materialized prediction extension does not match the Inkling target";
-}
-
-impl<B> MaterializedPredictionTarget<B> for crate::qwen::hybrid::ConditionalLayeredModel<B>
-where
-    B: BlockwiseAttentionBackend
-        + DistributedNeuralBackend
-        + eredu_nn::TensorParallelGroupedNeuralBackend
-        + HyperNeuralBackend,
-{
-    type Extension<M>
-        = MaterializedQwenHybridPrediction<B, M>
-    where
-        M: PredictionExtensionMaterializer<B>;
-
-    const PAIRING_MISMATCH: &'static str =
-        "materialized prediction extension does not match the conditional Qwen target";
-}
-
-impl<B> MaterializedPredictionTarget<B> for crate::qwen::hybrid::LayeredModel<B>
-where
-    B: BlockwiseAttentionBackend
-        + DistributedNeuralBackend
-        + eredu_nn::TensorParallelGroupedNeuralBackend
-        + HyperNeuralBackend,
-{
-    type Extension<M>
-        = MaterializedQwenHybridPrediction<B, M>
-    where
-        M: PredictionExtensionMaterializer<B>;
-
-    const PAIRING_MISMATCH: &'static str =
-        "materialized prediction extension does not match the Qwen text target";
-}
-
-impl<B, P: 'static> MaterializedPredictionTarget<B>
-    for crate::replicated_model::FixedReplicatedModel<
-        B,
-        crate::replicated_text::QwenHybridReplicated,
-        P,
-    >
-where
-    B: BlockwiseAttentionBackend
-        + DistributedNeuralBackend
-        + eredu_nn::TensorParallelGroupedNeuralBackend
-        + HyperNeuralBackend,
-{
-    type Extension<M>
-        = MaterializedQwenHybridPrediction<B, M>
-    where
-        M: PredictionExtensionMaterializer<B>;
-
-    const PAIRING_MISMATCH: &'static str =
-        "materialized prediction extension does not match the Qwen text target";
-}
+prediction_pairing!(
+    B, P; M;
+    crate::replicated_model::FixedReplicatedKernel<B, crate::replicated_text::QwenHybridReplicated, P> => crate::replicated_model::FixedReplicatedModel<B, crate::replicated_text::QwenHybridReplicated, P>;
+    MaterializedQwenHybridPrediction<B, M>; eredu_nn::TensorParallelGroupedNeuralBackend;
+    "materialized prediction extension does not match the Qwen text target"
+);
 
 /// Architecture-owned mutable lane-state geometry for one materialized
 /// prediction extension.
@@ -3691,11 +2883,16 @@ where
     /// geometry.
     pub fn new_state(
         &self,
-    ) -> MaterializedPredictionExtensionState<M::SequentialState, M::PoolingState, M::ModelState>
-    {
+    ) -> MaterializedPredictionExtensionState<
+        SequentialPredictionCache<B, M>,
+        PredictionPoolingState<B, M>,
+        M::ModelState,
+    > {
         match self {
             Self::DeepSeekV3 { units } => MaterializedPredictionExtensionState::DeepSeekV3(
-                (0..units.len()).map(|_| M::sequential_state()).collect(),
+                (0..units.len())
+                    .map(|_| SequentialPredictionCache::<B, M>::new())
+                    .collect(),
             ),
             Self::DeepSeekV4 { state, .. } => {
                 MaterializedPredictionExtensionState::DeepSeekV4(state.clone())
@@ -3729,39 +2926,39 @@ where
         match &mut self {
             Self::DeepSeekV3 { units, .. } => {
                 for unit in units {
-                    unit.residency = residency;
+                    unit.set_residency(residency);
                 }
             }
             Self::DeepSeekV4 { units, .. } => {
                 for unit in units {
-                    unit.residency = residency;
+                    unit.set_residency(residency);
                 }
             }
             Self::DeepSeekV4Dspark {
                 extension, units, ..
             } => {
-                extension.static_modules.residency = residency;
+                extension.static_modules.set_residency(residency);
                 for unit in units {
-                    unit.residency = residency;
+                    unit.set_residency(residency);
                 }
             }
             Self::Inkling { units, shared, .. } => {
                 for unit in units {
-                    unit.residency = residency;
+                    unit.set_residency(residency);
                 }
                 if let Some(shared) = shared {
-                    shared.residency = residency;
+                    shared.set_residency(residency);
                 }
             }
             Self::QwenHybrid { units, shared, .. } => {
                 for unit in units {
-                    unit.residency = residency;
+                    unit.set_residency(residency);
                 }
-                shared.residency = residency;
+                shared.set_residency(residency);
             }
             Self::NemotronH { groups, .. } => {
                 for unit in groups.iter_mut().flatten() {
-                    unit.residency = residency;
+                    unit.set_residency(residency);
                 }
             }
         }
@@ -3786,7 +2983,7 @@ where
         match self {
             Self::DeepSeekV3 { layout, units, .. } => {
                 Ok(MaterializedPredictionExtension::DeepSeekV3 {
-                    units: M::materialize_units(context, units, Some(&layout))?,
+                    units: materialize_prediction_units::<B, M, _>(context, units, Some(&layout))?,
                 })
             }
             Self::DeepSeekV4 {
@@ -3795,10 +2992,14 @@ where
                 state,
                 ..
             } => Ok(MaterializedPredictionExtension::DeepSeekV4 {
-                units: M::materialize_units(context, units, Some(&layout))?,
+                units: materialize_prediction_units::<B, M, _>(context, units, Some(&layout))?,
                 state: state
                     .into_iter()
-                    .map(|(ordinal, policy)| M::pooling_state(context, ordinal, policy))
+                    .map(|(ordinal, policy)| {
+                        PredictionPoolingState::<B, M>::resident_from_policy(ordinal, &policy)
+                            .map_err(eredu_core::BackendFailure::from_error)
+                            .map_err(M::Error::from)
+                    })
                     .collect::<Result<_, _>>()?,
             }),
             Self::DeepSeekV4Dspark {
@@ -3811,11 +3012,19 @@ where
                 let (strategy, static_modules) = extension.into_parts();
                 Ok(MaterializedPredictionExtension::DeepSeekV4Dspark {
                     strategy,
-                    static_modules: M::materialize_module(context, static_modules, Some(&layout))?,
-                    units: M::materialize_units(context, units, Some(&layout))?,
+                    static_modules: materialize_prediction_module::<B, M, _>(
+                        context,
+                        static_modules,
+                        Some(&layout),
+                    )?,
+                    units: materialize_prediction_units::<B, M, _>(context, units, Some(&layout))?,
                     state: state
                         .into_iter()
-                        .map(|(ordinal, policy)| M::pooling_state(context, ordinal, policy))
+                        .map(|(ordinal, policy)| {
+                            PredictionPoolingState::<B, M>::resident_from_policy(ordinal, &policy)
+                                .map_err(eredu_core::BackendFailure::from_error)
+                                .map_err(M::Error::from)
+                        })
                         .collect::<Result<_, _>>()?,
                 })
             }
@@ -3827,10 +3036,12 @@ where
                 ..
             } => Ok(MaterializedPredictionExtension::Inkling {
                 shared: shared
-                    .map(|shared| M::materialize_module(context, shared, Some(&layout)))
+                    .map(|shared| {
+                        materialize_prediction_module::<B, M, _>(context, shared, Some(&layout))
+                    })
                     .transpose()?,
-                units: M::materialize_units(context, units, Some(&layout))?,
-                state: M::model_state(context, state)?,
+                units: materialize_prediction_units::<B, M, _>(context, units, Some(&layout))?,
+                state: M::ModelState::device(state).map_err(M::Error::from)?,
             }),
             Self::QwenHybrid {
                 layout,
@@ -3839,9 +3050,9 @@ where
                 state,
                 ..
             } => Ok(MaterializedPredictionExtension::QwenHybrid {
-                shared: M::materialize_module(context, shared, Some(&layout))?,
-                units: M::materialize_units(context, units, Some(&layout))?,
-                state: M::model_state(context, state)?,
+                shared: materialize_prediction_module::<B, M, _>(context, shared, Some(&layout))?,
+                units: materialize_prediction_units::<B, M, _>(context, units, Some(&layout))?,
+                state: M::ModelState::device(state).map_err(M::Error::from)?,
             }),
             Self::NemotronH {
                 layout,
@@ -3851,9 +3062,11 @@ where
             } => Ok(MaterializedPredictionExtension::NemotronH {
                 groups: groups
                     .into_iter()
-                    .map(|units| M::materialize_units(context, units, Some(&layout)))
+                    .map(|units| {
+                        materialize_prediction_units::<B, M, _>(context, units, Some(&layout))
+                    })
                     .collect::<Result<_, _>>()?,
-                state: M::model_state(context, state)?,
+                state: M::ModelState::device(state).map_err(M::Error::from)?,
             }),
         }
     }
@@ -4056,12 +3269,8 @@ where
                     }
                 }
                 units.push(
-                    PreparedPredictionUnit::new(
-                        source_unit,
-                        local_unit,
-                        bindings.take(Some(depth))?,
-                    )?
-                    .with_source_layout(source_layout.clone()),
+                    prepare_prediction_unit(source_unit, local_unit, bindings.take(Some(depth))?)?
+                        .with_source_layout(source_layout.clone()),
                 );
             }
             Ok(PreparedPredictionExtension::DeepSeekV3 {
@@ -4167,12 +3376,8 @@ where
                     );
                 }
                 units.push(
-                    PreparedPredictionUnit::new(
-                        source_unit,
-                        local_unit,
-                        bindings.take(Some(depth))?,
-                    )?
-                    .with_source_layout(source_layout.clone()),
+                    prepare_prediction_unit(source_unit, local_unit, bindings.take(Some(depth))?)?
+                        .with_source_layout(source_layout.clone()),
                 );
                 state.push((ordinal, policy));
             }
@@ -4198,7 +3403,7 @@ where
                     parameters: std::sync::Arc::new(parameters),
                     extension: PreparedDsparkPredictionExtension {
                         strategy,
-                        static_modules: PreparedPredictionUnit::new(
+                        static_modules: prepare_prediction_unit(
                             source_static,
                             local_static,
                             bindings.take(None)?,
@@ -4233,7 +3438,7 @@ where
                 .map_err(|error| invalid(error.to_string()))?
                 .ok_or_else(|| invalid("Inkling prediction extension has no state layout"))?;
             let shared = match (source.chain_norm, local.chain_norm) {
-                (Some(source), Some(local)) => Some(PreparedPredictionUnit::new(
+                (Some(source), Some(local)) => Some(prepare_prediction_unit(
                     crate::inkling::MtpShared { chain_norm: source },
                     crate::inkling::MtpShared { chain_norm: local },
                     bindings.take(None)?,
@@ -4251,7 +3456,7 @@ where
                 .zip(local.layers)
                 .enumerate()
                 .map(|(depth, (source, local))| {
-                    PreparedPredictionUnit::new(source, local, bindings.take(Some(depth))?)
+                    prepare_prediction_unit(source, local, bindings.take(Some(depth))?)
                 })
                 .collect::<Result<_, _>>()?;
             Ok(PreparedPredictionExtension::Inkling {
@@ -4355,7 +3560,7 @@ where
                     );
                 }
                 units.push(
-                    PreparedPredictionUnit::new(source, local, bindings.take(Some(depth))?)?
+                    prepare_prediction_unit(source, local, bindings.take(Some(depth))?)?
                         .with_source_layout(source_layout.clone()),
                 );
             }
@@ -4363,7 +3568,7 @@ where
                 .state_layout()
                 .slice(target..target + extension.depth())
                 .map_err(|error| invalid(error.to_string()))?;
-            let shared = PreparedPredictionUnit::new(
+            let shared = prepare_prediction_unit(
                 crate::qwen::hybrid::PredictionShared::<B>::from_parameters(
                     source_shared,
                     source_context,
@@ -4500,7 +3705,7 @@ where
                         );
                     }
                     units.push(
-                        PreparedPredictionUnit::new(source, local, bindings.take(Some(physical))?)?
+                        prepare_prediction_unit(source, local, bindings.take(Some(physical))?)?
                             .with_source_layout(source_layout.clone()),
                     );
                 }

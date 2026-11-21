@@ -56,7 +56,7 @@ export GEMMA2_VALIDATION=/private/tmp/eredu-gemma2
 HF_HOME="$GEMMA2_VALIDATION/hf-cache" python \
   eredu-architectures/tests/fixtures/gemma2/transformers_reference.py \
   "$GEMMA2_VALIDATION"
-cargo run -p eredu-backend-mlx --no-default-features --example checkpoint_probe -- \
+cargo run -p eredu --no-default-features --features mlx --example checkpoint_probe -- \
   --model "$GEMMA2_VALIDATION/synthetic-transformers" --device cpu \
   --input-ids 1,3,2 --teacher-forced-ids 4,5,6,7 --warmup-runs 0 \
   --output "$GEMMA2_VALIDATION/native"
@@ -125,7 +125,7 @@ hf download google/gemma-2-2b-it --revision "$GEMMA2_REVISION" \
 export GEMMA2_MODEL="$GEMMA2_VALIDATION/hf-cache/models--google--gemma-2-2b-it/snapshots/$GEMMA2_REVISION"
 shasum -a 256 "$GEMMA2_MODEL"/model-*.safetensors \
   "$GEMMA2_MODEL"/tokenizer.json "$GEMMA2_MODEL"/tokenizer.model
-cargo run -p eredu-backend-mlx --no-default-features --example checkpoint_probe -- \
+cargo run -p eredu --no-default-features --features mlx --example checkpoint_probe -- \
   --model "$GEMMA2_MODEL" --device cpu --add-special-tokens \
   --prompt '<start_of_turn>user
 What is the capital of France?<end_of_turn>

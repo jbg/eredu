@@ -1,6 +1,8 @@
 //! Ordinary target refinement is independent of the retained causal draft source.
 use super::AutoregressiveMechanisms;
-use crate::speculative::shared_backbone::SharedBackboneMechanisms;
+use crate::speculative::shared_backbone::{
+    execution, SharedBackboneMechanisms, SharedRefinementState,
+};
 use eredu_core::{
     decoding::DecodingCapabilities, execution_control::SnapshotEstimate,
     speculative::RefinementProgress,
@@ -84,9 +86,9 @@ impl<R, F> SharedTargetRefinementState<R, F> {
     }
 }
 impl<M: SharedBackboneMechanisms> TargetRefinement<M> for SharedTargetRefinement {
-    type State = SharedTargetRefinementState<M::ProposalRandomness, M::RefinementState>;
+    type State = SharedTargetRefinementState<M::ProposalRandomness, SharedRefinementState<M>>;
     fn capabilities(&self, target: &M::Model) -> DecodingCapabilities {
-        let retained = M::draft_capabilities(target);
+        let retained = execution::draft_capabilities::<M>(target);
         DecodingCapabilities {
             autoregressive: retained.autoregressive,
             diffusion: retained.diffusion,
@@ -107,7 +109,7 @@ impl<M: SharedBackboneMechanisms> TargetRefinement<M> for SharedTargetRefinement
         temperature: f32,
         context: M::Context<'_>,
     ) -> Result<Option<RefinementProgress<M::Logits>>, M::Error> {
-        M::refine(
+        execution::refine::<M>(
             target,
             prefix,
             logits,

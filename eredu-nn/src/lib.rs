@@ -19,7 +19,9 @@ pub mod codebooks;
 
 mod indexed_attention;
 mod read_only_attention;
-pub use indexed_attention::{IndexedAttentionInput, LocalAttentionInput};
+pub use indexed_attention::{
+    compact_indexed_positions, IndexedAttentionInput, LocalAttentionInput,
+};
 pub use read_only_attention::{ReadOnlyAttentionCache, ReadOnlyCache};
 
 mod clipped_linear;
@@ -48,6 +50,10 @@ pub use split_gated::SplitGatedProductSpec;
 mod layer_normalization;
 pub use layer_normalization::LayerNormalizationConstructionSpec;
 
+mod parallel;
+pub use parallel::RowParallelProjection;
+use parallel::{agree_parallel_setup, tensor_geometry, vocabulary_project};
+
 mod parameter_declarations;
 pub use parameter_declarations::{
     validate_logical_parameter_scope, validate_logical_parameter_topology,
@@ -56,6 +62,8 @@ pub use parameter_declarations::{
 };
 
 mod grouped_linear;
+mod grouped_operation;
+pub use grouped_operation::GroupedOperationRequirement;
 mod grouped_units;
 mod linear_rows;
 pub use grouped_units::{GroupedUnitBatch, GroupedUnitError, GroupedUnitObserver};
@@ -79,6 +87,8 @@ pub mod routing_intervention;
 pub use grouped_linear::{GroupedLinearActivation, GroupedLinearOperator, GroupedLinearSpec};
 /// Pure sequence layouts shared by patch-based encoders.
 pub mod sequence_layout;
+/// Indexed movement contracts for grouped operators.
+pub mod tensor_movement;
 /// Side-effect-free, invocation-scoped backing metadata for existing tensors.
 pub mod tensor_storage;
 
@@ -761,6 +771,22 @@ pub enum ParameterTopologyError {
 pub trait ParameterVisitor<'a, T: 'a> {
     /// Visits one authoritative parameter slot.
     fn visit(&mut self, metadata: ParameterMetadata, value: &'a T);
+}
+
+/// Publishes selected immutable parameter handles by their declared logical identity.
+pub fn publish_parameter_replacements<T: Tensor, P: Parameterized<T>>(
+    parameters: &mut P,
+    replacements: &std::collections::BTreeMap<String, T>,
+) {
+    struct Publish<'a, T>(&'a std::collections::BTreeMap<String, T>);
+    impl<'a, T: Tensor + 'a> ParameterVisitorMut<'a, T> for Publish<'_, T> {
+        fn visit_mut(&mut self, metadata: ParameterMetadata, value: &'a mut T) {
+            if let Some(replacement) = self.0.get(metadata.id.as_str()) {
+                value.publish_parameter(replacement);
+            }
+        }
+    }
+    parameters.visit_parameters_mut(&mut Publish(replacements));
 }
 
 /// Mutable statically dispatched parameter visitor.
@@ -4422,13 +4448,33 @@ pub trait BlockwiseAttentionBackend: NeuralBackend {
     ) -> Result<Self::Tensor, Error>;
 }
 
-/// Backend-owned compressed-attention state over semantic components.
+/// Ordered compressed history consumed by the architecture's reconstruction operator.
+pub trait CompressedAttentionHistory<T: Tensor> {
+    /// Visits the retained blocks without host tensor materialization.
+    /// The consumer reports its transient reconstruction scratch usage.
+    fn scan_blocks<F>(
+        &self,
+        query_tokens: i32,
+        context: &T::Context,
+        visitor: F,
+    ) -> Result<CompressedAttentionScan, Error>
+    where
+        F: FnMut(CompressedAttentionBlock<T>) -> Result<u64, Error>;
+}
+
+/// Compressed-attention state over semantic components.
 ///
-/// Checkpoints are cheap backend snapshots used by speculative fork/rollback.
+/// Checkpoints preserve the logical cache and its residency identity.
 /// `finalize` seals mutable state before runtime prompt-cache persistence.
 pub trait CompressedAttentionCache<T: Tensor>: Debug {
     /// Backend snapshot preserving paging and residency identity.
     type Checkpoint: Clone + Debug;
+
+    /// Portable scan owner borrowed before invoking the reconstruction operator.
+    type History: CompressedAttentionHistory<T> + ?Sized;
+
+    /// Borrows the installed compressed-history owner.
+    fn history(&self) -> Option<&Self::History>;
 
     /// Current absolute token frontier.
     fn offset(&self) -> i32;
@@ -4449,7 +4495,12 @@ pub trait CompressedAttentionCache<T: Tensor>: Debug {
         visitor: F,
     ) -> Result<CompressedAttentionScan, Error>
     where
-        F: FnMut(CompressedAttentionBlock<T>) -> Result<u64, Error>;
+        F: FnMut(CompressedAttentionBlock<T>) -> Result<u64, Error>,
+    {
+        self.history()
+            .ok_or_else(|| Error::backend("layer has no compressed-latent attention history"))?
+            .scan_blocks(query_tokens, context, visitor)
+    }
     /// Captures a cheap speculative checkpoint.
     fn checkpoint(&self) -> Self::Checkpoint;
     /// Restores a previous checkpoint, removing any later paged state.
@@ -5274,15 +5325,53 @@ pub trait NeuralBackend: Sized + 'static {
         context: &<Self::Tensor as Tensor>::Context,
     ) -> Result<Self::Tensor, Error>;
 
+    /// Builds one rank-local row projection and returns its replicated bias separately.
+    fn prepare_row_parallel_linear(
+        linear: &mut Self::Linear,
+        input: &Self::Tensor,
+        context: &<Self::Tensor as Tensor>::Context,
+        observer: Option<&mut dyn ProjectionInputObserver<Self::Tensor>>,
+    ) -> Result<RowParallelProjection<Self::Tensor>, Error>;
+
+    /// Whether this execution context supports explicit readiness and ordered completion.
+    fn coordinates_parallel_readiness(_parallel: &Self::ParallelContext) -> bool {
+        false
+    }
+
+    /// Completes one exact readiness exchange on a context that advertises it.
+    fn complete_parallel_readiness(
+        _: &Self::ParallelContext,
+        _: [u64; 8],
+        local_success: bool,
+        _: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<bool, Error> {
+        Ok(local_success)
+    }
+
+    /// Validates the local tensor against the exact reduction contract.
+    fn validate_parallel_sum(_: &Self::Tensor, _: &Self::ParallelContext) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// Submits the selected sum, completing it before the next readiness exchange
+    /// when the context coordinates readiness.
+    fn reduce_parallel_sum(
+        value: Self::Tensor,
+        parallel: &Self::ParallelContext,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::Tensor, Error>;
+
     /// Applies a row-parallel projection and its collective reduction.
     fn row_parallel_linear(
         linear: &mut Self::Linear,
         input: &Self::Tensor,
         parallel: &Self::ParallelContext,
         context: &<Self::Tensor as Tensor>::Context,
-    ) -> Result<Self::Tensor, Error>;
-    /// Same reduction and bias ordering with optional rank-local input evidence.
-    /// Input-transforming mechanisms override this default identity path.
+    ) -> Result<Self::Tensor, Error> {
+        Self::row_parallel_linear_with_input_observer(linear, input, parallel, context, None)
+    }
+
+    /// Sequences local projection, readiness, reduction, and replicated bias.
     fn row_parallel_linear_with_input_observer(
         linear: &mut Self::Linear,
         input: &Self::Tensor,
@@ -5290,10 +5379,45 @@ pub trait NeuralBackend: Sized + 'static {
         context: &<Self::Tensor as Tensor>::Context,
         observer: Option<&mut dyn ProjectionInputObserver<Self::Tensor>>,
     ) -> Result<Self::Tensor, Error> {
-        if let Some(observer) = observer {
-            observer.observe(input)?;
-        }
-        Self::row_parallel_linear(linear, input, parallel, context)
+        let prepared = Self::prepare_row_parallel_linear(linear, input, context, observer)
+            .and_then(|prepared| {
+                Self::validate_parallel_sum(&prepared.partial, parallel)?;
+                Ok(prepared)
+            });
+        let prepared = agree_parallel_setup::<Self, _>(
+            parallel,
+            context,
+            0x524f57504152414c,
+            0,
+            prepared,
+            |value, words| {
+                tensor_geometry(&value.partial, words);
+                words.push(u64::from(value.bias.is_some()));
+                words.push(value.output_cast.map_or(u64::MAX, |kind| kind as u64));
+                if let Some(bias) = &value.bias {
+                    tensor_geometry(bias, words);
+                }
+            },
+        )?;
+        let reduced = Self::reduce_parallel_sum(prepared.partial, parallel, context)?;
+        let completed = (|| {
+            let biased = match prepared.bias {
+                Some(bias) => reduced.add(&bias, context)?,
+                None => reduced,
+            };
+            match prepared.output_cast {
+                Some(dtype) => biased.cast_float(dtype, context),
+                None => Ok(biased),
+            }
+        })();
+        agree_parallel_setup::<Self, _>(
+            parallel,
+            context,
+            0x524f57504152414c,
+            1,
+            completed,
+            tensor_geometry,
+        )
     }
     /// Number of participants in a tensor-parallel collective context.
     fn parallel_size(_parallel: &Self::ParallelContext) -> usize {
@@ -5322,6 +5446,27 @@ pub trait DistributedNeuralBackend: NeuralBackend {
         range: VocabularyParallelRange,
         context: &<Self::Tensor as Tensor>::Context,
     ) -> Result<Self::Linear, Error>;
+    /// Retained vocabulary ownership of a rank-local linear projection.
+    fn vocabulary_linear_range(linear: &Self::Linear) -> Option<&VocabularyParallelRange>;
+
+    /// Retained vocabulary ownership of a rank-local embedding or tied projection.
+    fn vocabulary_embedding_range(embedding: &Self::Embedding) -> Option<&VocabularyParallelRange>;
+
+    /// Validates the exact agreed gather shape and native transport limits.
+    fn validate_vocabulary_gather(
+        local: &Self::Tensor,
+        widths: &[usize],
+        parallel: &Self::ParallelContext,
+    ) -> Result<(), Error>;
+
+    /// Gathers the admitted last-axis shards with the selected completion policy.
+    fn gather_vocabulary(
+        local: Self::Tensor,
+        widths: &[usize],
+        parallel: &Self::ParallelContext,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::Tensor, Error>;
+
     /// Looks up global token IDs and sums this rank's local contribution.
     fn vocabulary_parallel_lookup(
         embedding: &mut Self::Embedding,
@@ -5329,32 +5474,65 @@ pub trait DistributedNeuralBackend: NeuralBackend {
         policy: EmbeddingLookupPolicy,
         parallel: &Self::ParallelContext,
         context: &<Self::Tensor as Tensor>::Context,
-    ) -> Result<Self::Tensor, Error>;
-    /// Forms each rank's weighted vocabulary contribution and sums the complete
-    /// embedding. Coefficients contain the full, already-normalized vocabulary
-    /// distribution; every table selects its owned rows before multiplication.
+    ) -> Result<Self::Tensor, Error> {
+        let local = Self::vocabulary_embedding_range(embedding)
+            .map(|_| ())
+            .ok_or_else(|| Error::backend("embedding has no vocabulary ownership"))
+            .and_then(|_| embedding.lookup(input, policy, context))
+            .and_then(|value| {
+                Self::validate_parallel_sum(&value, parallel)?;
+                Ok(value)
+            });
+        let value = agree_parallel_setup::<Self, _>(
+            parallel,
+            context,
+            0x564f434142,
+            1,
+            local,
+            tensor_geometry,
+        )?;
+        Self::sum_parallel(value, parallel, context)
+    }
+
+    /// Forms each rank's weighted vocabulary contribution and sums the complete embedding.
     fn vocabulary_parallel_weighted_sum(
         embedding: &mut Self::Embedding,
         coefficients: &Self::Tensor,
         parallel: &Self::ParallelContext,
         context: &<Self::Tensor as Tensor>::Context,
     ) -> Result<Self::Tensor, Error> {
-        Self::sum_parallel(
-            embedding.weighted_sum(coefficients, context)?,
+        let local = Self::vocabulary_embedding_range(embedding)
+            .map(|_| ())
+            .ok_or_else(|| Error::backend("embedding has no vocabulary ownership"))
+            .and_then(|_| embedding.weighted_sum(coefficients, context))
+            .and_then(|value| {
+                Self::validate_parallel_sum(&value, parallel)?;
+                Ok(value)
+            });
+        let value = agree_parallel_setup::<Self, _>(
             parallel,
             context,
-        )
+            0x564f434142,
+            4,
+            local,
+            tensor_geometry,
+        )?;
+        Self::sum_parallel(value, parallel, context)
     }
+
     /// Projects to local vocabulary rows and gathers complete logits.
     fn vocabulary_parallel_project(
         linear: &mut Self::Linear,
         input: &Self::Tensor,
         parallel: &Self::ParallelContext,
         context: &<Self::Tensor as Tensor>::Context,
-    ) -> Result<Self::Tensor, Error>;
-    /// Projects and gathers while exposing the actual local multiplication input.
-    /// Input-transforming backends override this default identity path. An absent
-    /// observer adds no tensor work or communication.
+    ) -> Result<Self::Tensor, Error> {
+        Self::vocabulary_parallel_project_with_input_observer(
+            linear, input, parallel, context, None,
+        )
+    }
+
+    /// Projects and gathers while exposing the local multiplication input.
     fn vocabulary_parallel_project_with_input_observer(
         linear: &mut Self::Linear,
         input: &Self::Tensor,
@@ -5362,18 +5540,31 @@ pub trait DistributedNeuralBackend: NeuralBackend {
         context: &<Self::Tensor as Tensor>::Context,
         observer: Option<&mut dyn ProjectionInputObserver<Self::Tensor>>,
     ) -> Result<Self::Tensor, Error> {
-        if let Some(observer) = observer {
-            observer.observe(input)?;
-        }
-        Self::vocabulary_parallel_project(linear, input, parallel, context)
+        let prepared = (|| {
+            let range = Self::vocabulary_linear_range(linear)
+                .ok_or_else(|| Error::backend("linear has no vocabulary ownership"))?;
+            let widths = range.balanced_peer_widths(
+                Self::parallel_size(parallel),
+                Self::parallel_rank(parallel),
+            )?;
+            let local = linear.forward_with_input_observer(input, context, observer)?;
+            Ok((local, widths))
+        })();
+        vocabulary_project::<Self>(prepared, parallel, context, 2)
     }
+
     /// Projects through a rank-local vocabulary embedding and gathers complete logits.
     fn vocabulary_parallel_embedding_project(
         embedding: &mut Self::Embedding,
         input: &Self::Tensor,
         parallel: &Self::ParallelContext,
         context: &<Self::Tensor as Tensor>::Context,
-    ) -> Result<Self::Tensor, Error>;
+    ) -> Result<Self::Tensor, Error> {
+        Self::vocabulary_parallel_embedding_project_with_input_observer(
+            embedding, input, parallel, context, None,
+        )
+    }
+
     /// Tied vocabulary projection with the same actual-input evidence contract.
     fn vocabulary_parallel_embedding_project_with_input_observer(
         embedding: &mut Self::Embedding,
@@ -5382,17 +5573,27 @@ pub trait DistributedNeuralBackend: NeuralBackend {
         context: &<Self::Tensor as Tensor>::Context,
         observer: Option<&mut dyn ProjectionInputObserver<Self::Tensor>>,
     ) -> Result<Self::Tensor, Error> {
-        if let Some(observer) = observer {
-            observer.observe(input)?;
-        }
-        Self::vocabulary_parallel_embedding_project(embedding, input, parallel, context)
+        let prepared = (|| {
+            let range = Self::vocabulary_embedding_range(embedding)
+                .ok_or_else(|| Error::backend("embedding has no vocabulary ownership"))?;
+            let widths = range.balanced_peer_widths(
+                Self::parallel_size(parallel),
+                Self::parallel_rank(parallel),
+            )?;
+            let local = embedding.as_linear_with_input_observer(input, context, observer)?;
+            Ok((local, widths))
+        })();
+        vocabulary_project::<Self>(prepared, parallel, context, 3)
     }
+
     /// Sums a rank-local tensor contribution across the tensor-parallel group.
     fn sum_parallel(
         value: Self::Tensor,
         parallel: &Self::ParallelContext,
         context: &<Self::Tensor as Tensor>::Context,
-    ) -> Result<Self::Tensor, Error>;
+    ) -> Result<Self::Tensor, Error> {
+        Self::reduce_parallel_sum(value, parallel, context)
+    }
 }
 
 /// Projected inputs to one gated-delta recurrent scan.
@@ -5861,6 +6062,20 @@ pub trait Tensor: Clone + Debug + Sized + 'static {
             "filled tensor construction is not implemented by this backend",
         ))
     }
+    /// Allocates zeros directly in the requested floating precision.
+    fn zeros_float(
+        shape: &[i32],
+        element: TensorElementType,
+        context: &Self::Context,
+    ) -> Result<Self, Error> {
+        if element == TensorElementType::F32 {
+            return Self::full_f32(0.0, shape, context);
+        }
+        Err(Error::backend(
+            "zero allocation for this floating precision is unavailable",
+        ))
+    }
+
     /// Creates a signed 32-bit integer tensor filled with one scalar.
     fn full_i32(value: i32, shape: &[i32], context: &Self::Context) -> Result<Self, Error> {
         let _ = (value, shape, context);

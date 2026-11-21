@@ -45,7 +45,8 @@ fn main() -> anyhow::Result<()> {
     let plan = ExecutionPlan::fully_resident(eredu_core::DevicePlan::new("mlx", "metal:0")?)
         .with_parameter_conversion_retention(Some(policy));
     let factory = MlxBackendFactory::default();
-    let (mut model, _) = LoadedModel::load_execution_plan(&factory, &path, &plan)?.into_parts();
+    let (mut model, _) =
+        LoadedModel::load_execution_plan(&factory, &path, &plan, None)?.into_parts();
     let config = model.resolve_generation_config(GenerationConfigOverrides {
         temperature: Some(0.0),
         max_new_tokens: Some(8),

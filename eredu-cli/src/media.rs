@@ -9,7 +9,7 @@ use eredu::api::{
 };
 use eredu::runtime::chat::ChatTemplateRequest;
 use eredu_core::{
-    ModelCapabilityBackend, MultimodalPreparationBackend, RgbImage, Video, VideoSampling,
+    ModelCapabilitySession, MultimodalPreparationSession, RgbImage, Video, VideoSampling,
 };
 use image::{ImageFormat, ImageReader};
 
@@ -46,12 +46,17 @@ impl MediaArgs {
         Ok(())
     }
 
-    pub(crate) fn prepare<B: MultimodalPreparationBackend + ModelCapabilityBackend>(
+    pub(crate) fn prepare<
+        B: eredu_core::TextGenerationBackend,
+        S: eredu_core::TextExecutionSession<B>
+            + ModelCapabilitySession<B>
+            + MultimodalPreparationSession<B>,
+    >(
         &self,
-        model: &mut LoadedModel<B>,
+        model: &mut LoadedModel<B, S>,
         text: &ChatTemplateRequest,
         prompt: &str,
-    ) -> Result<Option<PreparedChatRequest<B>>> {
+    ) -> Result<Option<PreparedChatRequest<S::Prompt>>> {
         if self.is_empty() {
             return Ok(None);
         }

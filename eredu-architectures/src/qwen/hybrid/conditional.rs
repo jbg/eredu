@@ -19,10 +19,7 @@ use crate::decoder::{DecoderStaticResources, PartitionStaticModules};
 use crate::qwen::ingress::{prepare_input, prepared_semantic_tokens, ProjectedTokenPolicy};
 use crate::qwen::vision::{VisionBlock, VisionInput, VisionMode, VisionState, VisionStatic};
 use crate::qwen::vl::InputPart;
-use crate::{
-    composite_execution::{CompositeArchitecture, PreparedCompositeInput},
-    media_plan::QwenInputPartPlan,
-};
+use crate::{composite_execution::PreparedCompositeInput, media_plan::QwenInputPartPlan};
 
 use super::{Block, ConditionalLocalGeometry, ForwardMode, ParsedHybridConfig, PredictionUnit};
 
@@ -212,8 +209,8 @@ pub enum ConditionalInput<'a, T> {
     },
 }
 
-impl<B, S> crate::composite_execution::ParallelCompositeArchitecture<B, S>
-    for ConditionalLayeredModel<B>
+impl<B, S> eredu_runtime::composite_execution::ParallelCompositeComponentKernel<B, S>
+    for ConditionalKernel<B>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
@@ -221,7 +218,8 @@ where
 {
 }
 
-impl<B, S> CompositeArchitecture<B, S> for ConditionalLayeredModel<B>
+impl<B, S> eredu_runtime::composite_execution::CompositeComponentKernel<B, S>
+    for ConditionalKernel<B>
 where
     B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
@@ -256,7 +254,7 @@ where
         crate::composite_execution::SingleCompositePrefillRequest<B::Tensor, Self::InputPartPlan>;
 
     fn prepare_prefill_request(
-        prepared: eredu_runtime::PreparedModelInput<B::Tensor>,
+        prepared: eredu_core::PreparedModelInput<B::Tensor>,
         admitted: crate::media_plan::AdmittedCompositeInput<Self::InputPartPlan>,
         _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::PrefillRequest, Self::Error> {
@@ -265,13 +263,13 @@ where
     type AdmissionConfig = ParsedHybridConfig;
 
     fn admission_config(&self) -> Self::AdmissionConfig {
-        self.kernel().parsed.clone()
+        self.parsed.clone()
     }
 
     fn admit_prepared_input(
         config: &Self::AdmissionConfig,
-        input: &eredu_runtime::PreparedModelInput<B::Tensor>,
-        inspector: &impl eredu_runtime::PreparedInputInspector<B::Tensor>,
+        input: &eredu_core::PreparedModelInput<B::Tensor>,
+        inspector: &impl eredu_core::input::PreparedInputInspector<B::Tensor>,
     ) -> Result<
         crate::media_plan::AdmittedCompositeInput<Self::InputPartPlan>,
         eredu_core::CapabilityError,
@@ -363,7 +361,6 @@ where
                     "conditional Qwen continuation patch count exceeds i32".to_owned()
                 })?;
                 let width = self
-                    .kernel()
                     .parsed
                     .vision
                     .as_ref()
@@ -382,7 +379,7 @@ where
                 if group != 0 || tensor_partitions <= 1 || pipeline_stages <= 1 {
                     return Ok(None);
                 }
-                let vision = self.kernel().parsed.vision.as_ref().ok_or_else(|| {
+                let vision = self.parsed.vision.as_ref().ok_or_else(|| {
                     "conditional Qwen collective schedule has no vision config".to_owned()
                 })?;
                 let mut patch_positions = 0_u64;
@@ -445,7 +442,7 @@ where
                         let positions = i32::try_from(*positions)
                             .map_err(|_| "conditional Qwen text positions exceed i32".to_owned())?;
                         ingress_operations.push(CompositeTensorCollective::Sum {
-                            shape: vec![batch, positions, self.kernel().parsed.text.hidden_size],
+                            shape: vec![batch, positions, self.parsed.text.hidden_size],
                         });
                     }
                 }
@@ -502,10 +499,10 @@ where
         if !vision_edge && !decoder_continuation {
             return Ok(None);
         }
-        use eredu_runtime::{BoundaryTensorDimension as Dim, BoundaryTensorDtype as Dtype};
+        use eredu_core::communication::BoundaryTensorDtype as Dtype;
+        use eredu_runtime::BoundaryTensorDimension as Dim;
         let vision_continuation = source_group == 0 && destination_group == 0;
         let vision = self
-            .kernel()
             .parsed
             .vision
             .as_ref()
@@ -522,7 +519,7 @@ where
                 [
                     Dim::Batch,
                     Dim::Sequence,
-                    Dim::Fixed(self.kernel().parsed.text.hidden_size),
+                    Dim::Fixed(self.parsed.text.hidden_size),
                 ],
                 Dtype::Activation,
             )
@@ -542,7 +539,7 @@ where
                     [
                         Dim::Batch,
                         Dim::Sequence,
-                        Dim::Fixed(self.kernel().parsed.text.hidden_size),
+                        Dim::Fixed(self.parsed.text.hidden_size),
                     ],
                     Dtype::Activation,
                 )
@@ -646,7 +643,7 @@ where
             let mut values = values.into_iter();
             let hidden = values.next().expect("validated decoder boundary primary");
             let boundary = eredu_runtime::ArchitectureBoundary::decode(
-                &self.kernel().pipeline_boundary_schema(),
+                &self.pipeline_boundary_schema(),
                 values.collect(),
             )
             .map_err(|error| Error::backend(error.to_string()))?;
@@ -795,7 +792,8 @@ impl eredu_runtime::ArchitectureBoundary for ConditionalPipelineBoundarySchema {
     }
 
     fn auxiliary_tensor_specs(&self) -> Vec<eredu_runtime::BoundaryTensorSpec> {
-        use eredu_runtime::{BoundaryTensorDimension as Dim, BoundaryTensorDtype as Dtype};
+        use eredu_core::communication::BoundaryTensorDtype as Dtype;
+        use eredu_runtime::BoundaryTensorDimension as Dim;
         (0..self.deepstack_count)
             .map(|index| {
                 eredu_runtime::BoundaryTensorSpec::new(

@@ -28,12 +28,16 @@ impl<E: std::error::Error + Send + Sync + 'static> BoundedCompletion
     }
 }
 
-trait NativeDecisionContext<B: TextGenerationBackend> {
-    fn runtime(&self) -> RefMut<'_, ModelRuntime<B>>;
+trait NativeDecisionContext<B: TextGenerationBackend, S: TextExecutionSession<B>> {
+    fn runtime(&self) -> RefMut<'_, ModelRuntime<B, S>>;
 }
-struct NativeDecisionScope<'a, B: TextGenerationBackend>(RefCell<&'a mut ModelRuntime<B>>);
-impl<B: TextGenerationBackend> NativeDecisionContext<B> for NativeDecisionScope<'_, B> {
-    fn runtime(&self) -> RefMut<'_, ModelRuntime<B>> {
+struct NativeDecisionScope<'a, B: TextGenerationBackend, S: TextExecutionSession<B>>(
+    RefCell<&'a mut ModelRuntime<B, S>>,
+);
+impl<B: TextGenerationBackend, S: TextExecutionSession<B>> NativeDecisionContext<B, S>
+    for NativeDecisionScope<'_, B, S>
+{
+    fn runtime(&self) -> RefMut<'_, ModelRuntime<B, S>> {
         RefMut::map(self.0.borrow_mut(), |runtime| &mut **runtime)
     }
 }
@@ -43,23 +47,23 @@ fn unsupported<B: TextGenerationBackend, C: TokenFilterController>(
     TextOperationPolicyError::OutcomeMismatch.into()
 }
 
-struct NativeDecisionExecutor<B, C> {
+struct NativeDecisionExecutor<B, C, S> {
     capabilities: crate::decoding::DecodingCapabilities,
-    types: PhantomData<fn() -> (B, C)>,
+    types: PhantomData<fn() -> (B, C, S)>,
 }
 #[allow(unused_variables)]
-impl<B: TextGenerationBackend, C: TokenFilterController> SpeculativeExecutor
-    for NativeDecisionExecutor<B, C>
+impl<B: TextGenerationBackend, C: TokenFilterController, S: TextExecutionSession<B>>
+    SpeculativeExecutor for NativeDecisionExecutor<B, C, S>
 {
     type Input = ();
-    type Cache = NativeDecisionState<B, C>;
+    type Cache = NativeDecisionState<B, C, S>;
     type TargetState = ();
     type DraftState = NoScores;
     type CacheCheckpoint = NoScores;
     type Verification = NoScores;
     type Logits = NoScores;
     type Context<'a>
-        = &'a dyn NativeDecisionContext<B>
+        = &'a dyn NativeDecisionContext<B, S>
     where
         Self: 'a;
     type Completion = NoVerificationCompletion<ControlledTextGenerationError<B::Error, C::Error>>;
@@ -140,7 +144,7 @@ impl<B: TextGenerationBackend, C: TokenFilterController> SpeculativeExecutor
             .commit_token(token)
             .map_err(ControlledTextGenerationError::Controller)?;
         cache.position.committed_tokens = position;
-        B::commit_text_token(
+        S::commit_text_token(
             &mut context.runtime(),
             token,
             cache.position,
@@ -165,7 +169,7 @@ impl<B: TextGenerationBackend, C: TokenFilterController> SpeculativeExecutor
         cache
             .resolve_completions_before_decode()
             .map_err(ControlledTextGenerationError::Backend)?;
-        let settled = B::settle_decoding_mode(
+        let settled = S::settle_decoding_mode(
             &mut context.runtime(),
             &mut cache.step,
             &mut cache.backend_state,
@@ -190,7 +194,7 @@ impl<B: TextGenerationBackend, C: TokenFilterController> SpeculativeExecutor
     where
         Self: 'a,
     {
-        B::coordinate_decoding_control(&mut context.runtime(), local)
+        S::coordinate_decoding_control(&mut context.runtime(), local)
             .map_err(BackendFailure::from_error)
     }
     fn prefill<'context>(
@@ -286,15 +290,15 @@ impl<B: TextGenerationBackend, C: TokenFilterController> SpeculativeExecutor
     }
 }
 // This carrier never samples: the opaque sampler and controller stay in source state.
-struct NativeDecisionSampling<B, C>(PhantomData<fn() -> (B, C)>, bool);
-impl<B, C> Clone for NativeDecisionSampling<B, C> {
+struct NativeDecisionSampling<B, C, S>(PhantomData<fn() -> (B, C, S)>, bool);
+impl<B, C, S> Clone for NativeDecisionSampling<B, C, S> {
     fn clone(&self) -> Self {
         Self(PhantomData, self.1)
     }
 }
 #[allow(unused_variables)]
-impl<B: TextGenerationBackend, C: TokenFilterController> SpeculativeSampling
-    for NativeDecisionSampling<B, C>
+impl<B: TextGenerationBackend, C: TokenFilterController, S: TextExecutionSession<B>>
+    SpeculativeSampling for NativeDecisionSampling<B, C, S>
 {
     fn control_requires_positive_temperature(&self) -> Option<bool> {
         Some(self.1)
@@ -306,7 +310,7 @@ impl<B: TextGenerationBackend, C: TokenFilterController> SpeculativeSampling
     type DraftRandomness = NoScores;
     type RandomnessRoot = NoScores;
     type Context<'a>
-        = &'a dyn NativeDecisionContext<B>
+        = &'a dyn NativeDecisionContext<B, S>
     where
         Self: 'a;
     type Error = ControlledTextGenerationError<B::Error, C::Error>;
@@ -456,14 +460,15 @@ fn map_operation<B: std::error::Error + 'static, C: std::error::Error + 'static>
     }
 }
 
-pub(super) struct NativeDecisionState<B, C>
+pub(super) struct NativeDecisionState<B, C, S>
 where
     B: TextGenerationBackend,
+    S: TextExecutionSession<B>,
     C: TokenFilterController,
 {
-    pub(super) backend_state: B::TextGenerationState,
+    pub(super) backend_state: S::TextGenerationState,
     pub(super) controller: C,
-    pub(super) step: Option<PendingTextInput<B::Prompt, B::Token>>,
+    pub(super) step: Option<PendingTextInput<S::Prompt, B::Token>>,
     pub(super) completions: Vec<B::TextCompletion>,
     pub(super) remaining_tokens: Option<usize>,
     pub(super) prefill: PrefillChunkPolicy,
@@ -473,24 +478,25 @@ where
     pub(super) decoding: crate::decoding::DecodingControl,
 }
 
-impl<B, C> NativeDecisionState<B, C>
+impl<B, C, S> NativeDecisionState<B, C, S>
 where
     B: TextGenerationBackend,
+    S: TextExecutionSession<B>,
     C: TokenFilterController,
 {
     pub(super) fn new(
-        runtime: &ModelRuntime<B>,
-        prompt: B::Prompt,
+        runtime: &ModelRuntime<B, S>,
+        prompt: S::Prompt,
         mut config: TextGenerationConfig,
         controller: C,
     ) -> Result<Self, ControlledTextGenerationError<B::Error, C::Error>> {
         let active = config
             .decoding_mode()
-            .unwrap_or_else(|| B::default_decoding_mode(runtime));
+            .unwrap_or_else(|| runtime.session().default_decoding_mode());
         let requires_causal_scores =
             matches!(config.strategy(), TextSamplingStrategy::MirostatV2 { .. });
         let decoding = crate::decoding::DecodingControl::new(
-            B::decoding_capabilities(runtime),
+            runtime.session().decoding_capabilities(),
             active,
             requires_causal_scores,
         )
@@ -516,7 +522,7 @@ where
                 } else if block_refinement
                     && config
                         .refinement_policy()
-                        .is_some_and(|policy| !B::supports_refinement_policy(runtime, policy))
+                        .is_some_and(|policy| !runtime.session().supports_refinement_policy(policy))
                 {
                     Err(ControlledTextGenerationError::Operation(
                         TextOperationPolicyError::RefinementPolicyMismatch,
@@ -527,12 +533,12 @@ where
             });
         let admission = admission.and_then(|()| {
             if let Some(canvas) = config.refinement_canvas() {
-                let length = B::refinement_canvas_length(runtime).ok_or(
+                let length = runtime.session().refinement_canvas_length().ok_or(
                     ControlledTextGenerationError::Operation(
                         TextOperationPolicyError::RequiresBlockRefinementArchitecture,
                     ),
                 )?;
-                let vocabulary = B::refinement_vocabulary_size(runtime).ok_or(
+                let vocabulary = runtime.session().refinement_vocabulary_size().ok_or(
                     ControlledTextGenerationError::Operation(
                         TextOperationPolicyError::RequiresBlockRefinementArchitecture,
                     ),
@@ -553,7 +559,9 @@ where
             admission,
             ControlledTextGenerationError::Preparation,
         )?;
-        let backend_state = B::start_text_generation(runtime.backend(), config.clone())
+        let backend_state = runtime
+            .session()
+            .start_text_generation(runtime.backend(), config.clone())
             .map_err(ControlledTextGenerationError::Backend);
         let backend_state = runtime.finish_text_preparation(
             crate::run_preparation::TextPreparationStage::Sampling,
@@ -625,7 +633,7 @@ where
     /// sampling/controller state. Backends return only after native completion.
     pub(super) fn advance_prefill(
         &mut self,
-        runtime: &mut ModelRuntime<B>,
+        runtime: &mut ModelRuntime<B, S>,
     ) -> Result<bool, B::Error> {
         let max_tokens = match self.prefill {
             PrefillChunkPolicy::Unchunked => std::num::NonZeroUsize::MAX,
@@ -647,7 +655,7 @@ where
             return Ok(false);
         };
         let advanced =
-            B::prefill_text_prefix(runtime, &mut prompt, max_tokens, &mut self.backend_state)?;
+            S::prefill_text_prefix(runtime, &mut prompt, max_tokens, &mut self.backend_state)?;
         self.step = Some(PendingTextInput::Prefill(prompt));
         if advanced {
             self.position.execution_step += 1;
@@ -657,7 +665,7 @@ where
 
     fn advance(
         &mut self,
-        runtime: &mut ModelRuntime<B>,
+        runtime: &mut ModelRuntime<B, S>,
     ) -> Result<CompletedDecisionProgress, ControlledTextGenerationError<B::Error, C::Error>> {
         if self.position.execution_step == u64::MAX || self.position.committed_tokens == u64::MAX {
             return Err(TextOperationPolicyError::PositionOverflow.into());
@@ -683,23 +691,23 @@ where
             self.resolve_completions_before_decode()
                 .map_err(ControlledTextGenerationError::Backend)?;
         }
-        let kind = B::text_operation_kind(runtime, &step, &self.backend_state);
+        let kind = S::text_operation_kind(runtime, &step, &self.backend_state);
         let decision = match kind {
             TextOperationKind::Progress(_) => None,
-            TextOperationKind::Decision(_) => Some(
+            TextOperationKind::CausalDecision | TextOperationKind::Decision(_) => Some(
                 self.controller
                     .current_decision()
                     .map_err(ControlledTextGenerationError::Controller)?,
             ),
         };
-        let submission = B::submit_text_operation(
-            runtime,
-            step,
-            decision.as_ref(),
-            &mut self.backend_state,
-            self.remaining_tokens,
-        )
-        .map_err(map_operation)?;
+        let submission = runtime
+            .submit_text_operation(
+                step,
+                decision.as_ref(),
+                &mut self.backend_state,
+                self.remaining_tokens,
+            )
+            .map_err(map_operation)?;
         drop(decision);
         self.retain_completion(submission.completion)
             .map_err(ControlledTextGenerationError::Backend)?;
@@ -715,8 +723,14 @@ where
                 Ok(CompletedDecisionProgress::Progress(progress))
             }
             TextOperationOutput::Token(token) => {
-                let TextOperationKind::Decision(score_kind) = kind else {
-                    return Err(TextOperationPolicyError::OutcomeMismatch.into());
+                let score_kind = match kind {
+                    TextOperationKind::CausalDecision => {
+                        crate::refinement::PredictionScoreKind::CausalConditional
+                    }
+                    TextOperationKind::Decision(score_kind) => score_kind,
+                    TextOperationKind::Progress(_) => {
+                        return Err(TextOperationPolicyError::OutcomeMismatch.into())
+                    }
                 };
                 self.resolve_completions_before_decode()
                     .map_err(ControlledTextGenerationError::Backend)?;
@@ -735,9 +749,10 @@ where
         }
     }
 }
-impl<B, C> Drop for NativeDecisionState<B, C>
+impl<B, C, S> Drop for NativeDecisionState<B, C, S>
 where
     B: TextGenerationBackend,
+    S: TextExecutionSession<B>,
     C: TokenFilterController,
 {
     fn drop(&mut self) {
@@ -748,22 +763,26 @@ where
     }
 }
 
-type NativeDecisionTable<B, C> = GenerationRequestTable<
+type NativeDecisionTable<B, C, S> = GenerationRequestTable<
     'static,
-    NativeDecisionExecutor<B, C>,
-    NativeDecisionSampling<B, C>,
+    NativeDecisionExecutor<B, C, S>,
+    NativeDecisionSampling<B, C, S>,
     SpeculativeSemanticConstraint,
     NativeDecisionPublisher,
 >;
 
-pub(super) struct TextRequestDriver<B: TextGenerationBackend, C: TokenFilterController> {
-    table: NativeDecisionTable<B, C>,
+pub(super) struct TextRequestDriver<
+    B: TextGenerationBackend,
+    C: TokenFilterController,
+    S: TextExecutionSession<B>,
+> {
+    table: NativeDecisionTable<B, C, S>,
     request: crate::SpeculativeRequestId,
 }
-impl<B: TextGenerationBackend, C: TokenFilterController> std::ops::Deref
-    for TextRequestDriver<B, C>
+impl<B: TextGenerationBackend, C: TokenFilterController, S: TextExecutionSession<B>> std::ops::Deref
+    for TextRequestDriver<B, C, S>
 {
-    type Target = NativeDecisionState<B, C>;
+    type Target = NativeDecisionState<B, C, S>;
     fn deref(&self) -> &Self::Target {
         self.table
             .request(self.request)
@@ -771,8 +790,8 @@ impl<B: TextGenerationBackend, C: TokenFilterController> std::ops::Deref
             .completed_source_cache()
     }
 }
-impl<B: TextGenerationBackend, C: TokenFilterController> std::ops::DerefMut
-    for TextRequestDriver<B, C>
+impl<B: TextGenerationBackend, C: TokenFilterController, S: TextExecutionSession<B>>
+    std::ops::DerefMut for TextRequestDriver<B, C, S>
 {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.table
@@ -782,10 +801,12 @@ impl<B: TextGenerationBackend, C: TokenFilterController> std::ops::DerefMut
             .0
     }
 }
-impl<B: TextGenerationBackend, C: TokenFilterController> TextRequestDriver<B, C> {
+impl<B: TextGenerationBackend, C: TokenFilterController, S: TextExecutionSession<B>>
+    TextRequestDriver<B, C, S>
+{
     pub(super) fn new(
-        runtime: &mut ModelRuntime<B>,
-        prompt: B::Prompt,
+        runtime: &mut ModelRuntime<B, S>,
+        prompt: S::Prompt,
         config: TextGenerationConfig,
         controller: C,
     ) -> Result<Self, ControlledTextGenerationError<B::Error, C::Error>> {
@@ -847,7 +868,7 @@ impl<B: TextGenerationBackend, C: TokenFilterController> TextRequestDriver<B, C>
     }
     pub(super) fn advance_prefill(
         &mut self,
-        runtime: &mut ModelRuntime<B>,
+        runtime: &mut ModelRuntime<B, S>,
     ) -> Result<bool, ControlledTextGenerationError<B::Error, C::Error>> {
         let mut executor = NativeDecisionExecutor {
             capabilities: self.decoding.capabilities(),
@@ -879,7 +900,7 @@ impl<B: TextGenerationBackend, C: TokenFilterController> TextRequestDriver<B, C>
     }
     pub(super) fn fork(
         &self,
-        state: NativeDecisionState<B, C>,
+        state: NativeDecisionState<B, C, S>,
         sequence: crate::GenerationSequence,
     ) -> Self {
         let cancellation = crate::GenerationCancellationToken::new();
@@ -908,7 +929,7 @@ impl<B: TextGenerationBackend, C: TokenFilterController> TextRequestDriver<B, C>
     #[allow(clippy::type_complexity)]
     pub(super) fn next_physical_committed(
         &mut self,
-        runtime: &mut ModelRuntime<B>,
+        runtime: &mut ModelRuntime<B, S>,
     ) -> Option<Result<TextAdvancement<B::Token>, ControlledTextGenerationError<B::Error, C::Error>>>
     {
         let previous = self.decoding.state().acknowledgement;
@@ -962,7 +983,7 @@ impl<B: TextGenerationBackend, C: TokenFilterController> TextRequestDriver<B, C>
     #[allow(clippy::type_complexity)]
     pub(super) fn next_committed(
         &mut self,
-        runtime: &mut ModelRuntime<B>,
+        runtime: &mut ModelRuntime<B, S>,
     ) -> Option<Result<ControlledToken<B::Token>, ControlledTextGenerationError<B::Error, C::Error>>>
     {
         loop {
@@ -975,7 +996,7 @@ impl<B: TextGenerationBackend, C: TokenFilterController> TextRequestDriver<B, C>
     }
     pub(super) fn next_output(
         &mut self,
-        runtime: &mut ModelRuntime<B>,
+        runtime: &mut ModelRuntime<B, S>,
     ) -> Option<ControlledGenerationResult<B, C>> {
         self.next_committed(runtime)
             .map(|result| result.map(ControlledToken::into_output))

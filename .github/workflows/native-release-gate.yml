@@ -65,7 +65,7 @@ jobs:
       - name: Check validation tooling
         run: |
           python3 -m unittest discover -s validation -p 'test_release_*.py'
-          python3 -m unittest discover -s validation -p 'test_native_unit_batches.py'
+          python3 -m unittest discover -s validation -p 'test_native_ring_batches.py'
 
   native:
     needs: plan

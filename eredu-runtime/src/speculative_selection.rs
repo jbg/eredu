@@ -414,67 +414,23 @@ impl SpeculativeStrategyRequirements {
     }
 }
 
-/// Generic backend mechanism needed by speculative composition.
-#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
-#[non_exhaustive]
-pub enum SpeculativeMechanism {
-    /// Backend-native tensor indexing, concatenation, and shape-preserving movement.
-    TensorOperations,
-    /// General neural operators needed to construct and execute the target or draft.
-    NeuralOperations,
-    /// Routed or grouped neural operators required by a selected model family.
-    GroupedNeuralOperations,
-    /// Hyper-connection and hyper-head operators required by a selected model family.
-    HyperNeuralOperations,
-    /// Checkpoint payload decoding and backend-native parameter materialization.
-    PayloadMaterialization,
-    /// Generic logits processing and probability construction.
-    LogitsProcessing,
-    /// Generic categorical or deterministic token selection.
-    Sampling,
-    /// Forkable random state and stable random substreams.
-    Randomness,
-    /// Architecture-shaped prediction or assistant state storage.
-    StateStorage,
-    /// Placement and residency of materialized payload and mutable speculative state.
-    StorageResidency,
-    /// Exact completion retaining submitted resources.
-    ExactCompletion,
-    /// Architecture-declared activation observation and replacement.
-    Observation,
-    /// Component timing collection and attribution.
-    Timing,
-    /// Native target and draft execution queue binding.
-    QueueBinding,
-    /// Communication required by an architecture-declared distributed realization.
-    Communication,
-    /// Exact target/draft agreement before canonical state is committed.
-    Agreement,
-    /// Publication of only canonically committed tokens and semantic events.
-    Publication,
-    /// Ordered handoff between distinct queues on one device.
-    SameDeviceHandoff,
-    /// Shape- and dtype-preserving transfer between devices.
-    CrossDeviceTransfer,
-}
+pub use eredu_core::speculative::{SpeculativeMechanism, SpeculativeMechanismCapabilities};
 
-impl SpeculativeMechanism {
-    const BASE: [Self; 13] = [
-        Self::TensorOperations,
-        Self::NeuralOperations,
-        Self::PayloadMaterialization,
-        Self::LogitsProcessing,
-        Self::Sampling,
-        Self::Randomness,
-        Self::StateStorage,
-        Self::StorageResidency,
-        Self::ExactCompletion,
-        Self::Observation,
-        Self::QueueBinding,
-        Self::Agreement,
-        Self::Publication,
-    ];
-}
+const BASE_SPECULATIVE_MECHANISMS: [SpeculativeMechanism; 13] = [
+    SpeculativeMechanism::TensorOperations,
+    SpeculativeMechanism::NeuralOperations,
+    SpeculativeMechanism::PayloadMaterialization,
+    SpeculativeMechanism::LogitsProcessing,
+    SpeculativeMechanism::Sampling,
+    SpeculativeMechanism::Randomness,
+    SpeculativeMechanism::StateStorage,
+    SpeculativeMechanism::StorageResidency,
+    SpeculativeMechanism::ExactCompletion,
+    SpeculativeMechanism::Observation,
+    SpeculativeMechanism::QueueBinding,
+    SpeculativeMechanism::Agreement,
+    SpeculativeMechanism::Publication,
+];
 
 /// Exact generic mechanisms required by one strategy.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -486,7 +442,7 @@ impl SpeculativeMechanismRequirements {
     /// Creates requirements containing the mandatory transaction mechanisms and additions.
     pub fn new(additional: impl IntoIterator<Item = SpeculativeMechanism>) -> Self {
         Self {
-            mechanisms: SpeculativeMechanism::BASE
+            mechanisms: BASE_SPECULATIVE_MECHANISMS
                 .into_iter()
                 .chain(additional)
                 .collect(),
@@ -502,31 +458,6 @@ impl SpeculativeMechanismRequirements {
 impl Default for SpeculativeMechanismRequirements {
     fn default() -> Self {
         Self::new([])
-    }
-}
-
-/// Generic speculative mechanisms implemented by a backend.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct SpeculativeMechanismCapabilities {
-    mechanisms: BTreeSet<SpeculativeMechanism>,
-}
-
-impl SpeculativeMechanismCapabilities {
-    /// Creates a fail-closed capability set.
-    pub fn new(mechanisms: impl IntoIterator<Item = SpeculativeMechanism>) -> Self {
-        Self {
-            mechanisms: mechanisms.into_iter().collect(),
-        }
-    }
-
-    /// Returns supported mechanisms in stable order.
-    pub const fn mechanisms(&self) -> &BTreeSet<SpeculativeMechanism> {
-        &self.mechanisms
-    }
-
-    /// Returns whether one exact generic mechanism is supported.
-    pub fn supports(&self, mechanism: SpeculativeMechanism) -> bool {
-        self.mechanisms.contains(&mechanism)
     }
 }
 
@@ -1294,7 +1225,7 @@ mod tests {
     }
 
     fn capabilities() -> SpeculativeMechanismCapabilities {
-        SpeculativeMechanismCapabilities::new(SpeculativeMechanism::BASE.into_iter().chain([
+        SpeculativeMechanismCapabilities::new(BASE_SPECULATIVE_MECHANISMS.into_iter().chain([
             SpeculativeMechanism::GroupedNeuralOperations,
             SpeculativeMechanism::HyperNeuralOperations,
             SpeculativeMechanism::Timing,
@@ -1514,7 +1445,7 @@ mod tests {
                 SpeculativeMechanism::Communication,
             ],
         );
-        let cases = SpeculativeMechanism::BASE
+        let cases = BASE_SPECULATIVE_MECHANISMS
             .into_iter()
             .chain([
                 SpeculativeMechanism::GroupedNeuralOperations,

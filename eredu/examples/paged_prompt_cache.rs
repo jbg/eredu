@@ -1,0 +1,212 @@
+//! Save, drop, lazily reopen, and continue an MLX text prompt cache.
+
+use eredu_runtime::text_session_driver::{PreparedTextPrompt, TextPromptView};
+use std::path::PathBuf;
+
+use clap::Parser;
+use eredu_backend_mlx::backend::{runtime::media::input::token_ids_part, MlxBackend};
+use eredu_backend_mlx::native::ExecutionContext;
+use eredu_backend_mlx::MlxTensor;
+use eredu_core::{
+    cache::{PromptCacheDescriptor, PromptCacheOptions},
+    load_model, BackendSession as _,
+};
+use eredu_runtime::{CacheResidencyPolicy, PagedCacheOptions};
+use eredu_text::tokenizer::Tokenizer;
+use safemlx::{transforms::async_eval_with_event, Array, Device, DeviceType};
+
+type LoadedSession = eredu_runtime::text_session_driver::PreparedTextDriver<
+    MlxBackend<'static>,
+    eredu_backend_mlx::native::MlxSessionMechanisms,
+>;
+
+#[derive(Debug, Parser)]
+#[command(about = "Verify reusable paged prompt-cache parity")]
+struct Args {
+    /// Directory containing a supported text model.
+    model_dir: PathBuf,
+    /// Persistent prompt-cache destination.
+    cache_dir: PathBuf,
+    /// Deterministic text prefix.
+    #[arg(long)]
+    prompt: String,
+    /// One token appended after the restored prefix.
+    #[arg(long)]
+    suffix_token: u32,
+    /// Stable content-based checkpoint identity.
+    #[arg(long)]
+    checkpoint_fingerprint: String,
+    /// Token count per immutable cache block.
+    #[arg(long, default_value_t = 128)]
+    block_tokens: i32,
+    /// Finite logical execution-device cache bytes.
+    #[arg(long, default_value_t = 512 << 20)]
+    device_cache_bytes: u64,
+    /// Finite logical host cache bytes.
+    #[arg(long, default_value_t = 2 << 30)]
+    host_cache_bytes: u64,
+    /// Recent device blocks protected per layer.
+    #[arg(long, default_value_t = 1)]
+    recent_device_blocks: usize,
+    /// Optional explicit live-cache backing directory.
+    #[arg(long)]
+    live_disk_dir: Option<PathBuf>,
+    /// Finite logical live-cache disk bytes.
+    #[arg(long, default_value_t = 8 << 30)]
+    live_disk_bytes: u64,
+    /// Replace an existing persistent cache directory atomically.
+    #[arg(long)]
+    replace: bool,
+    /// Use the ordinary device-resident cache and skip persistence.
+    #[arg(long)]
+    device_cache: bool,
+}
+
+fn prefill_tokens(
+    tokens: &Array,
+    backend: &MlxBackend<'static>,
+    session: &mut LoadedSession,
+) -> anyhow::Result<Array> {
+    let parts = [token_ids_part(tokens)?];
+    let input = PreparedTextPrompt::from(TextPromptView::new(&parts));
+    session
+        .prefill(backend, input)?
+        .wait()?
+        .into_logits()
+        .map(MlxTensor::into_array)
+        .ok_or_else(|| anyhow::anyhow!("selected MLX rank does not own prefill logits"))
+}
+
+fn decode_tokens(
+    tokens: &Array,
+    backend: &MlxBackend<'static>,
+    session: &mut LoadedSession,
+) -> anyhow::Result<Array> {
+    session
+        .decode(backend, tokens.clone())?
+        .wait()?
+        .into_logits()
+        .map(MlxTensor::into_array)
+        .ok_or_else(|| anyhow::anyhow!("selected MLX rank does not own decode logits"))
+}
+
+fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
+    let execution = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+    let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = execution.stream();
+    let backend = eredu_backend_mlx::native::backend(stream, weights.stream());
+    let selected_paged = if args.device_cache {
+        None
+    } else {
+        let mut paged = PagedCacheOptions::new(
+            args.block_tokens,
+            args.device_cache_bytes,
+            args.host_cache_bytes,
+            args.recent_device_blocks,
+        )?
+        .with_full_attention(true)
+        .with_persistence_retention(true)
+        .with_process_sampling(true);
+        if let Some(directory) = &args.live_disk_dir {
+            paged = paged.with_live_disk(directory, args.live_disk_bytes, 2)?;
+        }
+        Some(paged)
+    };
+    let request =
+        selected_paged
+            .clone()
+            .map_or_else(eredu_core::ModelLoadOptions::default, |paged| {
+                eredu_core::ModelLoadOptions::new(
+                    eredu_runtime::NormalizedLoadRequest::default()
+                        .with_state_residency(CacheResidencyPolicy::Paged(paged)),
+                )
+            });
+    let model = load_model::<
+        eredu_backend_mlx::backend::MlxBackend<'_>,
+        _,
+        eredu_runtime::ModelLoadFacts<_>,
+    >(
+        &backend,
+        &args.model_dir,
+        &eredu_architectures::configuration::MODEL_CONFIGURATIONS,
+        request,
+    )?;
+    let mut session =
+        <LoadedSession as eredu_core::backend::ModelSessionInstaller<_>>::install_session(
+            &backend, model,
+        )?;
+    let tokenizer = Tokenizer::from_file(args.model_dir.join("tokenizer.json"))
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let prefix_ids = tokenizer
+        .encode(args.prompt.as_str(), false)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?
+        .get_ids()
+        .to_vec();
+    anyhow::ensure!(
+        !prefix_ids.is_empty(),
+        "prompt must encode to at least one token"
+    );
+    let prefix = Array::from_slice(&prefix_ids, &[1, prefix_ids.len() as i32]);
+    let suffix = Array::from_slice(&[args.suffix_token], &[1, 1]);
+
+    if args.device_cache {
+        let _ = prefill_tokens(&prefix, &backend, &mut session)?;
+        let logits = decode_tokens(&suffix, &backend, &mut session)?;
+        async_eval_with_event([&logits])?.synchronize()?;
+        println!(
+            "ordinary device cache suffix logits shape: {:?}",
+            logits.shape()
+        );
+        return Ok(());
+    }
+
+    let prompt_cache_identity = session.prompt_cache_model_identity(&backend)?;
+    let _ = prefill_tokens(&prefix, &backend, &mut session)?;
+    let uninterrupted_logits = decode_tokens(&suffix, &backend, &mut session)?;
+    async_eval_with_event([&uninterrupted_logits])?.synchronize()?;
+    println!(
+        "uninterrupted report: {:#?}",
+        session.cache_residency_report()?
+    );
+
+    session.reset(&backend)?;
+    let _ = prefill_tokens(&prefix, &backend, &mut session)?;
+    let descriptor = PromptCacheDescriptor::from_model_identity(
+        prompt_cache_identity,
+        args.checkpoint_fingerprint,
+        format!("tokens:{prefix_ids:?}"),
+        1,
+    )?;
+    let manifest = session.save_prompt_cache(
+        &backend,
+        &eredu_runtime::DirectoryPromptCacheStore::new(&args.cache_dir, u64::MAX),
+        descriptor.clone(),
+        &prefix_ids,
+        &PromptCacheOptions::new(Some("paged-prompt-cache-example".into()), args.replace)?,
+    )?;
+    println!("saved blocks: {}", manifest.blocks.len());
+    println!("save report: {:#?}", session.cache_residency_report()?);
+
+    let inspected = session.load_prompt_cache(
+        &backend,
+        &eredu_runtime::DirectoryPromptCacheStore::new(&args.cache_dir, u64::MAX),
+        &descriptor,
+        &prefix_ids,
+        None,
+    )?;
+    println!("cataloged blocks: {}", inspected.blocks.len());
+    println!("load report: {:#?}", session.cache_residency_report()?);
+    let restored_logits = decode_tokens(&suffix, &backend, &mut session)?;
+    async_eval_with_event([&restored_logits])?.synchronize()?;
+    let equal = restored_logits
+        .all_close(&uninterrupted_logits, 1e-4, 1e-4, None, stream)?
+        .item::<bool>(stream);
+    println!("restored suffix logits match uninterrupted execution: {equal}");
+    println!("continued report: {:#?}", session.cache_residency_report()?);
+    anyhow::ensure!(
+        equal,
+        "restored suffix logits differ from uninterrupted execution"
+    );
+    Ok(())
+}

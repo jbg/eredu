@@ -182,7 +182,7 @@ fn native_facade(device: &str, text: bool) {
         ExecutionPlan::fully_resident(eredu_core::DevicePlan::new("mlx", device).unwrap())
             .with_required_session_capabilities(SessionCapabilities::new(true, true, true));
     let (mut model, _) =
-        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &root.0, &execution)
+        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &root.0, &execution, None)
             .unwrap()
             .into_parts();
     let chat = model
@@ -366,7 +366,7 @@ fn text_matches_ordinary_sampling_with_policy(
                 },
             );
     let (mut model, _) =
-        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &root.0, &execution)
+        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &root.0, &execution, None)
             .unwrap()
             .into_parts();
     for temperature in [0.0, 1.7] {
@@ -459,7 +459,7 @@ fn prompt_cache_stores_share_generation_identity_cancellation_and_budget_contrac
             .with_paged_state(eredu_core::PagedStatePlan::new(3, 4 << 20, 4 << 20).unwrap())
             .with_prompt_cache_persistence(true);
     let load = || {
-        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &root.0, &execution)
+        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &root.0, &execution, None)
             .unwrap()
             .into_parts()
             .0
@@ -480,7 +480,7 @@ fn prompt_cache_stores_share_generation_identity_cancellation_and_budget_contrac
         },
         ..Default::default()
     };
-    let generate = |model: &mut LoadedModel<_>, ids: Vec<u32>, cancellation| {
+    let generate = |model: &mut LoadedModel<_, _>, ids: Vec<u32>, cancellation| {
         model.reset().unwrap();
         model
             .session()

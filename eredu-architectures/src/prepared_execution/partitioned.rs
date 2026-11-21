@@ -1,51 +1,9 @@
-use std::marker::PhantomData;
-
-use eredu_nn::{NeuralBackend, Tensor};
+use eredu_nn::NeuralBackend;
 use eredu_runtime::LayerRuntimeState;
 
 use super::*;
 use crate::{composite_partitioned::*, partitioned_execution::*};
 
-/// Direct partitioned construction from an exact native visitor factory.
-pub struct PartitionedDenseRoute<'a, B: NeuralBackend, S, V, P = WithoutPrediction> {
-    context: &'a <B::Tensor as Tensor>::Context,
-    source_context: &'a <B::Tensor as Tensor>::Context,
-    visitor: V,
-    prediction: P,
-    state: PhantomData<fn() -> S>,
-}
-impl<'a, B: NeuralBackend, S, V> PartitionedDenseRoute<'a, B, S, V> {
-    /// Binds a factory receiving only checked native communication and source roles.
-    pub fn new(
-        context: &'a <B::Tensor as Tensor>::Context,
-        source_context: &'a <B::Tensor as Tensor>::Context,
-        visitor: V,
-    ) -> Self {
-        Self {
-            context,
-            source_context,
-            visitor,
-            prediction: WithoutPrediction,
-            state: PhantomData,
-        }
-    }
-}
-impl<'a, B: NeuralBackend, S, V, P> PartitionedDenseRoute<'a, B, S, V, P> {
-    /// Adds native extension materialization and a partitioned prediction visitor factory.
-    pub fn with_prediction<M, F, V2>(
-        self,
-        materialize: F,
-        visitor: V2,
-    ) -> PartitionedDenseRoute<'a, B, S, V, PredictionMechanisms<M, S, F, V2>> {
-        PartitionedDenseRoute {
-            context: self.context,
-            source_context: self.source_context,
-            visitor: self.visitor,
-            prediction: PredictionMechanisms::new(materialize, visitor),
-            state: PhantomData,
-        }
-    }
-}
 impl<B: NeuralBackend, S, V, P> sealed::Sealed for PartitionedDenseRoute<'_, B, S, V, P> {}
 
 impl<B, S, VF, V, P, C, E, F> PreparedExecutionRoute<SelectedDensePartitionedExecution, C, E, F>
@@ -86,60 +44,6 @@ where
     }
 }
 
-/// Routed partitioned construction with architecture-owned operator/state selection.
-pub struct PartitionedRoutedRoute<'a, B: NeuralBackend, S, PS, SS, G, T, U, P = WithoutPrediction> {
-    context: &'a <B::Tensor as Tensor>::Context,
-    source_context: &'a <B::Tensor as Tensor>::Context,
-    gated: G,
-    pooling: T,
-    streams: U,
-    prediction: P,
-    states: PhantomData<fn() -> (S, PS, SS)>,
-}
-impl<'a, B: NeuralBackend, S, PS, SS, G, T, U> PartitionedRoutedRoute<'a, B, S, PS, SS, G, T, U> {
-    /// Binds factories for mixed-state grouped execution and pooling execution.
-    ///
-    /// The first visitor implements both gated-product and ReLU-squared contracts.
-    pub fn new(
-        context: &'a <B::Tensor as Tensor>::Context,
-        source_context: &'a <B::Tensor as Tensor>::Context,
-        gated: G,
-        pooling: T,
-        streams: U,
-    ) -> Self {
-        Self {
-            context,
-            source_context,
-            gated,
-            pooling,
-            streams,
-            prediction: WithoutPrediction,
-            states: PhantomData,
-        }
-    }
-}
-
-impl<'a, B: NeuralBackend, S, PS, SS, G, T, U, P>
-    PartitionedRoutedRoute<'a, B, S, PS, SS, G, T, U, P>
-{
-    /// Adds native extension materialization and a typed prediction visitor factory.
-    pub fn with_prediction<M, F, V>(
-        self,
-        materialize: F,
-        visitor: V,
-    ) -> PartitionedRoutedRoute<'a, B, S, PS, SS, G, T, U, PredictionMechanisms<M, (S, PS), F, V>>
-    {
-        PartitionedRoutedRoute {
-            context: self.context,
-            source_context: self.source_context,
-            gated: self.gated,
-            pooling: self.pooling,
-            streams: self.streams,
-            prediction: PredictionMechanisms::new(materialize, visitor),
-            states: PhantomData,
-        }
-    }
-}
 impl<B: NeuralBackend, S, PS, SS, G, T, U, P> sealed::Sealed
     for PartitionedRoutedRoute<'_, B, S, PS, SS, G, T, U, P>
 {
@@ -167,9 +71,9 @@ where
     GF: FnOnce(PreparedPartitionResources<C>) -> G,
     TF: FnOnce(PreparedPartitionResources<C>) -> T,
     UF: FnOnce(PreparedPartitionResources<C>) -> U,
-    G: RoutedPartitionedProductionVisitor<B, S, Output = E, Error = F>,
-    T: RoutedPartitionedProductionVisitor<B, PS, Output = E, Error = F>,
-    U: RoutedPartitionedProductionVisitor<B, SS, Output = E, Error = F>,
+    G: RoutedPartitionedProductionVisitor<B, S, crate::SelectedRoutedBank, Output = E, Error = F>,
+    T: RoutedPartitionedProductionVisitor<B, PS, crate::SelectedRoutedBank, Output = E, Error = F>,
+    U: RoutedPartitionedProductionVisitor<B, SS, crate::SelectedRoutedBank, Output = E, Error = F>,
     P: PredictionConstruction<B, SelectedRoutedPartitionedExecution, C, E, F>,
 {
     fn construct(
@@ -239,46 +143,6 @@ where
     }
 }
 
-/// Composite partitioned construction from checked native resources.
-pub struct PartitionedCompositeRoute<'a, B: NeuralBackend, S, V, P = WithoutPrediction> {
-    context: &'a <B::Tensor as Tensor>::Context,
-    source_context: &'a <B::Tensor as Tensor>::Context,
-    visitor: V,
-    prediction: P,
-    state: PhantomData<fn() -> S>,
-}
-impl<'a, B: NeuralBackend, S, V> PartitionedCompositeRoute<'a, B, S, V> {
-    /// Binds a visitor factory receiving only checked communication and sources.
-    pub fn new(
-        context: &'a <B::Tensor as Tensor>::Context,
-        source_context: &'a <B::Tensor as Tensor>::Context,
-        visitor: V,
-    ) -> Self {
-        Self {
-            context,
-            source_context,
-            visitor,
-            prediction: WithoutPrediction,
-            state: PhantomData,
-        }
-    }
-}
-impl<'a, B: NeuralBackend, S, V, P> PartitionedCompositeRoute<'a, B, S, V, P> {
-    /// Adds native extension materialization and composite prediction binding.
-    pub fn with_prediction<M, F, V2>(
-        self,
-        materialize: F,
-        visitor: V2,
-    ) -> PartitionedCompositeRoute<'a, B, S, V, PredictionMechanisms<M, S, F, V2>> {
-        PartitionedCompositeRoute {
-            context: self.context,
-            source_context: self.source_context,
-            visitor: self.visitor,
-            prediction: PredictionMechanisms::new(materialize, visitor),
-            state: PhantomData,
-        }
-    }
-}
 impl<B: NeuralBackend, S, V, P> sealed::Sealed for PartitionedCompositeRoute<'_, B, S, V, P> {}
 
 impl<B, S, VF, V, P, C, E, F> PreparedExecutionRoute<SelectedCompositePartitionedExecution, C, E, F>
@@ -295,7 +159,13 @@ where
         + eredu_runtime::RuntimeAppendStreams<B>
         + eredu_nn::AuxiliaryConvolutionState<B::Tensor>,
     VF: FnOnce(PreparedPartitionResources<C>) -> V,
-    V: AuthoritativeCompositePartitionVisitor<B, S, Output = E, Error = F>,
+    V: AuthoritativeCompositePartitionVisitor<
+        B,
+        S,
+        crate::SelectedRoutedBank,
+        Output = E,
+        Error = F,
+    >,
     P: PredictionConstruction<B, SelectedCompositePartitionedExecution, C, E, F>,
 {
     fn construct(

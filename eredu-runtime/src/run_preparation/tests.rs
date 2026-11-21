@@ -1,5 +1,8 @@
 use super::*;
-use eredu_core::{consensus::ConsensusTransport, BoundedCompletionOutcome, Submission};
+use eredu_core::{
+    consensus::{BoundedConsensusTransport, ConsensusTransport},
+    BoundedCompletionOutcome, Submission,
+};
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Barrier,
@@ -138,7 +141,7 @@ impl TextPreparationTransport for Transport {
             Ok(())
         }
     }
-    fn fail_preparation(&self, _: &TextPreparationAgreementError) {
+    fn fence_preparation(&self) {
         self.fenced.store(true, Ordering::SeqCst);
     }
 }
@@ -165,8 +168,13 @@ fn ranks<R: Send>(
                         fenced: AtomicBool::new(false),
                         fault: if rank == 1 { fault } else { Fault::None },
                     };
-                    let manifest =
-                        crate::CommunicationManifest::new(2, rank, vec![], vec![]).unwrap();
+                    let manifest = eredu_core::communication::CommunicationManifest::new(
+                        2,
+                        rank,
+                        vec![],
+                        vec![],
+                    )
+                    .unwrap();
                     let identity = crate::establish_communication_session(
                         &transport,
                         &manifest,
@@ -377,7 +385,8 @@ fn exhausted_accounting_and_unsupported_completion_submit_nothing() {
 #[test]
 fn repeated_setup_identity_cannot_attach_to_another_preparation_owner() {
     ranks(Fault::None, |rank, transport, owner| {
-        let manifest = crate::CommunicationManifest::new(2, rank, vec![], vec![]).unwrap();
+        let manifest =
+            eredu_core::communication::CommunicationManifest::new(2, rank, vec![], vec![]).unwrap();
         let other = crate::establish_communication_session(
             transport,
             &manifest,

@@ -3,10 +3,11 @@
 use super::*;
 use crate::lfm3::audio::{placement::prepare_audio_units, ArtifactError, BindingSource};
 use eredu_checkpoint::store::SharedCheckpointSource;
+use eredu_core::residency::parameter_binding::WeightBinding;
 use eredu_core::BackendFailure;
 use eredu_runtime::{
     ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddressMap, ExecutionUnitLayout,
-    LayerwiseAcquireError, LayerwisePolicy, LayerwisePolicyForward, WeightBinding,
+    LayerwiseAcquireError, LayerwisePolicy, LayerwisePolicyForward,
 };
 use std::{iter, marker::PhantomData};
 
@@ -288,19 +289,15 @@ impl PreparedAudioDepth {
     }
 
     /// Materializes retained physical owners and constructs the depth traversal.
-    pub fn bind<B, P>(
+    pub fn bind<B, M>(
         self,
         context: &<B::Tensor as Tensor>::Context,
-        bind_units: impl FnOnce(
-            SharedCheckpointSource,
-            ExecutionUnitAddressMap,
-            Vec<Vec<WeightBinding>>,
-            &dyn Fn() -> Result<Vec<DepthModule<B>>, BackendFailure>,
-        ) -> Result<P, BackendFailure>,
-    ) -> Result<PolicyDepth<B, P>, BackendFailure>
+        residency: eredu_runtime::LayerWeightResidency,
+        mechanisms: &M,
+    ) -> Result<PolicyDepth<B, M::UnitPolicy<DepthModule<B>>>, BackendFailure>
     where
         B: NeuralBackend,
-        P: LayerwisePolicy<B, DepthModule<B>>,
+        M: eredu_runtime::ParameterUnitMechanisms<B>,
     {
         let Self {
             declaration,
@@ -309,9 +306,14 @@ impl PreparedAudioDepth {
             units,
         } = self;
         require_capabilities::<B>().map_err(BackendFailure::from_error)?;
-        let policy = bind_units(source, invocations.clone(), units, &|| {
-            resident_units(&declaration, true, context).map_err(BackendFailure::from_error)
-        })?;
+        let (policy, _) = eredu_runtime::bind_parameter_units(
+            mechanisms,
+            source,
+            invocations.clone(),
+            units,
+            residency,
+            || resident_units(&declaration, true, context).map_err(BackendFailure::from_error),
+        )?;
         Ok(PolicyDepth {
             declaration,
             invocations,

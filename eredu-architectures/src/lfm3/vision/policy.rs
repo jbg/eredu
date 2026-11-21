@@ -6,11 +6,12 @@ use eredu_checkpoint::{
     recipe::{DerivedWeightRecipe, RecipeDtype},
     store::SharedCheckpointSource,
 };
+use eredu_core::residency::parameter_binding::WeightBinding;
 use eredu_nn::{Error, NeuralBackend, Tensor};
 use eredu_runtime::{
     prepare_resource_bindings, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddressMap,
     ExecutionUnitLayout, LayerwiseAcquireError, LayerwisePolicy, LayerwisePolicyForward,
-    ParameterResourceRecipes, WeightBinding,
+    ParameterResourceRecipes,
 };
 
 use super::{Declaration, VisionAdvance, VisionExecution, VisionInput, VisionModule};
@@ -152,6 +153,7 @@ impl PreparedVisionExecution {
         &self.bindings
     }
 
+    #[cfg(feature = "audio")]
     pub(in crate::lfm3) fn validate_device_window(
         &self,
         residency: eredu_runtime::LayerWeightResidency,
@@ -169,30 +171,33 @@ impl PreparedVisionExecution {
     }
 
     /// Constructs the portable vision traversal through a generic unit policy binder.
-    pub fn bind<B, P>(
+    pub fn bind<B, M>(
         self,
         context: &<B::Tensor as Tensor>::Context,
-        bind_units: impl FnOnce(
-            SharedCheckpointSource,
-            ExecutionUnitAddressMap,
-            Vec<Vec<WeightBinding>>,
-            &dyn Fn() -> Result<Vec<VisionModule<B>>, eredu_core::BackendFailure>,
-        ) -> Result<P, eredu_core::BackendFailure>,
-    ) -> Result<PolicyVision<B, P>, eredu_core::BackendFailure>
+        residency: eredu_runtime::LayerWeightResidency,
+        mechanisms: &M,
+    ) -> Result<PolicyVision<B, M::UnitPolicy<VisionModule<B>>>, eredu_core::BackendFailure>
     where
         B: NeuralBackend,
-        P: LayerwisePolicy<B, VisionModule<B>>,
+        M: eredu_runtime::ParameterUnitMechanisms<B>,
     {
         use eredu_core::BackendFailure;
 
         let (declaration, source, addresses, bindings) = self.into_parts();
-        let policy = bind_units(source, addresses.clone(), bindings, &|| {
-            declaration
-                .units()
-                .map(|unit| VisionModule::new(&declaration, unit, context))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(BackendFailure::from_error)
-        })?;
+        let (policy, _) = eredu_runtime::bind_parameter_units(
+            mechanisms,
+            source,
+            addresses.clone(),
+            bindings,
+            residency,
+            || {
+                declaration
+                    .units()
+                    .map(|unit| VisionModule::new(&declaration, unit, context))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(BackendFailure::from_error)
+            },
+        )?;
         PolicyVision::new(declaration, addresses, policy).map_err(BackendFailure::from_error)
     }
 

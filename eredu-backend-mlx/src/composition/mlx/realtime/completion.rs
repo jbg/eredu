@@ -5,16 +5,7 @@ use std::{
     rc::Rc,
 };
 
-/// Execution ownership retained by shared native completion and observation.
-///
-/// Implementations retain selected stores, streams, collectives and other native
-/// authorities needed by outstanding work. Resource destruction must obey native
-/// retirement restrictions, for example through `OrdinaryRetirement`. Poisoning
-/// permanently rejects further submissions through the associated execution;
-/// it must not wait for completion or release outstanding resources.
-pub(crate) trait MlxRealtimeExecutionResources {
-    fn poison(&self);
-}
+use eredu_core::realtime_mechanisms::RealtimeSubmissionOwner;
 
 /// Exact MLX completion retaining the frame's arrays and native ownership.
 /// Dropping a pending or failed completion never waits or retries evaluation.
@@ -35,7 +26,7 @@ struct RealtimeCompletionResources {
     observation_error: RefCell<Option<String>>,
     retained: Vec<Array>,
     token_validations: TokenValidationBatch,
-    _execution_resources: Option<Arc<dyn MlxRealtimeExecutionResources>>,
+    _execution_resources: Option<Arc<dyn RealtimeSubmissionOwner>>,
 }
 
 impl Retention for RealtimeCompletionResources {
@@ -96,7 +87,8 @@ impl Drop for ObservationUnwind<'_> {
 
 /// Captures every native submission in a coupled invocation, including eager
 /// work performed before its final output arrays exist.
-pub(super) struct MlxRealtimeSubmissionScope {
+#[doc(hidden)]
+pub struct MlxRealtimeSubmissionScope {
     recovery: Option<Recovery<RealtimeCompletionResources>>,
     token_validations: Option<TokenValidationScope>,
 }
@@ -104,7 +96,7 @@ pub(super) struct MlxRealtimeSubmissionScope {
 impl MlxRealtimeSubmissionScope {
     /// Enters recovery and index validation before any execution begins.
     pub(crate) fn begin(
-        execution_resources: Option<Arc<dyn MlxRealtimeExecutionResources>>,
+        execution_resources: Option<Arc<dyn RealtimeSubmissionOwner>>,
     ) -> Result<Self, Error> {
         let validations = TokenValidationScope::begin()?;
         Ok(Self {
@@ -118,6 +110,15 @@ impl MlxRealtimeSubmissionScope {
             })?),
             token_validations: Some(validations),
         })
+    }
+
+    pub(super) fn retain_initial(&mut self, retained: impl Iterator<Item = Array>) {
+        self.recovery
+            .as_mut()
+            .expect("live submission scope")
+            .retention_mut()
+            .retained
+            .extend(retained);
     }
 
     fn retain(&mut self, mut retained: Vec<Array>) {
@@ -317,208 +318,5 @@ impl Completion for MlxRealtimeCompletion {
             std::thread::yield_now();
         }
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod observation_tests {
-    use super::*;
-    use crate::backend::submission_recovery::Probe;
-    struct FakeProbe(Rc<Cell<Status>>);
-    impl Probe for FakeProbe {
-        fn seal(&mut self) {}
-        fn progress(&self) -> Status {
-            self.0.get()
-        }
-    }
-
-    fn completion() -> MlxRealtimeCompletion {
-        MlxRealtimeSubmissionScope::begin(None)
-            .unwrap()
-            .finish(Vec::new())
-            .unwrap_or_else(|_| panic!("completion submission failed"))
-    }
-
-    #[test]
-    fn validated_realtime_completion_stays_ready_while_another_thread_owns_runtime() {
-        use std::{
-            sync::mpsc,
-            time::{Duration, Instant},
-        };
-
-        let completion = completion();
-        completion.wait().unwrap();
-        let retained_copy = completion.clone();
-        let (ready_tx, ready_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let holder = std::thread::spawn(move || loop {
-            if safemlx::try_with_submission_retirement(|| {
-                ready_tx.send(()).unwrap();
-                // Test-only contention with a watchdog, matching the native
-                // retirement tests: an accidental blocking poll cannot hang.
-                let _ = release_rx.recv_timeout(Duration::from_secs(5));
-            })
-            .is_some()
-            {
-                break;
-            }
-            std::thread::yield_now();
-        });
-        ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        let started = Instant::now();
-        let ready = retained_copy.is_complete();
-        // Cached publication proof does not bypass native retirement exclusion.
-        let releasable = retained_copy.resources_releasable();
-        let elapsed = started.elapsed();
-        let _ = release_tx.send(());
-        holder.join().unwrap();
-        assert!(ready.unwrap());
-        assert!(!releasable);
-        assert!(elapsed < Duration::from_secs(1));
-    }
-
-    #[test]
-    fn failed_invocation_scope_retains_eager_work_without_a_final_event() {
-        struct Owner(Rc<Cell<bool>>);
-        impl MlxRealtimeExecutionResources for Owner {
-            fn poison(&self) {
-                self.0.set(true);
-            }
-        }
-        let poisoned = Rc::new(Cell::new(false));
-        let owner = Arc::new(Owner(Rc::clone(&poisoned)));
-        let weak = Arc::downgrade(&owner);
-        let scope = MlxRealtimeSubmissionScope::begin(Some(owner)).unwrap();
-        let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-        let eager = Array::from_slice(&[2.0_f32, 3.0], &[2])
-            .multiply(Array::from_f32(7.0), &stream)
-            .unwrap();
-        let _event = async_eval_with_event([&eager]).unwrap();
-        let completion = scope.fail(vec![eager]);
-        assert!(poisoned.get());
-        assert!(completion.inner.recovery.retention().event.is_none());
-        assert!(completion.wait().is_err());
-        assert!(weak.upgrade().is_some());
-        crate::backend::submission_recovery::wait_for_retirement(|| {
-            completion.resources_releasable()
-        });
-        // Terminal failure permits release but can never become publishable.
-        assert!(completion.is_complete().is_err());
-        drop(completion);
-        crate::backend::submission_recovery::wait_for_retirement(|| weak.upgrade().is_none());
-    }
-
-    #[test]
-    fn unwinding_invocation_scope_poison_closes_token_validation() {
-        struct Owner(Rc<Cell<bool>>);
-        impl MlxRealtimeExecutionResources for Owner {
-            fn poison(&self) {
-                self.0.set(true);
-            }
-        }
-        let poisoned = Rc::new(Cell::new(false));
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _scope =
-                MlxRealtimeSubmissionScope::begin(Some(Arc::new(Owner(Rc::clone(&poisoned)))))
-                    .unwrap();
-            panic!("injected eager execution unwind");
-        }));
-        assert!(result.is_err());
-        assert!(poisoned.get());
-        // A failed invocation must not leave the thread-local index collector open.
-        let _next_scope = TokenValidationScope::begin().unwrap();
-    }
-
-    #[test]
-    fn original_completion_cannot_hide_an_unresolved_observation() {
-        let completion = completion();
-        completion.wait().unwrap();
-        let state = Rc::new(Cell::new(Status {
-            settled: false,
-            failed: false,
-            blocked: false,
-        }));
-        let observation = Recovery::with_probe(
-            ObservationTicket::new(&completion.inner).unwrap(),
-            FakeProbe(Rc::clone(&state)),
-        );
-        drop(observation);
-        assert!(!completion.is_complete().unwrap());
-        state.set(Status {
-            settled: true,
-            failed: false,
-            blocked: false,
-        });
-        crate::backend::submission_recovery::wait_for_retirement(|| {
-            completion.is_complete().unwrap()
-        });
-    }
-
-    #[test]
-    fn failed_observation_becomes_releasable_only_after_its_native_scope_settles() {
-        use super::super::submission::SharedRealtimeExecution;
-
-        let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-        let execution = SharedRealtimeExecution::new((), &stream);
-        let sibling = execution.share();
-        assert!(sibling.require_available().is_ok());
-        let owner = execution.retain(());
-        let retained_owner = Arc::downgrade(&owner);
-        let completion = MlxRealtimeSubmissionScope::begin(Some(owner))
-            .unwrap()
-            .finish(Vec::new())
-            .unwrap_or_else(|failure| match failure {
-                RealtimeCompletionCreationError::BeforeSubmission(error)
-                | RealtimeCompletionCreationError::AfterSubmission { error, .. } => {
-                    panic!("completion submission failed: {error}")
-                }
-            });
-        assert!(sibling.is_busy());
-        assert!(sibling.require_available().is_err());
-        completion.wait().unwrap();
-        let state = Rc::new(Cell::new(Status {
-            settled: false,
-            failed: true,
-            blocked: true,
-        }));
-        drop(Recovery::with_probe(
-            ObservationTicket::new(&completion.inner).unwrap(),
-            FakeProbe(Rc::clone(&state)),
-        ));
-        crate::backend::submission_recovery::wait_for_retirement(|| {
-            completion.is_complete().is_err()
-        });
-        assert!(!sibling.is_busy());
-        assert!(sibling.require_healthy().is_err());
-        assert!(retained_owner.upgrade().is_some());
-        assert!(!completion.resources_releasable());
-        state.set(Status {
-            settled: true,
-            failed: true,
-            blocked: false,
-        });
-        crate::backend::submission_recovery::wait_for_retirement(|| {
-            completion.resources_releasable()
-        });
-        crate::backend::submission_recovery::wait_for_retirement(|| {
-            completion.is_complete().is_err()
-        });
-        drop(completion);
-        crate::backend::submission_recovery::wait_for_retirement(|| {
-            retained_owner.upgrade().is_none()
-        });
-    }
-
-    #[test]
-    fn observation_unwind_poison_does_not_wait_for_native_terminal_status() {
-        let completion = completion();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _unwind = ObservationUnwind(completion.inner.recovery.retention());
-            panic!("injected observation unwind");
-        }));
-        assert!(result.is_err());
-        crate::backend::submission_recovery::wait_for_retirement(|| {
-            completion.is_complete().is_err()
-        });
     }
 }

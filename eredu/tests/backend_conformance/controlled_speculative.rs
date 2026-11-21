@@ -9,7 +9,7 @@ use eredu_core::{
 use std::time::{Duration, Instant};
 
 fn setup() -> (
-    LoadedModel<MockBackend>,
+    LoadedModel<MockBackend, MockSession>,
     PreparedChat,
     PreparedChatGenerationSettings,
 ) {
@@ -59,7 +59,7 @@ fn speculative_mode_commands_share_uninterrupted_delivery_and_controlled_handoff
             GenerationRequest {
                 output_mode: eredu::api::OutputMode::Semantic,
                 control_handle: Some(&handle),
-                input: PreparedChatInput::prepared_backend_input(&chat, vec![0]),
+                input: PreparedChatInput::prepared_input(&chat, vec![0]),
 
                 settings: eredu::api::PreparedChatGenerationSettings {
                     decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
@@ -186,7 +186,7 @@ fn retained_draft_source_admits_initial_ar_and_forecasts_only_causal_work() {
             GenerationRequest {
                 output_mode: eredu::api::OutputMode::Semantic,
                 control_handle: Some(&handle),
-                input: PreparedChatInput::prepared_backend_input(&chat, vec![0]),
+                input: PreparedChatInput::prepared_input(&chat, vec![0]),
 
                 settings,
                 caller_stop_sequences: &[],
@@ -281,7 +281,7 @@ fn speculative_branch_mailboxes_preserve_inactive_commands_and_close_on_release(
             GenerationRequest {
                 output_mode: eredu::api::OutputMode::Text,
                 control_handle: Some(&parent),
-                input: PreparedChatInput::prepared_backend_input(&chat, vec![0]),
+                input: PreparedChatInput::prepared_input(&chat, vec![0]),
 
                 settings: eredu::api::PreparedChatGenerationSettings {
                     decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
@@ -349,7 +349,7 @@ fn speculative_forecast_covers_a_pending_return_from_ar_without_advancing() {
             GenerationRequest {
                 output_mode: eredu::api::OutputMode::Text,
                 control_handle: None,
-                input: PreparedChatInput::prepared_backend_input(&chat, vec![0]),
+                input: PreparedChatInput::prepared_input(&chat, vec![0]),
 
                 settings: eredu::api::PreparedChatGenerationSettings {
                     decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
@@ -435,7 +435,7 @@ fn public_internal_activation_authority_preserves_parity_and_applies_edits() {
                 GenerationRequest {
                     output_mode: eredu::api::OutputMode::Semantic,
                     control_handle: None,
-                    input: PreparedChatInput::prepared_backend_input(&chat, vec![3, 4]),
+                    input: PreparedChatInput::prepared_input(&chat, vec![3, 4]),
 
                     settings: eredu::api::PreparedChatGenerationSettings {
                         decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
@@ -590,7 +590,7 @@ fn failed_internal_actions_deliver_bounded_original_evidence_without_recovery() 
                 GenerationRequest {
                     output_mode: eredu::api::OutputMode::Semantic,
                     control_handle: None,
-                    input: PreparedChatInput::prepared_backend_input(&chat, vec![3, 4]),
+                    input: PreparedChatInput::prepared_input(&chat, vec![3, 4]),
 
                     settings: eredu::api::PreparedChatGenerationSettings {
                         decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
@@ -653,10 +653,7 @@ fn controlled_speculation_uses_identical_semantics_and_reports_accepted_and_fail
         .generate(GenerationRequest {
             output_mode: eredu::api::OutputMode::Semantic,
             control_handle: None,
-            input: PreparedChatInput::prepared_backend_input(
-                &chat,
-                vec![CONTROL_REJECTION_PROMPT_TOKEN],
-            ),
+            input: PreparedChatInput::prepared_input(&chat, vec![CONTROL_REJECTION_PROMPT_TOKEN]),
 
             settings: eredu::api::PreparedChatGenerationSettings {
                 decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
@@ -677,7 +674,7 @@ fn controlled_speculation_uses_identical_semantics_and_reports_accepted_and_fail
             GenerationRequest {
                 output_mode: eredu::api::OutputMode::Semantic,
                 control_handle: None,
-                input: PreparedChatInput::prepared_backend_input(
+                input: PreparedChatInput::prepared_input(
                     &chat,
                     vec![CONTROL_REJECTION_PROMPT_TOKEN],
                 ),
@@ -766,7 +763,7 @@ fn controlled_speculative_snapshots_replay_semantics_without_rewinding_delivery_
             GenerationRequest {
                 output_mode: eredu::api::OutputMode::Semantic,
                 control_handle: None,
-                input: PreparedChatInput::prepared_backend_input(&chat, vec![0]),
+                input: PreparedChatInput::prepared_input(&chat, vec![0]),
 
                 settings: eredu::api::PreparedChatGenerationSettings {
                     decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
@@ -871,7 +868,7 @@ fn speculative_ttft_excludes_pause_and_delivery_and_counts_invisible_first_commi
             GenerationRequest {
                 output_mode: eredu::api::OutputMode::Text,
                 control_handle: None,
-                input: PreparedChatInput::prepared_backend_input(&chat, vec![0]),
+                input: PreparedChatInput::prepared_input(&chat, vec![0]),
 
                 settings: eredu::api::PreparedChatGenerationSettings {
                     decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
@@ -909,7 +906,7 @@ fn cancellation_before_prefill_and_during_verification_never_commits_drafts() {
                 GenerationRequest {
                     output_mode: eredu::api::OutputMode::Semantic,
                     control_handle: None,
-                    input: PreparedChatInput::prepared_backend_input(&chat, vec![0]),
+                    input: PreparedChatInput::prepared_input(&chat, vec![0]),
 
                     settings: eredu::api::PreparedChatGenerationSettings {
                         decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
@@ -952,7 +949,7 @@ fn trace_limit_failure_is_terminal_even_if_the_controller_ignores_it() {
             GenerationRequest {
                 output_mode: eredu::api::OutputMode::Semantic,
                 control_handle: None,
-                input: PreparedChatInput::prepared_backend_input(&chat, vec![0]),
+                input: PreparedChatInput::prepared_input(&chat, vec![0]),
 
                 settings: eredu::api::PreparedChatGenerationSettings {
                     decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
@@ -996,7 +993,7 @@ fn snapshot_handles_are_run_scoped_and_failed_admission_does_not_advance() {
                 GenerationRequest {
                     output_mode: eredu::api::OutputMode::Text,
                     control_handle: None,
-                    input: PreparedChatInput::prepared_backend_input(&chat, vec![0]),
+                    input: PreparedChatInput::prepared_input(&chat, vec![0]),
 
                     settings: eredu::api::PreparedChatGenerationSettings {
                         decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
@@ -1055,7 +1052,7 @@ fn speculative_forks_isolate_choices_sampling_and_semantics_and_reject_foreign_h
                 GenerationRequest {
                     output_mode: eredu::api::OutputMode::Text,
                     control_handle: None,
-                    input: PreparedChatInput::prepared_backend_input(&chat, vec![0]),
+                    input: PreparedChatInput::prepared_input(&chat, vec![0]),
 
                     settings: eredu::api::PreparedChatGenerationSettings {
                         decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
@@ -1192,7 +1189,7 @@ fn conversion_retention_queries_preserve_speculative_proposals_and_budgets() {
                 GenerationRequest {
                     output_mode: eredu::api::OutputMode::Semantic,
                     control_handle: None,
-                    input: PreparedChatInput::prepared_backend_input(&chat, vec![0]),
+                    input: PreparedChatInput::prepared_input(&chat, vec![0]),
 
                     settings: eredu::api::PreparedChatGenerationSettings {
                         decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
@@ -1245,7 +1242,11 @@ fn controlled_speculative_trim_preserves_canonical_state_and_rejects_transaction
     use eredu_core::residency::ParameterConversionTrimError;
     for external in [false, true] {
         let (_, chat, settings) = setup();
-        let runtime = ModelRuntime::prepare(MockBackend, Default::default()).unwrap();
+        let runtime = ModelRuntime::install::<MockSession>(
+            MockBackend,
+            fixture_prepared_model(Default::default()),
+        )
+        .unwrap();
         conversion_retention::retain_fixture(&runtime);
         let mut model = unicode_model_with_runtime(None, 64, QWEN_TEMPLATE, runtime);
         let mut drafter = MockDrafter {
@@ -1257,7 +1258,7 @@ fn controlled_speculative_trim_preserves_canonical_state_and_rejects_transaction
                 GenerationRequest {
                     output_mode: eredu::api::OutputMode::Semantic,
                     control_handle: None,
-                    input: PreparedChatInput::prepared_backend_input(&chat, vec![0]),
+                    input: PreparedChatInput::prepared_input(&chat, vec![0]),
 
                     settings: eredu::api::PreparedChatGenerationSettings {
                         decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(

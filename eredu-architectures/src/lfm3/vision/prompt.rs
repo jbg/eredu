@@ -1,11 +1,10 @@
 //! Projected media ingress for the shared LFM3 decoder.
 
+use eredu_core::input::PreparedInputInspector;
 use eredu_core::{CapabilityError, InputMetadataKey, InputModality};
+use eredu_core::{PreparedInputPart, PreparedInputPayload, PreparedModelInput};
 use eredu_nn::{Error, Tensor};
-use eredu_runtime::{
-    PreparedInputCacheIdentity, PreparedInputInspector, PreparedInputPart, PreparedInputPayload,
-    PreparedModelInput,
-};
+use eredu_runtime::PreparedInputCacheIdentity;
 
 use crate::media_plan::{
     admit_composite_input, AdmittedCompositeInput, CompositePartPlan, MediaShapePlan,

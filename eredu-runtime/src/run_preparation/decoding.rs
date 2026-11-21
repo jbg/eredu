@@ -1,6 +1,7 @@
 //! Complete decoding commands over the retained fixed-frame session transport.
 use super::*;
 use eredu_core::decoding::{agree_decoding_controls, DecodingCoordination};
+use eredu_core::run_preparation::TextPreparationTransport;
 
 const CONTROL_MAGIC: u32 = 0x4552_4443;
 // Modes contain validated scalar options only. This bound is independent of
@@ -95,7 +96,7 @@ impl TextPreparationCoordinator {
             // poison an otherwise healthy loaded model or refund its credits.
             if !matches!(error, TextPreparationAgreementError::Decoding(_)) {
                 state.fenced = true;
-                transport.fail_preparation(error);
+                transport.fence_preparation();
             }
         }
         result

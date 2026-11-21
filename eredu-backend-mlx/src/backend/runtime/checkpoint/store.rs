@@ -27,15 +27,6 @@ use safetensors::tensor::{Dtype, TensorView};
 
 use super::gguf::GgufTensor;
 
-#[cfg(test)]
-use super::gguf::GgufCheckpoint;
-#[cfg(test)]
-use eredu_checkpoint::gguf_store::GgufWeightStore as NeutralGgufWeightStore;
-#[cfg(test)]
-use eredu_checkpoint::store::{
-    CheckpointSource, ReadPolicy as WeightReadPolicy, SafetensorsWeightStore, TensorReadRequest,
-};
-
 pub(super) fn safetensors_dtype(
     key: &str,
     value: &StoredDtype,
@@ -182,14 +173,8 @@ impl MlxParameterMaterializationContext {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod test_support;
-
 mod leases;
 mod materialization;
 
 pub use leases::WeightLease;
 pub use materialization::{PendingWeightMaterialization, WeightMaterialization};
-
-#[cfg(test)]
-mod tests;

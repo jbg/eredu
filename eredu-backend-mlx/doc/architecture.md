@@ -3,28 +3,28 @@
 This guide describes the MLX-specific realization of Eredu's
 [backend-neutral architecture](../../doc/backend-architecture.md). Model-family
 configuration, checkpoint schemas, parameter topology, execution equations,
-and state geometry remain in `eredu-architectures`; this crate binds those
-declarations to MLX storage and execution.
+and state geometry live in `eredu-architectures`. Portable composition binds
+selected models using the MLX storage and execution mechanisms supplied here.
 
 ## Public surfaces
 
 Reusable mechanics are rooted at `eredu_backend_mlx::backend::{nn, runtime,
 ...}`. The `native` module is an explicit escape hatch for backend tooling that
-needs composition-owned sessions, execution contexts, or random state. Raw MLX
+needs mechanism bindings, execution contexts, or random state. Raw MLX
 arrays, streams, devices, operations, and distributed groups retain their
 canonical `safemlx` paths instead of being re-exported by the backend. The flat
 crate root exposes the narrow adapters used by the `eredu` facade.
 
-- `backend::MlxBackend` implements complete model/session contracts and owns
-  its execution and weight-materialization streams.
+- `backend::MlxBackend` provides native resources for model and session
+  binding and owns its execution and weight-materialization streams.
 - `backend::nn::shared::MlxNeuralBackend` is the stateless selector that
   implements neutral neural, parameter, submission, and transfer traits.
 - `MlxTensor` is a transparent, zero-copy wrapper around `safemlx::Array` and
   implements `eredu_nn::Tensor`.
-- `native::MlxModelSession` owns the executable model, cache, processor state,
-  and optional distributed context. `backend::MlxModel` exposes its neutral
-  capabilities and telemetry while keeping the architecture-erased executable
-  private.
+- The portable text driver constructs and owns the installed executable,
+  together with the exact native cache and distributed context. MLX supplies
+  borrowed binding resources and realizes communication from the agreed
+  manifest. The portable rank visitors retain the realized handles directly.
 
 The crate never depends on the `eredu` facade. MLX arrays, streams, devices,
 events, groups, and exceptions do not appear in neutral core or facade
@@ -41,19 +41,18 @@ private layout part of the public API:
   grouped or hyper extensions. Packed grouped operations and native
   quantization are divided by operation and lowering responsibility.
 - `backend::runtime` contains native storage and execution mechanisms. Cache
-  modules separate state representations from residency lifecycle and I/O;
-  checkpoint modules separate source leases, materialization, recipes, and
+  modules supply native state, page allocation, transfer, and completion.
+  Portable residency selects the page schedule and publishes staged spills.
+  Checkpoint modules separate source leases, materialization, recipes, and
   bounded transformation; residency modules separate catalogs, acquisition,
   movement, and telemetry; distributed modules separate handles, operations,
   completion ownership, manifest realization, and placement.
-- `composition::mlx` is the private adapter layer. Cold selection and selected
-  materialization are separate from completed session erasure. Replicated-text
-  composition keeps capability adaptation, state mechanisms, prediction,
-  session completion, dense or routed binding, partitioned binding, and
-  format lowering in focused modules.
-- Crate-private validation support lives under `src/tests/support`. The Ring
-  pipeline coverage keeps process launching, worker protocol, artifact
-  fixtures, and execution suites separate from production composition.
+- `composition::mlx` supplies mechanism adapters such as cold capability
+  facts, selected parameter storage, queue and completion handling, and
+  native tensor formats. The portable driver owns selection, state, and
+  session erasure.
+- The facade's feature-gated integration targets exercise native Ring and
+  model execution against the portable contracts.
 
 These modules exchange typed neutral plans and concrete MLX mechanisms. They
 do not introduce dynamic dispatch into tensor operations or per-unit execution.
@@ -69,25 +68,21 @@ shapes, or configuration fields.
 Canonical artifact identity, prepared-source exactness, declarative parameter
 binding, host media processing, admission/report assembly, replicated-session
 construction, and logical distributed placement come from neutral crates.
-Public checkpoint runtime types are the MLX-owned materializers, materialized
-tensors, errors, and explicit conversion options and reports used by backend
-tooling. Raw SafeTensors visitation, shard discovery, GGUF metadata copying and
-format lowering, and strict module assignment remain crate-internal composition
-helpers; portable catalogs, stores, selections, recipes, and I/O errors use
-their canonical `eredu-checkpoint` and `eredu-gguf` APIs.
+Public native checkpoint types include MLX materializers, materialized
+tensors, and native errors. Checkpoint conversion options, reports, shard
+discovery and publication use the portable `eredu-checkpoint` APIs. The MLX
+packer handles selected dense tensors through that crate's encoding contract.
 
-GGUF family selection and portable structural admission remain architecture
-registry concerns. MLX composition consumes the admitted family and schema,
-then validates only native encoding, operator, placement, and device
-compatibility. Resident, tensor-parallel, pipeline, and expert-parallel paths
+GGUF family selection and structural admission use the architecture registry.
+MLX receives the resulting exact encoding, operator, placement, and device
+requirements. Resident, tensor-parallel, pipeline, and expert-parallel paths
 therefore share the same architecture declarations.
 
 Architecture-owned typed dispatch selects direct, routed, composite, or narrow
 extension construction before MLX materialization. The MLX binder receives the
-selected rank-local tasks, parameter recipes, state factory, opaque
-communication manifest, and generic residency requirements; it does not carry
-an exhaustive family realization matrix. Every active expert-parallel
-combination uses the same neutral routed provider and addressable-bank
+selected rank-local tasks, parameter recipes, and agreed communication
+resources. Portable construction owns the state factory and residency policy.
+Expert-parallel variants use the shared routed provider and addressable-bank
 mechanisms.
 
 Strict module loading performs no prefix rewriting, unused-prefix exemptions,
@@ -120,7 +115,7 @@ requests, and controls retain their backend parameters. `ExecutionPlan`
 provides portable policy for `eredu::api::inspect_execution`.
 Backend tooling may
 instead pass a checked neutral `ParallelRankTopology` and a process-local
-`native::DeviceAssignment` through the root `MlxLoadRequest` adapter. Selection
+`native::DeviceAssignment` through `eredu_core::ModelLoadOptions`. Selection
 projects the architecture's exact groups and routes into an opaque manifest
 before payload access. The neutral runtime validates complete-world groups,
 routes, capabilities, and realization waves before MLX binds the prepared

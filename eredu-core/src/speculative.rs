@@ -5,8 +5,7 @@ use crate::backend::BoundedCompletionOutcome;
 use crate::{
     backend::{
         BoundedCompletion, BoundedCompletionWait, Completion, CompletionCancellationMode,
-        ModelRuntime, SpeculativeTokenFilterController, Submission, TextGenerationBackend,
-        TextGenerationConfig,
+        SpeculativeTokenFilterController, Submission, TextGenerationConfig,
     },
     generation::{
         FinishReason, GenerationCancellationToken, GenerationError, GenerationRequestConfig,
@@ -15,13 +14,47 @@ use crate::{
         SpeculativeSchedulerOptions, TokenTerminalSignals,
     },
 };
+/// Exact queue identity and dependency submission for speculative invocations.
+pub trait SpeculativeQueueMechanisms {
+    /// Native execution queue.
+    type Queue;
+    /// Native tensor root retained through a queue handoff.
+    type Root;
+    /// Completion ordering the receiving queue after the producer.
+    type Handoff;
+    /// Native queue or submission failure.
+    type Error;
+
+    /// Whether the two handles name the same queue.
+    fn same_queue(left: &Self::Queue, right: &Self::Queue) -> bool;
+    /// Whether values on the queues share one device.
+    fn same_device(left: &Self::Queue, right: &Self::Queue) -> Result<bool, Self::Error>;
+    /// Submits the roots and orders the receiving queue after their completion.
+    fn order_roots<'a>(
+        roots: impl IntoIterator<Item = &'a Self::Root>,
+        consumer: &Self::Queue,
+    ) -> Result<Self::Handoff, Self::Error>
+    where
+        Self::Root: 'a;
+    /// Translates a rejected assignment to the invocation boundary.
+    fn invalid_assignment(message: String) -> Self::Error;
+}
+
 use serde::{Deserialize, Serialize};
 use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
 
+/// Native operations used by conditioned external assistants.
+pub mod assistant;
+/// Native operations used by embedded predictors.
+pub mod embedded;
 pub mod erasure;
+/// Native operations used by installed speculative targets.
+pub mod installed;
+/// Native score and random-state primitives for portable sampling.
+pub mod sampling;
 pub use erasure::{
     DynGenerationCache, DynGenerationCheckpoint, DynGenerationDraftState, DynGenerationExecutor,
     DynGenerationTargetState, DynGenerationVerification, GenerationExecutorCacheFactory,
@@ -106,13 +139,12 @@ impl SpeculativeGenerationBatchOutput {
 }
 
 /// One independently executable lane in a speculative batch.
-pub struct SpeculativeGenerationLane<'a, B, C>
+pub struct SpeculativeGenerationLane<'a, P, C>
 where
-    B: TextGenerationBackend,
     C: SpeculativeTokenFilterController,
 {
-    /// Backend-owned prompt prepared by the selected session backend.
-    prompt: Option<B::Prompt>,
+    /// Prompt prepared by the installed session driver.
+    prompt: Option<P>,
     /// Fully resolved portable sampling configuration and random seed.
     generation: Option<TextGenerationConfig>,
     /// Resolved token budget, proposal width, temperature, and EOS ids.
@@ -128,15 +160,14 @@ where
     control_handle: Option<crate::execution_control::GenerationControlHandle>,
 }
 
-impl<'a, B, C> SpeculativeGenerationLane<'a, B, C>
+impl<'a, P, C> SpeculativeGenerationLane<'a, P, C>
 where
-    B: TextGenerationBackend,
     C: SpeculativeTokenFilterController,
 {
     /// Creates one independently executable speculative lane.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        prompt: B::Prompt,
+        prompt: P,
         generation: TextGenerationConfig,
         config: GenerationRequestConfig,
         constraint: C,
@@ -169,12 +200,12 @@ where
     ) -> Option<crate::execution_control::GenerationControlHandle> {
         self.control_handle.take()
     }
-    /// Takes the backend-owned prompt exactly once.
-    pub fn take_prompt(&mut self) -> B::Prompt {
+    /// Takes the driver-owned prompt exactly once.
+    pub fn take_prompt(&mut self) -> P {
         self.prompt.take().expect("lane prompt already taken")
     }
-    /// Borrows the backend-owned prompt before preparation consumes it.
-    pub fn prompt(&self) -> &B::Prompt {
+    /// Borrows the driver-owned prompt before preparation consumes it.
+    pub fn prompt(&self) -> &P {
         self.prompt.as_ref().expect("lane prompt already taken")
     }
     /// Takes the resolved generation controls exactly once.
@@ -223,133 +254,22 @@ where
     }
 }
 
-/// Backend-preparation input for one or more speculative lanes.
-pub struct SpeculativeGenerationBatchRequest<'a, B, D, C>
-where
-    B: TextGenerationBackend,
-    C: SpeculativeTokenFilterController,
-{
-    /// Embedded or separately prepared draft-model selection.
-    drafting: Option<SpeculativeDraft<'a, D>>,
-    /// Independently prepared speculative lanes.
-    lanes: Option<Vec<SpeculativeGenerationLane<'a, B, C>>>,
-    /// Target tokenizer vocabulary identity used for drafter compatibility.
-    tokenizer_fingerprint: [u8; 32],
-}
-
-impl<'a, B, D, C> SpeculativeGenerationBatchRequest<'a, B, D, C>
-where
-    B: TextGenerationBackend,
-    C: SpeculativeTokenFilterController,
-{
-    /// Creates one validated backend-preparation request.
-    pub fn new(
-        drafting: SpeculativeDraft<'a, D>,
-        lanes: Vec<SpeculativeGenerationLane<'a, B, C>>,
-        tokenizer_fingerprint: [u8; 32],
-    ) -> Self {
-        Self {
-            drafting: Some(drafting),
-            lanes: Some(lanes),
-            tokenizer_fingerprint,
-        }
-    }
-    /// Target tokenizer vocabulary identity.
-    pub const fn tokenizer_fingerprint(&self) -> [u8; 32] {
-        self.tokenizer_fingerprint
-    }
-    /// Takes draft selection exactly once.
-    pub fn take_drafting(&mut self) -> SpeculativeDraft<'a, D> {
-        self.drafting.take().expect("draft selection already taken")
-    }
-    /// Takes prepared lanes exactly once.
-    pub fn take_lanes(&mut self) -> Vec<SpeculativeGenerationLane<'a, B, C>> {
-        self.lanes.take().expect("speculative lanes already taken")
-    }
+/// Realized executable facts used by portable speculative capability selection.
+pub struct SpeculativeTargetFacts<'a> {
+    /// Exact installed execution supports shared-backbone drafting.
+    pub shared_backbone_ready: bool,
+    /// Exact installed execution supplies an embedded causal draft.
+    pub embedded_ready: bool,
+    /// Semantics of the installed target score distribution.
+    pub score_kind: crate::refinement::PredictionScoreKind,
+    /// Draft source declared by the selected executable.
+    pub declared_source: Option<SpeculativeDraftSource>,
+    /// Stable architecture identity used in unsupported capability diagnostics.
+    pub architecture: &'a str,
 }
 
 /// Optional speculative model-session capability.
 ///
-/// Implementations prepare native executors, caches, sampling state, and
-/// execution placement, then expose them to the caller-provided neutral
-/// visitor. The backend must not drive request lifecycles or fair scheduling.
-/// A backend is selected for the complete model session; requests cannot mix
-/// runtime implementations.
-pub trait SpeculativeGenerationBackend: TextGenerationBackend {
-    /// Backend-owned separately prepared draft model.
-    type Drafter;
-
-    /// Reports fail-closed speculative support for the selected model session.
-    fn speculative_capability(runtime: &ModelRuntime<Self>) -> SpeculativeCapability;
-
-    /// Exact internal activation/edit support for the selected speculative path.
-    /// Ordinary sampler-logit capture has a separate admission contract.
-    #[cfg(feature = "tensor-capture")]
-    fn speculative_activation_discovery(
-        _runtime: &ModelRuntime<Self>,
-    ) -> Result<SpeculativeActivationDiscovery, crate::capture::CaptureError> {
-        Err(crate::capture::CaptureError::Unsupported(
-            "backend has no scoped speculative activation admission".into(),
-        ))
-    }
-
-    /// Rechecks immutable internal authority against the actual loaded session.
-    #[cfg(feature = "tensor-capture")]
-    fn validate_speculative_activations(
-        runtime: &ModelRuntime<Self>,
-        plan: &AdmittedSpeculativeActivations,
-    ) -> Result<(), crate::capture::CaptureError> {
-        plan.validate(&Self::speculative_activation_discovery(runtime)?)
-    }
-
-    /// Genuine mutable hooks with explicit speculative attribution.
-    #[cfg(feature = "tensor-capture")]
-    fn speculative_intervention_discovery(
-        _runtime: &ModelRuntime<Self>,
-    ) -> Result<crate::intervention::InterventionDiscovery, crate::capture::CaptureError> {
-        Err(crate::capture::CaptureError::Unsupported(
-            "backend has no speculative tensor interventions".into(),
-        ))
-    }
-    /// Validates edit geometry, exact loaded capabilities and evidence budgets.
-    #[cfg(feature = "tensor-capture")]
-    fn validate_speculative_interventions(
-        _runtime: &ModelRuntime<Self>,
-        _capture: &crate::capture::AdmittedCapturePlan,
-        _plan: &crate::intervention::AdmittedInterventionPlan,
-    ) -> Result<(), crate::capture::CaptureError> {
-        Err(crate::capture::CaptureError::Unsupported(
-            "backend has no speculative tensor interventions".into(),
-        ))
-    }
-
-    /// Validates speculative observation support without allocating or executing.
-    /// Ordinary capture support does not imply attribution for speculative phases.
-    #[cfg(feature = "tensor-capture")]
-    fn validate_speculative_capture(
-        _runtime: &ModelRuntime<Self>,
-        plan: &crate::capture::AdmittedCapturePlan,
-    ) -> Result<(), crate::capture::CaptureError> {
-        if plan.is_empty() {
-            Ok(())
-        } else {
-            Err(crate::capture::CaptureError::Unsupported(
-                "backend has no bounded speculative capture".into(),
-            ))
-        }
-    }
-
-    /// Prepares native execution resources and lends them to neutral orchestration.
-    fn with_speculative_execution<C, V>(
-        runtime: &mut ModelRuntime<Self>,
-        request: SpeculativeGenerationBatchRequest<'_, Self, Self::Drafter, C>,
-        visitor: V,
-    ) -> Result<SpeculativeGenerationBatchOutput, Self::Error>
-    where
-        C: SpeculativeTokenFilterController,
-        V: SpeculativeGenerationVisitor;
-}
-
 /// Relationship between target and assistant execution placements.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -859,6 +779,18 @@ pub enum RefinementProgress<L> {
     Complete(RefinementBlock<L>),
 }
 
+/// Creates a fresh canonical cache for an admitted lane.
+pub trait SpeculativeCacheFactory<Binding = ()>: SpeculativeExecutor {
+    /// Allocates independent cache state using the selected route's binding.
+    fn create_cache<'a>(
+        &mut self,
+        binding: &Binding,
+        context: Self::Context<'a>,
+    ) -> Result<Self::Cache, Self::Error>
+    where
+        Self: 'a;
+}
+
 /// Whole-session speculative execution contract.
 ///
 /// Tensor values, execution queues, caches, model state, logits, native
@@ -1088,7 +1020,6 @@ pub trait SpeculativeExecutor {
     fn set_activation_origin(&mut self, _origin: Option<SpeculativeActivationOrigin>) {}
 
     /// Moves one previously charged internal activation record to its consumer.
-    #[cfg(feature = "tensor-capture")]
     fn take_activation_capture(&mut self) -> Option<SpeculativeActivationCapture> {
         None
     }
@@ -1100,7 +1031,6 @@ pub trait SpeculativeExecutor {
 
     /// Replaces prospective internal edits at a drained canonical boundary.
     /// The loaded controller must validate authority against current discovery.
-    #[cfg(feature = "tensor-capture")]
     fn readmit_activation_interventions(
         &mut self,
         _plan: AdmittedSpeculativeActivations,
@@ -1113,7 +1043,6 @@ pub trait SpeculativeExecutor {
     /// Installs internal capture authority for this borrowed executor scope.
     /// Implementations restore prior observer ownership when the scope ends;
     /// the next ordinary run must not inherit this plan or a fresh allowance.
-    #[cfg(feature = "tensor-capture")]
     fn configure_activation_capture<'a>(
         &mut self,
         plan: AdmittedSpeculativeActivations,
@@ -1534,7 +1463,6 @@ pub trait SpeculativeGenerationVisitor {
 /// token is selected, and when tentative sampler state is promoted.
 pub trait SpeculativeSampling: Clone {
     /// Installs immutable role-specific plans, preserving the shared capture ledger.
-    #[cfg(feature = "tensor-capture")]
     fn control_intervene(
         &mut self,
         plans: Vec<SpeculativeInterventionPlan>,
@@ -1603,7 +1531,6 @@ pub trait SpeculativeSampling: Clone {
 
     /// Installs explicitly admitted raw-logit capture before any generation. Clones
     /// must share non-rewindable capture accounting, never duplicate its allowance.
-    #[cfg(feature = "tensor-capture")]
     fn enable_control_capture(
         &mut self,
         plan: crate::capture::AdmittedCapturePlan,
@@ -1619,7 +1546,6 @@ pub trait SpeculativeSampling: Clone {
 
     /// Drains completed captures from the last scheduler action, including
     /// tentative target rows and failed draft proposals. No native values escape.
-    #[cfg(feature = "tensor-capture")]
     fn take_control_captures(&mut self) -> Vec<SpeculativePredictionCapture> {
         Vec::new()
     }
@@ -2907,12 +2833,19 @@ pub fn settle_committed_suffix<'a, E: SpeculativeExecutor + 'a>(
     state: &E::TargetState,
     tokens: &[u32],
     wait: BoundedCompletionWait,
-    mut observe: impl FnMut(SpeculativeLifecycleStage) -> Result<(), SpeculativeOutputError>,
+    observe: Option<
+        &mut dyn FnMut(SpeculativeLifecycleStage) -> Result<(), SpeculativeOutputError>,
+    >,
     context: E::Context<'a>,
 ) -> Result<
     SettledCommittedSuffix<E::TargetState, E::Logits, E::Telemetry>,
     SpeculativeDriverError<E::Error>,
 > {
+    let mut observe = observe;
+    let mut observe_stage = |stage| match observe.as_deref_mut() {
+        Some(observer) => observer(stage),
+        None => Ok(()),
+    };
     let first = coordination::ready_result(
         executor,
         tokens
@@ -2938,8 +2871,8 @@ pub fn settle_committed_suffix<'a, E: SpeculativeExecutor + 'a>(
     let mut retained_output = None;
     let mut completion = None;
     let result = (|| {
-        let observed =
-            observe(SpeculativeLifecycleStage::Execution).map_err(SpeculativeDriverError::Output);
+        let observed = observe_stage(SpeculativeLifecycleStage::Execution)
+            .map_err(SpeculativeDriverError::Output);
         coordination::ready_result(executor, observed, context)?;
         let draft = executor
             .begin_proposal(state, first, 0, context)
@@ -2954,10 +2887,10 @@ pub fn settle_committed_suffix<'a, E: SpeculativeExecutor + 'a>(
         coordination::settle_completion::<E>(
             &mut completion,
             Ok(wait),
-            observe(SpeculativeLifecycleStage::Completion),
+            observe_stage(SpeculativeLifecycleStage::Completion),
         )?;
         let computed = (|| {
-            observe(SpeculativeLifecycleStage::Observation)
+            observe_stage(SpeculativeLifecycleStage::Observation)
                 .map_err(SpeculativeDriverError::Output)?;
             let output = retained_output
                 .as_mut()
@@ -2967,7 +2900,7 @@ pub fn settle_committed_suffix<'a, E: SpeculativeExecutor + 'a>(
             Ok((telemetry, logits))
         })();
         let (telemetry, logits) = coordination::ready_result(executor, computed, context)?;
-        let observed = observe(SpeculativeLifecycleStage::CachePersistence)
+        let observed = observe_stage(SpeculativeLifecycleStage::CachePersistence)
             .map_err(SpeculativeDriverError::Output);
         coordination::ready_result(executor, observed, context)?;
         let committed = executor
@@ -3754,7 +3687,7 @@ where
                         .scheduler_options(ceiling)
                         .completion_wait()
                         .map_err(SpeculativeDriverError::Generation)?,
-                    |stage| self.runtime.observe_lifecycle(stage),
+                    Some(&mut |stage| self.runtime.observe_lifecycle(stage)),
                     context,
                 )
             })?;
@@ -3931,7 +3864,7 @@ where
                         .scheduler_options(ceiling)
                         .completion_wait()
                         .map_err(SpeculativeDriverError::Generation)?,
-                    |stage| self.runtime.observe_lifecycle(stage),
+                    Some(&mut |stage| self.runtime.observe_lifecycle(stage)),
                     context,
                 )
             })?;
@@ -5880,7 +5813,6 @@ mod tests {
 
     struct MockGenerationTypes;
     impl GenerationExecutorTypes for MockGenerationTypes {
-        type Input = Vec<u32>;
         type Logits = Vec<f32>;
         type Context<'a> = ();
         type Completion = Done;
@@ -6544,7 +6476,7 @@ mod tests {
             SpeculativeSchedulerOptions::default()
                 .completion_wait()
                 .unwrap(),
-            |_| Ok(()),
+            None,
             (),
         )
         .unwrap();
@@ -6861,8 +6793,8 @@ mod tests {
             ..Default::default()
         };
         {
-            let mut executor = DynGenerationExecutor::<MockGenerationTypes>::new(&mut source);
-            let cache = executor.new_cache(()).unwrap();
+            let mut executor = DynGenerationExecutor::<MockGenerationTypes, _>::new(&mut source);
+            let cache = executor.create_cache(&(), ()).unwrap();
             let mut table = GenerationRequestTable::new(
                 Default::default(),
                 SpeculativeExecutionTopology::Single,
@@ -9544,5 +9476,74 @@ mod tests {
             trace.borrow().as_slice()[..4],
             ["submit", "wait", "drop_completion", "restore"]
         );
+    }
+}
+
+/// Generic backend mechanism needed by speculative composition.
+#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[non_exhaustive]
+pub enum SpeculativeMechanism {
+    /// Backend-native tensor indexing, concatenation, and shape-preserving movement.
+    TensorOperations,
+    /// General neural operators needed to construct and execute the target or draft.
+    NeuralOperations,
+    /// Routed or grouped neural operators required by a selected model family.
+    GroupedNeuralOperations,
+    /// Hyper-connection and hyper-head operators required by a selected model family.
+    HyperNeuralOperations,
+    /// Checkpoint payload decoding and backend-native parameter materialization.
+    PayloadMaterialization,
+    /// Generic logits processing and probability construction.
+    LogitsProcessing,
+    /// Generic categorical or deterministic token selection.
+    Sampling,
+    /// Forkable random state and stable random substreams.
+    Randomness,
+    /// Architecture-shaped prediction or assistant state storage.
+    StateStorage,
+    /// Placement and residency of materialized payload and mutable speculative state.
+    StorageResidency,
+    /// Exact completion retaining submitted resources.
+    ExactCompletion,
+    /// Architecture-declared activation observation and replacement.
+    Observation,
+    /// Component timing collection and attribution.
+    Timing,
+    /// Native target and draft execution queue binding.
+    QueueBinding,
+    /// Communication required by an architecture-declared distributed realization.
+    Communication,
+    /// Exact target/draft agreement before canonical state is committed.
+    Agreement,
+    /// Publication of only canonically committed tokens and semantic events.
+    Publication,
+    /// Ordered handoff between distinct queues on one device.
+    SameDeviceHandoff,
+    /// Shape- and dtype-preserving transfer between devices.
+    CrossDeviceTransfer,
+}
+
+/// Generic speculative mechanisms implemented by a backend.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SpeculativeMechanismCapabilities {
+    mechanisms: std::collections::BTreeSet<SpeculativeMechanism>,
+}
+
+impl SpeculativeMechanismCapabilities {
+    /// Creates a fail-closed capability set.
+    pub fn new(mechanisms: impl IntoIterator<Item = SpeculativeMechanism>) -> Self {
+        Self {
+            mechanisms: mechanisms.into_iter().collect(),
+        }
+    }
+
+    /// Returns supported mechanisms in stable order.
+    pub const fn mechanisms(&self) -> &std::collections::BTreeSet<SpeculativeMechanism> {
+        &self.mechanisms
+    }
+
+    /// Returns whether one exact generic mechanism is supported.
+    pub fn supports(&self, mechanism: SpeculativeMechanism) -> bool {
+        self.mechanisms.contains(&mechanism)
     }
 }

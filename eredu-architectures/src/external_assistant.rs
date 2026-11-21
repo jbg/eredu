@@ -1,16 +1,25 @@
 //! Architecture-owned inspection and preparation of external draft assistants.
 
+use eredu_core::speculative::assistant::ExternalAssistantBinder;
 mod parameters;
+use eredu_runtime::speculative::{ExternalAssistantPrompt, ExternalAssistantTarget};
 pub use parameters::AssistantParameterDeclarations;
 mod capture_placement;
 mod construction;
 use construction::NormalizedExternalAssistant;
+use eredu_runtime::speculative::{AssistantDispatch, TypedAssistant};
+use eredu_runtime::speculative::{
+    BoundAssistantRefVisitor, BoundAssistantVisitor, ExternalAssistantConstruction,
+    PreparedAssistantBinding, SelectedAssistantExecutionVisitor, SelectedAssistantExecutor,
+};
 mod static_placement;
-mod target_operation;
 pub use capture_placement::PreparedTargetCapturePlacement;
+pub use eredu_runtime::speculative::{
+    ExternalAssistantExecutionMechanisms, ExternalAssistantExecutorVisitor, ExternalAssistantModel,
+    ExternalAssistantTensorPlacement, ExternalAssistantTransfer, PreparedExternalTargetOperation,
+};
 pub use static_placement::PreparedTargetStaticPlacement;
 pub(crate) use static_placement::TargetStaticDescription;
-pub use target_operation::PreparedExternalTargetOperation;
 mod execution_plan;
 pub use execution_plan::{
     prepare_execution_plan_assistant, MaterializedExternalAssistantExecution,
@@ -51,10 +60,9 @@ use eredu_runtime::{
     local_parameter_acquisition_units, order_parameter_acquisition_units,
     parameter_acquisition_units, ParameterAcquisitionUnit, ReplicatedTextMaterializationTask,
     ReplicatedTextOutputCompanion, ReplicatedTextParameterRole, ReplicatedTextPhysicalSource,
-    SpeculativeArchitectureCompatibilityProof, SpeculativeCaptureEntry, SpeculativeCaptureEnvelope,
-    SpeculativeCaptureMetadata, SpeculativeCaptureSchema, SpeculativeIdentity,
-    SpeculativeMechanism, SpeculativeMechanismRequirements, SpeculativePlacementRequest,
-    SpeculativeRealizationRequirements, SpeculativeSelectionRequest,
+    SpeculativeArchitectureCompatibilityProof, SpeculativeCaptureEntry, SpeculativeCaptureSchema,
+    SpeculativeIdentity, SpeculativeMechanism, SpeculativeMechanismRequirements,
+    SpeculativePlacementRequest, SpeculativeRealizationRequirements, SpeculativeSelectionRequest,
     SpeculativeStateCacheIdentityIngredients, SpeculativeStrategyRequirements,
     WeightLoweringDescriptor, WeightLoweringKind,
 };
@@ -67,214 +75,9 @@ pub const EXTERNAL_ASSISTANT_PROPOSAL_LOGITS_OBSERVATION_PATH: &str =
 pub const EXTERNAL_ASSISTANT_VERIFICATION_LOGITS_OBSERVATION_PATH: &str =
     "external_assistant.verification_logits";
 
-/// Architecture-owned external target-cache envelope.
-///
-/// The native cache remains opaque. Prepared-input ownership, the selected realization, and the
-/// committed target frontier are portable lifecycle state and therefore live above every backend.
-pub struct ExternalAssistantCache<C> {
-    native: C,
-    selected: eredu_runtime::SelectedSpeculativeRealization,
-    prepared_input: Option<SpeculativeIdentity>,
-    frontier: u64,
-}
-
-impl<C> ExternalAssistantCache<C> {
-    /// Couples one opaque native cache to the realization selected before materialization.
-    pub fn new(native: C, selected: eredu_runtime::SelectedSpeculativeRealization) -> Self {
-        Self {
-            native,
-            selected,
-            prepared_input: None,
-            frontier: 0,
-        }
-    }
-
-    /// Borrows opaque backend state for one native mechanism call.
-    pub const fn native(&self) -> &C {
-        &self.native
-    }
-
-    /// Mutably borrows opaque backend state for one native mechanism call.
-    pub const fn native_mut(&mut self) -> &mut C {
-        &mut self.native
-    }
-
-    /// Binds one prepared semantic input to the reusable lane cache.
-    pub fn bind_prepared_input(&mut self, identity: SpeculativeIdentity) -> Result<(), String> {
-        match self.prepared_input.as_ref() {
-            Some(bound) if bound != &identity => {
-                Err("external speculative cache belongs to a different prepared input".into())
-            }
-            Some(_) => Ok(()),
-            None => {
-                self.prepared_input = Some(identity);
-                Ok(())
-            }
-        }
-    }
-
-    /// Derives and binds the speculative identity of one portable prepared-input cache key.
-    pub fn bind_prepared_input_cache_identity(
-        &mut self,
-        prepared: &eredu_runtime::PreparedInputCacheIdentity,
-    ) -> Result<(), String> {
-        let identity = SpeculativeIdentity::new(format!(
-            "prepared-input/{}",
-            prepared.prefix_content_fingerprint()
-        ))
-        .map_err(|error| error.to_string())?;
-        self.bind_prepared_input(identity)
-    }
-
-    /// Advances the portable committed frontier from a backend-reported native offset.
-    pub fn advance_frontier(&mut self, frontier: i32) -> Result<(), String> {
-        let frontier = u64::try_from(frontier)
-            .map_err(|_| "external target cache frontier is negative".to_owned())?;
-        if frontier < self.frontier {
-            return Err(format!(
-                "external target cache frontier regressed from {} to {frontier}",
-                self.frontier
-            ));
-        }
-        self.frontier = frontier;
-        Ok(())
-    }
-
-    /// Returns the architecture-owned committed frontier.
-    pub fn frontier(&self) -> Result<i32, String> {
-        i32::try_from(self.frontier)
-            .map_err(|_| "external target cache frontier exceeds i32".to_owned())
-    }
-
-    /// Returns architecture-declared capture paths in their validated tensor order.
-    pub fn capture_paths(&self) -> Vec<&str> {
-        self.selected
-            .requirements()
-            .capture()
-            .entries()
-            .iter()
-            .map(|entry| entry.path().as_str())
-            .collect()
-    }
-
-    /// Closes and validates one ordered architecture capture at the current frontier.
-    pub fn validate_capture_shapes(&self, shapes: &[Vec<usize>]) -> Result<(), String> {
-        let prepared_input = self
-            .prepared_input
-            .clone()
-            .ok_or_else(|| "external target capture precedes prepared-input binding".to_owned())?;
-        let schema = self
-            .selected
-            .requirements()
-            .capture()
-            .instantiate(shapes.iter().cloned())
-            .map_err(|error| error.to_string())?;
-        let values = vec![(); schema.entries().len()];
-        let envelope = SpeculativeCaptureEnvelope::new(
-            SpeculativeCaptureMetadata::new(schema, self.frontier),
-            values,
-        )
-        .map_err(|error| error.to_string())?;
-        let lane = self.selected.lane_identity(prepared_input, self.frontier);
-        self.selected
-            .validate_capture(&lane, &envelope)
-            .map_err(|error| error.to_string())
-    }
-
-    /// Heap and envelope storage copied with a native checkpoint.
-    pub fn control_metadata_bytes(&self) -> Option<u64> {
-        (std::mem::size_of::<ExternalAssistantCacheCheckpoint<C>>() as u64).checked_add(
-            self.prepared_input
-                .as_ref()
-                .map_or(0, |id| id.as_str().len() as u64),
-        )
-    }
-
-    /// Wraps one opaque native checkpoint in the exact semantic cache boundary.
-    pub fn checkpoint<N>(&self, native: N) -> ExternalAssistantCacheCheckpoint<N> {
-        ExternalAssistantCacheCheckpoint {
-            native,
-            prepared_input: self.prepared_input.clone(),
-            frontier: self.frontier,
-        }
-    }
-
-    /// Restores the semantic half after its opaque native checkpoint was restored.
-    pub fn restore_semantics<N>(&mut self, checkpoint: &ExternalAssistantCacheCheckpoint<N>) {
-        self.prepared_input.clone_from(&checkpoint.prepared_input);
-        self.frontier = checkpoint.frontier;
-    }
-}
-
-/// Exact architecture-owned checkpoint envelope around opaque native cache storage.
-pub struct ExternalAssistantCacheCheckpoint<C> {
-    native: C,
-    prepared_input: Option<SpeculativeIdentity>,
-    frontier: u64,
-}
-
-impl<C> ExternalAssistantCacheCheckpoint<C> {
-    /// Borrows the opaque backend checkpoint.
-    pub const fn native(&self) -> &C {
-        &self.native
-    }
-
-    /// Returns the committed frontier retained by this checkpoint.
-    pub fn frontier(&self) -> Result<i32, String> {
-        i32::try_from(self.frontier)
-            .map_err(|_| "external target checkpoint frontier exceeds i32".to_owned())
-    }
-}
-
-/// Explicit production observers for external-assistant activations and logits.
-///
-/// They are installed on a reusable materialized assistant and invoked by its architecture-owned
-/// executor. The default is the neutral no-op observer used by ordinary generation.
-pub struct ExternalAssistantObservers<T, L, E> {
-    tensors: Box<dyn eredu_runtime::ActivationObserver<T, E>>,
-    logits: Box<dyn eredu_runtime::ActivationObserver<L, E>>,
-}
-
-impl<T, L, E> Default for ExternalAssistantObservers<T, L, E>
-where
-    E: 'static,
-{
-    fn default() -> Self {
-        Self {
-            tensors: Box::new(eredu_runtime::NoopObserver),
-            logits: Box::new(eredu_runtime::NoopObserver),
-        }
-    }
-}
-
-impl<T, L, E> ExternalAssistantObservers<T, L, E> {
-    /// Installs explicit typed observers used by the production executor.
-    pub fn new(
-        tensors: impl eredu_runtime::ActivationObserver<T, E> + 'static,
-        logits: impl eredu_runtime::ActivationObserver<L, E> + 'static,
-    ) -> Self {
-        Self {
-            tensors: Box::new(tensors),
-            logits: Box::new(logits),
-        }
-    }
-
-    /// Observes and optionally replaces one tensor activation.
-    pub fn observe_tensor(&mut self, path: &str, value: &T) -> Result<T, E>
-    where
-        T: Clone,
-    {
-        eredu_runtime::observe_and_intervene(self.tensors.as_mut(), path, value)
-    }
-
-    /// Observes and optionally replaces one logits value.
-    pub fn observe_logits(&mut self, path: &str, value: &L) -> Result<L, E>
-    where
-        L: Clone,
-    {
-        eredu_runtime::observe_and_intervene(self.logits.as_mut(), path, value)
-    }
-}
+pub use eredu_runtime::speculative::{
+    ExternalAssistantCache, ExternalAssistantCacheCheckpoint, ExternalAssistantObservers,
+};
 
 /// Architecture-owned ordinary-target facts needed to admit an external assistant.
 #[derive(Debug, Clone)]
@@ -413,9 +216,9 @@ mod sealed {
 /// crate. Materializers receive its associated configuration through one
 /// generic visitor method and never match an assistant-family enum.
 #[allow(private_bounds)]
-pub trait ExternalAssistantArchitecture: sealed::Sealed + Sized + 'static {
-    /// Exact normalized architecture configuration.
-    type Config: Clone + std::fmt::Debug;
+pub trait ExternalAssistantArchitecture:
+    sealed::Sealed + ExternalAssistantConstruction<Geometry = PreparedAssistantModule<Self>>
+{
     /// Retained family construction authority, independent of target invocation state.
     type ParameterDefinition: Clone + std::fmt::Debug;
     /// Complete neural construction geometry after target compatibility is proven.
@@ -438,53 +241,14 @@ pub trait ExternalAssistantArchitecture: sealed::Sealed + Sized + 'static {
         target: Option<&ExternalAssistantTargetProfile>,
     ) -> Result<Self::ModuleConfig, String>;
 
-    /// Backend-neutral assistant module specialized to a neutral neural backend.
-    type Module<B>: Clone + eredu_nn::Parameterized<B::Tensor>
-    where
-        B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone;
-
-    /// One true independently constructed parameter unit.
-    type Unit<B>: eredu_nn::Parameterized<B::Tensor> + 'static
-    where
-        B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone;
-
-    /// Execution container specialized to the selected ordinary parameter policy.
-    /// It need not implement parameter traversal or cloning.
-    type Execution<B, P>
-    where
-        B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone;
-
     /// Canonical unit construction, or a separately constructed resident module.
     fn execution_unit_layout(
         config: &Self::ModuleConfig,
     ) -> Result<Option<eredu_runtime::ExecutionUnitLayout>, eredu_nn::Error>;
 
-    /// Constructs one unloaded unit from retained target-proven geometry.
-    fn build_execution_unit<B>(
-        construction: &PreparedAssistantModule<Self>,
-        ordinal: usize,
-        context: &<B::Tensor as eredu_nn::Tensor>::Context,
-    ) -> Result<Self::Unit<B>, eredu_nn::Error>
-    where
-        B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone;
-
-    /// Consumes the construction tree once. The supplied constructor may retain
-    /// its actual units or replace unloaded units with an exact-source policy.
-    fn into_execution<B, P>(
-        module: Self::Module<B>,
-        policy: impl FnOnce(Vec<Self::Unit<B>>) -> P,
-    ) -> Result<Self::Execution<B, P>, eredu_nn::Error>
-    where
-        B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone;
-
-    /// Borrows the selected policy when the runtime owns independently acquired units.
-    fn parameter_policy<B, P>(execution: &Self::Execution<B, P>) -> Option<&P>
-    where
-        B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone;
-
     /// Architecture-owned speculative executor specialized to backend mechanisms.
     type Executor<'a, M>: eredu_core::SpeculativeExecutor<
-        Input = M::Input,
+        Input = ExternalAssistantPrompt<M>,
         Cache = ExternalAssistantCache<M::NativeCache>,
         Logits = M::Logits,
         Context<'a> = M::Context<'a>,
@@ -494,7 +258,7 @@ pub trait ExternalAssistantArchitecture: sealed::Sealed + Sized + 'static {
     >
     where
         Self: 'a,
-        M: ExternalAssistantExecutionMechanisms<Self> + 'static;
+        M: ExternalAssistantExecutionMechanisms + 'static;
 
     /// Architecture identity whose tokenizer contract the assistant shares.
     fn tokenizer_model_type(config: &Self::Config) -> &'static str;
@@ -510,15 +274,6 @@ pub trait ExternalAssistantArchitecture: sealed::Sealed + Sized + 'static {
 
     /// Stable artifact identity carried by the normalized configuration.
     fn configuration_model_type(config: &Self::Config) -> &str;
-
-    /// Builds the unloaded neutral assistant module.
-    fn module<B>(
-        construction: PreparedAssistantModule<Self>,
-        context: &<B::Tensor as eredu_nn::Tensor>::Context,
-    ) -> Result<Self::Module<B>, eredu_nn::Error>
-    where
-        Self: Sized,
-        B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone;
 
     /// Checkpoint-declared weight encoding before optional load-time conversion.
     fn quantization(config: &Self::Config) -> Option<eredu_checkpoint::WeightQuantization>;
@@ -560,386 +315,23 @@ pub trait ExternalAssistantArchitecture: sealed::Sealed + Sized + 'static {
 
     /// Binds a typed assistant to the architecture-owned speculative lifecycle.
     fn executor<'a, M>(
-        target: &'a mut M::Target,
-        assistant: &'a mut M::Assistant,
+        target: &'a mut ExternalAssistantTarget<M>,
+        assistant: &'a mut eredu_runtime::speculative::InstalledAssistantFor<M, Self>,
         capture: crate::composite_execution::ExternalPredictionCaptureRequest,
     ) -> Self::Executor<'a, M>
     where
-        M: ExternalAssistantExecutionMechanisms<Self> + 'static;
+        M: ExternalAssistantExecutionMechanisms + 'static;
 
     /// Constructs the selected executor and lends it to one family-blind runtime visitor.
     fn visit_executor<'a, M, V>(
-        target: &'a mut M::Target,
-        assistant: &'a mut M::Assistant,
+        target: &'a mut ExternalAssistantTarget<M>,
+        assistant: &'a mut eredu_runtime::speculative::InstalledAssistantFor<M, Self>,
         capture: crate::composite_execution::ExternalPredictionCaptureRequest,
         visitor: V,
     ) -> V::Output
     where
-        M: ExternalAssistantExecutionMechanisms<Self> + 'static,
+        M: ExternalAssistantExecutionMechanisms + 'static,
         V: ExternalAssistantExecutorVisitor<Self, M>;
-}
-
-/// Family-blind continuation invoked with an architecture-selected external executor.
-pub trait ExternalAssistantExecutorVisitor<
-    A: ExternalAssistantArchitecture,
-    M: ExternalAssistantExecutionMechanisms<A>,
->
-{
-    /// Result returned to the backend session.
-    type Output;
-
-    /// Runs one concrete architecture executor through a shared runtime scheduler.
-    fn execute<'run, E>(self, executor: &'run mut E) -> Self::Output
-    where
-        Self: 'run,
-        E: eredu_core::SpeculativeExecutor<
-                Input = M::Input,
-                Cache = ExternalAssistantCache<M::NativeCache>,
-                Logits = M::Logits,
-                Context<'run> = M::Context<'run>,
-                Completion = M::Completion,
-                Telemetry = M::Telemetry,
-                Error = M::Error,
-            > + 'run;
-}
-
-/// Device placement used by a family-neutral tensor primitive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExternalAssistantTensorPlacement {
-    /// Ordinary-target placement.
-    Target,
-    /// Draft-assistant placement.
-    Draft,
-}
-
-/// Direction of one explicitly ordered assistant transfer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExternalAssistantTransfer {
-    /// Ordinary target to draft assistant.
-    TargetToDraft,
-    /// Draft assistant to ordinary target.
-    DraftToTarget,
-}
-
-/// Family-neutral mechanisms supplied by a concrete backend.
-///
-/// Family configuration, capture interpretation, proposal equations, state geometry, and
-/// executor choice remain owned by [`ExternalAssistantArchitecture`]. A backend supplies this
-/// contract once for every sealed architecture it can materialize.
-///
-/// Coordination defaults describe a local session. A distributed binding overrides
-/// all three agreement methods with the same retained session authority. Checkpoints
-/// copy model state, never that authority or its cumulative transport usage.
-pub trait ExternalAssistantExecutionMechanisms<A: ExternalAssistantArchitecture>: 'static {
-    /// Resolves cancellation and completion across the retained target session.
-    fn coordinate_speculative_step(
-        local: Vec<eredu_core::SpeculativeScheduleState>,
-        _context: Self::Context<'_>,
-    ) -> Result<Vec<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure> {
-        Ok(local)
-    }
-
-    /// Agrees host preparation before any participant enters the next phase.
-    fn agree_text_preparation(
-        _stage: eredu_core::run_preparation::TextPreparationStage,
-        status: eredu_core::run_preparation::TextPreparationStatus,
-        _context: Self::Context<'_>,
-    ) -> Result<eredu_core::run_preparation::TextPreparationOutcome, eredu_core::BackendFailure>
-    {
-        use eredu_core::run_preparation::{
-            TextPreparationOutcome as O, TextPreparationStatus as S,
-        };
-        Ok(match status {
-            S::Ready => O::Ready,
-            S::Cancelled => O::Cancelled,
-            S::Failed => O::Rejected { rank: 0 },
-        })
-    }
-
-    /// Agrees explicit commands without executing model work or restoring credits.
-    fn coordinate_decoding_control(
-        local: eredu_core::decoding::DecodingCoordination,
-        _context: Self::Context<'_>,
-    ) -> Result<eredu_core::decoding::DecodingCoordination, eredu_core::BackendFailure> {
-        Ok(local)
-    }
-
-    /// Full score-row backing allowance for settled decoding handoffs.
-    fn control_logits_estimate(
-        _logits: &Self::Logits,
-    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
-        None
-    }
-    /// Neutral neural backend used by the materialized assistant module.
-    type NeuralBackend: eredu_nn::GroupedNeuralBackend<Tensor = Self::Tensor>
-        + eredu_nn::DistributedNeuralBackend
-        + Clone;
-    /// Selected complete parameter policy, independent of the target's residency.
-    type ParameterPolicy: eredu_runtime::LayerwisePolicy<
-        Self::NeuralBackend,
-        A::Unit<Self::NeuralBackend>,
-        Error: std::error::Error + Send + Sync + 'static,
-    >;
-    /// Attention cache used by sequential assistant layers.
-    type AttentionCache: eredu_nn::AttentionCache<Self::Tensor>;
-    /// Materialized ordinary target.
-    type Target: ?Sized;
-    /// Materialized assistant container.
-    type Assistant;
-    /// Prepared ordinary-target input.
-    type Input;
-    /// Opaque native ordinary-target cache storage.
-    type NativeCache;
-    /// Opaque native target-cache checkpoint storage.
-    type NativeCacheCheckpoint;
-    /// Retained native tensor.
-    type Tensor: eredu_nn::Tensor + Clone;
-    /// Native logits consumed by sampling.
-    type Logits: Clone;
-    /// Selected target/draft execution assignment.
-    type Context<'a>: Copy
-    where
-        Self: 'a;
-    /// Exact verification completion.
-    type Completion: eredu_core::BoundedCompletion<Error = Self::Error>;
-    /// Optional component telemetry.
-    type Telemetry: eredu_core::SpeculativeTelemetry;
-    /// Native mechanism failure.
-    type Error: std::error::Error + Send + Sync + 'static;
-
-    /// Releases optional conversions; caller must establish a settled boundary.
-    fn trim_parameter_conversions(
-        _target: &mut Self::Target,
-        _assistant: &mut Self::Assistant,
-    ) -> Result<
-        eredu_core::residency::ExecutionConversionRetentionTrimReport,
-        eredu_core::residency::ParameterConversionTrimError,
-    > {
-        Err(eredu_core::residency::ParameterConversionTrimError::Unsupported)
-    }
-
-    /// Reads participant budgets without touching caches or submitted work.
-    fn parameter_conversion_retention(
-        _target: &Self::Target,
-        _assistant: &Self::Assistant,
-    ) -> Result<
-        Option<eredu_core::residency::ExecutionConversionRetentionReport>,
-        eredu_core::BackendFailure,
-    > {
-        Ok(None)
-    }
-
-    /// Reads the installed target frontier, native capacity and parameter owners.
-    fn target_memory_observation(
-        _target: &Self::Target,
-        _cache: &Self::NativeCache,
-        _additional: u64,
-    ) -> Result<
-        Option<eredu_core::speculative::SpeculativeModelMemoryObservation>,
-        eredu_core::BackendFailure,
-    > {
-        Ok(None)
-    }
-
-    /// Reads the current assistant parameter owner without acquiring any unit.
-    fn assistant_memory_observation(
-        _assistant: &Self::Assistant,
-    ) -> Result<
-        Option<eredu_core::speculative::SpeculativeParameterMemoryObservation>,
-        eredu_core::BackendFailure,
-    > {
-        Ok(None)
-    }
-
-    /// Complete available backing upper allowance for one borrowed tensor survey.
-    /// Unknown or foreign backing stays unknown; observation never evaluates work.
-    fn tensor_backing_bytes(
-        _tensors: &[&Self::Tensor],
-    ) -> Result<Option<u64>, eredu_core::BackendFailure> {
-        Ok(None)
-    }
-
-    /// Known bound for an isolated reusable target-cache checkpoint.
-    fn control_cache_estimate(
-        _cache: &Self::NativeCache,
-    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
-        None
-    }
-    /// Complete conservative logical tensor-copy bound.
-    fn control_tensor_bytes(_tensor: &Self::Tensor) -> Option<u64> {
-        None
-    }
-    /// Isolated native checkpoint, available only with a known control estimate.
-    fn control_checkpoint<'a>(
-        cache: &Self::NativeCache,
-        context: Self::Context<'a>,
-    ) -> Result<Self::NativeCacheCheckpoint, Self::Error> {
-        let _ = context;
-        Self::checkpoint_native(cache)
-    }
-    /// Atomic isolated native restoration; never consumes saved state.
-    fn control_restore<'a>(
-        cache: &mut Self::NativeCache,
-        saved: &Self::NativeCacheCheckpoint,
-        context: Self::Context<'a>,
-    ) -> Result<(), Self::Error> {
-        Self::restore_checkpoint_native(cache, saved, context)
-    }
-    /// Copies one immutable seed tensor after budget admission.
-    fn control_copy_tensor<'a>(
-        tensor: &Self::Tensor,
-        placement: ExternalAssistantTensorPlacement,
-        context: Self::Context<'a>,
-    ) -> Result<Self::Tensor, Self::Error> {
-        let _ = (placement, context);
-        Ok(tensor.clone())
-    }
-
-    /// Borrows the exact normalized assistant configuration.
-    fn config(assistant: &Self::Assistant) -> &A::Config;
-    /// Borrows the neutral assistant module.
-    fn module(
-        assistant: &mut Self::Assistant,
-    ) -> &mut A::Execution<Self::NeuralBackend, Self::ParameterPolicy>;
-    /// Validates the required operations against the retained group admission,
-    /// then borrows its communicator from this invocation's target session.
-    /// A caller cannot substitute an independently constructed equal-sized group.
-    /// Replicated execution requires no tensor communicator.
-    fn assistant_parallel_context<'a>(
-        _context: Self::Context<'a>,
-        _requirements: &eredu_runtime::CommunicationGroupRequirements,
-    ) -> Result<
-        Option<&'a <Self::NeuralBackend as eredu_nn::NeuralBackend>::ParallelContext>,
-        Self::Error,
-    > {
-        Ok(None)
-    }
-
-    /// Maps a portable neural error into the backend failure type.
-    fn neural_error(error: eredu_nn::Error) -> Self::Error;
-    /// Constructs a stable architecture lifecycle failure.
-    fn error(message: String) -> Self::Error;
-    /// Exposes the portable cache identity already attached to one prepared backend prompt.
-    fn prepared_input_cache_identity(
-        input: &Self::Input,
-    ) -> Result<eredu_runtime::PreparedInputCacheIdentity, Self::Error>;
-    /// Returns the exact logical shape of one retained target-capture tensor.
-    fn tensor_shape(value: &Self::Tensor) -> Result<Vec<usize>, Self::Error>;
-    /// Closes and validates one architecture-ordered capture against the selected realization.
-    /// Runs native ordinary-target prefill and returns its architecture-declared capture.
-    fn prefill_target_native<'a>(
-        target: &mut Self::Target,
-        request: &crate::composite_execution::ExternalPredictionCaptureRequest,
-        input: Self::Input,
-        cache: &mut Self::NativeCache,
-        context: Self::Context<'a>,
-    ) -> Result<
-        (
-            Self::Tensor,
-            crate::composite_execution::ExternalPredictionTargetCapture<Self::Tensor>,
-        ),
-        Self::Error,
-    >;
-    /// Runs native ordinary-target verification and returns its architecture-declared capture.
-    fn verify_target_native<'a>(
-        target: &mut Self::Target,
-        request: &crate::composite_execution::ExternalPredictionCaptureRequest,
-        tokens: &Self::Tensor,
-        cache: &mut Self::NativeCache,
-        context: Self::Context<'a>,
-    ) -> Result<
-        (
-            Self::Tensor,
-            crate::composite_execution::ExternalPredictionTargetCapture<Self::Tensor>,
-        ),
-        Self::Error,
-    >;
-    /// Captures an exact opaque native target-cache checkpoint.
-    fn checkpoint_native(
-        cache: &Self::NativeCache,
-    ) -> Result<Self::NativeCacheCheckpoint, Self::Error>;
-    /// Restores an exact opaque native target-cache checkpoint.
-    fn restore_checkpoint_native<'a>(
-        cache: &mut Self::NativeCache,
-        checkpoint: &Self::NativeCacheCheckpoint,
-        context: Self::Context<'a>,
-    ) -> Result<(), Self::Error>;
-    /// Reports the native target-cache frontier after one target operation.
-    fn native_cache_len(cache: &Self::NativeCache) -> Result<i32, Self::Error>;
-    /// Observes and optionally replaces one retained architecture tensor.
-    fn observe_tensor(
-        _assistant: &mut Self::Assistant,
-        _path: &str,
-        value: Self::Tensor,
-    ) -> Result<Self::Tensor, Self::Error> {
-        Ok(value)
-    }
-    /// Observes and optionally replaces one logits row.
-    fn observe_logits(
-        _assistant: &mut Self::Assistant,
-        _path: &str,
-        value: Self::Logits,
-    ) -> Result<Self::Logits, Self::Error> {
-        Ok(value)
-    }
-    /// Returns the sequence width of a tensor.
-    fn sequence_len(value: &Self::Tensor) -> Result<usize, Self::Error>;
-    /// Selects one sequence row, optionally retaining the sequence dimension.
-    fn sequence_row<'a>(
-        value: &Self::Tensor,
-        row: usize,
-        retain_dimension: bool,
-        placement: ExternalAssistantTensorPlacement,
-        context: Self::Context<'a>,
-    ) -> Result<Self::Tensor, Self::Error>;
-    /// Converts a retained tensor into native sampling logits.
-    fn into_logits(value: Self::Tensor) -> Self::Logits;
-    /// Retains a sequence suffix.
-    fn sequence_suffix<'a>(
-        value: &Self::Tensor,
-        maximum: i32,
-        context: Self::Context<'a>,
-    ) -> Result<Self::Tensor, Self::Error>;
-    /// Retains a shared-attention prefix.
-    fn shared_prefix<'a>(
-        value: &Self::Tensor,
-        cache_len: i32,
-        context: Self::Context<'a>,
-    ) -> Result<Self::Tensor, Self::Error>;
-    /// Selects a target-token prefix.
-    fn token_prefix<'a>(
-        value: &Self::Tensor,
-        end: usize,
-        context: Self::Context<'a>,
-    ) -> Result<Self::Tensor, Self::Error>;
-    /// Constructs exact target token ids.
-    fn target_tokens<'a>(
-        tokens: &[u32],
-        context: Self::Context<'a>,
-    ) -> Result<Self::Tensor, Self::Error>;
-    /// Explicitly orders or transfers a tensor between selected placements.
-    fn transfer<'a>(
-        value: &Self::Tensor,
-        direction: ExternalAssistantTransfer,
-        context: Self::Context<'a>,
-    ) -> Result<Self::Tensor, Self::Error>;
-    /// Applies one architecture-declared ordinary-target operation.
-    fn target_operation<'a>(
-        target: &mut Self::Target,
-        operation: crate::composite_execution::ExternalPredictionTargetOperation<'_, Self::Tensor>,
-        context: Self::Context<'a>,
-    ) -> Result<Self::Tensor, Self::Error>;
-    /// Borrows the selected neural execution context.
-    fn neural_context<'a>(
-        context: Self::Context<'a>,
-        placement: ExternalAssistantTensorPlacement,
-    ) -> &'a <Self::Tensor as eredu_nn::Tensor>::Context;
-    /// Submits all retained tensors needed to complete verification.
-    fn submit_completion<'a>(
-        values: impl IntoIterator<Item = &'a Self::Tensor>,
-    ) -> Result<Self::Completion, Self::Error>
-    where
-        Self::Tensor: 'a;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -948,21 +340,8 @@ pub struct Gemma4AssistantArchitecture;
 
 impl sealed::Sealed for Gemma4AssistantArchitecture {}
 
-impl ExternalAssistantArchitecture for Gemma4AssistantArchitecture {
+impl ExternalAssistantModel for Gemma4AssistantArchitecture {
     type Config = gemma4::AssistantConfig;
-    type ParameterDefinition = gemma4::AssistantDefinition;
-    type ModuleConfig = gemma4::AssistantConfig;
-    fn module_config(
-        config: &Self::Config,
-        _definition: &Self::ParameterDefinition,
-        _target: Option<&ExternalAssistantTargetProfile>,
-    ) -> Result<Self::ModuleConfig, String> {
-        Ok(config.clone())
-    }
-    type Module<B>
-        = gemma4::Assistant<B>
-    where
-        B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone;
     type Unit<B>
         = gemma4::DenseBlock<B>
     where
@@ -971,13 +350,22 @@ impl ExternalAssistantArchitecture for Gemma4AssistantArchitecture {
         = gemma4::Assistant<B>
     where
         B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone;
-    fn execution_unit_layout(
-        _config: &Self::ModuleConfig,
-    ) -> Result<Option<eredu_runtime::ExecutionUnitLayout>, eredu_nn::Error> {
-        Ok(None)
+    fn parameter_policy<B, P>(_execution: &Self::Execution<B, P>) -> Option<&P>
+    where
+        B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone,
+    {
+        None
     }
+}
+
+impl ExternalAssistantConstruction for Gemma4AssistantArchitecture {
+    type Geometry = PreparedAssistantModule<Self>;
+    type Module<B>
+        = gemma4::Assistant<B>
+    where
+        B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone;
     fn build_execution_unit<B>(
-        construction: &PreparedAssistantModule<Self>,
+        construction: &Self::Geometry,
         ordinal: usize,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<Self::Unit<B>, eredu_nn::Error>
@@ -995,11 +383,31 @@ impl ExternalAssistantArchitecture for Gemma4AssistantArchitecture {
     {
         Ok(module)
     }
-    fn parameter_policy<B, P>(_execution: &Self::Execution<B, P>) -> Option<&P>
+    fn module<B>(
+        construction: Self::Geometry,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<Self::Module<B>, eredu_nn::Error>
     where
         B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone,
     {
-        None
+        gemma4::Assistant::new(&construction.definition, context)
+    }
+}
+
+impl ExternalAssistantArchitecture for Gemma4AssistantArchitecture {
+    type ParameterDefinition = gemma4::AssistantDefinition;
+    type ModuleConfig = gemma4::AssistantConfig;
+    fn module_config(
+        config: &Self::Config,
+        _definition: &Self::ParameterDefinition,
+        _target: Option<&ExternalAssistantTargetProfile>,
+    ) -> Result<Self::ModuleConfig, String> {
+        Ok(config.clone())
+    }
+    fn execution_unit_layout(
+        _config: &Self::ModuleConfig,
+    ) -> Result<Option<eredu_runtime::ExecutionUnitLayout>, eredu_nn::Error> {
+        Ok(None)
     }
     type Executor<'a, M>
         = gemma4::speculative::ExternalExecutor<
@@ -1007,7 +415,7 @@ impl ExternalAssistantArchitecture for Gemma4AssistantArchitecture {
         gemma4::speculative::ArchitectureExternalMechanisms<M>,
     >
     where
-        M: ExternalAssistantExecutionMechanisms<Self> + 'static;
+        M: ExternalAssistantExecutionMechanisms + 'static;
 
     fn tokenizer_model_type(_config: &Self::Config) -> &'static str {
         "gemma4"
@@ -1015,16 +423,6 @@ impl ExternalAssistantArchitecture for Gemma4AssistantArchitecture {
 
     fn configuration_model_type(config: &Self::Config) -> &str {
         &config.model_type
-    }
-
-    fn module<B>(
-        construction: PreparedAssistantModule<Self>,
-        context: &<B::Tensor as eredu_nn::Tensor>::Context,
-    ) -> Result<Self::Module<B>, eredu_nn::Error>
-    where
-        B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone,
-    {
-        gemma4::Assistant::new(&construction.definition, context)
     }
 
     fn quantization(config: &Self::Config) -> Option<eredu_checkpoint::WeightQuantization> {
@@ -1078,24 +476,24 @@ impl ExternalAssistantArchitecture for Gemma4AssistantArchitecture {
     }
 
     fn executor<'a, M>(
-        target: &'a mut M::Target,
-        assistant: &'a mut M::Assistant,
+        target: &'a mut ExternalAssistantTarget<M>,
+        assistant: &'a mut eredu_runtime::speculative::InstalledAssistantFor<M, Self>,
         capture: crate::composite_execution::ExternalPredictionCaptureRequest,
     ) -> Self::Executor<'a, M>
     where
-        M: ExternalAssistantExecutionMechanisms<Self> + 'static,
+        M: ExternalAssistantExecutionMechanisms + 'static,
     {
         gemma4::speculative::ExternalExecutor::new(target, assistant, capture)
     }
 
     fn visit_executor<'a, M, V>(
-        target: &'a mut M::Target,
-        assistant: &'a mut M::Assistant,
+        target: &'a mut ExternalAssistantTarget<M>,
+        assistant: &'a mut eredu_runtime::speculative::InstalledAssistantFor<M, Self>,
         capture: crate::composite_execution::ExternalPredictionCaptureRequest,
         visitor: V,
     ) -> V::Output
     where
-        M: ExternalAssistantExecutionMechanisms<Self> + 'static,
+        M: ExternalAssistantExecutionMechanisms + 'static,
         V: ExternalAssistantExecutorVisitor<Self, M>,
     {
         let mut executor = gemma4::speculative::ExternalExecutor::<
@@ -1111,32 +509,8 @@ pub struct MuseAssistantArchitecture;
 
 impl sealed::Sealed for MuseAssistantArchitecture {}
 
-impl ExternalAssistantArchitecture for MuseAssistantArchitecture {
-    fn memory_topology(
-        config: &Self::ModuleConfig,
-    ) -> Result<
-        Option<eredu_runtime::memory_forecast::ConditionedPredictionTopology>,
-        eredu_nn::Error,
-    > {
-        config.execution_definition().memory_topology().map(Some)
-    }
+impl ExternalAssistantModel for MuseAssistantArchitecture {
     type Config = MuseAssistantConfig;
-    type ParameterDefinition = MuseAssistantParameterDefinition;
-    type ModuleConfig = MuseAssistantConstruction;
-    fn module_config(
-        _config: &Self::Config,
-        definition: &Self::ParameterDefinition,
-        target: Option<&ExternalAssistantTargetProfile>,
-    ) -> Result<Self::ModuleConfig, String> {
-        definition.construction(match target {
-            Some(ExternalAssistantTargetProfile::Muse(target)) => Some(target),
-            _ => None,
-        })
-    }
-    type Module<B>
-        = MuseAssistantModule<B>
-    where
-        B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone;
     type Unit<B>
         = muse::assistant::execution::MuseAssistantUnit<B>
     where
@@ -1145,13 +519,22 @@ impl ExternalAssistantArchitecture for MuseAssistantArchitecture {
         = MuseAssistantModule<B, P>
     where
         B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone;
-    fn execution_unit_layout(
-        config: &Self::ModuleConfig,
-    ) -> Result<Option<eredu_runtime::ExecutionUnitLayout>, eredu_nn::Error> {
-        Ok(Some(config.execution_definition().unit_layout().clone()))
+    fn parameter_policy<B, P>(execution: &Self::Execution<B, P>) -> Option<&P>
+    where
+        B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone,
+    {
+        Some(execution.policy())
     }
+}
+
+impl ExternalAssistantConstruction for MuseAssistantArchitecture {
+    type Geometry = PreparedAssistantModule<Self>;
+    type Module<B>
+        = MuseAssistantModule<B>
+    where
+        B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone;
     fn build_execution_unit<B>(
-        construction: &PreparedAssistantModule<Self>,
+        construction: &Self::Geometry,
         ordinal: usize,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<Self::Unit<B>, eredu_nn::Error>
@@ -1180,11 +563,43 @@ impl ExternalAssistantArchitecture for MuseAssistantArchitecture {
             ),
         ))
     }
-    fn parameter_policy<B, P>(execution: &Self::Execution<B, P>) -> Option<&P>
+    fn module<B>(
+        construction: Self::Geometry,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<Self::Module<B>, eredu_nn::Error>
     where
         B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone,
     {
-        Some(execution.policy())
+        construction.parameter_declarations().validate()?;
+        construction.config.module(context)
+    }
+}
+
+impl ExternalAssistantArchitecture for MuseAssistantArchitecture {
+    fn memory_topology(
+        config: &Self::ModuleConfig,
+    ) -> Result<
+        Option<eredu_runtime::memory_forecast::ConditionedPredictionTopology>,
+        eredu_nn::Error,
+    > {
+        config.execution_definition().memory_topology().map(Some)
+    }
+    type ParameterDefinition = MuseAssistantParameterDefinition;
+    type ModuleConfig = MuseAssistantConstruction;
+    fn module_config(
+        _config: &Self::Config,
+        definition: &Self::ParameterDefinition,
+        target: Option<&ExternalAssistantTargetProfile>,
+    ) -> Result<Self::ModuleConfig, String> {
+        definition.construction(match target {
+            Some(ExternalAssistantTargetProfile::Muse(target)) => Some(target),
+            _ => None,
+        })
+    }
+    fn execution_unit_layout(
+        config: &Self::ModuleConfig,
+    ) -> Result<Option<eredu_runtime::ExecutionUnitLayout>, eredu_nn::Error> {
+        Ok(Some(config.execution_definition().unit_layout().clone()))
     }
     type Executor<'a, M>
         = muse::speculative::ExternalExecutor<
@@ -1192,7 +607,7 @@ impl ExternalAssistantArchitecture for MuseAssistantArchitecture {
         muse::speculative::ArchitectureExternalMechanisms<M>,
     >
     where
-        M: ExternalAssistantExecutionMechanisms<Self> + 'static;
+        M: ExternalAssistantExecutionMechanisms + 'static;
 
     fn tokenizer_model_type(config: &Self::Config) -> &'static str {
         config.tokenizer_model_type()
@@ -1212,17 +627,6 @@ impl ExternalAssistantArchitecture for MuseAssistantArchitecture {
 
     fn configuration_model_type(config: &Self::Config) -> &str {
         config.model_type()
-    }
-
-    fn module<B>(
-        construction: PreparedAssistantModule<Self>,
-        context: &<B::Tensor as eredu_nn::Tensor>::Context,
-    ) -> Result<Self::Module<B>, eredu_nn::Error>
-    where
-        B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone,
-    {
-        construction.parameter_declarations().validate()?;
-        construction.config.module(context)
     }
 
     fn quantization(config: &Self::Config) -> Option<eredu_checkpoint::WeightQuantization> {
@@ -1270,24 +674,24 @@ impl ExternalAssistantArchitecture for MuseAssistantArchitecture {
     }
 
     fn executor<'a, M>(
-        target: &'a mut M::Target,
-        assistant: &'a mut M::Assistant,
+        target: &'a mut ExternalAssistantTarget<M>,
+        assistant: &'a mut eredu_runtime::speculative::InstalledAssistantFor<M, Self>,
         capture: crate::composite_execution::ExternalPredictionCaptureRequest,
     ) -> Self::Executor<'a, M>
     where
-        M: ExternalAssistantExecutionMechanisms<Self> + 'static,
+        M: ExternalAssistantExecutionMechanisms + 'static,
     {
         muse::speculative::ExternalExecutor::new(target, assistant, capture)
     }
 
     fn visit_executor<'a, M, V>(
-        target: &'a mut M::Target,
-        assistant: &'a mut M::Assistant,
+        target: &'a mut ExternalAssistantTarget<M>,
+        assistant: &'a mut eredu_runtime::speculative::InstalledAssistantFor<M, Self>,
         capture: crate::composite_execution::ExternalPredictionCaptureRequest,
         visitor: V,
     ) -> V::Output
     where
-        M: ExternalAssistantExecutionMechanisms<Self> + 'static,
+        M: ExternalAssistantExecutionMechanisms + 'static,
         V: ExternalAssistantExecutorVisitor<Self, M>,
     {
         let mut executor = muse::speculative::ExternalExecutor::<
@@ -1486,6 +890,24 @@ impl<A: ExternalAssistantArchitecture> PreparedExternalAssistantSource<A> {
         self.module_config.parameter_declarations()
     }
 
+    /// Projects the selected source into the contract used by parameter binders.
+    fn into_binding(self) -> Result<PreparedAssistantBinding<A>, eredu_nn::Error> {
+        let memory_topology = A::memory_topology(self.module_config.config())?;
+        Ok(PreparedAssistantBinding {
+            source: self.source,
+            source_geometry: self.source_module_config,
+            geometry: self.module_config,
+            config: self.config,
+            tasks: self.tasks,
+            parameter_units: self.parameter_units,
+            residency: self.residency,
+            execution_layout: self.execution_layout,
+            parameter_layout: self.parameter_layout,
+            conversion_retention: self.conversion_retention,
+            memory_topology,
+        })
+    }
+
     /// Consumes the exact source, source/selected neural geometry, selected config and tasks.
     pub fn into_parts(
         self,
@@ -1661,6 +1083,27 @@ pub trait ExternalAssistantPreparationVisitor {
     ) -> Result<Self::Output<A>, Self::Error>;
 }
 
+/// Projects a family-owned prepared source before invoking a neutral binder.
+pub struct BindPreparedAssistant<B>(pub B);
+
+impl<B: ExternalAssistantBinder> ExternalAssistantPreparationVisitor for BindPreparedAssistant<B> {
+    type Output<A: ExternalAssistantArchitecture> =
+        eredu_runtime::speculative::InstalledExternalAssistant<B, A>;
+    type Error = B::Error;
+
+    fn visit<A: ExternalAssistantArchitecture>(
+        self,
+        prepared: PreparedExternalAssistantSource<A>,
+    ) -> Result<Self::Output<A>, Self::Error> {
+        eredu_runtime::speculative::bind_external_assistant(
+            prepared
+                .into_binding()
+                .map_err(eredu_core::BackendFailure::from_error)?,
+            self.0,
+        )
+    }
+}
+
 enum DispatchedMaterializedExternalAssistant<V: ExternalAssistantPreparationVisitor> {
     Gemma4(V::Output<Gemma4AssistantArchitecture>),
     Muse(V::Output<MuseAssistantArchitecture>),
@@ -1674,30 +1117,9 @@ pub struct MaterializedExternalAssistant<V: ExternalAssistantPreparationVisitor>
     dispatched: DispatchedMaterializedExternalAssistant<V>,
 }
 
-/// Family-blind visitor for an already materialized assistant.
-pub trait MaterializedExternalAssistantVisitor<V: ExternalAssistantPreparationVisitor> {
-    /// Result of the selected operation.
-    type Output;
-
-    /// Visits the concrete assistant selected during architecture preparation.
-    fn visit<A: ExternalAssistantArchitecture>(self, assistant: &mut V::Output<A>) -> Self::Output;
-}
-
-/// Read-only operation on an architecture-dispatched materialized assistant.
-pub trait MaterializedExternalAssistantRefVisitor<V: ExternalAssistantPreparationVisitor> {
-    /// Result of the observation.
-    type Output;
-
-    /// Observes retained resources without obtaining mutation authority.
-    fn visit<A: ExternalAssistantArchitecture>(self, assistant: &V::Output<A>) -> Self::Output;
-}
-
-impl<V: ExternalAssistantPreparationVisitor> MaterializedExternalAssistant<V> {
-    /// Observes the retained typed assistant without changing execution state.
-    pub fn visit_ref<W: MaterializedExternalAssistantRefVisitor<V>>(
-        &self,
-        visitor: W,
-    ) -> W::Output {
+impl<B: ExternalAssistantBinder> MaterializedExternalAssistant<BindPreparedAssistant<B>> {
+    /// Observes the selected assistant through a neutral shared borrow.
+    pub fn visit_ref<W: BoundAssistantRefVisitor<B>>(&self, visitor: W) -> W::Output {
         match &self.dispatched {
             DispatchedMaterializedExternalAssistant::Gemma4(assistant) => {
                 visitor.visit::<Gemma4AssistantArchitecture>(assistant)
@@ -1708,11 +1130,8 @@ impl<V: ExternalAssistantPreparationVisitor> MaterializedExternalAssistant<V> {
         }
     }
 
-    /// Runs one generic backend visitor against the retained typed assistant.
-    pub fn visit<W>(&mut self, visitor: W) -> W::Output
-    where
-        W: MaterializedExternalAssistantVisitor<V>,
-    {
+    /// Visits the selected assistant under exclusive operation ownership.
+    pub fn visit<W: BoundAssistantVisitor<B>>(&mut self, visitor: W) -> W::Output {
         match &mut self.dispatched {
             DispatchedMaterializedExternalAssistant::Gemma4(assistant) => {
                 visitor.visit::<Gemma4AssistantArchitecture>(assistant)
@@ -1721,6 +1140,59 @@ impl<V: ExternalAssistantPreparationVisitor> MaterializedExternalAssistant<V> {
                 visitor.visit::<MuseAssistantArchitecture>(assistant)
             }
         }
+    }
+
+    /// Supplies the selected assistant and its executor authority.
+    pub fn visit_executor<W: SelectedAssistantExecutionVisitor<B>>(
+        &mut self,
+        visitor: W,
+    ) -> W::Output {
+        match &mut self.dispatched {
+            DispatchedMaterializedExternalAssistant::Gemma4(assistant) => visitor.visit(
+                assistant,
+                ArchitectureAssistantExecutor::<Gemma4AssistantArchitecture>(PhantomData),
+            ),
+            DispatchedMaterializedExternalAssistant::Muse(assistant) => visitor.visit(
+                assistant,
+                ArchitectureAssistantExecutor::<MuseAssistantArchitecture>(PhantomData),
+            ),
+        }
+    }
+}
+
+/// Executor authority for a family chosen by portable assistant preparation.
+#[derive(Clone, Copy)]
+pub struct ArchitectureAssistantExecutor<A>(PhantomData<A>);
+
+/// Typed dispatcher produced by portable assistant preparation.
+pub type BoundExternalAssistantDispatch<B> = AssistantDispatch<
+    TypedAssistant<
+        B,
+        Gemma4AssistantArchitecture,
+        ArchitectureAssistantExecutor<Gemma4AssistantArchitecture>,
+    >,
+    TypedAssistant<
+        B,
+        MuseAssistantArchitecture,
+        ArchitectureAssistantExecutor<MuseAssistantArchitecture>,
+    >,
+>;
+
+impl<A: ExternalAssistantArchitecture> SelectedAssistantExecutor<A>
+    for ArchitectureAssistantExecutor<A>
+{
+    fn execute<M, V>(
+        self,
+        target: &mut ExternalAssistantTarget<M>,
+        assistant: &mut eredu_runtime::speculative::InstalledAssistantFor<M, A>,
+        capture: crate::composite_execution::ExternalPredictionCaptureRequest,
+        visitor: V,
+    ) -> V::Output
+    where
+        M: ExternalAssistantExecutionMechanisms,
+        V: ExternalAssistantExecutorVisitor<A, M>,
+    {
+        A::visit_executor::<M, V>(target, assistant, capture, visitor)
     }
 }
 
@@ -2012,6 +1484,29 @@ impl PreparedCompatibleExternalAssistant {
     /// Exact architecture-owned target capture request.
     pub const fn capture(&self) -> &crate::composite_execution::ExternalPredictionCaptureRequest {
         &self.capture
+    }
+
+    fn bind<B: ExternalAssistantBinder>(
+        self,
+        binder: B,
+    ) -> Result<BoundExternalAssistantDispatch<B>, B::Error> {
+        let visitor = BindPreparedAssistant(binder);
+        match self.preparation {
+            DispatchedPreparedExternalAssistant::Gemma4(prepared) => {
+                let assistant = visitor.visit(prepared)?;
+                Ok(AssistantDispatch::First(TypedAssistant::new(
+                    assistant,
+                    ArchitectureAssistantExecutor(PhantomData),
+                )))
+            }
+            DispatchedPreparedExternalAssistant::Muse(prepared) => {
+                let assistant = visitor.visit(prepared)?;
+                Ok(AssistantDispatch::Second(TypedAssistant::new(
+                    assistant,
+                    ArchitectureAssistantExecutor(PhantomData),
+                )))
+            }
+        }
     }
 
     /// Dispatches an already prepared neutral source to native materialization.
@@ -2814,7 +2309,7 @@ fn external_speculative_contract(
         (
             DispatchedNormalizedExternalAssistant::Gemma4(prepared),
             ExternalAssistantTargetProfile::Gemma4(target),
-            crate::composite_execution::ExternalPredictionCaptureRequest::Gemma4SharedAttention {
+            crate::composite_execution::ExternalPredictionCaptureRequest::SharedAttention {
                 final_hidden_path,
             },
         ) => {
@@ -2907,7 +2402,7 @@ fn external_speculative_contract(
         (
             DispatchedNormalizedExternalAssistant::Muse(prepared),
             ExternalAssistantTargetProfile::Muse(target),
-            crate::composite_execution::ExternalPredictionCaptureRequest::Muse {
+            crate::composite_execution::ExternalPredictionCaptureRequest::OrderedLayerOutputs {
                 target_layers,
                 target_paths,
             },

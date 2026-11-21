@@ -177,10 +177,10 @@ Run fixture generation and native comparison from the repository root:
 
 ```sh
 /tmp/diffusion-gemma-reference/bin/python eredu-evaluation/scripts/diffusion_gemma_reference.py /tmp/diffusion-gemma-official /tmp/diffusion-gemma-reference.safetensors
-cargo run -p eredu-backend-mlx --no-default-features --example diffusion_gemma_reference -- /tmp/diffusion-gemma-official /tmp/diffusion-gemma-reference.safetensors
+cargo run -p eredu --no-default-features --features mlx --example diffusion_gemma_reference -- /tmp/diffusion-gemma-official /tmp/diffusion-gemma-reference.safetensors
 /tmp/diffusion-gemma-reference/bin/python eredu-evaluation/scripts/diffusion_gemma_reference.py /tmp/diffusion-gemma-official /tmp/diffusion-gemma-vision-reference.safetensors --vision-only --vision-grid 3 6
-cargo run -p eredu-backend-mlx --no-default-features --example diffusion_gemma_reference -- /tmp/diffusion-gemma-official /tmp/diffusion-gemma-vision-reference.safetensors --vision-only
-EREDU_DIFFUSION_CHECKPOINT=/tmp/diffusion-gemma-official EREDU_DIFFUSION_REFERENCE=/tmp/diffusion-gemma-reference.safetensors cargo test -p eredu-backend-mlx --no-default-features --lib reference_acceptance::released_diffusion_public_loader_matches_cached_reference -- --ignored --nocapture
+cargo run -p eredu --no-default-features --features mlx --example diffusion_gemma_reference -- /tmp/diffusion-gemma-official /tmp/diffusion-gemma-vision-reference.safetensors --vision-only
+EREDU_DIFFUSION_CHECKPOINT=/tmp/diffusion-gemma-official EREDU_DIFFUSION_REFERENCE=/tmp/diffusion-gemma-reference.safetensors cargo test -p eredu --no-default-features --features mlx --test released_reference_acceptance released_diffusion_public_loader_matches_cached_reference -- --ignored --nocapture
 ```
 
 The public-loader BF16 comparison matches all three encoder outputs exactly and
@@ -204,7 +204,7 @@ with path.open("rb") as source:
 
 ```sh
 /tmp/diffusion-gemma-reference/bin/python eredu-evaluation/scripts/diffusion_gemma_reference.py /tmp/diffusion-gemma-official /tmp/diffusion-gemma-gguf-reference.safetensors --gguf /tmp/diffusion-gemma-gguf/diffusiongemma-26B-A4B-it-Q4_K_M.gguf
-EREDU_DIFFUSION_CHECKPOINT=/tmp/diffusion-gemma-official EREDU_DIFFUSION_GGUF=/tmp/diffusion-gemma-gguf/diffusiongemma-26B-A4B-it-Q4_K_M.gguf EREDU_DIFFUSION_REFERENCE=/tmp/diffusion-gemma-gguf-reference.safetensors cargo test -p eredu-backend-mlx --no-default-features --lib reference_acceptance::released_diffusion_gguf_public_loader_matches_cached_reference -- --ignored --nocapture
+EREDU_DIFFUSION_CHECKPOINT=/tmp/diffusion-gemma-official EREDU_DIFFUSION_GGUF=/tmp/diffusion-gemma-gguf/diffusiongemma-26B-A4B-it-Q4_K_M.gguf EREDU_DIFFUSION_REFERENCE=/tmp/diffusion-gemma-gguf-reference.safetensors cargo test -p eredu --no-default-features --features mlx --test released_reference_acceptance released_diffusion_gguf_public_loader_matches_cached_reference -- --ignored --nocapture
 EREDU_DIFFUSION_CHECKPOINT=/tmp/diffusion-gemma-official EREDU_DIFFUSION_GGUF=/tmp/diffusion-gemma-gguf/diffusiongemma-26B-A4B-it-Q4_K_M.gguf cargo test -p eredu-text --no-default-features --lib released_diffusion_gemma_bpe_matches_official_tokenizer -- --ignored
 ```
 

@@ -1,0 +1,781 @@
+//! Session lifecycle, block catalog mutation, and manager reset operations.
+
+use super::*;
+
+impl<M: LiveCacheBackend> CacheResidencyManager<M> {
+    /// Creates an empty manager with globally shared finite limits.
+    pub fn new(options: PagedCacheOptions) -> Result<Self, CacheResidencyError> {
+        if let LiveCacheDiskPolicy::Enabled { directory, .. } = options.live_disk_policy() {
+            fs::create_dir_all(directory).map_err(|source| CacheResidencyError::Io {
+                action: "create live cache directory",
+                path: directory.clone(),
+                source,
+            })?;
+        }
+        let queue_capacity = match options.live_disk_policy() {
+            LiveCacheDiskPolicy::Disabled => 0,
+            LiveCacheDiskPolicy::Enabled { queue_capacity, .. } => *queue_capacity,
+        };
+        let effective_queue_capacity = queue_capacity.max(1);
+        let telemetry = CacheResidencyTelemetry::new(effective_queue_capacity);
+        let disk_worker = Some(Arc::new(DiskWorker::new(effective_queue_capacity)?));
+        let host_demotion_worker = Arc::new(HostDemotionWorker::new()?);
+        let recent_device_blocks = options.recent_device_blocks();
+        let device_budget_bytes = options.device_budget_bytes();
+        let host_budget_bytes = options.host_budget_bytes();
+        let disk_budget_bytes = match options.live_disk_policy() {
+            LiveCacheDiskPolicy::Disabled => None,
+            LiveCacheDiskPolicy::Enabled { budget_bytes, .. } => Some(*budget_bytes),
+        };
+        let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+        let pool = match options.pool().cloned() {
+            Some(pool) => pool,
+            None => options.create_pool()?,
+        };
+        let pool_membership = Arc::new(pool.register_manager(session_id)?);
+        Ok(Self {
+            session_id,
+            inner: Arc::new(CacheResidencyManagerInner {
+                options,
+                state: Arc::new(Mutex::new(CacheManagerState {
+                    pool,
+                    pool_manager_id: session_id,
+                    generation: 0,
+                    background_disk_error: None,
+                    lifecycle: CacheBlockLifecycle::new(),
+                    blocks: BTreeMap::new(),
+                    history_retentions: Vec::new(),
+                    host_write_reservations: HashMap::new(),
+                    retiring_host_demotions: HashMap::new(),
+                    retiring_disk_reads: HashMap::new(),
+                    transfer_device: None,
+                    telemetry,
+                    recent_device_blocks,
+                    device_budget_bytes,
+                    host_budget_bytes,
+                    disk_budget_bytes,
+                })),
+                host_demotion_worker,
+                disk_worker,
+                pool_membership,
+            }),
+        })
+    }
+
+    /// Returns the live cache identity included in every block id.
+    pub const fn session_id(&self) -> u64 {
+        self.session_id
+    }
+
+    /// Forks one quiescent cache session into an independent block namespace.
+    ///
+    /// Immutable block arrays may be shared, but lifecycle ownership, mutable-tail accounting,
+    /// budgets, and future block identities belong exclusively to the returned manager.
+    pub fn fork_session(&self, stream: &Queue<M>) -> Result<Self, CacheResidencyError> {
+        self.copy_session(stream, self.options().clone(), false)
+    }
+
+    /// Shares immutable sealed roots in an independent namespace in the same pool.
+    pub fn transaction_candidate(&self, stream: &Queue<M>) -> Result<Self, CacheResidencyError> {
+        self.copy_session(
+            stream,
+            self.options().clone().with_pool(self.pool().clone())?,
+            false,
+        )
+    }
+
+    /// Copies sealed arrays into a new namespace in the same bounded process pool.
+    pub fn isolated_snapshot(&self, stream: &Queue<M>) -> Result<Self, CacheResidencyError> {
+        self.copy_session(
+            stream,
+            self.options().clone().with_pool(self.pool().clone())?,
+            true,
+        )
+    }
+
+    /// Includes all catalogued blocks, including blocks currently on host or disk.
+    pub fn isolated_snapshot_bytes(&self) -> Option<u64> {
+        let state = self.lock().ok()?;
+        state.blocks.values().try_fold(65536_u64, |total, block| {
+            total
+                .checked_add(block.bytes.checked_mul(2)?)?
+                .checked_add(8192)
+        })
+    }
+
+    fn copy_session(
+        &self,
+        stream: &Queue<M>,
+        options: PagedCacheOptions,
+        copy_arrays: bool,
+    ) -> Result<Self, CacheResidencyError> {
+        let (blocks, tails) = {
+            let state = self.lock()?;
+            let blocks = state
+                .blocks
+                .keys()
+                .map(|id| {
+                    state
+                        .lifecycle
+                        .is_protected_prefix(id)
+                        .map(|protected| (id.clone(), protected))
+                        .map_err(CacheResidencyError::from)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let tails = state.lifecycle.tails().collect::<Vec<_>>();
+            (blocks, tails)
+        };
+        let fork = Self::new(options)?;
+        for (id, protected) in blocks {
+            let lease = self.lease_block(&id, stream)?;
+            let arrays = if copy_arrays {
+                let [first, second] = lease.arrays().arrays();
+                CacheBlockArrays::from_parts(
+                    lease.arrays().representation(),
+                    [
+                        M::copy_tensor(first, stream)?,
+                        M::copy_tensor(second, stream)?,
+                    ],
+                )
+            } else {
+                lease.arrays().clone()
+            };
+            fork.seal_block(
+                id.global_layer,
+                id.start,
+                id.end,
+                id.rank,
+                arrays,
+                protected,
+            )?;
+        }
+        for (stream, tail) in tails {
+            fork.set_tail_state(
+                stream.global_layer,
+                stream.representation,
+                tail.bytes,
+                tail.end,
+            )?;
+        }
+        Ok(fork)
+    }
+
+    /// Returns validated paged-cache options.
+    pub fn options(&self) -> &PagedCacheOptions {
+        &self.inner.options
+    }
+
+    /// Returns the aggregate process pool accounting for this manager.
+    pub fn pool(&self) -> &CacheResidencyPool {
+        self.inner.pool_membership.pool()
+    }
+
+    pub(super) fn lock(&self) -> Result<MutexGuard<'_, CacheManagerState<M>>, CacheResidencyError> {
+        self.inner
+            .state
+            .lock()
+            .map_err(|_| CacheResidencyError::ManagerPoisoned)
+    }
+
+    /// Binds the manager to the transfer device selected by `stream`.
+    pub fn bind_transfer_device(&self, stream: &Queue<M>) -> Result<(), CacheResidencyError> {
+        let device = M::device(stream)?;
+        let mut state = self.lock()?;
+        match state.transfer_device {
+            Some(bound) if bound != device => Err(CacheResidencyError::Runtime(format!(
+                "paged cache is bound to device {bound:?} but received {device:?}"
+            ))),
+            Some(_) => Ok(()),
+            None => {
+                state.transfer_device = Some(device);
+                Ok(())
+            }
+        }
+    }
+
+    /// Updates the mutable tail's logical byte count and end position.
+    pub fn set_tail_state(
+        &self,
+        layer: usize,
+        representation: CacheRepresentation,
+        bytes: u64,
+        end: i64,
+    ) -> Result<(), CacheResidencyError> {
+        let mut state = self.lock()?;
+        let stream = CacheStreamId::new(layer, representation);
+        let previous = state
+            .lifecycle
+            .set_tail(stream, MutableCacheTail { bytes, end });
+        let allocated = previous.is_none_or(|tail| tail.bytes == 0) && bytes > 0;
+        if allocated {
+            state.telemetry.report.tail_allocations += 1;
+        }
+        drop(state);
+        if let Err(error) = self.rebalance(None, false) {
+            let mut state = self.lock()?;
+            state.lifecycle.restore_tail(stream, previous);
+            if allocated {
+                state.telemetry.report.tail_allocations =
+                    state.telemetry.report.tail_allocations.saturating_sub(1);
+            }
+            update_report_totals(&mut state);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Publishes a completed mutable tail range as an immutable cache block.
+    pub fn seal_block(
+        &self,
+        global_layer: usize,
+        start: i64,
+        end: i64,
+        rank: Option<CacheRankIdentity>,
+        arrays: Page<M>,
+        protected_prefix: bool,
+    ) -> Result<CacheBlockId, CacheResidencyError> {
+        if start < 0 || end <= start {
+            return Err(CacheResidencyError::InvalidTokenRange { start, end });
+        }
+        let representation = arrays.representation();
+        validate_block_arrays::<M>(&arrays, end - start)?;
+        M::settle_tensors(&arrays.arrays())?;
+        let id = CacheBlockId {
+            session_id: self.session_id,
+            global_layer,
+            representation,
+            start,
+            end,
+            rank,
+        };
+        let mut state = self.lock()?;
+        if state.blocks.contains_key(&id) {
+            return Err(CacheLifecycleError::DuplicateBlock(id).into());
+        }
+        let bytes = page_bytes::<M>(&arrays);
+        let record = CacheBlockRecord {
+            shapes: page_shapes::<M>(&arrays),
+            dtypes: page_dtypes::<M>(&arrays)?,
+            physical: LiveCacheBlockStorage::device(id.clone(), arrays, None),
+            bytes,
+            imported: false,
+        };
+        state
+            .lifecycle
+            .insert(id.clone(), protected_prefix)
+            .map_err(CacheResidencyError::from)?;
+        state.blocks.insert(id.clone(), record);
+        drop(state);
+        if let Err(error) = self.rebalance(Some(&id), false) {
+            let mut state = self.lock()?;
+            if let Some(record) = state.blocks.remove(&id) {
+                state.lifecycle.remove(&id)?;
+                cancel_record_operation(&record, &mut state.telemetry.report);
+                remove_ephemeral_file(&record);
+            }
+            update_report_totals(&mut state);
+            return Err(error);
+        }
+        let mut state = self.lock()?;
+        state.telemetry.report.block_seals += 1;
+        Ok(id)
+    }
+
+    /// Checks retained named records without promoting payloads or changing counters.
+    /// A mutable tail must be restored by its owning state, never reconstructed from pages.
+    pub fn validate_append_stream_layout(
+        &self,
+        layer: usize,
+        lane: u32,
+        rank: Option<CacheRankIdentity>,
+        spec: &eredu_core::cache::append_stream::AppendStreamSpec,
+        limits: eredu_core::cache::append_stream::AppendStreamLimits,
+    ) -> Result<(), CacheResidencyError> {
+        use eredu_nn::TensorElementType as T;
+        let dtype = dtype_name(match spec.element {
+            T::Bool => StoredDtype::Bool,
+            T::F16 => StoredDtype::F16,
+            T::Bf16 => StoredDtype::BF16,
+            T::F32 => StoredDtype::F32,
+            T::F64 => StoredDtype::F64,
+            T::I8 => StoredDtype::I8,
+            T::I16 => StoredDtype::I16,
+            T::I32 => StoredDtype::I32,
+            T::I64 => StoredDtype::I64,
+            T::U8 => StoredDtype::U8,
+            T::U16 => StoredDtype::U16,
+            T::U32 => StoredDtype::U32,
+            T::U64 => StoredDtype::U64,
+            T::Complex64 => StoredDtype::C64,
+        })?;
+        let representation = CacheRepresentation::AppendStream {
+            slot: spec.slot,
+            lane,
+        };
+        let state = self.lock()?;
+        if state
+            .lifecycle
+            .tail(CacheStreamId::new(layer, representation))
+            .is_some_and(|tail| tail.bytes != 0)
+        {
+            return Err(CacheResidencyError::ArrayMismatch(
+                "cannot reopen an append stream with an unsealed mutable tail".into(),
+            ));
+        }
+        let mut frontier = 0;
+        for (id, record) in state
+            .blocks
+            .iter()
+            .filter(|(id, _)| id.global_layer == layer && id.representation == representation)
+        {
+            let count = id.end - id.start;
+            if id.start != frontier
+                || count <= 0
+                || count > limits.page_entries as i64
+                || id.end > limits.entries as i64
+                || id.rank != rank
+                || record.shapes
+                    != [
+                        vec![1, 1, count as i32, spec.width],
+                        vec![1, 1, count as i32, 0],
+                    ]
+                || record.dtypes.iter().any(|actual| *actual != dtype)
+            {
+                return Err(CacheResidencyError::ArrayMismatch(
+                    "stored append stream differs from its declared geometry or range".into(),
+                ));
+            }
+            frontier = id.end;
+        }
+        Ok(())
+    }
+
+    /// Returns ordered block identities for a layer and visible token range.
+    pub fn layer_block_ids(
+        &self,
+        layer: usize,
+        representation: CacheRepresentation,
+        visible_start: i64,
+        visible_end: i64,
+        prefix_tokens: i64,
+    ) -> Result<Vec<CacheBlockId>, CacheResidencyError> {
+        let state = self.lock()?;
+        Ok(state
+            .blocks
+            .keys()
+            .filter(|id| {
+                id.global_layer == layer
+                    && id.representation == representation
+                    && id.start < visible_end
+                    && (id.end > visible_start || id.start < prefix_tokens)
+            })
+            .cloned()
+            .collect())
+    }
+
+    /// Catalogs only blocks intersecting sorted selected positions. The returned
+    /// metadata is bounded by the selection, including widely separated rows.
+    pub fn selected_layer_block_ids(
+        &self,
+        layer: usize,
+        representation: CacheRepresentation,
+        positions: &[i32],
+    ) -> Result<Vec<CacheBlockId>, CacheResidencyError> {
+        let state = self.lock()?;
+        Ok(state
+            .blocks
+            .keys()
+            .filter(|id| {
+                if id.global_layer != layer || id.representation != representation {
+                    return false;
+                }
+                let index = positions.partition_point(|p| i64::from(*p) < id.start);
+                positions.get(index).is_some_and(|p| i64::from(*p) < id.end)
+            })
+            .cloned()
+            .collect())
+    }
+
+    /// Returns the greatest logical end position stored for a layer.
+    pub fn layer_end(
+        &self,
+        layer: usize,
+        representation: CacheRepresentation,
+    ) -> Result<i64, CacheResidencyError> {
+        let state = self.lock()?;
+        Ok(state
+            .blocks
+            .keys()
+            .filter(|id| id.global_layer == layer && id.representation == representation)
+            .map(|id| id.end)
+            .max()
+            .unwrap_or(0))
+    }
+
+    /// Removes one unleased cache block from all tiers.
+    pub fn remove_block(&self, id: &CacheBlockId) -> Result<(), CacheResidencyError> {
+        let mut state = self.lock()?;
+        if !state.blocks.contains_key(id) {
+            return Err(CacheLifecycleError::MissingBlock(id.clone()).into());
+        }
+        state.lifecycle.remove(id)?;
+        let tickets = advance_generation_locked(&mut state);
+        let record = state
+            .blocks
+            .remove(id)
+            .expect("validated cache block still present");
+        remove_ephemeral_file(&record);
+        update_report_totals(&mut state);
+        drop(state);
+        self.retire_tickets(&tickets)?;
+        Ok(())
+    }
+
+    /// Atomically truncates a layer while preserving its protected prefix.
+    pub fn truncate_layer_transaction(
+        &self,
+        global_layer: usize,
+        representation: CacheRepresentation,
+        end: i64,
+        replacement: Option<(CacheBlockLease<M>, Page<M>)>,
+        protected_prefix_tokens: i64,
+    ) -> Result<(), CacheResidencyError> {
+        if end < 0 {
+            return Err(CacheResidencyError::InvalidTokenRange { start: 0, end });
+        }
+        if let Some((lease, arrays)) = &replacement {
+            let old_id = lease.id();
+            if old_id.global_layer != global_layer
+                || old_id.representation != representation
+                || old_id.start >= end
+                || old_id.end <= end
+                || arrays.representation() != representation
+            {
+                return Err(CacheResidencyError::ArrayMismatch(
+                    "trailing cache replacement does not match the truncated layer".into(),
+                ));
+            }
+            validate_block_arrays::<M>(arrays, end - old_id.start)?;
+            M::settle_tensors(&arrays.arrays())?;
+        }
+
+        let mut state = self.lock()?;
+        if let Some(error) = state.background_disk_error.take() {
+            return Err(error.into());
+        }
+        let affected = state
+            .blocks
+            .keys()
+            .filter(|id| {
+                id.global_layer == global_layer
+                    && id.representation == representation
+                    && id.end > end
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let crossing = affected.iter().find(|id| id.start < end);
+        match (crossing, replacement.as_ref()) {
+            (Some(crossing), Some((lease, _))) if crossing == lease.id() => {}
+            (None, None) => {}
+            _ => {
+                return Err(CacheResidencyError::ArrayMismatch(
+                    "trailing cache replacement does not match the block crossing the truncation boundary"
+                        .into(),
+                ))
+            }
+        }
+        for id in &affected {
+            let record = state
+                .blocks
+                .get(id)
+                .ok_or_else(|| CacheLifecycleError::MissingBlock(id.clone()))?;
+            let owned_replacement_lease = replacement
+                .as_ref()
+                .is_some_and(|(lease, _)| lease.id() == id);
+            if owned_replacement_lease && record.tier() != CacheTier::Device {
+                return Err(CacheResidencyError::Runtime(
+                    "truncated cache replacement lease is not device resident".into(),
+                ));
+            }
+        }
+
+        let replacement_id = replacement.as_ref().map(|(lease, _)| CacheBlockId {
+            session_id: self.session_id,
+            global_layer,
+            representation,
+            start: lease.id().start,
+            end,
+            rank: lease.id().rank,
+        });
+        if let Some(id) = &replacement_id {
+            if state.blocks.contains_key(id) && !affected.contains(id) {
+                return Err(CacheLifecycleError::DuplicateBlock(id.clone()).into());
+            }
+        }
+
+        let removals = affected
+            .iter()
+            .map(|id| {
+                let owned_replacement_lease = replacement
+                    .as_ref()
+                    .is_some_and(|(lease, _)| lease.id() == id);
+                (id.clone(), usize::from(owned_replacement_lease))
+            })
+            .collect::<Vec<_>>();
+        state.lifecycle.replace(
+            &removals,
+            replacement_id
+                .clone()
+                .map(|id| (id, end <= protected_prefix_tokens)),
+            CacheStreamId::new(global_layer, representation),
+            MutableCacheTail { bytes: 0, end },
+        )?;
+
+        let tickets = advance_generation_locked(&mut state);
+        let mut removed = Vec::with_capacity(affected.len());
+        for id in &affected {
+            if let Some(record) = state.blocks.remove(id) {
+                removed.push(record);
+            }
+        }
+        if let Some((mut lease, arrays)) = replacement {
+            let old_id = lease.id().clone();
+            lease.released = true;
+            let id = replacement_id.expect("validated replacement id is available");
+            debug_assert_eq!(id.start, old_id.start);
+            let record = CacheBlockRecord {
+                shapes: page_shapes::<M>(&arrays),
+                dtypes: page_dtypes::<M>(&arrays)?,
+                bytes: page_bytes::<M>(&arrays),
+                physical: LiveCacheBlockStorage::device(id.clone(), arrays, None),
+                imported: false,
+            };
+            let previous = state.blocks.insert(id, record);
+            debug_assert!(previous.is_none());
+            state.telemetry.report.block_seals += 1;
+        }
+        update_report_totals(&mut state);
+        drop(state);
+
+        for record in &removed {
+            remove_ephemeral_file(record);
+        }
+        self.retire_tickets(&tickets)?;
+        Ok(())
+    }
+
+    /// Retains a checkpoint's sealed sliding prefix without materializing it.
+    /// Existing blocks remain charged to this manager and its finite pool, and
+    /// may still move between tiers. Dead metadata is pruned on every admission
+    /// and discard; live storage is proportional to outstanding checkpoints.
+    pub fn retain_history(
+        &self,
+        global_layer: usize,
+        representation: CacheRepresentation,
+        start: i64,
+        end: i64,
+    ) -> Result<Arc<CacheHistoryRetention>, CacheResidencyError> {
+        let mut state = self.lock()?;
+        state
+            .history_retentions
+            .retain(|entry| entry.strong_count() > 0);
+        let retained = Arc::new(CacheHistoryRetention {
+            global_layer,
+            representation,
+            start,
+            end,
+        });
+        state.history_retentions.push(Arc::downgrade(&retained));
+        Ok(retained)
+    }
+
+    /// Discards layer blocks entirely before every live checkpoint's window.
+    pub fn discard_before(
+        &self,
+        layer: usize,
+        representation: CacheRepresentation,
+        visible_start: i64,
+        prefix_tokens: i64,
+    ) -> Result<(), CacheResidencyError> {
+        if self.options().retains_discarded_for_persistence() {
+            return Ok(());
+        }
+        let mut state = self.lock()?;
+        state
+            .history_retentions
+            .retain(|entry| entry.strong_count() > 0);
+        let ids = state
+            .blocks
+            .iter()
+            .filter(|(id, record)| {
+                id.global_layer == layer
+                    && id.representation == representation
+                    && id.end <= visible_start
+                    && id.end > prefix_tokens
+                    && state.lifecycle.lease_count(id).ok() == Some(0)
+                    && !record.imported
+                    && !state.history_retentions.iter().any(|entry| {
+                        entry
+                            .upgrade()
+                            .is_some_and(|retained| retained.contains(id))
+                    })
+            })
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        let tickets = if ids.is_empty() {
+            Vec::new()
+        } else {
+            advance_generation_locked(&mut state)
+        };
+        for id in ids {
+            if let Some(record) = state.blocks.remove(&id) {
+                state.lifecycle.remove(&id)?;
+                remove_ephemeral_file(&record);
+                state.telemetry.report.discarded_sliding_blocks += 1;
+            }
+        }
+        update_report_totals(&mut state);
+        drop(state);
+        self.retire_tickets(&tickets)?;
+        Ok(())
+    }
+
+    /// Clears every live block and advances the manager generation.
+    pub fn clear(&self) -> Result<(), CacheResidencyError> {
+        let mut state = self.lock()?;
+        state.lifecycle.clear()?;
+        let tickets = advance_generation_locked(&mut state);
+        for record in state.blocks.values() {
+            remove_ephemeral_file(record);
+        }
+        state.blocks.clear();
+        update_report_totals(&mut state);
+        drop(state);
+        self.retire_tickets(&tickets)?;
+        Ok(())
+    }
+}
+
+pub(super) fn validate_block_arrays<M: LiveCacheBackend>(
+    arrays: &Page<M>,
+    token_count: i64,
+) -> Result<(), CacheResidencyError> {
+    let [first, second] = arrays.arrays();
+    let first_dtype = M::dtype(first);
+    let second_dtype = M::dtype(second);
+    let first = M::shape(first);
+    let second = M::shape(second);
+    if matches!(arrays, CacheBlockArrays::AppendStream { .. })
+        && (first.len() != 4
+            || second.len() != 4
+            || first[..2] != [1, 1]
+            || first[3] <= 0
+            || second[..2] != [1, 1]
+            || second[3] != 0)
+    {
+        return Err(CacheResidencyError::ArrayMismatch(
+            "append stream block has invalid record geometry".into(),
+        ));
+    }
+    if first_dtype != second_dtype {
+        return Err(CacheResidencyError::ArrayMismatch(
+            "both arrays in a cache block must share a dtype".into(),
+        ));
+    }
+    let sequence_axis = match arrays {
+        CacheBlockArrays::KeyValue { .. } | CacheBlockArrays::AppendStream { .. } => {
+            if first.len() < 2 || second.len() < 2 {
+                return Err(CacheResidencyError::ArrayMismatch(
+                    "key/value blocks must have a sequence axis".into(),
+                ));
+            }
+            first.len() - 2
+        }
+        CacheBlockArrays::CompressedLatentRotary { .. } => {
+            if first.len() != 3 || second.len() != 3 {
+                return Err(CacheResidencyError::ArrayMismatch(
+                    "compressed latent blocks must be rank-3".into(),
+                ));
+            }
+            1
+        }
+    };
+    if first.get(sequence_axis).copied().unwrap_or(-1) as i64 != token_count
+        || second.get(sequence_axis).copied().unwrap_or(-1) as i64 != token_count
+    {
+        return Err(CacheResidencyError::ArrayMismatch(
+            "cache block range does not match its sequence dimensions".into(),
+        ));
+    }
+    match arrays {
+        CacheBlockArrays::KeyValue { .. } | CacheBlockArrays::AppendStream { .. } => {
+            if first.len() != second.len() || first[..first.len() - 2] != second[..second.len() - 2]
+            {
+                return Err(CacheResidencyError::ArrayMismatch(
+                    "key and value blocks must share leading dimensions".into(),
+                ));
+            }
+        }
+        CacheBlockArrays::CompressedLatentRotary { .. } => {
+            if first[0] != second[0] || first[1] != second[1] {
+                return Err(CacheResidencyError::ArrayMismatch(
+                    "compressed latent and rotary blocks must share batch and sequence dimensions"
+                        .into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cancel_record_operation<M: LiveCacheBackend>(
+    record: &CacheBlockRecord<M>,
+    report: &mut CacheResidencyReport,
+) {
+    if let Some(pending) = record.pending_disk() {
+        if pending.ticket.cancel() {
+            report.cancellations += 1;
+        }
+    }
+}
+
+fn advance_generation_locked<M: LiveCacheBackend>(
+    state: &mut CacheManagerState<M>,
+) -> Vec<PendingCacheOperation<M>> {
+    state.generation = state.generation.wrapping_add(1);
+    state.background_disk_error = None;
+    let mut tickets = Vec::new();
+    let mut demotion_reservations = Vec::new();
+    let mut read_reservations = Vec::new();
+    for record in state.blocks.values_mut() {
+        if let Some(ticket) = record.host_demotion_ticket().cloned() {
+            demotion_reservations.push((
+                ticket.operation_id,
+                RetiringHostDemotion {
+                    id: record.physical.id().clone(),
+                    device_bytes: record.bytes,
+                    host_bytes: ticket.reserved_host_bytes,
+                },
+            ));
+            tickets.push(PendingCacheOperation::HostDemotion(ticket));
+        }
+        if let Some(pending) = record.pending_disk().cloned() {
+            if pending.ticket.cancel() {
+                state.telemetry.report.cancellations += 1;
+            }
+            tickets.push(PendingCacheOperation::Disk(pending.ticket.clone()));
+            if pending.ticket.key.kind != CacheIoOperationKind::Write {
+                if let Some(reserved_host_bytes) = pending.reserved_host_bytes {
+                    read_reservations.push((
+                        pending.ticket.key.clone(),
+                        (record.physical.id().global_layer, reserved_host_bytes),
+                    ));
+                }
+                record.physical.fail_io_if_matches(&pending.ticket.key);
+            }
+        }
+    }
+    state.retiring_host_demotions.extend(demotion_reservations);
+    state.retiring_disk_reads.extend(read_reservations);
+    tickets
+}

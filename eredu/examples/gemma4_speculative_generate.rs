@@ -80,7 +80,7 @@ fn prepare_prompt(target_dir: &PathBuf, prompt: &str) -> anyhow::Result<Prepared
         &MlxBackendFactory::default(),
     )?);
     let planned =
-        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), target_dir, &plan)?;
+        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), target_dir, &plan, None)?;
     let (mut loaded, _) = planned.into_parts();
     loaded
         .prepare_chat(ChatTemplateRequest {
@@ -103,7 +103,7 @@ fn run_greedy(
         &MlxBackendFactory::default(),
     )?);
     let planned =
-        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), target_dir, &plan)?;
+        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), target_dir, &plan, None)?;
     let (mut loaded, _) = planned.into_parts();
     let prompt_tokens = loaded.encode(prompt, false)?;
     let eos = loaded.eos_token_ids().to_vec();
@@ -154,7 +154,7 @@ fn run_speculative(
         adaptive_lookahead: false,
     });
     let mut target =
-        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), target_dir, &plan)?;
+        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), target_dir, &plan, None)?;
     let output = target.generate(GenerationRequest {
         output_mode: eredu::api::OutputMode::Semantic,
         control_handle: None,

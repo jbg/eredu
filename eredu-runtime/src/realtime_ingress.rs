@@ -1,12 +1,14 @@
 //! Portable realtime-frame validation before opaque token materialization.
 
+use eredu_core::realtime_mechanisms::RealtimeHostTokenMaterializer;
 use eredu_core::{
     RealtimeChannelCadence, RealtimeChannelDeclaration, RealtimeChannelFeedback, RealtimeChannelId,
     RealtimeChannelLayout, RealtimeChannelPayload, RealtimeFrameForcing, RealtimeInputFrame,
     RealtimeSpeechConfig,
 };
 
-use crate::{RealtimeChannelIngressError, TokenDomain};
+use crate::RealtimeChannelIngressError;
+use eredu_core::sampling::TokenDomain;
 
 /// Exact schedule and token domains used to validate portable realtime input.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -230,31 +232,6 @@ impl ValidatedRealtimeInput<'_> {
             self.frame.retains_diagnostics(),
         ))
     }
-}
-
-/// Narrow backend mechanism for copying one validated host token matrix.
-pub trait RealtimeHostTokenMaterializer {
-    /// Opaque/native token tensor.
-    type Tensor;
-    /// Materialization failure.
-    type Error;
-
-    /// Copies one already validated row-major i32 matrix.
-    fn materialize_i32(
-        &mut self,
-        values: &[i32],
-        shape: [usize; 2],
-    ) -> Result<Self::Tensor, Self::Error>;
-}
-
-/// Host materialization capability for mixed categorical and dense channels.
-pub trait RealtimeHostFrameMaterializer: RealtimeHostTokenMaterializer {
-    /// Copies a validated finite f32 frame with its leading batch dimension.
-    fn materialize_f32(
-        &mut self,
-        values: &[f32],
-        shape: &[usize],
-    ) -> Result<Self::Tensor, Self::Error>;
 }
 
 /// Opaque categorical or dense channel inputs and independently selected overrides.

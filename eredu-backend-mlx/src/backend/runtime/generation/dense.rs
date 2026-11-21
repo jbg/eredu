@@ -1,8 +1,7 @@
 //! Explicit-key dense random mechanisms and supplied-uniform Gumbel selection.
 
-use eredu_runtime::{
-    dense_sampling::{validate_dense_draw_shape, validate_gumbel_epsilon},
-    DenseSamplingBackend, GumbelTruncation,
+use eredu_core::sampling::{
+    validate_dense_draw_shape, validate_gumbel_epsilon, DenseSamplingBackend, GumbelTruncation,
 };
 use safemlx::{argmax_axis, error::Exception, Array, Dtype, Stream};
 

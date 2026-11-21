@@ -1,10 +1,8 @@
 //! Sparse invocation placement from retained bank policy and logical parameters.
 use super::*;
-#[cfg(feature = "tensor-capture")]
 use eredu_core::capture::{AdmittedCapturePlan, CapturePhase, CaptureSlicePartition};
 use eredu_core::capture::{CaptureError, RoutedUnitCaptureOwnership};
 use eredu_core::routing::RoutedUnitGeometry;
-#[cfg(feature = "tensor-capture")]
 use eredu_runtime::capture::partition::{
     PartitionCaptureReceiptLimits, PartitionRoutedCapturePlacement, PartitionRoutedCaptureProducer,
     PartitionRoutedCaptureSource,
@@ -331,7 +329,6 @@ pub(in crate::component_partition) fn prediction_observations(
 }
 
 impl ComponentPartitionLayouts {
-    #[cfg(feature = "tensor-capture")]
     pub(in crate::component_partition) fn routed_placement(
         &self,
         plan: &AdmittedCapturePlan,

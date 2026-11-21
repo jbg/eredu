@@ -138,24 +138,18 @@ verified baseline `084458c34eabd80eb3bf8d85d13d3c7ea1c5b499`.
 
 The **Extended Ring conformance** workflow runs the complete synthetic Ring suite
 weekly and on manual dispatch, independently of routine CI and the release
-compatibility gate. Use it for broad distributed-runtime or model-matrix validation. It builds
-the test executable once using the optimized `conformance` profile, retaining
-debug assertions and overflow checks, and distributes every ignored Ring test across 32
-shards, excluding only the two explicitly opt-in released Moshi checkpoint tests.
-Large DeepSeek matrices expose each topology/residency configuration as an
-individual test, preserving every combination while allowing balanced sharding.
-Each test runs in a fresh process with a ten-minute limit; each shard has a
-30-minute execution budget and a 35-minute job ceiling. Timeout terminates the
-entire worker process group. Missing smoke tests, unmatched filters, and unrun
-tests after budget exhaustion fail validation. Selected tests, individual logs,
-and completed-test timings are retained even when a shard fails. Four concurrent
-shards leave a hosted macOS slot available for PR work.
+compatibility gate. It builds the `eredu` native Ring integration executable
+once with the optimized `conformance` profile. Five synthetic cases exercise
+partitioned checkpoint loading, bounded consensus, rank-local failure agreement,
+and realtime execution and publication. Released-checkpoint cases run separately
+with their pinned fixtures. Each CI case runs in a fresh process with a deadline
+that also covers its child workers. Selected tests, logs and timings are saved
+as artifacts.
 
-To run a focused Ring regression locally, reuse a built executable or let the
-runner build it, and select a test by name:
+Run a focused case locally by name:
 
 ```bash
-python3 validation/run_native_unit_tests.py --suite ring \
+python3 validation/run_native_ring_tests.py \
   --filter ring_two_process_partition_load --results-dir /tmp/eredu-ring-results
 ```
 

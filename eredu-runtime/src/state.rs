@@ -1,8 +1,8 @@
 //! Backend-neutral mutable model-state contracts.
 //!
 //! Architectures declare state geometry through [`StateLayout`]. Runtime
-//! policies select a residency realization, while concrete backends retain
-//! their native layer-state and tensor types.
+//! policies select a residency realization. Portable state owners hold the
+//! native tensors supplied by the backend’s storage contracts.
 
 use std::{marker::PhantomData, ops::Range};
 
@@ -14,6 +14,27 @@ use eredu_core::{
     LayerSchedule,
 };
 use eredu_nn::NeuralBackend;
+
+pub(crate) mod pooling;
+pub use pooling::{PoolingAttentionLayer, PoolingAttentionState, PoolingStateError};
+
+mod hybrid;
+pub use hybrid::{HybridCacheStorage, HybridLayerState, HybridState, HybridStateError};
+
+mod hybrid_attention;
+pub use hybrid_attention::HybridAttentionState;
+
+mod key_value;
+pub use key_value::{
+    KeyValueLayerState, KeyValueState, KeyValueStateError, KeyValueTransactionBranch,
+};
+
+pub(crate) mod text;
+pub use text::PortableTextState;
+pub(crate) use text::{allocate_selected_prediction_state, allocate_selected_text_state};
+
+mod allocation;
+pub use allocation::StateAllocation;
 
 /// Architecture-declared placement of one contiguous mutable-state range.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]

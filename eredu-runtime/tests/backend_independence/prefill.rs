@@ -112,7 +112,11 @@ fn distributed_prefill_cursor_rejections_preserve_committed_prefix_and_retry() {
                         } else {
                             &mut passing
                         };
-                    assert!(session.advance_prefill(&mut cursor, &(), observer).is_err());
+                    let rejection = session
+                        .advance_prefill(&mut cursor, &(), observer)
+                        .err()
+                        .expect("peer observation rejection");
+                    assert!(rejection.state_preserved());
                     assert_eq!(cursor.position(), 1);
                     assert_eq!(
                         session.report().unwrap().state_report(),

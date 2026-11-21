@@ -18,6 +18,7 @@ use std::{
 
 #[path = "persistence/retained.rs"]
 mod retained;
+pub(crate) use retained::read_live_cache_block;
 pub use retained::RetainedCacheShard;
 mod store;
 mod transfer;
@@ -106,6 +107,15 @@ pub enum PromptCachePersistenceError {
 /// Filesystem failure while publishing one ephemeral live-cache block.
 #[derive(Debug, thiserror::Error)]
 pub enum LiveCachePublicationError {
+    /// The completed host tensor has no recognized storage encoding.
+    #[error("live cache spill does not support storage encoding {0:?}")]
+    Encoding(eredu_checkpoint::StoredDtype),
+    /// The exact host tensors could not be serialized.
+    #[error("encode live cache spill: {0}")]
+    Encode(#[from] safetensors::SafeTensorError),
+    /// A live spill must own an exact write operation.
+    #[error("live cache spill requires a write operation")]
+    NotWrite,
     /// A filesystem operation failed.
     #[error("failed to {action} at {path}: {source}")]
     Io {
@@ -121,7 +131,7 @@ pub enum LiveCachePublicationError {
 
 /// Runtime-owned unique staging and atomic publication for one live-cache block.
 #[derive(Debug)]
-pub struct LiveCacheBlockPublication {
+struct LiveCacheBlockPublication {
     destination: PathBuf,
     staging: PathBuf,
     committed: bool,
@@ -129,7 +139,7 @@ pub struct LiveCacheBlockPublication {
 
 impl LiveCacheBlockPublication {
     /// Reserves unique paths derived from the complete block and rank identity.
-    pub fn begin(directory: &Path, id: &CacheBlockId) -> Self {
+    fn begin(directory: &Path, id: &CacheBlockId) -> Self {
         let process_namespace = LIVE_CACHE_PROCESS_NAMESPACE.get_or_init(|| {
             let started = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -170,17 +180,18 @@ impl LiveCacheBlockPublication {
     }
 
     /// Unique temporary path into which the backend serializes native storage.
-    pub fn staging_path(&self) -> &Path {
+    fn staging_path(&self) -> &Path {
         &self.staging
     }
 
     /// Final unique path used by the live-cache catalog.
-    pub fn destination_path(&self) -> &Path {
+    #[cfg(test)]
+    fn destination_path(&self) -> &Path {
         &self.destination
     }
 
     /// Atomically publishes the staged file without replacing an existing path.
-    pub fn commit(mut self) -> Result<PathBuf, LiveCachePublicationError> {
+    fn commit(mut self) -> Result<PathBuf, LiveCachePublicationError> {
         fs::hard_link(&self.staging, &self.destination).map_err(|source| {
             LiveCachePublicationError::Io {
                 action: "publish uniquely named live cache block",
@@ -206,6 +217,102 @@ impl Drop for LiveCacheBlockPublication {
         if !self.committed {
             let _ = fs::remove_file(&self.staging);
         }
+    }
+}
+
+/// Synchronized spill bytes awaiting a matching catalog transition.
+pub struct StagedLiveCacheBlock {
+    key: eredu_core::cache::mechanisms::CacheIoOperationKey,
+    publication: LiveCacheBlockPublication,
+    names: (&'static str, &'static str),
+    logical_bytes: u64,
+}
+
+/// Exact disk backing installed by a successful spill publication.
+pub struct PublishedLiveCacheBlock {
+    /// Unique published spill path.
+    pub path: PathBuf,
+    /// Ordered names for the two stored tensors.
+    pub names: (&'static str, &'static str),
+    /// Exact combined tensor payload length.
+    pub logical_bytes: u64,
+}
+
+/// Encodes exact host views into an uncommitted spill without copying the payload.
+pub fn stage_live_cache_block(
+    directory: &Path,
+    key: &eredu_core::cache::mechanisms::CacheIoOperationKey,
+    tensors: [eredu_core::cache::mechanisms::CacheHostTensor<'_>; 2],
+) -> Result<StagedLiveCacheBlock, LiveCachePublicationError> {
+    use eredu_checkpoint::store::safetensors_dtype_from_stored;
+    use safetensors::tensor::{TensorView, View as _};
+
+    fn view(
+        tensor: eredu_core::cache::mechanisms::CacheHostTensor<'_>,
+    ) -> Result<TensorView<'_>, LiveCachePublicationError> {
+        let dtype = safetensors_dtype_from_stored(&tensor.dtype)
+            .ok_or(LiveCachePublicationError::Encoding(tensor.dtype))?;
+        Ok(TensorView::new(dtype, tensor.shape, tensor.bytes)?)
+    }
+
+    if key.kind != eredu_core::cache::mechanisms::CacheIoOperationKind::Write {
+        return Err(LiveCachePublicationError::NotWrite);
+    }
+    let publication = LiveCacheBlockPublication::begin(directory, &key.id);
+    let names = prompt_cache_array_names(key.id.representation);
+    let [first, second] = tensors;
+    let (first, second) = (view(first)?, view(second)?);
+    let logical_bytes = (first.data_len() as u64).saturating_add(second.data_len() as u64);
+    let staging = publication.staging_path();
+    safetensors::tensor::serialize_to_file([(names.0, first), (names.1, second)], None, staging)?;
+    File::open(staging)
+        .and_then(|file| file.sync_all())
+        .map_err(|source| LiveCachePublicationError::Io {
+            action: "synchronize cache spill",
+            path: staging.to_path_buf(),
+            source,
+        })?;
+    Ok(StagedLiveCacheBlock {
+        key: key.clone(),
+        publication,
+        names,
+        logical_bytes,
+    })
+}
+
+impl StagedLiveCacheBlock {
+    /// Publishes only while the exact write still owns the active catalog entry.
+    /// Hold the catalog lock from validation through installation.
+    pub fn publish<D, H, B, HD, IO>(
+        self,
+        generation: u64,
+        storage: Option<&mut super::CacheBlockStorage<D, H, B, HD, IO>>,
+    ) -> Result<bool, LiveCachePublicationError>
+    where
+        B: From<PublishedLiveCacheBlock>,
+        HD: eredu_core::cache::mechanisms::CacheHostDemotionOperation,
+        IO: eredu_core::cache::mechanisms::CacheIoOperation,
+    {
+        let Some(storage) = storage else {
+            return Ok(false);
+        };
+        if generation != self.key.generation
+            || storage.phase() != super::CacheStoragePhase::HostWriting
+            || !storage.io_matches(&self.key)
+        {
+            return Ok(false);
+        }
+
+        let path = self.publication.commit()?;
+        let backing = PublishedLiveCacheBlock {
+            path,
+            names: self.names,
+            logical_bytes: self.logical_bytes,
+        };
+        storage
+            .finish_write(&self.key, B::from(backing))
+            .expect("validated write owns its exact catalog transition");
+        Ok(true)
     }
 }
 
@@ -496,8 +603,8 @@ impl ReversiblePromptCachePublication {
                     source,
                 }
             })?;
-            sync_directory(&self.parent)?;
             self.published = true;
+            sync_directory(&self.parent)?;
             return Ok(());
         }
         if !self.replace_existing {
@@ -541,8 +648,9 @@ impl ReversiblePromptCachePublication {
         self.previous_generation = Some(previous_generation);
         self.moved_generation = Some(target);
         sync_directory(&generations)?;
-        publish_generation_pointer(&self.destination, &generation_name, self.nonce)?;
+        // The pointer may be switched even if syncing its directory fails.
         self.published = true;
+        publish_generation_pointer(&self.destination, &generation_name, self.nonce)?;
         Ok(())
     }
 

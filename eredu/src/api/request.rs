@@ -61,46 +61,46 @@ pub struct PreparedChatGenerationSettings {
 ///
 /// `GenerationRequest::output_mode` selects semantic parsing or literal text output.
 /// The selected variant determines only how the model prompt is prefetched.
-pub enum PreparedChatInput<'a, B: eredu_core::TextGenerationBackend> {
+pub enum PreparedChatInput<'a, P> {
     /// Counted typed input whose loaded-session and chat identity are checked at execution.
     SessionBound {
         /// Exact rendered chat paired with the payload.
         prepared_chat: &'a PreparedChat,
         /// Opaque counted prompt from typed preparation.
-        payload: super::PreparedChatPayload<B>,
+        payload: super::PreparedChatPayload<P>,
     },
     /// Tokenize and prefill the rendered prompt stored in the prepared chat.
     RenderedPrompt(&'a PreparedChat),
     /// Prefill exact token IDs with the chat's semantic and termination policy.
-    /// Native prompt construction occurs inside coordinated run preparation.
+    /// Prompt preparation occurs inside coordinated run preparation.
     TokenIds {
         /// Prepared chat supplying generation policy.
         prepared_chat: &'a PreparedChat,
         /// Exact prefix; generation never forces the tested prediction.
         token_ids: Vec<u32>,
     },
-    /// Prefill an already-tokenized and backend-prepared model input.
+    /// Prefill the session driver's already-prepared input.
     ///
-    /// The caller must ensure that `model_input` represents the same rendered
+    /// The caller must ensure that `prompt` represents the same rendered
     /// conversation as `prepared_chat`. This variant supports ordered image,
     /// audio, and video parts without discarding the chat's tool runtime plan.
-    PreparedBackendInput {
+    PreparedInput {
         /// Prepared chat that supplies generation and semantic-streaming state.
         prepared_chat: &'a PreparedChat,
-        /// Backend-owned prompt supplied directly to model prefill.
-        prompt: B::Prompt,
+        /// Session-prepared prompt supplied directly to model prefill.
+        prompt: P,
     },
 }
 
-impl<'a, B: eredu_core::TextGenerationBackend> PreparedChatInput<'a, B> {
+impl<'a, P> PreparedChatInput<'a, P> {
     /// Creates a text-only input from the prepared chat's rendered prompt.
     pub const fn rendered_prompt(prepared_chat: &'a PreparedChat) -> Self {
         Self::RenderedPrompt(prepared_chat)
     }
 
-    /// Binds an opaque backend-prepared prompt to prepared-chat semantics.
-    pub fn prepared_backend_input(prepared_chat: &'a PreparedChat, prompt: B::Prompt) -> Self {
-        Self::PreparedBackendInput {
+    /// Binds an already prepared session prompt to prepared-chat semantics.
+    pub fn prepared_input(prepared_chat: &'a PreparedChat, prompt: P) -> Self {
+        Self::PreparedInput {
             prepared_chat,
             prompt,
         }
@@ -120,16 +120,16 @@ impl<'a, B: eredu_core::TextGenerationBackend> PreparedChatInput<'a, B> {
             Self::RenderedPrompt(prepared_chat)
             | Self::TokenIds { prepared_chat, .. }
             | Self::SessionBound { prepared_chat, .. }
-            | Self::PreparedBackendInput { prepared_chat, .. } => prepared_chat,
+            | Self::PreparedInput { prepared_chat, .. } => prepared_chat,
         }
     }
 
-    /// Returns the explicitly prepared backend prompt, when present.
-    pub const fn backend_prompt(&self) -> Option<&B::Prompt> {
+    /// Returns the explicitly prepared session prompt, when present.
+    pub const fn prepared_prompt(&self) -> Option<&P> {
         match self {
-            Self::SessionBound { payload, .. } => payload.backend_prompt(),
+            Self::SessionBound { payload, .. } => payload.prepared_prompt(),
             Self::RenderedPrompt(_) | Self::TokenIds { .. } => None,
-            Self::PreparedBackendInput { prompt, .. } => Some(prompt),
+            Self::PreparedInput { prompt, .. } => Some(prompt),
         }
     }
 
@@ -161,9 +161,9 @@ impl<'a, B: eredu_core::TextGenerationBackend> PreparedChatInput<'a, B> {
 /// Cache and execution-stream ownership belong to the selected backend
 /// session. The prepared chat's portable constraint controller supplies a
 /// vocabulary filter to the backend before each sampling submission.
-pub struct GenerationRequest<'a, B: eredu_core::TextGenerationBackend, F> {
+pub struct GenerationRequest<'a, P, F> {
     /// Explicit prompt source and embedded format/runtime plan.
-    pub input: PreparedChatInput<'a, B>,
+    pub input: PreparedChatInput<'a, P>,
     /// Semantic parsing or literal text decoding.
     pub output_mode: OutputMode,
     /// Portable sampling configuration, token limit, and random seed.
@@ -178,7 +178,7 @@ pub struct GenerationRequest<'a, B: eredu_core::TextGenerationBackend, F> {
     pub on_event: F,
 }
 
-impl<B: eredu_core::TextGenerationBackend, F> GenerationRequest<'_, B, F> {
+impl<P, F> GenerationRequest<'_, P, F> {
     pub(super) fn link_cancellation(&mut self) {
         if let Some(control) = self.control_handle {
             self.cancellation = self.cancellation.linked(control.cancellation());
@@ -271,8 +271,8 @@ pub(super) enum PreparedChatSetupError {
     Semantic(String),
 }
 
-pub(super) struct SourceRequest<'a, B: eredu_core::TextGenerationBackend, D, F> {
-    pub request: GenerationRequest<'a, B, F>,
+pub(super) struct SourceRequest<'a, P, D, F> {
+    pub request: GenerationRequest<'a, P, F>,
     pub drafting: SpeculativeDraft<'a, D>,
     pub limits: Option<super::SpeculationOptions>,
     pub started: std::time::Instant,
@@ -285,9 +285,9 @@ pub(super) struct SourceRequest<'a, B: eredu_core::TextGenerationBackend, D, F> 
 /// before dispatch; the backend allocates only its execution cache and sampling
 /// state. Lanes are shared by the external-assistant and embedded-head drafting
 /// strategies.
-pub struct PreparedChatSpeculativeBatchLane<'a, B: eredu_core::TextGenerationBackend> {
+pub struct PreparedChatSpeculativeBatchLane<'a, P> {
     /// Explicit prompt source and embedded format/runtime plan.
-    pub input: PreparedChatInput<'a, B>,
+    pub input: PreparedChatInput<'a, P>,
     /// Portable sampling configuration, token limit, and independent random root.
     pub settings: PreparedChatGenerationSettings,
     /// Additional decoded text sequences that terminate only this lane.
@@ -303,13 +303,13 @@ pub struct PreparedChatSpeculativeBatchLane<'a, B: eredu_core::TextGenerationBac
 /// Cohesive fair-scheduler request for independent prepared-chat speculative lanes.
 /// Used by `PlannedModel::generate_speculative_batch` and
 /// `generate_speculative_batch`.
-pub struct PreparedChatSpeculativeBatchRequest<'a, B: eredu_core::TextGenerationBackend, D> {
+pub struct PreparedChatSpeculativeBatchRequest<'a, P, D> {
     /// Semantic parsing or literal text for every lane.
     pub output_mode: OutputMode,
     /// Embedded or separately loaded draft-model selection.
     pub drafting: SpeculativeDraft<'a, D>,
     /// Independently executable prepared-chat lanes.
-    pub lanes: Vec<PreparedChatSpeculativeBatchLane<'a, B>>,
+    pub lanes: Vec<PreparedChatSpeculativeBatchLane<'a, P>>,
 }
 
 /// Facade-prepared speculative grammar state consumed by a backend sampler.
@@ -594,26 +594,22 @@ pub(super) enum GenerationStepKind {
     Failed,
 }
 
-#[cfg(feature = "tensor-capture")]
-pub(super) type GenerationStepCallback<'a> =
-    dyn FnMut(GenerationStepKind, Option<eredu_core::capture::CapturedStep>, f64) + 'a;
-#[cfg(not(feature = "tensor-capture"))]
-pub(super) type GenerationStepCallback<'a> = dyn FnMut(GenerationStepKind, f64) + 'a;
-
-pub(super) struct BackendGenerationTokenSource<'a, B>
+pub(super) struct BackendGenerationTokenSource<'a, B, S>
 where
     B: eredu_core::TextGenerationBackend,
+    S: eredu_core::TextExecutionSession<B>,
 {
-    pub(super) generator: eredu_core::ControlledTextGeneration<'a, B, ConstraintController>,
+    pub(super) generator: eredu_core::ControlledTextGeneration<'a, B, ConstraintController, S>,
     pub(super) on_token: Option<&'a mut GenerationStepCallback<'a>>,
     pub(super) delivery_failure: Option<&'a dyn Fn() -> Option<eredu_core::capture::CaptureError>>,
     pub(super) generation_started: std::time::Instant,
     pub(super) time_to_first_token: Option<std::time::Duration>,
 }
 
-impl<B> CommittedTokenSource for BackendGenerationTokenSource<'_, B>
+impl<B, S> CommittedTokenSource for BackendGenerationTokenSource<'_, B, S>
 where
     B: eredu_core::TextGenerationBackend,
+    S: eredu_core::TextExecutionSession<B>,
 {
     type Error = eredu_core::ControlledTextGenerationError<B::Error, ConstraintError>;
 
@@ -2293,3 +2289,10 @@ pub(super) fn prepare_chat_from_parts_with_history(
         profile_stop_sequences: profile.stop_sequences,
     })
 }
+
+#[cfg(feature = "tensor-capture")]
+pub(super) type GenerationStepCallback<'a> =
+    dyn FnMut(GenerationStepKind, Option<eredu_core::capture::CapturedStep>, f64) + 'a;
+
+#[cfg(not(feature = "tensor-capture"))]
+pub(super) type GenerationStepCallback<'a> = dyn FnMut(GenerationStepKind, f64) + 'a;

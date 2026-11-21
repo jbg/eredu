@@ -6,7 +6,8 @@ use crate::routed_text::{
 };
 use eredu_checkpoint::recipe::RecipeCatalog;
 use eredu_checkpoint::validation::ResolvedCheckpointPlan;
-use eredu_runtime::{AppendStreamBinding, BackendMechanismCapabilities, SelectedRowLookupPlans};
+use eredu_core::cache::append_stream::AppendStreamBinding;
+use eredu_runtime::{BackendMechanismCapabilities, SelectedRowLookupPlans};
 
 use checkpoint::table::TableDeclaration;
 

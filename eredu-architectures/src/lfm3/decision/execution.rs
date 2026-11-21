@@ -149,9 +149,10 @@ where
         context: &<B::Tensor as Tensor>::Context,
         input_lowering: I,
     ) -> Result<Self, DecisionExecutionError> {
-        let decoder = DecisionDecoder::<B, S, M, C>::local(
-            mechanisms.bind_local(|| decoder.prepare_local(residency, context))?,
-        );
+        use eredu_core::checkpoint_mechanisms::unit_binding::ComponentPreparationScope as _;
+        let scope = mechanisms.begin_local_preparation()?;
+        let prepared = scope.finish(decoder.prepare_local(residency, context))?;
+        let decoder = DecisionDecoder::<B, S, M, C>::local(prepared.bind(mechanisms, context)?);
         Ok(Self::from_decoder(
             preparation,
             decoder,
@@ -200,8 +201,8 @@ where
             communication,
             context,
             |pipeline| {
-                mechanisms
-                    .bind_pipeline(pipeline, world)
+                pipeline
+                    .bind(mechanisms, world)
                     .map(|(execution, _)| execution)
             },
         )?;

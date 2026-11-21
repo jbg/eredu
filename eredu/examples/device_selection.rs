@@ -1,14 +1,14 @@
 //! Device policy shared by the standalone examples.
 
 use anyhow::{Context, Result};
-use eredu_core::{AutomaticPlanningBackend, DevicePlan, HardwareDeviceKind};
+use eredu_core::{BackendHardware, DevicePlan, HardwareDeviceKind};
 
-pub fn default_device(factory: &impl AutomaticPlanningBackend) -> Result<DevicePlan> {
+pub fn default_device(factory: &impl BackendHardware) -> Result<DevicePlan> {
     select_device(factory, &[HardwareDeviceKind::Gpu, HardwareDeviceKind::Cpu])
 }
 
 fn select_device(
-    factory: &impl AutomaticPlanningBackend,
+    factory: &impl BackendHardware,
     preferred: &[HardwareDeviceKind],
 ) -> Result<DevicePlan> {
     let backend = factory.backend_id();

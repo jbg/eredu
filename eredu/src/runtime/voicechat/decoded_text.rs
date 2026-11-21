@@ -6,9 +6,7 @@ use eredu_architectures::voicechat::{
     host::TextControls, observation::OwnedHostOutput, schedule::Step,
 };
 use eredu_core::BackendFailure;
-use eredu_runtime::execution_control::{
-    snapshot_value_estimate, SnapshotReservation, SnapshotValue,
-};
+use eredu_runtime::execution_control::{snapshot_value_estimate, SnapshotRetention, SnapshotValue};
 
 use crate::api::TextDecoder;
 
@@ -81,7 +79,7 @@ impl SnapshotValue for VoiceChatAgentDecoder {
         ])
     }
 
-    fn copy_snapshot_value(&self, _: &SnapshotReservation) -> Result<Self, BackendFailure> {
+    fn copy_snapshot_value(&self, _: &SnapshotRetention) -> Result<Self, BackendFailure> {
         let mut ids = Vec::new();
         ids.try_reserve_exact(self.decoder.ids.len())
             .map_err(BackendFailure::from_error)?;

@@ -194,7 +194,7 @@ impl eredu_runtime::execution_control::SnapshotValue for AudioForward {
     }
     fn copy_snapshot_value(
         &self,
-        _: &eredu_runtime::execution_control::SnapshotReservation,
+        _: &eredu_runtime::execution_control::SnapshotRetention,
     ) -> Result<Self, eredu_core::BackendFailure> {
         Ok(self.clone())
     }

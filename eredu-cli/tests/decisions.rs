@@ -163,7 +163,7 @@ fn ordinary_and_controlled_facade_preserve_pins_and_canonical_commitment() {
     fixture(root.path());
     let plan = ExecutionPlan::fully_resident(eredu_core::DevicePlan::new("mlx", "cpu:0").unwrap());
     let (mut model, _) =
-        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), root.path(), &plan)
+        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), root.path(), &plan, None)
             .unwrap()
             .into_parts();
     let chat = model

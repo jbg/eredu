@@ -81,17 +81,13 @@ impl Drop for TrimCacheOnRetirement {
 }
 
 /// Preallocated ownership staged for explicit, unlocked ordinary-host cleanup.
-pub(crate) struct OrdinaryRetirement<T: 'static>(Option<Box<Node<T>>>);
+#[doc(hidden)]
+pub struct OrdinaryRetirement<T: 'static>(Option<Box<Node<T>>>);
 
 impl<T: 'static> OrdinaryRetirement<T> {
     pub(crate) fn new(value: T) -> Self {
         prepare_thread();
         Self(Some(Box::new(Node { value, next: None })))
-    }
-
-    /// Transfers an unretired owner to an ordinary caller without running Drop.
-    pub(crate) fn into_inner(mut self) -> T {
-        self.0.take().expect("live retirement owner").value
     }
 }
 
@@ -188,71 +184,5 @@ pub(crate) fn reclaim_all() {
         {
             return;
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    };
-
-    struct Witness(Arc<AtomicUsize>);
-    impl Drop for Witness {
-        fn drop(&mut self) {
-            self.0.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    #[test]
-    fn ordinary_retirement_into_inner_transfers_identity_without_retirement() {
-        let drops = Arc::new(AtomicUsize::new(0));
-        let owner = OrdinaryRetirement::new(Witness(Arc::clone(&drops)));
-        let witness = owner.into_inner();
-        assert!(Arc::ptr_eq(&drops, &witness.0));
-        reclaim();
-        assert_eq!(drops.load(Ordering::SeqCst), 0);
-        drop(witness);
-        assert_eq!(drops.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn ordinary_retirement_never_drops_owners_under_the_runtime_lock() {
-        let drops = Arc::new(AtomicUsize::new(0));
-        let mut owner = Some(OrdinaryRetirement::new(Witness(Arc::clone(&drops))));
-        loop {
-            if safemlx::try_with_submission_retirement(|| {
-                drop(owner.take());
-                reclaim();
-                assert_eq!(drops.load(Ordering::SeqCst), 0);
-            })
-            .is_some()
-            {
-                break;
-            }
-            std::thread::yield_now();
-        }
-        reclaim();
-        assert_eq!(drops.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn ordinary_retirement_defers_reentrant_new_owners_to_the_next_snapshot() {
-        struct Reentrant(Arc<AtomicUsize>);
-        impl Drop for Reentrant {
-            fn drop(&mut self) {
-                drop(OrdinaryRetirement::new(Witness(Arc::clone(&self.0))));
-                reclaim();
-                assert_eq!(self.0.load(Ordering::SeqCst), 0);
-            }
-        }
-        let drops = Arc::new(AtomicUsize::new(0));
-        drop(OrdinaryRetirement::new(Reentrant(Arc::clone(&drops))));
-        reclaim();
-        assert_eq!(drops.load(Ordering::SeqCst), 0);
-        reclaim();
-        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 }

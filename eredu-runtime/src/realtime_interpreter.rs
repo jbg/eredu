@@ -1,5 +1,8 @@
 //! Family-blind interpretation of portable realtime schedule transitions.
 
+use eredu_core::realtime_mechanisms::RealtimeFrameTensorMechanisms;
+#[cfg(test)]
+use eredu_core::realtime_mechanisms::RealtimeHostTokenMaterializer;
 use std::collections::BTreeMap;
 
 use eredu_core::{
@@ -13,17 +16,6 @@ use crate::{
     RealtimeCompletedFrameError, RealtimeFrameChannel, RealtimeIngressContract,
     RealtimePayloadHistory, RealtimePayloadHistoryError,
 };
-
-/// Narrow tensor mechanisms needed to populate and resolve scheduled slots.
-pub trait RealtimeFrameTensorMechanisms {
-    /// Opaque/native token payload.
-    type Tensor: Clone;
-    /// Mechanism failure.
-    type Error;
-
-    /// Creates one batch-by-one column containing an architecture-selected token.
-    fn filled_column(&mut self, token: i32, batch: usize) -> Result<Self::Tensor, Self::Error>;
-}
 
 /// Fully resolved temporal inputs and ordered target directives for one step.
 pub struct PreparedRealtimeFrame<T> {
@@ -467,9 +459,10 @@ mod tests {
     };
 
     use crate::{
-        RealtimeHostTokenMaterializer, RealtimeIngressContract, RealtimePayloadContract,
-        RealtimePayloadGeneration, RealtimePayloadOwnerIdentity, TokenDomain,
+        RealtimeIngressContract, RealtimePayloadContract, RealtimePayloadGeneration,
+        RealtimePayloadOwnerIdentity,
     };
+    use eredu_core::sampling::TokenDomain;
 
     use super::*;
 

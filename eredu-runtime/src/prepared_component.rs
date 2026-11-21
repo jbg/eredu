@@ -6,27 +6,14 @@ use crate::{
     place_weight_bindings, prepare_resource_bindings, ArchitectureParameterDescription,
     BindingPlacementError, ExecutionUnitAddress, ExecutionUnitLayout, ExecutionUnitLayoutError,
     LocalModelLayout, ParameterGroupOwner, ParameterMemberSpec, ParameterResourceRecipes,
-    ParameterStorageId, RecipeBindingError, WeightBinding, WeightBindingPlan,
+    ParameterStorageId, RecipeBindingError,
 };
 use eredu_checkpoint::{
     recipe::{DerivedWeightRecipe, RecipeAlias, RecipeDtype, RecipeError},
     store::{CheckpointSource, RestrictedCheckpointSource, SharedCheckpointSource, StoreError},
 };
+use eredu_core::residency::parameter_binding::{WeightBinding, WeightBindingPlan};
 use std::{collections::BTreeMap, sync::Arc};
-
-/// Native preparation scope for a retained component plan.
-pub trait ComponentPreparation: Sized {
-    /// Execution context used by the bound components.
-    type Context: ?Sized;
-
-    /// Applies the native preparation and recovery lifecycle around portable binding.
-    fn prepare_components<T, E>(
-        &self,
-        bind: impl FnOnce(&Self, &Self::Context) -> Result<T, E>,
-    ) -> Result<T, E>
-    where
-        E: From<eredu_core::BackendFailure>;
-}
 
 /// Failure preparing exact component resources without allocating native values.
 #[derive(Debug, thiserror::Error)]

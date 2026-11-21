@@ -1,5 +1,6 @@
 use super::*;
-use crate::{AppendStreamBinding, AppendStreamLimits, AppendStreamSpec, PartitionState};
+use crate::PartitionState;
+use eredu_core::cache::append_stream::{AppendStreamBinding, AppendStreamLimits, AppendStreamSpec};
 use eredu_core::{cache::AppendStreamPolicy, AttentionPolicy, LayerSchedule};
 
 fn layout(width: i32, layers: usize, cadence: i32) -> StateLayout {
@@ -122,7 +123,11 @@ fn selected_streams_preserve_partition_ownership_geometry_and_replica_allowances
     let (requirements, capabilities) = fixture();
     let selected = select(&requirements, &capabilities, CacheResidencyPolicy::Device).unwrap();
     assert_eq!(
-        selected.state().append_streams(),
+        selected
+            .state()
+            .append_streams()
+            .cloned()
+            .collect::<Vec<_>>(),
         requirements.append_streams()
     );
     let total = selected.state().append_stream_allowances();
@@ -137,19 +142,15 @@ fn selected_streams_preserve_partition_ownership_geometry_and_replica_allowances
     let partition = PartitionState::new(selected.state().layout().slice(1..3).unwrap(), 1).unwrap();
     let local = selected.state().for_partition(&partition).unwrap();
     assert_eq!(
-        local
-            .append_streams()
-            .iter()
-            .map(|b| b.layer)
-            .collect::<Vec<_>>(),
+        local.append_streams().map(|b| b.layer).collect::<Vec<_>>(),
         [0, 1]
     );
     assert_eq!(local.append_stream_allowances().scratch_bytes, 768);
-    assert_eq!(local.append_streams()[0].lanes, 2);
+    assert_eq!(local.append_streams().next().unwrap().lanes, 2);
     let narrow = PartitionState::new(layout(2, 2, 4), 1).unwrap();
     assert!(selected.state().for_partition(&narrow).is_err());
     let local = selected.state().for_partitioned_geometry(&narrow).unwrap();
-    assert_eq!(local.append_streams()[0].spec.width, 2);
+    assert_eq!(local.append_streams().next().unwrap().spec.width, 2);
     // Narrowed TP geometry retains the admitted allowances; no replica budget is refunded.
     assert_eq!(local.append_stream_allowances().payload_bytes, 1024);
     assert!(selected
@@ -218,7 +219,11 @@ fn paged_stream_admission_checks_page_geometry_and_device_capacity() {
     assert!(select(&requirements, &capabilities, policy(4, 63)).is_err());
     let selected = select(&requirements, &capabilities, policy(4, 64)).unwrap();
     assert_eq!(
-        selected.state().append_streams(),
+        selected
+            .state()
+            .append_streams()
+            .cloned()
+            .collect::<Vec<_>>(),
         requirements.append_streams()
     );
 }
@@ -297,7 +302,7 @@ fn standalone_state_selection_preserves_text_admission_and_rejects_missing_lifec
         let text =
             select_replicated_text_realization(&requirements, &request, &capabilities).unwrap();
         assert_eq!(&selected, text.state());
-        assert_eq!(selected.append_streams(), state.append_streams());
+        assert!(selected.append_streams().eq(state.append_streams()));
         assert_eq!(selected.append_stream_allowances().payload_bytes, 1536);
         let mut missing = capabilities.state().clone();
         missing.components.pop();

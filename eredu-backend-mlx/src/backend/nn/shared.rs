@@ -1,24 +1,25 @@
 //! MLX implementation of backend-neutral neural operators.
 
+use eredu_core::checkpoint_mechanisms::{CheckpointParameterBackend, ParameterTransferBackend};
+use eredu_core::SubmissionBackend;
+
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
-    rc::Rc,
     sync::Arc,
 };
 
 use eredu_checkpoint::LinearFormat;
 use eredu_core::{checkpoint::TensorDtype, Completion, Submission};
 use eredu_nn::{
-    validate_parameter_topology, AttentionCache, AttentionRequest, BlockwiseAttentionBackend,
-    BlockwiseAttentionSpec, EmbeddingLookupPolicy, EmbeddingOperator, EmbeddingSpec,
-    Error as ComputeError, GatedDeltaScanInput, GatedDeltaScanOutput, GatedProductGroupLayout,
-    GatedProductPolicy, GroupScoring, GroupSelection, GroupSelectionOperator,
-    GroupedGatedProductOperator, GroupedGatedProductSpec, GroupedNeuralBackend,
-    GroupedRelu2Operator, GroupedRelu2Spec, HyperConnectionOperator, HyperConnectionSpec,
-    HyperConnectionState, HyperHeadOperator, HyperHeadSpec, HyperNeuralBackend,
-    IndexedAttentionInput, JointGroupSelection, JointGroupSelectionInput, LinearFormatSpec,
-    LinearOperator, LinearSpec, NeuralBackend, NormalizationConstructionSpec,
+    AttentionRequest, BlockwiseAttentionBackend, BlockwiseAttentionSpec, EmbeddingLookupPolicy,
+    EmbeddingOperator, EmbeddingSpec, Error as ComputeError, GatedDeltaScanInput,
+    GatedDeltaScanOutput, GatedProductGroupLayout, GatedProductPolicy, GroupScoring,
+    GroupSelection, GroupSelectionOperator, GroupedGatedProductOperator, GroupedGatedProductSpec,
+    GroupedNeuralBackend, GroupedRelu2Operator, GroupedRelu2Spec, HyperConnectionOperator,
+    HyperConnectionSpec, HyperConnectionState, HyperHeadOperator, HyperHeadSpec,
+    HyperNeuralBackend, IndexedAttentionInput, JointGroupSelection, JointGroupSelectionInput,
+    LinearFormatSpec, LinearOperator, LinearSpec, NeuralBackend, NormalizationConstructionSpec,
     NormalizationOperator, NormalizationScale, ParameterMetadata, ParameterSpec, ParameterVisitor,
     ParameterVisitorMut, Parameterized, PooledAttentionInput, PooledPositionInput,
     RelativeAttentionInput, RotaryOperator, RotaryPosition, SegmentedAttentionInput,
@@ -26,12 +27,7 @@ use eredu_nn::{
     TensorParallelGroupedGatedProductOperator, TensorParallelGroupedOutput,
     TensorParallelGroupedRelu2Operator, TopKGroupSelectorSpec, VocabularyParallelRange,
 };
-use eredu_runtime::{
-    BarrierBackend, BroadcastBackend, CommunicationBackend, CommunicationPeerCounts,
-    EvenGatherBackend, FailureAgreementBackend, ParameterBackend, PointToPointBackend,
-    RoleExactBoundaryValue, SubmissionBackend, SumReductionBackend, TransferBackend,
-    UnevenGatherBackend, VariableAllToAllBackend,
-};
+
 use ref_cast::RefCast;
 use safemlx::ops::{
     arange, argpartition_axis, broadcast_to, concatenate_axis, einsum,
@@ -55,15 +51,11 @@ use crate::backend::{
         rope::{self, RopeVariant},
         tensor::validate_token_domain,
     },
-    runtime::cache::kv::{
-        BlockwiseAttentionAccumulator, ConcatKeyValueCache, KeyValueAttentionBlock, KeyValueCache,
-        PagedKeyValueCache,
-    },
+    runtime::cache::kv::{BlockwiseAttentionAccumulator, KeyValueAttentionBlock},
 };
 use crate::MlxTensor;
 use crate::{
-    module::{Module, ModuleParamRef, PhysicalParameters},
-    nested::NestedValue,
+    module::{Module, PhysicalParameters},
     nn,
 };
 

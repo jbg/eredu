@@ -1,5 +1,6 @@
 //! Architecture-owned speech startup and invocation over native mechanisms.
 
+use eredu_core::realtime_mechanisms::{RealtimeQueue, RealtimeStartupMechanisms};
 use std::sync::Arc;
 
 use eredu_architectures::voicechat::{
@@ -8,7 +9,7 @@ use eredu_architectures::voicechat::{
     preparation::Generation,
 };
 use eredu_core::RealtimeDecisionDiagnostics;
-use eredu_runtime::{RealtimeStartupMechanisms, SpeechRealtimeMechanisms};
+use eredu_runtime::{SharedRealtimeExecution, SpeechRealtimeMechanisms};
 
 use super::{
     VoiceChatExecutionError, VoiceChatExecutionInputs, VoiceChatExecutor,
@@ -17,36 +18,38 @@ use super::{
 };
 use crate::api::realtime::{PreparedSpeechSelection, ShareSpeechExecution, SpeechRealtimeSession};
 
-type NativeTensor<M> = <<M as SpeechRealtimeMechanisms>::Neural as eredu_nn::NeuralBackend>::Tensor;
+type NativeTensor<M> = <<M as eredu_core::realtime_mechanisms::SpeechRealtimeNative>::Neural as eredu_nn::NeuralBackend>::Tensor;
 
 type Components<M> = BoundVoiceChatComponents<
-    <M as SpeechRealtimeMechanisms>::Neural,
-    <M as SpeechRealtimeMechanisms>::Backbone,
-    <M as SpeechRealtimeMechanisms>::Components,
-    <M as SpeechRealtimeMechanisms>::Cohort,
+    <M as eredu_core::realtime_mechanisms::SpeechRealtimeNative>::Neural,
+    eredu_runtime::state::HybridState<
+        <M as eredu_core::realtime_mechanisms::SpeechRealtimeNative>::CacheBackend,
+    >,
+    <M as eredu_core::realtime_mechanisms::SpeechRealtimeNative>::Components,
+    std::convert::Infallible,
 >;
 type SpeechGeneration<M> = Generation<
     NativeTensor<M>,
-    <M as SpeechRealtimeMechanisms>::Joint,
+    eredu_runtime::SpeechRealtimeState<M>,
     <M as RealtimeStartupMechanisms>::Random,
     <M as RealtimeStartupMechanisms>::Completion,
 >;
 type SpeechBranch<M> = LocalInvocationBranch<
     NativeTensor<M>,
-    <M as SpeechRealtimeMechanisms>::JointBranch,
+    eredu_runtime::SpeechRealtimeStateBranch<M>,
     <M as RealtimeStartupMechanisms>::Random,
     <M as RealtimeStartupMechanisms>::Completion,
 >;
 
 struct SpeechExecutor<M: SpeechRealtimeMechanisms> {
-    execution: M::Owner<Components<M>>,
+    execution: SharedRealtimeExecution<Components<M>, M::Queue>,
     inputs: Arc<VoiceChatStartupInputs<NativeTensor<M>>>,
 }
 
 impl<M: SpeechRealtimeMechanisms> ShareSpeechExecution for SpeechExecutor<M> {
     fn share_for_fork(&self) -> Self {
         Self {
-            execution: M::share(&self.execution),
+            execution: self.execution.share(),
             inputs: Arc::clone(&self.inputs),
         }
     }
@@ -56,7 +59,7 @@ impl<M: SpeechRealtimeMechanisms>
     VoiceChatExecutor<SpeechGeneration<M>, RealtimeDecisionDiagnostics> for SpeechExecutor<M>
 {
     fn is_busy(&self) -> bool {
-        M::is_busy(&self.execution)
+        self.execution.is_busy()
     }
 
     fn submit(
@@ -73,13 +76,15 @@ impl<M: SpeechRealtimeMechanisms>
             speech: self.inputs.speech,
         };
         work.submit(branch, &inputs, |branch, invocation| {
-            M::submit(
+            eredu_runtime::submit_speech_realtime_frame::<M, _, _, _, _, _, _, _, _>(
                 &self.execution,
                 branch,
                 invocation,
                 |state| &state.neural,
                 |state, visit| state.visit_component_tensors(visit),
-                VoiceChatHostObserver::new(M::observer(&self.execution)),
+                VoiceChatHostObserver::new(eredu_runtime::RealtimeChannelObserver::new(
+                    self.execution.queue().readback(),
+                )),
                 |components, branch, context, begin| {
                     components.invoke_local::<M::Sampling, _, _>(
                         invocation,
@@ -108,10 +113,13 @@ pub(crate) fn bind_speech<M: SpeechRealtimeMechanisms>(
         mechanisms,
         |construction, frontend, residency| {
             let (components, input) = construction
-                .materialize::<M::Neural, M::Backbone, _, M::Cohort>(
+                .materialize::<M::Neural, eredu_runtime::state::HybridState<M::CacheBackend>, _, std::convert::Infallible>(
                     frontend, residency, &binder,
                 )?;
-            Ok((mechanisms.own(components), input))
+            Ok((
+                SharedRealtimeExecution::new(components, mechanisms.speech_queue()),
+                input,
+            ))
         },
         |execution, inputs| SpeechExecutor::<M> {
             execution,

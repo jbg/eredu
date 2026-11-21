@@ -7,14 +7,10 @@ pub mod scheduler;
 
 pub use scheduler::SpeculativeComponentTimingGuard;
 
+use eredu_core::speculative::{SpeculativeMechanism, SpeculativeMechanismCapabilities};
 use eredu_core::{
     BoundedCompletion, BoundedCompletionOutcome, BoundedCompletionWait, Completion,
-    CompletionCancellationMode, SamplingPlacement, SpeculativeDraftRandomPosition,
-    SpeculativeExecutionTopology, SpeculativeSampling, TokenizerCompatibilityProof,
-};
-use eredu_runtime::{
-    SelectedSpeculativeRealization, SpeculativeMechanism, SpeculativeMechanismCapabilities,
-    SpeculativeSampler,
+    CompletionCancellationMode, SpeculativeDraftRandomPosition,
 };
 use safemlx::{
     error::Exception,
@@ -25,11 +21,8 @@ use safemlx::{
 };
 
 use crate::{
-    backend::error::Error,
-    backend::nn::shared::{MlxModule, MlxNeuralBackend},
-    backend::random::RandomState,
-    backend::runtime::generation::MlxSamplingBackend,
-    MlxTensor,
+    backend::error::Error, backend::nn::shared::MlxNeuralBackend, backend::random::RandomState,
+    backend::runtime::generation::MlxSamplingBackend, MlxTensor,
 };
 
 mod assistant;
@@ -37,24 +30,13 @@ pub(crate) mod autoregressive;
 mod completion;
 mod execution_streams;
 pub(super) mod memory_observation;
-mod parameter_policy;
 mod sampling;
 pub(crate) mod state_snapshot;
 
-pub use assistant::MlxDrafter;
-pub(crate) use assistant::{
-    speculative_mechanism_capabilities, MlxAssistantPreparationVisitor, MlxExternalAssistant,
-};
+pub(crate) use assistant::speculative_mechanism_capabilities;
+pub use assistant::MlxAssistantBinder;
+#[doc(hidden)]
+pub use assistant::MlxDraftBinding;
+pub(super) use assistant::MlxDraftStorage;
 pub use completion::MlxSpeculativeCompletion;
-pub(in crate::composition::mlx) use execution_streams::BorrowedTargetObserver;
-pub use execution_streams::SpeculativeExecutionStreams;
-#[cfg(test)]
-use sampling::array_probability_at;
-#[cfg(feature = "tensor-capture")]
-pub(crate) use sampling::validate_control_capture;
-pub use sampling::MlxSpeculativeSampling;
-
-#[cfg(test)]
-mod completion_tests;
-#[cfg(test)]
-mod test_fixture;
+pub(super) use sampling::MlxSpeculativeSamplingPrimitives;

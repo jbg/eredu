@@ -1,14 +1,26 @@
 //! Backend-neutral ownership and admission algorithms for live model caches.
 //!
-//! A cache backend owns concrete tensors, transfer objects, and persistent
-//! files. This module owns both each session's block/lease/tail lifecycle and
-//! the process-wide accounting boundary shared by independently managed cache
-//! sessions. Reservations are RAII tokens: an admitted resource remains charged
+//! A cache backend supplies concrete tensors and transfer operations. This
+//! module owns each session's catalog, leases, tails, spill files, and the
+//! process-wide accounting boundary shared by cache sessions. Reservations are RAII tokens: an admitted resource remains charged
 //! until its exact backend transition either publishes the bytes into a
 //! registered manager or drops the reservation.
 
 mod executor;
+mod layer_append_streams;
 mod lifecycle;
+pub use layer_append_streams::{LayerAppendStream, LayerAppendStreamError, LayerAppendStreams};
+mod compressed;
+pub mod live;
+mod pooling;
+pub use pooling::{PoolingCache, PoolingCacheState};
+mod paged_append_stream;
+pub use paged_append_stream::PagedAppendStream;
+mod paged_key_value;
+pub use paged_key_value::PagedKeyValueCache;
+mod resident_key_value;
+pub use compressed::CompressedLatentCache;
+pub use resident_key_value::ResidentKeyValueCache;
 mod persistence;
 mod policy;
 mod storage;
@@ -20,26 +32,22 @@ pub use executor::{
     CacheIoExecutionStateError, CacheIoPreparation, CacheIoStartDisposition,
 };
 pub use lifecycle::{CacheBlockLifecycle, CacheLifecycleError, MutableCacheTail};
+pub(crate) use persistence::with_rank_prompt_cache_store;
 pub use persistence::{
     finalize_prompt_cache_shard, hash_prompt_cache_shard_payload, inspect_prompt_cache,
     prompt_cache_array_names, prompt_cache_export_allowance, prompt_cache_rank_path,
     publish_prompt_cache, resolve_prompt_cache_root, restore_prompt_cache_states,
-    safe_prompt_cache_shard_path, validate_prompt_cache_manifest, with_rank_prompt_cache_store,
-    DirectoryPromptCacheStore, LiveCacheBlockPublication, LiveCachePublicationError,
-    MemoryPromptCacheStore, PreparedPromptCachePublication, PromptCacheBlockRestore,
-    PromptCacheExport, PromptCacheExportBlock, PromptCacheExportInventory, PromptCacheExportState,
-    PromptCachePayload, PromptCachePersistenceError, PromptCachePublication, PromptCacheRestore,
-    PromptCacheStateRestore, PromptCacheTensorLayout, RetainedCacheShard,
-    ReversiblePromptCachePublication, MAX_PROMPT_CACHE_SHARD_HEADER_BYTES,
+    safe_prompt_cache_shard_path, stage_live_cache_block, validate_prompt_cache_manifest,
+    DirectoryPromptCacheStore, LiveCachePublicationError, MemoryPromptCacheStore,
+    PreparedPromptCachePublication, PromptCachePersistenceError, PromptCachePublication,
+    PromptCacheRestore, PublishedLiveCacheBlock, RetainedCacheShard,
+    ReversiblePromptCachePublication, StagedLiveCacheBlock, MAX_PROMPT_CACHE_SHARD_HEADER_BYTES,
     PROMPT_CACHE_CURRENT_FILE, PROMPT_CACHE_GENERATIONS_DIRECTORY,
 };
 pub use policy::{
     CacheResidencyConfigurationError, CacheResidencyPolicy, LiveCacheDiskPolicy, PagedCacheOptions,
 };
-pub use storage::{
-    CacheBlockStorage, CacheHostDemotionOperation, CacheHostPromotion, CacheIoOperation,
-    CacheIoOperationKey, CacheIoOperationKind, CacheStorageError, CacheStoragePhase,
-};
+pub use storage::{CacheBlockStorage, CacheHostPromotion, CacheStorageError, CacheStoragePhase};
 pub use telemetry::{
     CacheLayerResidencyReport, CacheLayerResidencyStats, CacheResidencyReport,
     CacheResidencyTelemetry, CACHE_RESIDENCY_LAYER_REPORT_LIMIT,
@@ -667,3 +675,9 @@ mod tests {
         ));
     }
 }
+
+/// Shared policy for live page movement.
+pub mod scheduling;
+
+/// Portable accounting of live cache pages and in-flight custody.
+pub mod catalog_telemetry;

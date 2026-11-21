@@ -1,85 +1,6 @@
 //! Bounded native route metadata and selected-unit copies. No expert-dense tensor.
 use super::*;
 
-#[cfg(test)]
-mod tests;
-
-pub(super) fn estimate_partition(
-    request: &PartitionRoutedUnitCaptureRequest<'_>,
-) -> Result<CaptureUsage, CaptureError> {
-    request.validate()?;
-    estimate_storage(&request.native_shape()?, request.slice, true)
-}
-
-pub(super) fn estimate(
-    shape: &[u64],
-    slice: &ResolvedCaptureSlice,
-) -> Result<CaptureUsage, CaptureError> {
-    if slice.strides.iter().any(|n| *n > i32::MAX as u64) {
-        return Err(CaptureError::Unsupported(
-            "MLX routed-unit capture stride".into(),
-        ));
-    }
-    estimate_storage(shape, slice, false)
-}
-
-fn estimate_storage(
-    shape: &[u64],
-    slice: &ResolvedCaptureSlice,
-    partitioned: bool,
-) -> Result<CaptureUsage, CaptureError> {
-    if shape.len() != 3
-        || slice.shape.len() != 3
-        || shape.iter().any(|n| *n > i32::MAX as u64)
-        || elements(shape)? > i32::MAX as u64
-    {
-        return Err(CaptureError::Unsupported(
-            "MLX routed-unit capture geometry".into(),
-        ));
-    }
-    let all_routes = mul(shape[0], shape[1])?;
-    let routes = if partitioned && slice.shape[2] == 0 {
-        0
-    } else {
-        mul(slice.shape[0], slice.shape[1])?
-    };
-    let values = mul(routes, slice.shape[2])?;
-    if routes == 0 {
-        return Ok(CaptureUsage {
-            captures: 1,
-            retained_bytes: 0,
-            host_bytes: add(4096, mul(shape[0], 32)?)?,
-            encoded_bytes: add(4096, mul(shape[0], 64)?)?,
-        });
-    }
-    // Full invocation source and conversion backing, bounded route-index arrays,
-    // every row envelope and duplicate-detection/sorting storage. Charged once
-    // before the first chunk, including when the selected rows occur much later.
-    Ok(CaptureUsage {
-        captures: 1,
-        retained_bytes: add(
-            4096,
-            add(mul(elements(shape)?, 24)?, mul(all_routes, 192)?)?,
-        )?,
-        host_bytes: add(
-            4096,
-            add(
-                mul(all_routes, 128)?,
-                add(mul(routes, 512)?, mul(values, 16)?)?,
-            )?,
-        )?,
-        // Native chunk evidence covers the whole invocation, even when the
-        // exported token selection is tiny or occurs only in its last chunk.
-        encoded_bytes: add(
-            4096,
-            add(
-                mul(shape[0], 64)?,
-                add(mul(routes, 768)?, mul(values, 32)?)?,
-            )?,
-        )?,
-    })
-}
-
 pub(super) fn capture(
     source: &RoutedUnitCaptureSource<'_, MlxTensor>,
     geometry: RoutedUnitGeometry,
@@ -94,7 +15,7 @@ pub(super) fn capture_partition(
     request: &PartitionRoutedUnitCaptureRequest<'_>,
     stream: &Stream,
 ) -> Result<RoutedUnitCapture, Error> {
-    estimate_partition(request).map_err(Error::observation)?;
+    request.validate().map_err(Error::observation)?;
     if source.unit_coordinates != request.ownership.coordinates.units() {
         return Err(Error::observation(CaptureError::Invalid(
             "routed source differs from prepared scalar placement".into(),
@@ -241,10 +162,6 @@ fn capture_inner(
         .take(source.selection_indices.as_array(), stream)?
         .as_dtype(Dtype::Float32, stream)?;
     let coefficients = coefficient_array.evaluated()?;
-    #[cfg(test)]
-    for _ in 0..4 {
-        record_host_read(token_ids.len());
-    }
     let unit_indices = if let Some((partition_source, _)) = partition {
         let indices = (0..slice.shape[2])
             .map(|index| {

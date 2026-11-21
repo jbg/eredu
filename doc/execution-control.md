@@ -472,7 +472,7 @@ geometry and history limits apply independently. See [LFM2 prefill validation](l
 The focused native regression runs outside the sandbox:
 
 ```sh
-cargo test -p eredu-backend-mlx --features metal --test chunked_prefill --locked -- --test-threads=1
+cargo test -p eredu --no-default-features --features mlx,metal --test chunked_prefill --locked -- --test-threads=1
 ```
 
 Its nonzero two-layer Llama/Mistral fixtures cover CPU and Metal, grouped-query
@@ -711,10 +711,10 @@ The MLX state-copy primitive independently copies device KV arrays and fixed
 recurrent/convolution tensors, materializing strided views contiguously first.
 It preserves sliding windows, backing capacity, absolute offsets and typed layout.
 Its estimates include native logical data, possible contiguous-copy storage and
-host layout/role and input-identity metadata. Paged and compressed state copies are
-explicitly absent from this primitive. The loaded MLX adapter implements the
-`NativeTextStateBackend` contract with existing submission/recovery ownership and
-checks exact executable identity before any state change. Copy completion failures
+host layout/role and input-identity metadata. Paged and compressed state are outside this primitive. The portable driver owns
+`NativeTextStateSession`, checks exact executable identity and admits copies
+through the existing submission authority. MLX supplies storage operations and
+native completion. Copy completion failures
 fence the shared engine when safe recovery is not established. An incompatible
 slot fails before mutation without poisoning an otherwise healthy run. Slot exchange
 is a host move under idle authority and opens no new native scope.
@@ -925,9 +925,9 @@ positions remain absolute; subtract the parent snapshot's next prediction for a
 branch-local decision index. Existing capture values remain before-intervention
 observations; intervention evidence retains its existing before/after meaning.
 
-`LoadedModel<B>::start_controlled` returns `ControlledGenerationSession<B>`;
-snapshots and branches use `ControlledGenerationSnapshot<B>` and
-`ControlledGenerationBranch<B>`. These generic types are also the MLX application API.
+`LoadedModel<B, S>::start_controlled` returns `ControlledGenerationSession<'_, B, S>`;
+snapshots and branches use `ControlledGenerationSnapshot<B, S>` and
+`ControlledGenerationBranch<B, S>`. These generic types are also the MLX application API.
 
 `force_next_token(id)` validates canonical vocabulary membership and the current
 grammar, then restricts the ordinary sampler to that one candidate. It commits
@@ -1438,7 +1438,7 @@ agreement. The cancellable variant accepts `Result<Option<T>, E>`; `Ok(None)`
 represents cancellation, and a peer failure takes precedence. Each participant
 must enter the same stages in the same order even if local preparation fails.
 For example, retain the result of `prepare_chat_multimodal_input`, agree it at
-`TextPreparationStage::Prompt`, then construct `PreparedBackendInput`. A failure
+`TextPreparationStage::Prompt`, then construct `PreparedChatInput::PreparedInput`. A failure
 returned before the agreement cannot be recovered retrospectively. These helpers
 preserve local error types and expose peer/transport failures through the supplied
 neutral error mapping. Usage remains cumulative across retries and restores.

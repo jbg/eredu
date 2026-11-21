@@ -3,6 +3,10 @@
 //! Runtime ownership, admission, storage transitions, and backing-store
 //! scheduling live in `eredu-runtime` so this crate remains declarative.
 
+/// Exact append-stream storage geometry and operations.
+pub mod append_stream;
+/// Native transfer interfaces for cache storage and restoration.
+pub mod mechanisms;
 mod policy;
 mod prompt;
 mod store;

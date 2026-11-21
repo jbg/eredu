@@ -49,7 +49,7 @@ jobs:
           cargo check --locked -p safemlx-tests --all-targets --no-default-features --features metal
           cargo check --locked -p eredu-text --all-targets --all-features
           cargo check --locked -p eredu-backend-mlx --all-targets --no-default-features --features "accelerate,metal,image"
-          cargo check --locked -p eredu --all-targets --no-default-features --features "mlx,metal,image,audio,onig,esaxx_fast"
+          cargo check --locked -p eredu --all-targets --no-default-features --features "mlx,metal,distributed,image,audio,onig,esaxx_fast"
           cargo check --locked -p eredu-cli --all-targets
 
   cpu:
@@ -150,11 +150,11 @@ jobs:
           cargo test -j 1 --locked -p safemlx --no-default-features --features "nccl,safetensors" --lib --no-run
           cargo test -j 1 --locked -p safemlx --features nccl --test events --no-run --no-default-features
           cargo test -j 1 --locked -p safemlx-tests --no-default-features --features nccl --no-run
-      - name: Compile facade and MLX backend tests and residency example with CUDA
+      - name: Build the CUDA facade, realtime benchmark, and residency example
         run: |
-          cargo test -j 1 --locked -p eredu --no-default-features --features "nccl,image,audio" --lib --no-run
-          cargo test -j 1 --locked -p eredu-backend-mlx --features "nccl,image" --lib --test mimi_codec --no-run --timings
-          cargo test -j 1 --locked -p eredu-backend-mlx --features nccl --example llama_residency --no-run
+          cargo test -j 1 --locked -p eredu --no-default-features --features "mlx,nccl,image,audio" --lib --no-run
+          cargo test -j 1 --locked -p eredu --no-default-features --features mlx,nccl,image --example mimi_realtime_bench --no-run --timings
+          cargo test -j 1 --locked -p eredu --no-default-features --features mlx,nccl --example llama_residency --no-run
       - name: Build and final-link the CUDA language-model CLI tests
         run: cargo test -j 1 --locked -p eredu-cli --no-default-features --features nccl --no-run
       - uses: actions/upload-artifact@v4
@@ -174,5 +174,5 @@ jobs:
         run: rustup toolchain install
       - name: Run CUDA device smoke test
         run: cargo run --release -p safemlx --no-default-features --features cuda --example cuda_smoke
-      - name: Run Eredu facade tests on CUDA
-        run: cargo test --release -p eredu --no-default-features --features cuda
+      - name: Run Eredu facade tests with CUDA enabled
+        run: cargo test --release -p eredu --no-default-features --features mlx,cuda

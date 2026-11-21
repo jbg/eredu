@@ -19,9 +19,6 @@ pub fn allocator_cache_limit() -> Result<usize, Error> {
     safemlx::memory::cache_limit().map_err(Into::into)
 }
 
-/// Fallback cache ceiling when available memory cannot be observed.
-pub const DEFAULT_ALLOCATOR_CACHE_LIMIT: usize = 256 * 1024 * 1024;
-
 fn cache_policy_report(
     policy: safemlx::memory::CacheLimitPolicy,
 ) -> eredu_core::AllocatorCachePolicyReport {
@@ -45,29 +42,43 @@ pub fn allocator_cache_policy() -> Result<eredu_core::AllocatorCachePolicyReport
         .map_err(Into::into)
 }
 
-/// Initializes the process-global allocator policy only if untouched. Explicit
-/// native setters always win; the first initialization selects automatic or
-/// preserved policy for subsequent sessions. Existing cache is not evicted.
-pub fn initialize_allocator_cache_policy(
-    preserve: bool,
-) -> Result<eredu_core::AllocatorCachePolicyReport, Error> {
-    let current = safemlx::memory::cache_policy()?;
-    if current.source != safemlx::memory::CacheLimitSource::NativeDefault {
-        return Ok(cache_policy_report(current));
-    }
-    let ceiling = if preserve {
-        DEFAULT_ALLOCATOR_CACHE_LIMIT
-    } else {
-        let available = safemlx::system::system_memory()
-            .ok()
-            .and_then(|memory| memory.available);
-        eredu_runtime::automatic_support::default_allocator_cache_bytes(available) as usize
-    };
-    // The native conditional setter remains authoritative if an explicit setter
-    // or another session wins initialization during the host observation.
-    safemlx::memory::configure_default_cache_policy(ceiling, preserve)
+/// Preserves the untouched native default without changing its limit or evicting storage.
+pub fn preserve_allocator_cache_policy() -> Result<eredu_core::AllocatorCachePolicyReport, Error> {
+    safemlx::memory::configure_default_cache_policy(0, true)
         .map(cache_policy_report)
         .map_err(Into::into)
+}
+
+/// Native operations for portable initialization of the MLX cache ceiling.
+pub struct MlxAllocatorCacheDefaults;
+
+impl eredu_core::capability::NativeAllocatorCacheDefaults for MlxAllocatorCacheDefaults {
+    fn initial_cache_facts(
+        &self,
+    ) -> Result<
+        Option<eredu_core::capability::InitialAllocatorCacheFacts>,
+        eredu_core::BackendFailure,
+    > {
+        let current = allocator_cache_policy().map_err(eredu_core::BackendFailure::from_error)?;
+        Ok(
+            (current.source == eredu_core::AllocatorCachePolicySource::NativeDefault).then(|| {
+                eredu_core::capability::InitialAllocatorCacheFacts {
+                    available_memory_bytes: safemlx::system::system_memory()
+                        .ok()
+                        .and_then(|memory| memory.available),
+                }
+            }),
+        )
+    }
+
+    fn apply_initial_cache_ceiling(&self, ceiling: u64) -> Result<(), eredu_core::BackendFailure> {
+        let ceiling = usize::try_from(ceiling).map_err(eredu_core::BackendFailure::from_error)?;
+        // The native lock remains authoritative if another process-local setter
+        // wins while portable sizing is observing available memory.
+        safemlx::memory::configure_default_cache_policy(ceiling, false)
+            .map(|_| ())
+            .map_err(eredu_core::BackendFailure::from_error)
+    }
 }
 
 /// Resets the process-global MLX allocator high-water mark.

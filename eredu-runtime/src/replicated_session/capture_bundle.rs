@@ -1,6 +1,14 @@
 //! Exact tensor bundles retained and published inside the ordinary forward transaction.
 use super::*;
+use crate::{
+    composite_execution::{CompositeArchitecture, PreparedCompositeInput},
+    speculative::{
+        ExternalPredictionCaptureRequest, ExternalPredictionTargetCapture, ExternalTargetPlacements,
+    },
+};
+use eredu_nn::{Error, TensorElementType};
 use sha2::{Digest, Sha256};
+use std::cell::RefCell;
 
 /// One architecture-selected producer and exact invocation tensor geometry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,6 +157,166 @@ impl ForwardCaptureBundle {
     }
 }
 
+struct ExactTargetObserver<'a, T> {
+    paths: &'a [String],
+    values: &'a RefCell<Vec<Option<T>>>,
+}
+
+impl<T: Clone> ActivationObserver<T, Error> for ExactTargetObserver<'_, T> {
+    fn observe_generated(
+        &mut self,
+        path: &str,
+        _: &T,
+        _: &eredu_core::capture::GeneratedCaptureSource,
+        generate: &mut dyn FnMut() -> Result<T, Error>,
+    ) -> Result<(), Error> {
+        if self.paths.iter().any(|expected| expected == path) {
+            self.observe(path, &generate()?)?;
+        }
+        Ok(())
+    }
+
+    fn observe(&mut self, path: &str, value: &T) -> Result<(), Error> {
+        if let Some(index) = self.paths.iter().position(|expected| expected == path) {
+            let mut values = self.values.borrow_mut();
+            if values[index].is_some() {
+                return Err(Error::backend(format!(
+                    "external-assistant target reached capture path {path} more than once"
+                )));
+            }
+            values[index] = Some(value.clone());
+        }
+        Ok(())
+    }
+}
+
+fn collect_exact_target_capture<T: Tensor>(
+    observed: &RefCell<Vec<Option<T>>>,
+    bundle: Option<&ForwardCaptureBundle>,
+    rank: usize,
+    context: &T::Context,
+) -> Result<Vec<T>, Error> {
+    observed
+        .borrow_mut()
+        .iter_mut()
+        .enumerate()
+        .map(|(index, value)| {
+            if let Some(value) = value.take() {
+                return Ok(value);
+            }
+            let slot = bundle.and_then(|plan| plan.slots().get(index));
+            if let Some(slot) = slot.filter(|slot| slot.owner() != rank) {
+                let element = slot.placeholder_element();
+                if !matches!(
+                    element,
+                    TensorElementType::F16 | TensorElementType::Bf16 | TensorElementType::F32
+                ) {
+                    return Err(Error::backend(
+                        "selected target capture placeholder precision is unsupported",
+                    ));
+                }
+                return T::zeros_float(slot.shape(), element, context);
+            }
+            Err(Error::backend(format!(
+                "external-assistant target did not reach capture path {index}"
+            )))
+        })
+        .collect()
+}
+
+impl<A, B, M, D> ReplicatedTextSession<A, B, M, D>
+where
+    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    M: ReplicatedTextSessionMechanisms<A, B>,
+    A: CompositeArchitecture<B, M::State, Error = Error>,
+    D: ReplicatedTextExecutionStrategy<A, B, M::State, M::ResidentPolicy, M::BoundedPolicy>,
+    M::PolicyError: std::fmt::Display,
+    M::Error: std::fmt::Display,
+{
+    /// Advances a target prefill or verification pass and commits its assistant capture
+    /// with the same state transaction. Admission failures participate in rank agreement.
+    pub fn capture_external_target<'a>(
+        &mut self,
+        input: Result<PreparedCompositeInput<'a, B::Tensor, A::InputPartPlan>, Error>,
+        pass: ExpertPass,
+        request: &ExternalPredictionCaptureRequest,
+        placements: &mut ExternalTargetPlacements,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<
+        (B::Tensor, ExternalPredictionTargetCapture<B::Tensor>),
+        ReplicatedTextSessionError<Error, M::PolicyError, M::Error>,
+    > {
+        let prepared = (|| {
+            let paths = A::external_prediction_capture_paths(request)?.ok_or_else(|| {
+                Error::backend("assistant capture request differs from the target architecture")
+            })?;
+            let input = input?;
+            let (bundle, rank) = placements
+                .capture(&paths, input.admitted().decoder_shape())
+                .map_err(Error::backend_source)?;
+            if paths.is_empty() {
+                return Err(Error::backend(
+                    "external-assistant capture declares no target paths",
+                ));
+            }
+            if paths.iter().collect::<BTreeSet<_>>().len() != paths.len() {
+                return Err(Error::backend(
+                    "external-assistant capture paths are not unique",
+                ));
+            }
+            if bundle.as_ref().is_some_and(|plan| {
+                plan.slots().len() != paths.len()
+                    || plan
+                        .slots()
+                        .iter()
+                        .zip(&paths)
+                        .any(|(slot, path)| slot.role() != path)
+            }) {
+                return Err(Error::backend(
+                    "external-assistant capture bundle differs from the requested paths",
+                ));
+            }
+            Ok((A::prepared_input(input), paths, bundle, rank))
+        })();
+        let (input, paths, bundle, rank) = match prepared {
+            Ok((input, paths, bundle, rank)) => (Ok(input), paths, bundle, rank),
+            Err(error) => (Err(error), Vec::new(), None, 0),
+        };
+        let values = RefCell::new(vec![None; paths.len()]);
+        let mut observer = ExactTargetObserver {
+            paths: &paths,
+            values: &values,
+        };
+        self.capture_input(
+            input,
+            pass,
+            context,
+            &mut observer,
+            bundle.as_ref(),
+            |_| collect_exact_target_capture(&values, bundle.as_ref(), rank, context),
+            |forward, values| {
+                A::external_prediction_capture(request, forward, values)?.ok_or_else(|| {
+                    Error::backend("architecture did not produce its selected assistant capture")
+                })
+            },
+        )
+    }
+
+    /// Binds the admitted static operation and runs it through the shared target driver.
+    pub fn execute_external_target_operation(
+        &mut self,
+        operation: crate::speculative::ExternalPredictionTargetOperation<'_, B::Tensor>,
+        placements: &mut ExternalTargetPlacements,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, ReplicatedTextSessionError<Error, M::PolicyError, M::Error>> {
+        let assembly = placements.operation(operation.kind(), operation.input().shape());
+        self.apply_prediction_target_operation(
+            crate::speculative::PreparedExternalTargetOperation::new(operation, assembly),
+            context,
+        )
+    }
+}
+
 impl<A, B, M, D> ReplicatedTextSession<A, B, M, D>
 where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
@@ -159,60 +327,6 @@ where
     M::PolicyError: std::fmt::Display,
     M::Error: std::fmt::Display,
 {
-    /// Runs ordinary prefill and publishes an additive capture in the same transaction.
-    /// Partitioned callers supply an architecture-authored exact bundle; every rank
-    /// collects source tensors or matching placeholders before any transfer.
-    /// Input admission errors participate in readiness before bundle resolution
-    /// or model execution; a failed caller may supply no bundle.
-    pub fn prefill_input_with_capture<'a, O, C, F, Finish>(
-        &mut self,
-        input: Result<A::Input<'a>, A::Error>,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-        bundle: Option<&ForwardCaptureBundle>,
-        collect: F,
-        assemble: Finish,
-    ) -> Result<(B::Tensor, C), ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
-    where
-        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
-        F: FnOnce(&A::ForwardContext) -> Result<Vec<B::Tensor>, A::Error>,
-        Finish: FnOnce(&A::ForwardContext, Vec<B::Tensor>) -> Result<C, A::Error>,
-    {
-        self.capture_input(
-            input,
-            ExpertPass::Prefill,
-            context,
-            observer,
-            bundle,
-            collect,
-            assemble,
-        )
-    }
-    /// Runs cached decoding through the same capture and state-commit transaction.
-    pub fn decode_input_with_capture<'a, O, C, F, Finish>(
-        &mut self,
-        input: Result<A::Input<'a>, A::Error>,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-        bundle: Option<&ForwardCaptureBundle>,
-        collect: F,
-        assemble: Finish,
-    ) -> Result<(B::Tensor, C), ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
-    where
-        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
-        F: FnOnce(&A::ForwardContext) -> Result<Vec<B::Tensor>, A::Error>,
-        Finish: FnOnce(&A::ForwardContext, Vec<B::Tensor>) -> Result<C, A::Error>,
-    {
-        self.capture_input(
-            input,
-            ExpertPass::Decode,
-            context,
-            observer,
-            bundle,
-            collect,
-            assemble,
-        )
-    }
     fn capture_input<'a, O, C, F, Finish>(
         &mut self,
         input: Result<A::Input<'a>, A::Error>,

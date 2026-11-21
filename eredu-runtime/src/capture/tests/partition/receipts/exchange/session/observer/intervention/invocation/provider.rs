@@ -50,7 +50,13 @@ fn speculative_collector_binds_live_partition_provider_and_preserves_scoped_repl
                 scope.spawn(move || {
                     let identity = crate::establish_communication_session(
                         &Bootstrap(transport(setup, rank, Fault::None)),
-                        &crate::CommunicationManifest::new(5, rank, vec![], vec![]).unwrap(),
+                        &eredu_core::communication::CommunicationManifest::new(
+                            5,
+                            rank,
+                            vec![],
+                            vec![],
+                        )
+                        .unwrap(),
                         Some([rank as u8 + 1; 32]),
                     )
                     .unwrap()

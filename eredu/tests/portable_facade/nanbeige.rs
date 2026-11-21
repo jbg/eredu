@@ -10,13 +10,17 @@ const TOKENIZER: &str =
 
 type Calls = std::rc::Rc<std::cell::RefCell<BackendCalls>>;
 
-fn model() -> (LoadedModel<MockBackend>, Calls) {
+fn model() -> (LoadedModel<MockBackend, MockSession>, Calls) {
     let tokenizer = Tokenizer::from_bytes(TOKENIZER).unwrap();
     let backend = MockBackend::default();
     let calls = backend.calls.clone();
     (
         LoadedModel::from_runtime(
-            ModelRuntime::prepare(backend, ()).unwrap(),
+            ModelRuntime::install::<MockSession>(
+                backend,
+                PreparedModel::new((), SessionCapabilities::default()),
+            )
+            .unwrap(),
             ChatTokenizer::from_tokenizer(tokenizer),
             LoadedTextModelConfig {
                 model_family: ModelKind::Nanbeige,
@@ -52,7 +56,7 @@ fn request(thinking: bool, tools: Vec<Value>) -> ChatTemplateRequest {
 }
 
 fn generate(
-    model: &mut LoadedModel<MockBackend>,
+    model: &mut LoadedModel<MockBackend, MockSession>,
     prepared: &eredu::runtime::chat::PreparedChat,
     calls: &Calls,
     text: &str,

@@ -119,7 +119,7 @@ executor runs, including zero-work cancellation. Target-only execution leaves it
 absent. Backend failures retain their original sources in `BackendFailure`.
 
 ```rust,ignore
-let mut session = LoadedModel::load_execution_plan(&factory, path, &plan)?;
+let mut session = LoadedModel::load_execution_plan(&factory, path, &plan, None)?;
 let chat = session.model_mut().prepare_chat(chat_request)?;
 let request = GenerationRequest {
     input: PreparedChatInput::rendered_prompt(&chat),

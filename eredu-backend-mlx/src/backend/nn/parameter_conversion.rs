@@ -6,18 +6,12 @@
 //! Native conversion/evaluation runs outside all these locks; publication is
 //! serialized with invalidation by the native entry lock.
 
-use eredu_core::{
-    residency::{
-        ParameterConversionRetentionEligibility, ParameterConversionRetentionGroup,
-        ParameterConversionRetentionPolicy, ParameterConversionRetentionPolicyReport,
-    },
-    resources::ResourceIdentity,
-};
-use eredu_runtime::residency::conversion_retention::{
+use eredu_core::residency::conversion_claim::{
     conversion_retention_payload_bytes, ConversionRetentionAdmission, ConversionRetentionBudget,
     ConversionRetentionClaim, ConversionRetentionError, ConversionRetentionParameter,
     ConversionRetentionRegistry,
 };
+use eredu_core::resources::ResourceIdentity;
 use safemlx::{error::Exception, Array, Dtype, Stream};
 use std::{
     collections::BTreeMap,
@@ -68,17 +62,6 @@ fn identity(scope: &str) -> ResourceIdentity {
         scope: scope.into(),
         key: next_identity().to_string(),
     }
-}
-
-/// Creates a fixed execution-scoped budget without allocating native storage.
-pub(crate) fn execution_budget(
-    requested: Option<ParameterConversionRetentionPolicy>,
-    eligibility: ParameterConversionRetentionEligibility,
-) -> Result<ConversionRetentionBudget, ConversionRetentionError> {
-    controller().budget(
-        ParameterConversionRetentionGroup(identity("mlx.parameter_conversion_group")),
-        ParameterConversionRetentionPolicyReport::resolve(requested, eligibility),
-    )
 }
 
 /// Cache ownership follows one permanently resident device materialization.

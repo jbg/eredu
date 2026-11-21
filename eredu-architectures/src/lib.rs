@@ -31,6 +31,8 @@ pub use configuration::{GgufArchitecture, ModelKind};
 /// Architecture-owned external assistant inspection and preparation.
 pub mod external_assistant;
 pub mod external_draft;
+/// Backend-neutral schedules and recipes for independent expert residency.
+pub use eredu_runtime::expert_residency;
 pub use external_assistant::{
     prepare_execution_plan_assistant, prepare_external_assistant, AssistantParameterDeclarations,
     CompatibleExternalAssistantPreparation, ExternalAssistantArchitecture,
@@ -39,8 +41,7 @@ pub use external_assistant::{
     ExternalAssistantPreparationVisitor, ExternalAssistantTargetProfile,
     ExternalAssistantTensorPlacement, ExternalAssistantTransfer, ExternalSpeculativeContract,
     ExternalSpeculativeContractRequest, MaterializedExternalAssistant,
-    MaterializedExternalAssistantExecution, MaterializedExternalAssistantRefVisitor,
-    MaterializedExternalAssistantVisitor, PreparedCompatibleExternalAssistant,
+    MaterializedExternalAssistantExecution, PreparedCompatibleExternalAssistant,
     PreparedExternalAssistantExecution, PreparedExternalAssistantSource,
     SelectedExternalAssistantPreparation,
 };
@@ -48,8 +49,6 @@ pub use external_draft::{
     prepare_execution_plan_draft, prepare_external_draft, ExternalDraftPreparation,
     PreparedExternalDraft,
 };
-/// Backend-neutral schedules and recipes for independent expert residency.
-pub mod expert_residency;
 mod gguf_admission;
 mod gguf_catalog;
 pub use gguf_catalog::GgufTensorCatalog;
@@ -125,12 +124,11 @@ pub use routed_text::{
     visit_routed_text_architecture, EmptyPartitionParameterProvider, GatedProductOperation,
     LinearOperation, PlannedAddressableGatedProduct, PlannedAddressableLinear,
     PlannedAddressableRelu2, PlannedResidentGatedProduct, PlannedResidentRelu2,
-    PreparedRoutedTextArchitecture, Relu2Operation, Relu2RoutedTextArchitectureVisitor,
-    RoutedBankRequirements, RoutedGroupedOperation, RoutedGroupedOperationValidation,
-    RoutedGroupedPlan, RoutedTextArchitectureVisitor, RoutedTextDispatchError,
-    RoutedTextExecutionError, RoutedTextPreparationError, RoutedTextRequirements,
-    RoutedTextRequirementsError, RoutedTextSelectionError, RoutedTextSelectionRequest,
-    SelectedRoutedBank, SelectedRoutedTextRealization,
+    PreparedRoutedTextArchitecture, Relu2Operation, RoutedBankRequirements, RoutedGroupedOperation,
+    RoutedGroupedOperationValidation, RoutedGroupedPlan, RoutedTextArchitectureVisitor,
+    RoutedTextDispatchError, RoutedTextExecutionError, RoutedTextPreparationError,
+    RoutedTextRequirements, RoutedTextRequirementsError, RoutedTextSelectionError,
+    RoutedTextSelectionRequest, SelectedRoutedBank, SelectedRoutedTextRealization,
 };
 
 /// Shared decoder mechanics used by backend-neutral text architectures.

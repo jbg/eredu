@@ -206,10 +206,11 @@ impl CaptureBackend for LazyBackend {
         value: &Value,
         selection: &CaptureSelection,
         slice: &ResolvedCaptureSlice,
+        score_row: Option<u64>,
     ) -> Result<CapturePayload, Self::Error> {
         assert_eq!(*self.ready.0.lock().unwrap(), self.participants);
         self.exports.fetch_add(1, Ordering::SeqCst);
-        self.inner.transform(value, selection, slice)
+        self.inner.transform(value, selection, slice, score_row)
     }
 }
 

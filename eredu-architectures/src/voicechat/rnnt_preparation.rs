@@ -1,5 +1,7 @@
 //! Exact cold recipes for independently leased RNNT prediction and joint units.
 
+use eredu_core::SubmissionBackend;
+
 use std::collections::BTreeMap;
 
 use super::{
@@ -8,15 +10,15 @@ use super::{
 };
 use eredu_core::BackendFailure;
 use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Tensor};
-use eredu_runtime::{LayeredTensorCohort, ParameterUnitMechanisms, SubmissionBackend};
+use eredu_runtime::{LayeredTensorCohort, ParameterUnitMechanisms};
 
 use eredu_checkpoint::{
     recipe::{DerivedWeightRecipe, RecipeDtype},
     store::SharedCheckpointSource,
 };
+use eredu_core::residency::parameter_binding::WeightBinding;
 use eredu_runtime::{
     ComponentPreparationError, ComponentRecipeConversion, LocalModelLayout, PreparedComponent,
-    WeightBinding,
 };
 
 use super::{
@@ -46,10 +48,10 @@ pub enum RnntPreparationError {
     Parallel(String),
     /// The selected communication group cannot cover an exact neural operation.
     #[error(transparent)]
-    Communication(#[from] eredu_runtime::CommunicationCapabilityError),
+    Communication(#[from] eredu_core::communication::CommunicationCapabilityError),
     /// A communication requirement or descriptor is malformed.
     #[error(transparent)]
-    Manifest(#[from] eredu_runtime::CommunicationManifestError),
+    Manifest(#[from] eredu_core::communication::CommunicationManifestError),
     /// A required canonical parameter has no recipe.
     #[error("VoiceChat RNNT parameter {0} is missing")]
     MissingParameter(String),
@@ -247,7 +249,7 @@ impl PreparedRnntBindings {
 /// architecture operation; its storage is owned by the selected gather mechanism.
 pub fn validate_parallel_communication(
     dimensions: RnntDimensions,
-    manifest: &eredu_runtime::CommunicationManifest,
+    manifest: &eredu_core::communication::CommunicationManifest,
     group: eredu_core::CollectiveGroupId,
 ) -> Result<(), RnntPreparationError> {
     validate_neural_communication(dimensions, manifest, group, true)
@@ -256,14 +258,15 @@ pub fn validate_parallel_communication(
 /// Shared exact neural admission; projection-only owners omit greedy decisions.
 pub(crate) fn validate_neural_communication(
     dimensions: RnntDimensions,
-    manifest: &eredu_runtime::CommunicationManifest,
+    manifest: &eredu_core::communication::CommunicationManifest,
     group: eredu_core::CollectiveGroupId,
     include_decisions: bool,
 ) -> Result<(), RnntPreparationError> {
     use eredu_core::checkpoint::TensorDtype;
-    use eredu_runtime::{
-        CommunicationCapabilities, CommunicationOperation as Op,
-        CommunicationOperationRequirement as Requirement, CommunicationTensorLimits,
+    use eredu_core::communication::CommunicationOperation as Op;
+    use eredu_core::communication::{
+        CommunicationCapabilities, CommunicationOperationRequirement as Requirement,
+        CommunicationTensorLimits,
     };
     dimensions.validate()?;
     let selected = manifest

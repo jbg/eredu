@@ -227,7 +227,7 @@ impl<T: Tensor + eredu_runtime::execution_control::SnapshotValue>
 
     fn copy_snapshot_value(
         &self,
-        retention: &eredu_runtime::execution_control::SnapshotReservation,
+        retention: &eredu_runtime::execution_control::SnapshotRetention,
     ) -> Result<Self, eredu_core::BackendFailure> {
         let carry = self
             .carry

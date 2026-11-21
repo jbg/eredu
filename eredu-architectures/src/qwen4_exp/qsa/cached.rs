@@ -1,10 +1,11 @@
 //! Cached causal selection over named summary/position streams and fixed tails.
 use super::*;
+use eredu_core::cache::append_stream::AppendStreamSpec;
 use eredu_core::{
     attention::AttentionPolicy,
     cache::{AppendStreamPolicy, LayerCachePolicy, StateTensorDtype},
 };
-use eredu_runtime::{AppendStreamSpec, RuntimeAppendStreams, RuntimeStateComponents};
+use eredu_runtime::{RuntimeAppendStreams, RuntimeStateComponents};
 
 /// Exact mutable ownership for one indexer. Slots are local to the attention unit.
 #[derive(Debug, Clone, Copy)]

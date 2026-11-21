@@ -9,7 +9,8 @@ use crate::lfm3::{
     decision::{PreparedDecisionAudio, PreparedDecisionVision},
     vision::{MediaTokens, PolicyVision, VisionModule, VisionPromptAdmission},
 };
-use crate::processor_execution::{MediaInputLowering, PreparedProcessor};
+use crate::processor_execution::PreparedProcessor;
+use eredu_core::input::MediaInputLowering;
 use eredu_core::{Media, MultimodalRequest, MultimodalSegment, RgbImage};
 use eredu_nn::Tensor;
 use eredu_runtime::ParameterUnitMechanisms;
@@ -408,11 +409,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<(), DecisionExecutionError> {
         let (audio, processor) = audio.into_parts();
-        let encoder = audio.bind(context, |source, addresses, units, build| {
-            mechanisms
-                .bind_units(source, addresses, units, residency, build)
-                .map(|(policy, _)| policy)
-        })?;
+        let encoder = audio.bind(context, residency, mechanisms)?;
         self.audio = Some((encoder, processor));
         Ok(())
     }
@@ -424,11 +421,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, DecisionExecutionError> {
         let (vision, processor, admission, max_pixels, markers, width) = prepared.into_parts();
-        let vision = vision.bind(context, |source, addresses, units, build| {
-            mechanisms
-                .bind_units(source, addresses, units, residency, build)
-                .map(|(policy, _)| policy)
-        })?;
+        let vision = vision.bind(context, residency, mechanisms)?;
         Ok(Self {
             vision,
             processor,
@@ -453,11 +446,15 @@ where
         let request = request
             .tokenize(&mut encode)
             .map_err(BackendFailure::from_error)?;
-        let (prepared, identity) =
-            input_lowering.prepare_input(&self.processor, &request, &mut encode)?;
+        let (prepared, identity) = eredu_runtime::processor_binding::prepare_graph_input(
+            input_lowering,
+            &self.processor,
+            &request,
+            &mut encode,
+        )?;
         let prompt = self
             .admission
-            .admit_with_identity(&prepared, input_lowering.inspector(), identity.as_ref())
+            .admit_with_identity(&prepared, input_lowering.inspector(), Some(&identity))
             .map_err(BackendFailure::from_error)?;
         Ok(self
             .vision

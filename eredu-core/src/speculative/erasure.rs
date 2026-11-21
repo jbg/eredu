@@ -2,13 +2,10 @@
 //! and native parameter binding remain with their declaring owners.
 use super::*;
 
-/// Backend-facing value types fixed at final generation-executor binding.
-/// Family construction remains typed. This bundle fixes input, score, context,
-/// completion and telemetry values while cache, source state and verification
-/// payloads retain their typed ownership behind the final executor boundary.
+/// Native value types fixed at final generation-executor binding.
+/// This bundle fixes scores, context, completion, and telemetry. The portable
+/// caller supplies the prompt type separately when erasing the executor.
 pub trait GenerationExecutorTypes: 'static {
-    /// Backend-owned model input.
-    type Input;
     /// Opaque logits consumed by backend sampling.
     type Logits: Clone;
     /// Selected execution assignment.
@@ -80,7 +77,7 @@ pub trait GenerationExecutorCacheFactory<T: GenerationExecutorTypes>: Speculativ
 /// The blanket implementation preserves typed source policies, mode admission,
 /// state ownership, exact completions and transactional verification. It does
 /// not select a family, reopen artifacts or construct model parameters.
-pub trait ErasedGenerationExecutor<T: GenerationExecutorTypes> {
+pub trait ErasedGenerationExecutor<T: GenerationExecutorTypes, P> {
     /// Verification evidence selected by the retained source.
     fn verification_policy(&self) -> SpeculativeVerificationPolicy;
     /// Updates only request-local state from retained source declarations.
@@ -135,7 +132,6 @@ pub trait ErasedGenerationExecutor<T: GenerationExecutorTypes> {
     where
         Self: 'a;
     /// Installs validated prospective internal edits through the typed collector.
-    #[cfg(feature = "tensor-capture")]
     fn readmit_activation_interventions(
         &mut self,
         plan: AdmittedSpeculativeActivations,
@@ -186,7 +182,6 @@ pub trait ErasedGenerationExecutor<T: GenerationExecutorTypes> {
     where
         Self: 'a;
     /// Installs one request's admitted collector for the borrowed executor scope.
-    #[cfg(feature = "tensor-capture")]
     fn configure_activation_capture<'a>(
         &mut self,
         plan: AdmittedSpeculativeActivations,
@@ -200,7 +195,6 @@ pub trait ErasedGenerationExecutor<T: GenerationExecutorTypes> {
     /// Forwards the shared scheduler's bounded operation scope.
     fn set_activation_origin(&mut self, origin: Option<SpeculativeActivationOrigin>);
     /// Moves one already charged internal record through erasure.
-    #[cfg(feature = "tensor-capture")]
     fn take_activation_capture(&mut self) -> Option<SpeculativeActivationCapture>;
     /// Drains the original portable capture failure.
     fn take_activation_error(&mut self) -> Option<crate::speculative::SpeculativeControlError>;
@@ -226,7 +220,7 @@ pub trait ErasedGenerationExecutor<T: GenerationExecutorTypes> {
     /// Prefills one lane.
     fn prefill<'a>(
         &mut self,
-        input: T::Input,
+        input: P,
         cache: &mut DynGenerationCache,
         context: T::Context<'a>,
     ) -> Result<SpeculativePrefill<DynGenerationTargetState, T::Logits>, T::Error>
@@ -313,12 +307,12 @@ fn erased_mut<'a, T: 'static, E: GenerationExecutorTypes>(
         .ok_or_else(|| E::erased_type_mismatch(name))
 }
 
-impl<T, E> ErasedGenerationExecutor<T> for E
+impl<T, P, E> ErasedGenerationExecutor<T, P> for E
 where
     T: GenerationExecutorTypes,
     E: GenerationExecutorCacheFactory<
         T,
-        Input = T::Input,
+        Input = P,
         Logits = T::Logits,
         Completion = T::Completion,
         Telemetry = T::Telemetry,
@@ -382,7 +376,6 @@ where
     ) -> Option<crate::execution_control::SnapshotEstimate> {
         SpeculativeExecutor::logits_snapshot_estimate(self, logits)
     }
-    #[cfg(feature = "tensor-capture")]
     fn readmit_activation_interventions(
         &mut self,
         plan: AdmittedSpeculativeActivations,
@@ -535,7 +528,6 @@ where
         )
     }
 
-    #[cfg(feature = "tensor-capture")]
     fn configure_activation_capture<'a>(
         &mut self,
         plan: AdmittedSpeculativeActivations,
@@ -557,7 +549,6 @@ where
         SpeculativeExecutor::set_activation_origin(self, origin);
     }
 
-    #[cfg(feature = "tensor-capture")]
     fn take_activation_capture(&mut self) -> Option<SpeculativeActivationCapture> {
         SpeculativeExecutor::take_activation_capture(self)
     }
@@ -604,7 +595,7 @@ where
 
     fn prefill<'a>(
         &mut self,
-        input: T::Input,
+        input: P,
         cache: &mut DynGenerationCache,
         context: T::Context<'a>,
     ) -> Result<SpeculativePrefill<DynGenerationTargetState, T::Logits>, T::Error>
@@ -752,18 +743,23 @@ where
 }
 
 /// Concrete `SpeculativeExecutor` view over an architecture-erased retained executor.
-pub struct DynGenerationExecutor<'a, T: GenerationExecutorTypes> {
-    inner: &'a mut dyn ErasedGenerationExecutor<T>,
+pub struct DynGenerationExecutor<'a, T: GenerationExecutorTypes, P> {
+    inner: &'a mut dyn ErasedGenerationExecutor<T, P>,
 }
 
-impl<'a, T: GenerationExecutorTypes> DynGenerationExecutor<'a, T> {
+impl<'a, T: GenerationExecutorTypes, P> DynGenerationExecutor<'a, T, P> {
     /// Lends one already retained executor to backend scheduling.
-    pub fn new(inner: &'a mut dyn ErasedGenerationExecutor<T>) -> Self {
+    pub fn new(inner: &'a mut dyn ErasedGenerationExecutor<T, P>) -> Self {
         Self { inner }
     }
+}
 
-    /// Realizes one independent lane cache from the retained executor.
-    pub fn new_cache<'b>(&mut self, context: T::Context<'b>) -> Result<DynGenerationCache, T::Error>
+impl<T: GenerationExecutorTypes, P> SpeculativeCacheFactory for DynGenerationExecutor<'_, T, P> {
+    fn create_cache<'b>(
+        &mut self,
+        _: &(),
+        context: T::Context<'b>,
+    ) -> Result<DynGenerationCache, T::Error>
     where
         Self: 'b,
     {
@@ -771,7 +767,7 @@ impl<'a, T: GenerationExecutorTypes> DynGenerationExecutor<'a, T> {
     }
 }
 
-impl<T: GenerationExecutorTypes> SpeculativeExecutor for DynGenerationExecutor<'_, T> {
+impl<T: GenerationExecutorTypes, P> SpeculativeExecutor for DynGenerationExecutor<'_, T, P> {
     fn verification_policy(&self) -> SpeculativeVerificationPolicy {
         self.inner.verification_policy()
     }
@@ -817,7 +813,7 @@ impl<T: GenerationExecutorTypes> SpeculativeExecutor for DynGenerationExecutor<'
     {
         self.inner.coordinate_decoding_control(local, context)
     }
-    type Input = T::Input;
+    type Input = P;
     type Cache = DynGenerationCache;
     type TargetState = DynGenerationTargetState;
     type DraftState = DynGenerationDraftState;
@@ -832,7 +828,6 @@ impl<T: GenerationExecutorTypes> SpeculativeExecutor for DynGenerationExecutor<'
     type Telemetry = T::Telemetry;
     type Error = T::Error;
 
-    #[cfg(feature = "tensor-capture")]
     fn readmit_activation_interventions(
         &mut self,
         plan: AdmittedSpeculativeActivations,
@@ -923,7 +918,6 @@ impl<T: GenerationExecutorTypes> SpeculativeExecutor for DynGenerationExecutor<'
         self.inner.agree_text_preparation(stage, status, context)
     }
 
-    #[cfg(feature = "tensor-capture")]
     fn configure_activation_capture<'a>(
         &mut self,
         plan: AdmittedSpeculativeActivations,
@@ -945,7 +939,6 @@ impl<T: GenerationExecutorTypes> SpeculativeExecutor for DynGenerationExecutor<'
         self.inner.set_activation_origin(origin);
     }
 
-    #[cfg(feature = "tensor-capture")]
     fn take_activation_capture(&mut self) -> Option<SpeculativeActivationCapture> {
         self.inner.take_activation_capture()
     }

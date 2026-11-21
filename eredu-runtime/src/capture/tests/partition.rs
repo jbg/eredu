@@ -73,6 +73,7 @@ impl CaptureBackend for Backend {
         value: &Value,
         selection: &CaptureSelection,
         slice: &ResolvedCaptureSlice,
+        _score_row: Option<u64>,
     ) -> Result<CapturePayload, Self::Error> {
         self.transforms += 1;
         if self.fail {
@@ -742,6 +743,7 @@ fn reduced_fragment_assembly_storage_is_independent_of_global_component_width() 
             _: &Self::Tensor,
             _: &CaptureSelection,
             slice: &ResolvedCaptureSlice,
+            _score_row: Option<u64>,
         ) -> Result<CapturePayload, Self::Error> {
             let count = elements(&slice.shape).unwrap();
             Ok(CapturePayload::Summary(CaptureSummary {

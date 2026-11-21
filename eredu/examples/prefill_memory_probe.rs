@@ -32,7 +32,7 @@ fn main() -> anyhow::Result<()> {
     let input: Value = serde_json::from_slice(&std::fs::read(&args[2])?)?;
     let plan = ExecutionPlan::fully_resident(eredu_core::DevicePlan::new("mlx", "metal:0")?);
     let (mut model, _) =
-        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &args[1], &plan)?
+        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &args[1], &plan, None)?
             .into_parts();
     model.synchronize()?;
     let loaded = memory()?;

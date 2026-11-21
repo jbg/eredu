@@ -259,15 +259,14 @@ where
         .map_err(architecture)?;
     visitor
         .visit(
-            PreparedPartitionedArchitecture {
+            prepare_dense_partition_binding(
                 prepared,
                 source_architecture,
                 layout,
                 tasks,
                 capability_estimate,
                 effective_model_type,
-                backend: PhantomData,
-            },
+            ),
             store,
         )
         .map_err(DenseDecoderPartitionedDispatchError::Visitor)

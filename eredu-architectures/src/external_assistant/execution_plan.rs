@@ -1,5 +1,6 @@
 //! Portable external-assistant selection and its inseparable construction handoff.
 
+use eredu_core::speculative::assistant::ExternalAssistantBinder;
 use std::num::NonZeroUsize;
 
 use eredu_core::{
@@ -15,7 +16,7 @@ use eredu_runtime::{
 use super::{
     ExternalAssistantPreparation, ExternalAssistantPreparationVisitor,
     ExternalSpeculativeContractRequest, MaterializedExternalAssistant,
-    MaterializedExternalAssistantVisitor, PreparedCompatibleExternalAssistant,
+    PreparedCompatibleExternalAssistant,
 };
 use crate::{
     composite_execution::ExternalPredictionCaptureRequest, processor_plan::ArtifactArchitecturePlan,
@@ -67,25 +68,45 @@ impl PreparedExternalAssistantExecution {
         let assistant = self.source.visit(visitor)?;
         Ok(MaterializedExternalAssistantExecution {
             target: self.target,
-            assistant,
-            selected: self.selected,
-            tokenizer: self.tokenizer,
-            capture,
-            residency,
+            bound: eredu_runtime::speculative::BoundAssistant::new(
+                assistant,
+                self.selected,
+                self.tokenizer,
+                capture,
+                residency,
+            ),
             parameter_requirement: self.parameter_requirement,
             source_placement: self.source_placement,
         })
     }
 }
 
+impl<B> eredu_runtime::speculative::PreparedAssistantExecution<B>
+    for PreparedExternalAssistantExecution
+where
+    B: ExternalAssistantBinder,
+{
+    type Output =
+        eredu_runtime::speculative::BoundAssistant<super::BoundExternalAssistantDispatch<B>>;
+
+    fn bind_assistant(self, binder: B) -> Result<Self::Output, B::Error> {
+        let capture = self.source.capture().clone();
+        let residency = self.source.residency();
+        let dispatch = self.source.bind(binder)?;
+        Ok(eredu_runtime::speculative::BoundAssistant::new(
+            dispatch,
+            self.selected,
+            self.tokenizer,
+            capture,
+            residency,
+        ))
+    }
+}
+
 /// A typed materialized assistant paired with its admitted execution contract.
 pub struct MaterializedExternalAssistantExecution<V: ExternalAssistantPreparationVisitor> {
     target: super::construction::AdmittedAssistantTarget,
-    assistant: MaterializedExternalAssistant<V>,
-    selected: SelectedSpeculativeRealization,
-    tokenizer: TokenizerCompatibilityProof,
-    capture: ExternalPredictionCaptureRequest,
-    residency: eredu_runtime::LayerWeightResidency,
+    bound: eredu_runtime::speculative::BoundAssistant<MaterializedExternalAssistant<V>>,
     parameter_requirement: eredu_core::BoundedResidencyRequirement,
     source_placement: super::ExternalAssistantSourcePlacement,
 }
@@ -103,36 +124,45 @@ impl<V: ExternalAssistantPreparationVisitor> MaterializedExternalAssistantExecut
     pub const fn parameter_residency_requirement(&self) -> eredu_core::BoundedResidencyRequirement {
         self.parameter_requirement
     }
-    /// Observes the selected assistant without acquiring execution mutation authority.
-    pub fn visit_ref<W: super::MaterializedExternalAssistantRefVisitor<V>>(
-        &self,
-        visitor: W,
-    ) -> W::Output {
-        self.assistant.visit_ref(visitor)
-    }
-
     /// The same assistant policy retained through native construction.
     pub const fn residency(&self) -> eredu_runtime::LayerWeightResidency {
-        self.residency
+        self.bound.residency()
     }
-    /// Runs an architecture-generic visitor against the selected materialized assistant.
-    pub fn visit<W: MaterializedExternalAssistantVisitor<V>>(&mut self, visitor: W) -> W::Output {
-        self.assistant.visit(visitor)
-    }
-
     /// Returns the exact realization retained before source and native construction.
     pub const fn selected(&self) -> &SelectedSpeculativeRealization {
-        &self.selected
+        self.bound.selected()
     }
 
     /// Returns the tokenizer proof retained by this construction.
     pub const fn tokenizer_compatibility(&self) -> TokenizerCompatibilityProof {
-        self.tokenizer
+        self.bound.tokenizer_compatibility()
     }
 
     /// Returns the target capture selected by architecture compatibility.
     pub const fn capture(&self) -> &ExternalPredictionCaptureRequest {
-        &self.capture
+        self.bound.capture()
+    }
+}
+
+impl<B: ExternalAssistantBinder>
+    MaterializedExternalAssistantExecution<super::BindPreparedAssistant<B>>
+{
+    /// Observes the selected assistant through a neutral shared borrow.
+    pub fn visit_ref<W: super::BoundAssistantRefVisitor<B>>(&self, visitor: W) -> W::Output {
+        self.bound.dispatch().visit_ref(visitor)
+    }
+
+    /// Supplies an exclusive borrow of the selected assistant's native resources.
+    pub fn visit<W: super::BoundAssistantVisitor<B>>(&mut self, visitor: W) -> W::Output {
+        self.bound.dispatch_mut().visit(visitor)
+    }
+
+    /// Supplies the selected executor and its retained materialized assistant.
+    pub fn visit_executor<W: super::SelectedAssistantExecutionVisitor<B>>(
+        &mut self,
+        visitor: W,
+    ) -> W::Output {
+        self.bound.dispatch_mut().visit_executor(visitor)
     }
 }
 

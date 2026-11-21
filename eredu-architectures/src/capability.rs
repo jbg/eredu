@@ -877,163 +877,7 @@ fn qwen_hybrid_spec(args: &QwenHybridConfig, multimodal: bool) -> Result<Spec, C
     ))
 }
 
-/// Complete portable capability and runtime-state estimate for one architecture.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CapabilityEstimate {
-    capabilities: ModelCapabilities,
-    state_layout: StateMemoryLayout,
-    missing_media_companions: Vec<(eredu_core::InputModality, &'static str)>,
-    draft_source: Option<SpeculativeDraftSource>,
-    shared_backbone:
-        Option<eredu_runtime::speculative::shared_backbone::SharedBackboneExecutionPolicy>,
-    ordinary_refinement:
-        Option<eredu_runtime::generation::refinement::architecture::RefinementExecutionPolicy>,
-}
-
-impl CapabilityEstimate {
-    /// Attaches an admitted shared-backbone draft policy to the family declaration.
-    pub(crate) fn with_shared_backbone_draft(
-        mut self,
-        policy: eredu_runtime::speculative::shared_backbone::SharedBackboneExecutionPolicy,
-    ) -> Self {
-        self.ordinary_refinement = Some(
-            eredu_runtime::generation::refinement::architecture::RefinementExecutionPolicy {
-                geometry: policy.geometry(),
-                policy: policy
-                    .diffusion_policy(0.0)
-                    .expect("validated family policy"),
-                causal_sampling: true,
-                seed_first: policy.seed_first(),
-            },
-        );
-        self.shared_backbone = Some(policy);
-        self.draft_source = Some(SpeculativeDraftSource::SharedBackbone);
-        self
-    }
-    /// Source-free masked draft defaults consumed by native construction adapters.
-    pub const fn shared_backbone_draft(
-        &self,
-    ) -> Option<eredu_runtime::speculative::shared_backbone::SharedBackboneExecutionPolicy> {
-        self.shared_backbone
-    }
-    /// Retained ordinary numerical equations, independent of any draft source.
-    pub const fn ordinary_refinement(
-        &self,
-    ) -> Option<eredu_runtime::generation::refinement::architecture::RefinementExecutionPolicy>
-    {
-        self.ordinary_refinement
-    }
-    /// Complete target-stack observation semantics for a retained shared draft.
-    /// All modes reuse ordinary target hook identities and producer ownership.
-    pub fn shared_backbone_activation_execution(
-        &self,
-    ) -> Option<crate::speculative_execution::SpeculativeActivationExecution> {
-        self.shared_backbone.map(|_| {
-            crate::speculative_execution::SpeculativeActivationExecution::shared_backbone()
-        })
-    }
-    /// Projects memory accounting onto the exact selected rank-local state.
-    /// Family capabilities and context limits remain global model properties.
-    pub(crate) fn for_selected_state(
-        mut self,
-        layout: Option<&RuntimeStateLayout>,
-    ) -> Result<Self, CapabilityError> {
-        self.state_layout = StateMemoryLayout::new(
-            layout.map_or_else(eredu_core::LayerSchedule::empty, |layout| {
-                layout.layers().clone()
-            }),
-            layout.map_or_else(Vec::new, |layout| layout.layer_prefix_offsets()),
-            self.state_layout.hidden_size,
-            self.state_layout.allocation_granularity,
-            self.state_layout.completeness,
-        )?;
-        Ok(self)
-    }
-
-    /// Reuses an exact mechanism/state estimate for an architecture extension
-    /// that implements the same validated neutral geometry under a new identity.
-    pub fn for_architecture_extension(mut self, effective_model_type: impl Into<String>) -> Self {
-        self.capabilities.effective_model_type = effective_model_type.into();
-        self
-    }
-
-    /// Returns validated portable model capabilities.
-    pub const fn capabilities(&self) -> &ModelCapabilities {
-        &self.capabilities
-    }
-
-    /// Admits decoded media against selected component coverage before processor lookup.
-    /// Token-only segments require no media components or processor assets.
-    pub fn admit_raw_media_request(
-        &self,
-        request: &eredu_core::TokenizedMultimodalRequest,
-        processor_available: bool,
-    ) -> Result<(), CapabilityError> {
-        use eredu_core::{InputModality, Media, TokenizedMultimodalSegment};
-        for segment in request.segments() {
-            let modality = match segment {
-                TokenizedMultimodalSegment::TokenIds(_) => continue,
-                TokenizedMultimodalSegment::Media(Media::Image(_)) => InputModality::Image,
-                TokenizedMultimodalSegment::Media(Media::Video(_)) => InputModality::Video,
-                TokenizedMultimodalSegment::Media(Media::Audio(_)) => InputModality::Audio,
-            };
-            if let Some((_, component)) = self
-                .missing_media_companions
-                .iter()
-                .find(|(missing, _)| *missing == modality)
-            {
-                return Err(CapabilityError::MissingCompanion {
-                    architecture: self.capabilities.effective_model_type.clone(),
-                    modality,
-                    component,
-                });
-            }
-            let supported = match modality {
-                InputModality::Text => self.capabilities.modalities.text,
-                InputModality::Image => self.capabilities.modalities.image,
-                InputModality::Video => self.capabilities.modalities.video,
-                InputModality::Audio => self.capabilities.modalities.audio,
-                _ => false,
-            };
-            if !supported {
-                return Err(CapabilityError::UnsupportedInput {
-                    architecture: self.capabilities.effective_model_type.clone(),
-                    reason: format!(
-                        "selected architecture does not accept {} input",
-                        modality.as_str()
-                    ),
-                });
-            }
-            if !processor_available {
-                return Err(CapabilityError::MissingCompanion {
-                    architecture: self.capabilities.effective_model_type.clone(),
-                    modality,
-                    component: "processor assets",
-                });
-            }
-        }
-        Ok(())
-    }
-
-    /// Returns memory metadata around the exact executable layer schedule.
-    pub const fn state_layout(&self) -> &StateMemoryLayout {
-        &self.state_layout
-    }
-
-    /// Architecture-declared checkpoint form for executable draft weights.
-    ///
-    /// `None` means that this exact normalized configuration exposes no
-    /// speculative drafting graph. Concrete backends decide whether they
-    /// implement the declared graph; they do not infer family policy themselves.
-    pub const fn speculative_draft_source(&self) -> Option<SpeculativeDraftSource> {
-        self.draft_source
-    }
-
-    /// Splits the estimate into its portable capability and state values.
-    pub fn into_parts(self) -> (ModelCapabilities, StateMemoryLayout) {
-        (self.capabilities, self.state_layout)
-    }
-}
+pub use eredu_runtime::CapabilityEstimate;
 
 fn finish(effective_model_type: String, spec: Spec) -> CapabilityEstimate {
     let (native_max_context, effective_max_context, state_strategy, modalities, state_layout) =
@@ -1043,8 +887,8 @@ fn finish(effective_model_type: String, spec: Spec) -> CapabilityEstimate {
     } else {
         state_layout.completeness
     };
-    CapabilityEstimate {
-        capabilities: ModelCapabilities {
+    CapabilityEstimate::new(
+        ModelCapabilities {
             effective_model_type,
             native_max_context,
             effective_max_context,
@@ -1053,19 +897,14 @@ fn finish(effective_model_type: String, spec: Spec) -> CapabilityEstimate {
             estimation,
         },
         state_layout,
-        missing_media_companions: Vec::new(),
-        draft_source: None,
-        shared_backbone: None,
-        ordinary_refinement: None,
-    }
+    )
 }
 
 fn with_speculative_draft_source(
-    mut estimate: CapabilityEstimate,
+    estimate: CapabilityEstimate,
     draft_source: Option<SpeculativeDraftSource>,
 ) -> CapabilityEstimate {
-    estimate.draft_source = draft_source;
-    estimate
+    estimate.with_speculative_draft_source(draft_source)
 }
 
 fn embedded_mtp_draft_source(layers: i32) -> Option<SpeculativeDraftSource> {
@@ -1242,7 +1081,7 @@ pub fn muse(args: &crate::muse::DecoderConfig) -> Result<CapabilityEstimate, Cap
         finish(args.identity.text_model_type().into(), muse_spec(args)?),
         Some(SpeculativeDraftSource::Separate),
     );
-    estimate.missing_media_companions = muse_missing_media_companions(args);
+    estimate.set_missing_media_companions(muse_missing_media_companions(args));
     Ok(estimate)
 }
 
@@ -1315,31 +1154,33 @@ pub fn diffusion_gemma(
         args.input_modalities(),
         crate::diffusion_gemma::state_layout(args),
     )?;
-    let mut estimate = finish("diffusion_gemma_text".into(), spec);
-    estimate.ordinary_refinement = Some(
-        eredu_runtime::generation::refinement::architecture::RefinementExecutionPolicy {
-            geometry:
-                eredu_runtime::generation::refinement::architecture::BlockRefinementGeometry {
-                    canvas_length: args.canvas_length,
-                    vocabulary_size: std::num::NonZeroU32::new(
-                        u32::try_from(args.text.vocab_size).map_err(|_| {
+    Ok(
+        finish("diffusion_gemma_text".into(), spec).with_ordinary_refinement(
+            eredu_runtime::generation::refinement::architecture::RefinementExecutionPolicy {
+                geometry:
+                    eredu_runtime::generation::refinement::architecture::BlockRefinementGeometry {
+                        canvas_length: args.canvas_length,
+                        vocabulary_size: std::num::NonZeroU32::new(
+                            u32::try_from(args.text.vocab_size).map_err(|_| {
+                                CapabilityError::InvalidConfiguration {
+                                    field: "vocab_size",
+                                    detail: "outside refinement domain".into(),
+                                }
+                            })?,
+                        )
+                        .ok_or_else(|| {
                             CapabilityError::InvalidConfiguration {
                                 field: "vocab_size",
-                                detail: "outside refinement domain".into(),
+                                detail: "empty refinement domain".into(),
                             }
                         })?,
-                    )
-                    .ok_or_else(|| CapabilityError::InvalidConfiguration {
-                        field: "vocab_size",
-                        detail: "empty refinement domain".into(),
-                    })?,
-                },
-            policy: eredu_core::refinement::RefinementPolicy::default(),
-            causal_sampling: false,
-            seed_first: false,
-        },
-    );
-    Ok(estimate)
+                    },
+                policy: eredu_core::refinement::RefinementPolicy::default(),
+                causal_sampling: false,
+                seed_first: false,
+            },
+        ),
+    )
 }
 
 /// Derives Gemma 4 capabilities from its complete normalized family policy.
@@ -1502,20 +1343,20 @@ pub(crate) fn qwen4_exp_prediction(
                 detail: error.to_string(),
             })?;
     let layers = estimate
-        .state_layout
+        .state_layout()
         .layer_layout()
         .iter()
         .cloned()
         .chain(prediction_state.layers().iter().cloned())
         .collect::<Vec<_>>();
     let offsets = estimate
-        .state_layout
+        .state_layout()
         .layer_prefix_offsets()
         .iter()
         .copied()
         .chain(prediction_state.layer_prefix_offsets())
         .collect();
-    estimate.state_layout = StateMemoryLayout::new(
+    estimate.set_state_layout(StateMemoryLayout::new(
         eredu_core::LayerSchedule::new(layers.len(), layers).map_err(|error| {
             CapabilityError::InvalidConfiguration {
                 field: "prediction_state_layout",
@@ -1523,15 +1364,15 @@ pub(crate) fn qwen4_exp_prediction(
             }
         })?,
         offsets,
-        estimate.state_layout.hidden_size,
-        estimate.state_layout.allocation_granularity,
+        estimate.state_layout().hidden_size,
+        estimate.state_layout().allocation_granularity,
         EstimationCompleteness::PersistentStateOnly,
-    )?;
+    )?);
     if let CacheStateStrategy::HybridRecurrent {
         full_attention_layers,
         recurrent_layers,
         ..
-    } = &mut estimate.capabilities.state_strategy
+    } = &mut estimate.capabilities_mut().state_strategy
     {
         for unit in &prediction.units {
             match &unit.mixer {
@@ -1540,8 +1381,7 @@ pub(crate) fn qwen4_exp_prediction(
             }
         }
     }
-    estimate.draft_source = Some(SpeculativeDraftSource::Embedded);
-    Ok(estimate)
+    Ok(estimate.with_speculative_draft_source(Some(SpeculativeDraftSource::Embedded)))
 }
 
 /// Prepared joint image/video and target equations. Host processor dispatch and
@@ -1554,9 +1394,10 @@ pub(crate) fn qwen4_exp_conditional(
         Some(prediction) => qwen4_exp_prediction(spec, prediction)?,
         None => qwen4_exp_target(spec)?,
     };
-    estimate.capabilities.effective_model_type = "qwen4_exp".into();
-    estimate.capabilities.modalities.image = true;
-    estimate.capabilities.modalities.video = true;
+    let capabilities = estimate.capabilities_mut();
+    capabilities.effective_model_type = "qwen4_exp".into();
+    capabilities.modalities.image = true;
+    capabilities.modalities.video = true;
     Ok(estimate)
 }
 

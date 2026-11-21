@@ -50,7 +50,12 @@ pub enum BankParameterPreparationError {
 /// infers metadata only; parameter slot admission, leases and editing authority
 /// remain separate. No destination is reconstructed from synthetic source names.
 pub fn prepare_bank_parameter_members<'a, C: eredu_checkpoint::recipe::RecipeCatalog + ?Sized>(
-    entries: impl IntoIterator<Item = (ParameterBankKey, &'a [crate::WeightBinding])>,
+    entries: impl IntoIterator<
+        Item = (
+            ParameterBankKey,
+            &'a [eredu_core::residency::parameter_binding::WeightBinding],
+        ),
+    >,
     targets: &BTreeMap<(ParameterBankKey, String), String>,
     source: &C,
 ) -> Result<Vec<PreparedBankParameterMember>, BankParameterPreparationError> {

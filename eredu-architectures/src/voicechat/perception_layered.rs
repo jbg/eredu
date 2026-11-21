@@ -1,5 +1,7 @@
 //! Perception equations over the shared resident and bounded unit traversal.
 
+use eredu_core::SubmissionBackend;
+
 use super::perception_specs::{Declaration, PerceptionDeclaration};
 use super::{
     conformer::{ConformerBlock, ConformerLocalDimensions, ConformerState},
@@ -23,7 +25,7 @@ use eredu_runtime::{
     ComponentKernel, ComponentUnit, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress,
     ExecutionUnitLayout, LayeredForwardState, LayeredInvocation, LayerwisePolicy, LayerwiseRuntime,
     LocalModelLayout, MemberSharding, OwnedParameterGroupSpec, ParallelComponentKernel,
-    ParameterGroupOwner, ParameterRole, RuntimeState, StateError, StateLayout, SubmissionBackend,
+    ParameterGroupOwner, ParameterRole, RuntimeState, StateError, StateLayout,
 };
 use std::{marker::PhantomData, num::NonZeroU32};
 
@@ -247,7 +249,7 @@ impl<T: eredu_runtime::execution_control::SnapshotValue>
     }
     fn copy_snapshot_value(
         &self,
-        retention: &eredu_runtime::execution_control::SnapshotReservation,
+        retention: &eredu_runtime::execution_control::SnapshotRetention,
     ) -> Result<Self, BackendFailure> {
         Ok(Self {
             layout: self.layout.clone(),

@@ -2,46 +2,38 @@
 
 use eredu_core::capture::*;
 
-#[cfg(feature = "tensor-capture")]
 mod projection;
-#[cfg(feature = "tensor-capture")]
 pub use projection::{
     project_capture_usage, CaptureUsageOutlook, CaptureUsageProjection, ScheduledCaptureUsage,
 };
-#[cfg(feature = "tensor-capture")]
 mod checkpoint;
-#[cfg(feature = "tensor-capture")]
 mod empty;
 mod generated;
-#[cfg(feature = "tensor-capture")]
 mod invocation;
-#[cfg(feature = "tensor-capture")]
 pub use invocation::CaptureInvocationSelection;
 mod speculative;
-pub use speculative::SpeculativeCaptureScope;
-#[cfg(feature = "tensor-capture")]
+pub(crate) use speculative::bind_speculative_observer;
 pub use speculative::{
-    CaptureBackendProvider, PartitionCaptureBackendProvider, SpeculativeCaptureObserver,
+    CaptureBackendProvider, PartitionCaptureBackendProvider, PreparedSpeculativeActivationRestore,
+    SpeculativeActivationCheckpoint, SpeculativeCaptureObserver, SpeculativeCaptureScope,
+    SpeculativePartitionBinding, SpeculativePartitionCaptureDiscovery, SpeculativePartitionLayout,
+    SpeculativePartitionLayouts,
 };
-#[cfg(feature = "tensor-capture")]
-pub use speculative::{PreparedSpeculativeActivationRestore, SpeculativeActivationCheckpoint};
-#[cfg(feature = "tensor-capture")]
+pub use speculative::{
+    SpeculativeCaptureMechanisms, SpeculativeCaptureProvider, SpeculativeContextFor,
+};
 mod routed;
-#[cfg(feature = "tensor-capture")]
 use empty::empty_payload;
 pub use generated::generated_capture_source;
 pub mod partition;
 #[cfg(test)]
-#[cfg(feature = "tensor-capture")]
 mod tests;
-#[cfg(feature = "tensor-capture")]
 pub use checkpoint::{
     CaptureCheckpoint, CaptureForkRequest, InterventionForkRequest, PreparedCaptureRestore,
 };
 
 /// A run owns one ledger and at most one step of host records. Consumers must drain
 /// each step before another is started; there is no producer queue.
-#[cfg(feature = "tensor-capture")]
 pub struct CaptureSession {
     // Identity is deliberately not serialized or copied into child sessions.
     owner: std::sync::Arc<()>,
@@ -70,7 +62,6 @@ enum CaptureTransactionStatus {
     Aborted,
 }
 
-#[cfg(feature = "tensor-capture")]
 impl CaptureSession {
     /// Supplies authoritative output cadence for architectures with physical
     /// forwards between commitments. Capture invocation indices remain distinct;
@@ -534,7 +525,6 @@ impl CaptureSession {
 
 /// Shared transformation path for ordinary captures and intervention evidence.
 #[allow(clippy::too_many_arguments)]
-#[cfg(feature = "tensor-capture")]
 pub(crate) fn capture_value<B: CaptureBackend>(
     backend: &mut B,
     tensor: &B::Tensor,
@@ -565,7 +555,6 @@ pub(crate) fn capture_value<B: CaptureBackend>(
 
 /// The native reservation/transform sequence shared by ordinary observations,
 /// intervention evidence and globally identified partition fragments.
-#[cfg(feature = "tensor-capture")]
 pub(super) fn capture_resolved_value<B: CaptureBackend>(
     backend: &mut B,
     tensor: &B::Tensor,
@@ -575,6 +564,7 @@ pub(super) fn capture_resolved_value<B: CaptureBackend>(
     slice: &ResolvedCaptureSlice,
     ledger: &mut dyn CaptureReservation,
 ) -> Result<(), CaptureExecutionError<B::Error>> {
+    let score_row = resolve_capture_score_row(&selection.transform, &shape)?;
     let usage = backend.estimate(tensor, selection, slice)?;
     record.source_shape = Some(shape);
     record.selected_shape = Some(slice.shape.clone());
@@ -583,7 +573,7 @@ pub(super) fn capture_resolved_value<B: CaptureBackend>(
         return Ok(());
     }
     record.charged = record.charged.checked_add(usage)?;
-    let transformed = backend.transform(tensor, selection, slice);
+    let transformed = backend.transform(tensor, selection, slice, score_row);
     // A deferred source becomes known only after its reserved factory runs.
     // Preserve that fact even if the subsequent transformation fails.
     record.source_dtype = backend.source_dtype(tensor);
@@ -612,7 +602,6 @@ pub(super) fn capture_resolved_value<B: CaptureBackend>(
     Ok(())
 }
 
-#[cfg(feature = "tensor-capture")]
 fn completed_capture_outcome(transform: &CaptureTransform, available: u64) -> CaptureOutcome {
     match transform {
         CaptureTransform::Preview { max_elements } if *max_elements < available => {
@@ -651,7 +640,6 @@ pub(crate) fn bounded_diagnostic(error: &impl std::fmt::Display) -> String {
 /// six bytes; each dimension can use twenty decimal digits. Numeric payloads are
 /// reserved by the native estimator. Selection count and metadata are bounded before
 /// generation begins, so missing/skipped points cannot form an unbounded queue.
-#[cfg(feature = "tensor-capture")]
 pub fn metadata_reservation(
     selection: &CaptureSelection,
     point: &eredu_core::ObservationPoint,
@@ -673,7 +661,6 @@ pub fn metadata_reservation(
 /// Backends supply only their side-effect-free storage/transfer estimator. Unknown
 /// dimensions remain subject to exact observation-time reservation. Step estimates
 /// conservatively allow every phase-enabled selection to coincide.
-#[cfg(feature = "tensor-capture")]
 pub fn preflight(
     plan: &AdmittedCapturePlan,
     estimate: impl FnMut(
@@ -688,7 +675,6 @@ pub fn preflight(
 /// Revalidates admission against the loaded catalog, then checks known geometry
 /// and budgets with backend estimates. Native execution-mode checks stay with the
 /// caller; this helper never accesses a device or starts a submission.
-#[cfg(feature = "tensor-capture")]
 pub fn validate_session(
     plan: &AdmittedCapturePlan,
     discovery: &CaptureDeclarations,
@@ -701,7 +687,6 @@ pub fn validate_session(
     validate_continuation(plan, discovery, 0, CaptureUsage::default(), estimate)
 }
 
-#[cfg(feature = "tensor-capture")]
 pub(crate) fn validate_continuation(
     plan: &AdmittedCapturePlan,
     discovery: &CaptureDeclarations,
@@ -730,7 +715,6 @@ pub(crate) fn validate_continuation(
     )
 }
 
-#[cfg(feature = "tensor-capture")]
 pub(crate) fn preflight_with_extra(
     plan: &AdmittedCapturePlan,
     extra: &[(CaptureSelection, eredu_core::ObservationPoint)],
@@ -754,7 +738,6 @@ pub(crate) fn preflight_with_extra(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[cfg(feature = "tensor-capture")]
 pub(crate) fn preflight_continuation(
     plan: &AdmittedCapturePlan,
     extra: &[(CaptureSelection, eredu_core::ObservationPoint)],
@@ -813,12 +796,10 @@ pub(crate) fn preflight_continuation(
     Ok(())
 }
 
-#[cfg(feature = "tensor-capture")]
 struct CountingWriter {
     written: u64,
     limit: u64,
 }
-#[cfg(feature = "tensor-capture")]
 impl std::io::Write for CountingWriter {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         let next = self
@@ -843,4 +824,14 @@ pub enum CaptureExecutionError<E: std::error::Error + 'static> {
     /// Native transformation failed under the backend's recovery owner.
     #[error("native capture failed: {0}")]
     Backend(#[source] E),
+}
+
+impl<E: std::error::Error + From<eredu_core::BackendFailure> + 'static> CaptureExecutionError<E> {
+    /// Preserves native failures directly and retains portable admission failures as typed causes.
+    pub fn into_operation_error(self) -> E {
+        match self {
+            Self::Admission(error) => eredu_core::BackendFailure::from_error(error).into(),
+            Self::Backend(error) => error,
+        }
+    }
 }

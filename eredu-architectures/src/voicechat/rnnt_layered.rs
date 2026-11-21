@@ -3,6 +3,8 @@
 //! Each invocation owns only an unpublished neural phase. The shared RNNT
 //! execution trait owns priming, hypothesis capacity and the greedy label loop.
 
+use eredu_core::SubmissionBackend;
+
 use super::rnnt::{
     encoder_projection_input, step_predictor_layer, RnntDimensions, RnntError, RnntExecution,
     RnntPredictionState,
@@ -22,7 +24,7 @@ use eredu_runtime::{
     ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress, ExecutionUnitLayout,
     LayeredForwardState, LayeredInvocation, LayerwisePolicy, LayerwiseRuntime, LocalModelLayout,
     MemberSharding, OwnedParameterGroupSpec, ParallelComponentKernel, ParameterGroupOwner,
-    ParameterRole, StatelessComponentState, SubmissionBackend, TensorPlacement,
+    ParameterRole, StatelessComponentState, TensorPlacement,
 };
 use std::marker::PhantomData;
 

@@ -555,7 +555,7 @@ let prompt = model.finish_text_preparation(
     local,
     MultimodalPreparationError::Backend,
 )?;
-let input = PreparedChatInput::prepared_backend_input(&chat, prompt);
+let input = PreparedChatInput::prepared_input(&chat, prompt);
 ```
 
 Every participant must enter the same stages in the same order, including failed

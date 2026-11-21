@@ -497,10 +497,11 @@ impl<
     ) -> Result<Self, BackendFailure> {
         // All component copies complete before their result can be installed.
         // Neural copying retains the same lease on any unresolved failure.
-        let input = self.input.copy_snapshot_value(retention)?;
-        let speech = self.speech.copy_snapshot_value(retention)?;
-        let retained_audio = self.retained_audio.copy_snapshot_value(retention)?;
-        let pending_audio = self.pending_audio.copy_snapshot_value(retention)?;
+        let authority = retention.authority();
+        let input = self.input.copy_snapshot_value(&authority)?;
+        let speech = self.speech.copy_snapshot_value(&authority)?;
+        let retained_audio = self.retained_audio.copy_snapshot_value(&authority)?;
+        let pending_audio = self.pending_audio.copy_snapshot_value(&authority)?;
         let neural = copy_neural(&self.neural).map_err(BackendFailure::from_error)?;
         Ok(Self {
             neural,

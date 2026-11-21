@@ -176,10 +176,12 @@ fn distributed_plan_requires_exact_portable_rank_contract() {
     ));
     let parallel = ParallelLoadRequest::new(
         ParallelRankTopology::new(topology, 1).unwrap(),
-        crate::PipelineWireContract::new(crate::PipelineActivationDtype::Float32),
+        crate::PipelineWireContract::new(
+            eredu_core::communication::PipelineActivationDtype::Float32,
+        ),
         2,
         128,
-        crate::CommunicationCompletionPolicy::new(
+        eredu_core::communication::CommunicationCompletionPolicy::new(
             std::time::Duration::from_secs(2),
             eredu_core::CompletionCancellationMode::QuarantineUntilComplete,
         )

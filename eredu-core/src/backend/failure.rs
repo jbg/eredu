@@ -32,6 +32,7 @@ pub enum BackendFailureKind {
 pub struct BackendFailure {
     kind: BackendFailureKind,
     operation: &'static str,
+    model_state_preserved: bool,
     #[source]
     source: Box<dyn Error + Send + Sync + 'static>,
 }
@@ -43,6 +44,7 @@ impl BackendFailure {
         Self {
             kind,
             operation: "backend operation",
+            model_state_preserved: false,
             source: Box::new(source),
         }
     }
@@ -63,10 +65,26 @@ impl BackendFailure {
         self.operation
     }
 
+    /// Records evidence from the operation owner that model state was not advanced.
+    /// Native submission still needs its own independent settlement evidence.
+    pub fn with_model_state_preserved(mut self, preserved: bool) -> Self {
+        self.model_state_preserved = preserved;
+        self
+    }
+
+    /// Whether the operation owner proved that model state was preserved.
+    pub const fn model_state_preserved(&self) -> bool {
+        self.model_state_preserved
+    }
+
     /// Preserves an error whose portable classification is not known.
     pub fn from_error(source: impl Error + Send + Sync + 'static) -> Self {
         // Preserve a classification already supplied by a lower adapter.
-        let source: Box<dyn Error + Send + Sync> = Box::new(source);
+        Self::from_boxed_error(Box::new(source))
+    }
+
+    /// Preserves an already boxed failure and its original dynamic type.
+    pub fn from_boxed_error(source: Box<dyn Error + Send + Sync>) -> Self {
         match source.downcast::<Self>() {
             Ok(error) => *error,
             Err(source) => {
@@ -94,6 +112,7 @@ impl BackendFailure {
                 Self {
                     kind,
                     operation: "backend operation",
+                    model_state_preserved: false,
                     source,
                 }
             }

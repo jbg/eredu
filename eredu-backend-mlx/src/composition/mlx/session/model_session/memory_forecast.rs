@@ -1,397 +1,47 @@
+//! MLX memory observations for the portable text forecast driver.
+
 use super::*;
-use eredu_core::{CapabilityError, Observed, TextGenerationBackend};
-use eredu_runtime::memory_estimation::LogitsWorkspace;
-use eredu_runtime::memory_forecast::GenerationForecastError;
-use eredu_runtime::memory_forecast::{
-    ForecastExecutionContract, GenerationForecastBackend, LoadedMemoryProfile,
-};
+use crate::composition::mlx::capability::MlxAllocatorObservations;
+use eredu_core::capability::{NativeExecutionMemory, NativeWorkspaceEstimate};
 
-impl
-    eredu_runtime::memory_forecast::SpeculativeForecastBackend<
-        crate::composition::mlx::speculative::MlxDrafter,
-    > for MlxBackend<'_>
-{
-    fn speculative_target_memory_profile(
-        runtime: &ModelRuntime<Self>,
-    ) -> Result<LoadedMemoryProfile, GenerationForecastError> {
-        // Independent speculative lanes realize isolated caches. Retain selected
-        // geometry even when an unrelated ordinary session has advanced.
-        memory_profile(runtime, true)
+impl<Dispatch> NativeExecutionMemory<MlxBackend<'_, Dispatch>> for MlxSessionMechanisms {
+    type Allocator = MlxAllocatorObservations;
+
+    fn refinement_workspace() -> NativeWorkspaceEstimate {
+        NativeWorkspaceEstimate {
+            lower: 0,
+            upper: 64,
+            evidence: "native full-score/feedback, retained selection rows, categorical/noise and processing scratch envelope; F32 upper width",
+        }
     }
 
-    fn speculative_memory_profile(
-        runtime: &ModelRuntime<Self>,
-        drafting: &eredu_core::SpeculativeDraft<
-            '_,
-            crate::composition::mlx::speculative::MlxDrafter,
-        >,
-    ) -> Result<
-        Option<eredu_runtime::memory_forecast::SpeculativeMemoryProfile>,
-        GenerationForecastError,
-    > {
-        if matches!(drafting, eredu_core::SpeculativeDraft::Target) {
-            if Self::decoding_capabilities(runtime).speculation {
-                return Self::shared_backbone_memory_profile(runtime);
-            }
-            return Ok(Some(
-                eredu_runtime::memory_forecast::SpeculativeMemoryProfile {
-                    conditioned: None,
-                    refinement: Self::refinement_memory_plan(runtime, None)?,
-                    shared_backbone: None,
-                    embedded: None,
-                    parameter_conversions: None,
-                    draft: None,
-                    auxiliary_bytes_per_position:
-                        eredu_runtime::memory_estimation::MemoryBytes::exact(0),
-                    sampling_bytes_per_vocabulary_entry: speculative_sampling_memory(),
-                    proposal_capacity: 0,
-                    shared_allocator: true,
-                },
-            ));
+    fn sampling_workspace() -> NativeWorkspaceEstimate {
+        NativeWorkspaceEstimate {
+            lower: 0,
+            upper: 128,
+            evidence: "MLX speculative sampling calibration v1: 32 float32/index rows per live distribution for logits processing, filtering, normalization and residual sampling; planning envelope, not a kernel allocation guarantee",
         }
-        if matches!(drafting, eredu_core::SpeculativeDraft::SharedBackbone) {
-            return Self::shared_backbone_memory_profile(runtime);
-        }
-        let eredu_core::SpeculativeDraft::External(drafter) = drafting else {
-            let Some(discovery) = runtime.session().capture_discovery.as_ref() else {
-                return Ok(None);
-            };
-            let Some(topology) = discovery
-                .embedded_prediction_topology()
-                .map_err(|error| CapabilityError::Observation(error.to_string()))?
-            else {
-                return Ok(None);
-            };
-            return Ok(Some(
-                eredu_runtime::memory_forecast::SpeculativeMemoryProfile {
-                    conditioned: None,
-                    refinement: Self::refinement_memory_plan(runtime, None)?,
-                    shared_backbone: None,
-                    embedded: Some(topology.clone()),
-                    parameter_conversions: runtime
-                        .session()
-                        .residency_report()
-                        .map_err(eredu_core::BackendFailure::from_error)?
-                        .and_then(|report| {
-                            report.device_parameter_conversions().map(<[_]>::to_vec)
-                        }),
-                    draft: None,
-                    auxiliary_bytes_per_position:
-                        eredu_runtime::memory_estimation::MemoryBytes::exact(0),
-                    sampling_bytes_per_vocabulary_entry: speculative_sampling_memory(),
-                    proposal_capacity: topology.proposal_capacity as u64,
-                    shared_allocator: true,
-                },
-            ));
-        };
-        let target = Self::loaded_memory_profile(runtime)?;
-        if drafter.topology() == eredu_core::SpeculativeExecutionTopology::CrossDeviceSplit
-            && target.parameters.physical_semantics != eredu_core::PhysicalMemorySemantics::Unified
-        {
-            // Cross-device copies need exact separate-pool identities/placement.
-            return Ok(None);
-        }
-        let conditioned = drafter.conditioned_memory_profile()?;
-        let draft = drafter.autoregressive_memory_profile(target)?;
-        if draft.is_none() && conditioned.is_none() {
-            // This selected assistant has no retained architecture resource projection.
-            return Ok(None);
-        }
-        Ok(Some(
-            eredu_runtime::memory_forecast::SpeculativeMemoryProfile {
-                conditioned,
-                refinement: Self::refinement_memory_plan(runtime, None)?,
-                shared_backbone: None,
-                embedded: None,
-                parameter_conversions: None,
-                draft,
-                auxiliary_bytes_per_position: eredu_runtime::memory_estimation::MemoryBytes::exact(
-                    0,
-                ),
-                sampling_bytes_per_vocabulary_entry: speculative_sampling_memory(),
-                proposal_capacity: drafter
-                    .selected()
-                    .requirements()
-                    .strategy()
-                    .proposal_capacity()
-                    .get() as u64,
-                shared_allocator: true,
-            },
-        ))
-    }
-}
-
-impl GenerationForecastBackend for MlxBackend<'_> {
-    fn refinement_memory_plan(
-        runtime: &ModelRuntime<Self>,
-        policy: Option<eredu_core::refinement::RefinementPolicy>,
-    ) -> Result<Option<eredu_runtime::memory_forecast::RefinementMemoryPlan>, GenerationForecastError>
-    {
-        Ok(runtime.session().payload.model.erased().block_refinement_geometry().map(|geometry| eredu_runtime::memory_forecast::RefinementMemoryPlan {
-            canvas_positions: geometry.canvas_length,
-            vocabulary_size: geometry.vocabulary_size,
-            stability_history: policy.unwrap_or_default().stability_history_length(),
-            bytes_per_vocabulary_entry: eredu_runtime::memory_estimation::MemoryBytes::estimated(0, 64, "native full-score/feedback, retained selection rows, categorical/noise and processing scratch envelope; F32 upper width"),
-        }))
-    }
-    fn shared_backbone_memory_profile(
-        runtime: &ModelRuntime<Self>,
-    ) -> Result<
-        Option<eredu_runtime::memory_forecast::SpeculativeMemoryProfile>,
-        GenerationForecastError,
-    > {
-        let Some(policy) = runtime
-            .session()
-            .capability_estimate()
-            .map_err(|error| CapabilityError::Observation(error.to_string()))?
-            .shared_backbone_draft()
-        else {
-            return Ok(None);
-        };
-        Ok(Some(
-            eredu_runtime::memory_forecast::SpeculativeMemoryProfile {
-                conditioned: None,
-                refinement: Self::refinement_memory_plan(runtime, None)?,
-                shared_backbone: Some(
-                    eredu_runtime::memory_forecast::SharedBackboneMemoryPlan::from_policy(policy),
-                ),
-                embedded: None,
-                draft: None,
-                parameter_conversions: None,
-                auxiliary_bytes_per_position: eredu_runtime::memory_estimation::MemoryBytes::exact(
-                    0,
-                ),
-                sampling_bytes_per_vocabulary_entry: speculative_sampling_memory(),
-                proposal_capacity: policy.proposal_capacity().get() as u64,
-                shared_allocator: true,
-            },
-        ))
     }
 
-    #[cfg(feature = "tensor-capture")]
-    fn capture_memory_projection(
-        runtime: &ModelRuntime<Self>,
-        capture: &eredu_core::capture::AdmittedCapturePlan,
-        intervention: Option<&eredu_core::intervention::AdmittedInterventionPlan>,
-        first_prediction: u64,
-    ) -> Result<Option<eredu_runtime::capture::CaptureUsageProjection>, GenerationForecastError>
-    {
-        // Partition transport and intervention evidence need their own complete
-        // accounting. Deferred activation sources may allocate during creation;
-        // ordinary logits are already materialized by generation's workspace.
-        if runtime.session().payload.distributed.is_some()
-            || intervention.is_some_and(|p| !p.plan().operations.is_empty())
-        {
-            return Ok(None);
-        }
-        eredu_runtime::capture::project_capture_usage(
-            capture,
-            first_prediction,
-            |shape, selection, slice| {
-                if selection.path != eredu_core::MODEL_LOGITS_OBSERVATION_PATH {
-                    return Ok(None);
-                }
-                super::super::bounded_capture::estimate_shape(shape, selection, slice).map(Some)
-            },
-        )
-        .map_err(|e| CapabilityError::Observation(e.to_string()).into())
-    }
-
-    #[cfg(feature = "tensor-capture")]
-    fn capture_transforms_complete_per_step(_: &ModelRuntime<Self>) -> bool {
-        // Bounded capture evaluates and transfers synchronously; no lazy capture
-        // graphs or native views survive delivery of a completed prediction.
+    fn shares_allocator() -> bool {
         true
     }
 
-    fn loaded_memory_profile(
-        runtime: &ModelRuntime<Self>,
-    ) -> Result<LoadedMemoryProfile, GenerationForecastError> {
-        memory_profile(runtime, false)
+    fn capture_completes_per_step() -> bool {
+        // Transforms evaluate and transfer synchronously.
+        true
     }
 
-    fn forecast_execution_contract(
-        runtime: &ModelRuntime<Self>,
-        prompt: Option<&Self::Prompt>,
-        instrumented: bool,
-    ) -> ForecastExecutionContract {
-        let full_pass_reason = if runtime
-            .session()
-            .payload
-            .model
-            .erased()
-            .supports_retained_prefill()
-        {
-            None
-        } else if instrumented {
-            Some("capture or intervention requires one complete prefill invocation".into())
-        } else if let Err(reason) = Self::text_prefill_chunking_support(runtime) {
-            Some(reason.into())
-        } else if prompt.is_some_and(|prompt| prompt.chunkable_text_tokens().is_none()) {
-            Some("prepared input structure requires a complete prefill pass".into())
-        } else {
-            None
-        };
-        ForecastExecutionContract {
-            input_retention: if runtime
-                .session()
-                .payload
-                .model
-                .erased()
-                .supports_retained_prefill()
-            {
-                eredu_runtime::memory_forecast::PrefillInputRetention::PreparedProducts
-            } else {
-                eredu_runtime::memory_forecast::PrefillInputRetention::TokenIds
-            },
-            full_pass_reason,
-            logits: if !instrumented
-                && runtime
-                    .session()
-                    .payload
-                    .model
-                    .erased()
-                    .projects_final_prefill_position()
-            {
-                LogitsWorkspace::FinalPosition
-            } else {
-                LogitsWorkspace::EveryPosition
-            },
-        }
+    fn host_execution(backend: &MlxBackend<'_, Dispatch>) -> Result<bool, Error> {
+        backend
+            .stream()
+            .get_device()
+            .and_then(|d| d.get_type())
+            .map(|device| device == safemlx::DeviceType::Cpu)
+            .map_err(|error| {
+                BackendFailure::from_error(error)
+                    .with_operation("forecast execution device")
+                    .into()
+            })
     }
-}
-
-fn memory_profile(
-    runtime: &ModelRuntime<MlxBackend<'_>>,
-    continuation: bool,
-) -> Result<LoadedMemoryProfile, GenerationForecastError> {
-    let session = runtime.session();
-    let mut geometry = session
-        .capture_discovery
-        .as_ref()
-        .ok_or_else(|| {
-            CapabilityError::Observation(
-                "loaded executable has no retained architecture memory projection".into(),
-            )
-        })?
-        .generation_memory()?
-        .clone();
-    let offset = session
-        .payload
-        .model
-        .erased()
-        .forecast_state_offset()
-        .map_err(eredu_core::BackendFailure::from_error)?;
-    if !continuation && offset != Some(0) {
-        geometry.workspace = None;
-        geometry.execution_topology = None;
-        geometry.assumptions.push("existing or unavailable session state is not projected; reset before forecasting a fresh request".into());
-    }
-    let host_execution = runtime
-        .backend()
-        .stream()
-        .get_device()
-        .and_then(|d| d.get_type())
-        .map_err(|e| {
-            eredu_core::BackendFailure::from_error(e).with_operation("forecast execution device")
-        })?
-        == safemlx::DeviceType::Cpu;
-    let allocator_cache_limit = match crate::allocator_cache_policy() {
-        Ok(policy) => {
-            let source = format!(
-                "MLX allocator-cache policy {:?}: {} bytes",
-                policy.source, policy.limit_bytes
-            );
-            geometry.assumptions.push(source.clone());
-            Observed::exact(policy.limit_bytes, source)
-        }
-        Err(error) => Observed::unavailable(error.to_string()),
-    };
-    let parameters = crate::composition::mlx::capability::static_model_memory(session)?;
-    if geometry.fully_resident
-        && session.payload.distributed.is_none()
-        && session.payload.parameter_state.active.is_none()
-    {
-        if let (Some(topology), Some(report)) = (
-            geometry.execution_topology.as_mut(),
-            session
-                .residency_report()
-                .map_err(eredu_core::BackendFailure::from_error)?,
-        ) {
-            topology.projection_storage = report.projection_storage().clone();
-            topology.f32_rms_normalization_gains = report.f32_rms_normalization_gains().clone();
-        }
-    }
-    let parameter_conversions = session
-        .residency_report()
-        .map_err(eredu_core::BackendFailure::from_error)?
-        .and_then(|report| report.device_parameter_conversions().map(<[_]>::to_vec));
-    Ok(LoadedMemoryProfile {
-        parameter_conversions,
-        geometry,
-        parameters,
-        available: crate::composition::mlx::capability::available_memory()?,
-        host_execution,
-        allocator_cache_limit,
-    })
-}
-
-impl eredu_runtime::memory_forecast::ContinuationForecastBackend for MlxBackend<'_> {
-    fn continuation_memory_profile(
-        runtime: &ModelRuntime<Self>,
-        additional_input_tokens: u64,
-    ) -> Result<
-        Option<eredu_runtime::memory_forecast::ContinuationMemoryProfile>,
-        GenerationForecastError,
-    > {
-        use eredu_core::execution_control::NativeTextStateBackend;
-        use eredu_runtime::memory_estimation::MemoryBytes;
-        // This read-only native observation validates backend identity and idle authority.
-        let Some(current) = Self::estimate_native_text_state(runtime, None)
-            .map_err(eredu_core::BackendFailure::from_error)?
-        else {
-            return Ok(None);
-        };
-        let model = runtime.session().payload.model.erased();
-        let Some(position) = model
-            .forecast_state_offset()
-            .map_err(eredu_core::BackendFailure::from_error)?
-            .and_then(|n| u64::try_from(n).ok())
-        else {
-            return Ok(None);
-        };
-        // Include the current capacity envelope even for a zero-token forecast;
-        // retained tensor views alone need not describe their backing capacity.
-        let current_capacity = model
-            .estimate_installed_control_growth(0)
-            .map_err(eredu_core::BackendFailure::from_error)?;
-        let current_bound = current_capacity.and_then(|n| current.retained_bytes.checked_add(n));
-        let growth = model
-            .estimate_installed_control_growth(additional_input_tokens)
-            .map_err(eredu_core::BackendFailure::from_error)?;
-        let peak = growth.and_then(|n| current.retained_bytes.checked_add(n));
-        Ok(Some(eredu_runtime::memory_forecast::ContinuationMemoryProfile {
-            loaded: memory_profile(runtime, true)?,
-            plan: eredu_runtime::memory_forecast::ContinuationMemoryPlan {
-                current_positions: position,
-                additional_input_tokens,
-                query_tokens: model.block_refinement_geometry().map_or(1, |geometry| u64::from(geometry.canvas_length.get())),
-                current_state: match current_bound {
-                    Some(n) => MemoryBytes::estimated(0, n,
-                        "installed native logical state/capacity and materialization allowance; not measured distinct backing"),
-                    None => MemoryBytes::unknown("installed native capacity allowance unavailable or overflowing"),
-                },
-                peak_state: match peak {
-                    Some(n) => MemoryBytes::estimated(0, n,
-                        "installed state plus native growth envelope, including allocation capacity and interior peaks"),
-                    None => MemoryBytes::unknown("native continuation growth bound unavailable or overflowing"),
-                },
-            },
-        }))
-    }
-}
-
-fn speculative_sampling_memory() -> eredu_runtime::memory_estimation::MemoryBytes {
-    eredu_runtime::memory_estimation::MemoryBytes::estimated(0, 128,
-        "MLX speculative sampling calibration v1: 32 float32/index rows per live distribution for logits processing, filtering, normalization and residual sampling; planning envelope, not a kernel allocation guarantee")
 }

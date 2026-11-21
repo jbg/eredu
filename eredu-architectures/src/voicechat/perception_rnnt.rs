@@ -5,9 +5,7 @@
 //! does not establish native completion or publish either component's state.
 
 use eredu_core::{execution_control::SnapshotEstimate, BackendFailure};
-use eredu_runtime::execution_control::{
-    snapshot_value_estimate, SnapshotReservation, SnapshotValue,
-};
+use eredu_runtime::execution_control::{snapshot_value_estimate, SnapshotRetention, SnapshotValue};
 
 use eredu_nn::RetainedTensorRoots;
 
@@ -72,7 +70,7 @@ impl<T: SnapshotValue, C: SnapshotValue> SnapshotValue for PerceptionRnntState<T
             self.rnnt.estimate_snapshot_value(),
         ])
     }
-    fn copy_snapshot_value(&self, retention: &SnapshotReservation) -> Result<Self, BackendFailure> {
+    fn copy_snapshot_value(&self, retention: &SnapshotRetention) -> Result<Self, BackendFailure> {
         Ok(Self {
             perception: self.perception.copy_snapshot_value(retention)?,
             rnnt: self.rnnt.copy_snapshot_value(retention)?,

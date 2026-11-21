@@ -1,8 +1,8 @@
 //! Backend-neutral tokenizer and media-preparation facade.
 
 use eredu_core::{
-    MediaBinding, MediaRequestError, MultimodalPreparationBackend, MultimodalPreparationFailure,
-    MultimodalRequest,
+    MediaBinding, MediaRequestError, MultimodalPreparationFailure, MultimodalPreparationSession,
+    MultimodalRequest, TextExecutionSession, TextGenerationBackend,
 };
 
 use super::{LoadedModel, TextModelError};
@@ -25,25 +25,31 @@ pub enum MultimodalPreparationError {
     Backend(#[source] eredu_core::BackendFailure),
 }
 
-impl<B: MultimodalPreparationBackend> LoadedModel<B> {
+impl<B: TextGenerationBackend, S: TextExecutionSession<B> + MultimodalPreparationSession<B>>
+    LoadedModel<B, S>
+{
     /// Tokenizes text segments and asks this model's backend to prepare media.
     pub fn prepare_multimodal_input(
         &self,
         request: &MultimodalRequest,
-    ) -> Result<B::Prompt, MultimodalPreparationError> {
+    ) -> Result<S::Prompt, MultimodalPreparationError> {
         let tokenized = request.tokenize(|text| self.encode(text, false))?;
-        B::prepare_multimodal_input(&self.runtime, &tokenized, &mut |text| {
-            self.encode(text, false)
-        })
-        .map_err(|error| match error {
-            MultimodalPreparationFailure::Capability(error) => {
-                MultimodalPreparationError::Capability(error)
-            }
-            MultimodalPreparationFailure::Backend(error) => {
-                MultimodalPreparationError::Backend(eredu_core::BackendFailure::from_error(error))
-            }
-            MultimodalPreparationFailure::Text(error) => MultimodalPreparationError::Text(error),
-        })
+        self.runtime
+            .session()
+            .prepare_multimodal_input(&tokenized, &mut |text| self.encode(text, false))
+            .map_err(|error| match error {
+                MultimodalPreparationFailure::Capability(error) => {
+                    MultimodalPreparationError::Capability(error)
+                }
+                MultimodalPreparationFailure::Backend(error) => {
+                    MultimodalPreparationError::Backend(eredu_core::BackendFailure::from_error(
+                        error,
+                    ))
+                }
+                MultimodalPreparationFailure::Text(error) => {
+                    MultimodalPreparationError::Text(error)
+                }
+            })
     }
 
     /// Binds decoded media to a rendered chat and prepares its backend prompt.
@@ -51,7 +57,7 @@ impl<B: MultimodalPreparationBackend> LoadedModel<B> {
         &self,
         prepared_chat: &PreparedChat,
         bindings: &[MediaBinding],
-    ) -> Result<B::Prompt, MultimodalPreparationError> {
+    ) -> Result<S::Prompt, MultimodalPreparationError> {
         let request = MultimodalRequest::from_chat(prepared_chat.rendered_prompt(), bindings)?;
         self.prepare_multimodal_input(&request)
     }

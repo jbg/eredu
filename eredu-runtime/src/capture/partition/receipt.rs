@@ -1,10 +1,7 @@
 //! Expected-producer receipt admission and bounded host-record encoding/decoding.
 use super::*;
-#[cfg(feature = "tensor-capture")]
 use eredu_core::checkpoint::TensorDtype;
-#[cfg(feature = "tensor-capture")]
 use std::collections::BTreeMap;
-#[cfg(feature = "tensor-capture")]
 use std::sync::Arc;
 
 /// One retained producer projection for an exact global selection and forward.
@@ -33,7 +30,6 @@ pub struct PartitionCaptureReceiptLimits {
 /// Session identity, global work quotas and native completion must be established
 /// by the enclosing distributed session before it lends these facts.
 #[derive(Debug)]
-#[cfg(feature = "tensor-capture")]
 pub struct PartitionCaptureReceiptPlan {
     pub(super) combination: PartitionCaptureCombination,
     pub(super) plan: Arc<AdmittedCapturePlan>,
@@ -47,18 +43,15 @@ pub struct PartitionCaptureReceiptPlan {
     world_size: usize,
 }
 
-#[cfg(feature = "tensor-capture")]
 fn invalid(message: &str) -> CaptureError {
     CaptureError::Invalid(message.into())
 }
 
-#[cfg(feature = "tensor-capture")]
 fn reserve(ledger: &mut dyn CaptureReservation, usage: CaptureUsage) -> Result<(), CaptureError> {
     ledger.reserve_quota(usage)?;
     Ok(())
 }
 
-#[cfg(feature = "tensor-capture")]
 impl PartitionCaptureReceiptPlan {
     /// Cold host storage bound before retaining these already bounded declarations.
     pub fn preparation_usage(
@@ -720,14 +713,12 @@ impl PartitionCaptureReceiptPlan {
 /// Bounded receipt collection for exactly one retained forward selection.
 /// A failed receipt does not refund decoding or previously completed capture work.
 #[derive(Debug)]
-#[cfg(feature = "tensor-capture")]
 pub struct PartitionCaptureDelivery {
     plan: PartitionCaptureReceiptPlan,
     receipts: BTreeMap<usize, Vec<CapturedPartitionFragment>>,
     precision: Option<Option<TensorDtype>>,
 }
 
-#[cfg(feature = "tensor-capture")]
 impl PartitionCaptureDelivery {
     /// Validates the independently known sender before allocating decoded data.
     /// The encoded-byte bound and conservative parser storage are reserved first.
@@ -930,14 +921,12 @@ impl PartitionCaptureDelivery {
 /// and every producer acknowledgment, including producers contributing no values.
 /// This remains evidence pending the enclosing session's native completion agreement.
 #[derive(Debug)]
-#[cfg(feature = "tensor-capture")]
 pub struct ReceivedPartitionCapture {
     receipt_plan_identity: String,
     context: PartitionCaptureContext,
     producers: Vec<usize>,
     capture: AssembledPartitionCapture,
 }
-#[cfg(feature = "tensor-capture")]
 impl ReceivedPartitionCapture {
     /// Validated expected-producer geometry and delivery-bound identity.
     pub fn receipt_plan_identity(&self) -> &str {
@@ -973,7 +962,6 @@ impl ReceivedPartitionCapture {
     }
 }
 
-#[cfg(feature = "tensor-capture")]
 impl PartitionCaptureReceiptPlan {
     fn empty_capture(
         &self,
@@ -1015,7 +1003,6 @@ impl PartitionCaptureReceiptPlan {
     }
 }
 
-#[cfg(feature = "tensor-capture")]
 fn source_representation_matches(
     dtype: Option<&TensorDtype>,
     data: &eredu_core::TensorObservationData,
@@ -1037,7 +1024,6 @@ fn source_representation_matches(
     }
 }
 
-#[cfg(feature = "tensor-capture")]
 fn receipt_identity(
     context: &PartitionCaptureContext,
     producers: &BTreeMap<usize, CaptureSlicePartition>,
@@ -1150,7 +1136,6 @@ fn receipt_identity(
             }
         }
     }
-    #[cfg(feature = "tensor-capture")]
     use std::fmt::Write;
     let mut identity = String::with_capacity(64);
     for byte in hash.finalize() {

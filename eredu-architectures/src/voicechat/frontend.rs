@@ -9,7 +9,7 @@ use eredu_media::audio::{
     },
     LogMelFeatures,
 };
-use eredu_runtime::execution_control::{SnapshotReservation, SnapshotValue};
+use eredu_runtime::execution_control::{SnapshotRetention, SnapshotValue};
 
 /// Released input cadence in samples at 16 kHz.
 pub const INPUT_FRAME_SAMPLES: usize = 1280;
@@ -124,7 +124,7 @@ impl SnapshotValue for VoiceChatFrontend {
         })
     }
 
-    fn copy_snapshot_value(&self, _: &SnapshotReservation) -> Result<Self, BackendFailure> {
+    fn copy_snapshot_value(&self, _: &SnapshotRetention) -> Result<Self, BackendFailure> {
         self.estimate_snapshot_value()?;
         Ok(Self {
             options: self.options,

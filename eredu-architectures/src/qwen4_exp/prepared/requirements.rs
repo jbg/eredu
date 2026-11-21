@@ -6,8 +6,9 @@ use crate::{
     ExpertResidencyDistribution, ExpertResidencyUnit,
 };
 use eredu_checkpoint::store::TensorSelection;
+use eredu_core::cache::append_stream::AppendStreamBinding;
 use eredu_runtime::{
-    AppendStreamBinding, ExecutionGraph, ExecutionGroupId, ExecutionUnitLayout, ParameterBankKey,
+    ExecutionGraph, ExecutionGroupId, ExecutionUnitLayout, ParameterBankKey,
     ParameterTransformConstraint, ReplicatedTextParameterOwner as Owner,
     ReplicatedTextParameterPresence as Presence, ReplicatedTextParameterRequirement as Parameter,
     ReplicatedTextParameterRole as Role, ReplicatedTextRequirements, ReplicatedTextStateAccess,
@@ -198,18 +199,20 @@ pub(super) fn target_requirements<C: eredu_checkpoint::recipe::RecipeCatalog + ?
     row_admission: SelectedRowLookupPlans,
 ) -> Result<RoutedTextRequirements, PreparationError> {
     let state_layout = spec.state_layout()?;
-    AppendStreamBinding::validate_layout(&state_layout, &streams)?;
+    eredu_runtime::validate_append_stream_layout(&state_layout, &streams)?;
     for binding in &streams {
         if binding.lanes != spec.limits.qsa.batch as u32 {
-            return Err(eredu_runtime::AppendStreamError::Geometry.into());
+            return Err(eredu_core::cache::append_stream::AppendStreamError::Geometry.into());
         }
         if binding.limits.read_entries < spec.limits.tile_blocks as usize {
-            return Err(eredu_runtime::AppendStreamError::Budget {
-                resource: "summary tile entries",
-                required: spec.limits.tile_blocks as u64,
-                limit: binding.limits.read_entries as u64,
-            }
-            .into());
+            return Err(
+                eredu_core::cache::append_stream::AppendStreamError::Budget {
+                    resource: "summary tile entries",
+                    required: spec.limits.tile_blocks as u64,
+                    limit: binding.limits.read_entries as u64,
+                }
+                .into(),
+            );
         }
     }
     let graph = ExecutionGraph::chain([crate::decoder::TARGET_EXECUTION_GROUP]).map_err(invalid)?;

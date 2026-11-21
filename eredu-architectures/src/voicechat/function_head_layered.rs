@@ -1,10 +1,12 @@
 //! Independent function-vocabulary projection over shared bounded execution.
+
 use super::channels::{
     agree_parallel_projection, compute_type, validate_logits, ChannelError, DualChannelLogits,
     FunctionHead,
 };
 use crate::decoder::StaticModules;
 use eredu_core::BackendFailure;
+use eredu_core::SubmissionBackend;
 use eredu_nn::{
     DeclareLogicalParameters, DistributedNeuralBackend, LinearFormatSpec, LinearSpec,
     NeuralBackend, ParameterSpec, Tensor, VocabularyParallelRange,
@@ -17,7 +19,7 @@ use eredu_runtime::{
     ExecutionUnitLayout, LayeredForwardState, LayeredInvocation, LayeredTraversalHook,
     LayerwisePolicy, LayerwiseRuntime, LocalModelLayout, MemberSharding, OwnedParameterGroupSpec,
     ParallelComponentKernel, ParallelLayeredInvocation, ParameterGroupOwner, ParameterRole,
-    StatelessComponentState, SubmissionBackend, TensorPlacement,
+    StatelessComponentState, TensorPlacement,
 };
 use std::marker::PhantomData;
 

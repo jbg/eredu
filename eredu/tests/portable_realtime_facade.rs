@@ -20,16 +20,18 @@ use eredu_checkpoint::{
     validation::{CatalogTensorMetadata, SafetensorsCatalog},
     StoredDtype,
 };
+use eredu_core::communication::{
+    CommunicationCompletionCapabilities, CommunicationCompletionPolicy,
+};
 use eredu_core::{
     scheduler::{SemanticStateTransaction, TransitionOutput},
     Completion, CompletionCancellationMode,
 };
 use eredu_runtime::{
-    BackendMechanismFacts, CacheResidencyPolicy, CommunicationCompletionCapabilities,
-    CommunicationCompletionPolicy, ExecutionResidency, NormalizedLoadRequest, RealtimeLoadSupport,
+    BackendMechanismFacts, CacheResidencyPolicy, NormalizedLoadRequest, RealtimeLoadSupport,
     RealtimeMechanism, RealtimeMechanismFacts, RealtimeMechanismSupport,
     ReplicatedTextMechanismSupport, StateComponentPlacement, StateLifecycleCapabilities,
-    StateStorageDtype, WeightLoweringDescriptor, WeightLoweringKind, WeightResidency,
+    StateStorageDtype, WeightLoweringDescriptor, WeightResidency,
 };
 
 struct HeaderCatalog(BTreeMap<String, TensorMetadata>);
@@ -155,7 +157,7 @@ impl RealtimeMechanismSupport for ReferenceSupport {
                 Transfer,
                 Observation,
             ],
-            [ExecutionResidency::FullyResident],
+            [eredu_runtime::WeightResidencyMechanism::Resident],
             NonZeroUsize::new(1).unwrap(),
             CommunicationCompletionCapabilities::new([
                 CompletionCancellationMode::QuarantineUntilComplete,
@@ -166,7 +168,7 @@ impl RealtimeMechanismSupport for ReferenceSupport {
         .with_state_lifecycle(Self::STATE)
     }
 
-    fn supports_lowering(&self, _: &WeightLoweringDescriptor, _: WeightLoweringKind) -> bool {
+    fn supports_lowering(&self, _: &WeightLoweringDescriptor, _: bool) -> bool {
         true
     }
 
@@ -182,7 +184,7 @@ impl RealtimeMechanismSupport for ReferenceSupport {
 }
 
 impl ReplicatedTextMechanismSupport for ReferenceSupport {
-    fn facts(&self, _: &CacheResidencyPolicy) -> BackendMechanismFacts {
+    fn facts(&self, _: StateComponentPlacement) -> BackendMechanismFacts {
         BackendMechanismFacts::new(
             eredu_nn::NeuralOperatorCapabilities::ALL,
             [eredu_runtime::WeightResidencyMechanism::Resident],
@@ -205,7 +207,7 @@ impl ReplicatedTextMechanismSupport for ReferenceSupport {
 
     fn supports_state_component(
         &self,
-        _: &eredu_core::cache::StateComponentPolicy,
+        _: &[eredu_core::cache::StateTensorDimension],
         _: StateStorageDtype,
         placement: StateComponentPlacement,
     ) -> bool {
@@ -277,9 +279,13 @@ impl Completion for Ready {
     }
 }
 
-struct ReferenceStartup(Cell<usize>);
+struct ReferenceStartup;
 
-impl eredu_runtime::RealtimeStartupMechanisms for ReferenceStartup {
+thread_local! {
+    static STATE_ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+}
+
+impl eredu_core::realtime_mechanisms::RealtimeStartupMechanisms for ReferenceStartup {
     type Random = u64;
     type Completion = Ready;
 
@@ -288,18 +294,12 @@ impl eredu_runtime::RealtimeStartupMechanisms for ReferenceStartup {
     }
 }
 
-impl
-    eredu_runtime::RealtimeStateMaterializer<
-        eredu_runtime::SelectedRealtimeStateRealization,
-        ReferenceState,
-    > for ReferenceStartup
-{
-    fn realize_state(
-        &self,
-        _: &eredu_runtime::SelectedRealtimeStateRealization,
-    ) -> Result<ReferenceState, eredu_core::BackendFailure> {
-        self.0.set(self.0.get() + 1);
-        Ok(ReferenceState(0))
+impl eredu_runtime::CategoricalRealtimeState for ReferenceState {
+    fn resident_categorical_state(
+        _: &eredu_runtime::StateLayout,
+    ) -> Result<Self, eredu_core::BackendFailure> {
+        STATE_ALLOCATIONS.with(|count| count.set(count.get() + 1));
+        Ok(Self(0))
     }
 }
 
@@ -371,22 +371,22 @@ fn no_default_facade_selects_runs_and_resumes_realtime_with_reference_mechanisms
     assert!(model.session_capabilities().persistent_cache());
 
     let execution = prepared.execution_descriptor().bind(());
-    let startup = ReferenceStartup(Cell::new(0));
+    let startup = ReferenceStartup;
     let invalid_sampling = RealtimeSampling::greedy()
         .with_top_k(Some(i32::MAX as usize + 1), None)
         .unwrap();
     assert!(matches!(
-        execution.initialize_generation::<_, i32, _>(&startup, invalid_sampling),
+        execution.initialize_generation::<ReferenceState, i32, _>(&startup, invalid_sampling),
         Err(moshi::MoshiRealtimeStartupError::Sampling(_))
     ));
     assert_eq!(
-        startup.0.get(),
+        STATE_ALLOCATIONS.with(Cell::get),
         0,
         "rejected startup must not allocate state"
     );
     let sampling = RealtimeSampling::new(0.7, 0.6, 42).unwrap();
     let generation = execution
-        .initialize_generation::<_, i32, _>(&startup, sampling)
+        .initialize_generation::<ReferenceState, i32, _>(&startup, sampling)
         .unwrap();
     assert_eq!(generation.random_state(), Some(&42));
     let mut scheduler = RealtimeSessionScheduler::new(

@@ -48,7 +48,7 @@ fn main() -> anyhow::Result<()> {
         .collect();
     let execution = ExecutionPlan::fully_resident(eredu_core::DevicePlan::new("mlx", "cpu:0")?);
     let (mut model, _) =
-        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), path, &execution)?
+        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), path, &execution, None)?
             .into_parts();
     let chat = model.prepare_chat(ChatTemplateRequest {
         messages: vec![serde_json::json!({"role":"user", "content":"reference output contract"})],

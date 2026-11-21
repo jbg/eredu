@@ -1,5 +1,6 @@
 //! Validated independently leased bank entry declarations.
-use crate::{OffloadUnit, ParameterBankKey};
+use crate::ParameterBankKey;
+use eredu_core::residency::parameter_binding::OffloadUnit;
 use eredu_core::residency::OffloadUnitId;
 
 /// Invalid independent parameter storage identity or admitted byte extent.
@@ -83,7 +84,7 @@ pub enum AddressableBankCatalogError {
     },
     /// A binding plan cannot form a valid residency unit.
     #[error(transparent)]
-    Declaration(#[from] crate::ResidencyDeclarationError),
+    Declaration(#[from] eredu_core::residency::parameter_binding::ResidencyDeclarationError),
     /// A selected independent entry declaration is invalid.
     #[error(transparent)]
     Entry(#[from] AddressableBankEntryError),

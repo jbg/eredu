@@ -1,18 +1,20 @@
 //! Cold exact binding plans for independently leased TTS transformer units.
 
+use eredu_core::SubmissionBackend;
+
 use std::collections::BTreeMap;
 
 use eredu_checkpoint::{
     recipe::{RecipeDtype, RecipeError},
     store::{SharedCheckpointSource, StoreError},
 };
+use eredu_core::residency::parameter_binding::WeightBinding;
 use eredu_core::BackendFailure;
 use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Tensor};
 use eredu_runtime::{
     ComponentPreparationError, LocalModelLayout, PreparedComponent, RecipeBindingError,
-    WeightBinding,
 };
-use eredu_runtime::{LayeredTensorCohort, ParameterUnitMechanisms, SubmissionBackend};
+use eredu_runtime::{LayeredTensorCohort, ParameterUnitMechanisms};
 
 use super::{
     artifact::{ParameterAdmission, RetainedVoiceChatArtifacts},
@@ -188,10 +190,10 @@ impl PreparedTtsTransformerBindings {
         let selected = if let Some(cohort) = &cohort {
             let (manifest, group) = cohort.selection();
             let width = self.config().geometry().hidden_size;
-            let sum = eredu_runtime::CommunicationOperationRequirement::tensors(
-                eredu_runtime::CommunicationOperation::AllReduceSum,
+            let sum = eredu_core::communication::CommunicationOperationRequirement::tensors(
+                eredu_core::communication::CommunicationOperation::AllReduceSum,
                 [eredu_core::checkpoint::TensorDtype::F32],
-                eredu_runtime::CommunicationTensorLimits::new(1, 3, width, None)
+                eredu_core::communication::CommunicationTensorLimits::new(1, 3, width, None)
                     .map_err(BackendFailure::from_error)?,
                 true,
             )

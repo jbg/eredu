@@ -8,17 +8,13 @@
 
 use std::ffi::c_void;
 
-#[cfg(test)]
 use bytemuck::cast_slice;
+use half::slice::HalfFloatSliceExt;
 use safetensors::tensor::TensorView;
-#[cfg(test)]
-use std::mem::transmute;
 
 use crate::{error::ConversionError, Dtype};
 
-use super::Array;
-#[cfg(test)]
-use super::EvaluatedArray;
+use super::{Array, EvaluatedArray};
 
 impl<'data> TryFrom<TensorView<'data>> for Array {
     type Error = ConversionError;
@@ -101,77 +97,40 @@ fn adjust_packed_shape(
     Ok(())
 }
 
-#[cfg(test)]
-pub(crate) fn tensor_view_from_array<'a>(
-    value: &'a EvaluatedArray<'a>,
-) -> Result<TensorView<'a>, ConversionError> {
-    let dtype: safetensors::tensor::Dtype = value.as_array().dtype().try_into()?;
-    let shape = value.as_array().shape()
-        .iter()
-        .map(|x| *x as usize)
-        .collect::<Vec<_>>();
-    let data: &[u8] = unsafe {
-        match value.as_array().dtype() {
-            Dtype::Bool => {
-                let data = value.as_slice::<bool>();
-                cast_slice(data)
-            },
-            Dtype::Uint8 => {
-                let data = value.as_slice::<u8>();
-                cast_slice(data)
-            },
-            Dtype::Uint16 => {
-                let data = value.as_slice::<u16>();
-                cast_slice(data)
-            },
-            Dtype::Uint32 => {
-                let data = value.as_slice::<u32>();
-                cast_slice(data)
-            },
-            Dtype::Uint64 => {
-                let data = value.as_slice::<u64>();
-                cast_slice(data)
-            },
-            Dtype::Int8 => {
-                let data = value.as_slice::<i8>();
-                cast_slice(data)
-            },
-            Dtype::Int16 => {
-                let data = value.as_slice::<i16>();
-                cast_slice(data)
-            },
-            Dtype::Int32 => {
-                let data = value.as_slice::<i32>();
-                cast_slice(data)
-            },
-            Dtype::Int64 => {
-                let data = value.as_slice::<i64>();
-                cast_slice(data)
-            },
-            Dtype::Float16 => {
-                let data = value.as_slice::<half::f16>();
-                let bits: &[u16] = transmute(data);
-                cast_slice(bits)
-            },
-            Dtype::Float32 => {
-                let data = value.as_slice::<f32>();
-                cast_slice(data)
-            },
-            Dtype::Float64 => {
-                let data = value.as_slice::<f64>();
-                cast_slice(data)
-            },
-            Dtype::Bfloat16 => {
-                let data = value.as_slice::<half::bf16>();
-                let bits: &[u16] = transmute(data);
-                cast_slice(bits)
-            },
-            Dtype::Complex64 => return Err(ConversionError::MlxDtype(Dtype::Complex64)),
+impl EvaluatedArray<'_> {
+    /// Borrows the bytes of a row-contiguous array as a little-endian tensor.
+    pub fn safetensors_view(&self) -> Result<TensorView<'_>, ConversionError> {
+        if cfg!(target_endian = "big") {
+            return Err(crate::error::Exception::custom(
+                "borrowing SafeTensors data requires little-endian native storage",
+            )
+            .into());
         }
-    };
-
-    TensorView::new(dtype, shape, data)
-        .map_err(Into::into)
+        let array = self.as_array();
+        let dtype = array.dtype().try_into()?;
+        let shape = array
+            .shape()
+            .iter()
+            .map(|&dimension| dimension as usize)
+            .collect();
+        let bytes = match array.dtype() {
+            Dtype::Bool => cast_slice(self.try_as_slice::<bool>()?),
+            Dtype::Uint8 => self.try_as_slice::<u8>()?,
+            Dtype::Uint16 => cast_slice(self.try_as_slice::<u16>()?),
+            Dtype::Uint32 => cast_slice(self.try_as_slice::<u32>()?),
+            Dtype::Uint64 => cast_slice(self.try_as_slice::<u64>()?),
+            Dtype::Int8 => cast_slice(self.try_as_slice::<i8>()?),
+            Dtype::Int16 => cast_slice(self.try_as_slice::<i16>()?),
+            Dtype::Int32 => cast_slice(self.try_as_slice::<i32>()?),
+            Dtype::Int64 => cast_slice(self.try_as_slice::<i64>()?),
+            Dtype::Float16 => cast_slice(self.try_as_slice::<half::f16>()?.reinterpret_cast()),
+            Dtype::Float32 => cast_slice(self.try_as_slice::<f32>()?),
+            Dtype::Float64 => cast_slice(self.try_as_slice::<f64>()?),
+            Dtype::Bfloat16 => cast_slice(self.try_as_slice::<half::bf16>()?.reinterpret_cast()),
+            Dtype::Complex64 => return Err(ConversionError::MlxDtype(Dtype::Complex64)),
+        };
+        Ok(TensorView::new(dtype, shape, bytes)?)
+    }
 }
 
 #[cfg(test)]
@@ -185,7 +144,7 @@ mod tests {
             let stream = crate::Stream::new_with_device(&crate::Device::new(crate::DeviceType::Cpu, 0));
             let arr = $arr.as_dtype($dtype, &stream).unwrap();
             let arr = arr.evaluated().unwrap();
-            let tensor = super::tensor_view_from_array(&arr).unwrap();
+            let tensor = arr.safetensors_view().unwrap();
             let arr2 = Array::try_from(tensor).unwrap();
             let arr2 = arr2.evaluated().unwrap();
 
@@ -212,7 +171,7 @@ mod tests {
             .as_type::<complex64>(&stream)
             .unwrap();
         let arr = arr.evaluated().unwrap();
-        let tensor = super::tensor_view_from_array(&arr);
+        let tensor = arr.safetensors_view();
         assert!(tensor.is_err());
     }
 

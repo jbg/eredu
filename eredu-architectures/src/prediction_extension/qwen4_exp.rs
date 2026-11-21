@@ -2,6 +2,7 @@
 use super::*;
 use crate::qwen4_exp::{mtp, target::TargetKernel};
 use eredu_nn::{residual_streams::ResidualStreamGeometry, EmbeddingOperator};
+use eredu_runtime::speculative::PredictionModule;
 use eredu_runtime::{RuntimeState, TensorParallelParameterProvider};
 
 /// Target-owned vocabulary access for prediction. The target session keeps these
@@ -77,8 +78,8 @@ where
         + HyperNeuralBackend,
     M: PredictionExtensionMaterializer<B>,
 {
-    units: Vec<M::Module<mtp::PredictionUnit<B>>>,
-    shared: M::Module<mtp::PredictionShared<B>>,
+    units: Vec<PredictionModule<B, M, mtp::PredictionUnit<B>>>,
+    shared: PredictionModule<B, M, mtp::PredictionShared<B>>,
     state: M::ModelState,
     provider: P,
     geometry: ResidualStreamGeometry,
@@ -101,8 +102,8 @@ where
     /// Pairs materialized owners with the exact separately constructed state.
     /// This does not select residency or acquire/reconstruct checkpoint sources.
     pub fn new(
-        mut units: Vec<M::Module<mtp::PredictionUnit<B>>>,
-        mut shared: M::Module<mtp::PredictionShared<B>>,
+        mut units: Vec<PredictionModule<B, M, mtp::PredictionUnit<B>>>,
+        mut shared: PredictionModule<B, M, mtp::PredictionShared<B>>,
         state: M::ModelState,
         provider: P,
     ) -> Result<Self, eredu_nn::Error> {
@@ -141,8 +142,8 @@ where
         + HyperNeuralBackend,
     M: PredictionExtensionMaterializer<B>,
 {
-    unit: &'a mut M::Module<mtp::PredictionUnit<B>>,
-    shared: &'a mut M::Module<mtp::PredictionShared<B>>,
+    unit: &'a mut PredictionModule<B, M, mtp::PredictionUnit<B>>,
+    shared: &'a mut PredictionModule<B, M, mtp::PredictionShared<B>>,
     hidden: &'a B::Tensor,
     tokens: &'a B::Tensor,
     depth: usize,
@@ -229,20 +230,6 @@ where
         })
     }
 }
-impl<A, B, M, P> executor_sealed::Sealed<A> for MaterializedQwen4Prediction<B, M, P>
-where
-    B: BlockwiseAttentionBackend
-        + DistributedNeuralBackend
-        + GroupedNeuralBackend
-        + HyperNeuralBackend,
-    M: PredictionExtensionMaterializer<B>,
-    <M::ModelState as PredictionModelState<B>>::LayerState: eredu_runtime::RuntimeAppendStreams<B>,
-    P: eredu_runtime::TensorParallelParameterProvider<B>,
-    P::Error: std::fmt::Display,
-    A: Qwen4PredictionTarget<B>,
-{
-}
-
 impl<A, B, M, P> MaterializedPredictionExecutor<A, B, M> for MaterializedQwen4Prediction<B, M, P>
 where
     B: BlockwiseAttentionBackend
@@ -383,20 +370,6 @@ where
             })
             .map(|output| (output.logits, output.capture))
     }
-}
-
-/// Failure while assembling selected prediction state and immutable owners.
-#[derive(Debug, thiserror::Error)]
-pub enum PredictionConstructionError<E> {
-    /// Native state construction failed before parameter materialization.
-    #[error("prediction state construction failed: {0}")]
-    State(#[source] E),
-    /// Binding a selected immutable parameter owner failed.
-    #[error("prediction weight construction failed: {0}")]
-    Weights(#[source] E),
-    /// Constructed state or parameter geometry violated the retained contract.
-    #[error(transparent)]
-    Contract(#[from] eredu_nn::Error),
 }
 
 /// Exact prediction parameter handoff after joint target/auxiliary weight selection.
@@ -574,7 +547,7 @@ where
         }
         B::require_operator_capabilities("qwen4_exp prediction", spec.required_operators())
             .map_err(|e| invalid(e.to_string()))?;
-        let shared = PreparedPredictionUnit::new(
+        let shared = super::prepare_prediction_unit(
             mtp::PredictionShared::<B>::new(source_spec, context)
                 .map_err(|e| invalid(e.to_string()))?,
             mtp::PredictionShared::<B>::new(&spec, context).map_err(|e| invalid(e.to_string()))?,
@@ -601,7 +574,7 @@ where
                 }
                 .map_err(|error| invalid(error.to_string()))?;
                 Ok(
-                    PreparedPredictionUnit::new(source, local, bindings.take(Some(depth))?)?
+                    super::prepare_prediction_unit(source, local, bindings.take(Some(depth))?)?
                         .with_source_layout(source_layout.clone())
                         .with_residency(residency),
                 )
@@ -622,36 +595,35 @@ where
     }
     pub(crate) fn with_discovery_binding(
         mut self,
-        binding: &crate::prepared_execution::PredictionBinding,
+        binding: &crate::prepared_execution::RetainedPredictionBinding,
     ) -> Result<Self, eredu_core::artifact::ArtifactError> {
-        if let Some((slot, topology)) = &binding.placement {
-            let layout = match &self.layout {
-                Some(layout) => layout.clone(),
-                None => std::sync::Arc::new(
-                    self.global_spec
-                        .tensor_partition(0, 1)
-                        .and_then(|partition| partition.projected_layout(&self.parameters))
-                        .map_err(|error| invalid(error.to_string()))?,
-                ),
-            };
-            let modules = std::iter::once(self.shared.resource_module(0))
-                .chain(
-                    self.units
-                        .iter()
-                        .enumerate()
-                        .map(|(index, unit)| unit.resource_module(index + 1)),
-                )
-                .collect();
-            let placement = super::PreparedPredictionPlacement::qwen4(
-                *topology,
-                self.global_spec.clone(),
-                self.parameters.clone(),
-                layout,
-                modules,
-                self.state.layout(),
-            );
-            self.placement = Some((slot.clone(), std::sync::Arc::new(placement)));
-        }
+        let (slot, topology) = &binding.placement;
+        let layout = match &self.layout {
+            Some(layout) => layout.clone(),
+            None => std::sync::Arc::new(
+                self.global_spec
+                    .tensor_partition(0, 1)
+                    .and_then(|partition| partition.projected_layout(&self.parameters))
+                    .map_err(|error| invalid(error.to_string()))?,
+            ),
+        };
+        let modules = std::iter::once(self.shared.resource_module(0))
+            .chain(
+                self.units
+                    .iter()
+                    .enumerate()
+                    .map(|(index, unit)| unit.resource_module(index + 1)),
+            )
+            .collect();
+        let placement = super::PreparedPredictionPlacement::qwen4(
+            *topology,
+            self.global_spec.clone(),
+            self.parameters.clone(),
+            layout,
+            modules,
+            self.state.layout(),
+        );
+        self.placement = Some((slot.clone(), std::sync::Arc::new(placement)));
         Ok(self)
     }
     /// Original retained source; backend context construction must use this source.
@@ -667,7 +639,9 @@ where
         self.layout.as_deref()
     }
     /// Architecture-admitted stream identities and finite bounds.
-    pub fn streams(&self) -> &[eredu_runtime::AppendStreamBinding] {
+    pub fn streams(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &eredu_core::cache::append_stream::AppendStreamBinding> {
         self.state.append_streams()
     }
     /// Exact selected mechanisms for independent prediction-state construction.
@@ -722,16 +696,24 @@ where
         context: &mut M::Context<'_>,
     ) -> Result<
         (
-            M::Module<mtp::PredictionShared<B>>,
-            Vec<M::Module<mtp::PredictionUnit<B>>>,
+            PredictionModule<B, M, mtp::PredictionShared<B>>,
+            Vec<PredictionModule<B, M, mtp::PredictionUnit<B>>>,
         ),
         M::Error,
     >
     where
         M: PredictionExtensionMaterializer<B>,
     {
-        let shared = M::materialize_module(context, self.shared, self.layout.as_deref())?;
-        let units = M::materialize_units(context, self.units, self.layout.as_deref())?;
+        let shared = eredu_runtime::speculative::materialize_prediction_module::<B, M, _>(
+            context,
+            self.shared,
+            self.layout.as_deref(),
+        )?;
+        let units = eredu_runtime::speculative::materialize_prediction_units::<B, M, _>(
+            context,
+            self.units,
+            self.layout.as_deref(),
+        )?;
         Ok((shared, units))
     }
 }

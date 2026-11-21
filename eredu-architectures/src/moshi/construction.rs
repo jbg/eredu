@@ -2,12 +2,12 @@
 
 use std::borrow::Borrow;
 
+use eredu_core::communication::{CommunicationBackend, CommunicationTensorMetadata};
 use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Tensor};
 use eredu_runtime::{
-    construct_realtime_execution, CommunicationBackend, CommunicationTensorMetadata,
-    ConstructedRealtimeExecution, ExecutionResidency, LayeredArchitecture, LayerwisePolicy,
-    LayerwiseRuntime, LayerwiseTraversalPartitionExecutor, LayerwiseTraversalRuntime,
-    LocalModelLayout, NoBoundaryTransport, NoCommitAgreement, NoOutputPublisher,
+    construct_realtime_execution, ConstructedRealtimeExecution, ExecutionResidency,
+    LayeredArchitecture, LayerwisePolicy, LayerwiseRuntime, LayerwiseTraversalPartitionExecutor,
+    LayerwiseTraversalRuntime, NoBoundaryTransport, NoCommitAgreement, NoOutputPublisher,
     PartitionedExecutionPlan, PartitionedTextRuntime, RealtimeArchitectureIdentity,
     RealtimeLayerwiseRuntime, RealtimeModelConstructionMechanisms, RealtimeTensorResources,
 };
@@ -24,7 +24,6 @@ type MoshiTensorTraversal<A, B, S, P, G, R, I> = LayerwiseTraversalRuntime<
             A,
             B,
             S,
-            (),
             LayerwiseTraversalPartitionExecutor<A, B, S, P>,
             G,
             R,
@@ -55,7 +54,7 @@ where
     TensorBounded(MoshiTensorTraversal<A, B, M::State, M::BoundedPolicy, G, R, I>),
 }
 
-impl<A, B, M, G, R, I> eredu_runtime::RealtimeResidencyTelemetry
+impl<A, B, M, G, R, I> eredu_runtime::UnitResidencyTelemetry
     for MoshiRealtimeTraversal<A, B, M, G, R, I>
 where
     B: CommunicationBackend<Executor = Context<B>>,
@@ -66,8 +65,8 @@ where
     R: Borrow<B::CommunicationRoute>,
     I: CommunicationTensorMetadata<B>,
     M::PolicyError: std::fmt::Display,
-    M::ResidentPolicy: eredu_runtime::RealtimeResidencyTelemetry<Error = M::PolicyError>,
-    M::BoundedPolicy: eredu_runtime::RealtimeResidencyTelemetry<Error = M::PolicyError>,
+    M::ResidentPolicy: eredu_runtime::UnitResidencyTelemetry<Error = M::PolicyError>,
+    M::BoundedPolicy: eredu_runtime::UnitResidencyTelemetry<Error = M::PolicyError>,
 {
     type Error = M::PolicyError;
 
@@ -98,12 +97,12 @@ where
     R: Borrow<B::CommunicationRoute>,
     I: CommunicationTensorMetadata<B>,
     M::PolicyError: std::fmt::Display,
-    M::ResidentPolicy: eredu_runtime::RealtimeResidencyTelemetry<Error = M::PolicyError>,
-    M::BoundedPolicy: eredu_runtime::RealtimeResidencyTelemetry<Error = M::PolicyError>,
+    M::ResidentPolicy: eredu_runtime::UnitResidencyTelemetry<Error = M::PolicyError>,
+    M::BoundedPolicy: eredu_runtime::UnitResidencyTelemetry<Error = M::PolicyError>,
 {
     fn active_telemetry(
         &self,
-    ) -> &dyn eredu_runtime::RealtimeResidencyTelemetry<Error = M::PolicyError> {
+    ) -> &dyn eredu_runtime::UnitResidencyTelemetry<Error = M::PolicyError> {
         match self {
             Self::Replicated(execution) => match execution.execution() {
                 RealtimeLayerwiseRuntime::Resident(runtime) => runtime.policy(),
@@ -129,7 +128,11 @@ where
     <M::State as eredu_runtime::LayerRuntimeState<B>>::LayerState:
         eredu_nn::AttentionCache<B::Tensor>,
     M::PolicyError: std::fmt::Display,
-    SB: eredu_runtime::SamplingBackend<Logits = B::Tensor, Token = B::Tensor, Context = Context<B>>,
+    SB: eredu_core::sampling::SamplingBackend<
+        Logits = B::Tensor,
+        Token = B::Tensor,
+        Context = Context<B>,
+    >,
     SB::Error: std::fmt::Display,
     S: eredu_runtime::Sampler<SB>,
 {
@@ -169,40 +172,55 @@ where
     I: CommunicationTensorMetadata<B>,
 {
     /// Constructs the selected parameter policy and assembles the retained route.
-    pub(super) fn construct<M, E, Report>(
+    pub(super) fn construct<M, E>(
         self,
         context: &Context<B>,
-        materializer: impl FnOnce(Option<&LocalModelLayout>) -> M,
-        report: impl FnOnce(&M) -> Result<Report, E>,
-    ) -> Result<(MoshiRealtimeTraversal<A, B, M, G, R, I>, Report), MoshiRealtimeDispatchError<E>>
+        source: eredu_checkpoint::store::SharedCheckpointSource,
+        transform: Option<eredu_checkpoint::WeightQuantization>,
+        materializer: &M,
+    ) -> Result<
+        (
+            MoshiRealtimeTraversal<A, B, M, G, R, I>,
+            eredu_runtime::LayerwiseModelMetadata,
+        ),
+        MoshiRealtimeDispatchError<E>,
+    >
     where
+        B: eredu_core::checkpoint_mechanisms::CheckpointParameterBackend,
         M: RealtimeModelConstructionMechanisms<A, B>,
         A: LayeredArchitecture<B, M::State> + RealtimeArchitectureIdentity,
         A::Error: std::fmt::Display,
         M::PolicyError: std::fmt::Display,
         M::Error: std::fmt::Display,
     {
-        let (architecture, source, contract, parallel) = self.into_construction_parts();
-        let materializer = materializer(parallel.as_ref().map(|(plan, _)| plan.layout()));
-        let execution =
-            construct_realtime_execution(architecture, source, contract, materializer, context)
-                .map_err(|error| MoshiRealtimeDispatchError::Architecture(error.to_string()))?;
-        let report =
-            report(execution.mechanisms()).map_err(MoshiRealtimeDispatchError::Mechanism)?;
+        let (architecture, source_architecture, contract, parallel) =
+            self.into_construction_parts();
+        let layout = parallel.as_ref().map(|(plan, _)| plan.layout());
+        let (execution, report) = construct_realtime_execution(
+            architecture,
+            source_architecture,
+            contract,
+            source,
+            layout,
+            transform,
+            materializer,
+            context,
+        )
+        .map_err(|error| MoshiRealtimeDispatchError::Architecture(error.to_string()))?;
         let Some((parallel, resources)) = parallel else {
             return Ok((MoshiRealtimeTraversal::Replicated(execution), report));
         };
 
         let (_, _, _, _, plan) = parallel.into_parts();
-        let (selected, runtime, _) = execution.into_parts();
+        let (selected, runtime) = execution.into_parts();
         let residency = selected.residency().execution_residency();
         let traversal = match runtime {
             RealtimeLayerwiseRuntime::Resident(runtime) => {
-                construct_tensor(plan, resources, runtime, residency, None)
+                construct_tensor(plan, resources, runtime, residency, false)
                     .map(MoshiRealtimeTraversal::TensorResident)
             }
             RealtimeLayerwiseRuntime::Bounded(runtime) => {
-                construct_tensor(plan, resources, runtime, residency, Some(()))
+                construct_tensor(plan, resources, runtime, residency, true)
                     .map(MoshiRealtimeTraversal::TensorBounded)
             }
         }
@@ -216,7 +234,7 @@ fn construct_tensor<A, B, S, P, G, R, I>(
     resources: RealtimeTensorResources<B, G, R, I>,
     runtime: LayerwiseRuntime<A, B, S, P>,
     residency: ExecutionResidency,
-    bounded: Option<()>,
+    bounded: bool,
 ) -> Result<MoshiTensorTraversal<A, B, S, P, G, R, I>, eredu_runtime::PartitionExecutionError>
 where
     B: CommunicationBackend<Executor = Context<B>> + DistributedNeuralBackend,

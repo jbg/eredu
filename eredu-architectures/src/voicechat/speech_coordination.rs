@@ -6,9 +6,11 @@ use super::super::{
 };
 use eredu_nn::{NeuralBackend, Tensor, TensorElementType};
 use eredu_runtime::{
-    replicated_execution::ReplicatedCoordinator, DenseSamplingBackend, GumbelTruncation,
-    RealtimeGenerationBranch, RealtimeRandomStateTransactionError, RealtimeScheduleState,
+    replicated_execution::ReplicatedCoordinator, RealtimeGenerationBranch,
+    RealtimeRandomStateTransactionError, RealtimeScheduleState,
 };
+
+use eredu_core::sampling::{DenseSamplingBackend, GumbelTruncation};
 
 const PROTOCOL: u64 = 0x5350454543480001;
 
@@ -172,7 +174,7 @@ where
             let latent = i32::try_from(self.latent)
                 .map_err(|_| TtsError::Configuration("speech latent width exceeds I32"))?;
             for dimensions in [shape, &[shape[0], shape[1], latent]] {
-                eredu_runtime::dense_sampling::validate_dense_draw_shape(dimensions)
+                eredu_core::sampling::validate_dense_draw_shape(dimensions)
                     .map_err(eredu_nn::Error::backend_source)?;
             }
             Ok(latent)

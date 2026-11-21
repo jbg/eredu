@@ -1,32 +1,7 @@
 //! Exact result and state dependencies of one physical prediction-module call.
 
-/// An equation outcome together with every output and changed-state tensor
-/// needed to settle its module loan. An error does not imply native completion.
-pub struct PredictionInvocation<T, O> {
-    outcome: Result<O, eredu_nn::Error>,
-    retained: Vec<T>,
-}
-
-impl<T, O> PredictionInvocation<T, O> {
-    /// Retains the exact dependency set on both successful and failed work.
-    pub fn new(outcome: Result<O, eredu_nn::Error>, retained: impl IntoIterator<Item = T>) -> Self {
-        Self {
-            outcome,
-            retained: retained.into_iter().collect(),
-        }
-    }
-
-    /// Borrows evaluation roots while the native module lease remains held.
-    pub fn retained_values(&self) -> impl Iterator<Item = &T> {
-        self.retained.iter()
-    }
-
-    /// Publishes the equation outcome after the caller has established safe
-    /// completion, terminal failure, or teardown of the retained native work.
-    pub fn into_outcome(self) -> Result<O, eredu_nn::Error> {
-        self.outcome
-    }
-}
+use eredu_runtime::speculative::PredictionInvocation;
+use eredu_runtime::speculative::PredictionModule;
 
 pub(crate) fn prediction_invocation<'a, T: Clone + 'a, O, const N: usize>(
     outcome: Result<O, eredu_nn::Error>,
@@ -79,7 +54,7 @@ where
     C: eredu_runtime::RuntimeLayerState<B>,
     M: super::PredictionExtensionMaterializer<B>,
 {
-    type Module = M::Module<U>;
+    type Module = PredictionModule<B, M, U>;
     fn invoke<O, const N: usize>(
         module: &mut Self::Module,
         state: &mut C,

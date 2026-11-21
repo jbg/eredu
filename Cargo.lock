@@ -848,9 +848,11 @@ name = "eredu"
 version = "0.5.0"
 dependencies = [
  "anyhow",
+ "clap",
  "eredu-architectures",
  "eredu-backend-mlx",
  "eredu-checkpoint",
+ "eredu-codec",
  "eredu-core",
  "eredu-evaluation",
  "eredu-gguf",
@@ -860,6 +862,8 @@ dependencies = [
  "eredu-text",
  "jsonschema",
  "llguidance",
+ "safemlx",
+ "safetensors",
  "serde",
  "serde_json",
  "sha2",
@@ -894,22 +898,12 @@ dependencies = [
 name = "eredu-backend-mlx"
 version = "0.5.0"
 dependencies = [
- "anyhow",
- "clap",
- "eredu-architectures",
  "eredu-backend-mlx-macros",
  "eredu-checkpoint",
- "eredu-codec",
  "eredu-core",
- "eredu-evaluation",
  "eredu-gguf",
- "eredu-media",
  "eredu-nn",
- "eredu-runtime",
- "eredu-text",
- "float_eq",
  "half",
- "pretty_assertions",
  "ref-cast",
  "safemlx",
  "safetensors",
@@ -917,7 +911,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "smallvec",
- "tempfile",
  "thiserror 2.0.20",
 ]
 
@@ -991,6 +984,7 @@ version = "0.5.0"
 dependencies = [
  "eredu-checkpoint",
  "eredu-gguf",
+ "eredu-nn",
  "serde",
  "serde_json",
  "sha2",

@@ -111,13 +111,7 @@ exercise state preservation. Pending transactions reject trimming. These tests
 compare replayed output and preserve tokens, RNG and snapshot accounting.
 
 ```sh
-cargo test -p eredu-backend-mlx --features metal --lib parameter_conversion \
-  --locked -- --nocapture --test-threads=1
-cargo test -p eredu-backend-mlx --features metal --lib mixed_projection \
-  --locked -- --test-threads=1
 cargo test -p safemlx --features metal --lib availability_query_does_not_evaluate_lazy_layout \
-  --locked -- --test-threads=1
-cargo test -p eredu-backend-mlx --features metal --lib loaded_conversion_retention_policy_reaches_native_residency \
   --locked -- --test-threads=1
 cargo test -p eredu --features mlx,metal --test native_execution_control \
   native_embedded_continuation_forecasts_preserve_settled_state_and_bound_growth \

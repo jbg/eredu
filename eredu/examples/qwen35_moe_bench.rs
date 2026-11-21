@@ -3,7 +3,8 @@ mod device_selection;
 use std::{path::PathBuf, time::Instant};
 
 use eredu::api::LoadedModel;
-use eredu_backend_mlx::{backend::MlxBackend, MlxBackendFactory};
+use eredu_backend_mlx::MlxBackendFactory;
+use eredu_core::TokenOutput as _;
 use eredu_core::{
     ExecutionPlan, GenerationConfigOverrides, TextGenerationConfig, WeightTransformationPlan,
 };
@@ -53,7 +54,7 @@ fn main() -> anyhow::Result<()> {
     eredu_backend_mlx::reset_allocator_peak()?;
     let load_start = Instant::now();
     let planned =
-        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &model_dir, &plan)?;
+        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &model_dir, &plan, None)?;
     let (mut model, _) = planned.into_parts();
     model.synchronize()?;
     let load_elapsed = load_start.elapsed();
@@ -116,8 +117,11 @@ struct BenchResult {
     ids: Vec<u32>,
 }
 
-fn run_case(
-    model: &mut LoadedModel<MlxBackend<'_>>,
+fn run_case<
+    B: eredu_core::TextGenerationBackend,
+    S: eredu_core::TextExecutionSession<B> + eredu_core::AutomaticPromptCacheSession<B>,
+>(
+    model: &mut LoadedModel<B, S>,
     prompt: &str,
     decode_tokens: usize,
 ) -> anyhow::Result<BenchResult> {
@@ -168,8 +172,11 @@ fn run_case(
     })
 }
 
-fn prompt_near_token_count(
-    model: &mut LoadedModel<MlxBackend<'_>>,
+fn prompt_near_token_count<
+    B: eredu_core::TextGenerationBackend,
+    S: eredu_core::TextExecutionSession<B> + eredu_core::AutomaticPromptCacheSession<B>,
+>(
+    model: &mut LoadedModel<B, S>,
     target_tokens: usize,
 ) -> anyhow::Result<String> {
     let base = "Discuss hybrid linear attention, sparse mixture-of-experts routing, recurrent cache updates, grouped convolution, and vocabulary projection in a text generation runtime. ";

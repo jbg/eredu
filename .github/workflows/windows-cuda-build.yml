@@ -110,12 +110,12 @@ jobs:
       - name: Build and final-link safemlx CUDA tests
         run: cargo test --locked -j 1 -p safemlx --features cuda --lib --test events --example cuda_smoke --no-run --no-default-features --timings
       - name: Build and final-link eredu configurations
-        run: cargo test --locked -j 1 -p eredu --no-default-features --features "cuda,image,audio" --no-run
+        run: cargo test --locked -j 1 -p eredu --no-default-features --features "mlx,cuda,image,audio" --no-run
       - name: Build and final-link the eredu CLI tests
         run: cargo test --locked -j 1 -p eredu-cli --no-default-features --features cuda --no-run
-      - name: Compile CUDA Mimi and integration tests
+      - name: Compile the CUDA Mimi benchmark and SafeMLX integration tests
         run: |
-          cargo test --locked -j 1 -p eredu-backend-mlx --features cuda --test mimi_codec --no-run
+          cargo test --locked -j 1 -p eredu --no-default-features --features mlx,cuda --example mimi_realtime_bench --no-run
           cargo test --locked -j 1 -p safemlx-tests --no-default-features --features cuda --no-run
       - uses: actions/upload-artifact@v4
         if: always()

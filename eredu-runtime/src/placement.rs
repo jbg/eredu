@@ -7,10 +7,134 @@ use eredu_checkpoint::{
     store::{StoreError, TensorSelection},
 };
 
-use crate::{
-    LocalModelLayout, LocalTensorLayout, ResidencyDeclarationError, TensorPlacement, WeightBinding,
-    WeightBindingSelectionError,
+use crate::{LocalModelLayout, LocalTensorLayout, TensorPlacement};
+use eredu_core::residency::parameter_binding::{
+    ResidencyDeclarationError, WeightBinding, WeightBindingSelectionError,
 };
+
+/// Failure selecting or materializing a rank-local checkpoint partition.
+#[derive(Debug, thiserror::Error)]
+pub enum RankPartitionError {
+    /// The selected placement and checkpoint metadata disagree.
+    #[error(transparent)]
+    Placement(#[from] PlacementPlanError),
+    /// A checkpoint catalog lookup or bounded read failed.
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    /// A local checkpoint key was enumerated more than once.
+    #[error("duplicate local checkpoint source {0}")]
+    DuplicateSource(String),
+    /// The exact binding or its native realization failed.
+    #[error(transparent)]
+    Binding(#[from] eredu_core::BackendFailure),
+}
+
+/// Materialized local checkpoint values with their observed physical sources.
+#[derive(Debug)]
+pub struct RankPartition<T> {
+    rank: PlacementRank,
+    tensors: BTreeMap<String, T>,
+    opened_shards: Vec<std::path::PathBuf>,
+}
+
+impl<T> RankPartition<T> {
+    /// Logical checkpoint rank.
+    pub const fn rank(&self) -> PlacementRank {
+        self.rank
+    }
+    /// Exact selected source tensor.
+    pub fn get(&self, source: &str) -> Option<&T> {
+        self.tensors.get(source)
+    }
+    /// Locally materialized tensor count.
+    pub fn len(&self) -> usize {
+        self.tensors.len()
+    }
+    /// Whether the rank owns any tensors.
+    pub fn is_empty(&self) -> bool {
+        self.tensors.is_empty()
+    }
+    /// Physical shards acquired by the selected reads.
+    pub fn opened_shards(&self) -> &[std::path::PathBuf] {
+        &self.opened_shards
+    }
+}
+
+/// Resolves placement and validates the complete rank before acquiring any leases.
+pub fn load_rank_partition<B, T>(
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
+    plan: &PlacementPlan,
+    mut materialize: impl FnMut(
+        eredu_checkpoint::store::CheckpointLease,
+    ) -> Result<T, eredu_core::BackendFailure>,
+) -> Result<RankPartition<T>, RankPartitionError>
+where
+    B: eredu_core::checkpoint_mechanisms::CheckpointParameterBackend,
+{
+    use eredu_checkpoint::{
+        recipe::DerivedWeightRecipe,
+        store::{EncodedTensorLease, ReadPolicy, TensorReadRequest},
+    };
+    use eredu_core::{residency::parameter_binding::preflight_bindings, BackendFailure};
+
+    plan.validate()?;
+    let mut loaded = BTreeSet::new();
+    let mut unexpected = Vec::new();
+    let mut bindings = Vec::new();
+    let mut reads = Vec::new();
+    for key in store.source_keys() {
+        match plan.potentially_local(&key) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(PlacementPlanError::UnexpectedSource { .. }) => {
+                unexpected.push(key);
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let metadata = store.source_metadata(&key)?;
+        let selection = match plan.resolve(&key, &metadata.logical_shape)? {
+            ResolvedTensorPlacement::Omit => continue,
+            ResolvedTensorPlacement::Materialize => TensorSelection::Full,
+            ResolvedTensorPlacement::Selection(selection) => selection,
+        };
+        let recipe = DerivedWeightRecipe::source(key.clone(), selection.clone());
+        let size = recipe
+            .infer(store)
+            .map_err(BackendFailure::from_error)?
+            .byte_len();
+        bindings.push(
+            WeightBinding::from_recipe(key.clone(), recipe, size)
+                .map_err(BackendFailure::from_error)?,
+        );
+        if !loaded.insert(key.clone()) {
+            return Err(RankPartitionError::DuplicateSource(key));
+        }
+        reads.push(TensorReadRequest {
+            key,
+            selection,
+            policy: ReadPolicy::RequireBounded,
+        });
+    }
+    plan.validate_loaded_sources(&loaded, unexpected)?;
+    preflight_bindings::<B>(store, &bindings).map_err(BackendFailure::from_error)?;
+
+    let mut tensors = BTreeMap::new();
+    let mut opened_shards = BTreeSet::new();
+    for request in reads {
+        let key = request.key.clone();
+        let lease = store.acquire_lease(request)?;
+        if let Some(path) = lease.backing_path() {
+            opened_shards.insert(path.to_path_buf());
+        }
+        tensors.insert(key, materialize(lease)?);
+    }
+    Ok(RankPartition {
+        rank: plan.rank(),
+        tensors,
+        opened_shards: opened_shards.into_iter().collect(),
+    })
+}
 
 /// Validated world identity used by logical checkpoint placement.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]

@@ -363,7 +363,6 @@ mod tests {
         }
         .validate()
         .is_err());
-        #[cfg(feature = "tensor-capture")]
         {
             let schedule = CaptureSchedule {
                 first_prediction: 3,

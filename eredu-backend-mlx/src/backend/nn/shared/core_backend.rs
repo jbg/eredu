@@ -17,7 +17,7 @@ pub enum MlxParameterError {
     Mlx(#[from] safemlx::error::Exception),
 }
 
-impl ParameterBackend for MlxNeuralBackend {
+impl CheckpointParameterBackend for MlxNeuralBackend {
     type Parameter = MlxTensor;
     type MaterializedWeight = MlxTensor;
     type MaterializationContext =
@@ -1038,23 +1038,66 @@ impl NeuralBackend for MlxNeuralBackend {
         ))
     }
 
-    fn row_parallel_linear(
+    fn prepare_row_parallel_linear(
         linear: &mut MlxLinear,
         input: &MlxTensor,
-        parallel: &Group,
-        context: &Stream,
-    ) -> Result<MlxTensor, ComputeError> {
-        linear.forward_observed_input(input, Some(parallel), context, None)
-    }
-
-    fn row_parallel_linear_with_input_observer(
-        linear: &mut MlxLinear,
-        input: &MlxTensor,
-        parallel: &Group,
         context: &Stream,
         observer: Option<&mut dyn eredu_nn::ProjectionInputObserver<MlxTensor>>,
+    ) -> Result<eredu_nn::RowParallelProjection<MlxTensor>, ComputeError> {
+        linear.prepare_row_parallel(input, context, observer)
+    }
+
+    fn coordinates_parallel_readiness(parallel: &Group) -> bool {
+        parallel.readiness_authority().is_some()
+    }
+
+    fn complete_parallel_readiness(
+        parallel: &Group,
+        descriptor: [u64; 8],
+        ready: bool,
+        context: &Stream,
+    ) -> Result<bool, ComputeError> {
+        use eredu_core::communication::{CommunicationOperation, FailureAgreementBackend};
+        let operation = CommunicationOperation::FailureAgreement;
+        let authority = parallel
+            .readiness_authority()
+            .ok_or_else(|| ComputeError::backend("parallel context has no readiness authority"))?;
+        authority
+            .ensure_active()
+            .map_err(ComputeError::backend_source)?;
+        let submitted = Self::agree_success(ready, Some(descriptor), parallel, context)
+            .map_err(|error| authority.submission_failure(error, operation, None))
+            .map_err(ComputeError::backend_source)?;
+        let output = authority
+            .wait(submitted, operation, None)
+            .map_err(ComputeError::backend_source)?;
+        Self::resolve_failure_agreement(output)
+            .map_err(|error| authority.completion_failure(error, operation, None))
+            .map_err(ComputeError::backend_source)
+    }
+
+    fn validate_parallel_sum(value: &MlxTensor, parallel: &Group) -> Result<(), ComputeError> {
+        use eredu_core::communication::CommunicationOperation::AllReduceSum;
+        let value = value.as_array();
+        compute(parallel.validate_tensor(AllReduceSum, value, false))?;
+        compute(parallel.validate_expected_output(
+            AllReduceSum,
+            value.dtype(),
+            value.ndim(),
+            value.size(),
+        ))
+    }
+
+    fn reduce_parallel_sum(
+        value: MlxTensor,
+        parallel: &Group,
+        context: &Stream,
     ) -> Result<MlxTensor, ComputeError> {
-        linear.forward_observed_input(input, Some(parallel), context, observer)
+        use eredu_core::communication::CommunicationOperation::AllReduceSum;
+        compute_tensor(
+            crate::backend::runtime::distributed::all_sum(value.as_array(), parallel, context)
+                .map_err(|error| parallel.record_data_failure(AllReduceSum, error)),
+        )
     }
 
     fn parallel_size(parallel: &Group) -> usize {
@@ -1131,140 +1174,43 @@ impl eredu_nn::DistributedNeuralBackend for MlxNeuralBackend {
         })
     }
 
-    fn vocabulary_parallel_lookup(
-        embedding: &mut MlxEmbedding,
-        input: &MlxTensor,
-        policy: EmbeddingLookupPolicy,
-        parallel: &Group,
-        context: &Stream,
-    ) -> Result<MlxTensor, ComputeError> {
-        let prepared = if embedding.vocabulary_range.is_none() {
-            Err(ComputeError::backend(
-                "embedding has no vocabulary ownership",
-            ))
-        } else {
-            embedding
-                .lookup(input, policy, context)
-                .map(MlxTensor::into_array)
-        };
-        let value = agree_vocabulary_setup(parallel, 1, prepared, context)?;
-        compute_tensor(crate::backend::runtime::distributed::all_sum(
-            &value, parallel, context,
-        ))
+    fn vocabulary_linear_range(linear: &MlxLinear) -> Option<&VocabularyParallelRange> {
+        linear.vocabulary_range.as_ref()
     }
 
-    fn vocabulary_parallel_project(
-        linear: &mut MlxLinear,
-        input: &MlxTensor,
-        parallel: &Group,
-        context: &Stream,
-    ) -> Result<MlxTensor, ComputeError> {
-        Self::vocabulary_parallel_project_with_input_observer(
-            linear, input, parallel, context, None,
-        )
+    fn vocabulary_embedding_range(embedding: &MlxEmbedding) -> Option<&VocabularyParallelRange> {
+        embedding.vocabulary_range.as_ref()
     }
 
-    fn vocabulary_parallel_project_with_input_observer(
-        linear: &mut MlxLinear,
-        input: &MlxTensor,
+    fn validate_vocabulary_gather(
+        local: &MlxTensor,
+        widths: &[usize],
         parallel: &Group,
-        context: &Stream,
-        observer: Option<&mut dyn eredu_nn::ProjectionInputObserver<MlxTensor>>,
-    ) -> Result<MlxTensor, ComputeError> {
-        let prepared = (|| {
-            let range = linear
-                .vocabulary_range
-                .clone()
-                .ok_or_else(|| ComputeError::backend("projection has no vocabulary ownership"))?;
-            let widths = range
-                .balanced_peer_widths(parallel.size(), parallel.rank())
-                .map_err(ComputeError::backend)?;
-            let local = linear.forward_with_input_observer(input, context, observer)?;
-            Ok((local, widths))
-        })();
-        let (local, widths) = agree_vocabulary_setup(parallel, 2, prepared, context)?;
-        compute_tensor(crate::backend::distributed::all_gather_uneven_axis(
+    ) -> Result<(), ComputeError> {
+        compute(crate::backend::distributed::validate_uneven_axis(
             local.as_array(),
             -1,
-            &widths,
+            widths,
             parallel,
-            context,
         ))
     }
 
-    fn vocabulary_parallel_embedding_project(
-        embedding: &mut MlxEmbedding,
-        input: &MlxTensor,
+    fn gather_vocabulary(
+        local: MlxTensor,
+        widths: &[usize],
         parallel: &Group,
         context: &Stream,
     ) -> Result<MlxTensor, ComputeError> {
-        Self::vocabulary_parallel_embedding_project_with_input_observer(
-            embedding, input, parallel, context, None,
+        use eredu_core::communication::CommunicationOperation::AllGatherUneven;
+        compute_tensor(
+            crate::backend::distributed::all_gather_uneven_axis(
+                local.as_array(),
+                -1,
+                widths,
+                parallel,
+                context,
+            )
+            .map_err(|error| parallel.record_data_failure(AllGatherUneven, error)),
         )
-    }
-
-    fn vocabulary_parallel_embedding_project_with_input_observer(
-        embedding: &mut MlxEmbedding,
-        input: &MlxTensor,
-        parallel: &Group,
-        context: &Stream,
-        observer: Option<&mut dyn eredu_nn::ProjectionInputObserver<MlxTensor>>,
-    ) -> Result<MlxTensor, ComputeError> {
-        let prepared = (|| {
-            let range = embedding
-                .vocabulary_range
-                .clone()
-                .ok_or_else(|| ComputeError::backend("embedding has no vocabulary ownership"))?;
-            let widths = range
-                .balanced_peer_widths(parallel.size(), parallel.rank())
-                .map_err(ComputeError::backend)?;
-            let local = embedding.as_linear_with_input_observer(input, context, observer)?;
-            Ok((local, widths))
-        })();
-        let (local, widths) = agree_vocabulary_setup(parallel, 3, prepared, context)?;
-        compute_tensor(crate::backend::distributed::all_gather_uneven_axis(
-            local.as_array(),
-            -1,
-            &widths,
-            parallel,
-            context,
-        ))
-    }
-
-    fn sum_parallel(
-        value: MlxTensor,
-        parallel: &Group,
-        context: &Stream,
-    ) -> Result<MlxTensor, ComputeError> {
-        compute_tensor(crate::backend::runtime::distributed::all_sum(
-            value.as_array(),
-            parallel,
-            context,
-        ))
-    }
-}
-
-/// Local lazy-graph construction must finish on every participant before the
-/// dependent vocabulary collective. The retained authority owns timed-out
-/// completions and gates subsequent communication after terminal failure.
-fn agree_vocabulary_setup<T>(
-    parallel: &Group,
-    operation: u64,
-    prepared: Result<T, ComputeError>,
-    context: &Stream,
-) -> Result<T, ComputeError> {
-    let accepted = parallel
-        .agree_local_phase(
-            [0x564f434142, operation, 0, 0, 0, 0, 0, 0],
-            prepared.is_ok(),
-            context,
-        )
-        .map_err(ComputeError::backend_source)?;
-    match prepared {
-        Err(error) => Err(error),
-        Ok(value) if accepted => Ok(value),
-        Ok(_) => Err(ComputeError::backend(
-            "a vocabulary participant failed local preparation",
-        )),
     }
 }

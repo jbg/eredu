@@ -15,7 +15,7 @@ mod snapshots;
 mod text;
 
 fn setup() -> (
-    LoadedModel<MockBackend>,
+    LoadedModel<MockBackend, MockSession>,
     PreparedChat,
     PreparedChatGenerationSettings,
     u32,
@@ -47,7 +47,7 @@ fn limits() -> TraceLimits {
     }
 }
 
-impl eredu_runtime::execution_control::TextSamplingControlBackend for MockBackend {
+impl eredu_runtime::execution_control::TextSamplingControlBackend<MockSession> for MockBackend {
     fn sampling_control_facts(state: &observed_mock::State) -> eredu::api::SamplingStateFacts {
         eredu::api::SamplingStateFacts {
             temperature: state.sampling.temperature,
@@ -56,7 +56,7 @@ impl eredu_runtime::execution_control::TextSamplingControlBackend for MockBacken
         }
     }
     fn install_sampling_override(
-        _: &mut ModelRuntime<Self>,
+        _: &mut ModelRuntime<Self, MockSession>,
         state: &mut observed_mock::State,
         request: eredu_runtime::execution_control::ValidatedSamplingOverride,
     ) -> Result<(), MockError> {
@@ -582,7 +582,11 @@ fn controlled_choices_use_sparse_tokenizer_ids_instead_of_entry_count() {
     assert!(tokenizer.get_vocab_size(true) < 65);
     let eos = tokenizer.token_to_id("<|im_end|>").unwrap();
     let mut model = LoadedModel::from_runtime(
-        ModelRuntime::prepare(MockBackend, Default::default()).unwrap(),
+        ModelRuntime::install::<MockSession>(
+            MockBackend,
+            fixture_prepared_model(Default::default()),
+        )
+        .unwrap(),
         ChatTokenizer::from_tokenizer(tokenizer),
         LoadedTextModelConfig {
             model_family: ModelKind::Qwen2,

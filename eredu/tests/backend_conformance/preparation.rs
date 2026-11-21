@@ -179,7 +179,7 @@ pub(super) fn agreement(stage: Stage, status: Status) -> Outcome {
     })
 }
 fn setup() -> (
-    LoadedModel<MockBackend>,
+    LoadedModel<MockBackend, MockSession>,
     PreparedChat,
     PreparedChatGenerationSettings,
 ) {
@@ -204,7 +204,7 @@ fn setup() -> (
     (model, chat, settings)
 }
 fn run(
-    model: &mut LoadedModel<MockBackend>,
+    model: &mut LoadedModel<MockBackend, MockSession>,
     chat: &PreparedChat,
     settings: PreparedChatGenerationSettings,
     controlled: bool,
@@ -376,7 +376,7 @@ fn asynchronous_public_token_generation_agrees_native_preparation() {
 }
 
 fn run_speculative(
-    model: &mut LoadedModel<MockBackend>,
+    model: &mut LoadedModel<MockBackend, MockSession>,
     chat: &PreparedChat,
     settings: PreparedChatGenerationSettings,
     controlled: bool,
@@ -385,7 +385,7 @@ fn run_speculative(
 }
 
 fn run_speculative_with_scheduler(
-    model: &mut LoadedModel<MockBackend>,
+    model: &mut LoadedModel<MockBackend, MockSession>,
     chat: &PreparedChat,
     mut settings: PreparedChatGenerationSettings,
     controlled: bool,
@@ -706,7 +706,7 @@ fn peer_delivery_failure_after_a_committed_token_preserves_the_completed_prefix(
 fn local_token_record_budget_failure_votes_failed_and_keeps_its_typed_cause() {
     for controlled in [false, true] {
         let (mut model, chat, settings) = setup();
-        let prepare = |model: &LoadedModel<MockBackend>, total_bytes| {
+        let prepare = |model: &LoadedModel<MockBackend, MockSession>, total_bytes| {
             model
                 .prepare_observed_chat(
                     &chat,
@@ -843,7 +843,7 @@ fn terminal_record_peer_failure_is_reported_after_the_completed_prediction() {
 fn boundary_record_budget_failure_votes_failed_with_the_original_cause() {
     for controlled in [false, true] {
         let (mut model, chat, settings) = setup();
-        let prepare = |model: &LoadedModel<MockBackend>, total_bytes| {
+        let prepare = |model: &LoadedModel<MockBackend, MockSession>, total_bytes| {
             model
                 .prepare_observed_chat(
                     &chat,

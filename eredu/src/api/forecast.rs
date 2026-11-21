@@ -7,9 +7,9 @@ pub use eredu_runtime::memory_forecast::{
     ConditionedPredictionScoring, ConditionedPredictionTopology,
     ConversionRetentionGroupMemoryPlan, ConversionRetentionMemoryPlan,
     DecodingContinuationMemoryPlan, EmbeddedPredictionMemoryPlan, ForecastCalibration,
-    ForecastExecutionContract, GenerationForecastBackend, GenerationForecastError,
+    ForecastExecutionContract, GenerationForecastError, GenerationForecastSession,
     ParameterResidencyMemoryBounds, PrefillInputRetention, RefinementMemoryPlan,
-    SpeculativeForecastBackend, SpeculativeMemoryPlan,
+    SpeculativeForecastSession, SpeculativeMemoryPlan,
 };
 use serde::{Deserialize, Serialize};
 mod continuation;
@@ -131,7 +131,11 @@ fn chunk_tokens(policy: eredu_core::PrefillChunkPolicy, positions: u64) -> u64 {
     }
 }
 
-impl<B: GenerationForecastBackend> LoadedModel<B> {
+impl<
+        B: eredu_core::TextGenerationBackend,
+        S: GenerationForecastSession<B> + eredu_core::TextExecutionSession<B>,
+    > LoadedModel<B, S>
+{
     /// Forecasts a raw-token speculative lane with its actual selected drafter.
     /// Uses the same accounting as prepared ordinary and controlled requests.
     pub fn forecast_speculative_token_ids<D>(
@@ -142,7 +146,7 @@ impl<B: GenerationForecastBackend> LoadedModel<B> {
         options: &GenerationForecastOptions,
     ) -> Result<GenerationForecast, GenerationForecastError>
     where
-        B: SpeculativeForecastBackend<D>,
+        S: SpeculativeForecastSession<B, D>,
     {
         let (settings, mode) = speculative_forecast_settings(settings);
         let mut forecast = self.forecast_token_ids(token_ids, settings, options)?;
@@ -159,7 +163,7 @@ impl<B: GenerationForecastBackend> LoadedModel<B> {
         limits: Option<SpeculationOptions>,
     ) -> Result<(), GenerationForecastError>
     where
-        B: SpeculativeForecastBackend<D>,
+        S: SpeculativeForecastSession<B, D>,
     {
         let speculative = match mode {
             DecodingMode::SelfSpeculation(options) => options,
@@ -168,7 +172,7 @@ impl<B: GenerationForecastBackend> LoadedModel<B> {
         if let DecodingMode::SelfSpeculation(options) = mode {
             let shared = matches!(drafting, eredu_core::SpeculativeDraft::SharedBackbone)
                 || matches!(drafting, eredu_core::SpeculativeDraft::Target)
-                    && B::decoding_capabilities(&self.runtime).speculation;
+                    && self.runtime.session().decoding_capabilities().speculation;
             if !shared
                 && (options.request().draft_adapter || options.request().refinement.is_some())
             {
@@ -177,13 +181,13 @@ impl<B: GenerationForecastBackend> LoadedModel<B> {
                 ));
             }
         }
-        let Some(profile) = B::speculative_memory_profile(&self.runtime, drafting)? else {
+        let Some(profile) = S::speculative_memory_profile(&self.runtime, drafting)? else {
             return mark_speculative_forecast(forecast);
         };
         self.project_speculation_profile(
             forecast,
             profile,
-            B::speculative_target_memory_profile(&self.runtime)?,
+            S::speculative_target_memory_profile(&self.runtime)?,
             speculative,
             mode,
             options,
@@ -314,7 +318,7 @@ impl<B: GenerationForecastBackend> LoadedModel<B> {
             shared_allocator: profile.shared_allocator,
         });
         if let DecodingMode::Diffusion { policy } = mode {
-            match B::refinement_memory_plan(&self.runtime, policy)? {
+            match S::refinement_memory_plan(&self.runtime, policy)? {
                 Some(plan) => forecast.refinement = Some(plan),
                 None => mark_specialized(
                     forecast,
@@ -327,7 +331,7 @@ impl<B: GenerationForecastBackend> LoadedModel<B> {
 
     pub(super) fn forecast_input(
         &self,
-        input: &PreparedChatInput<'_, B>,
+        input: &PreparedChatInput<'_, S::Prompt>,
         settings: PreparedChatGenerationSettings,
         options: &GenerationForecastOptions,
         instrumented: bool,
@@ -339,13 +343,11 @@ impl<B: GenerationForecastBackend> LoadedModel<B> {
             PreparedChatInput::SessionBound { payload, .. } => payload.count(),
             PreparedChatInput::RenderedPrompt(chat) => self.count_prepared_chat(chat)?,
             PreparedChatInput::TokenIds { token_ids, .. } => self.count_token_ids(token_ids)?,
-            PreparedChatInput::PreparedBackendInput { prompt, .. } => {
-                self.count_prepared_input(prompt)?
-            }
+            PreparedChatInput::PreparedInput { prompt, .. } => self.count_prepared_input(prompt)?,
         };
         self.forecast_count(
             count,
-            input.backend_prompt(),
+            input.prepared_prompt(),
             settings,
             options,
             instrumented,
@@ -387,7 +389,7 @@ impl<B: GenerationForecastBackend> LoadedModel<B> {
     #[cfg(feature = "tensor-capture")]
     pub fn forecast_observed_generation(
         &self,
-        prepared: &PreparedObservedGeneration<B>,
+        prepared: &PreparedObservedGeneration<S::Prompt>,
         options: &GenerationForecastOptions,
     ) -> Result<GenerationForecast, GenerationForecastError> {
         if prepared.session_identity != self.session_identity {
@@ -407,7 +409,7 @@ impl<B: GenerationForecastBackend> LoadedModel<B> {
             instrumented,
         )?;
         if instrumented {
-            let projection = B::capture_memory_projection(
+            let projection = S::capture_memory_projection(
                 &self.runtime,
                 prepared.capture_plan(),
                 prepared.intervention.as_ref(),
@@ -418,7 +420,7 @@ impl<B: GenerationForecastBackend> LoadedModel<B> {
                 prepared.capture_plan(),
                 prepared.intervention.as_ref(),
                 prepared.trace_limits,
-                B::capture_transforms_complete_per_step(&self.runtime),
+                S::capture_transforms_complete_per_step(&self.runtime),
                 projection,
             ));
             result.reestimate()?;
@@ -429,14 +431,14 @@ impl<B: GenerationForecastBackend> LoadedModel<B> {
     fn forecast_count(
         &self,
         input: InputTokenCount,
-        prompt: Option<&B::Prompt>,
+        prompt: Option<&S::Prompt>,
         settings: PreparedChatGenerationSettings,
         options: &GenerationForecastOptions,
         instrumented: bool,
     ) -> Result<GenerationForecast, GenerationForecastError> {
         let (_, output) = self.resolve_text_generation_settings(settings)?;
-        let profile = B::loaded_memory_profile(&self.runtime)?;
-        let contract = B::forecast_execution_contract(&self.runtime, prompt, instrumented);
+        let profile = S::loaded_memory_profile(&self.runtime)?;
+        let contract = S::forecast_execution_contract(&self.runtime, prompt, instrumented);
         let target_profile = profile.clone();
         let mut forecast = loaded_forecast(
             profile,
@@ -447,7 +449,7 @@ impl<B: GenerationForecastBackend> LoadedModel<B> {
             options,
         )?;
         if let Some(DecodingMode::SelfSpeculation(speculative)) = settings.decoding_mode {
-            match B::shared_backbone_memory_profile(&self.runtime)? {
+            match S::shared_backbone_memory_profile(&self.runtime)? {
                 Some(profile) => self.project_speculation_profile(
                     &mut forecast,
                     profile,
@@ -461,14 +463,14 @@ impl<B: GenerationForecastBackend> LoadedModel<B> {
         } else if matches!(
             settings
                 .decoding_mode
-                .unwrap_or_else(|| B::default_decoding_mode(&self.runtime)),
+                .unwrap_or_else(|| self.runtime.session().default_decoding_mode()),
             DecodingMode::Diffusion { .. }
         ) {
             let policy = match settings.decoding_mode {
                 Some(DecodingMode::Diffusion { policy }) => policy,
                 _ => None,
             };
-            match B::refinement_memory_plan(&self.runtime, policy)? {
+            match S::refinement_memory_plan(&self.runtime, policy)? {
                 Some(plan) => {
                     forecast.refinement = Some(plan);
                     forecast.reestimate()?;

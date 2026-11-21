@@ -54,7 +54,7 @@ eight generated tokens. It selects CPU explicitly; no native type appears in
 the application.
 
 For prepared multimodal input, obtain `InputTokenCount` through
-`ModelCapabilityBackend::count_prepared_input` and use `model_positions` as the
+`ModelCapabilitySession::count_prepared_input` and use `model_positions` as the
 capture request's prompt length. Composite adapters count the architecture's
 admitted decoder positions, including media expansion, and retain media
 workspace accounting. Submission validates the actual assembled batch and

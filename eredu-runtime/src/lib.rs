@@ -9,15 +9,21 @@
 
 /// Portable automatic-plan resource sizing and telemetry projections.
 pub mod automatic_support;
-/// Backend execution, parameter, transfer, and collective capabilities.
-pub mod backend;
 /// Explicit finite invocation and streaming-mechanism load policy.
 pub mod bounded_execution;
 /// Backend-neutral mutable-cache ownership, storage, and admission algorithms.
 pub mod cache;
+mod capability_estimate;
 /// Bounded observation admission and collection.
 pub mod capture;
+pub use capability_estimate::CapabilityEstimate;
 mod checkpoint_handoff;
+mod checkpoint_quantization;
+/// Neutral typed executable publication and native binding facts.
+pub mod decision_binding;
+pub mod executable_binding;
+/// Expert ownership, placement and checkpoint plans for routed execution.
+pub mod expert_residency;
 pub use checkpoint_handoff::{
     restrict_checkpoint_handoff, validate_checkpoint_handoff, SourceHandoffError,
     SourceHandoffScope,
@@ -51,12 +57,14 @@ pub use component_partition::{
 /// Exact cold component preparation and consuming placement.
 pub mod prepared_component;
 pub use prepared_component::{
-    ComponentPreparation, ComponentPreparationDeclaration, ComponentPreparationError,
-    ComponentRecipe, ComponentRecipeConversion, PreparedComponent,
+    ComponentPreparationDeclaration, ComponentPreparationError, ComponentRecipe,
+    ComponentRecipeConversion, PreparedComponent,
 };
 mod component_pipeline;
 /// Mechanism-only selection contracts for composite model input.
 pub mod composite;
+/// Portable composite input admission, invocation and prefill contracts.
+pub mod composite_execution;
 /// Backend-neutral sequential prediction decisions and layered handoff.
 pub mod decision;
 /// Backend-neutral dense-stream residency telemetry.
@@ -72,10 +80,11 @@ pub mod draft;
 pub mod execution;
 mod execution_unit_preparation;
 pub use execution_unit_preparation::{
-    execution_unit_resource_requirements, ExecutionUnitPreparationError,
-    ExecutionUnitResourcePreparation, ExecutionUnitResourceRequirements,
-    ParameterResourcePreparation, ParameterResourcePreparationError,
-    PreparedExecutionUnitResources, PreparedParameterResources,
+    execution_unit_resource_requirements, prepare_parameter_resources,
+    ExecutionUnitPreparationError, ExecutionUnitResourcePreparation,
+    ExecutionUnitResourceRequirements, ParameterResourcePreparation,
+    ParameterResourcePreparationError, PreparedExecutionUnitResources, PreparedParameterResources,
+    SupplementaryResidencyUnit,
 };
 /// Statically dispatched layered architecture lifecycle and resident policy.
 mod bound_layerwise_component;
@@ -97,7 +106,6 @@ pub mod input;
 pub mod input_transfer;
 pub mod inspection;
 /// Immutable intervention scheduling and evidence using the shared capture ledger.
-#[cfg(feature = "tensor-capture")]
 pub mod intervention;
 pub use bound_layerwise_component::{BoundLayerwiseComponent, BoundStatelessComponent};
 pub mod layered;
@@ -137,9 +145,25 @@ pub mod partition;
 /// Rank-local graph execution over opaque communication resources.
 pub mod partitioned_execution;
 pub use local_component::{
-    BoundLocalComponent, LocalComponentMechanisms, LocalComponentPolicy, PreparedLocalComponent,
+    BoundLocalComponent, LocalComponentDriver, LocalComponentMechanisms, LocalComponentPolicy,
+    LocalParameterRetention, PreparedLocalComponent,
 };
+mod exact_parameter_materialization;
 mod pipeline_executor;
+pub use exact_parameter_materialization::companion_catalog as packed_parameter_layout;
+pub use exact_parameter_materialization::{
+    exact_text_transform_targets, PreparedReplicatedParameterBindings,
+};
+pub use exact_parameter_materialization::{
+    materialize_checkpoint_bindings, materialize_parameter_owners,
+};
+mod parameter_units;
+pub use parameter_units::{
+    bind_parameter_units, build_resident_units, prepare_parameter_unit_storage,
+    BindReplicatedParameterStorage, ParameterUnitLayout, ParameterUnitMechanisms,
+    ParameterUnitPolicy, ParameterUnitStorage, ParameterUnitStorageResources,
+    PreparedUnitResidency, ReplicatedWeightOptions, WeightResidencyStorage,
+};
 /// Bounded agreement and owner publication for architecture-owned replicated transitions.
 pub mod replicated_execution;
 mod tensor_wave;
@@ -148,9 +172,9 @@ pub use component_pipeline::{
     ComponentPipelinePreparationError, PipelineBindingError,
 };
 pub use pipeline_executor::{
-    validate_pipeline_local_agreement, BoundComponentPipeline, ComponentRankMechanisms,
-    DecoderPipelineState, ImmutableParameterPolicy, LayeredTensorCohort,
-    OrdinaryPipelinePartitionUnitStrategy, ParameterUnitMechanisms, PartitionTensorAllocator,
+    validate_pipeline_local_agreement, BoundComponentPipeline, ComponentPipeline,
+    ComponentPipelineResources, ComponentRankMechanisms, DecoderPipelineState,
+    ImmutableParameterPolicy, LayeredTensorCohort, OrdinaryPipelinePartitionUnitStrategy,
     PipelineLocalAgreementError, PipelinePartitionArchitecture, PipelinePartitionExecutor,
     PipelinePartitionUnitStrategy, PreparedComponentPipeline, ResidentPipelinePartitionPass,
     UnitPolicyResidency,
@@ -163,10 +187,13 @@ pub mod prediction_resources;
 pub mod prefetch;
 /// Request-bounded chunked prefill through shared session advancement.
 pub mod prefill;
+mod preparation_mechanisms;
+/// Neutral tensor binding and observation of portable processor products.
+pub mod processor_binding;
 /// Request preparation buffer bounds and typed admission.
 pub mod processor_resources;
 /// Explicit native projection storage coverage without native handles.
-pub mod projection_memory;
+mod projection_memory;
 /// Atomic realtime model, schedule, sampler, and random-state transactions.
 pub mod realtime;
 /// Mixed categorical and dense host frame admission.
@@ -203,24 +230,25 @@ pub mod residency;
 pub mod resource_lifetimes;
 /// Bounded all-rank readiness and lifetime accounting before text execution.
 pub mod run_preparation;
+/// Portable ownership and submission of a bound text executable.
+pub mod text_session_driver;
+pub use preparation_mechanisms::{
+    AutomaticModelFacts, BackendInspection, ExternalDraftFacts, ModelLoadFacts, PlanMechanismFacts,
+    PreparationMechanismProvider,
+};
 /// Backend-neutral speculative request lifecycle and fair scheduling.
 pub mod speculative;
 /// Family-blind speculative requirements, selection, and construction gating.
 pub mod speculative_selection;
 /// Architecture-declared mutable state and concrete runtime realizations.
 pub mod state;
+
 mod weight_residency;
 
 pub use automatic_support::{
     execution_unit_parameter_window_bytes, placed_source_recipe, residency_telemetry,
     selected_parameter_resources, selected_parameter_resources_for_layout,
     selected_text_bounded_requirement, BoundedResidencySizingError, SelectedParameterResources,
-};
-pub use backend::{
-    BarrierBackend, BroadcastBackend, CollectiveBackend, CommunicationBackend, EvenGatherBackend,
-    FailureAgreementBackend, ParameterBackend, PointToPointBackend, RoleExactBoundaryValue,
-    SubmissionBackend, SumReductionBackend, TransferBackend, UnevenGatherBackend,
-    VariableAllToAllBackend,
 };
 pub use bounded_execution::{
     AppendStreamLoadPolicy, BoundedExecutionPolicy, BoundedExecutionPolicyError, InvocationLimits,
@@ -230,22 +258,17 @@ pub use cache::{
     finalize_prompt_cache_shard, hash_prompt_cache_shard_payload, inspect_prompt_cache,
     prompt_cache_array_names, prompt_cache_export_allowance, prompt_cache_rank_path,
     publish_prompt_cache, resolve_prompt_cache_root, restore_prompt_cache_states,
-    safe_prompt_cache_shard_path, validate_prompt_cache_manifest, with_rank_prompt_cache_store,
-    CacheBlockLifecycle, CacheBlockStorage, CacheHostDemotionOperation, CacheHostPromotion,
-    CacheIoAdmission, CacheIoCompletionDisposition, CacheIoExecutionState,
-    CacheIoExecutionStateError, CacheIoOperation, CacheIoOperationKey, CacheIoOperationKind,
-    CacheIoPreparation, CacheIoStartDisposition, CacheIoSubmission, CacheIoSubmissionOutcome,
-    CacheIoTicket, CacheIoWorker, CacheIoWorkerError, CacheLayerResidencyReport,
-    CacheLayerResidencyStats, CacheLifecycleError, CachePoolError, CachePoolLimits,
-    CachePoolMembership, CachePoolReport, CachePoolReservation, CachePoolResource, CachePoolUsage,
-    CacheResidencyConfigurationError, CacheResidencyPolicy, CacheResidencyPool,
+    safe_prompt_cache_shard_path, validate_prompt_cache_manifest, CacheBlockLifecycle,
+    CacheBlockStorage, CacheHostPromotion, CacheIoAdmission, CacheIoCompletionDisposition,
+    CacheIoExecutionState, CacheIoExecutionStateError, CacheIoPreparation, CacheIoStartDisposition,
+    CacheIoSubmission, CacheIoSubmissionOutcome, CacheIoTicket, CacheIoWorker, CacheIoWorkerError,
+    CacheLayerResidencyReport, CacheLayerResidencyStats, CacheLifecycleError, CachePoolError,
+    CachePoolLimits, CachePoolMembership, CachePoolReport, CachePoolReservation, CachePoolResource,
+    CachePoolUsage, CacheResidencyConfigurationError, CacheResidencyPolicy, CacheResidencyPool,
     CacheResidencyReport, CacheResidencyTelemetry, CacheStorageError, CacheStoragePhase,
-    DirectoryPromptCacheStore, LiveCacheBlockPublication, LiveCacheDiskPolicy,
-    LiveCachePublicationError, MemoryPromptCacheStore, MutableCacheTail, PagedCacheOptions,
-    PreparedPromptCachePublication, PromptCacheBlockRestore, PromptCacheExport,
-    PromptCacheExportBlock, PromptCacheExportInventory, PromptCacheExportState, PromptCachePayload,
-    PromptCachePersistenceError, PromptCachePublication, PromptCacheRestore,
-    PromptCacheStateRestore, PromptCacheTensorLayout, RetainedCacheShard,
+    DirectoryPromptCacheStore, LiveCacheDiskPolicy, LiveCachePublicationError,
+    MemoryPromptCacheStore, MutableCacheTail, PagedCacheOptions, PreparedPromptCachePublication,
+    PromptCachePersistenceError, PromptCachePublication, PromptCacheRestore, RetainedCacheShard,
     ReversiblePromptCachePublication, CACHE_RESIDENCY_LAYER_REPORT_LIMIT,
     MAX_PROMPT_CACHE_SHARD_HEADER_BYTES, PROMPT_CACHE_CURRENT_FILE,
     PROMPT_CACHE_GENERATIONS_DIRECTORY,
@@ -254,15 +277,8 @@ pub use communication::validate_communication_manifest_consensus;
 pub use communication::{
     establish_communication_session, prepare_communication_realization,
     project_all_communication_manifests, project_communication_manifest,
-    validate_compatible_communication_manifests, AgreedCommunicationSession,
-    BoundaryDimensionContract, BoundaryFramingProtocol, BoundaryRoleContract,
-    CommunicationCapabilities, CommunicationCapabilityError, CommunicationCompletionCapabilities,
-    CommunicationCompletionPolicy, CommunicationGroupDescriptor, CommunicationGroupRequirements,
-    CommunicationManifest, CommunicationManifestConsensusError, CommunicationManifestError,
-    CommunicationOperation, CommunicationOperationRequirement, CommunicationPeerCounts,
-    CommunicationRealizationError, CommunicationRouteDescriptor, CommunicationRouteId,
-    CommunicationSessionIdentity, CommunicationTensorLimits, CommunicationTopologyCapabilities,
-    PreparedCommunicationRealization, RoleExactBoundaryContract, TopologyCommunicationPlan,
+    AgreedCommunicationSession, CommunicationManifestConsensusError, CommunicationProjectionError,
+    CommunicationRealizationError, TopologyCommunicationPlan,
 };
 pub use component::{
     ComponentDomain, ComponentGraph, ComponentGraphError, ComponentKind, ComponentResidencyClass,
@@ -284,9 +300,7 @@ pub use dense::{
     DenseCacheMetrics, DenseDiskStreamReport, DenseExecutionGroupReport, DensePassCounterSnapshot,
     DensePassReport, DenseStreamTelemetry, DenseStreamTelemetryError, DenseTierResidencyReport,
 };
-pub use dense_sampling::{
-    DenseSamplingBackend, DenseSamplingError, DenseSamplingPolicyError, GumbelTruncation,
-};
+pub use dense_sampling::DenseSamplingError;
 pub use draft::{execute_draft_group, DraftGroupExecutionError, DraftStateTransaction};
 pub use execution::{
     ArchitectureExecutionLayoutError, ExecutionGraph, ExecutionGraphError, ExecutionGroupId,
@@ -311,11 +325,10 @@ pub use expert::{
     AddressableBankTask, AddressableBankTaskCache, AddressableBindingTransform,
     AddressableExpertRouteProvider, AddressableExpertRouteRequest, AddressableGatedProductBank,
     AddressableGroupedBank, ExpertRouteCombination, ExpertRouteExchange, ExpertRouteInvocation,
-    ExpertRouteTensorMovement, IndexedMovement, ObservedExpertProvider,
-    ObservedExpertProviderError, ParameterProvider, ProviderUnitObserver, ResidentExpertProvider,
-    RoutedBankId, RoutedBankProviderError, RoutedBankProviders, RoutedExpertRequest,
-    RoutedExpertTensorParallelOutput, RoutedObservationPoints, RoutedUnitBatch,
-    RoutedUnitInvocation, RoutedUnitObserver, TensorParallelParameterProvider,
+    ObservedExpertProvider, ObservedExpertProviderError, ParameterProvider, ProviderUnitObserver,
+    ResidentExpertProvider, RoutedBankId, RoutedBankProviderError, RoutedBankProviders,
+    RoutedExpertRequest, RoutedExpertTensorParallelOutput, RoutedObservationPoints,
+    RoutedUnitBatch, RoutedUnitInvocation, RoutedUnitObserver, TensorParallelParameterProvider,
 };
 pub use expert::{
     plan_addressable_bank_residency, AddressableBankCatalog, AddressableBankCatalogError,
@@ -336,15 +349,11 @@ pub use expert::{
     PreparedSelectedAddressableBank,
 };
 pub use generation::{
-    CausalModel, ConstrainedSampler, DefaultSampler, GenerationSampler, MirostatV2Sampler,
-    PenaltyConfig, Sampler, SamplingBackend, SamplingConfigurationError, SpeculativeSampler,
-    TokenDomain,
+    CausalModel, ConstrainedSampler, DefaultSampler, GenerationSampler, MirostatV2Sampler, Sampler,
+    SamplingConfigurationError, SpeculativeSampler,
 };
 pub use host_random::HostRandomState;
-pub use input::{
-    PreparedInputCacheIdentity, PreparedInputCacheIdentityError, PreparedInputInspector,
-    PreparedInputPart, PreparedInputPayload, PreparedModelInput,
-};
+pub use input::{PreparedInputCacheIdentity, PreparedInputCacheIdentityError};
 pub use inspection::{
     observe_and_intervene, observe_model_logits, ActivationObserver, BorrowedActivationObserver,
     NoopObserver, RoutingDecision, RoutingObservation, TargetStateCapture, TargetStateCaptureError,
@@ -388,12 +397,12 @@ pub use parallel::{
 };
 pub use parameter::{
     apply_parameter_storage_layouts, bind_materialized_unit, bind_materialized_unit_excluding,
-    bindings_from_recipe_set, build_exact_replicated_text_bindings, build_module_binding_plan,
-    materialize_bindings, materialize_selected_bindings, preflight_bindings,
-    prepare_resource_bindings, select_bindings, select_parameter_bank_recipes,
-    select_parameter_recipe, BindingPlan, BindingPlanError, MaterializedUnit, ModuleBindingPlan,
-    ModuleBindingPlanError, ParameterBankRecipes, ParameterBatchBudget, ParameterBindingTarget,
-    ParameterOrchestrationError, ParameterResourceRecipes, PlannedBinding,
+    bind_module_recipe_subset, bindings_from_recipe_set, build_exact_replicated_text_bindings,
+    build_module_binding_plan, materialize_bindings, materialize_selected_bindings,
+    prepare_resource_bindings, resident_parameter_values, select_bindings,
+    select_parameter_bank_recipes, select_parameter_recipe, BindingPlan, BindingPlanError,
+    MaterializedUnit, ModuleBindingPlan, ModuleBindingPlanError, ParameterBankRecipes,
+    ParameterBatchBudget, ParameterOrchestrationError, ParameterResourceRecipes, PlannedBinding,
     PreparedParameterRecipes, RecipeBindingError, SelectedBindingPlan,
 };
 pub use parameter_acquisition::{
@@ -412,23 +421,21 @@ pub use parameter_layout::{
 pub use partition::{
     validate_boundary_tensor_count, ArchitectureBoundary, ArchitectureBoundaryError,
     ArchitectureBoundaryValue, ArchitectureParameterDescription, ArchitectureParameterError,
-    ArchitecturePartition, ArchitecturePartitionError, BoundaryTensorDimension,
-    BoundaryTensorDtype, BoundaryTensorSpec, BoundaryWireSchema, LayeredPartitionBeginError,
-    LayeredPartitionDriver, LayeredPartitionError, NoAuxiliaryBoundary, NoAuxiliaryBoundarySchema,
-    OwnedParameterGroupSpec, ParameterGroupOwner, PartitionGroup, PartitionOwnership,
-    PartitionState, PipelineActivationDtype, PipelineWireContract, ResolvedBoundaryTensorSpec,
-    ResolvedBoundaryWireSchema, TransformParameterOwnershipError,
+    ArchitecturePartition, ArchitecturePartitionError, BoundaryTensorDimension, BoundaryTensorSpec,
+    BoundaryWireSchema, LayeredPartitionBeginError, LayeredPartitionDriver, LayeredPartitionError,
+    NoAuxiliaryBoundary, NoAuxiliaryBoundarySchema, OwnedParameterGroupSpec, ParameterGroupOwner,
+    PartitionGroup, PartitionOwnership, PartitionState, PipelineWireContract,
+    ResolvedBoundaryTensorSpec, ResolvedBoundaryWireSchema, TransformParameterOwnershipError,
 };
 pub use partitioned_execution::{
-    CommunicationTensorMetadata, DistributedExecutionPhase, LayerwiseTraversalPartitionExecutor,
-    LayerwiseTraversalRuntime, NoBoundaryTransport, NoCommitAgreement, NoOutputPublisher,
-    OpaqueBoundaryTransport, OpaqueCommitAgreement, OpaqueFailureAgreement, OpaqueOutputPublisher,
-    PartitionBoundaryRoute, PartitionBoundaryTransport, PartitionCommitAgreement,
-    PartitionCommunication, PartitionCommunicationAuthority, PartitionExecutionError,
-    PartitionOutputAuthority, PartitionOutputPublication, PartitionOutputPublisher,
-    PartitionedExecutionPlan, PartitionedGroupExecutor, PartitionedTextExecution,
-    PartitionedTextRuntime, PartitionedTraversalError, PartitionedTraversalResult,
-    RealizedCommunicationGroup, RealizedCommunicationRoute, ReceivedPartitionBoundary,
+    DistributedExecutionPhase, LayerwiseTraversalPartitionExecutor, LayerwiseTraversalRuntime,
+    NoBoundaryTransport, NoCommitAgreement, NoOutputPublisher, OpaqueBoundaryTransport,
+    OpaqueCommitAgreement, OpaqueFailureAgreement, OpaqueOutputPublisher, PartitionBoundaryRoute,
+    PartitionBoundaryTransport, PartitionCommitAgreement, PartitionCommunication,
+    PartitionExecutionError, PartitionOutputAuthority, PartitionOutputPublication,
+    PartitionOutputPublisher, PartitionedExecutionPlan, PartitionedGroupExecutor,
+    PartitionedTextExecution, PartitionedTextRuntime, PartitionedTraversalError,
+    PartitionedTraversalResult, ReceivedPartitionBoundary,
 };
 pub use placement::{
     place_addressable_member_bindings, place_weight_bindings, placement_selection,
@@ -454,34 +461,31 @@ pub use realtime_contract::{
 };
 pub use realtime_executor::{
     execute_realtime_frame, submit_realtime_output, MappedRealtimeFrameHostObserver,
-    PreparedRealtimeFrameExecutor, PrepublicationRealtimeFrame, RealtimeCompletionCreationError,
-    RealtimeCompletionMechanism, RealtimeDecisionExecution, RealtimeFrameCoordinatorError,
-    RealtimeFrameHostObserver, RealtimeFramePlan, RealtimeFrameResources,
-    RealtimeHostOutputMappingError, RealtimeHostOutputProjection, RealtimeHostOutputUnavailable,
-    RealtimeOutputSubmissionError, RealtimePrepublicationError, SubmittedRealtimeFrame,
+    PreparedRealtimeFrameExecutor, PrepublicationRealtimeFrame, RealtimeCompletionMechanism,
+    RealtimeDecisionExecution, RealtimeFrameCoordinatorError, RealtimeFrameHostObserver,
+    RealtimeFramePlan, RealtimeFrameResources, RealtimeHostOutputMappingError,
+    RealtimeHostOutputProjection, RealtimeHostOutputUnavailable, RealtimeOutputSubmissionError,
+    RealtimePrepublicationError, SubmittedRealtimeFrame,
 };
 pub use realtime_ingress::{
-    MaterializedRealtimeInput, RealtimeHostFrameMaterializer, RealtimeHostTokenMaterializer,
-    RealtimeIngressContract, RealtimeIngressError, RealtimePayloadKind, RealtimeTokenKind,
-    ValidatedRealtimeInput,
+    MaterializedRealtimeInput, RealtimeIngressContract, RealtimeIngressError, RealtimePayloadKind,
+    RealtimeTokenKind, ValidatedRealtimeInput,
 };
 pub use realtime_interpreter::{
     complete_realtime_frame, prepare_realtime_frame, PreparedRealtimeFrame,
-    RealtimeFrameInterpretationError, RealtimeFrameTensorMechanisms,
+    RealtimeFrameInterpretationError,
 };
 pub use realtime_mechanism_synthesis::{
     synthesize_realtime_capabilities, RealtimeLoadSupport, RealtimeMechanismFacts,
     RealtimeMechanismSupport,
 };
 pub use realtime_model::{
-    construct_realtime_execution, preflight_realtime_materialization_tasks,
-    realtime_task_binding_plan, ConstructedRealtimeExecution, PreparedRealtimeBinding,
-    PreparedRealtimeModelContract, RealizedRealtimePolicy,
-    RealtimeArchitectureConstructionIdentity, RealtimeArchitectureIdentity,
-    RealtimeBindingMechanisms, RealtimeLayerwiseRuntime, RealtimeMaterializationComponent,
+    construct_realtime_execution, ConstructedRealtimeExecution, PreparedRealtimeBinding,
+    PreparedRealtimeModelContract, RealtimeArchitectureConstructionIdentity,
+    RealtimeArchitectureIdentity, RealtimeLayerwiseRuntime, RealtimeMaterializationComponent,
     RealtimeMaterializationTask, RealtimeModelConstructionError,
-    RealtimeModelConstructionMechanisms, RealtimeModelContractError, RealtimeResidencyTelemetry,
-    RealtimeTaskBindingPlan, RealtimeTensorResources,
+    RealtimeModelConstructionMechanisms, RealtimeModelContractError, RealtimeTensorResources,
+    UnitResidencyTelemetry,
 };
 pub use realtime_payload::{
     RealtimePayloadContract, RealtimePayloadContractError, RealtimePayloadEnvelope,
@@ -522,10 +526,10 @@ pub use replicated_session::{
     PredictionTargetTransport, PredictionTensorAssembly, PredictionTensorAssemblyPlan,
     PredictionTensorSource, PreparedPartitionedRuntimeComponents,
     PreparedPartitionedSessionRuntime, PreparedReplicatedTextContract,
-    ReplicatedRuntimeExecutionStrategy, ReplicatedTextExecutionStrategy, ReplicatedTextRuntime,
-    ReplicatedTextSession, ReplicatedTextSessionCheckpoint, ReplicatedTextSessionError,
-    ReplicatedTextSessionMechanisms, ReplicatedTextSessionReport, RoutedReplicatedTextExecution,
-    SessionStateRealization, TransactionalPromptCacheMechanisms,
+    ReplicatedRuntimeExecutionStrategy, ReplicatedTextExecutionStrategy, ReplicatedTextInvocation,
+    ReplicatedTextRuntime, ReplicatedTextSession, ReplicatedTextSessionCheckpoint,
+    ReplicatedTextSessionError, ReplicatedTextSessionMechanisms, ReplicatedTextSessionReport,
+    RoutedReplicatedTextExecution, SessionStateRealization,
 };
 pub use replicated_text::{
     group_replicated_text_transform_tasks, locally_materialized_replicated_text_outputs,
@@ -549,13 +553,10 @@ pub use replicated_text::{
     WeightLoweringDescriptor, WeightLoweringKind, WeightResidencyMechanism,
 };
 pub use residency::{
-    physical_binding_bytes, DeviceLayerWindow, OffloadUnit, QuantizationCompanionBindings,
-    ResidencyAcquisition, ResidencyController, ResidencyControllerError, ResidencyDeclarationError,
-    ResidencyLease, ResidencyLeaseOwner, ResidencyLeaseStorage, ResidencyReport, ResidencyTransfer,
-    ResidencyTransferOwner, ResidencyWindowError, ResidencyWindowManager, ResidentLayerGroup,
-    ResidentLayerGroupReport, ResidentParameterConversion, ResidentParameterConversionBinding,
-    RowResidencyRange, WeightBinding, WeightBindingPlan, WeightBindingSelectionError,
-    WeightMaterializationReport,
+    DeviceLayerWindow, ResidencyAcquisition, ResidencyController, ResidencyControllerError,
+    ResidencyReport, ResidencyTransfer, ResidencyTransferOwner, ResidencyWindowError,
+    ResidencyWindowManager, ResidentLayerGroup, ResidentLayerGroupReport,
+    ResidentParameterConversion, ResidentParameterConversionBinding, RowResidencyRange,
 };
 pub use speculative::{RunSpeculativeGeneration, SpeculativeScheduler};
 pub use speculative_selection::{
@@ -639,8 +640,8 @@ pub use integer_history::{IntegerHistoryError, IntegerHistorySpec};
 
 pub mod append_stream;
 pub use append_stream::{
-    AppendOnlyStream, AppendStreamAllowances, AppendStreamBinding, AppendStreamError,
-    AppendStreamLimits, AppendStreamSpec, ResidentAppendStream, RuntimeAppendStreams,
+    append_stream_allowances, resolve_append_stream_allocations, validate_append_stream_layout,
+    AppendStreamAllowances, ResidentAppendStream, RuntimeAppendStreams,
 };
 
 mod unit_policy_view;
@@ -651,14 +652,41 @@ pub use unit_policy_view::{
 mod vocabulary_module;
 pub use vocabulary_module::VocabularyModulePlacement;
 
+mod realtime_execution;
+pub use realtime_execution::{InstalledRealtimeExecution, SharedRealtimeExecution};
+mod realtime_joint_state;
 mod realtime_mechanisms;
+pub use realtime_joint_state::{
+    JointRealtimeBranch, JointRealtimeState, JointStateError, RealtimeCopyLimits,
+};
 pub use realtime_mechanisms::{
-    BeginRealtimeSubmission, CategoricalFrameBranch, CategoricalRealtimeMechanisms,
-    RealtimeBackendFactory, RealtimeHostFrame, RealtimeSubmissionBranch, SpeechRealtimeMechanisms,
+    bind_prepared_realtime, submit_categorical_realtime_frame, submit_speech_realtime_frame,
+    BeginRealtimeSubmission, CategoricalFrameBranch, CategoricalRealtimeExecution,
+    CategoricalRealtimeFrame, CategoricalRealtimeStateFor, RealtimeBackendFactory,
+    RealtimeChannelObservationError, RealtimeChannelObserver, RealtimeHostFrame,
+    RealtimeSubmissionBranch, SpeechRealtimeMechanisms, SpeechRealtimeState,
+    SpeechRealtimeStateBranch,
 };
 mod realtime_startup;
-pub use realtime_startup::{
-    PipelineTransportProvider, RealtimeCopyLimits, RealtimeGraphMechanisms,
-    RealtimeJointStateParts, RealtimeStartupMechanisms, RealtimeStartupPreparation,
-    RealtimeStateGroup, RealtimeStateMaterializer,
-};
+pub use realtime_startup::{CategoricalRealtimeState, RealtimeGraphMechanisms};
+
+/// Mutable prediction-only state with contiguous architecture-ordered layers.
+///
+/// This is deliberately narrower than a backend's complete model-state API:
+/// embedded extensions only need the ordered layer slice selected by the
+/// architecture when it constructed the extension.
+pub trait PredictionModelState<B>: Clone + crate::RuntimeState<B>
+where
+    B: eredu_nn::BlockwiseAttentionBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::GroupedNeuralBackend
+        + eredu_nn::HyperNeuralBackend,
+{
+    /// Concrete state consumed by an embedded prediction unit.
+    type LayerState: eredu_nn::AttentionCache<B::Tensor>
+        + eredu_nn::AuxiliaryConvolutionState<B::Tensor>
+        + crate::RuntimeStateComponents<B>;
+
+    /// Borrows prediction layers in the architecture-declared execution order.
+    fn prediction_layers_mut(&mut self) -> &mut [Self::LayerState];
+}

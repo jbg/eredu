@@ -242,7 +242,7 @@ pub(super) fn invocation_descriptor<T: Tensor>(
     invocation: &super::Invocation<'_, T>,
     plan: &super::super::schedule::StepPlan,
     feedback: super::super::channel_decision::FeedbackTokens,
-    vocabulary: eredu_runtime::TokenDomain,
+    vocabulary: eredu_core::sampling::TokenDomain,
     input_limits: super::super::perception_rnnt::PerceptionRnntLimits,
 ) -> Vec<u64> {
     use super::{Invocation, ToolAudio};

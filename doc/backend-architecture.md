@@ -35,6 +35,36 @@ available parallel axes, and MLX load requests reject a rank topology when the
 feature is disabled. Single-device model families, checkpoint formats, residency
 policies, speculative decoding and native kernels use their ordinary routes.
 
+Collective submission, peer-count validation, framed tensor inputs, and pipeline
+buffer allocation use contracts in `eredu-core::communication`. Concrete
+backends implement those operations. The portable runtime projects the
+communication manifest and advances the partition schedule.
+
+Rank-local text preparation in `eredu-runtime` validates the admitted parameter
+layout, assembles the session, and matches realized communication resources
+against the retained manifest. MLX resolves the requested communicator and route
+identities, supplies the native execution stream, and retains the shared
+completion authority. The composite partition driver combines the selected
+grouped and row providers with the partition executor and publication policy. The dense
+partition driver constructs the direct or pipeline session for both ordinary text
+and embedded prediction. The backend supplies the exact checkpoint mechanisms,
+communication handles, boundary allocator, and publication adapter. The routed
+rank driver constructs the selected grouped and row providers, installs the
+local or pipeline executor, and pairs the selected predictor with its retained
+banks. The native adapter supplies exact storage, row binding, tensor movement,
+predictor materialization inputs, and publication. Indexed movement
+through grouped operators uses contracts in `eredu-nn::tensor_movement`.
+Cross-stage collective planning reads the global component declaration so
+all ranks can describe banks in stages they do not execute locally.
+
+The portable component pipeline driver holds the selected partition plan,
+validates parameter ownership, and plans and pins admitted storage. It assembles
+the executor from the installed policy, exact rank transport, and selected
+tensor context, then drives invocation agreement, readout publication, and
+commit. The backend realizes the admitted communicators and boundary allocator
+and retains the selected native handles and tensor roots through bounded
+completion.
+
 The configuration resolver declares any GGUF architecture sidecars. Core reads
 them beside a local primary or consumes the supplied bytes during metadata-only
 inspection. LFM3 VL retains its publisher model and processor configuration
@@ -188,19 +218,25 @@ canonical sampling rank and communication authority from that binding. The
 executable keeps the prefill cursor separate from mutable decoder state and
 uses the rank agreement when replacing that state on reset.
 
-MLX uses a common pipeline runtime binder for component pipelines and ordinary
-dense decoder pipelines. It consumes a portable pipeline architecture, an admitted
-execution plan, a layerwise policy, and realized communication. VL supplies its
-partitioned language component through this binder. Dense decoders, including
-Llama pipeline ranks, supply their own architecture and policy through the same
-binder. The binder realizes the shared partition executor and retains the caller's
-selected local agreement and residency policies.
+Components and external assistants derive their resident or bounded parameter
+policy from the same portable unit binding. Native unit operations retain
+typed modules, exact transfer leases, and completion resources. Policy
+construction and the residency window belong to the portable driver.
+
+Component pipelines and ordinary dense decoder pipelines use the same portable
+partition executor. Each driver assembles it from the selected architecture,
+execution plan, parameter residency, and realized communication. VL supplies a
+partitioned language component. Dense decoders such as Llama supply the selected
+decoder stage. MLX binds the native storage, transport, and completion resources.
 
 The prepared VL rank graph validates session admission, constructs the decoder
 stage, and selects its state layout and output authority before native binding.
 It passes the retained source, addressed parameter bindings, residency and
-communication plan as a portable `PreparedComponentPipeline`. The MLX binder
-realizes that plan through the shared pipeline executor. The VL constructor
+communication plan as a portable `PreparedComponentPipeline`. The portable
+component driver constructs the pipeline from the realized communication,
+parameter policy, and native transfer and submission resources. Rank-local
+checkpoint placement resolves bounded selections and validates the full catalog
+before acquiring payload leases. The backend materializes the exact leases. The VL constructor
 requests state allocation using the selected layout and first global layer.
 The portable vision traversal supplies its unit factory to the same MLX
 unit-policy binder used by Audio. Image projection for Decision and Audio/Omni
@@ -212,8 +248,8 @@ composite route constructs the rank through the portable component binding contr
 the completed vision traversal, decoder binding, and initial state into a typed
 rank text session. The architecture constructs replicated VL equations and supplies
 the retained source, residency, conversion retention, and state selection to the
-generic local component binder. Replicated and distributed VL use the same
-retained-prefill executable adapter for cursor, snapshot, and tensor erasure. Replicated VL
+generic local component binder. Replicated and distributed VL share portable
+prefill cursor erasure and the same native snapshot and tensor bindings. Replicated VL
 reports the combined graph's residency and conversion retention. Distributed VL
 reports component residency and its selected publication authority. The adapter admits output
 observation according to the session report and fails closed for persistent
@@ -237,13 +273,14 @@ validates snapshot ownership before an exchange, while the backend supplies
 isolated native copies and retention estimates. The portable rank execution driver
 routes prefill admission, cursor advancement, cached decoding and reset through
 the bound component mechanisms. MLX converts native request tensors and supplies
-native execution, retention, and erasure.
+native execution, retention, and snapshot copies.
 
-A retained prefill cursor declares its phase, committed position,
-host metadata and live tensor roots through the portable cursor contract. MLX
-erases compatible cursors and counts distinct native backing allocations through
-one adapter. Uninterrupted VL prefill drains the typed cursor through the same
-advancement used by controlled prefill.
+A retained prefill cursor declares its phase, committed position, host
+metadata and live tensor roots through the portable cursor contract. The
+portable driver erases cursor types, accounts for retained storage and
+dispatches the final decoder step. Native tensor implementations supply
+storage observations. Uninterrupted VL prefill drains the typed cursor through
+the same advancement used by controlled prefill.
 
 The ordinary MLX loader has a CPU Ring placement comparison with two pipeline
 stages, one tensor rank per stage, and F32 activation transport. It uses the
@@ -265,13 +302,165 @@ checkpoint encoding on both placements.
 The facade's `PreparedTextModel` retains resolved tokenizer, template, EOS policy,
 and generation defaults once. Text probes borrow that state. Execution selection
 retains the complete plan, target admission and its compatibility/resource report,
-plus the selected drafting preparation and vocabulary proof. The MLX factory
+plus the selected drafting preparation and vocabulary proof. The portable loader
 obtains the report and native binding selection from one architecture inspection
 outcome. `SelectedTextModel` borrows the selecting factory and consumes those
 retained selections during realization; callers cannot replace its plan or text
 options. Convenience path loaders use this same pipeline. Native source guards
 remain authoritative for changed files and later payload leases. Metadata-only
 inspection does not grant local text or payload loading authority.
+
+Direct and planned realization share the portable executable construction path.
+Direct loading accepts the portable admission policy from its caller and obtains
+immutable mechanism facts and exact placement from the backend. Planned loading
+retains the preparation returned by target admission alongside the native
+placement. The types for both selections belong to the portable load operation.
+Portable construction checks the selected manifest against placement, agrees the
+manifest through the native setup transport, and validates the realized rank
+before binding parameters. The portable driver constructs and retains the
+prepared replicated, routed, or composite executable alongside its discovery,
+processor, and exact native placement. The same portable visitors assemble
+ordinary and prediction-enabled executables. The backend supplies the physical
+tensor representation, checkpoint materialization, storage, queues, and
+observation mechanisms used during construction. The retained media processor
+runs through portable preparation, admission, and observation. Its native
+scope allocates tensors from exact host values, reports metadata, and retains
+the native roots through completion. Portable capability synthesis
+resolves logical state roles, dtype requirements, and paging policy before
+asking the backend whether it supports a specific shape, storage dtype,
+and placement.
+
+Partition construction, row admission, text capture admission, sample
+publication, and speculative sampler configuration keep their typed errors
+in the portable driver. Failures that cross a native interface carry their
+original source through `BackendFailure`. The owner of a failed operation records
+whether model state was preserved. Native recovery still requires independent
+submission and completion evidence before it can reuse the session.
+
+For a distributed route, portable binding computes the exact source exclusions
+for the admitted rank and passes them to checkpoint materialization. The portable
+driver installs the bank catalog and erases the completed dense, routed, or
+composite executable, including when it retains a predictor. Each portable
+visitor takes the agreed communication handle directly and uses it to construct
+the exact rank. Native binding supplies checkpoint and state operations,
+pipeline buffer allocation, and the retained storage for that placement.
+
+The installed text driver defines the prepared prompt over the native input
+tensor and assembles the executable, processor, and retained placement into
+one resource root. Native retirement retains that root as an opaque payload.
+The driver reads capture geometry and forecast facts from the executable.
+For inspection, it selects activation paths and assembles the named observations.
+The backend reads the exact tensors in order and retains their handles and
+submission authority through native settlement. Ordinary, partitioned, and
+forecast capture use the same native capture workspace estimate. Forecast
+assembly interprets native scratch bounds and allocator observations alongside
+the executable geometry and the requested schedule.
+For speculative execution, portable binding selects the embedded or external
+executor and pairs the shared-backbone target observer with the selected queue.
+Native implementations supply tensor transforms, readback, queue handles,
+storage estimates, and exact completion.
+
+The installed text driver creates each generation request and configures its
+sampler after admission. It chooses the sampling rank, applies the admitted
+token filter on that rank, and requests exchange of the resulting token on the
+selected group. MLX initializes native random storage from the supplied seed,
+extracts score rows, executes the requested numerical operations, and retains
+submission resources through completion. The portable snapshot driver visits
+retained refinement and verification state and accounts for each native value.
+The backend reports the storage of each supplied value and copies the values
+selected by the snapshot driver. Ordinary and speculative refinement share
+the same invocation and score shapes. The portable block driver creates the
+next prompt, commits the sampled position, and hands native completion an
+opaque output. Masked refinement constructs the host canvas, applies the shared
+float64 sampling and confidence equations, preserves selected score rows, and
+remasks dependent suffixes in portable code. The backend supplies exact random
+draws and tensor transfers, reshapes the selected tensors, and retains the
+submission until it settles.
+
+Portable allocation projects each selected layer into an exact attention backing,
+fixed slots, and append-stream allocations. Text, prediction, and coupled speech
+use the same projection. The live cache owns the page catalog, mutable tail and
+frontier updates, visible and indexed range selection, and append rollback. The
+portable scan orders sealed pages, the retained tail, and transient tensors, then
+releases expired history after completion. Native storage implements exact
+slices, compact copies, gathers, and attention accumulation, and retains each
+page lease until its work settles.
+
+Portable text route assembly maps the selected state access profile to a
+key/value, hybrid, or pooling owner. The replicated driver derives rank
+identity and the global layer offset from the selected partition, then
+constructs, resets, checkpoints, and restores that owner. Local components
+and routed predictors use the same allocation path for their selected layout
+and cache. The state owners supply snapshot bounds and the exact roots required
+for publication. MLX allocates, copies, and transfers tensors and settles the
+supplied roots on its native queues.
+
+The portable resident key/value cache owns its absolute frontier, visible
+sliding window, prefix reservations, and snapshot and rollback decisions. It
+selects append backing before requesting an allocation or a native memory
+description. Native implementations allocate and mutate exact intervals, retain
+immutable prefix views, and evaluate the supplied attention inputs. Read-only
+attention combines transient inputs with retained history in the portable owner.
+
+The portable compressed-latent cache owns resident capacity growth, paged state,
+and checkpoint restoration. Composite layer storage lends that cache to
+architecture execution before reconstruction begins. The backend supplies the
+tensor backing, exact interval updates, and copies. Prediction construction
+initializes the same portable cache owner for sequential prediction layers. The
+portable prediction lifecycle accounts for the owner, asks the backend for
+per-tensor copy bounds, and settles the copied values before publication.
+
+Live spill encoding and exact shard reads use the portable cache persistence
+code. Native host transfers supply the completed byte slices for writes and
+allocate writable buffers from the exact tensor layouts for restores.
+
+The portable driver binds the installed external draft to the target batch,
+owns its selection and forecast, and borrows it for proposal and verification.
+Native retirement retains the draft as an opaque payload and supplies its queue,
+allocator observations, and exact completion.
+The portable parameter binder constructs unit storage and its residency owner
+for resident and bounded execution from the backend's native operations. It
+gives prediction units physical identities, includes them
+in the target budget, and attaches the same initialized owner to each unit.
+Native allocation, transfer ordering, and retirement retain the exact storage
+and leases used by each submission. Resident, bounded, and prediction unit
+loans return exact retained parameter handles. Portable construction validates
+their identities and installs them into modules. The native retirement contract
+keeps storage alive through completion, and portable code preserves policy
+errors as typed causes through the neutral failure boundary.
+
+Portable external-draft binding chooses the installed assistant type and owns
+its configuration, executable, observer, and budget reporting. Portable binding
+also erases the independent draft model before handing the payload to the
+backend's completion and retirement scope. The same native assistant contract
+supplies numerical operations for every supported family.
+Portable speculative invocation associates the admitted target and draft queues
+with the retained capture transport and target observer. The runtime constructs
+the prediction state and resident assistant cache, selects same-device
+dependencies or cross-device copies, and assembles continuation memory reports
+from the retained state, parameter owners, and native allocator facts. Backends
+supply numerical operators, tensor copies, event submission, capture transforms,
+and physical memory observations. The portable refinement finalizer applies
+current token constraints and decides whether to keep or replace the selected
+candidate using native numeric score classifications.
+
+The realtime loader opens separate host-materialization and selected-device
+execution contexts through the native factory contract. Portable binding
+uses the pair to construct the selected speech or categorical executable
+and retains the frame transaction. The runtime derives the categorical cache
+from the native storage contract and owns state branching and publication.
+Native Ring opens the world and reports its identity. Portable binding validates
+placement, agrees the selected manifest, and constructs the rank pipeline
+using native groups, transfers, and completion. Layered realtime construction derives its
+resident and bounded execution from the shared parameter-unit mechanisms. The
+portable binder matches the selected rank against the native world and local
+rank identities before opening materialization. The driver validates completed
+channel geometry, projects categorical and dense values, and assembles host
+observations and diagnostics. The same native queue contract supplies readback
+for categorical and speech frames. Native mechanisms supply tensor creation,
+state roots, queue scopes, completion, and teardown. Native target binding
+reports exact rank and world identity and controls the lifetime of native
+materialization handles while portable code validates the selected route.
 
 Prepared generation, including retained external and embedded draft sources,
 uses the request-local `DecodingMode` in shared generation settings. The
@@ -298,7 +487,7 @@ Portable snapshots copy logical modes with cache, sampler and pending input;
 branches retain independent command owners and charge their storage separately.
 
 The core text machine advances architecture-declared physical operations through
-`TextGenerationBackend::submit_text_operation`. Progress retains pending input
+`ModelRuntime::submit_text_operation`. Progress retains pending input
 without querying or committing the token controller. A selecting operation alone
 receives the current commitment decision. Native completion is retained before
 publication, and the ordinary iterator and controlled facade use this same machine.
@@ -1363,9 +1552,8 @@ the returned `SpeechRealtimeSession`. Checkpoint naming, admission, neural equat
 and conversation policy remain in their existing owners. The CLI owns configuration, recorded tool scripts, wall-clock pacing and
 file/device delivery.
 `eredu-media::audio::wav` supplies bounded, standard-library-only mono WAV processing
-without optional host-audio dependencies. The facade selects cache realization
-through MLX's cold `native::state_capabilities`; the CLI supplies policy and
-budgets. Fallible `ExecutionContext::cpu` and `accelerator` constructors keep native
+without optional host-audio dependencies. The facade selects cache realization from backend-neutral capability facts.
+The CLI supplies policy and budgets. Fallible `ExecutionContext::cpu` and `accelerator` constructors keep native
 device creation in the backend.
 
 `eredu-media::audio::system` gates CPAL capture/playback behind `system-audio`.
@@ -1391,14 +1579,23 @@ driver and model state advance normally during muted input.
 The safe external host-library wrapper retains its own FFI boundary; repository
 crates retain `unsafe_code = "forbid"`.
 
-`eredu-checkpoint::quantization` owns bounded transformation targets, cold output
-metadata and pending prepared-source publication. Architecture preparation selects
-eligible matrices and execution precision before residency admission. The MLX
-backend realizes the retained plan through its generic bounded quantizer and
-prepared-checkpoint cache, then publishes exact encoded storage after completion.
-Restricted views preserve that preparation authority and deny unrelated reads;
-transformed reads fail until publication. No family branch selects quantization
-inside the backend.
+`eredu-checkpoint::quantization` owns bounded transformation targets, cold
+output metadata and working-set sizing. Architecture preparation selects matrices
+and precision before residency admission. The portable runtime resolves source
+dependencies, sizes tiles against backend limits, sequences reads and
+submissions, and publishes completed storage through the checkpoint contract.
+MLX supplies stream limits, tile packing and completion, and allocator trimming. Restricted views retain
+preparation authority and deny unrelated reads. Transformed reads become
+available after publication.
+
+`eredu-checkpoint::checkpoint_conversion` owns offline conversion of exact
+SafeTensors targets. It admits source shards, preserves unselected tensor bytes
+and checkpoint assets, and writes the supplied config, output shards and index.
+The selected backend stages packing for each selected weight and evaluates the
+packed tensors together when the portable writer flushes a shard. The writer
+borrows the evaluated bytes for serialization. The `eredu` facade's
+`quantize_checkpoint` example supplies the validated plan and selects the MLX
+execution device.
 
 VoiceChat retains selected host integer payloads during their bounded hash-validation
 pass and reports their canonical host storage separately from learned weights.
@@ -1949,22 +2146,20 @@ ranges, partition rules and optional group semantics without native allocation.
 Runtime incrementally admits independently leased execution-unit resources in selected
 invocation order. It validates physical payload totals, source keys, residency identities
 and specifications, and aggregate host-capacity facts supplied by the backend. Admission
-is consuming and requires complete selected-unit coverage. Native callback-derived and
-retained-binding preparation consume the same admitted resource representation without
-combining independent units or changing source authority.
+is consuming and requires complete selected-unit coverage. Preparation consumes exact
+bindings without combining independent units or changing source authority.
 Runtime also combines ordinary windows with auxiliary lifetime requirements. Resident
 resources coexist; bounded sequential phases share device windows, host-resident phases
 retain their complete host payloads, and disk-streamed phases reuse bounded host caches.
-Both native preparation paths validate budgets against these shared capacity results.
+Native preparation validates budgets against these shared capacity results.
 Pinned and auxiliary resource admission also lives in runtime. Empty static declarations
 produce no residency resource; nonempty pinned bindings retain exact destinations, source
 keys and alias-free physical accounting. Auxiliary owners retain independent policies and
 backend-supplied host capacities under their declared shared/sequential lifetime.
-Native callback-derived and retained-binding policy preparation use one finalization
-implementation for residency streams and managers, pinned static binding, dense-stream
-controllers and policy assembly. Their source realization and binding admission order
-remain specific to each prepared input path; ordinary and supplementary sources feed
-the same native finalizer.
+Prepared bindings feed the shared runtime constructor for residency owners,
+pinned static binding, dense-stream controllers, and policy assembly. Native
+mechanisms supply the selected streams and exact transfer resources. Reference
+runners that inspect temporary modules supply exact bindings to this path.
 Runtime validates tensor-only communicator topology and exact selected physical
 parameter placement through the shared layout compiler. Speech kernels supply their
 declarations and selected layouts, retain coupled width checks, and preserve guarded
@@ -1982,11 +2177,10 @@ in canonical order before acquisition, retains the same observer for internal an
 boundary callbacks, and preserves the original architecture error as the cause of
 preflight failure. Architecture kernels supply equations; shared traversal delivers
 observations.
-Resident native materialization uses one transfer-acquisition and population loop
-for architecture-built modules and modules supplied by neutral construction. Source
-adapters supply each unit once; the common finalizer validates supplied cardinality,
-orders the retained transfer before population, enables resident parameter conversions,
-and moves pinned leases and the transfer owner into the resident policy.
+Resident materialization acquires one transfer and populates the units supplied by
+portable construction. The finalizer validates the unit and lease counts, orders the
+retained transfer before population, enables resident parameter conversions, and
+moves pinned leases and the transfer owner into the resident policy.
 Canonical execution-unit layout projection is a portable architecture contract.
 The shared component adapter returns the retained definition's layout, preserving
 nonzero global addresses and sparse selections. Native preparation and portable
@@ -2321,6 +2515,16 @@ the combined report. A later failure retains earlier completed overlays; the
 single-group mechanism owns native completion and failed-resource retirement.
 Format grouping and task identities remain runtime contracts.
 
+Portable parameter materialization groups eligible direct checkpoint reads
+within a byte and parameter bound. It uses the native scope's slot count to
+schedule submissions, settles earlier work when a bounded shard cache is
+pinned, and retries the affected ordinary read. Residency uses the same
+scheduler and can batch direct reads across admitted units. The portable
+driver assembles completed owners and publishes them under the existing
+residency reservations. Native scopes supply direct-read eligibility,
+layout conversion, copies, and exact completion. They retain any unsettled
+source leases and allocations through recovery.
+
 Shared source restriction, binding and placement failures propagate through
 `ComponentPreparationError`. Family preparation errors add their active source
 admission, recipe, precision, geometry and communication failures.
@@ -2338,7 +2542,15 @@ explicit unit selection supplies a restricted view. Initial preparation and
 identity projection do not clone an unchanged complete layout.
 Unit-only consuming handoffs return the retained declaration alongside placement,
 invocation mapping, restricted source and independently leased bindings. Callers
-explicitly discard declaration metadata they do not retain.
+explicitly discard declaration metadata they do not retain. The portable
+parameter-unit binder opens native recovery and prepares the selected storage.
+For resident execution it constructs the architecture's units in physical order
+and hands them to the backend for population. For bounded execution it installs
+the prepared storage and leaves unit construction to traversal. The local
+component and pipeline binders also construct resident units from their exact
+physical storage maps. Pipeline binding establishes native communication before
+parameter preparation and construction. The backend retains native resources
+through completion.
 VoiceChat backbone preparation retains its validated component definition with
 the selected parameters. Resource reporting and binding preparation share that
 definition; consuming quantization selection derives the definition for its
@@ -2452,9 +2664,9 @@ retain their frame identity without allocating another stage's cache tensors.
 Prepared stage sources expose only the canonical recipes used by those units.
 
 The final perception stage publishes a packed encoder/projected tensor through
-the existing shared output publisher. Architecture code unpacks the two feature
-branches without repeating perception. `MlxComponentPipeline` supplies native
-binding, transport, phase agreement, completion and commit for these stages.
+the shared output publisher. Architecture code unpacks the two feature
+branches from the packed result. The portable component pipeline owns phase
+agreement and commit. MLX supplies native binding, transport, and completion.
 Output preparation participates in all-rank failure agreement. Exposed tensors
 and candidate caches remain retained through exact completion before commitment. Cold component constructors return runtime's
 `ComponentPipelinePreparationError<E>`, preserving the typed family geometry error
@@ -2465,7 +2677,7 @@ VoiceChat perception, predictor and transformer constructors use this shared err
 boundary without family-specific translation matches.
 These component pipelines do not select the full coupled
 VoiceChat graph or distribute its conversational policy.
-Shared MLX policy preparation omits static residency units when their binding set
+Portable policy preparation omits static residency units when their binding set
 is empty. Resident conversion retains the actual static leases and reports their
 count, including zero; it does not synthesize a pinned allocation for an empty role.
 Disk-streamed traversal completes and releases each group's transfer window at
@@ -2507,10 +2719,12 @@ agreement boundaries. Ordinary and guarded paths share the same lookup and
 cast/add equations. `BackboneInput::prepare_parallel_guarded` feeds this result
 into the existing supplied-embedding path; `ParallelBackbone` accepts an optional
 retained ingress callback. An ingress rejection precedes layered acquisition and
-cache advancement. The callback does not guard operations inside subsequent
-Nemotron blocks. Native low-level bindings can borrow
-`MlxReplicatedCoordinator::parallel_group()` to retain the same bounded failure
-and completion authority in vocabulary mechanisms and architecture agreements.
+cache advancement. That ingress check ends at the supplied-embedding boundary. The portable
+replicated coordinator exposes the realized tensor context for component
+bindings. Architecture agreements and operator readiness retain the same
+bounded communication authority. The neutral row and vocabulary operators
+agree local preparation and geometry before data submission. Native data
+completion settles the transport before a subsequent readiness exchange.
 
 `FunctionHeadExecution` supplies the same readout to ordinary and controlled
 coupled execution. Its shared dual-head method projects agent and function logits
@@ -2531,14 +2745,14 @@ the acquired unit must match the selected vocabulary range. Gathering completes
 before releasing the head lease. The native adapter binds the selected communicator
 and provider policy without owning sharding equations or conversational scheduling.
 
-The native TP function-head constructor requires a retained
-`MlxReplicatedCoordinator`. Architecture-owned cold validation checks bounded
+The TP function-head constructor takes a retained cohort built from the
+selected rank resources. Architecture-owned cold validation checks bounded
 failure agreement, F32 uneven-gather input/output capacity and vocabulary degree
 before payload reads. Guarded projection agrees full hidden shape, dtype and
 logical dimensions, then uses the existing layered traversal hook for parameter
 acquisition and completion. Leased-unit identity is agreed before local projection;
-the shared MLX vocabulary primitive agrees local multiplication success before
-entering its gather. `GuardedFunctionHeadExecution` requires explicit cohort
+the neutral vocabulary operator agrees local multiplication success and
+gather geometry before requesting a native gather. `GuardedFunctionHeadExecution` requires explicit cohort
 agreement and traversal hooks in addition to ordinary parallel projection.
 Resident and bounded providers use this same guarded path.
 A local failure retains its original source, and acquired peer leases remain
@@ -2606,9 +2820,8 @@ placement without applying recipes twice.
 Typed boundaries carry the hidden row, zero-state prototype, global layer cut and
 full-width explicit predictor step. Cold communication admission checks the
 readout's complete F32 broadcast bounds as well as the boundary roles.
-The native adapter supplies mechanisms through
-`MlxComponentPipeline`, including transport, failure agreement, completion and
-commit. Its caller supplies the invocation descriptor and commit epoch and adopts
+The portable component pipeline sequences failure agreement and commit over
+native transport and completion mechanisms. Its caller supplies the invocation descriptor and commit epoch and adopts
 the returned local candidate only after commitment. The adapter includes the full
 predictor step in rank agreement before parameter reads. This predictor primitive does
 not select a coupled speech session.
@@ -2753,12 +2966,19 @@ geometry declares one conversation row and two classifier-free guidance rows.
 Portable VoiceChat startup validates both layouts before binding learned
 components or allocating state. The retained VoiceChat plan supplies frontend
 options and independent residency policies to its portable component driver.
-`ComponentPreparation` lets that driver use the ordinary component binder's
-native allocation, detached recovery, and post-binding cache cleanup. Startup
-completes the fixed speaker prompt and tool silence, realizes the selected caches
+The portable component driver opens a `ComponentPreparation` scope before
+constructing the aggregate and hands the result back for native retirement and
+allocator cleanup. For each local decoder it prepares the architecture under a
+native recovery scope, then supplies a `PreparedLocalComponent` to the materializer.
+`LocalComponentDriver` owns the layerwise runtime and advances resident or bounded
+execution with the selected policy. MLX supplies parameter materialization, state
+storage, completion, and conversion retention operations. Startup completes the fixed speaker prompt and tool silence, realizes the selected caches
 and explicit RNG, then registers the generation transaction with prefill queued.
 The backend supplies state materialization for device and paged placements.
-`RealtimeStateGroup` groups the caches under one finite copy budget.
+The portable `JointRealtimeState` groups the selected caches under one finite
+copy budget. It owns candidate identity, atomic publication, snapshot restore and
+shared descendant accounting. Native state storage supplies copy costs, exact
+copy operations and completion retention.
 `RealtimeJointStateParts` gives portable execution disjoint access to the
 unpublished cache parts under that same transaction. The shared selector
 requires checkpoint and rollback support.
@@ -3015,8 +3235,9 @@ components, prepares fixed-Aria and silence inputs, and registers the existing
 session. Loading accepts no replacement sources or policy.
 Prefill runs only on advancement. `RealtimeSession::Speech` exposes a
 `SpeechRealtimeSession` with controlled advancement, snapshots and forks.
-The backend implements the realtime factory and mechanism contracts in
-`eredu-runtime`. The factory opens one native realtime context. The portable
+The native factory opens the execution and host-materialization contexts.
+The portable loader binds the selected components and caches through the
+realtime mechanism contracts. The portable
 categorical scheduler binds architecture preparations through execution, state,
 and host observation contracts. Coupled PCM startup uses generic component
 binding, joint state, isolated copying, and exact submission ownership.
@@ -3044,30 +3265,33 @@ Errors and unwinds seal failed recovery without evaluating another graph.
 `eredu_nn::RetainedTensorRoots` visits borrowed tensor roots without allocation,
 evaluation or family inspection in the backend. Recurrent, convolution, spectral
 and VoiceChat component owners expose independent carry as well as visible output.
-VoiceChat and Moshi use the same MLX execution gate and candidate recovery scope.
-Each portable graph declares its retained tensor roots. The native adapters add
-the selected cache and RNG resources; VoiceChat also supplies the joint copy
-permit. The shared completion owner retains the execution, streams, and any
-paging or collective authorities independently of candidate lifetime. Native
-retirement controls release if candidate disposal follows a failed completion
-observation. Retained handles are not a deduplicated memory census.
+VoiceChat and Moshi share a portable execution gate and queue contract.
+`eredu-core::realtime_mechanisms` defines queue recovery, exact completion
+creation, state realization, and primitive tensor materialization. Runtime
+owns candidate admission, failure handling, and publication. The
+portable runtime owns the installed component borrow, erased categorical
+executor, and move-only invocation authority. The scheduler selects frame
+work, and the driver assembles the retained roots for that work from the
+architecture's declared tensors and native cache and RNG roots. VoiceChat's
+invocation also supplies the joint copy permit. MLX keeps that authority,
+the queue, and any paging or collective resources through exact completion
+or teardown. Retained handles are not a deduplicated memory census.
 
-Fixed-Aria prompt and silence preparation share a native completion scope with
-retained model ownership. Architecture-declared roots cover every startup tensor;
-errors and unwinds preserve pending native work and poison shared execution.
-Successful preparation returns only after exact completion. Shared execution
-handles retain one active/poison gate without copying caches or random state.
+The portable driver runs fixed-Aria prompt and silence preparation under
+native recovery and waits for their architecture-declared roots before
+returning. Errors and unwinds preserve pending native work and poison the
+shared execution. Sibling handles share one gate without copying caches or
+random state.
 
-VoiceChat's portable invocation runs preflight and enters
-`SharedRealtimeExecution` before executing the coupled equations. The generic
-MLX owner accepts the invocation, branch and input roots, opaque native
-retention, and a host observer. It attaches exact completion to the unpublished
-branch and handles recovery for errors or unwinds after submission begins.
-The categorical coordinator and the coupled invocation use the same native
-candidate lifecycle to consume retention authority once, enter recovery, and
-finish exact completion. Each portable driver controls when its preflight
-allows that lifecycle to begin. Rejected preflight leaves the execution
-available for retry.
+The categorical coordinator and the coupled VoiceChat invocation run
+portable preflight before opening a native queue scope. Rejected preflight
+leaves the execution available for retry. The driver attaches exact
+completion to the unpublished candidate, and its recovery guard attaches
+failed completion evidence when work exits early after admission.
+LFM3 audio input and forked execution use explicit native recovery scopes
+while the portable session invokes the component code and retains the
+branch's accounting.
+
 Siblings share the execution gate until completion and its retained resources
 are released. VoiceChat's joint admission also stays occupied while completion
 owns the copy permit. Its portable observer validates output attribution around
@@ -3172,8 +3396,9 @@ The shared scheduler treats `AudioDecoder` groups as mandatory. This declaration
 keeps codec state ownership distinct from text decoding and from projections
 whose activity follows their upstream modality dependencies.
 
-The shared component pipeline owns transport, bounded parameter leases,
-completion and exact commit agreement for both encoder and decoder stages.
+The shared component pipeline advances both encoder and decoder stages,
+including exact commit agreement. The native backend supplies transport,
+bounded parameter leases, and completion.
 Common cold route validation checks contiguous ranges and equal unit ownership
 within tensor cohorts. Codec preparation retains restricted source views and
 exact local state layouts; the MLX adapters bind them without discovering cuts
@@ -3233,7 +3458,8 @@ before acquiring parameters. The last unit completes the frame-major conversion,
 and the shared runtime publishes full latents with exact completion and commit
 agreement. Restricted stage source views retain only owned recipes. Combined
 TP/PP selection verifies that tensor participants own the same unit range.
-The MLX adapter binds these retained contracts through `MlxComponentPipeline`.
+The portable component pipeline binds the retained contracts using MLX
+transport and completion mechanisms.
 Spectral preprocessing and borrowed quantization remain separate components.
 
 `EncoderDeclaration` retains the finite encoder's canonical unit paths,
@@ -3495,13 +3721,12 @@ That transaction branches and publishes Nemotron and both TTS guidance cache
 lanes together. The architecture does not clone mutable native cache handles or
 compose two fallible cache commits. Component candidates are adopted only after
 the joint neural commit succeeds; discard delegates to the same neural owner.
-MLX's reusable `MlxJointState` owns a hybrid state and a key/value state under
-one transaction identity. Identity and layout validation precede replacement of
-either canonical state. Admission uses actual retained tensor extents, including
-both rows of classifier-free guidance, and keeps cumulative copy usage outside
-the candidate. Native recovery retains unresolved copy work. The final composition
-adapter implements the architecture's borrowed cache access contract; the reusable
-owner has no VoiceChat scheduling policy.
+The portable `JointRealtimeState` owns both caches under one transaction
+identity. Identity and layout validation precede replacement of either canonical
+state. Admission uses native copy estimates that include both rows of
+classifier-free guidance, and keeps cumulative copy usage outside the candidate.
+Native recovery retains unresolved copy work and the associated admission.
+The branch exposes both caches through the borrowed state-parts contract.
 
 Joint frame candidates copy metadata and share immutable attention, fixed-state
 and resident append-stream roots. Fixed-state replacement constructs unpublished
@@ -3546,7 +3771,7 @@ before invoking those mechanisms, retains the original budget for later restores
 and translates mechanism failures through `BackendFailure`. Native recovery
 retains a clone of the logical reservation with unresolved copied resources.
 
-`MlxJointState` realizes this contract through its completed isolated-copy path.
+`JointRealtimeState` realizes this contract through the native storage copy operation.
 An isolated owner has its own exclusive execution admission and shares its
 origin's cumulative copy counter and limits. Saved caches therefore coexist with
 continued inference; restoration adopts both cache families only after origin,
@@ -3608,8 +3833,11 @@ storage drops after complete host installation. The scheduler remains the sole
 execution driver and keeps cumulative counters and submission identities.
 
 Undelivered speech, text, tool-event strings and diagnostics have explicit bounded
-copies. `eredu-runtime` supplies `SnapshotValue` for core realtime diagnostic
-records, preserving observation accounting; architecture-owned speech and RNNT
+copies. Core defines `SnapshotValue` for independent value copying, including
+realtime diagnostic records. Runtime admits those costs and passes a
+`SnapshotRetention` share of the reservation to copy operations. Native
+recovery retains the share until completion or safe teardown and has no access
+to budget mutation or admission. Architecture-owned speech and RNNT
 host outputs compose those records without native types. Host policy prices its
 mutable carry and retained response/reminder/RNNT vocabulary storage. Immutable
 tokenizer/schema resources retain their shared preparation lifetime and are not
@@ -3656,8 +3884,7 @@ actual component receipts and resources for the shared completion mechanism.
 Native submission scopes and prepublication observation belong to the enclosing
 execution owner; the shared realtime loader binds that owner to the facade session.
 
-`voicechat::observation::VoiceChatHostObserver` wraps a family-independent native
-channel observer. After exact completion it validates the output projection,
+`voicechat::observation::VoiceChatHostObserver` wraps the portable realtime channel observer. After exact completion it validates the output projection,
 retained schedule policy and fresh-input attribution, then returns owned PCM,
 RVQ codes, raw/effective decisions, diagnostics and timestamped RNNT output.
 Source sample counts exclude explicit final padding; tool and reminder steps
@@ -3665,13 +3892,12 @@ carry no new transcription. Conversion errors preserve their native source
 through `BackendFailure`. `PrepublicationRealtimeFrame` caches these host values
 and gates the shared scheduler's commit.
 
-MLX exposes `MlxRealtimeChannelObserver` as an ordinary backend runtime mechanism.
-It converts declared categorical/dense channels, aligned values and diagnostics
-without applying family semantics. Moshi composition delegates to that mechanism
-before its architecture-owned projection; VoiceChat's neutral observer accepts
-the same mechanism. Submission scopes must still begin before neural execution
-and retain or retire failed work before branch disposal. Wrapping a successful
-result in `submit_realtime_output` does not discharge that failure-path duty.
+The portable `RealtimeChannelObserver` validates geometry and assembles
+categorical channels, dense channels, aligned values and diagnostics. Moshi and
+VoiceChat both use it before their family-specific projections.
+`MlxRealtimeReadback` supplies exact integer and floating tensor reads.
+Submission scopes begin before neural execution and retain failed work through
+terminal proof or teardown.
 
 `voicechat::backbone_execution::BackboneExecution` owns selected prompt/audio
 fusion, normalized-hidden execution, agent projection and state-frontier validation.
@@ -4078,13 +4304,14 @@ and commit metadata. The portable session validates and exchanges those slots fo
 serial branches without rebuilding the executable or assigning a second native
 completion owner. Backend realization and complete facade snapshot composition are
 separate from this low-level state-slot mechanism.
-`NativeTextStateBackend` provides the narrow outer backend contract for those
-native slots. MLX implements it through the same typed replicated session and
-architecture-erased adapter, without family dispatch. Copy operations settle under
-the existing session authority and recovery owner. Exchange performs a validated
-host move while that authority is idle, so no fallible native submission follows
-the swap. Input-identity and commit metadata are included in portable storage
-estimates. Full generation capabilities remain a facade composition concern.
+`NativeTextStateSession` exposes persistent state on the installed text session.
+The portable text driver checks target identity and state-copy support, opens a
+settled copy transaction, and validates saved slots before exchange. The erased
+executable supplies storage operations and state geometry. MLX retains native
+copy resources through completion. An exchange requires idle submission
+authority. Partitioned executables settle rank agreement before moving the slot.
+Input identity and commit metadata contribute to storage estimates. The facade
+composes full generation capabilities.
 
 `TextSnapshotBackend` supplies complete native sampler/RNG and pending-input
 copying beside that model-state contract. `TextContinuationSnapshot` in runtime
@@ -4112,7 +4339,7 @@ non-resettable resource limits are established. Built-in semantic parsers have
 explicit logical storage estimates; opaque active llguidance state remains
 unsupported until it supplies complete costs. Snapshot/restore pairs native state
 with exact cursor/parser/decoder state and a versioned consumer output checkpoint.
-The generic `LoadedModel<B>` exposes these controls and snapshots without
+The generic `LoadedModel<B, S>` exposes these controls and snapshots without
 exposing native handles or duplicating their policy. Reusable host/native continuation
 checks live in `eredu-evaluation::execution_control`, used only as validation
 tooling, with native forward/reload probes and source-preserving copy failures.
@@ -4155,34 +4382,196 @@ and an execution backend. It is intended for backend authors and maintainers of
 
 ## Dependency direction
 
+The required dependency direction is shown below. Arrows point from a caller
+or dependent to its dependency.
+
 ```text
-eredu-core / eredu-checkpoint / eredu-nn / eredu-media
-                           |
-                     eredu-runtime ---- eredu-codec
-                           |
-                   eredu-architectures
-                           |
-                   eredu-backend-mlx
-                           |
-                         eredu
+applications -> eredu API -> portable model driver
+portable model driver -> eredu-architectures / eredu-codec / eredu-runtime
+portable execution -> eredu-core / eredu-nn / eredu-checkpoint
+applications -> eredu-backend-mlx -> eredu-core / eredu-nn / eredu-checkpoint
+eredu-backend-mlx -> safemlx
 ```
 
-Backend-internal
-fixtures and composition tests are crate-private unit tests; published crates
-expose no test-support feature or fixture namespace. The facade does not
-directly depend on `eredu-nn`, `eredu-checkpoint`, or `eredu-media`. Portable
-media algorithms are enabled through narrowly forwarded image or audio
+The portable model driver coordinates checkpoint inspection, family admission,
+execution selection using backend capability facts, source preparation, and
+typed construction. Families compose portable neural and runtime components
+and supply family-specific equations, state geometry, and checkpoint schemas.
+MLX supplies native mechanisms and resource ownership through neutral
+contracts. Its production dependency graph excludes the portable runtime and
+family implementation crates. Family features select portable code independently
+of the backend.
+
+The facade text-model driver owns artifact inspection and coordinates retained
+target and drafting selection and realization. For execution inspection it calls
+the portable architecture inspector using a normalized request, media
+availability, and side-effect-free mechanism facts from the backend. The
+portable inspection and preparation policy lives in `eredu-runtime`. Native
+fact and submission contracts live below the runtime.
+Low-level `eredu-core` loading helpers take a caller-supplied resolver or
+inspection. `ModelLoadingBackend` supplies the facts and mechanisms for the
+caller’s artifact catalog.
+
+For planned and direct text loading, portable orchestration invokes
+architecture admission using backend mechanism facts, binds the admitted
+placement, and transforms the retained plan into checkpoint sources. It
+assembles the typed ordinary and rank-local routes from native execution and
+weight contexts, state profiles, visitors, and placement mechanisms. The
+key/value-only path needs one visitor and no rank or prediction mechanisms.
+Architecture admission selects the route and supplies checked target roles,
+extension keys, and prediction facts. The portable constructor executes the
+architecture's one-shot constructor and assembles the loaded executable with
+its state layout, communication, processor, and discovery. It attaches
+discovery to the external assistant placement cache when the selected
+executable exposes one. MLX binds the native target and media tensor
+conversions. The automatic planner invokes portable model analysis for resource
+inspection, candidate admission, and bounded residency sizing. It retains one
+inspection across candidate probes. MLX supplies the normalized request and
+side-effect-free mechanism facts.
+
+Portable residency preparation validates exact source overrides, compact row
+catalogs, global alias ownership, and materialization support. The portable
+residency owner retains the controller, source catalog, and native storage
+under one serialized access boundary. The driver initializes selected tiers,
+releases lease pins, advances protected lookahead windows, and waits for prior
+transfers that overlap a demand batch. It preflights transient units, acquires
+and pins alias owners, reserves capacity, and publishes or rolls back copies
+in the residency ledger. Demand leases are
+issued only after all native storage handles are available and the ledger
+accepts the entire batch of pins. Core defines the move-only residency lease
+and the checkpoint parameter materialization and transfer contracts. The
+portable owner issues one move-only settlement token for the exact pending
+copies and generation. The backend retains the token alongside the native
+transfer and reports the terminal disposition after its ordered consumers
+settle. It supplies native copies, measured capacities, and recovery progress.
+The owner assembles logical telemetry and checkpoint-source diagnostics under
+the same policy for every backend. Native reports supply physical resource
+observations. Each native copy request carries the selected checkpoint source,
+binding recipes, alias owners, and reserved capacity. Materialization uses
+these inputs without consulting the residency ledger.
+
+The portable selected layer policy owns the bounded-unit driver, serializes
+access to the installed policy, and checks the invocation and owner of each
+returned lease. Portable parameter binding creates the dense-stream controller
+from the selected parameter layout. The bounded driver advances it directly.
+The controller schedules bounded host prefetch and a device transfer window,
+and settles prior transfers before acquiring repeated uses of the same unit.
+The bounded driver checks each transfer against the admitted invocation and
+storage ordinals, retires exact consumers before reusing storage, drains the
+current group before clearing protections, and publishes forward telemetry
+after the output settles. The driver also selects and records allocator and
+process memory samples. MLX supplies the device copies, bound unit storage,
+event ordering and settlement, native observations, and safe resource
+retirement.
+
+Registry-facing binding, discovery, capture orchestration, and speculative
+adapters belong to the portable side of this boundary. They use neutral
+mechanism contracts implemented by the selected backend.
+
+The low-level `eredu-core::SubmissionBackend` contract exposes queue creation,
+submission, ordering, and retention alongside exact completion. Core resource
+descriptions include native allocation lifetime facts. Runtime owns scheduling
+and composes the descriptions into execution and memory reports.
+
+The portable text session dispatches ordinary causal prefill, decode, or
+retained scores. It checks the parameter version, admits optional capture
+geometry, and publishes scores on the selected rank. The generation driver
+then requests one sampling operation under the current commitment filter.
+Uninterrupted and controlled generation share this sequence. The installed
+portable session selects specialized operations from the retained decoding
+mode and pending input. It advances refinement context, canvas updates, and
+candidate commitment. For shared-backbone proposals it validates the retained
+policy, clips the proposal width to the remaining token budget, sets the
+verification completion limit, and owns proposal verification, target selection,
+and cache commitment. MLX supplies tensor shaping, native sampling and observer
+operations, and resources for exact completion.
+`TextSessionDriver` checks the exact native target and realized capabilities,
+installs the erased executable, and settles its initial state reset before
+publishing the session. The driver retains exact admitted capabilities, the
+state residency and precision facts, and speculative capture placements. It
+owns loaded model capability queries, parameter-conversion trim admission,
+and ordinary, continuation, and speculative memory forecasts. Native mechanisms
+report concrete allocation counters, retained backing and workspace bounds,
+prepared input storage, and the selected placements used by those projections.
+The driver submits explicit distributed samples under the installed session's
+lease and advances the request's prediction and capture boundary after causal
+or shared-backbone sampling. Native completion retains the lease and payload.
+The driver advances inspected prefill and decode to exact completion before asking MLX to
+materialize the collected observations. It validates the target before reset or
+synchronization and requires retirement of the exact authority after waiting
+for native queues. It invokes the installed executable directly for
+prefill, decode, observed execution, and tentative refinement. It opens retained
+prefill cursors and advances ingress and non-final decoder steps under the same
+submission authority. The installed session sets capture spans from the retained
+cursor, completes plain prefill without sampling, and replaces a split prompt
+with its suffix after the prefix settles.
+Synchronous model transactions agree on local admission
+before mutation and settle unused scopes on a peer rejection. The driver owns
+shared-backbone proposal verification, score access, and accepted-cache
+publication. Portable block state owns constrained candidate selection and
+the resulting transitions. The portable session coordinates mode commands on
+the retained transport. Its mode state waits for a settled block
+or verification boundary, replays authoritative tokens into causal state, and
+retains the resulting score row before changing the installed mode. MLX
+supplies the prebound executable, placement and native retirement mechanism.
+The portable driver assembles the resource root from those parts. MLX also
+supplies the device context, native input materialization, score handles,
+collector operations, and completion.
+The portable driver owns session submission authority and acquires a move-only
+lease before opening a native scope for execution, inspection, sampling, or
+state changes. The core retirement contract reports native health to the driver,
+which classifies lifecycle failures. The driver hands completion an opaque resource root after
+exclusive model access ends. The native scope retains the lease and resource
+root through failure, cancellation, and unwinding until it establishes native
+settlement.
+Capture admission prices host records and encoded output from the selected
+geometry using shared formulas. Backends supply their indexing limits, chunk
+size and native allocation bounds. The portable capture driver validates
+invocation-group membership, handles singleton votes locally, and sequences
+world receipt exchange and delivery. Native transport supplies the selected
+bounded wait, collective completion, and fencing of the communication owner.
+
+Categorical realtime startup constructs the portable resident key/value state
+from the selected layout after validating sampling. The backend supplies cache
+storage operations and creates a random state for stochastic sampling.
+
+The portable text driver binds the retained capture catalog to exact native
+collector facts. It validates capture plans, establishes partition provenance,
+and admits invocation geometry before opening the collector. Capture setup
+rejections enter the same observer agreement as ordinary invocation preparation.
+The backend supplies tensor operations, transfer, and resource estimates.
+Specialized dispatch selects the current refinement phase, a shared proposal,
+or sampling from retained verification. These routes enter distinct execution
+operations with the required committed token or sampling decision.
+
+The typed replicated runtime validates capture geometry and reports whether a
+rejection or rollback preserved model state.
+
+The portable executable constructor combines its retained discovery
+declarations with the constructed executable's observation and parameter
+facts. The native session receives the bound discovery projection. Ordinary
+partition capture admission and deferred identity resolution use neutral
+transport and layout contracts. The native collector borrows the layout
+through runtime capture and intervention interfaces.
+Speculative capture scope validation, external target capture requests and
+embedded observers use neutral contracts in `eredu-runtime`. The portable
+driver validates draft mode and target identity, invokes external draft
+admission with backend mechanism facts, and passes each validated binding
+to the backend. MLX binds native resources and retains the portable selection
+through neutral contracts.
+
+Native model composition is exercised by feature-gated integration and
+acceptance targets in the facade. Portable media algorithms are enabled through narrowly forwarded image or audio
 features; a concrete backend feature adds only native conversion. Backend feature diagnostics
 name the active public spelling; published Cargo features are selectable API,
 not a privacy mechanism.
 
-The facade root exposes the `api` and `runtime` namespaces. `LoadedModel<B>`,
-`PlannedModel<B, D>`, prepared-chat requests, and controlled generation sessions,
+The facade root exposes the `api` and `runtime` namespaces. `LoadedModel<B, S>`,
+`PlannedModel<B, S, RealizedDrafting<D>>`, prepared-chat requests, and controlled generation sessions,
 snapshots, and branches are the canonical application API for every backend.
 Applications select MLX by importing `eredu_backend_mlx::MlxBackendFactory` and
-passing it to the generic loading methods; inference supplies the backend type.
-Explicit model annotations use `LoadedModel<MlxBackend<'static>>`. The facade
-provides no wrappers or aliases that fix these generic types to MLX. Application
+passing it to the generic loading methods. Rust infers the backend and installed
+session types. Application
 errors do not carry backend error type parameters. Loading, media preparation,
 ordinary/speculative/observed generation, control, snapshots and branches retain
 portable operation error variants with `eredu_core::BackendFailure` for native
@@ -4194,22 +4583,20 @@ frame execution and sampling replacement also expose portable failure types.
 Backend implementation traits may retain concrete errors internally; application
 callers do not need to name or match them.
 
-The implementation crate exports composition-owned adapter factories at its
-flat root and makes its reusable `backend` module tree public for backend
-authors. Family composition and architecture-erased dispatch remain
-crate-private. Raw native binding APIs retain their canonical `safemlx` paths.
+The backend crate exports `MlxBackendFactory` and native mechanisms. The
+portable driver constructs the installed session. Reusable MLX mechanisms
+are available through its `backend` module. Raw native binding APIs retain their canonical `safemlx` paths.
 Native facade integration tests use the same generic model and control APIs
 as portable conformance tests, which use neutral traits and mock backends.
 
-The facade does not re-export dependency-owned types. Architecture identities
+The underlying contracts have canonical owners. Architecture identities
 and preparation plans come from `eredu-architectures`; artifact, execution,
 generation, media, realtime, scheduler, and prompt-cache contracts come from
 `eredu-core`; processed host media buffers come from `eredu-media`; tokenizer
 contracts come from `eredu-text`; and runtime
-infrastructure comes from `eredu-runtime`. This gives every public type one
-canonical import path and prevents a facade release from committing to aliases
-for operations it does not own. In particular, the facade exposes no
-prompt-cache types because it exposes no prompt-cache operation.
+infrastructure comes from `eredu-runtime`. The facade attaches a prompt-cache
+store through the neutral storage contract and exposes cache statistics for
+ordinary generation.
 
 Realtime applications prepare sources with `prepare_realtime_model` and select
 execution through their chosen factory with `prepare_realtime`. `bind_realtime`
@@ -4235,9 +4622,9 @@ Explicit allocator cache limits use the factory's allocator policy contract.
 Cold forecasting validates a proposed ceiling without applying it. Native
 realization supplies the default policy when the application has no override.
 Verbose generation uses portable session, allocator and speculation reports.
-Session lifecycle is portable: every `TextGenerationBackend` implements explicit
-`reset_session` and `synchronize_session` hooks, exposed by `ModelRuntime<B>` and
-`LoadedModel<B>` as `reset()` and `synchronize()` with the same non-generic
+The installed text session implements `TextSessionLifecycle`. `ModelRuntime<B, S>`
+calls that session directly for reset, synchronization, and preparation readiness.
+`LoadedModel<B, S>` exposes the same lifecycle with a non-generic
 `BackendFailure` on every backend. Its portable `BackendFailureKind` distinguishes
 busy authority, invalid/poisoned sessions, identified resource exhaustion,
 unsupported or invalid requests, I/O and other backend failures. The original
@@ -4264,9 +4651,11 @@ safe completion or teardown. Live detached submissions may be rejected as busy.
 These operations do not promise an allocator-cache flush or immediate
 process-wide memory reclamation, so native telemetry is not required for the
 portable reuse/eviction protocol.
-Backend adapters own native resources and outer type erasure, while shared
-replicated-text execution and stateful lifecycle orchestration remain in the
-neutral runtime.
+Backend adapters own native resources and expose the installed executable's
+state owner with its native context. Portable text control owns snapshot
+type erasure, support checks, ownership validation and exchange. Replicated,
+composite and retained vision-language execution share this boundary. Native
+mechanisms supply isolated copies, storage estimates and reclamation.
 `ExecutionPlan` contains only neutral
 quantization, residency, and session-capability policy, while native
 device-bound contexts are selected only by backend tooling. `BackendFailure`
@@ -4338,17 +4727,18 @@ GGUF companions have independent artifact declarations. Backends receive the bou
 graph and retained selection without container parsing or alias rediscovery. Realtime Moshi
 and codec construction use their separate preparation contracts.
 
-External drafting follows the same two-stage boundary: the facade supplies the
-architecture-inspected assistant to the factory's cold drafting-selection hook
-before target realization. That hook establishes architecture-owned
-target/assistant compatibility and selects the neutral speculative realization
-against the retained target inspection before target payload or native-resource
-creation. The retained result contains every exact
+The facade inspects external draft artifacts and passes them to portable cold
+admission before target realization. The architecture admission proves
+target/assistant compatibility and selects the speculative realization against
+the retained target inspection. Runtime dispatches the retained assistant or
+autoregressive route to its native binder with the paired sources and
+tokenizer proof. The retained result contains every exact
 physical source, executable format, lowering descriptor, and reader-cache
 mechanism setting consumed later by assistant materialization. Target or draft
 streams therefore cannot exist when assistant selection fails.
 `tensor-capture` enables MLX activation collectors, interventions and partition
-receipts at architecture-declared observation points. The facade admits and
+receipts at architecture-declared observation points. Neutral capture types
+and collector contracts remain available to portable execution code. The facade admits and
 delivers records on the same generation driver used by `prepare_controlled_chat`.
 The portable contracts describe requests and host records, runtime capture
 owns reservations and delivery accounting, and MLX implements transformations
@@ -4378,18 +4768,19 @@ architecture-erased sessions must use it rather than defining backend-local
 names. Inspection never performs an implicit cross-rank host gather.
 
 Backend-neutral parity, distribution metrics, timing summaries, evidence, and
-evaluation drivers live in `eredu-evaluation`. Concrete backend examples only
-select execution contexts and supply generic mechanisms for neutral model and
-codec artifact construction; they do not own checkpoint interpretation,
-comparison thresholds, or reference policy. Backend-specific validation
-inputs and reference-fixture generators live with the backend that consumes
-them, so every published backend package contains the tooling required by its
-examples; they do not live under the facade.
+evaluation drivers live in `eredu-evaluation`. Reference examples under the
+facade select execution contexts and compose native mechanisms with neutral
+model and codec construction. Checkpoint interpretation, comparison thresholds,
+and reference policy remain portable.
 
 ## Ownership boundary
 
 Portable crates split tensor-independent ownership by responsibility:
 
+- `eredu-checkpoint` owns the validated SafeTensors conversion plan, including
+  the exact tensor identities, encoding, and output configuration supplied
+  by the caller. Native conversion applies that plan when packing tensors
+  and writing shards.
 - `eredu-checkpoint` owns canonical SafeTensors index parsing, exact
   index-to-shard-header validation, shard-path admission, and stable
   filesystem-backed content fingerprinting. Inspection and
@@ -4756,13 +5147,26 @@ source, content identity under the architecture-selected domain, retained
 resolution and metadata validation, selected topology and architecture, and a
 consistent lowering summary. MLX receives that completed handoff and adds only
 groups, streams, caches, arrays, random state, completion, and final erasure.
-`MlxRealtimeExecutionContext::bind_realtime` consumes a neutral prepared
-construction and a native target. It compares the selected world size and rank
-with the target and world group, then checks the execution stream's device.
-Only after those checks can the portable construction access native binding
-mechanisms. `MlxLoadRequest` holds one `NormalizedLoadRequest` with its optional
-native device assignment. Portable selection uses the normalized policy and
-the binder checks the assigned target against the retained realization.
+The portable realtime constructor validates the selected physical storage map
+and exact tasks, applies rank-local placement, and prepares residency through
+the same parameter-storage driver as local and pipeline components. It builds
+resident units or target modules for an admitted load-time transform and
+projects transformed tasks into exact checkpoint quantization targets. The
+backend encodes those targets, opens native storage, and populates the modules
+from the resulting bindings.
+
+`bind_prepared_realtime` consumes the portable construction. It opens a binding
+for the selected world size and rank, invokes the preparation, and settles the
+native materialization resources. The portable frame drivers invoke the
+prepared categorical and coupled speech executables, open submission after
+input preflight, and attach exact completion to the unpublished branch before
+host observation. A failure after opening the scope attaches failed
+completion evidence to the same branch. MLX supplies tensor conversion,
+submission scopes, and retention of native roots. MLX checks the bound world
+and execution stream when opening the binding. `ModelLoadOptions` pairs a
+`NormalizedLoadRequest` with an optional native device assignment for direct
+text loading. Portable selection uses the policy and passes the exact rank and
+device assignment to native placement validation.
 Prepared MLX models retain their actual native device and, for distributed
 execution, the selected world handle. Session publication and every
 backend-taking session operation validate this retained target before input
@@ -5242,6 +5646,14 @@ plans translate tensor, pipeline, routed, data, or later axes into ordered
 world-rank memberships, group-local ranks, generic point-to-point routes, and
 required collective operations before invoking a backend. Backend sessions
 materialize groups by opaque identity and never infer why a group exists.
+Core owns the opaque manifests, group and route descriptors, framing
+contracts, completion bounds, and backend capability facts. Core also owns
+the shared failure fence, which retains the first failed operation and its
+disposition. The runtime projects semantic axes, selects reachable waves,
+and decides when failure agreement must precede fencing. Native completion
+owners retain live resources until exact completion or safe disposition.
+Checkpoint quantization reports describe bounded materialization; the runtime
+uses those reports when accounting for residency and loading.
 Before creating any native subgroup, every rank exchanges its complete opaque
 communication manifest over the unsplit world control plane. The neutral
 runtime gathers fixed-size length metadata followed by equally padded payload
@@ -5249,6 +5661,11 @@ words, reconstructs every rank artifact, and validates descriptor and
 invocation-limit compatibility. Backend-local capability and world/rank checks
 run only after that collective proof, so a mismatched rank cannot return early
 while peers block in subgroup construction.
+Text model loading, realtime tensor-parallel binding, and component pipeline
+construction run agreement and produce the checked setup in portable code.
+The backend supplies the world transport, setup nonce, capability facts, and
+native handles. Component pipelines can also adopt the exact communication
+retained by an enclosing session.
 Each MLX manifest realization retains its exact opaque group ID and operation
 requirements on the mechanism handle, including singleton and full-world
 groups that reuse the same native membership. Reusable collective entry points
@@ -7212,10 +7629,10 @@ Artifact loading has four stages:
    quantization, residency, state, and session policy. Materialization options
    must reproduce the selected values rather than supplying a merely
    equivalent class of request.
-4. The selected backend adapter realizes native mechanisms from the plan and
-   passes its exact prepared-source bundle to `construct_prepared_execution`.
-   Architecture-owned sealed routes invoke the appropriate typed construction
-   contract. The backend erases the completed typed session at the outer boundary.
+4. The portable driver binds the exact prepared sources to the selected
+   backend's construction mechanisms. Architecture-owned sealed routes invoke
+   the appropriate typed construction contract. The portable driver erases the
+   completed typed session at the outer boundary.
 
 `ReplicatedTextMechanismSupport` reports backend facts and answers support for
 one exact lowering candidate or state component. Runtime capability synthesis
@@ -7236,11 +7653,110 @@ Complete profile dispatch uses an explicit `ReplicatedTextStateProfiles` set
 and `SharedReplicatedTextVisitor`, retaining profile-specific static bounds and
 the original visitor's construction-start notification.
 
-`PreparedExecutableAssembler` receives an executable only after typed
-construction succeeds, together with the exact selected state policy,
-capabilities, physical floating-state width, prepared processor, and retained
-native communication. MLX wraps these values; it does not repeat processor
-selection, extension pairing, or the six-class dispatch.
+Direct and planned admission, automatic planning, and external draft selection
+consume normalized requests and mechanism facts.
+Direct loading takes the artifact catalog from the caller's resolver or retained
+inspection. The portable loader pairs the request with native mechanism facts
+for admission and passes the exact rank and device assignment to the backend.
+Planned loading takes its catalog from the retained artifact, and automatic
+discovery uses the portable caller’s catalog. Hardware discovery is independent
+of the catalog. The caller supplies the per-load `ParallelLoadRequest` alongside
+the plan. Portable admission owns its rank topology, pipeline wire, invocation
+bounds, and completion policy. It projects just the world size and global rank
+to the factory's cold placement query. The factory supplies exact support and
+realizes the retained native placement.
+Portable draft admission supplies the prepared assistant or independent
+checkpoint sources for that catalog. The factory accepts them through the
+assistant and executable construction contracts and supplies the mechanism
+facts consumed by admission. The catalog’s prepared assistant supplies the typed
+dispatcher retained by the native drafter. The native backend and drafter
+are parameterized by that dispatch contract. Native mechanisms have no
+production dependency on the family implementations.
+For planned target realization, the portable driver retains the selected
+artifact and passes the chosen device and native placement to the factory.
+It validates the returned backend's identity and device capabilities before
+pairing the backend with the retained selection.
+Finite decision construction also uses a portable prepared program. The
+factory supplies the selected device, component mechanisms, and input
+lowering, and synchronizes the load when requested.
+Architecture code defines admission for the portable artifact plan and
+associates its checkpoint source preparation with direct admission. The
+shared loader retains the source selection alongside opaque native placement,
+derives admission from the source selection, and prepares the sources before
+binding. The portable loader invokes the prepared source's `BindModelSources`
+implementation. Architecture-owned sources call the portable construction
+driver, which requests bound mechanisms for the selected native placement.
+
+Runtime assembles the local and partitioned text route table from the native
+execution and weight contexts, parameter materializers, and rank support.
+It derives the executable representation from `NativeTextValues`, including
+the portable prediction state and observers. Local, routed, and distributed
+routes share a publication owner that retains the selected native sampling
+group and rank authority. Composite binding obtains its component operators
+from the same native contexts. Local and rank binding retain the exact checkpoint
+source with the portable parameter owner. The backend supplies its parameter
+operators, rank buffer allocator, and the reader for an admitted predictor.
+
+The outer constructor compares the realized communication with the selected
+manifest, validates the floating-state representation, invokes the exact
+typed route, and binds discovery facts before publication. Architectures
+supply the selected source roles, processor, discovery projection, and
+one-shot typed dispatch. The backend supplies native representation and
+collector facts, allocation and transfer operations, and exact completion.
+The portable driver retains the processor program and admission with the
+completed executable.
+
+Runtime also owns the prepared handoffs and session constructors for
+replicated, routed, and composite text. Family dispatch supplies the exact modules,
+state layout, capability estimate, and optional composite ingress admission.
+The native binder supplies materialization, state and completion mechanisms to
+the runtime constructor. The portable binder resolves module slots, source
+recipes, rank-local placement and packed companions before asking the backend
+to encode or transfer the selected tensors. Portable code installs the exact
+materialized handles under the pinned, resident, bounded or prediction lease.
+
+Runtime owns the composite execution traits and implements them once for
+`ComponentAdapter`. Families implement `CompositeComponentKernel` on their
+local kernels, supplying input admission, ingress semantics, prefill request
+policy, and target equations. The shared prefill requests bind to the kernel's
+input and continuation methods through the runtime adapter. Runtime also
+resolves retained assistant placements and invokes the target equation within
+the ordinary session transaction.
+
+The model and session retain an erased discovery interface for capture,
+intervention, memory forecasts, parameter layout, and external assistant
+placement. Architecture code implements these projections from the retained
+selection. Native transport supplies bounded collector facts for partition
+discovery, and content identity remains deferred until requested.
+
+Runtime defines the selected processor program and tensor constructor
+contracts. It lowers validated typed host buffers and recomputes prepared input
+identity after observation or intervention. Architecture implementations
+validate the host products and admit any intervened input against the selected
+processor policy. The portable text session retains and executes the selected
+program. The portable graph driver also runs its selected program, then checks
+the prepared input identity in the graph tensor representation. The backend
+supplies tensor constructors, representation conversion, metadata inspection,
+and scopes that retain allocations until native preparation settles.
+
+Native prediction visitors receive the selected realization and capability
+estimate through a runtime contract. Architecture-owned placement authority
+binds discovery before those facts reach the visitor. Runtime also defines the
+partition resource handoff and the invocation contract for retained text
+sessions, including input accounting and capture geometry.
+
+For routed text and routed composite sessions, runtime checks the selected row
+provider and bank identities, chooses the retained resident or addressable path,
+and splits auxiliary prediction banks after constructing the complete collection.
+Selected bank plans supply the concrete grouped provider types and equations.
+The backend supplies native storage and movement and adapts the completed session.
+
+For routed partitions, runtime constructs the complete provider collection from
+the admitted bank plans and one selected residency policy. It preserves idle
+banks, rejects unused native mechanisms, and supplies retained scalar
+coordinates to routed observations. Architectures project exact bank geometry
+and grouped equations. The backend supplies addressable storage and movement
+mechanisms for the shared residency budget.
 
 Concrete backend preflight reports mechanisms rather than family support or a
 parallel execution-class table. Architecture dispatch is authoritative for
@@ -7286,21 +7802,301 @@ or sibling filename policy after planning; payload stores may still map weight
 members during materialization, but those reads do not replace the plan's
 configuration, checkpoint metadata, companion selection, or route.
 
-`ModelLoadingBackend` implements backend capability reporting, native
-materialization, and outer adaptation. `BackendProvider::create_session`
-consumes a `PreparedModel`, so an executable cannot be paired with state or
-session mechanisms created by another backend. Replicated prepared models
-already contain the neutral lifecycle paired with their concrete mechanisms.
+`BackendProvider` supplies native identity, device capabilities, and the
+prepared model type. Native loading and cold target realization use that
+contract without selecting an execution session. `ModelRuntime<B, S>` owns its
+selected backend and installed session. The facade selects a
+`ModelSessionInstaller` for direct and planned construction. Installation
+consumes the exact `PreparedModel` and compares realized capabilities with
+admission before publishing the runtime. The installed `BackendSession`
+contract covers execution and lifecycle.
 
-`ModelRuntime<B>` owns a backend and its sole session. All facade clients use
-`eredu::api::LoadedModel<B>`, whose runtime remains private while portable model
-operations stay generic. Loading and generation failures retain `B::Error` in
-their generic error types.
+The portable `TextSessionDriver` consumes the loaded executable and adopts its
+state layout and discovery. The backend attaches native placement, lifetime,
+and completion mechanisms. The facade installs this driver for direct and
+planned loads and `eredu::api::LoadedModel<B, S>` retains the resulting runtime.
+Speculative batch composition reads mechanism types through
+`SpeculativeBatchBinding` and calls the portable executors with the installed
+session.
+Composite drivers validate the selected input representation and maintain
+prepared-input cache identity. Native input inspectors supply tensor geometry
+and token reads. The retained vision-language driver applies processor
+selection before architecture ingress and forwards preflight failures into
+the selected rank agreement.
+A portable bound executable owns the typed replicated, composite, or
+retained prefill session and its selected facts and prediction extension. It
+dispatches ordinary replicated and composite prefill and decode. Concrete backends attach native placement, queues, banks,
+and observers to the same executable, and bind tensors and inputs at the
+native boundary.
+Core defines native prepared-tensor inspection and distributed text and
+parameter control transport. The portable runtime owns processor admission,
+the setup transcript, and the coordination protocols that use those
+mechanisms. The text driver selects final-position prefill when the installed
+executable accepts it and the request has no observation or capture. It selects
+local or coordinated reset using the selected placement. Retained
+prefill validates the erased cursor's ingress or decoder phase before calling
+typed execution.
+Bound replicated, composite, and retained sessions implement the portable
+erased executable contract. The binder owns the installed executable and
+publishes selected routed variants through that contract. Concrete backends
+supply the tensor, context, and completion types. The text driver borrows
+the prepared prompt and decode tokens,
+preserves input rejection for distributed agreement, and interprets the installed
+executable's speculative capability facts. It maps invocation tensor handles for
+observers through a core contract and finishes observation within the submission.
+Core defines the native resource handoff for installing an already prepared
+executable and the transaction scope for retaining resources through settlement.
+The portable text installer checks admission before registering native resources,
+installs preparation and parameter-control coordination, and resets the new
+session under submission authority. The facade's feature wiring selects the
+portable installer and supplies the native mechanism implementation. The source
+binder declares the assembled model type and the installer declares the type
+it accepts. Direct and planned loading require those types to agree before
+retaining the concrete session in the loaded model.
+The driver selects prepared positions, an exact token ID, or a sampled token
+for cached decode. Native code materializes or reshapes the selected input
+within the admitted submission. The portable prepared prompt owns the ordered
+tensor parts, leaves the prompt identity on the final fragment, and tracks the
+installed prefill cursor. Native token mechanisms report the sequence length
+and split the tensor at the selected boundary. Ordinary generation, media
+preparation, capability and forecast queries, and parameter access accept the
+installed session explicitly.
+The portable typed replicated and composite sessions invoke the final-position,
+full-output, and cached decode routes through native tensor conversions.
+The portable binder erases completed routes, owns installed parameter publication,
+and pairs selected embedded predictors with their typed target and retained
+observers. Backend bindings name the concrete portable route types and expose
+native state, parameter storage, and communication. Portable embedded
+prediction admits prompt geometry and advances retained input chunks, using
+native token slicing and completion between leases.
+The portable speculative batch driver borrows embedded and conditioned prediction
+directly from the installed executable under the target transaction.
+Retained prefill installs its typed session in the portable erasure and advances
+ingress and decoder steps through that erasure. The composite driver agrees
+the admitted decoder extent and chunk size before any rank advances and
+drives each chunk through the same state transaction.
+Replicated and composite sessions also select architecture input for explicit
+attention invocations from portable attention semantics.
+Portable binding checks whether native rank placement matches the selected
+communication manifest before opening the control plane. The portable runtime
+agrees the manifest and determines group and route participation. Core carries
+the agreed realization bindings, authority, and ordered resource identities
+across the native boundary. Backends realize those bindings and expose resources
+by exact identity. The portable driver compares the realized manifest with
+the prepared model's selection before constructing the executable. The
+portable rank driver resolves sampling, tensor operation,
+and row status roles. Portable component and realtime construction pair the
+realized resources with the selected manifest and tensor role. The portable
+driver also frames layered traversal status for agreement through the selected
+cohort and preserves typed setup and construction failures through loading.
+Cold selection synthesizes text and state capability reports from backend
+predicates for individual operators
+and state components. The driver reads partition
+discovery and drafting facts from the constructed executable, and retains
+composite ingress admission across local, routed, and partitioned execution. It validates the selected
+prediction extension and installs its parameter catalog by visiting the
+materialized modules. The materializer reports each module's bound slots,
+checkpoint tasks, and materialization. The portable binder also installs the
+physical bank inventory reported by the native bank resources.
 
-Automatic planning produces a portable `ExecutionPlan`. An
-`ExecutionPlanBackendFactory` realizes the complete plan into a target backend,
-backend load options, and the selected disabled, embedded, or external drafting
-configuration. `LoadedModel::load_execution_plan` and `LoadedModel::plan_and_load`
+For partitioned composite text, the portable rank driver binds the selected
+target source, grouped providers, row pool, and paired or separately prepared
+predictor. It installs the parameter catalog, retains the admitted native
+communication handles, and erases the completed executable.
+
+The portable driver installs resident and selected bounded policies and owns
+window advancement, transfer acquisition, lease pinning, and replacement
+publication. For independently acquired experts and rows, it validates source
+extents, prepares the index and residency ledger, and scopes the installed pool.
+The portable bank assembles compact bindings in acquisition order from exact
+source handles and published replacement rows. The driver selects local or
+tensor-parallel row binding using the realized rank plan. Only the elected
+owner retains row storage, and telemetry counts a shared expert and row pool
+once. Row binding preflights ranges and exact scalars before materialization.
+
+MLX supplies allocator budget registration, native storage, exact scalar
+materialization and row decoding, and completion resources. Native transfers
+carry core-owned pins and an opaque settlement ticket. Portable residency
+publishes or retires the generation using terminal evidence from the native
+owner.
+
+The portable text driver exposes the communication retained by the installed
+session. It admits raw media against the installed executable, runs its selected
+processor with native tensor-lowering operations, and retains the resulting
+prompt and cache identity.
+
+The portable prepared-input transfer driver admits the complete wire payload
+and peak staging bound before asking the backend to copy. The backend reports
+native staging capacity and retains the exact buffers and events through
+completion.
+
+The live cache in `eredu-runtime` owns page and tail accounting, leases,
+prefetch, tier eviction, and the host transfer and disk workers. It applies
+the same append, seal, and truncation operations to key/value, compressed
+latent, and named record streams. The cache calls the native mechanism
+contracts in `eredu-core` for exact tensor slices, independent storage, byte
+transfers, queue dependencies, and completion. A backend supplies those
+operations and reports allocation capacity for its own storage.
+
+The paged key/value owner drives advancing and read-only attention. It plans
+the visible range, selects sealed pages and the mutable tail, and advances
+the score and value passes. For indexed attention it deduplicates the
+requested positions, gathers only those rows under their page leases, and
+completes each query before admitting the next. Native kernels receive the
+selected ranges, index slots, and tensors. The runtime binds each named append
+lane to resident or paged storage and owns lane restoration, isolation, and
+publication checks. Paged lanes use the same page catalog without requiring
+attention kernels.
+
+The runtime assembles model-wide key/value and hybrid state from exact layer
+storage requests. It owns the lifecycle of attention, named streams, and fixed
+tensor slots across allocation, snapshot, segment reset, rollback, and prompt
+cache restore and export. Hybrid copies share immutable roots only where the
+storage contract permits it. Native code provides tensor storage, exact copies,
+cost facts, and completion for the selected roots.
+
+Pooling state uses the same portable resident and paged key/value owners for
+local history. The runtime retains partial and completed pooling windows,
+chooses visibility ranges, and restores pooling streams by their declared
+tensor roles and absolute layer identities. Native code slices and copies
+tensors and evaluates visibility for the supplied position ranges.
+
+The portable realtime driver constructs the coupled backbone and speech state
+from admitted layouts. It checks the compatibility of both owners, accounts
+for copy budgets, and publishes both parts as one transaction. Native copy
+scopes retain source state, partially built candidates, and admission authority
+until queued tensor work has settled or can safely retire.
+
+The cache schedules against local limits and the shared process pool. It
+can evict an eligible page, reuse durable backing, or wait for the exact
+work holding the required capacity. A spill encodes completed host bytes as
+SafeTensors. Publication checks the generation and write identity under the
+catalog lock. A cancelled or obsolete write releases its staging file and
+reservation when its worker retires. Live reads validate the stored names,
+shapes, dtypes, and payload extent before allocating the admitted host
+buffers.
+
+The portable prompt-cache driver opens and pins a store generation, validates
+the manifest, constructs the live cache, and drives page and fixed-state
+restoration. It decides which pages to pin and retains an opaque,
+digest-checked source for deferred reads. It passes the completed cache,
+fixed-state tensors, and exact rank and frontiers to the installed model
+state. The runtime also builds the export inventory and publishes the
+manifest under the selected store budget. Native code supplies completed
+payload bytes and exact transfer events.
+Append-stream admission retains the chosen backing alongside each stream's
+exact geometry and lane bounds. Native stream allocation consumes these
+instructions without interpreting component placement policy. The portable text driver owns snapshot admission,
+continuation sizing, and the choice of values to retain or copy. Native
+primitives report storage costs and copy the selected tensors and random keys.
+The driver assembles the speculative partition binding from
+retained discovery, transport identity, and model state. Bounded capture
+combines that binding with native readback, transform, and estimator
+mechanisms.
+
+The replicated session owns the installed catalog, including bank members and
+auxiliary prediction modules. Local and partitioned sessions query the
+installed execution policy for residency, dense stream counters, and
+conversion retention. The backend supplies native allocator observations
+for the portable memory report. Transaction errors report model rollback
+evidence, which native
+completion owners combine with queue retirement status. Ordinary generation
+and independent drafting combine selected memory geometry with observed local
+parameter storage the same way.
+
+The core submission scope retains the resource root through completion,
+cancellation, and unwind. It is parameterized by native output and error
+types. The portable driver invokes the executable and passes the result to
+that scope.
+
+The text driver validates and installs capture and intervention plans, drains
+completed capture records, and projects residency telemetry. The text driver
+also installs speculative observers under a settled transaction and drains
+retained speculative evidence under exclusive ownership. Native mechanisms
+supply collector capabilities, cost estimates, and exact occupancy observations.
+The selected state realization supplies paging options for native cache allocation.
+The portable residency driver selects conversion retention before permanent
+allocations register, preserves device, host-layerwise, and disk-streamed
+exclusions during reconfiguration, and reports a busy trim as a non-quiescent
+session. The backend registers native allocations against the selected budget
+and detaches conversions once native publication can no longer race the trim.
+Dense projection storage coverage is a neutral observation in
+`eredu-core::residency::projection`. Runtime uses those exact ranges to refine
+promotion and workspace estimates.
+
+Exact checkpoint bindings and local owner/alias plans are neutral materialization
+contracts in `eredu-core::residency::parameter_binding`. The native storage copy
+contract takes those bindings directly. Shared preflight checks exact recipe
+geometry and calls the native recipe support predicate before payload reads.
+Portable parameter preparation joins the bindings to source keys, global
+residency ownership, and coexistence budgets. The driver initializes residency,
+pins static parameters, and installs prepared handles into module slots for
+local components, independently addressable units, and replicated and
+partitioned text. It retains the slot catalog and materialization report.
+Native materializers receive exact physical owners after portable preflight.
+The driver resolves logical aliases after all required owners complete. Native
+mechanisms allocate, transfer, and retain the supplied leases. Portable construction
+builds direct and routed text and composite sessions. The routed driver
+selects bank and row ownership, installs and initializes admitted addressable
+pools, and pairs prediction extensions with their exact predictor banks. It
+retains the target's bank and row pools alongside the executable and installs
+the parameter catalog after separating predictor-owned banks. It binds routed ingress, placement, and
+prediction before publication. For local and pipeline partitions it also
+binds rank publication authority, sampling communication, and prediction
+before portable type erasure. Predictor modules register their supplemental
+units with the same portable residency owner as the target. Native mechanisms
+supply the placement, storage, and movement operations.
+Portable parameter binding installs the selected conversion budget with the
+residency ledger before native population. Replicated text, local components,
+and assistants use the same preparation. The driver acquires fully resident unit
+leases in storage order and hands off the retained transfer. Native mechanisms
+order its completion and populate the supplied modules. A partitioned session
+cannot grant one process-local conversion allowance to every rank. The residency
+driver validates and combines storage and detached-work observations with its ledger.
+Portable resident and bounded unit owners retain the residency driver and map
+logical invocations to physical storage. The bounded owner also holds the dense
+stream controller. Portable binding populates units, retains the static pin,
+and records admitted immutable replacements. Native mechanisms expose exact
+leased weights, establish queue dependencies, and protect units and pins
+through completion.
+The grouped acquisition driver validates scoped demand, chooses optional host
+staging, and acquires exact device leases. The row driver projects sparse
+demand into physical residency IDs and admits the native decoder workspace
+before device acquisition. Both retain the compact member order and accounting
+alongside the acquired transfer. The portable driver opens and settles each
+loan around compact member copies or row decoding. Native scopes establish
+queue dependencies and retain the source leases and outputs through safe
+completion or retirement. The loaded parameter catalog resolves declared
+companions and prices each bank loan. The portable overlay transaction orders
+tensor publication, state exchange, and rollback. Native mechanisms report
+physical encoding and conversion costs and execute the selected tensor work.
+The portable constructor owns the prepared executable and its discovery from
+construction through installation. For direct replicated and composite text,
+it binds placement and, when selected, installs embedded prediction before
+passing the typed binding to the native adapter for erasure. Native mechanisms
+supply the communication, processor and retirement resources retained
+alongside the executable. During causal generation, the portable driver
+records that a newly sampled token still needs to be appended to the cache;
+the backend submits the sampling operation and retains its completion resources.
+
+Portable external-draft construction pairs the exact target session identity with
+the selected assistant or independent decoder, its tokenizer proof, and its
+retained capture requirements. The native draft scope retains this assembled
+payload through materialization completion and owns subsequent queue recovery.
+
+For finite decision tasks, the portable driver invokes the prepared program
+with a native binding and requests synchronization when the caller needs
+load completion. The backend binding supplies streams, state storage, and
+media conversion.
+
+Automatic planning produces a portable single-device `ExecutionPlan`. Explicit
+distributed plans take a caller-owned `ParallelLoadRequest` at inspection and
+target selection. The runtime combines that request and the backend's diagnostic
+choices with exact placement and communication facts. MLX factory configuration
+specifies the native world initializer. The factory opens the world and queues
+only when the selected target is realized. Portable draft selection determines
+the disabled, embedded, or external configuration.
+`LoadedModel::load_execution_plan` and `LoadedModel::plan_and_load`
 therefore infer the backend from its factory without requiring callers to
 construct backend devices, queues, streams, assistant models, or sessions. Concrete device families are
 validated against the backend features and runtime hardware during realization.
@@ -7313,8 +8109,16 @@ Core binds cold drafting selection to the exact complete execution plan and
 target selection, and rejects either selection if later realization supplies a
 different plan. Each selected target carries an opaque core-owned identity;
 `ExecutionPlanTarget::into_runtime` moves that exact backend/prepared-model pair
-into the runtime, and external drafting realization rejects a runtime produced
-from any other target even when both targets implement the same plan.
+into the runtime. Draft realization checks that identity before requesting
+native binding, even when another runtime uses the same plan. The portable
+text session reports realized speculative capability from executable facts.
+Core checks embedded readiness on the installed session. For external
+drafting, the factory opens a native binding scope using the selected
+placement, backend, and session identity. Portable construction consumes the
+prepared draft and invokes either conditioned-assistant binding or independent
+model construction. The native scope supplies streams, tracks completion,
+and publishes the draft only after the native work settles. The installed
+draft retains the target session identity and checks it before running.
 
 The loading APIs' `*_with_text_options` variants accept facade-owned `TextModelOptions`,
 as do retained-inspection and direct backend loading. A caller-supplied single
@@ -7357,6 +8161,27 @@ do not receive an unrestricted assistant store, reopen configuration or
 metadata for dispatch, bind against raw native topology, or duplicate
 assistant admission.
 
+A prepared external draft binds exactly one selected route. The conditioned
+assistant binds through the portable assistant program and the independent
+decoder binds through the ordinary executable constructor. The runtime's
+`BoundAssistant` retains the selected execution, capture, tokenizer proof, and
+residency beside the typed dispatcher. Portable preparation constructs the
+dispatcher with the selected family executor. Native ownership retains the
+bound output of that preparation policy and establishes completion before
+publishing it.
+
+The selected assistant source projects into `PreparedAssistantBinding` in
+`eredu-runtime`. It carries the restricted source, exact materialization tasks,
+unit layout, selected residency, and portable memory topology. The binder uses
+the neutral construction contract to allocate unloaded modules and units and
+the selected native mechanisms to populate them. The architecture retains
+family dispatch and supplies a `SelectedAssistantExecutor` to the runtime
+visitor. The visitor provides native target, cache and scheduling resources.
+Shared and exclusive runtime visitors expose the retained assistant for native
+memory reporting, parameter-conversion retention, and observer installation.
+The executor uses the runtime mechanism contract for operations such as target
+capture, tensor placement, cache checkpoints, and native completion.
+
 The facade accepts a `DevicePlan` with an exact backend and opaque device ID.
 The backend reports device kind and process-local index independently of memory
 placement. The CLI resolves `cpu` and `gpu:N` from those discovery facts and
@@ -7366,8 +8191,8 @@ through the backend adapter. Optional allocator telemetry and peak reset use the
 selected factory.
 
 Loaded text sessions expose optional weight-residency and expert-cache reports
-through the neutral `TextGenerationBackend` contract. The backend projects its
-session counters into portable telemetry, and `LoadedModel` forwards the
+through the neutral `TextOperationDriver` contract. The portable driver
+projects native counters into telemetry, and `LoadedModel` forwards the
 observation. An unavailable report is distinct from an observation failure.
 
 Architecture inspection reports both embedded-draft depth and maximum proposal
@@ -7547,7 +8372,7 @@ are deterministic for unchanged inputs, and never enter tokenization.
 argument selection, template rendering and binding validation. Its
 `PreparedTypedChat` permits capability inspection before native materialization.
 `materialize_chat_input` consumes this retained conversation through ordinary
-`MultimodalPreparationBackend` mechanisms; `prepare_chat_input` combines both
+`MultimodalPreparationSession` mechanisms; `prepare_chat_input` combines both
 phases. Text-only backends use `prepare_chat_text_input` or
 `materialize_chat_text_input`, without implementing media or capability traits.
 `PreparedChatRequest` owns the rendered `PreparedChat` and an opaque payload
@@ -7595,18 +8420,26 @@ architecture crates do not own alias allocation or application-name restoration.
 
 `prepare_observed_chat_input` and `prepare_intervened_chat_input` admit the same
 counted typed request for observed or controlled execution. Text retains its
-encoded IDs; media uses `ModelCapabilityBackend::prepared_input_token_ids` for
+encoded IDs; media uses `ModelCapabilitySession::prepared_input_token_ids` for
 complete decoder alignment, whose length must equal the counted model positions.
-The MLX adapter delegates to architecture-owned semantic token construction,
-including declared media placeholders and original projected-input IDs. Native
-inspection reads those integer IDs rather than inferring IDs from embeddings.
-Adapters without alignment observation return `BackendFailureKind::Unsupported`.
+The portable session obtains alignment from architecture-owned semantic token
+construction, including declared media placeholders and projected-input IDs.
+Sessions without alignment observation return `BackendFailureKind::Unsupported`.
 Public preparation errors retain native failures as `BackendFailure` sources.
 
-`TextGenerationBackend` submits complete prefill-and-sample and
-decode-and-sample operations. The backend owns logits, sampler state,
-randomness, and token handles. Portable generation code owns token budgets,
-stop and EOS precedence, cancellation, grammar state, and semantic events.
+Portable ingress prepares prompts and the installed session owns request state.
+`TextGenerationBackend` names the native input, token, and completion types.
+Neutral mechanism contracts supply sampling and execution primitives.
+The ordinary generation iterator, request scheduler, and continuation driver
+take the session installed in the model runtime as an explicit type parameter.
+Controlled advancement, snapshots, prompt-cache operations, and speculative
+batches use that same concrete session.
+The portable driver reads decoding capabilities, shared-backbone policy, and
+refinement geometry from the installed executable. It advances prefill, decode,
+and causal sampling through native mechanisms. The backend
+owns tensor handles, sampling primitives, randomness, and native completion.
+Portable generation code owns token budgets, stop and EOS precedence,
+cancellation, grammar state, and semantic events.
 
 `eredu-core` owns the common `GenerationOutput<S>` terminal contract: committed
 token ids, finish reason, `GenerationTiming`, and mode-specific statistics.
@@ -7630,7 +8463,7 @@ lane-submission origin. Runtime adds the facade preparation interval when it
 constructs `GenerationTiming`; the output contains no speculative timing policy.
 The CLI consumes this committed-token TTFT directly.
 
-`MultimodalPreparationBackend` accepts portable ordered text, token, image,
+`MultimodalPreparationSession` accepts portable ordered text, token, image,
 audio, and video inputs and produces the backend's ordinary opaque prompt.
 Image resizing, signal processing, feature extraction, tensor construction,
 and placement remain backend operations, while architecture processor plans
@@ -7829,10 +8662,17 @@ accounting failure as its source without adding a runtime dependency to core.
 
 Ordinary text, prediction and assistant materialization use runtime's exact
 transform-group planner. Groups preserve first-observed format and task order,
-exclude direct tasks, and reject missing packed formats. Assistant construction
-validates these groups before creating native source/target modules. MLX applies
-the declared transformations and retains original neutral task and assistant
-neural-construction errors through its typed error boundary.
+exclude direct tasks, and reject missing packed formats. Portable ordinary and
+rank-local text binding assigns tasks to physical units, applies exact placement,
+and records the resulting parameter slots before handing bindings to the backend.
+The portable prediction driver uses the same exact recipe and slot planning for
+each independent module. The backend supplies parameter geometry, encoding,
+allocation, and retention for these bindings. The portable assistant
+constructor builds source and target modules, orders exact bindings, computes
+residency and loading bounds, and constructs the executable. Independently
+acquired assistant units use the same parameter-storage driver as other model
+components. MLX supplies exact payload transformations, allocation and workspace
+facts, native storage and population, and retained resources for the executable.
 
 Spark's construction retains released identity and per-weight formats separately;
 the same selected encoding drives exact source constraints and neural operators.
@@ -7968,10 +8808,14 @@ checkpoint. The ordinary neutral session remains the sole owner of target
 prefill, decode, mutable state, prompt-cache control, completion, observation,
 rollback, and publication. A target pass may retain an architecture-declared
 hidden capture from that same transaction for an embedded predictor or
-external assistant. Missing capture fails the transaction before publication.
-Architecture composition owns prediction-local state geometry, identity, and
-transaction semantics; a backend owns only its native storage and prediction
-operator mechanisms. It must not construct a second target model or target
+external assistant. The portable external-target driver validates the ordered
+paths, resolves their placement, collects values or exact-precision rank
+placeholders, and commits the capture with the target output. The portable
+session owns the paired lane-state exchange and return, including local ownership
+repair when return agreement fails. Missing capture fails the transaction before
+publication. Architecture composition owns prediction-local state geometry,
+identity, and transaction semantics. The backend supplies native tensor
+allocation and state storage. It must not construct a second target model or target
 cache. Any extension whose unit execution lacks a typed additive handoff
 remains fail-closed; loading a second complete model beside the neutral target
 is not an admissible compatibility mechanism. DeepSeek-V4 DSpark uses its
@@ -8355,29 +9199,22 @@ bounded failure-agreement group. Load first agrees exact descriptor, topology,
 rank-local identity, and prepared-input preflight; each stateful rank then
 loads and validates a detached provisional state while stateless pipeline ranks
 still vote. Live state and commit metadata are replaced only after the second
-all-rank success. Save requires the backend mechanism to expose a reversible
-transaction: serialization remains unpublished through preparation, publication
-retains any replaced destination, and a final all-rank vote either commits every
-rank's candidate or restores every prior destination. Failure after any selected
+all-rank success. For save, the portable session stages each rank's ordinary
+state export in a private directory generation. It publishes provisionally
+while retaining any replaced generation. The final all-rank vote commits every
+candidate or restores every prior destination. Failure after any selected
 control phase permanently fences that session before retry, execution, or new
 cache I/O. Replicated sessions retain their ordinary local save/load behavior;
 partitioned strategies without exact failure agreement cannot claim this atomic
 control API.
 
-MLX binds that contract directly to the neutral replicated-text session. Each
-stateful rank derives one storage directory from the descriptor's stage, tensor,
-and addressable coordinates; family configuration and native group structure do
-not participate in the path. Preparation serializes the already validated MLX
-state into a hidden reversible destination. A fresh publication becomes visible
-by directory rename. Replacement instead installs an immutable generation and
-atomically switches `CURRENT`, retaining the prior generation until the final
-all-rank vote. Rollback restores that exact pointer and removes the candidate,
-while commit discards only the transaction's retained staging metadata. The
-public MLX session selects these distributed methods from an explicit control
-capability owned by the neutral executable. A retained native communicator is
-only a mechanism resource and does not own this protocol. Cleanup or restore
-failure is fail-stop rather than allowing execution with a partially published
-cache.
+The portable session derives each stateful rank's directory from the
+descriptor's stage, tensor, and addressable coordinates. It publishes a fresh
+cache by directory rename. On replacement it installs an immutable generation
+and switches `CURRENT`, retaining the prior generation until the final vote.
+Rollback restores that pointer and removes the candidate. Commit discards the
+transaction's retained staging metadata. Cleanup or restore failure is
+fail-stop rather than allowing execution with a partially published cache.
 
 Manual state control follows the same rule. A partitioned checkpoint is returned
 only after every stateful rank captured its local opaque checkpoint; stateless
@@ -8691,6 +9528,22 @@ uses this neutral identity directly. Scoped handles share one residency manager
 and the configured host/device budgets, so switching banks can evict entries
 from either bank. Runtime reports retain per-bank placements and counters, while
 aggregate peak occupancy counts each shared physical pool once.
+Portable route binding determines which selected expert members and row readers
+share a pool. Ordinary and pooling routes pass their selected bank bindings
+through the shared routed visitor contract. For partitioned routes, the handoff
+includes the exact physical layout, bank scopes, and the row policy on the rank
+that owns acquisition. Dense, routed, and composite partition admission project
+publication and cache facts into runtime handoffs alongside the validated
+partition, rank-local layout, and checkpoint tasks. Routed and composite
+partitions use the same native bank allocation contract. Runtime executors
+consume the grouped equations and collective schedules selected by admission. Replicated composite binders accept the selected
+bank binding and retained requirements through runtime contracts. Replicated
+and routed prediction visitors take an extension that architecture dispatch
+has already paired with its typed target.
+The routed prediction contract binds immutable modules and separately selected
+state before the portable driver hands the retained provider to the executor.
+MLX opens the native storage and reports its residency through the selected
+provider's neutral observation contract.
 
 Routing specifications independently select projection, score and coefficient
 precision. Scaled softplus is a neutral operation with explicit beta and an
@@ -8865,8 +9718,10 @@ unit reload applies that set after its original exact binding. Removing it resto
 pinned/resident handles and resumes the untouched prepared sources for bounded
 units. The ordinary residency ledger accounts for unit materialization separately
 from cumulative query and overlay work reservations.
-Publication clears incompatible state and invalidates native snapshots; facade
-session identities invalidate outstanding prepared requests. Parameter queries and
+Publication clears incompatible state and invalidates native snapshots. The
+portable executable state owner supplies the reset slot, which the parameter
+coordinator exchanges without a nested collective. Facade session identities
+invalidate outstanding prepared requests. Parameter queries and
 edit records carry the effective execution version. The component-analysis support matrix records packed-format verification and
 residency/partition coverage.
 
@@ -8926,10 +9781,9 @@ parameter mechanisms consume these declarations without a backend family branch.
 Independent expert banks retain architecture parameter declarations alongside
 their exact lowered member bindings. Runtime joins these into bank-owned
 `PreparedParameterSlot` records, preserving original member identities, companion
-relationships and local physical geometry. Native parameter loans use the same
-prepared cache manager as inference, copying selected members sequentially under
-completion-safe transfer ownership. They do not reopen artifacts or retain every
-source member in the residency cache at once.
+relationships and local physical geometry. The portable read driver borrows and
+copies selected members sequentially through the same residency owner used for
+inference. Each native scope retains its transfer until the copied value settles.
 
 An overlay publishes ordinary module handles and independent-bank replacement
 handles together. Bank providers select those handles while constructing compact
@@ -9067,8 +9921,10 @@ Operator seams alone do not establish public partitioned component support.
 The parallel layered contract has an internal-observation unit entry. The
 ordinary parallel residency traversal supplies its shared observer to that entry,
 retains forward resources for completion, and keeps group/unit boundaries in the
-existing traversal hook. Shared full/local decoders and composite kernels use the same adapter entry,
-and the direct partition executor consumes that traversal.
+existing traversal hook. Shared full/local decoders and composite kernels use
+the same adapter entry. Runtime builds the publication plan for an admitted
+direct tensor partition. Its executor consumes the portable traversal and
+retains the parameter policy for the selected tensor group.
 Parallel layered traversal also invokes architecture-owned observed ingress and
 readout when an observer is present. Shared decoders expose embedding, residual,
 normalization, actual projection input and complete linear logits, with the
@@ -9584,7 +10440,10 @@ Cold text-run preparation has a separate shared boundary before that forward.
 Core declares request, prompt, sampling, instrumentation and initial delivery
 stages, with ready/cancelled/failed dispositions and typed peer rejection.
 The ordinary generation machine and detached controlled driver use the same
-fallible preparation composition. Facade code supplies tokenizer, semantic policy,
+fallible preparation composition. The portable session validates the native
+target and submission authority, votes failure before returning a local rejection,
+and resolves single-participant readiness locally. The backend provides the retained
+transport for all-rank exchanges. Facade code supplies tokenizer, semantic policy,
 trace delivery and cancellation decisions; native prompt and sampler construction
 remain backend mechanisms. Exact token IDs can enter `PreparedChatInput::TokenIds`
 without early native construction. Raw token iteration returns the neutral
@@ -9594,8 +10453,10 @@ preparation/transport failure with `TextCaptureSetupError`.
 Runtime's `TextPreparationCoordinator` uses the existing bounded portable-word
 transport. Two fixed-size exchanges bind readiness to the retained setup identity,
 monotone attempt and stage, then confirm validated decisions before continuation.
-The native session shares that coordinator and its actual communication authority
-across adapter clones; model snapshots and resets do not copy or rewind it.
+The portable text driver installs the coordinator from native bounds and retains
+one shared owner for ordinary generation and speculative execution. The backend
+retains the actual communication authority. Model snapshots and resets preserve
+the coordinator and its cumulative reservations.
 Native gather estimates and runtime framing are reserved before submission, with
 cumulative logical charges exposed separately from capture through
 `text_preparation_usage`. These charges are not physical allocator measurements.
@@ -9751,21 +10612,28 @@ disagreement fence the retained owner without claiming physical native completio
 After an unwind, poisoned authority reports terminal failure while already charged
 control usage remains readable; reading counters cannot reactivate the owner.
 
-MLX retains that coordinator alongside its existing native communication authority
-and supplies ordinary bounded word transport, exact rank/setup facts and native
-storage estimates. Each constructed model receives a distinct runtime-issued
-`ParameterModelIdentity` from the retained coordinator. Corresponding ranks pair
-model constructions in the same order; operations compare the resulting model
-identity as well as source, execution and parameter version. Reset, snapshot
-restoration and destruction never recycle that identity. Registration performs
-no native work or communication. Source reads and contractions share the same
-native mechanisms
-as ordinary public parameter operations. Architecture semantics and native tensor
-handles do not enter the control protocol.
+The portable text session owns the coordinator and registers its
+`ParameterModelIdentity` against the retained communication setup. It binds catalog
+discovery to the model and parameter version, and binds reads and edits to the
+retained source and execution identities as well. Registration uses local
+bookkeeping. Reset and snapshot restoration preserve the identity, operation
+sequence and accumulated usage. MLX supplies bounded word transport, exact rank
+and setup facts, native storage estimates and completion behavior. Source reads
+and contractions use the native tensor mechanisms behind the control protocol.
 
-Public partition discovery exchanges bounded loaded metadata, without evaluating
-parameter tensors. Runtime `PartitionParameterCatalog` validates actual sharing,
-global/local geometry, per-operation capabilities and complete source coverage.
+The facade calls the portable text driver for parameter discovery, reads and edits.
+The driver owns parameter admission, session-lifetime resource accounting, and
+submission scopes for local and partitioned execution. For partitioned models
+it also resolves retained placement, exchanges bounded loaded metadata, and
+assembles results from the participating ranks. Runtime
+`PartitionParameterCatalog` validates sharing, global and local geometry,
+per-operation capabilities, and complete source coverage.
+The driver resolves each operation's exact parameter owner and encoding
+companions. For bank owners it acquires one member lease at a time, using a
+coherent snapshot of the selected replacement handles and residency pool.
+Native mechanisms copy each member under completion authority, assemble the
+copies in caller order, and perform tensor edits, contractions, and readback.
+Discovery uses metadata without evaluating tensors.
 An empty shard cannot downgrade a nonempty owner's native mechanism. The model's
 catalog-only binding permits source-resolution errors to reach shared admission;
 it cannot authorize parameter reads or edits. Queries and projections use the
@@ -9775,14 +10643,19 @@ explicit flags override the legacy aggregate support field. Metadata exchange,
 source preparation, conversion, native contraction, transport and host delivery
 are charged before their work; counters survive rejected attempts.
 
-Distributed overlay composition prepares all replacements and a fresh mutable
-state before publishing any handle. Runtime supplies a local state exchange for
-use under the parameter coordinator, without nesting ordinary control collectives.
-The exchange retains the previous cache and prompt identity for rollback and does
-not rewind commit epochs. After every peer confirms publication, native composition
-invalidates old snapshots and advances the parameter version, including on ranks
-that own no edited slot. A completed publication rejection restores both weights
-and state; failed restoration fences the session. All actual aliases and replicas
+For a single owner, the driver prepares replacements before clearing model state
+and publishing the new handles. For partitioned owners, it projects overlay
+edits into local coordinates, opens and settles native submission scopes, and
+coordinates preparation, publication, and rollback. The installed text driver retains
+original and published tensor handles, the reset allowance, and committed
+overlay identity with the executable. It admits removal and chooses which
+handles to publish on commit or rollback. Native mechanisms exchange execution
+state and retain the previous cache and prompt identity until rollback can no
+longer occur. After every
+peer confirms publication, the driver commits the next parameter version and
+invalidates old snapshots through the native mechanism, including on ranks that
+own no edited slot. A completed publication rejection restores both weights and
+state. Failed restoration fences the session. All actual aliases and replicas
 participate. Packed affected parameters are promoted on every nonempty owner,
 including shards outside the edit rectangle, so the selected input arithmetic
 remains consistent. Distributed active provenance uses the common admitted edit
@@ -10868,9 +11741,11 @@ identity before invocation admission, so metadata reservations include every ran
 Native composition supplies primitives, estimates and source-preserving error
 conversion. Architecture ownership remains in the supplied layout. Routed neural
 callbacks retain typed admission errors and native sources through the same outer
-speculative owner. The provider does not select prediction ownership; public
-partitioned speculative admission requires the prepared prediction layouts
-and their native factory binding.
+speculative owner. `SpeculativePartitionCaptureDiscovery` projects the retained
+model declarations and placements behind a neutral contract. Runtime compiles
+the layout lazily, checks it against the realized participant count, and combines
+producer ownership with collector facts. Admission and the observer use the
+same retained layout.
 
 Prepared prediction modules retain their exact `LocalModelLayout` and global
 parameter declaration through shared `Arc` owners. The total architecture
@@ -11291,6 +12166,9 @@ construction with prediction, including admitted media placeholders and projecte
 spans. Backends perform generic prepared-input admission and call that contract;
 they do not infer placeholder IDs or discard media while extracting text tokens.
 Token identity construction creates no media features, grids or tower output.
+Runtime owns ordinary text-only admission and the shared prepared-input
+observations. Native code supplies the input inspector. Families consume the
+same observations for their own media geometry and placeholder policy.
 
 Nemotron prediction units share one architecture-owned fusion and final-normalization
 driver across ordinary and observed serial/parallel paths. Observed scheduled
@@ -13301,8 +14179,10 @@ provenance; explicit disabled, bounded (including zero), and unlimited requests
 survive normalization and architecture selection. The retained neutral selection
 supplies the policy to native residency construction before target or embedded
 owners register. Loading another model cannot change a published budget.
-Runtime owns shared admission and reservation policy; the backend owns native
-conversion storage, evaluation, completion safety and observations. Allocator
+Runtime opens the execution budget and selects retention policy.
+`eredu-core::residency::conversion_claim` owns atomic reservation and publication
+claims for evaluated immutable conversions. The backend owns native conversion
+storage, evaluation, completion safety and observations. Allocator
 caching remains an independent policy. A retained-payload ceiling covers retained
 plus reserved conversion payload, not backing capacity, temporary casts, graph
 storage, process RSS or total memory. Admission is first-admitted without automatic
@@ -13330,7 +14210,7 @@ policy, eligibility, budget identity, retained claims and reservations. Retained
 conversion payload remains a named subset of the memory report's current device
 parameters; group admission charges must not be added to physical residency.
 `LoadedModel::parameter_conversion_retention` reads these facts through the neutral
-`ModelCapabilityBackend` hook. `PlannedModel` composes role-labelled `target` and
+`ModelCapabilitySession` hook. `PlannedModel` composes role-labelled `target` and
 `external_drafter` observations through `ParameterConversionRetentionObserver`;
 embedded prediction has only the shared target entry. A missing external entry
 means no separate participant, while an unsupported entry means a participant
@@ -13361,13 +14241,13 @@ neutral scope and live binding observations. The
 and [facade example](../eredu/examples/conversion_retention.rs) use these contracts
 without managing another cache or importing native storage mechanisms.
 
-`eredu-runtime::residency::conversion_retention` implements the shared portable
+`eredu-core::residency::conversion_claim` implements the shared portable
 budget and weak registry. Composition may attach one `ConversionRetentionBudget`
 to each execution `ResidencyController`; target units, embedded owners and
 in-process partitions can receive clones of the same selected budget. MLX
 multi-process partitions reject retention as described below. Named layer windows
-do not create allowances. MLX residency constructors install the managed budget
-without creating conversions. Registry lookup joins live group identities only
+do not create allowances. Portable residency installation opens the selected
+budget without creating conversions. Registry lookup joins live group identities only
 when policy facts agree, and immutable source identities only when payload agrees.
 Allocation descriptors preserve the actual backing
 identity and reject conflicting live payload observations across groups.
@@ -13409,7 +14289,7 @@ owners. Native failures and retirement during evaluation drop or cancel the tick
 Source publication revokes all obsolete claims; restoration needs a new resident
 registration. Native graphs may still retain storage after logical claim release.
 
-One MLX residency manager shares its budget across permanent units and supplementary
+One portable residency driver shares its budget across permanent units and supplementary
 embedded prediction owners. Independently loaded models and external drafters have
 separate budgets. Multi-rank selected TP, PP, EP and DP topologies currently reject
 retention with typed `Unsupported` eligibility and effective `Disabled`: the local
@@ -13437,7 +14317,7 @@ contract explicitly permits settlement. Ordinary reset preserves conversions;
 trim, parameter invalidation and allocator-cache flushing have separate semantics.
 Reports remain read-only and cannot evaluate, settle, trim or populate conversions.
 
-`ModelCapabilityBackend::trim_parameter_conversions` is the neutral settled-only
+`ModelCapabilitySession::trim_parameter_conversions` is the neutral settled-only
 backend hook. `ModelRuntime` and the ordinary facade synchronize before calling
 it; controlled ordinary continuations call it through `TextContinuationBoundary`
 after canonical completion and record draining. Controlled speculative execution
@@ -13475,11 +14355,11 @@ preparation retains selected state, ordinary invocation topology and native
 input-score mechanism facts in `PreparedModelDiscovery`. Selected materialization
 formats replace checkpoint defaults, including load-time quantization; cached
 conversion credit reduces only the remaining selected promotion allowance.
-The neutral `GenerationForecastBackend` supplies loaded residency, allocator and
+The neutral `GenerationForecastSession` supplies loaded residency, allocator and
 capacity observations plus the actual prompt/instrumentation execution contract.
-The MLX adapter derives final-row projection from architecture and execution-strategy
-capabilities, shares prompt eligibility with the prefix executor, and leaves existing
-unprojected mutable state unknown. It does not reconstruct family semantics.
+The portable driver selects final-row projection and shares prompt eligibility
+with the prefix executor. It leaves existing unprojected mutable state unknown.
+The native mechanisms report exact input support and numeric workspace bounds.
 The facade's prepared-request forecast combines these facts with resolved generation
 settings, token counts and application budgets without reopening artifacts or
 submitting inference. Observed ordinary and controlled preparations share the same
@@ -13489,7 +14369,7 @@ new funding protocol is involved. See [generation memory](generation-memory.md).
 
 Runtime owns ordinary capture sizing shared by preflight and forecasts: shape/slice
 resolution, absolute schedules, per-step diagnostic metadata and checked cumulative
-usage. `GenerationForecastBackend::capture_memory_projection` supplies complete
+usage. `GenerationForecastSession::capture_memory_projection` supplies complete
 native source/transform cost observations without submission or reservation. MLX
 reuses its admission estimator for ordinary logits; deferred sources, partition
 transport and intervention evidence without full projection coverage retain an
@@ -13508,7 +14388,7 @@ continuations retain actual charged history and use the sampler's absolute index
 independent of cache position. Restoration does not refund capture history. Unknown
 costs remain explicit and forecasts consume no admission authority.
 
-`SpeculativeForecastBackend<D>` supplies immutable selected-drafter resource
+`SpeculativeForecastSession<B, D>` supplies immutable selected-drafter resource
 facts. MLX derives independent autoregressive draft geometry from the retained
 architecture discovery and reports its own residency, placement and sampling
 calibration. The runtime owns single-lane speculative phase accounting: joint
@@ -13547,9 +14427,11 @@ lock caps only untouched defaults at a ceiling sized by portable runtime policy:
 when the observation is unavailable. Smaller native defaults remain smaller;
 there is no minimum for constrained processes. The adapter supplies the host
 observation without selecting model-family behavior. Initialization can instead
-record an explicit choice to preserve the native policy. The MLX adapter applies this
-native cache policy at target/model realization, including controlled and realtime
-paths. It never applies it during cold selection or forecasting. Selected facade
+record an explicit choice to preserve the native policy. Portable text,
+categorical realtime, and speech binding choose the default ceiling before
+materializing model tensors. MLX reports untouched defaults and applies the
+supplied ceiling under the native allocator lock. Cold selection and forecasting
+only observe the allocator. Selected facade
 configuration exposes automatic, preserved-native and fixed policies; portable
 `AllocatorCachePolicyReport` and `AllocatorCachePolicySource` describe observations.
 Explicit settings and earlier initialization win across sessions. The adaptive
@@ -13570,12 +14452,12 @@ buffers under the selected policy. `eredu_backend_mlx::trim_allocator_cache` exp
 ordinary-host trimming without changing the limit or its provenance.
 
 `eredu-checkpoint::prepared_cache` owns content-addressed, file-backed prepared
-weights. The producer identity includes the conversion mechanism version,
-native platform, execution-device class, quantization policy, source recipes and companion
-precision. Source identity hashes exact bounded leases, including scalar geometry
-and source encoding; filenames and timestamps do not authorize reuse. The generic
-MLX bounded quantizer writes each completed encoded tile directly to this neutral
-sink, with no complete packed payload retained in host vectors. Applications
+weights. The portable runtime builds the cache key from the backend's encoder
+identity, the selected encoding, and exact source recipes and companion
+precision. Source identity hashes bounded leases, including scalar geometry
+and source encoding. The runtime writes borrowed bytes from completed tiles
+directly to the cache writer. The checkpoint source records original shard
+provenance and combines original and prepared-source read diagnostics. Applications
 supply a directory and maximum prepared tensor file bytes through
 `PreparedCheckpointCachePolicy`. Ordinary loads accept the policy through
 `ExecutionPlan::with_prepared_checkpoint_cache`. Realtime loads take it on
@@ -13658,9 +14540,9 @@ consume this selection rather than a caller hint or workspace-coverage heuristic
 This keeps model semantics out of the native capability provider and allows
 chunking support and estimator coverage to evolve independently.
 
-The neutral ordinary/controlled text driver requests bounded prefill through an
-optional backend prefix operation. Native adapters preserve compatible prompt
-slicing, positions and completion; an intermediate prefix is settled before the
+The installed text driver admits bounded prefill using retained cursor and
+plain-token split support together with its communication topology. Native
+adapters supply prompt slicing, positions and completion; an intermediate prefix is settled before the
 next is submitted. Requests with incompatible observation or specialized input
 contracts keep a full prefill pass. Sampling and commitment remain in the shared
 driver, and the prefill policy survives controlled continuation.
@@ -13668,11 +14550,11 @@ driver, and the prefill policy survives controlled continuation.
 
 ### Settled continuation memory observations
 
-`eredu-runtime::memory_forecast::ContinuationForecastBackend` supplies neutral
+`eredu-runtime::memory_forecast::ContinuationForecastSession` supplies neutral
 installed-state/frontier facts and horizon-specific native storage envelopes.
 Runtime owns decode-only phase composition, cache-copy overlap, physical-pool
-comparisons and uncertainty. The MLX adapter validates idle session authority and
-uses the existing typed state geometry/capacity growth mechanism through
+comparisons and uncertainty. The portable driver validates idle session authority
+and uses the existing typed state geometry/capacity growth mechanism through
 `ReplicatedTextSession::estimate_installed_control_state_growth`; it never
 snapshots or submits work to obtain a forecast. Architecture state geometry stays
 in portable family declarations. Core's state estimator also supplies required
@@ -13726,8 +14608,8 @@ reservations are conservative allowances and never resident credits. Instrumente
 retention without coverage leaves an explicit unknown contribution. Forecasting
 has no admission, copy, randomness, observation-budget or execution authority.
 
-`SpeculativeForecastBackend::speculative_target_memory_profile` supplies selection
-geometry for the isolated lane. MLX retains that geometry even if an unrelated
+`SpeculativeForecastSession::speculative_target_memory_profile` supplies selection
+geometry for the isolated lane. The portable driver retains that geometry even if an unrelated
 installed ordinary cache has advanced; forecasting never resets either cache.
 
 ### Neutral execution resource descriptions
@@ -13931,6 +14813,20 @@ Cold and loaded calls remain read-only and cannot materialize modules, populate
 parameter conversion caches or consume observation budgets.
 
 ### Embedded prediction resource descriptions
+
+Portable construction consumes the selected prediction sources and determines
+module order and state layout. It asks the backend's
+`PredictionExtensionMaterializer` to bind the exact source to native
+resources, then supplies the prepared units and cache policies through the
+binding contract in `eredu-runtime`. Runtime also defines the tensor,
+input-lowering, and native-state mechanisms used by embedded prediction.
+Runtime owns the generic embedded executor, replicated target orchestration,
+prediction state lifecycle, cache envelopes, and snapshot accounting.
+The selected family extension supplies proposal equations and exact tensor
+membership. The family kernel declares its compatible extension. Runtime
+exposes that shape through the paired target contract, and the portable
+family driver validates the checkpoint extension before passing it to native
+binding.
 
 `SelectedPreparation::embedded_prediction_topology` projects additional invocations
 from the ordinary architecture descriptor and the admitted speculative strategy.
@@ -14394,7 +15290,7 @@ completion consume the admitted demand without reconstructing it.
 `eredu-nn::IndexedAttentionInput` declares grouped K/V heads, absolute selected
 positions, validity, optional selected-score masks, bounded local sources and sinks.
 Architecture equations own selection and causal eligibility. `AttentionCache::indexed_attention`
-routes the request through resident or paged storage. MLX deduplicates positions and
+routes the request through resident or paged storage. The paged cache deduplicates positions and
 completes one query's compact gathers before advancing. Paged reads acquire only
 intersecting pages. Sparse attention retains full K/V history; its read counters are
 separate from full-history scans. Failed native page copies retain source leases until
@@ -14431,19 +15327,21 @@ encoding, scalar identity, one-row access and maximum acquisition/planning/outpu
 The largest permitted acquisition must fit the device cache. Missing mechanisms,
 incompatible bindings and inadequate budgets produce typed errors before construction.
 
-`MlxRowLookups::bind` consumes the selected parameter pool and retained row declarations.
-It validates decoder availability, scratch, scalar budget and exact source ownership
-before materializing companions. Binding reads no table rows.
+The portable routed driver constructs the shared bank and `BoundRowLookups`
+from the selected pool and retained row declarations. It checks decoder
+availability, scratch, scalar budget and exact source ownership before
+requesting native scalar materialization. Binding reads no table rows.
 
 `RowLookupDescriptor::plan_demand` validates exact bank/unit/row ownership, nonzero
 use counts and unique members, then projects logical rows through the retained
 residency namespace offset. `RowBankDemand` preserves caller order and exact use
 counts for both source acquisitions and returned logical identities. Descriptor
 member extents and demand projections require no payload reads or row catalog
-expansion. Native row banks retain this descriptor for addressing and specification
-agreement; native decoder workspace admission and completion remain backend-owned.
+expansion. Portable row banks retain this descriptor for addressing and specification
+agreement. Native decoders supply workspace facts, decode the acquired ranges,
+and retain native completion resources.
 
-Native `MlxRowBank` supports dense, shared-scalar E4M3 and GGML block rows; shared scalar FP8 uses its declared parameter
+`MlxRowDecoder` supports dense, shared-scalar E4M3 and GGML block rows; shared scalar FP8 uses its declared parameter
 identity rather than expert block-scale equations. Lookup retains exact host integer IDs,
 chunks native acquisitions and keeps source/residency leases through completion.
 
@@ -14513,7 +15411,14 @@ selection checks coverage, representation, resident capacity, scratch and page g
 State partitioning rebases owners and can narrow record width under architecture-authored
 TP geometry without changing token cadence or increasing retained limits.
 
-Resident append storage retains immutable chunks. Native paged append storage reuses
+The portable driver constructs the page owner for the selected text, predictor,
+or component state and supplies it to native allocation. Runtime owns append
+admission, page boundaries, dirty-tail sealing, sliding eviction, and the
+read plan for contiguous, indexed, and sliding-window attention. MLX executes
+tensor slices, gathers, concatenation, transfers, and attention on the
+selected inputs and retains native leases through completion.
+
+Resident append storage retains immutable chunks. Portable paged append storage reuses
 ordinary cache blocks, device/host/disk residency, completion leases and rollback.
 `CacheStreamId` separates layer, representation, slot and sequence lane identities.
 Reads compact only requested ranges and retain source leases through completion.
@@ -15523,18 +16428,31 @@ checks. Failed managers remain observable while new acquisition rejects. Process
 identities need rank/session namespaces for cross-process composition; observations omit
 host bookkeeping and do not turn measured capacities into future bounds.
 
-Detached submission reporting uses neutral inventory contracts and pure native retained
-metadata. The calling-thread report limits detached nodes to 64 and allocation records to
-256. Truncation, undescribed nodes, borrowed queues and reentrant/in-progress reaping are
+Detached submission reporting starts with native retained metadata. The backend
+returns a `DetachedResourceObservation` for the requested traversal bounds.
+Runtime chooses those bounds, validates counts and shared allocation identities,
+and assembles the residency inventory. The calling-thread report limits detached
+nodes to 64 and allocation records to 256. Truncation, undescribed nodes, borrowed queues and reentrant/in-progress reaping are
 explicit. Reporting does not poll, evaluate, acquire or retire native work, establish global
 coverage, or authorize refunds. Safe retirement still requires completion evidence or teardown.
 
 `InputTransferResources` derives logical wire counts/payload and selected staging capacity
 bounds before copies. Repeated aliases count once per wire occurrence; serial staging uses
 maximum capacity while destination payloads sum. Native transfer recovery retains sources,
-created destinations and staging through partial failures/unwinding. Successful copies complete
-before publication and preserve structural/semantic cache identity. These are operation
+created destinations and staging through partial failures or unwinding. The runtime
+supplies ordered tensor values, validates the destination against the original wire
+description, and carries semantic cache identity through publication. The native
+copy accepts tensor handles and an admitted staging capacity. These are operation
 ceilings rather than process/session memory reservations.
+
+Cold preparation reads `NativePreparation` facts and exact operator, state
+storage, row decode and weight-lowering predicates. The portable selector
+enumerates the candidate requirements and synthesizes capability reports and
+typed admission errors. Native row queries receive bounded decode geometry,
+logical tensor shapes and any scalar recipe headers. For an actual decode, the
+backend receives the acquired loan, the exact binding and tensor geometry. The
+portable row driver owns bank topology and admission. External assistants use the same exact
+weight-lowering predicates as the ordinary text selector.
 
 `NeuralBackend::mechanism_memory_in_context` supplies side-effect-free facts for an already
 selected context; cold queries remain context-free. `segmented_attention_memory` describes
@@ -15570,9 +16488,11 @@ Reusable miniature artifacts and comparison fixtures belong to `eredu-evaluation
 dependencies. Codec and architecture tests import packaged fixture constants rather than
 reading sibling workspace paths, so archive validation exercises the same references.
 Nemotron Labs Diffusion's draft adapter configuration and Pixtral numerical reference
-are packaged constants shared by architecture, backend and facade tests.
-Production architectures, facade and backends do not depend on evaluation. Native
-conformance uses ordinary selected constructors and erased executables. Numerical, distributed
+are packaged constants shared by architecture and facade tests.
+Backend development targets observe the same dependency direction as the
+backend library. Tests and reference runners that compose MLX with runtime or
+family code live in `eredu` behind its `mlx` feature. Native conformance uses
+ordinary selected constructors and erased executables. Numerical, distributed
 and released-artifact verification scope is recorded in the family validation report.
 
 ### Automatic residency memory reserve
@@ -15836,10 +16756,50 @@ Scoped executor contexts borrow the loaded runtime without requiring a static
 backend or cloning parameters. Owned lane caches may contain borrowed controller
 state; exclusive borrowed caches retain a move-only dereference lease.
 `GenerationCache` gives each lane exclusive borrowed or owned canonical state.
-Prepared native batch requests move their fresh caches into the common driver;
-cache and parameter owners are not cloned when entering controlled execution.
+The facade selects the target-only, shared-backbone, embedded, or external
+executor after checking the target's score semantics. For target-only,
+shared-backbone and embedded batches, the portable text driver acquires
+submission authority, agrees readiness, runs the scheduler, and settles the
+transaction. The embedded executor borrows the installed predictor and
+observers for the duration of that transaction. Its drop restores the session's
+observer if the request installed a temporary one.
+The backend binds queues, preparation transport, and the native submission
+scope. For an external draft, the portable driver verifies the installed
+target identity, agrees placement and ownership, and acquires the draft
+scope under the target transaction. It dispatches the retained independent
+model or conditioned assistant, then settles the draft before the target.
+The portable installed assistant retains the normalized configuration, bound
+module and typed observers. The module is built with the selected parameter
+policy and native storage operations. The native draft scope lends that payload and retains its resources
+through completion or recovery. The portable executable adapter invokes causal
+prefill, verification and accepted-prefix replay on the installed model. It owns
+checkpoint and cache publication, while native primitives supply exact cache
+copies and truncation, token tensors, queue submission and completion.
+Portable batch assembly constructs the ordinary, independent-draft, and
+shared-backbone executors from their bound model handles. It chooses the
+proposal and refinement randomness substreams from the retained route and its
+declared policy. MLX creates, splits, and settles the native keys inside the
+acquired model scope.
+The portable speculative batch driver checks each lane's proposal capacity
+before preparing its native sampler. Once ranks agree that the prepared lanes
+and native scopes are ready, it requests one fresh cache per lane through the
+selected executor. It agrees cache readiness before initializing canonical randomness
+and assembling the lane's semantic state, cancellation, and delivery callback.
+It agrees delivery before invoking the common scheduler. Native code supplies
+sampling, cache storage, tensor, placement, and completion mechanisms.
 Borrowed caches retain their enclosing scope's final state through the same
 request lifecycle and completion guards.
+The portable text request owns its active mode, sampling policy and ordinary
+capture session. The speculative sampler owns a separate prediction ledger shared
+by its tentative branches, with branch-local intervention plans. For each emitted
+prediction it selects the role, phase, position and score kind, applies the
+admitted intervention, and publishes the bounded record. Snapshot and restore
+account for observation storage and preserve cumulative spending. The capture
+driver resolves score rows from admitted selectors and logical tensor geometry.
+Native mechanisms reshape and transform the selected values, report storage
+costs and settle the work. The portable collector binds a local or partitioned
+observer to the installed placement and sequences transport readiness and delivery.
+
 The shared-backbone executor also supplies complete ordinary diffusion through
 `refine_block`. Initial diffusion retains causal prefill scores without sampling
 or publishing an AR token. Complete admitted canvases remain separate from the
@@ -15902,8 +16862,11 @@ retain its causal next-token row without sampling. Ordinary shared-backbone
 handoffs use this same portable append transaction; native composition only
 publishes its settled cache and score row. Typed executor erasure
 preserves mode facts, bounded command agreement and score-row storage estimates.
-Request-local draft policy updates consume retained architecture declarations;
-native adapters supply transport and storage mechanisms. The numerical masked
+The portable driver resolves request-local draft options against retained
+architecture declarations. It initializes the masked canvas, advances each
+numerical iteration, and retains paused refinement state before selecting
+settled token IDs and score rows. Native mechanisms supply queues, tensor
+layout, forward operations, and completion-safe readback. The numerical masked
 draft capability is distinct from complete diffusion commitment. Incremental
 verification cursors live in `eredu-runtime` as
 `SharedBackboneTransaction`: they retain completed evidence, enforce sampled-target
@@ -15951,9 +16914,10 @@ cast as CPU execution.
 
 Shared-backbone activation discovery uses the ordinary target descriptor and
 producer placement. It adds no prediction parameter owner or second component
-layout. `SharedBackboneExecutor` owns request-scoped admitted observers; native
-mechanisms bridge tensor and error domains while the portable collector owns
-reservation, provenance and delivery. Activation schema version 3 distinguishes
+layout. `SharedBackboneExecutor` owns request-scoped admitted observers.
+The portable driver derives prefill geometry and opens each capture phase
+around the exact invocation. Native mechanisms bridge tensor and error
+domains. The portable collector owns reservation, provenance and delivery. Activation schema version 3 distinguishes
 ordinary `Refinement` iterations from draft-only `MaskedDraft` iterations. Each
 complete-canvas forward has its own physical width and monotonically increasing
 invocation identity. Prefill, verification and accepted-prefix replay retain
@@ -16469,6 +17433,14 @@ allowance before requesting any native copy. Dropped or failed writers refund
 reservations. Rank scoping and reversible distributed publication are portable
 runtime operations; native adapters export into the supplied staging store.
 
+The portable text session driver validates the bound target and opens a
+settled model transaction for explicit cache import and export. The bound
+text session retains the shard identity, chooses local or coordinated I/O,
+and resolves each rank's cache location from its execution topology.
+Composite prefixes require an exact prepared-input identity on restore and
+the committed identity on save. Native mechanisms materialize or export
+cache state using the supplied store and execution context.
+
 Import/export currently binds the selected paged-state realization. Resident KV
 snapshot primitives alone do not cover resident append streams, compressed state
 and pooling state. Those require complete resident export/restore bindings and
@@ -16486,7 +17458,8 @@ cancellation evict the published entry. Hits retain that original prefix: a
 suffix prepared independently cannot attest an extended composite input.
 There is no separate prefix-cache owner or cached-generation API.
 
-Automatic reuse requires local ordinary text execution. Explicit all-rank
+The installed portable text session admits automatic reuse for local ordinary
+text execution and derives prefix identity from the prepared input. Explicit all-rank
 directory publication retains its coordinated path; a process-local memory
 store cannot provide cross-rank atomic publication. Controlled, speculative and
 observed runs reject a configured automatic store because external publication
@@ -17020,12 +17993,15 @@ selected recipes and storage preferences. MLX uses the generic local component
 binder for both and supplies the tensor collective for a sharded execution.
 The retained Audio selection assembles replicated, tensor, and pipeline graphs.
 It compares a distributed transport’s world and rank with the retained route
-before binding components. Backends supply communication handles and reusable
-realtime graph mechanisms for state allocation and branching, recovery,
-sampling, and local or pipeline component realization.
-Audio and VL use the same MLX component binder for parameter units, local
-execution, and pipeline stages. Its local component runs observed execution,
-tensor-parallel execution, and architecture-owned readout over retained weights.
+before binding components. Portable graph binding constructs and branches
+hybrid state from the selected layout. Backends supply cache storage, sampling,
+and queue recovery, with opaque retention for outstanding state copies.
+Audio and VL use the same native parameter-unit operations, local queues,
+and pipeline mechanisms. The runtime constructs residency storage and selects
+the unit policy. The local driver runs observed execution, tensor-parallel
+execution, and architecture-owned readout over retained weights. Decision
+and embedded prediction bindings also derive their state from the native
+cache contracts in portable code.
 Pipeline binding realizes a session from a native world or reuses the session
 already established by model loading. Both supply the retained plan to the same
 native pipeline materializer. Cache allocation consumes the selected component's state

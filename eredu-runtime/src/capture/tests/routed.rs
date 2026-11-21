@@ -84,6 +84,7 @@ impl CaptureBackend for Backend {
         _: &u64,
         _: &CaptureSelection,
         _: &ResolvedCaptureSlice,
+        _score_row: Option<u64>,
     ) -> Result<CapturePayload, Self::Error> {
         panic!("dense collector")
     }

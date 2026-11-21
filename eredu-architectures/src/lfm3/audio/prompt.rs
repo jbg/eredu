@@ -1,5 +1,7 @@
 //! Speech embedding replacement through the shared LFM3 decoder traversal.
 
+use eredu_core::SubmissionBackend;
+
 use super::AudioTokens;
 use crate::lfm3::{LayeredModel, Lfm3Input};
 use eredu_nn::{
@@ -7,7 +9,7 @@ use eredu_nn::{
 };
 use eredu_runtime::{
     LayerRuntimeState, LayerwisePolicy, LayerwiseRuntime, LayerwiseRuntimeError, ResidentRuntime,
-    RuntimeStateComponents, SubmissionBackend,
+    RuntimeStateComponents,
 };
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]

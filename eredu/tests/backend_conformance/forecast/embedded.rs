@@ -1,6 +1,6 @@
 use super::*;
 use eredu_runtime::execution_topology::TextExecutionTopology;
-use eredu_runtime::memory_forecast::{SpeculativeForecastBackend, SpeculativeMemoryProfile};
+use eredu_runtime::memory_forecast::{SpeculativeForecastSession, SpeculativeMemoryProfile};
 use eredu_runtime::prediction_resources::{
     EmbeddedPredictionTopology, PredictionExecutionMode, PredictionStateLayer,
 };
@@ -62,9 +62,9 @@ pub(super) fn topology() -> EmbeddedPredictionTopology {
     }
 }
 
-impl SpeculativeForecastBackend<EmbeddedFixture> for MockBackend {
+impl SpeculativeForecastSession<MockBackend, EmbeddedFixture> for MockSession {
     fn speculative_memory_profile(
-        _: &ModelRuntime<Self>,
+        _: &ModelRuntime<MockBackend, Self>,
         _: &eredu_core::SpeculativeDraft<'_, EmbeddedFixture>,
     ) -> Result<Option<SpeculativeMemoryProfile>, GenerationForecastError> {
         Ok(Some(SpeculativeMemoryProfile {

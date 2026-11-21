@@ -6,8 +6,9 @@ use super::{
     rnnt_specs::RnntPredictorDeclaration,
 };
 use eredu_checkpoint::store::SharedCheckpointSource;
+use eredu_core::residency::parameter_binding::WeightBinding;
 use eredu_runtime::{
-    ArchitecturePartition, ExecutionUnitAddress, LocalModelLayout, PreparedComponent, WeightBinding,
+    ArchitecturePartition, ExecutionUnitAddress, LocalModelLayout, PreparedComponent,
 };
 /// Retained canonical LSTM recipes and explicit optional replica placement.
 pub struct PreparedRnntPredictorBindings {

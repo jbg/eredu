@@ -34,7 +34,9 @@ impl SessionAdmission {
 
 /// A realized session differs from the exact admitted capability report.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, thiserror::Error)]
-#[error("realized session capabilities {realized:?} do not match pre-materialization admission {admitted:?}")]
+#[error(
+    "realized session capabilities {realized:?} do not match pre-materialization admission {admitted:?}"
+)]
 pub struct SessionAdmissionError {
     admitted: SessionCapabilities,
     realized: SessionCapabilities,
@@ -117,6 +119,76 @@ pub enum SessionAuthorityError {
     /// The non-repeating ticket sequence cannot allocate another submission.
     #[error("model session submission ticket space exhausted")]
     TicketExhausted,
+}
+
+/// Native retirement and health facts used by a portable submission owner.
+pub trait SessionRetirement {
+    /// Error reported by the native resource owner.
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Progresses native retirement and checks whether the session can accept work.
+    fn refresh_native_session(&self) -> Result<(), Self::Error>;
+
+    /// Reports whether native work has fenced the session.
+    fn native_session_fenced(&self) -> bool;
+
+    /// Preserves the typed rejection when combining native and portable errors.
+    fn submission_authority_error(error: SessionAuthorityError) -> Self::Error;
+}
+
+/// Native operator selection shared by target-only and assistant-assisted execution.
+pub trait SpeculativeTargetNative: crate::BackendProvider {
+    /// Native operators for the retained target.
+    type TargetOperators;
+}
+
+/// Native storage and operator types used to compose a selected draft.
+pub trait DraftNativeResources: SpeculativeTargetNative {
+    /// Native queue retained for secondary execution.
+    type DraftQueue;
+    /// Native checkpoint binding resources for one assistant.
+    type AssistantBinder;
+    /// Opaque dispatch chosen by the portable caller.
+    type AssistantDispatch: 'static;
+    /// Native operators supplied to a bound assistant.
+    type AssistantOperators;
+    /// Retires native work while retaining its exact opaque payload.
+    type DraftStorage<P: 'static>: RetainedExecutionPayload<
+        Payload = P,
+        Queue = Self::DraftQueue,
+        Error = Self::Error,
+    >;
+}
+
+/// Native retention of an installed payload and its exact submission context.
+pub trait RetainedExecutionPayload {
+    /// Opaque value whose allocations may outlive the calling operation.
+    type Payload: 'static;
+    /// Exact native queue or execution context.
+    type Queue;
+    /// Failure establishing native authority or completion.
+    type Error;
+    /// Exclusive mutation scope that settles work or retains the payload on drop.
+    type Operation<'a>: RetainedPayloadOperation<Self::Error, Payload = Self::Payload>
+    where
+        Self: 'a;
+
+    /// Observes the payload without beginning native work.
+    fn payload(&self) -> &Self::Payload;
+    /// Retains an owned reference to the exact queue.
+    fn retain_queue(&self) -> Self::Queue;
+    /// Acquires exclusive mutation authority over the retained payload.
+    fn begin_operation(&mut self) -> Result<Self::Operation<'_>, Self::Error>;
+}
+
+/// One native operation with exclusive mutation authority over an opaque payload.
+pub trait RetainedPayloadOperation<E>: Sized {
+    /// Opaque value guarded by the operation.
+    type Payload;
+    /// Borrows the value after the native owner establishes exclusivity.
+    fn payload_mut(&mut self) -> &mut Self::Payload;
+    /// Settles native work or retains its resources until safe retirement.
+    fn settle<T>(self, result: Result<T, E>) -> Result<T, E>;
 }
 
 /// Move-only ownership of one unresolved session submission.

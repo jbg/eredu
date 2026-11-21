@@ -80,8 +80,8 @@ with the results. Metal commands require access to native devices.
 ```sh
 python -c 'from huggingface_hub import snapshot_download; snapshot_download("LiquidAI/LFM3-Audio-2B", revision="2d6c1f99c129b3ef07a8d168bc0ff08e2bdb93f1", local_dir="/private/tmp/lfm3-audio-source", allow_patterns=["*.py", "audio_tokenizer/config.json", "audio_tokenizer/model.safetensors"])'
 HF_HOME=/private/tmp/lfm3-hf HF_MODULES_CACHE=/private/tmp/lfm3-hf/modules python validation/lfm3_liquid_reference.py /private/tmp/lfm3-audio-source /private/tmp/lfm3-liquid-reference
-cargo run -p eredu-backend-mlx --no-default-features --example lfm3_liquid_reference -- /private/tmp/lfm3-liquid-reference/f32-neural /private/tmp/lfm3-liquid-reference /private/tmp/lfm3-liquid-reference/cpu-results.json --device cpu --neural
-MLX_ENABLE_TF32=0 cargo run -p eredu-backend-mlx --features metal --example lfm3_liquid_reference -- /private/tmp/lfm3-liquid-reference/f32-neural /private/tmp/lfm3-liquid-reference /private/tmp/lfm3-liquid-reference/metal-results.json --device gpu --neural
+cargo run -p eredu --no-default-features --features mlx --example lfm3_liquid_reference -- /private/tmp/lfm3-liquid-reference/f32-neural /private/tmp/lfm3-liquid-reference /private/tmp/lfm3-liquid-reference/cpu-results.json --device cpu --neural
+MLX_ENABLE_TF32=0 cargo run -p eredu --no-default-features --features mlx,metal --example lfm3_liquid_reference -- /private/tmp/lfm3-liquid-reference/f32-neural /private/tmp/lfm3-liquid-reference /private/tmp/lfm3-liquid-reference/metal-results.json --device gpu --neural
 ```
 
 ## Integration scope

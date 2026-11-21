@@ -3,7 +3,7 @@
 use std::fmt::Display;
 
 use eredu_checkpoint::schema::{GgufCheckpointPlan, SafetensorsCheckpointPlan};
-use eredu_core::checkpoint::{TensorCatalog, TensorDtype};
+use eredu_core::checkpoint::TensorCatalog;
 use eredu_core::InputModalities;
 
 use crate::GgufArchitecture;
@@ -289,32 +289,7 @@ fn invalid(error: impl Display) -> PreparationCapabilityError {
     PreparationCapabilityError(error.to_string())
 }
 
-/// Architecture-resolved source of the dtype used by generic floating runtime
-/// state.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct FloatingStateDtypeSource {
-    parameter: String,
-    checkpoint_tensor: String,
-    dtype: TensorDtype,
-}
-
-impl FloatingStateDtypeSource {
-    /// Architecture-declared checkpoint parameter whose loaded values establish
-    /// the ordinary decoder activation dtype.
-    pub fn parameter(&self) -> &str {
-        &self.parameter
-    }
-
-    /// Physical tensor name selected from the architecture's admitted aliases.
-    pub fn checkpoint_tensor(&self) -> &str {
-        &self.checkpoint_tensor
-    }
-
-    /// Inspected scalar dtype of the selected physical tensor.
-    pub fn dtype(&self) -> &TensorDtype {
-        &self.dtype
-    }
-}
+pub use eredu_runtime::executable_binding::FloatingStateDtypeSource;
 
 fn resolve_floating_state_dtype_source(
     plan: &SafetensorsCheckpointPlan,
@@ -373,11 +348,11 @@ fn resolve_declared_floating_state_dtype_source(
         .filter_map(|name| tensors.get(name))
         .collect::<Vec<_>>();
     match present.as_slice() {
-        [tensor] => Ok(FloatingStateDtypeSource {
-            parameter: parameter.into(),
-            checkpoint_tensor: tensor.name.clone(),
-            dtype: tensor.dtype.clone(),
-        }),
+        [tensor] => Ok(FloatingStateDtypeSource::new(
+            parameter.into(),
+            tensor.name.clone(),
+            tensor.dtype.clone(),
+        )),
         [] => Err(invalid(format!(
             "architecture checkpoint plan {:?} did not find floating-state dtype source {parameter:?} or any of its declared aliases",
             plan_identity

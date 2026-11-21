@@ -2,8 +2,8 @@
 
 use eredu_core::{
     Audio, BackendFailure, CapabilityError, InputTokenCount, Media, MediaBinding,
-    MediaRequestError, ModelCapabilityBackend, MultimodalPreparationBackend, MultimodalRequest,
-    RgbImage, TextGenerationBackend, Video,
+    MediaRequestError, ModelCapabilitySession, MultimodalPreparationSession, MultimodalRequest,
+    RgbImage, TextExecutionSession, TextGenerationBackend, Video,
 };
 use serde_json::{json, Map, Value};
 
@@ -244,21 +244,21 @@ impl PreparedTypedChat {
     }
 }
 
-enum Prompt<B: TextGenerationBackend> {
+enum Prompt<P> {
     Tokens(Vec<u32>),
-    Backend(B::Prompt),
+    Prepared(P),
 }
 
 /// Opaque, counted prompt paired with its rendered chat and loaded session.
 /// Conversion to the existing low-level input checks both identities.
-pub struct PreparedChatPayload<B: TextGenerationBackend> {
-    prompt: Prompt<B>,
+pub struct PreparedChatPayload<P> {
+    prompt: Prompt<P>,
     count: InputTokenCount,
     chat: PreparedChat,
     session_identity: String,
 }
 
-impl<B: TextGenerationBackend> PreparedChatPayload<B> {
+impl<P> PreparedChatPayload<P> {
     /// Exact token and decoder-position accounting for this payload.
     pub fn count(&self) -> InputTokenCount {
         self.count
@@ -266,11 +266,11 @@ impl<B: TextGenerationBackend> PreparedChatPayload<B> {
 
     /// Consumes the prompt for ordinary, speculative or batch generation.
     /// The returned low-level input retains the existing caller-owned execution contract.
-    pub fn into_input<'a>(
+    pub fn into_input<'a, B: TextGenerationBackend, S: TextExecutionSession<B, Prompt = P>>(
         self,
-        model: &LoadedModel<B>,
+        model: &LoadedModel<B, S>,
         chat: &'a PreparedChat,
-    ) -> Result<PreparedChatInput<'a, B>, ChatInputPreparationError> {
+    ) -> Result<PreparedChatInput<'a, P>, ChatInputPreparationError> {
         if self.session_identity != model.session_identity {
             return Err(ChatInputPreparationError::SessionMismatch);
         }
@@ -304,28 +304,28 @@ impl<B: TextGenerationBackend> PreparedChatPayload<B> {
         Ok(())
     }
 
-    pub(super) const fn backend_prompt(&self) -> Option<&B::Prompt> {
+    pub(super) const fn prepared_prompt(&self) -> Option<&P> {
         match &self.prompt {
-            Prompt::Backend(prompt) => Some(prompt),
+            Prompt::Prepared(prompt) => Some(prompt),
             Prompt::Tokens(_) => None,
         }
     }
 
-    pub(super) fn into_unbound(self, chat: &PreparedChat) -> PreparedChatInput<'_, B> {
+    pub(super) fn into_unbound(self, chat: &PreparedChat) -> PreparedChatInput<'_, P> {
         match self.prompt {
             Prompt::Tokens(ids) => PreparedChatInput::token_ids(chat, ids),
-            Prompt::Backend(prompt) => PreparedChatInput::prepared_backend_input(chat, prompt),
+            Prompt::Prepared(prompt) => PreparedChatInput::prepared_input(chat, prompt),
         }
     }
 }
 
 /// One owned rendered chat and its counted, prepared input. No self-references are stored.
-pub struct PreparedChatRequest<B: TextGenerationBackend> {
+pub struct PreparedChatRequest<P> {
     chat: PreparedChat,
-    payload: PreparedChatPayload<B>,
+    payload: PreparedChatPayload<P>,
 }
 
-impl<B: TextGenerationBackend> PreparedChatRequest<B> {
+impl<P> PreparedChatRequest<P> {
     /// Rendered prompt and generation semantics.
     pub fn chat(&self) -> &PreparedChat {
         &self.chat
@@ -335,7 +335,7 @@ impl<B: TextGenerationBackend> PreparedChatRequest<B> {
         self.payload.count
     }
     /// Splits ownership for the existing borrowed generation request APIs.
-    pub fn into_parts(self) -> (PreparedChat, PreparedChatPayload<B>) {
+    pub fn into_parts(self) -> (PreparedChat, PreparedChatPayload<P>) {
         (self.chat, self.payload)
     }
 }
@@ -369,7 +369,7 @@ pub(super) fn lower_tool_arguments(
     Ok(())
 }
 
-impl<B: TextGenerationBackend> LoadedModel<B> {
+impl<B: TextGenerationBackend, S: TextExecutionSession<B>> LoadedModel<B, S> {
     /// Lowers typed messages and renders the selected checkpoint template without native media work.
     pub fn prepare_typed_chat(
         &mut self,
@@ -409,7 +409,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
     pub fn materialize_chat_text_input(
         &self,
         prepared: PreparedTypedChat,
-    ) -> Result<PreparedChatRequest<B>, ChatInputPreparationError> {
+    ) -> Result<PreparedChatRequest<S::Prompt>, ChatInputPreparationError> {
         self.validate_typed_chat(&prepared)?;
         if prepared.media.is_some() {
             return Err(ChatInputPreparationError::MediaRequiresBackend);
@@ -427,7 +427,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
     pub fn prepare_chat_text_input(
         &mut self,
         request: ChatInputRequest,
-    ) -> Result<PreparedChatRequest<B>, ChatInputPreparationError> {
+    ) -> Result<PreparedChatRequest<S::Prompt>, ChatInputPreparationError> {
         let prepared = self.prepare_typed_chat(request)?;
         self.materialize_chat_text_input(prepared)
     }
@@ -445,9 +445,9 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
     fn finish_chat_input(
         &self,
         prepared: PreparedTypedChat,
-        prompt: Prompt<B>,
+        prompt: Prompt<S::Prompt>,
         count: InputTokenCount,
-    ) -> PreparedChatRequest<B> {
+    ) -> PreparedChatRequest<S::Prompt> {
         PreparedChatRequest {
             payload: PreparedChatPayload {
                 prompt,
@@ -460,42 +460,50 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
     }
 }
 
-impl<B: MultimodalPreparationBackend + ModelCapabilityBackend> LoadedModel<B> {
+impl<
+        B: eredu_core::TextGenerationBackend,
+        S: TextExecutionSession<B> + ModelCapabilitySession<B> + MultimodalPreparationSession<B>,
+    > LoadedModel<B, S>
+{
     /// Materializes decoded media using the retained rendered conversation and counts actual positions.
     pub fn materialize_chat_input(
         &self,
         prepared: PreparedTypedChat,
-    ) -> Result<PreparedChatRequest<B>, ChatInputPreparationError> {
+    ) -> Result<PreparedChatRequest<S::Prompt>, ChatInputPreparationError> {
         self.validate_typed_chat(&prepared)?;
         let Some(media) = &prepared.media else {
             return self.materialize_chat_text_input(prepared);
         };
         let prompt = self.prepare_multimodal_input(media)?;
         let count = self.count_prepared_input(&prompt)?;
-        Ok(self.finish_chat_input(prepared, Prompt::Backend(prompt), count))
+        Ok(self.finish_chat_input(prepared, Prompt::Prepared(prompt), count))
     }
 
     /// Prepares complete typed chat input and returns exact text/media/model position accounting.
     pub fn prepare_chat_input(
         &mut self,
         request: ChatInputRequest,
-    ) -> Result<PreparedChatRequest<B>, ChatInputPreparationError> {
+    ) -> Result<PreparedChatRequest<S::Prompt>, ChatInputPreparationError> {
         let prepared = self.prepare_typed_chat(request)?;
         self.materialize_chat_input(prepared)
     }
 }
 
-impl<B: ModelCapabilityBackend> LoadedModel<B> {
+impl<
+        B: eredu_core::TextGenerationBackend,
+        S: TextExecutionSession<B> + ModelCapabilitySession<B>,
+    > LoadedModel<B, S>
+{
     /// Admits the same typed input with prospective interventions for ordinary or controlled runs.
     #[cfg(feature = "tensor-capture")]
     pub fn prepare_intervened_chat_input(
         &self,
-        prepared: PreparedChatRequest<B>,
+        prepared: PreparedChatRequest<S::Prompt>,
         settings: super::PreparedChatGenerationSettings,
         capture: eredu_core::capture::CapturePlan,
         intervention: eredu_core::intervention::InterventionPlan,
         trace_limits: super::TraceLimits,
-    ) -> Result<super::PreparedObservedGeneration<B>, ChatInputPreparationError> {
+    ) -> Result<super::PreparedObservedGeneration<S::Prompt>, ChatInputPreparationError> {
         let prepared =
             self.prepare_observed_chat_input(prepared, settings, capture, trace_limits)?;
         Ok(self.admit_prepared_interventions(prepared, intervention)?)
@@ -506,11 +514,11 @@ impl<B: ModelCapabilityBackend> LoadedModel<B> {
     #[cfg(feature = "tensor-capture")]
     pub fn prepare_observed_chat_input(
         &self,
-        prepared: PreparedChatRequest<B>,
+        prepared: PreparedChatRequest<S::Prompt>,
         settings: super::PreparedChatGenerationSettings,
         plan: eredu_core::capture::CapturePlan,
         trace_limits: super::TraceLimits,
-    ) -> Result<super::PreparedObservedGeneration<B>, ChatInputPreparationError> {
+    ) -> Result<super::PreparedObservedGeneration<S::Prompt>, ChatInputPreparationError> {
         if prepared.payload.session_identity != self.session_identity {
             return Err(ChatInputPreparationError::SessionMismatch);
         }
@@ -523,8 +531,8 @@ impl<B: ModelCapabilityBackend> LoadedModel<B> {
                 plan,
                 trace_limits,
             )?),
-            Prompt::Backend(prompt) => {
-                let ids = B::prepared_input_token_ids(&self.runtime, &prompt)?;
+            Prompt::Prepared(prompt) => {
+                let ids = S::prepared_input_token_ids(&self.runtime, &prompt)?;
                 if u64::try_from(ids.len()).ok() != Some(count.model_positions) {
                     return Err(ChatInputPreparationError::Alignment {
                         expected: count.model_positions,

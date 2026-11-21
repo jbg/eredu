@@ -6,12 +6,14 @@ use super::{
     },
     tts_transformer_preparation::PreparedTtsTransformerPartitionBindings,
 };
+use eredu_core::communication::CommunicationManifest;
+use eredu_core::communication::PipelineActivationDtype;
 use eredu_core::{BackendFailure, CollectiveGroupId};
 use eredu_nn::{DistributedNeuralBackend, NeuralBackend};
 use eredu_runtime::{
-    ArchitectureBoundary, ArchitectureGroupKind, ArchitecturePartition, CommunicationManifest,
+    ArchitectureBoundary, ArchitectureGroupKind, ArchitecturePartition,
     ComponentPipelinePreparationError, ComponentRankMechanisms, LayerWeightResidency,
-    LayerwiseModelMetadata, PartitionedExecutionPlan, PipelineActivationDtype,
+    LayerwiseModelMetadata, PartitionedExecutionPlan,
 };
 
 use super::tts_transformer_stage::{TtsTransformerPipeline, TtsTransformerPipelineArchitecture};
@@ -126,7 +128,7 @@ impl PreparedTtsTransformerPipelineBindings {
     {
         let (pipeline, layout, state) =
             self.into_pipeline::<B, Cache>(residency, allocate_caches)?;
-        let (execution, metadata) = mechanisms.bind_pipeline(pipeline, communication)?;
+        let (execution, metadata) = pipeline.bind(mechanisms, communication)?;
         Ok((
             TtsTransformerPipeline::new(execution, layout),
             state,

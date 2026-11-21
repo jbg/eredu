@@ -1,9 +1,7 @@
 //! Shared forecast calibration and loaded execution observations.
 
 use crate::memory_estimation::*;
-use eredu_core::{
-    AvailableMemory, CapabilityError, ModelCapabilityBackend, ModelRuntime, StaticMemoryReport,
-};
+use eredu_core::{AvailableMemory, CapabilityError, ModelRuntime, StaticMemoryReport};
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroU8;
 
@@ -17,9 +15,7 @@ mod loaded;
 pub use loaded::*;
 mod continuation;
 pub use continuation::*;
-#[cfg(feature = "tensor-capture")]
 mod capture;
-#[cfg(feature = "tensor-capture")]
 pub use capture::{apply_capture_memory_bound, CaptureMemoryPlan};
 mod speculative;
 pub use speculative::*;
@@ -124,6 +120,22 @@ pub struct LoadedMemoryGeometry {
     pub assumptions: Vec<String>,
 }
 
+impl LoadedMemoryGeometry {
+    /// Combines local immutable parameter observations with selected topology.
+    pub fn apply_resident_storage(
+        &mut self,
+        local_unmodified_parameters: bool,
+        report: Option<&crate::ResidencyReport>,
+    ) {
+        if self.fully_resident && local_unmodified_parameters {
+            if let (Some(topology), Some(report)) = (self.execution_topology.as_mut(), report) {
+                topology.projection_storage = report.projection_storage().clone();
+                topology.f32_rms_normalization_gains = report.f32_rms_normalization_gains().clone();
+            }
+        }
+    }
+}
+
 /// Native observations; portable policy performs the physical-pool accounting.
 #[derive(Clone)]
 pub struct LoadedMemoryProfile {
@@ -164,10 +176,12 @@ pub struct ForecastExecutionContract {
 }
 
 /// Backend facts needed to forecast an already loaded request. No inference is submitted.
-pub trait GenerationForecastBackend: ModelCapabilityBackend {
+pub trait GenerationForecastSession<B: eredu_core::TextGenerationBackend>:
+    eredu_core::ModelCapabilitySession<B>
+{
     /// Retained full-canvas geometry and native numerical-storage envelope.
     fn refinement_memory_plan(
-        _runtime: &ModelRuntime<Self>,
+        _runtime: &ModelRuntime<B, Self>,
         _policy: Option<eredu_core::refinement::RefinementPolicy>,
     ) -> Result<Option<RefinementMemoryPlan>, GenerationForecastError> {
         Ok(None)
@@ -175,16 +189,15 @@ pub trait GenerationForecastBackend: ModelCapabilityBackend {
     /// Retained shared-backbone proposal geometry for the ordinary mode driver.
     /// None means invocation overlap remains unbounded in the forecast.
     fn shared_backbone_memory_profile(
-        _runtime: &ModelRuntime<Self>,
+        _runtime: &ModelRuntime<B, Self>,
     ) -> Result<Option<SpeculativeMemoryProfile>, GenerationForecastError> {
         Ok(None)
     }
 
     /// Complete ordinary capture sizing, including source creation where needed.
     /// None retains the admitted ceilings. No submission or reservation is allowed.
-    #[cfg(feature = "tensor-capture")]
     fn capture_memory_projection(
-        _runtime: &ModelRuntime<Self>,
+        _runtime: &ModelRuntime<B, Self>,
         _capture: &eredu_core::capture::AdmittedCapturePlan,
         _intervention: Option<&eredu_core::intervention::AdmittedInterventionPlan>,
         _first_prediction: u64,
@@ -195,8 +208,7 @@ pub trait GenerationForecastBackend: ModelCapabilityBackend {
     /// Whether capture/intervention native temporaries are completed and released
     /// before the next prediction. This excludes allocator cache, accounted for
     /// separately. The conservative default uses the cumulative retained limit.
-    #[cfg(feature = "tensor-capture")]
-    fn capture_transforms_complete_per_step(_runtime: &ModelRuntime<Self>) -> bool {
+    fn capture_transforms_complete_per_step(_runtime: &ModelRuntime<B, Self>) -> bool {
         false
     }
 
@@ -204,11 +216,11 @@ pub trait GenerationForecastBackend: ModelCapabilityBackend {
     /// mutable state must be projected or leave the workspace upper end unknown;
     /// a continuation must never silently be treated as a fresh request.
     fn loaded_memory_profile(
-        runtime: &ModelRuntime<Self>,
+        runtime: &ModelRuntime<B, Self>,
     ) -> Result<LoadedMemoryProfile, GenerationForecastError>;
     /// Reports the actual prompt and instrumentation contract without submission.
     fn forecast_execution_contract(
-        runtime: &ModelRuntime<Self>,
+        runtime: &ModelRuntime<B, Self>,
         prompt: Option<&Self::Prompt>,
         instrumented: bool,
     ) -> ForecastExecutionContract;

@@ -143,7 +143,7 @@ relative-L2/cosine/top-five/argmax thresholds above. These commands are the exis
 interface, not a claim that released Flash-Next weights have passed:
 
 ```sh
-cargo run --release -p eredu-backend-mlx --features metal --example checkpoint_probe -- \
+cargo run --release -p eredu --no-default-features --features mlx,metal --example checkpoint_probe -- \
   --model /path/to/Flash-Next --device gpu --input-ids 1,3,2,5 \
   --decode-steps 16 --output /tmp/flash-next-actual
 python validation/reference_runner.py --probe /tmp/flash-next-actual.json \

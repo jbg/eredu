@@ -1,5 +1,7 @@
 //! Backend-neutral checkpoint materialization and parameter binding.
 
+use eredu_core::checkpoint_mechanisms::CheckpointParameterBackend;
+use eredu_core::checkpoint_mechanisms::ParameterBindingTarget;
 use std::{
     collections::{BTreeMap, BTreeSet},
     marker::PhantomData,
@@ -19,9 +21,10 @@ use eredu_nn::{
     ParameterId, ParameterMetadata, ParameterVisitor, ParameterVisitorMut, Parameterized,
 };
 
-use crate::{
-    ParameterBackend, ReplicatedTextMaterializationTask, ResidencyDeclarationError, WeightBinding,
-    WeightBindingPlan, WeightLoweringKind,
+use crate::{ReplicatedTextMaterializationTask, WeightLoweringKind};
+use eredu_core::residency::parameter_binding::{
+    preflight_bindings, BindingPreflightError, ResidencyDeclarationError, WeightBinding,
+    WeightBindingPlan,
 };
 
 /// Portable bound on a group of final parameter allocations during loading.
@@ -315,20 +318,6 @@ pub enum BindingPlanError {
     Declaration(#[from] ResidencyDeclarationError),
 }
 
-/// Backend-described geometry of one statically traversed parameter slot.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct ParameterBindingTarget {
-    /// Logical shape expected by the destination.
-    pub shape: Vec<usize>,
-    /// Logical dtype expected by the destination.
-    pub dtype: RecipeDtype,
-    /// Source dtypes the backend can bind to this slot in addition to `dtype`.
-    ///
-    /// Admission preserves the recipe's dtype and byte accounting; it does not
-    /// request conversion to the unloaded slot's initial dtype.
-    pub permitted_source_dtypes: Vec<RecipeDtype>,
-}
-
 /// A canonical binding plan with ordered identities, logical targets and storage preferences.
 #[derive(Debug, Clone)]
 pub struct ModuleBindingPlan {
@@ -371,7 +360,7 @@ impl ModuleBindingPlan {
     }
 }
 
-fn collect_module_parameters<P: 'static, M: Parameterized<P>>(
+pub(crate) fn collect_module_parameters<P: 'static, M: Parameterized<P>>(
     module: &M,
 ) -> Result<BTreeMap<ParameterId, (&P, eredu_nn::ParameterStorageLayout)>, ModuleBindingPlanError> {
     struct Collector<'a, P> {
@@ -401,6 +390,38 @@ fn collect_module_parameters<P: 'static, M: Parameterized<P>>(
         });
     }
     Ok(collector.parameters)
+}
+
+/// Builds bindings for one module out of a shared recipe catalog.
+///
+/// Recipes for other modules remain available for their own construction.
+pub fn bind_module_recipe_subset<P: 'static, M: Parameterized<P>>(
+    module: &M,
+    source: &dyn CheckpointSource,
+    recipes: &mut BTreeMap<String, DerivedWeightRecipe>,
+    shared_source_keys: BTreeSet<String>,
+    excluded: impl Fn(&str) -> bool,
+    describe: impl Fn(&P) -> Option<ParameterBindingTarget>,
+) -> Result<Vec<WeightBinding>, ModuleBindingPlanError> {
+    let parameters = collect_module_parameters(module)?;
+    let selected = parameters
+        .keys()
+        .filter_map(|name| {
+            recipes
+                .remove(name.as_str())
+                .map(|recipe| (name.to_string(), recipe))
+        })
+        .collect();
+    build_module_binding_plan(
+        module,
+        "",
+        source,
+        selected,
+        shared_source_keys,
+        excluded,
+        describe,
+    )?
+    .build_bindings(source)
 }
 
 /// Builds the singular declarative plan by traversing any neutral parameterized module.
@@ -1343,7 +1364,7 @@ pub enum RecipeBindingError {
 }
 
 /// One fully realized atomic unit keyed by stable parameter identity.
-pub struct MaterializedUnit<B: ParameterBackend> {
+pub struct MaterializedUnit<B: CheckpointParameterBackend> {
     weights: BTreeMap<ParameterId, B::MaterializedWeight>,
 }
 
@@ -1352,13 +1373,13 @@ pub struct MaterializedUnit<B: ParameterBackend> {
 /// Construction is intentionally restricted to [`select_bindings`]. Consuming
 /// this token materializes the already selected operations without asking the
 /// backend to select them again.
-pub struct SelectedBindingPlan<B: ParameterBackend> {
+pub struct SelectedBindingPlan<B: CheckpointParameterBackend> {
     source: SharedCheckpointSource,
     plan: WeightBindingPlan<'static>,
     backend: PhantomData<fn() -> B>,
 }
 
-impl<B: ParameterBackend> std::fmt::Debug for SelectedBindingPlan<B> {
+impl<B: CheckpointParameterBackend> std::fmt::Debug for SelectedBindingPlan<B> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("SelectedBindingPlan")
@@ -1367,46 +1388,19 @@ impl<B: ParameterBackend> std::fmt::Debug for SelectedBindingPlan<B> {
     }
 }
 
-fn validated_binding_plan<'a, B: ParameterBackend>(
-    source: &dyn CheckpointSource,
-    plan: WeightBindingPlan<'a>,
-) -> Result<WeightBindingPlan<'a>, ParameterOrchestrationError<B::ParameterError>> {
-    for binding in plan.owners() {
-        let inferred = binding.recipe_view().infer(source)?;
-        if inferred.byte_len() != binding.expected_bytes() {
-            return Err(ParameterOrchestrationError::ByteMismatch {
-                parameter: binding.name().to_owned(),
-                expected: binding.expected_bytes(),
-                actual: inferred.byte_len(),
-            });
-        }
-    }
-    for binding in plan.owners() {
-        B::preflight_recipe(&binding.recipe_view(), source)
-            .map_err(ParameterOrchestrationError::Backend)?;
-    }
-    Ok(plan)
-}
-
-/// Validates a complete binding unit before any payload read or native work.
-pub fn preflight_bindings<'a, B: ParameterBackend>(
-    source: &dyn CheckpointSource,
-    bindings: &'a [WeightBinding],
-) -> Result<WeightBindingPlan<'a>, ParameterOrchestrationError<B::ParameterError>> {
-    validated_binding_plan::<B>(source, WeightBindingPlan::new(bindings)?)
-}
-
 /// Selects a complete immutable binding unit against one exact source.
 ///
 /// Selection validates every declaration, recipe, byte count, and backend
 /// capability without reading payloads, allocating native tensors, or
 /// publishing parameters. The returned token owns both the source and tasks so
 /// later materialization cannot substitute either or repeat backend selection.
-pub fn select_bindings<B: ParameterBackend>(
+pub fn select_bindings<B: CheckpointParameterBackend>(
     source: SharedCheckpointSource,
     bindings: Vec<WeightBinding>,
 ) -> Result<SelectedBindingPlan<B>, ParameterOrchestrationError<B::ParameterError>> {
-    let plan = validated_binding_plan::<B>(source.as_ref(), WeightBindingPlan::owned(bindings)?)?;
+    let plan = WeightBindingPlan::owned(bindings)
+        .map_err(BindingPreflightError::Declaration)?
+        .validate_source::<B>(source.as_ref())?;
     Ok(SelectedBindingPlan {
         source,
         plan,
@@ -1414,7 +1408,7 @@ pub fn select_bindings<B: ParameterBackend>(
     })
 }
 
-impl<B: ParameterBackend> MaterializedUnit<B> {
+impl<B: CheckpointParameterBackend> MaterializedUnit<B> {
     /// Creates a realized unit from already completed backend-native weights.
     ///
     /// This supports bounded backend executors while preserving the singular
@@ -1429,6 +1423,23 @@ impl<B: ParameterBackend> MaterializedUnit<B> {
             }
         }
         Ok(Self { weights: collected })
+    }
+
+    /// Adopts materialized tensors with exact checkpoint binding names.
+    pub fn try_from_named_weights<S: Into<String>>(
+        weights: impl IntoIterator<Item = (S, B::MaterializedWeight)>,
+    ) -> Result<Self, ParameterOrchestrationError<B::ParameterError>> {
+        let weights = weights
+            .into_iter()
+            .map(|(name, weight)| {
+                ParameterId::new(name)
+                    .map(|id| (id, weight))
+                    .map_err(|error| {
+                        ParameterOrchestrationError::InvalidParameterIdentity(error.to_string())
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::try_from_weights(weights)
     }
 
     /// Returns the number of realized parameter values.
@@ -1447,12 +1458,36 @@ impl<B: ParameterBackend> MaterializedUnit<B> {
     }
 }
 
+/// Collects native device handles protected by an exact resident lease.
+pub fn resident_parameter_values<B, S>(
+    lease: &eredu_core::residency::ResidencyLease<S>,
+    retain: impl Fn(&S::DeviceValue) -> B::MaterializedWeight,
+) -> Result<MaterializedUnit<B>, eredu_core::BackendFailure>
+where
+    B: CheckpointParameterBackend,
+    S: eredu_core::residency::ResidencyLeaseStorage<
+        Error: std::error::Error + Send + Sync + 'static,
+    >,
+{
+    let weights = lease
+        .binding_names()
+        .map(|name| {
+            let value = lease
+                .device_value(name)
+                .map_err(eredu_core::BackendFailure::from_error)?;
+            Ok((name, retain(value)))
+        })
+        .collect::<Result<Vec<_>, eredu_core::BackendFailure>>()?;
+    MaterializedUnit::try_from_named_weights(weights)
+        .map_err(eredu_core::BackendFailure::from_error)
+}
+
 /// Materializes one atomic unit without inspecting backend-native values.
 ///
 /// Each encoded source remains retained by its backend materialization guard
 /// until exact completion. The returned weights are independently owned native
 /// handles ready for binding.
-pub fn materialize_bindings<B: ParameterBackend>(
+pub fn materialize_bindings<B: CheckpointParameterBackend>(
     source: &dyn CheckpointSource,
     bindings: &[WeightBinding],
     context: &B::MaterializationContext,
@@ -1463,7 +1498,7 @@ pub fn materialize_bindings<B: ParameterBackend>(
 
 /// Materializes a previously selected binding unit without repeating backend
 /// capability selection.
-pub fn materialize_selected_bindings<B: ParameterBackend>(
+pub fn materialize_selected_bindings<B: CheckpointParameterBackend>(
     selected: SelectedBindingPlan<B>,
     context: &B::MaterializationContext,
 ) -> Result<MaterializedUnit<B>, ParameterOrchestrationError<B::ParameterError>> {
@@ -1475,7 +1510,7 @@ pub fn materialize_selected_bindings<B: ParameterBackend>(
     materialize_validated_plan::<B>(source.as_ref(), plan, context)
 }
 
-fn materialize_validated_plan<B: ParameterBackend>(
+fn materialize_validated_plan<B: CheckpointParameterBackend>(
     source: &dyn CheckpointSource,
     plan: WeightBindingPlan<'_>,
     context: &B::MaterializationContext,
@@ -1540,7 +1575,7 @@ pub fn bind_materialized_unit<B, M>(
     unit: MaterializedUnit<B>,
 ) -> Result<(), ParameterOrchestrationError<B::ParameterError>>
 where
-    B: ParameterBackend,
+    B: CheckpointParameterBackend,
     M: Parameterized<B::Parameter>,
 {
     bind_materialized_unit_excluding::<B, M, _>(module, unit, |_| false)
@@ -1553,18 +1588,20 @@ pub fn bind_materialized_unit_excluding<B, M, F>(
     excluded: F,
 ) -> Result<(), ParameterOrchestrationError<B::ParameterError>>
 where
-    B: ParameterBackend,
+    B: CheckpointParameterBackend,
     M: Parameterized<B::Parameter>,
     F: Fn(&ParameterId) -> bool,
 {
-    struct Validator<'a, B: ParameterBackend> {
+    struct Validator<'a, B: CheckpointParameterBackend> {
         weights: &'a BTreeMap<ParameterId, B::MaterializedWeight>,
         visited: BTreeSet<ParameterId>,
         error: Option<ParameterOrchestrationError<B::ParameterError>>,
         excluded: &'a dyn Fn(&ParameterId) -> bool,
     }
 
-    impl<'a, 'value, B: ParameterBackend> ParameterVisitor<'value, B::Parameter> for Validator<'a, B> {
+    impl<'a, 'value, B: CheckpointParameterBackend> ParameterVisitor<'value, B::Parameter>
+        for Validator<'a, B>
+    {
         fn visit(&mut self, metadata: ParameterMetadata, parameter: &'value B::Parameter) {
             if self.error.is_some() {
                 return;
@@ -1665,12 +1702,14 @@ where
         });
     }
 
-    struct Binder<'a, B: ParameterBackend> {
+    struct Binder<'a, B: CheckpointParameterBackend> {
         weights: &'a mut BTreeMap<ParameterId, B::MaterializedWeight>,
         excluded: &'a dyn Fn(&ParameterId) -> bool,
     }
 
-    impl<'a, 'value, B: ParameterBackend> ParameterVisitorMut<'value, B::Parameter> for Binder<'a, B> {
+    impl<'a, 'value, B: CheckpointParameterBackend> ParameterVisitorMut<'value, B::Parameter>
+        for Binder<'a, B>
+    {
         fn visit_mut(&mut self, metadata: ParameterMetadata, parameter: &'value mut B::Parameter) {
             if (self.excluded)(&metadata.id) {
                 return;
@@ -1701,15 +1740,12 @@ pub enum ParameterOrchestrationError<E>
 where
     E: std::error::Error + Send + Sync + 'static,
 {
-    /// Binding aliases were invalid before materialization began.
+    /// Exact binding inputs failed validation before materialization.
     #[error(transparent)]
-    Declaration(#[from] ResidencyDeclarationError),
+    Preflight(#[from] BindingPreflightError<E>),
     /// Neutral checkpoint access failed.
     #[error(transparent)]
     Store(#[from] StoreError),
-    /// Neutral recipe validation failed.
-    #[error(transparent)]
-    Recipe(#[from] RecipeError),
     /// A stable runtime parameter identity was invalid.
     #[error("invalid runtime parameter identity: {0}")]
     InvalidParameterIdentity(String),
@@ -1730,16 +1766,6 @@ where
     ParameterTraversalMismatch {
         /// Identities present in only one traversal.
         parameters: Vec<ParameterId>,
-    },
-    /// Inferred and declared materialized byte sizes disagreed.
-    #[error("parameter {parameter:?} declares {expected} bytes but its recipe produces {actual}")]
-    ByteMismatch {
-        /// Stable binding name.
-        parameter: String,
-        /// Declared bytes.
-        expected: u64,
-        /// Inferred bytes.
-        actual: u64,
     },
     /// A traversed parameter had no realized value.
     #[error("materialized unit has no value for parameter {parameter}")]

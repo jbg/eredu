@@ -39,10 +39,7 @@ fn main() -> anyhow::Result<()> {
     let factory = MlxBackendFactory::default();
     let plan = ExecutionPlan::fully_resident(eredu_core::DevicePlan::new("mlx", "metal:0")?)
         .with_parameter_conversion_retention(Some(policy));
-    let inspection = eredu_backend_mlx::native::inspect_model_preparation(
-        &path,
-        eredu_backend_mlx::native::MlxInspectionOptions::new(factory.load_request_for_plan(&plan)?),
-    )?;
+    let inspection = eredu::api::inspect_execution(&factory, &path, &plan, None)?;
     let mut cold_options = GenerationMemoryOptions::for_backend_device(
         &eredu_backend_mlx::MlxBackendFactory::default(),
         InputTokenCount::text(positions as u64),
@@ -61,7 +58,8 @@ fn main() -> anyhow::Result<()> {
             }
         }
     }
-    let (mut model, _) = LoadedModel::load_execution_plan(&factory, &path, &plan)?.into_parts();
+    let (mut model, _) =
+        LoadedModel::load_execution_plan(&factory, &path, &plan, None)?.into_parts();
     let settings = PreparedChatGenerationSettings {
         overrides: GenerationConfigOverrides {
             temperature: Some(0.0),
@@ -189,7 +187,8 @@ fn main() -> anyhow::Result<()> {
         lookahead: false,
         adaptive_lookahead: false,
     });
-    let mut loaded_spec = LoadedModel::load_execution_plan(&factory, &path, &speculative_plan)?;
+    let mut loaded_spec =
+        LoadedModel::load_execution_plan(&factory, &path, &speculative_plan, None)?;
     let request = GenerationRequest {
         output_mode: eredu::api::OutputMode::Text,
         control_handle: None,

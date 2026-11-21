@@ -1,11 +1,12 @@
 //! Original request provenance retained independently from evolving embeddings.
 use super::ngram::NGramError;
+use eredu_core::communication::BoundaryTensorDtype as K;
 use eredu_nn::residual_streams::ResidualStreamGeometry;
 use eredu_nn::{Error, RotaryPosition, Tensor, TensorElementType};
 use eredu_runtime::{
     ArchitectureBoundary, ArchitectureBoundaryError, ArchitectureBoundaryValue,
-    BoundaryTensorDimension as D, BoundaryTensorDtype as K, BoundaryTensorSpec, OriginalTokenIds,
-    TokenInputError, TokenVisibility,
+    BoundaryTensorDimension as D, BoundaryTensorSpec, OriginalTokenIds, TokenInputError,
+    TokenVisibility,
 };
 use std::sync::Arc;
 

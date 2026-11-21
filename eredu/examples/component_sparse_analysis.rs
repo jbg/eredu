@@ -125,8 +125,11 @@ pub fn retention_allowance(
 /// Reconstructs the final prefill position. LFM2's released equation rounds each
 /// expert projection and weighted result to BF16, then adds by expert identity.
 /// The signed real-valued sum remains separate from these physical roundings.
-pub fn reconstruct<B: ParameterBackend>(
-    model: &mut LoadedModel<B>,
+pub fn reconstruct<
+    B: eredu_core::TextGenerationBackend,
+    S: eredu_core::TextExecutionSession<B> + ParameterSession<B>,
+>(
+    model: &mut LoadedModel<B, S>,
     graph: &ArchitectureDescriptor,
     selected: &[Value],
     step: &Value,

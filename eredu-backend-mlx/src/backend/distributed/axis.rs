@@ -8,7 +8,7 @@ pub fn all_gather_axis(
     stream: impl AsRef<Stream>,
 ) -> Result<Array, Exception> {
     all_gather_axis_for(
-        eredu_runtime::CommunicationOperation::AllGatherEven,
+        eredu_core::communication::CommunicationOperation::AllGatherEven,
         input,
         axis,
         group,
@@ -17,7 +17,7 @@ pub fn all_gather_axis(
 }
 
 fn all_gather_axis_for(
-    operation: eredu_runtime::CommunicationOperation,
+    operation: eredu_core::communication::CommunicationOperation,
     input: &Array,
     axis: i32,
     group: &Group,
@@ -102,19 +102,19 @@ fn all_gather_axis_unchecked(
     concatenate_axis(&shard_refs, axis, stream)
 }
 
-/// Gathers unequal contiguous shards along an arbitrary tensor axis.
-pub fn all_gather_uneven_axis(
+struct UnevenAxisLayout {
+    axis: i32,
+    local_width: usize,
+    max_width: usize,
+    output_width: i32,
+}
+
+fn uneven_axis_layout(
     input: &Array,
     axis: i32,
     widths: &[usize],
     group: &Group,
-    stream: impl AsRef<Stream>,
-) -> Result<Array, Exception> {
-    let _setup = group.begin_bounded_setup()?;
-    if let Some(setup) = &_setup {
-        setup.check()?;
-    }
-    let stream = stream.as_ref();
+) -> Result<UnevenAxisLayout, Exception> {
     if widths.len() != group.size() {
         return Err(Exception::custom(format!(
             "uneven all-gather received {} widths for group size {}",
@@ -151,7 +151,7 @@ pub fn all_gather_uneven_axis(
             "uneven all-gather requires at least one non-empty shard",
         ));
     }
-    let operation = eredu_runtime::CommunicationOperation::AllGatherUneven;
+    let operation = eredu_core::communication::CommunicationOperation::AllGatherUneven;
     group.validate_tensor(operation, input, false)?;
     let output_width = widths.iter().try_fold(0usize, |total, width| {
         total
@@ -174,6 +174,46 @@ pub fn all_gather_uneven_axis(
         .checked_mul(output_width)
         .ok_or_else(|| Exception::custom("uneven all-gather output elements overflowed usize"))?;
     group.validate_expected_output(operation, input.dtype(), input.ndim(), output_elements)?;
+    let output_width = i32::try_from(output_width)
+        .map_err(|_| Exception::custom("uneven all-gather output width exceeds i32"))?;
+    Ok(UnevenAxisLayout {
+        axis,
+        local_width,
+        max_width,
+        output_width,
+    })
+}
+
+pub(crate) fn validate_uneven_axis(
+    input: &Array,
+    axis: i32,
+    widths: &[usize],
+    group: &Group,
+) -> Result<(), Exception> {
+    uneven_axis_layout(input, axis, widths, group).map(|_| ())
+}
+
+/// Gathers unequal contiguous shards along an arbitrary tensor axis.
+pub fn all_gather_uneven_axis(
+    input: &Array,
+    axis: i32,
+    widths: &[usize],
+    group: &Group,
+    stream: impl AsRef<Stream>,
+) -> Result<Array, Exception> {
+    let started = std::time::Instant::now();
+    let _setup = group.begin_bounded_setup()?;
+    if let Some(setup) = &_setup {
+        setup.check()?;
+    }
+    let stream = stream.as_ref();
+    let UnevenAxisLayout {
+        axis,
+        local_width,
+        max_width,
+        output_width,
+    } = uneven_axis_layout(input, axis, widths, group)?;
+    let operation = eredu_core::communication::CommunicationOperation::AllGatherUneven;
     let padded = if local_width == max_width {
         input.clone()
     } else {
@@ -205,10 +245,10 @@ pub fn all_gather_uneven_axis(
     }
     let shard_refs = shards.iter().collect::<Vec<_>>();
     let output = concatenate_axis(&shard_refs, axis, stream)?;
+    group.finish_coordinated_output(operation, &output, stream, started)?;
     group.validate_tensor(operation, &output, true)?;
     let mut expected = input.shape().to_vec();
-    expected[axis as usize] = i32::try_from(output_width)
-        .map_err(|_| Exception::custom("uneven all-gather output width exceeds i32"))?;
+    expected[axis as usize] = output_width;
     if output.shape() != expected {
         return Err(Exception::custom(format!(
             "uneven all-gather completed with shape {:?}, expected {expected:?}",

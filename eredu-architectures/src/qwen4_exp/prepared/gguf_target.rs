@@ -3,7 +3,8 @@ use super::target_preparation::validate_row_requests;
 use super::*;
 use crate::routed_text::SelectedRoutedTextRealization;
 use checkpoint::gguf_text::GgufTextPlan;
-use eredu_runtime::{AppendStreamBinding, ReplicatedTextPhysicalSource, SelectedRowLookupPlans};
+use eredu_core::cache::append_stream::AppendStreamBinding;
+use eredu_runtime::{ReplicatedTextPhysicalSource, SelectedRowLookupPlans};
 
 /// Complete published GGUF text header contract. The pinned exporter omits MTP
 /// and supplies vision separately; optional prediction uses independent SafeTensors headers.

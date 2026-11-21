@@ -188,6 +188,17 @@ impl PromptCacheDescriptor {
     pub fn layer_prefix_offsets(&self) -> &[i32] {
         &self.layer_prefix_offsets
     }
+    /// Absolute processed-token frontiers for the layers owned by this rank.
+    pub fn layer_frontiers(&self, prefix_tokens: usize) -> Result<Vec<i32>, PromptCacheError> {
+        self.layer_prefix_offsets()
+            .iter()
+            .map(|&offset| {
+                i32::try_from(layer_prefix_tokens(prefix_tokens, offset)?).map_err(|_| {
+                    PromptCacheError::Malformed("cache layer frontier exceeds i32".into())
+                })
+            })
+            .collect()
+    }
     /// Named state-layout ranges.
     pub fn state_segments(&self) -> &[PromptCacheStateSegment] {
         &self.state_segments

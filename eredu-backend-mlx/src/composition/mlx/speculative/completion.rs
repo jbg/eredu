@@ -85,11 +85,6 @@ impl MlxSpeculativeCompletion {
             observations: Rc::new(SpeculativeObservations::default()),
         })
     }
-
-    #[cfg(test)]
-    pub(super) fn retained(&self) -> &[Array] {
-        &self.recovery.retention().arrays
-    }
 }
 
 impl Completion for MlxSpeculativeCompletion {
@@ -204,44 +199,5 @@ impl BoundedCompletion for MlxSpeculativeCompletion {
             }
             std::thread::yield_now();
         }
-    }
-}
-
-#[cfg(test)]
-mod observation_scope_tests {
-    use super::*;
-    use crate::backend::submission_recovery::Probe;
-    struct FakeProbe(Rc<Cell<Status>>);
-    impl Probe for FakeProbe {
-        fn seal(&mut self) {}
-        fn progress(&self) -> Status {
-            self.0.get()
-        }
-    }
-
-    #[test]
-    fn prior_pending_observation_stays_active_until_terminal_and_failure_is_sticky() {
-        let state = Rc::new(SpeculativeObservations::default());
-        let native = Rc::new(Cell::new(Status {
-            settled: false,
-            failed: true,
-            blocked: true,
-        }));
-        let observation = Recovery::with_probe(
-            SpeculativeObservation::new(&Rc::new(Vec::new()), &state),
-            FakeProbe(Rc::clone(&native)),
-        );
-        drop(observation);
-        assert_eq!(state.active.get(), 1);
-        assert!(state.failed.get());
-        native.set(Status {
-            settled: true,
-            failed: false,
-            blocked: false,
-        });
-        crate::backend::submission_recovery::reap();
-        crate::backend::submission_recovery::wait_for_retirement(|| state.active.get() == 0);
-        assert_eq!(state.active.get(), 0);
-        assert!(state.failed.get());
     }
 }

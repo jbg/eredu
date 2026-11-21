@@ -28,7 +28,7 @@ fn main() -> anyhow::Result<()> {
     let execution = ExecutionPlan::fully_resident(eredu_core::DevicePlan::new("mlx", "cpu:0")?)
         .with_required_session_capabilities(SessionCapabilities::new(true, true, true));
     let (mut model, _) =
-        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), path, &execution)?
+        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), path, &execution, None)?
             .into_parts();
     let discovery = model.intervention_discovery()?;
     eprintln!("{}", serde_json::to_string_pretty(&discovery)?);

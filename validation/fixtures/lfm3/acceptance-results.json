@@ -251,7 +251,7 @@
     }
   },
   "shared_conformance": {
-    "target": "eredu-backend-mlx/tests/chunked_prefill.rs",
+    "target": "eredu/tests/chunked_prefill.rs",
     "cases": {
       "cpu_chunked_prefill_matches_full_observed_logits_and_controlled_generation": "passed",
       "metal_chunked_prefill_matches_full_observed_logits_and_controlled_generation": "passed"

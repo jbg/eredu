@@ -23,7 +23,7 @@ impl PreparedTargetPartition {
         S::LayerState: eredu_nn::AttentionCache<B::Tensor>
             + eredu_runtime::RuntimeStateComponents<B>
             + eredu_runtime::RuntimeAppendStreams<B>,
-        V: RoutedPartitionedProductionVisitor<B, S>,
+        V: RoutedPartitionedProductionVisitor<B, S, crate::SelectedRoutedBank>,
     {
         self.visit_with::<B, S, _>(context, OrdinaryFamilyRoutedPartitionVisitor(visitor))
     }
@@ -303,7 +303,7 @@ impl PreparedTargetPartition {
         self,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
         visitor: V,
-        binding: crate::prepared_execution::PredictionBinding,
+        binding: crate::prepared_execution::RetainedPredictionBinding,
     ) -> Result<V::Output, DenseDecoderPartitionedDispatchError<V::Error>>
     where
         B: eredu_nn::TensorParallelGroupedNeuralBackend
@@ -315,7 +315,7 @@ impl PreparedTargetPartition {
         S::LayerState: eredu_nn::AttentionCache<B::Tensor>
             + eredu_runtime::RuntimeStateComponents<B>
             + eredu_runtime::RuntimeAppendStreams<B>,
-        V: RoutedPartitionedProductionVisitor<B, S>,
+        V: RoutedPartitionedProductionVisitor<B, S, crate::SelectedRoutedBank>,
     {
         let prediction = self
             .prediction_weights::<B>(context)
@@ -341,7 +341,7 @@ impl PreparedTargetPartition {
                 spec,
                 layout,
                 source,
-                binding,
+                binding: binding.into_facts(),
             },
         )
         .map_err(|error| match error {
@@ -371,14 +371,14 @@ where
     S::LayerState: eredu_nn::AttentionCache<B::Tensor>
         + eredu_runtime::RuntimeStateComponents<B>
         + eredu_runtime::RuntimeAppendStreams<B>,
-    V: RoutedPartitionedProductionVisitor<B, S>,
+    V: RoutedPartitionedProductionVisitor<B, S, crate::SelectedRoutedBank>,
     P: crate::prediction_extension::PreparedRoutedPrediction<B, TargetModel<B>>,
 {
     type Output = V::Output;
     type Error = DenseDecoderPartitionedDispatchError<V::Error>;
     fn visit<G>(
         self,
-        mut prepared: PreparedRoutedPartitionedArchitecture<
+        mut prepared: AdmittedRoutedPartition<
             B,
             TargetModel<B>,
             G,
@@ -407,7 +407,12 @@ where
         }
         prepared.banks.extend(banks);
         prepared.provider_layout = Some(provider_layout);
-        self.visitor
-            .visit_prediction(prepared, self.prediction, source, self.source, self.binding)
+        self.visitor.visit_prediction(
+            prepared.into_binding(),
+            self.prediction,
+            source,
+            self.source,
+            self.binding,
+        )
     }
 }

@@ -1,7 +1,8 @@
 //! Shared-stack invocation semantics transported across pipeline cuts.
+use eredu_core::communication::BoundaryTensorDtype;
 use eredu_runtime::{
     ArchitectureBoundary, ArchitectureBoundaryError, ArchitectureBoundaryValue,
-    BoundaryTensorDimension, BoundaryTensorDtype, BoundaryTensorSpec,
+    BoundaryTensorDimension, BoundaryTensorSpec,
 };
 
 /// Invocation phase and authoritative rotary frontier, encoded as two I32 values.

@@ -6,6 +6,10 @@ use eredu_core::{
     BoundedCompletion, SpeculativeCommit, SpeculativeExecutor, SpeculativePrefill, Submission,
 };
 
+use eredu_runtime::speculative::{
+    external_assistant_input_identity, ExternalAssistantPrompt, ExternalAssistantTarget,
+};
+
 use super::{
     assistant::integration::{MuseAssistantConfig, MuseAssistantProposal},
     DFlashContext,
@@ -26,7 +30,7 @@ pub struct ArchitectureExternalMechanisms<M>(PhantomData<fn() -> M>);
 
 impl<M> ExternalMechanisms for ArchitectureExternalMechanisms<M>
 where
-    M: ExternalAssistantExecutionMechanisms<MuseAssistantArchitecture> + 'static,
+    M: ExternalAssistantExecutionMechanisms + 'static,
 {
     fn coordinate_speculative_step(
         local: Vec<eredu_core::SpeculativeScheduleState>,
@@ -51,10 +55,11 @@ where
         M::coordinate_decoding_control(local, context)
     }
 
-    type Target = M::Target;
-    type Assistant = M::Assistant;
+    type Target = ExternalAssistantTarget<M>;
+    type Assistant =
+        eredu_runtime::speculative::InstalledAssistantFor<M, MuseAssistantArchitecture>;
     type Capture = crate::composite_execution::ExternalPredictionCaptureRequest;
-    type Input = M::Input;
+    type Input = ExternalAssistantPrompt<M>;
     type Cache = ExternalAssistantCache<M::NativeCache>;
     type CacheCheckpoint = ExternalAssistantCacheCheckpoint<M::NativeCacheCheckpoint>;
     type Tensor = M::Tensor;
@@ -64,6 +69,16 @@ where
     type Completion = M::Completion;
     type Telemetry = M::Telemetry;
     type Error = M::Error;
+
+    fn create_cache(
+        target: &mut Self::Target,
+        selected: &eredu_runtime::SelectedSpeculativeRealization,
+    ) -> Result<Self::Cache, Self::Error> {
+        Ok(ExternalAssistantCache::new(
+            M::new_target_cache(target)?,
+            selected.clone(),
+        ))
+    }
 
     fn control_logits_estimate(
         logits: &Self::Logits,
@@ -79,7 +94,10 @@ where
         eredu_core::residency::ExecutionConversionRetentionTrimReport,
         eredu_core::residency::ParameterConversionTrimError,
     > {
-        M::trim_parameter_conversions(target, assistant)
+        eredu_runtime::speculative::trim_external_assistant_conversions::<
+            M,
+            MuseAssistantArchitecture,
+        >(target, assistant)
     }
 
     fn parameter_conversion_retention(
@@ -89,7 +107,10 @@ where
         Option<eredu_core::residency::ExecutionConversionRetentionReport>,
         eredu_core::BackendFailure,
     > {
-        M::parameter_conversion_retention(target, assistant)
+        eredu_runtime::speculative::external_assistant_conversion_retention::<
+            M,
+            MuseAssistantArchitecture,
+        >(target, assistant)
     }
 
     fn target_memory_observation(
@@ -109,7 +130,7 @@ where
         Option<eredu_core::speculative::SpeculativeParameterMemoryObservation>,
         eredu_core::BackendFailure,
     > {
-        M::assistant_memory_observation(assistant)
+        assistant.parameter_memory_observation::<M::Memory>()
     }
 
     fn tensor_backing_bytes(
@@ -119,19 +140,19 @@ where
     }
 
     fn proposal_layout(assistant: &Self::Assistant) -> super::assistant::ProposalLayout {
-        M::config(assistant).proposal_layout()
+        assistant.config.proposal_layout()
     }
 
     fn max_proposals(assistant: &Self::Assistant) -> usize {
-        M::config(assistant).proposal_capacity()
+        assistant.config.proposal_capacity()
     }
 
     fn mask_token(assistant: &Self::Assistant) -> u32 {
-        M::config(assistant).mask_token_id()
+        assistant.config.mask_token_id()
     }
 
     fn sliding_window(assistant: &Self::Assistant) -> i32 {
-        M::config(assistant).sliding_window()
+        assistant.config.sliding_window()
     }
 
     fn empty_input() -> Self::Error {
@@ -167,7 +188,7 @@ where
         path: &str,
         value: Self::Logits,
     ) -> Result<Self::Logits, Self::Error> {
-        M::observe_logits(assistant, path, value)
+        assistant.observers.observe_logits(path, &value)
     }
 
     fn observe_output(
@@ -176,7 +197,9 @@ where
         output: &mut ExternalTargetOutput<Self::Tensor>,
         logits_path: &str,
     ) -> Result<(), Self::Error> {
-        output.logits = M::observe_tensor(assistant, logits_path, output.logits.clone())?;
+        output.logits = assistant
+            .observers
+            .observe_tensor(logits_path, &output.logits.clone())?;
         Ok(())
     }
 
@@ -192,7 +215,7 @@ where
         cache: &mut Self::Cache,
     ) -> Result<(), Self::Error> {
         cache
-            .bind_prepared_input_cache_identity(&M::prepared_input_cache_identity(input)?)
+            .bind_prepared_input_cache_identity(external_assistant_input_identity::<M>(input)?)
             .map_err(M::error)
     }
 
@@ -205,7 +228,7 @@ where
         context: Self::Context<'a>,
     ) -> Result<ExternalTargetOutput<Self::Tensor>, Self::Error> {
         let (logits, mut capture) =
-            M::prefill_target_native(target, request, input, cache.native_mut(), context)?;
+            M::prefill_target(target, request, input, cache.native_mut(), context)?;
         cache
             .advance_frontier(M::native_cache_len(cache.native())?)
             .map_err(M::error)?;
@@ -222,7 +245,7 @@ where
         context: Self::Context<'a>,
     ) -> Result<ExternalTargetOutput<Self::Tensor>, Self::Error> {
         let (logits, mut capture) =
-            M::verify_target_native(target, request, tokens, cache.native_mut(), context)?;
+            M::verify_target(target, request, tokens, cache.native_mut(), context)?;
         cache
             .advance_frontier(M::native_cache_len(cache.native())?)
             .map_err(M::error)?;
@@ -314,7 +337,8 @@ where
         last_token: u32,
         context: Self::Context<'a>,
     ) -> Result<Self::Logits, Self::Error> {
-        let result = M::module(assistant)
+        let result = assistant
+            .module
             .proposal_row(
                 value,
                 row,
@@ -323,7 +347,9 @@ where
             )
             .map_err(M::neural_error)?;
         if let Some(confidence) = result.confidence {
-            M::observe_tensor(assistant, "external_assistant.confidence", confidence)?;
+            assistant
+                .observers
+                .observe_tensor("external_assistant.confidence", &confidence)?;
         }
         Ok(M::into_logits(result.logits))
     }
@@ -363,7 +389,8 @@ where
         states: &[Self::Tensor],
         context: Self::Context<'a>,
     ) -> Result<Self::Tensor, Self::Error> {
-        M::module(assistant)
+        assistant
+            .module
             .assemble_target_states(
                 states,
                 M::neural_context(context, ExternalAssistantTensorPlacement::Draft),
@@ -378,7 +405,8 @@ where
         absolute_end: i32,
         context: Self::Context<'a>,
     ) -> Result<DFlashContext<Self::Tensor>, Self::Error> {
-        M::module(assistant)
+        assistant
+            .module
             .update_context(
                 previous,
                 pending,
@@ -395,11 +423,8 @@ where
         context: Self::Context<'a>,
     ) -> Result<Self::Tensor, Self::Error> {
         let ids = M::target_tokens(ids, context)?;
-        let embeddings = M::target_operation(
-            target,
-            M::config(assistant).embedding_operation(&ids),
-            context,
-        )?;
+        let embeddings =
+            M::target_operation(target, assistant.config.embedding_operation(&ids), context)?;
         M::transfer(
             &embeddings,
             ExternalAssistantTransfer::TargetToDraft,
@@ -414,7 +439,8 @@ where
         absolute_end: i32,
         context: Self::Context<'a>,
     ) -> Result<Self::Tensor, Self::Error> {
-        let requirements = M::module(assistant)
+        let requirements = assistant
+            .module
             .definition()
             .tensor_parallel_requirements()
             .map_err(M::neural_error)?;
@@ -423,7 +449,8 @@ where
             .map(|requirements| M::assistant_parallel_context(context, requirements))
             .transpose()?
             .flatten();
-        M::module(assistant)
+        assistant
+            .module
             .proposal_states_selected(
                 embeddings,
                 committed,
@@ -440,16 +467,17 @@ where
         states: &Self::Tensor,
         context: Self::Context<'a>,
     ) -> Result<Self::Proposal, Self::Error> {
-        let vocabulary = match M::config(assistant) {
+        let vocabulary = match &assistant.config {
             MuseAssistantConfig::Spark(c) => i32::try_from(c.released().vocabulary_size())
                 .map_err(|_| M::error("Muse vocabulary exceeds i32".into()))?,
             MuseAssistantConfig::Glimmer(_) => 0,
         };
         // Transfer only when the architecture declares a target-owned head.
-        let projected = if M::module(assistant).target_projection(states).is_some() {
+        let projected = if assistant.module.target_projection(states).is_some() {
             let target_states =
                 M::transfer(states, ExternalAssistantTransfer::DraftToTarget, context)?;
-            let operation = M::module(assistant)
+            let operation = assistant
+                .module
                 .target_projection(&target_states)
                 .ok_or_else(|| M::error("Muse target projection contract changed".into()))?;
             let projected = M::target_operation(target, operation, context)?;
@@ -461,7 +489,8 @@ where
         } else {
             None
         };
-        M::module(assistant)
+        assistant
+            .module
             .prepare_proposal(
                 states,
                 projected.as_ref(),
@@ -485,14 +514,14 @@ where
 }
 
 fn observe_capture<M>(
-    assistant: &mut M::Assistant,
+    assistant: &mut eredu_runtime::speculative::InstalledAssistantFor<M, MuseAssistantArchitecture>,
     cache: &ExternalAssistantCache<M::NativeCache>,
     capture: &mut ExternalPredictionTargetCapture<M::Tensor>,
 ) -> Result<(), M::Error>
 where
-    M: ExternalAssistantExecutionMechanisms<MuseAssistantArchitecture>,
+    M: ExternalAssistantExecutionMechanisms,
 {
-    let ExternalPredictionTargetCapture::Muse { target_states } = capture else {
+    let ExternalPredictionTargetCapture::OrderedLayerOutputs { target_states } = capture else {
         return Err(M::error(
             "Muse target returned a different assistant capture".into(),
         ));
@@ -506,7 +535,7 @@ where
         )));
     }
     for (path, state) in paths.into_iter().zip(target_states) {
-        *state = M::observe_tensor(assistant, path, state.clone())?;
+        *state = assistant.observers.observe_tensor(path, &state.clone())?;
     }
     Ok(())
 }
@@ -516,7 +545,7 @@ fn validate_output_capture<M>(
     output: &ExternalTargetOutput<M::Tensor>,
 ) -> Result<(), M::Error>
 where
-    M: ExternalAssistantExecutionMechanisms<MuseAssistantArchitecture>,
+    M: ExternalAssistantExecutionMechanisms,
 {
     let shapes = output
         .target_states
@@ -531,9 +560,9 @@ fn target_output<M>(
     capture: ExternalPredictionTargetCapture<M::Tensor>,
 ) -> Result<ExternalTargetOutput<M::Tensor>, M::Error>
 where
-    M: ExternalAssistantExecutionMechanisms<MuseAssistantArchitecture>,
+    M: ExternalAssistantExecutionMechanisms,
 {
-    let ExternalPredictionTargetCapture::Muse { target_states } = capture else {
+    let ExternalPredictionTargetCapture::OrderedLayerOutputs { target_states } = capture else {
         return Err(M::error(
             "Muse target returned a different assistant capture".into(),
         ));
@@ -687,6 +716,12 @@ pub trait ExternalMechanisms: 'static {
     type Input;
     /// Complete target cache.
     type Cache;
+
+    /// Provisions one cache for the selected target and assistant.
+    fn create_cache(
+        target: &mut Self::Target,
+        selected: &eredu_runtime::SelectedSpeculativeRealization,
+    ) -> Result<Self::Cache, Self::Error>;
     /// Exact target checkpoint.
     type CacheCheckpoint;
     /// Retained native tensor.
@@ -964,6 +999,22 @@ pub struct ExternalExecutor<'a, M: ExternalMechanisms> {
     assistant: &'a mut M::Assistant,
     capture: M::Capture,
     _mechanisms: PhantomData<fn() -> M>,
+}
+
+impl<M: ExternalMechanisms>
+    eredu_core::speculative::SpeculativeCacheFactory<eredu_runtime::SelectedSpeculativeRealization>
+    for ExternalExecutor<'_, M>
+{
+    fn create_cache<'context>(
+        &mut self,
+        selected: &eredu_runtime::SelectedSpeculativeRealization,
+        _: Self::Context<'context>,
+    ) -> Result<Self::Cache, Self::Error>
+    where
+        Self: 'context,
+    {
+        M::create_cache(self.target, selected)
+    }
 }
 
 impl<'a, M: ExternalMechanisms> ExternalExecutor<'a, M> {

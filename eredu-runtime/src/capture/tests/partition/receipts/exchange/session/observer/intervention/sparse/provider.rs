@@ -51,7 +51,13 @@ fn speculative_partition_provider_retains_sparse_edits_and_native_failures() {
                     scope.spawn(move || {
                         let identity = crate::establish_communication_session(
                             &Bootstrap(transport(setup, rank, Fault::None)),
-                            &crate::CommunicationManifest::new(9, rank, vec![], vec![]).unwrap(),
+                            &eredu_core::communication::CommunicationManifest::new(
+                                9,
+                                rank,
+                                vec![],
+                                vec![],
+                            )
+                            .unwrap(),
                             Some([rank as u8 + 1; 32]),
                         )
                         .unwrap()

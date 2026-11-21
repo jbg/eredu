@@ -12,6 +12,7 @@ pub struct RetainedCacheShard {
     file: Mutex<Box<dyn eredu_core::cache::PromptCacheReader>>,
     metadata: safetensors::tensor::Metadata,
     data_start: u64,
+    expected_digest: Option<String>,
 }
 
 #[cfg(test)]
@@ -140,6 +141,53 @@ mod tests {
     }
 }
 
+/// Reads a bounded live spill into exactly two backend-allocated host buffers.
+pub(crate) fn read_live_cache_block<N: eredu_core::cache::mechanisms::CacheHostBuffer>(
+    path: &Path,
+    payload_bytes: u64,
+    destinations: [(&str, &[usize], eredu_checkpoint::StoredDtype); 2],
+) -> Result<[N::Buffer; 2], eredu_core::BackendFailure> {
+    use eredu_checkpoint::store::stored_dtype_from_safetensors;
+    use eredu_core::BackendFailure;
+
+    let source =
+        RetainedCacheShard::open(path, payload_bytes).map_err(BackendFailure::from_error)?;
+    let [(first_name, first_shape, first_dtype), (second_name, second_shape, second_dtype)] =
+        destinations;
+    if source.metadata().tensors().len() != 2 || first_name == second_name {
+        return Err(BackendFailure::from_error(malformed(
+            path,
+            "expected two distinct arrays",
+        )));
+    }
+    for (name, shape, dtype) in [
+        (first_name, first_shape, &first_dtype),
+        (second_name, second_shape, &second_dtype),
+    ] {
+        let info = source.metadata().info(name).ok_or_else(|| {
+            BackendFailure::from_error(malformed(path, format!("missing array {name}")))
+        })?;
+        if info.shape != shape || stored_dtype_from_safetensors(info.dtype) != *dtype {
+            return Err(BackendFailure::from_error(malformed(
+                path,
+                format!("array {name} does not match admitted cache layout"),
+            )));
+        }
+    }
+    let mut first = N::allocate(first_shape, first_dtype)?;
+    let mut second = N::allocate(second_shape, second_dtype)?;
+    source
+        .read_into(
+            &mut [
+                (first_name, N::bytes_mut(&mut first)?),
+                (second_name, N::bytes_mut(&mut second)?),
+            ],
+            None,
+        )
+        .map_err(BackendFailure::from_error)?;
+    Ok([first, second])
+}
+
 impl RetainedCacheShard {
     /// Opens bounded metadata and checks the exact admitted payload length.
     pub fn open(path: &Path, payload_bytes: u64) -> Result<Self, PromptCachePersistenceError> {
@@ -161,6 +209,7 @@ impl RetainedCacheShard {
             file: Mutex::new(Box::new(file)),
             metadata,
             data_start,
+            expected_digest: None,
         })
     }
 
@@ -183,6 +232,7 @@ impl RetainedCacheShard {
             file: Mutex::new(reader),
             metadata,
             data_start,
+            expected_digest: None,
         })
     }
 
@@ -192,7 +242,7 @@ impl RetainedCacheShard {
         reader: Box<dyn eredu_core::cache::PromptCacheReader>,
         block: &PromptCacheBlock,
     ) -> Result<Self, PromptCachePersistenceError> {
-        let source = Self::from_reader(name, reader, block.logical_bytes)?;
+        let mut source = Self::from_reader(name, reader, block.logical_bytes)?;
         validate_block_metadata(
             name,
             block,
@@ -200,6 +250,7 @@ impl RetainedCacheShard {
             source.data_start + source.metadata.data_len() as u64,
             source.data_start,
         )?;
+        source.expected_digest = Some(block.payload_sha256.clone());
         Ok(source)
     }
     /// Validates fixed-state declarations against the reader used for payload reads.
@@ -208,7 +259,7 @@ impl RetainedCacheShard {
         reader: Box<dyn eredu_core::cache::PromptCacheReader>,
         state: &PromptCacheStateTensor,
     ) -> Result<Self, PromptCachePersistenceError> {
-        let source = Self::from_reader(name, reader, state.logical_bytes)?;
+        let mut source = Self::from_reader(name, reader, state.logical_bytes)?;
         validate_state_metadata(
             name,
             state,
@@ -216,6 +267,7 @@ impl RetainedCacheShard {
             source.data_start + source.metadata.data_len() as u64,
             source.data_start,
         )?;
+        source.expected_digest = Some(state.payload_sha256.clone());
         Ok(source)
     }
 
@@ -225,7 +277,7 @@ impl RetainedCacheShard {
         path: &Path,
         block: &PromptCacheBlock,
     ) -> Result<Self, PromptCachePersistenceError> {
-        let source = Self::open(path, block.logical_bytes)?;
+        let mut source = Self::open(path, block.logical_bytes)?;
         validate_block_metadata(
             path,
             block,
@@ -233,6 +285,7 @@ impl RetainedCacheShard {
             source.data_start + source.metadata.data_len() as u64,
             source.data_start,
         )?;
+        source.expected_digest = Some(block.payload_sha256.clone());
         Ok(source)
     }
 
@@ -311,5 +364,15 @@ impl std::fmt::Debug for RetainedCacheShard {
             .field("name", &self.path)
             .field("metadata", &self.metadata)
             .finish_non_exhaustive()
+    }
+}
+
+impl eredu_core::cache::mechanisms::PromptCacheShardPayload for RetainedCacheShard {
+    fn read_into(
+        &self,
+        destinations: &mut [(&str, &mut [u8])],
+    ) -> Result<(), eredu_core::BackendFailure> {
+        self.read_into(destinations, self.expected_digest.as_deref())
+            .map_err(eredu_core::BackendFailure::from_error)
     }
 }

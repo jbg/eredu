@@ -1,5 +1,7 @@
 //! Portable construction and scheduling of categorical realtime execution.
 
+use eredu_core::realtime_mechanisms::CategoricalRealtimeNative;
+use eredu_core::realtime_mechanisms::RealtimeStartupMechanisms;
 use std::{rc::Rc, time::Instant};
 
 use eredu_architectures::moshi::{
@@ -10,40 +12,40 @@ use eredu_core::{
     BackendFailure,
 };
 use eredu_runtime::{
-    CategoricalRealtimeMechanisms, GenerationSampler, RealtimePayloadState,
-    RealtimeStartupMechanisms,
+    CategoricalRealtimeExecution, CategoricalRealtimeStateFor, GenerationSampler,
+    RealtimePayloadState,
 };
 
 use super::*;
 
 type NativeTensor<M> =
-    <<M as CategoricalRealtimeMechanisms>::Neural as eredu_nn::NeuralBackend>::Tensor;
+    <<M as eredu_core::realtime_mechanisms::CategoricalRealtimeNative>::Neural as eredu_nn::NeuralBackend>::Tensor;
 
 type CategoricalScheduler<M> = RealtimeSessionScheduler<
     RealtimeInputFrame,
-    RealtimePayloadState<<M as CategoricalRealtimeMechanisms>::State, NativeTensor<M>>,
+    RealtimePayloadState<CategoricalRealtimeStateFor<M>, NativeTensor<M>>,
     RealtimeFrameScheduleState,
     RealtimeSampling,
     GenerationSampler,
     <M as RealtimeStartupMechanisms>::Random,
     <M as RealtimeStartupMechanisms>::Completion,
-    <M as CategoricalRealtimeMechanisms>::Frame<MoshiRealtimeOutputProjection>,
+    eredu_runtime::CategoricalRealtimeFrame<M, MoshiRealtimeOutputProjection>,
 >;
 
-pub(super) fn bind_categorical<M: CategoricalRealtimeMechanisms>(
+pub(super) fn bind_categorical<M: CategoricalRealtimeNative>(
     selected: PreparedMoshiRealtimeSource,
     mechanisms: M,
 ) -> Result<Box<dyn CategoricalRealtimeModel>, BackendFailure> {
-    let model = mechanisms.bind(selected)?;
+    let model = eredu_runtime::bind_prepared_realtime(&mechanisms, selected, None)?;
     Ok(Box::new(Rc::new(CategoricalModel { mechanisms, model })))
 }
 
-struct CategoricalModel<M: CategoricalRealtimeMechanisms> {
+struct CategoricalModel<M: CategoricalRealtimeNative> {
     mechanisms: M,
-    model: MoshiRealtimeExecution<M::Execution>,
+    model: MoshiRealtimeExecution<CategoricalRealtimeExecution<M>>,
 }
 
-impl<M: CategoricalRealtimeMechanisms> CategoricalRealtimeModel for Rc<CategoricalModel<M>> {
+impl<M: CategoricalRealtimeNative> CategoricalRealtimeModel for Rc<CategoricalModel<M>> {
     fn frame_schedule(&self) -> &RealtimeSpeechConfig {
         self.model.execution_config().frame_schedule()
     }
@@ -58,7 +60,9 @@ impl<M: CategoricalRealtimeMechanisms> CategoricalRealtimeModel for Rc<Categoric
             RealtimeModelSessionIdentity::from_selected(self.model.selected()),
             limits,
         )?;
-        self.mechanisms.validate_execution(self.model.executor())?;
+        self.model.executor().require_healthy()?;
+        self.mechanisms
+            .validate_execution(self.model.executor().queue())?;
         let state = self
             .model
             .initialize_generation(&self.mechanisms, sampling)
@@ -72,13 +76,13 @@ impl<M: CategoricalRealtimeMechanisms> CategoricalRealtimeModel for Rc<Categoric
     }
 }
 
-struct CategoricalSession<M: CategoricalRealtimeMechanisms> {
+struct CategoricalSession<M: CategoricalRealtimeNative> {
     model: Rc<CategoricalModel<M>>,
     scheduler: CategoricalScheduler<M>,
     request: RequestId,
 }
 
-impl<M: CategoricalRealtimeMechanisms> CategoricalRealtimeSession for CategoricalSession<M> {
+impl<M: CategoricalRealtimeNative> CategoricalRealtimeSession for CategoricalSession<M> {
     fn enqueue(&mut self, frame: RealtimeInputFrame) -> Result<WorkId, SchedulerError> {
         self.scheduler.enqueue(self.request, frame)
     }
@@ -90,16 +94,26 @@ impl<M: CategoricalRealtimeMechanisms> CategoricalRealtimeSession for Categorica
                 .prepare_frame()
                 .map_err(std::io::Error::other)
                 .map_err(BackendFailure::from_error)?;
-            self.model
-                .mechanisms
-                .submit(model.executor(), plan, input, branch)
+            eredu_runtime::submit_categorical_realtime_frame(
+                &self.model.mechanisms,
+                model.executor(),
+                plan,
+                input,
+                branch,
+            )
         })?;
         Ok(CategoricalRealtimeProgress {
             newly_submitted: progress.newly_submitted,
             committed: progress
                 .committed
                 .into_iter()
-                .map(|(work, input, frame)| (work, input, M::into_host_output(frame)))
+                .map(|(work, input, frame)| {
+                    (
+                        work,
+                        input,
+                        frame.into_host_output().map_err(BackendFailure::from_error),
+                    )
+                })
                 .collect(),
             failed: progress.failed,
         })

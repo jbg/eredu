@@ -14,7 +14,26 @@ use std::{
     time::Duration,
 };
 
+mod addressable;
+pub use addressable::{AddressableStorageCapabilities, AddressableStorageTiers};
+/// Atomic payload admission and publication claims for native parameter conversions.
+pub mod conversion_claim;
 mod conversion_retention;
+/// Physical observations and exact transfer operations for resident weights.
+pub mod observations;
+/// Exact physical checkpoint bindings and local aliases for materialization.
+pub mod parameter_binding;
+/// Exact native storage facts for dense projection mechanisms.
+pub mod projection;
+mod storage;
+pub use storage::{
+    RealizedResidency, RealizedResidencyCopy, ResidencyCopyRequest, ResidencyCopyScope,
+    ResidencyStorage, ResidencyStorageMechanisms, ResidencyTransferOrdering, ResidentBindingAlias,
+};
+mod lease;
+pub use lease::{
+    ResidencyLease, ResidencyLeaseOwner, ResidencyLeaseStorage, ResidencyTransferTicket,
+};
 mod prefetch;
 mod ranges;
 pub use ranges::OffloadUnitRange;
@@ -28,6 +47,28 @@ pub use conversion_retention::{
     ParameterConversionRetentionTrimReport, ParameterConversionRetentionTrimmer,
     ParameterConversionRetentionUsage, ParameterConversionTrimError,
 };
+
+/// Exact binding and conversion identities available to native storage observation.
+pub struct ResidencyObservationBindings<'a> {
+    /// Prepared physical catalog, including any materialized compact members.
+    pub units: &'a BTreeMap<OffloadUnitId, parameter_binding::OffloadUnit>,
+    /// Selected shared conversion group identity, when available.
+    pub retention_group: Option<&'a ParameterConversionRetentionGroup>,
+    /// Whether the selected plan admits observations of projection backing conversions.
+    pub projection_storage_eligible: bool,
+}
+
+impl ResidencyObservationBindings<'_> {
+    /// Returns the declared logical target for an exact installed unit binding.
+    pub fn logical_target(&self, unit: &OffloadUnitId, name: &str) -> Option<&str> {
+        self.units
+            .get(unit)?
+            .bindings()
+            .iter()
+            .find(|binding| binding.name() == name)?
+            .logical_target()
+    }
+}
 
 pub use prefetch::{
     BackgroundPrefetchReport, PrefetchAdmission, PrefetchCompletion, PrefetchDemandObservation,
@@ -1754,6 +1795,33 @@ impl ResidencyLedger {
         Ok(copy.status().expect("resident copy has status"))
     }
 
+    /// Pins a whole resident batch together, or leaves all pins and demand unchanged.
+    pub fn pin_batch(
+        &mut self,
+        requests: &[(OffloadUnitId, u64)],
+        tier: MemoryTier,
+    ) -> Result<(), ResidencyLedgerError> {
+        validate_ledger_tier(tier, "pin")?;
+        let mut seen = BTreeSet::new();
+        for (id, _) in requests {
+            if !seen.insert(id) {
+                return Err(ResidencyLedgerError::DuplicateBatchUnit);
+            }
+            let status = self
+                .copy_status(id, tier)?
+                .ok_or_else(|| inconsistent(id, tier, "pin"))?;
+            if status.pins() == u64::MAX {
+                return Err(ResidencyLedgerError::ArithmeticOverflow {
+                    context: "resident lease count",
+                });
+            }
+        }
+        for (id, demand) in requests {
+            self.pin(id, tier, *demand)?;
+        }
+        Ok(())
+    }
+
     /// Releases one pin. Unknown or already released copies are ignored for drop safety.
     pub fn unpin(&mut self, id: &OffloadUnitId, tier: MemoryTier) {
         if let Some(copy) = self.units.get_mut(id).and_then(|unit| unit.copy_mut(tier)) {
@@ -2744,4 +2812,170 @@ mod tests {
             0
         );
     }
+}
+
+/// Native resource retirement for installed storage and in-flight work.
+pub trait UnitRetirement {
+    /// Failure reported by the native execution mechanisms.
+    type Error: std::error::Error + Send + Sync + From<crate::BackendFailure> + 'static;
+    /// Retains resources until native work reaches terminal evidence.
+    type RetainedResource<T: 'static>: std::ops::DerefMut<Target = T>;
+
+    /// Defers release of owned resources to a safe native retirement boundary.
+    fn retain_resource<T: 'static>(resource: T) -> Self::RetainedResource<T>;
+}
+
+/// Native transfer and completion for any portable bounded unit.
+pub trait NativeBoundedUnits: UnitRetirement {
+    /// Value supplied by the execution graph.
+    type Tensor: eredu_nn::Tensor;
+    /// Execution context for the admitted target.
+    type Context: ?Sized;
+    /// Native parameter operations for the unit.
+    type Parameters: crate::checkpoint_mechanisms::CheckpointParameterBackend<
+        Parameter = Self::Tensor,
+    >;
+    /// Unit populated under an exact native lease.
+    type Lease<U: 'static>: std::ops::DerefMut<Target = U> + 'static;
+    /// Exact native transfer holding the selected unit's parameter leases.
+    type Transfer;
+
+    /// Progresses native recovery at an ordinary host boundary.
+    fn reclaim(&mut self, inspection: bool);
+    /// Releases settled lock-taking resources.
+    fn reclaim_retired(&mut self);
+    /// Returns the admitted token width.
+    fn token_width(&self, input: &Self::Tensor) -> usize;
+    /// Reports whether a consumer and all its resources have reached completion.
+    fn is_complete<U: 'static>(&self, lease: &Self::Lease<U>) -> Result<bool, Self::Error>;
+    /// Retires one exact consumer and its transfers.
+    fn retire<U: 'static>(&mut self, lease: Self::Lease<U>) -> Result<(), Self::Error>;
+    /// Orders the consumer after its transfer and opens native completion retention.
+    fn bind_lease<U: 'static>(
+        &mut self,
+        unit: U,
+        transfer: Self::Transfer,
+        context: &Self::Context,
+    ) -> Result<Self::Lease<U>, Self::Error>;
+    /// Retains the exact device weights protected by the lease.
+    fn unit_weights<U: 'static>(lease: &mut Self::Lease<U>) -> Result<Vec<(String, <Self::Parameters as crate::checkpoint_mechanisms::CheckpointParameterBackend>::MaterializedWeight)>, Self::Error>;
+
+    /// Submits the exact output and state roots and attaches native completion.
+    fn submit<'a, U: 'static>(
+        &mut self,
+        lease: &mut Self::Lease<U>,
+        roots: impl Iterator<Item = &'a Self::Tensor>,
+    ) -> Result<(), Self::Error>
+    where
+        Self::Tensor: 'a;
+    /// Places a completion marker after an inspection's native work.
+    fn submit_inspection<U: 'static>(
+        &mut self,
+        lease: &mut Self::Lease<U>,
+        context: &Self::Context,
+    ) -> Result<(), Self::Error>;
+    /// Settles the graph's exported output.
+    fn finish_output(
+        &mut self,
+        output: &Self::Tensor,
+        context: &Self::Context,
+    ) -> Result<(), Self::Error>;
+}
+
+/// Native handles and completion for permanently retained units.
+pub trait NativeResidentUnits<B: eredu_nn::NeuralBackend, T>: UnitRetirement + Sized {
+    /// Native module used by the portable resident owner.
+    type Module<U: 'static>: std::ops::DerefMut<Target = U> + 'static;
+    /// Native handle validation and assignment primitives.
+    type Parameters: crate::checkpoint_mechanisms::CheckpointParameterBackend<Parameter = B::Tensor>;
+    /// Orders the native transfer and reports its exact number of parameter units.
+    fn order_resident_transfer(
+        transfer: &T,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<usize, Self::Error>;
+    /// Retains the materialized native values of one admitted unit.
+    fn resident_weights(transfer: &T, ordinal: usize) -> Result<Vec<(String, <Self::Parameters as crate::checkpoint_mechanisms::CheckpointParameterBackend>::MaterializedWeight)>, Self::Error>;
+    /// Prepares a native module's resource lifetime.
+    fn retain_unit<U: 'static>(unit: U) -> Self::Module<U>;
+}
+
+/// Open native scope for a parameter transfer borrowed by portable execution.
+///
+/// A dropped or failed scope must retain its resources until native completion
+/// or teardown makes release safe.
+pub trait ParameterLoan<T, C: ?Sized> {
+    /// Native indexing or completion failure.
+    type Error;
+
+    /// Gives the caller a handle to the supplied binding on its selected queue.
+    fn copy_binding(&mut self, binding: &str, context: &C) -> Result<T, Self::Error>;
+
+    /// Settles exact consumption of the loan and then releases its native pins.
+    fn finish(self, output: &T) -> Result<(), Self::Error>;
+}
+
+/// Exact native slot names and publication of already compacted parameter tensors.
+pub trait CompactGroupBindings<T> {
+    /// Returns physical binding names for this native operator.
+    fn binding_names(&self) -> Vec<String>;
+    /// Validates and binds the complete native tensor set.
+    fn bind_compact(&mut self, values: BTreeMap<String, T>) -> Result<(), eredu_nn::Error>;
+}
+
+/// Tensor access and completion for a portable addressable-bank owner.
+pub trait NativeBankMechanisms:
+    ResidencyStorageMechanisms<
+        Transfer: ResidencyTransferOrdering<
+            <<Self::Backend as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
+            Error = Self::Error,
+        >,
+    > + Clone
+    + Send
+    + Sync
+    + 'static
+{
+    /// Native neural operators used by this bank.
+    type Backend: eredu_nn::GroupedNeuralBackend;
+    /// Failures in grouped construction, tensor access or residency.
+    type BankError: std::error::Error
+        + Send
+        + Sync
+        + 'static
+        + From<Self::Error>
+        + From<crate::parameters::ParameterError>
+        + From<crate::BackendFailure>
+        + From<eredu_nn::Error>;
+    /// Native scope that retains a loan through completion of its exact use.
+    type Loan: ParameterLoan<
+        <Self::Backend as eredu_nn::NeuralBackend>::Tensor,
+        <<Self::Backend as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
+        Error = Self::BankError,
+    >;
+
+    /// Names the current host-tier capacity failure for the staging fallback.
+    fn host_capacity_exhausted(error: &Self::Error) -> bool;
+    /// Retains a handle to one exact source slot protected by this acquisition.
+    fn member(
+        transfer: &Self::Transfer,
+        index: usize,
+        name: &str,
+    ) -> Result<<Self::Backend as eredu_nn::NeuralBackend>::Tensor, Self::BankError>;
+    /// Slices one leading row from a replacement parameter.
+    fn replacement(
+        value: &<Self::Backend as eredu_nn::NeuralBackend>::Tensor,
+        row: usize,
+        context: &<<Self::Backend as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<<Self::Backend as eredu_nn::NeuralBackend>::Tensor, Self::BankError>;
+    /// Concatenates already selected rows for the compact operator.
+    fn concatenate(
+        values: &[<Self::Backend as eredu_nn::NeuralBackend>::Tensor],
+        context: &<<Self::Backend as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<<Self::Backend as eredu_nn::NeuralBackend>::Tensor, Self::BankError>;
+    /// Opens native retention for the acquired and ordered transfer.
+    fn begin_loan(transfer: Self::Transfer) -> Result<Self::Loan, Self::BankError>;
+    /// Combines completed read copies into a caller-owned tensor.
+    fn assemble_members(
+        copies: Vec<<Self::Backend as eredu_nn::NeuralBackend>::Tensor>,
+        context: &<<Self::Backend as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<<Self::Backend as eredu_nn::NeuralBackend>::Tensor, Self::BankError>;
 }

@@ -1,5 +1,6 @@
 //! Backend-neutral ownership of one rank-local architecture partition.
 
+use eredu_core::communication::{BoundaryTensorDtype, PipelineActivationDtype};
 use std::ops::Deref;
 use std::{collections::BTreeMap, collections::BTreeSet, ops::Range};
 
@@ -933,39 +934,6 @@ pub enum ArchitectureParameterError {
         /// Logical group in the ownership declaration.
         group: String,
     },
-}
-
-/// Logical scalar kind carried by one architecture-owned boundary tensor.
-///
-/// `Activation` is resolved by a concrete backend to the execution dtype
-/// selected for the surrounding pipeline activation. Integer kinds are exact.
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
-#[non_exhaustive]
-pub enum BoundaryTensorDtype {
-    /// Exact FP32 auxiliary values, independent of activation transport precision.
-    Float32,
-    /// The selected execution activation dtype.
-    Activation,
-    /// Exact unsigned 32-bit integer values.
-    Uint32,
-    /// Exact signed 32-bit integer values.
-    Int32,
-}
-
-/// Portable floating-point dtype carried between pipeline stages.
-///
-/// This is execution transport policy, not checkpoint storage metadata. A
-/// concrete backend must lower the selected dtype to its native tensor dtype
-/// and normalize outgoing activations to it before transport.
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
-#[non_exhaustive]
-pub enum PipelineActivationDtype {
-    /// IEEE 16-bit floating point.
-    Float16,
-    /// Brain 16-bit floating point.
-    Bfloat16,
-    /// IEEE 32-bit floating point.
-    Float32,
 }
 
 /// Backend-neutral wire contract shared by every stage of one pipeline.
@@ -2412,7 +2380,7 @@ impl LayeredPartitionDriver {
         executor: &B::Executor,
     ) -> Result<B::Tensor, B::CollectiveError>
     where
-        B: crate::CollectiveBackend,
+        B: eredu_core::communication::CollectiveBackend,
     {
         B::all_to_all(value, group, executor)
     }

@@ -4,13 +4,14 @@ use crate::{
     ear_encoder_layered::{EncoderForward, EncoderKernel},
     Error,
 };
+use eredu_core::communication::BoundaryTensorDtype as Dtype;
+use eredu_core::communication::CommunicationRouteId;
 use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Tensor, TensorElementType};
 use eredu_runtime::{
     ArchitectureBoundary, ArchitectureBoundaryError, ArchitectureBoundaryValue,
-    ArchitecturePartition, BoundaryTensorDimension as Dim, BoundaryTensorDtype as Dtype,
-    BoundaryTensorSpec, CommunicationRouteId, ComponentAdapter, ComponentDefinition,
-    LayeredForwardState, LayeredPartitionInput, LayeredPartitionOutput, LocalModelLayout,
-    PartitionBoundaryRoute, PartitionComponentKernel, PipelineComponentKernel,
+    ArchitecturePartition, BoundaryTensorDimension as Dim, BoundaryTensorSpec, ComponentAdapter,
+    ComponentDefinition, LayeredForwardState, LayeredPartitionInput, LayeredPartitionOutput,
+    LocalModelLayout, PartitionBoundaryRoute, PartitionComponentKernel, PipelineComponentKernel,
     ResolvedBoundaryWireSchema, StatelessComponentState,
 };
 use std::{collections::BTreeMap, ops::Range};

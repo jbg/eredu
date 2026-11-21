@@ -1,54 +1,29 @@
 //! MLX observations and plan realization for neutral automatic planning.
 
-use std::path::Path;
-
+use eredu_core::automatic::{ColdPlanPlacement, ExecutionPlanNativeFactory};
 use eredu_core::{
-    AutomaticPlanningBackend, AutomaticPlanningError, BackendFailure, BackendId,
-    BoundedResidencyRequirement, CandidateAdmission, DevicePlan, DraftPlacementPlan, DraftingPlan,
-    ExecutionPlan, ExecutionPlanBackendFactory, ExecutionPlanTarget, ExecutionPlanTargetSelection,
-    ExternalDraftArtifact, HardwareBackendProfile, HardwareDeviceProfile, HardwareMemorySemantics,
-    HardwareProfile, ModelResourceProfile, ModelRuntime, Observed, RealizedDrafting, ResidencyPlan,
-    SelectedExecutionPlanTarget, SpeculativeDraftSource, SpeculativeGenerationBackend,
+    AutomaticPlanningError, BackendFailure, BackendId, DevicePlan, DraftPlacementPlan,
+    HardwareBackendProfile, HardwareDeviceProfile, HardwareMemorySemantics, HardwareProfile,
+    Observed,
 };
 use safemlx::{Device, DeviceType, Stream};
 
 use super::{
-    capability::available_memory, inspection::MlxInspectionOptions, speculative::MlxDrafter,
-    MlxBackend, MlxLoadRequest,
+    capability::available_memory,
+    speculative::{MlxAssistantBinder, MlxDraftBinding},
+    MlxBackend,
 };
 use crate::backend::{MlxAcceleratorFamily, MlxDeviceIdentity};
-use eredu_runtime::selected_text_bounded_requirement;
-
-#[derive(Debug, Clone, Copy)]
-struct ParallelExecution {
-    request: eredu_runtime::ParallelLoadRequest,
-    backend: safemlx::distributed::Backend,
-}
 
 /// MLX automatic-planning adapter and whole-session backend factory.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MlxBackendFactory {
     sample_mlx_memory: bool,
     sample_process_memory: bool,
-    parallel: Option<ParallelExecution>,
+    world_backend: Option<safemlx::distributed::Backend>,
 }
 
-impl eredu_architectures::BackendInspection for MlxBackendFactory {
-    fn inspect_execution(
-        &self,
-        path: &std::path::Path,
-        plan: &ExecutionPlan,
-    ) -> Result<eredu_architectures::ModelInspectionOutcome, BackendFailure> {
-        let request = self
-            .load_request_for_plan(plan)
-            .map_err(BackendFailure::from_error)?;
-        crate::native::inspect_model_preparation(
-            path,
-            crate::native::MlxInspectionOptions::new(request),
-        )
-        .map_err(|error| BackendFailure::from_error(error).with_operation("model inspection"))
-    }
-
+impl eredu_core::preparation::BackendInspection for MlxBackendFactory {
     fn device_uses_host_memory(&self, device: &DevicePlan) -> Result<bool, BackendFailure> {
         self.device_uses_host_memory(device)
             .map_err(BackendFailure::from_error)
@@ -107,47 +82,15 @@ fn allocator_telemetry() -> Result<eredu_core::AllocatorTelemetry, BackendFailur
     })
 }
 
-impl eredu_architectures::decision_task::DecisionBackendFactory for MlxBackendFactory {
-    fn bind_decision(
-        &self,
-        model: eredu_architectures::decision_task::PreparedDecisionModel,
-        device: &DevicePlan,
-        residency: eredu_runtime::LayerWeightResidency,
-        synchronize_load: bool,
-    ) -> Result<
-        Box<dyn eredu_architectures::decision_task::BoundDecisionModel>,
-        eredu_architectures::decision_task::DecisionTaskError,
-    > {
-        use super::component_binding::MlxComponentBinder;
-        use crate::backend::{
-            distributed::MlxDistributedSession, nn::shared::MlxNeuralBackend,
-            runtime::cache::state::MlxHybridState, ExecutionContext,
-        };
+impl eredu_core::decision::DecisionBindingFactory for MlxBackendFactory {
+    type Binding = super::component_binding::MlxComponentBinder;
+
+    fn decision_binding(&self, device: &DevicePlan) -> Result<Self::Binding, BackendFailure> {
+        use crate::backend::ExecutionContext;
 
         let weights = ExecutionContext::cpu().map_err(BackendFailure::from_error)?;
         let execution = self.execution_context(device)?;
-        let mechanisms = MlxComponentBinder::new(weights.stream(), execution.stream());
-        #[cfg(feature = "image")]
-        let input = super::MlxMediaInputLowering;
-        #[cfg(not(feature = "image"))]
-        let input = ();
-        let bound = model.bind::<MlxNeuralBackend, MlxHybridState, _, MlxDistributedSession, _>(
-            residency,
-            &mechanisms,
-            execution.stream(),
-            input,
-        )?;
-        if synchronize_load {
-            weights
-                .stream()
-                .synchronize()
-                .map_err(BackendFailure::from_error)?;
-            execution
-                .stream()
-                .synchronize()
-                .map_err(BackendFailure::from_error)?;
-        }
-        Ok(bound)
+        Ok(Self::Binding::new(weights.stream(), execution.stream()))
     }
 }
 
@@ -183,59 +126,11 @@ impl MlxBackendFactory {
         self
     }
 
-    /// Selects the exact process rank, wire, invocation bounds and world initializer.
-    ///
-    /// The native backend choice is retained with cold target selection. Its world
-    /// is initialized strictly during realization using the launcher's environment.
-    /// No communicator, device or stream is created by this configuration.
-    pub const fn with_parallel_execution(
-        mut self,
-        request: eredu_runtime::ParallelLoadRequest,
-        backend: safemlx::distributed::Backend,
-    ) -> Self {
-        self.parallel = Some(ParallelExecution { request, backend });
+    /// Chooses the native world initializer used when a load supplies a rank.
+    /// The world is initialized during realization using the launcher's environment.
+    pub const fn with_world_backend(mut self, backend: safemlx::distributed::Backend) -> Self {
+        self.world_backend = Some(backend);
         self
-    }
-
-    /// Translates a portable execution plan into its backend load request.
-    ///
-    /// This performs no native device or stream realization and is suitable
-    /// for inspection and admission before an executable target is created.
-    pub fn load_request_for_plan(
-        &self,
-        plan: &ExecutionPlan,
-    ) -> Result<MlxLoadRequest, AutomaticPlanningError> {
-        let normalized = eredu_runtime::NormalizedLoadRequest::from_execution_plan(
-            plan,
-            eredu_runtime::ResidencyDiagnostics::new(
-                self.sample_mlx_memory,
-                self.sample_process_memory,
-            ),
-            self.parallel.map(|parallel| parallel.request),
-        )
-        .map_err(|error| AutomaticPlanningError::Invalid(error.to_string()))?;
-        let request = MlxLoadRequest::from_normalized(normalized);
-        if let Some(parallel) = self.parallel {
-            if !safemlx::distributed::is_available(parallel.backend) {
-                return Err(AutomaticPlanningError::Invalid(format!(
-                    "MLX communication backend {} is not compiled",
-                    parallel.backend.as_str(),
-                )));
-            }
-            let (family, index) = parse_mlx_device(plan.device())?;
-            request
-                .bind_parallel_device(crate::backend::DeviceAssignment::new(
-                    if family.is_some() {
-                        DeviceType::Gpu
-                    } else {
-                        DeviceType::Cpu
-                    },
-                    index as usize,
-                ))
-                .map_err(|error| planning_backend_error("bind_parallel_device", error))
-        } else {
-            Ok(request)
-        }
     }
 }
 
@@ -333,11 +228,7 @@ pub fn discover_hardware() -> HardwareProfile {
     )
 }
 
-impl AutomaticPlanningBackend for MlxBackendFactory {
-    type Inspection = eredu_core::ArtifactInspection<
-        eredu_architectures::processor_plan::ArtifactArchitecturePlan,
-    >;
-
+impl eredu_core::BackendHardware for MlxBackendFactory {
     fn backend_id(&self) -> BackendId {
         BackendId::new("mlx").expect("MLX is a valid backend identifier")
     }
@@ -345,124 +236,91 @@ impl AutomaticPlanningBackend for MlxBackendFactory {
     fn discover_hardware(&self) -> Result<HardwareProfile, AutomaticPlanningError> {
         Ok(discover_hardware())
     }
+}
 
-    fn inspect_resources(
-        &self,
-        model_path: &Path,
-    ) -> Result<(ModelResourceProfile, Self::Inspection), AutomaticPlanningError> {
-        let inspection = eredu_architectures::configuration::inspect_artifact(model_path)
-            .map_err(|error| planning_backend_error("inspect_resources", error))?;
-        let report = super::inspection::inspect_selected_artifact(
-            &inspection,
-            MlxInspectionOptions::default(),
-        );
-        Ok((report.resources, inspection))
+impl eredu_core::preparation::PlanMechanismFacts for MlxBackendFactory {
+    type Preparation = super::loading::MlxPreparationMechanisms;
+
+    fn preparation_mechanisms(&self) -> Self::Preparation {
+        super::loading::MlxPreparationMechanisms
     }
 
-    fn admit_candidate(
-        &self,
-        inspection: &Self::Inspection,
-        plan: &ExecutionPlan,
-    ) -> Result<CandidateAdmission, AutomaticPlanningError> {
-        let load = self.load_request_for_plan(plan)?;
-        match super::loading::select_preparation(inspection, load) {
-            Ok(_) => Ok(CandidateAdmission {
-                supported: true,
-                rejection: None,
-            }),
-            Err(error) => Ok(CandidateAdmission {
-                supported: false,
-                rejection: Some(error.to_string()),
-            }),
-        }
+    fn residency_diagnostics(&self) -> eredu_core::preparation::ResidencyDiagnostics {
+        eredu_core::preparation::ResidencyDiagnostics::new(
+            self.sample_mlx_memory,
+            self.sample_process_memory,
+        )
     }
 
-    fn bounded_residency_requirement(
-        &self,
-        inspection: &Self::Inspection,
-        plan: &ExecutionPlan,
-    ) -> Result<BoundedResidencyRequirement, AutomaticPlanningError> {
-        if matches!(plan.residency(), ResidencyPlan::FullyResident) {
-            return Err(AutomaticPlanningError::Invalid(
-                "fully resident execution has no bounded device window".into(),
-            ));
-        }
-        let options = self
-            .load_request_for_plan(plan)
-            .map_err(|error| planning_backend_error("bounded_residency_options", error))?;
-        let selected = super::loading::select_preparation(inspection, options)
-            .map_err(|error| planning_backend_error("select_model_preparation", error))?;
-        let (text, excluded) = selected.neutral().selected_bounded_residency();
-        selected_text_bounded_requirement(&text, &excluded)
-            .map_err(|error| planning_backend_error("selected_text_residency", error))
+    fn media_features(&self) -> eredu_core::MediaFeatureAvailability {
+        super::inspection::inspection_media_features()
     }
 }
 
-impl ExecutionPlanBackendFactory for MlxBackendFactory {
-    type Backend = MlxBackend<'static>;
-    type DrafterPreparation = eredu_architectures::ExternalDraftPreparation;
-    type SelectedDrafterPreparation = eredu_architectures::PreparedExternalDraft;
-    type Drafter = MlxDrafter;
+impl ColdPlanPlacement for MlxBackendFactory {
+    type Placement = super::loading::MlxModelPlacement;
 
-    fn select_target(
+    fn plan_placement(
         &self,
-        inspection: &eredu_core::ArtifactInspection<
-            eredu_architectures::processor_plan::ArtifactArchitecturePlan,
-        >,
-        plan: &ExecutionPlan,
-    ) -> Result<ExecutionPlanTargetSelection<Self::Backend>, AutomaticPlanningError> {
-        let options = self.load_request_for_plan(plan)?;
-        let (outcome, rank_context) = super::inspection::inspect_selected_preparation(
-            inspection.clone(),
-            &MlxInspectionOptions::new(options),
-        )
-        .map_err(|error| planning_backend_error("select_model_preparation", error))?;
-        let (report, selected) = outcome.into_parts();
-        let selected = selected.ok_or_else(|| {
+        device: &DevicePlan,
+        rank: Option<(usize, usize)>,
+    ) -> Result<Self::Placement, AutomaticPlanningError> {
+        let (family, index) = parse_mlx_device(device)?;
+        let Some((world_size, global_rank)) = rank else {
+            return Ok(Self::Placement::direct(None));
+        };
+        if !cfg!(feature = "distributed") {
+            return Err(planning_backend_error(
+                "bind_parallel_device",
+                super::Error::DistributedModelExecutionDisabled,
+            ));
+        }
+        let backend = self.world_backend.ok_or_else(|| {
             AutomaticPlanningError::Invalid(
-                report
-                    .issues
-                    .iter()
-                    .map(|issue| issue.detail.as_str())
-                    .collect::<Vec<_>>()
-                    .join("; "),
+                "parallel placement requires an MLX world initializer".into(),
             )
         })?;
-        let (_, neutral) = selected.into_parts();
-        let selected = super::loading::MlxSelectedPreparation::new(neutral, rank_context);
-        let selected = match self.parallel {
-            Some(parallel) => selected
-                .with_world_backend(parallel.backend)
-                .map_err(|error| planning_backend_error("select_world_backend", error))?,
-            None => selected,
-        };
-        let policy = selected.neutral().admission().request().policy();
-        let capabilities = selected.session_capabilities();
-        Ok(ExecutionPlanTargetSelection::new(
-            policy,
-            selected,
-            capabilities,
-            report,
-        ))
+        if !safemlx::distributed::is_available(backend) {
+            return Err(AutomaticPlanningError::Invalid(format!(
+                "MLX communication backend {} is not compiled",
+                backend.as_str(),
+            )));
+        }
+        let assignment = crate::backend::DeviceAssignment::new(
+            if family.is_some() {
+                DeviceType::Gpu
+            } else {
+                DeviceType::Cpu
+            },
+            index as usize,
+        );
+        let rank_context = crate::backend::MlxRankContext::new(world_size, global_rank, assignment)
+            .map_err(|error| planning_backend_error("bind_parallel_device", error))?;
+        Ok(Self::Placement {
+            rank_context: Some(rank_context),
+            world_backend: Some(backend),
+        })
     }
+}
 
-    fn realize_target(
+impl ExecutionPlanNativeFactory for MlxBackendFactory {
+    type Backend<D: 'static> = MlxBackend<'static, D>;
+    type AssistantBinder = MlxAssistantBinder;
+    type DraftBinding<D: 'static, P: 'static> = MlxDraftBinding<D, P>;
+
+    fn realize_placement<D: 'static>(
         &self,
-        selected: SelectedExecutionPlanTarget<Self::Backend>,
-    ) -> Result<ExecutionPlanTarget<Self::Backend>, AutomaticPlanningError> {
-        #[cfg(test)]
-        crate::tests::support::path_instrumentation::target_native_resource_realization_attempt();
-        let realized = mlx_device(selected.execution_plan().device())?;
-        let world = match selected.selected_preparation().world_backend() {
+        device: &DevicePlan,
+        placement: &super::loading::MlxModelPlacement,
+    ) -> Result<Self::Backend<D>, AutomaticPlanningError> {
+        let realized = mlx_device(device)?;
+        let world = match placement.world_backend {
             Some(backend) => {
-                let rank = selected
-                    .selected_preparation()
-                    .rank_context()
-                    .ok_or_else(|| {
-                        AutomaticPlanningError::Invalid(
-                            "selected native world has no rank authority".into(),
-                        )
-                    })?;
+                let rank = placement.rank_context.ok_or_else(|| {
+                    AutomaticPlanningError::Invalid(
+                        "selected native world has no rank authority".into(),
+                    )
+                })?;
                 let world = safemlx::distributed::init(true, backend).map_err(|error| {
                     planning_backend_error("initialize_distributed_world", error)
                 })?;
@@ -479,108 +337,39 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
             }
             None => None,
         };
-        crate::initialize_allocator_cache_policy(false)
-            .map_err(|error| planning_backend_error("initialize_allocator_cache", error))?;
         let stream = Stream::try_new_with_device(&realized.device)
             .map_err(|error| planning_backend_error("create_execution_stream", error))?;
         let weights_stream = Stream::try_new_with_device(&Device::new(DeviceType::Cpu, 0))
             .map_err(|error| planning_backend_error("create_weights_stream", error))?;
-        Ok(ExecutionPlanTarget::new(
-            MlxBackend::for_execution_plan(&stream, &weights_stream, realized.identity, world),
-            selected,
+        Ok(MlxBackend::for_execution_plan(
+            &stream,
+            &weights_stream,
+            realized.identity,
+            world,
         ))
     }
 
-    fn select_drafting(
+    fn open_draft<D: 'static, P: 'static>(
         &self,
-        plan: &ExecutionPlan,
-        target: &SelectedExecutionPlanTarget<Self::Backend>,
-        external_artifact: Option<ExternalDraftArtifact<Self::DrafterPreparation>>,
-    ) -> Result<
-        Option<ExternalDraftArtifact<Self::SelectedDrafterPreparation>>,
-        AutomaticPlanningError,
-    > {
-        let Some(artifact) = external_artifact else {
-            return Ok(None);
+        binding: eredu_core::ExternalDraftBinding<'_, Self::Backend<D>>,
+    ) -> Result<Self::DraftBinding<D, P>, AutomaticPlanningError> {
+        let (placement, backend) = binding.into_parts();
+        let draft_stream = match placement {
+            DraftPlacementPlan::Target => backend.stream().clone(),
+            DraftPlacementPlan::Device { device } => {
+                let realized = mlx_device(device)?;
+                Stream::try_new_with_device(&realized.device).map_err(|error| {
+                    planning_backend_error("create_draft_execution_stream", error)
+                })?
+            }
+            _ => {
+                return Err(AutomaticPlanningError::Invalid(
+                    "unsupported draft placement".into(),
+                ))
+            }
         };
-        eredu_architectures::prepare_execution_plan_draft(
-            plan,
-            target.inspection(),
-            target.selected_preparation().neutral(),
-            artifact,
-            &super::loading::MlxPreparationMechanisms::new(
-                &super::replicated_text::GROUPED_OPERATION_CAPABILITIES,
-            ),
-            |descriptor, transforms| {
-                if transforms && super::replicated_text::supports_transform(descriptor) {
-                    Some(eredu_runtime::WeightLoweringKind::Transform)
-                } else if !transforms && super::replicated_text::supports_direct(descriptor) {
-                    Some(eredu_runtime::WeightLoweringKind::Direct)
-                } else {
-                    None
-                }
-            },
-        )
-        .map(Some)
-    }
-
-    fn realize_drafting(
-        &self,
-        plan: &ExecutionPlan,
-        target: &ModelRuntime<Self::Backend>,
-        selected: eredu_core::SelectedExecutionPlanDrafting<Self::SelectedDrafterPreparation>,
-    ) -> Result<RealizedDrafting<MlxDrafter>, AutomaticPlanningError> {
-        let external_artifact = selected.into_external_artifact(plan, target)?;
-        match plan.drafting() {
-            DraftingPlan::Disabled => Ok(RealizedDrafting::Disabled),
-            DraftingPlan::Embedded { .. } => {
-                let capability =
-                    <MlxBackend<'static> as SpeculativeGenerationBackend>::speculative_capability(
-                        target,
-                    );
-                if !capability.is_ready_for(SpeculativeDraftSource::Embedded) {
-                    return Err(AutomaticPlanningError::Invalid(format!(
-                        "execution plan selects embedded drafting but target capability is {capability:?}"
-                    )));
-                }
-                Ok(RealizedDrafting::Embedded)
-            }
-            DraftingPlan::External { placement, .. } => {
-                let artifact = external_artifact.ok_or_else(|| {
-                    AutomaticPlanningError::Invalid(
-                        "external drafting is missing proven tokenizer compatibility".into(),
-                    )
-                })?;
-                let draft_stream = match placement {
-                    DraftPlacementPlan::Target => target.backend().stream().clone(),
-                    DraftPlacementPlan::Device { device } => {
-                        let realized = mlx_device(device)?;
-                        Stream::try_new_with_device(&realized.device).map_err(|error| {
-                            planning_backend_error("create_draft_execution_stream", error)
-                        })?
-                    }
-                    _ => {
-                        return Err(AutomaticPlanningError::Invalid(
-                            "unsupported draft placement".into(),
-                        ))
-                    }
-                };
-                let drafter = MlxDrafter::materialize(
-                    artifact.preparation,
-                    target.session(),
-                    &draft_stream,
-                    target.backend().weights_stream(),
-                )
-                .map_err(|error| planning_backend_error("realize_external_drafter", error))?;
-                draft_stream.synchronize().map_err(|error| {
-                    planning_backend_error("complete_external_drafter_load", error)
-                })?;
-                Ok(RealizedDrafting::External(drafter))
-            }
-            _ => Err(AutomaticPlanningError::Invalid(
-                "unsupported speculative drafting plan".into(),
-            )),
-        }
+        MlxDraftBinding::begin(&draft_stream, backend.weights_stream())
+            .map_err(|error| planning_backend_error("realize_external_drafter", error))
     }
 }
 
@@ -670,6 +459,3 @@ fn planning_backend_error(
         message: error.to_string(),
     }
 }
-
-#[cfg(test)]
-mod tests;

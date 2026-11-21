@@ -5,9 +5,7 @@
 //! replaced only after the complete layer transition succeeds.
 
 use eredu_core::{execution_control::SnapshotEstimate, BackendFailure};
-use eredu_runtime::execution_control::{
-    snapshot_value_estimate, SnapshotReservation, SnapshotValue,
-};
+use eredu_runtime::execution_control::{snapshot_value_estimate, SnapshotRetention, SnapshotValue};
 
 use eredu_nn::RetainedTensorRoots;
 
@@ -157,7 +155,7 @@ impl<T: SnapshotValue> SnapshotValue for ConformerState<T> {
             self.convolution.estimate_snapshot_value(),
         ])
     }
-    fn copy_snapshot_value(&self, retention: &SnapshotReservation) -> Result<Self, BackendFailure> {
+    fn copy_snapshot_value(&self, retention: &SnapshotRetention) -> Result<Self, BackendFailure> {
         Ok(Self {
             channel: self.channel.copy_snapshot_value(retention)?,
             convolution: self.convolution.copy_snapshot_value(retention)?,

@@ -25,7 +25,7 @@ export PHI4_VALIDATION=/private/tmp/eredu-phi4-validation
 python eredu-architectures/tests/fixtures/phi4/transformers_reference.py "$PHI4_VALIDATION"
 for artifact in synthetic-transformers synthetic.gguf synthetic-q8.gguf; do
   prefix="$PHI4_VALIDATION/${artifact%.*}"
-  cargo run -p eredu-backend-mlx --features accelerate --example checkpoint_probe -- \
+  cargo run -p eredu --no-default-features --features mlx,accelerate --example checkpoint_probe -- \
     --model "$PHI4_VALIDATION/$artifact" --device cpu --input-ids 1,3,2 \
     --teacher-forced-ids 4,5,6,7 --warmup-runs 0 \
     --output "$prefix-native"
@@ -97,7 +97,7 @@ PY
 Run the native probe, then the reference and comparison sequentially to bound memory use:
 
 ```sh
-cargo run --release -p eredu-backend-mlx --features accelerate --example checkpoint_probe -- \
+cargo run --release -p eredu --no-default-features --features mlx,accelerate --example checkpoint_probe -- \
   --model "$PHI4_CHECKPOINT" --device cpu --decode-steps 8 --warmup-runs 0 \
   --prompt '<|im_start|>user<|im_sep|>What is the capital of France?<|im_end|><|im_start|>assistant<|im_sep|>' \
   --output "$PHI4_VALIDATION/official-native"

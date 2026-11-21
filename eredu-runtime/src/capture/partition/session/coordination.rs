@@ -70,7 +70,7 @@ impl CaptureSession {
             .into());
         }
         transport.ensure_capture_active()?;
-        let wait = transport.capture_wait()?;
+        let wait = crate::capture::partition::capture_wait(transport)?;
         if !T::Completion::supports_cancellation(wait.cancellation()) {
             return Err(CaptureError::Unsupported(
                 "partition coordination cancellation policy".into(),
@@ -216,7 +216,7 @@ impl CaptureSession {
                         ..
                     }
                 ) {
-                    coordination.transport.fail_capture_exchange(&error);
+                    coordination.transport.fence_capture_exchange();
                 }
                 Err(error)
             }

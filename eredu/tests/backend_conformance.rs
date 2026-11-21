@@ -5,6 +5,9 @@
 //! speculative, realtime, distributed, automatic-planning, and residency
 //! realization call shapes.
 
+use eredu_core::backend::TextOperationDriver;
+use eredu_runtime::speculative::autoregressive::SpeculativeGenerationBackend;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::Write,
@@ -13,6 +16,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use eredu::runtime::speculative::SpeculativeBatchBackend;
 use eredu::{
     api::{
         GenerationRequest, LoadedModel, LoadedTextModelConfig, PreparedChatError,
@@ -33,26 +37,26 @@ use eredu_core::{
     BackendProvider, BackendSession, BoundedCompletion, BoundedCompletionOutcome,
     BoundedCompletionWait, BoundedResidencyRequirement, CacheStateStrategy, CandidateAdmission,
     CapabilityError, CollectiveGroupDescriptor, CollectiveGroupId, CollectiveScope, Completion,
-    DeviceCapabilities, DeviceDescriptor, DevicePlan, DistributedBackend, DistributedCapabilities,
-    DistributedSession, DistributedSessionDescriptor, DraftPlacementPlan, DraftingPlan,
-    EstimationCompleteness, ExecutionPlan, ExecutionPlanBackendFactory, ExecutionPlanReport,
-    ExecutionPlanTarget, ExecutionPlanTargetSelection, ExternalDraftArtifact, FinishReason,
+    DeviceCapabilities, DeviceDescriptor, DevicePlan, DistributedCapabilities,
+    DistributedModelSession, DistributedSession, DistributedSessionDescriptor, DraftPlacementPlan,
+    DraftingPlan, EstimationCompleteness, ExecutionPlan, ExecutionPlanBackendFactory,
+    ExecutionPlanReport, ExecutionPlanTargetSelection, ExternalDraftArtifact, FinishReason,
     GenerationConfigOverrides, HardwareBackendProfile, HardwareDeviceProfile,
     HardwareMemorySemantics, HardwareProfile, InputModalities, InputTokenCount, Media,
-    ModelCapabilities, ModelCapabilityBackend, ModelLoadingBackend, ModelResourceProfile,
-    ModelRuntime, MultimodalPreparationBackend, MultimodalPreparationFailure, MultimodalRequest,
+    ModelCapabilities, ModelCapabilitySession, ModelLoadingBackend, ModelResourceProfile,
+    ModelRuntime, MultimodalPreparationFailure, MultimodalPreparationSession, MultimodalRequest,
     MultimodalSegment, ObservationSet, ObservationValue, Observed, PhysicalMemorySemantics,
     PreparedModel, PreparedSpeculativeLane, RealizedDrafting, ResidencyPlan, RgbImage,
     RuntimeStateEstimate, SamplingPlacement, SelectedExecutionPlanTarget, SemanticEvent,
     SessionCapabilities, SpeculativeCallbackPublisher, SpeculativeCapability, SpeculativeCommit,
     SpeculativeDraft, SpeculativeDraftRandomPosition, SpeculativeDraftSource, SpeculativeExecutor,
-    SpeculativeGenerationBackend, SpeculativeGenerationBatchOutput,
-    SpeculativeGenerationBatchRequest, SpeculativeGenerationOutput, SpeculativeGenerationVisitor,
+    SpeculativeGenerationBatchOutput, SpeculativeGenerationOutput, SpeculativeGenerationVisitor,
     SpeculativeOutputRuntime, SpeculativePrefill, SpeculativeRandomness, SpeculativeSampling,
     SpeculativeSemanticConstraint, SpeculativeTokenFilterController, StateMemoryLayout,
     StaticMemoryReport, Submission, TextGenerationBackend, TextGenerationConfig, TokenFilter,
     TokenOutput, ValueDescriptor, AUTOMATIC_SCHEMA_VERSION,
 };
+use eredu_runtime::speculative::autoregressive::ResidentBatchRoute;
 use eredu_text::tokenizer::{ModelChatTemplate, Tokenizer as ChatTokenizer};
 use tokenizers::{
     decoders::byte_level::ByteLevel, models::wordlevel::WordLevel,
@@ -129,11 +133,9 @@ struct MockSession {
     retention_forecast: bool,
     retention_failure: bool,
     retention_claims: std::sync::Arc<
-        std::sync::Mutex<
-            Vec<eredu_runtime::residency::conversion_retention::ConversionRetentionClaim>,
-        >,
+        std::sync::Mutex<Vec<eredu_core::residency::conversion_claim::ConversionRetentionClaim>>,
     >,
-    retention: eredu_runtime::residency::conversion_retention::ConversionRetentionBudget,
+    retention: eredu_core::residency::conversion_claim::ConversionRetentionBudget,
     cache_positions: u64,
     authority: eredu_core::SessionAuthority,
     intervention_identity: String,
@@ -205,10 +207,16 @@ impl BoundedCompletion for Done {
     }
 }
 
+fn fixture_prepared_model(
+    request: eredu_runtime::NormalizedLoadRequest,
+) -> PreparedModel<eredu_core::residency::conversion_claim::ConversionRetentionBudget> {
+    PreparedModel::new(
+        conversion_retention::budget(&request),
+        SessionCapabilities::new(true, true, false),
+    )
+}
+
 impl BackendProvider for MockBackend {
-    type ModelConfig = eredu_runtime::NormalizedLoadRequest;
-    type Model = eredu_runtime::residency::conversion_retention::ConversionRetentionBudget;
-    type Session = MockSession;
     type Error = MockError;
 
     fn descriptor(&self) -> BackendDescriptor {
@@ -226,21 +234,22 @@ impl BackendProvider for MockBackend {
             DeviceCapabilities::new(true, true, true),
         )])
     }
+}
 
-    fn prepare_model(
-        &self,
-        options: Self::ModelConfig,
-    ) -> Result<PreparedModel<Self::Model>, Self::Error> {
-        Ok(PreparedModel::new(
-            conversion_retention::budget(&options),
-            SessionCapabilities::new(true, true, false),
-        ))
-    }
+impl eredu::api::TextSessionComposition for MockBackend {
+    type Model = eredu_core::residency::conversion_claim::ConversionRetentionBudget;
+    type Installed = MockSession;
+    type Installer = MockSession;
+}
 
-    fn create_session(
-        &self,
-        model: PreparedModel<Self::Model>,
-    ) -> Result<Self::Session, Self::Error> {
+impl eredu_core::backend::ModelSessionInstaller<MockBackend> for MockSession {
+    type Model = eredu_core::residency::conversion_claim::ConversionRetentionBudget;
+    type Session = Self;
+
+    fn install_session(
+        _: &MockBackend,
+        model: PreparedModel<eredu_core::residency::conversion_claim::ConversionRetentionBudget>,
+    ) -> Result<Self, MockError> {
         eredu_core::SessionAdmission::new(model.capabilities())
             .validate(SessionCapabilities::new(true, true, false))?;
         Ok(MockSession {
@@ -274,6 +283,16 @@ impl BackendSession<MockBackend> for MockSession {
     type DecodeInput = u32;
     type Output = u32;
     type Completion = MockSessionCompletion;
+
+    fn speculative_capability(&self) -> SpeculativeCapability {
+        SpeculativeCapability::Ready {
+            draft_source: SpeculativeDraftSource::Embedded,
+        }
+    }
+
+    fn draft_target_identity(&self) -> Option<&str> {
+        Some(&self.intervention_identity)
+    }
 
     fn capabilities(&self) -> SessionCapabilities {
         SessionCapabilities::new(true, true, false)
@@ -424,43 +443,192 @@ impl DistributedSession for MockDistributedSession {
     }
 }
 
-impl DistributedBackend for MockBackend {
+impl DistributedModelSession<MockBackend> for MockSession {
     type DistributedSession = MockDistributedSession;
 
-    fn distributed_session(session: &Self::Session) -> Option<&Self::DistributedSession> {
-        Some(&session.distributed)
+    fn distributed_session(&self) -> Option<&Self::DistributedSession> {
+        Some(&self.distributed)
     }
 }
 
-impl TextGenerationBackend for MockBackend {
-    fn decoding_capabilities(
-        runtime: &ModelRuntime<Self>,
-    ) -> eredu_core::decoding::DecodingCapabilities {
+impl eredu_core::TextSessionLifecycle<MockBackend> for MockSession {
+    fn agree_text_preparation(
+        &self,
+        _: &MockBackend,
+        stage: eredu_core::run_preparation::TextPreparationStage,
+        status: eredu_core::run_preparation::TextPreparationStatus,
+    ) -> Result<eredu_core::run_preparation::TextPreparationOutcome, eredu_core::BackendFailure>
+    {
+        Ok(preparation::agreement(stage, status))
+    }
+    fn reset_session(&mut self, _: &MockBackend) -> Result<(), eredu_core::BackendFailure> {
+        self.authority.require_idle()?;
+        self.cache_positions = 0;
+        Ok(())
+    }
+
+    fn synchronize_session(&self, _: &MockBackend) -> Result<(), eredu_core::BackendFailure> {
+        self.authority.require_idle()?;
+        Ok(())
+    }
+}
+
+impl eredu_core::backend::CausalTextSession<MockBackend, Vec<u32>, MockToken, observed_mock::State>
+    for MockSession
+{
+}
+
+impl eredu_core::backend::TextOperationDriver<MockBackend> for MockSession {
+    type Prompt = Vec<u32>;
+    fn prepare_text_prompt(
+        _: &MockBackend,
+        prompt_token_ids: Vec<u32>,
+    ) -> Result<
+        <MockSession as eredu_core::backend::TextOperationDriver<MockBackend>>::Prompt,
+        <MockBackend as BackendProvider>::Error,
+    > {
+        preparation::native(eredu_core::run_preparation::TextPreparationStage::Prompt)?;
+        Ok(prompt_token_ids)
+    }
+
+    type TextGenerationState = observed_mock::State;
+
+    fn start_text_generation(
+        &self,
+        _: &MockBackend,
+        config: TextGenerationConfig,
+    ) -> Result<
+        <Self as eredu_core::backend::TextOperationDriver<MockBackend>>::TextGenerationState,
+        <MockBackend as BackendProvider>::Error,
+    > {
+        preparation::native(eredu_core::run_preparation::TextPreparationStage::Sampling)?;
+        Ok(observed_mock::State {
+            sampling: observed_mock::Sampling {
+                temperature: config.sampling().temperature,
+                seed: (config.sampling().temperature > 0.0).then_some(config.seed()),
+                prediction: 0,
+                physical: 0,
+                iterative_first: 0,
+                draft_events: config.draft_events(),
+                mode: config.decoding_mode().unwrap_or_default(),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    }
+
+    fn decoding_capabilities(&self) -> eredu_core::decoding::DecodingCapabilities {
         eredu_core::decoding::DecodingCapabilities {
-            autoregressive: runtime.session().switchable || !runtime.session().iterative,
-            diffusion: runtime.session().switchable || runtime.session().iterative,
-            entropy_feedback: runtime.session().switchable || runtime.session().iterative,
-            speculation: runtime.session().switchable,
-            mode_changes: runtime.session().switchable,
+            autoregressive: self.switchable || !self.iterative,
+            diffusion: self.switchable || self.iterative,
+            entropy_feedback: self.switchable || self.iterative,
+            speculation: self.switchable,
+            mode_changes: self.switchable,
             ..Default::default()
         }
     }
-    fn settle_decoding_mode(
-        runtime: &mut ModelRuntime<Self>,
-        input: &mut Option<eredu_core::PendingTextInput<Self::Prompt, Self::Token>>,
-        state: &mut Self::TextGenerationState,
-        _: eredu_core::decoding::DecodingMode,
-        requested: eredu_core::decoding::DecodingMode,
-    ) -> Result<bool, eredu_core::TextOperationError<Self::Error>> {
-        decoding_modes::settle(runtime, input, state, requested)
+
+    fn supports_block_refinement(&self) -> bool {
+        self.iterative
     }
-    fn supports_block_refinement(runtime: &ModelRuntime<Self>) -> bool {
-        runtime.session().iterative
+
+    fn text_sampling_control_support(
+        &self,
+        _: &MockBackend,
+    ) -> eredu_core::execution_control::ControlSupport {
+        eredu_core::execution_control::ControlSupport::Supported
     }
+
+    fn text_execution_control_support(
+        &self,
+        _: &MockBackend,
+    ) -> eredu_core::execution_control::ControlSupport {
+        eredu_core::execution_control::ControlSupport::Supported
+    }
+
+    #[cfg(feature = "tensor-capture")]
+    fn intervention_discovery(
+        &self,
+    ) -> Result<eredu_core::intervention::InterventionDiscovery, eredu_core::capture::CaptureError>
+    {
+        Ok(observed_mock::intervention_discovery(
+            &self.intervention_identity,
+        ))
+    }
+    #[cfg(feature = "tensor-capture")]
+    fn validate_text_interventions(
+        &self,
+        capture: &eredu_core::capture::AdmittedCapturePlan,
+        plan: &eredu_core::intervention::AdmittedInterventionPlan,
+    ) -> Result<(), eredu_core::capture::CaptureError> {
+        self.validate_text_capture(capture)?;
+        eredu_runtime::intervention::validate_session(
+            capture,
+            plan,
+            &self.intervention_discovery()?,
+            &observed_mock::Estimates,
+        )
+    }
+
+    #[cfg(feature = "tensor-capture")]
+    fn configure_text_interventions(
+        &self,
+        state: &mut observed_mock::State,
+        capture: eredu_core::capture::AdmittedCapturePlan,
+        plan: eredu_core::intervention::AdmittedInterventionPlan,
+    ) -> Result<(), eredu_core::capture::CaptureError> {
+        self.validate_text_interventions(&capture, &plan)?;
+        eredu_runtime::intervention::install_session(
+            &mut state.capture,
+            capture,
+            Some((plan, std::sync::Arc::new(observed_mock::Estimates))),
+        )
+    }
+
+    #[cfg(feature = "tensor-capture")]
+    fn capture_declarations(
+        &self,
+    ) -> Result<eredu_core::capture::CaptureDeclarations, eredu_core::capture::CaptureError> {
+        Ok(observed_mock::discovery().declarations())
+    }
+    #[cfg(feature = "tensor-capture")]
+    fn capture_discovery(
+        &self,
+    ) -> Result<eredu_core::capture::CaptureDiscovery, eredu_core::capture::CaptureError> {
+        Ok(observed_mock::content_discovery())
+    }
+    #[cfg(feature = "tensor-capture")]
+    fn validate_text_capture(
+        &self,
+        plan: &eredu_core::capture::AdmittedCapturePlan,
+    ) -> Result<(), eredu_core::capture::CaptureError> {
+        observed_mock::validate(plan)
+    }
+    #[cfg(feature = "tensor-capture")]
+    fn configure_text_capture(
+        &self,
+        state: &mut observed_mock::State,
+        plan: eredu_core::capture::AdmittedCapturePlan,
+    ) -> Result<(), eredu_core::capture::CaptureError> {
+        preparation::native(eredu_core::run_preparation::TextPreparationStage::Instrumentation)
+            .map_err(|error| eredu_core::capture::CaptureError::Invalid(error.to_string()))?;
+        observed_mock::validate(&plan)?;
+        eredu_runtime::intervention::install_session(&mut state.capture, plan, None)
+    }
+    #[cfg(feature = "tensor-capture")]
+    fn take_text_capture(
+        state: &mut observed_mock::State,
+    ) -> Option<eredu_core::capture::CapturedStep> {
+        state
+            .capture
+            .as_mut()
+            .and_then(eredu_runtime::capture::CaptureSession::take_step)
+    }
+
     fn text_operation_kind(
-        runtime: &ModelRuntime<Self>,
+        runtime: &ModelRuntime<MockBackend, MockSession>,
         _: &eredu_core::PendingTextInput<Vec<u32>, MockToken>,
-        state: &Self::TextGenerationState,
+        state: &<Self as eredu_core::backend::TextOperationDriver<MockBackend>>::TextGenerationState,
     ) -> eredu_core::TextOperationKind {
         if runtime.session().switchable {
             return decoding_modes::operation_kind(state);
@@ -479,165 +647,24 @@ impl TextGenerationBackend for MockBackend {
         }
     }
 
-    fn agree_text_preparation(
-        _: &ModelRuntime<Self>,
-        stage: eredu_core::run_preparation::TextPreparationStage,
-        status: eredu_core::run_preparation::TextPreparationStatus,
-    ) -> Result<eredu_core::run_preparation::TextPreparationOutcome, eredu_core::BackendFailure>
-    {
-        Ok(preparation::agreement(stage, status))
-    }
-    fn reset_session(
-        _: &Self,
-        session: &mut Self::Session,
-    ) -> Result<(), eredu_core::BackendFailure> {
-        session.authority.require_idle()?;
-        session.cache_positions = 0;
-        Ok(())
-    }
-
-    fn synchronize_session(
-        _: &Self,
-        session: &Self::Session,
-    ) -> Result<(), eredu_core::BackendFailure> {
-        session.authority.require_idle()?;
-        Ok(())
-    }
-
-    fn text_sampling_control_support(
-        _: &ModelRuntime<Self>,
-    ) -> eredu_core::execution_control::ControlSupport {
-        eredu_core::execution_control::ControlSupport::Supported
-    }
-    fn text_execution_control_support(
-        _: &ModelRuntime<Self>,
-    ) -> eredu_core::execution_control::ControlSupport {
-        eredu_core::execution_control::ControlSupport::Supported
-    }
-    type Prompt = Vec<u32>;
-    type Token = MockToken;
-    type TextGenerationState = observed_mock::State;
-    type TextCompletion = MockSessionCompletion;
-
-    #[cfg(feature = "tensor-capture")]
-    fn intervention_discovery(
-        runtime: &ModelRuntime<Self>,
-    ) -> Result<eredu_core::intervention::InterventionDiscovery, eredu_core::capture::CaptureError>
-    {
-        Ok(observed_mock::intervention_discovery(
-            &runtime.session().intervention_identity,
-        ))
-    }
-    #[cfg(feature = "tensor-capture")]
-    fn validate_text_interventions(
-        runtime: &ModelRuntime<Self>,
-        capture: &eredu_core::capture::AdmittedCapturePlan,
-        plan: &eredu_core::intervention::AdmittedInterventionPlan,
-    ) -> Result<(), eredu_core::capture::CaptureError> {
-        Self::validate_text_capture(runtime, capture)?;
-        eredu_runtime::intervention::validate_session(
-            capture,
-            plan,
-            &Self::intervention_discovery(runtime)?,
-            &observed_mock::Estimates,
-        )
-    }
-
-    #[cfg(feature = "tensor-capture")]
-    fn configure_text_interventions(
-        runtime: &ModelRuntime<Self>,
-        state: &mut Self::TextGenerationState,
-        capture: eredu_core::capture::AdmittedCapturePlan,
-        plan: eredu_core::intervention::AdmittedInterventionPlan,
-    ) -> Result<(), eredu_core::capture::CaptureError> {
-        Self::validate_text_interventions(runtime, &capture, &plan)?;
-        eredu_runtime::intervention::install_session(
-            &mut state.capture,
-            capture,
-            Some((plan, std::sync::Arc::new(observed_mock::Estimates))),
-        )
-    }
-
-    #[cfg(feature = "tensor-capture")]
-    fn capture_declarations(
-        _: &ModelRuntime<Self>,
-    ) -> Result<eredu_core::capture::CaptureDeclarations, eredu_core::capture::CaptureError> {
-        Ok(observed_mock::discovery().declarations())
-    }
-    #[cfg(feature = "tensor-capture")]
-    fn capture_discovery(
-        _: &ModelRuntime<Self>,
-    ) -> Result<eredu_core::capture::CaptureDiscovery, eredu_core::capture::CaptureError> {
-        Ok(observed_mock::content_discovery())
-    }
-    #[cfg(feature = "tensor-capture")]
-    fn validate_text_capture(
-        _: &ModelRuntime<Self>,
-        plan: &eredu_core::capture::AdmittedCapturePlan,
-    ) -> Result<(), eredu_core::capture::CaptureError> {
-        observed_mock::validate(plan)
-    }
-    #[cfg(feature = "tensor-capture")]
-    fn configure_text_capture(
-        _: &ModelRuntime<Self>,
-        state: &mut Self::TextGenerationState,
-        plan: eredu_core::capture::AdmittedCapturePlan,
-    ) -> Result<(), eredu_core::capture::CaptureError> {
-        preparation::native(eredu_core::run_preparation::TextPreparationStage::Instrumentation)
-            .map_err(|error| eredu_core::capture::CaptureError::Invalid(error.to_string()))?;
-        observed_mock::validate(&plan)?;
-        eredu_runtime::intervention::install_session(&mut state.capture, plan, None)
-    }
-    #[cfg(feature = "tensor-capture")]
-    fn take_text_capture(
-        state: &mut Self::TextGenerationState,
-    ) -> Option<eredu_core::capture::CapturedStep> {
-        state
-            .capture
-            .as_mut()
-            .and_then(eredu_runtime::capture::CaptureSession::take_step)
-    }
-
-    fn start_text_generation(
-        _: &Self,
-        config: TextGenerationConfig,
-    ) -> Result<Self::TextGenerationState, Self::Error> {
-        preparation::native(eredu_core::run_preparation::TextPreparationStage::Sampling)?;
-        Ok(observed_mock::State {
-            sampling: observed_mock::Sampling {
-                temperature: config.sampling().temperature,
-                seed: (config.sampling().temperature > 0.0).then_some(config.seed()),
-                prediction: 0,
-                physical: 0,
-                iterative_first: 0,
-                draft_events: config.draft_events(),
-                mode: config.decoding_mode().unwrap_or_default(),
-                ..Default::default()
-            },
-            ..Default::default()
-        })
-    }
-
-    fn prepare_text_prompt(
-        _: &Self,
-        prompt_token_ids: Vec<u32>,
-    ) -> Result<Self::Prompt, Self::Error> {
-        preparation::native(eredu_core::run_preparation::TextPreparationStage::Prompt)?;
-        Ok(prompt_token_ids)
-    }
-
-    fn submit_text_operation(
-        runtime: &mut ModelRuntime<Self>,
-        input: eredu_core::PendingTextInput<Self::Prompt, Self::Token>,
+    fn submit_specialized_text_operation(
+        runtime: &mut ModelRuntime<MockBackend, MockSession>,
+        input: eredu_core::PendingTextInput<
+            <MockSession as eredu_core::backend::TextOperationDriver<MockBackend>>::Prompt,
+            <MockBackend as TextGenerationBackend>::Token,
+        >,
         decision: Option<&eredu_core::TokenSamplingDecision<'_>>,
-        state: &mut Self::TextGenerationState,
+        state: &mut <Self as eredu_core::backend::TextOperationDriver<MockBackend>>::TextGenerationState,
         _remaining_tokens: Option<usize>,
     ) -> Result<
         Submission<
-            eredu_core::TextOperationOutput<Self::Prompt, Self::Token>,
-            Self::TextCompletion,
+            eredu_core::TextOperationOutput<
+                <MockSession as eredu_core::backend::TextOperationDriver<MockBackend>>::Prompt,
+                <MockBackend as TextGenerationBackend>::Token,
+            >,
+            <MockBackend as TextGenerationBackend>::TextCompletion,
         >,
-        eredu_core::TextOperationError<Self::Error>,
+        eredu_core::TextOperationError<<MockBackend as eredu_core::BackendProvider>::Error>,
     > {
         if runtime.session().switchable {
             return decoding_modes::submit(runtime, input, decision, state);
@@ -651,7 +678,7 @@ impl TextGenerationBackend for MockBackend {
             return Err(eredu_core::TextOperationPolicyError::UnsupportedContinuation.into());
         }
         let submission =
-            || -> Result<Submission<Self::Token, Self::TextCompletion>, Self::Error> {
+            || -> Result<Submission<<MockBackend as TextGenerationBackend>::Token, <MockBackend as TextGenerationBackend>::TextCompletion>, <MockBackend as eredu_core::BackendProvider>::Error> {
                 match input {
                     eredu_core::PendingTextInput::Prefill(prompt) => {
                         preparation::forward();
@@ -695,11 +722,35 @@ impl TextGenerationBackend for MockBackend {
             completion: submission.completion,
         })
     }
+
+    fn settle_decoding_mode(
+        runtime: &mut ModelRuntime<MockBackend, MockSession>,
+        input: &mut Option<eredu_core::PendingTextInput<Vec<u32>, MockToken>>,
+        state: &mut observed_mock::State,
+        _: eredu_core::decoding::DecodingMode,
+        requested: eredu_core::decoding::DecodingMode,
+    ) -> Result<bool, eredu_core::TextOperationError<MockError>> {
+        decoding_modes::settle(runtime, input, state, requested)
+    }
+}
+
+impl eredu_core::AutomaticPromptCacheSession<MockBackend> for MockSession {}
+
+impl TextGenerationBackend for MockBackend {
+    type InputTensor = u32;
+
+    type Token = MockToken;
+
+    type TextCompletion = MockSessionCompletion;
 }
 
 #[test]
 fn lifecycle_rejects_unsettled_authority_without_resetting_it() {
-    let mut runtime = ModelRuntime::prepare(MockBackend, Default::default()).unwrap();
+    let mut runtime = ModelRuntime::<_, _>::install::<MockSession>(
+        MockBackend,
+        fixture_prepared_model(Default::default()),
+    )
+    .unwrap();
     let pending = runtime.prefill(vec![1, 2]).unwrap();
     assert_eq!(
         runtime.synchronize().unwrap_err().kind(),
@@ -715,12 +766,15 @@ fn lifecycle_rejects_unsettled_authority_without_resetting_it() {
     runtime.reset().unwrap();
 }
 
-impl MultimodalPreparationBackend for MockBackend {
+impl MultimodalPreparationSession<MockBackend> for MockSession {
     fn prepare_multimodal_input<E>(
-        _: &ModelRuntime<Self>,
+        &self,
         request: &eredu_core::TokenizedMultimodalRequest,
         encode_backend_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
-    ) -> Result<Self::Prompt, MultimodalPreparationFailure<Self::Error, E>>
+    ) -> Result<
+        <MockSession as eredu_core::backend::TextOperationDriver<MockBackend>>::Prompt,
+        MultimodalPreparationFailure<MockError, E>,
+    >
     where
         E: std::error::Error + Send + Sync + 'static,
     {
@@ -738,15 +792,15 @@ impl MultimodalPreparationBackend for MockBackend {
     }
 }
 
-impl ModelCapabilityBackend for MockBackend {
+impl ModelCapabilitySession<MockBackend> for MockSession {
     fn prepared_input_token_ids(
-        _: &ModelRuntime<Self>,
-        input: &Self::Prompt,
+        _: &ModelRuntime<MockBackend, Self>,
+        input: &<MockSession as eredu_core::backend::TextOperationDriver<MockBackend>>::Prompt,
     ) -> Result<Vec<u32>, eredu_core::BackendFailure> {
         Ok(input.clone())
     }
     fn trim_parameter_conversions(
-        runtime: &mut ModelRuntime<Self>,
+        runtime: &mut ModelRuntime<MockBackend, Self>,
     ) -> Result<
         Vec<eredu_core::residency::ParameterConversionRetentionTrimReport>,
         eredu_core::residency::ParameterConversionTrimError,
@@ -770,7 +824,7 @@ impl ModelCapabilityBackend for MockBackend {
     }
 
     fn parameter_conversion_retention(
-        runtime: &ModelRuntime<Self>,
+        runtime: &ModelRuntime<MockBackend, Self>,
     ) -> Result<
         Observed<Vec<eredu_core::residency::ParameterConversionRetentionReport>>,
         eredu_core::BackendFailure,
@@ -786,7 +840,9 @@ impl ModelCapabilityBackend for MockBackend {
         ))
     }
 
-    fn model_capabilities(_: &ModelRuntime<Self>) -> Result<ModelCapabilities, CapabilityError> {
+    fn model_capabilities(
+        _: &ModelRuntime<MockBackend, Self>,
+    ) -> Result<ModelCapabilities, CapabilityError> {
         Ok(ModelCapabilities {
             effective_model_type: "mistral".into(),
             native_max_context: Observed::exact(32, "mock configuration"),
@@ -801,8 +857,8 @@ impl ModelCapabilityBackend for MockBackend {
     }
 
     fn count_prepared_input(
-        _: &ModelRuntime<Self>,
-        input: &Self::Prompt,
+        _: &ModelRuntime<MockBackend, Self>,
+        input: &<MockSession as eredu_core::backend::TextOperationDriver<MockBackend>>::Prompt,
     ) -> Result<InputTokenCount, CapabilityError> {
         let media = input.iter().filter(|id| **id == 2_001).count() as u64;
         Ok(InputTokenCount::prepared(
@@ -815,7 +871,7 @@ impl ModelCapabilityBackend for MockBackend {
     }
 
     fn estimate_runtime_state(
-        _: &ModelRuntime<Self>,
+        _: &ModelRuntime<MockBackend, Self>,
         input: InputTokenCount,
         max_output_tokens: u64,
         batch_size: u64,
@@ -845,7 +901,9 @@ impl ModelCapabilityBackend for MockBackend {
         )
     }
 
-    fn static_memory(runtime: &ModelRuntime<Self>) -> Result<StaticMemoryReport, CapabilityError> {
+    fn static_memory(
+        runtime: &ModelRuntime<MockBackend, Self>,
+    ) -> Result<StaticMemoryReport, CapabilityError> {
         let unavailable = || Observed::unavailable("mock counter is unavailable");
         Ok(StaticMemoryReport {
             parameter_conversion_retention: Observed::exact(
@@ -865,25 +923,73 @@ impl ModelCapabilityBackend for MockBackend {
     }
 }
 
-impl ModelLoadingBackend for MockBackend {
-    type LoadOptions = ();
-    type SelectedPreparation = (
-        eredu_core::PreparationAdmission,
-        eredu_runtime::NormalizedLoadRequest,
-    );
-    type ConfigurationResolver = eredu_architectures::configuration::ModelConfigurations;
+struct RetainFixturePlan(eredu_core::PreparationAdmission);
 
-    fn configuration_resolver(&self) -> &Self::ConfigurationResolver {
-        &eredu_architectures::configuration::MODEL_CONFIGURATIONS
+impl
+    eredu_core::ModelSourcePreparation<
+        eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+    > for RetainFixturePlan
+{
+    type Prepared = eredu_core::ModelPreparationPlan<
+        eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+    >;
+    type Error = std::convert::Infallible;
+
+    fn admission(&self) -> eredu_core::PreparationAdmission {
+        self.0
     }
 
-    fn select_preparation(
-        &self,
+    fn prepare(self, plan: Self::Prepared) -> Result<Self::Prepared, Self::Error> {
+        Ok(plan)
+    }
+}
+
+impl eredu_core::backend::DirectLoadFacts for FixtureLoadSelection {
+    type Request = ();
+    type Mechanisms = ();
+    fn rank(_: &()) -> Option<eredu_core::ParallelRankTopology> {
+        None
+    }
+    fn from_request((): (), (): ()) -> Self {
+        Self
+    }
+}
+
+impl eredu_core::backend::AdmissionFacts for FixtureTargetFacts {
+    type Inputs = ();
+    fn from_inputs((): ()) -> Self {
+        Self
+    }
+}
+
+impl eredu_core::backend::AdmissionFacts for FixtureDraftAdmission {
+    type Inputs = ();
+    fn from_inputs((): ()) -> Self {
+        Self
+    }
+}
+
+impl eredu_core::backend::AdmissionFacts for MockBackend {
+    type Inputs = ();
+    fn from_inputs((): ()) -> Self {
+        Self
+    }
+}
+
+struct FixtureLoadSelection;
+
+impl eredu_core::ModelLoadAdmission<eredu_architectures::processor_plan::ArtifactArchitecturePlan>
+    for FixtureLoadSelection
+{
+    type Error = std::convert::Infallible;
+    type SourcePreparation = RetainFixturePlan;
+
+    fn select(
+        self,
         inspection: &eredu_core::ArtifactInspection<
             eredu_architectures::processor_plan::ArtifactArchitecturePlan,
         >,
-        _: &Self::LoadOptions,
-    ) -> Result<Self::SelectedPreparation, Self::Error> {
+    ) -> Result<Self::SourcePreparation, Self::Error> {
         let request = eredu_core::PreparationAdmissionRequest::new(
             eredu_core::LoadingProtocol::Model,
             inspection.format(),
@@ -897,7 +1003,7 @@ impl ModelLoadingBackend for MockBackend {
                 eredu_core::InputModalities::TEXT,
             ),
         );
-        Ok((
+        Ok(RetainFixturePlan(
             eredu_core::admit_preparation(
                 request,
                 eredu_core::PreparationMechanismCapabilities::new(true, true)
@@ -906,32 +1012,47 @@ impl ModelLoadingBackend for MockBackend {
                     .with_session(SessionCapabilities::new(true, true, false)),
             )
             .expect("mock preparation facts are coherent"),
-            Default::default(),
         ))
-    }
-
-    fn selected_preparation_admission(
-        &self,
-        selected: &Self::SelectedPreparation,
-    ) -> eredu_core::PreparationAdmission {
-        selected.0
-    }
-
-    fn model_config(
-        &self,
-        selected: eredu_core::SelectedModelPreparation<Self>,
-    ) -> Result<Self::ModelConfig, Self::Error> {
-        let (plan, (_admission, request)) = selected.into_parts();
-        assert_eq!(plan.inspection().configuration().family(), "llama");
-        Ok(request)
     }
 }
 
-impl AutomaticPlanningBackend for MockBackend {
-    type Inspection = eredu_core::ArtifactInspection<
-        eredu_architectures::processor_plan::ArtifactArchitecturePlan,
-    >;
+impl ModelLoadingBackend for MockBackend {
+    type LoadPlacement = ();
+    type Binding = eredu_runtime::NormalizedLoadRequest;
+    type LoadMechanisms = ();
+    fn load_mechanisms(&self) {}
+    fn bind_load_placement(
+        &self,
+        _: Option<eredu_core::ParallelRankTopology>,
+        _: Option<()>,
+    ) -> Result<Self::Binding, Self::Error> {
+        Ok(Default::default())
+    }
+}
 
+impl eredu_core::BindModelSources<MockBackend>
+    for eredu_core::ModelPreparationPlan<
+        eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+    >
+{
+    type Model = eredu_core::residency::conversion_claim::ConversionRetentionBudget;
+
+    fn construct_model(
+        self,
+        _: &MockBackend,
+        request: eredu_runtime::NormalizedLoadRequest,
+    ) -> Result<
+        PreparedModel<eredu_core::residency::conversion_claim::ConversionRetentionBudget>,
+        eredu_core::BackendFailure,
+    > {
+        assert_eq!(self.inspection().configuration().family(), "llama");
+        Ok(fixture_prepared_model(request))
+    }
+}
+
+use eredu_core::BackendHardware as _;
+
+impl eredu_core::BackendHardware for MockBackend {
     fn backend_id(&self) -> BackendId {
         BackendId::new("mock").unwrap()
     }
@@ -960,11 +1081,34 @@ impl AutomaticPlanningBackend for MockBackend {
             }],
         })
     }
+}
 
-    fn inspect_resources(
-        &self,
+impl AutomaticPlanningBackend<eredu_architectures::processor_plan::ArtifactArchitecturePlan>
+    for MockBackend
+{
+    type Inspection = eredu_core::ArtifactInspection<
+        eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+    >;
+    type ModelFacts<'a> = Self;
+
+    fn planning_inputs(&self, _: Option<&ExecutionPlan>) -> Result<(), AutomaticPlanningError> {
+        Ok(())
+    }
+}
+
+impl
+    eredu_core::AutomaticModelPlanning<
+        eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+    > for MockBackend
+{
+    type Artifact = <Self as AutomaticPlanningBackend<
+        eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+    >>::Inspection;
+
+    fn inspect(
+        self,
         model_path: &Path,
-    ) -> Result<(ModelResourceProfile, Self::Inspection), AutomaticPlanningError> {
+    ) -> Result<(ModelResourceProfile, Self::Artifact), AutomaticPlanningError> {
         assert!(model_path.join("model.safetensors").is_file());
         let inspection = eredu_architectures::configuration::inspect_artifact(model_path)
             .map_err(|error| AutomaticPlanningError::Invalid(error.to_string()))?;
@@ -981,12 +1125,12 @@ impl AutomaticPlanningBackend for MockBackend {
         Ok((profile, inspection))
     }
 
-    fn admit_candidate(
-        &self,
-        _: &Self::Inspection,
+    fn admit(
+        self,
+        _: &Self::Artifact,
         plan: &ExecutionPlan,
     ) -> Result<CandidateAdmission, AutomaticPlanningError> {
-        assert_eq!(plan.device().backend(), &self.backend_id());
+        assert_eq!(plan.device().backend(), &MockBackend.backend_id());
         let supported = plan.expert_cache().is_none();
         Ok(CandidateAdmission {
             supported,
@@ -994,9 +1138,9 @@ impl AutomaticPlanningBackend for MockBackend {
         })
     }
 
-    fn bounded_residency_requirement(
-        &self,
-        _: &Self::Inspection,
+    fn bounded_requirement(
+        self,
+        _: &Self::Artifact,
         plan: &ExecutionPlan,
     ) -> Result<BoundedResidencyRequirement, AutomaticPlanningError> {
         assert!(matches!(
@@ -1016,27 +1160,25 @@ thread_local! {
     static FACTORY_PHASES: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-impl ExecutionPlanBackendFactory for MockBackend {
-    type Backend = Self;
-    type DrafterPreparation = eredu_architectures::ExternalDraftPreparation;
-    type SelectedDrafterPreparation = eredu_architectures::ExternalDraftPreparation;
-    type Drafter = MockDrafter;
+struct FixtureTargetFacts;
 
-    fn select_target(
-        &self,
+impl
+    eredu_core::ExecutionPlanTargetAdmission<
+        eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+    > for FixtureTargetFacts
+{
+    type Preparation = RetainFixturePlan;
+
+    fn select(
+        self,
         inspection: &eredu_core::ArtifactInspection<
             eredu_architectures::processor_plan::ArtifactArchitecturePlan,
         >,
-        plan: &ExecutionPlan,
-    ) -> Result<ExecutionPlanTargetSelection<Self::Backend>, AutomaticPlanningError> {
+        _: &ExecutionPlan,
+    ) -> Result<ExecutionPlanTargetSelection<Self::Preparation>, AutomaticPlanningError> {
         FACTORY_PHASES.with_borrow_mut(|phases| phases.push("select target"));
-        let mut selection = self.select_preparation(inspection, &()).unwrap();
-        selection.1 = eredu_runtime::NormalizedLoadRequest::from_execution_plan(
-            plan,
-            eredu_runtime::ResidencyDiagnostics::default(),
-            None,
-        )
-        .map_err(|error| AutomaticPlanningError::Invalid(error.to_string()))?;
+        let selection =
+            eredu_core::ModelLoadAdmission::select(FixtureLoadSelection, inspection).unwrap();
         let mut report =
             eredu_core::ModelInspectionReport::unverified(inspection.path(), inspection.format());
         report.record_artifact_inspection(inspection);
@@ -1048,77 +1190,124 @@ impl ExecutionPlanBackendFactory for MockBackend {
             report,
         ))
     }
+}
+
+struct FixtureDraftAdmission;
+
+impl
+    eredu_core::ExecutionPlanDraftAdmission<
+        eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+        MockBackend,
+    > for FixtureDraftAdmission
+{
+    type TargetPreparation = RetainFixturePlan;
+    type Inspection = eredu_architectures::ExternalDraftPreparation;
+    type Selection = Option<eredu_core::residency::ParameterConversionRetentionPolicy>;
+
+    fn select(
+        self,
+        plan: &ExecutionPlan,
+        _: &SelectedExecutionPlanTarget<
+            MockBackend,
+            eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+            Self::TargetPreparation,
+        >,
+        artifact: Option<ExternalDraftArtifact<eredu_architectures::ExternalDraftPreparation>>,
+    ) -> Result<Option<ExternalDraftArtifact<Self::Selection>>, AutomaticPlanningError> {
+        FACTORY_PHASES.with_borrow_mut(|phases| phases.push("select draft"));
+        Ok(artifact.map(|artifact| ExternalDraftArtifact {
+            preparation: plan.parameter_conversion_retention(),
+            tokenizer_compatibility: artifact.tokenizer_compatibility,
+        }))
+    }
+}
+
+impl ExecutionPlanBackendFactory<eredu_architectures::processor_plan::ArtifactArchitecturePlan>
+    for MockBackend
+{
+    type Backend = Self;
+    type Drafter = MockDrafter;
+
+    type TargetFacts = FixtureTargetFacts;
+    type SourcePreparation = RetainFixturePlan;
+    type TargetOptions = Option<eredu_runtime::ParallelLoadRequest>;
+    type TargetBinding = (ExecutionPlan, Self::TargetOptions);
+
+    fn target_inputs(
+        &self,
+        plan: &ExecutionPlan,
+        parallel: Self::TargetOptions,
+    ) -> Result<((), Self::TargetBinding), AutomaticPlanningError> {
+        Ok(((), (plan.clone(), parallel)))
+    }
+
+    fn bind_target_placement(
+        &self,
+        (plan, parallel): Self::TargetBinding,
+    ) -> Result<<Self as ModelLoadingBackend>::Binding, AutomaticPlanningError> {
+        eredu_runtime::NormalizedLoadRequest::from_execution_plan(
+            &plan,
+            eredu_runtime::ResidencyDiagnostics::default(),
+            parallel,
+        )
+        .map_err(|error| AutomaticPlanningError::Invalid(error.to_string()))
+    }
 
     fn realize_target(
         &self,
-        selected: SelectedExecutionPlanTarget<Self::Backend>,
-    ) -> Result<ExecutionPlanTarget<Self::Backend>, AutomaticPlanningError> {
+        _: &DevicePlan,
+        _: &<Self::Backend as ModelLoadingBackend>::Binding,
+    ) -> Result<Self::Backend, AutomaticPlanningError> {
         FACTORY_PHASES.with_borrow_mut(|phases| phases.push("realize target"));
-        Ok(ExecutionPlanTarget::new(MockBackend, selected))
+        Ok(MockBackend)
     }
 
-    fn select_drafting(
-        &self,
-        _: &ExecutionPlan,
-        _: &SelectedExecutionPlanTarget<Self::Backend>,
-        external_artifact: Option<ExternalDraftArtifact<Self::DrafterPreparation>>,
-    ) -> Result<
-        Option<ExternalDraftArtifact<Self::SelectedDrafterPreparation>>,
-        AutomaticPlanningError,
-    > {
-        FACTORY_PHASES.with_borrow_mut(|phases| phases.push("select draft"));
-        Ok(external_artifact)
-    }
+    type DraftFacts = FixtureDraftAdmission;
+    type DraftBinding = ();
 
-    fn realize_drafting(
+    fn draft_inputs(&self) {}
+
+    fn begin_external_draft(
         &self,
-        plan: &ExecutionPlan,
-        target: &ModelRuntime<Self::Backend>,
-        selected: eredu_core::SelectedExecutionPlanDrafting<Self::SelectedDrafterPreparation>,
-    ) -> Result<RealizedDrafting<MockDrafter>, AutomaticPlanningError> {
+        _: eredu_core::ExternalDraftBinding<'_, Self::Backend>,
+    ) -> Result<Self::DraftBinding, AutomaticPlanningError> {
         FACTORY_PHASES.with_borrow_mut(|phases| phases.push("realize draft"));
-        let external_artifact = selected.into_external_artifact(plan, target)?;
-        Ok(match plan.drafting() {
-            DraftingPlan::Disabled => {
-                assert!(external_artifact.is_none());
-                RealizedDrafting::Disabled
-            }
-            DraftingPlan::Embedded { .. } => {
-                assert!(external_artifact.is_none());
-                RealizedDrafting::Embedded
-            }
-            DraftingPlan::External { .. } => {
-                let artifact = external_artifact.expect("external drafting carries identities");
-                let _shared_tokenizer_fingerprint = artifact.tokenizer_compatibility.fingerprint();
-                RealizedDrafting::External(MockDrafter {
-                    retention: Some(conversion_retention::budget(
-                        &eredu_runtime::NormalizedLoadRequest::default()
-                            .with_parameter_conversion_retention(
-                                plan.parameter_conversion_retention(),
-                            ),
-                    )),
-                })
-            }
-            _ => {
-                return Err(AutomaticPlanningError::Invalid(
-                    "unsupported drafting plan".into(),
-                ));
-            }
+        Ok(())
+    }
+}
+
+impl
+    eredu_core::ExternalDraftConstruction<
+        eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+        MockBackend,
+        (),
+    > for FixtureDraftAdmission
+{
+    type Drafter = MockDrafter;
+
+    fn construct_external_draft(
+        artifact: ExternalDraftArtifact<Self::Selection>,
+        (): (),
+        _target_identity: &str,
+    ) -> Result<Self::Drafter, AutomaticPlanningError> {
+        Ok(MockDrafter {
+            retention: Some(conversion_retention::budget(
+                &eredu_runtime::NormalizedLoadRequest::default()
+                    .with_parameter_conversion_retention(artifact.preparation),
+            )),
         })
     }
 }
 
 #[derive(Default)]
 struct MockDrafter {
-    retention: Option<eredu_runtime::residency::conversion_retention::ConversionRetentionBudget>,
+    retention: Option<eredu_core::residency::conversion_claim::ConversionRetentionBudget>,
 }
 
 struct MockSpeculativeExecutor {
-    target_retention: eredu_runtime::residency::conversion_retention::ConversionRetentionBudget,
+    target_retention: eredu_core::residency::conversion_claim::ConversionRetentionBudget,
     target_claims: std::sync::Arc<
-        std::sync::Mutex<
-            Vec<eredu_runtime::residency::conversion_retention::ConversionRetentionClaim>,
-        >,
+        std::sync::Mutex<Vec<eredu_core::residency::conversion_claim::ConversionRetentionClaim>>,
     >,
     retention: eredu_core::residency::ExecutionConversionRetentionReport,
     embedded: bool,
@@ -1705,12 +1894,12 @@ impl SpeculativeSampling for MockSpeculativeSampling {
     }
 }
 
-impl SpeculativeGenerationBackend for MockBackend {
+impl SpeculativeGenerationBackend<MockSession> for MockBackend {
     type Drafter = MockDrafter;
 
     #[cfg(feature = "tensor-capture")]
     fn speculative_activation_discovery(
-        runtime: &ModelRuntime<Self>,
+        runtime: &ModelRuntime<Self, MockSession>,
     ) -> Result<
         eredu_core::speculative::SpeculativeActivationDiscovery,
         eredu_core::capture::CaptureError,
@@ -1719,30 +1908,70 @@ impl SpeculativeGenerationBackend for MockBackend {
             schema_version: eredu_core::speculative::SPECULATIVE_ACTIVATION_SCHEMA_VERSION,
             execution_identity: "mock-speculative".into(),
             captures: observed_mock::discovery(),
-            interventions: Self::intervention_discovery(runtime)?,
+            interventions: runtime.session().intervention_discovery()?,
             bindings: vec![eredu_core::speculative::SpeculativeCaptureBinding {
                 node_id: "output".into(),
                 scope: eredu_core::speculative::SpeculativeCaptureScope::Target,
             }],
         })
     }
+}
 
-    fn speculative_capability(_: &ModelRuntime<Self>) -> SpeculativeCapability {
-        SpeculativeCapability::Ready {
-            draft_source: SpeculativeDraftSource::Embedded,
-        }
+impl SpeculativeBatchBackend<MockSession> for MockBackend {
+    fn execute_resident_batch<C, V>(
+        runtime: &mut ModelRuntime<Self, MockSession>,
+        route: ResidentBatchRoute,
+        lanes: Vec<eredu_core::SpeculativeGenerationLane<'_, Vec<u32>, C>>,
+        visitor: V,
+    ) -> Result<SpeculativeGenerationBatchOutput, Self::Error>
+    where
+        C: SpeculativeTokenFilterController + 'static,
+        V: SpeculativeGenerationVisitor,
+    {
+        let draft = match route {
+            ResidentBatchRoute::Target => SpeculativeDraft::Target,
+            ResidentBatchRoute::SharedBackbone => SpeculativeDraft::SharedBackbone,
+        };
+        Self::execute_fixture_batch(runtime, draft, lanes, visitor)
     }
 
-    fn with_speculative_execution<C, V>(
-        runtime: &mut ModelRuntime<Self>,
-        mut request: SpeculativeGenerationBatchRequest<'_, Self, Self::Drafter, C>,
+    fn execute_external_batch<C, V>(
+        runtime: &mut ModelRuntime<Self, MockSession>,
+        draft: &mut Self::Drafter,
+        lanes: Vec<eredu_core::SpeculativeGenerationLane<'_, Vec<u32>, C>>,
+        visitor: V,
+    ) -> Result<SpeculativeGenerationBatchOutput, Self::Error>
+    where
+        C: SpeculativeTokenFilterController + 'static,
+        V: SpeculativeGenerationVisitor,
+    {
+        Self::execute_fixture_batch(runtime, SpeculativeDraft::External(draft), lanes, visitor)
+    }
+
+    fn execute_embedded_batch<C, V>(
+        runtime: &mut ModelRuntime<Self, MockSession>,
+        lanes: Vec<eredu_core::SpeculativeGenerationLane<'_, Vec<u32>, C>>,
+        visitor: V,
+    ) -> Result<SpeculativeGenerationBatchOutput, Self::Error>
+    where
+        C: SpeculativeTokenFilterController + 'static,
+        V: SpeculativeGenerationVisitor,
+    {
+        Self::execute_fixture_batch(runtime, SpeculativeDraft::Embedded, lanes, visitor)
+    }
+}
+
+impl MockBackend {
+    fn execute_fixture_batch<C, V>(
+        runtime: &mut ModelRuntime<Self, MockSession>,
+        drafting: SpeculativeDraft<'_, MockDrafter>,
+        mut lanes: Vec<eredu_core::SpeculativeGenerationLane<'_, Vec<u32>, C>>,
         visitor: V,
     ) -> Result<SpeculativeGenerationBatchOutput, MockError>
     where
         C: SpeculativeTokenFilterController,
         V: SpeculativeGenerationVisitor,
     {
-        let drafting = request.take_drafting();
         let embedded = matches!(drafting, SpeculativeDraft::Embedded);
         let retention = eredu_core::residency::ExecutionConversionRetentionReport {
             target: Observed::exact(vec![runtime.session().retention.report()], "mock execution ledger"),
@@ -1751,7 +1980,6 @@ impl SpeculativeGenerationBackend for MockBackend {
                 _ => None,
             },
         };
-        let mut lanes = request.take_lanes();
         let result_cardinality = lanes
             .first()
             .and_then(|lane| lane.prompt().first())
@@ -1835,8 +2063,8 @@ fn apply_filter(candidate: u32, filter: &TokenFilter) -> u32 {
         .unwrap()
 }
 
-type DistributedValue<B> =
-    <<B as DistributedBackend>::DistributedSession as DistributedSession>::Value;
+type DistributedValue<B, S> =
+    <<S as DistributedModelSession<B>>::DistributedSession as DistributedSession>::Value;
 
 struct DistributedProbe<V> {
     reduced: V,
@@ -1847,11 +2075,13 @@ struct DistributedProbe<V> {
     scheduler_words: Vec<u32>,
 }
 
-fn distributed_client_code<B: DistributedBackend>(
-    runtime: &ModelRuntime<B>,
-    input: &DistributedValue<B>,
-) -> DistributedProbe<DistributedValue<B>> {
-    let session = B::distributed_session(runtime.session())
+fn distributed_client_code<B: BackendProvider, S: DistributedModelSession<B>>(
+    runtime: &ModelRuntime<B, S>,
+    input: &DistributedValue<B, S>,
+) -> DistributedProbe<DistributedValue<B, S>> {
+    let session = runtime
+        .session()
+        .distributed_session()
         .expect("the conformance backend must expose its selected distributed session");
     let descriptor = session.descriptor();
     assert_eq!(descriptor.world_size(), 2);
@@ -1900,7 +2130,9 @@ fn distributed_client_code<B: DistributedBackend>(
     }
 }
 
-fn client_code<B: TextGenerationBackend>(model: &mut LoadedModel<B>) -> Vec<u32> {
+fn client_code<B: TextGenerationBackend, S: eredu_core::TextExecutionSession<B>>(
+    model: &mut LoadedModel<B, S>,
+) -> Vec<u32> {
     let prompt = model.encode("hello", false).unwrap();
     let sampling = model
         .resolve_generation_config(GenerationConfigOverrides {
@@ -1915,7 +2147,12 @@ fn client_code<B: TextGenerationBackend>(model: &mut LoadedModel<B>) -> Vec<u32>
         .collect()
 }
 
-fn multimodal_client_code<B: MultimodalPreparationBackend>(model: &LoadedModel<B>) -> B::Prompt {
+fn multimodal_client_code<
+    B: TextGenerationBackend,
+    S: eredu_core::TextExecutionSession<B> + MultimodalPreparationSession<B>,
+>(
+    model: &LoadedModel<B, S>,
+) -> S::Prompt {
     let request = MultimodalRequest::new(vec![
         MultimodalSegment::Text("hello".into()),
         MultimodalSegment::Media(Media::Image(RgbImage::new(vec![10, 20, 30], 1, 1).unwrap())),
@@ -1925,7 +2162,13 @@ fn multimodal_client_code<B: MultimodalPreparationBackend>(model: &LoadedModel<B
     model.prepare_multimodal_input(&request).unwrap()
 }
 
-fn capability_client_code<B: ModelCapabilityBackend>(model: &LoadedModel<B>, prepared: &B::Prompt) {
+fn capability_client_code<
+    B: eredu_core::TextGenerationBackend,
+    S: eredu_core::TextExecutionSession<B> + ModelCapabilitySession<B>,
+>(
+    model: &LoadedModel<B, S>,
+    prepared: &S::Prompt,
+) {
     let capabilities = model.capabilities().unwrap();
     assert_eq!(
         capabilities.effective_model_type,
@@ -1965,8 +2208,11 @@ fn capability_client_code<B: ModelCapabilityBackend>(model: &LoadedModel<B>, pre
     ));
 }
 
-fn speculative_client_code<B: SpeculativeGenerationBackend>(
-    model: &mut LoadedModel<B>,
+fn speculative_client_code<
+    B: SpeculativeBatchBackend<S>,
+    S: eredu_core::TextExecutionSession<B>,
+>(
+    model: &mut LoadedModel<B, S>,
     prepared: &PreparedChat,
 ) -> (eredu::api::GenerationOutput, Vec<SemanticEvent>) {
     assert!(matches!(
@@ -2001,8 +2247,11 @@ fn speculative_client_code<B: SpeculativeGenerationBackend>(
     (output, events)
 }
 
-fn speculative_batch_client_code<B: SpeculativeGenerationBackend>(
-    model: &mut LoadedModel<B>,
+fn speculative_batch_client_code<
+    B: SpeculativeBatchBackend<S>,
+    S: eredu_core::TextExecutionSession<B>,
+>(
+    model: &mut LoadedModel<B, S>,
     prepared: &PreparedChat,
 ) -> (SpeculativeGenerationBatchOutput, Vec<SemanticEvent>) {
     let mut events = Vec::new();
@@ -2041,7 +2290,7 @@ fn speculative_batch_client_code<B: SpeculativeGenerationBackend>(
 }
 
 fn assert_single_lane_speculative_cardinality_is_validated(
-    model: &mut LoadedModel<MockBackend>,
+    model: &mut LoadedModel<MockBackend, MockSession>,
     prepared: &PreparedChat,
 ) {
     for (prompt, actual) in [
@@ -2053,7 +2302,7 @@ fn assert_single_lane_speculative_cardinality_is_validated(
             .generate(GenerationRequest {
                 output_mode: eredu::api::OutputMode::Semantic,
                 control_handle: None,
-                input: PreparedChatInput::prepared_backend_input(prepared, prompt),
+                input: PreparedChatInput::prepared_input(prepared, prompt),
 
                 settings: eredu::api::PreparedChatGenerationSettings {
                     decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
@@ -2194,7 +2443,9 @@ fn replace_with_incompatible_tokenizer(root: &std::path::Path) {
         .unwrap();
 }
 
-fn automatic_planning_client_code<B: AutomaticPlanningBackend>(
+fn automatic_planning_client_code<
+    B: AutomaticPlanningBackend<eredu_architectures::processor_plan::ArtifactArchitecturePlan>,
+>(
     backend: &B,
     model_path: &Path,
     device: &str,
@@ -2214,22 +2465,34 @@ fn planned_loading_client_code<F>(
     model_path: &Path,
     device: &str,
 ) -> (
-    eredu::api::PlannedModel<F::Backend, RealizedDrafting<F::Drafter>>,
+    eredu::api::PlannedModel<
+        F::Backend,
+        <F::Backend as eredu::api::TextSessionComposition>::Installed,
+        RealizedDrafting<F::Drafter>,
+    >,
     ExecutionPlanReport,
 )
 where
     F: ExecutionPlanBackendFactory<
-            DrafterPreparation = eredu_architectures::ExternalDraftPreparation,
+            eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+            DraftFacts: eredu_core::ExecutionPlanDraftAdmission<
+                eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+                F::Backend,
+                Inspection = eredu_architectures::ExternalDraftPreparation,
+            >,
         > + AutomaticPlanningBackend<
+            eredu_architectures::processor_plan::ArtifactArchitecturePlan,
             Inspection = eredu_core::ArtifactInspection<
                 eredu_architectures::processor_plan::ArtifactArchitecturePlan,
             >,
         >,
-    F::Backend: TextGenerationBackend,
-    <F::Backend as ModelLoadingBackend>::ConfigurationResolver:
-        eredu_core::ModelConfigurationResolver<
-            ArtifactPlan = eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+    F::Backend: eredu::api::TextSessionComposition<
+        Model = eredu_core::backend::LoadedModelFor<
+            F::Backend,
+            eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+            F::SourcePreparation,
         >,
+    >,
 {
     let request = AutomaticPlanRequest::new(
         model_path,
@@ -2325,6 +2588,7 @@ fn assert_automatic_planning_conformance() {
             &backend,
             &wrong_backend,
             eredu_architectures::configuration::inspect_artifact(artifact.path()).unwrap(),
+            None,
         ),
         Err(AutomaticPlanningError::Invalid(message))
             if message.contains("factory owns mock")
@@ -2338,6 +2602,7 @@ fn assert_automatic_planning_conformance() {
         &backend,
         &missing_device,
         eredu_architectures::configuration::inspect_artifact(artifact.path()).unwrap(),
+        None,
     )
     .unwrap();
     assert!(matches!(
@@ -2354,6 +2619,7 @@ fn assert_automatic_planning_conformance() {
         &backend,
         &report.plan,
         eredu_architectures::configuration::inspect_artifact(artifact.path()).unwrap(),
+        None,
     )
     .unwrap();
     let changed_plan = report.plan.clone().with_drafting(DraftingPlan::Embedded {
@@ -2382,6 +2648,7 @@ fn assert_automatic_planning_conformance() {
         &backend,
         &external,
         eredu_architectures::configuration::inspect_artifact(artifact.path()).unwrap(),
+        None,
     )
     .unwrap();
     let changed_external = external.clone().with_drafting(DraftingPlan::External {
@@ -2424,7 +2691,7 @@ fn assert_automatic_planning_conformance() {
     .unwrap();
     let realization =
         eredu_core::realize_execution_plan_target(&backend, &external, selected_target).unwrap();
-    let selected_runtime = realization.into_runtime().unwrap();
+    let selected_runtime = realization.install::<MockSession>().unwrap();
     assert!(matches!(
         eredu_core::realize_execution_plan_drafting(
             &backend,
@@ -2440,6 +2707,7 @@ fn assert_automatic_planning_conformance() {
         &backend,
         &external,
         eredu_architectures::configuration::inspect_artifact(artifact.path()).unwrap(),
+        None,
     )
     .unwrap();
     let first_drafting = eredu_core::select_execution_plan_drafting(
@@ -2459,12 +2727,13 @@ fn assert_automatic_planning_conformance() {
         &backend,
         &external,
         eredu_architectures::configuration::inspect_artifact(artifact.path()).unwrap(),
+        None,
     )
     .unwrap();
     let second_runtime =
         eredu_core::realize_execution_plan_target(&backend, &external, second_target)
             .unwrap()
-            .into_runtime()
+            .install::<MockSession>()
             .unwrap();
     assert!(matches!(
         eredu_core::realize_execution_plan_drafting(
@@ -2482,6 +2751,7 @@ fn assert_automatic_planning_conformance() {
             &backend,
             &external,
             eredu_architectures::configuration::inspect_artifact(artifact.path()).unwrap(),
+            None,
         )
         .unwrap();
         let drafting = eredu_core::select_execution_plan_drafting(
@@ -2499,9 +2769,13 @@ fn assert_automatic_planning_conformance() {
         .unwrap();
         let mut runtime = eredu_core::realize_execution_plan_target(&backend, &external, selected)
             .unwrap()
-            .into_runtime()
+            .install::<MockSession>()
             .unwrap();
-        let mut foreign = ModelRuntime::prepare(MockBackend, Default::default()).unwrap();
+        let mut foreign = ModelRuntime::<_, _>::install::<MockSession>(
+            MockBackend,
+            fixture_prepared_model(Default::default()),
+        )
+        .unwrap();
         if through_parts {
             std::mem::swap(runtime.parts_mut().1, foreign.parts_mut().1);
         } else {
@@ -2514,7 +2788,7 @@ fn assert_automatic_planning_conformance() {
         ));
     }
 
-    let mut planned = LoadedModel::load_execution_plan(&backend, artifact.path(), &external)
+    let mut planned = LoadedModel::load_execution_plan(&backend, artifact.path(), &external, None)
         .expect("generic plan loading realizes the external assistant");
     assert!(planned.drafting().is_external());
     assert_eq!(planned.drafting_plan(), Some(external.drafting()));
@@ -2543,7 +2817,7 @@ fn assert_automatic_planning_conformance() {
         adaptive_lookahead: true,
     });
     assert!(matches!(
-        LoadedModel::load_execution_plan(&backend, artifact.path(), &external),
+        LoadedModel::load_execution_plan(&backend, artifact.path(), &external, None),
         Err(eredu::api::PlannedModelLoadError::Planning(
             AutomaticPlanningError::Invalid(message)
         )) if message.contains("assistant token-id vocabulary mapping does not match the target")
@@ -2645,7 +2919,9 @@ fn assert_loading_generation_capability_and_multimodal_conformance() {
     let artifact = TestDirectory::new();
     write_loadable_text_artifact(artifact.path());
 
-    let mut model = LoadedModel::load(MockBackend, artifact.path(), ()).unwrap();
+    let mut model =
+        LoadedModel::load::<FixtureLoadSelection>(MockBackend, artifact.path(), Default::default())
+            .unwrap();
 
     assert_eq!(model.model_family(), ModelKind::Llama);
     assert_eq!(model.effective_model_type(), "mistral");
@@ -2657,7 +2933,11 @@ fn assert_loading_generation_capability_and_multimodal_conformance() {
 }
 
 fn assert_distributed_conformance() {
-    let runtime = ModelRuntime::prepare(MockBackend, Default::default()).unwrap();
+    let runtime = ModelRuntime::<_, _>::install::<MockSession>(
+        MockBackend,
+        fixture_prepared_model(Default::default()),
+    )
+    .unwrap();
     let distributed = distributed_client_code(&runtime, &MockDistributedValue(vec![2, 3]));
     assert_eq!(distributed.reduced, MockDistributedValue(vec![4, 6]));
     assert_eq!(distributed.gathered, MockDistributedValue(vec![2, 3, 2, 3]));
@@ -2668,7 +2948,11 @@ fn assert_distributed_conformance() {
 }
 
 fn assert_session_observation_conformance() {
-    let mut runtime = ModelRuntime::prepare(MockBackend, Default::default()).unwrap();
+    let mut runtime = ModelRuntime::<_, _>::install::<MockSession>(
+        MockBackend,
+        fixture_prepared_model(Default::default()),
+    )
+    .unwrap();
     let output = runtime.prefill(vec![1, 2, 3]).unwrap().wait().unwrap();
     let observations = runtime.observe_output(&output).unwrap();
     assert_eq!(
@@ -2699,7 +2983,11 @@ fn assert_prepared_generation_and_speculative_conformance() {
         serde_json::json!("<|begin_of_text|>"),
     )]));
 
-    let runtime = ModelRuntime::prepare(MockBackend, Default::default()).unwrap();
+    let runtime = ModelRuntime::<_, _>::install::<MockSession>(
+        MockBackend,
+        fixture_prepared_model(Default::default()),
+    )
+    .unwrap();
     let mut model = LoadedModel::from_runtime(
         runtime,
         tokenizer,
@@ -2916,7 +3204,7 @@ fn assert_prepared_generation_and_speculative_conformance() {
         .generate(GenerationRequest {
             output_mode: eredu::api::OutputMode::Semantic,
             control_handle: None,
-            input: PreparedChatInput::prepared_backend_input(&prepared, vec![0; 999]),
+            input: PreparedChatInput::prepared_input(&prepared, vec![0; 999]),
             settings: PreparedChatGenerationSettings {
                 overrides: GenerationConfigOverrides {
                     max_new_tokens: Some(1),
@@ -2967,14 +3255,14 @@ fn assert_prepared_generation_and_speculative_conformance() {
     );
 }
 
-fn unicode_model(first: Option<u32>) -> LoadedModel<MockBackend> {
+fn unicode_model(first: Option<u32>) -> LoadedModel<MockBackend, MockSession> {
     unicode_model_with_vocabulary(first, 64)
 }
 
 fn unicode_model_with_vocabulary(
     first: Option<u32>,
     vocabulary_size: u32,
-) -> LoadedModel<MockBackend> {
+) -> LoadedModel<MockBackend, MockSession> {
     unicode_model_with_template(first, vocabulary_size, QWEN_TEMPLATE)
 }
 
@@ -2982,12 +3270,16 @@ fn unicode_model_with_template(
     first: Option<u32>,
     vocabulary_size: u32,
     template: &str,
-) -> LoadedModel<MockBackend> {
+) -> LoadedModel<MockBackend, MockSession> {
     unicode_model_with_runtime(
         first,
         vocabulary_size,
         template,
-        ModelRuntime::prepare(MockBackend, Default::default()).unwrap(),
+        ModelRuntime::<_, _>::install::<MockSession>(
+            MockBackend,
+            fixture_prepared_model(Default::default()),
+        )
+        .unwrap(),
     )
 }
 
@@ -2995,8 +3287,8 @@ fn unicode_model_with_runtime(
     first: Option<u32>,
     vocabulary_size: u32,
     template: &str,
-    runtime: ModelRuntime<MockBackend>,
-) -> LoadedModel<MockBackend> {
+    runtime: ModelRuntime<MockBackend, MockSession>,
+) -> LoadedModel<MockBackend, MockSession> {
     let mut vocabulary: std::collections::HashMap<String, u32> =
         std::iter::once(("[UNK]".into(), 0))
             .chain((0..vocabulary_size).map(|i| (format!("ordinary_{i}"), i + 1)))

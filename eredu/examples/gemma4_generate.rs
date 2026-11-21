@@ -4,7 +4,8 @@ use std::path::PathBuf;
 
 use eredu::{api::LoadedModel, runtime::chat::ChatTemplateRequest};
 use eredu_architectures::ModelKind;
-use eredu_backend_mlx::{backend::MlxBackend, MlxBackendFactory};
+use eredu_backend_mlx::MlxBackendFactory;
+use eredu_core::TokenOutput as _;
 use eredu_core::{ExecutionPlan, GenerationConfigOverrides, TextGenerationConfig};
 
 fn main() -> anyhow::Result<()> {
@@ -27,7 +28,7 @@ fn main() -> anyhow::Result<()> {
         &MlxBackendFactory::default(),
     )?);
     let planned =
-        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &model_dir, &plan)?;
+        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &model_dir, &plan, None)?;
     let (mut model, _) = planned.into_parts();
 
     let prepared = model.prepare_chat(ChatTemplateRequest {
@@ -81,8 +82,11 @@ fn gemma4_message(prompt: &str, model_family: ModelKind) -> serde_json::Value {
     }
 }
 
-fn print_first_token_distribution(
-    model: &mut LoadedModel<MlxBackend<'_>>,
+fn print_first_token_distribution<
+    B: eredu_core::TextGenerationBackend,
+    S: eredu_core::TextExecutionSession<B> + eredu_core::AutomaticPromptCacheSession<B>,
+>(
+    model: &mut LoadedModel<B, S>,
     tokens: Vec<u32>,
 ) -> anyhow::Result<()> {
     let resolved = model.resolve_generation_config(GenerationConfigOverrides {

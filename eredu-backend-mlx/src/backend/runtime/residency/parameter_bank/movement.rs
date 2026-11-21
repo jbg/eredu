@@ -139,251 +139,80 @@ impl IndexedMovement<MlxNeuralBackend> for MlxIndexedMovement {
     }
 }
 
-impl eredu_runtime::ParameterBank<MlxNeuralBackend> for AddressableParameterBank {
-    type Acquisition = AcquiredParameters;
-    type Report = ParameterBankResidencyReport;
-    type Error = Error;
+/// Concatenates the exact named tensors protected by the selected transfer.
+pub(super) fn compact_binding(
+    transfer: &ResidentTransfer,
+    name: &str,
+    stream: &Stream,
+) -> Result<Array, AddressableParameterBankError> {
+    let values = transfer
+        .leases()
+        .iter()
+        .map(|lease| lease.device_value(name).cloned())
+        .collect::<Result<Vec<_>, _>>()?;
+    if values.is_empty() {
+        return Err(AddressableParameterBankError::EmptyCompactBinding {
+            name: name.to_owned(),
+        });
+    }
+    Ok(concatenate_axis(&values, 0, stream)?)
+}
 
-    fn member_bytes(&self, key: ParameterBankKey) -> Option<u64> {
-        self.effective_member_bytes.get(&key).copied()
+struct ParameterLoanResources {
+    transfer: ResidentTransfer,
+    output: Option<MlxTensor>,
+}
+
+impl crate::backend::submission_recovery::Retention for ParameterLoanResources {
+    fn observe(&self, _: crate::backend::submission_recovery::Status) {}
+}
+
+/// Native recovery and completion for an exact borrowed parameter transfer.
+#[doc(hidden)]
+pub struct MlxParameterLoan {
+    recovery: crate::backend::submission_recovery::Recovery<ParameterLoanResources>,
+}
+
+impl MlxParameterLoan {
+    pub(super) fn begin(transfer: ResidentTransfer) -> Result<Self, Error> {
+        let recovery =
+            crate::backend::submission_recovery::Recovery::begin(ParameterLoanResources {
+                transfer,
+                output: None,
+            })?;
+        Ok(Self { recovery })
     }
 
-    fn acquire(
-        &mut self,
-        request: ParameterBankAcquisition<'_>,
-        stream: &Stream,
-    ) -> Result<Self::Acquisition, Self::Error> {
-        let entries = request
-            .entries()
-            .iter()
-            .map(|(key, count)| (*key, *count))
-            .collect::<Vec<_>>();
-        let pass = match request.access() {
-            ParameterBankAccess::Bulk => BankAccessClass::Bulk,
-            ParameterBankAccess::Incremental => BankAccessClass::Incremental,
-            _ => {
-                return Err(Error::ArchitectureModel(
-                    "unsupported addressable storage access class".into(),
-                ))
-            }
-        };
-        self.acquire_entry_demand(&entries, pass, stream)
-            .map_err(Into::into)
-    }
-
-    fn complete(
-        &mut self,
-        acquisition: Self::Acquisition,
-        output: &MlxTensor,
-        _: &Stream,
-    ) -> Result<(), Self::Error> {
-        complete_parameters(acquisition, |_| Ok(output.clone())).map(|_| ())
-    }
-
-    fn report(&self) -> Result<Self::Report, Self::Error> {
-        AddressableParameterBank::report(self).map_err(Into::into)
+    pub(super) fn transfer(&self) -> &ResidentTransfer {
+        &self.recovery.retention().transfer
     }
 }
 
-impl AddressableGroupedBank<MlxNeuralBackend> for AddressableParameterBank {
-    fn gated_product_groups(
-        &mut self,
-        acquisition: &Self::Acquisition,
-        spec: &eredu_nn::GroupedGatedProductSpec,
-        stream: &Stream,
-    ) -> Result<<MlxNeuralBackend as GroupedNeuralBackend>::GatedProductGroups, Self::Error> {
-        let started = Instant::now();
-        let mut groups = MlxNeuralBackend::grouped_gated_product(spec.clone(), stream)?;
-        let bindings = groups
-            .local_parameter_names()
-            .into_iter()
-            .map(|name| {
-                self.compact_parameter_binding(acquisition, &name, stream)
-                    .map(|value| (name, value))
-            })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
-        groups.bind_local_parameters(bindings)?;
-        self.record_compact_bank(
-            acquisition.identities()[0].bank(),
-            acquisition.pass(),
-            acquisition.scratch_bytes(),
-            started.elapsed(),
-        )?;
-        Ok(groups)
-    }
-
-    /// Constructs one compact selected-linear bank from acquired bindings.
-    fn linear_groups(
-        &mut self,
-        acquisition: &Self::Acquisition,
-        spec: &eredu_nn::GroupedLinearSpec,
-        stream: &Stream,
-    ) -> Result<<MlxNeuralBackend as GroupedNeuralBackend>::LinearGroups, Self::Error> {
-        let started = Instant::now();
-        let mut groups = MlxNeuralBackend::grouped_linear_bank(spec.clone(), stream)?;
-        let bindings = groups
-            .local_parameter_names()
-            .into_iter()
-            .map(|name| {
-                self.compact_parameter_binding(acquisition, &name, stream)
-                    .map(|value| (name, value))
-            })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
-        groups.bind_local_parameters(bindings)?;
-        self.record_compact_bank(
-            acquisition.identities()[0].bank(),
-            acquisition.pass(),
-            acquisition.scratch_bytes(),
-            started.elapsed(),
-        )?;
-        Ok(groups)
-    }
-
-    fn relu2_groups(
-        &mut self,
-        acquisition: &Self::Acquisition,
-        spec: &eredu_nn::GroupedRelu2Spec,
-        stream: &Stream,
-    ) -> Result<<MlxNeuralBackend as GroupedNeuralBackend>::Relu2Groups, Self::Error> {
-        let started = Instant::now();
-        let mut groups = MlxNeuralBackend::grouped_relu2(spec.clone(), stream)?;
-        let bindings = groups
-            .local_parameter_names()
-            .into_iter()
-            .map(|name| {
-                self.compact_parameter_binding(acquisition, &name, stream)
-                    .map(|value| (name, value))
-            })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
-        groups.bind_local_parameters(bindings)?;
-        self.record_compact_bank(
-            acquisition.identities()[0].bank(),
-            acquisition.pass(),
-            acquisition.scratch_bytes(),
-            started.elapsed(),
-        )?;
-        Ok(groups)
-    }
-}
-
-impl eredu_runtime::ParameterBank<MlxNeuralBackend> for SharedAddressableParameterBank {
-    type Acquisition = AcquiredParameters;
-    type Report = ParameterBankResidencyReport;
+impl eredu_core::residency::ParameterLoan<MlxTensor, Stream> for MlxParameterLoan {
     type Error = Error;
 
-    fn member_bytes(&self, key: ParameterBankKey) -> Option<u64> {
-        if self.scope.is_some_and(|bank| bank != key.bank()) {
-            return None;
-        }
-        self.inner.lock().ok()?.member_bytes(key)
+    fn copy_binding(&mut self, binding: &str, stream: &Stream) -> Result<MlxTensor, Error> {
+        let lease = self.transfer().leases().first().ok_or_else(|| {
+            Error::ArchitectureModel("parameter loan has no acquired storage".into())
+        })?;
+        let value =
+            MlxTensor::from_array(lease.device_value(binding)?.ensure_device_storage(stream)?);
+        self.recovery.retention_mut().output = Some(value.clone());
+        Ok(value)
     }
 
-    fn acquire(
-        &mut self,
-        request: ParameterBankAcquisition<'_>,
-        stream: &Stream,
-    ) -> Result<Self::Acquisition, Self::Error> {
-        if request
-            .entries()
-            .iter()
-            .any(|(key, _)| self.scope.is_some_and(|bank| bank != key.bank()))
-        {
+    fn finish(mut self, output: &MlxTensor) -> Result<(), Error> {
+        self.recovery.retention_mut().output = Some(output.clone());
+        let submitted = eval([output.as_array()]);
+        self.recovery.seal();
+        submitted?;
+        self.recovery.retention_mut().transfer.synchronize()?;
+        let status = self.recovery.finish();
+        if status.failed || status.blocked {
             return Err(Error::ArchitectureModel(
-                "acquisition exceeds selected bank scope".into(),
+                "parameter-bank consumer failed; unresolved leases remain retained".into(),
             ));
         }
-        self.inner
-            .lock()
-            .map_err(|_| {
-                Error::ArchitectureModel("addressable parameter bank lock was poisoned".into())
-            })?
-            .acquire(request, stream)
+        Ok(())
     }
-
-    fn complete(
-        &mut self,
-        acquisition: Self::Acquisition,
-        output: &MlxTensor,
-        stream: &Stream,
-    ) -> Result<(), Self::Error> {
-        self.inner
-            .lock()
-            .map_err(|_| {
-                Error::ArchitectureModel("addressable parameter bank lock was poisoned".into())
-            })?
-            .complete(acquisition, output, stream)
-    }
-
-    fn report(&self) -> Result<Self::Report, Self::Error> {
-        SharedAddressableParameterBank::report(self)
-    }
-}
-
-impl AddressableGroupedBank<MlxNeuralBackend> for SharedAddressableParameterBank {
-    fn gated_product_groups(
-        &mut self,
-        acquisition: &Self::Acquisition,
-        spec: &eredu_nn::GroupedGatedProductSpec,
-        stream: &Stream,
-    ) -> Result<<MlxNeuralBackend as GroupedNeuralBackend>::GatedProductGroups, Self::Error> {
-        self.inner
-            .lock()
-            .map_err(|_| {
-                Error::ArchitectureModel("addressable parameter bank lock was poisoned".into())
-            })?
-            .gated_product_groups(acquisition, spec, stream)
-    }
-
-    /// Constructs one compact selected-linear bank from acquired bindings.
-    fn linear_groups(
-        &mut self,
-        acquisition: &Self::Acquisition,
-        spec: &eredu_nn::GroupedLinearSpec,
-        stream: &Stream,
-    ) -> Result<<MlxNeuralBackend as GroupedNeuralBackend>::LinearGroups, Self::Error> {
-        self.inner
-            .lock()
-            .map_err(|_| {
-                Error::ArchitectureModel("addressable parameter bank lock was poisoned".into())
-            })?
-            .linear_groups(acquisition, spec, stream)
-    }
-
-    fn relu2_groups(
-        &mut self,
-        acquisition: &Self::Acquisition,
-        spec: &eredu_nn::GroupedRelu2Spec,
-        stream: &Stream,
-    ) -> Result<<MlxNeuralBackend as GroupedNeuralBackend>::Relu2Groups, Self::Error> {
-        self.inner
-            .lock()
-            .map_err(|_| {
-                Error::ArchitectureModel("addressable parameter bank lock was poisoned".into())
-            })?
-            .relu2_groups(acquisition, spec, stream)
-    }
-}
-
-/// Shared lease lifetime for grouped operators and row decoding, including
-/// operators that submit work while constructing their returned tensor.
-pub(super) fn complete_parameters(
-    acquisition: AcquiredParameters,
-    operation: impl FnOnce(&AcquiredParameters) -> Result<MlxTensor, Error>,
-) -> Result<MlxTensor, Error> {
-    let mut recovery = crate::backend::submission_recovery::Recovery::begin(acquisition)?;
-    let result = operation(recovery.retention());
-    let submitted = result.and_then(|output| {
-        eval([output.as_array()])?;
-        Ok(output)
-    });
-    recovery.seal();
-    let output = submitted?;
-    recovery.retention_mut().transfer.synchronize()?;
-    let status = recovery.finish();
-    if status.failed || status.blocked {
-        return Err(Error::ArchitectureModel(
-            "parameter-bank consumer failed; unresolved leases remain retained".into(),
-        ));
-    }
-    Ok(output)
 }

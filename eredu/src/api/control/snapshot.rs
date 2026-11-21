@@ -60,8 +60,11 @@ pub struct GenerationSnapshotMetadata {
 /// termination, pending-input and capture/intervention continuation. It is usable
 /// only with the source logical run and loaded driver; metadata may outlive that
 /// run, but cannot authorize restoration into a new model or process.
-pub struct ControlledGenerationSnapshot<B: TextSnapshotBackend> {
-    pub(super) continuation: TextContinuationSnapshot<B, ControlConstraints>,
+pub struct ControlledGenerationSnapshot<
+    B: TextSnapshotBackend<S>,
+    S: eredu_core::TextExecutionSession<B> + eredu_core::execution_control::NativeTextStateSession<B>,
+> {
+    pub(super) continuation: TextContinuationSnapshot<B, ControlConstraints, S>,
     pub(super) cursor: CommittedGenerationCursor,
     pub(super) pipeline: CommittedTokenPipeline<PreparedChatTokenDecoder>,
     pub(super) lifecycle: GenerationBoundary,
@@ -69,7 +72,12 @@ pub struct ControlledGenerationSnapshot<B: TextSnapshotBackend> {
     pub(super) semantic_prefix: Vec<SemanticEvent>,
     pub(super) prompt_token_ids: std::sync::Arc<[u32]>,
 }
-impl<B: TextSnapshotBackend> ControlledGenerationSnapshot<B> {
+impl<
+        B: TextSnapshotBackend<S>,
+        S: eredu_core::TextExecutionSession<B>
+            + eredu_core::execution_control::NativeTextStateSession<B>,
+    > ControlledGenerationSnapshot<B, S>
+{
     /// Exact immutable canonical prompt, shared safely by the branch tree.
     pub fn prompt_token_ids(&self) -> &[u32] {
         &self.prompt_token_ids
@@ -84,7 +92,9 @@ impl<B: TextSnapshotBackend> ControlledGenerationSnapshot<B> {
     }
 }
 
-impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
+impl<B: TextGenerationBackend, S: eredu_core::TextExecutionSession<B>>
+    ControlledGenerationSession<'_, B, S>
+{
     /// Current consumer checkpoint; capturing it alone does not save native state.
     pub fn output_checkpoint(&self) -> GenerationOutputCheckpoint {
         GenerationOutputCheckpoint {
@@ -100,7 +110,12 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
     }
 }
 
-impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
+impl<
+        B: TextSnapshotBackend<S>,
+        S: eredu_core::TextExecutionSession<B>
+            + eredu_core::execution_control::NativeTextStateSession<B>,
+    > ControlledGenerationSession<'_, B, S>
+{
     pub(super) fn snapshot_result<T>(
         &mut self,
         result: Result<T, ControlledGenerationError>,
@@ -111,7 +126,7 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
                 eredu_runtime::execution_control::TextSnapshotError::<eredu_core::BackendFailure>::Backend(_)
             ))
         ) && !matches!(
-            B::estimate_native_text_state(self.driver.runtime(), None),
+            S::estimate_native_text_state(self.driver.runtime(), None),
             Ok(Some(_))
         ) {
             // Preserve known, safely completed copy failures. An unresolved or
@@ -135,7 +150,7 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
             );
         }
         if let ControlSupport::Unsupported { reason } =
-            B::native_text_state_support(self.driver.runtime())
+            S::native_text_state_support(self.driver.runtime())
         {
             return Err(CaptureError::Unsupported(reason).into());
         }
@@ -149,7 +164,7 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
             .ok_or(ExecutionControlError::UnknownEstimate)?;
         let boundary = self.state.boundary(&mut self.driver)?;
         let (runtime, state, pending) = boundary.parts();
-        B::estimate_native_text_state(runtime, None)
+        S::estimate_native_text_state(runtime, None)
             .map_err(|error| eredu_runtime::execution_control::TextSnapshotError::<eredu_core::BackendFailure>::Backend(eredu_core::BackendFailure::from_error(error)))?
             .ok_or(ExecutionControlError::UnknownEstimate)?;
         B::estimate_sampling_state(runtime, B::sampling_state(state))
@@ -176,7 +191,7 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
     pub fn snapshot(
         &mut self,
         emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
-    ) -> Result<ControlledGenerationSnapshot<B>, ControlledGenerationError> {
+    ) -> Result<ControlledGenerationSnapshot<B, S>, ControlledGenerationError> {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.snapshot_inner(emit))) {
             Ok(result) => self.snapshot_result(result),
             Err(payload) => {
@@ -190,7 +205,7 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
     fn snapshot_inner(
         &mut self,
         mut emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
-    ) -> Result<ControlledGenerationSnapshot<B>, ControlledGenerationError> {
+    ) -> Result<ControlledGenerationSnapshot<B, S>, ControlledGenerationError> {
         if self.delivery.cancellation.is_cancelled() {
             return Err(
                 CaptureError::Invalid("cancelled generation cannot be snapshotted".into()).into(),
@@ -217,7 +232,7 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
         let host_bytes = self
             .semantic_snapshot_bytes()
             .ok_or(ExecutionControlError::UnknownEstimate)?
-            .checked_add(std::mem::size_of::<ControlledGenerationSnapshot<B>>() as u64)
+            .checked_add(std::mem::size_of::<ControlledGenerationSnapshot<B, S>>() as u64)
             .and_then(|n| n.checked_add(metadata.snapshot_id.len() as u64))
             .and_then(|n| n.checked_add(metadata.session_id.len() as u64))
             .and_then(|n| {
@@ -261,7 +276,10 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
         };
         let max_predictions = snapshot.cursor.max_predictions();
         self.branch_growth_known = matches!(
-            B::text_sampling_control_support(self.driver.runtime()),
+            self.driver
+                .runtime()
+                .session()
+                .text_sampling_control_support(self.driver.runtime().backend()),
             ControlSupport::Supported
         ) && snapshot
             .pipeline
@@ -294,7 +312,7 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
     /// be revived by restoration.
     pub fn restore(
         &mut self,
-        snapshot: &ControlledGenerationSnapshot<B>,
+        snapshot: &ControlledGenerationSnapshot<B, S>,
         emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
     ) -> Result<(), ControlledGenerationError> {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -311,7 +329,7 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
 
     fn restore_inner(
         &mut self,
-        snapshot: &ControlledGenerationSnapshot<B>,
+        snapshot: &ControlledGenerationSnapshot<B, S>,
         mut emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
     ) -> Result<(), ControlledGenerationError> {
         if self.delivery.cancellation.is_cancelled() {

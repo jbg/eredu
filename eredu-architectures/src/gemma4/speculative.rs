@@ -6,6 +6,10 @@ use eredu_core::{
     BoundedCompletion, SpeculativeCommit, SpeculativeExecutor, SpeculativePrefill, Submission,
 };
 
+use eredu_runtime::speculative::{
+    external_assistant_input_identity, ExternalAssistantPrompt, ExternalAssistantTarget,
+};
+
 use super::{AssistantState, SharedAttentionStates};
 use crate::{
     composite_execution::ExternalPredictionTargetCapture,
@@ -23,7 +27,7 @@ pub struct ArchitectureExternalMechanisms<M>(PhantomData<fn() -> M>);
 
 impl<M> ExternalMechanisms for ArchitectureExternalMechanisms<M>
 where
-    M: ExternalAssistantExecutionMechanisms<Gemma4AssistantArchitecture> + 'static,
+    M: ExternalAssistantExecutionMechanisms + 'static,
 {
     fn coordinate_speculative_step(
         local: Vec<eredu_core::SpeculativeScheduleState>,
@@ -48,10 +52,11 @@ where
         M::coordinate_decoding_control(local, context)
     }
 
-    type Target = M::Target;
-    type Assistant = M::Assistant;
+    type Target = ExternalAssistantTarget<M>;
+    type Assistant =
+        eredu_runtime::speculative::InstalledAssistantFor<M, Gemma4AssistantArchitecture>;
     type Capture = crate::composite_execution::ExternalPredictionCaptureRequest;
-    type Input = M::Input;
+    type Input = ExternalAssistantPrompt<M>;
     type Cache = ExternalAssistantCache<M::NativeCache>;
     type CacheCheckpoint = ExternalAssistantCacheCheckpoint<M::NativeCacheCheckpoint>;
     type Tensor = M::Tensor;
@@ -60,6 +65,16 @@ where
     type Completion = M::Completion;
     type Telemetry = M::Telemetry;
     type Error = M::Error;
+
+    fn create_cache(
+        target: &mut Self::Target,
+        selected: &eredu_runtime::SelectedSpeculativeRealization,
+    ) -> Result<Self::Cache, Self::Error> {
+        Ok(ExternalAssistantCache::new(
+            M::new_target_cache(target)?,
+            selected.clone(),
+        ))
+    }
 
     fn control_logits_estimate(
         logits: &Self::Logits,
@@ -75,7 +90,10 @@ where
         eredu_core::residency::ExecutionConversionRetentionTrimReport,
         eredu_core::residency::ParameterConversionTrimError,
     > {
-        M::trim_parameter_conversions(target, assistant)
+        eredu_runtime::speculative::trim_external_assistant_conversions::<
+            M,
+            Gemma4AssistantArchitecture,
+        >(target, assistant)
     }
 
     fn parameter_conversion_retention(
@@ -85,11 +103,14 @@ where
         Option<eredu_core::residency::ExecutionConversionRetentionReport>,
         eredu_core::BackendFailure,
     > {
-        M::parameter_conversion_retention(target, assistant)
+        eredu_runtime::speculative::external_assistant_conversion_retention::<
+            M,
+            Gemma4AssistantArchitecture,
+        >(target, assistant)
     }
 
     fn max_proposals(assistant: &Self::Assistant) -> usize {
-        M::config(assistant).block_size.saturating_sub(1)
+        assistant.config.block_size.saturating_sub(1)
     }
 
     fn empty_input() -> Self::Error {
@@ -113,7 +134,7 @@ where
         path: &str,
         value: Self::Tensor,
     ) -> Result<Self::Tensor, Self::Error> {
-        M::observe_tensor(assistant, path, value)
+        assistant.observers.observe_tensor(path, &value)
     }
 
     fn observe_output(
@@ -122,7 +143,9 @@ where
         output: &mut ExternalTargetOutput<Self::Tensor>,
         logits_path: &str,
     ) -> Result<(), Self::Error> {
-        output.logits = M::observe_tensor(assistant, logits_path, output.logits.clone())?;
+        output.logits = assistant
+            .observers
+            .observe_tensor(logits_path, &output.logits.clone())?;
         Ok(())
     }
 
@@ -138,7 +161,7 @@ where
         cache: &mut Self::Cache,
     ) -> Result<(), Self::Error> {
         cache
-            .bind_prepared_input_cache_identity(&M::prepared_input_cache_identity(input)?)
+            .bind_prepared_input_cache_identity(external_assistant_input_identity::<M>(input)?)
             .map_err(M::error)
     }
 
@@ -151,7 +174,7 @@ where
         context: Self::Context<'a>,
     ) -> Result<ExternalTargetOutput<Self::Tensor>, Self::Error> {
         let (logits, mut capture) =
-            M::prefill_target_native(target, request, input, cache.native_mut(), context)?;
+            M::prefill_target(target, request, input, cache.native_mut(), context)?;
         cache
             .advance_frontier(M::native_cache_len(cache.native())?)
             .map_err(M::error)?;
@@ -168,7 +191,7 @@ where
         context: Self::Context<'a>,
     ) -> Result<ExternalTargetOutput<Self::Tensor>, Self::Error> {
         let (logits, mut capture) =
-            M::verify_target_native(target, request, tokens, cache.native_mut(), context)?;
+            M::verify_target(target, request, tokens, cache.native_mut(), context)?;
         cache
             .advance_frontier(M::native_cache_len(cache.native())?)
             .map_err(M::error)?;
@@ -317,7 +340,7 @@ where
         state: &mut AssistantState<Self::Tensor>,
         context: Self::Context<'a>,
     ) -> Result<Self::Logits, Self::Error> {
-        let module = M::module(assistant);
+        let module = &mut assistant.module;
         let logits = module
             .draft_step::<M::AttentionCache>(
                 embedding,
@@ -326,11 +349,9 @@ where
             )
             .map(M::into_logits)
             .map_err(M::neural_error)?;
-        M::observe_logits(
-            assistant,
-            EXTERNAL_ASSISTANT_PROPOSAL_LOGITS_OBSERVATION_PATH,
-            logits,
-        )
+        assistant
+            .observers
+            .observe_logits(EXTERNAL_ASSISTANT_PROPOSAL_LOGITS_OBSERVATION_PATH, &logits)
     }
 
     fn submit_verification<'a>(
@@ -350,14 +371,18 @@ where
 }
 
 fn observe_capture<M>(
-    assistant: &mut M::Assistant,
+    assistant: &mut eredu_runtime::speculative::InstalledAssistantFor<
+        M,
+        Gemma4AssistantArchitecture,
+    >,
     cache: &ExternalAssistantCache<M::NativeCache>,
     capture: &mut ExternalPredictionTargetCapture<M::Tensor>,
 ) -> Result<(), M::Error>
 where
-    M: ExternalAssistantExecutionMechanisms<Gemma4AssistantArchitecture>,
+    M: ExternalAssistantExecutionMechanisms,
 {
-    let ExternalPredictionTargetCapture::Gemma4 { hidden, shared_kv } = capture else {
+    let ExternalPredictionTargetCapture::HiddenWithSharedAttention { hidden, shared_kv } = capture
+    else {
         return Err(M::error(
             "Gemma target returned a different assistant capture".into(),
         ));
@@ -370,12 +395,18 @@ where
             1 + shared_kv.len() * 2
         )));
     }
-    *hidden = M::observe_tensor(assistant, paths[0], hidden.clone())?;
+    *hidden = assistant
+        .observers
+        .observe_tensor(paths[0], &hidden.clone())?;
     let (shared_paths, remainder) = paths[1..].as_chunks::<2>();
     debug_assert!(remainder.is_empty());
     for ((_, keys, values), paths) in shared_kv.iter_mut().zip(shared_paths) {
-        *keys = M::observe_tensor(assistant, paths[0], keys.clone())?;
-        *values = M::observe_tensor(assistant, paths[1], values.clone())?;
+        *keys = assistant
+            .observers
+            .observe_tensor(paths[0], &keys.clone())?;
+        *values = assistant
+            .observers
+            .observe_tensor(paths[1], &values.clone())?;
     }
     Ok(())
 }
@@ -385,7 +416,7 @@ fn validate_output_capture<M>(
     output: &ExternalTargetOutput<M::Tensor>,
 ) -> Result<(), M::Error>
 where
-    M: ExternalAssistantExecutionMechanisms<Gemma4AssistantArchitecture>,
+    M: ExternalAssistantExecutionMechanisms,
 {
     let mut shapes = Vec::with_capacity(1 + output.shared_kv.len() * 2);
     shapes.push(M::tensor_shape(&output.hidden)?);
@@ -401,9 +432,10 @@ fn target_output<M>(
     capture: ExternalPredictionTargetCapture<M::Tensor>,
 ) -> Result<ExternalTargetOutput<M::Tensor>, M::Error>
 where
-    M: ExternalAssistantExecutionMechanisms<Gemma4AssistantArchitecture>,
+    M: ExternalAssistantExecutionMechanisms,
 {
-    let ExternalPredictionTargetCapture::Gemma4 { hidden, shared_kv } = capture else {
+    let ExternalPredictionTargetCapture::HiddenWithSharedAttention { hidden, shared_kv } = capture
+    else {
         return Err(M::error(
             "Gemma 4 target returned a different assistant capture".into(),
         ));
@@ -515,6 +547,12 @@ pub trait ExternalMechanisms: 'static {
     type Input;
     /// Complete ordinary-target cache.
     type Cache;
+
+    /// Provisions one cache for the selected target and assistant.
+    fn create_cache(
+        target: &mut Self::Target,
+        selected: &eredu_runtime::SelectedSpeculativeRealization,
+    ) -> Result<Self::Cache, Self::Error>;
     /// Exact cache checkpoint.
     type CacheCheckpoint;
     /// Retained native tensor.
@@ -739,6 +777,22 @@ pub struct ExternalExecutor<'a, M: ExternalMechanisms> {
     assistant: &'a mut M::Assistant,
     capture: M::Capture,
     _mechanisms: PhantomData<fn() -> M>,
+}
+
+impl<M: ExternalMechanisms>
+    eredu_core::speculative::SpeculativeCacheFactory<eredu_runtime::SelectedSpeculativeRealization>
+    for ExternalExecutor<'_, M>
+{
+    fn create_cache<'context>(
+        &mut self,
+        selected: &eredu_runtime::SelectedSpeculativeRealization,
+        _: Self::Context<'context>,
+    ) -> Result<Self::Cache, Self::Error>
+    where
+        Self: 'context,
+    {
+        M::create_cache(self.target, selected)
+    }
 }
 
 impl<'a, M: ExternalMechanisms> ExternalExecutor<'a, M> {

@@ -5,13 +5,14 @@ use crate::{
     streaming::StreamPhase,
     Error,
 };
+use eredu_core::communication::BoundaryTensorDtype as Dtype;
+use eredu_core::communication::CommunicationRouteId;
 use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Tensor, TensorElementType};
 use eredu_runtime::{
     ArchitectureBoundary, ArchitectureBoundaryError, ArchitectureBoundaryValue,
-    ArchitecturePartition, BoundaryTensorDimension as Dim, BoundaryTensorDtype as Dtype,
-    BoundaryTensorSpec, CommunicationRouteId, ComponentAdapter, ComponentDefinition,
-    LayeredForwardState, LayeredPartitionInput, LayeredPartitionOutput, LocalModelLayout,
-    PartitionBoundaryRoute, PartitionComponentKernel, PipelineComponentKernel,
+    ArchitecturePartition, BoundaryTensorDimension as Dim, BoundaryTensorSpec, ComponentAdapter,
+    ComponentDefinition, LayeredForwardState, LayeredPartitionInput, LayeredPartitionOutput,
+    LocalModelLayout, PartitionBoundaryRoute, PartitionComponentKernel, PipelineComponentKernel,
     ResolvedBoundaryWireSchema, StateLayout,
 };
 use std::{collections::BTreeMap, ops::Range};
@@ -476,9 +477,7 @@ use eredu_core::{
     execution_control::{ExecutionControlError, SnapshotEstimate},
     BackendFailure,
 };
-use eredu_runtime::execution_control::{
-    snapshot_value_estimate, SnapshotReservation, SnapshotValue,
-};
+use eredu_runtime::execution_control::{snapshot_value_estimate, SnapshotRetention, SnapshotValue};
 impl SnapshotValue for DecoderPartitionStateIdentity {
     fn estimate_snapshot_value(&self) -> Result<SnapshotEstimate, BackendFailure> {
         snapshot_value_estimate::<Self>([
@@ -489,7 +488,7 @@ impl SnapshotValue for DecoderPartitionStateIdentity {
             }),
         ])
     }
-    fn copy_snapshot_value(&self, retention: &SnapshotReservation) -> Result<Self, BackendFailure> {
+    fn copy_snapshot_value(&self, retention: &SnapshotRetention) -> Result<Self, BackendFailure> {
         let mut prefix = String::new();
         prefix
             .try_reserve_exact(self.prefix.len())
@@ -517,7 +516,7 @@ impl<T: Tensor + SnapshotValue> SnapshotValue for DecoderRuntimeState<T> {
             }),
         ])
     }
-    fn copy_snapshot_value(&self, retention: &SnapshotReservation) -> Result<Self, BackendFailure> {
+    fn copy_snapshot_value(&self, retention: &SnapshotRetention) -> Result<Self, BackendFailure> {
         Ok(Self {
             layout: self.layout.clone(),
             value: self.value.copy_snapshot_value(retention)?,

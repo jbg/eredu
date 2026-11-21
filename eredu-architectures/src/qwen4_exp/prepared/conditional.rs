@@ -419,15 +419,25 @@ impl SelectedConditionalExecution {
         mut visitor: V,
     ) -> Result<V::Output, crate::prepared_execution::PreparedExecutionError<V::Error>>
     where
-        B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone + 'static,
+        B: eredu_core::SubmissionBackend<
+                Executor = <<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
+            > + eredu_nn::GroupedNeuralBackend
+            + eredu_nn::DistributedNeuralBackend
+            + Clone
+            + 'static,
         S: eredu_runtime::LayerRuntimeState<B>,
         S::LayerState: eredu_nn::AttentionCache<B::Tensor>
             + eredu_runtime::RuntimeStateComponents<B>
             + eredu_runtime::RuntimeAppendStreams<B>,
-        V: crate::replicated_text::CompositeTextArchitectureVisitor<B, S>,
+        V: crate::replicated_text::CompositeTextArchitectureVisitor<
+            B,
+            S,
+            crate::SelectedRoutedBank,
+            crate::replicated_text::CompositeTextRequirements,
+            crate::replicated_text::RoutedCompositeRequirements,
+        >,
     {
         use crate::prepared_execution::PreparedExecutionError;
-        use crate::replicated_text::PreparedRoutedCompositeTextArchitecture;
         if self.selected.prediction_state().is_some() {
             return Err(PreparedExecutionError::UnavailablePrediction);
         }
@@ -442,7 +452,7 @@ impl SelectedConditionalExecution {
         let (prepared, source, processor) = self
             .prepare_composite::<B, S>(context)
             .map_err(|error| PreparedExecutionError::Architecture(error.to_string()))?;
-        let prepared = PreparedRoutedCompositeTextArchitecture::from_routed_declared(
+        let prepared = crate::replicated_text::prepare_routed_composite_handoff(
             prepared,
             requirements,
             &selected,
@@ -451,9 +461,19 @@ impl SelectedConditionalExecution {
             admission,
         )
         .map_err(PreparedExecutionError::Architecture)?;
-        visitor
-            .visit_routed(prepared, source)
-            .map_err(PreparedExecutionError::Backend)
+        let mechanisms = visitor.session_mechanisms(source.clone());
+        let (session, facts) =
+            eredu_runtime::executable_binding::routed_session::construct_selected_routed_composite_session(
+                &visitor, prepared, mechanisms, Default::default(), source, &[],
+            )?;
+        let executable = eredu_runtime::executable_binding::routed_session::bind_routed_composite(
+            &visitor, session, facts,
+        );
+        Ok(eredu_runtime::executable_binding::install_text_route::<
+            V::BoundCompositeRouted<_>,
+            _,
+            _,
+        >(executable))
     }
 
     /// Constructs the conditional target and independent predictor from one retained
@@ -463,23 +483,40 @@ impl SelectedConditionalExecution {
         self,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
         mut visitor: V,
-        binding: crate::prepared_execution::PredictionBinding,
+        binding: crate::prepared_execution::RetainedPredictionBinding,
     ) -> Result<V::Output, crate::prepared_execution::PreparedExecutionError<V::Error>>
     where
-        B: eredu_nn::GroupedNeuralBackend
+        B: eredu_core::SubmissionBackend<
+                Executor = <<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
+            > + eredu_nn::TensorParallelGroupedNeuralBackend
             + eredu_nn::DistributedNeuralBackend
             + eredu_nn::BlockwiseAttentionBackend
             + eredu_nn::HyperNeuralBackend
             + Clone
             + 'static,
-        S: eredu_runtime::LayerRuntimeState<B>,
-        S::LayerState: eredu_nn::AttentionCache<B::Tensor>
-            + eredu_runtime::RuntimeStateComponents<B>
-            + eredu_runtime::RuntimeAppendStreams<B>,
-        V: crate::replicated_text::CompositeTextArchitectureVisitor<B, S>,
+        S: eredu_runtime::LayerRuntimeState<B>
+            + eredu_runtime::PredictionModelState<
+                B,
+                LayerState: eredu_runtime::RuntimeAppendStreams<B>,
+            >,
+        <S as eredu_runtime::LayerRuntimeState<B>>::LayerState:
+            eredu_nn::AttentionCache<B::Tensor>
+                + eredu_runtime::RuntimeStateComponents<B>
+                + eredu_runtime::RuntimeAppendStreams<B>,
+        V: crate::replicated_text::CompositeTextArchitectureVisitor<
+                B,
+                S,
+                crate::SelectedRoutedBank,
+                crate::replicated_text::CompositeTextRequirements,
+                crate::replicated_text::RoutedCompositeRequirements,
+            > + eredu_runtime::executable_binding::routed_session::RetainedCompositePrediction<
+                B,
+                S,
+                crate::SelectedRoutedBank,
+                Published = V::Output,
+            >,
     {
         use crate::prepared_execution::PreparedExecutionError;
-        use crate::replicated_text::PreparedRoutedCompositeTextArchitecture;
         if self.selected.prediction_state().is_none() {
             return Err(PreparedExecutionError::PredictionSourceMismatch);
         }
@@ -505,7 +542,7 @@ impl SelectedConditionalExecution {
         let (prepared, target_source, processor) = self
             .prepare_composite::<B, S>(context)
             .map_err(|error| PreparedExecutionError::Architecture(error.to_string()))?;
-        let prepared = PreparedRoutedCompositeTextArchitecture::from_routed_declared(
+        let prepared = crate::replicated_text::prepare_routed_composite_handoff(
             prepared,
             requirements,
             &selected,
@@ -514,12 +551,13 @@ impl SelectedConditionalExecution {
             admission,
         )
         .map_err(PreparedExecutionError::Architecture)?;
-        visitor.visit_prediction(
+        eredu_runtime::executable_binding::routed_session::construct_retained_composite_prediction(
+            visitor,
             prepared,
             prediction,
             target_source,
             provider_source,
-            binding,
+            binding.into_facts(),
         )
     }
 

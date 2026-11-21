@@ -7,9 +7,8 @@ use crate::{
     ExpertParameterRecipe, ExpertParameterRole, ExpertRealizationPlan, ExpertResidencyCatalog,
     ExpertResidencyDistribution, ExpertResidencyUnit,
 };
-use eredu_runtime::{
-    AppendStreamBinding, ExecutionGroupId, ParameterBankKey, ReplicatedTextParameterOwner as Owner,
-};
+use eredu_core::cache::append_stream::AppendStreamBinding;
+use eredu_runtime::{ExecutionGroupId, ParameterBankKey, ReplicatedTextParameterOwner as Owner};
 
 const GROUP: &str = crate::qwen4_exp::mtp::PREDICTION_EXECUTION_GROUP;
 fn invalid(error: impl std::fmt::Display) -> PreparationError {
@@ -86,12 +85,12 @@ pub(super) fn prediction_requirements<C: eredu_checkpoint::recipe::RecipeCatalog
         ));
     }
     let global_experts = prediction.global_expert_count()?;
-    AppendStreamBinding::validate_layout(&state, &streams)?;
+    eredu_runtime::validate_append_stream_layout(&state, &streams)?;
     for binding in &streams {
         if binding.lanes != prediction.limits.qsa.batch as u32
             || binding.limits.read_entries < prediction.limits.tile_blocks as usize
         {
-            return Err(eredu_runtime::AppendStreamError::Geometry.into());
+            return Err(eredu_core::cache::append_stream::AppendStreamError::Geometry.into());
         }
     }
     let bank = prediction

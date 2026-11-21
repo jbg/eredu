@@ -4,6 +4,13 @@
 //! parameter and cache mechanisms; they do not resolve artifacts or interpret
 //! checkpoint layouts. Session admission and publication remain caller-owned.
 
+use eredu_core::sampling::DenseSamplingBackend;
+
+use eredu_core::checkpoint_mechanisms::unit_binding::ComponentPreparation;
+
+use eredu_core::realtime_mechanisms::RealtimeJointStateParts;
+use eredu_core::SubmissionBackend;
+
 use super::rnnt::RnntExecution;
 use eredu_codec::{
     ear_decoder_layered::DecoderExecution, ear_encoder_layered::EncoderExecution,
@@ -15,9 +22,8 @@ use eredu_nn::{
     TensorElementType,
 };
 use eredu_runtime::{
-    ComponentPreparation, DenseSamplingBackend, LayerRuntimeState, LayeredInvocation,
-    LayeredTensorCohort, LocalComponentMechanisms, ParameterUnitMechanisms,
-    RealtimeGenerationBranch, RealtimeJointStateParts, RuntimeStateComponents, SubmissionBackend,
+    LayerRuntimeState, LayeredInvocation, LayeredTensorCohort, LocalComponentMechanisms,
+    ParameterUnitMechanisms, RealtimeGenerationBranch, RuntimeStateComponents,
 };
 
 use crate::nemotron_h;
@@ -232,17 +238,24 @@ impl<'a> PreparedVoiceChatConstruction<'a> {
             + ComponentPreparation<Context = <B::Tensor as Tensor>::Context>,
         C: LayeredTensorCohort<B>,
     {
-        mechanisms.prepare_components(move |mechanisms, context| {
+        use eredu_core::checkpoint_mechanisms::unit_binding::ComponentPreparationScope as _;
+        eredu_runtime::automatic_support::initialize_allocator_defaults(
+            mechanisms.allocator_cache_defaults(),
+        )?;
+        let scope = mechanisms.begin_component_preparation()?;
+        let context = mechanisms.component_context();
+        let result = (|| {
             let residency_report = policy.validate(&self.backbone, &self.speech)?;
             let input = InputState::from_retained(self.artifacts, options)?;
             let (speech, _) =
                 self.speech
                     .materialize::<B, H, C>(policy.speech(), mechanisms, context)?;
-            let backbone = mechanisms.bind_local(|| {
-                self.backbone
-                    .prepare_local::<B, S>(policy.backbone(), context)
-                    .map_err(eredu_core::BackendFailure::from_error)
-            })?;
+            let backbone_scope = mechanisms.begin_local_preparation()?;
+            let backbone = self
+                .backbone
+                .prepare_local::<B, S>(policy.backbone(), context)
+                .map_err(eredu_core::BackendFailure::from_error);
+            let backbone = backbone_scope.finish(backbone)?.bind(mechanisms, context)?;
             Ok((
                 VoiceChatComponents {
                     backbone,
@@ -254,7 +267,8 @@ impl<'a> PreparedVoiceChatConstruction<'a> {
                 },
                 input,
             ))
-        })
+        })();
+        scope.finish(result)
     }
 }
 

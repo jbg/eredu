@@ -1,10 +1,12 @@
 //! Finite EAR encoder units over the shared resident and bounded traversal.
+
 use crate::ear_specs::EncoderSpec;
 use crate::{
     ear_encoder::{invalid, EncoderConfig, EncoderUnit, EncoderUnitSpec},
     Error,
 };
 use eredu_core::BackendFailure;
+use eredu_core::SubmissionBackend;
 use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Tensor, TensorElementType};
 use eredu_runtime::{
     ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitectureGroupTransport,
@@ -13,7 +15,6 @@ use eredu_runtime::{
     ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress, ExecutionUnitLayout,
     LayeredForwardState, LayeredInvocation, LayerwisePolicy, LayerwiseRuntime, LocalModelLayout,
     OwnedParameterGroupSpec, ParallelComponentKernel, ParameterGroupOwner, StatelessComponentState,
-    SubmissionBackend,
 };
 use std::marker::PhantomData;
 

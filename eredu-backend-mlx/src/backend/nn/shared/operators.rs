@@ -42,7 +42,7 @@ impl LinearOperator<MlxTensor> for MlxLinear {
         Ok(())
     }
     fn forward(&mut self, input: &MlxTensor, context: &Stream) -> Result<MlxTensor, ComputeError> {
-        self.forward_observed_input(input, None, context, None)
+        self.forward_observed_input(input, context, None)
     }
     fn forward_with_input_observer(
         &mut self,
@@ -50,7 +50,7 @@ impl LinearOperator<MlxTensor> for MlxLinear {
         context: &Stream,
         observer: Option<&mut dyn eredu_nn::ProjectionInputObserver<MlxTensor>>,
     ) -> Result<MlxTensor, ComputeError> {
-        self.forward_observed_input(input, None, context, observer)
+        self.forward_observed_input(input, context, observer)
     }
 }
 
@@ -148,22 +148,57 @@ impl MlxLinear {
     pub(super) fn forward_observed_input(
         &mut self,
         input: &MlxTensor,
-        parallel: Option<&Group>,
         context: &Stream,
         observer: Option<&mut dyn eredu_nn::ProjectionInputObserver<MlxTensor>>,
     ) -> Result<MlxTensor, ComputeError> {
         if self.arithmetic == eredu_nn::LinearArithmetic::ChannelMajorAffine {
-            if parallel.is_some() {
+            return self.forward_channel_major(input, context, observer);
+        }
+        if self.arithmetic == eredu_nn::LinearArithmetic::RowMajorAffine {
+            return self.forward_row_affine(input, context, observer);
+        }
+        let compute_element = self.arithmetic.compute_element();
+        let original = input
+            .element_type()
+            .ok_or_else(|| ComputeError::backend("unknown projection input precision"))?;
+        let cast = compute_element
+            .map(|kind| input.cast_float(kind, context))
+            .transpose()?;
+        let mut adapter = observer.map(|inner| NativeInputObserver {
+            inner,
+            failure: None,
+        });
+        let observed = adapter
+            .as_mut()
+            .map(|adapter| adapter as &mut dyn common::linear::NativeProjectionInputObserver);
+        let result = self.module.forward_with_input_observer(
+            cast.as_ref().unwrap_or(input).as_array(),
+            context,
+            observed,
+        );
+        if let Some(error) = adapter.and_then(|adapter| adapter.failure) {
+            return Err(error);
+        }
+        let output = compute_tensor(result)?;
+        if compute_element.is_some() {
+            output.cast_float(original, context)
+        } else {
+            Ok(output)
+        }
+    }
+
+    pub(super) fn prepare_row_parallel(
+        &mut self,
+        input: &MlxTensor,
+        context: &Stream,
+        observer: Option<&mut dyn eredu_nn::ProjectionInputObserver<MlxTensor>>,
+    ) -> Result<eredu_nn::RowParallelProjection<MlxTensor>, ComputeError> {
+        let compute_element = match self.arithmetic {
+            eredu_nn::LinearArithmetic::ChannelMajorAffine => {
                 return Err(ComputeError::backend(
                     "channel-major affine arithmetic requires a replicated projection",
                 ));
             }
-            return self.forward_channel_major(input, context, observer);
-        }
-        if self.arithmetic == eredu_nn::LinearArithmetic::RowMajorAffine && parallel.is_none() {
-            return self.forward_row_affine(input, context, observer);
-        }
-        let compute_element = match self.arithmetic {
             eredu_nn::LinearArithmetic::RowMajorAffine => Some(eredu_nn::TensorElementType::F32),
             arithmetic => arithmetic.compute_element(),
         };
@@ -171,44 +206,40 @@ impl MlxLinear {
             .element_type()
             .ok_or_else(|| ComputeError::backend("unknown projection input precision"))?;
         let cast = compute_element
-            .filter(|_| parallel.is_none())
-            .map(|e| input.cast_float(e, context))
+            .map(|kind| input.cast_float(kind, context))
             .transpose()?;
-        let input = cast.as_ref().unwrap_or(input);
         let mut adapter = observer.map(|inner| NativeInputObserver {
             inner,
             failure: None,
         });
-        let observer = adapter
+        let observed = adapter
             .as_mut()
             .map(|adapter| adapter as &mut dyn common::linear::NativeProjectionInputObserver);
-        let result = match parallel {
-            Some(group) => self.module.forward_row_parallel_with_compute(
-                input.as_array(),
-                group,
-                context,
-                observer,
-                compute_element.map(|e| match e {
-                    eredu_nn::TensorElementType::F16 => safemlx::Dtype::Float16,
-                    eredu_nn::TensorElementType::Bf16 => safemlx::Dtype::Bfloat16,
-                    _ => safemlx::Dtype::Float32,
-                }),
-            ),
-            None => self
-                .module
-                .forward_with_input_observer(input.as_array(), context, observer),
-        };
-        match adapter.and_then(|adapter| adapter.failure) {
-            Some(error) => Err(error),
-            None => {
-                let output = compute_tensor(result)?;
-                if compute_element.is_some() {
-                    output.cast_float(original, context)
-                } else {
-                    Ok(output)
-                }
-            }
+        let result = self.module.project_without_bias(
+            cast.as_ref().unwrap_or(input).as_array(),
+            context,
+            observed,
+        );
+        if let Some(error) = adapter.and_then(|adapter| adapter.failure) {
+            return Err(error);
         }
+        let partial = compute_tensor(result)?;
+        let output_cast = compute_element.map(|_| original);
+        let partial = match output_cast {
+            Some(kind) => partial.cast_float(kind, context)?,
+            None => partial,
+        };
+        Ok(eredu_nn::RowParallelProjection {
+            partial,
+            bias: self
+                .module
+                .bias
+                .as_ref()
+                .as_ref()
+                .cloned()
+                .map(MlxTensor::from_array),
+            output_cast,
+        })
     }
 }
 

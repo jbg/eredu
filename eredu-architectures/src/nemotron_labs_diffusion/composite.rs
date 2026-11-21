@@ -10,8 +10,7 @@ use super::{
 };
 use crate::{
     composite_execution::{
-        CompositeArchitecture, ParallelCompositeArchitecture, PreparedCompositeInput,
-        SingleCompositePrefillRequest,
+        CompositeArchitecture, PreparedCompositeInput, SingleCompositePrefillRequest,
     },
     decoder::{Config, PartitionedConfig},
     media_plan::AdmittedCompositeInput,
@@ -720,7 +719,7 @@ where
         )
     }
 }
-impl<B, S> CompositeArchitecture<B, S> for Model<B>
+impl<B, S> eredu_runtime::composite_execution::CompositeComponentKernel<B, S> for CompositeKernel<B>
 where
     B: DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
@@ -765,14 +764,14 @@ where
         )
     }
     fn prepare_prefill_request(
-        prepared: eredu_runtime::PreparedModelInput<B::Tensor>,
+        prepared: eredu_core::PreparedModelInput<B::Tensor>,
         admitted: AdmittedCompositeInput<InputPartPlan>,
         _: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::PrefillRequest, Error> {
         SingleCompositePrefillRequest::new(prepared, admitted)
     }
     fn admission_config(&self) -> FamilyConfig {
-        self.kernel().config.clone()
+        self.config.clone()
     }
     fn prepared_prediction_token_ids(
         input: PreparedCompositeInput<'_, B::Tensor, InputPartPlan>,
@@ -789,8 +788,8 @@ where
     }
     fn admit_prepared_input(
         config: &FamilyConfig,
-        input: &eredu_runtime::PreparedModelInput<B::Tensor>,
-        inspector: &impl eredu_runtime::PreparedInputInspector<B::Tensor>,
+        input: &eredu_core::PreparedModelInput<B::Tensor>,
+        inspector: &impl eredu_core::input::PreparedInputInspector<B::Tensor>,
     ) -> Result<AdmittedCompositeInput<InputPartPlan>, eredu_core::CapabilityError> {
         admit_input(config, input, inspector)
     }
@@ -832,7 +831,7 @@ where
                             grid, native: true, ..
                         } => Some(
                             (grid.0 as u64) * (grid.1 as u64)
-                                / u64::from(self.kernel().config.spatial_merge_size).pow(2),
+                                / u64::from(self.config.spatial_merge_size).pow(2),
                         ),
                         _ => None,
                     })
@@ -852,8 +851,7 @@ where
                     CompositeContinuationGeometry::Uniform(vec![
                         1,
                         patches,
-                        self.kernel()
-                            .config
+                        self.config
                             .vision
                             .as_ref()
                             .expect("validated tower")
@@ -873,8 +871,8 @@ where
                 if group == 2 {
                     let sequence = i32::try_from(input.admitted().decoder_positions())
                         .map_err(|_| "decoder sequence exceeds i32")?;
-                    let width = self.kernel().config.hidden_size();
-                    let vocabulary = self.kernel().config.vocabulary_size() as usize;
+                    let width = self.config.hidden_size();
+                    let vocabulary = self.config.vocabulary_size() as usize;
                     let counts = (0..tensor_partitions)
                         .map(|rank| {
                             eredu_core::balanced_contiguous_range(
@@ -888,7 +886,6 @@ where
                         })
                         .collect::<Result<Vec<_>, _>>()?;
                     let adapter_rank = self
-                        .kernel()
                         .config
                         .draft_parameters()
                         .map(|adapter| {
@@ -898,7 +895,7 @@ where
                                 .map_err(|error| error.to_string())
                         })
                         .transpose()?;
-                    let last = self.kernel().config.num_hidden_layers() as usize;
+                    let last = self.config.num_hidden_layers() as usize;
                     return Ok(Some(
                         stage_units
                             .iter()
@@ -949,7 +946,6 @@ where
                 }
                 let patches = native_patch_positions(input)?;
                 let vision = self
-                    .kernel()
                     .config
                     .vision
                     .as_ref()
@@ -992,7 +988,7 @@ where
                     1,
                     i32::try_from(input.admitted().decoder_positions())
                         .map_err(|_| "decoder extent exceeds i32")?,
-                    self.kernel().config.hidden_size(),
+                    self.config.hidden_size(),
                 ],
             }]
         } else {
@@ -1033,7 +1029,7 @@ where
         continuation: Option<(i32, i32)>,
     ) -> Result<Option<eredu_runtime::ResolvedBoundaryWireSchema>, Error> {
         resolve_group_boundary(
-            &self.kernel().config,
+            &self.config,
             source,
             destination,
             selected,
@@ -1043,7 +1039,8 @@ where
         )
     }
 }
-impl<B, S> ParallelCompositeArchitecture<B, S> for Model<B>
+impl<B, S> eredu_runtime::composite_execution::ParallelCompositeComponentKernel<B, S>
+    for CompositeKernel<B>
 where
     B: DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
@@ -1252,7 +1249,7 @@ pub fn group_boundary_schema(
         [BoundaryTensorSpec::new(
             "activation_precision",
             [eredu_runtime::BoundaryTensorDimension::Fixed(1)],
-            eredu_runtime::BoundaryTensorDtype::Int32,
+            eredu_core::communication::BoundaryTensorDtype::Int32,
         )],
     )
     .map_err(Error::backend)

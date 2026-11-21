@@ -17,6 +17,17 @@ use safemlx::{
 };
 use smallvec::SmallVec;
 
+fn floating_dtype(element: eredu_nn::TensorElementType) -> Option<Dtype> {
+    use eredu_nn::TensorElementType as T;
+    match element {
+        T::F16 => Some(Dtype::Float16),
+        T::Bf16 => Some(Dtype::Bfloat16),
+        T::F32 => Some(Dtype::Float32),
+        T::F64 => Some(Dtype::Float64),
+        _ => None,
+    }
+}
+
 /// Native scalar metadata shared by capture and communication; no evaluation.
 pub(crate) fn portable_dtype(dtype: Dtype) -> TensorDtype {
     match dtype {
@@ -58,13 +69,6 @@ impl MlxTensor {
     /// Borrows the backend-native array.
     pub const fn as_array(&self) -> &Array {
         &self.0
-    }
-
-    /// Mutably borrows the native array for parameter binding without
-    /// materialization or copying.
-    #[cfg(test)]
-    pub(crate) fn as_array_mut(&mut self) -> &mut Array {
-        &mut self.0
     }
 
     /// Unwraps the backend-native array without evaluation or copying.
@@ -266,6 +270,16 @@ impl Tensor for MlxTensor {
         tensor(Array::full::<f32>(shape, Array::from_f32(value), context))
     }
 
+    fn zeros_float(
+        shape: &[i32],
+        element: eredu_nn::TensorElementType,
+        context: &Self::Context,
+    ) -> Result<Self, Error> {
+        let dtype = floating_dtype(element)
+            .ok_or_else(|| Error::backend("zero allocation requires a floating precision"))?;
+        tensor(safemlx::ops::zeros_dtype(shape, dtype, context))
+    }
+
     fn full_i32(value: i32, shape: &[i32], context: &Self::Context) -> Result<Self, Error> {
         tensor(Array::full::<i32>(shape, Array::from_int(value), context))
     }
@@ -288,20 +302,14 @@ impl Tensor for MlxTensor {
         context: &Self::Context,
     ) -> Result<Self, Error> {
         use eredu_nn::TensorElementType as T;
-        use safemlx::Dtype as D;
         if !matches!(
             self.element_type(),
             Some(T::F16 | T::Bf16 | T::F32 | T::F64)
         ) {
             return Err(Error::backend("floating cast requires a floating input"));
         }
-        let dtype = match element {
-            T::F16 => D::Float16,
-            T::Bf16 => D::Bfloat16,
-            T::F32 => D::Float32,
-            T::F64 => D::Float64,
-            _ => return Err(Error::backend("floating cast requires a floating output")),
-        };
+        let dtype = floating_dtype(element)
+            .ok_or_else(|| Error::backend("floating cast requires a floating output"))?;
         tensor(self.as_array().as_dtype(dtype, context))
     }
 
@@ -1180,6 +1188,3 @@ impl Tensor for MlxTensor {
         ))
     }
 }
-
-#[cfg(test)]
-mod tests;

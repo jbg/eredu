@@ -10,9 +10,10 @@ use crate::{
     },
     qwen4_exp::config::MediaTokens,
 };
+use eredu_core::input::PreparedInputInspector;
 use eredu_core::{checkpoint::TensorDtype, InputMetadataKey as Key, InputModality};
+use eredu_core::{PreparedInputPayload, PreparedModelInput};
 use eredu_nn::{Error, Tensor};
-use eredu_runtime::{PreparedInputInspector, PreparedInputPayload, PreparedModelInput};
 
 /// Source-independent processor policy. No checkpoint, device or native context is retained.
 #[derive(Clone)]

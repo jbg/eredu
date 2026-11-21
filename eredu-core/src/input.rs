@@ -4,7 +4,17 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::checkpoint::TensorDtype;
+use crate::{checkpoint::TensorDtype, CapabilityError};
+
+mod wire;
+pub use wire::{
+    PreparedInputPart, PreparedInputPayload, PreparedInputTensorRole, PreparedModelInput,
+};
+
+mod processor_native;
+pub use processor_native::{
+    MediaInputLowering, OptionalProcessorMechanism, ProcessorMechanisms, ProcessorPreparationScope,
+};
 
 /// Modality of one ordered model-input part.
 #[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -76,6 +86,38 @@ impl InputPayloadKind {
             Self::Tensor => !matches!(modality, InputModality::Text),
             Self::Embeddings => true,
         }
+    }
+
+    /// Validates the decoder-facing shape and token representation of a payload.
+    pub fn validate_decoder_tensor<D: Copy + TryInto<usize>>(
+        self,
+        dtype: &TensorDtype,
+        shape: &[D],
+    ) -> Result<(), PreparedInputError> {
+        let nonempty = || {
+            shape
+                .iter()
+                .all(|dimension| (*dimension).try_into().is_ok_and(|length| length != 0))
+        };
+        let valid_shape = match self {
+            Self::TokenIds => shape.len() == 2 && nonempty(),
+            Self::Embeddings => shape.len() == 3 && nonempty(),
+            Self::Tensor => shape.len() >= 2,
+        };
+        if !valid_shape {
+            return Err(PreparedInputError::InvalidTensorShape {
+                shape: shape
+                    .iter()
+                    .map(|dimension| (*dimension).try_into().unwrap_or(0))
+                    .collect(),
+            });
+        }
+        if self == Self::TokenIds && !matches!(dtype, TensorDtype::I32 | TensorDtype::U32) {
+            return Err(PreparedInputError::InvalidTokenDtype {
+                dtype: dtype.clone(),
+            });
+        }
+        Ok(())
     }
 
     const fn wire_tag(self) -> u32 {
@@ -403,6 +445,27 @@ pub struct PreparedInputIdentity {
     parts: Vec<InputPartDescriptor>,
 }
 
+/// Native capacity reporting and completion-owned copy of exact tensor values.
+pub trait InputTensorTransfer: PreparedInputInspector<Self::Tensor> {
+    /// Native tensor representation.
+    type Tensor;
+    /// Exact destination context used by the native copy.
+    type Context: ?Sized;
+    /// Native transfer error.
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Reports the upper bound for one host staging allocation without allocating.
+    fn host_staging_capacity(&self, payload_bytes: u64) -> Result<u64, Self::Error>;
+
+    /// Copies values in order, settling or retaining all native work and buffers.
+    fn copy_input_tensors(
+        &self,
+        values: Vec<&Self::Tensor>,
+        context: &Self::Context,
+        staging_capacity_bytes: u64,
+    ) -> Result<Vec<Self::Tensor>, Self::Error>;
+}
+
 impl PreparedInputIdentity {
     /// Validates a non-empty ordered set of input-part descriptors.
     pub fn new(parts: Vec<InputPartDescriptor>) -> Result<Self, PreparedInputError> {
@@ -542,6 +605,12 @@ pub enum PreparedInputError {
     InvalidTensorShape {
         /// Invalid logical dimensions.
         shape: Vec<usize>,
+    },
+    /// Decoder token indices require a supported integer representation.
+    #[error("public token ids must use int32 or uint32 storage, got {dtype:?}")]
+    InvalidTokenDtype {
+        /// Actual token tensor dtype.
+        dtype: TensorDtype,
     },
     /// A modality cannot consume the selected primary payload kind.
     #[error("{modality:?} input is incompatible with {payload:?} payload")]
@@ -830,4 +899,79 @@ mod tests {
             })
         ));
     }
+}
+
+/// Mechanism for describing native prepared tensors and reading bounded metadata.
+///
+/// Architecture admission owns which metadata values are semantically relevant.
+/// Implementations expose only tensor identity and evaluation of the small integer
+/// or Boolean arrays requested by that admission logic.
+pub trait PreparedInputInspector<Tensor> {
+    /// Returns the portable identity of a native tensor.
+    fn identity(&self, tensor: &Tensor) -> Result<InputTensorIdentity, PreparedInputError>;
+
+    /// Reads an evaluated signed-integer metadata tensor in row-major order.
+    fn i32_values(&self, tensor: &Tensor) -> Result<Vec<i32>, CapabilityError>;
+
+    /// Reads original token IDs in row-major order, preserving unsigned IDs.
+    fn token_ids(&self, tensor: &Tensor) -> Result<Vec<u32>, crate::BackendFailure> {
+        self.i32_values(tensor)
+            .map_err(crate::BackendFailure::from_error)?
+            .into_iter()
+            .map(|id| u32::try_from(id).map_err(crate::BackendFailure::from_error))
+            .collect()
+    }
+
+    /// Reads an evaluated Boolean metadata tensor in row-major order.
+    fn bool_values(&self, tensor: &Tensor) -> Result<Vec<bool>, CapabilityError>;
+}
+
+impl<T> PreparedInputInspector<T> for &dyn PreparedInputInspector<T> {
+    fn identity(&self, tensor: &T) -> Result<InputTensorIdentity, PreparedInputError> {
+        (**self).identity(tensor)
+    }
+
+    fn i32_values(&self, tensor: &T) -> Result<Vec<i32>, CapabilityError> {
+        (**self).i32_values(tensor)
+    }
+
+    fn token_ids(&self, tensor: &T) -> Result<Vec<u32>, crate::BackendFailure> {
+        (**self).token_ids(tensor)
+    }
+
+    fn bool_values(&self, tensor: &T) -> Result<Vec<bool>, CapabilityError> {
+        (**self).bool_values(tensor)
+    }
+}
+
+/// Native metadata and slicing for a prepared token tensor.
+pub trait PlainTextTokens<T>: crate::BackendProvider {
+    /// Converts the exact admitted host token IDs to an owned tensor.
+    fn materialize_tokens(&self, ids: &[u32]) -> Result<T, Self::Error>;
+
+    /// Side-effect-free metadata inspection for the token tensor.
+    fn token_identity(tokens: &T) -> Result<InputTensorIdentity, PreparedInputError>;
+
+    /// Length of a rank-two prepared token tensor, when supported.
+    fn token_count(tokens: &T) -> Option<usize>;
+
+    /// Splits an already admitted token tensor at the selected position.
+    fn split_tokens(&self, tokens: &T, at: std::num::NonZeroUsize) -> Result<(T, T), Self::Error>;
+}
+
+/// Native conversion of committed tokens into the exact input tensor for another invocation.
+pub trait CommittedTokenTensors: crate::TextGenerationBackend {
+    /// A retained token from a finalized block.
+    type BlockToken;
+    /// The native tensor accepted by token input parts.
+    type TokenTensor;
+
+    /// Concatenates token values into a single batch in the supplied position order.
+    fn concatenate_committed_tokens(
+        &self,
+        tokens: &[Self::BlockToken],
+    ) -> Result<Self::TokenTensor, Self::Error>;
+
+    /// Shapes one committed decode token as a single batch of length one.
+    fn decode_token_tensor(&self, token: Self::Token) -> Result<Self::TokenTensor, Self::Error>;
 }

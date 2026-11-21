@@ -2,6 +2,10 @@
 
 #![allow(clippy::type_complexity)]
 
+use crate::bounded_execution::units::{BindBoundedPolicy, BindResidentPolicy};
+
+use eredu_core::SubmissionBackend;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     marker::PhantomData,
@@ -10,17 +14,32 @@ use std::{
 
 use eredu_core::cache::{
     validate_prompt_cache_model_identity, PromptCacheDescriptor, PromptCacheError,
-    PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
+    PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions, PromptCacheStoreError,
+    PromptCacheTopology,
 };
 use eredu_core::{DistributedCommitEpoch, DistributedCommitOutcome, DistributedCommitPhase};
 use eredu_nn::{NeuralBackend, Tensor};
 
 mod capture_bundle;
+mod composite;
+pub use composite::{CompositePrompt, CompositeTextInvocation};
 mod control;
+mod installed_parameters;
+pub use installed_parameters::PredictionModuleParameters;
 mod prediction;
+mod prompt_cache;
+mod state_snapshot_memory;
 mod target_transport;
 pub use capture_bundle::{ForwardCaptureBundle, ForwardCaptureSlot};
-pub use control::{ReplicatedTextControlState, ReplicatedTextSnapshotMechanisms};
+mod state_binding;
+pub use state_binding::TextStateStorage;
+
+pub use control::{
+    ReplicatedTextControlState, ReplicatedTextSnapshotMechanisms, ReplicatedTextSnapshotPrimitives,
+};
+pub use prediction::{finish_prediction_state_operation, PredictionStateRecoveryFailure};
+pub use prompt_cache::{PromptCacheInput, TextPromptCache};
+pub use state_snapshot_memory::StateSnapshotMemoryCosts;
 pub use target_transport::{
     PredictionTargetTransport, PredictionTensorAssembly, PredictionTensorAssemblyPlan,
     PredictionTensorSource,
@@ -29,168 +48,49 @@ pub use target_transport::{
 use crate::{
     observe_model_logits, partitioned_replicated_text_materialization_tasks,
     replicated_text_materialization_tasks, ActivationObserver, ArchitecturePartition,
-    CommunicationManifest, ExecutionResidency, ExpertPass, LayerWeightResidency,
-    LayeredArchitecture, LayerwisePolicy, LayerwiseRuntime, LayerwiseRuntimeError,
-    ParameterGroupOwner, ParameterProvider, PartitionState, PreparedInputCacheIdentity,
-    ReplicatedTextArchitecture, ReplicatedTextMaterializationTask, ReplicatedTextOutputCompanion,
+    ExecutionResidency, ExpertPass, LayerWeightResidency, LayeredArchitecture, LayerwisePolicy,
+    LayerwiseRuntime, LayerwiseRuntimeError, ParameterGroupOwner, ParameterProvider,
+    PartitionState, PreparedInputCacheIdentity, ReplicatedTextArchitecture,
+    ReplicatedTextMaterializationTask, ReplicatedTextOutputCompanion,
     ReplicatedTextOutputSelection, ReplicatedTextParameterPresence, RoutedLayeredArchitecture,
     RuntimeState, SelectedReplicatedTextRealization, SelectedStateRealization, StateError,
-    SubmissionBackend,
 };
+use eredu_core::communication::CommunicationManifest;
 
 use crate::parameter_operations::LayeredParameterOwner;
 
-/// Backend mechanisms used by the generic replicated-text constructor.
-///
-/// Implementations allocate native state, prepare exact materialization tasks,
-/// supply a bounded residency policy, persist opaque state bytes, apply a
-/// requested native tensor index, and retain resources through final
-/// completion. The trait receives selected values but no family identity or
-/// caller selection request.
-pub trait ReplicatedTextSessionMechanisms<A, B>
+pub use eredu_core::capability::ParameterMemoryFacts;
+
+/// Portable state lifecycle used by a replicated text session.
+pub trait ReplicatedTextState<B>
 where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
-    A: LayeredArchitecture<B, Self::State>,
-    Self::State: RuntimeState<B>,
-    Self::ResidentPolicy: LayerwisePolicy<B, A::Unit, Error = Self::PolicyError>,
-    Self::BoundedPolicy: LayerwisePolicy<B, A::Unit, Error = Self::PolicyError>,
 {
-    /// Exact slot facts retained at selected materialization preparation.
-    /// Empty means that this mechanism does not expose prepared slot metadata.
-    fn prepared_parameter_slots(&self) -> &[crate::parameter_operations::PreparedParameterSlot] {
-        &[]
-    }
-    /// Architecture parameter metadata retained before ordinary/bank ownership separation.
-    fn parameter_declarations(&self) -> &[eredu_nn::ParameterMetadata] {
-        &[]
-    }
     /// Concrete mutable-state realization paired with the architecture.
     type State: RuntimeState<B>;
-    /// Shared failure type for resident and bounded runtime policies.
-    type PolicyError;
-    /// Concrete policy that owns fully resident bound units.
-    type ResidentPolicy: LayerwisePolicy<B, A::Unit, Error = Self::PolicyError>;
-    /// Concrete policy used for host-windowed or disk-streamed traversal.
-    type BoundedPolicy: LayerwisePolicy<B, A::Unit, Error = Self::PolicyError>;
-    /// Opaque state checkpoint owned by the backend mechanism.
+
+    /// Rollback checkpoint owned by the portable state realization.
     type StateCheckpoint;
-    /// Backend-native mutable-state residency report.
+
+    /// Mutable-state observations.
     type StateReport;
-    /// Backend-native parameter/runtime residency report.
-    type ExecutionReport;
-    /// Mechanism failure.
+
+    /// Failure type used by the session.
     type Error;
 
-    /// Releases optional conversions at an already settled session boundary.
-    fn trim_parameter_conversions(
+    /// Preserves a portable failure and its source at the session boundary.
+    fn parameter_storage_error(error: eredu_core::BackendFailure) -> Self::Error;
+
+    /// Portable cache owner accepted by state allocation.
+    type LiveCache: crate::cache::live::SelectedLiveCache;
+
+    /// Allocates the selected native components around the supplied cache.
+    fn allocate_state(
         &mut self,
-        _bounded: Option<&Self::BoundedPolicy>,
-    ) -> Result<
-        Vec<eredu_core::residency::ParameterConversionRetentionTrimReport>,
-        eredu_core::residency::ParameterConversionTrimError,
-    > {
-        Err(eredu_core::residency::ParameterConversionTrimError::Unsupported)
-    }
-
-    /// Reads retention policy and usage without touching state or native work.
-    fn parameter_conversion_retention(
-        &self,
-        _residency: LayerWeightResidency,
-        _bounded: Option<&Self::BoundedPolicy>,
-    ) -> Result<
-        eredu_core::Observed<Vec<eredu_core::residency::ParameterConversionRetentionReport>>,
-        Self::Error,
-    > {
-        Ok(eredu_core::residency::unreported_parameter_conversion_retention())
-    }
-
-    /// Projects existing native residency into portable memory observations.
-    /// Must not submit, settle, allocate execution resources, or consume budgets.
-    fn parameter_memory_observation(
-        &self,
-        _residency: LayerWeightResidency,
-        _bounded: Option<&Self::BoundedPolicy>,
-    ) -> Result<Option<eredu_core::speculative::SpeculativeParameterMemoryObservation>, Self::Error>
-    {
-        Ok(None)
-    }
-
-    /// Takes the aggregate report produced while realizing the selected
-    /// materialization tasks.
-    ///
-    /// The neutral constructor calls this exactly once after successful
-    /// preparation and retains the value with the completed session. This
-    /// keeps report handoff in the same typed sequencing path as preparation
-    /// instead of requiring an adapter-owned synchronization side channel.
-    fn take_materialization_report(
-        &mut self,
-    ) -> Result<Option<crate::WeightMaterializationReport>, Self::Error> {
-        Ok(None)
-    }
-
-    /// Configures rank-local neutral placement facts before partition payload
-    /// preparation and state realization.
-    fn configure_partition(
-        &mut self,
-        _target_layout: crate::LocalModelLayout,
-        _source_layout: Option<crate::LocalModelLayout>,
-        _rank: eredu_core::cache::CacheRankIdentity,
-        _global_layer_start: usize,
-    ) {
-    }
-
-    /// Prepares exact payload work for an explicitly selected rank-local unit
-    /// sequence.
-    ///
-    /// The default is suitable for mechanisms whose ordinary preparation
-    /// already accepts the retained invocation map. Backends with distinct local-unit
-    /// binding storage override this method while retaining the neutral
-    /// construction sequencing.
-    #[allow(clippy::too_many_arguments)]
-    fn prepare_partition_materialization(
-        &mut self,
-        architecture: &mut A,
-        invocations: &crate::ExecutionUnitAddressMap,
-        task_partition: &crate::ReplicatedTextMaterializationPartitionPlan,
-        units: &mut [A::Unit],
-        source_architecture: Option<&mut A>,
-        source_units: Option<&mut [A::Unit]>,
-        tasks: &[ReplicatedTextMaterializationTask],
-        addressable_parameters: &[String],
-        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
-    ) -> Result<(), Self::Error> {
-        let _ = task_partition;
-        self.prepare_materialization(
-            architecture,
-            invocations,
-            units,
-            source_architecture,
-            source_units,
-            tasks,
-            addressable_parameters,
-            context,
-        )
-    }
-
-    /// Consumes exact selected tasks and their logical-to-physical map. Units
-    /// follow canonical storage order, independently of invocation count.
-    #[allow(clippy::too_many_arguments)]
-    fn prepare_materialization(
-        &mut self,
-        architecture: &mut A,
-        invocations: &crate::ExecutionUnitAddressMap,
-        units: &mut [A::Unit],
-        source_architecture: Option<&mut A>,
-        source_units: Option<&mut [A::Unit]>,
-        tasks: &[ReplicatedTextMaterializationTask],
-        addressable_parameters: &[String],
-        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
-    ) -> Result<(), Self::Error>;
-
-    /// Realizes exactly the selected mutable-state components and placements.
-    fn realize_state(
-        &mut self,
-        selected: &SelectedStateRealization,
+        selected: &crate::state::StateAllocation<'_>,
+        cache: Option<Self::LiveCache>,
+        rank: Option<eredu_core::cache::CacheRankIdentity>,
+        global_layer_start: usize,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
     ) -> Result<Self::State, Self::Error>;
 
@@ -198,31 +98,6 @@ where
     fn realize_stateless_state(&mut self) -> Option<Self::State> {
         None
     }
-
-    /// Creates the concrete policy owning fully resident bound units.
-    fn resident_policy(
-        &mut self,
-        architecture: &mut A,
-        units: Vec<A::Unit>,
-        selected: &SelectedReplicatedTextRealization,
-        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
-    ) -> Result<Self::ResidentPolicy, Self::Error>;
-
-    /// Creates the concrete bounded-unit policy selected for this session.
-    fn bounded_policy(
-        &mut self,
-        architecture: &mut A,
-        selected: &SelectedReplicatedTextRealization,
-        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
-    ) -> Result<Self::BoundedPolicy, Self::Error>;
-
-    /// Applies one neutral sequence-axis index to a complete architecture output.
-    fn index_text_output(
-        &mut self,
-        output: B::Tensor,
-        sequence_index: i32,
-        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error>;
 
     /// Captures an opaque checkpoint of every live state component.
     fn checkpoint_state(
@@ -241,61 +116,219 @@ where
 
     /// Forks canonical state for one independently advanceable prediction lane.
     ///
-    /// The default composes ordinary realization and checkpoint restoration. Backends whose
-    /// state carries immutable transaction identity, such as a paged-cache residency session,
-    /// override this operation so copied content receives one coherent independent identity
-    /// without weakening unrelated cross-session restore validation.
+    /// The default composes ordinary realization and checkpoint restoration.
+    /// A state owner with a cache transaction identity forks its content into
+    /// an independent identity and keeps cross-session restore validation.
     fn fork_prediction_target_state(
         &mut self,
         state: &Self::State,
         selected: &SelectedStateRealization,
+        identity: Option<&PromptCacheModelIdentity>,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
     ) -> Result<Self::State, Self::Error> {
         let checkpoint = self.checkpoint_state(state, context)?;
-        let mut fork = self.realize_state(selected, context)?;
+        let mut fork = realize_live_state(self, selected, identity, context)?;
         self.restore_state(&mut fork, checkpoint, context)?;
         Ok(fork)
     }
 
-    /// Restores native state bytes from a validated prompt-cache artifact.
-    fn load_prompt_cache(
-        &mut self,
-        store: &dyn eredu_core::cache::PromptCacheStore,
-        expected: &PromptCacheDescriptor,
-        identity: &PromptCacheModelIdentity,
-        prefix_token_ids: &[u32],
-        selected: &SelectedStateRealization,
-        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
-    ) -> Result<(Self::State, PromptCacheManifest), Self::Error>;
+    /// Portable page and fixed-state restore for this backend's storage resources.
+    type CacheRestore: crate::cache::live::RestoreCache<
+        <<B as NeuralBackend>::Tensor as Tensor>::Context,
+    >;
 
-    /// Serializes native state bytes for a neutrally validated cache identity.
-    fn save_prompt_cache(
+    /// Installs the restored resources under the already validated placement and frontiers.
+    fn install_restored_cache(
+        &mut self,
+        restored: <Self::CacheRestore as crate::cache::live::RestoreCache<
+            <<B as NeuralBackend>::Tensor as Tensor>::Context,
+        >>::Restored,
+        rank: Option<eredu_core::cache::CacheRankIdentity>,
+        global_layer_start: usize,
+        prefix: i32,
+        layer_frontiers: &[i32],
+        selected: &crate::state::StateAllocation<'_>,
+    ) -> Result<Self::State, Self::Error>;
+
+    /// Stable export inventory and exact native transfer operations.
+    type CacheExport: eredu_core::cache::mechanisms::PromptCacheExport;
+
+    /// Finalizes native page tails and exposes the selected export inventory.
+    fn cache_export(
         &mut self,
         state: &mut Self::State,
-        store: &dyn eredu_core::cache::PromptCacheStore,
-        descriptor: PromptCacheDescriptor,
-        prefix_token_ids: &[u32],
-        options: &PromptCacheOptions,
-        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
-    ) -> Result<PromptCacheManifest, Self::Error>;
+        descriptor: &PromptCacheDescriptor,
+        layer_frontiers: &[i32],
+    ) -> Result<Self::CacheExport, Self::Error>;
+
+    /// Borrows the exact mutable-state tensor roots for completion.
+    fn state_roots(state: &Self::State) -> Vec<&B::Tensor>;
 
     /// Reports the realized mutable-state storage.
     fn state_report(&self, state: &Self::State) -> Result<Self::StateReport, Self::Error>;
+}
 
-    /// Reports the selected resident or bounded runtime realization.
-    fn execution_report(
-        &self,
-        residency: LayerWeightResidency,
-        bounded: Option<&Self::BoundedPolicy>,
-    ) -> Result<Self::ExecutionReport, Self::Error>;
+/// Exact parameter, tensor, and completion mechanisms used by replicated text.
+pub trait ReplicatedTextPrimitives<B>: ReplicatedTextState<B>
+where
+    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+{
+    /// Initialized parameter storage with its retained pins.
+    type UnitStorage;
 
-    /// Retains final output and mutable state through exact completion.
+    /// Residency authority shared with supplementary weight owners.
+    type WeightStorage: crate::WeightResidencyStorage;
+
+    /// Binding for the exact prepared source and retained native allocation mechanisms.
+    type UnitBinding<'a>: crate::BindReplicatedParameterStorage<
+        B,
+        Storage = Self::UnitStorage,
+        WeightStorage = Self::WeightStorage,
+    >
+    where
+        Self: 'a;
+
+    /// Transfers the exact source bindings to portable residency construction.
+    fn take_parameter_storage(&mut self) -> Result<Self::UnitBinding<'_>, Self::Error>;
+
+    /// Observes backend allocation and available-memory facts without submitting work.
+    fn parameter_memory_facts(&self) -> Result<Option<ParameterMemoryFacts>, Self::Error> {
+        Ok(None)
+    }
+
+    /// Optional parameter facts from storage supplied already bound by the caller.
+    fn prebound_materialization_report(
+        &mut self,
+    ) -> Result<Option<eredu_checkpoint::quantization::WeightMaterializationReport>, Self::Error>
+    {
+        Ok(None)
+    }
+
+    /// Backend facts for exact parameter encodings.
+    type Parameters: eredu_core::checkpoint_mechanisms::ExactParameterMaterializer<B>;
+
+    /// Supplies the retained checkpoint when parameters require binding.
+    /// A session whose parameters are already realized supplies no source.
+    fn parameter_source(&self) -> Option<eredu_checkpoint::store::SharedCheckpointSource>;
+
+    /// Observes the plan when parameters arrived already bound.
+    fn observe_prebound_parameter_tasks(
+        &mut self,
+        _partition: &crate::ReplicatedTextMaterializationPartitionPlan,
+        _tasks: &[ReplicatedTextMaterializationTask],
+    ) {
+    }
+
+    /// Applies one neutral sequence-axis index to a complete architecture output.
+    fn index_text_output(
+        &mut self,
+        output: B::Tensor,
+        sequence_index: i32,
+        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error>;
+
+    /// Retains final output and the supplied roots through exact completion.
     fn complete(
         &mut self,
         output: &B::Tensor,
-        state: &Self::State,
+        state_roots: &[&B::Tensor],
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
     ) -> Result<(), Self::Error>;
+}
+
+fn realize_live_state<B, M>(
+    mechanisms: &mut M,
+    selected: &SelectedStateRealization,
+    identity: Option<&PromptCacheModelIdentity>,
+    context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
+) -> Result<M::State, M::Error>
+where
+    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    M: ReplicatedTextState<B> + ?Sized,
+{
+    realize_live_state_at(
+        mechanisms,
+        selected,
+        identity.and_then(|identity| identity.topology().cache_rank_identity()),
+        identity.map_or(0, PromptCacheModelIdentity::global_layer_start),
+        context,
+    )
+}
+
+fn realize_live_state_at<B, M>(
+    mechanisms: &mut M,
+    selected: &SelectedStateRealization,
+    rank: Option<eredu_core::cache::CacheRankIdentity>,
+    global_layer_start: usize,
+    context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
+) -> Result<M::State, M::Error>
+where
+    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    M: ReplicatedTextState<B> + ?Sized,
+{
+    use crate::cache::live::SelectedLiveCache;
+    let allocation = selected.allocation().map_err(M::parameter_storage_error)?;
+    let cache = M::LiveCache::open(selected).map_err(M::parameter_storage_error)?;
+    mechanisms.allocate_state(&allocation, cache, rank, global_layer_start, context)
+}
+
+/// Portable policy composed with native text state and weight mechanisms.
+pub trait ReplicatedTextSessionMechanisms<A, B>: ReplicatedTextPrimitives<B>
+where
+    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    A: LayeredArchitecture<B, Self::State>,
+{
+    /// Shared failure type for resident and bounded runtime policies.
+    type PolicyError;
+    /// Concrete policy that owns fully resident bound units.
+    type ResidentPolicy: LayerwisePolicy<B, A::Unit, Error = Self::PolicyError>
+        + BindResidentPolicy<B, A::Unit, Self::UnitStorage>;
+    /// Concrete policy used for host-windowed or disk-streamed traversal.
+    type BoundedPolicy: LayerwisePolicy<B, A::Unit, Error = Self::PolicyError>
+        + BindBoundedPolicy<A::Unit, Self::UnitStorage>;
+}
+
+/// Portable binding for independently executable parameter units.
+pub trait ReplicatedUnitBinding<B, U>: ReplicatedTextPrimitives<B>
+where
+    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+{
+    /// Failure during resident or bounded traversal.
+    type PolicyError;
+    /// Policy composed from the supplied native unit and storage operations.
+    type Policy: LayerwisePolicy<B, U, Error = Self::PolicyError>
+        + BindResidentPolicy<B, U, Self::UnitStorage>
+        + BindBoundedPolicy<U, Self::UnitStorage>;
+}
+
+impl<B, U, N> ReplicatedUnitBinding<B, U> for N
+where
+    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    N: ReplicatedTextPrimitives<B, UnitStorage = crate::ParameterUnitStorage<B, N>>
+        + eredu_core::checkpoint_mechanisms::unit_binding::ParameterStorageBinding<B>,
+    U: 'static,
+    N::UnitOperations: eredu_core::residency::NativeResidentUnits<
+        B,
+        <N::ResidencyMechanisms as eredu_core::residency::ResidencyStorageMechanisms>::Transfer,
+    >,
+    crate::ParameterUnitPolicy<B, U, N>: LayerwisePolicy<B, U>
+        + BindResidentPolicy<B, U, N::UnitStorage>
+        + BindBoundedPolicy<U, N::UnitStorage>,
+{
+    type PolicyError = <crate::ParameterUnitPolicy<B, U, N> as LayerwisePolicy<B, U>>::Error;
+    type Policy = crate::ParameterUnitPolicy<B, U, N>;
+}
+
+impl<A, B, N, S> ReplicatedTextSessionMechanisms<A, B> for N
+where
+    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    A: LayeredArchitecture<B, S>,
+    S: crate::LayerRuntimeState<B>,
+    N: ReplicatedUnitBinding<B, A::Unit, State = S>,
+{
+    type PolicyError = <N as ReplicatedUnitBinding<B, A::Unit>>::PolicyError;
+    type ResidentPolicy = <N as ReplicatedUnitBinding<B, A::Unit>>::Policy;
+    type BoundedPolicy = <N as ReplicatedUnitBinding<B, A::Unit>>::Policy;
 }
 
 /// One typed adapter-owned operation over the authoritative prediction target.
@@ -337,55 +370,6 @@ where
     {
         self.apply(architecture, state, parallel, context)
     }
-}
-
-/// Reversible prompt-cache publication used by distributed session control.
-///
-/// Preparation must not make the destination visible. Publication may replace
-/// an existing destination, but the returned transaction must retain enough
-/// ownership to restore that destination exactly until [`Self::commit_prompt_cache_save`]
-/// is called. Commit and rollback are deliberately infallible: an implementation
-/// that cannot provide an exact reversible publication must not implement this
-/// capability.
-pub trait TransactionalPromptCacheMechanisms<A, B>: ReplicatedTextSessionMechanisms<A, B>
-where
-    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
-    A: LayeredArchitecture<B, Self::State>,
-    Self::State: RuntimeState<B>,
-    Self::ResidentPolicy: LayerwisePolicy<B, A::Unit, Error = Self::PolicyError>,
-    Self::BoundedPolicy: LayerwisePolicy<B, A::Unit, Error = Self::PolicyError>,
-{
-    /// Opaque staged publication retaining any superseded destination.
-    type PromptCacheSaveTransaction;
-
-    /// Serializes a candidate without publishing or replacing the destination.
-    #[allow(clippy::too_many_arguments)]
-    fn prepare_prompt_cache_save(
-        &mut self,
-        state: &mut Self::State,
-        destination: &Path,
-        descriptor: PromptCacheDescriptor,
-        prefix_token_ids: &[u32],
-        options: &PromptCacheOptions,
-        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
-    ) -> Result<Self::PromptCacheSaveTransaction, Self::Error>;
-
-    /// Returns the fully validated candidate manifest before publication.
-    fn prepared_prompt_cache_manifest(
-        transaction: &Self::PromptCacheSaveTransaction,
-    ) -> &PromptCacheManifest;
-
-    /// Makes the staged candidate visible while retaining reversible ownership.
-    fn publish_prompt_cache_save(
-        &mut self,
-        transaction: &mut Self::PromptCacheSaveTransaction,
-    ) -> Result<(), Self::Error>;
-
-    /// Finalizes a globally successful publication and releases its backup.
-    fn commit_prompt_cache_save(&mut self, transaction: Self::PromptCacheSaveTransaction);
-
-    /// Removes an unpublished candidate or exactly restores a published destination.
-    fn rollback_prompt_cache_save(&mut self, transaction: Self::PromptCacheSaveTransaction);
 }
 
 /// Resident or bounded execution selected before construction.
@@ -543,10 +527,10 @@ where
         }
     }
 
-    fn bounded_policy(&self) -> Option<&P> {
+    fn parameter_telemetry(&self) -> Option<&dyn crate::layered::ParameterPolicyTelemetry> {
         match &self.kind {
-            ReplicatedTextRuntimeKind::Resident(_) => None,
-            ReplicatedTextRuntimeKind::Bounded(runtime) => Some(runtime.policy()),
+            ReplicatedTextRuntimeKind::Resident(runtime) => runtime.policy().parameter_telemetry(),
+            ReplicatedTextRuntimeKind::Bounded(runtime) => runtime.policy().parameter_telemetry(),
         }
     }
 
@@ -651,8 +635,10 @@ where
         Ok(false)
     }
 
-    /// Returns bounded residency state for the shared session report.
-    fn bounded_policy(runtime: &Self::Runtime) -> Option<&P>;
+    /// Borrows reports from the selected execution policy.
+    fn parameter_telemetry(
+        runtime: &Self::Runtime,
+    ) -> Option<&dyn crate::layered::ParameterPolicyTelemetry>;
 
     /// Returns the execution residency actually installed on this rank.
     fn execution_residency(
@@ -861,8 +847,10 @@ where
         runtime.publish_parameter_replacements(values, active)
     }
 
-    fn bounded_policy(runtime: &Self::Runtime) -> Option<&P> {
-        runtime.bounded_policy()
+    fn parameter_telemetry(
+        runtime: &Self::Runtime,
+    ) -> Option<&dyn crate::layered::ParameterPolicyTelemetry> {
+        runtime.parameter_telemetry()
     }
 
     fn execution_residency(
@@ -1002,8 +990,10 @@ where
         runtime.publish_parameter_replacements(values, active)
     }
 
-    fn bounded_policy(runtime: &Self::Runtime) -> Option<&P> {
-        runtime.bounded_policy()
+    fn parameter_telemetry(
+        runtime: &Self::Runtime,
+    ) -> Option<&dyn crate::layered::ParameterPolicyTelemetry> {
+        runtime.parameter_telemetry()
     }
 
     fn execution_residency(
@@ -1111,6 +1101,23 @@ mod restoration_witness_tests {
     }
 }
 
+#[derive(Default)]
+struct ReplicatedParameterMetadata {
+    slots: Vec<crate::parameter_operations::PreparedParameterSlot>,
+    declarations: Vec<eredu_nn::ParameterMetadata>,
+    report: Option<eredu_checkpoint::quantization::WeightMaterializationReport>,
+}
+
+impl ReplicatedParameterMetadata {
+    fn take_from(bindings: &mut crate::PreparedReplicatedParameterBindings) -> Self {
+        Self {
+            slots: std::mem::take(&mut bindings.slots),
+            declarations: std::mem::take(&mut bindings.declarations),
+            report: bindings.materialization.take(),
+        }
+    }
+}
+
 /// Complete backend-neutral replicated-text session.
 pub struct ReplicatedTextSession<A, B, M, D = DirectReplicatedTextExecution>
 where
@@ -1127,7 +1134,8 @@ where
     driver: D,
     state: M::State,
     mechanisms: M,
-    materialization_report: Option<crate::WeightMaterializationReport>,
+    installed_parameters: Option<installed_parameters::InstalledTextParameters>,
+    parameter_metadata: ReplicatedParameterMetadata,
     partition_parameters: Option<std::sync::Arc<crate::ArchitectureParameterDescription>>,
     prompt_cache_identity: Option<PromptCacheModelIdentity>,
     committed_prompt_input_identity: Option<PreparedInputCacheIdentity>,
@@ -1158,6 +1166,7 @@ pub enum SessionStateRealization {
 pub struct PreparedPartitionedSessionRuntime<R, S> {
     selected: SelectedReplicatedTextRealization,
     parameters: std::sync::Arc<crate::ArchitectureParameterDescription>,
+    parameter_metadata: Option<ReplicatedParameterMetadata>,
     runtime: R,
     state: S,
     selected_state: SessionStateRealization,
@@ -1190,14 +1199,15 @@ impl<R, S> PreparedPartitionedSessionRuntime<R, S> {
 /// and the payload tasks have been re-derived from that same architecture/partition pair. A
 /// factory consumes all four authorities together instead of receiving independently assembled
 /// runtime inputs.
-pub struct PartitionedSessionFactoryInput<A, G, W> {
+pub struct PartitionedSessionFactoryInput<'a, A, G, W> {
     architecture: A,
     partition: ArchitecturePartition<G, W>,
     communication: CommunicationManifest,
     tasks: Vec<ReplicatedTextMaterializationTask>,
+    parameter_metadata: &'a mut Option<ReplicatedParameterMetadata>,
 }
 
-impl<A, G, W> PartitionedSessionFactoryInput<A, G, W> {
+impl<A, G, W> PartitionedSessionFactoryInput<'_, A, G, W> {
     /// Exact architecture-owned payload tasks for this rank.
     pub fn materialization_tasks(&self) -> &[ReplicatedTextMaterializationTask] {
         &self.tasks
@@ -1237,7 +1247,7 @@ pub struct PreparedPartitionedRuntimeComponents<A, G, W, S, P> {
     partition: ArchitecturePartition<G, W>,
     communication: CommunicationManifest,
     execution_policy: P,
-    bounded_policy: Option<P>,
+    bounded: bool,
     state: S,
 }
 
@@ -1252,7 +1262,7 @@ impl<A, G, W, S, P> PreparedPartitionedRuntimeComponents<A, G, W, S, P> {
         ArchitecturePartition<G, W>,
         CommunicationManifest,
         P,
-        Option<P>,
+        bool,
         S,
     ) {
         (
@@ -1260,7 +1270,7 @@ impl<A, G, W, S, P> PreparedPartitionedRuntimeComponents<A, G, W, S, P> {
             self.partition,
             self.communication,
             self.execution_policy,
-            self.bounded_policy,
+            self.bounded,
             self.state,
         )
     }
@@ -1293,14 +1303,15 @@ pub enum PartitionedRuntimeConstructionError<
 /// needed to create native communication and executor mechanisms.
 #[allow(clippy::too_many_arguments)]
 pub fn prepare_default_partitioned_runtime<A, B, M, G, W, P>(
-    input: PartitionedSessionFactoryInput<A, G, W>,
-    mut source_architecture: Option<A>,
+    input: PartitionedSessionFactoryInput<'_, A, G, W>,
+    source_architecture: Option<A>,
     target_parallel_layout: crate::LocalModelLayout,
     source_parallel_layout: Option<crate::LocalModelLayout>,
     selected: &SelectedReplicatedTextRealization,
     topology: &PromptCacheTopology,
     scope: PartitionedUnitScope,
     addressable_parameters: &[String],
+    weights: crate::ReplicatedWeightOptions<M::WeightStorage>,
     mechanisms: &mut M,
     context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
 ) -> Result<
@@ -1315,7 +1326,13 @@ where
     M::Error: std::fmt::Display,
     P: LayerwisePolicy<B, A::Unit, Error = M::PolicyError> + Clone,
 {
-    let (mut architecture, partition, communication, tasks) = input.into_parts();
+    let PartitionedSessionFactoryInput {
+        mut architecture,
+        partition,
+        communication,
+        tasks,
+        parameter_metadata,
+    } = input;
     let invocations = match scope {
         PartitionedUnitScope::All => {
             let map = architecture.execution_unit_storage_map().map_err(|error| {
@@ -1337,9 +1354,9 @@ where
     let task_partition =
         crate::plan_replicated_text_materialization_tasks(&tasks, invocations.storage_layout())
             .map_err(|error| PartitionedRuntimeConstructionError::Contract(error.to_string()))?;
-    let mut units = construct_units::<A, B, M::State>(&architecture, &invocations, context)
+    let units = construct_units::<A, B, M::State>(&architecture, &invocations, context)
         .map_err(PartitionedRuntimeConstructionError::Architecture)?;
-    let mut source_units = source_architecture
+    let source_units = source_architecture
         .as_ref()
         .map(|source| {
             let source_map = source
@@ -1363,34 +1380,46 @@ where
         .map(|local| selected.state().for_partitioned_geometry(local))
         .transpose()
         .map_err(|error| PartitionedRuntimeConstructionError::Contract(error.to_string()))?;
-    let rank = eredu_core::cache::CacheRankIdentity::new(
-        topology.stage().map(|(_, rank)| rank),
-        topology.shard().map(|(_, rank)| rank),
-        topology.addressable().map(|(_, rank)| rank),
-    );
-    mechanisms.configure_partition(
-        target_parallel_layout,
-        source_parallel_layout,
-        rank,
-        local_state.map_or(0, |local| local.global_layer_offset()),
-    );
-    mechanisms
-        .prepare_partition_materialization(
-            &mut architecture,
-            &invocations,
-            &task_partition,
-            &mut units,
-            source_architecture.as_mut(),
-            source_units.as_deref_mut(),
-            &tasks,
-            addressable_parameters,
+    let mut bindings = mechanisms
+        .parameter_source()
+        .map(|store| {
+            crate::exact_parameter_materialization::prepare_replicated_parameter_bindings::<
+                A,
+                B,
+                M::State,
+                M::Parameters,
+            >(
+                store,
+                &architecture,
+                &units,
+                &invocations,
+                source_architecture.as_ref().zip(source_units.as_deref()),
+                source_parallel_layout.as_ref(),
+                Some(&target_parallel_layout),
+                &task_partition,
+                &tasks,
+                addressable_parameters,
+                context,
+            )
+        })
+        .transpose()
+        .map_err(M::parameter_storage_error)
+        .map_err(PartitionedRuntimeConstructionError::Mechanism)?;
+    *parameter_metadata = bindings
+        .as_mut()
+        .map(ReplicatedParameterMetadata::take_from);
+    if bindings.is_none() {
+        mechanisms.observe_prebound_parameter_tasks(&task_partition, &tasks);
+    }
+    let state = match selected_state.as_ref() {
+        Some(selected) => realize_live_state_at(
+            mechanisms,
+            selected,
+            topology.cache_rank_identity(),
+            local_state.map_or(0, |local| local.global_layer_offset()),
             context,
         )
-        .map_err(PartitionedRuntimeConstructionError::Mechanism)?;
-    let state = match selected_state.as_ref() {
-        Some(selected) => mechanisms
-            .realize_state(selected, context)
-            .map_err(PartitionedRuntimeConstructionError::Mechanism)?,
+        .map_err(PartitionedRuntimeConstructionError::Mechanism)?,
         None => mechanisms.realize_stateless_state().ok_or_else(|| {
             PartitionedRuntimeConstructionError::Contract(
                 "mechanism cannot realize a stateless partition".into(),
@@ -1402,27 +1431,35 @@ where
             "realized partition state differs from selected local geometry".into(),
         ));
     }
-    let (execution_policy, bounded_policy) = match selected.residency() {
-        LayerWeightResidency::FullyResident => (
-            mechanisms
-                .resident_policy(&mut architecture, units, selected, context)
-                .map_err(PartitionedRuntimeConstructionError::Mechanism)?,
-            None,
+    let resident_units = if selected.residency().is_fully_resident() {
+        Some(units)
+    } else {
+        drop(units);
+        None
+    };
+    let storage = bind_replicated_parameter_storage::<A, B, M>(
+        mechanisms,
+        bindings,
+        weights,
+        &mut architecture,
+        selected,
+    )
+    .map_err(PartitionedRuntimeConstructionError::Mechanism)?;
+    let (execution_policy, bounded) = match resident_units {
+        Some(units) => (
+            install_resident_policy::<A, B, M>(storage, units, context).map_err(|error| {
+                PartitionedRuntimeConstructionError::Mechanism(M::parameter_storage_error(error))
+            })?,
+            false,
         ),
-        LayerWeightResidency::LayerwiseHost(_) | LayerWeightResidency::DenseDiskStream(_) => {
-            drop(units);
-            let policy = mechanisms
-                .bounded_policy(&mut architecture, selected, context)
-                .map_err(PartitionedRuntimeConstructionError::Mechanism)?;
-            (policy.clone(), Some(policy))
-        }
+        None => (install_bounded_policy::<A, B, M>(storage), true),
     };
     Ok(PreparedPartitionedRuntimeComponents {
         architecture,
         partition,
         communication,
         execution_policy,
-        bounded_policy,
+        bounded,
         state,
     })
 }
@@ -1463,7 +1500,7 @@ where
     A: LayeredArchitecture<B, S>,
     A::Error: std::fmt::Display,
     F: FnOnce(
-        PartitionedSessionFactoryInput<A, G, W>,
+        PartitionedSessionFactoryInput<'_, A, G, W>,
         &SelectedReplicatedTextRealization,
         &<B::Tensor as Tensor>::Context,
     ) -> Result<(R, S), E>,
@@ -1503,7 +1540,7 @@ where
     A: LayeredArchitecture<B, S>,
     A::Error: std::fmt::Display,
     F: FnOnce(
-        PartitionedSessionFactoryInput<A, G, W>,
+        PartitionedSessionFactoryInput<'_, A, G, W>,
         &SelectedReplicatedTextRealization,
         &<B::Tensor as Tensor>::Context,
     ) -> Result<(R, S), E>,
@@ -1574,12 +1611,14 @@ where
         ),
         None => (SessionStateRealization::Stateless, None),
     };
+    let mut parameter_metadata = None;
     let (runtime, state) = factory(
         PartitionedSessionFactoryInput {
             architecture,
             partition,
             communication,
             tasks,
+            parameter_metadata: &mut parameter_metadata,
         },
         &selected,
         context,
@@ -1601,6 +1640,7 @@ where
     Ok(PreparedPartitionedSessionRuntime {
         selected,
         parameters: std::sync::Arc::new(parameters),
+        parameter_metadata,
         runtime,
         state,
         selected_state,
@@ -1641,7 +1681,24 @@ pub struct DistributedSessionCheckpoint<C> {
     last_commit_outcome: Option<DistributedCommitOutcome>,
 }
 
-/// Cold-path failure from replicated-text construction or session control.
+/// One prepared text invocation on an installed decoder state.
+pub enum ReplicatedTextInvocation<T, E> {
+    /// Ordinary prefill can project just the final prompt position.
+    FinalPositionPrefill(Result<T, E>),
+    /// Full prefill for observed execution or a consumer of all score rows.
+    Prefill {
+        /// Prepared tokens, retaining an input rejection for rank agreement.
+        tokens: Result<T, E>,
+        /// Optional additive attention mask.
+        mask: Option<T>,
+        /// Installed observation geometry, if capture is active.
+        capture: Option<eredu_core::capture::CaptureRequestShape>,
+    },
+    /// Cached execution for the prepared token positions.
+    Decode(Result<T, E>),
+}
+
+/// Failure from replicated-text construction, execution, or session control.
 #[derive(Debug)]
 pub enum ReplicatedTextSessionError<A, P, M>
 where
@@ -1657,15 +1714,26 @@ where
     Architecture(A),
     /// Bounded residency failed.
     Policy(P),
+    /// An installed parameter policy could not report its storage.
+    ParameterReport(eredu_core::BackendFailure),
+    /// Portable parameter memory projection failed.
+    ParameterMemory(eredu_core::capability::CapabilityError),
     /// A native mechanism failed.
     Mechanism(M),
     /// Shared admission failed before the driver received mutable model state.
     /// This proves state preservation only; native completion/recovery is separate.
     BeforeStateMutation(Box<ReplicatedTextSessionError<A, P, M>>),
+    /// Execution failed and the portable driver restored the prior model state.
+    /// The backend must still establish native completion before allowing reuse.
+    StateRestored(Box<ReplicatedTextSessionError<A, P, M>>),
     /// Mutable-state access failed.
     State(StateError),
     /// Prompt-cache identity or manifest validation failed.
     PromptCache(PromptCacheError),
+    /// The portable live-cache restore could not allocate or publish its destination.
+    LiveCache(crate::cache::live::CacheResidencyError),
+    /// Staging or publishing a cache generation failed.
+    PromptCacheStorage(PromptCacheStoreError),
     /// The globally fixed final decision was an abort.
     CommitAborted {
         /// Durable transaction identity.
@@ -1680,6 +1748,15 @@ where
     },
 }
 
+impl<A: std::fmt::Display, P: std::fmt::Display, M: std::fmt::Display>
+    ReplicatedTextSessionError<A, P, M>
+{
+    /// Evidence that rejection or rollback preserved the installed model state.
+    pub fn state_preserved(&self) -> bool {
+        matches!(self, Self::BeforeStateMutation(_) | Self::StateRestored(_))
+    }
+}
+
 impl<A: std::fmt::Display, P: std::fmt::Display, M: std::fmt::Display> std::fmt::Display
     for ReplicatedTextSessionError<A, P, M>
 {
@@ -1689,13 +1766,22 @@ impl<A: std::fmt::Display, P: std::fmt::Display, M: std::fmt::Display> std::fmt:
             Self::Partition(error) => std::fmt::Display::fmt(error, f),
             Self::Architecture(error) => write!(f, "replicated text architecture failed: {error}"),
             Self::Policy(error) => write!(f, "replicated text residency failed: {error}"),
+            Self::ParameterReport(error) => {
+                write!(f, "replicated text residency observation failed: {error}")
+            }
+            Self::ParameterMemory(error) => {
+                write!(f, "replicated text memory projection failed: {error}")
+            }
             Self::Mechanism(error) => write!(f, "replicated text mechanism failed: {error}"),
             Self::BeforeStateMutation(error) => write!(
                 f,
                 "replicated text admission rejected before state mutation: {error}"
             ),
+            Self::StateRestored(error) => std::fmt::Display::fmt(error, f),
             Self::State(error) => std::fmt::Display::fmt(error, f),
             Self::PromptCache(error) => std::fmt::Display::fmt(error, f),
+            Self::PromptCacheStorage(error) => std::fmt::Display::fmt(error, f),
+            Self::LiveCache(error) => std::fmt::Display::fmt(error, f),
             Self::CommitAborted { epoch } => {
                 write!(f, "distributed transaction epoch {epoch:?} was aborted")
             }
@@ -1718,14 +1804,26 @@ where
             Self::Partition(error) => Some(error),
             Self::Architecture(error) => Some(error),
             Self::Policy(error) => Some(error),
+            Self::ParameterReport(error) => Some(error),
+            Self::ParameterMemory(error) => Some(error),
             Self::Mechanism(error) => Some(error),
-            Self::BeforeStateMutation(error) => Some(error.as_ref()),
+            Self::BeforeStateMutation(error) | Self::StateRestored(error) => Some(error.as_ref()),
             Self::State(error) => Some(error),
             Self::PromptCache(error) => Some(error),
+            Self::PromptCacheStorage(error) => Some(error),
+            Self::LiveCache(error) => Some(error),
             Self::Contract(_) | Self::CommitAborted { .. } | Self::CommitIndeterminate { .. } => {
                 None
             }
         }
+    }
+}
+
+impl<A: std::fmt::Display, P: std::fmt::Display, M: std::fmt::Display> From<PromptCacheStoreError>
+    for ReplicatedTextSessionError<A, P, M>
+{
+    fn from(error: PromptCacheStoreError) -> Self {
+        Self::PromptCacheStorage(error)
     }
 }
 
@@ -1747,9 +1845,10 @@ impl<A: std::fmt::Display, P: std::fmt::Display, M: std::fmt::Display> From<Prom
 
 /// Immutable session and residency report produced by neutral orchestration.
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub struct ReplicatedTextSessionReport<E, S> {
+pub struct ReplicatedTextSessionReport<S> {
     execution: ExecutionResidency,
-    execution_report: E,
+    residency: Option<crate::ResidencyReport>,
+    dense_stream: Option<crate::DenseDiskStreamReport>,
     state_report: S,
     distributed_commit: Option<DistributedCommitOutcome>,
 }
@@ -2090,15 +2189,20 @@ where
     })
 }
 
-impl<E, S> ReplicatedTextSessionReport<E, S> {
+impl<S> ReplicatedTextSessionReport<S> {
     /// Returns the selected resident or bounded execution class.
     pub const fn execution(&self) -> ExecutionResidency {
         self.execution
     }
 
-    /// Returns backend-native parameter/runtime residency details.
-    pub const fn execution_report(&self) -> &E {
-        &self.execution_report
+    /// Returns parameter residency from the installed execution policy.
+    pub const fn residency(&self) -> Option<&crate::ResidencyReport> {
+        self.residency.as_ref()
+    }
+
+    /// Returns dense streaming counters from the installed execution policy.
+    pub const fn dense_stream(&self) -> Option<&crate::DenseDiskStreamReport> {
+        self.dense_stream.as_ref()
     }
 
     /// Returns backend-native mutable-state residency details.
@@ -2112,13 +2216,37 @@ impl<E, S> ReplicatedTextSessionReport<E, S> {
     }
 }
 
-/// Constructs one complete replicated-text session from selected policy and
-/// mechanism implementations.
+fn bind_replicated_parameter_storage<A, B, M>(
+    mechanisms: &mut M,
+    prepared: Option<crate::PreparedReplicatedParameterBindings>,
+    weights: crate::ReplicatedWeightOptions<M::WeightStorage>,
+    architecture: &mut A,
+    selected: &SelectedReplicatedTextRealization,
+) -> Result<M::UnitStorage, M::Error>
+where
+    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    A: LayeredArchitecture<B, M::State>,
+    M: ReplicatedTextSessionMechanisms<A, B>,
+{
+    use crate::BindReplicatedParameterStorage;
+    mechanisms
+        .take_parameter_storage()?
+        .bind(
+            prepared,
+            weights,
+            architecture.static_modules_mut(),
+            selected,
+        )
+        .map_err(M::parameter_storage_error)
+}
+
+/// Constructs one complete replicated-text session from selected policy and mechanisms.
 pub fn construct_replicated_text_session<A, B, M>(
     architecture: A,
     source_architecture: Option<A>,
     prepared: PreparedReplicatedTextContract,
     mechanisms: M,
+    weights: crate::ReplicatedWeightOptions<M::WeightStorage>,
     context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
 ) -> Result<
     ReplicatedTextSession<A, B, M>,
@@ -2137,6 +2265,7 @@ where
         source_architecture,
         prepared,
         mechanisms,
+        weights,
         DirectReplicatedTextExecution,
         context,
     )
@@ -2149,9 +2278,10 @@ where
 /// identical to ordinary replicated text construction.
 pub fn construct_replicated_text_session_with_execution<A, B, M, D>(
     mut architecture: A,
-    mut source_architecture: Option<A>,
+    source_architecture: Option<A>,
     prepared: PreparedReplicatedTextContract,
     mut mechanisms: M,
+    weights: crate::ReplicatedWeightOptions<M::WeightStorage>,
     driver: D,
     context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
 ) -> Result<
@@ -2175,9 +2305,9 @@ where
     invocations
         .validate_layout(selected.requirements().execution_units())
         .map_err(|error| ReplicatedTextSessionError::Contract(error.to_string()))?;
-    let mut units = construct_units::<A, B, M::State>(&architecture, &invocations, context)
+    let units = construct_units::<A, B, M::State>(&architecture, &invocations, context)
         .map_err(ReplicatedTextSessionError::Architecture)?;
-    let mut source_units = source_architecture
+    let source_units = source_architecture
         .as_ref()
         .map(|source| {
             let source_map = source
@@ -2192,31 +2322,68 @@ where
                 .map_err(ReplicatedTextSessionError::Architecture)
         })
         .transpose()?;
-    mechanisms
-        .prepare_materialization(
-            &mut architecture,
-            &invocations,
-            &mut units,
-            source_architecture.as_mut(),
-            source_units.as_deref_mut(),
-            &tasks,
-            &addressable_parameters,
-            context,
-        )
+    let task_partition =
+        crate::plan_replicated_text_materialization_tasks(&tasks, invocations.storage_layout())
+            .map_err(|error| ReplicatedTextSessionError::Contract(error.to_string()))?;
+    let mut bindings = mechanisms
+        .parameter_source()
+        .map(|store| {
+            crate::exact_parameter_materialization::prepare_replicated_parameter_bindings::<
+                A,
+                B,
+                M::State,
+                M::Parameters,
+            >(
+                store,
+                &architecture,
+                &units,
+                &invocations,
+                source_architecture.as_ref().zip(source_units.as_deref()),
+                None,
+                None,
+                &task_partition,
+                &tasks,
+                &addressable_parameters,
+                context,
+            )
+        })
+        .transpose()
+        .map_err(M::parameter_storage_error)
         .map_err(ReplicatedTextSessionError::Mechanism)?;
-    let materialization_report = mechanisms
-        .take_materialization_report()
-        .map_err(ReplicatedTextSessionError::Mechanism)?;
-    let state = mechanisms
-        .realize_state(selected.state(), context)
-        .map_err(ReplicatedTextSessionError::Mechanism)?;
+    let parameter_metadata = if let Some(bindings) = bindings.as_mut() {
+        ReplicatedParameterMetadata::take_from(bindings)
+    } else {
+        mechanisms.observe_prebound_parameter_tasks(&task_partition, &tasks);
+        ReplicatedParameterMetadata {
+            report: mechanisms
+                .prebound_materialization_report()
+                .map_err(ReplicatedTextSessionError::Mechanism)?,
+            ..Default::default()
+        }
+    };
+    let state = realize_live_state(
+        &mut mechanisms,
+        selected.state(),
+        Some(&prompt_cache_identity),
+        context,
+    )
+    .map_err(ReplicatedTextSessionError::Mechanism)?;
     validate_realized_state(&state, selected.state())?;
     let selected_state = SessionStateRealization::Stateful(selected.state().clone());
+    let storage = bind_replicated_parameter_storage::<A, B, M>(
+        &mut mechanisms,
+        bindings,
+        weights,
+        &mut architecture,
+        &selected,
+    )
+    .map_err(ReplicatedTextSessionError::Mechanism)?;
     let execution = match selected.residency() {
         LayerWeightResidency::FullyResident => {
-            let policy = mechanisms
-                .resident_policy(&mut architecture, units, &selected, context)
-                .map_err(ReplicatedTextSessionError::Mechanism)?;
+            let policy =
+                install_resident_policy::<A, B, M>(storage, units, context).map_err(|error| {
+                    ReplicatedTextSessionError::Mechanism(M::parameter_storage_error(error))
+                })?;
             ReplicatedTextRuntime {
                 kind: ReplicatedTextRuntimeKind::Resident(LayerwiseRuntime::new(
                     architecture,
@@ -2225,9 +2392,7 @@ where
             }
         }
         LayerWeightResidency::LayerwiseHost(_) | LayerWeightResidency::DenseDiskStream(_) => {
-            let policy = mechanisms
-                .bounded_policy(&mut architecture, &selected, context)
-                .map_err(ReplicatedTextSessionError::Mechanism)?;
+            let policy = install_bounded_policy::<A, B, M>(storage);
             ReplicatedTextRuntime {
                 kind: ReplicatedTextRuntimeKind::Bounded(LayerwiseRuntime::new(
                     architecture,
@@ -2243,7 +2408,8 @@ where
         driver,
         state,
         mechanisms,
-        materialization_report,
+        parameter_metadata,
+        installed_parameters: None,
         partition_parameters: None,
         prompt_cache_identity: Some(prompt_cache_identity),
         committed_prompt_input_identity: None,
@@ -2285,6 +2451,7 @@ where
     let PreparedPartitionedSessionRuntime {
         selected,
         parameters,
+        parameter_metadata,
         runtime,
         state,
         selected_state,
@@ -2345,9 +2512,15 @@ where
             }
         }
     }
-    let materialization_report = mechanisms
-        .take_materialization_report()
-        .map_err(ReplicatedTextSessionError::Mechanism)?;
+    let parameter_metadata = match parameter_metadata {
+        Some(metadata) => metadata,
+        None => ReplicatedParameterMetadata {
+            report: mechanisms
+                .prebound_materialization_report()
+                .map_err(ReplicatedTextSessionError::Mechanism)?,
+            ..Default::default()
+        },
+    };
     Ok(ReplicatedTextSession {
         selected,
         selected_state,
@@ -2355,7 +2528,8 @@ where
         driver,
         state,
         mechanisms,
-        materialization_report,
+        parameter_metadata,
+        installed_parameters: None,
         partition_parameters: Some(parameters),
         prompt_cache_identity,
         committed_prompt_input_identity: None,
@@ -2403,15 +2577,21 @@ where
 {
     /// Returns the aggregate report captured by the neutral construction
     /// driver after exact materialization preparation completed.
-    pub const fn materialization_report(&self) -> Option<&crate::WeightMaterializationReport> {
-        self.materialization_report.as_ref()
+    pub const fn materialization_report(
+        &self,
+    ) -> Option<&eredu_checkpoint::quantization::WeightMaterializationReport> {
+        self.parameter_metadata.report.as_ref()
     }
 
     /// Adds completed native observations for separately prepared auxiliary
     /// modules. This changes telemetry only; selected requirements and resource
     /// authority remain with the construction driver.
-    pub fn record_auxiliary_materialization(&mut self, report: crate::WeightMaterializationReport) {
-        self.materialization_report
+    pub fn record_auxiliary_materialization(
+        &mut self,
+        report: eredu_checkpoint::quantization::WeightMaterializationReport,
+    ) {
+        self.parameter_metadata
+            .report
             .get_or_insert_with(Default::default)
             .merge(report);
     }
@@ -2439,14 +2619,14 @@ where
 
     /// Describes prepared physical slots without acquiring their residency units.
     pub fn parameter_declarations(&self) -> &[eredu_nn::ParameterMetadata] {
-        self.mechanisms.parameter_declarations()
+        &self.parameter_metadata.declarations
     }
 
     /// Exact prepared source slots.
     pub fn prepared_parameter_slots(
         &self,
     ) -> &[crate::parameter_operations::PreparedParameterSlot] {
-        self.mechanisms.prepared_parameter_slots()
+        &self.parameter_metadata.slots
     }
 
     /// Describes hypothetical prepared geometry from this session's retained
@@ -2831,7 +3011,7 @@ where
 
     /// Agrees request preparation and the selected prefill branch before any rank
     /// enters ordinary execution or starts a chunk cursor.
-    pub fn prepare_prefill<V>(
+    pub(crate) fn prepare_prefill<V>(
         &mut self,
         prepared: Result<V, A::Error>,
         describe: impl FnOnce(&V) -> crate::prefill::PrefillRequestDescriptor,
@@ -2906,6 +3086,52 @@ where
                 "distributed prefill preparation or descriptor disagreed at {phase:?}"
             ))),
         }
+    }
+
+    /// Admits a complete composite prompt and erases the selected chunked request.
+    pub fn start_composite_prefill(
+        &mut self,
+        input: Result<CompositePrompt<B::Tensor, A::InputPartPlan>, eredu_nn::Error>,
+        max_tokens: usize,
+        capture: Option<eredu_core::capture::CaptureRequestShape>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<
+        crate::prefill::ErasedPrefillCursor,
+        ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
+    >
+    where
+        A: crate::composite_execution::CompositeArchitecture<B, M::State, Error = eredu_nn::Error>,
+        A::PrefillRequest: 'static,
+        <A::PrefillRequest as crate::prefill::ChunkedPrefillRequest<A, B, M::State>>::Continuation:
+            'static,
+    {
+        use crate::prefill::{
+            ChunkedPrefillRequest, ErasedPrefillCursor, PrefillRequestDescriptor,
+        };
+
+        let input = input.and_then(|input| {
+            if let Some(capture) = capture {
+                let [batch, sequence] = input.1.decoder_shape();
+                capture
+                    .validate_prefill(batch, sequence)
+                    .map_err(eredu_nn::Error::backend_source)?;
+            }
+            Ok(input)
+        });
+        let (prepared, admitted, identity) = self.prepare_prefill(
+            input,
+            |(_, admitted, _)| PrefillRequestDescriptor {
+                tokens: admitted.decoder_positions() as usize,
+                chunk_tokens: Some(max_tokens),
+            },
+            context,
+        )?;
+        let request = A::prepare_prefill_request(prepared, admitted, context);
+        let chunk_tokens = request.as_ref().map_or(max_tokens, |request| {
+            max_tokens.min(request.maximum_chunk_tokens())
+        });
+        self.start_prefill(request, chunk_tokens, identity, context)
+            .map(ErasedPrefillCursor::chunked::<A, B, M::State>)
     }
 
     /// Reports the retained realization's support for partial prefill invocations.
@@ -3104,8 +3330,21 @@ where
         R: crate::prefill::ChunkedPrefillRequest<A, B, M::State>,
         O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
+        let start = cursor.position();
         loop {
-            let step = self.advance_prefill(cursor, context, observer)?;
+            let step = self
+                .advance_prefill(cursor, context, observer)
+                .map_err(|error| {
+                    if cursor.position() == start {
+                        return error;
+                    }
+                    // Per-step rollback leaves earlier committed chunks installed.
+                    match error {
+                        ReplicatedTextSessionError::StateRestored(error)
+                        | ReplicatedTextSessionError::BeforeStateMutation(error) => *error,
+                        error => error,
+                    }
+                })?;
             if step.complete {
                 return Ok(step.output);
             }
@@ -3124,6 +3363,28 @@ where
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
         self.prefill_input_with_observer(input, context, &mut crate::NoopObserver)
+    }
+
+    /// Invokes an installed replicated decoder with explicit attention semantics.
+    pub fn execute_text_attention<O>(
+        &mut self,
+        tokens: &B::Tensor,
+        feedback: Option<&B::Tensor>,
+        invocation: eredu_core::decoding::AttentionInvocation,
+        pass: ExpertPass,
+        context: &B::Executor,
+        observer: &mut O,
+    ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
+    where
+        A: ReplicatedTextArchitecture<B, M::State>,
+        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        let input = A::invocation_input(tokens, feedback, None, invocation).ok_or_else(|| {
+            ReplicatedTextSessionError::Contract(
+                "selected architecture rejects attention invocation".into(),
+            )
+        })?;
+        self.sequence_output_with_observer(input, pass, context, observer)
     }
 
     /// Runs ordinary unobserved causal prefill with a final-position readout
@@ -3490,7 +3751,7 @@ where
     /// ordinary agreement-backed exchange can run again. The caller must still
     /// return the original distributed failure; this swap does not clear a
     /// poison, publish state, or make the session reusable.
-    pub fn recover_prediction_target_state_after_failure(
+    pub(crate) fn recover_prediction_target_state_after_failure(
         &mut self,
         replacement: &mut M::State,
     ) -> Result<(), ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
@@ -3541,7 +3802,12 @@ where
                 }),
             Some(selected) => self
                 .mechanisms
-                .fork_prediction_target_state(&self.state, selected, context)
+                .fork_prediction_target_state(
+                    &self.state,
+                    selected,
+                    self.prompt_cache_identity.as_ref(),
+                    context,
+                )
                 .map_err(ReplicatedTextSessionError::Mechanism)
                 .and_then(|state| {
                     validate_realized_state(&state, selected)?;
@@ -3740,13 +4006,17 @@ where
         self.ensure_commit_resolved()?;
         self.require_cache_control_agreement()?;
         let provisional = self.selected_state.state().map(|selected| {
-            self.mechanisms
-                .realize_state(selected, context)
-                .map_err(ReplicatedTextSessionError::Mechanism)
-                .and_then(|state| {
-                    validate_realized_state(&state, selected)?;
-                    Ok(state)
-                })
+            realize_live_state(
+                &mut self.mechanisms,
+                selected,
+                self.prompt_cache_identity.as_ref(),
+                context,
+            )
+            .map_err(ReplicatedTextSessionError::Mechanism)
+            .and_then(|state| {
+                validate_realized_state(&state, selected)?;
+                Ok(state)
+            })
         });
         let success = provisional.as_ref().is_none_or(Result::is_ok);
         let phase = crate::DistributedExecutionPhase::SessionResetPreparation;
@@ -3771,10 +4041,13 @@ where
     ) -> Result<(), ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
         self.ensure_commit_resolved()?;
         if let Some(selected_state) = self.selected_state.state() {
-            let state = self
-                .mechanisms
-                .realize_state(selected_state, context)
-                .map_err(ReplicatedTextSessionError::Mechanism)?;
+            let state = realize_live_state(
+                &mut self.mechanisms,
+                selected_state,
+                self.prompt_cache_identity.as_ref(),
+                context,
+            )
+            .map_err(ReplicatedTextSessionError::Mechanism)?;
             validate_realized_state(&state, selected_state)?;
             self.state = state;
         } else if self.state.optional_layout().is_some() {
@@ -3803,17 +4076,18 @@ where
                 "this partition rank owns no prompt-cache state shard".into(),
             )
         })?;
-        let (state, manifest) = self
-            .mechanisms
-            .load_prompt_cache(
-                store,
-                expected,
-                &identity,
-                prefix_token_ids,
-                selected_state,
-                context,
-            )
-            .map_err(ReplicatedTextSessionError::Mechanism)?;
+        let (state, manifest) =
+            crate::cache::with_rank_prompt_cache_store(store, expected.topology(), |store| {
+                prompt_cache::restore_cached_state::<A, B, M>(
+                    &mut self.mechanisms,
+                    store,
+                    expected,
+                    &identity,
+                    prefix_token_ids,
+                    selected_state,
+                    context,
+                )
+            })?;
         manifest.validate_compatibility(expected, prefix_token_ids)?;
         validate_realized_state(&state, selected_state)?;
         self.state = state;
@@ -3891,23 +4165,23 @@ where
         descriptor: PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         options: &PromptCacheOptions,
-        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
+        _context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
     ) -> Result<PromptCacheManifest, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
     {
         self.ensure_control_unfenced()?;
         validate_prompt_cache_model_identity(&descriptor, self.prompt_cache_identity()?)?;
         let descriptor = descriptor.with_distributed_commit(self.last_commit_outcome);
-        let manifest = self
-            .mechanisms
-            .save_prompt_cache(
-                &mut self.state,
-                store,
-                descriptor.clone(),
-                prefix_token_ids,
-                options,
-                context,
-            )
-            .map_err(ReplicatedTextSessionError::Mechanism)?;
+        let manifest =
+            crate::cache::with_rank_prompt_cache_store(store, descriptor.topology(), |store| {
+                prompt_cache::publish_cached_state::<A, B, M>(
+                    &mut self.mechanisms,
+                    &mut self.state,
+                    store,
+                    descriptor.clone(),
+                    prefix_token_ids,
+                    options,
+                )
+            })?;
         manifest.validate_compatibility(&descriptor, prefix_token_ids)?;
         Ok(manifest)
     }
@@ -3981,22 +4255,23 @@ where
         };
 
         let provisional = local.map(|(selected_state, identity)| {
-            self.mechanisms
-                .load_prompt_cache(
-                    &crate::DirectoryPromptCacheStore::new(directory, u64::MAX),
-                    expected,
-                    &identity,
-                    prefix_token_ids,
-                    &selected_state,
-                    context,
-                )
-                .map_err(ReplicatedTextSessionError::Mechanism)
-                .and_then(|(state, manifest)| {
-                    manifest.validate_compatibility(expected, prefix_token_ids)?;
-                    validate_realized_state(&state, &selected_state)?;
-                    validate_distributed_commit_restore(manifest.distributed_commit)?;
-                    Ok((state, manifest))
-                })
+            let path = crate::prompt_cache_rank_path(directory, expected.topology());
+            let store = crate::DirectoryPromptCacheStore::new(path, u64::MAX);
+            prompt_cache::restore_cached_state::<A, B, M>(
+                &mut self.mechanisms,
+                &store,
+                expected,
+                &identity,
+                prefix_token_ids,
+                &selected_state,
+                context,
+            )
+            .and_then(|(state, manifest)| {
+                manifest.validate_compatibility(expected, prefix_token_ids)?;
+                validate_realized_state(&state, &selected_state)?;
+                validate_distributed_commit_restore(manifest.distributed_commit)?;
+                Ok((state, manifest))
+            })
         });
         let local_success = provisional.as_ref().is_none_or(Result::is_ok);
         let phase = crate::DistributedExecutionPhase::PromptCacheLoadPreparation;
@@ -4044,16 +4319,20 @@ where
         self.require_cache_control_agreement()?;
         let provisional = match (self.selected_state.state(), checkpoint) {
             (Some(selected), Some(checkpoint)) => Some(
-                self.mechanisms
-                    .realize_state(selected, context)
-                    .map_err(ReplicatedTextSessionError::Mechanism)
-                    .and_then(|mut state| {
-                        self.mechanisms
-                            .restore_state(&mut state, checkpoint, context)
-                            .map_err(ReplicatedTextSessionError::Mechanism)?;
-                        validate_realized_state(&state, selected)?;
-                        Ok(state)
-                    }),
+                realize_live_state(
+                    &mut self.mechanisms,
+                    selected,
+                    self.prompt_cache_identity.as_ref(),
+                    context,
+                )
+                .map_err(ReplicatedTextSessionError::Mechanism)
+                .and_then(|mut state| {
+                    self.mechanisms
+                        .restore_state(&mut state, checkpoint, context)
+                        .map_err(ReplicatedTextSessionError::Mechanism)?;
+                    validate_realized_state(&state, selected)?;
+                    Ok(state)
+                }),
             ),
             (None, None) => None,
             _ => Some(Err(ReplicatedTextSessionError::Contract(
@@ -4114,8 +4393,9 @@ where
         Vec<eredu_core::residency::ParameterConversionRetentionTrimReport>,
         eredu_core::residency::ParameterConversionTrimError,
     > {
-        self.mechanisms
-            .trim_parameter_conversions(D::bounded_policy(&self.execution))
+        D::parameter_telemetry(&self.execution)
+            .ok_or(eredu_core::residency::ParameterConversionTrimError::Unsupported)?
+            .trim_local_conversions()
     }
 
     /// Observes the installed retention budget without touching lane state.
@@ -4125,12 +4405,10 @@ where
         eredu_core::Observed<Vec<eredu_core::residency::ParameterConversionRetentionReport>>,
         ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
     > {
-        self.mechanisms
-            .parameter_conversion_retention(
-                self.selected.residency(),
-                D::bounded_policy(&self.execution),
-            )
-            .map_err(ReplicatedTextSessionError::Mechanism)
+        Ok(self.parameter_residency()?.map_or_else(
+            eredu_core::residency::unreported_parameter_conversion_retention,
+            |report| report.offload().parameter_conversion_retention().clone(),
+        ))
     }
 
     /// Observes the installed shared parameter owner without touching lane state.
@@ -4140,35 +4418,78 @@ where
         Option<eredu_core::speculative::SpeculativeParameterMemoryObservation>,
         ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
     > {
-        self.mechanisms
-            .parameter_memory_observation(
-                self.selected.residency(),
-                D::bounded_policy(&self.execution),
+        self.parameter_memory_observation_with_banks([])
+    }
+
+    pub(crate) fn parameter_memory_observation_with_banks(
+        &self,
+        banks: impl IntoIterator<Item = crate::text_session_driver::capability::BankMemoryFacts>,
+    ) -> Result<
+        Option<eredu_core::speculative::SpeculativeParameterMemoryObservation>,
+        ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
+    > {
+        let Some(facts) = self
+            .mechanisms
+            .parameter_memory_facts()
+            .map_err(ReplicatedTextSessionError::Mechanism)?
+        else {
+            return Ok(None);
+        };
+        let residency = self.parameter_residency()?;
+        let parameter_conversions = residency
+            .as_ref()
+            .and_then(|report| report.device_parameter_conversions().map(<[_]>::to_vec));
+        let parameters =
+            crate::text_session_driver::capability::static_memory_from_residency_and_components(
+                residency,
+                std::iter::empty(),
+                banks,
+                facts.native,
             )
-            .map_err(ReplicatedTextSessionError::Mechanism)
+            .map_err(ReplicatedTextSessionError::ParameterMemory)?;
+        Ok(Some(
+            eredu_core::speculative::SpeculativeParameterMemoryObservation {
+                parameters,
+                parameter_conversions,
+                available: facts.available,
+                allocator_cache_limit: facts.allocator_cache_limit,
+            },
+        ))
+    }
+
+    fn parameter_residency(
+        &self,
+    ) -> Result<
+        Option<crate::ResidencyReport>,
+        ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
+    > {
+        D::parameter_telemetry(&self.execution)
+            .map(crate::UnitPolicyResidency::residency)
+            .transpose()
+            .map_err(ReplicatedTextSessionError::ParameterReport)
     }
 
     /// Returns one coherent execution and state residency report.
     pub fn report(
         &self,
     ) -> Result<
-        ReplicatedTextSessionReport<M::ExecutionReport, M::StateReport>,
+        ReplicatedTextSessionReport<M::StateReport>,
         ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
     > {
-        let execution_report = self
-            .mechanisms
-            .execution_report(
-                self.selected.residency(),
-                D::bounded_policy(&self.execution),
-            )
-            .map_err(ReplicatedTextSessionError::Mechanism)?;
+        let residency = self.parameter_residency()?;
+        let dense_stream = D::parameter_telemetry(&self.execution)
+            .map(crate::UnitPolicyResidency::dense_stream_report)
+            .transpose()
+            .map_err(ReplicatedTextSessionError::ParameterReport)?
+            .flatten();
         let state_report = self
             .mechanisms
             .state_report(&self.state)
             .map_err(ReplicatedTextSessionError::Mechanism)?;
         Ok(ReplicatedTextSessionReport {
             execution: D::execution_residency(&self.execution, &self.selected),
-            execution_report,
+            residency,
+            dense_stream,
             state_report,
             distributed_commit: self.last_commit_outcome,
         })
@@ -4188,11 +4509,20 @@ where
     where
         O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
+        let before = self.successful_state_restorations;
         let guard =
             crate::inspection::ObservationTransactionGuard::new(observer, self.next_commit_epoch);
         let result = operation(self, guard.observer);
         guard.finish(result.is_ok());
-        result
+        result.map_err(|error| {
+            if !error.state_preserved()
+                && matches!((before, self.successful_state_restorations), (Some(before), Some(after)) if after > before)
+            {
+                ReplicatedTextSessionError::StateRestored(Box::new(error))
+            } else {
+                error
+            }
+        })
     }
 
     fn require_input_result_agreement(
@@ -4582,10 +4912,11 @@ where
             || self.selected.exact_completion()
             || observer.transactional())
         .then(|| {
+            let roots = M::state_roots(&self.state);
             for value in retained {
-                self.mechanisms.complete(value, &self.state, context)?;
+                self.mechanisms.complete(value, &roots, context)?;
             }
-            self.mechanisms.complete(&output, &self.state, context)
+            self.mechanisms.complete(&output, &roots, context)
         })
         .transpose();
         let completion_agreed = match D::agree_distributed_phase(
@@ -4836,6 +5167,11 @@ where
         Ok(())
     }
 
+    /// Exact model identity retained by the current rank, when it owns cache state.
+    pub fn prompt_cache_model_identity(&self) -> Option<&PromptCacheModelIdentity> {
+        self.prompt_cache_identity.as_ref()
+    }
+
     fn prompt_cache_identity(
         &self,
     ) -> Result<
@@ -4858,7 +5194,7 @@ where
 impl<A, B, M, D> ReplicatedTextSession<A, B, M, D>
 where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
-    M: TransactionalPromptCacheMechanisms<A, B>,
+    M: ReplicatedTextSessionMechanisms<A, B>,
     A: LayeredArchitecture<B, M::State>,
     D: ReplicatedTextExecutionStrategy<A, B, M::State, M::ResidentPolicy, M::BoundedPolicy>,
     A::Error: std::fmt::Display,
@@ -4970,36 +5306,40 @@ where
             }
         };
 
-        let mut transaction = local_descriptor.map(|descriptor| {
-            self.mechanisms
-                .prepare_prompt_cache_save(
-                    &mut self.state,
-                    destination,
-                    descriptor.clone(),
-                    prefix_token_ids,
-                    options,
-                    context,
-                )
-                .map_err(ReplicatedTextSessionError::Mechanism)
-                .and_then(|transaction| {
-                    M::prepared_prompt_cache_manifest(&transaction)
-                        .validate_compatibility(&descriptor, prefix_token_ids)?;
-                    Ok(transaction)
-                })
+        let transaction = local_descriptor.map(|descriptor| {
+            let transaction = crate::PreparedPromptCachePublication::stage(
+                destination,
+                descriptor.topology(),
+                options,
+                |store, options| {
+                    prompt_cache::publish_cached_state::<A, B, M>(
+                        &mut self.mechanisms,
+                        &mut self.state,
+                        store,
+                        descriptor.clone(),
+                        prefix_token_ids,
+                        options,
+                    )
+                },
+            )?;
+            transaction
+                .manifest()
+                .validate_compatibility(&descriptor, prefix_token_ids)?;
+            Ok(transaction)
         });
         let local_success = transaction.as_ref().is_none_or(Result::is_ok);
         let phase = crate::DistributedExecutionPhase::PromptCacheSavePreparation;
         let agreement = self.agree_cache_control_phase(phase, local_success, context);
-        let mut transaction = match (transaction.take(), agreement) {
+        let mut transaction = match (transaction, agreement) {
             (Some(Ok(transaction)), Ok(true)) => Some(transaction),
             (None, Ok(true)) => None,
             (Some(Ok(transaction)), Ok(false)) => {
-                self.mechanisms.rollback_prompt_cache_save(transaction);
+                transaction.rollback();
                 return self.fence_remote_cache_control_failure(phase);
             }
             (None, Ok(false)) => return self.fence_remote_cache_control_failure(phase),
             (Some(Ok(transaction)), Err(error)) => {
-                self.mechanisms.rollback_prompt_cache_save(transaction);
+                transaction.rollback();
                 return Err(error);
             }
             (None, Err(error)) => return Err(error),
@@ -5011,23 +5351,22 @@ where
 
         let publication = transaction
             .as_mut()
-            .map(|transaction| self.mechanisms.publish_prompt_cache_save(transaction));
+            .map(crate::PreparedPromptCachePublication::publish);
         let local_success = publication.as_ref().is_none_or(Result::is_ok);
         let phase = crate::DistributedExecutionPhase::PromptCacheSavePublication;
         let agreement = self.agree_cache_control_phase(phase, local_success, context);
         let agreed = match (publication, agreement) {
             (Some(Err(error)), _) => {
-                self.mechanisms.rollback_prompt_cache_save(
-                    transaction
-                        .take()
-                        .expect("failed publication retains its transaction"),
-                );
+                transaction
+                    .take()
+                    .expect("failed publication retains its transaction")
+                    .rollback();
                 self.control_fence = Some(phase);
-                return Err(ReplicatedTextSessionError::Mechanism(error));
+                return Err(ReplicatedTextSessionError::PromptCacheStorage(error));
             }
             (Some(Ok(())) | None, Err(error)) => {
                 if let Some(transaction) = transaction.take() {
-                    self.mechanisms.rollback_prompt_cache_save(transaction);
+                    transaction.rollback();
                 }
                 return Err(error);
             }
@@ -5035,13 +5374,13 @@ where
         };
         if !agreed {
             if let Some(transaction) = transaction {
-                self.mechanisms.rollback_prompt_cache_save(transaction);
+                transaction.rollback();
             }
             return self.fence_remote_cache_control_failure(phase);
         }
         Ok(transaction.map(|transaction| {
-            let manifest = M::prepared_prompt_cache_manifest(&transaction).clone();
-            self.mechanisms.commit_prompt_cache_save(transaction);
+            let manifest = transaction.manifest().clone();
+            transaction.commit();
             manifest
         }))
     }
@@ -5492,11 +5831,26 @@ where
             ReplicatedTextSessionError::Architecture(error)
         }
         ReplicatedTextSessionError::Policy(error) => ReplicatedTextSessionError::Policy(error),
+        ReplicatedTextSessionError::ParameterReport(error) => {
+            ReplicatedTextSessionError::ParameterReport(error)
+        }
+        ReplicatedTextSessionError::ParameterMemory(error) => {
+            ReplicatedTextSessionError::ParameterMemory(error)
+        }
         ReplicatedTextSessionError::Mechanism(error) => match error {},
         ReplicatedTextSessionError::BeforeStateMutation(error) => {
             ReplicatedTextSessionError::BeforeStateMutation(Box::new(widen_infallible(*error)))
         }
+        ReplicatedTextSessionError::StateRestored(error) => {
+            ReplicatedTextSessionError::StateRestored(Box::new(widen_infallible(*error)))
+        }
         ReplicatedTextSessionError::State(error) => ReplicatedTextSessionError::State(error),
+        ReplicatedTextSessionError::PromptCacheStorage(error) => {
+            ReplicatedTextSessionError::PromptCacheStorage(error)
+        }
+        ReplicatedTextSessionError::LiveCache(error) => {
+            ReplicatedTextSessionError::LiveCache(error)
+        }
         ReplicatedTextSessionError::PromptCache(error) => {
             ReplicatedTextSessionError::PromptCache(error)
         }
@@ -5507,4 +5861,26 @@ where
             ReplicatedTextSessionError::CommitIndeterminate { epoch, phase }
         }
     }
+}
+
+fn install_resident_policy<A, B, M>(
+    storage: M::UnitStorage,
+    units: Vec<A::Unit>,
+    context: &B::Executor,
+) -> Result<M::ResidentPolicy, eredu_core::BackendFailure>
+where
+    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    M: ReplicatedTextSessionMechanisms<A, B>,
+    A: LayeredArchitecture<B, M::State>,
+{
+    M::ResidentPolicy::bind_resident(storage, units, context)
+}
+
+fn install_bounded_policy<A, B, M>(storage: M::UnitStorage) -> M::BoundedPolicy
+where
+    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    M: ReplicatedTextSessionMechanisms<A, B>,
+    A: LayeredArchitecture<B, M::State>,
+{
+    M::BoundedPolicy::bind_bounded(storage)
 }

@@ -405,7 +405,7 @@ impl ConditionalPartitionLocalFoundation {
                         eredu_runtime::BoundaryTensorDimension::Sequence,
                         eredu_runtime::BoundaryTensorDimension::Fixed(parsed.text.hidden_size),
                     ],
-                    eredu_runtime::BoundaryTensorDtype::Activation,
+                    eredu_core::communication::BoundaryTensorDtype::Activation,
                 )
             })
             .collect::<Vec<_>>();

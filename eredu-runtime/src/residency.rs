@@ -1,75 +1,42 @@
 //! Backend-neutral immutable-weight residency declarations and control state.
 
-/// Shared execution-scoped admission for optional parameter conversions.
-pub mod conversion_retention;
+mod acquisition;
+mod driver;
+mod materialization;
+pub use driver::ResidencyDriver;
+mod conversion_retention;
+mod prepared;
+pub use acquisition::{
+    ResidencyAccess, ResidencyOwner, ResidencySnapshot, ResidencyState, ResidencyStatePoisoned,
+    ResidentLease,
+};
 mod rows;
+pub use prepared::{
+    PreparedResidency, PreparedResidencyError, ResidencyInstallation, ResidencySources,
+};
 pub use rows::RowResidencyRange;
 
 use std::{
-    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     sync::Weak,
     time::Duration,
 };
 
 use eredu_checkpoint::{
-    recipe::{DerivedWeightRecipe, RecipeCatalog, RecipeError},
-    store::{TensorSelection, WeightStoreDiagnostics},
+    recipe::{RecipeCatalog, RecipeError},
+    store::WeightStoreDiagnostics,
 };
 use eredu_core::residency::{
-    EvictedResidencyCopy, MemoryTier, OffloadPlan, OffloadReport, OffloadUnitId, PrefetchOutcome,
-    ResidencyLedger, ResidencyLedgerError, UnitResidencyReport,
+    conversion_claim::ConversionRetentionBudget, EvictedResidencyCopy, MemoryTier, OffloadPlan,
+    OffloadReport, OffloadUnitId, PrefetchOutcome, ResidencyLedger, ResidencyLedgerError,
+    UnitResidencyReport,
 };
 
-/// Deterministic telemetry from one bounded weight-materialization pass.
-#[derive(Debug, Clone, Default, Eq, PartialEq)]
-pub struct WeightMaterializationReport {
-    /// Planner ceiling for simultaneously live conversion data.
-    pub admitted_working_set_bytes: u64,
-    /// Number of dense semantic matrices transformed.
-    pub transformed_weights: usize,
-    /// Number of independently evaluated source row tiles.
-    pub source_tiles: usize,
-    /// Largest number of submitted tile completions retained simultaneously.
-    pub peak_in_flight_tiles: usize,
-    /// Total logical dense bytes selected from the source store.
-    pub source_bytes_read: u64,
-    /// Total encoded output bytes written to persistent storage.
-    pub output_bytes: u64,
-    /// Largest conservative conversion working set admitted for one tile.
-    pub peak_planned_working_set_bytes: u64,
-    /// Largest source recipe output tile.
-    pub largest_source_tile_bytes: u64,
-    /// Largest encoded output tile written together.
-    pub largest_output_tile_bytes: u64,
-}
+use eredu_checkpoint::quantization::WeightMaterializationReport;
 
-impl WeightMaterializationReport {
-    /// Merges one independent materialization pass into this aggregate.
-    ///
-    /// Additive counters retain the total work while capacity and peak fields
-    /// retain the greatest requirement observed by any pass.
-    pub fn merge(&mut self, next: Self) {
-        self.admitted_working_set_bytes = self
-            .admitted_working_set_bytes
-            .max(next.admitted_working_set_bytes);
-        self.transformed_weights += next.transformed_weights;
-        self.source_tiles += next.source_tiles;
-        self.peak_in_flight_tiles = self.peak_in_flight_tiles.max(next.peak_in_flight_tiles);
-        self.source_bytes_read += next.source_bytes_read;
-        self.output_bytes += next.output_bytes;
-        self.peak_planned_working_set_bytes = self
-            .peak_planned_working_set_bytes
-            .max(next.peak_planned_working_set_bytes);
-        self.largest_source_tile_bytes = self
-            .largest_source_tile_bytes
-            .max(next.largest_source_tile_bytes);
-        self.largest_output_tile_bytes = self
-            .largest_output_tile_bytes
-            .max(next.largest_output_tile_bytes);
-    }
-}
-
+use eredu_core::residency::parameter_binding::{
+    physical_binding_bytes, OffloadUnit, ResidencyDeclarationError, WeightBinding,
+};
 pub use eredu_core::residency::{ResidentParameterConversion, ResidentParameterConversionBinding};
 
 pub(crate) fn conversion_payload_bytes(
@@ -152,7 +119,7 @@ pub struct ResidencyReport {
     device_parameter_conversions: Option<Vec<ResidentParameterConversion>>,
     host_storage_resources: Option<eredu_core::resources::ResourceDescription>,
     detached_resources: Option<crate::detached_resources::DetachedResourceInventory>,
-    projection_storage: BTreeMap<String, crate::projection_memory::ProjectionStorageFacts>,
+    projection_storage: BTreeMap<String, eredu_core::residency::projection::ProjectionStorageFacts>,
     f32_rms_normalization_gains: std::collections::BTreeSet<String>,
 }
 
@@ -221,13 +188,13 @@ impl ResidencyReport {
     /// Storage coverage established by current permanent native parameter bindings.
     pub fn projection_storage(
         &self,
-    ) -> &BTreeMap<String, crate::projection_memory::ProjectionStorageFacts> {
+    ) -> &BTreeMap<String, eredu_core::residency::projection::ProjectionStorageFacts> {
         &self.projection_storage
     }
     /// Attaches allocation-free backend facts. Missing bindings remain uncovered.
     pub fn with_projection_storage(
         mut self,
-        facts: BTreeMap<String, crate::projection_memory::ProjectionStorageFacts>,
+        facts: BTreeMap<String, eredu_core::residency::projection::ProjectionStorageFacts>,
     ) -> Self {
         self.projection_storage = facts;
         self
@@ -333,444 +300,6 @@ impl ResidencyReport {
     }
 }
 
-/// One named checkpoint selection within an atomic resident unit.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct WeightBinding {
-    name: String,
-    alias_of: Option<String>,
-    logical_target: Option<String>,
-    checkpoint_key: String,
-    selection: TensorSelection,
-    recipe: Option<DerivedWeightRecipe>,
-    quantization_companions: Option<QuantizationCompanionBindings>,
-    expected_bytes: u64,
-    storage_layout: eredu_nn::ParameterStorageLayout,
-}
-
-/// Exact local outputs created by one load-time packed-weight transform.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct QuantizationCompanionBindings {
-    scale: String,
-    affine_bias: Option<String>,
-}
-
-impl QuantizationCompanionBindings {
-    /// Creates the role-keyed local companion identities.
-    pub fn new(
-        scale: impl Into<String>,
-        affine_bias: Option<String>,
-    ) -> Result<Self, ResidencyDeclarationError> {
-        let scale = validate_name(scale.into())?;
-        let affine_bias = affine_bias.map(validate_name).transpose()?;
-        if affine_bias.as_ref() == Some(&scale) {
-            return Err(ResidencyDeclarationError::InvalidQuantizationCompanions {
-                name: "packed weight".into(),
-                scales: scale,
-                biases: affine_bias.unwrap(),
-            });
-        }
-        Ok(Self { scale, affine_bias })
-    }
-
-    /// Returns the required scale binding.
-    pub fn scale(&self) -> &str {
-        &self.scale
-    }
-    /// Returns the affine-bias binding when the selected format has one.
-    pub fn affine_bias(&self) -> Option<&str> {
-        self.affine_bias.as_deref()
-    }
-}
-
-impl WeightBinding {
-    /// Selects an optional physical layout without changing source or byte accounting.
-    pub fn with_storage_layout(mut self, layout: eredu_nn::ParameterStorageLayout) -> Self {
-        self.storage_layout = layout;
-        self
-    }
-
-    /// Preferred immutable storage, retaining canonical logical geometry.
-    pub const fn storage_layout(&self) -> eredu_nn::ParameterStorageLayout {
-        self.storage_layout
-    }
-
-    /// Creates a direct binding with a stable local name and selected size.
-    pub fn new(
-        name: impl Into<String>,
-        checkpoint_key: impl Into<String>,
-        selection: TensorSelection,
-        expected_bytes: u64,
-    ) -> Result<Self, ResidencyDeclarationError> {
-        let name = validate_name(name.into())?;
-        let checkpoint_key = checkpoint_key.into();
-        if checkpoint_key.trim().is_empty() {
-            return Err(ResidencyDeclarationError::InvalidCheckpointKey { name });
-        }
-        validate_size(&name, expected_bytes)?;
-        Ok(Self {
-            name,
-            alias_of: None,
-            logical_target: None,
-            checkpoint_key,
-            selection,
-            recipe: None,
-            quantization_companions: None,
-            expected_bytes,
-            storage_layout: eredu_nn::ParameterStorageLayout::Canonical,
-        })
-    }
-
-    /// Creates a binding backed by a composable derived-weight recipe.
-    pub fn from_recipe(
-        name: impl Into<String>,
-        recipe: DerivedWeightRecipe,
-        expected_bytes: u64,
-    ) -> Result<Self, ResidencyDeclarationError> {
-        let name = validate_name(name.into())?;
-        validate_size(&name, expected_bytes)?;
-        let checkpoint_key = first_source(&name, &recipe)?;
-        Ok(Self {
-            name,
-            alias_of: None,
-            logical_target: None,
-            checkpoint_key,
-            selection: TensorSelection::Full,
-            recipe: Some(recipe),
-            quantization_companions: None,
-            expected_bytes,
-            storage_layout: eredu_nn::ParameterStorageLayout::Canonical,
-        })
-    }
-
-    /// Creates one logical destination that shares an already materialized
-    /// owner binding in the same atomic unit.
-    pub fn alias(
-        name: impl Into<String>,
-        owner: impl Into<String>,
-        expected_bytes: u64,
-    ) -> Result<Self, ResidencyDeclarationError> {
-        let name = validate_name(name.into())?;
-        let owner = validate_name(owner.into())?;
-        validate_size(&name, expected_bytes)?;
-        Ok(Self {
-            name,
-            alias_of: Some(owner),
-            logical_target: None,
-            checkpoint_key: String::new(),
-            selection: TensorSelection::Full,
-            recipe: None,
-            quantization_companions: None,
-            expected_bytes,
-            storage_layout: eredu_nn::ParameterStorageLayout::Canonical,
-        })
-    }
-
-    /// Returns the stable name used to look up a resident value.
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// Returns the logical owner when this binding is an alias.
-    pub fn alias_of(&self) -> Option<&str> {
-        self.alias_of.as_deref()
-    }
-
-    /// Returns whether this binding reuses another logical binding's native
-    /// materialization.
-    pub const fn is_alias(&self) -> bool {
-        self.alias_of.is_some()
-    }
-
-    /// Replaces the stable name used to address this value inside its resident unit.
-    pub fn with_name(mut self, name: impl Into<String>) -> Result<Self, ResidencyDeclarationError> {
-        self.name = validate_name(name.into())?;
-        Ok(self)
-    }
-
-    /// Returns the architecture-logical parameter destination.
-    pub fn logical_target(&self) -> Option<&str> {
-        self.logical_target.as_deref()
-    }
-
-    /// Attaches the architecture-logical parameter destination.
-    pub fn with_logical_target(
-        mut self,
-        target: impl Into<String>,
-    ) -> Result<Self, ResidencyDeclarationError> {
-        self.logical_target = Some(validate_name(target.into())?);
-        Ok(self)
-    }
-
-    /// Declares exact local companion names produced by load-time quantization.
-    pub fn with_quantization_companions(
-        mut self,
-        scales_binding: impl Into<String>,
-        biases_binding: Option<String>,
-    ) -> Result<Self, ResidencyDeclarationError> {
-        let scales_binding = validate_name(scales_binding.into())?;
-        let biases_binding = biases_binding.map(validate_name).transpose()?;
-        if scales_binding == self.name
-            || biases_binding.as_ref() == Some(&self.name)
-            || biases_binding.as_ref() == Some(&scales_binding)
-        {
-            return Err(ResidencyDeclarationError::InvalidQuantizationCompanions {
-                name: self.name,
-                scales: scales_binding,
-                biases: biases_binding.unwrap_or_default(),
-            });
-        }
-        self.quantization_companions = Some(QuantizationCompanionBindings {
-            scale: scales_binding,
-            affine_bias: biases_binding,
-        });
-        Ok(self)
-    }
-
-    /// Returns exact local scale and affine-bias bindings for load-time quantization.
-    pub const fn quantization_companions(&self) -> Option<&QuantizationCompanionBindings> {
-        self.quantization_companions.as_ref()
-    }
-
-    /// Returns the first physical checkpoint source.
-    pub fn checkpoint_key(&self) -> &str {
-        &self.checkpoint_key
-    }
-
-    /// Returns the direct checkpoint selection.
-    pub fn selection(&self) -> &TensorSelection {
-        &self.selection
-    }
-
-    /// Returns the derived recipe when this is not a direct binding.
-    pub const fn recipe(&self) -> Option<&DerivedWeightRecipe> {
-        self.recipe.as_ref()
-    }
-
-    /// Returns the complete source recipe represented by this binding.
-    pub fn source_recipe(&self) -> DerivedWeightRecipe {
-        self.recipe_view().into_owned()
-    }
-
-    // Transfers a complete recipe when the binding metadata is no longer needed.
-    pub(crate) fn into_source_recipe(self) -> DerivedWeightRecipe {
-        assert!(
-            self.alias_of.is_none(),
-            "logical aliases have no physical recipe"
-        );
-        self.recipe
-            .unwrap_or_else(|| DerivedWeightRecipe::source(self.checkpoint_key, self.selection))
-    }
-
-    // Inspection borrows retained derived recipes; direct bindings synthesize
-    // their source expression from the checkpoint key and selection.
-    pub(crate) fn recipe_view(&self) -> Cow<'_, DerivedWeightRecipe> {
-        assert!(
-            self.alias_of.is_none(),
-            "logical aliases have no physical recipe"
-        );
-        match &self.recipe {
-            Some(recipe) => Cow::Borrowed(recipe),
-            None => Cow::Owned(DerivedWeightRecipe::source(
-                self.checkpoint_key.clone(),
-                self.selection.clone(),
-            )),
-        }
-    }
-
-    /// Returns every checkpoint key consumed by this binding.
-    pub fn checkpoint_keys(&self) -> Vec<&str> {
-        if self.alias_of.is_some() {
-            return Vec::new();
-        }
-        self.recipe.as_ref().map_or_else(
-            || vec![self.checkpoint_key.as_str()],
-            DerivedWeightRecipe::source_keys,
-        )
-    }
-
-    /// Returns the exact logical materialized byte length.
-    pub const fn expected_bytes(&self) -> u64 {
-        self.expected_bytes
-    }
-
-    /// Replaces the physical source with an equivalent validated recipe.
-    pub fn with_source_recipe(
-        mut self,
-        recipe: DerivedWeightRecipe,
-        expected_bytes: u64,
-    ) -> Result<Self, ResidencyDeclarationError> {
-        if self.alias_of.is_some() {
-            return Err(ResidencyDeclarationError::AliasHasPhysicalSource { name: self.name });
-        }
-        validate_size(&self.name, expected_bytes)?;
-        self.checkpoint_key = first_source(&self.name, &recipe)?;
-        self.selection = TensorSelection::Full;
-        self.recipe = Some(recipe);
-        self.expected_bytes = expected_bytes;
-        Ok(self)
-    }
-
-    /// Rewrites one logical output selection into bounded physical sources.
-    pub fn select_bounded_output<C: RecipeCatalog + ?Sized>(
-        self,
-        catalog: &C,
-        selection: TensorSelection,
-    ) -> Result<Self, WeightBindingSelectionError> {
-        let recipe = self.recipe_view().select_bounded(catalog, selection)?;
-        let bytes = recipe.infer(catalog)?.byte_len();
-        Ok(self.with_source_recipe(recipe, bytes)?)
-    }
-}
-
-/// Checked executable parameter payload for a binding selection.
-///
-/// Logical aliases add no storage. Distinct physical owners remain separately
-/// charged even when their checkpoint keys or recipes are equal. Source payload,
-/// loading scratch and native host capacity are separate estimates. This does not
-/// validate alias topology; a selection may include aliases to another resource.
-pub fn physical_binding_bytes(
-    bindings: &[WeightBinding],
-) -> Result<u64, ResidencyDeclarationError> {
-    bindings
-        .iter()
-        .filter(|binding| !binding.is_alias())
-        .try_fold(0u64, |total, binding| {
-            total.checked_add(binding.expected_bytes()).ok_or_else(|| {
-                ResidencyDeclarationError::BindingBytesOverflow {
-                    target: binding
-                        .logical_target()
-                        .unwrap_or_else(|| binding.name())
-                        .into(),
-                }
-            })
-        })
-}
-
-/// Validated owner/alias partition for one atomic binding unit.
-#[derive(Debug)]
-pub struct WeightBindingPlan<'a> {
-    bindings: Cow<'a, [WeightBinding]>,
-    owners: Vec<usize>,
-    aliases: Vec<(usize, usize)>,
-}
-
-impl<'a> WeightBindingPlan<'a> {
-    /// Validates unique identities, owner existence, cycles, and byte geometry.
-    pub fn new(bindings: &'a [WeightBinding]) -> Result<Self, ResidencyDeclarationError> {
-        Self::build(Cow::Borrowed(bindings))
-    }
-
-    /// Retains validated declarations and their partition for deferred loading.
-    pub fn owned(
-        bindings: Vec<WeightBinding>,
-    ) -> Result<WeightBindingPlan<'static>, ResidencyDeclarationError> {
-        WeightBindingPlan::build(Cow::Owned(bindings))
-    }
-
-    fn build(bindings: Cow<'a, [WeightBinding]>) -> Result<Self, ResidencyDeclarationError> {
-        let mut by_name = BTreeMap::new();
-        for (index, binding) in bindings.iter().enumerate() {
-            if by_name.insert(binding.name(), index).is_some() {
-                return Err(ResidencyDeclarationError::DuplicateLogicalBinding {
-                    name: binding.name().into(),
-                });
-            }
-        }
-        fn resolve(
-            index: usize,
-            bindings: &[WeightBinding],
-            by_name: &BTreeMap<&str, usize>,
-            resolved: &mut [Option<usize>],
-            visiting: &mut [bool],
-        ) -> Result<usize, ResidencyDeclarationError> {
-            if let Some(owner) = resolved[index] {
-                return Ok(owner);
-            }
-            let binding = &bindings[index];
-            if visiting[index] {
-                return Err(ResidencyDeclarationError::BindingAliasCycle {
-                    name: binding.name().into(),
-                });
-            }
-            visiting[index] = true;
-            let owner = match binding.alias_of() {
-                None => index,
-                Some(name) => {
-                    let owner = *by_name.get(name).ok_or_else(|| {
-                        ResidencyDeclarationError::UnknownBindingAliasOwner {
-                            alias: binding.name().into(),
-                            owner: name.into(),
-                        }
-                    })?;
-                    resolve(owner, bindings, by_name, resolved, visiting)?
-                }
-            };
-            visiting[index] = false;
-            resolved[index] = Some(owner);
-            Ok(owner)
-        }
-        let mut resolved = vec![None; bindings.len()];
-        let mut visiting = vec![false; bindings.len()];
-        let mut owners = Vec::new();
-        let mut aliases = Vec::new();
-        for (index, binding) in bindings.iter().enumerate() {
-            let owner = resolve(index, &bindings, &by_name, &mut resolved, &mut visiting)?;
-            if owner == index {
-                owners.push(index);
-            } else {
-                if binding.expected_bytes() != bindings[owner].expected_bytes() {
-                    return Err(ResidencyDeclarationError::BindingAliasByteMismatch {
-                        alias: binding.name().into(),
-                        owner: bindings[owner].name().into(),
-                        alias_bytes: binding.expected_bytes(),
-                        owner_bytes: bindings[owner].expected_bytes(),
-                    });
-                }
-                aliases.push((index, owner));
-            }
-        }
-        Ok(Self {
-            bindings,
-            owners,
-            aliases,
-        })
-    }
-
-    /// Canonical bindings which require physical materialization.
-    pub fn owners(&self) -> impl Iterator<Item = &WeightBinding> {
-        self.owners.iter().map(|index| &self.bindings[*index])
-    }
-
-    /// Logical aliases paired with their resolved canonical owners.
-    pub fn aliases(&self) -> impl Iterator<Item = (&WeightBinding, &WeightBinding)> {
-        self.alias_indices()
-            .map(|(alias, owner)| (&self.bindings[alias], &self.bindings[owner]))
-    }
-
-    // Indices refer to this plan's binding order and resolve directly to physical owners.
-    pub(crate) fn alias_indices(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
-        self.aliases.iter().copied()
-    }
-}
-
-/// Failure while rewriting a binding into bounded physical selections.
-#[derive(Debug, thiserror::Error)]
-pub enum WeightBindingSelectionError {
-    /// Neutral recipe inference or selection pushdown failed.
-    #[error(transparent)]
-    Recipe(#[from] RecipeError),
-    /// The rewritten binding declaration was invalid.
-    #[error(transparent)]
-    Declaration(#[from] ResidencyDeclarationError),
-}
-
-/// A deterministic group of weight bindings managed as one atomic unit.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct OffloadUnit {
-    id: OffloadUnitId,
-    bindings: Vec<WeightBinding>,
-}
-
 /// Validated backend-neutral declarations paired with residency control state.
 ///
 /// Concrete backends own their native values separately and mirror every
@@ -779,11 +308,12 @@ pub struct OffloadUnit {
 /// validated before any backend allocation begins.
 #[derive(Debug)]
 pub struct ResidencyController {
-    conversion_retention: Option<conversion_retention::ConversionRetentionBudget>,
+    conversion_retention: Option<ConversionRetentionBudget>,
     ledger: ResidencyLedger,
     units: BTreeMap<OffloadUnitId, OffloadUnit>,
     row_ranges: Vec<RowResidencyRange>,
     alias_owners: BTreeMap<(OffloadUnitId, String), (OffloadUnitId, String)>,
+    alias_owner_pins: BTreeSet<(OffloadUnitId, MemoryTier)>,
 }
 
 /// One validated immutable-weight acquisition batch and its initial hit/miss state.
@@ -791,43 +321,6 @@ pub struct ResidencyController {
 pub struct ResidencyAcquisition {
     ids: Vec<OffloadUnitId>,
     missing: Vec<bool>,
-}
-
-/// Backend-native host/device storage exposed through a neutral residency lease.
-pub trait ResidencyLeaseStorage {
-    /// Backend-native executable value.
-    type DeviceValue;
-    /// Backend-native host-resident value.
-    type HostValue;
-    /// Concrete lookup failure.
-    type Error;
-    /// Allocation-free or cold-path iterator over stable binding names.
-    type BindingNames<'a>: Iterator<Item = &'a str>
-    where
-        Self: 'a;
-
-    /// Looks up one executable binding.
-    fn device_value<'a>(
-        &'a self,
-        id: &OffloadUnitId,
-        name: &str,
-    ) -> Result<&'a Self::DeviceValue, Self::Error>;
-
-    /// Looks up one host-resident binding.
-    fn host_value<'a>(
-        &'a self,
-        id: &OffloadUnitId,
-        name: &str,
-    ) -> Result<&'a Self::HostValue, Self::Error>;
-
-    /// Returns binding names in stable order.
-    fn binding_names(&self) -> Self::BindingNames<'_>;
-}
-
-/// Concrete manager hook used when a residency lease releases its exact pin.
-pub trait ResidencyLeaseOwner: Sized {
-    /// Releases one tier pin. Drop paths must tolerate an already-destroyed manager.
-    fn release_residency_pin(&self, id: &OffloadUnitId, tier: MemoryTier);
 }
 
 /// Backend hook used by the neutral exact-transfer ownership lifecycle.
@@ -997,71 +490,6 @@ where
     }
 }
 
-/// Statically dispatched lease retaining one backend-native resident unit.
-pub struct ResidencyLease<S, O>
-where
-    S: ResidencyLeaseStorage,
-    O: ResidencyLeaseOwner,
-{
-    id: OffloadUnitId,
-    tier: MemoryTier,
-    storage: S,
-    owner: Weak<O>,
-}
-
-impl<S, O> ResidencyLease<S, O>
-where
-    S: ResidencyLeaseStorage,
-    O: ResidencyLeaseOwner,
-{
-    /// Creates a lease after the neutral controller has pinned the resident copy.
-    pub fn new(id: OffloadUnitId, tier: MemoryTier, storage: S, owner: Weak<O>) -> Self {
-        Self {
-            id,
-            tier,
-            storage,
-            owner,
-        }
-    }
-
-    /// Returns the acquired unit identifier.
-    pub fn id(&self) -> &OffloadUnitId {
-        &self.id
-    }
-
-    /// Returns the protected resident tier.
-    pub const fn tier(&self) -> MemoryTier {
-        self.tier
-    }
-
-    /// Looks up one backend-native executable binding without cloning it.
-    pub fn device_value(&self, name: &str) -> Result<&S::DeviceValue, S::Error> {
-        self.storage.device_value(&self.id, name)
-    }
-
-    /// Looks up one backend-native host binding without cloning it.
-    pub fn host_value(&self, name: &str) -> Result<&S::HostValue, S::Error> {
-        self.storage.host_value(&self.id, name)
-    }
-
-    /// Returns binding names in stable order.
-    pub fn binding_names(&self) -> S::BindingNames<'_> {
-        self.storage.binding_names()
-    }
-}
-
-impl<S, O> Drop for ResidencyLease<S, O>
-where
-    S: ResidencyLeaseStorage,
-    O: ResidencyLeaseOwner,
-{
-    fn drop(&mut self) {
-        if let Some(owner) = self.owner.upgrade() {
-            owner.release_residency_pin(&self.id, self.tier);
-        }
-    }
-}
-
 impl ResidencyAcquisition {
     /// Returns requested units in caller order.
     pub fn ids(&self) -> &[OffloadUnitId] {
@@ -1096,25 +524,13 @@ impl ResidencyController {
     /// Every partition and embedded owner must receive a clone of this same
     /// budget; named layer windows never create an independent allowance.
     /// Existing controllers remain unwired unless composition supplies a budget.
-    pub fn with_conversion_retention(
-        mut self,
-        budget: conversion_retention::ConversionRetentionBudget,
-    ) -> Self {
+    pub fn with_conversion_retention(mut self, budget: ConversionRetentionBudget) -> Self {
         self.conversion_retention = Some(budget);
         self
     }
 
-    /// Installs selection-time policy before native owners register conversions.
-    /// Callers must not replace the authority of already registered owners.
-    pub fn set_conversion_retention(
-        &mut self,
-        budget: conversion_retention::ConversionRetentionBudget,
-    ) {
-        self.conversion_retention = Some(budget);
-    }
-
     /// Selected execution's conversion admission authority, when installed.
-    pub fn conversion_retention(&self) -> Option<&conversion_retention::ConversionRetentionBudget> {
+    pub fn conversion_retention(&self) -> Option<&ConversionRetentionBudget> {
         self.conversion_retention.as_ref()
     }
 
@@ -1218,6 +634,7 @@ impl ResidencyController {
             units: definitions,
             row_ranges,
             alias_owners,
+            alias_owner_pins: BTreeSet::new(),
         })
     }
 
@@ -1278,6 +695,21 @@ impl ResidencyController {
     /// Returns declarations in stable unit-identifier order.
     pub fn units(&self) -> impl ExactSizeIterator<Item = &OffloadUnit> {
         self.units.values()
+    }
+
+    /// Supplies the exact prepared declaration and retention identities for native observation.
+    pub(crate) fn observation_bindings(
+        &self,
+    ) -> eredu_core::residency::ResidencyObservationBindings<'_> {
+        let retention = self.conversion_retention();
+        eredu_core::residency::ResidencyObservationBindings {
+            units: &self.units,
+            retention_group: retention.map(|budget| budget.group()),
+            projection_storage_eligible: retention.is_some_and(|budget| {
+                budget.policy().eligibility
+                    == eredu_core::residency::ParameterConversionRetentionEligibility::Eligible
+            }),
+        }
     }
 
     /// Resolves a logical alias to its canonical owner unit and binding.
@@ -1646,7 +1078,7 @@ pub enum ResidencyControllerError {
 /// Backend-independent operations required by ordered residency windows.
 pub trait ResidencyWindowManager {
     /// Manager-specific failure including neutral window validation failures.
-    type Error: std::error::Error + From<ResidencyWindowError>;
+    type Error: std::error::Error + From<eredu_core::BackendFailure>;
 
     /// Replaces the default protected window and prepares bounded lookahead.
     fn prepare_window(
@@ -1736,7 +1168,9 @@ impl DeviceLayerWindow {
         manager: &M,
         current: usize,
     ) -> Result<Vec<(OffloadUnitId, PrefetchOutcome)>, M::Error> {
-        let desired = self.desired(current).map_err(M::Error::from)?;
+        let desired = self
+            .desired(current)
+            .map_err(eredu_core::BackendFailure::from_error)?;
         let outcomes = manager.prepare_window(desired, desired, MemoryTier::Device)?;
         self.trim_to(manager, desired)?;
         Ok(outcomes)
@@ -1809,7 +1243,10 @@ impl ResidentLayerGroup {
         manager: &M,
         current: usize,
     ) -> Result<Vec<(OffloadUnitId, PrefetchOutcome)>, M::Error> {
-        let desired = self.window.desired(current).map_err(M::Error::from)?;
+        let desired = self
+            .window
+            .desired(current)
+            .map_err(eredu_core::BackendFailure::from_error)?;
         let outcomes =
             manager.prepare_group_window(&self.id, desired, desired, MemoryTier::Device)?;
         self.window.trim_to(manager, desired)?;
@@ -1851,7 +1288,7 @@ impl ResidentLayerGroup {
                     .ok_or(ResidencyWindowError::ArithmeticOverflow {
                         context: "execution group host bytes",
                     })
-                    .map_err(M::Error::from)?;
+                    .map_err(eredu_core::BackendFailure::from_error)?;
             }
             if unit.device_resident() {
                 device_bytes = device_bytes
@@ -1859,7 +1296,7 @@ impl ResidentLayerGroup {
                     .ok_or(ResidencyWindowError::ArithmeticOverflow {
                         context: "execution group device bytes",
                     })
-                    .map_err(M::Error::from)?;
+                    .map_err(eredu_core::BackendFailure::from_error)?;
                 device_units += 1;
             }
         }
@@ -1951,177 +1388,6 @@ pub enum ResidencyWindowError {
     },
 }
 
-impl OffloadUnit {
-    /// Creates a non-empty unit and sorts bindings by local name.
-    pub fn new(
-        id: OffloadUnitId,
-        bindings: impl IntoIterator<Item = WeightBinding>,
-    ) -> Result<Self, ResidencyDeclarationError> {
-        let mut bindings = bindings.into_iter().collect::<Vec<_>>();
-        if bindings.is_empty() {
-            return Err(ResidencyDeclarationError::EmptyUnit { id });
-        }
-        bindings.sort_by(|left, right| left.name.cmp(&right.name));
-        if let Some(pair) = bindings
-            .windows(2)
-            .find(|pair| pair[0].name == pair[1].name)
-        {
-            return Err(ResidencyDeclarationError::DuplicateBindingName {
-                id,
-                name: pair[0].name.clone(),
-            });
-        }
-        Ok(Self { id, bindings })
-    }
-
-    /// Returns the plan identifier for this unit.
-    pub fn id(&self) -> &OffloadUnitId {
-        &self.id
-    }
-
-    /// Returns bindings in stable local-name order.
-    pub fn bindings(&self) -> &[WeightBinding] {
-        &self.bindings
-    }
-}
-
-fn validate_name(name: String) -> Result<String, ResidencyDeclarationError> {
-    if name.trim().is_empty() {
-        Err(ResidencyDeclarationError::InvalidBindingName)
-    } else {
-        Ok(name)
-    }
-}
-
-fn validate_size(name: &str, expected_bytes: u64) -> Result<(), ResidencyDeclarationError> {
-    if expected_bytes == 0 {
-        Err(ResidencyDeclarationError::ZeroSizedBinding {
-            name: name.to_owned(),
-        })
-    } else {
-        Ok(())
-    }
-}
-
-fn first_source(
-    name: &str,
-    recipe: &DerivedWeightRecipe,
-) -> Result<String, ResidencyDeclarationError> {
-    recipe
-        .source_keys()
-        .first()
-        .map(|key| (*key).to_owned())
-        .ok_or_else(|| ResidencyDeclarationError::EmptyRecipeSources {
-            name: name.to_owned(),
-        })
-}
-
-/// Invalid backend-neutral residency declaration.
-#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
-pub enum ResidencyDeclarationError {
-    /// A binding name was empty.
-    #[error("weight binding names must not be empty")]
-    InvalidBindingName,
-    /// A binding checkpoint key was empty.
-    #[error("weight binding {name:?} has an empty checkpoint key")]
-    InvalidCheckpointKey {
-        /// Invalid local name.
-        name: String,
-    },
-    /// A recipe had no physical source.
-    #[error("weight binding {name:?} has no checkpoint recipe source")]
-    EmptyRecipeSources {
-        /// Invalid local name.
-        name: String,
-    },
-    /// Load-time quantization companion names collide with one another.
-    #[error(
-        "weight binding {name:?} has invalid quantization companions {scales:?} and {biases:?}"
-    )]
-    InvalidQuantizationCompanions {
-        /// Quantizable weight binding.
-        name: String,
-        /// Declared scale binding.
-        scales: String,
-        /// Declared affine-bias binding.
-        biases: String,
-    },
-    /// A binding declared no bytes.
-    #[error("weight binding {name:?} must contain at least one byte")]
-    ZeroSizedBinding {
-        /// Invalid local name.
-        name: String,
-    },
-    /// Executable payload accounting exceeded its representable byte count.
-    #[error("physical binding byte total overflows at parameter {target:?}")]
-    BindingBytesOverflow {
-        /// Canonical destination when present, otherwise the module-local name.
-        target: String,
-    },
-    /// A unit had no bindings.
-    #[error("residency unit {id} must contain at least one binding")]
-    EmptyUnit {
-        /// Unit identifier.
-        id: OffloadUnitId,
-    },
-    /// Two bindings in one unit had the same local name.
-    #[error("residency unit {id} has duplicate binding name {name:?}")]
-    DuplicateBindingName {
-        /// Unit identifier.
-        id: OffloadUnitId,
-        /// Duplicated local name.
-        name: String,
-    },
-    /// A general binding list repeated one logical identity.
-    #[error("duplicate logical weight binding {name:?}")]
-    DuplicateLogicalBinding {
-        /// Repeated logical identity.
-        name: String,
-    },
-    /// An alias named no binding in its atomic unit.
-    #[error("weight binding alias {alias:?} has unknown owner {owner:?}")]
-    UnknownBindingAliasOwner {
-        /// Alias identity.
-        alias: String,
-        /// Missing owner identity.
-        owner: String,
-    },
-    /// An alias destination did not identify one unique global owner.
-    #[error("weight binding alias {alias:?} has ambiguous owner {owner:?}")]
-    AmbiguousBindingAliasOwner {
-        /// Alias identity.
-        alias: String,
-        /// Ambiguous owner identity.
-        owner: String,
-    },
-    /// Alias declarations formed a cycle.
-    #[error("weight binding alias cycle contains {name:?}")]
-    BindingAliasCycle {
-        /// One member of the cycle.
-        name: String,
-    },
-    /// Alias and resolved owner disagreed on materialized byte geometry.
-    #[error(
-        "weight binding alias {alias:?} declares {alias_bytes} bytes but owner {owner:?} declares {owner_bytes}"
-    )]
-    BindingAliasByteMismatch {
-        /// Alias identity.
-        alias: String,
-        /// Resolved canonical owner.
-        owner: String,
-        /// Alias byte declaration.
-        alias_bytes: u64,
-        /// Owner byte declaration.
-        owner_bytes: u64,
-    },
-    /// An alias was incorrectly rewritten with a physical source.
-    #[error("weight binding alias {name:?} cannot own a physical checkpoint source")]
-    AliasHasPhysicalSource {
-        /// Alias identity.
-        name: String,
-    },
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -2129,7 +1395,11 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
-    use eredu_checkpoint::{store::TensorMetadata, StoredDtype};
+    use eredu_checkpoint::{
+        recipe::DerivedWeightRecipe,
+        store::{TensorMetadata, TensorSelection},
+        StoredDtype,
+    };
     use eredu_core::residency::{MemoryTier, OffloadConfig, OffloadUnitSpec, ResidencyPolicy};
 
     use super::*;
@@ -2362,7 +1632,7 @@ mod tests {
 
     struct TestLeaseStorage(BTreeMap<String, u32>);
 
-    impl ResidencyLeaseStorage for TestLeaseStorage {
+    impl eredu_core::residency::ResidencyLeaseStorage for TestLeaseStorage {
         type DeviceValue = u32;
         type HostValue = u32;
         type Error = &'static str;
@@ -2395,7 +1665,7 @@ mod tests {
     #[derive(Default)]
     struct TestLeaseOwner(Mutex<Vec<(OffloadUnitId, MemoryTier)>>);
 
-    impl ResidencyLeaseOwner for TestLeaseOwner {
+    impl eredu_core::residency::ResidencyLeaseOwner for TestLeaseOwner {
         fn release_residency_pin(&self, id: &OffloadUnitId, tier: MemoryTier) {
             self.0.lock().unwrap().push((id.clone(), tier));
         }
@@ -2464,7 +1734,7 @@ mod tests {
     }
 
     impl ResidencyWindowManager for WindowManager {
-        type Error = ResidencyWindowError;
+        type Error = eredu_core::BackendFailure;
 
         fn prepare_window(
             &self,
@@ -2547,11 +1817,12 @@ mod tests {
     fn neutral_lease_exposes_native_storage_and_releases_exact_pin() {
         let owner = Arc::new(TestLeaseOwner::default());
         let id = OffloadUnitId::new("layer.0").unwrap();
-        let lease = ResidencyLease::new(
+        let pin_owner: Arc<dyn eredu_core::residency::ResidencyLeaseOwner> = owner.clone();
+        let lease = eredu_core::residency::ResidencyLease::new(
             id.clone(),
             MemoryTier::Device,
             TestLeaseStorage(BTreeMap::from([("weight".into(), 7)])),
-            Arc::downgrade(&owner),
+            Arc::downgrade(&pin_owner),
         );
         assert_eq!(lease.device_value("weight"), Ok(&7));
         assert_eq!(lease.binding_names().collect::<Vec<_>>(), vec!["weight"]);

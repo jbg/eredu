@@ -3,11 +3,14 @@ use super::{
     AddressableBankEntry, AddressableBankEntryError, AddressableBankMemberError,
     AddressableBindingTransform,
 };
-use crate::{OffloadUnit, ParameterBankKey, ResidencyDeclarationError, WeightBinding};
+use crate::ParameterBankKey;
 use eredu_checkpoint::{
     quantization::{BoundedQuantizationPlan, BoundedQuantizationTarget},
     recipe::RecipeError,
     store::{CheckpointSource, StoreError, TensorSelection},
+};
+use eredu_core::residency::parameter_binding::{
+    OffloadUnit, ResidencyDeclarationError, WeightBinding,
 };
 use std::collections::{BTreeMap, BTreeSet};
 

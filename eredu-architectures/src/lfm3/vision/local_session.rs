@@ -1,5 +1,7 @@
 //! Portable session policy for a bound replicated VL graph.
 
+use eredu_core::input::PreparedInputInspector;
+use eredu_core::PreparedModelInput;
 use eredu_core::{
     capture::CaptureRequestShape,
     residency::{ParameterConversionRetentionTrimReport, ParameterConversionTrimError},
@@ -9,8 +11,8 @@ use eredu_nn::{AttentionCache, DistributedNeuralBackend, Error, GroupedNeuralBac
 use eredu_runtime::{
     execution_control::SessionState, prefill::RetainedPrefillAdvance, ActivationObserver,
     BoundLocalComponent, DenseDiskStreamReport, LayerRuntimeState, LayerWeightResidency,
-    PreparedInputCacheIdentity, PreparedInputInspector, PreparedModelInput, ResidencyReport,
-    RuntimeStateComponents, SelectedProcessorExecution,
+    PreparedInputCacheIdentity, ResidencyReport, RuntimeStateComponents,
+    SelectedProcessorExecution,
 };
 
 use super::{
@@ -40,9 +42,8 @@ where
     Ok(LocalVlSession::<B, _, _> {
         backend: std::marker::PhantomData,
         graph,
-        driver: VlSessionDriver::new(admission, state),
+        driver: VlSessionDriver::new(admission, processor, state),
         capabilities,
-        processor,
         residency,
     })
 }
@@ -52,7 +53,6 @@ struct LocalVlSession<B, G, S> {
     graph: G,
     driver: VlSessionDriver<S>,
     capabilities: CapabilityEstimate,
-    processor: SelectedProcessorExecution,
     residency: LayerWeightResidency,
 }
 
@@ -66,9 +66,6 @@ where
 {
     type Cursor = VlPrefill<B::Tensor>;
 
-    fn processor(&self) -> &SelectedProcessorExecution {
-        &self.processor
-    }
     fn capabilities(&self) -> &CapabilityEstimate {
         &self.capabilities
     }

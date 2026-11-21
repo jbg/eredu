@@ -1,8 +1,16 @@
 //! Complete logical state for alternating context encoding and block refinement.
 
-use super::{RefinementBackend, RefinementError, RefinementState};
-use crate::generation::TokenDomain;
-use eredu_core::refinement::{GenerationPhase, RefinementPolicy};
+use super::{
+    finalization::{finalize_refinement_position, FinalizationError, FinalizedPosition},
+    RefinementError, RefinementState,
+};
+use eredu_core::refinement::RefinementBackend;
+use eredu_core::refinement::RefinementFinalizationBackend;
+use eredu_core::sampling::TokenDomain;
+use eredu_core::{
+    refinement::{GenerationPhase, RefinementPolicy},
+    TextProgress, TokenFilter,
+};
 use std::num::NonZeroU32;
 
 /// A transition requested outside its architecture-declared phase.
@@ -17,6 +25,9 @@ pub enum BlockRefinementError<E> {
     /// Preparing or settling the numerical refinement state failed.
     #[error(transparent)]
     Refinement(#[from] RefinementError<E>),
+    /// Position scores or constrained commitment could not be realized.
+    #[error(transparent)]
+    Finalization(#[from] FinalizationError<E>),
 }
 
 /// Snapshotable logical state for one generation's iterative blocks.
@@ -113,24 +124,20 @@ where
     /// A partially finalized block is encoded together, including its already
     /// committed positions, only if generation proceeds beyond that block.
     pub fn continuation_context_tokens(&self, commitments: u64) -> Option<u64> {
-        if commitments == 0 {
-            return Some(0);
-        }
-        let canvas = u64::from(self.canvas_length.get());
-        let pending_positions = if self.phase == GenerationPhase::Context {
-            0
+        continuation_context_tokens(
+            u64::from(self.canvas_length.get()),
+            self.pending_context_output()?,
+            commitments,
+        )
+    }
+
+    /// Outputs remaining in the current block before another context ingestion.
+    pub fn pending_context_output(&self) -> Option<u64> {
+        if self.phase == GenerationPhase::Context {
+            Some(0)
         } else {
-            canvas.checked_sub(self.position as u64)?
-        };
-        if commitments <= pending_positions {
-            return Some(0);
+            u64::from(self.canvas_length.get()).checked_sub(self.position as u64)
         }
-        let further = commitments.checked_sub(pending_positions)?;
-        further
-            .checked_sub(1)?
-            .checked_div(canvas)?
-            .checked_add(1)?
-            .checked_mul(canvas)
     }
 
     /// Retains validated policy without submitting work or drawing initial noise.
@@ -228,6 +235,77 @@ where
         Ok(())
     }
 
+    /// Applies a completed context encoding and describes the progress event.
+    pub fn accept_context(
+        &mut self,
+        random: B::RandomState,
+        seeds: Option<&eredu_core::refinement::RefinementCanvas>,
+        context: &B::Context,
+    ) -> Result<TextProgress, BlockRefinementError<B::Error>> {
+        self.replace_random(random);
+        self.context_encoded(context, seeds)?;
+        Ok(TextProgress {
+            phase: GenerationPhase::Context,
+            block: self.block,
+            iteration: 0,
+            tentative_token_ids: None,
+        })
+    }
+
+    /// Applies one tentative decoder result and describes the new progress.
+    pub fn accept_refinement(
+        &mut self,
+        scores: &B::Logits,
+        context: &B::Context,
+    ) -> Result<TextProgress, BlockRefinementError<B::Error>> {
+        self.refine(scores, context)?;
+        Ok(TextProgress {
+            phase: GenerationPhase::Refinement,
+            block: self.block,
+            iteration: self.iteration(),
+            tentative_token_ids: None,
+        })
+    }
+
+    /// Selects and installs the next authoritative candidate using the current
+    /// filter. The owning generation driver still publishes the commitment
+    /// after proving native completion.
+    pub fn commit_candidate(
+        &mut self,
+        filter: &TokenFilter,
+        context: &<B as RefinementBackend>::Context,
+    ) -> Result<
+        FinalizedPosition<<B as RefinementBackend>::Token, <B as RefinementBackend>::Logits>,
+        BlockRefinementError<<B as RefinementBackend>::Error>,
+    >
+    where
+        B: RefinementFinalizationBackend<
+            Token = <B as RefinementBackend>::Token,
+            Logits = <B as RefinementBackend>::Logits,
+            Context = <B as RefinementBackend>::Context,
+            Error = <B as RefinementBackend>::Error,
+        >,
+        <B as RefinementBackend>::Logits:
+            eredu_nn::Tensor<Context = <B as RefinementBackend>::Context>,
+    {
+        let (scores, position) = self.finalization_input()?;
+        let finalized = finalize_refinement_position::<B>(
+            scores,
+            position,
+            self.refinement()
+                .and_then(RefinementState::selected_candidates),
+            self.domain,
+            filter,
+            context,
+        )?;
+        self.finalize(
+            finalized.token.clone(),
+            finalized.candidate_replaced,
+            context,
+        )?;
+        Ok(finalized)
+    }
+
     /// Full final scores and the next position for an evolving constraint decision.
     /// Score selection uses `finalize_refinement_position`; no draft is committed.
     pub fn finalization_input(
@@ -293,4 +371,20 @@ where
         }
         Ok(())
     }
+}
+
+pub(crate) fn continuation_context_tokens(
+    canvas: u64,
+    pending_positions: u64,
+    commitments: u64,
+) -> Option<u64> {
+    if commitments <= pending_positions {
+        return Some(0);
+    }
+    let further = commitments.checked_sub(pending_positions)?;
+    further
+        .checked_sub(1)?
+        .checked_div(canvas)?
+        .checked_add(1)?
+        .checked_mul(canvas)
 }

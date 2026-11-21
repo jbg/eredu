@@ -2,8 +2,8 @@
 
 use eredu_core::checkpoint::TensorDtype;
 use eredu_core::{
-    BackendError, CollectiveGroupId, CollectiveScope, DistributedBackend, DistributedCapabilities,
-    DistributedSession, DistributedSessionDescriptor, Submission, ValueDescriptor,
+    BackendError, CollectiveGroupId, CollectiveScope, DistributedCapabilities, DistributedSession,
+    DistributedSessionDescriptor, Submission, ValueDescriptor,
 };
 use safemlx::{
     distributed::Group as NativeGroup,
@@ -22,19 +22,16 @@ use crate::{
     },
 };
 
-use super::MlxBackend;
 use crate::MlxTensor;
 
 mod axis;
+pub(crate) use axis::validate_uneven_axis;
 mod consensus;
 mod session;
 
 pub use axis::{all_gather_axis, all_gather_uneven_axis, all_to_all_v_axis};
 pub use consensus::MlxRealtimeConsensusTransport;
 pub use session::MlxDistributedSession;
-
-#[cfg(test)]
-mod tests;
 
 /// Initializes the Ring world from the process rank and hostfile.
 pub fn initialize_ring_world() -> Result<safemlx::distributed::Group, eredu_core::BackendFailure> {
@@ -52,15 +49,14 @@ impl MlxRingTransport {
     }
 }
 
-impl eredu_runtime::PipelineTransportProvider for MlxRingTransport {
+impl eredu_core::communication::pipeline::NativePipelineWorld for MlxRingTransport {
     type Transport = NativeGroup;
 
-    fn open(
-        &self,
-    ) -> Result<(eredu_runtime::PlacementRank, Self::Transport), eredu_core::BackendFailure> {
-        let world = initialize_ring_world()?;
-        let rank = eredu_runtime::PlacementRank::new(world.size(), world.rank())
-            .map_err(eredu_core::BackendFailure::from_error)?;
-        Ok((rank, world))
+    fn open_world(&self) -> Result<Self::Transport, eredu_core::BackendFailure> {
+        initialize_ring_world()
+    }
+
+    fn identity(world: &Self::Transport) -> (usize, usize) {
+        (world.size(), world.rank())
     }
 }

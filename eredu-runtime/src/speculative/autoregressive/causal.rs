@@ -27,8 +27,19 @@ impl<'a, M: AutoregressiveMechanisms, R: TargetRefinement<M>> CausalExecutor<'a,
     pub fn new(model: &'a mut M::Model, refinement: R) -> Self {
         Self { model, refinement }
     }
-    /// Realizes an isolated mutable causal lane using the model's ordinary geometry.
-    pub fn new_cache(&mut self, context: M::Context<'_>) -> Result<M::State, M::Error> {
+}
+
+impl<M: AutoregressiveMechanisms, R: TargetRefinement<M>>
+    eredu_core::speculative::SpeculativeCacheFactory for CausalExecutor<'_, M, R>
+{
+    fn create_cache<'context>(
+        &mut self,
+        _: &(),
+        context: Self::Context<'context>,
+    ) -> Result<Self::Cache, Self::Error>
+    where
+        Self: 'context,
+    {
         M::empty(self.model, AutoregressivePass::TargetPrefill, context)
     }
 }

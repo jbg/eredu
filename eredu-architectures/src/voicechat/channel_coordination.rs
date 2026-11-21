@@ -1,8 +1,9 @@
 //! Selected owner authority for one unpublished agent/function decision.
 
+use eredu_core::sampling::SamplingBackend;
 use eredu_core::{BackendFailure, BackendFailureKind};
 use eredu_nn::{Tensor, TensorElementType};
-use eredu_runtime::{replicated_execution::ReplicatedCoordinator, SamplingBackend};
+use eredu_runtime::replicated_execution::ReplicatedCoordinator;
 
 use super::{ChannelDecision, FeedbackTokens};
 

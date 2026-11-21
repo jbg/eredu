@@ -28,6 +28,7 @@ impl CaptureBackend for SparseBackend {
         _: &Value,
         _: &CaptureSelection,
         _: &ResolvedCaptureSlice,
+        _score_row: Option<u64>,
     ) -> Result<CapturePayload, Self::Error> {
         panic!("sparse work must use the actual routed source")
     }

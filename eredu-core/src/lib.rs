@@ -25,6 +25,10 @@ pub mod capability;
 pub mod capture;
 /// Neutral checkpoint tensor descriptions and validation.
 pub mod checkpoint;
+/// Native weight materialization and transfer contracts.
+pub mod checkpoint_mechanisms;
+/// Native communication contracts and exact transport inputs.
+pub mod communication;
 /// Portable scalar component topology and effective parameter relationships.
 pub mod component;
 /// Backend-neutral distributed scheduler consensus.
@@ -57,10 +61,14 @@ pub mod intervention;
 pub mod media;
 /// Portable, explicitly requested execution observations.
 pub mod observation;
+/// Exact native facts for portable preparation.
+pub mod preparation;
 /// Backend-generic realtime token-session execution and scheduling.
 pub mod realtime;
 /// Typed categorical and dense realtime channel declarations.
 pub mod realtime_channels;
+/// Native mechanisms for realtime execution.
+pub mod realtime_mechanisms;
 /// Iterative token-block generation policy and tentative-output records.
 pub mod refinement;
 /// Weight-residency ownership, capacity, and resource planning.
@@ -69,6 +77,8 @@ pub mod residency;
 pub mod resources;
 /// Portable text-run preparation status and cumulative reservation reports.
 pub mod run_preparation;
+/// Native token-sampling mechanisms and their exact numerical inputs.
+pub mod sampling;
 /// Transactional fair work scheduler.
 pub mod scheduler;
 /// Exact session admission and unresolved-submission ownership.
@@ -94,37 +104,41 @@ pub use attention::{AttentionPolicy, LayerSchedule, LayerScheduleError};
 pub use automatic::{
     realize_execution_plan_drafting, realize_execution_plan_target, select_execution_plan_drafting,
     select_execution_plan_target, speculative_decoding_telemetry, AllocatorTelemetry,
-    AutomaticPlanRequest, AutomaticPlanner, AutomaticPlannerPolicy, AutomaticPlanningBackend,
-    AutomaticPlanningError, BoundedResidencyRequirement, CandidateAdmission, DurationSeconds,
-    ExecutionPlanBackendFactory, ExecutionPlanReport, ExecutionPlanTarget,
-    ExecutionPlanTargetLoadError, ExecutionPlanTargetSelection, ExecutionTelemetry,
-    ExpertCacheTelemetry, ExternalDraftArtifact, HardwareBackendProfile, HardwareDeviceKind,
+    AutomaticModelPlanning, AutomaticPlanRequest, AutomaticPlanner, AutomaticPlannerPolicy,
+    AutomaticPlanningBackend, AutomaticPlanningError, BackendHardware, BoundedResidencyRequirement,
+    CandidateAdmission, DraftInspectionFor, DraftSelectionFor, DurationSeconds,
+    ExecutionPlanBackendFactory, ExecutionPlanDraftAdmission, ExecutionPlanReport,
+    ExecutionPlanTarget, ExecutionPlanTargetAdmission, ExecutionPlanTargetLoadError,
+    ExecutionPlanTargetSelection, ExecutionTelemetry, ExpertCacheTelemetry, ExternalDraftArtifact,
+    ExternalDraftBinding, ExternalDraftConstruction, HardwareBackendProfile, HardwareDeviceKind,
     HardwareDeviceProfile, HardwareMemorySemantics, HardwareProfile, ModelResourceProfile,
     ObservationKind, Observed, ParameterMaterializationWorkspace, PlanExplanation,
-    PlanExplanationEntry, PlanExplanationLevel, PreparedExecutionPlanTarget, RealizedDrafting,
-    ResidencyTelemetry, RetainedAutomaticPlan, SelectedExecutionPlanDrafting,
-    SelectedExecutionPlanTarget, SelectedRankResourceProfile, SpeculativeDecodingTelemetry,
+    PlanExplanationEntry, PlanExplanationLevel, RealizedDrafting, ResidencyTelemetry,
+    RetainedAutomaticPlan, SelectedExecutionPlanDrafting, SelectedExecutionPlanTarget,
+    SelectedExecutionPlanTargetFor, SelectedRankResourceProfile, SpeculativeDecodingTelemetry,
     TimingTelemetry, TokenizerCompatibilityError, TokenizerCompatibilityProof, TransferTelemetry,
     AUTOMATIC_SCHEMA_VERSION,
 };
 pub use backend::{
-    load_model, prepare_inspected_model, BackendDescriptor, BackendError, BackendFailure,
-    BackendFailureKind, BackendProvider, BackendSession, BoundedCompletion,
-    BoundedCompletionOutcome, BoundedCompletionWait, BoundedCompletionWaitError,
-    BoundedSubmissionOutcome, CollectiveGroupDescriptor, CollectiveGroupId, CollectiveScope,
-    Completion, CompletionCancellationMode, ControlledTextGeneration,
-    ControlledTextGenerationError, ControlledToken, DeviceCapabilities, DeviceDescriptor,
-    DistributedBackend, DistributedCapabilities, DistributedCommitEpoch, DistributedCommitOutcome,
-    DistributedCommitPhase, DistributedSession, DistributedSessionDescriptor,
-    ModelCapabilityBackend, ModelLoadError, ModelLoadingBackend, ModelRuntime,
-    MultimodalPreparationBackend, MultimodalPreparationFailure, PendingTextInput,
-    PrefillChunkPolicy, PreparedModel, SelectedModelPreparation, SessionCapabilities,
-    SessionCapabilityError, SpeculativeTokenFilterController, Submission, TextAdvancement,
-    TextContinuationBoundary, TextContinuationError, TextContinuationIdentity, TextDriverIdentity,
-    TextGeneration, TextGenerationBackend, TextGenerationConfig, TextGenerationContinuation,
-    TextGenerationDriver, TextOperationError, TextOperationKind, TextOperationOutput,
-    TextOperationPolicyError, TextProgress, TextSamplingStrategy, TokenFilter,
-    TokenFilterController, TokenFilterError, TokenOutput, TokenSamplingDecision, ValueDescriptor,
+    load_model, prepare_inspected_model, AutomaticPromptCacheSession, BackendDescriptor,
+    BackendError, BackendFailure, BackendFailureKind, BackendProvider, BackendSession,
+    BindModelSources, BoundedCompletion, BoundedCompletionOutcome, BoundedCompletionWait,
+    BoundedCompletionWaitError, BoundedSubmissionOutcome, CollectiveGroupDescriptor,
+    CollectiveGroupId, CollectiveScope, Completion, CompletionCancellationMode,
+    ControlledTextGeneration, ControlledTextGenerationError, ControlledToken, DeviceCapabilities,
+    DeviceDescriptor, DistributedCapabilities, DistributedCommitEpoch, DistributedCommitOutcome,
+    DistributedCommitPhase, DistributedModelSession, DistributedSession,
+    DistributedSessionDescriptor, ModelCapabilitySession, ModelLoadAdmission, ModelLoadError,
+    ModelLoadOptions, ModelLoadingBackend, ModelRuntime, ModelSourcePreparation,
+    MultimodalPreparationFailure, MultimodalPreparationSession, PendingTextInput,
+    PrefillChunkPolicy, PreparedModel, SelectedModelBinding, SelectedModelPreparation,
+    SessionCapabilities, SessionCapabilityError, SpeculativeTokenFilterController, Submission,
+    SubmissionBackend, TextAdvancement, TextContinuationBoundary, TextContinuationError,
+    TextContinuationIdentity, TextDriverIdentity, TextExecutionSession, TextGeneration,
+    TextGenerationBackend, TextGenerationConfig, TextGenerationContinuation, TextGenerationDriver,
+    TextOperationError, TextOperationKind, TextOperationOutput, TextOperationPolicyError,
+    TextProgress, TextSamplingStrategy, TextSessionLifecycle, TokenFilter, TokenFilterController,
+    TokenFilterError, TokenOutput, TokenSamplingDecision, ValueDescriptor,
 };
 pub use capability::{
     apply_admission_policy, estimate_runtime_state, estimate_runtime_state_payload_lower_bound,
@@ -150,7 +164,8 @@ pub use generation::{
 };
 pub use input::{
     InputExtent, InputMetadataKey, InputModality, InputPartDescriptor, InputPayloadKind,
-    InputTensorIdentity, PreparedInputError, PreparedInputIdentity,
+    InputTensorIdentity, PreparedInputError, PreparedInputIdentity, PreparedInputPart,
+    PreparedInputPayload, PreparedModelInput,
 };
 pub use inspection::{
     assemble_portable_model_inspection, finalize_realized_model_inspection,
@@ -202,15 +217,14 @@ pub use speculative::{
     SpeculativeCapability, SpeculativeCommit, SpeculativeConstraint, SpeculativeContinuation,
     SpeculativeDraft, SpeculativeDraftBlock, SpeculativeDraftRandomPosition,
     SpeculativeDraftSource, SpeculativeDriverError, SpeculativeExecutionTopology,
-    SpeculativeExecutor, SpeculativeGenerationBackend, SpeculativeGenerationBatchOutput,
-    SpeculativeGenerationBatchRequest, SpeculativeGenerationLane, SpeculativeGenerationOutput,
-    SpeculativeGenerationVisitor, SpeculativeLifecycleObserver, SpeculativeLifecycleStage,
-    SpeculativeOptimisticBranch, SpeculativeOutputError, SpeculativeOutputRuntime,
-    SpeculativePrefill, SpeculativeProposal, SpeculativeProposalEvidence, SpeculativeProposalStep,
-    SpeculativePublicationStatus, SpeculativePublisher, SpeculativeRandomness, SpeculativeRequest,
-    SpeculativeSampling, SpeculativeSchedule, SpeculativeScheduleState, SpeculativeSchedulerStats,
-    SpeculativeSemanticConstraint, SpeculativeSemanticState, SpeculativeStats,
-    SpeculativeTelemetry,
+    SpeculativeExecutor, SpeculativeGenerationBatchOutput, SpeculativeGenerationLane,
+    SpeculativeGenerationOutput, SpeculativeGenerationVisitor, SpeculativeLifecycleObserver,
+    SpeculativeLifecycleStage, SpeculativeOptimisticBranch, SpeculativeOutputError,
+    SpeculativeOutputRuntime, SpeculativePrefill, SpeculativeProposal, SpeculativeProposalEvidence,
+    SpeculativeProposalStep, SpeculativePublicationStatus, SpeculativePublisher,
+    SpeculativeRandomness, SpeculativeRequest, SpeculativeSampling, SpeculativeSchedule,
+    SpeculativeScheduleState, SpeculativeSchedulerStats, SpeculativeSemanticConstraint,
+    SpeculativeSemanticState, SpeculativeStats, SpeculativeTelemetry,
 };
 pub use topology::{
     balanced_contiguous_range, ParallelAxis, ParallelCoordinates, ParallelRankTopology,

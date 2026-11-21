@@ -2,10 +2,11 @@
 use crate::{prepared_sources::PreparedModelSources, processor_plan::ArtifactArchitecturePlan};
 use eredu_core::{
     artifact::ArtifactError, ArtifactInspection, AutomaticPlanningError, DraftingPlan,
-    ExecutionPlan, ExternalDraftArtifact, ModelPreparationPlan, TokenizerCompatibilityProof,
+    ExecutionPlan, ExternalDraftArtifact, ModelPreparationPlan,
 };
 use eredu_runtime::*;
 
+use eredu_core::speculative::assistant::ExternalAssistantBinder;
 /// Inspected external draft, before backend resources exist.
 pub enum ExternalDraftPreparation {
     /// A publisher-trained assistant consuming target features.
@@ -58,30 +59,83 @@ pub fn prepare_external_draft(
         Err(error) => Err(error),
     }
 }
-/// Exact prepared sources paired with independent-draft selection.
-pub struct PreparedAutoregressiveDraft {
-    sources: PreparedModelSources,
-    selected: SelectedSpeculativeRealization,
-    tokenizer: TokenizerCompatibilityProof,
-}
-impl PreparedAutoregressiveDraft {
-    /// Consumes the inseparable native materialization handoff.
-    pub fn into_parts(
-        self,
-    ) -> (
-        PreparedModelSources,
-        SelectedSpeculativeRealization,
-        TokenizerCompatibilityProof,
-    ) {
-        (self.sources, self.selected, self.tokenizer)
+/// Exact prepared source and independent-draft selection.
+pub type PreparedAutoregressiveDraft =
+    eredu_runtime::speculative::PreparedAutoregressiveDraft<PreparedModelSources>;
+
+/// Selected external execution with architecture-owned prepared sources.
+pub type PreparedExternalDraft = eredu_runtime::speculative::PreparedExternalDraft<
+    crate::PreparedExternalAssistantExecution,
+    PreparedModelSources,
+>;
+
+impl<F, D> eredu_core::automatic::ExecutionPlanComposition<F> for ArtifactArchitecturePlan
+where
+    F: eredu_runtime::PlanMechanismFacts + eredu_core::automatic::ExecutionPlanNativeFactory,
+    D: 'static,
+    F::Backend<D>: eredu_core::checkpoint_mechanisms::ModelBindingResources<
+        TextValues: eredu_core::backend::NativeTextValues,
+    >,
+    crate::PreparedExternalAssistantExecution: speculative::PreparedAssistantExecution<
+        F::AssistantBinder,
+        Output = speculative::BoundAssistant<D>,
+    >,
+    F::AssistantBinder: ExternalAssistantBinder,
+    eredu_runtime::AutomaticModelFacts<F::Preparation>:
+        eredu_core::ExecutionPlanTargetAdmission<Self, Preparation = crate::SelectedPreparation>,
+    crate::SelectedPreparation: eredu_core::ModelSourcePreparation<
+        Self,
+        Prepared: eredu_core::BindModelSources<F::Backend<D>>,
+    >,
+    ExternalDraftFacts<F::Preparation>: eredu_core::ExternalDraftConstruction<
+        Self,
+        F::Backend<D>,
+        F::DraftBinding<
+            D,
+            speculative::InstalledExternalDraft<
+                D,
+                eredu_runtime::executable_binding::TextTypesFor<F::Backend<D>>,
+            >,
+        >,
+        TargetPreparation = crate::SelectedPreparation,
+    >,
+{
+    type Dispatch = D;
+    type DraftPayload = speculative::InstalledExternalDraft<
+        D,
+        eredu_runtime::executable_binding::TextTypesFor<F::Backend<D>>,
+    >;
+    type Preparation = crate::SelectedPreparation;
+    type TargetFacts = eredu_runtime::AutomaticModelFacts<F::Preparation>;
+    type DraftFacts = ExternalDraftFacts<F::Preparation>;
+
+    type TargetOptions = Option<ParallelLoadRequest>;
+
+    fn target_rank(parallel: &Self::TargetOptions) -> Option<(usize, usize)> {
+        eredu_runtime::execution_plan::execution_plan_world_rank(*parallel)
     }
-}
-/// Architecture-selected external execution mechanism.
-pub enum PreparedExternalDraft {
-    /// Target-feature-conditioned assistant.
-    Assistant(crate::PreparedExternalAssistantExecution),
-    /// Two ordinary decoders with isolated caches.
-    Autoregressive(PreparedAutoregressiveDraft),
+
+    fn target_inputs(
+        factory: &F,
+        parallel: Self::TargetOptions,
+        support: Result<(), AutomaticPlanningError>,
+    ) -> <Self::TargetFacts as eredu_core::backend::AdmissionFacts>::Inputs {
+        (
+            eredu_runtime::execution_plan::ExecutionPlanPreparation {
+                diagnostics: factory.residency_diagnostics(),
+                parallel,
+                native_support: support,
+            },
+            factory.preparation_mechanisms(),
+            factory.media_features(),
+        )
+    }
+
+    fn draft_inputs(
+        factory: &F,
+    ) -> <Self::DraftFacts as eredu_core::backend::AdmissionFacts>::Inputs {
+        factory.preparation_mechanisms()
+    }
 }
 
 /// Resolves draft ownership from the target's exact retained cold selection.
@@ -115,6 +169,75 @@ pub(crate) fn external_draft_target_rank(
     Ok(rank)
 }
 
+impl<B, M> eredu_core::ExecutionPlanDraftAdmission<ArtifactArchitecturePlan, B>
+    for ExternalDraftFacts<M>
+where
+    B: eredu_core::ModelLoadingBackend,
+
+    M: PreparationMechanismProvider,
+{
+    type TargetPreparation = crate::SelectedPreparation;
+    type Inspection = ExternalDraftPreparation;
+    type Selection = PreparedExternalDraft;
+
+    fn select(
+        self,
+        plan: &ExecutionPlan,
+        target: &eredu_core::SelectedExecutionPlanTarget<
+            B,
+            ArtifactArchitecturePlan,
+            Self::TargetPreparation,
+        >,
+        artifact: Option<ExternalDraftArtifact<ExternalDraftPreparation>>,
+    ) -> Result<Option<ExternalDraftArtifact<PreparedExternalDraft>>, AutomaticPlanningError> {
+        artifact
+            .map(|artifact| {
+                prepare_execution_plan_draft(
+                    plan,
+                    target.inspection(),
+                    target.selected_preparation().as_ref(),
+                    artifact,
+                    &self.mechanisms,
+                )
+            })
+            .transpose()
+    }
+}
+
+impl<B, M, N, D, E> eredu_core::ExternalDraftConstruction<ArtifactArchitecturePlan, B, N>
+    for ExternalDraftFacts<M>
+where
+    B: eredu_core::ModelLoadingBackend,
+
+    M: PreparationMechanismProvider,
+    N: eredu_core::automatic::DraftBindingResources<
+        Payload = speculative::InstalledExternalDraft<D, E>,
+        AssistantBinder: ExternalAssistantBinder<
+            Error = <N::Backend as eredu_core::BackendProvider>::Error,
+        >,
+    >,
+    D: 'static,
+    E: eredu_core::backend::TextExecutableTypes,
+    crate::PreparedExternalAssistantExecution: speculative::PreparedAssistantExecution<
+        N::AssistantBinder,
+        Output = speculative::BoundAssistant<D>,
+    >,
+    PreparedModelSources: eredu_core::BindModelSources<
+        N::Backend,
+        Model: speculative::IndependentDraftModel<E> + 'static,
+    >,
+{
+    type Drafter = speculative::InstalledDraftSession<N::AssistantBinder, N::Resources>;
+
+    fn construct_external_draft(
+        artifact: ExternalDraftArtifact<PreparedExternalDraft>,
+        mechanisms: N,
+        target_identity: &str,
+    ) -> Result<Self::Drafter, AutomaticPlanningError> {
+        artifact.preparation.construct(mechanisms, target_identity)
+    }
+}
+
 /// Selects sources, equations, placement and tokenizer compatibility before native loading.
 pub fn prepare_execution_plan_draft(
     plan: &ExecutionPlan,
@@ -122,7 +245,6 @@ pub fn prepare_execution_plan_draft(
     target_selection: &crate::SelectedPreparation,
     artifact: ExternalDraftArtifact<ExternalDraftPreparation>,
     mechanisms: &impl crate::PreparationMechanismProvider,
-    lowering: impl Fn(&WeightLoweringDescriptor, bool) -> Option<WeightLoweringKind>,
 ) -> Result<ExternalDraftArtifact<PreparedExternalDraft>, AutomaticPlanningError> {
     let invalid = |e: &dyn std::fmt::Display| AutomaticPlanningError::Invalid(e.to_string());
     let target_rank = external_draft_target_rank(plan, target, target_selection)?;
@@ -137,7 +259,18 @@ pub fn prepare_execution_plan_draft(
                     preparation,
                     tokenizer_compatibility: tokenizer,
                 },
-                lowering,
+                |descriptor, transforms| {
+                    let support = mechanisms.replicated_text_support()?;
+                    if transforms {
+                        support
+                            .supports_transform(descriptor)
+                            .then_some(WeightLoweringKind::Transform)
+                    } else {
+                        support
+                            .supports_direct(descriptor)
+                            .then_some(WeightLoweringKind::Direct)
+                    }
+                },
                 &mechanisms.speculative_capabilities(),
             )?;
             return Ok(ExternalDraftArtifact {
@@ -265,11 +398,9 @@ pub fn prepare_execution_plan_draft(
     )
     .map_err(|e| invalid(&e))?;
     Ok(ExternalDraftArtifact {
-        preparation: PreparedExternalDraft::Autoregressive(PreparedAutoregressiveDraft {
-            sources,
-            selected,
-            tokenizer,
-        }),
+        preparation: PreparedExternalDraft::Autoregressive(PreparedAutoregressiveDraft::new(
+            sources, selected, tokenizer,
+        )),
         tokenizer_compatibility: tokenizer,
     })
 }

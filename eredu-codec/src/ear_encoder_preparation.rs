@@ -1,13 +1,15 @@
 //! Cold exact binding plans for independently leased EAR neural encoder units.
 
+use eredu_core::SubmissionBackend;
+
 use eredu_checkpoint::{recipe::RecipeDtype, store::SharedCheckpointSource};
+use eredu_core::residency::parameter_binding::WeightBinding;
 use eredu_core::BackendFailure;
 use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Tensor};
 use eredu_runtime::{
     ComponentPreparationError, ComponentRecipeConversion, LocalModelLayout, PreparedComponent,
-    WeightBinding,
 };
-use eredu_runtime::{LayeredTensorCohort, ParameterUnitMechanisms, SubmissionBackend};
+use eredu_runtime::{LayeredTensorCohort, ParameterUnitMechanisms};
 
 use crate::ear_encoder::EncoderConfig;
 use crate::{
@@ -97,10 +99,10 @@ impl PreparedEncoderBindings {
                 })
                 .max()
                 .expect("validated nonempty encoder") as usize;
-            let sum = eredu_runtime::CommunicationOperationRequirement::tensors(
-                eredu_runtime::CommunicationOperation::AllReduceSum,
+            let sum = eredu_core::communication::CommunicationOperationRequirement::tensors(
+                eredu_core::communication::CommunicationOperation::AllReduceSum,
                 [eredu_core::checkpoint::TensorDtype::F32],
-                eredu_runtime::CommunicationTensorLimits::new(1, 3, width, None)
+                eredu_core::communication::CommunicationTensorLimits::new(1, 3, width, None)
                     .map_err(BackendFailure::from_error)?,
                 true,
             )

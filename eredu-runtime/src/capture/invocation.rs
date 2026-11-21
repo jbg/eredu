@@ -26,7 +26,6 @@ pub(super) const INVOCATION_METADATA: CaptureUsage = CaptureUsage {
     host_bytes: 64,
     encoded_bytes: 192,
 };
-#[cfg(feature = "tensor-capture")]
 impl CaptureSession {
     /// Resolves the current invocation's physical axes without using prediction
     /// position as a sequence width or inferring a prediction-local cache length.

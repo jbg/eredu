@@ -7,20 +7,16 @@ impl NativeCapture<'_> {
         &self,
         tensor: &MlxTensor,
         ids: &[u32],
-        position: Option<u64>,
+        row_index: i32,
     ) -> Result<CapturePayload, Exception> {
         let stream = self.stream;
+        let position = u64::try_from(row_index).ok();
         let (row, vocabulary, maximum, log_mass) = super::super::score_readout::normalized_row(
             tensor.as_array(),
             ids,
             position,
             stream,
-            |elements| {
-                #[cfg(test)]
-                record_host_read(elements);
-                #[cfg(not(test))]
-                let _ = elements;
-            },
+            |_| {},
         )?;
         let log_partition = maximum + log_mass;
         let candidate = |token_id, score| CaptureCandidate {
@@ -44,8 +40,6 @@ impl NativeCapture<'_> {
                     stream,
                 )?;
                 let winner = safemlx::ops::indexing::argmax(&alternatives, false, stream)?;
-                #[cfg(test)]
-                record_host_read(1);
                 let winner = winner.evaluated()?.as_slice::<u32>()[0];
                 let value = scalar_f32(row.try_index_device(winner as i32, stream)?)? as f32;
                 Some(candidate(winner, value))

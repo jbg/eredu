@@ -41,7 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     let mut session =
-        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &target_path, &plan)?;
+        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &target_path, &plan, None)?;
     let prepared = session.model_mut().prepare_chat(ChatTemplateRequest {
         messages: vec![json!({
             "role": "user",

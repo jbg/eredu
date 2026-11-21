@@ -65,14 +65,14 @@ its published mixed K-quant encodings; the selected bounded neural execution
 decodes projections to F32.
 
 ```sh
-CARGO_INCREMENTAL=0 cargo build -p eredu-backend-mlx --release \
-  --no-default-features --features metal --example nemotron_generation_modes
+CARGO_INCREMENTAL=0 cargo build -p eredu --release \
+  --no-default-features --features mlx,metal --example nemotron_generation_modes
 target/release/examples/nemotron_generation_modes \
   PINNED_SPIRITBUUN_14B_Q8_0_GGUF INDEPENDENT_REFERENCE_F32_SAFETENSORS disk
 ```
 
 ```sh
-cargo run -p eredu-backend-mlx --no-default-features --features metal \
+cargo run -p eredu --no-default-features --features mlx,metal \
   --example nemotron_generation_modes -- \
   PINNED_INTELLAGENTS_3B_Q4_K_M_GGUF INDEPENDENT_REFERENCE_F32_SAFETENSORS disk
 ```
@@ -123,7 +123,7 @@ tolerances or native distributed correctness.
 python eredu-evaluation/scripts/nemotron_diffusion_reference.py \
   /private/tmp/eredu-nemotron-reference/3B \
   /private/tmp/eredu-nemotron-reference/3B/reference-f32.safetensors
-cargo run -p eredu-backend-mlx --no-default-features \
+cargo run -p eredu --no-default-features --features mlx \
   --example nemotron_diffusion_reference -- \
   /private/tmp/eredu-nemotron-reference/3B \
   /private/tmp/eredu-nemotron-reference/3B/reference-f32.safetensors
@@ -200,8 +200,8 @@ python eredu-evaluation/scripts/nemotron_diffusion_reference.py \
   /private/tmp/eredu-nemotron-reference/3B/reference-adapter-bf16-components.safetensors \
   --draft-adapter --compute-dtype bf16 --trace-components
 EREDU_NEMOTRON_RELEASE_ROOT=/private/tmp/eredu-nemotron-reference/3B \
-  CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx \
-  --no-default-features --features metal --lib \
+  CARGO_INCREMENTAL=0 cargo test -p eredu \
+  --no-default-features --features mlx,metal --test released_reference_acceptance \
   normal_loader_released_adapter_matches_independent_causal_and_draft_rows \
   -- --ignored --nocapture --test-threads=1
 python eredu-evaluation/scripts/nemotron_adapter_precision.py \
@@ -371,8 +371,8 @@ PYTHONPATH=/private/tmp/eredu-nemotron-reference/transformers-4.57.1 \
   /private/tmp/eredu-nemotron-reference/VLM-8B/reference-bf16-context.safetensors \
   --text-context --compute-dtype bf16
 EREDU_NEMOTRON_RELEASE_ROOT=/private/tmp/eredu-nemotron-reference/VLM-8B \
-  CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx \
-  --no-default-features --features metal --lib \
+  CARGO_INCREMENTAL=0 cargo test -p eredu \
+  --no-default-features --features mlx,metal,image --test released_reference_acceptance \
   normal_loader_released_pixtral_prepared_context_matches_independent_rows \
   -- --ignored --nocapture --test-threads=1
 python eredu-evaluation/scripts/nemotron_pixtral_precision.py \
@@ -384,7 +384,7 @@ python eredu-evaluation/scripts/nemotron_pixtral_precision.py \
 python eredu-evaluation/scripts/nemotron_pixtral_reference.py \
   /private/tmp/eredu-nemotron-reference/VLM-8B \
   /private/tmp/eredu-nemotron-reference/VLM-8B/reference-vision-f32.safetensors
-cargo run -p eredu-backend-mlx --no-default-features \
+cargo run -p eredu --no-default-features --features mlx \
   --example nemotron_diffusion_reference -- \
   /private/tmp/eredu-nemotron-reference/VLM-8B \
   /private/tmp/eredu-nemotron-reference/VLM-8B/reference-vision-f32.safetensors \
@@ -418,7 +418,7 @@ PYTHONPATH=/private/tmp/eredu-nemotron-reference/transformers-4.57.1 \
   /private/tmp/eredu-nemotron-reference/VLM-8B \
   /private/tmp/eredu-nemotron-reference/VLM-8B/reference-context-f32.safetensors \
   --text-context
-cargo run -p eredu-backend-mlx --features metal \
+cargo run -p eredu --no-default-features --features mlx,metal \
   --example nemotron_diffusion_reference -- \
   /private/tmp/eredu-nemotron-reference/VLM-8B \
   /private/tmp/eredu-nemotron-reference/VLM-8B/reference-context-f32.safetensors \
@@ -494,7 +494,7 @@ python eredu-evaluation/scripts/nemotron_diffusion_reference.py \
   /private/tmp/eredu-nemotron-reference/3B \
   /private/tmp/eredu-nemotron-reference/mlx-3B-4bit/reference-f32.safetensors \
   --mlx-affine /private/tmp/eredu-nemotron-reference/mlx-3B-4bit
-cargo run -p eredu-backend-mlx --no-default-features --features metal \
+cargo run -p eredu --no-default-features --features mlx,metal \
   --example nemotron_diffusion_reference -- \
   /private/tmp/eredu-nemotron-reference/mlx-3B-4bit \
   /private/tmp/eredu-nemotron-reference/mlx-3B-4bit/reference-f32.safetensors \
@@ -578,7 +578,7 @@ PYTHONPATH=/private/tmp/eredu-nemotron-gguf/llama-cpp-reference/gguf-py \
   eredu-evaluation/scripts/nemotron_diffusion_reference.py \
   /private/tmp/eredu-nemotron-reference/14B REFERENCE.safetensors \
   --gguf PINNED.gguf
-cargo run -p eredu-backend-mlx --features metal \
+cargo run -p eredu --no-default-features --features mlx,metal \
   --example nemotron_diffusion_reference -- \
   /private/tmp/eredu-nemotron-reference/14B REFERENCE.safetensors \
   --gguf PINNED.gguf
@@ -660,7 +660,7 @@ decoded comparison and its residency figures above.
 PYTHONPATH=TRANSFORMERS_4_57_1:PINNED_LLAMA_CPP/gguf-py \
   python eredu-evaluation/scripts/nemotron_pixtral_reference.py \
   OFFICIAL_VLM_DIRECTORY REFERENCE.safetensors --text-context --gguf GGUF_DIRECTORY
-cargo run -p eredu-backend-mlx --no-default-features --features metal \
+cargo run -p eredu --no-default-features --features mlx,metal \
   --example nemotron_diffusion_reference -- \
   OFFICIAL_VLM_DIRECTORY REFERENCE.safetensors \
   --gguf GGUF_DIRECTORY/VLM8B-F16.gguf \
@@ -677,8 +677,8 @@ PYTHONPATH=TRANSFORMERS_4_57_1:PINNED_LLAMA_CPP/gguf-py \
 EREDU_NEMOTRON_RELEASE_ROOT=OFFICIAL_VLM_DIRECTORY \
   EREDU_NEMOTRON_MODEL_SOURCE=GGUF_DIRECTORY/VLM8B-F16.gguf \
   EREDU_NEMOTRON_IMAGE_REFERENCE=GGUF_DIRECTORY/reference-context-mixed.safetensors \
-  env CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx \
-  --no-default-features --features metal --lib \
+  env CARGO_INCREMENTAL=0 cargo test -p eredu \
+  --no-default-features --features mlx,metal,image --test released_reference_acceptance \
   normal_loader_released_pixtral_prepared_context_matches_independent_rows \
   -- --ignored --nocapture --test-threads=1
 ```
@@ -800,8 +800,8 @@ PYTHONPATH=/private/tmp/eredu-nemotron-reference/transformers-4.57.1 \
   PINNED_FP8_DIRECTORY/reference-mixed-context.safetensors \
   --text-context --tensor-fp8 PINNED_FP8_DIRECTORY --compute-dtype mixed
 EREDU_NEMOTRON_RELEASE_ROOT=PINNED_FP8_DIRECTORY \
-  env CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx \
-  --no-default-features --features metal --lib \
+  env CARGO_INCREMENTAL=0 cargo test -p eredu \
+  --no-default-features --features mlx,metal,image --test released_reference_acceptance \
   normal_loader_released_pixtral_prepared_context_matches_independent_rows \
   -- --ignored --nocapture --test-threads=1
 ```
@@ -822,7 +822,7 @@ PYTHONPATH=/private/tmp/eredu-nemotron-reference/transformers-4.57.1 \
   eredu-evaluation/scripts/nemotron_pixtral_reference.py \
   /private/tmp/eredu-nemotron-reference/VLM-8B REFERENCE.safetensors \
   --text-context --tensor-fp8 PINNED_FP8_DIRECTORY
-cargo run -p eredu-backend-mlx --no-default-features --features metal \
+cargo run -p eredu --no-default-features --features mlx,metal \
   --example nemotron_diffusion_reference -- \
   PINNED_FP8_DIRECTORY REFERENCE.safetensors --vision-context
 ```
@@ -860,14 +860,6 @@ verification records retain their distinct phases. The capture fixture reserves
 ceiling; these logical bounds cover native transport and bounded receipt parsing
 on all receivers, separately from model parameter residency.
 
-The captured combined runs use the explicit native test binary built with
-`cargo check -p eredu-backend-mlx --no-default-features --features metal --tests`:
-
-```sh
-EREDU_NEMOTRON_RING_REQUEST_TABLE_ONLY=1 EREDU_NEMOTRON_RING_ACTIVATIONS=1 EREDU_NEMOTRON_RING_COMBINED_ONLY=1 target/debug/deps/eredu_backend_mlx-1d5f204e48b47786 native_shared_decoding_ring_tp_pp_and_combined_match_single_owner --ignored --nocapture
-EREDU_NEMOTRON_RING_REQUEST_TABLE_ONLY=1 EREDU_NEMOTRON_RING_ACTIVATIONS=1 target/debug/deps/eredu_backend_mlx-1d5f204e48b47786 native_adapted_shared_decoding_ring_combined_vlm_matches_single_owner --ignored --nocapture
-```
-
 Shared scoped activation discovery exposes ordinary text and Pixtral tower and
 projector hooks. Public bounded captures of a vision residual and final projector
 output pass combined TP2/PP5 under resident, host-layerwise and disk-streamed
@@ -895,8 +887,6 @@ selection, EOS, cancellation and failed-publication cases pass in 0.01 seconds.
 
 ```sh
 env CARGO_INCREMENTAL=0 cargo test -p eredu-core --lib packed_media_extents -- --nocapture
-target/debug/deps/eredu_backend_mlx-1d5f204e48b47786 controlled_shared_diffusion_forks_partial_canvases_and_refines_forced_suffixes --nocapture
-target/debug/deps/eredu_backend_mlx-1d5f204e48b47786 shared_request_table_refines_initial_blocks_and_all_six_handoffs --nocapture
 ```
 
 The shared neutral verification cursor passes the independently enumerable
@@ -918,10 +908,6 @@ unchanged. The neutral dense/MoVA independent verification, rejection and durabl
 restore fixture passes in 0.12 seconds through the explicit target-refinement input
 handoff.
 
-```sh
-target/debug/deps/eredu_backend_mlx-1d5f204e48b47786 independent_causal_source_handoffs_preserve_both_frontiers_and_target_output --nocapture
-```
-
 A single native storage survey compares canonical KV arrays with their settled
 prefix checkpoint arrays. Every backing is available and corresponding indices
 are equal under all three residency policies; this identity and rollback fixture
@@ -932,19 +918,12 @@ The public independent-drafter dense/MoVA conformance fixture passes greedy and
 stochastic sampling under all three residency policies in 7.28 seconds with
 controlled/uninterrupted output parity, forks, captures and snapshot budgets.
 
-```sh
-target/debug/deps/eredu_backend_mlx-1d5f204e48b47786 loaded_nemotron_shared_drafts_preserve_causal_frontier_across_residency_policies --nocapture
-```
-
 The common entropy/feedback driver matches DiffusionGemma's existing physical
 policy through the prepared target-only handoff as well as direct executor
 construction. The CPU fixture compares five unforced output IDs and numerical
 iteration counts across resident, host-layerwise and disk-streamed execution,
 including controlled and uninterrupted visitors. Its paid numerical snapshot
 replays the same continuation. The extended fixture passes in 0.57 seconds:
-
-```sh
-```
 
 The finalized entropy-score semantics remain `ConstrainedFinalization`.
 The prepared entropy session's continuation forecast includes full refinement
@@ -966,10 +945,6 @@ passes in 3.92 seconds through the shared refinement policy. The neutral single-
 suffix-settlement fixture passes in 0.03 seconds, and portable controlled
 speculative conformance passes in 0.23 seconds. Public dense/MoVA greedy and
 stochastic controlled/uninterrupted parity passes in 7.00 seconds with shared prefix checkpoints.
-
-```sh
-target/debug/deps/eredu_backend_mlx-1d5f204e48b47786 common_refinement_driver_preserves_entropy_feedback_outputs_iterations_and_snapshot_state --nocapture
-```
 
 ## Common generation request driver
 

@@ -1,5 +1,7 @@
 //! Portable execution of a bound vision and decoder rank.
 
+use eredu_core::input::PreparedInputInspector;
+use eredu_core::PreparedModelInput;
 use eredu_core::{
     capture::CaptureRequestShape, BackendFailure, CapabilityError, DistributedCommitEpoch,
 };
@@ -8,8 +10,8 @@ use eredu_nn::{
 };
 use eredu_runtime::{
     execution_control::SessionState, prefill::RetainedPrefillAdvance, BoundComponentPipeline,
-    DecoderPipelineState, LayerwisePolicy, PreparedInputCacheIdentity, PreparedInputInspector,
-    PreparedModelInput, RuntimeStateComponents, UnitPolicyResidency,
+    DecoderPipelineState, LayerwisePolicy, PreparedInputCacheIdentity, RuntimeStateComponents,
+    UnitPolicyResidency,
 };
 
 use super::{
@@ -27,7 +29,6 @@ pub(crate) struct VlRankSession<B: eredu_nn::NeuralBackend, P, D, S> {
     vision: PolicyVision<B, P>,
     decoder: PreparedVlDecoderStage<D>,
     driver: VlSessionDriver<S>,
-    processor: eredu_runtime::SelectedProcessorExecution,
     capabilities: crate::capability::CapabilityEstimate,
     session: eredu_core::SessionCapabilities,
     residency: eredu_runtime::LayerWeightResidency,
@@ -41,8 +42,7 @@ impl<B: eredu_nn::NeuralBackend, P, D, S> VlRankSession<B, P, D, S> {
         Self {
             vision: bound.vision,
             decoder: bound.decoder,
-            driver: VlSessionDriver::new(bound.admission, bound.state),
-            processor: bound.processor,
+            driver: VlSessionDriver::new(bound.admission, bound.processor, bound.state),
             capabilities: bound.capabilities,
             session: bound.session,
             residency: bound.decoder_residency,
@@ -63,9 +63,6 @@ where
 {
     type Cursor = VlPrefill<B::Tensor>;
 
-    fn processor(&self) -> &eredu_runtime::SelectedProcessorExecution {
-        &self.processor
-    }
     fn capabilities(&self) -> &crate::capability::CapabilityEstimate {
         &self.capabilities
     }

@@ -5,9 +5,7 @@ use eredu_core::{
     generation::SemanticEvent,
     BackendFailure,
 };
-use eredu_runtime::execution_control::{
-    snapshot_value_estimate, SnapshotReservation, SnapshotValue,
-};
+use eredu_runtime::execution_control::{snapshot_value_estimate, SnapshotRetention, SnapshotValue};
 
 use super::*;
 
@@ -38,7 +36,7 @@ impl<D: SnapshotValue> SnapshotValue for Queue<D> {
         )
     }
 
-    fn copy_snapshot_value(&self, retention: &SnapshotReservation) -> Result<Self, BackendFailure> {
+    fn copy_snapshot_value(&self, retention: &SnapshotRetention) -> Result<Self, BackendFailure> {
         let mut output = VecDeque::new();
         output
             .try_reserve_exact(self.limits.max_publications)
@@ -134,7 +132,7 @@ impl<D: SnapshotValue> SnapshotValue for VoiceChatConversationOutput<D> {
         )
     }
 
-    fn copy_snapshot_value(&self, retention: &SnapshotReservation) -> Result<Self, BackendFailure> {
+    fn copy_snapshot_value(&self, retention: &SnapshotRetention) -> Result<Self, BackendFailure> {
         Ok(Self {
             frame: self.frame.copy_snapshot_value(retention)?,
             turn: self.turn,

@@ -164,7 +164,7 @@ F32 conversion for floating host observations; integer signedness is retained in
 the returned `TensorObservationData`. With `tensor-capture`, `CapturePlan`
 admits exact paths and phases with explicit budgets and supports full tensors,
 slices, previews, summaries, histograms, and candidate scores. Selected support
-reports describe the transformations compiled into the backend. See
+reports describe the transformations available on the selected backend. See
 [bounded capture and observed generation](bounded-capture.md).
 
 Block inputs/outputs and logits are observed **before an intervention at that
@@ -895,7 +895,7 @@ The native example selects an advertised path, loads the model on CPU,
 and uses `CapturePlan` with `FullTensor` for prefill and decode.
 
 ```sh
-cargo run -p eredu-backend-mlx --features tensor-capture --example capture_discovery -- /path/to/artifact 1 2 3
+cargo run -p eredu --no-default-features --features mlx,tensor-capture --example capture_discovery -- /path/to/artifact 1 2 3
 ```
 
 Provide valid token IDs for the artifact. Native resources are created after

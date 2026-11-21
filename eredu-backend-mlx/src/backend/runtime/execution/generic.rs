@@ -1,584 +1,112 @@
 //! MLX realization of the backend-neutral layerwise unit policy.
 
-use eredu_checkpoint::store::SharedCheckpointSource;
-use eredu_runtime::{
-    DenseDiskStreamReport, ExecutionUnitAddress, ExecutionUnitLayout, LayerWeightResidency,
-    LayerwiseModelMetadata, ResidentLayerGroup, ResidentLayerGroupReport,
-};
+use eredu_core::residency::{NativeResidentUnits, ResidencyTransferOrdering, UnitRetirement};
 
-use std::{
-    collections::{BTreeSet, VecDeque},
-    sync::Arc,
-};
-
-use eredu_nn::Parameterized;
-use eredu_runtime::LayerwiseAcquireError;
-use eredu_runtime::{
-    LayeredArchitecture, LayerwisePolicy, OffloadUnit, RuntimeState, WeightBinding,
-};
 use safemlx::{transforms::async_eval_with_event, Event, Stream};
 
 use crate::backend::{
     error::Error,
     nn::shared::{MlxModule, MlxNeuralBackend},
     ordinary_retirement::OrdinaryRetirement,
-    runtime::{
-        checkpoint::binding::{
-            build_module_bindings, populate_module_from_lease, populate_module_from_lease_excluding,
-        },
-        execution::layerwise::{
-            validate_unused, DensePreparedTransfer, DenseStreamController, DenseStreamForwardGuard,
-            DenseStreamGroupGuard, DenseTransferWindow,
-        },
-        residency::manager::{
-            host_capacity_upper_bound_for_bindings, ResidencyManager, ResidentTransfer,
-            ResidentUnitLease,
-        },
-    },
+    runtime::residency::manager::{ResidentTransfer, ResidentUnitLease},
 };
 use crate::MlxTensor;
-use eredu_core::residency::{MemoryTier, OffloadUnitId};
-
-/// Binds an independently materialized unit sequence with no pinned modules.
-pub fn bind_parameter_units<U: Parameterized<MlxTensor> + 'static>(
-    source: SharedCheckpointSource,
-    invocations: eredu_runtime::ExecutionUnitAddressMap,
-    units: Vec<Vec<WeightBinding>>,
-    residency: LayerWeightResidency,
-    execution: &Stream,
-    weights: &Stream,
-    resident_units: impl FnOnce() -> Result<Vec<U>, eredu_core::BackendFailure>,
-) -> Result<(MlxSelectedLayerwisePolicy<U, ()>, LayerwiseModelMetadata), eredu_core::BackendFailure>
-{
-    use eredu_core::BackendFailure;
-
-    crate::backend::submission_recovery::detached_preparation(
-        Vec::<safemlx::Array>::new(),
-        || {
-            let (policy, metadata) = prepare_parameter_unit_policy(
-                source,
-                &mut eredu_runtime::EmptyParameterModule,
-                (),
-                residency,
-                execution,
-                weights,
-                |_| false,
-                invocations,
-                Vec::new(),
-                units,
-                Vec::new(),
-            )
-            .map_err(BackendFailure::from_error)?;
-            let policy = if residency.is_fully_resident() {
-                MlxSelectedLayerwisePolicy::resident(
-                    policy
-                        .into_resident_units(resident_units()?, execution)
-                        .map_err(BackendFailure::from_error)?,
-                )
-                .certify_immutable(execution)
-                .map_err(BackendFailure::from_error)?
-            } else {
-                MlxSelectedLayerwisePolicy::bounded(policy)
-            };
-            Ok((policy, metadata))
-        },
-        BackendFailure::from_error,
-    )
-}
-
-/// One populated MLX unit retained with its residency transfer.
-enum MlxUnitTransfer {
-    Ordinary { _transfer: ResidentTransfer },
-    Dense { _transfer: DensePreparedTransfer },
-}
 
 mod submission;
 pub use submission::MlxUnitLease;
 
-/// Inspects one retained source transfer under the ordinary completion owner.
-/// The callback evaluates exported copies; failures retain the original loan
-/// through native terminal evidence just like execution-unit inspection.
-pub(crate) fn with_parameter_transfer<T>(
-    transfer: ResidentTransfer,
-    stream: &Stream,
-    operation: impl FnOnce(&ResidentUnitLease) -> Result<T, Error>,
-) -> Result<T, Error> {
-    transfer.order_after(stream)?;
-    let mut loan = MlxUnitLease::new(
-        MlxModule::new(()),
-        MlxUnitTransfer::Ordinary {
-            _transfer: transfer,
-        },
-    )?;
-    let output = operation(loan.population_parts().1)?;
-    let marker = safemlx::ops::zeros_dtype(&[1], safemlx::Dtype::Float32, stream)?;
-    loan.submitted(async_eval_with_event([&marker])?)?;
-    loan.finish()?;
-    crate::backend::ordinary_retirement::reclaim_all();
-    Ok(output)
+/// Native retention and completion for a leased prediction module's tensor roots.
+pub struct MlxPredictionTransfer {
+    loan: MlxUnitLease<Vec<MlxTensor>>,
+    stream: Stream,
 }
 
-/// Executes one fallible module operation under its immutable-weight transfer.
-/// Changed-state and output roots are returned even after an equation failure;
-/// the transfer and those roots remain in the ordinary recovery owner until
-/// completion or terminal teardown. A callback error never releases the loan.
-pub(crate) fn with_module_transfer<T>(
-    transfer: ResidentTransfer,
-    stream: &Stream,
-    operation: impl FnOnce(&ResidentUnitLease) -> (Result<T, Error>, Vec<MlxTensor>),
-) -> Result<T, Error> {
-    transfer.order_after(stream)?;
-    let mut loan = MlxUnitLease::new(
-        MlxModule::new(Vec::<MlxTensor>::new()),
-        MlxUnitTransfer::Ordinary {
-            _transfer: transfer,
-        },
-    )?;
-    let (outcome, dependencies) = operation(loan.population_parts().1);
-    loan.population_parts().0.inner = dependencies;
-    let validations = crate::backend::nn::tensor::active_token_validation_arrays();
-    let marker = safemlx::ops::zeros_dtype(&[1], safemlx::Dtype::Float32, stream)?;
-    let event = async_eval_with_event(
-        loan.iter()
-            .map(MlxTensor::as_array)
-            .chain(validations.iter())
-            .chain([&marker]),
-    )?;
-    loan.submitted(event)?;
-    loan.finish()?;
-    crate::backend::nn::tensor::validate_active_token_validations()?;
-    crate::backend::ordinary_retirement::reclaim_all();
-    outcome
-}
-
-/// Additional physical owner executed outside the ordinary unit window.
-/// The source is exact for this owner, including retained load-time transforms.
-pub struct SupplementaryResidencyUnit {
-    /// Exact immutable bindings and the stable physical owner identity.
-    pub definition: OffloadUnit,
-    /// Already prepared source used only for this physical owner.
-    pub source: SharedCheckpointSource,
-    /// Whether this owner overlaps each sequential auxiliary invocation.
-    pub shared: bool,
-}
-
-/// Exact-completion MLX policy over generic parameterized execution units.
-pub struct MlxLayerwisePolicy<U: 'static, P = ()> {
-    residency: ResidencyManager,
-    store: SharedCheckpointSource,
-    unit_ids: Vec<OffloadUnitId>,
-    layout: ExecutionUnitLayout,
-    invocations: eredu_runtime::ExecutionUnitAddressMap,
-    window_depth: usize,
-    pinned_units: BTreeSet<OffloadUnitId>,
-    populator: P,
-    _static_leases: OrdinaryRetirement<Vec<ResidentUnitLease>>,
-    pending: VecDeque<MlxUnitLease<U>>,
-    dense: Option<OrdinaryRetirement<MlxDenseExecution>>,
-    sample_mlx_memory: bool,
-    sample_process_memory: bool,
-}
-
-struct MlxDenseExecution {
-    controller: Arc<DenseStreamController>,
-    windows: Vec<Option<DenseTransferWindow>>,
-    forward: Option<DenseStreamForwardGuard>,
-    groups: Vec<Option<DenseStreamGroupGuard>>,
-    prefill: bool,
-    aborted: bool,
-}
-
-mod resident;
-pub use resident::{MlxResidentPolicy, MlxResidentUnit};
-
-/// Statically dispatched parameter population used by the MLX policy.
-pub trait MlxUnitPopulator<U> {
-    /// Replaces the complete immutable override set used after ordinary population.
-    fn publish_parameter_replacements(
-        &mut self,
-        _values: &std::collections::BTreeMap<String, MlxTensor>,
-        _active: bool,
-    ) -> bool {
-        false
-    }
-
-    /// Populates the parameters owned by the execution-unit residency policy.
-    ///
-    /// Most units own every materialized parameter. Architectures with an
-    /// independently managed addressable parameter class
-    /// override this method with the same exclusion used while binding the
-    /// unit. Keeping the ownership decision on the populator makes resident,
-    /// bounded, and dense-stream execution follow one contract.
-    fn populate(&mut self, unit: &mut MlxModule<U>, lease: &ResidentUnitLease) -> Result<(), Error>
-    where
-        U: Parameterized<MlxTensor>,
-    {
-        populate_module_from_lease(unit, lease)?;
-        Ok(())
-    }
-}
-
-impl<U> MlxUnitPopulator<U> for () {}
-
-/// Exact parameter exclusions for units with independently stored members.
-#[derive(Clone)]
-pub struct MlxSelectiveUnitPopulator {
-    excluded: Arc<BTreeSet<String>>,
-    replacements: Arc<std::collections::BTreeMap<String, MlxTensor>>,
-}
-
-impl MlxSelectiveUnitPopulator {
-    /// Creates one generic logical-parameter exclusion set.
-    pub fn new(excluded: BTreeSet<String>) -> Self {
-        Self {
-            excluded: Arc::new(excluded),
-            replacements: Arc::new(std::collections::BTreeMap::new()),
-        }
-    }
-}
-
-pub(super) struct ParameterPublisher<'a>(
-    pub(super) &'a std::collections::BTreeMap<String, MlxTensor>,
-);
-impl<'a> eredu_nn::ParameterVisitorMut<'a, MlxTensor> for ParameterPublisher<'_> {
-    fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadata, value: &'a mut MlxTensor) {
-        if let Some(replacement) = self.0.get(metadata.id.as_str()) {
-            eredu_nn::Tensor::publish_parameter(value, replacement);
-        }
-    }
-}
-
-impl<U> MlxUnitPopulator<U> for MlxSelectiveUnitPopulator {
-    fn publish_parameter_replacements(
-        &mut self,
-        values: &std::collections::BTreeMap<String, MlxTensor>,
-        active: bool,
-    ) -> bool {
-        self.replacements = Arc::new(if active {
-            values.clone()
-        } else {
-            Default::default()
-        });
-        true
-    }
-
-    fn populate(&mut self, unit: &mut MlxModule<U>, lease: &ResidentUnitLease) -> Result<(), Error>
-    where
-        U: Parameterized<MlxTensor>,
-    {
-        populate_module_from_lease_excluding(unit, lease, |name| self.excluded.contains(name))?;
-        unit.inner
-            .visit_parameters_mut(&mut ParameterPublisher(&self.replacements));
-        Ok(())
-    }
-}
-
-/// Builds one unloaded unit through the neutral architecture's declared flat layout.
-pub fn construct_architecture_unit<A, S>(
-    architecture: &A,
-    layout: &ExecutionUnitLayout,
-    ordinal: usize,
-    stream: &Stream,
-    _state: std::marker::PhantomData<S>,
-) -> Result<A::Unit, Error>
-where
-    A: LayeredArchitecture<MlxNeuralBackend, S>,
-    S: RuntimeState<MlxNeuralBackend>,
-    A::Error: std::fmt::Display,
-{
-    let address = layout.address(ordinal).ok_or_else(|| {
-        Error::ArchitectureModel(format!(
-            "architecture unit ordinal {ordinal} is outside 0..{}",
-            layout.len()
-        ))
-    })?;
-    architecture
-        .build_unit(address.group(), address.index(), stream)
-        .map_err(|error| Error::Other(Box::new(error)))
-}
-
-impl<U: 'static, P> MlxLayerwisePolicy<U, P> {
-    /// Shares the existing ledger with separately invoked prepared modules.
-    pub(crate) fn residency_manager(&self) -> &ResidencyManager {
-        &self.residency
-    }
-    /// Invocation references retained by cold resource admission.
-    pub fn invocation_map(&self) -> &eredu_runtime::ExecutionUnitAddressMap {
-        &self.invocations
-    }
-    /// Creates a bounded policy over validated ordered residency units.
-    pub fn new(
-        residency: ResidencyManager,
-        store: SharedCheckpointSource,
-        unit_ids: Vec<OffloadUnitId>,
-        invocations: eredu_runtime::ExecutionUnitAddressMap,
-        window_depth: usize,
-        populator: P,
-        static_leases: Vec<ResidentUnitLease>,
-        dense: Option<Arc<DenseStreamController>>,
-        sample_mlx_memory: bool,
-        sample_process_memory: bool,
-    ) -> Result<Self, Error> {
-        let layout = invocations.storage_layout();
-        if unit_ids.len() != layout.len() {
-            return Err(Error::Parallel(
-                "residency units differ from the selected canonical execution layout".into(),
-            ));
-        }
-        if unit_ids.is_empty() {
-            return Err(Error::Parallel(
-                "generic MLX layerwise policy requires at least one unit".into(),
-            ));
-        }
-        if window_depth == 0 {
-            return Err(Error::Parallel(
-                "generic MLX layerwise policy window depth must be nonzero".into(),
-            ));
-        }
-        let pinned_units = residency.pinned_unit_ids(&unit_ids)?;
-        Ok(Self {
-            residency,
-            store,
-            unit_ids,
-            layout: layout.clone(),
-            invocations: invocations.clone(),
-            window_depth,
-            pinned_units,
-            populator,
-            _static_leases: OrdinaryRetirement::new(static_leases),
-            pending: VecDeque::new(),
-            dense: dense.map(|controller| {
-                OrdinaryRetirement::new(MlxDenseExecution {
-                    controller,
-                    windows: (0..layout.group_count()).map(|_| None).collect(),
-                    forward: None,
-                    groups: (0..layout.group_count()).map(|_| None).collect(),
-                    prefill: false,
-                    aborted: false,
-                })
-            }),
-            sample_mlx_memory,
-            sample_process_memory,
-        })
-    }
-
-    fn reap_completed(&mut self) -> Result<(), Error> {
-        loop {
-            let Some(lease) = self.pending.front() else {
-                return Ok(());
-            };
-            if !lease.is_complete()? {
-                return Ok(());
-            }
-            self.pending.pop_front().expect("completed unit").finish()?;
-            crate::backend::ordinary_retirement::reclaim_all();
-        }
-    }
-
-    fn drain_one(&mut self) -> Result<(), Error> {
-        if let Some(lease) = self.pending.pop_front() {
-            lease.finish()?;
-            crate::backend::ordinary_retirement::reclaim_all();
-        }
-        Ok(())
-    }
-
-    fn drain(&mut self) -> Result<(), Error> {
-        while !self.pending.is_empty() {
-            self.drain_one()?;
-        }
-        Ok(())
-    }
-
-    fn trim_device_window(
-        &self,
-        window: &[eredu_runtime::ExecutionUnitStorageLocation],
-    ) -> Result<(), Error> {
-        for (index, id) in self.unit_ids.iter().enumerate() {
-            if !self.pinned_units.contains(id)
-                && !window.iter().any(|storage| storage.ordinal() == index)
-            {
-                self.residency.evict(id, MemoryTier::Device)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Returns the checkpoint source backing this layerwise policy.
-    pub fn checkpoint_store(&self) -> &dyn eredu_checkpoint::store::CheckpointSource {
-        self.store.as_ref()
-    }
-
-    /// Clones the shared checkpoint source backing this layerwise policy.
-    pub fn checkpoint_store_arc(&self) -> SharedCheckpointSource {
-        Arc::clone(&self.store)
-    }
-
-    /// Returns current weight-residency accounting.
-    pub fn residency_report(&self) -> Result<eredu_runtime::ResidencyReport, Error> {
-        self.residency.report().map_err(Into::into)
-    }
-
-    /// Returns dense disk-stream telemetry when that policy is active.
-    pub fn dense_stream_report(&self) -> Result<Option<DenseDiskStreamReport>, Error> {
-        self.dense
-            .as_ref()
-            .map(|dense| dense.controller.report(&self.residency))
-            .transpose()
-    }
-
-    /// Returns the number of pinned static-weight leases.
-    pub fn static_lease_count(&self) -> usize {
-        self._static_leases.len()
-    }
-
-    fn execution_group(&self, group: usize) -> Result<ResidentLayerGroup, Error> {
-        let range = self
-            .layout
-            .group_range(group)
-            .ok_or_else(|| Error::Parallel(format!("unknown execution group {group}")))?;
-        let id = self
-            .layout
-            .group_id(group)
-            .expect("validated layout names every execution group")
-            .as_str();
-        let depth = self.window_depth.min(range.len());
-        ResidentLayerGroup::new(id, self.unit_ids[range].iter().cloned(), depth)
-            .map_err(|error| Error::Parallel(error.to_string()))
-    }
-
-    /// Returns residency reports for every semantic execution group.
-    pub fn execution_group_reports(&self) -> Result<Vec<ResidentLayerGroupReport>, Error> {
-        (0..self.layout.group_count())
-            .filter(|&group| {
-                self.layout
-                    .group_range(group)
-                    .is_some_and(|range| !range.is_empty())
-            })
-            .map(|group| {
-                self.execution_group(group)?
-                    .report(&self.residency)
-                    .map_err(Into::into)
-            })
-            .collect()
-    }
-
-    /// Populates every unit once and converts the bounded loader into a
-    /// permanently resident policy without changing the architecture loop.
-    pub fn into_resident<A, S>(
-        self,
-        architecture: &A,
-        stream: &Stream,
-        _state: std::marker::PhantomData<S>,
-    ) -> Result<MlxResidentPolicy<U>, Error>
-    where
-        U: Parameterized<MlxTensor>,
-        P: MlxUnitPopulator<U>,
-        A: LayeredArchitecture<MlxNeuralBackend, S, Unit = U>,
-        S: RuntimeState<MlxNeuralBackend>,
-        A::Error: std::fmt::Display,
-    {
-        let unit_count = self.unit_ids.len();
-        self.materialize_resident(unit_count, stream, |storage, context| {
-            architecture
-                .build_storage_unit(storage, context)
-                .map_err(|error| Error::Other(Box::new(error)))
-        })
-    }
-
-    /// Populates architecture units already constructed by neutral
-    /// orchestration and converts this loader into a resident policy.
-    pub fn into_resident_units(
-        self,
-        units: Vec<U>,
-        stream: &Stream,
-    ) -> Result<MlxResidentPolicy<U>, Error>
-    where
-        U: Parameterized<MlxTensor>,
-        P: MlxUnitPopulator<U>,
-    {
-        let unit_count = units.len();
-        let mut units = units.into_iter();
-        self.materialize_resident(unit_count, stream, |_, _| {
-            Ok(units.next().expect("validated resident unit count"))
-        })
-    }
-
-    fn materialize_resident(
-        mut self,
-        unit_count: usize,
-        stream: &Stream,
-        mut build: impl FnMut(eredu_runtime::ExecutionUnitStorageLocation, &Stream) -> Result<U, Error>,
-    ) -> Result<MlxResidentPolicy<U>, Error>
-    where
-        U: Parameterized<MlxTensor>,
-        P: MlxUnitPopulator<U>,
-    {
-        self.drain()?;
-        if unit_count != self.unit_ids.len() {
-            return Err(Error::ArchitectureModel(format!(
-                "neutral resident construction supplied {} units for layout length {}",
-                unit_count,
-                self.unit_ids.len()
-            )));
-        }
-        let requests = self
-            .unit_ids
-            .iter()
-            .cloned()
-            .map(|id| (id, 1))
-            .collect::<Vec<_>>();
-        let transfer = self
-            .residency
-            .acquire_many_with_transfer(&requests, MemoryTier::Device)?;
+impl MlxPredictionTransfer {
+    pub(crate) fn begin(transfer: ResidentTransfer, stream: &Stream) -> Result<Self, Error> {
         transfer.order_after(stream)?;
-        let mut units = Vec::with_capacity(self.unit_ids.len());
-        for (index, lease) in transfer.leases().iter().enumerate() {
-            let storage = self
-                .invocations
-                .storage_location(index)
-                .expect("validated physical owner");
-            let mut unit = MlxModule::new(build(storage, stream)?);
-            self.populator.populate(&mut unit, lease)?;
-            units.push(Some(unit));
-        }
-        self.residency.enable_resident_parameter_conversions()?;
-        Ok(MlxResidentPolicy {
-            invocations: self.invocations,
-            units,
-            residency: self.residency.clone(),
-            store: Arc::clone(&self.store),
-            unit_ids: self.unit_ids.clone(),
-            layout: self.layout.clone(),
-            window_depth: self.window_depth,
-            _static_leases: self._static_leases,
-            _transfer: transfer,
+        Ok(Self {
+            loan: MlxUnitLease::new(MlxModule::new(Vec::new()), transfer)?,
+            stream: stream.clone(),
         })
+    }
+
+    pub(crate) fn weights(&mut self) -> Result<Vec<(String, MlxTensor)>, Error> {
+        resident_weights(self.loan.population_parts().1)
+    }
+
+    pub(crate) fn finish(mut self, roots: Vec<MlxTensor>) -> Result<(), Error> {
+        self.loan.population_parts().0.inner = roots;
+        let validations = crate::backend::nn::tensor::active_token_validation_arrays();
+        let marker = safemlx::ops::zeros_dtype(&[1], safemlx::Dtype::Float32, &self.stream)?;
+        let event = async_eval_with_event(
+            self.loan
+                .iter()
+                .map(MlxTensor::as_array)
+                .chain(validations.iter())
+                .chain([&marker]),
+        )?;
+        self.loan.submitted(event)?;
+        self.loan.finish()?;
+        crate::backend::ordinary_retirement::reclaim_all();
+        crate::backend::nn::tensor::validate_active_token_validations()?;
+        Ok(())
     }
 }
 
-fn populate_selected_parameterized<M: Parameterized<MlxTensor>>(
-    module: &mut M,
-    lease: &ResidentUnitLease,
-    selected: &BTreeSet<String>,
-) -> Result<(), Error> {
-    // A pipeline rank can retain unloaded handles for another rank's static
-    // roles. Bind exactly the planned destinations, keeping every selected
-    // destination mandatory even if its materialized value is missing.
-    populate_module_from_lease_excluding(module, lease, |name| !selected.contains(name))
-        .map_err(Error::from)
+/// Native transfer, submission and retirement for a selected parameter unit.
+#[doc(hidden)]
+pub struct MlxUnitOperations;
+
+impl UnitRetirement for MlxUnitOperations {
+    type Error = Error;
+    type RetainedResource<T: 'static> = OrdinaryRetirement<T>;
+
+    fn retain_resource<T: 'static>(resource: T) -> Self::RetainedResource<T> {
+        OrdinaryRetirement::new(resource)
+    }
+}
+
+impl NativeResidentUnits<MlxNeuralBackend, ResidentTransfer> for MlxUnitOperations {
+    type Module<U: 'static> = MlxModule<U>;
+    type Parameters = MlxNeuralBackend;
+
+    fn order_resident_transfer(
+        transfer: &ResidentTransfer,
+        stream: &Stream,
+    ) -> Result<usize, Error> {
+        transfer.order_after(stream)?;
+        Ok(transfer.leases().len())
+    }
+
+    fn resident_weights(
+        transfer: &ResidentTransfer,
+        ordinal: usize,
+    ) -> Result<Vec<(String, MlxTensor)>, Error> {
+        resident_weights(&transfer.leases()[ordinal])
+    }
+
+    fn retain_unit<U: 'static>(unit: U) -> Self::Module<U> {
+        MlxModule::new(unit)
+    }
+}
+
+fn resident_weights(lease: &ResidentUnitLease) -> Result<Vec<(String, MlxTensor)>, Error> {
+    lease
+        .binding_names()
+        .map(|name| {
+            let array = lease
+                .device_value(name)
+                .map_err(eredu_core::BackendFailure::from_error)?;
+            Ok((name.to_owned(), MlxTensor::from_array(array.clone())))
+        })
+        .collect()
 }
 
 /// Cold preparation for bounded and resident policies.
 mod preparation;
-pub use preparation::{
-    prepare_layerwise_policy, prepare_layerwise_policy_from_addressed_bindings,
-    prepare_layerwise_policy_from_bindings, prepare_layerwise_policy_with_bindings,
-    prepare_layerwise_policy_with_supplementary_bindings, prepare_parameter_unit_policy,
-};
+pub(crate) use preparation::parameter_residency_streams;
 
 mod bounded;
 
 mod selected;
-pub use selected::MlxSelectedLayerwisePolicy;
-pub use selected::MlxSelectedUnitLease;
+pub(crate) use selected::MlxImmutableParameters;

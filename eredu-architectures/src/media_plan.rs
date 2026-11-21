@@ -4,11 +4,13 @@
 //! native arrays. Architecture policy validates those values and returns the
 //! decoder positions and scalar workspace implied by the family equations.
 
-use eredu_core::{
-    CapabilityError, InputExtent, InputMetadataKey, InputModalities, InputModality,
-    InputPartDescriptor, InputPayloadKind, InputTensorIdentity, PreparedInputIdentity,
+use eredu_core::input::PreparedInputInspector;
+use eredu_core::{CapabilityError, InputExtent, InputModality, InputPayloadKind};
+use eredu_core::{PreparedInputPart, PreparedModelInput};
+use eredu_runtime::executable_binding::input_admission::{
+    batch_one_sequence, inspect_part, payload_name, u64_shape, unsupported, MediaAdmissionInput,
+    MetadataValues,
 };
-use eredu_runtime::{PreparedInputInspector, PreparedInputPart, PreparedModelInput};
 
 use crate::qwen::{
     hybrid::{HybridConfig, ParsedHybridConfig},
@@ -16,192 +18,10 @@ use crate::qwen::{
     vl::ModelArgs as QwenVlModelArgs,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct MetadataValues<T> {
-    shape: Vec<u64>,
-    values: Vec<T>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct MediaAdmissionInput {
-    descriptor: InputPartDescriptor,
-    payload_shape: Vec<u64>,
-    patch_grid: Option<MetadataValues<i32>>,
-    patch_positions: Option<MetadataValues<i32>>,
-    audio_mask: Option<MetadataValues<bool>>,
-}
-
-impl MediaAdmissionInput {
-    fn modality(&self) -> InputModality {
-        self.descriptor.modality()
-    }
-
-    fn patch_extent(&self) -> Option<[usize; 3]> {
-        self.descriptor.extents().find_map(|extent| match extent {
-            InputExtent::PatchGrid {
-                time,
-                height,
-                width,
-            } => Some([time, height, width]),
-            InputExtent::AudioValidFrames(_) => None,
-            _ => None,
-        })
-    }
-
-    fn audio_valid_frames(&self) -> Option<usize> {
-        self.descriptor.extents().find_map(|extent| match extent {
-            InputExtent::AudioValidFrames(frames) => Some(frames),
-            InputExtent::PatchGrid { .. } => None,
-            _ => None,
-        })
-    }
-}
-
-fn payload_name(kind: InputPayloadKind) -> &'static str {
-    match kind {
-        InputPayloadKind::TokenIds => "token-ID",
-        InputPayloadKind::Tensor => "tensor",
-        InputPayloadKind::Embeddings => "embedding",
-        _ => unreachable!("unsupported input payload kind requires explicit admission"),
-    }
-}
-
-fn u64_shape(identity: &InputTensorIdentity) -> Result<Vec<u64>, CapabilityError> {
-    identity
-        .shape()
-        .iter()
-        .map(|dimension| {
-            u64::try_from(*dimension).map_err(|_| CapabilityError::ArithmeticOverflow {
-                operation: "prepared-input tensor dimension",
-            })
-        })
-        .collect()
-}
-
-fn inspect_part<Tensor>(
-    input: &PreparedInputPart<Tensor>,
-    inspector: &impl PreparedInputInspector<Tensor>,
-) -> Result<MediaAdmissionInput, CapabilityError> {
-    let descriptor = input
-        .descriptor(&|tensor| inspector.identity(tensor))
-        .map_err(|error| CapabilityError::Observation(error.to_string()))?;
-    let inspect_metadata = descriptor.payload_kind() == InputPayloadKind::Tensor
-        && descriptor.modality() != InputModality::Text;
-
-    let metadata_shape = |key| descriptor.metadata_value(key).map(u64_shape).transpose();
-    let i32_metadata = |key| -> Result<Option<MetadataValues<i32>>, CapabilityError> {
-        if !inspect_metadata {
-            return Ok(None);
-        }
-        input
-            .metadata_value(key)
-            .map(|tensor| {
-                Ok(MetadataValues {
-                    shape: metadata_shape(key)?.expect("runtime metadata has a descriptor"),
-                    values: inspector.i32_values(tensor)?,
-                })
-            })
-            .transpose()
-    };
-    let bool_metadata = |key| -> Result<Option<MetadataValues<bool>>, CapabilityError> {
-        if !inspect_metadata {
-            return Ok(None);
-        }
-        input
-            .metadata_value(key)
-            .map(|tensor| {
-                Ok(MetadataValues {
-                    shape: metadata_shape(key)?.expect("runtime metadata has a descriptor"),
-                    values: inspector.bool_values(tensor)?,
-                })
-            })
-            .transpose()
-    };
-    let payload_shape = u64_shape(descriptor.payload())?;
-    let patch_grid = i32_metadata(InputMetadataKey::PatchGrid)?;
-    let patch_positions = i32_metadata(InputMetadataKey::PatchPositions)?;
-    let audio_mask = bool_metadata(InputMetadataKey::AudioMask)?;
-    let media = MediaAdmissionInput {
-        descriptor,
-        payload_shape,
-        patch_grid,
-        patch_positions,
-        audio_mask,
-    };
-    Ok(media)
-}
-
-/// Architecture-owned admission and accounting plan for one prepared input part.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PreparedInputPartPlan {
-    /// Text decoder positions supplied as token IDs or accepted embeddings.
-    Text {
-        /// Decoder positions occupied by the part.
-        positions: u64,
-    },
-    /// Decoder-width embeddings supplied directly by the caller.
-    Projected {
-        /// Semantic modality retained by decoder input assembly.
-        modality: InputModality,
-        /// Decoder positions occupied by the part.
-        positions: u64,
-    },
-    /// Model-native media requiring tower execution.
-    Media {
-        /// Decoder and workspace accounting for tower execution.
-        shape: MediaShapePlan,
-    },
-}
-
-impl PreparedInputPartPlan {
-    /// Exact decoder positions after architecture-owned media preparation.
-    pub const fn decoder_positions(&self) -> u64 {
-        match self {
-            Self::Text { positions } | Self::Projected { positions, .. } => *positions,
-            Self::Media { shape } => shape.decoder_positions,
-        }
-    }
-}
-
-/// Architecture-derived geometry and conservative execution workspace.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MediaShapePlan {
-    /// Exact packed capture axes for towers with declared internal hooks.
-    pub capture_media: Option<eredu_core::capture::CaptureMediaShape>,
-    /// Decoder positions occupied by the projected media.
-    pub decoder_positions: u64,
-    /// Conservative count of temporary execution scalars.
-    pub execution_workspace_scalars: u64,
-}
-
-/// Resolves independently packed tower axes before observation transaction admission.
-/// Projected caller inputs contribute no tower invocation.
-pub fn capture_media_shape(
-    plans: &[PreparedInputPartPlan],
-) -> Result<Option<eredu_core::capture::CaptureMediaShape>, CapabilityError> {
-    let mut result: Option<eredu_core::capture::CaptureMediaShape> = None;
-    for plan in plans {
-        if let PreparedInputPartPlan::Media { shape } = plan {
-            if let Some(media) = shape.capture_media {
-                let current = result.get_or_insert(eredu_core::capture::CaptureMediaShape {
-                    patches: 0,
-                    projected: 0,
-                });
-                current.patches = current.patches.checked_add(media.patches).ok_or(
-                    CapabilityError::ArithmeticOverflow {
-                        operation: "capture media patches",
-                    },
-                )?;
-                current.projected = current.projected.checked_add(media.projected).ok_or(
-                    CapabilityError::ArithmeticOverflow {
-                        operation: "capture projected media",
-                    },
-                )?;
-            }
-        }
-    }
-    Ok(result)
-}
+pub use eredu_runtime::executable_binding::input_admission::text_only_input_part;
+pub use eredu_runtime::executable_binding::retained_session::{
+    capture_media_shape, MediaShapePlan, PreparedInputPartPlan,
+};
 
 /// Architecture-owned Qwen image/video ingress policy for one prepared tensor.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -456,66 +276,8 @@ pub struct MuseVisionIngressPlan {
     pub patch_grid: Vec<(i32, i32, i32)>,
 }
 
-/// Whole-request architecture admission coupled to exact prepared tensor identity.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AdmittedCompositeInput<P> {
-    identity: PreparedInputIdentity,
-    parts: Vec<P>,
-    decoder_positions: u64,
-    active_modalities: InputModalities,
-}
-
-impl<P> AdmittedCompositeInput<P> {
-    /// Attaches architecture-owned execution context while preserving the admitted
-    /// request identity and neutral accounting. Only architecture constructors may
-    /// replace these private plans.
-    pub(crate) fn map_parts<Q>(
-        self,
-        mut map: impl FnMut(usize, P) -> Q,
-    ) -> AdmittedCompositeInput<Q> {
-        AdmittedCompositeInput {
-            identity: self.identity,
-            parts: self
-                .parts
-                .into_iter()
-                .enumerate()
-                .map(|(index, part)| map(index, part))
-                .collect(),
-            decoder_positions: self.decoder_positions,
-            active_modalities: self.active_modalities,
-        }
-    }
-
-    /// Identity recomputed from the exact tensor handles admitted by the architecture.
-    pub const fn identity(&self) -> &PreparedInputIdentity {
-        &self.identity
-    }
-
-    /// Ordered architecture-owned plan for every prepared input part.
-    pub fn parts(&self) -> &[P] {
-        &self.parts
-    }
-
-    /// Admitted decoder batch and sequence dimensions after assembling all parts.
-    /// Current composite ingress contracts validate one sequence per request.
-    pub const fn decoder_shape(&self) -> [u64; 2] {
-        [1, self.decoder_positions]
-    }
-
-    /// Total decoder positions occupied by all ordered parts.
-    pub const fn decoder_positions(&self) -> u64 {
-        self.decoder_positions
-    }
-
-    /// Modalities that activate request-optional roots for this exact input.
-    pub const fn active_modalities(&self) -> InputModalities {
-        self.active_modalities
-    }
-}
-
-pub(crate) trait CompositePartPlan {
-    fn decoder_positions(&self) -> u64;
-}
+pub use eredu_runtime::composite_execution::AdmittedCompositeInput;
+pub(crate) use eredu_runtime::composite_execution::{admit_composite_input, CompositePartPlan};
 
 impl CompositePartPlan for QwenVlInputPartPlan {
     fn decoder_positions(&self) -> u64 {
@@ -560,65 +322,6 @@ impl CompositePartPlan for MuseInputPartPlan {
             Self::Vision { shape, .. } | Self::Audio { shape, .. } => shape.decoder_positions,
         }
     }
-}
-
-pub(crate) fn admit_composite_input<Tensor, P>(
-    input: &PreparedModelInput<Tensor>,
-    inspector: &impl PreparedInputInspector<Tensor>,
-    mut admit_part: impl FnMut(&PreparedInputPart<Tensor>) -> Result<P, CapabilityError>,
-) -> Result<AdmittedCompositeInput<P>, CapabilityError>
-where
-    P: CompositePartPlan,
-{
-    let descriptors = input
-        .parts()
-        .iter()
-        .map(|part| part.descriptor(&|tensor| inspector.identity(tensor)))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| CapabilityError::Observation(error.to_string()))?;
-    let identity = PreparedInputIdentity::new(descriptors)
-        .map_err(|error| CapabilityError::Observation(error.to_string()))?;
-    if &identity != input.identity() {
-        return Err(CapabilityError::Observation(
-            "prepared-input tensor identity changed before architecture admission".into(),
-        ));
-    }
-    let mut active_modalities = InputModalities {
-        text: false,
-        image: false,
-        audio: false,
-        video: false,
-    };
-    let mut decoder_positions = 0u64;
-    let mut parts = Vec::with_capacity(input.len());
-    for part in input.parts() {
-        let plan = admit_part(part)?;
-        decoder_positions = decoder_positions
-            .checked_add(plan.decoder_positions())
-            .ok_or(CapabilityError::ArithmeticOverflow {
-                operation: "composite decoder-position total",
-            })?;
-        match part.modality() {
-            InputModality::Text => active_modalities.text = true,
-            InputModality::Image => active_modalities.image = true,
-            InputModality::Audio => active_modalities.audio = true,
-            InputModality::Video => active_modalities.video = true,
-            _ => {}
-        }
-        parts.push(plan);
-    }
-    if decoder_positions == 0 {
-        return Err(CapabilityError::UnsupportedInput {
-            architecture: "replicated composite".into(),
-            reason: "prepared input occupies no decoder positions".into(),
-        });
-    }
-    Ok(AdmittedCompositeInput {
-        identity,
-        parts,
-        decoder_positions,
-        active_modalities,
-    })
 }
 
 /// Admits a complete Qwen3-VL request before composite graph execution.
@@ -712,13 +415,6 @@ fn dimension(shape: &[u64], axis: usize, field: &'static str) -> Result<u64, Cap
             field,
             detail: format!("shape {shape:?} has no axis {axis}"),
         })
-}
-
-fn unsupported(architecture: &str, reason: impl Into<String>) -> CapabilityError {
-    CapabilityError::UnsupportedInput {
-        architecture: architecture.into(),
-        reason: reason.into(),
-    }
 }
 
 fn qwen_attention_chunk_squares(
@@ -1064,21 +760,6 @@ fn qwen_vision_ingress_with_shape(
         },
         shape,
     ))
-}
-
-fn batch_one_sequence(
-    shape: &[u64],
-    rank: usize,
-    name: &str,
-    architecture: &str,
-) -> Result<u64, CapabilityError> {
-    if shape.len() != rank || shape.first() != Some(&1) || shape.get(1).copied().unwrap_or(0) == 0 {
-        return Err(unsupported(
-            architecture,
-            format!("prepared {name} must be batch-one with rank {rank}, got {shape:?}"),
-        ));
-    }
-    Ok(shape[1])
 }
 
 /// Validates one prepared Qwen3-VL part and derives the exact prefill and
@@ -2187,32 +1868,6 @@ pub fn muse_input_part<Tensor>(
             args.identity.text_model_type(),
             format!(
                 "Muse-Glimmer does not support a {} {} payload",
-                modality.as_str(),
-                payload_name(payload)
-            ),
-        )),
-    }
-}
-
-/// Validates one prepared input part for a text-only architecture.
-pub fn text_only_input_part<Tensor>(
-    architecture: &str,
-    input: &PreparedInputPart<Tensor>,
-    inspector: &impl PreparedInputInspector<Tensor>,
-) -> Result<PreparedInputPartPlan, CapabilityError> {
-    let inspected = inspect_part(input, inspector)?;
-    let descriptor = &inspected.descriptor;
-    let modality = descriptor.modality();
-    let payload = descriptor.payload_kind();
-    let shape = u64_shape(descriptor.payload())?;
-    match (modality, payload) {
-        (InputModality::Text, InputPayloadKind::TokenIds) => Ok(PreparedInputPartPlan::Text {
-            positions: batch_one_sequence(&shape, 2, "text token IDs", architecture)?,
-        }),
-        (modality, payload) => Err(unsupported(
-            architecture,
-            format!(
-                "text-only architecture does not support a {} {} payload",
                 modality.as_str(),
                 payload_name(payload)
             ),

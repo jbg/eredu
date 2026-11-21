@@ -112,11 +112,11 @@ pub(crate) fn profile_path(input: &Array) -> &'static str {
 pub(crate) fn storage_facts(
     weight: &Array,
     stream: &Stream,
-) -> Result<Option<eredu_runtime::projection_memory::ProjectionStorageFacts>, Exception> {
+) -> Result<Option<eredu_core::residency::projection::ProjectionStorageFacts>, Exception> {
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
     {
         use eredu_core::checkpoint::TensorDtype;
-        use eredu_runtime::projection_memory::{ProjectionRowStorage, ProjectionStorageFacts};
+        use eredu_core::residency::projection::{ProjectionRowStorage, ProjectionStorageFacts};
         use safemlx::{DeviceType, Dtype};
         if weight.ndim() != 2
             || !matches!(weight.dtype(), Dtype::Float16 | Dtype::Bfloat16)

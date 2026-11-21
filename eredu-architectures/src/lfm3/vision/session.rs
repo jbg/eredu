@@ -1,12 +1,14 @@
 //! Prepared input and retained-prefill policy for the selected VL session.
 
+use eredu_core::input::PreparedInputInspector;
 use std::num::NonZeroUsize;
 
+use eredu_core::PreparedModelInput;
 use eredu_core::{capture::CaptureRequestShape, BackendFailure, CapabilityError};
 use eredu_nn::{Error, Tensor};
 use eredu_runtime::{
-    execution_control::SessionState, PreparedInputCacheIdentity, PreparedInputInspector,
-    PreparedModelInput,
+    composite_execution::validate_selected_composite_input, execution_control::SessionState,
+    PreparedInputCacheIdentity, SelectedProcessorExecution,
 };
 
 use super::{VisionPromptAdmission, VisionPromptPreparation};
@@ -15,14 +17,20 @@ use crate::media_plan::PreparedInputPartPlan;
 /// Owns the admitted prompt semantics and mutable decoder state of a VL session.
 pub struct VlSessionDriver<S> {
     admission: VisionPromptAdmission,
+    processor: SelectedProcessorExecution,
     state: SessionState<S>,
 }
 
 impl<S> VlSessionDriver<S> {
     /// Pairs the selected prompt admission with its initial decoder state.
-    pub fn new(admission: VisionPromptAdmission, state: S) -> Self {
+    pub fn new(
+        admission: VisionPromptAdmission,
+        processor: SelectedProcessorExecution,
+        state: S,
+    ) -> Self {
         Self {
             admission,
+            processor,
             state: SessionState::new(state),
         }
     }
@@ -44,6 +52,8 @@ impl<S> VlSessionDriver<S> {
         inspector: &impl PreparedInputInspector<T>,
         identity: Option<&PreparedInputCacheIdentity>,
     ) -> Result<VisionPromptPreparation<T>, Error> {
+        validate_selected_composite_input(&self.processor, input.parts())
+            .map_err(Error::backend)?;
         self.admission
             .admit_with_identity(input, inspector, identity)
     }
@@ -84,6 +94,12 @@ impl<S> VlSessionDriver<S> {
         input: &PreparedModelInput<T>,
         inspector: &impl PreparedInputInspector<T>,
     ) -> Result<Vec<PreparedInputPartPlan>, CapabilityError> {
+        validate_selected_composite_input(&self.processor, input.parts()).map_err(|reason| {
+            CapabilityError::UnsupportedInput {
+                architecture: "lfm3_vl".into(),
+                reason,
+            }
+        })?;
         Ok(self
             .admission
             .admit_composite(input, inspector)?

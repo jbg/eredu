@@ -2,14 +2,15 @@
 
 use super::request::SourceRequest;
 use super::{
-    GenerationForecast, GenerationForecastBackend, GenerationForecastError,
-    GenerationForecastOptions, GenerationRequest, LoadedModel, PreparedChatError,
-    PreparedChatGenerationSettings, SpeculativeForecastBackend,
+    GenerationForecast, GenerationForecastError, GenerationForecastOptions,
+    GenerationForecastSession, GenerationRequest, LoadedModel, PreparedChatError,
+    PreparedChatGenerationSettings, SpeculativeForecastSession,
 };
+use crate::runtime::speculative::SpeculativeBatchBackend;
 use eredu_core::decoding::{DecodingMode, SpeculationOptions};
 use eredu_core::{
     DraftingPlan, GenerationOutput, RealizedDrafting, SemanticEvent, SpeculativeDraft,
-    SpeculativeGenerationBackend, SpeculativeStats, TextGenerationBackend,
+    SpeculativeStats,
 };
 use std::{
     borrow::{Borrow, BorrowMut},
@@ -33,17 +34,24 @@ pub struct NoDrafting;
 /// Factories return an owned session. `LoadedModel::session` and
 /// `LoadedModel::drafting_session` lend the same interface for explicitly assembled
 /// models. The request never borrows drafting resources.
-pub struct PlannedModel<B: TextGenerationBackend, S = NoDrafting, M = LoadedModel<B>> {
+pub struct PlannedModel<
+    B: eredu_core::TextGenerationBackend,
+    I: eredu_core::TextExecutionSession<B>,
+    S = NoDrafting,
+    M = LoadedModel<B, I>,
+> {
     model: M,
     drafting: S,
     drafting_plan: Option<DraftingPlan>,
     options: Option<SpeculationOptions>,
-    backend: PhantomData<fn() -> B>,
+    backend: PhantomData<fn() -> (B, I)>,
 }
 
-impl<B: TextGenerationBackend, D> PlannedModel<B, RealizedDrafting<D>> {
+impl<B: eredu_core::TextGenerationBackend, I: eredu_core::TextExecutionSession<B>, D>
+    PlannedModel<B, I, RealizedDrafting<D>>
+{
     pub(crate) fn new(
-        model: LoadedModel<B>,
+        model: LoadedModel<B, I>,
         drafting: RealizedDrafting<D>,
         plan: DraftingPlan,
     ) -> Self {
@@ -57,9 +65,15 @@ impl<B: TextGenerationBackend, D> PlannedModel<B, RealizedDrafting<D>> {
     }
 }
 
-impl<B: TextGenerationBackend, S, M: Borrow<LoadedModel<B>>> PlannedModel<B, S, M> {
+impl<
+        B: eredu_core::TextGenerationBackend,
+        I: eredu_core::TextExecutionSession<B>,
+        S,
+        M: Borrow<LoadedModel<B, I>>,
+    > PlannedModel<B, I, S, M>
+{
     /// Loaded target and its metadata, capability and preparation operations.
-    pub fn model(&self) -> &LoadedModel<B> {
+    pub fn model(&self) -> &LoadedModel<B, I> {
         self.model.borrow()
     }
     /// Retained source resources.
@@ -118,18 +132,24 @@ impl<B: TextGenerationBackend, S, M: Borrow<LoadedModel<B>>> PlannedModel<B, S, 
     }
 }
 
-impl<B: TextGenerationBackend, S, M: BorrowMut<LoadedModel<B>>> PlannedModel<B, S, M> {
+impl<
+        B: eredu_core::TextGenerationBackend,
+        I: eredu_core::TextExecutionSession<B>,
+        S,
+        M: BorrowMut<LoadedModel<B, I>>,
+    > PlannedModel<B, I, S, M>
+{
     /// Mutably borrows the target for preparation and lifecycle operations.
-    pub fn model_mut(&mut self) -> &mut LoadedModel<B> {
+    pub fn model_mut(&mut self) -> &mut LoadedModel<B, I> {
         self.model.borrow_mut()
     }
     /// Borrows target and source for resource inspection.
-    pub fn parts_mut(&mut self) -> (&mut LoadedModel<B>, &mut S) {
+    pub fn parts_mut(&mut self) -> (&mut LoadedModel<B, I>, &mut S) {
         (self.model.borrow_mut(), &mut self.drafting)
     }
     /// Releases drafting resources and keeps a target-only owner. This projection
     /// requires no speculative backend implementation, including for factory loads.
-    pub fn into_target_only(self) -> PlannedModel<B, NoDrafting, M> {
+    pub fn into_target_only(self) -> PlannedModel<B, I, NoDrafting, M> {
         PlannedModel {
             model: self.model,
             drafting: NoDrafting,
@@ -148,13 +168,19 @@ impl<B: TextGenerationBackend, S, M: BorrowMut<LoadedModel<B>>> PlannedModel<B, 
 // Sources are sealed by visibility. Concrete source types determine which neutral
 // backend contracts are required; target-only sessions never require speculation.
 #[allow(private_bounds)]
-impl<B: TextGenerationBackend, S: Source<B>, M: BorrowMut<LoadedModel<B>>> PlannedModel<B, S, M> {
+impl<B, I, S, M> PlannedModel<B, I, S, M>
+where
+    B: eredu_core::TextGenerationBackend,
+    I: eredu_core::TextExecutionSession<B>,
+    S: Source<B, I>,
+    M: BorrowMut<LoadedModel<B, I>>,
+{
     /// Runs one request with the retained source and output policy.
     /// Only canonical committed events enter the callback. Reset the target before
     /// an independent request; cancellation preserves the committed prefix.
     pub fn generate<F: FnMut(SemanticEvent)>(
         &mut self,
-        mut request: GenerationRequest<'_, B, F>,
+        mut request: GenerationRequest<'_, I::Prompt, F>,
     ) -> Result<GenerationOutput<GenerationStats>, PreparedChatError> {
         let started = std::time::Instant::now();
         request.link_cancellation();
@@ -175,14 +201,18 @@ impl<B: TextGenerationBackend, S: Source<B>, M: BorrowMut<LoadedModel<B>>> Plann
 }
 
 #[allow(private_bounds)]
-impl<B: GenerationForecastBackend, S: ForecastSource<B>, M: BorrowMut<LoadedModel<B>>>
-    PlannedModel<B, S, M>
+impl<B, I, S, M> PlannedModel<B, I, S, M>
+where
+    B: eredu_core::TextGenerationBackend,
+    I: GenerationForecastSession<B> + eredu_core::TextExecutionSession<B>,
+    S: ForecastSource<B, I>,
+    M: BorrowMut<LoadedModel<B, I>>,
 {
     /// Forecasts the same resolved source and request as `generate`, without
     /// consuming input, invoking callbacks or advancing execution.
     pub fn forecast_generation<F>(
         &mut self,
-        request: &GenerationRequest<'_, B, F>,
+        request: &GenerationRequest<'_, I::Prompt, F>,
         options: &GenerationForecastOptions,
     ) -> Result<GenerationForecast, GenerationForecastError> {
         let settings = self.resolve_settings(request.settings)?;
@@ -192,9 +222,11 @@ impl<B: GenerationForecastBackend, S: ForecastSource<B>, M: BorrowMut<LoadedMode
     }
 }
 
-impl<B: TextGenerationBackend> LoadedModel<B> {
+impl<B: eredu_core::TextGenerationBackend, I: eredu_core::TextExecutionSession<B>>
+    LoadedModel<B, I>
+{
     /// Lends a target-only generation owner with no speculative backend bound.
-    pub fn session(&mut self) -> PlannedModel<B, NoDrafting, &mut Self> {
+    pub fn session(&mut self) -> PlannedModel<B, I, NoDrafting, &mut Self> {
         PlannedModel {
             model: self,
             drafting: NoDrafting,
@@ -204,7 +236,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         }
     }
     /// Owns a target-only generation session.
-    pub fn into_session(self) -> PlannedModel<B> {
+    pub fn into_session(self) -> PlannedModel<B, I> {
         PlannedModel {
             model: self,
             drafting: NoDrafting,
@@ -213,6 +245,11 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
             backend: PhantomData,
         }
     }
+}
+
+impl<B: eredu_core::TextGenerationBackend, I: eredu_core::TextExecutionSession<B>>
+    LoadedModel<B, I>
+{
     /// Lends an explicitly paired source and its default speculative policy.
     /// `None` starts the source in causal mode unless the request selects another
     /// mode. Explicit options supply speculative defaults and resource ceilings.
@@ -221,7 +258,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         &'a mut self,
         drafting: SpeculativeDraft<'a, D>,
         options: Option<SpeculationOptions>,
-    ) -> PlannedModel<B, SpeculativeDraft<'a, D>, &'a mut Self> {
+    ) -> PlannedModel<B, I, SpeculativeDraft<'a, D>, &'a mut Self> {
         PlannedModel {
             model: self,
             drafting,
@@ -241,12 +278,12 @@ fn speculative_output(
     })
 }
 
-fn with_source<'a, B: TextGenerationBackend, D, F>(
-    request: GenerationRequest<'a, B, F>,
+fn with_source<'a, P, D, F>(
+    request: GenerationRequest<'a, P, F>,
     drafting: SpeculativeDraft<'a, D>,
     limits: Option<SpeculationOptions>,
     started: std::time::Instant,
-) -> SourceRequest<'a, B, D, F> {
+) -> SourceRequest<'a, P, D, F> {
     SourceRequest {
         request,
         drafting,
@@ -255,31 +292,39 @@ fn with_source<'a, B: TextGenerationBackend, D, F>(
     }
 }
 
-trait Source<B: TextGenerationBackend> {
+trait Source<B: eredu_core::TextGenerationBackend, I: eredu_core::TextExecutionSession<B>> {
     fn generate<F: FnMut(SemanticEvent)>(
         &mut self,
-        model: &mut LoadedModel<B>,
-        request: GenerationRequest<'_, B, F>,
+        model: &mut LoadedModel<B, I>,
+        request: GenerationRequest<'_, I::Prompt, F>,
         limits: Option<SpeculationOptions>,
         started: std::time::Instant,
     ) -> Result<GenerationOutput<GenerationStats>, PreparedChatError>;
 }
-impl<B: TextGenerationBackend> Source<B> for NoDrafting {
+impl<B, I> Source<B, I> for NoDrafting
+where
+    B: eredu_core::TextGenerationBackend,
+    I: eredu_core::TextExecutionSession<B> + eredu_core::AutomaticPromptCacheSession<B>,
+{
     fn generate<F: FnMut(SemanticEvent)>(
         &mut self,
-        model: &mut LoadedModel<B>,
-        request: GenerationRequest<'_, B, F>,
+        model: &mut LoadedModel<B, I>,
+        request: GenerationRequest<'_, I::Prompt, F>,
         _limits: Option<SpeculationOptions>,
         started: std::time::Instant,
     ) -> Result<GenerationOutput<GenerationStats>, PreparedChatError> {
         model.generate_request(request, started)
     }
 }
-impl<B: SpeculativeGenerationBackend> Source<B> for SpeculativeDraft<'_, B::Drafter> {
+impl<B, I> Source<B, I> for SpeculativeDraft<'_, B::Drafter>
+where
+    B: SpeculativeBatchBackend<I>,
+    I: eredu_core::TextExecutionSession<B>,
+{
     fn generate<F: FnMut(SemanticEvent)>(
         &mut self,
-        model: &mut LoadedModel<B>,
-        request: GenerationRequest<'_, B, F>,
+        model: &mut LoadedModel<B, I>,
+        request: GenerationRequest<'_, I::Prompt, F>,
         limits: Option<SpeculationOptions>,
         started: std::time::Instant,
     ) -> Result<GenerationOutput<GenerationStats>, PreparedChatError> {
@@ -288,11 +333,15 @@ impl<B: SpeculativeGenerationBackend> Source<B> for SpeculativeDraft<'_, B::Draf
             .map(speculative_output)
     }
 }
-impl<B: SpeculativeGenerationBackend> Source<B> for RealizedDrafting<B::Drafter> {
+impl<B, I> Source<B, I> for RealizedDrafting<B::Drafter>
+where
+    B: SpeculativeBatchBackend<I>,
+    I: eredu_core::TextExecutionSession<B> + eredu_core::AutomaticPromptCacheSession<B>,
+{
     fn generate<F: FnMut(SemanticEvent)>(
         &mut self,
-        model: &mut LoadedModel<B>,
-        request: GenerationRequest<'_, B, F>,
+        model: &mut LoadedModel<B, I>,
+        request: GenerationRequest<'_, I::Prompt, F>,
         limits: Option<SpeculationOptions>,
         started: std::time::Instant,
     ) -> Result<GenerationOutput<GenerationStats>, PreparedChatError> {
@@ -305,21 +354,29 @@ impl<B: SpeculativeGenerationBackend> Source<B> for RealizedDrafting<B::Drafter>
     }
 }
 
-trait ForecastSource<B: GenerationForecastBackend> {
+trait ForecastSource<
+    B: eredu_core::TextGenerationBackend,
+    I: GenerationForecastSession<B> + eredu_core::TextExecutionSession<B>,
+>
+{
     fn forecast<F>(
         &mut self,
-        model: &LoadedModel<B>,
-        request: &GenerationRequest<'_, B, F>,
+        model: &LoadedModel<B, I>,
+        request: &GenerationRequest<'_, I::Prompt, F>,
         settings: PreparedChatGenerationSettings,
         options: &GenerationForecastOptions,
         limits: Option<SpeculationOptions>,
     ) -> Result<GenerationForecast, GenerationForecastError>;
 }
-impl<B: GenerationForecastBackend> ForecastSource<B> for NoDrafting {
+impl<
+        B: eredu_core::TextGenerationBackend,
+        I: GenerationForecastSession<B> + eredu_core::TextExecutionSession<B>,
+    > ForecastSource<B, I> for NoDrafting
+{
     fn forecast<F>(
         &mut self,
-        model: &LoadedModel<B>,
-        request: &GenerationRequest<'_, B, F>,
+        model: &LoadedModel<B, I>,
+        request: &GenerationRequest<'_, I::Prompt, F>,
         settings: PreparedChatGenerationSettings,
         options: &GenerationForecastOptions,
         _limits: Option<SpeculationOptions>,
@@ -327,14 +384,15 @@ impl<B: GenerationForecastBackend> ForecastSource<B> for NoDrafting {
         model.forecast_input(&request.input, settings, options, false)
     }
 }
-impl<B, D> ForecastSource<B> for SpeculativeDraft<'_, D>
+impl<B, I, D> ForecastSource<B, I> for SpeculativeDraft<'_, D>
 where
-    B: GenerationForecastBackend + SpeculativeForecastBackend<D>,
+    B: eredu_core::TextGenerationBackend,
+    I: SpeculativeForecastSession<B, D> + eredu_core::TextExecutionSession<B>,
 {
     fn forecast<F>(
         &mut self,
-        model: &LoadedModel<B>,
-        request: &GenerationRequest<'_, B, F>,
+        model: &LoadedModel<B, I>,
+        request: &GenerationRequest<'_, I::Prompt, F>,
         settings: PreparedChatGenerationSettings,
         options: &GenerationForecastOptions,
         limits: Option<SpeculationOptions>,
@@ -347,14 +405,15 @@ where
         Ok(forecast)
     }
 }
-impl<B, D> ForecastSource<B> for RealizedDrafting<D>
+impl<B, I, D> ForecastSource<B, I> for RealizedDrafting<D>
 where
-    B: GenerationForecastBackend + SpeculativeForecastBackend<D>,
+    B: eredu_core::TextGenerationBackend,
+    I: SpeculativeForecastSession<B, D> + eredu_core::TextExecutionSession<B>,
 {
     fn forecast<F>(
         &mut self,
-        model: &LoadedModel<B>,
-        request: &GenerationRequest<'_, B, F>,
+        model: &LoadedModel<B, I>,
+        request: &GenerationRequest<'_, I::Prompt, F>,
         settings: PreparedChatGenerationSettings,
         options: &GenerationForecastOptions,
         limits: Option<SpeculationOptions>,
@@ -441,18 +500,25 @@ pub enum GenerationStep {
 /// Scoped advancement over the same drivers used by uninterrupted generation.
 /// Common operations do not require selecting an execution mechanism. Inspectors
 /// can borrow the typed controller for its specialized snapshots and interventions.
-pub enum GenerationControl<'a, 'm, B: TextGenerationBackend> {
+pub enum GenerationControl<
+    'a,
+    'm,
+    B: eredu_core::TextGenerationBackend,
+    I: eredu_core::TextExecutionSession<B>,
+> {
     /// Ordinary target driver and synchronous committed-event delivery.
     Ordinary {
         /// Native state stays borrowed for this scope.
-        session: &'a mut super::ControlledGenerationSession<'m, B>,
+        session: &'a mut super::ControlledGenerationSession<'m, B, I>,
         /// Shared request callback, excluding tentative output.
         on_event: &'a mut dyn FnMut(SemanticEvent),
     },
     /// Retained speculative source and its existing scheduler.
     Speculative(&'a mut dyn super::ControlledSpeculativeSession),
 }
-impl<'a, 'm, B: TextGenerationBackend> GenerationControl<'a, 'm, B> {
+impl<'a, 'm, B: eredu_core::TextGenerationBackend, I: eredu_core::TextExecutionSession<B>>
+    GenerationControl<'a, 'm, B, I>
+{
     /// Canonical committed output, excluding draft proposals.
     pub fn token_ids(&self) -> &[u32] {
         match self {
@@ -505,7 +571,7 @@ impl<'a, 'm, B: TextGenerationBackend> GenerationControl<'a, 'm, B> {
         Ok(())
     }
     /// Borrows the ordinary controller for typed snapshots and interventions.
-    pub fn ordinary(&mut self) -> Option<&mut super::ControlledGenerationSession<'m, B>> {
+    pub fn ordinary(&mut self) -> Option<&mut super::ControlledGenerationSession<'m, B, I>> {
         match self {
             Self::Ordinary { session, .. } => Some(*session),
             _ => None,
@@ -521,20 +587,24 @@ impl<'a, 'm, B: TextGenerationBackend> GenerationControl<'a, 'm, B> {
 }
 
 #[allow(private_bounds)]
-impl<B: TextGenerationBackend, S: ControlSource<B>, M: BorrowMut<LoadedModel<B>>>
-    PlannedModel<B, S, M>
+impl<B, I, S, M> PlannedModel<B, I, S, M>
+where
+    B: eredu_core::TextGenerationBackend,
+    I: eredu_core::TextExecutionSession<B>,
+    S: ControlSource<B, I>,
+    M: BorrowMut<LoadedModel<B, I>>,
 {
     /// Lends explicit advancement with the same request, defaults and result as `generate`.
     /// Dropping an unfinished scope cancels and settles its existing driver.
     pub fn with_controlled<F, D>(
         &mut self,
-        mut request: GenerationRequest<'_, B, F>,
+        mut request: GenerationRequest<'_, I::Prompt, F>,
         options: GenerationControlOptions,
         drive: D,
     ) -> Result<GenerationOutput<GenerationStats>, SessionControlError>
     where
         F: FnMut(SemanticEvent),
-        D: FnOnce(&mut GenerationControl<'_, '_, B>) -> Result<(), SessionControlError>,
+        D: FnOnce(&mut GenerationControl<'_, '_, B, I>) -> Result<(), SessionControlError>,
     {
         let started = std::time::Instant::now();
         request.link_cancellation();
@@ -564,7 +634,7 @@ impl<B: TextGenerationBackend, S: ControlSource<B>, M: BorrowMut<LoadedModel<B>>
     /// Breaking delivery cancels the same driver and closes further step delivery.
     pub fn generate_observed<F, D>(
         &mut self,
-        request: GenerationRequest<'_, B, F>,
+        request: GenerationRequest<'_, I::Prompt, F>,
         options: GenerationControlOptions,
         mut on_step: D,
     ) -> Result<GenerationOutput<GenerationStats>, SessionControlError>
@@ -596,14 +666,14 @@ impl<B: TextGenerationBackend, S: ControlSource<B>, M: BorrowMut<LoadedModel<B>>
     }
 }
 
-trait ControlSource<B: TextGenerationBackend> {
+trait ControlSource<B: eredu_core::TextGenerationBackend, I: eredu_core::TextExecutionSession<B>> {
     fn admission_stage(&self) -> eredu_core::run_preparation::TextPreparationStage {
         eredu_core::run_preparation::TextPreparationStage::Instrumentation
     }
     fn controlled<F, D>(
         &mut self,
-        model: &mut LoadedModel<B>,
-        request: GenerationRequest<'_, B, F>,
+        model: &mut LoadedModel<B, I>,
+        request: GenerationRequest<'_, I::Prompt, F>,
         options: GenerationControlOptions,
         limits: Option<SpeculationOptions>,
         started: std::time::Instant,
@@ -611,16 +681,20 @@ trait ControlSource<B: TextGenerationBackend> {
     ) -> Result<GenerationOutput<GenerationStats>, SessionControlError>
     where
         F: FnMut(SemanticEvent),
-        D: FnOnce(&mut GenerationControl<'_, '_, B>) -> Result<(), SessionControlError>;
+        D: FnOnce(&mut GenerationControl<'_, '_, B, I>) -> Result<(), SessionControlError>;
 }
-impl<B: eredu_core::ModelCapabilityBackend> ControlSource<B> for NoDrafting {
+impl<B, I> ControlSource<B, I> for NoDrafting
+where
+    B: eredu_core::TextGenerationBackend,
+    I: eredu_core::TextExecutionSession<B> + eredu_core::ModelCapabilitySession<B>,
+{
     fn admission_stage(&self) -> eredu_core::run_preparation::TextPreparationStage {
         eredu_core::run_preparation::TextPreparationStage::Request
     }
     fn controlled<F, D>(
         &mut self,
-        model: &mut LoadedModel<B>,
-        request: GenerationRequest<'_, B, F>,
+        model: &mut LoadedModel<B, I>,
+        request: GenerationRequest<'_, I::Prompt, F>,
         options: GenerationControlOptions,
         _limits: Option<SpeculationOptions>,
         started: std::time::Instant,
@@ -628,7 +702,7 @@ impl<B: eredu_core::ModelCapabilityBackend> ControlSource<B> for NoDrafting {
     ) -> Result<GenerationOutput<GenerationStats>, SessionControlError>
     where
         F: FnMut(SemanticEvent),
-        D: FnOnce(&mut GenerationControl<'_, '_, B>) -> Result<(), SessionControlError>,
+        D: FnOnce(&mut GenerationControl<'_, '_, B, I>) -> Result<(), SessionControlError>,
     {
         use super::PreparedChatInput;
         let prepared = (|| -> Result<_, PreparedChatError> {
@@ -691,9 +765,9 @@ impl<B: eredu_core::ModelCapabilityBackend> ControlSource<B> for NoDrafting {
                     )?;
                     prepared
                 }
-                PreparedChatInput::PreparedBackendInput { prompt, .. } => {
+                PreparedChatInput::PreparedInput { prompt, .. } => {
                     let count = model.count_prepared_input(&prompt)?;
-                    let ids = B::prepared_input_token_ids(&model.runtime, &prompt)
+                    let ids = I::prepared_input_token_ids(&model.runtime, &prompt)
                         .map_err(PreparedChatError::Backend)?;
                     if u64::try_from(ids.len()).ok() != Some(count.model_positions) {
                         return Err(PreparedChatError::Alignment {
@@ -784,14 +858,15 @@ impl<B: eredu_core::ModelCapabilityBackend> ControlSource<B> for NoDrafting {
         ))
     }
 }
-impl<B> ControlSource<B> for SpeculativeDraft<'_, B::Drafter>
+impl<B, I> ControlSource<B, I> for SpeculativeDraft<'_, B::Drafter>
 where
-    B: SpeculativeGenerationBackend + SpeculativeForecastBackend<B::Drafter>,
+    B: SpeculativeBatchBackend<I>,
+    I: SpeculativeForecastSession<B, B::Drafter> + eredu_core::TextExecutionSession<B>,
 {
     fn controlled<F, D>(
         &mut self,
-        model: &mut LoadedModel<B>,
-        request: GenerationRequest<'_, B, F>,
+        model: &mut LoadedModel<B, I>,
+        request: GenerationRequest<'_, I::Prompt, F>,
         options: GenerationControlOptions,
         limits: Option<SpeculationOptions>,
         started: std::time::Instant,
@@ -799,7 +874,7 @@ where
     ) -> Result<GenerationOutput<GenerationStats>, SessionControlError>
     where
         F: FnMut(SemanticEvent),
-        D: FnOnce(&mut GenerationControl<'_, '_, B>) -> Result<(), SessionControlError>,
+        D: FnOnce(&mut GenerationControl<'_, '_, B, I>) -> Result<(), SessionControlError>,
     {
         let mode = request.output_mode;
         #[cfg(feature = "tensor-capture")]
@@ -854,9 +929,10 @@ where
         Ok(speculative_output(result?))
     }
 }
-impl<B> ControlSource<B> for RealizedDrafting<B::Drafter>
+impl<B, I> ControlSource<B, I> for RealizedDrafting<B::Drafter>
 where
-    B: SpeculativeGenerationBackend + SpeculativeForecastBackend<B::Drafter>,
+    B: SpeculativeBatchBackend<I>,
+    I: SpeculativeForecastSession<B, B::Drafter> + eredu_core::TextExecutionSession<B>,
 {
     fn admission_stage(&self) -> eredu_core::run_preparation::TextPreparationStage {
         if self.is_enabled() {
@@ -867,8 +943,8 @@ where
     }
     fn controlled<F, D>(
         &mut self,
-        model: &mut LoadedModel<B>,
-        request: GenerationRequest<'_, B, F>,
+        model: &mut LoadedModel<B, I>,
+        request: GenerationRequest<'_, I::Prompt, F>,
         options: GenerationControlOptions,
         limits: Option<SpeculationOptions>,
         started: std::time::Instant,
@@ -876,7 +952,7 @@ where
     ) -> Result<GenerationOutput<GenerationStats>, SessionControlError>
     where
         F: FnMut(SemanticEvent),
-        D: FnOnce(&mut GenerationControl<'_, '_, B>) -> Result<(), SessionControlError>,
+        D: FnOnce(&mut GenerationControl<'_, '_, B, I>) -> Result<(), SessionControlError>,
     {
         match self.as_speculative_draft() {
             Some(mut draft) => draft.controlled(model, request, options, limits, started, drive),

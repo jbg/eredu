@@ -1,10 +1,12 @@
 //! EAR decoder units over the shared resident and bounded traversal.
+
 use crate::ear_specs::DecoderSpec;
 use crate::{
     ear_decoder::{invalid, DecoderConfig, DecoderState, DecoderUnit, DecoderUnitSpec},
     streaming::StreamPhase,
     Error,
 };
+use eredu_core::SubmissionBackend;
 use eredu_core::{cache::LayerCachePolicy, BackendFailure, LayerSchedule};
 use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Tensor, TensorElementType};
 use eredu_runtime::{
@@ -14,7 +16,7 @@ use eredu_runtime::{
     ComponentKernel, ComponentUnit, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress,
     ExecutionUnitLayout, LayeredForwardState, LayeredInvocation, LayerwisePolicy, LayerwiseRuntime,
     LocalModelLayout, OwnedParameterGroupSpec, ParallelComponentKernel, ParameterGroupOwner,
-    RuntimeState, StateError, StateLayout, SubmissionBackend,
+    RuntimeState, StateError, StateLayout,
 };
 use std::marker::PhantomData;
 

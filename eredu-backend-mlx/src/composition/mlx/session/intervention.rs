@@ -6,8 +6,6 @@ use eredu_core::{capture::*, intervention::*};
 use safemlx::ops::indexing::{ArrayIndex, IntoStrideBy, TryIndexMutOp};
 
 mod routed;
-#[cfg(test)]
-mod tests;
 
 pub(crate) fn mechanisms() -> InterventionMechanisms {
     InterventionMechanisms {
@@ -164,7 +162,7 @@ impl InterventionEstimator for NativeInterventionEstimator {
         selection: &CaptureSelection,
         slice: &ResolvedCaptureSlice,
     ) -> Result<CaptureUsage, CaptureError> {
-        super::bounded_capture::estimate_shape(source, selection, slice)
+        super::bounded_capture::CAPTURE_WORKSPACE.estimate(source, selection, slice)
     }
     fn original_route_usage(
         &self,

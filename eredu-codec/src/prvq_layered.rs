@@ -1,4 +1,5 @@
 //! Independently leased residual codebooks over the shared layered traversal.
+
 use crate::{
     prvq::{
         checked_rows, invalid, lookup_codes, quantize_residual_with_score_reduction, require_f32,
@@ -8,6 +9,7 @@ use crate::{
     Error,
 };
 use eredu_core::BackendFailure;
+use eredu_core::SubmissionBackend;
 use eredu_nn::{DistributedNeuralBackend, Index, NeuralBackend, Tensor, TensorElementType};
 use eredu_runtime::{
     ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitectureGroupTransport,
@@ -17,7 +19,7 @@ use eredu_runtime::{
     ExecutionUnitLayout, LayeredForwardState, LayeredInvocation, LayeredTraversalHook,
     LayerwisePolicy, LayerwiseRuntime, LocalModelLayout, MemberSharding, OwnedParameterGroupSpec,
     ParallelComponentKernel, ParameterGroupOwner, ParameterGroupSpec, ParameterRole,
-    StatelessComponentState, SubmissionBackend,
+    StatelessComponentState,
 };
 use std::marker::PhantomData;
 use std::ops::Range;

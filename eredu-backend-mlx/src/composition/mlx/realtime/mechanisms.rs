@@ -1,197 +1,113 @@
 //! MLX resource binding and completion for portable realtime execution.
 
+use crate::backend::runtime::cache::MlxCacheBackend;
 use crate::{
-    backend::{
-        nn::shared::MlxNeuralBackend,
-        runtime::{
-            cache::state::{MlxHybridState, MlxJointState, MlxJointStateBranch, MlxKeyValueState},
-            generation::MlxSamplingBackend,
-            realtime::MlxRealtimeChannelObserver,
-        },
-    },
+    backend::{nn::shared::MlxNeuralBackend, runtime::generation::MlxSamplingBackend},
     native::{
-        ExecutionContext, MlxComponentBinder, MlxPrepublicationFrame, MlxRealtimeBinding,
-        MlxRealtimeExecution, MlxRealtimeExecutionContext, MlxReplicatedCoordinator,
-        SharedRealtimeExecution,
+        ExecutionContext, MlxComponentBinder, MlxRealtimeBinding, MlxRealtimeExecutionContext,
+        MlxRealtimeQueue,
     },
     MlxBackendFactory, MlxTensor,
 };
+use eredu_core::realtime_mechanisms::{CategoricalRealtimeNative, SpeechRealtimeNative};
 use eredu_core::{
-    scheduler::SemanticStateTransaction, BackendFailure, DevicePlan, RealtimeInputFrame,
-    RealtimeOutputFrame,
-};
-use eredu_nn::{RetainedTensorRoots, Tensor};
-use eredu_runtime::{
-    BeginRealtimeSubmission, CategoricalFrameBranch, CategoricalRealtimeMechanisms,
-    PreparedRealtimeBinding, PrepublicationRealtimeFrame, RealtimeBackendFactory,
-    RealtimeBindingMechanisms, RealtimeFrameHostObserver, RealtimeFramePlan, RealtimeHostFrame,
-    RealtimeHostOutputProjection, RealtimeScheduleState, RealtimeSubmissionBranch,
-    SpeechRealtimeMechanisms,
+    realtime_mechanisms::{
+        RealtimeBindingMechanisms, RealtimeBindingTarget, RealtimeContextFactory,
+        RealtimeRandomRoot,
+    },
+    BackendFailure, DevicePlan,
 };
 
 use super::MlxRealtimeSupport;
+use safemlx::Stream;
 
-impl CategoricalRealtimeMechanisms for MlxRealtimeExecutionContext {
+impl CategoricalRealtimeNative for MlxRealtimeExecutionContext {
     type Neural = MlxNeuralBackend;
-    type State = MlxKeyValueState;
-    type Execution = MlxRealtimeExecution;
-    type BindingError = <MlxRealtimeBinding<'static> as RealtimeBindingMechanisms<
-        Self::Neural,
-        Self::State,
-    >>::Error;
-    type Group = <MlxRealtimeBinding<'static> as RealtimeBindingMechanisms<
-        Self::Neural,
-        Self::State,
-    >>::Group;
-    type Route = <MlxRealtimeBinding<'static> as RealtimeBindingMechanisms<
-        Self::Neural,
-        Self::State,
-    >>::Route;
-    type TensorMetadata = <MlxRealtimeBinding<'static> as RealtimeBindingMechanisms<
-        Self::Neural,
-        Self::State,
-    >>::TensorMetadata;
-    type Binding<'a> = MlxRealtimeBinding<'a>;
-    type Frame<P>
-        = MlxPrepublicationFrame<P>
-    where
-        P: RealtimeHostOutputProjection<
-            RealtimeHostFrame,
-            Output = RealtimeOutputFrame,
-            Error: Send + Sync,
-        >;
+    type FrameQueue = MlxRealtimeQueue;
+    type BindingError =
+        <MlxRealtimeBinding<'static> as RealtimeBindingMechanisms<Self::Neural>>::Error;
+    type Group = <MlxRealtimeBinding<'static> as RealtimeBindingMechanisms<Self::Neural>>::Group;
+    type Route = <MlxRealtimeBinding<'static> as RealtimeBindingMechanisms<Self::Neural>>::Route;
+    type TensorMetadata =
+        <MlxRealtimeBinding<'static> as RealtimeBindingMechanisms<Self::Neural>>::TensorMetadata;
+    type Materializer = MlxComponentBinder;
+    type Rank = crate::backend::MlxRankContext;
 
-    fn bind<P, E, F>(&self, prepared: P) -> Result<E, BackendFailure>
-    where
-        for<'a> P: PreparedRealtimeBinding<
-            Self::Neural,
-            Self::State,
-            Self::Binding<'a>,
-            Execution = E,
-            Error = F,
-        >,
-        F: std::error::Error + Send + Sync + 'static,
-    {
-        self.bind_realtime(prepared, None)
-            .map_err(BackendFailure::from_error)
-    }
+    type FrameSampling = MlxSamplingBackend;
+    type FrameError = crate::backend::error::Error;
+    type FrameTensors<'a> = super::frame_execution::MlxRealtimeFrameTensorMechanisms<'a>;
 
-    fn validate_execution(&self, execution: &Self::Execution) -> Result<(), BackendFailure> {
-        self.validate_execution(execution)
-    }
-
-    fn submit<P>(
-        &self,
-        execution: &Self::Execution,
-        plan: RealtimeFramePlan<P>,
-        input: &RealtimeInputFrame,
-        branch: &mut CategoricalFrameBranch<Self>,
-    ) -> Result<Self::Frame<P>, BackendFailure>
-    where
-        P: RealtimeHostOutputProjection<
-            RealtimeHostFrame,
-            Output = RealtimeOutputFrame,
-            Error: Send + Sync,
-        >,
-    {
-        self.submit_realtime(execution, plan, input, branch)
-            .map_err(BackendFailure::from_error)
-    }
-
-    fn into_host_output<P>(frame: Self::Frame<P>) -> Result<RealtimeOutputFrame, BackendFailure>
-    where
-        P: RealtimeHostOutputProjection<
-            RealtimeHostFrame,
-            Output = RealtimeOutputFrame,
-            Error: Send + Sync,
-        >,
-    {
-        frame.into_host_output().map_err(BackendFailure::from_error)
+    fn frame_tensors(queue: &Self::FrameQueue) -> Self::FrameTensors<'_> {
+        super::frame_execution::MlxRealtimeFrameTensorMechanisms::new(&queue.stream)
     }
 }
 
-impl SpeechRealtimeMechanisms for MlxRealtimeExecutionContext {
+impl RealtimeBindingTarget<crate::backend::MlxRankContext, MlxRealtimeQueue>
+    for MlxRealtimeExecutionContext
+{
+    type Binding<'a> = MlxRealtimeBinding<'a>;
+
+    fn native_rank_identity(rank: &crate::backend::MlxRankContext) -> (usize, usize) {
+        (rank.world_size(), rank.global_rank())
+    }
+
+    fn world_identity(&self) -> Option<(usize, usize)> {
+        self.world_identity()
+    }
+
+    fn allocator_cache_defaults(
+        &self,
+    ) -> Option<&dyn eredu_core::capability::NativeAllocatorCacheDefaults> {
+        Some(&crate::MlxAllocatorCacheDefaults)
+    }
+
+    fn open_binding(
+        &self,
+        native_rank: Option<&crate::backend::MlxRankContext>,
+    ) -> Result<Self::Binding<'_>, BackendFailure> {
+        self.open_materialization(native_rank)
+            .map_err(BackendFailure::from_error)
+    }
+
+    fn finish_binding(&self) -> Result<(), BackendFailure> {
+        crate::trim_allocator_cache().map_err(BackendFailure::from_error)
+    }
+
+    fn validate_execution(&self, queue: &MlxRealtimeQueue) -> Result<(), BackendFailure> {
+        self.validate_execution(queue)
+    }
+}
+
+impl RealtimeRandomRoot<MlxTensor> for MlxRealtimeExecutionContext {
+    fn random_root(random: &crate::backend::random::RandomState) -> MlxTensor {
+        MlxTensor::from_array(random.as_array().clone())
+    }
+}
+
+impl SpeechRealtimeNative for MlxRealtimeExecutionContext {
     type Neural = MlxNeuralBackend;
-    type Backbone = MlxHybridState;
-    type Speech = MlxKeyValueState;
-    type SpeechLayer =
-        <MlxKeyValueState as eredu_runtime::LayerRuntimeState<Self::Neural>>::LayerState;
-    type Joint = MlxJointState;
-    type JointBranch = <MlxJointState as SemanticStateTransaction>::Branch;
+    type CacheBackend = MlxCacheBackend;
+
+    fn state_copy_queue(&self) -> Stream {
+        self.stream().clone()
+    }
+
     type Components = MlxComponentBinder;
-    type Cohort = MlxReplicatedCoordinator;
     type Sampling = MlxSamplingBackend;
-    type Owner<C: 'static> = SharedRealtimeExecution<C>;
-    type Observer = MlxRealtimeChannelObserver;
+    type Queue = MlxRealtimeQueue;
 
     fn components(&self) -> Self::Components {
         self.component_binder()
     }
 
-    fn own<C: 'static>(&self, components: C) -> Self::Owner<C> {
-        SharedRealtimeExecution::new(components, self.stream())
-    }
-
-    fn share<C: 'static>(owner: &Self::Owner<C>) -> Self::Owner<C> {
-        owner.share()
-    }
-
-    fn is_busy<C: 'static>(owner: &Self::Owner<C>) -> bool {
-        owner.is_busy()
-    }
-
-    fn observer<C: 'static>(owner: &Self::Owner<C>) -> Self::Observer {
-        MlxRealtimeChannelObserver::new(owner.stream())
-    }
-
-    fn submit<C, S, Q, P, A, I, O, H>(
-        owner: &Self::Owner<C>,
-        branch: &mut RealtimeSubmissionBranch<Self, S, Q, P, A>,
-        input: &I,
-        joint: impl Fn(&S) -> &MlxJointStateBranch,
-        visit: impl for<'a> Fn(&'a S, &mut dyn FnMut(&'a MlxTensor)),
-        observer: H,
-        invoke: impl FnOnce(
-            &mut C,
-            &mut RealtimeSubmissionBranch<Self, S, Q, P, A>,
-            &<MlxTensor as Tensor>::Context,
-            &mut BeginRealtimeSubmission<'_, RealtimeSubmissionBranch<Self, S, Q, P, A>>,
-        ) -> Result<O, BackendFailure>,
-    ) -> Result<PrepublicationRealtimeFrame<O, Self::Completion, H>, BackendFailure>
-    where
-        C: 'static,
-        Q: RealtimeScheduleState,
-        I: RetainedTensorRoots<MlxTensor> + ?Sized,
-        O: RetainedTensorRoots<MlxTensor>,
-        H: RealtimeFrameHostObserver<O>,
-    {
-        owner.submit(
-            branch,
-            input,
-            |branch| {
-                let mut roots = joint(branch.model_state())
-                    .retained_arrays()
-                    .into_iter()
-                    .cloned()
-                    .collect::<Vec<_>>();
-                visit(branch.model_state(), &mut |tensor| {
-                    roots.push(tensor.as_array().clone())
-                });
-                roots.extend(
-                    branch
-                        .random_state()
-                        .map(|random| random.as_array().clone()),
-                );
-                roots
-            },
-            |branch| joint(branch.model_state()).retention(),
-            observer,
-            invoke,
-        )
+    fn speech_queue(&self) -> Self::Queue {
+        self.queue()
     }
 }
 
-impl RealtimeBackendFactory for MlxBackendFactory {
+impl RealtimeContextFactory for MlxBackendFactory {
+    type Context = ExecutionContext;
+    type MediaGraphSupport = MlxRealtimeSupport;
     type Support = MlxRealtimeSupport;
     type Mechanisms = MlxRealtimeExecutionContext;
 
@@ -199,42 +115,37 @@ impl RealtimeBackendFactory for MlxBackendFactory {
         MlxRealtimeSupport::new(false)
     }
 
-    fn media_graph_support(&self) -> impl eredu_runtime::RealtimeMechanismSupport {
+    fn media_graph_support(&self) -> Self::MediaGraphSupport {
         MlxRealtimeSupport::new(crate::native::MlxRingTransport::is_available())
     }
 
-    fn open_realtime(&self, device: &DevicePlan) -> Result<Self::Mechanisms, BackendFailure> {
-        let weights = ExecutionContext::cpu().map_err(BackendFailure::from_error)?;
-        let execution = self.execution_context(device)?;
-        Ok(MlxRealtimeExecutionContext::new(
-            execution.stream(),
-            weights.stream(),
-        ))
+    fn open_realtime_execution(
+        &self,
+        device: &DevicePlan,
+    ) -> Result<ExecutionContext, BackendFailure> {
+        self.execution_context(device)
+    }
+
+    fn open_realtime_host(&self) -> Result<ExecutionContext, BackendFailure> {
+        ExecutionContext::cpu().map_err(BackendFailure::from_error)
     }
 }
 
 #[cfg(feature = "audio")]
-impl eredu_architectures::processor_execution::MediaGraphMechanisms
-    for MlxRealtimeExecutionContext
-{
+impl eredu_core::realtime_mechanisms::MediaGraphNative for MlxRealtimeExecutionContext {
     type Neural = MlxNeuralBackend;
-    type Transport =
-        <crate::native::MlxRingTransport as eredu_runtime::PipelineTransportProvider>::Transport;
+    type World = crate::native::MlxRingTransport;
     type Graph = MlxComponentBinder;
 
     fn graph(&self) -> Self::Graph {
         self.component_binder()
     }
 
-    fn media_lowering(
-        &self,
-    ) -> impl eredu_architectures::processor_execution::MediaInputLowering<MlxTensor> {
+    fn media_lowering(&self) -> impl eredu_core::input::MediaInputLowering<MlxTensor> {
         crate::native::MlxMediaInputLowering
     }
 
-    fn pipeline_transport(
-        &self,
-    ) -> impl eredu_runtime::PipelineTransportProvider<Transport = Self::Transport> {
+    fn pipeline_world(&self) -> Self::World {
         crate::native::MlxRingTransport
     }
 }

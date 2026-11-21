@@ -3,11 +3,11 @@
 use std::num::NonZeroUsize;
 
 use eredu_checkpoint::recipe::RecipeDtype;
+use eredu_core::residency::parameter_binding::{physical_binding_bytes, WeightBinding};
 use eredu_core::ParallelRankTopology;
 use eredu_nn::Error;
 use eredu_runtime::{
-    execution_unit_parameter_window_bytes, physical_binding_bytes, ExecutionUnitAddressMap,
-    LayerWeightResidency, WeightBinding,
+    execution_unit_parameter_window_bytes, ExecutionUnitAddressMap, LayerWeightResidency,
 };
 
 use crate::lfm3::{
@@ -86,13 +86,13 @@ impl SelectedVlRankPlacement {
     }
 
     /// Manifest supplied to native communication realization.
-    pub fn communication_manifest(&self) -> &eredu_runtime::CommunicationManifest {
+    pub fn communication_manifest(&self) -> &eredu_core::communication::CommunicationManifest {
         &self.communication.manifest
     }
 
     pub(crate) fn with_completion_policy(
         mut self,
-        policy: eredu_runtime::CommunicationCompletionPolicy,
+        policy: eredu_core::communication::CommunicationCompletionPolicy,
     ) -> Self {
         self.communication.manifest = self.communication.manifest.with_completion_policy(policy);
         self
@@ -325,7 +325,7 @@ impl SelectedVlRankWeights {
     }
 
     /// Communication manifest for the selected rank.
-    pub fn communication_manifest(&self) -> &eredu_runtime::CommunicationManifest {
+    pub fn communication_manifest(&self) -> &eredu_core::communication::CommunicationManifest {
         &self.prepared.communication.manifest
     }
 

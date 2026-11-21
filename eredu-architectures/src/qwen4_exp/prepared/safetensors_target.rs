@@ -7,7 +7,8 @@ use eredu_checkpoint::{
     schema::SafetensorsCheckpointPlan,
     validation::{CatalogTensorMetadata, ResolvedCheckpointPlan, SafetensorsCatalog},
 };
-use eredu_runtime::{AppendStreamBinding, ReplicatedTextPhysicalSource, SelectedRowLookupPlans};
+use eredu_core::cache::append_stream::AppendStreamBinding;
+use eredu_runtime::{ReplicatedTextPhysicalSource, SelectedRowLookupPlans};
 
 /// Header-only target, prediction and vision contract. This value needs neither a
 /// readable source nor backend resources. Source provenance becomes authoritative

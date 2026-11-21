@@ -28,8 +28,11 @@ pub struct ScoreReadout {
 }
 
 impl ScoreReadout {
-    pub fn new<B: ParameterBackend>(
-        model: &mut LoadedModel<B>,
+    pub fn new<
+        B: eredu_core::TextGenerationBackend,
+        S: eredu_core::TextExecutionSession<B> + ParameterSession<B>,
+    >(
+        model: &mut LoadedModel<B, S>,
         graph: &ArchitectureDescriptor,
         facts: &ParameterDiscovery,
         step: &Value,

@@ -1,175 +1,74 @@
-//! Parameter work over retained members, independent of routing and cache eviction.
+//! Native binding access and completed copies for admitted parameter-bank transfers.
 use super::*;
-use eredu_runtime::parameter_operations::{
-    BankParameterReadPlan, ParameterSlotOperation, PreparedBankParameter,
-};
-use std::collections::BTreeSet;
+use crate::backend::runtime::residency::manager::MlxResidencyResources;
+use eredu_core::residency::{CompactGroupBindings, NativeBankMechanisms};
 
-impl SharedAddressableParameterBank {
-    pub(crate) fn owns_parameter_bank(&self, bank: usize) -> bool {
-        self.scope.is_none_or(|scope| scope == bank)
+impl NativeBankMechanisms for MlxResidencyResources {
+    type Backend = MlxNeuralBackend;
+    type BankError = Error;
+    type Loan = super::movement::MlxParameterLoan;
+
+    fn host_capacity_exhausted(error: &ResidencyError) -> bool {
+        matches!(
+            error,
+            ResidencyError::Ledger(ResidencyLedgerError::BudgetExhausted {
+                tier: MemoryTier::Host,
+                ..
+            })
+        )
     }
 
-    /// The caller has admitted and charged selected output copies before entry.
-    /// Member sources use the existing residency manager and completion-safe loans.
-    pub(crate) fn with_parameter_slots(
-        &self,
-        bank: usize,
-        unit: usize,
-        parameters: &[PreparedBankParameter],
-        selected: &BTreeSet<String>,
-        operation: &mut ParameterSlotOperation<'_, MlxTensor, Error>,
-        stream: &Stream,
-    ) -> Result<bool, Error> {
-        if !self.owns_parameter_bank(bank) {
-            return Ok(false);
-        }
-        let plan = BankParameterReadPlan::new(bank, unit, parameters, selected)
-            .map_err(|source| Error::Other(Box::new(source)))?;
-        let (manager, replacements) = {
-            let bank = self.inner.lock().map_err(|_| {
-                Error::ArchitectureModel("addressable parameter bank lock was poisoned".into())
+    fn member(transfer: &ResidentTransfer, index: usize, name: &str) -> Result<MlxTensor, Error> {
+        Ok(MlxTensor::from_array(
+            transfer.leases()[index].device_value(name)?.clone(),
+        ))
+    }
+
+    fn replacement(value: &MlxTensor, row: usize, stream: &Stream) -> Result<MlxTensor, Error> {
+        let end = row
+            .checked_add(1)
+            .and_then(|end| i32::try_from(end).ok())
+            .ok_or_else(|| {
+                Error::ArchitectureModel("replacement row exceeds MLX i32 indexing".into())
             })?;
-            let replacements = selected
-                .iter()
-                .filter_map(|id| {
-                    bank.parameter_replacements
-                        .get(id)
-                        .map(|value| (id.clone(), value.clone()))
-                })
-                .collect::<BTreeMap<_, _>>();
-            (bank.manager.clone(), replacements)
-        };
-        plan.with_slots(
-            |parameter| replacements.get(parameter).cloned(),
-            |member| {
-                let transfer = manager
-                    .acquire_many_with_transfer(&[(member.key.unit_id(), 1)], MemoryTier::Device)?;
-                crate::backend::runtime::execution::generic::with_parameter_transfer(
-                    transfer,
-                    stream,
-                    |lease| {
-                        let value = lease
-                            .device_value(&member.binding)?
-                            .ensure_device_storage(stream)?;
-                        value.evaluated()?;
-                        Ok(value)
-                    },
-                )
-            },
-            |copies| {
-                let value = concatenate_axis(&copies, 0, stream)?;
-                value.evaluated()?;
-                Ok(MlxTensor::from_array(value))
-            },
-            operation,
+        Ok(MlxTensor::from_array(
+            value
+                .as_array()
+                .try_index_device(((end - 1)..end, ..), stream)?,
+        ))
+    }
+
+    fn concatenate(values: &[MlxTensor], stream: &Stream) -> Result<MlxTensor, Error> {
+        MlxIndexedMovement.concatenate_rows(values, stream)
+    }
+
+    fn begin_loan(transfer: ResidentTransfer) -> Result<Self::Loan, Error> {
+        Self::Loan::begin(transfer)
+    }
+
+    fn assemble_members(copies: Vec<MlxTensor>, stream: &Stream) -> Result<MlxTensor, Error> {
+        let value = concatenate_axis(
+            &copies.iter().map(MlxTensor::as_array).collect::<Vec<_>>(),
+            0,
+            stream,
         )?;
-        Ok(true)
+        value.evaluated()?;
+        Ok(MlxTensor::from_array(value))
     }
 }
 
-/// Publishes ordinary and independent-bank handles only after every pool validates.
-/// No native work occurs here. Locks cover the final infallible bank handle swaps;
-/// the caller owns model quiescence and the outer all-rank transaction.
-pub(crate) fn publish_bank_parameter_replacements(
-    banks: &[SharedAddressableParameterBank],
-    values: &BTreeMap<String, MlxTensor>,
-    active: bool,
-    ordinary: impl FnOnce() -> Result<bool, Error>,
-) -> Result<bool, Error> {
-    let mut pools = Vec::new();
-    for bank in banks {
-        if !pools.iter().any(|pool| Arc::ptr_eq(pool, &bank.inner)) {
-            pools.push(Arc::clone(&bank.inner));
+macro_rules! compact_bindings {
+    ($($group:ident),+) => {$(
+        impl CompactGroupBindings<MlxTensor> for <MlxNeuralBackend as GroupedNeuralBackend>::$group {
+            fn binding_names(&self) -> Vec<String> {
+                self.local_parameter_names()
+            }
+
+            fn bind_compact(&mut self, values: BTreeMap<String, MlxTensor>) -> Result<(), eredu_nn::Error> {
+                self.bind_local_parameters(values.into_iter().map(|(name, tensor)| (name, tensor.as_array().clone())).collect())
+            }
         }
-    }
-    pools.sort_unstable_by_key(|pool| Arc::as_ptr(pool) as usize);
-    let mut guards = pools
-        .iter()
-        .map(|pool| {
-            pool.lock().map_err(|_| {
-                Error::ArchitectureModel("addressable parameter bank lock was poisoned".into())
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut prepared = Vec::with_capacity(guards.len());
-    for bank in &guards {
-        let (parameters, bytes) =
-            eredu_runtime::parameter_operations::prepare_bank_parameter_replacements(
-                bank.parameter_members.members(),
-                &bank.catalog,
-                active,
-                |parameter| {
-                    values.get(parameter).map(|value| {
-                        eredu_runtime::parameter_operations::BankParameterReplacementFacts {
-                            leading_dimension: value.as_array().shape().first().copied(),
-                            element_type: eredu_nn::Tensor::element_type(value),
-                            byte_len: value.as_array().nbytes() as u64,
-                        }
-                    })
-                },
-            )
-            .map_err(|source| Error::Other(Box::new(source)))?
-            .into_parts();
-        let replacements = parameters
-            .into_iter()
-            .map(|parameter| {
-                let value = values[&parameter].clone();
-                (parameter, value)
-            })
-            .collect();
-        prepared.push((replacements, bytes));
-    }
-    if !ordinary()? {
-        return Ok(false);
-    }
-    for (bank, (replacements, bytes)) in guards.iter_mut().zip(prepared) {
-        bank.parameter_replacements = replacements;
-        bank.effective_member_bytes = bytes;
-    }
-    Ok(true)
+    )+};
 }
 
-impl AddressableParameterBank {
-    pub(super) fn compact_parameter_binding(
-        &self,
-        acquisition: &AcquiredParameters,
-        binding: &str,
-        stream: &Stream,
-    ) -> Result<Array, AddressableParameterBankError> {
-        let mut values = Vec::with_capacity(acquisition.identities.len());
-        for (key, lease) in acquisition
-            .identities
-            .iter()
-            .zip(acquisition.transfer.leases())
-        {
-            let replacement = self
-                .parameter_members
-                .binding(*key, binding)
-                .and_then(|address| {
-                    self.parameter_replacements
-                        .get(&address.member().parameter)
-                        .map(|value| (address, value))
-                });
-            let value = if let Some((address, value)) = replacement {
-                let end = i32::try_from(address.row() + 1).map_err(|_| {
-                    AddressableParameterBankError::ReplacementRowOverflow {
-                        identity: *key,
-                        row: address.row(),
-                    }
-                })?;
-                let row = end - 1;
-                value.as_array().try_index_device((row..end, ..), stream)?
-            } else {
-                lease.device_value(binding)?.clone()
-            };
-            values.push(value);
-        }
-        if values.is_empty() {
-            return Err(AddressableParameterBankError::EmptyCompactBinding {
-                name: binding.into(),
-            });
-        }
-        Ok(concatenate_axis(&values, 0, stream)?)
-    }
-}
+compact_bindings!(GatedProductGroups, LinearGroups, Relu2Groups);

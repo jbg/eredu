@@ -4,7 +4,6 @@ use eredu_core::{
     component::ComponentCoordinateMap, ObservationPoint, ObservationValueType, TensorObservation,
     TensorObservationData,
 };
-#[cfg(feature = "tensor-capture")]
 use std::collections::BTreeMap;
 
 /// One expected sparse producer. The unit projection is rectangular; expert
@@ -19,12 +18,10 @@ pub struct PartitionRoutedCaptureProducer {
     pub ownership: RoutedUnitCaptureOwnership,
 }
 
-#[cfg(feature = "tensor-capture")]
 fn invalid(message: &str) -> CaptureError {
     CaptureError::Invalid(message.into())
 }
 
-#[cfg(feature = "tensor-capture")]
 pub(super) fn ownership_bytes(owned: &RoutedUnitCaptureOwnership) -> Result<u64, CaptureError> {
     [owned.coordinates.experts(), owned.coordinates.units()]
         .into_iter()
@@ -42,7 +39,6 @@ pub(super) fn ownership_bytes(owned: &RoutedUnitCaptureOwnership) -> Result<u64,
 
 /// Bounds copies of the retained ownership and native chunk evidence. A chunk
 /// contains at least one native row; the receipt byte cap bounds it independently.
-#[cfg(feature = "tensor-capture")]
 pub(super) fn provenance_bytes(plan: &PartitionCaptureReceiptPlan) -> Result<u64, CaptureError> {
     plan.producers().try_fold(0, |bytes, (rank, projection)| {
         let Some(owned) = plan.routed.get(&rank) else {
@@ -61,7 +57,6 @@ pub(super) fn provenance_bytes(plan: &PartitionCaptureReceiptPlan) -> Result<u64
     })
 }
 
-#[cfg(feature = "tensor-capture")]
 pub(super) fn payload_usage(
     plan: &PartitionCaptureReceiptPlan,
     slice: &ResolvedCaptureSlice,
@@ -80,7 +75,6 @@ pub(super) fn payload_usage(
     })
 }
 
-#[cfg(feature = "tensor-capture")]
 pub(in crate::capture::partition) fn maps_overlap(
     a: &ComponentCoordinateMap,
     b: &ComponentCoordinateMap,
@@ -99,7 +93,6 @@ pub(in crate::capture::partition) fn maps_overlap(
             .is_some()
     })
 }
-#[cfg(feature = "tensor-capture")]
 pub(super) fn owners_overlap(
     owners: &BTreeMap<usize, RoutedUnitCaptureOwnership>,
     a: usize,
@@ -111,7 +104,6 @@ pub(super) fn owners_overlap(
     }
 }
 
-#[cfg(feature = "tensor-capture")]
 pub(super) fn validate_declarations(
     point: &ObservationPoint,
     selection: &CaptureSelection,
@@ -164,7 +156,6 @@ pub(super) fn validate_declarations(
 }
 
 /// Exact original coordinates addressed by this selected-result fragment.
-#[cfg(feature = "tensor-capture")]
 pub(super) fn global_fragment_slice(
     projection: &CaptureSlicePartition,
     index: usize,
@@ -200,7 +191,6 @@ pub(super) fn global_fragment_slice(
     Ok(result)
 }
 
-#[cfg(feature = "tensor-capture")]
 pub(super) fn validate_payload(
     plan: &PartitionCaptureReceiptPlan,
     rank: usize,
@@ -250,7 +240,6 @@ pub(super) fn validate_payload(
     Ok(())
 }
 
-#[cfg(feature = "tensor-capture")]
 struct Row {
     expert: u64,
     coefficient: f32,
@@ -259,7 +248,6 @@ struct Row {
     filled: u64,
 }
 
-#[cfg(feature = "tensor-capture")]
 pub(super) fn assemble(
     plan: &PartitionCaptureReceiptPlan,
     fragments: Vec<CapturedPartitionFragment>,

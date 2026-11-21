@@ -5,7 +5,9 @@ use eredu_core::generation::{
     resolve_generation_config, CheckpointGenerationConfig, GenerationConfigOverrides,
     ResolvedGenerationConfig,
 };
-use eredu_core::{ModelRuntime, TextGenerationBackend, TextGenerationConfig, TokenOutput};
+use eredu_core::{
+    ModelRuntime, TextExecutionSession, TextGenerationBackend, TextGenerationConfig, TokenOutput,
+};
 use eredu_text::tokenizer::{ModelChatTemplate, Tokenizer as ChatTokenizer};
 
 /// Backend-independent failure from tokenizer-aware text facade operations.
@@ -161,11 +163,11 @@ impl From<crate::runtime::chat::ToolNameNormalizationError> for TextModelError {
 }
 
 /// Asynchronous token generation with backend-independent errors.
-pub struct TextGeneration<'a, B: TextGenerationBackend> {
-    pub(super) inner: eredu_core::TextGeneration<'a, B>,
+pub struct TextGeneration<'a, B: TextGenerationBackend, S: TextExecutionSession<B>> {
+    pub(super) inner: eredu_core::TextGeneration<'a, B, S>,
 }
 
-impl<B: TextGenerationBackend> TextGeneration<'_, B> {
+impl<B: TextGenerationBackend, S: TextExecutionSession<B>> TextGeneration<'_, B, S> {
     /// Settles retained submissions without consuming another token. Useful before
     /// observing a continuation forecast; failures close the iterator.
     pub fn synchronize(&mut self) -> Result<(), eredu_core::BackendFailure> {
@@ -173,7 +175,7 @@ impl<B: TextGenerationBackend> TextGeneration<'_, B> {
     }
 }
 
-impl<B: TextGenerationBackend> Iterator for TextGeneration<'_, B> {
+impl<B: TextGenerationBackend, S: TextExecutionSession<B>> Iterator for TextGeneration<'_, B, S> {
     type Item = Result<GeneratedToken<B>, eredu_core::BackendFailure>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -380,10 +382,10 @@ pub struct LoadedTextModelConfig {
 ///
 /// The type contains no backend tensor, device, stream, or completion type.
 /// Backend-specific state remains owned by [`ModelRuntime`].
-pub struct LoadedModel<B: TextGenerationBackend> {
+pub struct LoadedModel<B: TextGenerationBackend, S: TextExecutionSession<B>> {
     pub(crate) session_identity: String,
     pub(crate) prompt_cache_store: Option<(String, Box<dyn eredu_core::cache::PromptCacheStore>)>,
-    pub(crate) runtime: ModelRuntime<B>,
+    pub(crate) runtime: ModelRuntime<B, S>,
     pub(crate) tokenizer: ChatTokenizer,
     pub(crate) tokenizer_fingerprint: [u8; 32],
     pub(crate) token_validity: std::sync::Arc<eredu_core::TokenFilter>,
@@ -395,11 +397,11 @@ pub struct LoadedModel<B: TextGenerationBackend> {
     pub(crate) checkpoint_generation_config: Option<CheckpointGenerationConfig>,
 }
 
-impl<B: TextGenerationBackend> LoadedModel<B> {
+impl<B: TextGenerationBackend, S: TextExecutionSession<B>> LoadedModel<B, S> {
     /// Reports whether the selected executable can chunk ordinary plain-text
     /// prefill. Prepared media, captures and interventions retain a full pass.
     pub fn prefill_chunking_support(&self) -> Result<(), &'static str> {
-        B::text_prefill_chunking_support(&self.runtime)
+        self.runtime.session().text_prefill_chunking_support()
     }
 
     /// Settles prior work and clears request state for a fresh request.
@@ -433,19 +435,19 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
     pub fn residency_telemetry(
         &self,
     ) -> Result<Option<eredu_core::ResidencyTelemetry>, eredu_core::BackendFailure> {
-        B::residency_telemetry(&self.runtime)
+        self.runtime.session().residency_telemetry()
     }
 
     /// Returns expert-cache telemetry when the loaded session provides it.
     pub fn expert_cache_telemetry(
         &self,
     ) -> Result<Option<eredu_core::ExpertCacheTelemetry>, eredu_core::BackendFailure> {
-        B::expert_cache_telemetry(&self.runtime)
+        self.runtime.session().expert_cache_telemetry()
     }
 
     /// Combines any prepared backend runtime with portable tokenizer metadata.
     pub fn from_runtime(
-        runtime: ModelRuntime<B>,
+        runtime: ModelRuntime<B, S>,
         tokenizer: ChatTokenizer,
         config: LoadedTextModelConfig,
     ) -> Self {
@@ -468,7 +470,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         }
     }
 
-    pub(crate) const fn runtime(&self) -> &ModelRuntime<B> {
+    pub(crate) const fn runtime(&self) -> &ModelRuntime<B, S> {
         &self.runtime
     }
 
@@ -539,7 +541,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
 
     /// Trained canvas extent reported by the selected block-refinement realization.
     pub fn refinement_canvas_length(&self) -> Option<std::num::NonZeroU32> {
-        B::refinement_canvas_length(&self.runtime)
+        self.runtime.session().refinement_canvas_length()
     }
 
     /// Starts generation of committed native token handles from tokenizer ids.
@@ -550,7 +552,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         &mut self,
         prompt_token_ids: Vec<u32>,
         config: TextGenerationConfig,
-    ) -> Result<TextGeneration<'_, B>, eredu_core::BackendFailure> {
+    ) -> Result<TextGeneration<'_, B, S>, eredu_core::BackendFailure> {
         eredu_core::TextGeneration::with_token_filter(
             &mut self.runtime,
             prompt_token_ids,
@@ -593,7 +595,11 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
     }
 }
 
-impl<B: eredu_core::ModelCapabilityBackend> LoadedModel<B> {
+impl<
+        B: eredu_core::TextGenerationBackend,
+        S: eredu_core::TextExecutionSession<B> + eredu_core::ModelCapabilitySession<B>,
+    > LoadedModel<B, S>
+{
     /// Settles submitted work and releases optional parameter conversions while
     /// preserving loaded weights and request state. Future inference can retain
     /// conversions again within the selected policy. Reset preserves conversions;

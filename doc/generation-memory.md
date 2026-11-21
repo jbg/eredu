@@ -215,13 +215,12 @@ that limit and already retained cache, because lowering the limit may defer
 eviction. An explicit cache limit during cold inspection describes the proposed
 policy; reports after loading observe the policy in force. Query failures and
 arithmetic overflow remain explicit unknowns. Native model realization applies
-a ceiling of 1/32 of currently available memory, capped at 2 GiB, to an untouched
+a ceiling of 1/32 of currently available memory, capped at 8 GiB, to an untouched
 native default, preserving smaller defaults. If available memory is unknown, the
 ceiling is 256 MiB. This is a one-time process policy; later memory pressure does
 not resize the cache. Explicit limits remain authoritative. Pure cold queries still observe
-the current policy; they do not apply runtime configuration. To forecast with the
-managed default before loading, call `eredu_backend_mlx::initialize_allocator_cache_policy(false)`
-first. `--allocator-cache-limit-bytes 0` disables allocator-cache retention when desired.
+the current policy; they do not apply runtime configuration. To apply the managed default before a forecast, call
+`eredu_runtime::automatic_support::initialize_allocator_defaults(Some(&eredu_backend_mlx::MlxAllocatorCacheDefaults))`. `--allocator-cache-limit-bytes 0` disables allocator-cache retention when desired.
 
 On macOS, the MLX factory’s `discover_hardware` observes available host memory from Mach
 host VM statistics: free pages (which already include speculative pages) plus
@@ -429,8 +428,8 @@ cross-device MLX execution outside unified memory, uncovered ordinary workspaces
 media and transfer costs remain incomplete. Cold embedded planning can use
 `inspected_speculative_generation_memory_plan` with explicit sampling calibration;
 cold external-drafter planning still needs retained draft geometry.
-Other backends opt in through `SpeculativeForecastBackend<D>`; its default report
-is unavailable. The portable `SpeculativeMemoryPlan` can describe embedded
+The portable session implements `SpeculativeForecastSession<B, D>` when its
+native mechanisms and drafter supply the required facts. The portable `SpeculativeMemoryPlan` can describe embedded
 ownership and independent physical pools when a backend has the required facts.
 
 This forecasts one fresh lane. Extra controlled snapshots/branches, retained
@@ -633,7 +632,7 @@ outside Rust are included. Restoring a saved numeric limit also counts as explic
 
 The MLX adapter initializes an untouched policy at native target/model realization,
 including ordinary, controlled and realtime loading. The automatic ceiling is
-1/32 of currently available memory, capped at 2 GiB, with a 256 MiB fallback
+1/32 of currently available memory, capped at 8 GiB, with a 256 MiB fallback
 when unavailable; CPU's smaller native default stays smaller. Initialization is atomic with
 setters and idempotent across sessions. It never overrides explicit settings or
 an earlier initialization, and does not forcibly evict already retained cache.
@@ -643,7 +642,7 @@ This is a process-wide performance/memory tradeoff, not a physical process cap.
 Applications can retain the native policy before any model is realized:
 
 ```rust,ignore
-eredu_backend_mlx::initialize_allocator_cache_policy(true)?;
+eredu_backend_mlx::preserve_allocator_cache_policy()?;
 ```
 
 `set_allocator_cache_limit(bytes)` selects an explicit limit and can override
@@ -1058,7 +1057,6 @@ Reproducible commands:
 cargo test -p eredu --no-default-features --test portable_facade --test backend_conformance --locked
 cargo clippy -p eredu-runtime -p eredu-architectures -p eredu --no-default-features --lib --tests --locked -- -D warnings
 cargo clippy -p eredu-backend-mlx --features metal --lib --tests --locked -- -D warnings
-cargo test -p eredu-backend-mlx --features metal --lib parameter_conversion --locked -- --nocapture --test-threads=1
 cargo test -p eredu --no-default-features --features mlx,metal --test native_execution_control internal_activations_match_continuous_and_controlled_metal --locked -- --ignored --nocapture --test-threads=1
 cargo test -p eredu --no-default-features --features mlx,metal --test native_execution_control public_pooling_prediction_snapshots_metal --locked -- --ignored --nocapture --test-threads=1
 ```
@@ -1265,10 +1263,6 @@ group claims; owner drop; replacement/restoration; a native shape failure; and
 invalidation during evaluation. The policy matrix runs with allocator caching zero.
 Reproduce with:
 
-```sh
-cargo test -p eredu-backend-mlx --features metal --lib parameter_conversion --locked -- --test-threads=1
-```
-
 Native fixtures require device access. Multi-process retention is unsupported;
 these fixtures do not establish full-checkpoint throughput or process-memory bounds.
 
@@ -1336,10 +1330,6 @@ The native load-policy fixture checks the managed default, explicit disabled,
 17-byte bounded and unlimited policies, independent model identities, and matching
 live/static observations. Reproduce with:
 
-```sh
-cargo test -p eredu-backend-mlx --features metal --lib loaded_conversion_retention_policy_reaches_native_residency --locked -- --test-threads=1
-```
-
 These checks cover configuration and telemetry; the
 [validation matrix](conversion-retention-validation.md) covers execution behavior.
 
@@ -1375,8 +1365,6 @@ trim, shared backing, re-admission and the loaded-session hook. Reproduce with:
 
 ```sh
 cargo test -p eredu-core -p eredu-runtime -p eredu --no-default-features --lib --test portable_facade --test backend_conformance --locked
-cargo test -p eredu-backend-mlx --features metal --lib parameter_conversion --locked -- --test-threads=1
-cargo test -p eredu-backend-mlx --features metal --lib loaded_conversion_retention_policy_reaches_native_residency --locked -- --test-threads=1
 ```
 
 The [validation matrix](conversion-retention-validation.md) documents checkpoint

@@ -25,23 +25,18 @@ pub struct DistributedCompletion<T> {
     recovery: Rc<Recovery<Rc<NativeResources>>>,
     authority: Option<AuthorizedCompletion>,
     quarantined: Cell<bool>,
-    #[cfg(test)]
-    force_pending: Rc<Cell<bool>>,
 }
 
 #[derive(Debug)]
 struct AuthorizedCompletion {
-    authority: eredu_runtime::PartitionCommunicationAuthority,
-    operation: eredu_runtime::CommunicationOperation,
-    phase: eredu_runtime::DistributedExecutionPhase,
+    authority: eredu_core::communication::CommunicationAuthority,
+    operation: eredu_core::communication::CommunicationOperation,
 }
 
 #[derive(Debug)]
 pub(super) struct DistributedCompletionOrphan {
     pub(super) _event: Rc<Event>,
     recovery: Rc<Recovery<Rc<NativeResources>>>,
-    #[cfg(test)]
-    pub(super) force_pending: Rc<Cell<bool>>,
 }
 
 #[derive(Debug, Default)]
@@ -51,13 +46,7 @@ pub(super) struct DistributedCompletionOrphanQuarantine {
 
 impl DistributedCompletionOrphanQuarantine {
     pub(super) fn reap(&mut self) {
-        self.work.retain(|work| {
-            #[cfg(test)]
-            if work.force_pending.get() {
-                return true;
-            }
-            !work.recovery.progress().settled
-        });
+        self.work.retain(|work| !work.recovery.progress().settled);
     }
 }
 
@@ -120,8 +109,6 @@ impl<T> DistributedCompletion<T> {
             recovery: Rc::new(recovery),
             authority: None,
             quarantined: Cell::new(false),
-            #[cfg(test)]
-            force_pending: Rc::new(Cell::new(false)),
         })
     }
 
@@ -134,8 +121,8 @@ impl<T> DistributedCompletion<T> {
         groups: Vec<Group>,
         routes: Vec<CommunicationRouteRealization>,
         streams: Vec<Stream>,
-        authority: eredu_runtime::PartitionCommunicationAuthority,
-        operation: eredu_runtime::CommunicationOperation,
+        authority: eredu_core::communication::CommunicationAuthority,
+        operation: eredu_core::communication::CommunicationOperation,
     ) -> Result<Self, Error> {
         let outputs = outputs.into_iter().cloned().collect::<Vec<_>>();
         let mut recovery = Recovery::begin(NativeResources::new(
@@ -150,26 +137,16 @@ impl<T> DistributedCompletion<T> {
         recovery.retention().host_failed.set(event.is_err());
         recovery.progress();
         let event = Rc::new(event.map_err(|error| {
-            Error::Other(Box::new(authority.submission_failure(
-                error,
-                operation,
-                eredu_runtime::DistributedExecutionPhase::Execution,
-                None,
-            )))
+            Error::Other(Box::new(
+                authority.submission_failure(error, operation, None),
+            ))
         })?);
         *recovery.retention().event.borrow_mut() = Some(Rc::clone(&event));
         check_native_status(&recovery).map_err(|error| {
-            Error::Other(Box::new(authority.submission_failure(
-                error,
-                operation,
-                eredu_runtime::DistributedExecutionPhase::Execution,
-                None,
-            )))
+            Error::Other(Box::new(
+                authority.submission_failure(error, operation, None),
+            ))
         })?;
-        #[cfg(test)]
-        let force_pending = Rc::new(Cell::new(
-            FORCE_NEXT_COMMUNICATION_PENDING.with(|force| force.replace(false)),
-        ));
         Ok(Self {
             value,
             event,
@@ -177,11 +154,8 @@ impl<T> DistributedCompletion<T> {
             authority: Some(AuthorizedCompletion {
                 authority,
                 operation,
-                phase: eredu_runtime::DistributedExecutionPhase::Execution,
             }),
             quarantined: Cell::new(false),
-            #[cfg(test)]
-            force_pending,
         })
     }
 
@@ -190,7 +164,6 @@ impl<T> DistributedCompletion<T> {
             Some(context) => Error::Other(Box::new(context.authority.completion_failure(
                 error,
                 context.operation,
-                context.phase,
                 None,
             ))),
             None => Error::from(error),
@@ -204,8 +177,6 @@ impl<T> DistributedCompletion<T> {
         let work = DistributedCompletionOrphan {
             _event: self.event.clone(),
             recovery: Rc::clone(&self.recovery),
-            #[cfg(test)]
-            force_pending: self.force_pending.clone(),
         };
         safemlx::register_thread_runtime_housekeeping(reap_distributed_completion_orphans);
         DISTRIBUTED_COMPLETION_ORPHANS.with(|orphans| orphans.borrow_mut().work.push(work));
@@ -271,17 +242,6 @@ impl<T> DistributedCompletion<T> {
         self.recovery.retention().arrays.len()
     }
 
-    /// Returns retained count buffers, groups, routes, and streams in that order.
-    #[cfg(test)]
-    pub(crate) fn retained_native_resources(&self) -> (usize, usize, usize, usize) {
-        (
-            self.recovery.retention()._count_buffers.len(),
-            self.recovery.retention().groups.len(),
-            self.recovery.retention()._routes.len(),
-            self.recovery.retention()._streams.len(),
-        )
-    }
-
     /// Blocks the host for this exact completion, not the remainder of a stream.
     pub fn synchronize(&self) -> Result<(), Error> {
         check_native_status(&self.recovery).map_err(|error| self.completion_error(error))?;
@@ -302,18 +262,6 @@ impl<T> DistributedCompletion<T> {
             )));
         };
         loop {
-            #[cfg(test)]
-            let complete = if self.force_pending.get() {
-                safemlx::try_with_submission_retirement(|| {
-                    check_native_status(&self.recovery)
-                        .map(|_| false)
-                        .map_err(|error| self.completion_error(error))
-                })
-                .unwrap_or(Ok(false))
-            } else {
-                self.is_complete()
-            };
-            #[cfg(not(test))]
             let complete = self.is_complete();
             match complete {
                 Ok(true) => {
@@ -343,10 +291,6 @@ impl<T> eredu_core::Completion for DistributedCompletion<T> {
     type Error = Error;
 
     fn resources_releasable(&self) -> bool {
-        #[cfg(test)]
-        if self.force_pending.get() {
-            return false;
-        }
         native_resources_releasable(&self.recovery)
     }
 

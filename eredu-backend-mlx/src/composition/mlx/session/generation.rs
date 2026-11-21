@@ -1,339 +1,80 @@
+//! MLX score and token operations under the existing model completion.
+
 use super::*;
-use crate::composition::mlx::speculative::autoregressive::MlxAutoregressiveMechanisms;
-use eredu_runtime::speculative::shared_backbone::SharedBackboneTransaction;
-use eredu_runtime::{SamplingConfigurationError, SpeculativeSampler};
+use eredu_core::communication::{BroadcastBackend, CommunicationAuthority, CommunicationOperation};
+use eredu_core::BackendFailure;
 
-/// MLX sampling and randomness state for backend-generic text generation.
-pub struct MlxTextGenerationState {
-    pub(super) readout_selection: Option<Vec<eredu_core::refinement::RefinementScoreSelection>>,
-    pub(super) readout_rows: Option<eredu_core::refinement::RefinementScoreRows>,
-    pub(super) sampling: MlxTextSamplingState,
-    #[cfg(feature = "tensor-capture")]
-    pub(super) capture: Option<eredu_runtime::capture::CaptureSession>,
-}
-
-/// Native sampling component copied by the shared ordinary snapshot driver.
-/// Capture ownership remains separate; this alone is not a generation snapshot.
-pub struct MlxTextSamplingState {
-    pub(super) mode: eredu_core::decoding::DecodingMode,
-    pub(super) temperature: f32,
-    pub(super) prng: Option<RandomState>,
-    pub(super) sampler: MlxTextSampler,
-    pub(super) next_prediction: u64,
-    /// Parameter version bound on first submission and preserved by snapshots.
-    pub(super) parameter_epoch: Option<u64>,
-    pub(super) refinement_seed: u64,
-    pub(super) proposal_random: Option<RandomState>,
-    pub(super) speculative: Option<Box<SharedBackboneTransaction<MlxAutoregressiveMechanisms>>>,
-    /// Distinguishes a verified committed token from a suffix still awaiting append.
-    pub(super) committed_token_cached: bool,
-    /// Settled causal next-token logits when a committed suffix is already cached.
-    pub(super) next_logits: Option<Array>,
-    /// Spent refinement randomness survives mode changes independently of target draws.
-    pub(super) refinement_random: Option<RandomState>,
-    pub(super) refinement_policy: eredu_core::refinement::RefinementPolicy,
-    pub(super) draft_events: bool,
-    pub(super) canvas: Option<std::sync::Arc<eredu_core::refinement::RefinementCanvas>>,
-    pub(super) refinement: Option<
-        eredu_runtime::generation::refinement::block::BlockRefinementState<MlxSamplingBackend>,
-    >,
-}
-
-#[derive(Clone)]
-pub(crate) enum MlxTextSampler {
-    Standard(GenerationSampler),
-    MirostatV2(MirostatV2Sampler),
-}
-
-impl MlxTextSampler {
-    pub(crate) fn from_config(
-        config: &TextGenerationConfig,
-    ) -> Result<Self, SamplingConfigurationError> {
-        let sampling = config.sampling();
-        Ok(match config.strategy() {
-            TextSamplingStrategy::Standard => {
-                Self::Standard(GenerationSampler::from_resolved(sampling))
-            }
-            TextSamplingStrategy::MirostatV2 { tau, eta } => {
-                Self::MirostatV2(MirostatV2Sampler::new(tau, eta)?.penalties(
-                    sampling.repetition_penalty,
-                    sampling.repeat_last_n,
-                    sampling.frequency_penalty,
-                    sampling.presence_penalty,
-                ))
+pub(super) fn last_score_row(
+    output: &MlxModelOutput,
+    stream: &Stream,
+) -> Result<Option<MlxTensor>, Error> {
+    output
+        .logits()
+        .map(|logits| {
+            let array = logits.as_array();
+            match array.shape() {
+                [_, sequence, _] if *sequence > 0 => array
+                    .try_index_device((.., -1, ..), stream)
+                    .map(MlxTensor::from_array)
+                    .map_err(Into::into),
+                _ => Ok(logits.clone()),
             }
         })
-    }
-
-    fn sample(
-        &mut self,
-        logits: &MlxTensor,
-        temperature: f32,
-        random: Option<&mut RandomState>,
-        stream: &Stream,
-    ) -> Result<MlxTensor, Exception> {
-        match self {
-            Self::Standard(sampler) => {
-                Sampler::<MlxSamplingBackend>::sample(sampler, logits, temperature, random, stream)
-            }
-            Self::MirostatV2(sampler) => {
-                Sampler::<MlxSamplingBackend>::sample(sampler, logits, temperature, random, stream)
-            }
-        }
-    }
+        .transpose()
 }
 
-impl SpeculativeSampler<MlxSamplingBackend> for MlxTextSampler {
-    fn refinement_filter(&mut self, _history: &[u32]) -> Result<TokenFilter, Exception> {
-        Ok(TokenFilter::All)
-    }
-    fn control_requires_positive_temperature(&self) -> Option<bool> {
-        Some(matches!(self, Self::MirostatV2(_)))
-    }
-    fn control_snapshot_bytes(&self) -> Option<u64> {
-        let history = match self {
-            Self::Standard(sampler) => sampler.generated_tokens(),
-            Self::MirostatV2(sampler) => sampler.generated_tokens(),
-        };
-        (history.len() as u64)
-            .checked_mul(4)?
-            .checked_add(std::mem::size_of::<Self>() as u64)
-    }
-
-    fn continuation_storage_bytes(&self, additional_tokens: u64) -> Option<u64> {
-        // Retain a generous Vec growth/replacement allowance for history.
-        self.control_snapshot_bytes()?
-            .checked_mul(2)?
-            .checked_add(additional_tokens.checked_mul(8)?)
-    }
-
-    fn supports_exact_optimistic_promotion(&self) -> bool {
-        match self {
-            Self::Standard(sampler) => {
-                SpeculativeSampler::<MlxSamplingBackend>::supports_exact_optimistic_promotion(
-                    sampler,
-                )
-            }
-            Self::MirostatV2(sampler) => {
-                SpeculativeSampler::<MlxSamplingBackend>::supports_exact_optimistic_promotion(
-                    sampler,
-                )
-            }
-        }
-    }
-
-    fn process_logits(
-        &mut self,
-        logits: &MlxTensor,
-        temperature: f32,
-        history: &[u32],
-        stream: &Stream,
-    ) -> Result<MlxTensor, Exception> {
-        match self {
-            Self::Standard(sampler) => SpeculativeSampler::<MlxSamplingBackend>::process_logits(
-                sampler,
-                logits,
-                temperature,
-                history,
-                stream,
-            ),
-            Self::MirostatV2(sampler) => SpeculativeSampler::<MlxSamplingBackend>::process_logits(
-                sampler,
-                logits,
-                temperature,
-                history,
-                stream,
-            ),
-        }
-    }
-
-    fn commit_token(
-        &mut self,
-        processed_logits: &MlxTensor,
-        token: u32,
-        stream: &Stream,
-    ) -> Result<(), Exception> {
-        match self {
-            Self::Standard(sampler) => SpeculativeSampler::<MlxSamplingBackend>::commit_token(
-                sampler,
-                processed_logits,
-                token,
-                stream,
-            ),
-            Self::MirostatV2(sampler) => SpeculativeSampler::<MlxSamplingBackend>::commit_token(
-                sampler,
-                processed_logits,
-                token,
-                stream,
-            ),
-        }
-    }
-}
-
-struct FilteredTextSampler<'a> {
-    sampler: &'a mut MlxTextSampler,
-    filter: &'a TokenFilter,
-}
-
-impl Sampler<MlxSamplingBackend> for FilteredTextSampler<'_> {
-    fn sample(
-        &mut self,
-        logits: &MlxTensor,
-        temperature: f32,
-        random: Option<&mut RandomState>,
-        stream: &Stream,
-    ) -> Result<MlxTensor, Exception> {
-        let logits = MlxSamplingBackend::apply_token_filter(logits, self.filter, stream)?;
-        self.sampler.sample(&logits, temperature, random, stream)
-    }
-}
-
-pub(super) fn sample_text_submission(
-    session: &MlxModelSession,
-    submission: Submission<MlxModelOutput, MlxSessionCompletion>,
-    filter: &TokenFilter,
-    state: &mut MlxTextGenerationState,
-    stream: Stream,
-) -> Result<Submission<MlxTextToken, MlxTextCompletion>, Error> {
-    let operation = super::model_session::ResourceOperation::begin(submission.completion.owner())?;
-    let sampled = (|| {
-        // Instrumented context execution may retain every physical score row.
-        // One causal decision always consumes the final conditional row.
-        let logits = submission
-            .output
-            .logits()
-            .map(|logits| {
-                let array = logits.as_array();
-                match array.shape() {
-                    [_, sequence, _] if *sequence > 0 => array
-                        .try_index_device((.., -1, ..), &stream)
-                        .map(MlxTensor::from_array),
-                    _ => Ok(logits.clone()),
-                }
-            })
-            .transpose()?;
-        let MlxTextSamplingState {
-            temperature,
-            prng,
-            sampler,
-            ..
-        } = &mut state.sampling;
-        let mut sampler = FilteredTextSampler { sampler, filter };
-        let token = if session.synchronizes_sampling() {
-            session
-                .sample_under_submission(
-                    logits.as_ref(),
-                    1,
-                    &mut sampler,
-                    *temperature,
-                    prng.as_mut(),
-                    false,
-                )?
-                .token
-                .try_index_device((.., 0), &stream)?
-        } else {
-            let logits = logits.as_ref().ok_or_else(|| {
-                Error::Parallel("local text generation requires model logits".into())
-            })?;
-            Sampler::<MlxSamplingBackend>::sample(
-                &mut sampler,
-                logits,
-                *temperature,
-                prng.as_mut(),
-                &stream,
-            )?
+pub(super) fn exchange_sampled_token(
+    token: Option<MlxTensor>,
+    rank: usize,
+    group: &crate::backend::runtime::distributed::Group,
+    authority: &CommunicationAuthority,
+    stream: &Stream,
+) -> Result<MlxTensor, Error> {
+    let local = match token {
+        Some(token) => token
             .into_array()
-        };
-        MlxCompletion::submission(token)
-    })();
-    let (sampled, recovery) = operation.finish(sampled)?;
-    state.sampling.next_prediction = state
-        .sampling
-        .next_prediction
-        .checked_add(1)
-        .ok_or_else(|| Error::ArchitectureModel("text prediction overflow".into()))?;
-    #[cfg(feature = "tensor-capture")]
-    if let Some(capture) = &mut state.capture {
-        capture
-            .set_commitment_boundary(state.sampling.next_prediction)
-            .map_err(Error::observation)?;
-    }
+            .reshape(&[1, 1], stream)?
+            .as_dtype(Dtype::Float32, stream)?,
+        None => safemlx::ops::zeros::<f32>(&[1, 1], stream)?,
+    };
+    let operation = CommunicationOperation::Broadcast;
+    let submission = <crate::backend::nn::shared::MlxNeuralBackend as BroadcastBackend>::broadcast(
+        MlxTensor::from_array(local),
+        rank,
+        group,
+        stream,
+    )
+    .map_err(|error| authority.submission_failure(error, operation, None))
+    .map_err(BackendFailure::from_error)?;
+    let value = authority
+        .wait(submission, operation, None)
+        .map_err(BackendFailure::from_error)?;
+    Ok(MlxTensor::from_array(
+        value
+            .into_array()
+            .as_dtype(Dtype::Uint32, stream)?
+            .try_index_device((.., 0), stream)?,
+    ))
+}
+
+pub(super) fn finish_sampling(
+    scope: super::recovery::ResourceOperation,
+    model: MlxSessionCompletion,
+    token: Result<MlxTensor, Error>,
+    stream: &Stream,
+) -> Result<Submission<MlxTextToken, MlxTextCompletion>, Error> {
+    let submitted = token.and_then(|token| MlxCompletion::submission(token.into_array()));
+    let (sampled, recovery) = scope.finish(submitted)?;
     Ok(Submission {
         output: MlxTextToken {
             value: sampled.output,
-            stream,
-            owner: std::rc::Rc::clone(submission.completion.owner()),
+            stream: stream.clone(),
+            owner: std::rc::Rc::clone(model.owner()),
         },
         completion: MlxTextCompletion {
-            model: submission.completion,
+            model,
             token: sampled.completion,
             recovery: std::cell::RefCell::new(Some(recovery)),
         },
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn forced_decision_advances_one_rng_draw_and_updates_ordinary_sampler_state_once() {
-        let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-        let logits = MlxTensor::from_array(Array::from_slice(&[1.0f32, 0.2, -0.5, 2.0], &[1, 4]));
-        let filter = TokenFilter::allowed(vec![false, false, true, false]).unwrap();
-        let key = |random: &RandomState| {
-            random
-                .as_array()
-                .evaluated()
-                .unwrap()
-                .as_slice::<u32>()
-                .to_vec()
-        };
-        for adaptive in [false, true] {
-            for temperature in if adaptive { vec![0.8] } else { vec![0.0, 0.8] } {
-                let mut random = RandomState::with_seed(12345).unwrap();
-                let mut expected_random = RandomState::with_seed(12345).unwrap();
-                if temperature != 0.0 {
-                    expected_random
-                        .next_key(&stream)
-                        .unwrap()
-                        .evaluated()
-                        .unwrap();
-                }
-                let mut sampler = if adaptive {
-                    let mut sampler = MirostatV2Sampler::new(5.0, 0.3).unwrap();
-                    sampler.accept_token(1, 0.25).unwrap();
-                    MlxTextSampler::MirostatV2(sampler)
-                } else {
-                    MlxTextSampler::Standard(
-                        GenerationSampler::new()
-                            .top_k(4)
-                            .top_p(1.0)
-                            .min_p(0.0)
-                            .penalties(1.2, 64, 0.1, 0.1)
-                            .with_generated_tokens([1]),
-                    )
-                };
-                let previous_mu = match &sampler {
-                    MlxTextSampler::MirostatV2(s) => Some(s.mu()),
-                    _ => None,
-                };
-                let token = FilteredTextSampler {
-                    sampler: &mut sampler,
-                    filter: &filter,
-                }
-                .sample(&logits, temperature, Some(&mut random), &stream)
-                .unwrap();
-                assert_eq!(MlxSamplingBackend::token_id(&token, &stream).unwrap(), 2);
-                assert_eq!(key(&random), key(&expected_random));
-                match &sampler {
-                    MlxTextSampler::Standard(s) => assert_eq!(s.generated_tokens(), [1, 2]),
-                    MlxTextSampler::MirostatV2(s) => {
-                        assert_eq!(s.generated_tokens(), [1, 2]);
-                        assert!((s.mu() - (previous_mu.unwrap() + 0.3 * 5.0)).abs() < 1e-6);
-                    }
-                }
-            }
-        }
-    }
 }

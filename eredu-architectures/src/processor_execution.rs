@@ -1,21 +1,14 @@
 //! Architecture-owned execution of retained media processor plans.
 
+use eredu_core::input::PreparedInputInspector;
 use eredu_core::{
-    checkpoint::TensorDtype, InputExtent, InputMetadataKey, InputModality, InputTensorIdentity,
-    Media, PreparedInputError, RgbImage, TokenizedMultimodalRequest, TokenizedMultimodalSegment,
+    InputExtent, InputMetadataKey, InputModality, InputTensorIdentity, Media, PreparedInputError,
+    RgbImage, TokenizedMultimodalRequest, TokenizedMultimodalSegment,
 };
+use eredu_core::{PreparedInputPart, PreparedInputPayload, PreparedModelInput};
 use eredu_media::audio::{AudioWaveform, LeadingSlaneyLogMelConfig, LogMelConfig};
 use eredu_media::{audio::LogMelFeatures, image::NormalizedImage};
-use eredu_nn::{
-    DistributedNeuralBackend, NeuralBackend, RetainedTensorRoots, Tensor,
-    TensorParallelGroupedNeuralBackend,
-};
-use eredu_runtime::{
-    observe_and_intervene, ActivationObserver, ComponentRankMechanisms, LocalComponentMechanisms,
-    PipelineTransportProvider, PreparedInputInspector, PreparedInputPart, PreparedInputPayload,
-    PreparedModelInput, RealtimeGraphMechanisms, RealtimeStartupMechanisms, SamplingBackend,
-    SubmissionBackend,
-};
+use eredu_runtime::ActivationObserver;
 
 use crate::processor_plan::RgbResample;
 use crate::processor_plan::{
@@ -31,66 +24,13 @@ use eredu_runtime::processor_resources::{
     ProcessorRequestBudget, ProcessorRequestResources, ProcessorResourceError,
 };
 
-/// Native input lowering and inspection for an already selected portable processor.
-pub trait MediaInputLowering<T> {
-    /// Inspects native tensors during portable prompt admission.
-    fn inspector(&self) -> &impl PreparedInputInspector<T>;
+use eredu_core::input::{OptionalProcessorMechanism, ProcessorMechanisms};
+pub use eredu_runtime::processor_binding::ProcessorExecutionError;
+use eredu_runtime::processor_binding::{
+    lower_host_input, observe_processor_output, optional_mechanism_error, HostTensor,
+};
 
-    /// Lowers the request and preserves its optional semantic cache identity.
-    fn prepare_input<E: std::error::Error + Send + Sync + 'static>(
-        &self,
-        processor: &PreparedProcessor,
-        input: &TokenizedMultimodalRequest,
-        encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
-    ) -> Result<
-        (
-            PreparedModelInput<T>,
-            Option<eredu_runtime::PreparedInputCacheIdentity>,
-        ),
-        eredu_core::BackendFailure,
-    >;
-}
-
-/// Native mechanisms for finite media-conditioned execution over a layered graph.
-///
-/// Implemented on the context opened by the neutral realtime factory. Portable
-/// execution selects components and transport routes before using these mechanisms.
-pub trait MediaGraphMechanisms {
-    /// Neural, distributed, and submission operators used by the graph.
-    type Neural: TensorParallelGroupedNeuralBackend
-        + DistributedNeuralBackend
-        + SubmissionBackend<Executor = <<Self::Neural as NeuralBackend>::Tensor as Tensor>::Context>
-        + 'static;
-    /// Native transport for a selected distributed route.
-    type Transport: 'static;
-    /// State allocation, parameter binding, and sampling on the selected device.
-    type Graph: RealtimeGraphMechanisms<
-            Self::Neural,
-            State: RetainedTensorRoots<<Self::Neural as NeuralBackend>::Tensor>,
-            Components: LocalComponentMechanisms<
-                Self::Neural,
-                <Self::Graph as RealtimeGraphMechanisms<Self::Neural>>::State,
-            > + ComponentRankMechanisms<
-                Self::Neural,
-                <Self::Graph as RealtimeGraphMechanisms<Self::Neural>>::State,
-                Self::Transport,
-            >,
-            Sampling: SamplingBackend<
-                RandomState = <Self::Graph as RealtimeStartupMechanisms>::Random,
-            >,
-        > + RealtimeStartupMechanisms<Random: Clone>
-        + Clone
-        + 'static;
-
-    /// Opens the graph's component and state mechanisms on the selected device.
-    fn graph(&self) -> Self::Graph;
-
-    /// Supplies native media lowering for an already selected processor.
-    fn media_lowering(&self) -> impl MediaInputLowering<<Self::Neural as NeuralBackend>::Tensor>;
-
-    /// Supplies the transport provider for a retained pipeline route.
-    fn pipeline_transport(&self) -> impl PipelineTransportProvider<Transport = Self::Transport>;
-}
+pub use eredu_runtime::processor_binding::MediaGraphMechanisms;
 
 /// Prepared inputs with optional coarse request preparation limits.
 #[derive(Debug)]
@@ -163,45 +103,6 @@ pub enum AudioFeatureRequest {
     },
 }
 
-/// Optional primitive failure distinguishing capability denial from execution failure.
-#[derive(Debug, thiserror::Error)]
-pub enum OptionalProcessorMechanism<E: std::fmt::Display> {
-    /// The backend did not implement this additive primitive.
-    #[error("processor mechanism {0} is unavailable")]
-    Unavailable(&'static str),
-    /// The implemented primitive failed.
-    #[error("processor mechanism failed: {0}")]
-    Backend(E),
-}
-
-/// Backend-native tensor mechanisms used after portable processing succeeds.
-pub trait ProcessorMechanisms: PreparedInputInspector<Self::Tensor> {
-    /// Native tensor handle.
-    type Tensor;
-    /// Mechanism failure.
-    type Error: std::fmt::Display;
-
-    // Constructors must own copied inputs and retain asynchronous resources
-    // through completion, including on failure.
-    /// Constructs a native unsigned token tensor.
-    fn tensor_u32(&mut self, values: &[u32], shape: &[usize]) -> Result<Self::Tensor, Self::Error>;
-
-    /// Constructs a native floating-point tensor.
-    fn tensor_f32(&mut self, values: &[f32], shape: &[usize]) -> Result<Self::Tensor, Self::Error>;
-
-    /// Constructs a native signed metadata tensor.
-    fn tensor_i32(&mut self, values: &[i32], shape: &[usize]) -> Result<Self::Tensor, Self::Error>;
-
-    /// Constructs a native Boolean metadata tensor when implemented.
-    fn tensor_bool(
-        &mut self,
-        _values: &[bool],
-        _shape: &[usize],
-    ) -> Result<Self::Tensor, OptionalProcessorMechanism<Self::Error>> {
-        Err(OptionalProcessorMechanism::Unavailable("Boolean tensor"))
-    }
-}
-
 trait ProcessorOperations: PreparedInputInspector<Self::Tensor> {
     type Tensor;
     type Error: std::fmt::Display;
@@ -224,38 +125,6 @@ trait ProcessorOperations: PreparedInputInspector<Self::Tensor> {
         values: &[bool],
         shape: &[usize],
     ) -> Result<Self::Tensor, OptionalProcessorMechanism<Self::Error>>;
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum HostTensor {
-    U32 {
-        values: Vec<u32>,
-        shape: Vec<usize>,
-    },
-    F32 {
-        values: Vec<f32>,
-        shape: Vec<usize>,
-    },
-    I32 {
-        values: Vec<i32>,
-        shape: Vec<usize>,
-    },
-    Bool {
-        values: Vec<bool>,
-        shape: Vec<usize>,
-    },
-}
-
-impl HostTensor {
-    fn identity(&self) -> Result<InputTensorIdentity, PreparedInputError> {
-        let (dtype, shape) = match self {
-            Self::U32 { shape, .. } => (TensorDtype::U32, shape),
-            Self::F32 { shape, .. } => (TensorDtype::F32, shape),
-            Self::I32 { shape, .. } => (TensorDtype::I32, shape),
-            Self::Bool { shape, .. } => (TensorDtype::Bool, shape),
-        };
-        InputTensorIdentity::new(dtype, shape.clone())
-    }
 }
 
 #[derive(Default)]
@@ -565,7 +434,7 @@ impl PreparedProcessor {
 
     /// Executes preparation with a retained optional coarse budget and returns its report.
     /// Use ordinary `prepare` when no processor budget was selected.
-    pub fn prepare_budgeted<M: ProcessorMechanisms, E: std::fmt::Display>(
+    pub fn prepare_budgeted<M: ProcessorMechanisms + ?Sized, E: std::fmt::Display>(
         &self,
         request: &TokenizedMultimodalRequest,
         mechanisms: &mut M,
@@ -633,7 +502,7 @@ impl PreparedProcessor {
         encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
     ) -> Result<PreparedModelInput<M::Tensor>, ProcessorExecutionError<E, M::Error>>
     where
-        M: ProcessorMechanisms,
+        M: ProcessorMechanisms + ?Sized,
         E: std::fmt::Display,
     {
         self.prepare_checked(request, mechanisms, encode_text, None, |_| Ok(()))
@@ -650,7 +519,7 @@ impl PreparedProcessor {
         budget: ProcessorRequestBudget,
     ) -> Result<BudgetedProcessorInput<M::Tensor>, ProcessorExecutionError<E, M::Error>>
     where
-        M: ProcessorMechanisms,
+        M: ProcessorMechanisms + ?Sized,
         E: std::fmt::Display,
     {
         let (input, resources) =
@@ -680,7 +549,7 @@ impl PreparedProcessor {
         ProcessorExecutionError<E, M::Error>,
     >
     where
-        M: ProcessorMechanisms,
+        M: ProcessorMechanisms + ?Sized,
         E: std::fmt::Display,
     {
         let budget = match &self.authority {
@@ -760,56 +629,13 @@ impl PreparedProcessor {
         observer: &mut O,
     ) -> Result<PreparedModelInput<M::Tensor>, ProcessorExecutionError<E, M::Error>>
     where
-        M: ProcessorMechanisms,
+        M: ProcessorMechanisms + ?Sized,
         M::Tensor: Clone,
         E: std::fmt::Display,
         O: ActivationObserver<M::Tensor, ProcessorExecutionError<E, M::Error>> + ?Sized,
     {
         let prepared = self.prepare(request, mechanisms, encode_text)?;
-        let mut parts = Vec::with_capacity(prepared.len());
-        for (index, part) in prepared.parts().iter().enumerate() {
-            let path = format!(
-                "{}.{}",
-                eredu_core::PROCESSOR_OUTPUT_OBSERVATION_PATH,
-                index
-            );
-            let payload_value = observe_and_intervene(observer, &path, part.payload().value())?;
-            let payload = match part.payload() {
-                PreparedInputPayload::TokenIds(_) => PreparedInputPayload::TokenIds(payload_value),
-                PreparedInputPayload::Tensor(_) => PreparedInputPayload::Tensor(payload_value),
-                PreparedInputPayload::Embeddings(_) => {
-                    PreparedInputPayload::Embeddings(payload_value)
-                }
-                _ => {
-                    return Err(ProcessorExecutionError::Plan(
-                        "processor emitted an unsupported prepared payload kind".into(),
-                    ));
-                }
-            };
-            let metadata = part
-                .metadata()
-                .iter()
-                .map(|(key, value)| {
-                    let path = format!(
-                        "{}.{}.metadata.{key:?}",
-                        eredu_core::PROCESSOR_OUTPUT_OBSERVATION_PATH,
-                        index
-                    );
-                    observe_and_intervene(observer, &path, value).map(|value| (*key, value))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            parts.push(
-                PreparedInputPart::new_with_extents(
-                    part.modality(),
-                    payload,
-                    metadata,
-                    part.extents().iter().copied(),
-                )
-                .map_err(ProcessorExecutionError::Prepared)?,
-            );
-        }
-        let observed = PreparedModelInput::new(parts, |tensor| mechanisms.identity(tensor))
-            .map_err(ProcessorExecutionError::Prepared)?;
+        let observed = observe_processor_output(&prepared, mechanisms, observer)?;
         if let Some(authority) = &self.authority {
             // An observer owns its own allocations. The selected processor only
             // admits value changes within the original constructor geometry.
@@ -820,11 +646,36 @@ impl PreparedProcessor {
             }
             if let Some(admission) = &authority.admission {
                 admission
-                    .validate(&observed, mechanisms)
+                    .validate(&observed, &mechanisms.inspector())
                     .map_err(input_admission_error)?;
             }
         }
         Ok(observed)
+    }
+}
+
+impl<T: Clone, M: std::fmt::Display>
+    eredu_runtime::processor_binding::PreparedProcessorProgram<T, M> for PreparedProcessor
+{
+    fn execute(
+        &self,
+        request: &TokenizedMultimodalRequest,
+        mechanisms: &mut dyn ProcessorMechanisms<Tensor = T, Error = M>,
+        encode_text: &mut dyn FnMut(
+            &str,
+        ) -> Result<
+            Vec<u32>,
+            eredu_runtime::processor_binding::ProcessorTextError,
+        >,
+        observer: &mut dyn ActivationObserver<
+            T,
+            ProcessorExecutionError<eredu_runtime::processor_binding::ProcessorTextError, M>,
+        >,
+    ) -> Result<
+        PreparedModelInput<T>,
+        ProcessorExecutionError<eredu_runtime::processor_binding::ProcessorTextError, M>,
+    > {
+        self.prepare_with_observer(request, mechanisms, encode_text, observer)
     }
 }
 
@@ -854,110 +705,6 @@ fn host_execution_error<E: std::fmt::Display, M: std::fmt::Display>(
     }
 }
 
-fn lower_host_tensor<M, E>(
-    tensor: &HostTensor,
-    mechanisms: &mut M,
-) -> Result<M::Tensor, ProcessorExecutionError<E, M::Error>>
-where
-    M: ProcessorMechanisms,
-    E: std::fmt::Display,
-{
-    match tensor {
-        HostTensor::U32 { values, shape } => mechanisms
-            .tensor_u32(values, shape)
-            .map_err(ProcessorExecutionError::Mechanism),
-        HostTensor::F32 { values, shape } => mechanisms
-            .tensor_f32(values, shape)
-            .map_err(ProcessorExecutionError::Mechanism),
-        HostTensor::I32 { values, shape } => mechanisms
-            .tensor_i32(values, shape)
-            .map_err(ProcessorExecutionError::Mechanism),
-        HostTensor::Bool { values, shape } => mechanisms
-            .tensor_bool(values, shape)
-            .map_err(optional_mechanism_error),
-    }
-}
-
-fn lower_host_input<M, E>(
-    host: PreparedModelInput<HostTensor>,
-    mechanisms: &mut M,
-) -> Result<PreparedModelInput<M::Tensor>, ProcessorExecutionError<E, M::Error>>
-where
-    M: ProcessorMechanisms,
-    E: std::fmt::Display,
-{
-    if host.parts().iter().any(|part| {
-        !matches!(
-            part.payload(),
-            PreparedInputPayload::TokenIds(_)
-                | PreparedInputPayload::Tensor(_)
-                | PreparedInputPayload::Embeddings(_)
-        )
-    }) {
-        return Err(ProcessorExecutionError::Plan(
-            "host processor emitted an unsupported payload kind".into(),
-        ));
-    }
-    let mut parts = Vec::with_capacity(host.len());
-    for part in host.parts() {
-        let payload = match part.payload() {
-            PreparedInputPayload::TokenIds(value) => {
-                PreparedInputPayload::TokenIds(lower_host_tensor(value, mechanisms)?)
-            }
-            PreparedInputPayload::Tensor(value) => {
-                PreparedInputPayload::Tensor(lower_host_tensor(value, mechanisms)?)
-            }
-            PreparedInputPayload::Embeddings(value) => {
-                PreparedInputPayload::Embeddings(lower_host_tensor(value, mechanisms)?)
-            }
-            _ => unreachable!("payload kinds were preflighted before native lowering"),
-        };
-        let metadata = part
-            .metadata()
-            .iter()
-            .map(|(key, tensor)| lower_host_tensor(tensor, mechanisms).map(|tensor| (*key, tensor)))
-            .collect::<Result<Vec<_>, _>>()?;
-        parts.push(
-            PreparedInputPart::new_with_extents(
-                part.modality(),
-                payload,
-                metadata,
-                part.extents().iter().copied(),
-            )
-            .map_err(ProcessorExecutionError::Prepared)?,
-        );
-    }
-    PreparedModelInput::new(parts, |tensor| mechanisms.identity(tensor))
-        .map_err(ProcessorExecutionError::Prepared)
-}
-
-/// Failure from architecture processor semantics, text encoding, or a mechanism.
-#[derive(Debug, thiserror::Error)]
-pub enum ProcessorExecutionError<E, M>
-where
-    E: std::fmt::Display,
-    M: std::fmt::Display,
-{
-    /// Architecture processor policy rejected the request.
-    #[error("processor plan rejected input: {0}")]
-    Plan(String),
-    /// Architecture rejected final host products before native allocation.
-    #[error(transparent)]
-    Admission(eredu_core::CapabilityError),
-    /// Request buffer budget or arithmetic failed before media execution.
-    #[error(transparent)]
-    Resources(#[from] ProcessorResourceError),
-    /// Facade tokenizer callback failed.
-    #[error("processor text encoding failed: {0}")]
-    Text(E),
-    /// Generic host-media or tensor mechanism failed.
-    #[error("processor mechanism failed: {0}")]
-    Mechanism(M),
-    /// Prepared-part or identity construction failed.
-    #[error("prepared input is invalid: {0}")]
-    Prepared(PreparedInputError),
-}
-
 fn plan_error<E: std::fmt::Display, M: std::fmt::Display>(
     error: ProcessorPlanError,
 ) -> ProcessorExecutionError<E, M> {
@@ -968,17 +715,6 @@ fn mechanism_error<E: std::fmt::Display, M: std::fmt::Display>(
     error: M,
 ) -> ProcessorExecutionError<E, M> {
     ProcessorExecutionError::Mechanism(error)
-}
-
-fn optional_mechanism_error<E: std::fmt::Display, M: std::fmt::Display>(
-    error: OptionalProcessorMechanism<M>,
-) -> ProcessorExecutionError<E, M> {
-    match error {
-        OptionalProcessorMechanism::Unavailable(name) => {
-            ProcessorExecutionError::Plan(format!("required {name} mechanism is unavailable"))
-        }
-        OptionalProcessorMechanism::Backend(error) => ProcessorExecutionError::Mechanism(error),
-    }
 }
 
 fn push_tokens<M, E>(

@@ -1,13 +1,15 @@
 //! Cold exact binding plans for independently leased PRVQ codebook units.
 
+use eredu_core::SubmissionBackend;
+
 use eredu_core::BackendFailure;
 use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Tensor};
-use eredu_runtime::{LayeredTensorCohort, ParameterUnitMechanisms, SubmissionBackend};
+use eredu_runtime::{LayeredTensorCohort, ParameterUnitMechanisms};
 
 use eredu_checkpoint::{recipe::RecipeDtype, store::SharedCheckpointSource};
+use eredu_core::residency::parameter_binding::WeightBinding;
 use eredu_runtime::{
     ComponentPreparationError, ComponentRecipeConversion, LocalModelLayout, PreparedComponent,
-    WeightBinding,
 };
 
 use crate::{
@@ -26,7 +28,7 @@ pub enum QuantizerPreparationError {
     Coordination(#[from] eredu_runtime::replicated_execution::CollectiveCoordinationError),
     /// A communication requirement is malformed.
     #[error(transparent)]
-    Communication(#[from] eredu_runtime::CommunicationManifestError),
+    Communication(#[from] eredu_core::communication::CommunicationManifestError),
 
     /// Quantizer geometry cannot be constructed.
     #[error(transparent)]
@@ -193,14 +195,13 @@ impl PreparedQuantizerBindings {
 /// validates every requested batch/frame extent before each actual collective.
 pub fn validate_parallel_communication(
     geometry: Geometry,
-    manifest: &eredu_runtime::CommunicationManifest,
+    manifest: &eredu_core::communication::CommunicationManifest,
     group: eredu_core::CollectiveGroupId,
 ) -> Result<(), QuantizerPreparationError> {
     use eredu_core::checkpoint::TensorDtype;
-    use eredu_runtime::{
-        replicated_execution::validate_collective_coordination, CommunicationOperation,
-        CommunicationOperationRequirement, CommunicationTensorLimits,
-    };
+    use eredu_core::communication::CommunicationOperation;
+    use eredu_core::communication::{CommunicationOperationRequirement, CommunicationTensorLimits};
+    use eredu_runtime::replicated_execution::validate_collective_coordination;
     geometry.validate()?;
     let selected = validate_collective_coordination(
         manifest,

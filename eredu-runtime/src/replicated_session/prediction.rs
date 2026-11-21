@@ -1,6 +1,38 @@
 //! Observed auxiliary phases share ordinary preparation, recovery and commit.
 use super::*;
 
+/// Retains both causes when prediction work and recovery fail.
+#[derive(Debug, thiserror::Error)]
+#[error("prediction operation failed: {operation}, state recovery failed: {recovery}")]
+pub struct PredictionStateRecoveryFailure<E> {
+    /// The failure before recovery.
+    pub operation: E,
+    /// The failure while trying to restore ownership.
+    #[source]
+    pub recovery: E,
+}
+
+/// Resolves prediction work and its recovery without suppressing either failure.
+pub fn finish_prediction_state_operation<T, E>(
+    operation: Result<T, E>,
+    recovery: Result<(), E>,
+) -> Result<T, E>
+where
+    E: std::error::Error + Send + Sync + 'static + From<eredu_core::BackendFailure>,
+{
+    match (operation, recovery) {
+        (Err(operation), Err(recovery)) => Err(eredu_core::BackendFailure::from_error(
+            PredictionStateRecoveryFailure {
+                operation,
+                recovery,
+            },
+        )
+        .into()),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Ok(output), Ok(())) => Ok(output),
+    }
+}
+
 impl<A, B, M, D> ReplicatedTextSession<A, B, M, D>
 where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
@@ -11,6 +43,35 @@ where
     M::PolicyError: std::fmt::Display,
     M::Error: std::fmt::Display,
 {
+    /// Runs one prediction operation with the supplied lane state installed.
+    ///
+    /// Every successful exchange is paired with a restore. A failed agreement
+    /// on the return path triggers local ownership repair and remains fatal to
+    /// the operation even when the repair succeeds.
+    pub fn with_prediction_target_state<T, E>(
+        &mut self,
+        lane: &mut M::State,
+        context: &<B::Tensor as Tensor>::Context,
+        operation: impl FnOnce(&mut Self) -> Result<T, E>,
+        map_error: impl Fn(ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>) -> E,
+    ) -> Result<T, E>
+    where
+        E: std::error::Error + Send + Sync + 'static + From<eredu_core::BackendFailure>,
+    {
+        self.exchange_prediction_target_state(lane, context)
+            .map_err(&map_error)?;
+        let result = operation(self);
+        let restored = match self.exchange_prediction_target_state(lane, context) {
+            Ok(()) => Ok(()),
+            Err(error) => finish_prediction_state_operation(
+                Err(map_error(error)),
+                self.recover_prediction_target_state_after_failure(lane)
+                    .map_err(&map_error),
+            ),
+        };
+        finish_prediction_state_operation(result, restored)
+    }
+
     /// Runs a complete observed prediction phase, which may invoke several typed
     /// prediction operations. Preparation precedes mutation; native completion
     /// precedes receipt delivery and the common commit. No ordinary logits or

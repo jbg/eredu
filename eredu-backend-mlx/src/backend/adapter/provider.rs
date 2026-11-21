@@ -1,23 +1,30 @@
 use super::*;
 
 /// MLX backend selected for a complete model/session.
-pub struct MlxBackend<'a> {
+pub struct MlxBackend<'a, Dispatch = std::convert::Infallible> {
     stream: Stream,
     weights_stream: Stream,
     realized_device: Option<MlxDeviceIdentity>,
     world: Option<std::borrow::Cow<'a, safemlx::distributed::Group>>,
+    assistant_dispatch: std::marker::PhantomData<fn() -> Dispatch>,
 }
 
 impl MlxBackend<'static> {
     pub(crate) fn new(stream: &Stream, weights_stream: &Stream) -> Self {
+        Self::from_streams(stream, weights_stream)
+    }
+}
+
+impl<Dispatch> MlxBackend<'static, Dispatch> {
+    pub(crate) fn from_streams(stream: &Stream, weights_stream: &Stream) -> Self {
         Self {
             stream: stream.clone(),
             weights_stream: weights_stream.clone(),
             realized_device: None,
             world: None,
+            assistant_dispatch: std::marker::PhantomData,
         }
     }
-
     pub(crate) fn for_execution_plan(
         stream: &Stream,
         weights_stream: &Stream,
@@ -29,6 +36,7 @@ impl MlxBackend<'static> {
             weights_stream: weights_stream.clone(),
             realized_device: Some(realized_device),
             world: world.map(std::borrow::Cow::Owned),
+            assistant_dispatch: std::marker::PhantomData,
         }
     }
 }
@@ -44,8 +52,12 @@ impl<'a> MlxBackend<'a> {
             weights_stream: weights_stream.clone(),
             realized_device: None,
             world: Some(std::borrow::Cow::Borrowed(world)),
+            assistant_dispatch: std::marker::PhantomData,
         }
     }
+}
+
+impl<'a, Dispatch> MlxBackend<'a, Dispatch> {
     pub(crate) const fn stream(&self) -> &Stream {
         &self.stream
     }
@@ -58,46 +70,19 @@ impl<'a> MlxBackend<'a> {
         target.validate(&self.stream, self.world.as_deref())
     }
 
-    fn realize_selected_communication(
+    pub(crate) fn open_model_communication(
         &self,
-        manifest: Option<&eredu_runtime::CommunicationManifest>,
-        rank: Option<crate::backend::MlxRankContext>,
-    ) -> Result<Option<MlxDistributedSession>, Error> {
-        let Some(manifest) = manifest else {
-            return match rank {
-                None => Ok(None),
-                Some(_) => Err(Error::Parallel(
-                    "distributed MLX preparation has no architecture communication manifest".into(),
-                )),
-            };
-        };
-        let rank = rank.ok_or_else(|| {
-            Error::Parallel("communication manifest has no MLX rank/device context".into())
-        })?;
-        #[cfg(test)]
-        crate::tests::support::path_instrumentation::communication_realization_attempt();
+        rank: crate::backend::MlxRankContext,
+    ) -> Result<
+        crate::backend::runtime::distributed::topology::NativeWorldManifestTransport<'_>,
+        Error,
+    > {
+        use crate::backend::runtime::distributed::topology::NativeWorldManifestTransport;
         let world = self.world.as_deref().ok_or_else(|| {
             Error::Parallel("distributed model preparation requires a bound native world".into())
         })?;
         rank.validate_execution_stream(&self.stream)?;
-        #[cfg(test)]
-        crate::tests::support::path_instrumentation::manifest_communication_realization_attempt();
-        MlxDistributedSession::from_manifest(manifest, world, &self.stream).map(Some)
-    }
-
-    pub(in crate::backend) fn materialize_after_communication(
-        &self,
-        capabilities: SessionCapabilities,
-        manifest: Option<&eredu_runtime::CommunicationManifest>,
-        rank: Option<crate::backend::MlxRankContext>,
-        materialize: impl FnOnce(Option<MlxDistributedSession>) -> Result<MlxModel, Error>,
-    ) -> Result<PreparedModel<MlxModel>, Error> {
-        // This is an ordinary host entry, after cold selection and before new
-        // native allocations. Retire a previous executable here rather than
-        // keeping its weights until the replacement session is constructed.
-        crate::backend::nn::shared::MlxNeuralBackend::reclaim_retired_resources();
-        let distributed = self.realize_selected_communication(manifest, rank)?;
-        materialize(distributed).map(|model| PreparedModel::new(model, capabilities))
+        Ok(NativeWorldManifestTransport::new(world, &self.stream))
     }
 
     /// Waits for all work submitted to this backend's execution queue.
@@ -106,10 +91,7 @@ impl<'a> MlxBackend<'a> {
     }
 }
 
-impl<'a> BackendProvider for MlxBackend<'a> {
-    type ModelConfig = crate::composition::mlx::loading::MlxModelConfig;
-    type Model = MlxModel;
-    type Session = MlxModelSession;
+impl<'a, Dispatch> BackendProvider for MlxBackend<'a, Dispatch> {
     type Error = Error;
 
     fn descriptor(&self) -> BackendDescriptor {
@@ -131,36 +113,6 @@ impl<'a> BackendProvider for MlxBackend<'a> {
         )])
     }
 
-    fn prepare_model(
-        &self,
-        config: Self::ModelConfig,
-    ) -> Result<PreparedModel<Self::Model>, Self::Error> {
-        let capabilities = config.sources.selected().session_capabilities();
-        let rank = config.rank_context;
-        let manifest = config.sources.selected().communication_manifest();
-        if !cfg!(feature = "distributed") && manifest.is_some() {
-            return Err(Error::DistributedModelExecutionDisabled);
-        }
-        let manifest = manifest.cloned();
-        self.materialize_after_communication(capabilities, manifest.as_ref(), rank, |distributed| {
-            crate::composition::mlx::loading::materialize_model_plan(
-                config.sources,
-                distributed,
-                &self.stream,
-                &self.weights_stream,
-            )
-        })
-    }
-
-    fn create_session(
-        &self,
-        model: PreparedModel<Self::Model>,
-    ) -> Result<Self::Session, Self::Error> {
-        self.validate_prepared_target(model.native_target())?;
-        let admitted = model.capabilities();
-        MlxModelSession::from_model(model.into_inner(), admitted)
-    }
-
     fn session_capability_mismatch(
         &self,
         admitted: SessionCapabilities,
@@ -171,36 +123,29 @@ impl<'a> BackendProvider for MlxBackend<'a> {
         ))
     }
 }
-impl ModelLoadingBackend for MlxBackend<'_> {
-    type LoadOptions = MlxLoadRequest;
-    type SelectedPreparation = crate::composition::mlx::loading::MlxSelectedPreparation;
-    type ConfigurationResolver = eredu_architectures::configuration::ModelConfigurations;
 
-    fn configuration_resolver(&self) -> &Self::ConfigurationResolver {
-        &eredu_architectures::configuration::MODEL_CONFIGURATIONS
+impl<Dispatch> ModelLoadingBackend for MlxBackend<'_, Dispatch> {
+    type LoadPlacement = crate::backend::DeviceAssignment;
+    type Binding = crate::composition::mlx::loading::MlxModelPlacement;
+    type LoadMechanisms = crate::composition::mlx::loading::MlxPreparationMechanisms;
+
+    fn load_mechanisms(&self) -> crate::composition::mlx::loading::MlxPreparationMechanisms {
+        crate::composition::mlx::loading::MlxPreparationMechanisms
     }
 
-    fn select_preparation(
+    fn bind_load_placement(
         &self,
-        inspection: &eredu_core::ArtifactInspection<
-            eredu_architectures::processor_plan::ArtifactArchitecturePlan,
-        >,
-        options: &Self::LoadOptions,
-    ) -> Result<Self::SelectedPreparation, Self::Error> {
-        crate::composition::mlx::loading::select_preparation(inspection, options.clone())
+        rank: Option<eredu_core::ParallelRankTopology>,
+        device: Option<Self::LoadPlacement>,
+    ) -> Result<Self::Binding, Self::Error> {
+        let rank = crate::composition::mlx::loading::direct_rank(rank, device)?;
+        Ok(Self::Binding::direct(rank))
     }
 
-    fn selected_preparation_admission(
-        &self,
-        selected: &Self::SelectedPreparation,
-    ) -> eredu_core::PreparationAdmission {
-        selected.neutral().admission()
-    }
-
-    fn model_config(
-        &self,
-        selected: eredu_core::SelectedModelPreparation<Self>,
-    ) -> Result<Self::ModelConfig, Self::Error> {
-        crate::composition::mlx::loading::MlxModelConfig::new(selected)
+    fn validate_model_binding(&self, binding: &Self::Binding) -> Result<(), Self::Error> {
+        if !cfg!(feature = "distributed") && binding.rank_context.is_some() {
+            return Err(Error::DistributedModelExecutionDisabled);
+        }
+        Ok(())
     }
 }

@@ -1,6 +1,7 @@
 //! Backend-neutral causal-model and token-sampling contracts.
 
 use crate::execution_control::TokenChoiceController;
+use eredu_core::sampling::{PenaltyConfig, SamplingBackend, TokenDomain};
 use eredu_core::{
     generation::ResolvedGenerationConfig, SpeculativeTokenFilterController, TokenFilter,
     TokenFilterController,
@@ -8,6 +9,8 @@ use eredu_core::{
 use eredu_nn::Tensor;
 
 mod memory;
+mod text_sampler;
+pub use text_sampler::TextSampler;
 /// Iterative block sampling, independent of retained model context.
 pub mod refinement;
 pub use memory::sampling_invocation;
@@ -52,193 +55,6 @@ pub trait CausalModel<S> {
         _context: &<Self::Tensor as Tensor>::Context,
     ) -> Result<Self::Tensor, Self::Error> {
         Ok(logits)
-    }
-}
-
-/// Portable cardinality of one zero-based token-id domain.
-///
-/// Backends validate native token tensors without copying their values to the
-/// host. Architectures select the exact domain for each prediction boundary.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub struct TokenDomain {
-    cardinality: usize,
-}
-
-impl TokenDomain {
-    /// Creates the token IDs `0..cardinality`.
-    pub const fn new(cardinality: usize) -> Self {
-        Self { cardinality }
-    }
-
-    /// Number of valid zero-based token IDs.
-    pub const fn cardinality(self) -> usize {
-        self.cardinality
-    }
-}
-
-/// Backend primitives required by generic token-sampling policies.
-///
-/// The runtime owns ordering, history, adaptive state, and constraint rollback.
-/// Implementations operate directly on native logits and random state without
-/// copying values through a neutral tensor representation.
-pub trait SamplingBackend {
-    /// Describes sampling storage without tensors, random draws or state changes.
-    /// Backends without implementation facts preserve explicit incomplete coverage.
-    fn mechanism_memory(
-        invocation: &eredu_nn::mechanism_memory::MechanismInvocation,
-    ) -> Result<eredu_nn::mechanism_memory::MechanismMemoryContract, eredu_nn::Error> {
-        eredu_nn::mechanism_memory::MechanismMemoryContract::unknown(invocation)
-    }
-
-    /// Backend-native logits tensor.
-    type Logits: Clone;
-    /// Backend-native sampled-token tensor.
-    type Token: Clone;
-    /// Backend-native random-key stream.
-    type RandomState;
-    /// Execution context, such as a stream.
-    type Context: ?Sized;
-    /// Backend failure.
-    type Error;
-
-    /// Creates a backend error for a portable policy or constraint failure.
-    fn error(message: String) -> Self::Error;
-
-    /// Validates a native token tensor against one architecture-selected domain.
-    ///
-    /// The returned token must retain a backend-native dependency on the range
-    /// check so lazy backends cannot commit an unchecked forced token.
-    fn validate_token(
-        token: &Self::Token,
-        domain: TokenDomain,
-        context: &Self::Context,
-    ) -> Result<Self::Token, Self::Error>;
-
-    /// Scales logits by inverse temperature, preserving the native tensor.
-    fn scale_temperature(
-        logits: &Self::Logits,
-        temperature: f32,
-        context: &Self::Context,
-    ) -> Result<Self::Logits, Self::Error>;
-
-    /// Applies repetition, frequency, and presence penalties.
-    fn apply_penalties(
-        logits: &Self::Logits,
-        history: &[u32],
-        penalties: PenaltyConfig,
-        context: &Self::Context,
-    ) -> Result<Self::Logits, Self::Error>;
-
-    /// Masks all but the highest `top_k` logits. Non-positive values disable it.
-    fn apply_top_k(
-        logits: Self::Logits,
-        top_k: i32,
-        context: &Self::Context,
-    ) -> Result<Self::Logits, Self::Error>;
-
-    /// Applies nucleus filtering while retaining canonical vocabulary order.
-    fn apply_top_p(
-        logits: Self::Logits,
-        top_p: f32,
-        context: &Self::Context,
-    ) -> Result<Self::Logits, Self::Error>;
-
-    /// Applies minimum-relative-probability filtering.
-    fn apply_min_p(
-        logits: Self::Logits,
-        min_p: f32,
-        context: &Self::Context,
-    ) -> Result<Self::Logits, Self::Error>;
-
-    /// Masks tokens rejected by a portable vocabulary filter.
-    /// Explicit masks are closed sets: wider logits must mask the missing IDs,
-    /// while narrower logits use the executable prefix. Reject an empty
-    /// intersection before sampling; [`TokenFilter::allowed_mask_for`] implements
-    /// this shared domain policy without backend tensors.
-    fn apply_token_filter(
-        logits: &Self::Logits,
-        filter: &TokenFilter,
-        context: &Self::Context,
-    ) -> Result<Self::Logits, Self::Error>;
-
-    /// Applies Mirostat's surprise cutoff after penalties and temperature.
-    fn apply_mirostat(
-        logits: &Self::Logits,
-        history: &[u32],
-        penalties: PenaltyConfig,
-        temperature: f32,
-        mu: f32,
-        context: &Self::Context,
-    ) -> Result<Self::Logits, Self::Error>;
-
-    /// Selects from raw logits, applying temperature for stochastic sampling.
-    fn sample_raw(
-        logits: &Self::Logits,
-        temperature: f32,
-        random: Option<&mut Self::RandomState>,
-        context: &Self::Context,
-    ) -> Result<Self::Token, Self::Error>;
-
-    /// Selects from logits already scaled by the policy.
-    fn sample_processed(
-        logits: &Self::Logits,
-        temperature: f32,
-        random: Option<&mut Self::RandomState>,
-        context: &Self::Context,
-    ) -> Result<Self::Token, Self::Error>;
-
-    /// Materializes only the selected scalar token identifier.
-    fn token_id(token: &Self::Token, context: &Self::Context) -> Result<u32, Self::Error>;
-
-    /// Materializes a fixed group of selected scalar IDs. Backends may evaluate
-    /// and transfer the group together; order and scalar-token errors are retained.
-    fn token_ids<const N: usize>(
-        tokens: [&Self::Token; N],
-        context: &Self::Context,
-    ) -> Result<[u32; N], Self::Error> {
-        let mut ids = [0; N];
-        for (id, token) in ids.iter_mut().zip(tokens) {
-            *id = Self::token_id(token, context)?;
-        }
-        Ok(ids)
-    }
-
-    /// Materializes one committed token probability from processed logits.
-    fn token_probability(
-        logits: &Self::Logits,
-        token: u32,
-        context: &Self::Context,
-    ) -> Result<f32, Self::Error>;
-}
-
-/// Backend-neutral repetition/frequency/presence controls.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct PenaltyConfig {
-    /// Repetition multiplier; `1.0` disables it.
-    pub repeat_penalty: f32,
-    /// Number of recent tokens considered; negative means all.
-    pub repeat_last_n: i32,
-    /// Per-occurrence logit penalty.
-    pub frequency_penalty: f32,
-    /// One-time penalty for every present token.
-    pub presence_penalty: f32,
-}
-
-impl PenaltyConfig {
-    /// Returns whether every penalty is disabled.
-    pub fn is_identity(self) -> bool {
-        self.repeat_penalty == 1.0 && self.frequency_penalty == 0.0 && self.presence_penalty == 0.0
-    }
-}
-
-impl Default for PenaltyConfig {
-    fn default() -> Self {
-        Self {
-            repeat_penalty: 1.0,
-            repeat_last_n: 64,
-            frequency_penalty: 0.0,
-            presence_penalty: 0.0,
-        }
     }
 }
 
@@ -734,7 +550,7 @@ impl crate::execution_control::SnapshotValue for GenerationSampler {
 
     fn copy_snapshot_value(
         &self,
-        retention: &crate::execution_control::SnapshotReservation,
+        retention: &crate::execution_control::SnapshotRetention,
     ) -> Result<Self, eredu_core::BackendFailure> {
         Ok(Self {
             generated_tokens: self.generated_tokens.copy_snapshot_value(retention)?,

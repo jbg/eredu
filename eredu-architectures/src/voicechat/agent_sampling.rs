@@ -5,9 +5,10 @@
 //! does not enter repetition history on its own. Randomness belongs to the shared
 //! decision driver and its unpublished generation branch.
 
+use eredu_core::sampling::{PenaltyConfig, SamplingBackend, TokenDomain};
 use eredu_core::{execution_control::SnapshotEstimate, BackendFailure};
-use eredu_runtime::execution_control::{SnapshotReservation, SnapshotValue};
-use eredu_runtime::{PenaltyConfig, Sampler, SamplingBackend, TokenDomain};
+use eredu_runtime::execution_control::{SnapshotRetention, SnapshotValue};
+use eredu_runtime::Sampler;
 
 use super::channels::{TEXT_BOS_ID, TEXT_EOS_ID, TEXT_PAD_ID, TEXT_VOCABULARY_SIZE as VOCABULARY};
 
@@ -107,7 +108,7 @@ impl SnapshotValue for AgentSamplingPolicy {
         })
     }
 
-    fn copy_snapshot_value(&self, _: &SnapshotReservation) -> Result<Self, BackendFailure> {
+    fn copy_snapshot_value(&self, _: &SnapshotRetention) -> Result<Self, BackendFailure> {
         Ok(*self)
     }
 }
@@ -128,7 +129,7 @@ impl SnapshotValue for AgentSampler {
         })
     }
 
-    fn copy_snapshot_value(&self, _: &SnapshotReservation) -> Result<Self, BackendFailure> {
+    fn copy_snapshot_value(&self, _: &SnapshotRetention) -> Result<Self, BackendFailure> {
         let mut history = Vec::new();
         history
             .try_reserve_exact(self.history.len())

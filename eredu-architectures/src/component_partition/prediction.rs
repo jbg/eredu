@@ -67,7 +67,7 @@ impl ComponentPartitionLayouts {
                         0
                     }
                     ComponentExecutionScopeKind::Prediction { .. } => 1,
-                    ComponentExecutionScopeKind::FusedPrediction => execution.depth,
+                    ComponentExecutionScopeKind::FusedPrediction => execution.depth(),
                 };
                 if scope.execution_groups.len() != expected_groups
                     || scope

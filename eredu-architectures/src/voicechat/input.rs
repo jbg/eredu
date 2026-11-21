@@ -6,9 +6,7 @@
 
 use eredu_core::{execution_control::SnapshotEstimate, BackendFailure};
 use eredu_media::audio::streaming::{PcmFinishPolicy, PcmFrameSource};
-use eredu_runtime::execution_control::{
-    snapshot_value_estimate, SnapshotReservation, SnapshotValue,
-};
+use eredu_runtime::execution_control::{snapshot_value_estimate, SnapshotRetention, SnapshotValue};
 
 use eredu_nn::RetainedTensorRoots;
 
@@ -114,7 +112,7 @@ impl<T: SnapshotValue, C: SnapshotValue> SnapshotValue for InputState<T, C> {
             self.neural.estimate_snapshot_value(),
         ])
     }
-    fn copy_snapshot_value(&self, retention: &SnapshotReservation) -> Result<Self, BackendFailure> {
+    fn copy_snapshot_value(&self, retention: &SnapshotRetention) -> Result<Self, BackendFailure> {
         Ok(Self {
             frontend: self.frontend.copy_snapshot_value(retention)?,
             neural: self.neural.copy_snapshot_value(retention)?,

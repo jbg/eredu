@@ -1751,6 +1751,14 @@ impl AdmittedFile {
         Ok(Self { identity })
     }
 
+    pub(crate) fn read_all(&self, path: &Path) -> Result<Vec<u8>, StoreError> {
+        let mut file = self.open_validated(path)?;
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut bytes).map_err(|error| fs_error(path, error))?;
+        self.validate_file(path, &file)?;
+        Ok(bytes)
+    }
+
     fn open_validated(&self, path: &Path) -> Result<File, StoreError> {
         if path != self.identity.canonical_path {
             return Err(StoreError::AdmittedFileChanged {
@@ -2847,7 +2855,8 @@ fn invalid_selection(key: &str, message: impl Into<String>) -> StoreError {
     }
 }
 
-pub(crate) fn stored_dtype_from_safetensors(dtype: Dtype) -> StoredDtype {
+/// Converts a SafeTensors header dtype to the canonical storage encoding.
+pub fn stored_dtype_from_safetensors(dtype: Dtype) -> StoredDtype {
     match dtype {
         Dtype::BOOL => StoredDtype::Bool,
         Dtype::U8 => StoredDtype::U8,
@@ -2869,6 +2878,31 @@ pub(crate) fn stored_dtype_from_safetensors(dtype: Dtype) -> StoredDtype {
         Dtype::F8_E5M2 => StoredDtype::F8E5M2,
         other => StoredDtype::Other(format!("{other:?}")),
     }
+}
+
+/// Converts a named storage encoding to its SafeTensors header dtype.
+pub fn safetensors_dtype_from_stored(dtype: &StoredDtype) -> Option<Dtype> {
+    Some(match dtype {
+        StoredDtype::Bool => Dtype::BOOL,
+        StoredDtype::U8 => Dtype::U8,
+        StoredDtype::I8 => Dtype::I8,
+        StoredDtype::I16 => Dtype::I16,
+        StoredDtype::U16 => Dtype::U16,
+        StoredDtype::F16 => Dtype::F16,
+        StoredDtype::BF16 => Dtype::BF16,
+        StoredDtype::I32 => Dtype::I32,
+        StoredDtype::U32 => Dtype::U32,
+        StoredDtype::F32 => Dtype::F32,
+        StoredDtype::F64 => Dtype::F64,
+        StoredDtype::I64 => Dtype::I64,
+        StoredDtype::U64 => Dtype::U64,
+        StoredDtype::C64 => Dtype::C64,
+        StoredDtype::F8E4M3 => Dtype::F8_E4M3,
+        StoredDtype::F4 => Dtype::F4,
+        StoredDtype::F8E8M0 => Dtype::F8_E8M0,
+        StoredDtype::F8E5M2 => Dtype::F8_E5M2,
+        StoredDtype::Other(_) => return None,
+    })
 }
 
 fn io_error(path: &Path, error: impl std::fmt::Display) -> StoreError {

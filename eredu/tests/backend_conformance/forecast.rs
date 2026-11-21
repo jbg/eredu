@@ -12,12 +12,12 @@ use eredu_core::{generation::SpeculativeSchedulerOptions, AvailableMemory};
 use eredu_runtime::memory_estimation::WorkspaceGeometry;
 use eredu_runtime::memory_forecast::GenerationForecastError;
 use eredu_runtime::memory_forecast::{
-    GenerationForecastBackend, LoadedMemoryGeometry, LoadedMemoryProfile,
+    GenerationForecastSession, LoadedMemoryGeometry, LoadedMemoryProfile,
 };
 
-impl GenerationForecastBackend for MockBackend {
+impl GenerationForecastSession<MockBackend> for MockSession {
     fn refinement_memory_plan(
-        runtime: &ModelRuntime<Self>,
+        runtime: &ModelRuntime<MockBackend, Self>,
         policy: Option<eredu_core::refinement::RefinementPolicy>,
     ) -> Result<Option<eredu_runtime::memory_forecast::RefinementMemoryPlan>, GenerationForecastError>
     {
@@ -35,7 +35,7 @@ impl GenerationForecastBackend for MockBackend {
         }))
     }
     fn shared_backbone_memory_profile(
-        runtime: &ModelRuntime<Self>,
+        runtime: &ModelRuntime<MockBackend, Self>,
     ) -> Result<
         Option<eredu_runtime::memory_forecast::SpeculativeMemoryProfile>,
         GenerationForecastError,
@@ -68,7 +68,7 @@ impl GenerationForecastBackend for MockBackend {
 
     #[cfg(feature = "tensor-capture")]
     fn capture_memory_projection(
-        _: &ModelRuntime<Self>,
+        _: &ModelRuntime<MockBackend, Self>,
         capture: &eredu_core::capture::AdmittedCapturePlan,
         intervention: Option<&eredu_core::intervention::AdmittedInterventionPlan>,
         first_prediction: u64,
@@ -84,7 +84,7 @@ impl GenerationForecastBackend for MockBackend {
     }
 
     fn loaded_memory_profile(
-        runtime: &ModelRuntime<Self>,
+        runtime: &ModelRuntime<MockBackend, Self>,
     ) -> Result<LoadedMemoryProfile, GenerationForecastError> {
         Ok(if runtime.session().retention_forecast {
             retention::profile(runtime)
@@ -94,8 +94,8 @@ impl GenerationForecastBackend for MockBackend {
     }
 
     fn forecast_execution_contract(
-        _: &ModelRuntime<Self>,
-        prompt: Option<&Self::Prompt>,
+        _: &ModelRuntime<MockBackend, Self>,
+        prompt: Option<&Vec<u32>>,
         instrumented: bool,
     ) -> ForecastExecutionContract {
         ForecastExecutionContract {
@@ -116,9 +116,11 @@ impl GenerationForecastBackend for MockBackend {
     }
 }
 
-impl eredu_runtime::memory_forecast::SpeculativeForecastBackend<MockDrafter> for MockBackend {
+impl eredu_runtime::memory_forecast::SpeculativeForecastSession<MockBackend, MockDrafter>
+    for MockSession
+{
     fn speculative_memory_profile(
-        runtime: &ModelRuntime<Self>,
+        runtime: &ModelRuntime<MockBackend, Self>,
         drafting: &eredu_core::SpeculativeDraft<'_, MockDrafter>,
     ) -> Result<
         Option<eredu_runtime::memory_forecast::SpeculativeMemoryProfile>,
@@ -145,7 +147,8 @@ impl eredu_runtime::memory_forecast::SpeculativeForecastBackend<MockDrafter> for
             ));
         }
         if matches!(drafting, eredu_core::SpeculativeDraft::Embedded) {
-            return <MockBackend as eredu_runtime::memory_forecast::SpeculativeForecastBackend<
+            return <MockSession as eredu_runtime::memory_forecast::SpeculativeForecastSession<
+                MockBackend,
                 embedded::EmbeddedFixture,
             >>::speculative_memory_profile(
                 runtime, &eredu_core::SpeculativeDraft::Embedded
@@ -261,8 +264,11 @@ fn speculative_forecast_borrows_the_prepared_request_and_preserves_facts_on_reco
 }
 
 struct UnsupportedForecastFixture;
-impl eredu_runtime::memory_forecast::SpeculativeForecastBackend<UnsupportedForecastFixture>
-    for MockBackend
+impl
+    eredu_runtime::memory_forecast::SpeculativeForecastSession<
+        MockBackend,
+        UnsupportedForecastFixture,
+    > for MockSession
 {
 }
 
@@ -400,7 +406,7 @@ fn forecasting_preserves_controlled_and_uninterrupted_speculative_parity() {
 }
 
 fn setup() -> (
-    LoadedModel<MockBackend>,
+    LoadedModel<MockBackend, MockSession>,
     PreparedChat,
     PreparedChatGenerationSettings,
 ) {
@@ -672,7 +678,7 @@ fn prepared_backend_contract_and_calibration_overrides_are_retained() {
     let request = GenerationRequest {
         output_mode: eredu::api::OutputMode::Semantic,
         control_handle: None,
-        input: PreparedChatInput::prepared_backend_input(&chat, vec![1; 17]),
+        input: PreparedChatInput::prepared_input(&chat, vec![1; 17]),
         settings,
         caller_stop_sequences: &[],
         cancellation: Default::default(),
@@ -704,9 +710,9 @@ fn prepared_backend_contract_and_calibration_overrides_are_retained() {
     );
 }
 
-impl eredu::api::ContinuationForecastBackend for MockBackend {
+impl eredu::api::ContinuationForecastSession<MockBackend> for MockSession {
     fn continuation_memory_profile(
-        runtime: &ModelRuntime<Self>,
+        runtime: &ModelRuntime<MockBackend, Self>,
         additional_input_tokens: u64,
     ) -> Result<
         Option<eredu_runtime::memory_forecast::ContinuationMemoryProfile>,
@@ -1297,7 +1303,11 @@ fn settled_speculative_outlooks_are_read_only_and_follow_restore_and_branch_rete
 #[test]
 fn initial_self_mode_forecasts_shared_parameters_and_complete_masked_invocations() {
     use eredu_core::decoding::{DecodingMode, SpeculationOptionsRequest};
-    let mut runtime = ModelRuntime::prepare(MockBackend, Default::default()).unwrap();
+    let mut runtime = ModelRuntime::<_, _>::install::<MockSession>(
+        MockBackend,
+        fixture_prepared_model(Default::default()),
+    )
+    .unwrap();
     runtime.session_mut().switchable = true;
     let model = unicode_model_with_runtime(None, 64, QWEN_TEMPLATE, runtime);
     let options = SpeculationOptionsRequest {
@@ -1344,7 +1354,11 @@ fn initial_self_mode_forecasts_shared_parameters_and_complete_masked_invocations
 
 #[test]
 fn initial_diffusion_forecast_recomputes_short_output_without_shortening_canvas() {
-    let mut runtime = ModelRuntime::prepare(MockBackend, Default::default()).unwrap();
+    let mut runtime = ModelRuntime::<_, _>::install::<MockSession>(
+        MockBackend,
+        fixture_prepared_model(Default::default()),
+    )
+    .unwrap();
     runtime.session_mut().switchable = true;
     let model = unicode_model_with_runtime(None, 64, QWEN_TEMPLATE, runtime);
     let settings = PreparedChatGenerationSettings {

@@ -34,9 +34,13 @@ type ContinuationEvidence = Option<CapturedStep>;
 #[cfg(not(feature = "tensor-capture"))]
 type ContinuationEvidence = ();
 
-fn step<B: TextSnapshotBackend, C: TokenFilterController>(
-    driver: &mut TextGenerationDriver<'_, B>,
-    state: &mut ManagedTextContinuation<B, C>,
+fn step<
+    B: TextSnapshotBackend<S>,
+    C: TokenFilterController,
+    S: eredu_core::TextExecutionSession<B> + NativeTextStateSession<B>,
+>(
+    driver: &mut TextGenerationDriver<'_, B, S>,
+    state: &mut ManagedTextContinuation<B, C, S>,
 ) -> (u32, ContinuationEvidence) {
     let token = state.advance(driver).unwrap().expect("fixture ended early");
     assert!(matches!(
@@ -68,13 +72,14 @@ fn branch_values(mut value: (u32, ContinuationEvidence)) -> (u32, ContinuationEv
 /// Checks read-only rejection, exact inherited randomness across temperature
 /// changes, and reproducible explicit reseeding in an isolated child. Restores
 /// the initial parent afterward without model replay.
-pub fn sampling_override_conformance<B, C, P>(
-    driver: &mut TextGenerationDriver<'_, B>,
-    state: &mut ManagedTextContinuation<B, C>,
+pub fn sampling_override_conformance<B, C, P, S>(
+    driver: &mut TextGenerationDriver<'_, B, S>,
+    state: &mut ManagedTextContinuation<B, C, S>,
     limits: &ContinuationFixtureLimits,
     probe: impl Fn() -> P,
 ) where
-    B: TextSnapshotBackend + TextSamplingControlBackend,
+    B: TextSnapshotBackend<S> + TextSamplingControlBackend<S>,
+    S: eredu_core::TextExecutionSession<B> + NativeTextStateSession<B>,
     C: SnapshotTokenController + Clone + PartialEq + Debug,
     P: PartialEq + Debug,
 {
@@ -200,14 +205,15 @@ pub fn sampling_override_conformance<B, C, P>(
 /// and a reusable snapshot with a still-pending choice. The fixture must allow at
 /// least two tokens at its initial decision. Restores the initial state afterward,
 /// so the same run can enter `continuation_conformance` without replay.
-pub fn forced_choice_conformance<B, C, P>(
-    driver: &mut TextGenerationDriver<'_, B>,
-    state: &mut ManagedTextContinuation<B, TokenChoiceController<C>>,
+pub fn forced_choice_conformance<B, C, P, S>(
+    driver: &mut TextGenerationDriver<'_, B, S>,
+    state: &mut ManagedTextContinuation<B, TokenChoiceController<C>, S>,
     limits: &ContinuationFixtureLimits,
     vocabulary: usize,
     probe: impl Fn() -> P,
 ) where
-    B: TextSnapshotBackend,
+    B: TextSnapshotBackend<S>,
+    S: eredu_core::TextExecutionSession<B> + NativeTextStateSession<B>,
     C: SnapshotTokenController + Clone + PartialEq + Debug,
     P: PartialEq + Debug,
 {
@@ -296,13 +302,14 @@ pub fn forced_choice_conformance<B, C, P>(
 /// it must not count copying. Nonzero-temperature/adaptive fixtures detect lost
 /// RNG/history state. This function consumes the initial continuation for cleanup
 /// checks; its driver remains usable only for inspecting the fixture afterward.
-pub fn continuation_conformance<B, C, P>(
-    driver: &mut TextGenerationDriver<'_, B>,
-    mut state: ManagedTextContinuation<B, C>,
+pub fn continuation_conformance<B, C, P, S>(
+    driver: &mut TextGenerationDriver<'_, B, S>,
+    mut state: ManagedTextContinuation<B, C, S>,
     limits: ContinuationFixtureLimits,
     probe: impl Fn() -> P,
 ) where
-    B: TextSnapshotBackend,
+    B: TextSnapshotBackend<S>,
+    S: eredu_core::TextExecutionSession<B> + NativeTextStateSession<B>,
     C: SnapshotTokenController + Clone + PartialEq + Debug,
     P: PartialEq + Debug,
 {
@@ -329,7 +336,7 @@ pub fn continuation_conformance<B, C, P>(
     )
     .unwrap();
     assert_eq!(initial.next_prediction(), 0);
-    let initial_native = B::estimate_native_text_state(driver.runtime(), None)
+    let initial_native = S::estimate_native_text_state(driver.runtime(), None)
         .unwrap()
         .unwrap()
         .retained_bytes;
@@ -392,7 +399,7 @@ pub fn continuation_conformance<B, C, P>(
         .unwrap();
     assert_eq!(probe(), before, "copy/fork executed or rebuilt the model");
     let baseline: Vec<_> = (0..5).map(|_| step(driver, &mut state)).collect();
-    let native_after = B::estimate_native_text_state(driver.runtime(), None)
+    let native_after = S::estimate_native_text_state(driver.runtime(), None)
         .unwrap()
         .unwrap()
         .retained_bytes;

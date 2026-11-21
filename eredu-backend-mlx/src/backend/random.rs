@@ -1,7 +1,9 @@
 //! Stateful random-key ownership for MLX backend sessions.
 
-use eredu_core::{execution_control::SnapshotEstimate, BackendFailure, BackendFailureKind};
-use eredu_runtime::execution_control::{SnapshotReservation, SnapshotValue};
+use eredu_core::{
+    execution_control::{SnapshotEstimate, SnapshotRetention, SnapshotValue},
+    BackendFailure, BackendFailureKind,
+};
 use safemlx::{error::Result, ops::indexing::TryIndexOp, random, Array, Stream};
 
 use super::snapshot::{copy_array, estimate_array};
@@ -77,7 +79,7 @@ impl SnapshotValue for RandomState {
 
     fn copy_snapshot_value(
         &self,
-        retention: &SnapshotReservation,
+        retention: &SnapshotRetention,
     ) -> std::result::Result<Self, BackendFailure> {
         self.estimate_snapshot_value()?;
         Ok(Self {

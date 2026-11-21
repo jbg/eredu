@@ -1,7 +1,11 @@
 //! Portable policy and progress records for iterative token-block generation.
 
+use crate::sampling::SamplingBackend;
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroU32;
+
+mod native;
+pub use native::{RefinementBackend, TextRefinementNative};
 
 /// One canvas position and its selected token IDs in delivery order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -434,4 +438,35 @@ pub enum DraftEvent {
         /// Block whose draft is removed.
         block: u64,
     },
+}
+
+/// Native candidate validation for position-wise constrained finalization.
+pub trait RefinementFinalizationBackend: SamplingBackend {
+    /// Borrows one already selected canvas position as an immutable scalar token.
+    fn candidate_at(
+        candidates: &Self::Token,
+        position: usize,
+        context: &Self::Context,
+    ) -> Result<Self::Token, Self::Error>;
+    /// Tests whether the score indexed by this token is finite.
+    fn candidate_score_is_finite(
+        candidate: &Self::Token,
+        scores: &Self::Logits,
+        context: &Self::Context,
+    ) -> Result<bool, Self::Error>;
+    /// Reports finite and invalid score classes for the supplied position.
+    fn classify_position_scores(
+        scores: &Self::Logits,
+        context: &Self::Context,
+    ) -> Result<PositionScoreClass, Self::Error>;
+}
+
+/// Numeric classification of one score row.
+pub enum PositionScoreClass {
+    /// The row contains NaN or positive infinity.
+    Invalid,
+    /// All scores are negative infinity.
+    NoFinite,
+    /// The row is valid and at least one score is finite.
+    HasFinite,
 }
